@@ -1,0 +1,181 @@
+# homelab-bot 설정 초안 (DISCOVERY, 2026-10-18)
+#
+# 이 파일은 비밀값이 없는 예시다. 실제 값은 넣지 않는다.
+# - 바탕: 봇 문서 00-start.md §8 "초기 설정 예시". 00 §8에 있는 키는 모두 이 파일에도 있고 값이 같다.
+#   T15 결정 반영에서 00 §8도 확정 키를 이 파일과 같은 값으로 채웠다. 원래 초안 기본값이 바뀐 키는
+#   message_content_intent 하나다(unverified → enabled, D-17). 그 밖에 DISCOVERY가 찾은 키를 더했다.
+# - null은 미결정이거나, 확정됐지만 설계에 값 이름이 없는 키다(주석에 확정 내용. 예: auto_merge_scope).
+#   빈 목록은 "모두 거부"다. 필수 값이 비면 시작을 거부하는 것이 기본이다.
+# - D-14~D-17, D-24는 확정(사용자 2026-10-18, T15)이다(DECISIONS.md). 확정 값은 값으로 적었다.
+#   결정 안에 남은 세부(D-17 DM·브리핑 시각은 T16a, D-24 세부는 T19, R08 연결 방식은 T18)는 null로 둔다.
+#   "제안"이라고 적은 값은 에이전트 제안이고 담당 티켓에서 정한다.
+# - 허용 목록과 runtime policy의 실제 값, 비밀값은 Infisical /apps/homelab-bot/ 에 사람이 둔다(D-13).
+#   이 저장소(public)에는 키 이름만 둔다. Discord ID, 숫자 사용자 ID, 토큰을 여기에 쓰지 않는다.
+# - 결정 ID는 homelab spec §5 기준이다.
+
+target: V1
+mode: plan
+
+project:
+  source_repository: "ukyi-app/homelab-bot"   # D-13, 확정(사용자 2026-10-18, T14). public(D-29)
+  deployment_repository: "ukyi-app/homelab"   # C-01, C-07. 봇 배포 설정은 apps/homelab-bot/, data/homelab-bot/
+  control_host: "in-cluster"                  # D-15, 확정(사용자 2026-10-18, T15). NUC k3s 클러스터 안, ns app-homelab-bot
+  execution_host: "in-cluster"                # D-15, 확정. ns sandbox 상주 작업자 파드(동시성 1). U13 실패 때 호스트 전용 UID + nft
+  timezone: Asia/Seoul
+
+platform:
+  # 설계 이름(platform/design.md C.8)이다. 실제로 만들어졌는지는 T16b 시작 때 다시 실측한다(지금은 blocked).
+  design_doc: "docs/plans/2026-10-17-homelab-rebuild/platform/design.md"  # ukyi-app/homelab. T07 전 rebuild, 뒤 main
+  auto_merge_scope: null                      # D-07, 확정. 배포 App의 한 앱 image.yaml digest·revision PR만. 설계에 값 이름이 없어 null
+  webhook_ingress: "https://hooks.ukyi.app/github"  # 설계 C.8. POST 한 경로, HMAC 검증은 봇. 구축 T08a
+  observability_read_endpoints: []            # 설계 C.8: Grafana 서비스 계정 bot-reader(Viewer)로만. 주소는 T16b에서
+  cluster_read_account: "bot-reader"          # 설계 C.8: Kubernetes SA와 Argo CD 로컬 계정. 구축 T08b
+  alertmanager_receiver: "bot"                # 설계 C.8: 라우트(continue: true) → receiver bot → 클러스터 안 봇 Service
+  isolated_workspace: "sandbox_pod"           # 기본 방식 확정(T05): ns sandbox + ns egress. 남은 부분은 D-15 확정(T15)
+  bot_slot_target:                            # platform/bot-slot values.yaml의 target 입력(설계 C.8, E9)
+    namespace: "app-homelab-bot"              # D-13 이름 규칙
+    app_label: "homelab-bot"                  # D-15 확정. 설계 E9가 적은 값
+    app_port: 8080                            # D-15 확정. webhook 수신(공유 차트 예시 값)
+    alert_receiver_port: 8081                 # D-15 확정. 앱 포트와 분리
+    worker_port: 8080                         # D-15 확정. platform/sandbox 작업자 컨테이너 포트와 같아야 함
+  worker_code_read_hosts: ["codeload.github.com"]  # D-15 확정. github.com·api.github.com·gist는 뺀다. 작업자에 GitHub 자격 없음
+  worker_persistent_codex_home: null          # D-14 조건 4, 확정. 설계 C.8·E4b: PVC 하나, 파일이 없을 때만 시드. 크기·백업은 T08b. 값 이름이 설계에 없어 null
+  non_ai_alert_channel: telegram              # D-10, 확정. 봇과 독립
+  external_liveness_monitor: healthchecks_io  # D-10, 확정. Alertmanager Watchdog → 새 체크
+
+discord:
+  auth: official_bot
+  transport: gateway                          # D-17 확정: Interactions Endpoint URL 비움. INTERACTION_CREATE도 Gateway
+  # 앱 설정(D-17 확정, Developer Portal에서 사람이): Public Bot 끔, 서버 설치만. 봇 전용 개인 서버 신설
+  allowed_guilds: []                          # D-17 확정. 실제 값은 Infisical. 문자열 snowflake
+  allowed_channels: []                        # D-17 확정: 2개(대화, 알림·리뷰·브리핑). 실제 값은 Infisical. 스레드는 parent_id로 대조
+  allowed_users: []                           # D-17 확정: owner 1명. 실제 값은 Infisical. 문자열 snowflake
+  dm_enabled: null                            # D-17 남은 세부, T16a에서 정한다. DM 슬래시 명령은 전역 명령 + contexts BOT_DM 필요
+  alert_channel: null                         # R07. 알림·리뷰·브리핑 채널(D-17). 실제 ID는 Infisical
+  review_notify_channel: null                 # 기능 7. 같은 채널. 실제 ID는 Infisical
+  briefing_channel: null                      # R18. 같은 채널. 실제 ID는 Infisical
+  activation: explicit_mention_or_command     # 00 §8 원래 값. D-17 확정: 멘션이나 / 명령으로 공개 스레드 시작, 스레드 안은 멘션 없이
+  thread_type: public                         # D-17 확정. 메시지 없이 만들 때 type을 항상 명시
+  auto_archive_minutes: 1440                  # D-17 확정. 허용 값 60 | 1440 | 4320 | 10080
+  briefing_time: null                         # D-17 남은 세부, T16a에서 정한다
+  message_content_intent: enabled             # D-17 확정: 켬. 00 §8 원래 초안 값은 unverified. 실연동 확인은 T16b
+  gateway_intents: null                       # 제안: 37377(GUILDS|GUILD_MESSAGES|DIRECT_MESSAGES|MESSAGE_CONTENT). DM을 안 쓰면 33281, intent를 끄면 4609
+  bot_permissions: null                       # 제안 309237763136. D-17 확정: ADMINISTRATOR·MANAGE_THREADS·MENTION_EVERYONE 없음, 허용 채널 overwrite로
+  allowed_mentions_parse: []                  # D-17 확정. 모든 봇 메시지의 멘션 파싱 끔(모델 출력 속 @everyone 차단)
+
+github:
+  review_identity: dedicated_github_app       # 00 §8 원래 값. D-16 확정(사용자 2026-10-18, T15): 기본안
+  review_app_permissions: null                # 설계 세부(사용자 결정 아님), T17에서 확인. 제안: Pull requests write, Contents read, Metadata read,
+                                              # Checks read(설계 C.8대로 늘 포함), Issues read(issue_comment 구독용).
+                                              # Issues write·Contents write 없음(DECISIONS D-16 "리뷰 App 권한")
+  review_app_events: null                     # 설계 세부, T17. 제안: [pull_request, issue_comment]. pull_request는 edited 중 base 변경(재지정)도 트리거. issue_comment는 action created이고 본문이 정해진 리뷰 명령일 때만
+  reviewed_repositories: []                   # D-16, T17에서 정한다. 설치는 시험 저장소부터
+  review_mode: advisory_comment_only
+  review_drafts_by_default: false
+  model_call_author_associations: [OWNER, MEMBER, COLLABORATOR]  # D-29, 확정. CONTRIBUTOR는 넣지 않는다(D-16 하위 결정)
+  allowed_bot_author_ids: []                  # D-16 하위 결정, 확정. 숫자 사용자 ID. 실제 값은 Infisical runtime policy
+                                              # (키 이름 예: review.allowed_bot_author_ids). 대상: 호스팅형 Renovate 봇, D-24 App 봇 사용자(생성 뒤)
+                                              # 넣지 않는 것: 배포 갱신 App(homelab-deploy), Codex Connector, 옛 writer
+  exclude_fork_pull_requests: true            # D-16 하위 결정, 확정(spec §5.1). 모델 리뷰에서 fork PR 제외. 코드 실행 금지는 별도 규칙
+  ignore_bot_comments: true                   # D-16 하위 결정, 확정. 댓글 트리거는 comment.author_association을 본다
+                                              # 댓글 트리거도 대상 PR을 조회해 fork 제외·PR 작성자 조건을 그대로 적용(DECISIONS D-16 규칙 스케치)
+  renovate_body_policy: untrusted_data        # D-16 하위 결정, 확정: 허용 작성자의 PR 본문도 비신뢰 자료. 빼기·격리 방식은 T17
+  prohibit_approve_request_changes_merge: true
+  change_existing_merge_policy: false
+  change_writer_identity: dedicated_github_app  # D-24 확정: Contents·Pull requests write, Metadata read. Workflows·Actions·Administration·Issues 없음
+  change_writer_repositories: []              # D-24 남은 세부, T19
+  change_writer_branch_prefix: "bot/"
+  change_writer_allow_paths: []               # T19에서 정한다. .github/workflows 는 넣을 수 없다(권한 없음)
+  change_writer_split_tokens: null            # D-24 남은 세부, T19. 제안: 커밋·ref용과 PR용 토큰 분리
+  workflow_dispatch_enabled: false
+
+codex:
+  engine: codex
+  adapters_to_verify: [herdr, official_codex_interface]  # 00 §8 원래 값. DISCOVERY 결과: herdr는 봇 경로에서 제외
+  adapter: null                               # 제안: exec(codex exec --json). app-server는 실험 후보
+  pinned_version: null                        # 제안: codex-cli 0.163.0 기준으로 고정. T16a(대화 레인)·T18에서 확정
+  # 개인 CODEX_HOME 전체(목록은 00 §8 주석)는 자동 탐색하지 않고, 쓰거나 복사하지 않는다(01 §6, D-14)
+  auth: chatgpt_subscription                  # D-14 확정(사용자 2026-10-18, T15): 봇 전용 ChatGPT 구독 계정. 에이전트 추천(API 키)과 다름
+                                              # T17 차단 조건(확정(사용자 2026-10-18, PR #3 리뷰)): OpenAI 허용 확인이나 API 키 등 공식 지원 인증 전환 뒤에만
+                                              # 공개 저장소 PR 내용으로 구독 모델을 부른다(평가셋, authorized_external, 시범 P-2). 모델을 부르지 않는 로컬·mock은 T16a 뒤
+  codex_home: worker_dedicated                # D-14 확정: 작업자 전용 CODEX_HOME, 영속 쓰기 공간(platform.worker_persistent_codex_home)
+  on_limit_or_auth_expiry: wait               # D-14 조건 2, 확정. 다른 계정·인증으로 자동 전환하지 않는다
+  auth_fallback: none                         # D-14 확정. Codex 밖 OAuth 프록시·여러 계정 순회 금지
+  capabilities:                               # 01 §6 추상 계약. DISCOVERY 제안값(T18에서 실측으로 확정)
+    start_task: null                          # 제안: true
+    attach_task: null                         # 보류. R08 연결 방식은 T18에서 다시 판단한다(사용자 2026-10-18, T15)
+    answer_question: null                     # 제안: clarification_only(exec resume)
+    tool_approval_relay: false                # exec에 승인 플래그 없음. 무응답 자동 승인 금지
+    request_cancel: null                      # 제안: process_signal(작업 process group 또는 cgroup 전체). 자식이 모두 사라졌음을 확인한 뒤에만
+                                              # cancelled, 확인 못 하면 unknown·새 실행 차단 [가정], T18(ARCHITECTURE §4)
+                                              # 정상·실패·시간 초과 종료 때도 같은 정리. 막힘 해제는 파드 재생성 뒤 프로세스 0개 확인이나 owner 명령
+    resume_task: null                         # 제안: when_session_files_persist. 같은 작업의 세션만. 세션 저장 공간은 작업마다 나눈다 [가정], T18(ARCHITECTURE §5.1)
+  shell_environment_inherit: null             # 제안: none. 기본값은 KEY·SECRET·TOKEN 변수를 모델 명령에 넘긴다
+  authorized_task_ids: []
+  unattended_operational_approval: false
+
+homelab:
+  read_only: true
+  services: []
+  namespaces: []
+  allowed_query_templates: []                 # Grafana Viewer가 모든 데이터소스를 질의할 수 있어 이 목록이 로그 제외의 경계다
+  query_window_max:                           # R05 시간창 상한. T16a에서 정한다(예: 로그는 시간 단위). 보존 기간과 같으면 아무것도 막지 않는다
+    metrics: null
+    logs: null
+  data_retention_days:                        # 참고값: 설계 C.3.7 보존 기간. 질의 상한이 아니다
+    metrics: 30
+    logs: 14
+  read_secret_values: false
+
+safety:
+  publisher_separate_from_worker: true
+  model_credentials_only_in_worker: null      # 제안: true(ARCHITECTURE 방안 1). 대화 레인 경로는 T16a
+  execute_untrusted_pr_code_by_default: false
+  public_output_from_private_source: deny_without_declassification
+  allow_policy_self_edit: false
+  runtime_policy_source: null                 # 제안 [가정], T16a: mounted_secret_file(바뀌면 다시 읽음, ARCHITECTURE §6).
+                                              # 공유 차트 변경 필요(설계 C.4.5는 env만)
+  runtime_policy_max_age_seconds: null        # T16a. 현재 revision을 확인할 수 없거나 이 나이를 넘으면 거부(실패 시 닫힘)
+                                              # Infisical에서만 철회하면 ESO 갱신 주기만큼 통과할 수 있다. 즉시 철회는 owner 거부 목록 명령으로만
+                                              # (owner ID 검사 슬래시 명령, 모델 경유 없음, 거부 추가만. 해제는 owner 명령이나 Infisical 새 revision 확인 뒤)
+  worker_control_auth: null                   # 제안: 게시 서버가 요청마다 서명한 단기 capability. 결정은 T16a·T18(DECISIONS D-15 "작업자 제어 끝점")
+
+health:
+  readiness_scope: null                       # 제안: receivers_and_db. 수신기가 요청을 영속 저장할 수 있는지(DB 연결 등)만. Gateway·큐 지연은 넣지 않는다(ARCHITECTURE §8 (a))
+  gateway_alert: null                         # 제안: Gateway 연결 gauge + 봇 전용 룰(ARCHITECTURE §8 (c)). 지표 이름은 T16a, 룰 이름·지속 시간은 T08b
+  heartbeat_check: null                       # 제안: healthchecks_io 봇 전용 체크(ARCHITECTURE §8 (b))
+                                              # 대안: Gateway가 최근 N분 연결돼 있을 때만 ping. 채택 여부와 N은 T16a(ARCHITECTURE §8 "대안")
+
+budgets:                                      # 제안 초기값은 ARCHITECTURE §9. T16a·T16b에서 측정 뒤 정한다
+  max_concurrent_jobs: 1                      # D-14 조건 3, 확정. 작업자의 모델 호출(대화·작업 레인 합계) 직렬 1개
+  max_duration_seconds: null
+  max_tool_calls: null
+  max_retries: null
+  model_plan: null                            # D-14 A. Plus 또는 Pro, 사람이 봇 계정을 준비할 때 고른다
+
+retention:
+  event_days: null
+  evidence_days: null
+  memory: scoped_and_deletable
+  backup_days: 14                             # 설계 기본값, 확정. 삭제한 기억도 이 기간 백업에 남을 수 있음
+  deletion_ledger: null                       # 제안: 복원 대상 밖(예: R2 append-only 객체). 기억 ID·created_at·삭제 시각만. 기동 때마다 재적용
+                                              # ID와 created_at이 둘 다 맞을 때만 삭제. memory_id는 재사용되지 않는 값(UUID 등) 제안. T20(R17), ARCHITECTURE §7
+                                              # 순서: 원장 기록 확인 → DB 삭제 → 완료 응답. 원장 쓰기가 실패하면 지우지 않음(실패 알림 또는 재시도 outbox) [가정]
+                                              # DB 삭제가 실패하면 성공할 때까지 재시도하고 그동안 조회에서 숨김(원장 또는 DB 숨김 표식 대조) [가정]
+
+# 비밀값과 실제 값의 위치. 값은 여기 쓰지 않는다(키 이름만).
+secret_keys:
+  publisher:                                  # Infisical /apps/homelab-bot/ (게시 서버만)
+    - DISCORD_BOT_TOKEN
+    - GITHUB_REVIEW_APP_ID
+    - GITHUB_REVIEW_APP_PRIVATE_KEY
+    - GITHUB_REVIEW_WEBHOOK_SECRET
+    - GITHUB_WRITER_APP_ID
+    - GITHUB_WRITER_APP_PRIVATE_KEY
+    - GRAFANA_READER_TOKEN
+    - ARGOCD_READER_TOKEN
+    - HEALTHCHECKS_PING_URL
+    - RUNTIME_POLICIES                        # 허용 목록·runtime policy 실제 값(JSON). 마운트한 Secret 파일로 읽기는 제안 [가정], T16a.
+                                              # 공유 차트 변경 필요(설계 C.4.5는 env만)
+  worker:                                     # Infisical /apps/homelab-bot/worker (작업자만, 모델 자격 하나)
+    - CODEX_AUTH_JSON                         # 이름 제안. D-14 A의 시드 auth.json. 영속 CODEX_HOME에 없을 때만 시드로 쓴다
