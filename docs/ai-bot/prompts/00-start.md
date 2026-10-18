@@ -124,7 +124,7 @@ Discord / GitHub Webhook / 플랫폼 알림(Alertmanager 등)
 
 - **저장소:** `ukyi-app/homelab`을 같은 이름으로 재사용하고 내용을 교체한다(C-01). 옛 Argo CD가 main을 `prune`·`selfHeal` 자동 동기화로 따라가므로, 옛 클러스터를 내리기 전에는 main을 바꾸지 않고 새 작업은 `rebuild` 브랜치에 둔다(spec §4.5). main 교체는 T07이다.
 - **플랫폼 원칙:** k3s + Argo CD GitOps, 앱 저장소 분리, Infisical Cloud가 시크릿 원본이고 전달 계층은 ESO 우선 검토, CloudNativePG, 단일 서버(C-07). 전달 계층은 ESO v2.13.x로 정했다(확정(사용자 2026-10-18, T05), 설계 F "Kubernetes 시크릿 전달 계층"). 앱 소스는 `ukyi-app/<app>` 형태의 독립 저장소, 운영 설정은 homelab 중심이다(플랫폼 프롬프트 §2).
-- **하드웨어:** NUC 한 대(`nuc-15-pro`, LAN `192.168.117.15`). 옛 클러스터와 새 클러스터를 함께 돌릴 수 없어 구축 기간에는 홈랩 서비스가 멈춘다(spec §4.5).
+- **하드웨어:** NUC 한 대. 호스트 이름과 LAN 주소는 이 공개 저장소에 적지 않는다(플랫폼 설계 문서에 있다). 옛 클러스터와 새 클러스터를 함께 돌릴 수 없어 구축 기간에는 홈랩 서비스가 멈춘다(spec §4.5).
 - **데이터:** 옛 DB 데이터와 pg·cache 백업, `homelab-media-prod` 버킷과 files 데이터를 폐기한다(C-02, C-03).
 - **옛 자동화:** 옛 저장소 GitHub Actions는 비활성화했다(C-06).
 - **봇 저장소:** 봇 코드는 새 public 저장소 `ukyi-app/homelab-bot`에 둔다(D-13, 확정(사용자 2026-10-18, T14)). 앱 이름도 `homelab-bot`이라 namespace `app-homelab-bot`, Infisical `/apps/homelab-bot/`(게시 서버)와 `/apps/homelab-bot/worker`(작업자), 이미지 이름이 이를 따른다. 배포 설정은 homelab의 `apps/homelab-bot/`, `data/homelab-bot/`이다. 저장소는 사람이 만들고, 방법은 설계 C.8 "봇 저장소"다. 옛 `ukyi-app/aiops`는 재사용하지 않는다(아래 "옛 AIOps 시도").
