@@ -250,7 +250,9 @@ pull_request (opened | reopened | ready_for_review | synchronize | edited 중 ba
   ∧ draft == false (명시 요청 예외는 따로)
 
 issue_comment (PR 댓글로 리뷰 요청):
-  comment.author_association ∈ {OWNER, MEMBER, COLLABORATOR}   # issue.author_association 아님
+  action == "created"                                          # 수정·삭제는 트리거 아님
+  ∧ comment.body가 정해진 리뷰 명령과 정확히 일치               # 일반 토론 댓글은 트리거 아님. 문법은 T17
+  ∧ comment.author_association ∈ {OWNER, MEMBER, COLLABORATOR}   # issue.author_association 아님
   ∧ comment.user.type != "Bot"                                 # 자기·Codex 댓글 루프 차단
   ∧ pr := 대상 PR을 PR API로 조회                               # 아래 첫 항목
   ∧ pr.head.repo.id == pr.base.repo.id                         # fork PR 제외(자동 리뷰와 같음)
@@ -260,6 +262,7 @@ issue_comment (PR 댓글로 리뷰 요청):
 
 - `issue_comment` payload에는 PR의 head 저장소가 없어 fork 여부를 PR API로 읽는다 [가정]. 조회가 실패하면 모델을 호출하지 않는다.
 - `synchronize`의 `sender`는 감사·대조용으로 기록한다 [가정].
+- 댓글 리뷰 요청은 같은 PR의 같은 세대(`head_sha`, `comparison_revision`, `policy_revision`)에 대기·진행 중인 리뷰가 있으면 새로 넣지 않는다. 모델 호출이 직렬 1개(D-14)라 일반 토론 댓글이 리뷰를 다시 넣으면 대화와 작업이 밀린다 [가정].
 - `edited`는 base가 바뀐 경우(재지정)만 새 리뷰 세대로 본다. 판정은 받은 PR의 base를 처리 기록과 비교해 한다. base 브랜치가 앞서가기만 하는 경우는 PR 이벤트가 없어 열린 PR 폴링이 잡는다. 세대 구분은 `01` §5의 `(head_sha, comparison_revision, policy_revision)`이다(ARCHITECTURE §7, REVIEW-02) [가정].
 
 **초기 목록**

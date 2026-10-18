@@ -68,7 +68,7 @@ github:
   review_app_permissions: null                # 설계 세부(사용자 결정 아님), T17에서 확인. 제안: Pull requests write, Contents read, Metadata read,
                                               # Checks read(설계 C.8대로 늘 포함), Issues read(issue_comment 구독용).
                                               # Issues write·Contents write 없음(DECISIONS D-16 "리뷰 App 권한")
-  review_app_events: null                     # 설계 세부, T17. 제안: [pull_request, issue_comment]. pull_request는 edited 중 base 변경(재지정)도 트리거
+  review_app_events: null                     # 설계 세부, T17. 제안: [pull_request, issue_comment]. pull_request는 edited 중 base 변경(재지정)도 트리거. issue_comment는 action created이고 본문이 정해진 리뷰 명령일 때만
   reviewed_repositories: []                   # D-16, T17에서 정한다. 설치는 시험 저장소부터
   review_mode: advisory_comment_only
   review_drafts_by_default: false
