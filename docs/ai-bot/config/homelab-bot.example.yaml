@@ -96,6 +96,8 @@ codex:
   pinned_version: null                        # 제안: codex-cli 0.163.0 기준으로 고정. T16a(대화 레인)·T18에서 확정
   # 개인 CODEX_HOME 전체(목록은 00 §8 주석)는 자동 탐색하지 않고, 쓰거나 복사하지 않는다(01 §6, D-14)
   auth: chatgpt_subscription                  # D-14 확정(사용자 2026-10-18, T15): 봇 전용 ChatGPT 구독 계정. 에이전트 추천(API 키)과 다름
+                                              # T17 차단 조건(확정(사용자 2026-10-18, PR #3 리뷰)): OpenAI 허용 확인이나 API 키 등 공식 지원 인증 전환 뒤에만
+                                              # 공개 저장소 PR 내용으로 구독 모델을 부른다(평가셋, authorized_external, 시범 P-2). 모델을 부르지 않는 로컬·mock은 T16a 뒤
   codex_home: worker_dedicated                # D-14 확정: 작업자 전용 CODEX_HOME, 영속 쓰기 공간(platform.worker_persistent_codex_home)
   on_limit_or_auth_expiry: wait               # D-14 조건 2, 확정. 다른 계정·인증으로 자동 전환하지 않는다
   auth_fallback: none                         # D-14 확정. Codex 밖 OAuth 프록시·여러 계정 순회 금지
@@ -104,8 +106,10 @@ codex:
     attach_task: null                         # 보류. R08 연결 방식은 T18에서 다시 판단한다(사용자 2026-10-18, T15)
     answer_question: null                     # 제안: clarification_only(exec resume)
     tool_approval_relay: false                # exec에 승인 플래그 없음. 무응답 자동 승인 금지
-    request_cancel: null                      # 제안: process_signal
-    resume_task: null                         # 제안: when_session_files_persist
+    request_cancel: null                      # 제안: process_signal(작업 process group 또는 cgroup 전체). 자식이 모두 사라졌음을 확인한 뒤에만
+                                              # cancelled, 확인 못 하면 unknown·새 실행 차단 [가정], T18(ARCHITECTURE §4)
+                                              # 정상·실패·시간 초과 종료 때도 같은 정리. 막힘 해제는 파드 재생성 뒤 프로세스 0개 확인이나 owner 명령
+    resume_task: null                         # 제안: when_session_files_persist. 같은 작업의 세션만. 세션 저장 공간은 작업마다 나눈다 [가정], T18(ARCHITECTURE §5.1)
   shell_environment_inherit: null             # 제안: none. 기본값은 KEY·SECRET·TOKEN 변수를 모델 명령에 넘긴다
   authorized_task_ids: []
   unattended_operational_approval: false
@@ -156,6 +160,8 @@ retention:
   backup_days: 14                             # 설계 기본값, 확정. 삭제한 기억도 이 기간 백업에 남을 수 있음
   deletion_ledger: null                       # 제안: 복원 대상 밖(예: R2 append-only 객체). 기억 ID·created_at·삭제 시각만. 기동 때마다 재적용
                                               # ID와 created_at이 둘 다 맞을 때만 삭제. memory_id는 재사용되지 않는 값(UUID 등) 제안. T20(R17), ARCHITECTURE §7
+                                              # 순서: 원장 기록 확인 → DB 삭제 → 완료 응답. 원장 쓰기가 실패하면 지우지 않음(실패 알림 또는 재시도 outbox) [가정]
+                                              # DB 삭제가 실패하면 성공할 때까지 재시도하고 그동안 조회에서 숨김(원장 또는 DB 숨김 표식 대조) [가정]
 
 # 비밀값과 실제 값의 위치. 값은 여기 쓰지 않는다(키 이름만).
 secret_keys:

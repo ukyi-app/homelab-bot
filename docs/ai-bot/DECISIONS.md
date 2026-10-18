@@ -5,6 +5,7 @@
 - 확정된 결정 안에 남은 미정 세부는 새 결정 ID 없이 담당 티켓에서 정한다(spec §5.3): D-17의 DM 허용 여부와 브리핑 시각은 T16a, D-24의 토큰 분리·ruleset E 여부·App 이름·설치 저장소·허용 파일 경로는 T19.
 - 같은 응답에서 함께 정한 것: R08 연결 방식은 T18에서 다시 판단하고 그때까지 보류한다(아래 "R08"). V1 범위 조정은 안 3이다([V1_PLAN.md](V1_PLAN.md) §4). 둘 다 T15 질문에 에이전트 추천으로 제시한 안이고 사용자가 골랐다.
 - 같은 날 뒤이어 정한 것(사용자 2026-10-18): Codex Connector 설치 범위 축소는 `homelab-bot-ops`에 운영 산출물을 처음 올리기 전에 사람이 한다(아래 D-16 "Codex Connector 설치 범위"). 축소는 완료됐다(사람 2026-10-18 17:45, homelab `approvals.md`). 또 D-29의 비앱 저장소 처리를 `aiops`·`mac-uptime-guard` 제거, `aiops-autodeploy-canary` private 보관으로 바꿨다(사용자 2026-10-18 17:46, 실행 T22).
+- PR #3 리뷰 중 정한 것(사용자 2026-10-18): D-14에 T17 차단 조건을 더했다(아래 D-14 "차단 조건").
 - 에이전트가 문서끼리 맞춘 정리(사용자 결정 아님): D-14 봇 구독 계정 준비와 작업자 `auth.json` 첫 시드는 T16b 전(모델을 처음 쓰는 단계 전)에 한다. 대화 레인이 T16b에서 처음 모델을 쓰기 때문이다(아래 D-14 "시점").
 - 근거 꼬리표: `[확인: 출처]` 공식 문서나 계획 문서, `[실측: 명령과 결과 요지]` 읽기 전용 실행 결과, `[가정]` 근거 있는 추론, `[미확인]` 확인하지 못한 것. 확인일은 모두 2026-10-18이라 꼬리표마다 다시 적지 않는다. 세부 근거는 [DISCOVERY.md](DISCOVERY.md)와 [VERIFICATION.md](VERIFICATION.md)에 있다.
 - 실제 값(Discord ID, 허용 목록, 키)은 Infisical `/apps/homelab-bot/`에 사람이 두고, 이 저장소에는 키 이름만 둔다(D-13).
@@ -14,7 +15,7 @@
 
 | ID | 질문 | 결정 | 남은 미정·담당 |
 |---|---|---|---|
-| D-14 | 봇 모델 계정과 인증 | 봇 전용 ChatGPT 구독 계정 + 작업자 전용 CODEX_HOME, 함께 지킬 조건 다섯. 에이전트 추천(B, OpenAI API 프로젝트 키)과 다름 | OpenAI 확인 항목 셋 [미확인]. 계정 준비와 첫 시드: T16b 전(모델을 처음 쓰는 단계 전). 영속 쓰기 공간의 크기·백업(T08b) |
+| D-14 | 봇 모델 계정과 인증 | 봇 전용 ChatGPT 구독 계정 + 작업자 전용 CODEX_HOME, 함께 지킬 조건 다섯. 에이전트 추천(B, OpenAI API 프로젝트 키)과 다름 | OpenAI 확인 항목 셋 [미확인]. 공개 저장소 문구는 T17 차단 조건(허용 확인이나 공식 지원 인증 전환 전에는 공개 저장소 PR 내용으로 구독 모델을 부르지 않음. 모델을 부르지 않는 T17 로컬·mock 구현은 T16a 뒤 착수, 확정(사용자 2026-10-18, PR #3 리뷰)). T18도 같은 차단(확정(사용자 2026-10-18, PR #3 리뷰)). 계정 준비와 첫 시드: T16b 전(모델을 처음 쓰는 단계 전). 영속 쓰기 공간의 크기·백업(T08b) |
 | D-15 | 실행 호스트, 라벨·포트, 코드 읽기 호스트 | NUC 클러스터 안. 라벨 `homelab-bot`, 앱·작업자 포트 8080, 경보 수신 포트 8081. 작업자 코드 읽기는 `codeload.github.com` 압축본만 | U13·U29와 프록시 경유 압축본 받기 실측(T08b·T16b) |
 | D-16 | PR 리뷰 방식 | 기본안. 봇 리뷰 저장소의 Codex 자동 리뷰는 저장소별 설정에서 끔. Connector 설치는 선택 저장소로 줄이고 운영 저장소는 뺌(축소 완료, 사람 2026-10-18 17:45). 하위 결정: 허용 봇 작성자 목록 | 남긴 저장소 목록의 API 확인(사용자 보고만 있음). 리뷰 대상 저장소 목록과 리뷰 App 이름, 리뷰 App 권한 확인(Issues read 포함, 설계 세부)(T17) |
 | D-17 | Discord 서버, 채널, 허용 사용자 | 봇 전용 개인 서버 신설, 허용 사용자 owner 1명, 채널 2개, `MESSAGE_CONTENT` 켬 | DM 허용 여부, 브리핑 시각(T16a) |
@@ -24,7 +25,7 @@
 
 ## D-14 봇 모델 계정과 인증
 
-**상태:** 확정(사용자 2026-10-18, T15). **A: 봇 전용 ChatGPT 구독 계정 + 작업자 전용 CODEX_HOME.** 에이전트 추천은 B(OpenAI API 전용 프로젝트 + 서비스 계정 키)였다. 사용자는 추천이 아닌 A를 골랐다.
+**상태:** 확정(사용자 2026-10-18, T15). **A: 봇 전용 ChatGPT 구독 계정 + 작업자 전용 CODEX_HOME.** 에이전트 추천은 B(OpenAI API 전용 프로젝트 + 서비스 계정 키)였다. 사용자는 추천이 아닌 A를 골랐다. T17 차단 조건을 더했다(확정(사용자 2026-10-18, PR #3 리뷰), 아래 "차단 조건").
 
 **질문:** 봇이 모델(Codex)을 부를 때 어떤 계정과 인증을 쓰는가. spec §5.3의 추천 기본값은 "전용 계정과 전용 CODEX_HOME. 자동 호출 약관 확인 후 결정"이었다. 봇 문서는 구독 플랜의 사용 조건을 자동 호출 권한으로 가정하지 말라고 한다(`01` §3 질문 7).
 
@@ -38,12 +39,23 @@
 
 ### 남는 위험 (spec §10 7번)
 
-- **공개 저장소 문구:** 구독 인증의 무인 실행 안내는 이 경로를 "advanced workflow for enterprise and other trusted private automation"으로 두고 "Do not use this workflow for public or open-source repositories."라고 적는다 [확인: https://learn.chatgpt.com/docs/auth/ci-cd-auth]. 봇이 리뷰하는 저장소는 public이다(D-29). 이 문구가 실행 위치를 말하는지 다루는 코드를 말하는지는 [미확인]이다. OpenAI에 확인할 항목으로 남긴다.
+- **공개 저장소 문구:** 구독 인증의 무인 실행 안내는 이 경로를 "advanced workflow for enterprise and other trusted private automation"으로 두고 "Do not use this workflow for public or open-source repositories."라고 적는다 [확인: https://learn.chatgpt.com/docs/auth/ci-cd-auth]. 봇이 리뷰하는 저장소는 public이다(D-29). 이 문구가 실행 위치를 말하는지 다루는 코드를 말하는지는 [미확인]이다. OpenAI에 확인할 항목으로 남기고, 풀리기 전에는 공개 저장소 PR 내용으로 구독 모델을 부르지 않는다(아래 "차단 조건").
 - **OpenAI 확인 항목 세 가지:** 위 공개 저장소 문구의 범위, 개인용 이용 약관의 자동 추출 조항이 Codex CLI 무인 실행에 적용되는지, 한 사람이 봇 전용 두 번째 개인 ChatGPT 계정을 두는 것의 허용 여부. 셋 다 공식 해석이 없어 [미확인]이고 OpenAI에 확인한다. 조항별 검토는 이 공개 문서에 두지 않는다.
-- **되쓰기:** 파드를 다시 만들 때 옛 시드로 덮으면 회전된 갱신 토큰과 어긋나 사람이 다시 시드해야 한다 [확인: https://learn.chatgpt.com/docs/auth/ci-cd-auth 의 재시드 조건].
+- **되쓰기:** 파드를 다시 만들 때 옛 시드로 덮으면 회전된 갱신 토큰과 어긋나 사람이 다시 시드해야 한다 [확인: https://learn.chatgpt.com/docs/auth/ci-cd-auth 의 재시드 조건]. 작업별 세션 저장 공간을 나눌 때도 조건 4를 깨지 않는다. 예는 작업별 쓰기 가능 사본을 제어 프로세스가 직렬로 되쓰는 방식이다 [가정]. 취소·`unknown` 작업의 사본 처리는 T18이다(ARCHITECTURE §5.1).
 - **직렬 1개와 한도:** 긴 작업 중에는 대화도 기다린다(조건 3). 5시간·주간 한도는 공식 문서가 고정 수치가 아닌 추정치로 적어 예측하기 어렵다 [확인: https://learn.chatgpt.com/docs/pricing].
 - **같은 파드의 비신뢰 코드:** 장기 갱신 토큰이 든 `auth.json`이 PR 코드의 설치·시험이 도는 작업자 파드에 있다. 대책과 남는 위험은 ARCHITECTURE §5.1이다.
 - **학습 사용:** Free·Plus·Pro 입력은 기본으로 모델 개선에 쓰일 수 있고 설정에서 끈다 [확인: https://help.openai.com/en/articles/5722486]. 봇 계정을 준비할 때 이 설정을 확인한다.
+
+### 차단 조건 (확정(사용자 2026-10-18, PR #3 리뷰))
+
+PR #3 리뷰에서 공개 저장소 문구를 남는 위험으로만 두면 지원되지 않는 인증 방식으로 공개 저장소 리뷰를 운영할 수 있다는 지적이 나왔고, 사용자가 "T17 전 차단 조건 추가"로 답했다.
+
+- 조건: OpenAI가 공개 저장소 PR 리뷰에 봇 전용 구독 인증 사용을 허용한다고 확인했거나, API 키 등 공식 지원 인증으로 바꿨을 것.
+- 범위: 모델을 부르지 않는 로컬·mock 구현은 T16a 뒤 착수할 수 있다. 공개 저장소 PR 내용으로 구독 모델을 부르는 일(평가셋, `authorized_external`, 시범 P-2)은 차단 조건이 풀린 뒤에만 한다.
+- 그 전 단계(T16a·T16b, 대화 레인)는 그대로 진행한다.
+- 인증 전환은 D-14 변경이라 사용자 결정과 설계 C.8 검토가 필요하다.
+- T18 범위: T18도 같은 차단을 받는다(확정(사용자 2026-10-18, PR #3 리뷰)): 허용 확인이나 공식 지원 인증 전환 전에는 공개 저장소 코드로 구독 모델을 부르는 T18 작업을 하지 않고, 모델을 부르지 않는 로컬·mock 구현만 T16a 뒤 착수한다. T19는 T17 뒤라 함께 기다린다.
+- 반영 자리: [V1_PLAN.md](V1_PLAN.md) 머리말·§1·§2 T17 진입 조건·§3 REVIEW-01·§4 시범 운영 단계·§5 T17 행, [PROJECT_STATUS.md](PROJECT_STATUS.md) 결정 행·STAGE 진행표·주요 위험·다음 행동, [VERIFICATION.md](VERIFICATION.md) "모델 인증 형태 (D-14)" 행, [DISCOVERY.md](DISCOVERY.md) §10, 설정 초안 `codex.auth` 주석.
 
 ### 선택지 (기록)
 
@@ -76,7 +88,7 @@
 
 - 봇 전용 ChatGPT 계정 준비와 플랜 선택(Plus 월 $20, Pro 월 $100 이상). 학습 사용 설정 확인.
 - 시드 `auth.json` 만들기와 Infisical `/apps/homelab-bot/worker` 등록. 개인 CODEX_HOME이 아닌 빈 전용 디렉터리에서 로그인해 만든다 [가정: ci-cd-auth의 "원격 실행기에서 로그인할 수 없을 때" 흐름]. 키 이름 제안은 ARCHITECTURE §5.
-- OpenAI 확인 세 가지: 공개 저장소 문구의 범위, 자동 추출 조항의 적용, 봇 전용 두 번째 개인 계정의 허용.
+- OpenAI 확인 세 가지: 공개 저장소 문구의 범위, 자동 추출 조항의 적용, 봇 전용 두 번째 개인 계정의 허용. 공개 저장소 문구는 공개 저장소 PR 내용으로 구독 모델을 부르기 전에 풀려야 한다(위 "차단 조건").
 - 시점: 계정 준비와 작업자 `auth.json` 첫 시드는 T16b 전(모델을 처음 쓰는 단계 전)에 한다. 대화 레인이 T16b에서 처음 모델을 쓰기 때문이다. 설계 E9(T16b)의 사람 작업과 만들 것(작업자 영속 공간에 첫 시드)과 같다. 그 뒤 T17·T18은 이 계정을 그대로 쓴다. 이 시점은 결정 기록끼리 맞추려고 에이전트가 정리한 것이고 사용자 결정이 아니다. 반영 자리는 [V1_PLAN.md](V1_PLAN.md) §2·§5.
 
 ---
@@ -91,7 +103,7 @@
 
 - **실행 호스트:** NUC k3s 클러스터 안. 게시 서버는 ns `app-homelab-bot`의 공유 차트 Deployment(replicas 1), 작업자는 ns `sandbox`의 상주 파드이고 동시성 1이다(D-14 조건 3).
 - **라벨·포트:** 앱 라벨 `homelab-bot`, 게시 서버 앱 포트 8080, 작업자 포트 8080, 경보 수신 포트 8081.
-- **코드 읽기:** 작업자는 `codeload.github.com` 압축본만 받는다. 작업자 egress에서 `github.com`·`api.github.com`·gist를 뺀다. 작업자에는 GitHub 자격이 없다. 받은 코드는 작업자가 `git init`으로 한 번 커밋해 `codex exec`의 Git 저장소 요구를 맞춘다. diff는 base·head 압축본으로 만든다. push와 PR 생성은 게시 서버가 D-24 App으로 한다.
+- **코드 읽기:** 작업자는 `codeload.github.com` 압축본만 받는다. 작업자 egress에서 `github.com`·`api.github.com`·gist를 뺀다. 작업자에는 GitHub 자격이 없다. 받은 코드는 작업자가 `git init`으로 한 번 커밋해 `codex exec`의 Git 저장소 요구를 맞춘다. diff는 base·head 압축본으로 만든다. 리뷰 입력의 변경 목록은 압축본 비교만으로 정하지 않고, 게시 서버가 head·base SHA를 먼저 고정한 뒤 같은 SHA 쌍으로 리뷰 App 토큰으로 Git tree API(recursive)나 compare API에서 경로·mode·object ID 차이(submodule gitlink 포함)를 열거한다. 압축본은 같은 SHA의 blob 내용 수집에만 쓴다 [가정](설계 세부, 사용자 결정 아님. ARCHITECTURE §6). push와 PR 생성은 게시 서버가 D-24 App으로 한다.
 - **물러날 곳:** 파드 방화벽(U13)이 안 되면 작업자만 호스트 전용 UID + nft로 옮긴다(1b).
 
 ### (1) 실행 호스트 (기록)
@@ -378,7 +390,7 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 
 | 결정 | 봇 문서 자리(`01` §11, `00` §3·§5·§6·§8, `04` §2·§10) | homelab·그 밖 자리 |
 |---|---|---|
-| D-14 | `01` §3 질문 7·이 단계에서 정할 결정, `01` §6 격리, `00` §3 둘째 "> 참고:"(본문은 C-08 보호), `00` §5 "격리 작업 공간" 행, `00` §8 `platform.isolated_workspace`·`codex.codex_home`·`budgets.max_concurrent_jobs`와 주석 | spec §5.1, §10 7번(남는 위험), §11 모델 행, 설계 C.8 격리 행(작업자 영속 쓰기 공간)·E4b·E9·F, 플랫폼 프롬프트 D-14 자리, T08b·T16b·T18, 설정 초안 `codex.auth` |
+| D-14 | `01` §3 질문 7·이 단계에서 정할 결정, `01` §6 격리, `00` §3 둘째 "> 참고:"(본문은 C-08 보호), `00` §5 "격리 작업 공간" 행, `00` §8 `platform.isolated_workspace`·`codex.codex_home`·`budgets.max_concurrent_jobs`와 주석 | spec §5.1, §10 7번(남는 위험), §11 모델 행, 설계 C.8 격리 행(작업자 영속 쓰기 공간)·E4b·E9·F, 플랫폼 프롬프트 D-14 자리, T08b·T16b·T17(차단 조건)·T18, 설정 초안 `codex.auth` |
 | D-15 | `01` §3 질문 2·아키텍처 선택·이 단계에서 정할 결정, `01` §6 격리, `00` §3 둘째 "> 참고:", `00` §5 "격리 작업 공간"·"webhook 수신 경로"·"Alertmanager 수신자" 행(포트), `00` §8 `project.*_host`·`platform.isolated_workspace`·`budgets.max_concurrent_jobs` | spec §5.1, §10 8번, 설계 C.8 격리 행·봇 자리 Application·E4b·E9, 플랫폼 프롬프트 D-15 자리, T16b "봇 자리 `target` 변경" |
 | D-16(하위 결정 포함) | `01` §3 PR 리뷰 선택·이 단계에서 정할 결정, `01` §5 이벤트·신뢰 아래 참고(`author_association`), `04` §2 표 아래 "PR 인젝션"(`author_association` [미검증] 문장이 T15 실측으로 풀림)·§10 D-16 행, `00` §3 첫째 "> 참고:", `00` §5 "GitHub App 구조"·"webhook 수신 경로" 행, `00` §6 아래 "> 참고:", `00` §8 `github.review_identity`·`reviewed_repositories`·`model_call_author_associations` 주석과 새 키 `allowed_bot_author_ids` | spec §5.1, §10 17번, §11 Connector 행, D-26 설치 범위, 설계 C.8 리뷰 App 행(권한에 Issues read 추가 필요, 설계 세부)·webhook 행([미검증] 표시), 플랫폼 프롬프트 D-16 자리, T15(Connector 축소, 완료), T17 |
 | D-17 | `01` §3 질문 3·이 단계에서 정할 결정, `00` §3 둘째 "> 참고:", `00` §8 `discord.*` | spec §5.1, T16a·T16b |

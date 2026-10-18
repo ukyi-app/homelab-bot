@@ -263,10 +263,11 @@
 | 공개 스레드 수신의 멤버십 필요 여부, 스레드 생성 최소 권한 | T16b 권한 하나씩 빼기 시험 |
 | `codex exec`의 샌드박스 밖 동작 처리, 신호 처리, 오류 이벤트 필드, resume 상속 | 모델 호출 허가 뒤 T16b·T18 |
 | 파드 안 Codex bwrap 동작 | `codex sandbox -- true`(모델 호출 없음), T08b·T16b |
+| 작업 그룹 정리·소멸 확인 수단의 실현 가능성: 비특권 작업자 파드의 cgroup 위임(`cgroup.procs`), `unshare`로 작업별 PID namespace, 제어 프로세스 밖 프로세스 0개 확인(ARCHITECTURE §4 "작업 정리") | T08b·T16b 실측(bwrap·U13과 함께), 방법 결정은 T18 |
 | Codex의 `HTTPS_PROXY` 준수와 필요 호스트(구독 인증 도메인 포함) | T08b·T16b |
 | 외부인 `@codex` 호출(U38), Draft PR의 Codex 회피, Connector가 읽는 `AGENTS.md` 리비전 | 사람이 별도 계정으로 시험(허가된 시험 자산) |
 | 봇 PR 미리뷰 원인, Codex 저장소 설정에서 리뷰되는 작성자 범위(봇·Renovate PR 포함 여부) | 사람이 Codex 설정 화면 확인(T17) |
-| OpenAI 확인 항목 세 가지: 공개 저장소 문구 범위, 자동 추출 조항 적용, 봇 전용 두 번째 개인 계정 허용 | OpenAI 문의(D-14 남는 위험) |
+| OpenAI 확인 항목 세 가지: 공개 저장소 문구 범위, 자동 추출 조항 적용, 봇 전용 두 번째 개인 계정 허용 | OpenAI 문의(D-14 남는 위험). 공개 저장소 문구 범위는 T17 차단 조건이다. 풀리기 전에는 공개 저장소 PR 내용으로 구독 모델을 부르지 않는다(D-14 "차단 조건", 확정(사용자 2026-10-18, PR #3 리뷰)) |
 | Discord Developer Policy 원문 | 사람이 브라우저로 확인 |
 | Grafana `/api/ds/query` Viewer 허용, Argo CD live ConfigMap | T08b, T16b |
 | 앱 지표 스크레이프 규칙, 멈춘 봇·replicas 0·Gateway 단절 감지 룰(readiness에는 Gateway를 넣지 않음, ARCHITECTURE §8) | T08b 룰 확정 때 또는 T16b |
