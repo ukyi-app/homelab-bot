@@ -65,6 +65,10 @@ discord:
 
 github:
   review_identity: dedicated_github_app       # 00 §8 원래 값. D-16 확정(사용자 2026-10-18, T15): 기본안
+  review_app_permissions: null                # 설계 세부(사용자 결정 아님), T17에서 확인. 제안: Pull requests write, Contents read, Metadata read,
+                                              # Checks read(설계 C.8대로 늘 포함), Issues read(issue_comment 구독용).
+                                              # Issues write·Contents write 없음(DECISIONS D-16 "리뷰 App 권한")
+  review_app_events: null                     # 설계 세부, T17. 제안: [pull_request, issue_comment]. pull_request는 edited 중 base 변경(재지정)도 트리거
   reviewed_repositories: []                   # D-16, T17에서 정한다. 설치는 시험 저장소부터
   review_mode: advisory_comment_only
   review_drafts_by_default: false
@@ -72,8 +76,9 @@ github:
   allowed_bot_author_ids: []                  # D-16 하위 결정, 확정. 숫자 사용자 ID. 실제 값은 Infisical runtime policy
                                               # (키 이름 예: review.allowed_bot_author_ids). 대상: 호스팅형 Renovate 봇, D-24 App 봇 사용자(생성 뒤)
                                               # 넣지 않는 것: 배포 갱신 App(homelab-deploy), Codex Connector, 옛 writer
-  exclude_fork_pull_requests: true            # D-16 하위 결정, 확정. 설계 C.8·01 §5 "fork는 비신뢰 코드 실행 금지"
+  exclude_fork_pull_requests: true            # D-16 하위 결정, 확정(spec §5.1). 모델 리뷰에서 fork PR 제외. 코드 실행 금지는 별도 규칙
   ignore_bot_comments: true                   # D-16 하위 결정, 확정. 댓글 트리거는 comment.author_association을 본다
+                                              # 댓글 트리거도 대상 PR을 조회해 fork 제외·PR 작성자 조건을 그대로 적용(DECISIONS D-16 규칙 스케치)
   renovate_body_policy: untrusted_data        # D-16 하위 결정, 확정: 허용 작성자의 PR 본문도 비신뢰 자료. 빼기·격리 방식은 T17
   prohibit_approve_request_changes_merge: true
   change_existing_merge_policy: false
@@ -124,10 +129,18 @@ safety:
   execute_untrusted_pr_code_by_default: false
   public_output_from_private_source: deny_without_declassification
   allow_policy_self_edit: false
+  runtime_policy_source: null                 # 제안 [가정], T16a: mounted_secret_file(바뀌면 다시 읽음, ARCHITECTURE §6).
+                                              # 공유 차트 변경 필요(설계 C.4.5는 env만)
+  runtime_policy_max_age_seconds: null        # T16a. 현재 revision을 확인할 수 없거나 이 나이를 넘으면 거부(실패 시 닫힘)
+                                              # Infisical에서만 철회하면 ESO 갱신 주기만큼 통과할 수 있다. 즉시 철회는 owner 거부 목록 명령으로만
+                                              # (owner ID 검사 슬래시 명령, 모델 경유 없음, 거부 추가만. 해제는 owner 명령이나 Infisical 새 revision 확인 뒤)
+  worker_control_auth: null                   # 제안: 게시 서버가 요청마다 서명한 단기 capability. 결정은 T16a·T18(DECISIONS D-15 "작업자 제어 끝점")
 
 health:
-  readiness_includes_gateway_and_queue: null  # 제안: true(ARCHITECTURE §8 (a))
+  readiness_scope: null                       # 제안: receivers_and_db. 수신기가 요청을 영속 저장할 수 있는지(DB 연결 등)만. Gateway·큐 지연은 넣지 않는다(ARCHITECTURE §8 (a))
+  gateway_alert: null                         # 제안: Gateway 연결 gauge + 봇 전용 룰(ARCHITECTURE §8 (c)). 지표 이름은 T16a, 룰 이름·지속 시간은 T08b
   heartbeat_check: null                       # 제안: healthchecks_io 봇 전용 체크(ARCHITECTURE §8 (b))
+                                              # 대안: Gateway가 최근 N분 연결돼 있을 때만 ping. 채택 여부와 N은 T16a(ARCHITECTURE §8 "대안")
 
 budgets:                                      # 제안 초기값은 ARCHITECTURE §9. T16a·T16b에서 측정 뒤 정한다
   max_concurrent_jobs: 1                      # D-14 조건 3, 확정. 작업자의 모델 호출(대화·작업 레인 합계) 직렬 1개
@@ -141,6 +154,8 @@ retention:
   evidence_days: null
   memory: scoped_and_deletable
   backup_days: 14                             # 설계 기본값, 확정. 삭제한 기억도 이 기간 백업에 남을 수 있음
+  deletion_ledger: null                       # 제안: 복원 대상 밖(예: R2 append-only 객체). 기억 ID·created_at·삭제 시각만. 기동 때마다 재적용
+                                              # ID와 created_at이 둘 다 맞을 때만 삭제. memory_id는 재사용되지 않는 값(UUID 등) 제안. T20(R17), ARCHITECTURE §7
 
 # 비밀값과 실제 값의 위치. 값은 여기 쓰지 않는다(키 이름만).
 secret_keys:
@@ -154,6 +169,7 @@ secret_keys:
     - GRAFANA_READER_TOKEN
     - ARGOCD_READER_TOKEN
     - HEALTHCHECKS_PING_URL
-    - RUNTIME_POLICIES                        # 허용 목록·runtime policy 실제 값(JSON)
+    - RUNTIME_POLICIES                        # 허용 목록·runtime policy 실제 값(JSON). 마운트한 Secret 파일로 읽기는 제안 [가정], T16a.
+                                              # 공유 차트 변경 필요(설계 C.4.5는 env만)
   worker:                                     # Infisical /apps/homelab-bot/worker (작업자만, 모델 자격 하나)
     - CODEX_AUTH_JSON                         # 이름 제안. D-14 A의 시드 auth.json. 영속 CODEX_HOME에 없을 때만 시드로 쓴다

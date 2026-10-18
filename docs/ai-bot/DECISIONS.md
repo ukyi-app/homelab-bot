@@ -16,7 +16,7 @@
 |---|---|---|---|
 | D-14 | 봇 모델 계정과 인증 | 봇 전용 ChatGPT 구독 계정 + 작업자 전용 CODEX_HOME, 함께 지킬 조건 다섯. 에이전트 추천(B, OpenAI API 프로젝트 키)과 다름 | OpenAI 확인 항목 셋 [미확인]. 계정 준비와 첫 시드: T16b 전(모델을 처음 쓰는 단계 전). 영속 쓰기 공간의 크기·백업(T08b) |
 | D-15 | 실행 호스트, 라벨·포트, 코드 읽기 호스트 | NUC 클러스터 안. 라벨 `homelab-bot`, 앱·작업자 포트 8080, 경보 수신 포트 8081. 작업자 코드 읽기는 `codeload.github.com` 압축본만 | U13·U29와 프록시 경유 압축본 받기 실측(T08b·T16b) |
-| D-16 | PR 리뷰 방식 | 기본안. 봇 리뷰 저장소의 Codex 자동 리뷰는 저장소별 설정에서 끔. Connector 설치는 선택 저장소로 줄이고 운영 저장소는 뺌(축소 완료, 사람 2026-10-18 17:45). 하위 결정: 허용 봇 작성자 목록 | 남긴 저장소 목록의 API 확인(사용자 보고만 있음). 리뷰 대상 저장소 목록과 리뷰 App 이름(T17) |
+| D-16 | PR 리뷰 방식 | 기본안. 봇 리뷰 저장소의 Codex 자동 리뷰는 저장소별 설정에서 끔. Connector 설치는 선택 저장소로 줄이고 운영 저장소는 뺌(축소 완료, 사람 2026-10-18 17:45). 하위 결정: 허용 봇 작성자 목록 | 남긴 저장소 목록의 API 확인(사용자 보고만 있음). 리뷰 대상 저장소 목록과 리뷰 App 이름, 리뷰 App 권한 확인(Issues read 포함, 설계 세부)(T17) |
 | D-17 | Discord 서버, 채널, 허용 사용자 | 봇 전용 개인 서버 신설, 허용 사용자 owner 1명, 채널 2개, `MESSAGE_CONTENT` 켬 | DM 허용 여부, 브리핑 시각(T16a) |
 | D-24 | 봇 변경 PR 작성 신원 | 봇 전용 쓰기 GitHub App(Contents·Pull requests write, Metadata read) | 토큰 분리, ruleset E 여부, App 이름, 설치 저장소, 허용 파일 경로(T19) |
 
@@ -104,6 +104,14 @@
 
 작업자 구조 [가정]: 작업자 파드 안의 작은 상주 프로세스가 봇이 정한 HTTP 계약으로 작업을 받고, 작업마다 `codex exec --json`을 띄운다. 모델 호출은 동시성 1이다(D-14 조건 3). 작업 단위 파드는 ValidatingAdmissionPolicy로 파드 모양을 고정한 뒤에만 둔다(설계 C.8).
 
+**작업자 제어 끝점** (설계 세부, 사용자 결정 아님. 결정은 T16a(계약)·T18): 상주 제어 프로세스의 HTTP 끝점은 같은 파드에서 도는 작업 프로세스(PR의 설치 스크립트·시험, 모델의 셸 명령)가 loopback이나 파드 IP로 닿을 수 있다. Service 쪽 NetworkPolicy는 파드 안 경로를 가르지 않고 [가정], init 방화벽(U13)도 loopback을 허용한다 [확인: 설계 부록 1 U13]. 인증이 없으면 악성 코드가 모델 작업을 넣어 구독 한도를 쓰거나 상태·취소 요청을 보낼 수 있다. 제안 [가정]:
+
+- 게시 서버가 요청마다 서명한 단기 capability(작업 ID, 만료, 한 번만 쓰는 값을 묶음)를 요구한다.
+- 키는 제어 프로세스만 읽는 파일에 둔다. 작업 프로세스는 다른 UID와 정리된 환경으로 띄워 키와 capability를 물려받지 않게 한다. 다른 UID는 ARCHITECTURE §5.1의 `auth.json` 분리와도 겹친다.
+- HMAC 같은 대칭 키를 쓰면 작업자에 모델 자격 밖의 비밀이 하나 더 생겨 설계 C.8("작업자 Secret은 모델 자격 하나")의 변경이 된다. 게시 서버만 개인 키를 갖는 서명이면 작업자에는 공개 키만 있다.
+- 대안: 작업을 별도 네트워크 namespace에서 돌려 제어 끝점에 닿지 못하게 한다.
+- 시험: SEC-02에 "작업 프로세스가 제어 끝점을 부르면 거부"를 넣는다([V1_PLAN.md](V1_PLAN.md) §3).
+
 함께 알 위험: Codex의 Linux 샌드박스(bwrap + seccomp)가 파드 안에서 동작하는지 [미확인]. 안 되면 공식 안내대로 파드를 경계로 두고 `--sandbox danger-full-access`로 돌린다. 그러면 모델의 셸이 모델 자격을 읽을 수 있다 [확인: https://learn.chatgpt.com/docs/agent-approvals-security]. 어느 경우든 `shell_environment_policy`를 고정해야 한다. 기본값은 `KEY`·`SECRET`·`TOKEN` 이름의 변수를 모델이 띄우는 명령에 넘긴다 [확인: https://learn.chatgpt.com/docs/config-file/config-advanced].
 
 ### (2) 라벨·포트 (결정값)
@@ -184,6 +192,16 @@ Codex 결과의 Discord 중계는 V1 필수가 아니므로 선택 기능으로 
 - 리뷰 대상 저장소 목록(`github.reviewed_repositories`). 설치는 시험 저장소부터 시작한다(T17 제약).
 - 사람 작업(`approvals.md` 기록): 리뷰 App 생성·설치와 키 등록, 봇 리뷰 저장소의 Codex 자동 리뷰 끄기(저장소별 Codex 설정), 저장소 설정의 리뷰 범위 확인. Connector 설치 범위 축소는 T15에서 끝났고(사람 2026-10-18 17:45) T17은 확인만 한다. 남긴 저장소 목록의 API 확인은 아직이다.
 - Codex 결과의 Discord 중계를 둘지(위 에이전트 추천).
+- 리뷰 App 권한과 구독 이벤트 확인(아래).
+
+### 리뷰 App 권한과 구독 이벤트 (설계 세부, 사용자 결정 아님)
+
+D-16 기본안을 구현하려고 에이전트가 정리한 값이다. 최종 확인은 T17이 App을 만들 때 한다.
+
+- **권한:** Pull requests write(리뷰·요약 댓글 게시), Contents read, Metadata read(여기까지 `01` §5 "역할·권한"), Checks read, Issues read. Contents write·Workflows·Administration은 없다. Checks read는 설계 C.8 리뷰 App 행대로 늘 포함한다(`01` §5 표의 "실사용 시에만"보다 넓다). Actions read는 설계 C.8에 없고 `01` §5대로 실사용할 때만 더한다.
+- **Issues read를 두는 이유:** `issue_comment` 구독에는 Issues read 이상이 필요하다 [확인: https://docs.github.com/en/webhooks/webhook-events-and-payloads]. 없으면 아래 규칙 스케치의 댓글 리뷰 요청이 오지 않아 작성자 확인과 루프 차단이 돌 일도 없다. Issues write는 두지 않는다. PR 요약 댓글은 Pull requests write로 된다 [확인: https://docs.github.com/en/rest/issues/comments].
+- **구독 이벤트:** `pull_request`, `issue_comment`.
+- D-24 쓰기 App의 "Issues 없음"은 그대로다. 그 App은 webhook을 끄고 이벤트를 받지 않는다.
 
 ### 하위 결정: 모델 호출 전 작성자 확인의 App 예외
 
@@ -202,6 +220,8 @@ Codex 결과의 Discord 중계는 V1 필수가 아니므로 선택 기능으로 
 - 허용 봇 작성자 목록을 둔다. `pull_request.user.type`이 `Bot`이고 숫자 `user.id`가 목록에 있으면 통과한다.
 - 초기 목록은 호스팅형 Renovate 봇과 D-24 App의 봇 사용자(생성 뒤)다. 배포 갱신 App(`homelab-deploy`), Codex Connector, 옛 writer는 넣지 않는다.
 - fork PR은 제외한다. 댓글 트리거는 `comment.author_association`을 보고 Bot 댓글은 무시한다. `CONTRIBUTOR`는 허용하지 않는다.
+- 댓글 트리거도 대상 PR을 조회해 `head.repo.id == base.repo.id`(같은 저장소)이고 PR 작성자가 자동 리뷰와 같은 조건(OWNER·MEMBER·COLLABORATOR 또는 허용 봇)일 때만 모델을 호출한다. 새 결정이 아니라 위 fork 제외·허용 작성자 하위 결정을 댓글 경로에 그대로 적용한 것이다. 이것이 없으면 허용된 사람이 fork PR이나 외부인 PR에 리뷰 요청 댓글을 달 때 모델 호출이 통과한다.
+- 그래서 기능 7의 모델 리뷰 범위는 OWNER·MEMBER·COLLABORATOR와 허용 봇 작성자가 연 같은 저장소 PR이다. 외부인 PR은 D-29의 모델 호출 전 작성자 확인으로, fork PR은 이 하위 결정으로 모델 리뷰에서 빠진다. 외부인 PR이 모델 호출을 일으키지 않는다는 것은 `00` §3 7번 아래 참고 줄에도 있다.
 - 실제 ID는 Infisical runtime policy(키 이름 예: `review.allowed_bot_author_ids`)에만 둔다. 이 저장소에는 키 이름만 둔다(D-13).
 - 허용 작성자의 PR 본문도 비신뢰 자료로 다룬다. Renovate PR 본문에는 상류 프로젝트의 릴리스 노트가 그대로 들어간다 [실측]. 본문을 모델 입력에서 뺄지 자료 블록으로 격리할지는 T17 구현에서 정한다.
 
@@ -223,7 +243,7 @@ installation id로 작성 App을 가리는 것은 맞지 않다. 리뷰 App이 �
   ∧ repository.id ∈ 허용 저장소
   ∧ 이벤트별 조건
 
-pull_request (opened | reopened | ready_for_review | synchronize):
+pull_request (opened | reopened | ready_for_review | synchronize | edited 중 base 변경):
   head.repo.id == base.repo.id                       # fork PR 제외
   ∧ ( author_association ∈ {OWNER, MEMBER, COLLABORATOR}
       ∨ (user.type == "Bot" ∧ user.id ∈ allowed_bot_author_ids) )
@@ -232,9 +252,15 @@ pull_request (opened | reopened | ready_for_review | synchronize):
 issue_comment (PR 댓글로 리뷰 요청):
   comment.author_association ∈ {OWNER, MEMBER, COLLABORATOR}   # issue.author_association 아님
   ∧ comment.user.type != "Bot"                                 # 자기·Codex 댓글 루프 차단
+  ∧ pr := 대상 PR을 PR API로 조회                               # 아래 첫 항목
+  ∧ pr.head.repo.id == pr.base.repo.id                         # fork PR 제외(자동 리뷰와 같음)
+  ∧ ( pr.author_association ∈ {OWNER, MEMBER, COLLABORATOR}
+      ∨ (pr.user.type == "Bot" ∧ pr.user.id ∈ allowed_bot_author_ids) )
 ```
 
+- `issue_comment` payload에는 PR의 head 저장소가 없어 fork 여부를 PR API로 읽는다 [가정]. 조회가 실패하면 모델을 호출하지 않는다.
 - `synchronize`의 `sender`는 감사·대조용으로 기록한다 [가정].
+- `edited`는 base가 바뀐 경우(재지정)만 새 리뷰 세대로 본다. 판정은 받은 PR의 base를 처리 기록과 비교해 한다. base 브랜치가 앞서가기만 하는 경우는 PR 이벤트가 없어 열린 PR 폴링이 잡는다. 세대 구분은 `01` §5의 `(head_sha, comparison_revision, policy_revision)`이다(ARCHITECTURE §7, REVIEW-02) [가정].
 
 **초기 목록**
 
@@ -246,7 +272,7 @@ issue_comment (PR 댓글로 리뷰 요청):
 | Codex Connector | 제외 | PR 작성자가 아니고(Codex PR은 owner 계정으로 찍힘, 설계 C.4.7) 댓글은 루프 원인 |
 | 옛 쓰기 App | 제외 | T06에서 삭제 |
 
-**이 결정에서 나온 AC-B4 기대값:** `MEMBER` 통과, `NONE`·`CONTRIBUTOR`·`FIRST_TIME_CONTRIBUTOR` 차단, 허용 봇 ID 통과, 허용 밖 봇 ID 차단, fork PR 차단, Bot 댓글 무시.
+**이 결정에서 나온 AC-B4 기대값:** `MEMBER` 통과, `NONE`·`CONTRIBUTOR`·`FIRST_TIME_CONTRIBUTOR` 차단, 허용 봇 ID 통과, 허용 밖 봇 ID 차단, fork PR 차단, Bot 댓글 무시, 허용된 사람의 리뷰 요청 댓글이라도 대상 PR이 fork거나 PR 작성자가 허용 밖이면 차단.
 
 ---
 
@@ -351,7 +377,7 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 |---|---|---|
 | D-14 | `01` §3 질문 7·이 단계에서 정할 결정, `01` §6 격리, `00` §3 둘째 "> 참고:"(본문은 C-08 보호), `00` §5 "격리 작업 공간" 행, `00` §8 `platform.isolated_workspace`·`codex.codex_home`·`budgets.max_concurrent_jobs`와 주석 | spec §5.1, §10 7번(남는 위험), §11 모델 행, 설계 C.8 격리 행(작업자 영속 쓰기 공간)·E4b·E9·F, 플랫폼 프롬프트 D-14 자리, T08b·T16b·T18, 설정 초안 `codex.auth` |
 | D-15 | `01` §3 질문 2·아키텍처 선택·이 단계에서 정할 결정, `01` §6 격리, `00` §3 둘째 "> 참고:", `00` §5 "격리 작업 공간"·"webhook 수신 경로"·"Alertmanager 수신자" 행(포트), `00` §8 `project.*_host`·`platform.isolated_workspace`·`budgets.max_concurrent_jobs` | spec §5.1, §10 8번, 설계 C.8 격리 행·봇 자리 Application·E4b·E9, 플랫폼 프롬프트 D-15 자리, T16b "봇 자리 `target` 변경" |
-| D-16(하위 결정 포함) | `01` §3 PR 리뷰 선택·이 단계에서 정할 결정, `01` §5 이벤트·신뢰 아래 참고(`author_association`), `04` §2 표 아래 "PR 인젝션"(`author_association` [미검증] 문장이 T15 실측으로 풀림)·§10 D-16 행, `00` §3 첫째 "> 참고:", `00` §5 "GitHub App 구조"·"webhook 수신 경로" 행, `00` §6 아래 "> 참고:", `00` §8 `github.review_identity`·`reviewed_repositories`·`model_call_author_associations` 주석과 새 키 `allowed_bot_author_ids` | spec §5.1, §10 17번, §11 Connector 행, D-26 설치 범위, 설계 C.8 리뷰 App 행·webhook 행([미검증] 표시), 플랫폼 프롬프트 D-16 자리, T15(Connector 축소, 완료), T17 |
+| D-16(하위 결정 포함) | `01` §3 PR 리뷰 선택·이 단계에서 정할 결정, `01` §5 이벤트·신뢰 아래 참고(`author_association`), `04` §2 표 아래 "PR 인젝션"(`author_association` [미검증] 문장이 T15 실측으로 풀림)·§10 D-16 행, `00` §3 첫째 "> 참고:", `00` §5 "GitHub App 구조"·"webhook 수신 경로" 행, `00` §6 아래 "> 참고:", `00` §8 `github.review_identity`·`reviewed_repositories`·`model_call_author_associations` 주석과 새 키 `allowed_bot_author_ids` | spec §5.1, §10 17번, §11 Connector 행, D-26 설치 범위, 설계 C.8 리뷰 App 행(권한에 Issues read 추가 필요, 설계 세부)·webhook 행([미검증] 표시), 플랫폼 프롬프트 D-16 자리, T15(Connector 축소, 완료), T17 |
 | D-17 | `01` §3 질문 3·이 단계에서 정할 결정, `00` §3 둘째 "> 참고:", `00` §8 `discord.*` | spec §5.1, T16a·T16b |
 | D-24 | `01` §3 이 단계에서 정할 결정, `01` §6 격리, `01` §7 다섯째 항목, `00` §5 "봇 변경 PR 작성 자격" 행, `00` §6 아래 "> 참고:"(본문은 C-08 보호), `00` §8 `github.change_writer_*` 주석 | spec §5.1, 설계 C.8 봇 변경 PR 행, 플랫폼 프롬프트 D-24 자리, T19 |
 | R08 보류 | `01` §3 질문 4, `01` §11 새 행, `00` §3 둘째 "> 참고:", `00` §8 `codex.adapters_to_verify` 주석(요구·계약 문구는 그대로) | spec §5.1, T18 |

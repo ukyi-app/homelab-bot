@@ -172,7 +172,7 @@
 
 - git push(contents API가 아닌 경로)로 워크플로 파일을 바꿀 때도 Workflows 권한이 필요한지(E5 시험).
 - `author_association`이 이벤트 시점에 고정되는지(실측값은 조회 시점).
-- Pull requests 권한만으로 PR 댓글의 `issue_comment`가 오는지, webhook payload의 `comment.author_association` 필드.
+- Pull requests 권한만으로 PR 댓글의 `issue_comment`가 오는지(리뷰 App에 Issues read를 두기로 해 설계에는 영향이 없다. DECISIONS D-16 "리뷰 App 권한"), webhook payload의 `comment.author_association` 필드.
 - App 승인이 code owner 승인을 대신하지 못한다는 가정(U08).
 
 ## 6. 질문 6: 등록 서비스, 관측 API, 읽기 계정, 민감 자료, 예산
@@ -269,8 +269,8 @@
 | OpenAI 확인 항목 세 가지: 공개 저장소 문구 범위, 자동 추출 조항 적용, 봇 전용 두 번째 개인 계정 허용 | OpenAI 문의(D-14 남는 위험) |
 | Discord Developer Policy 원문 | 사람이 브라우저로 확인 |
 | Grafana `/api/ds/query` Viewer 허용, Argo CD live ConfigMap | T08b, T16b |
-| 앱 지표 스크레이프 규칙, 멈춘 봇·replicas 0 감지 룰 | T08b 룰 확정 때 또는 T16b |
-| 허용 목록 변경 반영 지연(AUTH-02) | T16b |
+| 앱 지표 스크레이프 규칙, 멈춘 봇·replicas 0·Gateway 단절 감지 룰(readiness에는 Gateway를 넣지 않음, ARCHITECTURE §8) | T08b 룰 확정 때 또는 T16b |
+| 허용 목록 변경 반영 지연(AUTH-02), 현재 정책 revision을 확인하는 방법(ARCHITECTURE §6 "허용 목록 반영") | 방법은 T16a, 지연 실측은 T16b |
 | R08 명시적 연결 방법(Codex 공식 훅 이벤트 목록 포함) | T18 |
 
 ## 11. 봇 문서 정비 후보

@@ -48,22 +48,22 @@ T16b → T22                     봇이 첫 실제 앱(D-01)
 
 | 시험 | 주 단계 | 함께 기여 | 첫 증거 | 실연동과 막는 것 | DISCOVERY가 더한 사례 |
 |---|---|---|---|---|---|
-| AUTH-01 | T16a→T16b | T17(PR 경로) | mock | `authorized_external`: D-17 서버·채널(T16b), 리뷰 App 시험 PR(T17) | Discord: 사용자 ID 문자열 비교, 스레드는 `parent_id`, DM(T16a 결정에 따라), 버튼 누른 사람, 봇·webhook 메시지 무시. GitHub(D-16 하위 결정): `MEMBER` 통과, `NONE`·`CONTRIBUTOR`·`FIRST_TIME_CONTRIBUTOR` 차단, 허용 봇 ID 통과, 허용 밖 봇 ID 차단, fork PR 차단, 댓글은 `comment.author_association`, Bot 댓글 무시 |
-| AUTH-02 | T16a→T16b | T18(질문), T20 | local_integration | `authorized_external`: Infisical 허용 목록 변경(T16b) | 반영 지연을 수치로 기록(ESO 동기화). 비공개 스레드 접근 상실은 이벤트가 오지 않음 |
-| EVENT-01 | T16a | T17 | local_integration | 없음 | Discord 메시지·상호작용 ID, GitHub `X-GitHub-Delivery`와 `(repo_id, pr, head_sha, comparison_revision, policy_revision)` |
+| AUTH-01 | T16a→T16b | T17(PR 경로) | mock | `authorized_external`: D-17 서버·채널(T16b), 리뷰 App 시험 PR(T17) | Discord: 사용자 ID 문자열 비교, 스레드는 `parent_id`, DM(T16a 결정에 따라), 버튼 누른 사람, 봇·webhook 메시지 무시. GitHub(D-16 하위 결정): `MEMBER` 통과, `NONE`·`CONTRIBUTOR`·`FIRST_TIME_CONTRIBUTOR` 차단, 허용 봇 ID 통과, 허용 밖 봇 ID 차단, fork PR 차단, 댓글은 `comment.author_association`, Bot 댓글 무시, 허용된 사람의 댓글이라도 대상 PR이 fork거나 PR 작성자가 허용 밖이면 차단 |
+| AUTH-02 | T16a→T16b | T18(질문), T20 | local_integration | `authorized_external`: Infisical 허용 목록 변경(T16b) | 실패 시 닫힘(ARCHITECTURE §6 "허용 목록 반영"): 현재 정책 revision을 확인할 수 없거나 최대 나이를 넘은 정책이면 거부, owner 즉시 철회 명령이 ESO 동기화 전에 효력(owner ID만, 모델 경유 없음, 거부 추가만), 마운트한 정책 파일(제안 [가정], T16a)이 바뀌면 재시작 없이 다시 읽음, 큐·예약·기억·질문 답의 실행 직전 재검사. 반영 지연을 수치로 기록(ESO 동기화). 비공개 스레드 접근 상실은 이벤트가 오지 않음 |
+| EVENT-01 | T16a | T17 | local_integration | 없음 | Discord 메시지·상호작용 ID, GitHub `X-GitHub-Delivery`와 `(repo_id, pr, head_sha, comparison_revision, policy_revision)`. Discord 상호작용은 inbox insert가 끝난 뒤에만 첫 응답(defer 포함), 저장 실패나 시간 초과 때 작업 수락 응답 없음(재시도 안내 또는 무응답). 저장 타임아웃 뒤 늦은 commit: 서버 쪽 트랜잭션 취소(`statement_timeout` 등), commit 결과를 모르는 행은 수락 안 함으로 두고 자동 실행 없음 |
 | EVENT-02 | T16a→T16b(Discord 전달) | T17·T19(게시) | local_integration(모의 API) | `authorized_external`(T16b) | Discord `nonce` + `enforce_nonce`와 outbox 대조, GitHub 리뷰·PR 존재 조회 뒤 재시도 |
-| EVENT-03 | T16a→T16b | T17 | local_integration | `authorized_external`(T16b) | Discord `after=` 대조(최대 100건), 보관 스레드는 봇 DB가 원본. GitHub 열린 PR 대조(수동 재전송 3일 한계) |
+| EVENT-03 | T16a→T16b | T17 | local_integration | `authorized_external`(T16b) | Discord `after=` 대조(최대 100건), 보관 스레드는 봇 DB가 원본. GitHub 열린 PR을 `(head_sha, comparison_revision, policy_revision)`으로 대조(head가 같고 base만 움직인 경우 포함, 수동 재전송 3일 한계) |
 | EVENT-04 | T16a | T18 | local_integration | 없음 | 작업자 파드 소멸 → `unknown`, 자동 재실행 없음 |
 | CHAT-01 | T16a→T16b | | local_integration | `authorized_external`: D-17 대화 채널(T16b) | `MESSAGE_CONTENT` 켬(기본)과 끔(명령/버튼 모드) 둘 다 |
 | CHAT-02 | T16a→T16b | | local_integration | `authorized_external`(T16b) | 구독 해제(방법은 T16a), 보관된 스레드(1440분)의 재활성화 |
 | READ-01 | T16a→T16b | | mock | `production_observation`: T13 뒤 T16b | 관측 불가와 등록 안 됨 구분, "정상"은 현재 증거가 있을 때만 |
 | READ-02 | T16a→T16b | | mock | `production_observation`(T16b) | 허용 밖 LogsQL·MetricsQL 거부, 시간창 상한 초과 거부, Secret·ConfigMap·`pods/log` 요청 거부, Argo CD live ConfigMap 노출 여부 기록 |
 | SEC-01 | T16a | T17 | mock | 없음 | 로그·PR 본문·변경된 `AGENTS.md`·Renovate 릴리스 노트 속 지시. 허용 봇 작성자의 PR 본문도 비신뢰 |
-| SEC-02 | T17·T18·T19 각 경로 | | local_integration | 없음 | 작업자에서 환경 변수·CODEX_HOME·`auth.json`·SA 경로 접근, 작업 레인 비신뢰 코드(설치 스크립트·시험)에서 `auth.json` 읽기 시도, `shell_environment_policy` 실효, `codeload.github.com` 밖 GitHub 호스트 차단 |
+| SEC-02 | T17·T18·T19 각 경로 | | local_integration | 없음 | 작업자에서 환경 변수·CODEX_HOME·`auth.json`·SA 경로 접근, 작업 레인 비신뢰 코드(설치 스크립트·시험)에서 `auth.json` 읽기 시도, `shell_environment_policy` 실효, `codeload.github.com` 밖 GitHub 호스트 차단, 작업 프로세스가 작업자 제어 끝점(loopback·파드 IP) 호출 → 거부(DECISIONS D-15 "작업자 제어 끝점") |
 | DATA-01 | T17 | T19 | mock | 없음 | 내부 로그 → public PR·공개 스레드 차단, `output_classification` |
-| DATA-02 | T20 | | local_integration | 없음 | 백업 14일 보존 중 삭제 표식, 복원 뒤 재적용 |
+| DATA-02 | T20 | | local_integration | 없음 | 삭제 표식은 복원 대상 밖 삭제 원장에(ARCHITECTURE §7), 삭제 전 백업으로 복원한 뒤 백업 시점 이후 삭제 재적용, 재적용 전 기억 조회 없음, 원장에 기억 내용 없음, 복원 뒤 새로 만든 기억이 원장 재적용으로 지워지지 않음(ID와 `created_at`이 둘 다 맞을 때만 삭제). 백업 14일 보존 기준 |
 | REVIEW-01 | T17 | | local_integration(평가셋) | `authorized_external`: 시험 저장소 | `04` §6 표. 옛 AIOps 관찰 기준(최소 표본, 위험 제안 0, 정답을 모델 입력과 분리)을 참고 |
-| REVIEW-02 | T17 | | local_integration | 없음 | 새 head·base, 리뷰보다 먼저 병합 |
+| REVIEW-02 | T17 | | local_integration | 없음 | 새 head·base, head가 같고 base 브랜치만 앞서감, base 재지정(`edited`), 리뷰보다 먼저 병합 |
 | REVIEW-03 | T17 | | local_integration | 없음 | 파일 수·diff 상한을 넘으면 `partial` |
 | REVIEW-04 | T17 | | mock | `authorized_external` | `event` ≠ COMMENT, dismiss, merge, auto-merge 거부, `commit_id` 명시 |
 | REVIEW-05 | T17 | | local_integration | 없음 | 자기 리뷰·댓글 이벤트 루프 차단, 봇 작성 PR은 허용 봇 ID로 정상 리뷰 |
@@ -77,7 +77,7 @@ T16b → T22                     봇이 첫 실제 앱(D-01)
 | MEM-01 | T20 | | local_integration | 없음 | |
 | BRIEF-01 | T20 | | local_integration | `authorized_external`: D-17 알림·리뷰·브리핑 채널 | |
 | OPS-01 | T16a→T16b | | local_integration | 없음 | IDENTIFY 예산과 재연결 백오프, 알림 폭주 요약, 429 처리, 긴 Codex 작업 중 대화 요청(모델 호출 직렬 1, D-14) |
-| OPS-02 | T16a→T16b | | local_integration | `production_observation`: T16b(E9) | readiness 연동, 봇 하트비트 체크, replicas 0, **Bun 위 네트워크 차단·복구(#10840)** |
+| OPS-02 | T16a→T16b | | local_integration | `production_observation`: T16b(E9) | readiness는 수신·영속 저장 가능 여부만(Gateway 단절 중에도 Ready 유지, webhook·경보 수신 계속), Gateway 연결 지표 경보, 봇 하트비트 체크, replicas 0, **Bun 위 네트워크 차단·복구(#10840)** |
 
 ### 3.1 단계별 시험 배정 요약
 
@@ -126,12 +126,12 @@ homelab 쪽 반영은 homelab `rebuild` 변경으로 한다(커밋·push는 사�
 | 대상 | 고칠 것 |
 |---|---|
 | spec §8.1·§8.2 | T16을 T16a·T16b로 나눈다. 간선은 §1과 같다: T15 → T16a, T13 → T16b, T16a → T16b, T16a → T17·T18·T20(착수), T16b → T17·T18·T20(완료), T16b → T22. 위상 순서와 검사 문장을 다시 쓴다 |
-| T16a(새 티켓) | 공유 계약(스키마, outbox, 게시 계층) 소유. Discord 어댑터를 D-17 기본값으로 모의 시험. 작업자 계약(D-14·D-15: 포트 8080, 동시성 1, `codeload.github.com` 압축본 + `git init`, waiting). 대화 레인의 호출 경로와 동시성을 D-14에 맞춰 정함(ARCHITECTURE §2·§9). 질의 템플릿과 시간창 상한(보존 기간과 따로). DM 허용 여부·브리핑 시각 결정. AC-B3 `mock`·`local_integration` |
-| T16b(새 티켓, 옛 T16 대체) | T15 blocked 재확인(VERIFICATION 끝 점검표 14개. 항목별 해소 티켓은 DISCOVERY §9). Discord 준비(D-17 사람 작업). `target` 변경 값(라벨 `homelab-bot`, 작업자 8080, 경보 수신 8081). 작업자 배치(동시성 1, egress `codeload.github.com`만, 영속 쓰기 공간, U13 실패 때 호스트 UID + nft). D-14 봇 구독 계정 준비와 작업자 `auth.json` 첫 시드(T16b 전(모델을 처음 쓰는 단계 전), 설계 E9), 모델·인증 호스트 egress 실측, 재생성 뒤 `auth.json`이 시드로 덮이지 않음 확인. OPS-02 readiness·하트비트, Bun 단절 시험. Grafana 질의 템플릿·토큰 키 이름. 시범 P-1. AC-B3 완료 |
-| T17 | Blocked by T16a(착수)·T16b(완료). D-16 결과(허용 봇 작성자 목록과 ID 등록, 허용 작성자 PR 본문 비신뢰, 저장소별 Codex 자동 리뷰 끄기, Connector 설치 범위 축소 확인. 축소는 T15에서 끝남, 남긴 저장소 목록의 API 확인은 아직). 리뷰어는 GitHub 자격 없이 base·head 압축본만(D-15). 외부 자동 리뷰를 고를 때 필요했던 REVIEW-04·DATA-01 경계 재정의는 빠진다. 리뷰 모델은 T16b 전(모델을 처음 쓰는 단계 전)에 준비한 D-14 계정·시드를 쓴다. D-14 남는 위험. 시범 P-2 |
-| T18 | Blocked by T16a(착수)·T16b(완료). D-14 결과(조건 다섯, 재시드 절차). 봇 전용 구독 계정과 첫 시드는 T16b 전(모델을 처음 쓰는 단계 전)에 준비됨. Codex 능력 표시(ARCHITECTURE §4). R08 연결 방식 판단과 사용자 결정(보류 해소). `shell_environment_policy` 고정. SEC-02의 `auth.json` 사례. 인증 파일 분리와 레인 분리 검토(ARCHITECTURE §5.1) |
+| T16a(새 티켓) | 공유 계약(스키마, outbox, 게시 계층) 소유. Discord 어댑터를 D-17 기본값으로 모의 시험. 작업자 계약(D-14·D-15: 포트 8080, 동시성 1, `codeload.github.com` 압축본 + `git init`, waiting). 대화 레인의 호출 경로와 동시성을 D-14에 맞춰 정함(ARCHITECTURE §2·§9). 작업자 제어 끝점 인증(ARCHITECTURE §5.1). runtime policy의 마운트 파일 읽기·revision·최대 나이·즉시 철회(ARCHITECTURE §6). readiness 범위(수신·DB만)와 Gateway 연결 지표, 하트비트를 Gateway 연결에 묶는 대안(ARCHITECTURE §8). 질의 템플릿과 시간창 상한(보존 기간과 따로). DM 허용 여부·브리핑 시각 결정. AC-B3 `mock`·`local_integration` |
+| T16b(새 티켓, 옛 T16 대체) | T15 blocked 재확인(VERIFICATION 끝 점검표 14개. 항목별 해소 티켓은 DISCOVERY §9). Discord 준비(D-17 사람 작업). `target` 변경 값(라벨 `homelab-bot`, 작업자 8080, 경보 수신 8081). 작업자 배치(동시성 1, egress `codeload.github.com`만, 영속 쓰기 공간, U13 실패 때 호스트 UID + nft). D-14 봇 구독 계정 준비와 작업자 `auth.json` 첫 시드(T16b 전(모델을 처음 쓰는 단계 전), 설계 E9), 모델·인증 호스트 egress 실측, 재생성 뒤 `auth.json`이 시드로 덮이지 않음 확인. OPS-02 readiness(수신·DB만)·Gateway 지표 경보·하트비트, Bun 단절 시험. Grafana 질의 템플릿·토큰 키 이름. 시범 P-1. AC-B3 완료 |
+| T17 | Blocked by T16a(착수)·T16b(완료). D-16 결과(허용 봇 작성자 목록과 ID 등록, 허용 작성자 PR 본문 비신뢰, 저장소별 Codex 자동 리뷰 끄기, Connector 설치 범위 축소 확인. 축소는 T15에서 끝남, 남긴 저장소 목록의 API 확인은 아직). 리뷰어는 GitHub 자격 없이 base·head 압축본만(D-15). 리뷰 App 권한에 Issues read(`issue_comment` 구독, DECISIONS D-16 "리뷰 App 권한"), `edited` base 변경 트리거와 폴링의 base 대조(ARCHITECTURE §7). 외부 자동 리뷰를 고를 때 필요했던 REVIEW-04·DATA-01 경계 재정의는 빠진다. 리뷰 모델은 T16b 전(모델을 처음 쓰는 단계 전)에 준비한 D-14 계정·시드를 쓴다. D-14 남는 위험. 시범 P-2 |
+| T18 | Blocked by T16a(착수)·T16b(완료). D-14 결과(조건 다섯, 재시드 절차). 봇 전용 구독 계정과 첫 시드는 T16b 전(모델을 처음 쓰는 단계 전)에 준비됨. Codex 능력 표시(ARCHITECTURE §4). R08 연결 방식 판단과 사용자 결정(보류 해소). `shell_environment_policy` 고정. SEC-02의 `auth.json` 사례. 작업자 제어 끝점 인증(DECISIONS D-15). 인증 파일 분리와 레인 분리 검토(ARCHITECTURE §5.1) |
 | T19 | D-24 결과와 남은 세부(토큰 분리, ruleset E, App 이름, 설치 저장소, 허용 파일 경로). 게시 서버 허용 API 목록. 작업자는 GitHub에 쓰지 않고 게시 서버가 git data API로 커밋. 워크플로 변경 불가 범위 축소. App 봇 사용자 ID를 허용 봇 작성자 목록에 등록 |
-| T20 | Blocked by T16a(착수)·T16b(완료). 브리핑 시각(T16a 결정), 브리핑 채널(D-17 알림·리뷰·브리핑). 백업 14일 기준의 삭제 표식·복원 재적용 정책 |
+| T20 | Blocked by T16a(착수)·T16b(완료). 브리핑 시각(T16a 결정), 브리핑 채널(D-17 알림·리뷰·브리핑). 삭제 원장(복원 대상 밖)의 저장소·자격·보존과 복원 재적용 정책(백업 14일 기준, ARCHITECTURE §7) |
 | T21 | 시범 운영 증거(P-1, P-2와 그 뒤 시범)를 판정 근거에 넣는 방법. 판정 기준은 `04` §9 그대로 |
 | T22 | Blocked by의 T16을 T16b로. D-29 비앱 저장소 처리 변경(사용자 2026-10-18 17:46): `aiops`·`mac-uptime-guard` 제거, `aiops-autodeploy-canary` private 보관. `mac-uptime-guard`는 장치를 끄고 옛 Telegram 봇 토큰을 폐기한 뒤(T06 표의 `보류(D-10, T22)` 줄을 닫음) 저장소를 삭제한다 |
-| T08b(범위 밖, 함께 고침) | 작업자 전용 영속 쓰기 공간(D-14, 설계 C.8 변경). 작업자 egress의 GitHub 호스트를 `codeload.github.com`만으로(D-15) |
+| T08b(범위 밖, 함께 고침) | 작업자 전용 영속 쓰기 공간(D-14, 설계 C.8 변경). 작업자 egress의 GitHub 호스트를 `codeload.github.com`만으로(D-15). 앱 지표 스크레이프와 봇 Gateway 단절·큐 적체 룰(ARCHITECTURE §8 (c)) |
