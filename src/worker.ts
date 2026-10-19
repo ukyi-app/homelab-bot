@@ -13,13 +13,15 @@ export const WorkerRequestSchema = z.strictObject({
   toolCalls: z.number().int().min(0).max(DEFAULTS.maxToolCalls),
 });
 export type WorkerRequest = z.infer<typeof WorkerRequestSchema>;
+export const CancelRequestSchema = z.strictObject({ job: z.string().uuid(), lease: z.string().uuid() });
+export type CancelRequest = z.infer<typeof CancelRequestSchema>;
 export type WorkerResult =
   | { status: 'succeeded'; answer: Answer; stopped: true }
   | { status: 'limited' | 'auth_expired' | 'failed'; stopped: true }
   | { status: 'unknown'; stopped: false };
 export interface WorkerClient {
   execute(request: WorkerRequest, capability: string, signal: AbortSignal): Promise<WorkerResult>;
-  cancel(job: string, capability: string): Promise<{ stopped: boolean }>;
+  cancel(request: CancelRequest, capability: string): Promise<{ stopped: boolean }>;
 }
 const CapabilitySchema = z.strictObject({
   audience: z.literal('homelab-worker'), operation: z.enum(['execute', 'cancel']),
@@ -29,8 +31,9 @@ const CapabilitySchema = z.strictObject({
 export class WorkerSigner {
   constructor(private readonly privateKey: KeyObject, private readonly now: Clock = Date.now) {}
   issue(job: Job, operation: 'execute' | 'cancel', body: unknown): string {
+    const issued = this.now();
     const payload = Buffer.from(JSON.stringify({ audience: 'homelab-worker', operation, job: job.id,
-      lease: job.lease_token, digest: digest(body), issued: this.now(), expires: this.now() + 30_000 })).toString('base64url');
+      lease: job.lease_token, digest: digest(body), issued, expires: issued + 30_000 })).toString('base64url');
     return `${payload}.${sign(null, Buffer.from(payload), this.privateKey).toString('base64url')}`;
   }
 }
@@ -38,14 +41,14 @@ const digest = (body: unknown) => createHash('sha256').update(JSON.stringify(bod
 export class WorkerVerifier {
   constructor(private readonly publicKey: KeyObject,
     private readonly consume: (nonce: string) => Promise<boolean>, private readonly now: Clock = Date.now) {}
-  async check(token: string, operation: 'execute' | 'cancel', body: { job: string; lease?: string }): Promise<void> {
+  async check(token: string, operation: 'execute' | 'cancel', body: { job: string; lease: string }): Promise<void> {
     try {
       const pieces = token.split('.');
       if (pieces.length !== 2) throw new Denied();
       const [payload, signature] = pieces as [string, string];
       if (!verify(null, Buffer.from(payload), this.publicKey, Buffer.from(signature, 'base64url'))) throw new Denied();
       const c = CapabilitySchema.parse(JSON.parse(Buffer.from(payload, 'base64url').toString()));
-      if (c.operation !== operation || c.job !== body.job || (body.lease && c.lease !== body.lease)
+      if (c.operation !== operation || c.job !== body.job || c.lease !== body.lease
         || c.digest !== digest(body) || c.issued > this.now() || c.expires <= this.now()
         || c.expires - c.issued > 30_000 || !await this.consume(digest(token))) throw new Denied();
     } catch { throw new Denied(); }
@@ -63,7 +66,7 @@ export class SerialWorker implements WorkerClient {
   private busy: { job: string; lease: string } | undefined;
   constructor(private readonly verifier: WorkerVerifier,
     private readonly run: (r: WorkerRequest, s: AbortSignal) => Promise<WorkerResult>,
-    private readonly stop: (job: string) => Promise<boolean>) {}
+    private readonly stop: (request: CancelRequest) => Promise<boolean>) {}
   async execute(input: WorkerRequest, capability: string, signal: AbortSignal): Promise<WorkerResult> {
     let r: WorkerRequest;
     try {
@@ -84,11 +87,12 @@ export class SerialWorker implements WorkerClient {
       return { status: 'unknown', stopped: false };
     }
   }
-  async cancel(job: string, capability: string): Promise<{ stopped: boolean }> {
-    await this.verifier.check(capability, 'cancel', { job });
+  async cancel(input: CancelRequest, capability: string): Promise<{ stopped: boolean }> {
+    const request = CancelRequestSchema.parse(input);
+    await this.verifier.check(capability, 'cancel', request);
     const active = this.busy;
-    if (active?.job !== job) return { stopped: false };
-    const stopped = await this.stop(job);
+    if (active?.job !== request.job || active.lease !== request.lease) return { stopped: false };
+    const stopped = await this.stop(request);
     if (stopped && this.busy === active) this.busy = undefined;
     return { stopped };
   }

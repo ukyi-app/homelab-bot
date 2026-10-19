@@ -3,8 +3,8 @@ import { z } from 'zod';
 import { Agent } from 'undici';
 import { AnswerSchema, WorkerRejected } from './contracts.js';
 import { body } from './http.js';
-import type { WorkerClient, WorkerRequest, WorkerResult } from './worker.js';
-import { WorkerRequestSchema } from './worker.js';
+import type { CancelRequest, WorkerClient, WorkerRequest, WorkerResult } from './worker.js';
+import { CancelRequestSchema, WorkerRequestSchema } from './worker.js';
 
 const ResultSchema = z.discriminatedUnion('status', [
   z.strictObject({ status: z.literal('succeeded'), stopped: z.literal(true), answer: AnswerSchema }),
@@ -49,10 +49,10 @@ export class HttpWorker implements WorkerClient {
       throw new Error('worker_response_uncertain');
     } finally { await dispatcher.destroy(); }
   }
-  async cancel(job: string, capability: string): Promise<{ stopped: boolean }> {
+  async cancel(request: CancelRequest, capability: string): Promise<{ stopped: boolean }> {
     const response = await this.send(`${this.origin}/v1/cancel`, { method: 'POST', redirect: 'error',
       headers: { 'content-type': 'application/json', authorization: `Capability ${capability}` },
-      body: JSON.stringify({ job }), signal: AbortSignal.timeout(5000) });
+      body: JSON.stringify(request), signal: AbortSignal.timeout(5000) });
     if (!response.ok) return { stopped: false };
     return z.strictObject({ stopped: z.boolean() }).parse(await response.json());
   }
@@ -67,11 +67,11 @@ export function workerServer(worker: WorkerClient) {
     let started = false;
     try {
       const input = await body(req);
-      const validated = req.url === '/v1/execute' ? WorkerRequestSchema.parse(input) : z.strictObject({ job: z.string().uuid() }).parse(input);
+      const validated = req.url === '/v1/execute' ? WorkerRequestSchema.parse(input) : CancelRequestSchema.parse(input);
       started = true;
       const result = req.url === '/v1/execute'
         ? await worker.execute(validated as WorkerRequest, auth.slice(11), new AbortController().signal)
-        : await worker.cancel(validated.job, auth.slice(11));
+        : await worker.cancel(validated, auth.slice(11));
       res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(result));
     } catch (error) {
       const rejected = !started || error instanceof WorkerRejected;

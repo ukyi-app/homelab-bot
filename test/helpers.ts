@@ -2,6 +2,7 @@ import { PGlite } from '@electric-sql/pglite';
 import { readFile } from 'node:fs/promises';
 import { generateKeyPairSync } from 'node:crypto';
 import type { Database } from '../src/database.js';
+import { remaining } from '../src/database.js';
 import { Store } from '../src/store.js';
 import { PolicyGate } from '../src/policy.js';
 import type { Policy } from '../src/policy.js';
@@ -18,12 +19,17 @@ export async function localDatabase(path?: string): Promise<{ db: Database; pg: 
   const pg = new PGlite(path);
   const db: Database = {
     query: async <T>(sql: string, params: unknown[] = []) => pg.query<T>(sql, params),
-    transaction: fn => pg.transaction(async tx => fn({ query: (sql, params = []) => tx.query(sql, params),
-      transaction: () => { throw new Error('nested'); } })),
+    transaction: (fn, deadline) => pg.transaction(async tx => {
+      const result = await fn({ query: (sql, params = []) => tx.query(sql, params),
+        transaction: () => { throw new Error('nested'); } });
+      if (deadline) remaining(deadline);
+      return result;
+    }),
   };
   await pg.exec(await readFile('migrations/001_foundation.sql', 'utf8'));
   await pg.exec(await readFile('migrations/002_denial_revision.sql', 'utf8'));
   await pg.exec(await readFile('migrations/003_recovery_controls.sql', 'utf8'));
+  await pg.exec(await readFile('migrations/004_delivery_services.sql', 'utf8'));
   return { db, pg };
 }
 export const thread: Scope = { guild: 'fixture-guild', channel: 'fixture-thread', parent: 'fixture-chat', kind: 'thread' };
@@ -57,7 +63,7 @@ export class MockDiscord implements DiscordRest {
     if (this.loseResponse) { this.loseResponse = false; throw new Error('response_lost'); }
     return record;
   }
-  async findDelivery(channel: string, marker: string, kind: 'message' | 'thread') {
+  async findDelivery(channel: string, marker: string, kind: 'message' | 'thread'): Promise<{ id: string } | undefined> {
     return kind === 'message' ? this.messages.find(m => m.channel === channel && m.body.content.includes(marker))
       : this.threads.find(t => t.channel === channel && t.body.name.includes(marker));
   }

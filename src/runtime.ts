@@ -17,6 +17,7 @@ export class Runtime {
     if (!job) return false;
     let dispatched = false;
     let stopped = false;
+    let waiting = false;
     try {
       const policy = await this.gate.authorize(job.owner_id, job.target);
       job.revision.policy = policy.revision;
@@ -29,7 +30,8 @@ export class Runtime {
           template: event.payload.text, from: this.store.now() - 60_000, to: this.store.now() });
         await this.gate.authorize(job.owner_id, job.target, job.revision.policy);
         if (!await this.store.active(job.conversation_id)) { await this.store.transition(job, 'superseded'); return true; }
-        await this.store.finish(job, result, { source: result.source, observedAt: result.observedAt }, readSummary(result), job.target);
+        await this.store.finish(job, result, { source: result.source, observedAt: result.observedAt }, readSummary(result), job.target,
+          result.status === 'unregistered' ? [] : [result.service]);
         return true;
       }
       const request = workerRequest(job, await this.store.context(job.conversation_id));
@@ -62,15 +64,16 @@ export class Runtime {
       const current = (await this.store.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0]!;
       if (current.state === 'cancel_requested' || abort.signal.aborted || monitorError) {
         const confirmation = result.stopped ? { stopped: true }
-          : await this.worker.cancel(job.id, this.signer.issue(job, 'cancel', { job: job.id })).catch(() => ({ stopped: false }));
+          : await this.worker.cancel({ job: job.id, lease: job.lease_token },
+            this.signer.issue(job, 'cancel', { job: job.id, lease: job.lease_token })).catch(() => ({ stopped: false }));
         stopped = confirmation.stopped;
         if (stopped && current.state !== 'cancel_requested') await this.store.fail(job, 'stop_confirmation');
         else await this.store.transition(job, stopped ? 'cancelled' : 'unknown', 'stop_confirmation');
       } else if (!result.stopped) {
         await this.store.transition(job, 'unknown', 'worker_disconnected');
       } else if (result.status === 'limited' || result.status === 'auth_expired') {
-        await this.store.transition(job, 'waiting_user', result.status === 'limited' ? 'model_limit' : 'auth_expired');
-        await this.store.db.query(`INSERT INTO controls VALUES ('scheduler','true') ON CONFLICT (key) DO UPDATE SET value='true'`);
+        waiting = true;
+        await this.store.waitForUser(job, result.status === 'limited' ? 'model_limit' : 'auth_expired');
       } else if (result.status === 'failed') await this.store.fail(job, 'model_failed');
       else if (result.status === 'succeeded') {
         const answer = AnswerSchema.parse(result.answer);
@@ -86,6 +89,8 @@ export class Runtime {
       await this.store.audit('model_timing', job.id, { queueWaitMs: Number(job.started_at) - Number(job.created_at),
         executionMs: this.store.now() - Number(job.started_at) });
     } catch (error) {
+      // An uncommitted limit transition must retain the slot until recovery, not become retryable.
+      if (waiting) return true;
       if (error instanceof PolicyUnavailable && !dispatched) await this.store.defer(job);
       else if (error instanceof WorkerRejected) await this.store.fail(job, 'worker_rejected');
       else if (error instanceof Denied && (!dispatched || stopped)) await this.store.transition(job, 'cancelled', 'authorization_revoked');

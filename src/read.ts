@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { Denied, PolicyUnavailable } from './contracts.js';
 import type { Clock, Scope } from './contracts.js';
 import type { PolicyGate } from './policy.js';
+import { bounded, summaryItems } from './format.js';
 
 export interface Service {
   id: string; repository: string; namespace: string; deployment: string;
@@ -68,7 +69,7 @@ export class ReadAdapter {
       if (data.rows.length > t.maxRows || data.observedAt > this.now() || data.observedAt < r.from || data.observedAt > r.to
         || this.now() - data.observedAt > 300_000) throw new Error('stale_or_oversized');
       if (!data.rows.length) throw new Error('no_observation');
-      await this.gate.authorize(actor, scope, p.revision);
+      if (!(await this.gate.authorize(actor, scope, p.revision)).services.includes(r.service)) throw new Denied();
       return { ...base, observedAt: data.observedAt, status: 'observed',
         facts: data.rows.flatMap(row => [row.status ? `상태: ${row.status}` : '', row.value !== undefined ? `값: ${row.value}` : ''].filter(Boolean)),
         unknowns: t.kind === 'status' ? ['메트릭·로그는 조회하지 않음', '복원 가능 여부는 확인하지 않음'] : [],
@@ -81,7 +82,7 @@ export class ReadAdapter {
 }
 // Public threads only get deterministic metadata/status, never raw logs or model declassification.
 export function readSummary(result: ReadResult): string {
-  return [`대상: ${result.service}`, `출처: ${result.source ?? '없음'}`, `시간창: ${result.window.from}~${result.window.to}`,
-    `관측 시각: ${result.observedAt ?? '미확인'}`, `사실: ${result.facts.join('; ') || '없음'}`,
-    '가설: 없음', `미확인: ${result.unknowns.join('; ') || '없음'}`, `권장 확인: ${result.checks.join('; ') || '없음'}`].join('\n');
+  return [`대상: ${bounded(result.service, 120)}`, `출처: ${bounded(result.source ?? '없음', 120)}`, `시간창: ${result.window.from}~${result.window.to}`,
+    `관측 시각: ${result.observedAt ?? '미확인'}`, `사실: ${summaryItems(result.facts, 600)}`,
+    '가설: 없음', `미확인: ${summaryItems(result.unknowns, 350)}`, `권장 확인: ${summaryItems(result.checks, 350)}`].join('\n');
 }

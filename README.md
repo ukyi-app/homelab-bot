@@ -46,7 +46,7 @@ REST는 `discordHttpApi(token, fetch)`를 주입한다. 직접 호출하지 않�
 게시 서버 수신 포트는 8080, 경보는 8081, 작업자 Service는 8080이다.
 
 `Postgres`에는 전용 DB/역할의 `pg.Pool`을 주입한다. `migrate()`는 빌드 결과에서 호출한다.
-운영 마이그레이션은 T16b의 Sync hook Job에서 실행한다. `001`은 초기 스키마, `002`는 철회 당시 정책 revision, `003`은 철회 ID·게시 일시 중지 상태를 추가한다.
+운영 마이그레이션은 T16b의 Sync hook Job에서 실행한다. `001`은 초기 스키마, `002`는 철회 당시 정책 revision, `003`은 철회 ID·게시 일시 중지 상태, `004`는 결과별 서비스 접근 범위를 추가한다.
 후속 티켓도 기존 파일을 변경하지 않고 expand/contract 후속 파일을 추가한다.
 
 ## 사용 계약
@@ -60,14 +60,17 @@ REST는 `discordHttpApi(token, fetch)`를 주입한다. 직접 호출하지 않�
 실제 slash 명령 등록·Gateway 연결은 T16b다.
 
 ACK 전에 이벤트와 처리 경로(job 또는 outbox, 제어 결과)를 영속 저장한다.
-저장 실패·1500ms 마감 초과면 ACK하지 않고 미수락 기록만 남긴다.
+수신 처리 transaction은 PostgreSQL 18의 transaction_timeout과 남은 시간별 statement_timeout으로
+1500ms 마감을 적용하고 최종 갱신 뒤에도 검사한다. 마감 내 commit한 뒤 응답만 잃은 경우의
+수락 여부는 단정하지 않으며 같은 이벤트 ID로 중복 작업을 만들지 않는다.
 ACK 응답 유실은 `ack_uncertain` 감사 기록을 남기고 이미 수락한 작업을 계속한다.
 상호작용 응답의 만료·유실은 처리 스레드/DM에 상태 확인 안내를 한 번 보낸다. 새 스레드는 생성 확인 뒤 안내한다.
 같은 이벤트 ID는 작업을 추가하지 않는다. 부모 채널은 구독하지 않으며 매번 멘션/명령이 필요하다.
 
 `queued/running/waiting_user/verifying/succeeded/failed/cancel_requested/cancelled/unknown/superseded`를
 구분한다. 한도·인증 만료는 `waiting_user` + `model_limit/auth_expired`이며 모델 스케줄러를 정지한다.
-자동 계정 변경은 없다. unknown과 외부 게시 결과 불명은 자동 재실행하지 않는다.
+waiting_user와 scheduler 중지는 한 transaction으로 기록한다. 기록 실패 시 슬롯을 보존하며,
+waiting_user 자체도 다음 모델 실행을 막는다. 자동 계정 변경은 없다. unknown과 외부 게시 결과 불명은 자동 재실행하지 않는다.
 worker 중단 확인·auth 갱신 뒤의 운영 재개 절차는 T18에서 구현한다.
 
 정책 파일에는 `revision`, `confirmedAt`, `owner`, `guild`, `conversationChannel`,
@@ -88,12 +91,17 @@ Discord 401은 게시를 pending에 두며 자격 갱신 뒤 새 REST 어댑터�
 `ReadTransport`의 제한된 observation 형식으로 투영하는 연결은 T16b에서 실측하며,
 Secret·ConfigMap·환경변수 원문을 observation에 넣지 않는다.
 로그 원문은 내부 result에만 남고 공개 스레드에는 결정적인 상태 요약만 보낸다.
+결과 outbox의 service_ids를 게시·대조 직전에 재인가하므로 전달 대기 중 서비스 철회도 적용된다.
+조회 요약은 항목별 예산과 생략 건수를 표시해 미확인·권장 확인을 보존한다. 긴 /list는 모든 작업을
+독립적으로 유효한 JSON 배열 페이지로 나누며, 각 페이지의 nonce/marker는 서로 다르다.
+unknown 게시 대조가 429를 만나면 루프를 중단하고 retry_after까지 DB에 기록한 시각을 기다린다.
 
 ## 후속 작업의 경계
 
 T16b는 실제 PostgreSQL·Gateway 세션 연결, 라이브 조회 응답 투영, 실제 Codex 실행기,
 전용 CODEX_HOME·네트워크 격리, 지속 capability 재생 방지 저장소, 정책 갱신 확인,
 Gateway 재연결·경보 규칙·하트비트 연결과 첫 배포를 맡는다.
+작업자 /v1/cancel은 `{job, lease}`를 필수로 받고 capability·현재 실행·중단 어댑터 모두 같은 lease를 사용한다.
 작업자 검증기는 `consume(nonce)`에 **원자적·영속적인 일회 사용 기록**을 요구한다.
 시험의 메모리 Set은 재시작 보안을 증명하지 않는다.
 

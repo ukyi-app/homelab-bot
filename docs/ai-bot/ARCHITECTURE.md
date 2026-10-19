@@ -202,7 +202,7 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 **순서 규칙**
 
 - 수신 → inbox 저장(짧은 타임아웃) → ACK. ACK는 최소 영속 insert가 끝난 뒤에만 보낸다. Discord 상호작용도 같다. 첫 응답(defer 포함)은 3초 안이어야 하지만 [확인: https://docs.discord.com/developers/interactions/receiving-and-responding] 저장 전에 defer하지 않는다. 저장이 그 안에 끝나지 않으면 작업을 받았다고 응답하지 않는다. 다시 시도하라는 명시적 실패를 응답하거나 응답하지 않아, 사용자가 실패를 보게 한다. 저장 전에 defer하면 그 뒤 프로세스가 죽거나 저장이 끝내 실패했을 때, 받은 것으로 보인 요청의 기록이 어디에도 남지 않아 대조할 수 없다 [가정]. 저장 타임아웃 값은 T16a에서 정한다(EVENT-01).
-- 저장 타임아웃 뒤 insert가 늦게 commit되면, 사용자는 실패를 봤는데 작업이 돌고 다시 시도한 요청(새 interaction ID)과 중복된다. 그래서 타임아웃 때 서버 쪽 트랜잭션을 취소하고(`statement_timeout` 등), commit 결과를 모르면 그 행을 수락 안 함으로 두고 자동 실행하지 않는다 [가정] (EVENT-01).
+- 저장 타임아웃 뒤 insert가 늦게 commit되면, 사용자는 실패를 봤는데 작업이 돌고 다시 시도한 요청(새 interaction ID)과 중복된다. 그래서 전체 transaction과 각 statement에 남은 시간을 적용한다(§11). commit 응답만 잃으면 실제 수락 여부를 단정하지 않고, 같은 이벤트 ID의 중복 작업을 막는다 (EVENT-01).
 - 외부 효과 전에 outbox에 멱등 키를 쓰고, 효과 뒤 외부 ID를 기록한다. 응답을 못 받으면 외부 상태를 먼저 조회한다(EVENT-02). Discord는 `nonce` + `enforce_nonce`로 짧은 창의 중복을 막고(창 길이 미확인), 그 밖은 outbox 대조로 막는다.
 - 결과를 모르는 작업은 `unknown`. 자동 재실행하지 않는다(EVENT-04).
 
@@ -285,7 +285,10 @@ Discord Gateway → `DiscordProtocol` → `DiscordIngress` → PostgreSQL 이벤
 
 작업자 모델 호출은 **대화·작업 레인 합쳐 1개**다. DB의 scheduler 행 잠금과 작업자의 별도 mutex가
 중복 실행을 막는다. lease가 끝나거나 호스트 결과를 모르면 `unknown`이 전체 모델 슬롯을 잡는다.
-한도·인증 만료는 `waiting_user` + `model_limit/auth_expired`, 스케줄러 정지이며 자동 인증 전환은 없다.
+한도·인증 만료는 `waiting_user` + `model_limit/auth_expired`와 스케줄러 정지를 원자적으로 기록한다.
+이 기록이 실패하면 실행 슬롯을 유지하고 lease 만료 뒤 unknown으로 남긴다. waiting_user 자체도
+새 claim을 차단한다. 자동 인증 전환은 없다. 완료 전이와 cancel_requested가 경합하면
+같은 조건부 UPDATE가 cancelled를 선택하고 성공 결과·실패 안내를 만들지 않는다.
 긴 작업 중 수신·저장 ACK·조회 없이 가능한 제어 명령은 계속 처리한다. 실행 중 작업을 대화가 선점하지 않는다.
 실제 모델 답변은 직렬 대기하므로 대화의 즉시 답변을 보장하지 않는다. 파드 분리는 T18의 판단이다.
 
@@ -302,10 +305,15 @@ Discord Gateway → `DiscordProtocol` → `DiscordIngress` → PostgreSQL 이벤
 `001_foundation.sql`은 이벤트, 대화/구독, 작업, 결과/증거, outbox, 예약 기반, 감사, 거부 목록,
 사건 그룹을 정의한다. `002_denial_revision.sql`은 철회 당시 revision을 추가한다.
 `003_recovery_controls.sql`은 철회 ID와 outbox의 영속 일시 중지 사유·횟수를 추가한다.
+`004_delivery_services.sql`은 outbox service_ids를 추가하고 기존 read 결과도 job/event에서 역으로 채운다.
 기존 revision/철회 ID 없는 거부 행은 자동 해제하지 않는다. T17·T18·T20은 후속 마이그레이션으로 확장한다.
 작업 상태는 `04` §3의 10개 값이며 작업 성공과 외부 전달 상태는 별도다.
 
-PostgreSQL transaction의 statement timeout은 **1500ms**, lock timeout은 **1000ms**다.
+일반 PostgreSQL transaction의 statement timeout은 **1500ms**, lock timeout은 **1000ms**다.
+수신 처리 경로에는 절대 마감을 전달하고, PostgreSQL 18의 transaction_timeout을 남은 시간으로 설정한다.
+각 statement 및 COMMIT 직전에는 남은 시간 이내로 statement_timeout을 줄이고, 최종 UPDATE 뒤에도
+마감을 검사해 rollback한다. 플랫폼 설계의 PostgreSQL 18.6 계약에 의존한다. DB에서 이미 commit한 뒤
+응답 전달만 늦어진 경우는 늦게 실행된 transaction과 구분하며 수락 여부를 임의로 뒤집지 않는다.
 ACK 전에 inbox와 처리 경로를 저장한다. 처리 경로 transaction 안에서 1500ms 마감을 검사하고,
 그 전에 실패하면 ACK하지 않고 `accepted=false`만 남긴다. commit 응답 유실은 실제 commit 여부가
 불확실하므로 수락 상태를 단정하지 않는다. 성공적으로 commit한 뒤 ACK 응답이 유실돼도 이미
@@ -335,8 +343,11 @@ Discord 401은 별도 오류로 pending을 유지한다. 토큰 갱신 후 새 R
 스레드는 공개, 보관 시간 **1440분**이다. 모든 메시지/상호작용 응답의 `allowed_mentions.parse=[]`를 강제한다.
 outbox UUID별 멱등 키에서 24자 nonce와 게시 marker를 만든다. 응답 유실은 unknown으로 두고 게시자의 marker와
 스레드 이름을 제한 조회한다. 못 찾았다고 재게시하지 않는다.
+대조 중 429는 즉시 루프를 중단하고 전역 다음 대조 시각을 DB에 기록한다. 재기동해도
+최소 1초 또는 retry_after 중 긴 쪽을 기다린다. 기존 unknown의 24시간 기한은 연장하지 않는다.
 unknown 전달은 별도 **100건/24시간** 한도로 유지하며 초과·만료 시 감사 기록 후 blocked로 닫는다.
-경보 backpressure는 pending/sending만 센다. unknown 지표 경보 연결은 T16b다. Discord의 exactly-once를 보증하지 않는다.
+경보 backpressure는 pending/sending만 센다. 서로 다른 groupKey도 공통 alert_admission 행을
+잠근 뒤 count와 삽입을 한 transaction에서 실행해 동시 경보 수락의 상한 검사를 직렬화한다. unknown 지표 경보 연결은 T16b다. Discord의 exactly-once를 보증하지 않는다.
 복구는 100건씩 **10페이지/30초**까지다. live 메시지 checkpoint를 갱신하고, 복구 중에는 `gap=true`로 작업을 막는다.
 한도를 넘으면 gap을 유지한다. 더 긴 누락의 수동 복구는 T16b 운영 절차로 정한다.
 
@@ -346,10 +357,16 @@ unknown 전달은 별도 **100건/24시간** 한도로 유지하며 초과·만�
 상한은 상태 **5분**, 메트릭 **6시간**, 로그 **1시간**, 응답 **64KiB/200행**, 질의 문자열 **2000자**,
 요청 **5초**다. 템플릿은 더 작게 정할 수 있다. 보존 기간 30일/14일과 별개다.
 현재 사실은 5분 안의 관측이며 빈 응답·오래된 값·조회 실패는 미확인이다.
-공개 응답은 대상·출처·시간창·시각·사실/가설/미확인을 포함한다. 로그 원문은 게시하지 않는다.
+공개 응답은 대상·출처·시간창·시각·사실/가설/미확인·권장 확인을 포함한다. 로그 원문은 게시하지 않는다.
+서비스별 read 결과는 outbox의 service_ids에 범위를 남기고 게시·대조 직전 현재 policy.services로 검사한다.
+요약 예산은 대상/출처 각 120자, 사실 600자, 미확인/권장 확인 각 350자다. 항목 수가 넘으면 생략 건수를
+표시한다. 긴 작업 목록은 유효한 JSON 배열로 1800자 이하 페이지를 만들어 별도 멱등 키로 게시한다.
+일반 텍스트도 1800자씩 손실 없이 나눈다. 게시자가 끝 1900자를 조용히 버리는 처리는 없다.
+004 이전의 비정상적인 큰 pending 메시지는 자동 절단하지 않고 blocked로 둔다.
 임의 질의·Secret·ConfigMap·pods/log/exec의 요청 이름과 추가 필드를 거부한다.
 라이브 API 응답 투영·플랫폼 권한 증거는 T16b다.
 
+부모 채널의 스레드 생성 뒤에도 저장된 urgent command/flag를 전달한다.
 기본 debounce **750ms**, urgent **0ms**, 큐 **100건**, lease **30초**, 대화 모델 **60초**,
 작업 레인 **1800초**, 도구 예산 **8회**, 확인된 실패의 사용자 재시도 **2회**다.
 FOUNDATION 모델 경로에는 실행 가능한 셸/도구 dispatch가 없다. 실제 도구 카운터·작업 실행은 T18 계약으로 구현한다.
@@ -364,7 +381,10 @@ IDENTIFY는 rolling 24시간 **900회**를 로컬 상한으로 두고 1000회 �
 
 작업자 제어 인증은 **Ed25519**다. 게시 서버에만 개인 키, 작업자에는 공개 키만 둔다.
 capability는 audience·operation·job·lease·body digest·발급/만료 시각에 묶이고 유효기간은 **30초**다.
-`execute`와 `cancel`을 구분하며 일회 사용 consume 저장소를 주입한다. 로컬은 메모리 모의이고,
+발급 시각은 한 번만 읽어 만료를 정확히 30초 뒤로 계산한다.
+`execute`와 `cancel`을 구분하며 일회 사용 consume 저장소를 주입한다.
+cancel body는 `{job, lease}`가 필수이며 서명 lease·현재 busy lease와 모두 일치해야 중단한다.
+실제 중단 어댑터에도 job/lease를 함께 전달해 이전 시도가 새 시도를 중단하지 못하게 한다. 로컬은 메모리 모의이고,
 작업자 재시작 뒤에도 남는 nonce 저장소는 T16b에서 제공해야 한다. 게시 토큰·GitHub 자격은 worker 요청에 없다.
 작업자 코드 읽기는 고정 SHA의 codeload 압축본 두 개, baseline git init/commit은 **선언 계약만**이다.
 T16a 작업에서는 Git 초기화나 커밋을 실행하지 않았다. 실제 archive 안전 추출·diff·CLI 프로세스는 T18에서 검증한다.

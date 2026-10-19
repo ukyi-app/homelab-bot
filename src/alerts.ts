@@ -26,6 +26,8 @@ export class AlertIngress {
     if (!supported.length) return;
     const fingerprint = createHash('sha256').update(JSON.stringify([alert.status, supported.map(a => a.fingerprint).sort()])).digest('hex');
     await this.store.db.transaction(async tx => {
+      await tx.query(`INSERT INTO controls VALUES ('alert_admission','false') ON CONFLICT DO NOTHING`);
+      await tx.query(`SELECT * FROM controls WHERE key='alert_admission' FOR UPDATE`);
       // Serialize a group's first thread and repeats without executing a model.
       await tx.query(`INSERT INTO incidents(group_key,status,fingerprint,count,updated_at) VALUES ($1,$2,'',0,$3) ON CONFLICT DO NOTHING`, [key, alert.status, this.store.now()]);
       const old = (await tx.query<{ fingerprint: string; conversation_id: string | null; count: number }>('SELECT * FROM incidents WHERE group_key=$1 FOR UPDATE', [key])).rows[0]!;

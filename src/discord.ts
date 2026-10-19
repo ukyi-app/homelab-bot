@@ -66,7 +66,7 @@ export class DiscordIngress {
       }
       if (!recovered && store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
       await store.db.query('UPDATE events SET accepted=true WHERE id=$1', [saved.id]);
-    });
+    }, recovered ? undefined : { expiresAt: started + DEFAULTS.inboxTimeoutMs, now: this.store.now });
     if (!recovered) {
       try {
         await this.rest.acknowledge(event,
@@ -121,6 +121,7 @@ export class DiscordPublisher {
   constructor(private readonly store: Store, private readonly gate: PolicyGate, private readonly rest: DiscordRest) {}
   private async authorized(row: Delivery): Promise<void> {
     const policy = await this.gate.authorize(row.owner_id, row.scope);
+    if (!row.service_ids.every(service => policy.services.includes(service))) throw new Denied();
     row.policy_revision = policy.revision;
     await this.store.db.query('UPDATE outbox SET policy_revision=$2 WHERE id=$1', [row.id, policy.revision]);
     if (row.payload.channel !== row.scope.channel || row.payload.classification !== 'safe_summary') throw new Denied();
@@ -132,9 +133,10 @@ export class DiscordPublisher {
     try {
       await this.authorized(row);
       const marker = deliveryMarker(row);
+      if (row.payload.kind === 'message' && row.payload.content.length > 1900) throw new Denied();
       const sent = row.payload.kind === 'thread'
         ? await this.rest.createThread(row.payload.channel, { name: `homelab-${marker}`, type: 11, auto_archive_duration: 1440 })
-        : await this.rest.sendMessage(row.payload.channel, { content: `${row.payload.content.slice(0, 1900)}\n[ref:${marker}]`,
+        : await this.rest.sendMessage(row.payload.channel, { content: `${row.payload.content}\n[ref:${marker}]`,
           nonce: marker, enforce_nonce: true, ...noMentions });
       await this.confirm(row, sent.id);
     } catch (error) {
@@ -151,13 +153,24 @@ export class DiscordPublisher {
   }
   async reconcile(): Promise<void> {
     await this.store.retireUnknownDeliveries();
+    const pause = (await this.store.db.query<{ value: number }>("SELECT value FROM controls WHERE key='discord_reconcile_after'")).rows[0];
+    if (pause && pause.value > this.store.now()) return;
     for (const row of (await this.store.db.query<Delivery>("SELECT * FROM outbox WHERE state='unknown' ORDER BY created_at LIMIT 100")).rows) {
       try {
         await this.authorized(row);
         const found = await this.rest.findDelivery(row.payload.channel, deliveryMarker(row), row.payload.kind);
         if (found) await this.confirm(row, found.id);
         // A bounded search miss is not proof of absence; keep unknown, never auto-resend.
-      } catch (error) { if (error instanceof Denied) await this.store.deliveryState(row, 'blocked'); }
+      } catch (error) {
+        if (error instanceof RateLimited) {
+          await this.store.db.query(`INSERT INTO controls VALUES ('discord_reconcile_after',to_jsonb($1::bigint))
+            ON CONFLICT (key) DO UPDATE SET value=to_jsonb(GREATEST(controls.value::bigint,$1::bigint))`,
+          [this.store.now() + Math.max(1000, error.retryAfterMs)]);
+          await this.store.audit('discord_reconcile_rate_limit', row.id, { retryAfterMs: error.retryAfterMs });
+          break;
+        }
+        if (error instanceof Denied) await this.store.deliveryState(row, 'blocked');
+      }
     }
   }
   private async confirm(row: Delivery, externalId: string): Promise<void> {
@@ -169,14 +182,15 @@ export class DiscordPublisher {
           ON CONFLICT DO NOTHING`, [id, row.owner_id, JSON.stringify(scope), externalId, this.store.now()]);
         await tx.query('UPDATE events SET conversation_id=$2,scope=$3 WHERE id=$1', [row.payload.content, id, JSON.stringify(scope)]);
       });
-      const event = (await this.store.db.query<{ payload: { command?: string; group?: string; text: string } }>('SELECT payload FROM events WHERE id=$1', [row.payload.content])).rows[0]!;
+      const event = (await this.store.db.query<{ payload: { command?: string; urgent?: boolean; group?: string; text: string } }>('SELECT payload FROM events WHERE id=$1', [row.payload.content])).rows[0]!;
       if (event.payload.command === 'alert') {
         await this.store.db.query('UPDATE incidents SET conversation_id=$2 WHERE group_key=$1', [event.payload.group, this.store.scopeId(scope)]);
         await this.store.db.query('UPDATE events SET accepted=true WHERE id=$1', [row.payload.content]);
         await this.store.enqueue({ key: `incident-summary:${row.id}`, actor: row.owner_id, scope,
           conversation: this.store.scopeId(scope), revision: row.policy_revision,
           payload: { kind: 'message', channel: externalId, content: event.payload.text, classification: 'safe_summary' } });
-      } else await this.store.accept(row.payload.content, event.payload.command === 'task' ? 'task' : 'chat', row.policy_revision);
+      } else await this.store.accept(row.payload.content, event.payload.command === 'task' ? 'task' : 'chat', row.policy_revision,
+        event.payload.urgent || event.payload.command === 'urgent');
       await this.store.ackNotice(row.payload.content);
     }
     await this.store.deliveryState(row, 'sent', externalId);

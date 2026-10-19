@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { DEFAULTS } from './contracts.js';
 import type { Clock, EventInput, Job, Scope, State } from './contracts.js';
-import type { Database } from './database.js';
+import { remaining } from './database.js';
+import type { Database, TransactionDeadline } from './database.js';
+import { messagePages } from './format.js';
 
 export interface Conversation {
   id: string; owner_id: string; scope: Scope; channel_id: string;
@@ -10,16 +12,27 @@ export interface Conversation {
 export interface Delivery {
   id: string; job_id: string | null; conversation_id: string | null;
   owner_id: string; scope: Scope; policy_revision: string; idempotency_key: string;
+  service_ids: string[];
   payload: { kind: 'message' | 'thread'; channel: string; content: string; classification: 'safe_summary' };
   state: string; external_id: string | null; lease_token: string; attempt: number;
 }
 const json = (value: unknown) => JSON.stringify(value);
 export class Store {
   constructor(public readonly db: Database, public readonly now: Clock = Date.now) {}
-  async atomic<T>(fn: (store: Store) => Promise<T>): Promise<T> {
-    return this.db.transaction(tx => fn(new Store({
-      query: (sql, params) => tx.query(sql, params), transaction: nested => nested(tx),
-    }, this.now)));
+  async atomic<T>(fn: (store: Store) => Promise<T>, deadline?: TransactionDeadline): Promise<T> {
+    return this.db.transaction(async tx => {
+      const scoped: Database = {
+        query: async <R>(sql: string, params?: unknown[]) => {
+          if (deadline) remaining(deadline);
+          const result = await tx.query<R>(sql, params);
+          if (deadline) remaining(deadline);
+          return result;
+        }, transaction: nested => nested(scoped),
+      };
+      const result = await fn(new Store(scoped, this.now));
+      if (deadline) remaining(deadline);
+      return result;
+    }, deadline);
   }
   async conversation(scope: Scope): Promise<Conversation | undefined> {
     return (await this.db.query<Conversation>('SELECT * FROM conversations WHERE id=$1', [this.scopeId(scope)])).rows[0];
@@ -39,7 +52,7 @@ export class Store {
       const inserted = await tx.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,
         conversation_id,received_at,payload) VALUES ($1,'discord',$2,$3,$4,$5,$6,$7,$8)
         ON CONFLICT DO NOTHING RETURNING id`, [id, event.id, key, event.actor, json(event.scope), scopeId,
-        this.now(), json({ text: event.text, command: event.command, target: event.target, kind: event.kind, revision })]);
+        this.now(), json({ text: event.text, command: event.command, target: event.target, kind: event.kind, urgent: event.urgent, revision })]);
       if (!inserted.rows.length) {
         const row = (await tx.query<{ id: string }>('SELECT id FROM events WHERE semantic_key=$1', [key])).rows[0]!;
         return { id: row.id, duplicate: true };
@@ -75,7 +88,7 @@ export class Store {
       const control = (await tx.query<{ value: boolean }>(`SELECT value FROM controls WHERE key='scheduler' FOR UPDATE`)).rows[0]!;
       if (control.value) return;
       // Unknown hosts may still be executing; they hold the global model slot.
-      if ((await tx.query(`SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown') LIMIT 1`)).rows.length) return;
+      if ((await tx.query(`SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown','waiting_user') LIMIT 1`)).rows.length) return;
       const row = (await tx.query<Job>(`SELECT j.* FROM jobs j JOIN events e ON e.id=j.event_id
         JOIN conversations c ON c.id=j.conversation_id WHERE j.state='queued' AND e.accepted=true
         AND c.active=true AND c.gap=false AND j.available_at<=$1
@@ -116,10 +129,24 @@ export class Store {
   }
   async fail(job: Job, reason: string): Promise<void> {
     await this.atomic(async store => {
-      if (!await store.transition(job, 'failed', reason)) return;
+      if (await store.complete(job, 'failed', reason) !== 'failed') return;
       await store.enqueue({ key: `failure:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id,
         actor: job.owner_id, scope: job.target, revision: job.revision.policy,
         payload: { kind: 'message', channel: job.target.channel, content: '작업 실패가 확인됐습니다. /list로 상태를 확인하고 /retry로 재시도할 수 있습니다.', classification: 'safe_summary' } });
+    });
+  }
+  private async complete(job: Job, state: State, reason: string | null = null, tx = this.db): Promise<State | undefined> {
+    return (await tx.query<{ state: State }>(`UPDATE jobs SET
+      state=CASE WHEN state='cancel_requested' THEN 'cancelled' ELSE $3 END,wait_reason=$4,finished_at=$5
+      WHERE id=$1 AND lease_token=$2 AND lease_until>$5 AND state IN ('running','verifying','cancel_requested') RETURNING state`,
+    [job.id, job.lease_token, state, reason, this.now()])).rows[0]?.state;
+  }
+  async waitForUser(job: Job, reason: string): Promise<void> {
+    await this.db.transaction(async tx => {
+      await tx.query(`INSERT INTO controls VALUES ('scheduler','false') ON CONFLICT DO NOTHING`);
+      await tx.query(`SELECT * FROM controls WHERE key='scheduler' FOR UPDATE`);
+      if (await this.complete(job, 'waiting_user', reason, tx) !== 'waiting_user') return;
+      await tx.query(`UPDATE controls SET value='true' WHERE key='scheduler'`);
     });
   }
   async transition(job: Job, state: State, reason: string | null = null): Promise<boolean> {
@@ -127,21 +154,23 @@ export class Store {
       WHERE id=$1 AND lease_token=$2 AND lease_until>$5 AND state IN ('running','verifying','cancel_requested') RETURNING id`,
     [job.id, job.lease_token, state, reason, this.now()])).rows.length === 1;
   }
-  async finish(job: Job, result: unknown, evidence: unknown, content: string, scope: Scope): Promise<void> {
+  async finish(job: Job, result: unknown, evidence: unknown, content: string, scope: Scope, services: string[] = []): Promise<void> {
     await this.db.transaction(async tx => {
-      const changed = await tx.query(`UPDATE jobs SET state='succeeded',finished_at=$3 WHERE id=$1 AND lease_token=$2
-        AND lease_until>$3 AND state='running' RETURNING id`, [job.id, job.lease_token, this.now()]);
-      if (!changed.rows.length) throw new Error('stale_result');
+      const state = await this.complete(job, 'succeeded', null, tx);
+      if (!state) throw new Error('stale_result');
+      if (state === 'cancelled') return;
       await tx.query('INSERT INTO results VALUES ($1,$2,$3,$4,$5)', [job.id, json(result), json(evidence), 'internal', this.now()]);
       await this.enqueue({ key: `result:${job.id}`, job: job.id, conversation: job.conversation_id,
-        actor: job.owner_id, scope, revision: job.revision.policy,
+        actor: job.owner_id, scope, revision: job.revision.policy, services,
         payload: { kind: 'message', channel: scope.channel, content, classification: 'safe_summary' } }, tx);
     });
   }
-  async enqueue(input: { key: string; job?: string; conversation?: string; actor: string; scope: Scope; revision: string; payload: Delivery['payload'] }, tx = this.db): Promise<void> {
-    await tx.query(`INSERT INTO outbox(id,job_id,conversation_id,owner_id,scope,policy_revision,idempotency_key,payload,available_at,created_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) ON CONFLICT (idempotency_key) DO NOTHING`,
-    [randomUUID(), input.job ?? null, input.conversation ?? null, input.actor, json(input.scope), input.revision, input.key, json(input.payload), this.now()]);
+  async enqueue(input: { key: string; job?: string; conversation?: string; actor: string; scope: Scope; revision: string; services?: string[]; payload: Delivery['payload'] }, tx = this.db): Promise<void> {
+    const pages = input.payload.kind === 'message' ? messagePages(input.payload.content) : [input.payload.content];
+    for (const [index, content] of pages.entries()) await tx.query(`INSERT INTO outbox(id,job_id,conversation_id,owner_id,scope,policy_revision,idempotency_key,payload,available_at,created_at,service_ids)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$10) ON CONFLICT (idempotency_key) DO NOTHING`,
+    [randomUUID(), input.job ?? null, input.conversation ?? null, input.actor, json(input.scope), input.revision,
+      index ? `${input.key}:page:${index + 1}` : input.key, json({ ...input.payload, content }), this.now(), json(input.services ?? [])]);
   }
   async claimDelivery(): Promise<Delivery | undefined> {
     return this.db.transaction(async tx => {

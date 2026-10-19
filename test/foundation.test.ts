@@ -378,7 +378,7 @@ test('작업자 capability 위조·재생·범위 변경·만료 거부', async 
   await f.verifier.check(token, 'execute', request);
   await assert.rejects(f.verifier.check(token, 'execute', request), Denied);
   const token2 = f.signer.issue(job, 'cancel', { job: job.id }); f.advance(30001);
-  await assert.rejects(f.verifier.check(token2, 'cancel', { job: job.id }), Denied);
+  await assert.rejects(f.verifier.check(token2, 'cancel', { job: job.id, lease: job.lease_token }), Denied);
 });
 test('작업자 HTTP 계약은 로컬 서버에서 서명 검증하고 잘못된 인증 거부', async () => {
   const server = workerServer(f.worker); server.listen(0, '127.0.0.1'); await once(server, 'listening');
@@ -401,7 +401,8 @@ test('작업자 취소 뒤 늦은 완료가 다음 실행의 mutex를 풀지 않
   const first = requests[0]!; const second = requests[1]!; const third = requests[2]!;
   const firstRun = f.worker.execute(first.request, f.signer.issue(first.job, 'execute', first.request), new AbortController().signal);
   while (completions.length < 1) await new Promise(resolve => setImmediate(resolve));
-  await f.worker.cancel(first.job.id, f.signer.issue(first.job, 'cancel', { job: first.job.id }));
+  const cancel = { job: first.job.id, lease: first.job.lease_token };
+  await f.worker.cancel(cancel, f.signer.issue(first.job, 'cancel', cancel));
   const secondRun = f.worker.execute(second.request, f.signer.issue(second.job, 'execute', second.request), new AbortController().signal);
   while (completions.length < 2) await new Promise(resolve => setImmediate(resolve));
   completions[0]!({ status: 'failed', stopped: true }); await firstRun;
