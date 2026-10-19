@@ -82,15 +82,16 @@ for (const stopConfirmed of [true, false]) test(`R2-02 실행 중 stale은 중�
   f.policy.confirmedAt = f.now(); f.advance(1000); await f.publisher.deliver();
   assert.equal(f.rest.messages.length, 1); assert.equal(f.requests.length, 1);
 });
-test('R2-02 실제 권한 철회는 중단, 종료 확인 실패 안내 보존', async () => {
+test('R2-02 실제 권한 철회는 종료 확인 뒤 취소, 실패 안내 없음', async () => {
   let started!: () => void; let cancels = 0;
   const ready = new Promise<void>(resolve => { started = resolve; });
   f.setRun(() => { started(); return new Promise(() => {}); });
   f.worker.cancel = async () => { cancels++; return { stopped: true }; };
   await queue(); const running = f.runtime.tick(); await ready;
   f.policy.owner = 'replacement-owner'; await running;
-  assert.equal(cancels, 1); assert.equal((await rows('jobs'))[0]!.state, 'failed');
-  assert.equal((await rows('outbox')).length, 1);
+  assert.equal(cancels, 1); assert.equal((await rows('jobs'))[0]!.state, 'cancelled');
+  assert.equal((await rows('jobs'))[0]!.wait_reason, 'authorization_revoked');
+  assert.equal((await rows('outbox')).length, 0);
   await f.publisher.deliver(); assert.equal(f.rest.messages.length, 0);
 });
 test('R2-02 timeout 중단 확인은 failed 안내, 새 작업 실행', async () => {

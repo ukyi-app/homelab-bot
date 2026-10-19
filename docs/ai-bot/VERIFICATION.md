@@ -43,13 +43,13 @@
 13. homelab에 ruleset A~D가 active인지(`gh api` GET, T10).
 14. 작업자 파드의 init 방화벽(U13): 프록시 ClusterIP:3128 밖으로 가는 새 연결(노드 IP의 6443·10250·22, DNS 53) → 실패, 봇 → 작업자 Service 요청의 응답 → 통과. 안 되면 작업자만 호스트 전용 UID + nft로 물러난다(D-15).
 
-## FOUNDATION T16a 실행 결과 (2026-10-19)
+## FOUNDATION T16a 실행 결과 (2026-10-20)
 
-현재 검증 기준은 호출자가 만든 `c4f868f621580304c76a64b51ba0d56d35c87fcd`(`feat/t16a-foundation`) 위 작업 트리다.
+현재 검증 기준은 호출자가 만든 `63810fe3a28cbc8a7f2b44c513e40acfa2027f3a`(`feat/t16a-foundation`) 위 작업 트리다.
 초기 구현 기준은 `2e84c5f58cc5d4d3b60eeebeb085b722ea3de795`이며, 작업자는 이번에도 커밋·index·브랜치를 변경하지 않았다.
-`npm run check`와 `npm test` 통과, **209 tests / 209 pass / 0 fail / 0 skipped**.
+`npm run check`와 `npm test` 통과, **236 tests / 236 pass / 0 fail / 0 skipped**.
 실행 환경은 Node 24.22.0, TypeScript 7.0.2, PGlite 0.5.10이다.
-시험 코드는 `test/foundation.test.ts`와 독립 리뷰 회귀 `test/review-1.test.ts`·`test/review-2.test.ts`·`test/review-3.test.ts`·`test/review-4.test.ts`·`test/review-5.test.ts`·`test/review-6.test.ts`, 모의/로컬 DB 구성은 `test/helpers.ts`다.
+시험 코드는 `test/foundation.test.ts`와 독립 리뷰 회귀 `test/review-1.test.ts`·`test/review-2.test.ts`·`test/review-3.test.ts`·`test/review-4.test.ts`·`test/review-5.test.ts`·`test/review-6.test.ts`·`test/review-7.test.ts`, 모의/로컬 DB 구성은 `test/helpers.ts`다.
 세부 명령 원문·실행 결과·파일 digest·HANDOFF는 호출자에게 전달한 비공개 작업 보고서에 있다.
 
 등급 `local_integration`은 실제 앱 코드·PostgreSQL 엔진·임시 디스크/loopback HTTP의 통합을 뜻한다.
@@ -140,3 +140,22 @@ HTTP cleanup 오류 mock의 재귀 구성은 순수 주입 dispatcher로 고쳤�
 
 미검증 범위는 위 표대로다. 다중 연결 PostgreSQL의 실제 lock/commit 경합과 원격 효과의 exactly-once를
 PGlite+mock 결과로 주장하지 않는다. migration 007은 로컬 DB에서만 실행했으며 운영 적용은 T16b다.
+
+
+REVIEW-7의 **4315477925**와 같은 오류 분류 계열을 고쳤다. 회귀 **27개**를 추가해 최종
+`npm run check` 및 **236/236 pass · 0 fail · 0 skipped**를 확인했다. 기준 commit은 `63810fe`다.
+
+- owner/scope/즉시 거부 목록 × 종료 확인/미확인 6개: cancelled 또는 unknown, 사유 authorization_revoked,
+  실패 안내·result 없음, /retry 거부. unknown은 다음 모델 실행도 막는다.
+- cancel의 Denied/transport 예외 2개, cancel 중 정책 복구, 취소 기록 일시 실패: 철회 이유를 잃지 않는다.
+- monitor 이전 succeeded/failed/limited/auth_expired 완료 4개와 완료/monitor 교차: 현재·확인된 철회 우선.
+- 같은 계열: 확인된 limited/auth_expired와 monitor DB 오류 2개, 일반 monitor 오류의 종료 확인/미확인 2개,
+  조회 응답 뒤 서비스 철회, failed/limited/auth_expired 결과의 stale 정책 3개,
+  limited/auth_expired 확인 직후 인가/상태 DB 오류 4개(슬롯 보존·lease 만료 뒤 unknown·자동 재실행 없음).
+
+수정 전 새 시험 20개를 실행해 **4 pass / 16 fail**로 재현했다. 수정 후 229/229 통과를 확인하고,
+추가 stale 회귀 3개와 조회 후 철회 검증으로 232개 통과 뒤, 한도 확인 직후 인가/상태 DB 오류 4개를
+추가해 수정 전 0 pass/4 fail로 재현하고 보완한 최종 236개도 통과했다. 기존 R2-02의 실제 철회 시험은
+실패/실패 안내를 기대하던 잘못된 기대를 cancelled/authorization_revoked 및 outbox 없음으로 고쳤다.
+추가 27개는 PGlite와 주입 worker·모의 interval의 local_integration이며 실제 정책 배포/worker 종료 증거는
+blocked(실연동 전), T16b/T18에서 확인한다. Git HEAD/index/브랜치와 외부 시스템은 변경하지 않았다.

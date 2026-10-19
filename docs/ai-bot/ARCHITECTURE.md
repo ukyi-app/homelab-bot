@@ -336,11 +336,13 @@ runtime policy는 파일을 접근마다 다시 읽는다. trusted updater가 �
 owner의 `/revoke`가 영속 거부 목록에 즉시 추가한다. 실행·조회·게시 전에 현재 owner·scope를 재검사한다.
 누락·stale은 queued/pending을 보존한다. queued는 1초 뒤, pending은 1초부터 최대 60초까지
 지수 backoff한다. 일시 중지 사유·횟수는 DB에 남기고 감사는 사유 변화 때만 기록한다. 새 revision 자체로 거부하지 않는다.
-실제 권한 철회만 cancelled/blocked로 종료한다. 완료된 모델 결과는 게시 정책 확인을 기다리며 재실행하지 않는다.
+실제 권한 철회는 작업 종료 확인 뒤 cancelled, 종료가 불명하면 unknown이며 게시는 blocked로 막는다. 완료된 모델 결과는 게시 정책 확인을 기다리며 재실행하지 않는다.
 이미 인가해 실행 중인 모델은 정책 누락·stale만으로 중단하지 않고 lease heartbeat를 유지한다.
 모델은 게시 권한이 없고, 완료 결과의 게시·새 작업은 최신 정책을 다시 확인한다.
 실제 Denied·사용자 취소·예산 초과·lease 유지 실패는 중단을 요청한다. 확인된 실패는 실패 안내
-outbox를 함께 기록하고 종료 불확실만 unknown이다. 실제 철회된 수신자에게는 실패 안내도 게시하지 않는다.
+outbox를 함께 기록하고 종료 불확실만 unknown이다. monitor에서 확인한 Denied는 실행 종료 처리까지
+보존한다. 종료 확인 뒤 cancelled/authorization_revoked, 종료가 불명하면 unknown/authorization_revoked로
+기록하고 실패 안내 outbox 자체를 만들지 않는다. /retry는 두 상태 모두 거부한다.
 거부 목록 해제는 §6의 명시적 `revocationRestores` 승인과 새 revision/confirmedAt 조건을 모두 요구한다.
 Discord 401은 별도 오류로 pending을 유지한다. 토큰 갱신 후 새 REST 어댑터를 주입해 재개한다.
 
@@ -480,3 +482,27 @@ service 없는 플랫폼 경보·미등록 service·지원하지 않는 severity
 `worker.ts`(execute/cancel/lease), `discord-protocol.ts`(정규화·원격 결과 판정)의 기존 경계도 점검했다.
 스케줄은 저장만 하며 실행 경로는 T20이다. Gateway 세션 루프와 메타데이터 조회의 transport 공통 제한,
 실제 다중 연결 PostgreSQL lock 경합과 외부 서비스 429 동작 실측은 T16b에서 연결·검증한다.
+
+
+### REVIEW-7: 실행 중 오류 분류 보존
+
+`Runtime`은 monitor의 Denied를 `authorizationRevoked`에 보존한다. 중단 요청 뒤 정책이 복구되거나
+취소 상태 쓰기가 일시 실패해 outer catch로 넘어가도 일반 실패로 바꾸지 않는다. cancel 호출 실패나
+종료 미확인은 권한 철회가 확인됐더라도 unknown이며, 모델 슬롯을 계속 점유한다.
+
+진행 중 monitor Promise는 interval 해제 뒤에도 종결 전에 기다린다. 정상 worker 완료와 늦은 Denied가
+교차할 때 성공으로 먼저 확정하지 않기 위해서다. worker 결과는 종류와 무관하게 현재 정책을 다시 본다.
+따라서 첫 1초 monitor 전에 failed/limited/auth_expired로 완료해도 현재 owner/scope/거부 목록의 철회가
+우선한다. 정책 누락/stale은 실제 철회와 구분하고 이미 확인한 worker 결과를 보존한다.
+
+종료가 확인된 limited/auth_expired는 일반 monitor DB 오류보다 우선해 waiting_user와 scheduler 중지를
+기록한다. 결과를 받은 직후부터 한도 사실을 보존해 후속 인가/상태 DB 조회가 실패해도 failed로
+바꾸지 않는다. 대기 전이를 저장하지 못하면 기존 슬롯을 유지하고 lease 만료 뒤 unknown으로 남긴다.
+명시적 사용자 취소와 실제 권한 철회는 이 대기 결과보다 우선한다. 일반 monitor 오류/timeout은
+기존대로 종료 확인 시 실패, 종료 불명 시 unknown이다. worker 실행 전 거부와 유효하지 않은 확인 결과도
+기존 확정 실패 분류를 유지한다. 상태 쓰기와 lease fencing은 기존 Store 경로를 사용한다.
+
+같은 계열의 catch를 Runtime, ReadAdapter, SerialWorker/HttpWorker/workerServer, Discord 수신·복구·게시·대조,
+PolicyGate, DB rollback, HTTP/health, format에서 점검했다. ReadAdapter는 Denied/PolicyUnavailable을
+재전파하고, worker의 불확실한 예외는 종료 증거 없이 failed로 확정하지 않는다. Discord 게시의 원격 성공
+뒤 DB 실패는 unknown이고 권한 거부/일시 대기/429는 구분한다. 이 경로들은 추가 코드 수정이 필요 없었다.

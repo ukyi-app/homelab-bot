@@ -18,6 +18,7 @@ export class Runtime {
     let dispatched = false;
     let stopped = false;
     let waiting = false;
+    let authorizationRevoked = false;
     try {
       const policy = await this.gate.authorize(job.owner_id, job.target);
       if (!await this.dispatchable(job)) return true;
@@ -40,16 +41,17 @@ export class Runtime {
       if (!await this.dispatchable(job)) return true;
       const abort = new AbortController();
       let timeout: ReturnType<typeof setTimeout> | undefined;
-      let monitorError = false;
-      let monitorBusy = false;
+      let monitorTask: Promise<void> | undefined;
       const interrupted = new Promise<WorkerResult>(resolve => {
         abort.signal.addEventListener('abort', () => resolve({ status: 'unknown', stopped: false }), { once: true });
       });
       const monitor = setInterval(() => {
-        if (monitorBusy) return;
-        monitorBusy = true;
-        void this.monitor(job).then(stop => { if (stop) abort.abort(); })
-          .catch(() => { monitorError = true; abort.abort(); }).finally(() => { monitorBusy = false; });
+        if (monitorTask) return;
+        monitorTask = this.monitor(job).then(stop => { if (stop) abort.abort(); })
+          .catch(error => {
+            if (error instanceof Denied) authorizationRevoked = true;
+            abort.abort();
+          }).finally(() => { monitorTask = undefined; });
       }, 1000);
       let result: WorkerResult;
       try {
@@ -62,26 +64,35 @@ export class Runtime {
             timeout = setTimeout(() => { abort.abort(); resolve({ status: 'unknown', stopped: false }); }, job.budget.timeoutMs);
           }),
         ]);
-      } finally { clearInterval(monitor); clearTimeout(timeout); }
+      } finally {
+        clearInterval(monitor); clearTimeout(timeout);
+        // An in-flight authorization check must settle before choosing a terminal state.
+        await monitorTask;
+      }
       stopped = result.stopped;
+      waiting = result.stopped && (result.status === 'limited' || result.status === 'auth_expired');
+      try { await this.gate.authorize(job.owner_id, job.target); }
+      catch (error) {
+        if (error instanceof Denied) { authorizationRevoked = true; abort.abort(); }
+        else if (!(error instanceof PolicyUnavailable)) throw error;
+      }
       const current = (await this.store.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0]!;
-      if (current.state === 'cancel_requested' || abort.signal.aborted || monitorError) {
+      if (!authorizationRevoked && current.state !== 'cancel_requested' && result.stopped
+        && (result.status === 'limited' || result.status === 'auth_expired')) {
+        await this.store.waitForUser(job, result.status === 'limited' ? 'model_limit' : 'auth_expired');
+      } else if (current.state === 'cancel_requested' || abort.signal.aborted || authorizationRevoked) {
         const confirmation = result.stopped ? { stopped: true }
           : await this.worker.cancel({ job: job.id, lease: job.lease_token },
             this.signer.issue(job, 'cancel', { job: job.id, lease: job.lease_token })).catch(() => ({ stopped: false }));
         stopped = confirmation.stopped;
-        if (stopped && current.state !== 'cancel_requested') await this.store.fail(job, 'stop_confirmation');
+        if (authorizationRevoked) await this.store.transition(job, stopped ? 'cancelled' : 'unknown', 'authorization_revoked');
+        else if (stopped && current.state !== 'cancel_requested') await this.store.fail(job, 'stop_confirmation');
         else await this.store.transition(job, stopped ? 'cancelled' : 'unknown', 'stop_confirmation');
       } else if (!result.stopped) {
         await this.store.transition(job, 'unknown', 'worker_disconnected');
-      } else if (result.status === 'limited' || result.status === 'auth_expired') {
-        waiting = true;
-        await this.store.waitForUser(job, result.status === 'limited' ? 'model_limit' : 'auth_expired');
       } else if (result.status === 'failed') await this.store.fail(job, 'model_failed');
       else if (result.status === 'succeeded') {
         const answer = AnswerSchema.parse(result.answer);
-        try { await this.gate.authorize(job.owner_id, job.target); }
-        catch (error) { if (!(error instanceof PolicyUnavailable)) throw error; }
         // Completed results remain durable while the publisher waits for fresh policy.
         if (!await this.store.active(job.conversation_id)) { await this.store.transition(job, 'superseded'); return true; }
         const section = (values: string[]) => values.join('; ').slice(0, 350) || '없음';
@@ -92,11 +103,13 @@ export class Runtime {
       await this.store.audit('model_timing', job.id, { queueWaitMs: Number(job.started_at) - Number(job.created_at),
         executionMs: this.store.now() - Number(job.started_at) });
     } catch (error) {
-      // An uncommitted limit transition must retain the slot until recovery, not become retryable.
-      if (waiting) return true;
-      if (error instanceof PolicyUnavailable && !dispatched) await this.store.defer(job);
+      // A known limit retains the slot even if subsequent policy/state reads or writes fail.
+      if (waiting && !authorizationRevoked && !(error instanceof Denied)) return true;
+      if (authorizationRevoked || error instanceof Denied) {
+        const confirmed = !dispatched || stopped || error instanceof WorkerRejected;
+        await this.store.transition(job, confirmed ? 'cancelled' : 'unknown', 'authorization_revoked');
+      } else if (error instanceof PolicyUnavailable && !dispatched) await this.store.defer(job);
       else if (error instanceof WorkerRejected) await this.store.fail(job, 'worker_rejected');
-      else if (error instanceof Denied && (!dispatched || stopped)) await this.store.transition(job, 'cancelled', 'authorization_revoked');
       else if (!dispatched || stopped) await this.store.fail(job, dispatched ? 'invalid_result' : 'before_dispatch');
       else await this.store.transition(job, 'unknown', 'runtime_uncertain');
     }

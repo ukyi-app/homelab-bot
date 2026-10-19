@@ -80,6 +80,10 @@ waiting_user와 scheduler 중지는 한 transaction으로 기록한다. 기록 �
 waiting_user 자체도 다음 모델 실행을 막는다. 자동 계정 변경은 없다. unknown과 외부 게시 결과 불명은 자동 재실행하지 않는다. 게시 호출 전 DB 오류는 pending backoff로
 돌린다. REST 직전 durable dispatch 표식을 기록하고, lease 만료 때 표식 없는 claim만 안전하게 재시도한다.
 표식 기록 직후 프로세스 종료는 원격 요청 여부를 확정할 수 없어 unknown이다.
+실행 중 권한 철회가 확인되면 종료 확인 후 `cancelled/authorization_revoked`, 종료 불명은
+`unknown/authorization_revoked`로 남긴다. 실패 안내와 `/retry` 대상은 만들지 않는다.
+완료와 교차한 monitor의 인가 결과도 반영하고, 정상·실패·한도·인증 만료 결과 모두 현재 정책을 확인한다.
+확인된 한도·인증 만료는 일반 monitor DB 오류 때문에 재시도 가능한 실패로 바꾸지 않는다.
 worker 중단 확인·auth 갱신 뒤의 운영 재개 절차는 T18에서 구현한다.
 
 정책 파일에는 `revision`, `confirmedAt`, `owner`, `guild`, `conversationChannel`,
