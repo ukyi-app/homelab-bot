@@ -45,11 +45,11 @@
 
 ## FOUNDATION T16a 실행 결과 (2026-10-20)
 
-현재 검증 기준은 호출자가 만든 `63810fe3a28cbc8a7f2b44c513e40acfa2027f3a`(`feat/t16a-foundation`) 위 작업 트리다.
+현재 검증 기준은 호출자가 만든 `c8cd348a9056297174e9820fa93a0edf764515c6`(`feat/t16a-foundation`) 위 작업 트리다.
 초기 구현 기준은 `2e84c5f58cc5d4d3b60eeebeb085b722ea3de795`이며, 작업자는 이번에도 커밋·index·브랜치를 변경하지 않았다.
-`npm run check`와 `npm test` 통과, **236 tests / 236 pass / 0 fail / 0 skipped**.
+`npm run check`와 `npm test` 통과, **276 tests / 276 pass / 0 fail / 0 skipped**.
 실행 환경은 Node 24.22.0, TypeScript 7.0.2, PGlite 0.5.10이다.
-시험 코드는 `test/foundation.test.ts`와 독립 리뷰 회귀 `test/review-1.test.ts`·`test/review-2.test.ts`·`test/review-3.test.ts`·`test/review-4.test.ts`·`test/review-5.test.ts`·`test/review-6.test.ts`·`test/review-7.test.ts`, 모의/로컬 DB 구성은 `test/helpers.ts`다.
+시험 코드는 `test/foundation.test.ts`와 독립 리뷰 회귀 `test/review-1.test.ts`·`test/review-2.test.ts`·`test/review-3.test.ts`·`test/review-4.test.ts`·`test/review-5.test.ts`·`test/review-6.test.ts`·`test/review-7.test.ts`·`test/review-8.test.ts`, 모의/로컬 DB 구성은 `test/helpers.ts`다.
 세부 명령 원문·실행 결과·파일 digest·HANDOFF는 호출자에게 전달한 비공개 작업 보고서에 있다.
 
 등급 `local_integration`은 실제 앱 코드·PostgreSQL 엔진·임시 디스크/loopback HTTP의 통합을 뜻한다.
@@ -69,7 +69,7 @@
 | READ-01 | local_integration / pass | 등록 서비스→승인 질의→근거/시각/미조회→맞는 스레드, 미등록/관측 불가/오래된 정상 구분, 요약 항목 보존·생략 표시 | 라이브 Grafana/K8s/Argo CD 응답 투영·현재 상태 blocked, T16b |
 | READ-02 | local_integration / pass | 임의 query·datasource·namespace·shell·Secret·ConfigMap·pods/log/exec 거부, 시간·응답행 상한 | 플랫폼 RBAC·Grafana Viewer·Argo CD live ConfigMap 노출 blocked, T16b |
 | SEC-01 | local_integration / pass | 로그 지시는 비신뢰 자료, 원문 공개 금지. PR/기억/AGENTS 지시는 untrusted, 모델 tool/policy 필드 거부·실패 안내, 이후 미허용 조회 거부·효과 없음 | 실제 모델의 인젝션 저항성은 이 증거에 포함하지 않음. PR 수집 경로 확장은 not_run, T17 |
-| OPS-01 | local_integration / pass | 긴 작업 중 ACK 지속·직렬 1, 대기 기록 ≥5초(모의 시계), 한도/인증 대기 원자성·실패 후 슬롯 보존, 연결 거부 failed·응답 단절 unknown, 취소 확인·timeout 실패 안내, 비상 중단·429·IDENTIFY 예산 | 실제 대화 지연·재연결 루프·자원·도구 호출 계수 blocked, T16b/T18 |
+| OPS-01 | local_integration / pass | 긴 작업 중 ACK 지속·직렬 1, 대기 기록 ≥5초(모의 시계), 한도/인증 대기 원자성·실패 후 슬롯 보존, 연결 거부 failed·응답 단절 unknown, 취소 확인·timeout 실패 안내, 비상 중단·owner 대기 재개/포기·비상 해제·429·IDENTIFY 예산 | 실제 대화 지연·재연결 루프·자원·도구 호출 계수 blocked, T16b/T18 |
 | OPS-02 | local_integration / pass | Gateway 단절 중 Ready·실제 로컬 HTTP 경보 저장, 5분 뒤 heartbeat 중단, Gateway gauge, 경보 중복/재발 요약·모델 0회, unknown 별도 상한·기한, 혼합 그룹 필터·미지원 라벨 감사/202, 게시 pause 감사 중복 억제·backoff, 경보 공통 admission 잠금 | 실제 healthchecks·스크레이프·Telegram·replicas 0·NUC 중단 blocked(실연동 전), T16b |
 
 추가 계약 시험: Ed25519 scope·body·만료·재생 거부, loopback worker HTTP 인증,
@@ -159,3 +159,22 @@ REVIEW-7의 **4315477925**와 같은 오류 분류 계열을 고쳤다. 회귀 *
 실패/실패 안내를 기대하던 잘못된 기대를 cancelled/authorization_revoked 및 outbox 없음으로 고쳤다.
 추가 27개는 PGlite와 주입 worker·모의 interval의 local_integration이며 실제 정책 배포/worker 종료 증거는
 blocked(실연동 전), T16b/T18에서 확인한다. Git HEAD/index/브랜치와 외부 시스템은 변경하지 않았다.
+
+
+REVIEW-8의 4개 ID에 회귀 **40개**를 추가해 최종 `npm run check`와 **276/276 pass · 0 fail · 0 skipped**를
+확인했다. 기준 commit은 `c8cd348`이며 Git HEAD/index/브랜치 변경과 외부 서비스 호출은 없다.
+
+- 4316099207: slash/버튼 × 수신부터 2499/2500/2600ms 경계 6개, callback HTTP 남은 예산/만료 1개.
+- 4316099215: limited/auth_expired × 재개/포기 4개, owner/scope/원인/unknown 거부, 대상·실행/큐 상한,
+  scheduler/outbox 실패 rollback 2개, 동시 재개 단일 수락 1개.
+- 4316099220: message/thread × 400/403/404 차단 6개, 408/409/500/502 unknown 유지 4개.
+- 4316099228: message/thread 저장 ID로 rate limit 중에도 로컬 확정 2개, 24시간 이후 확정,
+  현재 owner 철회 뒤 후속 효과 차단.
+- 공통 경계 10개: 비상 중지 보존·이전 중지 명시 확인·미확인 실행 해제 거부, 대조 GET 404의 증거 구분,
+  늦은 unknown/반복 confirm 실패의 ID 보존·backoff, cancel/비상 해제 outbox rollback 2개,
+  재개 뒤 이전 lease 결과 거부, verifying cancel/비상 중지 2개.
+
+첫 추가 32개를 포함한 268개가 모두 통과했고 경계 확장 후 276개도 통과했다. 기존 REVIEW-6의 직접
+emergency-stop rollback 시험은 verifying까지 중지 요청하는 SQL을 가리키도록 fault injection을 갱신했다.
+새 시험은 PGlite·실제 앱 코드·주입 API/worker의 local_integration/mock이다. 실제 Discord 3초 응답 수신,
+slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG 다중 연결 경합은 blocked(실연동 전), T16b/T18이다.

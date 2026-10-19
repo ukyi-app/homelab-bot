@@ -1,11 +1,11 @@
 import { z } from 'zod';
-import { Denied, DiscordUnauthorized, RateLimited } from './contracts.js';
+import { Denied, DiscordRejected, DiscordUnauthorized, RateLimited } from './contracts.js';
 import type { Clock, EventInput } from './contracts.js';
 import { gatewayMessage } from './discord.js';
 import type { DiscordIngress, DiscordRest, GatewayFrame } from './discord.js';
 
 export interface DiscordApi {
-  request(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown>;
+  request(method: 'GET' | 'POST', path: string, body?: unknown, options?: { expiresAt: number }): Promise<unknown>;
 }
 const ChannelSchema = z.object({ id: z.string(), type: z.number(), parent_id: z.string().nullable().optional(), guild_id: z.string().optional() });
 const MessageSchema = z.object({ id: z.string(), channel_id: z.string(), guild_id: z.string().optional(),
@@ -28,6 +28,7 @@ export class DiscordProtocol implements DiscordRest {
     return { type: c.type, parent_id: c.parent_id ?? undefined, guild_id: c.guild_id };
   }
   async gateway(type: 'MESSAGE_CREATE' | 'INTERACTION_CREATE', raw: unknown, ingress: DiscordIngress): Promise<void> {
+    const receivedAt = this.now();
     if (type === 'MESSAGE_CREATE') {
       const frame = MessageSchema.parse(raw);
       if (frame.author.bot || frame.webhook_id) return;
@@ -47,7 +48,7 @@ export class DiscordProtocol implements DiscordRest {
       command: interaction.type === 2 ? interaction.data.name : custom![0],
       urgent: interaction.type === 2 && interaction.data.name === 'urgent',
       text: options.get('text') ?? '', target: options.get('target') ?? custom?.[1] };
-    this.interactions.set(input.id, { token: interaction.token, expires: this.now() + 2500 });
+    this.interactions.set(input.id, { token: interaction.token, expires: receivedAt + 2500 });
     try { await ingress.receive(input); } finally { this.interactions.delete(input.id); }
   }
   async acknowledge(event: EventInput, content: string, options: Parameters<DiscordRest['acknowledge']>[2]): Promise<void> {
@@ -55,7 +56,7 @@ export class DiscordProtocol implements DiscordRest {
       const interaction = this.interactions.get(event.id);
       if (!interaction || this.now() >= interaction.expires) throw new Error('interaction_expired');
       await this.api.request('POST', `/interactions/${part(event.id)}/${part(interaction.token)}/callback`,
-        { type: 4, data: { content, flags: 64, ...options } });
+        { type: 4, data: { content, flags: 64, ...options } }, { expiresAt: interaction.expires });
     } else await this.api.request('POST', `/channels/${part(event.scope.channel)}/messages`,
       { content, nonce: event.id, enforce_nonce: true, ...options });
   }
@@ -91,19 +92,22 @@ export class DiscordProtocol implements DiscordRest {
   }
 }
 
-export function discordHttpApi(token: string, send: typeof fetch): DiscordApi {
+export function discordHttpApi(token: string, send: typeof fetch, now: Clock = Date.now): DiscordApi {
   let halted = false;
-  return { async request(method, path, body) {
+  return { async request(method, path, body, options) {
     if (halted) throw new DiscordUnauthorized();
     if (!path.startsWith('/') || path.includes('..')) throw new Denied();
+    const remaining = options ? Math.floor(options.expiresAt - now()) : 1000;
+    if (remaining <= 0) throw new Error('interaction_expired');
     const response = await send(`https://discord.com/api/v10${path}`, { method, redirect: 'error',
       headers: { authorization: `Bot ${token}`, 'content-type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(1000) });
+      body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(Math.min(1000, remaining)) });
     if (response.status === 401) { halted = true; throw new DiscordUnauthorized(); }
     if (response.status === 429) {
       const error = z.object({ retry_after: z.number().finite().nonnegative(), global: z.boolean().optional() }).parse(await response.json());
       throw new RateLimited(Math.ceil(error.retry_after * 1000), error.global === true, response.headers.get('x-ratelimit-bucket') ?? undefined);
     }
+    if (response.status === 400 || response.status === 403 || response.status === 404) throw new DiscordRejected(response.status);
     if (!response.ok) throw new Error('discord_request_failed');
     return response.status === 204 ? undefined : response.json();
   } };

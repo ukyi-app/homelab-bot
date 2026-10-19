@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { DEFAULTS, Denied, DiscordUnauthorized, HistoryGap, PolicyUnavailable, RateLimited, ScopeSchema } from './contracts.js';
+import { DEFAULTS, Denied, DiscordRejected, DiscordUnauthorized, HistoryGap, PolicyUnavailable, RateLimited, ScopeSchema } from './contracts.js';
 import type { EventInput, Scope } from './contracts.js';
 import type { PolicyGate } from './policy.js';
 import type { Delivery, Store } from './store.js';
@@ -13,7 +13,7 @@ export interface DiscordRest {
   history(channel: string, after: string | null, limit: 100): Promise<EventInput[]>;
 }
 const noMentions = { allowed_mentions: { parse: [] as never[] } };
-const controls = new Set(['stop', 'resume', 'list', 'cancel', 'retry', 'emergency-stop', 'revoke']);
+const controls = new Set(['stop', 'resume', 'list', 'cancel', 'retry', 'emergency-stop', 'resume-model', 'model-status', 'revoke']);
 const EventSchema = z.strictObject({
   id: z.string().min(1), actor: z.string().min(1), scope: ScopeSchema,
   text: z.string().max(DEFAULTS.maxInputChars), kind: z.enum(['message', 'command', 'button']),
@@ -38,7 +38,7 @@ export class DiscordIngress {
     if ((!conversation || !conversation.active) && !explicit && !isControl) return;
     // Unsupported commands cannot acquire model or control authority.
     if (event.kind !== 'message' && !['chat', 'urgent', 'task', 'read', ...controls].includes(event.command ?? '')) throw new Denied();
-    if (['cancel', 'retry', 'revoke', 'read'].includes(event.command ?? '') && !event.target) throw new Denied();
+    if (['cancel', 'retry', 'resume-model', 'revoke', 'read'].includes(event.command ?? '') && !event.target) throw new Denied();
     if (event.command === 'read' && !event.text.trim()) throw new Denied();
     const started = this.store.now();
     const saved = await this.store.save(event, p.revision, !!explicit && (!isControl || event.command === 'resume'));
@@ -239,7 +239,11 @@ export class DiscordPublisher {
       if (remoteId !== null) await this.store.deliveryState(row, 'unknown', remoteId);
       else if (error instanceof PolicyUnavailable || error instanceof DiscordUnauthorized || error instanceof HistoryGap) {
         await this.store.pauseDelivery(row, error.message);
-      } else if (error instanceof Denied) await this.store.deliveryState(row, 'blocked');
+      } else if (error instanceof DiscordRejected) await this.store.atomic(async store => {
+        await store.deliveryState(row, 'blocked');
+        await store.audit('discord_delivery_rejected', row.id, { status: error.status });
+      });
+      else if (error instanceof Denied) await this.store.deliveryState(row, 'blocked');
       else if (error instanceof RateLimited) {
         await this.store.recordRateLimit(error, row.payload.channel);
         await this.store.deliveryState(row, row.attempt > DEFAULTS.maxRetries ? 'blocked' : 'pending', null, Math.max(1000, error.retryAfterMs));
@@ -253,12 +257,13 @@ export class DiscordPublisher {
   async reconcile(): Promise<void> {
     await this.store.retireUnknownDeliveries();
     const pause = (await this.store.db.query<{ value: number }>("SELECT value FROM controls WHERE key='discord_reconcile_after'")).rows[0];
-    if (pause && pause.value > this.store.now()) return;
-    for (const row of (await this.store.db.query<Delivery>("SELECT * FROM outbox WHERE state='unknown' ORDER BY created_at LIMIT 100")).rows) {
-      if (await this.store.discordPauseUntil(row.payload.channel) > this.store.now()) continue;
+    const searchPaused = !!pause && pause.value > this.store.now();
+    for (const row of (await this.store.db.query<Delivery>("SELECT * FROM outbox WHERE state='unknown' AND (external_id IS NULL OR available_at<=$1) ORDER BY (external_id IS NOT NULL) DESC,created_at LIMIT 100", [this.store.now()])).rows) {
+      if (!row.external_id && (searchPaused || await this.store.discordPauseUntil(row.payload.channel) > this.store.now())) continue;
       try {
         await this.authorized(row);
-        const found = await this.rest.findDelivery(row.payload.channel, deliveryMarker(row), row.payload.kind);
+        const found = row.external_id ? { id: row.external_id }
+          : await this.rest.findDelivery(row.payload.channel, deliveryMarker(row), row.payload.kind);
         if (found) await this.confirm(row, found.id);
         // A bounded search miss is not proof of absence; keep unknown, never auto-resend.
       } catch (error) {
@@ -271,6 +276,7 @@ export class DiscordPublisher {
           break;
         }
         if (error instanceof Denied) await this.store.deliveryState(row, 'blocked');
+        else if (row.external_id) await this.store.deferConfirmation(row);
       }
     }
   }

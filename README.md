@@ -58,7 +58,8 @@ REST는 `discordHttpApi(token, fetch)`를 주입한다. 직접 호출하지 않�
 `/read`는 독립 job으로 즉시 대기열에 들어가며, 후속 chat/read가 앞선 조회를 합치거나 폐기하지 않는다.
 활성 스레드 후속 메시지는 멘션 없이 받고, intent를 끄면 명령/버튼만 받는다. `/urgent`는 debounce를 건너뛰고 후속 일반 chat에도 priority 0을 유지한다.
 `/stop`, `/resume`, `/list`, `/cancel target:<job-id>`, `/retry target:<job-id>`,
-`/emergency-stop`, `/revoke target:<actor-id>`는 모델을 거치지 않는다.
+`/emergency-stop`, `/model-status`, `/resume-model target:<job-id|emergency-stop>`,
+`/revoke target:<actor-id>`는 모델을 거치지 않는다.
 버튼의 custom ID는 `list`, `stop`, `resume`, `cancel:<job-id>`만 허용한다.
 실제 slash 명령 등록·Gateway 연결은 T16b다.
 
@@ -67,6 +68,8 @@ ACK 전에 이벤트와 처리 경로(job 또는 outbox, 제어 결과)를 영�
 수신 처리 transaction은 PostgreSQL 18의 transaction_timeout과 남은 시간별 statement_timeout으로
 1500ms 마감을 적용하고 최종 갱신 뒤에도 검사한다. 마감 내 commit한 뒤 응답만 잃은 경우의
 수락 여부는 단정하지 않으며 같은 이벤트 ID로 중복 작업을 만들지 않는다.
+상호작용 callback의 절대 마감은 Gateway 어댑터 진입 시각 + 2500ms다. 채널 조회·저장 시간을
+모두 포함하고 HTTP 전송도 min(1000ms, 남은 시간)만 사용한다. 만료 뒤 callback을 시도하지 않는다.
 ACK 응답 유실은 `ack_uncertain` 감사 기록을 남기고 이미 수락한 작업을 계속한다.
 상호작용 응답의 만료·유실은 처리 스레드/DM에 상태 확인 안내를 한 번 보낸다. 새 스레드는 생성 확인 뒤 안내한다.
 thread/DM의 모든 입력·복구·실행·게시에서 기존 대화 owner 일치를 확인한다. 모델 맥락은 같은 owner의
@@ -84,7 +87,14 @@ waiting_user 자체도 다음 모델 실행을 막는다. 자동 계정 변경�
 `unknown/authorization_revoked`로 남긴다. 실패 안내와 `/retry` 대상은 만들지 않는다.
 완료와 교차한 monitor의 인가 결과도 반영하고, 정상·실패·한도·인증 만료 결과 모두 현재 정책을 확인한다.
 확인된 한도·인증 만료는 일반 monitor DB 오류 때문에 재시도 가능한 실패로 바꾸지 않는다.
-worker 중단 확인·auth 갱신 뒤의 운영 재개 절차는 T18에서 구현한다.
+`/model-status`로 현재 중지 원인과 현재 대화의 waiting_user를 확인한다. 사람이 한도 창/인증 문제를
+해소한 뒤 같은 대화에서 `/resume-model target:<job-id>`로 재개하거나 `/cancel target:<job-id>`로 포기한다.
+재개는 대화 owner·대기 사유·구독·gap·100건 큐·총 3회 실행 상한을 확인하며 이전 lease를 지운다.
+작업 전이·scheduler 해제·제어 응답은 함께 저장한다. `/resume`는 계속 대화 구독만 제어한다.
+비상 중지는 `/resume-model target:emergency-stop`으로 명시 해제하며 실행 중/종료 불명 작업이 있으면 거부한다.
+남은 waiting_user가 있으면 비상 중지를 해제해도 scheduler는 멈춘 채다. 이전 버전의 원인 없는 중지도
+비상 중지로 보수적으로 취급해 이 확인을 먼저 요구한다. 자동 인증 복구·계정 전환은 없다.
+unknown worker의 실제 종료 증거 수집과 운영 복구는 T16b/T18에서 연결한다.
 
 정책 파일에는 `revision`, `confirmedAt`, `owner`, `guild`, `conversationChannel`,
 `notificationChannel`, `dmEnabled`, `services`가 필요하다. 실제 값은 Infisical에서만 전달한다.
@@ -98,6 +108,8 @@ worker 중단 확인·auth 갱신 뒤의 운영 재개 절차는 T18에서 구�
 `denied_actors.denial_id`를 정책의 `revocationRestores` 목록에 명시해야 한다. 무관한 정책 변경은 해제하지 않는다.
 다시 철회하면 새 ID를 발급해 이전 해제 승인을 재사용하지 못한다.
 Discord 401은 게시를 pending에 두며 자격 갱신 뒤 새 REST 어댑터를 주입해야 한다.
+게시 POST의 400/403/404는 확정 거부로 즉시 blocked와 감사 기록을 남긴다. 408/409/5xx·응답 유실은
+미전송을 단정하지 않고 unknown을 유지한다. 대조 GET의 404는 과거 POST의 미전송 증거가 아니다.
 
 읽기 템플릿은 운영자가 사전 승인해 생성자에 전달한다. 사용자·모델은 쿼리 문자열이나
 데이터소스·namespace를 바꿀 수 없다. Grafana/K8s/Argo CD의 실제 응답을
@@ -110,6 +122,9 @@ Secret·ConfigMap·환경변수 원문을 observation에 넣지 않는다.
 독립적으로 유효한 JSON 배열 페이지로 나누며, 각 페이지의 nonce/marker는 서로 다르다.
 페이지는 한 transaction으로 저장하고 앞 페이지가 sent일 때만 다음 페이지를 게시한다.
 앞 페이지의 pending/unknown/blocked 동안 뒤 페이지는 대기하며 공유 rate limit이 없는 다른 메시지는 진행한다.
+원격 생성 ID를 저장한 행은 현재 인가 뒤 그 ID로 로컬 confirm을 재시도하고 marker를 검색하지 않는다.
+로컬 확정은 REST rate limit 대기와 분리하며 실패 시 1초~60초 backoff한다. 확정 ID 없는 unknown만
+100건/24시간 불명 한도와 bounded marker 검색을 적용한다. 확정 ID는 보존하며 원격 재게시하지 않는다.
 unknown 게시 대조가 429를 만나면 루프를 중단하고 retry_after까지 DB에 기록한 시각을 기다린다.
 비전역 429는 채널 전체를 최소 1초 또는 retry_after 중 긴 시간 동안 영속 중지한다. 같은 채널의
 다른 route도 보수적으로 함께 대기하고, 다른 채널은 진행한다. bucket 헤더는 오류·감사에 보존한다.

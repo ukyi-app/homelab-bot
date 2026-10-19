@@ -136,7 +136,7 @@ export class Store {
   async retireUnknownDeliveries(): Promise<void> {
     await this.db.transaction(async tx => {
       const rows = (await tx.query<{ id: string; available_at: string }>(
-        "SELECT id,available_at FROM outbox WHERE state='unknown' ORDER BY available_at DESC,id FOR UPDATE")).rows;
+        "SELECT id,available_at FROM outbox WHERE state='unknown' AND external_id IS NULL ORDER BY available_at DESC,id FOR UPDATE")).rows;
       for (const [index, row] of rows.entries()) {
         if (index < DEFAULTS.maxUnknownDeliveries && this.now() - Number(row.available_at) < DEFAULTS.unknownDeliveryMs) continue;
         await tx.query("UPDATE outbox SET state='blocked' WHERE id=$1", [row.id]);
@@ -170,8 +170,7 @@ export class Store {
   }
   async waitForUser(job: Job, reason: string): Promise<void> {
     await this.db.transaction(async tx => {
-      await tx.query(`INSERT INTO controls VALUES ('scheduler','false') ON CONFLICT DO NOTHING`);
-      await tx.query(`SELECT * FROM controls WHERE key='scheduler' FOR UPDATE`);
+      await this.lockScheduler(tx);
       if (await this.complete(job, 'waiting_user', reason, tx) !== 'waiting_user') return;
       await tx.query(`UPDATE controls SET value='true' WHERE key='scheduler'`);
     });
@@ -235,10 +234,20 @@ export class Store {
       AND state='sending' AND lease_until>$3 RETURNING id`, [row.id, row.lease_token, this.now()])).rows.length === 1;
   }
   async deliveryState(row: Delivery, state: string, externalId: string | null = null, delay = 0): Promise<void> {
-    await this.db.query(`UPDATE outbox SET state=$3,external_id=$4,available_at=$5,pause_reason=NULL,pause_count=0,
+    await this.db.query(`UPDATE outbox SET state=$3,external_id=COALESCE($4,external_id),available_at=$5,pause_reason=NULL,pause_count=0,
       dispatch_started=CASE WHEN $3='pending' THEN false ELSE dispatch_started END
       WHERE id=$1 AND lease_token=$2 AND state IN ('sending','unknown')`,
       [row.id, row.lease_token, state, externalId, this.now() + delay]);
+  }
+  async deferConfirmation(row: Delivery): Promise<void> {
+    await this.atomic(async store => {
+      const current = (await store.db.query<{ pause_count: number }>(`SELECT pause_count FROM outbox
+        WHERE id=$1 AND lease_token=$2 AND state='unknown' AND external_id IS NOT NULL FOR UPDATE`, [row.id, row.lease_token])).rows[0];
+      if (!current) return;
+      const count = Math.min(current.pause_count + 1, 7);
+      await store.db.query(`UPDATE outbox SET pause_count=$3,pause_reason='local_confirmation',available_at=$4
+        WHERE id=$1 AND lease_token=$2`, [row.id, row.lease_token, count, store.now() + Math.min(60_000, DEFAULTS.retryDelayMs * 2 ** (count - 1))]);
+    });
   }
   async pauseDelivery(row: Delivery, reason: string): Promise<void> {
     await this.atomic(async store => {
@@ -288,6 +297,18 @@ export class Store {
     const row = (await this.db.query<Conversation>('SELECT * FROM conversations WHERE id=$1', [conversation])).rows[0];
     return !!row?.active;
   }
+  private async lockScheduler(tx = this.db): Promise<void> {
+    await tx.query(`INSERT INTO controls VALUES ('scheduler','false') ON CONFLICT DO NOTHING`);
+    await tx.query(`SELECT * FROM controls WHERE key='scheduler' FOR UPDATE`);
+    await tx.query(`INSERT INTO controls(key,value) SELECT 'scheduler_emergency',value FROM controls WHERE key='scheduler'
+      ON CONFLICT DO NOTHING`);
+  }
+  private async releaseScheduler(): Promise<boolean> {
+    await this.db.query(`UPDATE controls SET value='false' WHERE key='scheduler'
+      AND NOT EXISTS (SELECT 1 FROM controls WHERE key='scheduler_emergency' AND value='true')
+      AND NOT EXISTS (SELECT 1 FROM jobs WHERE state='waiting_user')`);
+    return (await this.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler'")).rows[0]!.value;
+  }
   async control(actor: string, conversation: string, action: string, target?: string, cursor?: string): Promise<unknown> {
     return this.atomic(store => store.controlLocked(actor, conversation, action, target, cursor));
   }
@@ -309,10 +330,45 @@ export class Store {
       const jobs = (await this.db.query('SELECT id,state,wait_reason FROM jobs WHERE owner_id=$1 AND conversation_id=$2 ORDER BY created_at', [actor, conversation])).rows;
       return jobs.length ? jobs : { ok: false, status: '현재 대화에 작업이 없습니다. 작업을 시작한 스레드에서 확인하세요.' };
     }
+    if (['cancel', 'emergency-stop', 'resume-model', 'model-status'].includes(action)) await this.lockScheduler();
+    if (action === 'model-status') {
+      const paused = (await this.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler'")).rows[0]!.value;
+      const emergency = (await this.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler_emergency'")).rows[0]!.value;
+      const waiting = (await this.db.query(`SELECT id,wait_reason FROM jobs WHERE owner_id=$1 AND conversation_id=$2
+        AND state='waiting_user' ORDER BY created_at LIMIT 5`, [actor, conversation])).rows;
+      const executionPending = (await this.db.query("SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown') LIMIT 1")).rows.length > 0;
+      return { paused, emergency, waiting, executionPending, status: '한도·인증 원인을 사람이 해소한 뒤 /resume-model target:<job-id>, 포기는 /cancel target:<job-id>. 비상/이전 중지는 /resume-model target:emergency-stop으로 확인하세요.' };
+    }
+    if (action === 'resume-model') {
+      if (target === 'emergency-stop') {
+        if ((await this.db.query("SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown') LIMIT 1")).rows.length)
+          return { ok: false, status: '실행 중이거나 종료를 확인하지 못한 작업이 있습니다. 중지 확인 전에는 재개할 수 없습니다.' };
+        await this.db.query("UPDATE controls SET value='false' WHERE key='scheduler_emergency'");
+        const paused = await this.releaseScheduler();
+        await this.audit('model_emergency_released', actor, { conversation, paused });
+        return { ok: true, paused, status: paused ? '비상 중지를 해제했습니다. 남은 waiting_user는 해당 대화에서 재개하거나 취소하세요.' : '비상 중지를 해제했습니다.' };
+      }
+      const emergency = (await this.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler_emergency'")).rows[0]!.value;
+      if (emergency) return { ok: false, status: '비상 또는 이전 중지가 유지되고 있습니다. /model-status로 확인하세요.' };
+      if (!current?.active || current.gap) return { ok: false, status: '현재 대화의 구독과 누락 복구를 먼저 확인하세요.' };
+      const count = (await this.db.query<{ count: string }>("SELECT count(*) FROM jobs WHERE state='queued'")).rows[0]!;
+      if (Number(count.count) >= DEFAULTS.maxQueue) return { ok: false, status: '대기열이 가득 찼습니다. 불필요한 작업을 취소한 뒤 재개하세요.' };
+      const changed = await this.db.query(`UPDATE jobs SET state='queued',available_at=$4,wait_reason=NULL,
+        lease_token=NULL,lease_until=NULL,started_at=NULL,finished_at=NULL
+        WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND state='waiting_user'
+        AND wait_reason IN ('model_limit','auth_expired') AND attempt<$5 RETURNING id`,
+      [target, actor, conversation, this.now(), DEFAULTS.maxRetries + 1]);
+      if (!changed.rows.length) return { ok: false, status: '현재 대화의 한도·인증 대기 작업이 아니거나 재시도 한도에 도달했습니다. /list로 확인하거나 /cancel로 포기하세요.' };
+      const paused = await this.releaseScheduler();
+      await this.audit('model_wait_resumed', target!, { actor, conversation, paused });
+      return { ok: true, paused, status: '원인 해소 확인을 기록하고 작업을 재개했습니다.' };
+    }
     if (action === 'cancel') {
-      const changed = await this.db.query(`UPDATE jobs SET state=CASE WHEN state='queued' THEN 'cancelled' ELSE 'cancel_requested' END
-        WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND state IN ('queued','running') RETURNING id`, [target, actor, conversation]);
+      const changed = await this.db.query(`UPDATE jobs SET state=CASE WHEN state IN ('queued','waiting_user') THEN 'cancelled' ELSE 'cancel_requested' END,
+        finished_at=CASE WHEN state IN ('queued','waiting_user') THEN $4 ELSE finished_at END
+        WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND state IN ('queued','running','verifying','waiting_user') RETURNING id`, [target, actor, conversation, this.now()]);
       if (!changed.rows.length) return { ok: false, status: '취소할 작업이 현재 대화에 없거나 취소 가능한 상태가 아닙니다.' };
+      await this.releaseScheduler();
       return { status: '취소 요청. 실행 중 작업의 종료 확인 전에는 cancelled로 표시하지 않습니다.' };
     }
     if (action === 'retry') {
@@ -323,8 +379,9 @@ export class Store {
       return { status: '확인된 실패 작업만 재시도합니다.' };
     }
     if (action === 'emergency-stop') {
+      await this.db.query("UPDATE controls SET value='true' WHERE key='scheduler_emergency'");
       await this.db.query(`INSERT INTO controls VALUES ('scheduler','true') ON CONFLICT (key) DO UPDATE SET value='true'`);
-      await this.db.query(`UPDATE jobs SET state='cancel_requested' WHERE state='running'`);
+      await this.db.query(`UPDATE jobs SET state='cancel_requested' WHERE state IN ('running','verifying')`);
       return { status: '새 모델 호출 차단, 실행 중 작업 취소 요청' };
     }
     throw new Error('unsupported_control');

@@ -293,7 +293,7 @@ for (const boundary of ['cancel', 'stop', 'gap', 'owner']) test(`R6-AUDIT contex
 });
 test('R6-AUDIT 직접 emergency-stop 두 번째 쓰기 실패는 scheduler도 rollback', async () => {
   await f.ingress.receive(event('100')); f.advance(800); await f.store.claim();
-  await failTransaction(sql => sql.includes("UPDATE jobs SET state='cancel_requested' WHERE state='running'"),
+  await failTransaction(sql => sql.includes("UPDATE jobs SET state='cancel_requested' WHERE state IN ('running','verifying')"),
     () => f.store.control(f.policy.owner, f.store.scopeId(thread), 'emergency-stop'));
   assert.equal((await rows('controls')).find(c => c.key === 'scheduler')!.value, false);
   assert.equal((await rows('jobs'))[0]!.state, 'running');

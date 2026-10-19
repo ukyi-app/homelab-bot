@@ -21,6 +21,9 @@ export const DEFAULTS = Object.freeze({
 export class Denied extends Error { constructor() { super('denied'); } }
 export class PolicyUnavailable extends Error { constructor() { super('policy_unavailable'); } }
 export class DiscordUnauthorized extends Error { constructor() { super('discord_unauthorized'); } }
+export class DiscordRejected extends Error {
+  constructor(public readonly status: 400 | 403 | 404) { super(`discord_rejected_${status}`); }
+}
 export class HistoryGap extends Error { constructor() { super('history_gap'); } }
 export class WorkerRejected extends Error { constructor(reason = 'worker_rejected') { super(reason); } }
 export class RateLimited extends Error {

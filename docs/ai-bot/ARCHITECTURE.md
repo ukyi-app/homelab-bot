@@ -356,7 +356,7 @@ HTTP 429의 global 필드를 보존하며 true면 controls.discord_global_after�
 새 delivery claim, 게시 직전, unknown 대조, ACK, history가 공통 중지 시각을 검사한다. ACK/history에서
 받은 global 429도 같은 시각을 갱신한다. 대기 때문에 생략한 ACK는 시각을 연장하지 않고 기존 만료 안내를 쓴다.
 이미 시작된 다른 요청을 소급 취소하지는 않는다. 실제 다중 프로세스 경합/Discord 제한 실측은 T16b다.
-unknown 전달은 별도 **100건/24시간** 한도로 유지하며 초과·만료 시 감사 기록 후 blocked로 닫는다.
+외부 생성 ID가 없는 unknown 전달은 별도 **100건/24시간** 한도로 유지하며 초과·만료 시 감사 기록 후 blocked로 닫는다.
 경보 backpressure는 pending/sending만 센다. 서로 다른 groupKey도 공통 alert_admission 행을
 잠근 뒤 count와 삽입을 한 transaction에서 실행해 동시 경보 수락의 상한 검사를 직렬화한다. unknown 지표 경보 연결은 T16b다. Discord의 exactly-once를 보증하지 않는다.
 경보의 pending/sending/unknown thread는 재사용하고 blocked는 새 수신의 세대 키로 대체한다.
@@ -506,3 +506,41 @@ service 없는 플랫폼 경보·미등록 service·지원하지 않는 severity
 PolicyGate, DB rollback, HTTP/health, format에서 점검했다. ReadAdapter는 Denied/PolicyUnavailable을
 재전파하고, worker의 불확실한 예외는 종료 증거 없이 failed로 확정하지 않는다. Discord 게시의 원격 성공
 뒤 DB 실패는 unknown이고 권한 거부/일시 대기/429는 구분한다. 이 경로들은 추가 코드 수정이 필요 없었다.
+
+
+### REVIEW-8: 마감 기준점·owner 재개·확정된 원격 응답
+
+상호작용 마감은 `DiscordProtocol.gateway` 진입 시각 + 2500ms다. 메타데이터 조회가 끝난 뒤 새 타이머를
+시작하지 않는다. slash/버튼 모두 같은 절대 시각을 사용하고 callback HTTP 예산은
+min(1000ms, expiresAt-now)다. 저장 전 deferred ACK는 하지 않는다. 이미 수락했지만 마감이 지난 요청은
+callback을 생략하고 기존 ackUncertain/처리 대화 안내 경로를 쓴다. 네트워크 지연 때문에 실제 최초 응답의
+성공을 보장하는 것은 아니며, 토큰을 늦게 사용하지 않는 경계다.
+
+`/model-status`는 scheduler 중지, 비상/이전 중지, 현재 대화의 대기 사유·ID(최대 5건), 실행 중/종료 불명
+작업의 존재를 보여 준다. owner가 원인을 해소한 후 `/resume-model target:<job-id>`로 waiting_user를
+queued로 돌리거나 `/cancel target:<job-id>`로 포기한다. 현재 대화 owner·active/gap·model_limit/auth_expired·
+100건 큐·최대 3회 실행 예산을 검사하고 재개 때 이전 lease와 완료 시각을 지운다. /retry는 failed 전용,
+/resume는 구독 전용이다. 스케줄러 행 잠금 안에서 job 전이와 전체 대기 해제를 처리하며 제어 outbox와도
+같이 commit한다. 다른 waiting_user 또는 비상 중지가 있으면 전체 대기를 풀지 않는다.
+
+`controls.scheduler_emergency`는 비상 중지를 별도로 보존한다. 기존 scheduler=true에 이 값이 없으면
+원인이 불명인 이전 중지로 취급해 true로 초기화한다. `/resume-model target:emergency-stop`은 owner의
+명시 확인으로 그 중지만 해제하며 running/verifying/cancel_requested/unknown이 있으면 거부한다.
+waiting_user는 각 대화에서 별도 처리해야 한다. verifying도 cancel/emergency-stop의 중지 요청 대상이다.
+자격 파일 읽기/복구, 자동 계정 전환, unknown worker의 종료를 추정하는 기능은 추가하지 않았다.
+실제 slash 명령 등록과 종료 확인 연결은 T16b/T18이다. 새 스키마 migration은 필요하지 않다.
+
+게시 POST의 400/403/404는 `DiscordRejected(status)`로 보존하고 즉시 blocked와 감사 기록을 원자적으로
+남긴다. 401/429의 기존 분류를 유지하고, 408/409/5xx·전송 단절은 미전송을 단정하지 않는다. 대조 GET의
+거부는 이전 POST 성공 여부를 증명하지 않으므로 기존 unknown을 유지한다.
+
+원격 생성 ID가 있는 unknown은 현재 owner/service/대화 인가를 확인한 뒤 같은 ID로 로컬 confirm을 재시도한다.
+외부 ID가 없는 경우에만 bounded marker 검색을 한다. 저장된 ID는 늦은 상태 갱신에서 null로 지우지 않는다.
+로컬 확정은 REST rate limit 중지 중에도 가능하고 반복 실패 시 1초부터 최대 60초 backoff한다. 확정 ID 없는
+unknown만 100건/24시간 폐기 한도를 적용한다. 확정 증거는 이 한도로 폐기하지 않으며 로컬 확정 대조는
+호출당 최대 100행이다. 오래 누적된 로컬 확정 대기는 기존 outbox 지표로 관찰하며 운영 보존 정책은 T16b다.
+
+동일 계열로 수신/복구/worker capability·HTTP timeout의 기준점, waiting/비상/unknown/failed 제어,
+POST 거부·GET 대조 거부·확정 ID 보존·인가 철회·local confirm 실패를 점검했다. 복구와 capability는
+이미 절대 시각/lease 검사를 사용하고 worker cancel은 별도 5초 예산을 갖는다. unknown worker는 종료
+증거 없이 해제하지 않는 기존 안전 경계를 유지한다.
