@@ -1,0 +1,33 @@
+{
+  "name": "homelab-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.22.0"
+  },
+  "_runtimePinReason": "Node 24는 DISCOVERY 대안과 검증된 로컬 실행 환경을 유지한다. 최신 major 전환은 T16b 연동 검증 뒤다.",
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "test": "npm run build && node --test dist/test/*.test.js"
+  },
+  "dependencies": {
+    "pg": "8.23.1",
+    "undici": "7.30.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.10",
+    "@openai/codex": "0.163.0",
+    "@types/node": "24.19.2",
+    "@types/pg": "8.23.1",
+    "typescript": "7.0.2"
+  },
+  "packageManager": "npm@11.19.1",
+  "_packageManagerPinReason": "Node 24 환경의 설치 도구를 유지한다. npm 12 전환은 런타임 major와 함께 검증한다.",
+  "_dependencyPinReasons": {
+    "@types/node": "최신 24.x로 Node 24 런타임 API 범위를 검사한다. 26.x 타입은 런타임 밖 API를 허용하므로 사용하지 않는다.",
+    "undici": "최신 7.x로 Node 24 내장 fetch의 dispatcher 계약과 맞춘다. 8.x Agent는 내장 fetch와 invalid onRequestStart method 오류가 발생해 제외했다."
+  }
+}

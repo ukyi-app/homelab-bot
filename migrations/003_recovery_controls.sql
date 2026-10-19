@@ -1,0 +1,6 @@
+BEGIN;
+ALTER TABLE denied_actors ADD COLUMN IF NOT EXISTS denial_id text;
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS pause_reason text;
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS pause_count integer NOT NULL DEFAULT 0;
+INSERT INTO schema_migrations VALUES (3) ON CONFLICT DO NOTHING;
+COMMIT;
