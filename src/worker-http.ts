@@ -26,11 +26,16 @@ export class HttpWorker implements WorkerClient {
     this.origin = url.origin;
   }
   async execute(request: WorkerRequest, capability: string, signal: AbortSignal): Promise<WorkerResult> {
-    const dispatcher = this.transport({ headersTimeout: request.timeoutMs + 30_000, bodyTimeout: request.timeoutMs + 30_000 });
+    let dispatcher: Agent;
+    let payload: string;
+    try {
+      payload = JSON.stringify(WorkerRequestSchema.parse(request));
+      dispatcher = this.transport({ headersTimeout: request.timeoutMs + 30_000, bodyTimeout: request.timeoutMs + 30_000 });
+    } catch { throw new WorkerRejected('worker_transport_setup'); }
     try {
       const options = { method: 'POST', redirect: 'error' as const,
         headers: { 'content-type': 'application/json', authorization: `Capability ${capability}` },
-        body: JSON.stringify(request), signal, dispatcher };
+        body: payload, signal, dispatcher };
       let response: Response;
       try { response = await this.send(`${this.origin}/v1/execute`, options); }
       catch (error) {
@@ -47,7 +52,7 @@ export class HttpWorker implements WorkerClient {
       if (result.success) return result.data;
       if (z.object({ stopped: z.literal(true) }).safeParse(raw).success) return { status: 'failed', stopped: true };
       throw new Error('worker_response_uncertain');
-    } finally { await dispatcher.destroy(); }
+    } finally { await dispatcher.destroy().catch(() => {}); }
   }
   async cancel(request: CancelRequest, capability: string): Promise<{ stopped: boolean }> {
     const response = await this.send(`${this.origin}/v1/cancel`, { method: 'POST', redirect: 'error',

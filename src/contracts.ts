@@ -16,6 +16,7 @@ export const DEFAULTS = Object.freeze({
   policyMaxAgeMs: 300_000, recoveryPages: 10, recoveryMs: 30_000,
   gatewayGraceMs: 300_000, heartbeatMs: 60_000,
   retryDelayMs: 1000, unknownDeliveryMs: 86_400_000, maxUnknownDeliveries: 100,
+  capabilitySkewMs: 1000,
 });
 export class Denied extends Error { constructor() { super('denied'); } }
 export class PolicyUnavailable extends Error { constructor() { super('policy_unavailable'); } }
@@ -23,7 +24,8 @@ export class DiscordUnauthorized extends Error { constructor() { super('discord_
 export class HistoryGap extends Error { constructor() { super('history_gap'); } }
 export class WorkerRejected extends Error { constructor(reason = 'worker_rejected') { super(reason); } }
 export class RateLimited extends Error {
-  constructor(public readonly retryAfterMs: number, public readonly global = false) { super('rate_limited'); }
+  constructor(public readonly retryAfterMs: number, public readonly global = false,
+    public readonly bucket?: string) { super('rate_limited'); }
 }
 export interface EventInput {
   id: string; actor: string; scope: Scope; text: string;

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { DEFAULTS, RateLimited } from './contracts.js';
+import { DEFAULTS, Denied, RateLimited } from './contracts.js';
 import type { Clock, EventInput, Job, Scope, State } from './contracts.js';
 import { remaining } from './database.js';
 import type { Database, TransactionDeadline } from './database.js';
@@ -8,6 +8,8 @@ import { messagePages } from './format.js';
 export interface Conversation {
   id: string; owner_id: string; scope: Scope; channel_id: string;
   active: boolean; gap: boolean; checkpoint: string | null;
+  activation_after: string | null; subscription_epoch: number;
+  recovery_token: string | null; recovery_until: number | null;
 }
 export interface Delivery {
   id: string; job_id: string | null; conversation_id: string | null;
@@ -37,6 +39,20 @@ export class Store {
   async conversation(scope: Scope): Promise<Conversation | undefined> {
     return (await this.db.query<Conversation>('SELECT * FROM conversations WHERE id=$1', [this.scopeId(scope)])).rows[0];
   }
+  async ownedConversation(scope: Scope, actor: string, lock = false): Promise<Conversation> {
+    const row = (await this.db.query<Conversation>(`SELECT * FROM conversations WHERE id=$1${lock ? ' FOR UPDATE' : ''}`, [this.scopeId(scope)])).rows[0];
+    if (!row || (scope.kind !== 'channel' && row.owner_id !== actor)) throw new Denied();
+    return row;
+  }
+  async activate(conversation: Conversation, cursor?: string): Promise<void> {
+    if (conversation.scope.kind === 'channel' || conversation.active) return;
+    const after = cursor && /^\d+$/.test(cursor) ? cursor
+      : conversation.subscription_epoch > 0 ? String(BigInt(Math.max(0, this.now() - 1420070400000)) << 22n) : null;
+    await this.db.query(`UPDATE conversations SET active=true,subscription_epoch=subscription_epoch+1,
+      activation_after=$2,checkpoint=CASE WHEN $2::text IS NULL THEN checkpoint
+        WHEN checkpoint IS NULL OR checkpoint::numeric<$2::numeric THEN $2 ELSE checkpoint END
+      WHERE id=$1`, [conversation.id, after]);
+  }
   scopeId(scope: Scope): string { return `${scope.kind}:${scope.guild ?? 'direct'}:${scope.channel}`; }
   async save(event: EventInput, revision: string, activate: boolean): Promise<{ id: string; duplicate: boolean }> {
     return this.db.transaction(async tx => {
@@ -45,14 +61,16 @@ export class Store {
       if (existing) return { id: existing.id, duplicate: true };
       const scopeId = this.scopeId(event.scope);
       await tx.query(`INSERT INTO conversations(id,owner_id,scope,channel_id,created_at,active)
-        VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO UPDATE SET
-        active=CASE WHEN $3::jsonb->>'kind'='channel' THEN false WHEN $6 THEN true ELSE conversations.active END`,
-      [scopeId, event.actor, json(event.scope), event.scope.channel, this.now(), activate && event.scope.kind !== 'channel']);
+        VALUES ($1,$2,$3,$4,$5,false) ON CONFLICT (id) DO NOTHING`,
+      [scopeId, event.actor, json(event.scope), event.scope.channel, this.now()]);
+      const conversation = (await tx.query<Conversation>('SELECT * FROM conversations WHERE id=$1 FOR UPDATE', [scopeId])).rows[0]!;
+      if (event.scope.kind !== 'channel' && conversation.owner_id !== event.actor) throw new Denied();
       const id = randomUUID();
       const inserted = await tx.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,
         conversation_id,received_at,payload) VALUES ($1,'discord',$2,$3,$4,$5,$6,$7,$8)
         ON CONFLICT DO NOTHING RETURNING id`, [id, event.id, key, event.actor, json(event.scope), scopeId,
-        this.now(), json({ text: event.text, command: event.command, target: event.target, kind: event.kind, urgent: event.urgent, revision })]);
+        this.now(), json({ text: event.text, command: event.command, target: event.target, kind: event.kind,
+          urgent: event.urgent, mention: event.mention, activate, revision })]);
       if (!inserted.rows.length) {
         const row = (await tx.query<{ id: string }>('SELECT id FROM events WHERE semantic_key=$1', [key])).rows[0]!;
         return { id: row.id, duplicate: true };
@@ -80,7 +98,7 @@ export class Store {
       await tx.query('UPDATE events SET accepted=true WHERE id=$1', [id]);
       if (!inserted.rows.length) return (await tx.query<{ id: string }>('SELECT id FROM jobs WHERE event_id=$1', [id])).rows[0]!.id;
       if (type === 'chat') await tx.query(`UPDATE jobs SET state='superseded' WHERE conversation_id=$1 AND type='chat'
-        AND state='queued' AND id<>$2`, [event.conversation_id, jobId]);
+        AND state='queued' AND priority<>0 AND id<>$2`, [event.conversation_id, jobId]);
       return jobId;
     });
   }
@@ -93,7 +111,7 @@ export class Store {
       if ((await tx.query(`SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown','waiting_user') LIMIT 1`)).rows.length) return;
       const row = (await tx.query<Job>(`SELECT j.* FROM jobs j JOIN events e ON e.id=j.event_id
         JOIN conversations c ON c.id=j.conversation_id WHERE j.state='queued' AND e.accepted=true
-        AND c.active=true AND c.gap=false AND j.available_at<=$1
+        AND c.active=true AND c.gap=false AND c.owner_id=j.owner_id AND e.actor_id=j.owner_id AND j.available_at<=$1
         ORDER BY j.priority,j.created_at,e.event_order FOR UPDATE OF j SKIP LOCKED LIMIT 1`, [this.now()])).rows[0];
       if (!row) return;
       return (await tx.query<Job>(`UPDATE jobs SET state='running',attempt=attempt+1,
@@ -109,7 +127,10 @@ export class Store {
   async expire(): Promise<void> {
     await this.db.query(`UPDATE jobs SET state='unknown',wait_reason='lease_expired'
       WHERE state IN ('running','verifying','cancel_requested') AND lease_until<=$1`, [this.now()]);
-    await this.db.query(`UPDATE outbox SET state='unknown',available_at=$1 WHERE state='sending' AND lease_until<=$1`, [this.now()]);
+    await this.db.query(`UPDATE outbox SET state=CASE WHEN dispatch_started THEN 'unknown' ELSE 'pending' END,
+      attempt=CASE WHEN dispatch_started THEN attempt ELSE GREATEST(0,attempt-1) END,
+      available_at=CASE WHEN dispatch_started THEN $1 ELSE $1+$2 END
+      WHERE state='sending' AND lease_until<=$1`, [this.now(), DEFAULTS.retryDelayMs]);
     await this.retireUnknownDeliveries();
   }
   async retireUnknownDeliveries(): Promise<void> {
@@ -124,14 +145,14 @@ export class Store {
       }
     });
   }
-  async defer(job: Job): Promise<void> {
+  async defer(job: Job, reason = 'policy_unavailable'): Promise<void> {
     await this.db.query(`UPDATE jobs SET
       state=CASE WHEN state='cancel_requested' THEN 'cancelled' ELSE 'queued' END,
-      wait_reason=CASE WHEN state='cancel_requested' THEN 'cancel_before_dispatch' ELSE 'policy_unavailable' END,
+      wait_reason=CASE WHEN state='cancel_requested' THEN 'cancel_before_dispatch' ELSE $5 END,
       finished_at=CASE WHEN state='cancel_requested' THEN $4 ELSE NULL END,attempt=GREATEST(0,attempt-1),
       available_at=$3,lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2
       AND lease_until>$4 AND state IN ('running','cancel_requested')`,
-    [job.id, job.lease_token, this.now() + DEFAULTS.retryDelayMs, this.now()]);
+    [job.id, job.lease_token, this.now() + DEFAULTS.retryDelayMs, this.now(), reason]);
   }
   async fail(job: Job, reason: string): Promise<void> {
     await this.atomic(async store => {
@@ -164,6 +185,9 @@ export class Store {
   }
   async finish(job: Job, result: unknown, evidence: unknown, content: string, scope: Scope, services: string[] = []): Promise<void> {
     await this.db.transaction(async tx => {
+      const conversation = (await tx.query<Conversation>('SELECT * FROM conversations WHERE id=$1 FOR UPDATE', [job.conversation_id])).rows[0];
+      if (!conversation || conversation.owner_id !== job.owner_id) throw new Denied();
+      if (!conversation.active) { await this.complete(job, 'superseded', 'subscription_stopped', tx); return; }
       const state = await this.complete(job, 'succeeded', null, tx);
       if (!state) throw new Error('stale_result');
       if (state === 'cancelled') return;
@@ -181,31 +205,39 @@ export class Store {
     [randomUUID(), input.job ?? null, input.conversation ?? null, input.actor, json(input.scope), input.revision,
       index ? `${input.key}:page:${index + 1}` : input.key, json({ ...input.payload, content }), this.now(), json(input.services ?? []), input.key, index]);
   }
-  async discordPauseUntil(): Promise<number> {
-    return Number((await this.db.query<{ value: number }>("SELECT value FROM controls WHERE key='discord_global_after'")).rows[0]?.value ?? 0);
+  async discordPauseUntil(channel?: string): Promise<number> {
+    const rows = (await this.db.query<{ value: number }>("SELECT value FROM controls WHERE key='discord_global_after' OR key=$1", [`discord_channel_after:${channel ?? ''}`])).rows;
+    return Math.max(0, ...rows.map(row => Number(row.value)));
   }
-  async recordRateLimit(error: RateLimited): Promise<void> {
-    if (!error.global) return;
-    await this.db.query(`INSERT INTO controls VALUES ('discord_global_after',to_jsonb($1::bigint))
+  async recordRateLimit(error: RateLimited, channel?: string): Promise<void> {
+    if (!error.global && !channel) throw new Error('rate_limit_resource_required');
+    await this.db.query(`INSERT INTO controls VALUES ($2,to_jsonb($1::bigint))
       ON CONFLICT (key) DO UPDATE SET value=to_jsonb(GREATEST(controls.value::bigint,$1::bigint))`,
-    [this.now() + Math.max(1000, error.retryAfterMs)]);
+    [this.now() + Math.max(1000, error.retryAfterMs), error.global ? 'discord_global_after' : `discord_channel_after:${channel}`]);
   }
   async claimDelivery(): Promise<Delivery | undefined> {
     return this.db.transaction(async tx => {
       const row = (await tx.query<Delivery>(`SELECT o.* FROM outbox o WHERE o.state='pending' AND o.available_at<=$1
         AND NOT EXISTS (SELECT 1 FROM controls WHERE key='discord_global_after' AND value::bigint>$1)
+        AND NOT EXISTS (SELECT 1 FROM controls WHERE key='discord_channel_after:' || (o.payload->>'channel') AND value::bigint>$1)
         AND (o.page_index=0 OR EXISTS (SELECT 1 FROM outbox predecessor WHERE predecessor.message_key=o.message_key
           AND predecessor.page_index=o.page_index-1 AND predecessor.state='sent'))
         AND NOT EXISTS (SELECT 1 FROM outbox previous WHERE previous.message_key=o.message_key
           AND previous.page_index<o.page_index AND previous.state<>'sent')
         ORDER BY o.created_at,o.message_key,o.page_index FOR UPDATE OF o SKIP LOCKED LIMIT 1`, [this.now()])).rows[0];
       if (!row) return;
-      return (await tx.query<Delivery>(`UPDATE outbox SET state='sending',attempt=attempt+1,
+      return (await tx.query<Delivery>(`UPDATE outbox SET state='sending',attempt=attempt+1,dispatch_started=false,
         lease_until=$2,lease_token=$3 WHERE id=$1 RETURNING *`, [row.id, this.now() + DEFAULTS.leaseMs, randomUUID()])).rows[0];
     });
   }
+  async dispatchDelivery(row: Delivery): Promise<boolean> {
+    return (await this.db.query(`UPDATE outbox SET dispatch_started=true WHERE id=$1 AND lease_token=$2
+      AND state='sending' AND lease_until>$3 RETURNING id`, [row.id, row.lease_token, this.now()])).rows.length === 1;
+  }
   async deliveryState(row: Delivery, state: string, externalId: string | null = null, delay = 0): Promise<void> {
-    await this.db.query(`UPDATE outbox SET state=$3,external_id=$4,available_at=$5,pause_reason=NULL,pause_count=0 WHERE id=$1 AND lease_token=$2`,
+    await this.db.query(`UPDATE outbox SET state=$3,external_id=$4,available_at=$5,pause_reason=NULL,pause_count=0,
+      dispatch_started=CASE WHEN $3='pending' THEN false ELSE dispatch_started END
+      WHERE id=$1 AND lease_token=$2 AND state IN ('sending','unknown')`,
       [row.id, row.lease_token, state, externalId, this.now() + delay]);
   }
   async pauseDelivery(row: Delivery, reason: string): Promise<void> {
@@ -216,7 +248,7 @@ export class Store {
       const count = previous.pause_reason === reason ? Math.min(previous.pause_count + 1, 7) : 1;
       const delay = Math.min(60_000, DEFAULTS.retryDelayMs * 2 ** (count - 1));
       await store.db.query(`UPDATE outbox SET state='pending',attempt=GREATEST(0,attempt-1),
-        pause_reason=$3,pause_count=$4,available_at=$5 WHERE id=$1 AND lease_token=$2`,
+        pause_reason=$3,pause_count=$4,available_at=$5,dispatch_started=false WHERE id=$1 AND lease_token=$2`,
       [row.id, row.lease_token, reason, count, store.now() + delay]);
       if (previous.pause_reason !== reason) await store.audit('delivery_paused', row.id, { reason });
     });
@@ -234,7 +266,9 @@ export class Store {
   }
   async context(conversation: string, event: string): Promise<unknown[]> {
     const rows = (await this.db.query<{ payload: unknown }>(`SELECT payload FROM events WHERE conversation_id=$1 AND accepted=true
-      AND event_order<=(SELECT event_order FROM events WHERE id=$3 AND conversation_id=$1)
+      AND actor_id=(SELECT owner_id FROM conversations WHERE id=$1)
+      AND event_order<=(SELECT e.event_order FROM events e JOIN conversations c ON c.id=e.conversation_id
+        WHERE e.id=$3 AND e.conversation_id=$1 AND e.actor_id=c.owner_id)
       ORDER BY event_order DESC LIMIT $2`, [conversation, DEFAULTS.contextMessages, event])).rows;
     const context: unknown[] = [];
     let bytes = 0;
@@ -245,20 +279,30 @@ export class Store {
     }
     return context;
   }
-  async checkpoint(conversation: string, message: string): Promise<void> {
+  async checkpoint(conversation: string, message: string, recovering = false): Promise<void> {
     if (!/^\d+$/.test(message)) return;
-    await this.db.query(`UPDATE conversations SET checkpoint=$2 WHERE id=$1 AND gap=false
-      AND (checkpoint IS NULL OR checkpoint::numeric<$2::numeric)`, [conversation, message]);
+    await this.db.query(`UPDATE conversations SET checkpoint=$2 WHERE id=$1 AND (gap=false OR $3)
+      AND (checkpoint IS NULL OR checkpoint::numeric<$2::numeric)`, [conversation, message, recovering]);
   }
   async active(conversation: string): Promise<boolean> {
     const row = (await this.db.query<Conversation>('SELECT * FROM conversations WHERE id=$1', [conversation])).rows[0];
     return !!row?.active;
   }
-  async control(actor: string, conversation: string, action: string, target?: string): Promise<unknown> {
+  async control(actor: string, conversation: string, action: string, target?: string, cursor?: string): Promise<unknown> {
+    return this.atomic(store => store.controlLocked(actor, conversation, action, target, cursor));
+  }
+  private async controlLocked(actor: string, conversation: string, action: string, target?: string, cursor?: string): Promise<unknown> {
+    const current = (await this.db.query<Conversation>('SELECT * FROM conversations WHERE id=$1 FOR UPDATE', [conversation])).rows[0];
+    if (current && current.scope.kind !== 'channel' && current.owner_id !== actor) return { ok: false, status: '대화 소유자가 일치하지 않습니다.' };
     if (action === 'stop' || action === 'resume') {
-      const changed = await this.db.query(`UPDATE conversations SET active=$3 WHERE id=$1 AND owner_id=$2
-        AND scope->>'kind'<>'channel' RETURNING id`, [conversation, actor, action === 'resume']);
-      if (!changed.rows.length) return { ok: false, status: '구독 제어는 작업을 시작한 스레드 또는 DM에서 실행하세요.' };
+      if (!current || current.scope.kind === 'channel') return { ok: false, status: '구독 제어는 작업을 시작한 스레드 또는 DM에서 실행하세요.' };
+      if (action === 'resume') await this.activate(current, cursor);
+      else {
+        await this.db.query(`UPDATE conversations SET active=false,gap=false,subscription_epoch=subscription_epoch+1,
+          recovery_token=NULL,recovery_until=NULL WHERE id=$1`, [conversation]);
+        await this.db.query(`UPDATE events SET buffered=false,payload=payload || '{"ignored":"subscription_stopped"}'::jsonb
+          WHERE conversation_id=$1 AND buffered=true`, [conversation]);
+      }
       return { active: action === 'resume' };
     }
     if (action === 'list') {

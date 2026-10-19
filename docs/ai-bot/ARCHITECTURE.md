@@ -387,7 +387,7 @@ fingerprint 계산에 서비스 ID도 포함해 같은 fingerprint 문자열의 
 요약 예산은 대상/출처 각 120자, 사실 600자, 미확인/권장 확인 각 350자다. 항목 수가 넘으면 생략 건수를
 표시한다. 긴 작업 목록은 유효한 JSON 배열로 1800자 이하 페이지를 만들어 별도 멱등 키로 게시한다.
 논리 메시지 key와 0부터 시작하는 page_index를 저장하고 선행 페이지가 모두 sent인 경우에만 다음 페이지를 claim한다.
-첫 페이지의 429/unknown/blocked 때문에 뒤 페이지가 추월하지 않으며 다른 논리 메시지는 계속 처리한다.
+첫 페이지의 429/unknown/blocked 때문에 뒤 페이지가 추월하지 않으며 공유 rate limit이 없는 다른 메시지는 계속 처리한다.
 페이지 생성 전체도 한 transaction이다. migration 005는 기존 :page:N 키를 순서로 옮기고 경보 전달 참조를 복원한다.
 이미 게시된 역순 페이지는 되돌리거나 재게시하지 않는다. blocked 선행 페이지의 수동 해소는 T16b 운영 절차다.
 일반 텍스트도 1800자씩 손실 없이 나눈다. 게시자가 끝 1900자를 조용히 버리는 처리는 없다.
@@ -439,3 +439,44 @@ service 없는 플랫폼 경보·미등록 service·지원하지 않는 severity
 
 경보는 groupKey·fingerprint·상태로 중복을 합치고 사건 스레드에 결정적인 요약만 전달한다.
 알림에서 모델을 부르지 않는다. 반복 횟수는 DB에 남기고 수신 대기 상한을 넘으면 503으로 backpressure를 건다.
+
+
+### REVIEW-6: 경합·원자성·외부 호출 경계 점검
+
+`007_execution_boundaries.sql`을 추가했다. 원격 효과와 DB commit은 하나의 transaction이 될 수 없으므로
+재시도 가능 여부를 확인된 미전송과 결과 불명으로 나눈다. 다음 경계를 같은 방식으로 점검했다.
+
+- **수신/복구:** 대화 → inbox 순서로 잠근다. `save`는 활성화하지 않고 route의 job/outbox·수락·활성화를
+  함께 commit한다. gap 동안 live 입력은 `events.buffered`에 최대 대화별 100건 저장 후 ACK한다.
+  중복 buffer 입력은 재ACK하지 않는다. 마지막 history 응답 뒤 buffer를 수락하고, 비었을 때 같은 대화
+  잠금 안에서 gap을 해제한다. buffer 수락 순서로 event_order를 재배치해 먼저 복구한 입력도 문맥에 포함한다.
+  복구 중단 시 buffer는 남고 다음 recover가 처리한다. token/30초 lease는 중복 복구를 막고 각 route에서
+  epoch/token/active를 재확인한다. 10페이지/30초 또는 수락 용량을 넘으면 gap을 유지한다.
+- **구독 경계:** stop은 epoch를 올리고 recovery token·buffer를 해제한다. 재활성화/명시적 resume는
+  수락 transaction 안에서 활성화 메시지/interaction snowflake를 activation_after와 checkpoint에 저장한다.
+  그 경계 이하 message는 live 재전달에도 실행하지 않는다. 직접 내부 control에 cursor가 없으면
+  현재 시각의 Discord snowflake 하한을 쓴다. 기존 active 대화의 resume는 경계를 이동하지 않는다.
+- **owner:** thread/DM의 message·command·button·저장·route·recover·claim·context·결과·게시·thread 확정에서
+  기존 owner를 확인한다. 공유 부모 채널은 구독/모델 문맥 대상이 아니므로 그 예외를 유지한다.
+  경보 group key는 owner/guild/notificationChannel을 포함한다. 이전 key와 합치지 않으므로 업그레이드 후
+  첫 동일 경보는 새 사건 세대를 만들 수 있다. admission 잠금 뒤 policy와 service를 다시 확인한다.
+- **게시:** 채널별 비전역 429 시각은 DB controls에 max로 저장하고 global 시각과 함께 검사한다.
+  같은 채널의 다른 route도 대기하는 보수적 선택이며, 다른 채널의 backlog는 진행한다.
+  bucket 헤더는 오류/감사에 남긴다. claim·dispatch·ACK·history·대조에서 공유 중지를 적용한다.
+  호출 전 DB 오류는 attempt를 돌려놓고 1초~60초 pending backoff한다. REST 직전 lease/state CAS로
+  dispatch_started를 기록한다. 표식 전 lease 만료는 pending, 표식 후 만료는 unknown이다.
+  marker와 외부 ID로 대조하며, confirm 실패는 외부 ID를 보존한 unknown이다. terminal 상태는 늦은 오류가
+  덮어쓰지 못한다. migration 007은 기존 sending/unknown을 보수적으로 표식 있는 상태로 이관한다.
+- **실행/제어:** context 조회 뒤 모델 호출 직전 현재 policy·owner·cancel·active·gap·lease를 다시 본다.
+  read 호출 직전에도 상태를 확인한다. finish는 대화를 잠그고 stop과 결과/outbox 쓰기를 직렬화한다.
+  직접 control 호출도 transaction으로 감싸 emergency-stop의 부분 commit을 막는다. 일반 chat 합치기는
+  queued priority 0 urgent를 제외한다. 이미 시작한 원격 호출을 소급 취소하는 보장은 하지 않는다.
+- **작업자/운영:** HTTP dispatcher 구성/본문 검증 실패는 미시작 WorkerRejected이고 정리 실패는 확인된
+  결과를 덮어쓰지 않는다. capability는 issued에만 1000ms 오차를 허용하고 TTL 30초·만료·digest·lease·nonce를
+  유지한다. heartbeat는 in-flight 호출을 한 번으로 제한하며 실패 후 재시도할 수 있다.
+
+`policy.ts`(현재 정책/철회), `read.ts`(조회 전후 인가·상한), `http.ts`(저장 후 응답·크기/시간 제한),
+`format.ts`(순수 요약/페이지 분리), `contracts.ts`(스키마/예산), `database.ts`(rollback·deadline),
+`worker.ts`(execute/cancel/lease), `discord-protocol.ts`(정규화·원격 결과 판정)의 기존 경계도 점검했다.
+스케줄은 저장만 하며 실행 경로는 T20이다. Gateway 세션 루프와 메타데이터 조회의 transport 공통 제한,
+실제 다중 연결 PostgreSQL lock 경합과 외부 서비스 429 동작 실측은 T16b에서 연결·검증한다.

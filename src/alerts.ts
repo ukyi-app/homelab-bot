@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { PolicyGate } from './policy.js';
 import type { Store } from './store.js';
-import { DEFAULTS } from './contracts.js';
+import { DEFAULTS, Denied } from './contracts.js';
 import type { Scope } from './contracts.js';
 
 const AlertSchema = z.object({
@@ -18,7 +18,7 @@ export class AlertIngress {
     const p = await this.gate.current();
     const scope: Scope = { guild: p.guild, channel: p.notificationChannel, parent: null, kind: 'channel' };
     await this.gate.authorize(p.owner, scope);
-    const key = createHash('sha256').update(alert.groupKey).digest('hex');
+    const key = createHash('sha256').update(JSON.stringify([p.owner, p.guild, p.notificationChannel, alert.groupKey])).digest('hex');
     const supported = alert.alerts.filter(a => a.labels.service && p.services.includes(a.labels.service)
       && ['info', 'warning', 'critical'].includes(a.labels.severity ?? ''));
     if (supported.length < alert.alerts.length) await this.store.audit('alert_ignored', key,
@@ -30,6 +30,8 @@ export class AlertIngress {
     await this.store.db.transaction(async tx => {
       await tx.query(`INSERT INTO controls VALUES ('alert_admission','false') ON CONFLICT DO NOTHING`);
       await tx.query(`SELECT * FROM controls WHERE key='alert_admission' FOR UPDATE`);
+      const current = await this.gate.withDatabase(tx).authorize(p.owner, scope);
+      if (!services.every(service => current.services.includes(service))) throw new Denied();
       // Serialize a group's first thread and repeats without executing a model.
       await tx.query(`INSERT INTO incidents(group_key,status,fingerprint,count,updated_at) VALUES ($1,$2,'',0,$3) ON CONFLICT DO NOTHING`, [key, alert.status, this.store.now()]);
       const old = (await tx.query<{ fingerprint: string; conversation_id: string | null; count: number; delivery_key: string | null }>('SELECT * FROM incidents WHERE group_key=$1 FOR UPDATE', [key])).rows[0]!;
@@ -45,7 +47,8 @@ export class AlertIngress {
       const pending = (await tx.query<{ count: string }>("SELECT count(*) FROM outbox WHERE state IN ('pending','sending')")).rows[0]!;
       if (Number(pending.count) >= DEFAULTS.maxQueue) throw new Error('alert_queue_full');
       if (old.conversation_id) {
-        const conversation = (await tx.query<{ scope: Scope }>('SELECT scope FROM conversations WHERE id=$1', [old.conversation_id])).rows[0]!;
+        const conversation = (await tx.query<{ scope: Scope; owner_id: string }>('SELECT * FROM conversations WHERE id=$1', [old.conversation_id])).rows[0]!;
+        if (conversation.owner_id !== p.owner) throw new Denied();
         const deliveryKey = `alert:${key}:${fingerprint}:${old.count + 1}`;
         await tx.query('UPDATE incidents SET delivery_key=$2 WHERE group_key=$1', [key, deliveryKey]);
         await this.store.enqueue({ key: deliveryKey, actor: p.owner, scope: conversation.scope,

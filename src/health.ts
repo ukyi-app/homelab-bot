@@ -6,6 +6,7 @@ export class Health {
   private lastConnected: number | null = null;
   private lastLoop: number | null = null;
   private lastPing: number | null = null;
+  private pinging = false;
   public receivers = { app: false, alerts: false };
   constructor(private readonly store: Store, private readonly ping: () => Promise<void>) {}
   gateway(connected: boolean): void {
@@ -25,12 +26,12 @@ export class Health {
   async heartbeat(): Promise<boolean> {
     const now = this.store.now();
     if (this.connected) this.lastConnected = now;
-    if (this.lastLoop === null || now - this.lastLoop > DEFAULTS.heartbeatMs
+    if (this.pinging || this.lastLoop === null || now - this.lastLoop > DEFAULTS.heartbeatMs
       || this.lastConnected === null || now - this.lastConnected > DEFAULTS.gatewayGraceMs
       || (this.lastPing !== null && now - this.lastPing < DEFAULTS.heartbeatMs)) return false;
-    await this.ping();
-    this.lastPing = now;
-    return true;
+    this.pinging = true;
+    try { await this.ping(); this.lastPing = now; return true; }
+    finally { this.pinging = false; }
   }
   async metrics(): Promise<string> {
     const unknown = (await this.store.db.query<{ count: string }>("SELECT count(*) FROM outbox WHERE state='unknown'")).rows[0]!;

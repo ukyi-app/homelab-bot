@@ -45,7 +45,7 @@ for (const stage of ['thread', 'initial-summary', 'repeat']) for (const state of
 for (const state of ['pending', 'sending', 'unknown']) test(`4314491268 ${state} 병합은 교체된 내용의 서비스 집합과 함께 갱신`, async () => {
   const ingress = new AlertIngress(f.store, f.gate); const next = 'fixture-next-service';
   f.policy.services.push(next); await ingress.receive(alert());
-  await database.db.query('UPDATE outbox SET state=$1,lease_token=$2,lease_until=$3', [state, randomUUID(), f.now() + 30_000]);
+  await database.db.query('UPDATE outbox SET state=$1,lease_token=$2,lease_until=$3,dispatch_started=true', [state, randomUUID(), f.now() + 30_000]);
   // The fingerprint string is unchanged; the service is part of the semantic identity.
   await ingress.receive(alert([next, next]));
   assert.equal((await rows('outbox')).length, 1);
@@ -147,7 +147,7 @@ test('4314491292 causal boundary 안에서도 20건/32KiB·accepted·대화 격�
 for (const checkpoint of ['1000', null]) test(`4314491302 after 최근접 페이지·내림차순 응답으로 150건 완전 복구 (${checkpoint})`, async () => {
   await f.store.save(event('seed', { kind: 'command', command: 'chat' }), f.policy.revision, true);
   await database.db.query('DELETE FROM events');
-  await database.db.query('UPDATE conversations SET checkpoint=$1', [checkpoint]);
+  await database.db.query('UPDATE conversations SET active=true,checkpoint=$1', [checkpoint]);
   const base = checkpoint === null ? 0 : Number(checkpoint);
   const source = Array.from({ length: 150 }, (_, i) => ({ id: String(base + i + 1), channel_id: thread.channel,
     content: `복구 ${i}`, author: { id: f.policy.owner } }));

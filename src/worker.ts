@@ -48,9 +48,10 @@ export class WorkerVerifier {
       const [payload, signature] = pieces as [string, string];
       if (!verify(null, Buffer.from(payload), this.publicKey, Buffer.from(signature, 'base64url'))) throw new Denied();
       const c = CapabilitySchema.parse(JSON.parse(Buffer.from(payload, 'base64url').toString()));
+      const now = this.now();
       if (c.operation !== operation || c.job !== body.job || c.lease !== body.lease
-        || c.digest !== digest(body) || c.issued > this.now() || c.expires <= this.now()
-        || c.expires - c.issued > 30_000 || !await this.consume(digest(token))) throw new Denied();
+        || c.digest !== digest(body) || c.issued > now + DEFAULTS.capabilitySkewMs || c.expires <= now
+        || c.expires <= c.issued || c.expires - c.issued > 30_000 || !await this.consume(digest(token))) throw new Denied();
     } catch { throw new Denied(); }
   }
 }

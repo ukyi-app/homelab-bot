@@ -45,11 +45,11 @@
 
 ## FOUNDATION T16a 실행 결과 (2026-10-19)
 
-현재 검증 기준은 호출자가 만든 `a9e94079587ebad012d513a58beb3d311c0b1112`(`feat/t16a-foundation`) 위 작업 트리다.
+현재 검증 기준은 호출자가 만든 `c4f868f621580304c76a64b51ba0d56d35c87fcd`(`feat/t16a-foundation`) 위 작업 트리다.
 초기 구현 기준은 `2e84c5f58cc5d4d3b60eeebeb085b722ea3de795`이며, 작업자는 이번에도 커밋·index·브랜치를 변경하지 않았다.
-`npm run check`와 `npm test` 통과, **163 tests / 163 pass / 0 fail / 0 skipped**.
+`npm run check`와 `npm test` 통과, **209 tests / 209 pass / 0 fail / 0 skipped**.
 실행 환경은 Node 24.22.0, TypeScript 7.0.2, PGlite 0.5.10이다.
-시험 코드는 `test/foundation.test.ts`와 독립 리뷰 회귀 `test/review-1.test.ts`·`test/review-2.test.ts`·`test/review-3.test.ts`·`test/review-4.test.ts`·`test/review-5.test.ts`, 모의/로컬 DB 구성은 `test/helpers.ts`다.
+시험 코드는 `test/foundation.test.ts`와 독립 리뷰 회귀 `test/review-1.test.ts`·`test/review-2.test.ts`·`test/review-3.test.ts`·`test/review-4.test.ts`·`test/review-5.test.ts`·`test/review-6.test.ts`, 모의/로컬 DB 구성은 `test/helpers.ts`다.
 세부 명령 원문·실행 결과·파일 digest·HANDOFF는 호출자에게 전달한 비공개 작업 보고서에 있다.
 
 등급 `local_integration`은 실제 앱 코드·PostgreSQL 엔진·임시 디스크/loopback HTTP의 통합을 뜻한다.
@@ -114,3 +114,29 @@ gap 중 chat/read 결과 보존, 정책 대기와 취소 경합, 독립 read, �
 첫 check/test는 신규 mock 반환형 오류로 build 단계에서 실패했다. 수정 후 162개 중 sending fixture의 lease_until 누락으로
 1개 실패했고, 유효한 lease 기한을 구성하고 claim 후 병합의 재인가 회귀를 더한 뒤 전체 163개가 통과했다. migration 006은 재적용·기존 경보 차단/감사도 검사했다.
 모든 서버 응답은 모의이며 실제 Discord의 after 선택 범위·서비스 철회 경합·PostgreSQL 다중 연결은 blocked(T16b)다.
+
+
+REVIEW-6 파일에 실제 기재된 **9개 ID(중복 1개, 고유 8개)**를 처리하고 동일 계열을 src 전체에서 점검했다.
+회귀 **46개**를 추가한 최종 **209/209**과 `npm run check`가 통과했다. 판정은 mock/local_integration이며
+운영 권한·외부 호출·Git 상태는 변경하지 않았다. 상세 경로 점검표는 작업 REPORT와 ARCHITECTURE에 남겼다.
+
+- 4314746162: 마지막 history/live 교차, 중복 ACK, 실패 후 재복구, 중복 recover, buffer 상한·문맥 순서.
+- 4314746171: 채널별 429의 backlog·ACK·history·대조 공유, 다른 채널 진행, HTTP bucket 헤더 전달.
+- 4314746177 및 중복 4314746204: thread/DM × message/command/button의 owner 교체 거부,
+  직접 저장·오염된 context·claim·control 게시와 경보 group 세대 격리.
+- 4314746184: 인가/대기 조회 DB 오류는 미전송 pending, 응답 유실/확정 실패는 unknown 및 한 번만 전달.
+- 4314746194: 첫 활성화/재활성화 수락 rollback, resume outbox 오류, queue full, 1500ms 기한 초과.
+- 4314746217: stop 기간 메시지의 resume/mention 뒤 제외, 복구 도중 stop/resume, save 직전 stop의 세대 fencing.
+- 4314746229: 후속 일반 chat에도 urgent priority 0/즉시 실행 보존.
+- 4314746240: execute/cancel 모두 issued +1000ms 허용, +1001ms·만료·TTL 초과·nonce 재생 거부.
+- 추가 공통 경계: dispatch 전후 lease 만료, terminal 게시 결과 fencing, 모델 직전 cancel/stop/gap/owner,
+  직접 emergency-stop rollback, thread 생성 후 owner 변경, HTTP transport setup/cleanup, 중첩 heartbeat,
+  migration 007 반복, 복구 lease 만료 응답 거부, 결과 저장 직전 stop, 경보 admission 잠금 뒤 owner/service 재인가.
+
+초기 기존 시험에서는 save가 활성화한다는 fixture 가정, 같은 채널의 별도 메시지가 429 대기를 피해 간다는
+기대, 실제 dispatch를 표시하지 않은 sending fixture 등이 새 계약과 충돌했다. 실제 활성 구독을 명시하고
+다른 채널의 독립 진행을 검사하도록 수정했다. 새 시험은 buffer checkpoint 누락도 검출해 고쳤다.
+HTTP cleanup 오류 mock의 재귀 구성은 순수 주입 dispatcher로 고쳤으며 최종 suite는 제한 없이 종료했다.
+
+미검증 범위는 위 표대로다. 다중 연결 PostgreSQL의 실제 lock/commit 경합과 원격 효과의 exactly-once를
+PGlite+mock 결과로 주장하지 않는다. migration 007은 로컬 DB에서만 실행했으며 운영 적용은 T16b다.

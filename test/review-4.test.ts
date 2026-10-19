@@ -98,8 +98,9 @@ test('4314215621 대조·ACK·history의 global 429도 게시자에 영속 전�
   let historyCalls = 0; f.rest.history = async () => { historyCalls++; return []; };
   await assert.rejects(f.ingress.recover(thread, f.policy.owner), RateLimited); assert.equal(historyCalls, 0);
 });
-test('4314215621 route 429는 다른 논리 메시지의 시도를 소진하지 않고 전달 허용', async () => {
-  await enqueue('a'); await enqueue('b'); f.rest.rateLimit = new RateLimited(3000);
+test('4314215621 route 429는 다른 채널의 시도를 소진하지 않고 전달 허용', async () => {
+  await enqueue('a'); await enqueue('b');
+  await database.db.query("UPDATE outbox SET scope=jsonb_set(scope,'{channel}','\"fixture-other\"'),payload=jsonb_set(payload,'{channel}','\"fixture-other\"') WHERE idempotency_key='b'"); f.rest.rateLimit = new RateLimited(3000);
   await f.publisher.deliver(); await f.publisher.deliver();
   assert.equal(f.rest.messages.length, 1); assert.equal(await f.store.discordPauseUntil(), 0);
 });
@@ -116,7 +117,9 @@ for (const obstruction of ['429', 'unknown', 'blocked']) test(`4314215638 ${obst
   if (obstruction !== 'blocked') await f.publisher.deliver();
   assert.equal(await f.publisher.deliver(), false);
   assert.ok((await rows('outbox')).filter(p => p.page_index > 0).every(p => p.attempt === 0));
-  await enqueue('other', '다른 메시지'); assert.equal(await f.publisher.deliver(), true);
+  await enqueue('other', '다른 메시지');
+  await database.db.query("UPDATE outbox SET scope=jsonb_set(scope,'{channel}','\"fixture-other\"'),payload=jsonb_set(payload,'{channel}','\"fixture-other\"') WHERE idempotency_key='other'");
+  assert.equal(await f.publisher.deliver(), true);
   if (obstruction === 'blocked') return;
   if (obstruction === 'unknown') await f.publisher.reconcile(); else f.advance(2000);
   while (await f.publisher.deliver()) { /* Ordered drain. */ }
@@ -216,6 +219,9 @@ for (const route of ['chat', 'thread', 'control']) test(`4314215673 save 직후 
   assert.equal(await f.ingress.receive(original), saved.id); assert.equal(f.rest.acks.length, 1);
 });
 test('4314215673 route rollback 뒤 history 복구는 job 저장 후 checkpoint 전진', async () => {
+  await f.store.save(event('seed'), f.policy.revision, true);
+  await database.db.query('DELETE FROM events');
+  await database.db.query('UPDATE conversations SET active=true');
   const transaction = database.db.transaction.bind(database.db); let fail = true;
   database.db.transaction = (fn, deadline) => transaction(tx => fn({ ...tx, query: async <T>(sql: string, params?: unknown[]) => {
     if (fail && sql === 'UPDATE events SET accepted=true WHERE id=$1') { fail = false; throw new Error('route_rollback'); }

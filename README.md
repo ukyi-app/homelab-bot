@@ -48,6 +48,7 @@ REST는 `discordHttpApi(token, fetch)`를 주입한다. 직접 호출하지 않�
 `Postgres`에는 전용 DB/역할의 `pg.Pool`을 주입한다. `migrate()`는 빌드 결과에서 호출한다.
 운영 마이그레이션은 T16b의 Sync hook Job에서 실행한다. `001`은 초기 스키마, `002`는 철회 당시 정책 revision, `003`은 철회 ID·게시 일시 중지 상태, `004`는 결과별 서비스 접근 범위, `005`는 메시지 페이지 순서·경보 전달 키·기존 read 유형을 보완한다.
 `006`은 서비스 범위를 복원할 수 없는 기존 미전달 경보를 blocked로 두고 감사한다. 새 경보 수신은 서비스 범위를 가진 새 세대를 만든다.
+`007`은 복구 buffer·구독 세대/활성화 커서·복구 lease·게시 dispatch 표식을 추가한다. 기존 sending/unknown은 전송 가능성이 있는 것으로 이관한다.
 후속 티켓도 기존 파일을 변경하지 않고 expand/contract 후속 파일을 추가한다.
 
 ## 사용 계약
@@ -55,26 +56,30 @@ REST는 `discordHttpApi(token, fetch)`를 주입한다. 직접 호출하지 않�
 허용 채널에서 멘션 또는 `/chat`으로 시작한다. `/read text:<template-id> target:<service-id>`는
 최근 min(60초, 템플릿 상한)의 승인 템플릿을 실행한다. 시간창 상한은 유한한 1초 이상이어야 한다. `/task`는 모의 작업 레인 계약이다.
 `/read`는 독립 job으로 즉시 대기열에 들어가며, 후속 chat/read가 앞선 조회를 합치거나 폐기하지 않는다.
-활성 스레드 후속 메시지는 멘션 없이 받고, intent를 끄면 명령/버튼만 받는다. `/urgent`는 debounce를 건너뛴다.
+활성 스레드 후속 메시지는 멘션 없이 받고, intent를 끄면 명령/버튼만 받는다. `/urgent`는 debounce를 건너뛰고 후속 일반 chat에도 priority 0을 유지한다.
 `/stop`, `/resume`, `/list`, `/cancel target:<job-id>`, `/retry target:<job-id>`,
 `/emergency-stop`, `/revoke target:<actor-id>`는 모델을 거치지 않는다.
 버튼의 custom ID는 `list`, `stop`, `resume`, `cancel:<job-id>`만 허용한다.
 실제 slash 명령 등록·Gateway 연결은 T16b다.
 
-ACK 전에 이벤트와 처리 경로(job 또는 outbox, 제어 결과)를 영속 저장한다.
+ACK 전에 이벤트와 처리 경로(job 또는 outbox, 제어 결과)를 영속 저장한다. 복구 중 live 입력은
+대화별 최대 100건의 DB buffer에 저장한 뒤 ACK하고, 복구 끝에 같은 대화 잠금으로 수락·인계한다.
 수신 처리 transaction은 PostgreSQL 18의 transaction_timeout과 남은 시간별 statement_timeout으로
 1500ms 마감을 적용하고 최종 갱신 뒤에도 검사한다. 마감 내 commit한 뒤 응답만 잃은 경우의
 수락 여부는 단정하지 않으며 같은 이벤트 ID로 중복 작업을 만들지 않는다.
 ACK 응답 유실은 `ack_uncertain` 감사 기록을 남기고 이미 수락한 작업을 계속한다.
 상호작용 응답의 만료·유실은 처리 스레드/DM에 상태 확인 안내를 한 번 보낸다. 새 스레드는 생성 확인 뒤 안내한다.
-모델 맥락은 해당 job의 event_order 이하인 수락 이벤트만 포함한다. 후속 요청은 자기 job에서 처리한다.
+thread/DM의 모든 입력·복구·실행·게시에서 기존 대화 owner 일치를 확인한다. 모델 맥락은 같은 owner의
+해당 job event_order 이하 수락 이벤트만 포함한다. buffer의 event_order는 실제 수락 때 재배치한다. 후속 요청은 자기 job에서 처리한다.
 같은 이벤트 ID의 accepted 상태를 행 잠금 안에서 검사한다. 이미 수락했으면 종료하고,
 미수락 inbox는 저장된 입력으로 처리 경로를 다시 만들어 save 직후 종료·transaction rollback을 복구한다. 부모 채널은 구독하지 않으며 매번 멘션/명령이 필요하다.
 
 `queued/running/waiting_user/verifying/succeeded/failed/cancel_requested/cancelled/unknown/superseded`를
 구분한다. 한도·인증 만료는 `waiting_user` + `model_limit/auth_expired`이며 모델 스케줄러를 정지한다.
 waiting_user와 scheduler 중지는 한 transaction으로 기록한다. 기록 실패 시 슬롯을 보존하며,
-waiting_user 자체도 다음 모델 실행을 막는다. 자동 계정 변경은 없다. unknown과 외부 게시 결과 불명은 자동 재실행하지 않는다.
+waiting_user 자체도 다음 모델 실행을 막는다. 자동 계정 변경은 없다. unknown과 외부 게시 결과 불명은 자동 재실행하지 않는다. 게시 호출 전 DB 오류는 pending backoff로
+돌린다. REST 직전 durable dispatch 표식을 기록하고, lease 만료 때 표식 없는 claim만 안전하게 재시도한다.
+표식 기록 직후 프로세스 종료는 원격 요청 여부를 확정할 수 없어 unknown이다.
 worker 중단 확인·auth 갱신 뒤의 운영 재개 절차는 T18에서 구현한다.
 
 정책 파일에는 `revision`, `confirmedAt`, `owner`, `guild`, `conversationChannel`,
@@ -100,11 +105,15 @@ Secret·ConfigMap·환경변수 원문을 observation에 넣지 않는다.
 조회 요약은 항목별 예산과 생략 건수를 표시해 미확인·권장 확인을 보존한다. 긴 /list는 모든 작업을
 독립적으로 유효한 JSON 배열 페이지로 나누며, 각 페이지의 nonce/marker는 서로 다르다.
 페이지는 한 transaction으로 저장하고 앞 페이지가 sent일 때만 다음 페이지를 게시한다.
-앞 페이지의 pending/unknown/blocked 동안 뒤 페이지는 대기하며 다른 논리 메시지는 진행한다.
+앞 페이지의 pending/unknown/blocked 동안 뒤 페이지는 대기하며 공유 rate limit이 없는 다른 메시지는 진행한다.
 unknown 게시 대조가 429를 만나면 루프를 중단하고 retry_after까지 DB에 기록한 시각을 기다린다.
+비전역 429는 채널 전체를 최소 1초 또는 retry_after 중 긴 시간 동안 영속 중지한다. 같은 채널의
+다른 route도 보수적으로 함께 대기하고, 다른 채널은 진행한다. bucket 헤더는 오류·감사에 보존한다.
 `global: true` 429는 영속 전체 중지 시각을 갱신한다. 새 delivery claim·대조·ACK·history는 그 시각까지 호출하지 않는다.
 복구 중 gap은 새 작업의 claim·결과 게시를 지연하지만 진행 중 모델/read의 완료 결과를 폐기하지 않는다.
-`/stop`은 구독 해제로 별도 처리한다. dispatch 전 정책 대기와 취소가 겹치면 worker 호출 없이 cancelled로 확정한다.
+`/stop`은 구독 해제로 별도 처리한다. 활성화는 수락 transaction에 포함하며, 재개 메시지/명령의
+커서 이전 메시지는 복구·지연 live 입력에서도 실행하지 않는다. 복구는 세대·token을 확인해 중지 이전
+작업이 새 구독을 바꾸지 못하게 한다. dispatch 전 정책 대기와 취소가 겹치면 worker 호출 없이 cancelled로 확정한다.
 차단된 경보 thread/요약 뒤 새 수신은 같은 fingerprint라도 새 세대 키로 수락한다.
 아직 pending/sending/unknown인 스레드는 합쳐 대조하며, 스레드 확정·요약 저장·sent 기록은 원자적이다.
 
@@ -114,6 +123,8 @@ T16b는 실제 PostgreSQL·Gateway 세션 연결, 라이브 조회 응답 투영
 전용 CODEX_HOME·네트워크 격리, 지속 capability 재생 방지 저장소, 정책 갱신 확인,
 Gateway 재연결·경보 규칙·하트비트 연결과 첫 배포를 맡는다.
 작업자 /v1/cancel은 `{job, lease}`를 필수로 받고 capability·현재 실행·중단 어댑터 모두 같은 lease를 사용한다.
+capability는 발급 시각이 검증기보다 최대 1000ms 앞서는 것만 허용한다. 발급→만료 30초 상한과
+만료 시각·서명·본문·job/lease·일회 사용 검증은 유지한다.
 작업자 검증기는 `consume(nonce)`에 **원자적·영속적인 일회 사용 기록**을 요구한다.
 시험의 메모리 Set은 재시작 보안을 증명하지 않는다.
 
