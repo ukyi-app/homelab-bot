@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { DEFAULTS } from './contracts.js';
+import { DEFAULTS, RateLimited } from './contracts.js';
 import type { Clock, EventInput, Job, Scope, State } from './contracts.js';
 import { remaining } from './database.js';
 import type { Database, TransactionDeadline } from './database.js';
@@ -12,7 +12,7 @@ export interface Conversation {
 export interface Delivery {
   id: string; job_id: string | null; conversation_id: string | null;
   owner_id: string; scope: Scope; policy_revision: string; idempotency_key: string;
-  service_ids: string[];
+  service_ids: string[]; message_key: string; page_index: number;
   payload: { kind: 'message' | 'thread'; channel: string; content: string; classification: 'safe_summary' };
   state: string; external_id: string | null; lease_token: string; attempt: number;
 }
@@ -60,11 +60,13 @@ export class Store {
       return { id, duplicate: false };
     });
   }
-  async accept(id: string, type: 'chat' | 'task', revision: string, urgent = false, debounce = DEFAULTS.debounceMs): Promise<string> {
+  async accept(id: string, type: Job['type'], revision: string, urgent = false, debounce = DEFAULTS.debounceMs): Promise<string> {
     return this.db.transaction(async tx => {
       // A common row serializes admission and model claims across publisher instances.
       await tx.query(`INSERT INTO controls VALUES ('scheduler','false') ON CONFLICT DO NOTHING`);
       await tx.query(`SELECT * FROM controls WHERE key='scheduler' FOR UPDATE`);
+      const existing = (await tx.query<{ id: string }>('SELECT id FROM jobs WHERE event_id=$1', [id])).rows[0];
+      if (existing) return existing.id;
       const queued = (await tx.query<{ count: string }>("SELECT count(*) FROM jobs WHERE state='queued'")).rows[0]!;
       if (Number(queued.count) >= DEFAULTS.maxQueue) throw new Error('queue_full');
       const event = (await tx.query<{ actor_id: string; scope: Scope; conversation_id: string }>('SELECT * FROM events WHERE id=$1', [id])).rows[0]!;
@@ -72,9 +74,9 @@ export class Store {
       const inserted = await tx.query<{ id: string }>(`INSERT INTO jobs(id,event_id,conversation_id,type,owner_id,target,revision,budget,
         priority,available_at,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
         ON CONFLICT (event_id) DO NOTHING RETURNING id`, [jobId, id, event.conversation_id, type, event.actor_id,
-        json(event.scope), json({ policy: revision }), json({ timeoutMs: type === 'chat' ? DEFAULTS.chatTimeoutMs : DEFAULTS.taskTimeoutMs,
-          toolCalls: DEFAULTS.maxToolCalls }), urgent ? 0 : type === 'chat' ? 10 : 30,
-        this.now() + (urgent || type === 'task' ? 0 : debounce), this.now()]);
+        json(event.scope), json({ policy: revision }), json({ timeoutMs: type === 'task' ? DEFAULTS.taskTimeoutMs : DEFAULTS.chatTimeoutMs,
+          toolCalls: DEFAULTS.maxToolCalls }), urgent ? 0 : type === 'task' ? 30 : 10,
+        this.now() + (urgent || type !== 'chat' ? 0 : debounce), this.now()]);
       await tx.query('UPDATE events SET accepted=true WHERE id=$1', [id]);
       if (!inserted.rows.length) return (await tx.query<{ id: string }>('SELECT id FROM jobs WHERE event_id=$1', [id])).rows[0]!.id;
       if (type === 'chat') await tx.query(`UPDATE jobs SET state='superseded' WHERE conversation_id=$1 AND type='chat'
@@ -123,9 +125,13 @@ export class Store {
     });
   }
   async defer(job: Job): Promise<void> {
-    await this.db.query(`UPDATE jobs SET state='queued',wait_reason='policy_unavailable',attempt=GREATEST(0,attempt-1),
-      available_at=$3,lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2 AND state='running'`,
-    [job.id, job.lease_token, this.now() + DEFAULTS.retryDelayMs]);
+    await this.db.query(`UPDATE jobs SET
+      state=CASE WHEN state='cancel_requested' THEN 'cancelled' ELSE 'queued' END,
+      wait_reason=CASE WHEN state='cancel_requested' THEN 'cancel_before_dispatch' ELSE 'policy_unavailable' END,
+      finished_at=CASE WHEN state='cancel_requested' THEN $4 ELSE NULL END,attempt=GREATEST(0,attempt-1),
+      available_at=$3,lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2
+      AND lease_until>$4 AND state IN ('running','cancel_requested')`,
+    [job.id, job.lease_token, this.now() + DEFAULTS.retryDelayMs, this.now()]);
   }
   async fail(job: Job, reason: string): Promise<void> {
     await this.atomic(async store => {
@@ -150,6 +156,8 @@ export class Store {
     });
   }
   async transition(job: Job, state: State, reason: string | null = null): Promise<boolean> {
+    // Only an uncertain worker may override cancellation with unknown.
+    if (state !== 'unknown') return (await this.complete(job, state, reason)) !== undefined;
     return (await this.db.query(`UPDATE jobs SET state=$3,wait_reason=$4,finished_at=$5
       WHERE id=$1 AND lease_token=$2 AND lease_until>$5 AND state IN ('running','verifying','cancel_requested') RETURNING id`,
     [job.id, job.lease_token, state, reason, this.now()])).rows.length === 1;
@@ -165,17 +173,32 @@ export class Store {
         payload: { kind: 'message', channel: scope.channel, content, classification: 'safe_summary' } }, tx);
     });
   }
-  async enqueue(input: { key: string; job?: string; conversation?: string; actor: string; scope: Scope; revision: string; services?: string[]; payload: Delivery['payload'] }, tx = this.db): Promise<void> {
+  async enqueue(input: { key: string; job?: string; conversation?: string; actor: string; scope: Scope; revision: string; services?: string[]; payload: Delivery['payload'] }, tx?: Database): Promise<void> {
+    if (!tx) return this.db.transaction(inner => this.enqueue(input, inner));
     const pages = input.payload.kind === 'message' ? messagePages(input.payload.content) : [input.payload.content];
-    for (const [index, content] of pages.entries()) await tx.query(`INSERT INTO outbox(id,job_id,conversation_id,owner_id,scope,policy_revision,idempotency_key,payload,available_at,created_at,service_ids)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$10) ON CONFLICT (idempotency_key) DO NOTHING`,
+    for (const [index, content] of pages.entries()) await tx.query(`INSERT INTO outbox(id,job_id,conversation_id,owner_id,scope,policy_revision,idempotency_key,payload,available_at,created_at,service_ids,message_key,page_index)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$10,$11,$12) ON CONFLICT (idempotency_key) DO NOTHING`,
     [randomUUID(), input.job ?? null, input.conversation ?? null, input.actor, json(input.scope), input.revision,
-      index ? `${input.key}:page:${index + 1}` : input.key, json({ ...input.payload, content }), this.now(), json(input.services ?? [])]);
+      index ? `${input.key}:page:${index + 1}` : input.key, json({ ...input.payload, content }), this.now(), json(input.services ?? []), input.key, index]);
+  }
+  async discordPauseUntil(): Promise<number> {
+    return Number((await this.db.query<{ value: number }>("SELECT value FROM controls WHERE key='discord_global_after'")).rows[0]?.value ?? 0);
+  }
+  async recordRateLimit(error: RateLimited): Promise<void> {
+    if (!error.global) return;
+    await this.db.query(`INSERT INTO controls VALUES ('discord_global_after',to_jsonb($1::bigint))
+      ON CONFLICT (key) DO UPDATE SET value=to_jsonb(GREATEST(controls.value::bigint,$1::bigint))`,
+    [this.now() + Math.max(1000, error.retryAfterMs)]);
   }
   async claimDelivery(): Promise<Delivery | undefined> {
     return this.db.transaction(async tx => {
-      const row = (await tx.query<Delivery>(`SELECT * FROM outbox WHERE state='pending' AND available_at<=$1
-        ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1`, [this.now()])).rows[0];
+      const row = (await tx.query<Delivery>(`SELECT o.* FROM outbox o WHERE o.state='pending' AND o.available_at<=$1
+        AND NOT EXISTS (SELECT 1 FROM controls WHERE key='discord_global_after' AND value::bigint>$1)
+        AND (o.page_index=0 OR EXISTS (SELECT 1 FROM outbox predecessor WHERE predecessor.message_key=o.message_key
+          AND predecessor.page_index=o.page_index-1 AND predecessor.state='sent'))
+        AND NOT EXISTS (SELECT 1 FROM outbox previous WHERE previous.message_key=o.message_key
+          AND previous.page_index<o.page_index AND previous.state<>'sent')
+        ORDER BY o.created_at,o.message_key,o.page_index FOR UPDATE OF o SKIP LOCKED LIMIT 1`, [this.now()])).rows[0];
       if (!row) return;
       return (await tx.query<Delivery>(`UPDATE outbox SET state='sending',attempt=attempt+1,
         lease_until=$2,lease_token=$3 WHERE id=$1 RETURNING *`, [row.id, this.now() + DEFAULTS.leaseMs, randomUUID()])).rows[0];
@@ -228,7 +251,7 @@ export class Store {
   }
   async active(conversation: string): Promise<boolean> {
     const row = (await this.db.query<Conversation>('SELECT * FROM conversations WHERE id=$1', [conversation])).rows[0];
-    return !!row?.active && !row.gap;
+    return !!row?.active;
   }
   async control(actor: string, conversation: string, action: string, target?: string): Promise<unknown> {
     if (action === 'stop' || action === 'resume') {

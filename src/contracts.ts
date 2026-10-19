@@ -20,9 +20,10 @@ export const DEFAULTS = Object.freeze({
 export class Denied extends Error { constructor() { super('denied'); } }
 export class PolicyUnavailable extends Error { constructor() { super('policy_unavailable'); } }
 export class DiscordUnauthorized extends Error { constructor() { super('discord_unauthorized'); } }
+export class HistoryGap extends Error { constructor() { super('history_gap'); } }
 export class WorkerRejected extends Error { constructor(reason = 'worker_rejected') { super(reason); } }
 export class RateLimited extends Error {
-  constructor(public readonly retryAfterMs: number) { super('rate_limited'); }
+  constructor(public readonly retryAfterMs: number, public readonly global = false) { super('rate_limited'); }
 }
 export interface EventInput {
   id: string; actor: string; scope: Scope; text: string;
@@ -30,7 +31,7 @@ export interface EventInput {
   mention?: boolean; command?: string; target?: string; urgent?: boolean;
 }
 export interface Job {
-  id: string; event_id: string; conversation_id: string; type: 'chat' | 'task';
+  id: string; event_id: string; conversation_id: string; type: 'chat' | 'task' | 'read';
   owner_id: string; target: Scope; revision: { policy: string };
   budget: { timeoutMs: number; toolCalls: number }; state: State; attempt: number;
   lease_token: string; lease_until: number; created_at: number; started_at: number;

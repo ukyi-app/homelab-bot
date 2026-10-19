@@ -45,11 +45,11 @@
 
 ## FOUNDATION T16a 실행 결과 (2026-10-19)
 
-현재 검증 기준은 호출자가 만든 `bdb0318e0f671ad8a3a170a97a053730b2400efd`(`feat/t16a-foundation`) 위 작업 트리다.
+현재 검증 기준은 호출자가 만든 `7999b85beb1b3c68aff677e87f1c0348787eac42`(`feat/t16a-foundation`) 위 작업 트리다.
 초기 구현 기준은 `2e84c5f58cc5d4d3b60eeebeb085b722ea3de795`이며, 작업자는 이번에도 커밋·index·브랜치를 변경하지 않았다.
-`npm run check`와 `npm test` 통과, **104 tests / 104 pass / 0 fail / 0 skipped**.
+`npm run check`와 `npm test` 통과, **141 tests / 141 pass / 0 fail / 0 skipped**.
 실행 환경은 Node 24.22.0, TypeScript 7.0.2, PGlite 0.5.10이다.
-시험 코드는 `test/foundation.test.ts`와 독립 리뷰 회귀 `test/review-1.test.ts`·`test/review-2.test.ts`·`test/review-3.test.ts`, 모의/로컬 DB 구성은 `test/helpers.ts`다.
+시험 코드는 `test/foundation.test.ts`와 독립 리뷰 회귀 `test/review-1.test.ts`·`test/review-2.test.ts`·`test/review-3.test.ts`·`test/review-4.test.ts`, 모의/로컬 DB 구성은 `test/helpers.ts`다.
 세부 명령 원문·실행 결과·파일 digest·HANDOFF는 호출자에게 전달한 비공개 작업 보고서에 있다.
 
 등급 `local_integration`은 실제 앱 코드·PostgreSQL 엔진·임시 디스크/loopback HTTP의 통합을 뜻한다.
@@ -96,3 +96,13 @@ available_at에 도달하지 못한 fixture 오류를 수정했고 재실행에�
 경보 상한 시험은 공통 잠금이 count 앞에 놓이는지도 검사한다. 실제 PostgreSQL 다중 연결 경합과
 transaction_timeout의 backend 종료·네트워크/COMMIT 응답 유실은 blocked(T16b)다.
 Postgres 어댑터의 남은 시간 설정·마감 뒤 COMMIT 금지는 모의 pg client로 검사했다.
+
+4차 PR 재리뷰의 7개 ID에 회귀 37개를 추가해 **141/141**을 확인했다. 경보 thread/요약 차단 뒤 새 세대,
+global 429의 게시·대조·ACK·history 공통 대기, 페이지 순서/앞 페이지 대기/일괄 rollback,
+gap 중 chat/read 결과 보존, 정책 대기와 취소 경합, 독립 read, 미수락 inbox 재전달을 포함한다.
+기존 경로도 넓혀 부모 read, 기다리는 read 두 건, superseded/waiting 취소, 큐 포화 시 기존 job 반환,
+경보 확정 중 summary 실패와 migration 재적용을 검사했다. 첫 추가 32개를 포함한 136개는 모두 통과했다.
+추가 확장 중 140개 중 1개가 경보 참조 migration의 같은 시각 thread/summary 선택 오류로 실패했고,
+대화 생성 뒤에는 요약만 참조하도록 수정했다. 최종 코드는 회귀 37개 단독과 전체 141개에서 통과했다.
+이 결과는 PGlite와 모의 Discord를 이용한 local_integration이다. 실제 PostgreSQL 다중 연결 잠금,
+전역 429의 다중 프로세스 경쟁, 실제 Gateway replay/Discord 메시지 순서는 blocked(T16b)다.

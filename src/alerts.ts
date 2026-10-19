@@ -30,20 +30,27 @@ export class AlertIngress {
       await tx.query(`SELECT * FROM controls WHERE key='alert_admission' FOR UPDATE`);
       // Serialize a group's first thread and repeats without executing a model.
       await tx.query(`INSERT INTO incidents(group_key,status,fingerprint,count,updated_at) VALUES ($1,$2,'',0,$3) ON CONFLICT DO NOTHING`, [key, alert.status, this.store.now()]);
-      const old = (await tx.query<{ fingerprint: string; conversation_id: string | null; count: number }>('SELECT * FROM incidents WHERE group_key=$1 FOR UPDATE', [key])).rows[0]!;
+      const old = (await tx.query<{ fingerprint: string; conversation_id: string | null; count: number; delivery_key: string | null }>('SELECT * FROM incidents WHERE group_key=$1 FOR UPDATE', [key])).rows[0]!;
+      const previous = (await tx.query<{ state: string }>('SELECT state FROM outbox WHERE idempotency_key=$1', [old.delivery_key])).rows[0];
+      // Unknown may already exist remotely; reconcile it rather than create a duplicate thread.
+      const pendingThread = (await tx.query<{ payload: { content: string } }>(`SELECT o.payload FROM outbox o
+        JOIN events e ON e.id=o.payload->>'content' WHERE e.payload->>'group'=$1
+        AND o.payload->>'kind'='thread' AND o.state IN ('pending','sending','unknown')
+        ORDER BY e.event_order DESC LIMIT 1`, [key])).rows[0];
       await tx.query('UPDATE incidents SET status=$2,fingerprint=$3,count=count+1,updated_at=$4 WHERE group_key=$1', [key, alert.status, fingerprint, this.store.now()]);
-      if (old.fingerprint === fingerprint) return;
+      if (old.fingerprint === fingerprint && (pendingThread || (previous && previous.state !== 'blocked'))) return;
       const content = `경보 ${alert.status}: ${supported.length}건. 원문은 게시하지 않았습니다. 복원 가능 여부는 미확인입니다.`;
       const pending = (await tx.query<{ count: string }>("SELECT count(*) FROM outbox WHERE state IN ('pending','sending')")).rows[0]!;
       if (Number(pending.count) >= DEFAULTS.maxQueue) throw new Error('alert_queue_full');
       if (old.conversation_id) {
         const conversation = (await tx.query<{ scope: Scope }>('SELECT scope FROM conversations WHERE id=$1', [old.conversation_id])).rows[0]!;
-        await this.store.enqueue({ key: `alert:${key}:${fingerprint}:${old.count + 1}`, actor: p.owner, scope: conversation.scope,
+        const deliveryKey = `alert:${key}:${fingerprint}:${old.count + 1}`;
+        await tx.query('UPDATE incidents SET delivery_key=$2 WHERE group_key=$1', [key, deliveryKey]);
+        await this.store.enqueue({ key: deliveryKey, actor: p.owner, scope: conversation.scope,
           conversation: old.conversation_id, revision: p.revision,
           payload: { kind: 'message', channel: conversation.scope.channel, content, classification: 'safe_summary' } }, tx);
         return;
       }
-      const pendingThread = (await tx.query<{ payload: { content: string } }>('SELECT payload FROM outbox WHERE idempotency_key=$1', [`incident:${key}`])).rows[0];
       if (pendingThread) {
         await tx.query('UPDATE events SET payload=$2 WHERE id=$1', [pendingThread.payload.content,
           JSON.stringify({ command: 'alert', group: key, text: content })]);
@@ -54,9 +61,11 @@ export class AlertIngress {
       await tx.query(`INSERT INTO conversations(id,owner_id,scope,channel_id,created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`,
         [conversationId, p.owner, JSON.stringify(scope), scope.channel, this.store.now()]);
       await tx.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,conversation_id,received_at,payload)
-        VALUES ($1,'alertmanager',$1,$2,$3,$4,$5,$6,$7)`, [id, `alert:${key}:${fingerprint}`, p.owner,
+        VALUES ($1,'alertmanager',$1,$2,$3,$4,$5,$6,$7)`, [id, `alert:${key}:${fingerprint}:${old.count + 1}`, p.owner,
         JSON.stringify(scope), conversationId, this.store.now(), JSON.stringify({ command: 'alert', group: key, text: content })]);
-      await this.store.enqueue({ key: `incident:${key}`, actor: p.owner, scope, conversation: conversationId,
+      const deliveryKey = `incident:${key}:${old.count + 1}`;
+      await tx.query('UPDATE incidents SET delivery_key=$2 WHERE group_key=$1', [key, deliveryKey]);
+      await this.store.enqueue({ key: deliveryKey, actor: p.owner, scope, conversation: conversationId,
         revision: p.revision, payload: { kind: 'thread', channel: scope.channel, content: id, classification: 'safe_summary' } }, tx);
     });
   }

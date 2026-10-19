@@ -100,8 +100,8 @@ export function discordHttpApi(token: string, send: typeof fetch): DiscordApi {
       body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(1000) });
     if (response.status === 401) { halted = true; throw new DiscordUnauthorized(); }
     if (response.status === 429) {
-      const error = z.object({ retry_after: z.number().finite().nonnegative() }).parse(await response.json());
-      throw new RateLimited(Math.ceil(error.retry_after * 1000));
+      const error = z.object({ retry_after: z.number().finite().nonnegative(), global: z.boolean().optional() }).parse(await response.json());
+      throw new RateLimited(Math.ceil(error.retry_after * 1000), error.global === true);
     }
     if (!response.ok) throw new Error('discord_request_failed');
     return response.status === 204 ? undefined : response.json();

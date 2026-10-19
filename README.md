@@ -46,13 +46,14 @@ REST는 `discordHttpApi(token, fetch)`를 주입한다. 직접 호출하지 않�
 게시 서버 수신 포트는 8080, 경보는 8081, 작업자 Service는 8080이다.
 
 `Postgres`에는 전용 DB/역할의 `pg.Pool`을 주입한다. `migrate()`는 빌드 결과에서 호출한다.
-운영 마이그레이션은 T16b의 Sync hook Job에서 실행한다. `001`은 초기 스키마, `002`는 철회 당시 정책 revision, `003`은 철회 ID·게시 일시 중지 상태, `004`는 결과별 서비스 접근 범위를 추가한다.
+운영 마이그레이션은 T16b의 Sync hook Job에서 실행한다. `001`은 초기 스키마, `002`는 철회 당시 정책 revision, `003`은 철회 ID·게시 일시 중지 상태, `004`는 결과별 서비스 접근 범위, `005`는 메시지 페이지 순서·경보 전달 키·기존 read 유형을 보완한다.
 후속 티켓도 기존 파일을 변경하지 않고 expand/contract 후속 파일을 추가한다.
 
 ## 사용 계약
 
 허용 채널에서 멘션 또는 `/chat`으로 시작한다. `/read text:<template-id> target:<service-id>`는
 최근 60초의 승인 템플릿을 실행한다. `/task`는 모의 작업 레인 계약이다.
+`/read`는 독립 job으로 즉시 대기열에 들어가며, 후속 chat/read가 앞선 조회를 합치거나 폐기하지 않는다.
 활성 스레드 후속 메시지는 멘션 없이 받고, intent를 끄면 명령/버튼만 받는다. `/urgent`는 debounce를 건너뛴다.
 `/stop`, `/resume`, `/list`, `/cancel target:<job-id>`, `/retry target:<job-id>`,
 `/emergency-stop`, `/revoke target:<actor-id>`는 모델을 거치지 않는다.
@@ -65,7 +66,8 @@ ACK 전에 이벤트와 처리 경로(job 또는 outbox, 제어 결과)를 영�
 수락 여부는 단정하지 않으며 같은 이벤트 ID로 중복 작업을 만들지 않는다.
 ACK 응답 유실은 `ack_uncertain` 감사 기록을 남기고 이미 수락한 작업을 계속한다.
 상호작용 응답의 만료·유실은 처리 스레드/DM에 상태 확인 안내를 한 번 보낸다. 새 스레드는 생성 확인 뒤 안내한다.
-같은 이벤트 ID는 작업을 추가하지 않는다. 부모 채널은 구독하지 않으며 매번 멘션/명령이 필요하다.
+같은 이벤트 ID의 accepted 상태를 행 잠금 안에서 검사한다. 이미 수락했으면 종료하고,
+미수락 inbox는 저장된 입력으로 처리 경로를 다시 만들어 save 직후 종료·transaction rollback을 복구한다. 부모 채널은 구독하지 않으며 매번 멘션/명령이 필요하다.
 
 `queued/running/waiting_user/verifying/succeeded/failed/cancel_requested/cancelled/unknown/superseded`를
 구분한다. 한도·인증 만료는 `waiting_user` + `model_limit/auth_expired`이며 모델 스케줄러를 정지한다.
@@ -94,7 +96,14 @@ Secret·ConfigMap·환경변수 원문을 observation에 넣지 않는다.
 결과 outbox의 service_ids를 게시·대조 직전에 재인가하므로 전달 대기 중 서비스 철회도 적용된다.
 조회 요약은 항목별 예산과 생략 건수를 표시해 미확인·권장 확인을 보존한다. 긴 /list는 모든 작업을
 독립적으로 유효한 JSON 배열 페이지로 나누며, 각 페이지의 nonce/marker는 서로 다르다.
+페이지는 한 transaction으로 저장하고 앞 페이지가 sent일 때만 다음 페이지를 게시한다.
+앞 페이지의 pending/unknown/blocked 동안 뒤 페이지는 대기하며 다른 논리 메시지는 진행한다.
 unknown 게시 대조가 429를 만나면 루프를 중단하고 retry_after까지 DB에 기록한 시각을 기다린다.
+`global: true` 429는 영속 전체 중지 시각을 갱신한다. 새 delivery claim·대조·ACK·history는 그 시각까지 호출하지 않는다.
+복구 중 gap은 새 작업의 claim·결과 게시를 지연하지만 진행 중 모델/read의 완료 결과를 폐기하지 않는다.
+`/stop`은 구독 해제로 별도 처리한다. dispatch 전 정책 대기와 취소가 겹치면 worker 호출 없이 cancelled로 확정한다.
+차단된 경보 thread/요약 뒤 새 수신은 같은 fingerprint라도 새 세대 키로 수락한다.
+아직 pending/sending/unknown인 스레드는 합쳐 대조하며, 스레드 확정·요약 저장·sent 기록은 원자적이다.
 
 ## 후속 작업의 경계
 

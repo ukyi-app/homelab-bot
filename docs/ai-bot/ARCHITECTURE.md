@@ -317,7 +317,10 @@ Discord Gateway → `DiscordProtocol` → `DiscordIngress` → PostgreSQL 이벤
 ACK 전에 inbox와 처리 경로를 저장한다. 처리 경로 transaction 안에서 1500ms 마감을 검사하고,
 그 전에 실패하면 ACK하지 않고 `accepted=false`만 남긴다. commit 응답 유실은 실제 commit 여부가
 불확실하므로 수락 상태를 단정하지 않는다. 성공적으로 commit한 뒤 ACK 응답이 유실돼도 이미
-저장한 작업은 계속되고 `ack_uncertain`을 남긴다. 같은 ID는 중복 실행하지 않는다.
+저장한 작업은 계속되고 `ack_uncertain`을 남긴다. 같은 ID는 event 행을 FOR UPDATE로 잠그고 accepted를
+확인한다. true면 종료하고 false면 저장된 actor/scope/입력으로 다시 라우팅한다. 제어 명령도 이 잠금과
+같은 transaction 안에서 한 번 실행한다. save 직후 프로세스 종료·route rollback 뒤 재전달/복구도 적용한다.
+기존 job 재수락은 큐 상한보다 먼저 검사하므로 큐가 가득 차도 같은 job을 반환한다.
 Discord REST의 1초 전송 제한은 상호작용 첫 응답 3초에 맞춰 유지하며 작업 수락 여부와 분리한다.
 상호작용 ACK 만료·유실 때는 처리 스레드/DM에 요청이 저장됐으며 재전송 전에 `/list`를 확인하라는
 멱등 안내를 보낸다. 새 스레드는 생성 대조 뒤 안내한다. 같은 명령 문자열의 별도 요청을 자동 합치지 않는다.
@@ -345,10 +348,20 @@ outbox UUID별 멱등 키에서 24자 nonce와 게시 marker를 만든다. 응�
 스레드 이름을 제한 조회한다. 못 찾았다고 재게시하지 않는다.
 대조 중 429는 즉시 루프를 중단하고 전역 다음 대조 시각을 DB에 기록한다. 재기동해도
 최소 1초 또는 retry_after 중 긴 쪽을 기다린다. 기존 unknown의 24시간 기한은 연장하지 않는다.
+HTTP 429의 global 필드를 보존하며 true면 controls.discord_global_after에 더 긴 중지 시각을 기록한다.
+새 delivery claim, 게시 직전, unknown 대조, ACK, history가 공통 중지 시각을 검사한다. ACK/history에서
+받은 global 429도 같은 시각을 갱신한다. 대기 때문에 생략한 ACK는 시각을 연장하지 않고 기존 만료 안내를 쓴다.
+이미 시작된 다른 요청을 소급 취소하지는 않는다. 실제 다중 프로세스 경합/Discord 제한 실측은 T16b다.
 unknown 전달은 별도 **100건/24시간** 한도로 유지하며 초과·만료 시 감사 기록 후 blocked로 닫는다.
 경보 backpressure는 pending/sending만 센다. 서로 다른 groupKey도 공통 alert_admission 행을
 잠근 뒤 count와 삽입을 한 transaction에서 실행해 동시 경보 수락의 상한 검사를 직렬화한다. unknown 지표 경보 연결은 T16b다. Discord의 exactly-once를 보증하지 않는다.
-복구는 100건씩 **10페이지/30초**까지다. live 메시지 checkpoint를 갱신하고, 복구 중에는 `gap=true`로 작업을 막는다.
+경보의 pending/sending/unknown thread는 재사용하고 blocked는 새 수신의 세대 키로 대체한다.
+incidents.delivery_key가 마지막 전달을 추적하므로 thread 생성 전후 모두 차단 뒤 동일 fingerprint를 다시 수락한다.
+세대는 사건 count를 사용하고 event semantic key도 세대를 포함한다. 원격 생성 여부가 불명인 unknown은 자동 재생성하지 않는다.
+스레드 확정은 alert_admission 잠금을 공유하고 대화·event·incident·요약·sent를 한 transaction으로 갱신한다.
+복구는 100건씩 **10페이지/30초**까지다. live 메시지 checkpoint를 갱신하고, 복구 중에는 `gap=true`로 새 job claim을 막는다.
+active는 구독 여부만 뜻한다. gap 중에도 이미 시작한 모델/read는 결과를 저장하며 publisher는 pending을
+history_gap 사유로 backoff하고 unknown 대조를 미룬다. gap 해제 뒤 같은 결과를 게시하며 모델을 다시 실행하지 않는다.
 한도를 넘으면 gap을 유지한다. 더 긴 누락의 수동 복구는 T16b 운영 절차로 정한다.
 
 ### 조회·예산·작업자 제어
@@ -361,12 +374,18 @@ unknown 전달은 별도 **100건/24시간** 한도로 유지하며 초과·만�
 서비스별 read 결과는 outbox의 service_ids에 범위를 남기고 게시·대조 직전 현재 policy.services로 검사한다.
 요약 예산은 대상/출처 각 120자, 사실 600자, 미확인/권장 확인 각 350자다. 항목 수가 넘으면 생략 건수를
 표시한다. 긴 작업 목록은 유효한 JSON 배열로 1800자 이하 페이지를 만들어 별도 멱등 키로 게시한다.
+논리 메시지 key와 0부터 시작하는 page_index를 저장하고 선행 페이지가 모두 sent인 경우에만 다음 페이지를 claim한다.
+첫 페이지의 429/unknown/blocked 때문에 뒤 페이지가 추월하지 않으며 다른 논리 메시지는 계속 처리한다.
+페이지 생성 전체도 한 transaction이다. migration 005는 기존 :page:N 키를 순서로 옮기고 경보 전달 참조를 복원한다.
+이미 게시된 역순 페이지는 되돌리거나 재게시하지 않는다. blocked 선행 페이지의 수동 해소는 T16b 운영 절차다.
 일반 텍스트도 1800자씩 손실 없이 나눈다. 게시자가 끝 1900자를 조용히 버리는 처리는 없다.
 004 이전의 비정상적인 큰 pending 메시지는 자동 절단하지 않고 blocked로 둔다.
 임의 질의·Secret·ConfigMap·pods/log/exec의 요청 이름과 추가 필드를 거부한다.
 라이브 API 응답 투영·플랫폼 권한 증거는 T16b다.
 
 부모 채널의 스레드 생성 뒤에도 저장된 urgent command/flag를 전달한다.
+스레드/DM/부모 채널에서 받은 `/read`는 type=read, debounce 0이며 queued-chat supersede 대상에서 제외한다.
+기존 read job도 migration 005로 유형을 옮긴다. 이미 종결된 superseded 작업은 임의로 재실행하지 않는다.
 기본 debounce **750ms**, urgent **0ms**, 큐 **100건**, lease **30초**, 대화 모델 **60초**,
 작업 레인 **1800초**, 도구 예산 **8회**, 확인된 실패의 사용자 재시도 **2회**다.
 FOUNDATION 모델 경로에는 실행 가능한 셸/도구 dispatch가 없다. 실제 도구 카운터·작업 실행은 T18 계약으로 구현한다.
@@ -375,6 +394,9 @@ failed와 실패 안내로 남기고 모델 슬롯을 해제한다. 연결 수�
 EAI_AGAIN·UND_ERR_CONNECT_TIMEOUT도 확정 실패다. ECONNRESET·응답 도중 단절은 unknown이다. dispatch 후 종료 불확실만 unknown이다.
 작업자 HTTP는 Node 24 내장 fetch와 호환하는 undici 7.30.1 Agent를 쓰고,
 headers/body timeout을 요청 예산 + 30초로 둔다. 호출자 예산·취소 신호는 그대로 적용한다.
+dispatch 전 PolicyUnavailable의 defer는 최신 cancel_requested를 원자적으로 cancelled로 바꾸고 lease를 해제한다.
+그 외에는 queued로 되돌린다. 유효 lease 조건은 유지한다. 완료/실패/대기/결과 폐기에서도 취소를 우선하며,
+종료가 확인되지 않은 worker만 unknown으로 남아 전역 슬롯을 유지한다.
 unknown은 자동 재시도 0회다. Discord 429는 retry_after를 지키고 총 3회 뒤 blocked다.
 IDENTIFY는 rolling 24시간 **900회**를 로컬 상한으로 두고 1000회 문서 한도에 여유를 남긴다.
 재연결 backoff는 1~60초 + 0~1초 jitter 계약이다. 실제 Gateway 연결 루프에 예산을 연결하는 것은 T16b다.
