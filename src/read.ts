@@ -36,11 +36,18 @@ export class ReadAdapter {
     this.templates = new Map(templates.map(t => {
       const service = this.services.get(t.service);
       const maxWindow = t.kind === 'logs' ? 3600 : t.kind === 'metrics' ? 21600 : 300;
-      if (!service || service.namespace !== t.namespace || t.maxWindowSeconds <= 0 || t.maxWindowSeconds > maxWindow
+      if (!service || service.namespace !== t.namespace || !Number.isFinite(t.maxWindowSeconds)
+        || t.maxWindowSeconds < 1 || t.maxWindowSeconds > maxWindow
         || t.maxRows < 1 || t.maxRows > 200 || t.maxBytes < 1 || t.maxBytes > 65536
         || t.query.length > 2000 || !t.query || !t.datasource) throw new Denied();
       return [t.id, structuredClone(t)];
     }));
+  }
+  async recent(actor: string, scope: Scope, request: { service: string; template: string }): Promise<ReadResult> {
+    const template = this.templates.get(request.template);
+    const to = this.now();
+    const seconds = template?.service === request.service ? Math.min(60, template.maxWindowSeconds) : 60;
+    return this.read(actor, scope, { ...request, from: to - seconds * 1000, to });
   }
   async read(actor: string, scope: Scope, request: unknown): Promise<ReadResult> {
     const r = RequestSchema.parse(request);

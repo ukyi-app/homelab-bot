@@ -85,7 +85,8 @@ export class DiscordProtocol implements DiscordRest {
   }
   async history(channel: string, after: string | null, limit: 100): Promise<EventInput[]> {
     const metadata = await this.channel(channel);
-    const messages = z.array(MessageSchema).parse(await this.api.request('GET', `/channels/${part(channel)}/messages?limit=${limit}${after ? `&after=${part(after)}` : ''}`));
+    // after selects the nearest newer page; omit it and Discord selects the latest page instead.
+    const messages = z.array(MessageSchema).parse(await this.api.request('GET', `/channels/${part(channel)}/messages?limit=${limit}&after=${part(after ?? '0')}`));
     return Promise.all(messages.map(m => gatewayMessage({ ...m, guild_id: metadata.guild_id }, this.botId, async () => metadata)));
   }
 }

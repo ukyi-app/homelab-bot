@@ -232,9 +232,10 @@ export class Store {
       payload: { kind: 'message', channel: event.scope.channel, classification: 'safe_summary',
         content: '상호작용 응답이 만료됐거나 확인되지 않았지만 요청 기록은 저장했습니다. 다시 보내기 전에 이 대화의 /list로 처리 상태를 확인하세요.' } });
   }
-  async context(conversation: string): Promise<unknown[]> {
+  async context(conversation: string, event: string): Promise<unknown[]> {
     const rows = (await this.db.query<{ payload: unknown }>(`SELECT payload FROM events WHERE conversation_id=$1 AND accepted=true
-      ORDER BY event_order DESC LIMIT $2`, [conversation, DEFAULTS.contextMessages])).rows;
+      AND event_order<=(SELECT event_order FROM events WHERE id=$3 AND conversation_id=$1)
+      ORDER BY event_order DESC LIMIT $2`, [conversation, DEFAULTS.contextMessages, event])).rows;
     const context: unknown[] = [];
     let bytes = 0;
     for (const row of rows) {

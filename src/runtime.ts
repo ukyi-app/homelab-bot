@@ -26,15 +26,14 @@ export class Runtime {
       const event = (await this.store.db.query<{ payload: { text: string; command?: string; target?: string } }>(
         'SELECT payload FROM events WHERE id=$1', [job.event_id])).rows[0]!;
       if (event.payload.command === 'read') {
-        const result = await this.reader.read(job.owner_id, job.target, { service: event.payload.target,
-          template: event.payload.text, from: this.store.now() - 60_000, to: this.store.now() });
+        const result = await this.reader.recent(job.owner_id, job.target, { service: event.payload.target!, template: event.payload.text });
         await this.gate.authorize(job.owner_id, job.target, job.revision.policy);
         if (!await this.store.active(job.conversation_id)) { await this.store.transition(job, 'superseded'); return true; }
         await this.store.finish(job, result, { source: result.source, observedAt: result.observedAt }, readSummary(result), job.target,
           result.status === 'unregistered' ? [] : [result.service]);
         return true;
       }
-      const request = workerRequest(job, await this.store.context(job.conversation_id));
+      const request = workerRequest(job, await this.store.context(job.conversation_id, job.event_id));
       const abort = new AbortController();
       let timeout: ReturnType<typeof setTimeout> | undefined;
       let monitorError = false;

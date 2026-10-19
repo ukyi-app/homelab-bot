@@ -45,11 +45,11 @@
 
 ## FOUNDATION T16a 실행 결과 (2026-10-19)
 
-현재 검증 기준은 호출자가 만든 `7999b85beb1b3c68aff677e87f1c0348787eac42`(`feat/t16a-foundation`) 위 작업 트리다.
+현재 검증 기준은 호출자가 만든 `a9e94079587ebad012d513a58beb3d311c0b1112`(`feat/t16a-foundation`) 위 작업 트리다.
 초기 구현 기준은 `2e84c5f58cc5d4d3b60eeebeb085b722ea3de795`이며, 작업자는 이번에도 커밋·index·브랜치를 변경하지 않았다.
-`npm run check`와 `npm test` 통과, **141 tests / 141 pass / 0 fail / 0 skipped**.
+`npm run check`와 `npm test` 통과, **163 tests / 163 pass / 0 fail / 0 skipped**.
 실행 환경은 Node 24.22.0, TypeScript 7.0.2, PGlite 0.5.10이다.
-시험 코드는 `test/foundation.test.ts`와 독립 리뷰 회귀 `test/review-1.test.ts`·`test/review-2.test.ts`·`test/review-3.test.ts`·`test/review-4.test.ts`, 모의/로컬 DB 구성은 `test/helpers.ts`다.
+시험 코드는 `test/foundation.test.ts`와 독립 리뷰 회귀 `test/review-1.test.ts`·`test/review-2.test.ts`·`test/review-3.test.ts`·`test/review-4.test.ts`·`test/review-5.test.ts`, 모의/로컬 DB 구성은 `test/helpers.ts`다.
 세부 명령 원문·실행 결과·파일 digest·HANDOFF는 호출자에게 전달한 비공개 작업 보고서에 있다.
 
 등급 `local_integration`은 실제 앱 코드·PostgreSQL 엔진·임시 디스크/loopback HTTP의 통합을 뜻한다.
@@ -106,3 +106,11 @@ gap 중 chat/read 결과 보존, 정책 대기와 취소 경합, 독립 read, �
 대화 생성 뒤에는 요약만 참조하도록 수정했다. 최종 코드는 회귀 37개 단독과 전체 141개에서 통과했다.
 이 결과는 PGlite와 모의 Discord를 이용한 local_integration이다. 실제 PostgreSQL 다중 연결 잠금,
 전역 429의 다중 프로세스 경쟁, 실제 Gateway replay/Discord 메시지 순서는 blocked(T16b)다.
+
+5차의 지적 4개에 회귀 22개를 추가해 **163/163**를 확인했다. 경보 service_ids(초기 thread·요약·후속·병합·대조),
+1/15/60/120초 템플릿 시간창, task/chat의 event_order 경계·20건/32KiB, 150건 복구를 포함한다.
+복구 커서 지적은 [문서 판정](DISCORD_RECOVERY.md)에 따라 기존 after 전진을 유지했고,
+별도 최초 checkpoint=null 경로는 after=0으로 수정했다. 문서·소스 읽기만 허용받아 수행했으며 Discord API는 호출하지 않았다.
+첫 check/test는 신규 mock 반환형 오류로 build 단계에서 실패했다. 수정 후 162개 중 sending fixture의 lease_until 누락으로
+1개 실패했고, 유효한 lease 기한을 구성하고 claim 후 병합의 재인가 회귀를 더한 뒤 전체 163개가 통과했다. migration 006은 재적용·기존 경보 차단/감사도 검사했다.
+모든 서버 응답은 모의이며 실제 Discord의 after 선택 범위·서비스 철회 경합·PostgreSQL 다중 연결은 blocked(T16b)다.

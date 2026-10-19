@@ -24,7 +24,9 @@ export class AlertIngress {
     if (supported.length < alert.alerts.length) await this.store.audit('alert_ignored', key,
       { reason: 'unsupported_labels', count: alert.alerts.length - supported.length });
     if (!supported.length) return;
-    const fingerprint = createHash('sha256').update(JSON.stringify([alert.status, supported.map(a => a.fingerprint).sort()])).digest('hex');
+    const services = [...new Set(supported.map(a => a.labels.service!))].sort();
+    const fingerprint = createHash('sha256').update(JSON.stringify([alert.status,
+      supported.map(a => JSON.stringify([a.fingerprint, a.labels.service])).sort()])).digest('hex');
     await this.store.db.transaction(async tx => {
       await tx.query(`INSERT INTO controls VALUES ('alert_admission','false') ON CONFLICT DO NOTHING`);
       await tx.query(`SELECT * FROM controls WHERE key='alert_admission' FOR UPDATE`);
@@ -33,7 +35,7 @@ export class AlertIngress {
       const old = (await tx.query<{ fingerprint: string; conversation_id: string | null; count: number; delivery_key: string | null }>('SELECT * FROM incidents WHERE group_key=$1 FOR UPDATE', [key])).rows[0]!;
       const previous = (await tx.query<{ state: string }>('SELECT state FROM outbox WHERE idempotency_key=$1', [old.delivery_key])).rows[0];
       // Unknown may already exist remotely; reconcile it rather than create a duplicate thread.
-      const pendingThread = (await tx.query<{ payload: { content: string } }>(`SELECT o.payload FROM outbox o
+      const pendingThread = (await tx.query<{ id: string; payload: { content: string } }>(`SELECT o.id,o.payload FROM outbox o
         JOIN events e ON e.id=o.payload->>'content' WHERE e.payload->>'group'=$1
         AND o.payload->>'kind'='thread' AND o.state IN ('pending','sending','unknown')
         ORDER BY e.event_order DESC LIMIT 1`, [key])).rows[0];
@@ -47,13 +49,14 @@ export class AlertIngress {
         const deliveryKey = `alert:${key}:${fingerprint}:${old.count + 1}`;
         await tx.query('UPDATE incidents SET delivery_key=$2 WHERE group_key=$1', [key, deliveryKey]);
         await this.store.enqueue({ key: deliveryKey, actor: p.owner, scope: conversation.scope,
-          conversation: old.conversation_id, revision: p.revision,
+          conversation: old.conversation_id, revision: p.revision, services,
           payload: { kind: 'message', channel: conversation.scope.channel, content, classification: 'safe_summary' } }, tx);
         return;
       }
       if (pendingThread) {
         await tx.query('UPDATE events SET payload=$2 WHERE id=$1', [pendingThread.payload.content,
-          JSON.stringify({ command: 'alert', group: key, text: content })]);
+          JSON.stringify({ command: 'alert', group: key, text: content, services })]);
+        await tx.query('UPDATE outbox SET service_ids=$2 WHERE id=$1', [pendingThread.id, JSON.stringify(services)]);
         return;
       }
       const id = randomUUID();
@@ -62,11 +65,11 @@ export class AlertIngress {
         [conversationId, p.owner, JSON.stringify(scope), scope.channel, this.store.now()]);
       await tx.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,conversation_id,received_at,payload)
         VALUES ($1,'alertmanager',$1,$2,$3,$4,$5,$6,$7)`, [id, `alert:${key}:${fingerprint}:${old.count + 1}`, p.owner,
-        JSON.stringify(scope), conversationId, this.store.now(), JSON.stringify({ command: 'alert', group: key, text: content })]);
+        JSON.stringify(scope), conversationId, this.store.now(), JSON.stringify({ command: 'alert', group: key, text: content, services })]);
       const deliveryKey = `incident:${key}:${old.count + 1}`;
       await tx.query('UPDATE incidents SET delivery_key=$2 WHERE group_key=$1', [key, deliveryKey]);
       await this.store.enqueue({ key: deliveryKey, actor: p.owner, scope, conversation: conversationId,
-        revision: p.revision, payload: { kind: 'thread', channel: scope.channel, content: id, classification: 'safe_summary' } }, tx);
+        revision: p.revision, services, payload: { kind: 'thread', channel: scope.channel, content: id, classification: 'safe_summary' } }, tx);
     });
   }
 }

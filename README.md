@@ -47,12 +47,13 @@ REST는 `discordHttpApi(token, fetch)`를 주입한다. 직접 호출하지 않�
 
 `Postgres`에는 전용 DB/역할의 `pg.Pool`을 주입한다. `migrate()`는 빌드 결과에서 호출한다.
 운영 마이그레이션은 T16b의 Sync hook Job에서 실행한다. `001`은 초기 스키마, `002`는 철회 당시 정책 revision, `003`은 철회 ID·게시 일시 중지 상태, `004`는 결과별 서비스 접근 범위, `005`는 메시지 페이지 순서·경보 전달 키·기존 read 유형을 보완한다.
+`006`은 서비스 범위를 복원할 수 없는 기존 미전달 경보를 blocked로 두고 감사한다. 새 경보 수신은 서비스 범위를 가진 새 세대를 만든다.
 후속 티켓도 기존 파일을 변경하지 않고 expand/contract 후속 파일을 추가한다.
 
 ## 사용 계약
 
 허용 채널에서 멘션 또는 `/chat`으로 시작한다. `/read text:<template-id> target:<service-id>`는
-최근 60초의 승인 템플릿을 실행한다. `/task`는 모의 작업 레인 계약이다.
+최근 min(60초, 템플릿 상한)의 승인 템플릿을 실행한다. 시간창 상한은 유한한 1초 이상이어야 한다. `/task`는 모의 작업 레인 계약이다.
 `/read`는 독립 job으로 즉시 대기열에 들어가며, 후속 chat/read가 앞선 조회를 합치거나 폐기하지 않는다.
 활성 스레드 후속 메시지는 멘션 없이 받고, intent를 끄면 명령/버튼만 받는다. `/urgent`는 debounce를 건너뛴다.
 `/stop`, `/resume`, `/list`, `/cancel target:<job-id>`, `/retry target:<job-id>`,
@@ -66,6 +67,7 @@ ACK 전에 이벤트와 처리 경로(job 또는 outbox, 제어 결과)를 영�
 수락 여부는 단정하지 않으며 같은 이벤트 ID로 중복 작업을 만들지 않는다.
 ACK 응답 유실은 `ack_uncertain` 감사 기록을 남기고 이미 수락한 작업을 계속한다.
 상호작용 응답의 만료·유실은 처리 스레드/DM에 상태 확인 안내를 한 번 보낸다. 새 스레드는 생성 확인 뒤 안내한다.
+모델 맥락은 해당 job의 event_order 이하인 수락 이벤트만 포함한다. 후속 요청은 자기 job에서 처리한다.
 같은 이벤트 ID의 accepted 상태를 행 잠금 안에서 검사한다. 이미 수락했으면 종료하고,
 미수락 inbox는 저장된 입력으로 처리 경로를 다시 만들어 save 직후 종료·transaction rollback을 복구한다. 부모 채널은 구독하지 않으며 매번 멘션/명령이 필요하다.
 
@@ -93,7 +95,8 @@ Discord 401은 게시를 pending에 두며 자격 갱신 뒤 새 REST 어댑터�
 `ReadTransport`의 제한된 observation 형식으로 투영하는 연결은 T16b에서 실측하며,
 Secret·ConfigMap·환경변수 원문을 observation에 넣지 않는다.
 로그 원문은 내부 result에만 남고 공개 스레드에는 결정적인 상태 요약만 보낸다.
-결과 outbox의 service_ids를 게시·대조 직전에 재인가하므로 전달 대기 중 서비스 철회도 적용된다.
+결과와 경보의 outbox.service_ids를 게시·대조 직전에 재인가하므로 전달 대기 중 서비스 철회도 적용된다.
+경보 thread·초기 요약·후속 요약·대기 병합 모두 서비스 범위를 유지한다.
 조회 요약은 항목별 예산과 생략 건수를 표시해 미확인·권장 확인을 보존한다. 긴 /list는 모든 작업을
 독립적으로 유효한 JSON 배열 페이지로 나누며, 각 페이지의 nonce/marker는 서로 다르다.
 페이지는 한 transaction으로 저장하고 앞 페이지가 sent일 때만 다음 페이지를 게시한다.
@@ -118,3 +121,6 @@ T17의 GitHub 리뷰·설치/저장소 게이트와 PR 대조, T18의 실제 작
 T20의 기억·예약 실행은 구현 범위 밖이다. 스키마의 예약 행은 보존만 하며 아직 실행하지 않는다.
 DM과 브리핑 시각은 사용자 결정 전 `null`이다. 상세 결정과 증거 범위는
 [ARCHITECTURE](docs/ai-bot/ARCHITECTURE.md), [VERIFICATION](docs/ai-bot/VERIFICATION.md)에 있다.
+
+복구 after 커서의 정렬/선택 범위 판정과 문서 근거는 [DISCORD_RECOVERY.md](docs/ai-bot/DISCORD_RECOVERY.md)에 있다.
+checkpoint가 없을 때도 after=0을 명시해 최초 페이지를 건너뛰지 않는다. 서버 실측은 T16b다.

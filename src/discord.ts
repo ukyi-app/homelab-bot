@@ -137,6 +137,10 @@ export function deliveryMarker(row: Delivery): string {
 export class DiscordPublisher {
   constructor(private readonly store: Store, private readonly gate: PolicyGate, private readonly rest: DiscordRest) {}
   private async authorized(row: Delivery): Promise<void> {
+    // Alert coalescing may have replaced the scope since this delivery was claimed.
+    const current = (await this.store.db.query<{ service_ids: string[] }>('SELECT service_ids FROM outbox WHERE id=$1', [row.id])).rows[0];
+    if (!current) throw new Denied();
+    row.service_ids = current.service_ids;
     const policy = await this.gate.authorize(row.owner_id, row.scope);
     if (!row.service_ids.every(service => policy.services.includes(service))) throw new Denied();
     row.policy_revision = policy.revision;
@@ -206,8 +210,8 @@ export class DiscordPublisher {
         await store.db.query(`INSERT INTO controls VALUES ('alert_admission','false') ON CONFLICT DO NOTHING`);
         await store.db.query(`SELECT * FROM controls WHERE key='alert_admission' FOR UPDATE`);
       }
-      const current = (await store.db.query<{ state: string }>(
-        'SELECT state FROM outbox WHERE id=$1 AND lease_token=$2 FOR UPDATE', [row.id, row.lease_token])).rows[0];
+      const current = (await store.db.query<{ state: string; service_ids: string[] }>(
+        'SELECT state,service_ids FROM outbox WHERE id=$1 AND lease_token=$2 FOR UPDATE', [row.id, row.lease_token])).rows[0];
       if (!current || !['sending', 'unknown'].includes(current.state)) return;
       if (row.payload.kind === 'thread') {
         const scope: Scope = { ...row.scope, kind: 'thread', parent: row.scope.channel, channel: externalId };
@@ -221,7 +225,7 @@ export class DiscordPublisher {
           const key = `incident-summary:${row.id}`;
           await store.db.query('UPDATE incidents SET conversation_id=$2,delivery_key=$3 WHERE group_key=$1', [event.payload.group, id, key]);
           await store.db.query('UPDATE events SET accepted=true WHERE id=$1', [row.payload.content]);
-          await store.enqueue({ key, actor: row.owner_id, scope, conversation: id, revision: row.policy_revision,
+          await store.enqueue({ key, actor: row.owner_id, scope, conversation: id, revision: row.policy_revision, services: current.service_ids,
             payload: { kind: 'message', channel: externalId, content: event.payload.text, classification: 'safe_summary' } });
         } else await store.accept(row.payload.content, event.payload.command === 'task' ? 'task' : event.payload.command === 'read' ? 'read' : 'chat', row.policy_revision,
           event.payload.urgent || event.payload.command === 'urgent');
