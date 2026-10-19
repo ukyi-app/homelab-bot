@@ -1,7 +1,8 @@
-# homelab-bot 설정 초안 (DISCOVERY, 2026-10-18)
+# homelab-bot 설정 예시 (FOUNDATION 로컬 계약, 2026-10-19)
 #
 # 이 파일은 비밀값이 없는 예시다. 실제 값은 넣지 않는다.
-# - 바탕: 봇 문서 00-start.md §8 "초기 설정 예시". 00 §8에 있는 키는 모두 이 파일에도 있고 값이 같다.
+# - 바탕: 봇 문서 00-start.md §8 "초기 설정 예시". T16a가 정한 세부는 ARCHITECTURE §11을 따른다.
+# - 이 YAML은 문서용 구성이다. 로컬 코드는 typed 생성자와 DEFAULTS를 쓴다. 배포 설정 로더는 T16b다.
 #   T15 결정 반영에서 00 §8도 확정 키를 이 파일과 같은 값으로 채웠다. 원래 초안 기본값이 바뀐 키는
 #   message_content_intent 하나다(unverified → enabled, D-17). 그 밖에 DISCOVERY가 찾은 키를 더했다.
 # - null은 미결정이거나, 확정됐지만 설계에 값 이름이 없는 키다(주석에 확정 내용. 예: auto_merge_scope).
@@ -92,8 +93,8 @@ github:
 codex:
   engine: codex
   adapters_to_verify: [herdr, official_codex_interface]  # 00 §8 원래 값. DISCOVERY 결과: herdr는 봇 경로에서 제외
-  adapter: null                               # 제안: exec(codex exec --json). app-server는 실험 후보
-  pinned_version: null                        # 제안: codex-cli 0.163.0 기준으로 고정. T16a(대화 레인)·T18에서 확정
+  adapter: exec                               # T16a 확정 계약. 실제 프로세스 호출은 T16b·T18
+  pinned_version: "0.163.0"                    # T16a: npm stable 확인, 패키지만 설치. 실제 CLI 호출 없음
   # 개인 CODEX_HOME 전체(목록은 00 §8 주석)는 자동 탐색하지 않고, 쓰거나 복사하지 않는다(01 §6, D-14)
   auth: chatgpt_subscription                  # D-14 확정(사용자 2026-10-18, T15): 봇 전용 ChatGPT 구독 계정. 에이전트 추천(API 키)과 다름
                                               # T17 차단 조건(확정(사용자 2026-10-18, PR #3 리뷰)): OpenAI 허용 확인이나 API 키 등 공식 지원 인증 전환 뒤에만
@@ -110,7 +111,7 @@ codex:
                                               # cancelled, 확인 못 하면 unknown·새 실행 차단 [가정], T18(ARCHITECTURE §4)
                                               # 정상·실패·시간 초과 종료 때도 같은 정리. 막힘 해제는 파드 재생성 뒤 프로세스 0개 확인이나 owner 명령
     resume_task: null                         # 제안: when_session_files_persist. 같은 작업의 세션만. 세션 저장 공간은 작업마다 나눈다 [가정], T18(ARCHITECTURE §5.1)
-  shell_environment_inherit: null             # 제안: none. 기본값은 KEY·SECRET·TOKEN 변수를 모델 명령에 넘긴다
+  shell_environment_inherit: none            # T16a 작업자 계약. 실제 CLI 격리는 T16b·T18
   authorized_task_ids: []
   unattended_operational_approval: false
 
@@ -119,9 +120,9 @@ homelab:
   services: []
   namespaces: []
   allowed_query_templates: []                 # Grafana Viewer가 모든 데이터소스를 질의할 수 있어 이 목록이 로그 제외의 경계다
-  query_window_max:                           # R05 시간창 상한. T16a에서 정한다(예: 로그는 시간 단위). 보존 기간과 같으면 아무것도 막지 않는다
-    metrics: null
-    logs: null
+  query_window_max:                           # T16a R05 시간창 상한, 초 단위. 보존 기간과 별개
+    metrics: 21600                            # T16a: 초, 6시간 상한
+    logs: 3600                                # T16a: 초, 1시간 상한
   data_retention_days:                        # 참고값: 설계 C.3.7 보존 기간. 질의 상한이 아니다
     metrics: 30
     logs: 14
@@ -129,28 +130,30 @@ homelab:
 
 safety:
   publisher_separate_from_worker: true
-  model_credentials_only_in_worker: null      # 제안: true(ARCHITECTURE 방안 1). 대화 레인 경로는 T16a
+  model_credentials_only_in_worker: true      # T16a: 방안 1 확정, 대화·작업 합산 직렬 1
   execute_untrusted_pr_code_by_default: false
   public_output_from_private_source: deny_without_declassification
   allow_policy_self_edit: false
-  runtime_policy_source: null                 # 제안 [가정], T16a: mounted_secret_file(바뀌면 다시 읽음, ARCHITECTURE §6).
+  runtime_policy_source: mounted_secret_file  # T16a 확정. 매 접근 재읽기. 실측·마운트는 T16b
                                               # 공유 차트 변경 필요(설계 C.4.5는 env만)
-  runtime_policy_max_age_seconds: null        # T16a. 현재 revision을 확인할 수 없거나 이 나이를 넘으면 거부(실패 시 닫힘)
+  runtime_policy_max_age_seconds: 300         # T16a. trusted updater의 원본 revision 확인 시각 기준. updater 연결은 T16b
                                               # Infisical에서만 철회하면 ESO 갱신 주기만큼 통과할 수 있다. 즉시 철회는 owner 거부 목록 명령으로만
-                                              # (owner ID 검사 슬래시 명령, 모델 경유 없음, 거부 추가만. 해제는 owner 명령이나 Infisical 새 revision 확인 뒤)
-  worker_control_auth: null                   # 제안: 게시 서버가 요청마다 서명한 단기 capability. 결정은 T16a·T18(DECISIONS D-15 "작업자 제어 끝점")
+                                              # (owner ID 검사 슬래시 명령, 모델 경유 없음, 거부 추가만. 해제는 새 revision·철회 이후 확인·owner/scope 허용·revocationRestores에 해당 denial_id 명시가 모두 필요)
+  worker_control_auth: ed25519_capability     # T16a: 30초, job·lease·operation·body 결합. 영속 nonce 저장소는 T16b
 
 health:
-  readiness_scope: null                       # 제안: receivers_and_db. 수신기가 요청을 영속 저장할 수 있는지(DB 연결 등)만. Gateway·큐 지연은 넣지 않는다(ARCHITECTURE §8 (a))
-  gateway_alert: null                         # 제안: Gateway 연결 gauge + 봇 전용 룰(ARCHITECTURE §8 (c)). 지표 이름은 T16a, 룰 이름·지속 시간은 T08b
-  heartbeat_check: null                       # 제안: healthchecks_io 봇 전용 체크(ARCHITECTURE §8 (b))
-                                              # 대안: Gateway가 최근 N분 연결돼 있을 때만 ping. 채택 여부와 N은 T16a(ARCHITECTURE §8 "대안")
+  readiness_scope: receivers_and_db          # T16a: 두 수신기 + DB 쓰기. Gateway·모델·큐 제외
+  gateway_alert: homelab_bot_gateway_connected # T16a 지표. 스크레이프·경보 룰은 T16b
+  heartbeat_check: healthchecks_io            # T16a 계약. 실제 체크는 T16b
+  heartbeat_interval_seconds: 60              # 조율 루프 최근 60초 동작 조건
+  heartbeat_gateway_grace_seconds: 300        # Gateway 최근 5분 연결 조건, T16a 채택
 
-budgets:                                      # 제안 초기값은 ARCHITECTURE §9. T16a·T16b에서 측정 뒤 정한다
+budgets:                                      # T16a 계약은 ARCHITECTURE §11. 실측 조정은 T16b
   max_concurrent_jobs: 1                      # D-14 조건 3, 확정. 작업자의 모델 호출(대화·작업 레인 합계) 직렬 1개
-  max_duration_seconds: null
-  max_tool_calls: null
-  max_retries: null
+  max_duration_seconds: 1800                 # T16a 작업 레인 계약
+  chat_duration_seconds: 60                   # 대화 레인 계약
+  max_tool_calls: 8                          # T16a 계약, 실제 실행 카운터는 T18
+  max_retries: 2                             # 확인된 실패만. unknown은 0
   model_plan: null                            # D-14 A. Plus 또는 Pro, 사람이 봇 계정을 준비할 때 고른다
 
 retention:
@@ -175,7 +178,8 @@ secret_keys:
     - GRAFANA_READER_TOKEN
     - ARGOCD_READER_TOKEN
     - HEALTHCHECKS_PING_URL
-    - RUNTIME_POLICIES                        # 허용 목록·runtime policy 실제 값(JSON). 마운트한 Secret 파일로 읽기는 제안 [가정], T16a.
+    - WORKER_CONTROL_PRIVATE_KEY              # T16a Ed25519. 작업자에는 공개 키만 설정으로 전달
+    - RUNTIME_POLICIES                        # 허용 목록·runtime policy 실제 값(JSON). T16a 마운트 파일 계약
                                               # 공유 차트 변경 필요(설계 C.4.5는 env만)
   worker:                                     # Infisical /apps/homelab-bot/worker (작업자만, 모델 자격 하나)
     - CODEX_AUTH_JSON                         # 이름 제안. D-14 A의 시드 auth.json. 영속 CODEX_HOME에 없을 때만 시드로 쓴다

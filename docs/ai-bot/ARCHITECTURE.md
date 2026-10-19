@@ -1,7 +1,7 @@
-# ARCHITECTURE: 봇 V1 구조 제안
+# ARCHITECTURE: 봇 V1 구조와 FOUNDATION 로컬 계약
 
-- 단계: `TARGET=V1`, `STAGE=DISCOVERY`, `MODE=plan` (homelab 티켓 T15). 작성일 2026-10-18. 초안.
-- **상태: 설계 제안이다.** 코드도 배포도 없다. D-14~D-17·D-24는 확정(사용자 2026-10-18, T15)이고 이 문서는 그 결정을 따른다([DECISIONS.md](DECISIONS.md)). D-14가 에이전트 추천(B, API 키)과 달라 대화 레인, 자격 배치, 예산을 구독 인증에 맞췄다(§2, §5, §5.1, §9). 대화 레인의 호출 경로와 동시성의 최종 값은 T16a가 정한다. R08 연결 방식은 T18에서 다시 판단한다(보류).
+- 단계: `TARGET=V1`, `STAGE=FOUNDATION`, `MODE=build` (T16a), 갱신 2026-10-19.
+- **상태: 로컬 코드·mock/local_integration 검증, 실연동·배포 대기.** T15 설계 중 T16a가 확정한 부분은 §11이 기준이다. §1~10의 T16a 미정·제안 표시는 당시 기록이며 §11의 결정으로 대체한다. T17~T20의 열린 항목은 유지한다. D-14~D-17·D-24는 [DECISIONS.md](DECISIONS.md)를 따른다.
 - 근거 꼬리표는 [DISCOVERY.md](DISCOVERY.md)와 같다. 확인일은 모두 2026-10-18이라 꼬리표마다 다시 적지 않는다.
 - 기준: 역할 경계는 `01` §1, 보안 경계는 `00` §6, 공통 계약은 `01` §2(F01~F09), 플랫폼 자리는 platform/design.md C.8. 이 문서는 이것들을 바꾸지 않는다.
 
@@ -44,7 +44,7 @@
 - 게시 서버가 닿는 클러스터 안 목적지는 `platform/bot-slot`이 연 셋(작업자 Service, Grafana, `argocd-server`)과 PostgreSQL뿐이다. vmsingle·VictoriaLogs·Alertmanager API에는 닿지 않는다 [확인: 설계 C.8]. Kubernetes API는 노드 로컬 경로라 읽기 전용 SA가 경계다.
 - 게시 서버의 인터넷 443은 공유 차트 규칙(IPv4, 사설·tailnet 대역 제외)을 따른다. Discord·GitHub·healthchecks.io 호출이 여기로 나간다 [확인: 설계 C.4.5 / IPv4만으로 되는지는 미확인, T16b].
 - replicas 1인 이유: Discord Gateway는 shard 하나에 연결 하나이고, 큐 소비의 중복을 lease로만 막기보다 단일 소비자가 단순하다 [가정]. 재시작 중 짧은 공백은 §7의 대조로 메운다.
-- 대화 레인을 `codex exec`로 두는 것은 D-14 A의 출발점 제안이다 [가정]. 호출 경로와 동시성의 최종 값은 T16a가 정한다(T16a 할 일 6).
+- T16a 확정: 대화도 작업자 Service:8080 → `codex exec` 계약을 따른다. 합산 모델 동시성은 1이다. 로컬 실행은 모의 작업자이며 실제 CLI 호출은 T16b다(§11).
 
 ## 2. 구현 방안 비교 (최대 2개)
 
@@ -60,7 +60,7 @@
 | 운영 단순성 | 대화 한 번에 홉 하나가 더 있다 | 대화 경로가 짧다 |
 | D-14 영향 | 대화 레인도 `codex exec`를 쓴다. API 직접 호출보다 느릴 수 있다 [가정]. 모델 호출이 작업 레인과 직렬이라 긴 작업 중 대화가 기다린다(§5.1) | 대화와 작업이 다른 사본을 쓰면 직렬 대기는 없다. 대신 위 자격 문제가 생긴다 |
 
-**추천: 방안 1.** `00` §6 "모델 vs 게시"를 프로세스 경계로 지키고, 설계 C.8의 "작업자 자격 하나"를 그대로 쓴다. 대화 레인 지연과 직렬 대기 시간은 T16a(모의)·T16b에서 측정한다 [미확인].
+**T16a 선택: 방안 1.** `00` §6 "모델 vs 게시"와 D-14의 자격 사본 하나·직렬 실행을 유지한다. 모의 지연 검증과 실측 계획은 §11이다. 실제 자격·프로세스 격리는 아직 미검증이다.
 
 고르지 않은 것:
 
@@ -72,8 +72,8 @@
 
 | 영역 | 제안 | 근거 | 확정 시점 |
 |---|---|---|---|
-| 언어·런타임 | TypeScript, Bun 1.4.3. **Bun 전용 API(`Bun.*`)는 쓰지 않는다** | NUC 설치본이다 [실측: `bun --version`]. discord.js 공식 Bun 템플릿이 있다 [확인: https://github.com/discordjs/discord.js (이슈 #11346)]. 전용 API를 피하면 Node 24로 바로 옮길 수 있다 | T16b 단절 시험이 실패하면 Node 24 [가정] |
-| Discord | `@discordjs/core` + `@discordjs/rest` + `@discordjs/ws`(캐시 없음, 상태 원본은 PostgreSQL). 대안 `discord.js` 14.27.0 | 둘 다 같은 ws·rest 계층이라 Bun 위험은 같다 [실측: 패키지 의존] | T16a |
+| 언어·런타임 | TypeScript 7.0.2, **Node 24.22.0** | T16a 선택. DISCOVERY의 Node 24 대안과 로컬 검증 환경 유지. Bun 재연결 위험을 분리하며 Bun은 채택하지 않음 | T16a 확정, 실연동 T16b |
+| Discord | **`DiscordProtocol` + 주입 REST(`discordHttpApi`)**. SDK 캐시 없이 PostgreSQL을 상태 원본으로 사용 | T16a는 Gateway frame 정규화·REST·history·게시 대조를 직접 계약 시험. `@discordjs/*`는 채택하지 않음 | T16a 어댑터 확정. 인증된 WebSocket 세션·heartbeat·RESUME 연결 구현은 T16b |
 | Discord intents | `GUILDS` + `GUILD_MESSAGES` + `DIRECT_MESSAGES` + `MESSAGE_CONTENT` = 37377. intent를 끄면 4609와 명령/버튼 모드. DM을 쓰지 않으면 `DIRECT_MESSAGES`를 뺄 수 있다 [가정] | [실측: discord.js bitfield], D-17 확정 | DM 여부는 T16a, 실연동 T16b |
 | GitHub | App JWT → 작업마다 저장소 하나·필요 권한만의 1시간 설치 토큰. webhook은 원본 바이트 HMAC 상수 시간 비교 | [확인: https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app , https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries] | T17 |
 | Codex | codex-cli 버전 고정(0.163.0 기준), `codex exec --json -o --output-schema`. JSONL fixture 계약 시험. 인증은 작업자 전용 CODEX_HOME의 `auth.json`(D-14) | [확인: https://learn.chatgpt.com/docs/non-interactive-mode / 실측: `codex exec --help`] | 대화 레인 T16a, 작업 레인 T18 |
@@ -188,8 +188,8 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 - 제안 [가정], T16a: runtime policy는 환경 변수가 아니라 마운트한 Secret 파일로 읽고, 파일이 바뀌면 다시 읽는다. 환경 변수는 파드를 다시 시작해야 반영된다 [확인: 설계 C.6.5]. 공유 차트 변경이 필요하다. 설계 C.4.5는 Secret을 키마다 환경 변수로만 넣는다 [확인: 설계 C.4.5]. 차트 대신 봇 쪽 추가 매니페스트로 할 수도 있다(T16a·T16b).
 - 정책에 revision과 최대 나이를 둔다. 나이는 그 revision이 현재 값임을 마지막으로 확인한 때부터 잰다. 현재 revision을 확인할 수 없거나 최대 나이를 넘으면 접근을 거부한다. 확인 방법은 [미확인]이고 T16a에서 정한다.
 - **남는 창:** Infisical에서만 철회하면 ESO 갱신 주기만큼 통과할 수 있다. 즉시 철회는 owner 거부 목록 명령으로만 된다. 위 확인 방법이 Infisical 원본 revision과 대조할 수 있는지는 [미확인]이다.
-- owner의 즉시 철회 명령은 봇 DB 거부 목록에 바로 쓰여 ESO 동기화 전에도 효력이 있다. 거부 목록은 동기화를 기다리는 동안의 장치이고, 원본은 Infisical 정책이라 거기서도 지운다.
-- 즉시 철회 명령의 경계: owner ID로 검사하는 슬래시 명령이고, 모델을 거치지 않으며, 거부를 더할 수만 있다. 해제는 owner 명령으로 하거나, Infisical 새 revision을 확인한 뒤에 한다. 그래서 `01` §10 비목표 "모델의 정책 자기 수정"(설정 `allow_policy_self_edit: false`)과 부딪히지 않는다 [가정].
+- owner의 즉시 철회 명령은 봇 DB 거부 목록에 바로 쓰여 ESO 동기화 전에도 효력이 있다. 거부 목록은 원본 정책 동기화와 별개로 명시적인 해제 확인까지 유지한다. 원본 Infisical 정책에서도 해당 권한을 철회한다.
+- 즉시 철회 명령의 경계: owner ID로 검사하는 슬래시 명령이고, 모델을 거치지 않으며, 거부를 더할 수만 있다. T16a 해제는 철회 시각 이후 확인한 Infisical 새 revision이 해당 owner·scope를 허용하고, 사람이 DB의 해당 `denial_id`를 정책 `revocationRestores` 목록에 명시했을 때만 한다. 무관한 서비스 추가·revision 변경은 해제하지 않는다. 매 철회마다 새 ID를 발급하므로 이전 승인으로 새 철회를 풀 수 없다. 같은 revision의 재확인은 해제하지 않고 별도 owner 해제 명령은 없다. 그래서 `01` §10 비목표 "모델의 정책 자기 수정"(설정 `allow_policy_self_edit: false`)과 부딪히지 않는다 [가정].
 - 큐에 든 작업, 예약, 기억 접근, 질문 답도 실행 직전에 같은 검사를 다시 한다(AUTH-02).
 - **대가:** Infisical이나 ESO가 최대 나이보다 오래 멈추면 owner도 거부된다. 최대 나이는 이 대가와 철회 지연을 함께 보고 정한다.
 
@@ -210,7 +210,7 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 
 | 출처 | 대조 방법 | 한계 |
 |---|---|---|
-| Discord | RESUME 성공이면 재생. 새 IDENTIFY면 구독 스레드마다 마지막 처리 메시지 이후를 `GET /channels/{id}/messages?after=`로 읽는다. 한 번에 최대 100건이라 저장한 체크포인트부터 페이지를 이어 읽어 빈틈이 없을 때까지 반복하고, 정해진 복구 한도(쪽 수·시간, 값은 T16a)를 넘으면 그 스레드를 `gap` 상태로 기록하고 작업을 진행하지 않는다 [가정] | 새 IDENTIFY 때 놓친 이벤트 재생 여부는 문서에 없다. 보관된 스레드는 연결 때 동기화되지 않으므로 구독 목록 원본은 봇 DB다 |
+| Discord | RESUME 성공이면 재생. 새 IDENTIFY면 구독 스레드마다 마지막 처리 메시지 이후를 `GET /channels/{id}/messages?after=`로 읽는다. 한 번에 최대 100건이라 저장한 체크포인트부터 페이지를 이어 읽어 빈틈이 없을 때까지 반복하고, 정해진 복구 한도(100건×10쪽/30초, T16a §11)를 넘으면 그 스레드를 `gap` 상태로 기록하고 작업을 진행하지 않는다 [가정] | 새 IDENTIFY 때 놓친 이벤트 재생 여부는 문서에 없다. 보관된 스레드는 연결 때 동기화되지 않으므로 구독 목록 원본은 봇 DB다 |
 | GitHub | 허용 저장소의 열린 PR을 주기적으로 읽어 처리 기록과 대조. 대조 키는 `01` §5의 세대 구분과 같은 `(head_sha, comparison_revision, policy_revision)`이다. head가 같아도 기록된 base·`comparison_revision`이 현재와 다르면(base 브랜치가 앞서감, base 재지정) 새 세대로 보고 이전 결과를 `superseded`로 둔다(REVIEW-02). webhook 트리거에도 `pull_request` `edited` 중 base가 바뀐 경우(재지정)를 넣는다(DECISIONS D-16 규칙 스케치). 새 설치 직후 과거 PR을 무제한 리뷰하지 않는다 | 실패한 webhook은 자동 재전송되지 않고 수동 재전송은 3일 안만 된다. base 브랜치가 앞서가기만 하면 리뷰 App이 받는 PR 이벤트가 없어 폴링이 잡는다 [가정]. `comparison_revision`을 무엇으로 둘지(base 브랜치 머리 또는 merge base), base만 움직였을 때 다시 리뷰할지 결과만 `superseded`로 표시할지는 모델 호출 직렬 1(D-14)을 보고 T17에서 정한다 |
 | Alertmanager | 그룹화·반복 전송에 기댄다. 수신 실패는 Alertmanager 지표에 남는다 | 봇이 놓친 경보는 Telegram 경로가 따로 받는다 |
 | 작업자 | 작업자 파드가 사라지면 `running` 작업을 `unknown`으로. CODEX_HOME은 영속 공간이라 세션 파일이 남을 수 있고, 재개 여부는 사람이 고른다 | 작업 공간(코드)은 영속이 아니다 [가정]. 영속 공간은 설계 C.8 변경이고 C.8 격리 행·E4b에 들어갔다(크기·백업은 T08b) |
@@ -268,3 +268,120 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 - runtime policy의 현재 revision 확인 방법과 최대 나이(§6 "허용 목록 반영") [T16a].
 - 삭제 원장의 저장소·자격·보존, 쓰기 순서와 부분 실패 처리(§7) [T20].
 - R08 연결 방식 [T18].
+
+## 11. T16a 확정 계약과 로컬 구현 (2026-10-19)
+
+이 절은 T16a 범위의 구현 선택이다. 새로운 사용자 결정을 만들지 않으며, DM·브리핑 시각은
+호출자가 답을 받을 때까지 `null`이다. 운영 상태를 뜻하지 않는다.
+
+### 호출 경로·직렬 대기·측정
+
+Discord Gateway → `DiscordProtocol` → `DiscordIngress` → PostgreSQL 이벤트 저장 →
+처리 경로(job/outbox/제어 결과) 영속 저장 → 수신 ACK → `Runtime` → 서명 capability를 붙인 작업자 Service:8080의 `/v1/execute` →
+`SerialWorker` → `codex exec` 계약 → 구조화 결과 → `results/outbox` → `DiscordPublisher`다.
+`/read`는 모델을 부르지 않고 승인 템플릿 조회를 실행한다. 실제 Gateway 연결 루프·모델 프로세스는 T16b다.
+런타임은 Node 24.22.0이며, Discord 클라이언트는 SDK 없이 주입 가능한 `DiscordProtocol`을 선택했다.
+인증된 WebSocket 세션은 T16b에서 이 어댑터에 연결하고 재연결·RESUME를 실측한다.
+
+작업자 모델 호출은 **대화·작업 레인 합쳐 1개**다. DB의 scheduler 행 잠금과 작업자의 별도 mutex가
+중복 실행을 막는다. lease가 끝나거나 호스트 결과를 모르면 `unknown`이 전체 모델 슬롯을 잡는다.
+한도·인증 만료는 `waiting_user` + `model_limit/auth_expired`, 스케줄러 정지이며 자동 인증 전환은 없다.
+긴 작업 중 수신·저장 ACK·조회 없이 가능한 제어 명령은 계속 처리한다. 실행 중 작업을 대화가 선점하지 않는다.
+실제 모델 답변은 직렬 대기하므로 대화의 즉시 답변을 보장하지 않는다. 파드 분리는 T18의 판단이다.
+
+`audit.kind=model_timing`에 `queueWaitMs=started_at-created_at`, `executionMs=종료-started_at`을 남긴다.
+로컬 시험은 모의 작업이 실행 중인 동안 두 번째 대화의 ACK가 도착하고 두 번째 모델 호출이 없음을 확인한 뒤,
+가상 시계 5초를 전진하고 첫 작업을 끝낸다. 두 번째 호출의 기록된 대기가 **5초 이상**인지 검증한다.
+이는 실제 모델 지연의 측정값이 아니다. T16b는 유휴 대화 30회와 긴 작업 중 대화 30회에서
+수신→저장 ACK, 큐 대기, 모델 실행, outbox 대기, 수신→최종 게시의 p50/p95/max와 표본 수를 기록한다.
+재연결·429·한도 대기는 따로 분류한다. 첫 ACK의 3초 제약, 아래 1500ms 저장 마감과 함께 실측하고
+목표를 못 맞추면 모델 동시성을 늘리지 않고 작업 시간·대화 안내·T18 레인 설계를 재검토한다.
+
+### 저장·권한·게시
+
+`001_foundation.sql`은 이벤트, 대화/구독, 작업, 결과/증거, outbox, 예약 기반, 감사, 거부 목록,
+사건 그룹을 정의한다. `002_denial_revision.sql`은 철회 당시 revision을 추가한다.
+`003_recovery_controls.sql`은 철회 ID와 outbox의 영속 일시 중지 사유·횟수를 추가한다.
+기존 revision/철회 ID 없는 거부 행은 자동 해제하지 않는다. T17·T18·T20은 후속 마이그레이션으로 확장한다.
+작업 상태는 `04` §3의 10개 값이며 작업 성공과 외부 전달 상태는 별도다.
+
+PostgreSQL transaction의 statement timeout은 **1500ms**, lock timeout은 **1000ms**다.
+ACK 전에 inbox와 처리 경로를 저장한다. 처리 경로 transaction 안에서 1500ms 마감을 검사하고,
+그 전에 실패하면 ACK하지 않고 `accepted=false`만 남긴다. commit 응답 유실은 실제 commit 여부가
+불확실하므로 수락 상태를 단정하지 않는다. 성공적으로 commit한 뒤 ACK 응답이 유실돼도 이미
+저장한 작업은 계속되고 `ack_uncertain`을 남긴다. 같은 ID는 중복 실행하지 않는다.
+Discord REST의 1초 전송 제한은 상호작용 첫 응답 3초에 맞춰 유지하며 작업 수락 여부와 분리한다.
+상호작용 ACK 만료·유실 때는 처리 스레드/DM에 요청이 저장됐으며 재전송 전에 `/list`를 확인하라는
+멱등 안내를 보낸다. 새 스레드는 생성 대조 뒤 안내한다. 같은 명령 문자열의 별도 요청을 자동 합치지 않는다.
+정상적인 반복 작업을 잃지 않으려는 선택이며, 안내 전에 사용자가 새 ID로 재전송할 중복 위험은 남는다.
+이벤트 payload는 검증된 사용자 입력만
+저장하고 상호작용 token·원문 헤더를 저장하지 않는다. 대화 맥락은 최근 **20건/32KiB**다.
+
+runtime policy는 파일을 접근마다 다시 읽는다. trusted updater가 원본 revision을 확인한 `confirmedAt`이
+**300초**를 넘거나 미래 시각이거나 파일/구조가 잘못되면 닫힌다. 파일을 읽었다는 이유로 freshness를 갱신하지 않는다.
+원본 확인 updater와 마운트 방식은 T16b에서 연결한다. ESO 동기화 지연 창은 남으며,
+owner의 `/revoke`가 영속 거부 목록에 즉시 추가한다. 실행·조회·게시 전에 현재 owner·scope를 재검사한다.
+누락·stale은 queued/pending을 보존한다. queued는 1초 뒤, pending은 1초부터 최대 60초까지
+지수 backoff한다. 일시 중지 사유·횟수는 DB에 남기고 감사는 사유 변화 때만 기록한다. 새 revision 자체로 거부하지 않는다.
+실제 권한 철회만 cancelled/blocked로 종료한다. 완료된 모델 결과는 게시 정책 확인을 기다리며 재실행하지 않는다.
+이미 인가해 실행 중인 모델은 정책 누락·stale만으로 중단하지 않고 lease heartbeat를 유지한다.
+모델은 게시 권한이 없고, 완료 결과의 게시·새 작업은 최신 정책을 다시 확인한다.
+실제 Denied·사용자 취소·예산 초과·lease 유지 실패는 중단을 요청한다. 확인된 실패는 실패 안내
+outbox를 함께 기록하고 종료 불확실만 unknown이다. 실제 철회된 수신자에게는 실패 안내도 게시하지 않는다.
+거부 목록 해제는 §6의 명시적 `revocationRestores` 승인과 새 revision/confirmedAt 조건을 모두 요구한다.
+Discord 401은 별도 오류로 pending을 유지한다. 토큰 갱신 후 새 REST 어댑터를 주입해 재개한다.
+
+부모 채널은 비활성이며 매번 멘션/명령이 필요하다. 활성 스레드만 멘션 없는 후속 메시지를 수집한다.
+스레드는 공개, 보관 시간 **1440분**이다. 모든 메시지/상호작용 응답의 `allowed_mentions.parse=[]`를 강제한다.
+outbox UUID별 멱등 키에서 24자 nonce와 게시 marker를 만든다. 응답 유실은 unknown으로 두고 게시자의 marker와
+스레드 이름을 제한 조회한다. 못 찾았다고 재게시하지 않는다.
+unknown 전달은 별도 **100건/24시간** 한도로 유지하며 초과·만료 시 감사 기록 후 blocked로 닫는다.
+경보 backpressure는 pending/sending만 센다. unknown 지표 경보 연결은 T16b다. Discord의 exactly-once를 보증하지 않는다.
+복구는 100건씩 **10페이지/30초**까지다. live 메시지 checkpoint를 갱신하고, 복구 중에는 `gap=true`로 작업을 막는다.
+한도를 넘으면 gap을 유지한다. 더 긴 누락의 수동 복구는 T16b 운영 절차로 정한다.
+
+### 조회·예산·작업자 제어
+
+읽기 템플릿은 service·datasource·namespace·고정 query·시간창·바이트·행 상한을 함께 가진다.
+상한은 상태 **5분**, 메트릭 **6시간**, 로그 **1시간**, 응답 **64KiB/200행**, 질의 문자열 **2000자**,
+요청 **5초**다. 템플릿은 더 작게 정할 수 있다. 보존 기간 30일/14일과 별개다.
+현재 사실은 5분 안의 관측이며 빈 응답·오래된 값·조회 실패는 미확인이다.
+공개 응답은 대상·출처·시간창·시각·사실/가설/미확인을 포함한다. 로그 원문은 게시하지 않는다.
+임의 질의·Secret·ConfigMap·pods/log/exec의 요청 이름과 추가 필드를 거부한다.
+라이브 API 응답 투영·플랫폼 권한 증거는 T16b다.
+
+기본 debounce **750ms**, urgent **0ms**, 큐 **100건**, lease **30초**, 대화 모델 **60초**,
+작업 레인 **1800초**, 도구 예산 **8회**, 확인된 실패의 사용자 재시도 **2회**다.
+FOUNDATION 모델 경로에는 실행 가능한 셸/도구 dispatch가 없다. 실제 도구 카운터·작업 실행은 T18 계약으로 구현한다.
+입력 오류는 수신 단계에서 거부한다. dispatch 전 확정 실패·작업자 실행 전 거부·중단 확인된 무효 출력은
+failed와 실패 안내로 남기고 모델 슬롯을 해제한다. 연결 수립 전의 ECONNREFUSED·ENOTFOUND·
+EAI_AGAIN·UND_ERR_CONNECT_TIMEOUT도 확정 실패다. ECONNRESET·응답 도중 단절은 unknown이다. dispatch 후 종료 불확실만 unknown이다.
+작업자 HTTP는 Node 24 내장 fetch와 호환하는 undici 7.30.1 Agent를 쓰고,
+headers/body timeout을 요청 예산 + 30초로 둔다. 호출자 예산·취소 신호는 그대로 적용한다.
+unknown은 자동 재시도 0회다. Discord 429는 retry_after를 지키고 총 3회 뒤 blocked다.
+IDENTIFY는 rolling 24시간 **900회**를 로컬 상한으로 두고 1000회 문서 한도에 여유를 남긴다.
+재연결 backoff는 1~60초 + 0~1초 jitter 계약이다. 실제 Gateway 연결 루프에 예산을 연결하는 것은 T16b다.
+
+작업자 제어 인증은 **Ed25519**다. 게시 서버에만 개인 키, 작업자에는 공개 키만 둔다.
+capability는 audience·operation·job·lease·body digest·발급/만료 시각에 묶이고 유효기간은 **30초**다.
+`execute`와 `cancel`을 구분하며 일회 사용 consume 저장소를 주입한다. 로컬은 메모리 모의이고,
+작업자 재시작 뒤에도 남는 nonce 저장소는 T16b에서 제공해야 한다. 게시 토큰·GitHub 자격은 worker 요청에 없다.
+작업자 코드 읽기는 고정 SHA의 codeload 압축본 두 개, baseline git init/commit은 **선언 계약만**이다.
+T16a 작업에서는 Git 초기화나 커밋을 실행하지 않았다. 실제 archive 안전 추출·diff·CLI 프로세스는 T18에서 검증한다.
+
+### readiness·중단 경보
+
+readiness는 두 수신기와 DB **쓰기 성공**만 본다. Gateway 연결, 모델 waiting, 큐 지연은 넣지 않는다.
+앱 수신 8080과 경보 수신 8081은 별도 HTTP 서버이며 Gateway 단절 시험 중에도 저장에 성공했다.
+`homelab_bot_gateway_connected`, `homelab_bot_outbox_oldest_seconds`, `homelab_bot_outbox_unknown`을 노출한다.
+service 없는 플랫폼 경보·미등록 service·지원하지 않는 severity는 제외 건수만 감사 후 202로 무시한다.
+혼합 그룹은 지원 항목의 fingerprint·건수만으로 계속 처리한다. 잘못된 요청 형식은 400이다.
+
+하트비트 대안은 **채택**한다. 조율 루프가 최근 **60초** 안에 돌고 Gateway가 최근 **5분** 안에 연결됐을 때만
+최소 **60초** 간격으로 ping한다. 기동 뒤 한 번도 연결되지 않았으면 ping하지 않는다.
+따라서 Gateway 룰 스크레이프가 준비되기 전에도 오래 단절된 봇의 ping이 멈춘다.
+실제 healthchecks 체크 생성·유예 시간·Telegram 도착·replicas 0은 T16b에서 확인한다.
+기존 Alertmanager→Telegram 경로는 이 코드에 의존하지 않는다.
+
+경보는 groupKey·fingerprint·상태로 중복을 합치고 사건 스레드에 결정적인 요약만 전달한다.
+알림에서 모델을 부르지 않는다. 반복 횟수는 DB에 남기고 수신 대기 상한을 넘으면 503으로 backpressure를 건다.
