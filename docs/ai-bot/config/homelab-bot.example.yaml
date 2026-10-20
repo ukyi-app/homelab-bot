@@ -60,7 +60,7 @@ discord:
   auto_archive_minutes: 1440                  # D-17 확정. 허용 값 60 | 1440 | 4320 | 10080
   briefing_time: "08:50"                     # 확정(사용자 2026-10-20, T16a). 위 timezone 기준, 매일
   message_content_intent: enabled             # D-17 확정: 켬. 00 §8 원래 초안 값은 unverified. 실연동 확인은 T16b
-  gateway_intents: null                       # 제안: 33281(GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT). DM 끔(T16a)이라 DIRECT_MESSAGES 뺌. intent를 끄면 4609
+  gateway_intents: null                       # 제안: 33281(GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT). DM 끔(T16a)이라 DIRECT_MESSAGES 뺌. MESSAGE_CONTENT를 끄는 fallback은 513(GUILDS|GUILD_MESSAGES)
   bot_permissions: null                       # 제안 309237763136. D-17 확정: ADMINISTRATOR·MANAGE_THREADS·MENTION_EVERYONE 없음, 허용 채널 overwrite로
   allowed_mentions_parse: []                  # D-17 확정. 모든 봇 메시지의 멘션 파싱 끔(모델 출력 속 @everyone 차단)
 

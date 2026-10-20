@@ -237,6 +237,7 @@ discord:
   allowed_channels: []                       # D-17: 채널 2개(대화, 알림·리뷰·브리핑). 실제 ID는 Infisical /apps/homelab-bot/에만
   allowed_users: []                          # D-17: owner 1명. 실제 ID는 Infisical /apps/homelab-bot/에만
   activation: explicit_mention_or_command    # D-17: 허용 채널에서 멘션 또는 / 명령으로 공개 스레드를 시작하고 스레드 안은 멘션 없이 처리. auto_archive 1440분. DM은 끔(확정(사용자 2026-10-20, T16a))
+  dm_enabled: false                          # 확정(사용자 2026-10-20, T16a). runtime policy의 dmEnabled. 켜려면 전역 명령(contexts BOT_DM)도 함께
   briefing_time: "08:50"                    # 확정(사용자 2026-10-20, T16a). R18, 매일, 시간대 Asia/Seoul
   message_content_intent: enabled            # D-17, 확정(사용자 2026-10-18, T15): 특권 intent 켬. 원래 초안 값은 unverified. 실제 토글과 동작은 아직 실측하지 않았다(실연동 확인은 T16b)
 github:
