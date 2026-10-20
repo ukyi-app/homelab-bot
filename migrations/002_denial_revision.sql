@@ -1,0 +1,4 @@
+BEGIN;
+ALTER TABLE denied_actors ADD COLUMN IF NOT EXISTS policy_revision text;
+INSERT INTO schema_migrations VALUES (2) ON CONFLICT DO NOTHING;
+COMMIT;
