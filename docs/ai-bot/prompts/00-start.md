@@ -208,7 +208,7 @@ platform/design.md, spec.md §1·§4.5·§5, homelab 저장소 현재 리비전�
 
 ## 8. 초기 설정 예시: 실제 비밀값 저장 금지
 
-아래 값은 프로젝트 코드의 확정 설정 스키마가 아니라 **DISCOVERY에서 채워야 할 계획 초안**이다. `null`은 미결정, 빈 허용 목록은 **모두 거부**를 뜻한다. T15에서 확정한 키(D-14~D-17, D-24)는 확정 값으로 채우고 주석에 결정 ID와 확정 표기를 단다. 값 이름은 봇 저장소 설정 초안 `docs/ai-bot/config/homelab-bot.example.yaml`과 같다. 결정 안에 남은 세부(D-17의 DM 허용 여부와 브리핑 시각은 T16a, D-24의 토큰 분리·ruleset E 여부·App 이름·설치 저장소는 T19, R08 연결 방식은 T18)는 `null`이나 빈 목록으로 둔다. 그 밖에 확정됐지만 설계에 값 이름이 없는 키는 `null`로 두고 주석에 확정 내용을 적는다(예: `auto_merge_scope`). 실수로 이대로 실서비스를 활성화하지 않도록 필수 값 검증 실패를 기본으로 한다. 주석의 결정 ID는 spec.md §5 기준이다. 새로 채운 값은 확정 결정(C-xx, 2026-10-18에 확정한 D-xx)과 플랫폼 설계 문서의 이름(설계 C.8)뿐이고, 미정(D-xx)에 걸린 새 키는 `null`이나 빈 목록으로 둔다. 원래 초안의 기본값(`review_identity` 등)은 그대로 두고 관련 결정만 주석으로 단다. 예외는 `message_content_intent` 하나로, D-17에 따라 원래 값 `unverified`를 `enabled`로 바꿨다. 허용 목록과 runtime-policies의 실제 값은 Infisical `/apps/homelab-bot/`에 두고, 봇 저장소(public)에는 키 이름만 둔다(D-13, 확정(사용자 2026-10-18, T14)).
+아래 값은 프로젝트 코드의 확정 설정 스키마가 아니라 **DISCOVERY에서 채워야 할 계획 초안**이다. `null`은 미결정, 빈 허용 목록은 **모두 거부**를 뜻한다. T15에서 확정한 키(D-14~D-17, D-24)는 확정 값으로 채우고 주석에 결정 ID와 확정 표기를 단다. 값 이름은 봇 저장소 설정 초안 `docs/ai-bot/config/homelab-bot.example.yaml`과 같다. 결정 안에 남은 세부(D-24의 토큰 분리·ruleset E 여부·App 이름·설치 저장소는 T19, R08 연결 방식은 T18)는 `null`이나 빈 목록으로 둔다. 그 밖에 확정됐지만 설계에 값 이름이 없는 키는 `null`로 두고 주석에 확정 내용을 적는다(예: `auto_merge_scope`). 실수로 이대로 실서비스를 활성화하지 않도록 필수 값 검증 실패를 기본으로 한다. 주석의 결정 ID는 spec.md §5 기준이다. 새로 채운 값은 확정 결정(C-xx, 2026-10-18에 확정한 D-xx)과 플랫폼 설계 문서의 이름(설계 C.8)뿐이고, 미정(D-xx)에 걸린 새 키는 `null`이나 빈 목록으로 둔다. 원래 초안의 기본값(`review_identity` 등)은 그대로 두고 관련 결정만 주석으로 단다. 예외는 `message_content_intent` 하나로, D-17에 따라 원래 값 `unverified`를 `enabled`로 바꿨다. 허용 목록과 runtime-policies의 실제 값은 Infisical `/apps/homelab-bot/`에 두고, 봇 저장소(public)에는 키 이름만 둔다(D-13, 확정(사용자 2026-10-18, T14)).
 
 ```yaml
 target: V1
@@ -236,8 +236,9 @@ discord:
   allowed_guilds: []                         # D-17, 확정(사용자 2026-10-18, T15): 봇 전용 개인 서버 하나. 실제 ID는 Infisical /apps/homelab-bot/에만
   allowed_channels: []                       # D-17: 채널 2개(대화, 알림·리뷰·브리핑). 실제 ID는 Infisical /apps/homelab-bot/에만
   allowed_users: []                          # D-17: owner 1명. 실제 ID는 Infisical /apps/homelab-bot/에만
-  activation: explicit_mention_or_command    # D-17: 허용 채널에서 멘션 또는 / 명령으로 공개 스레드를 시작하고 스레드 안은 멘션 없이 처리. auto_archive 1440분. DM 허용 여부는 T16a에서 정한다(미정)
-  briefing_time: null                        # 미정. T16a에서 정한다(R18, 기본 시간대 Asia/Seoul)
+  activation: explicit_mention_or_command    # D-17: 허용 채널에서 멘션 또는 / 명령으로 공개 스레드를 시작하고 스레드 안은 멘션 없이 처리. auto_archive 1440분. DM은 끔(확정(사용자 2026-10-20, T16a))
+  dm_enabled: false                          # 확정(사용자 2026-10-20, T16a). runtime policy의 dmEnabled. 켜려면 전역 명령(contexts BOT_DM)도 함께
+  briefing_time: "08:50"                    # 확정(사용자 2026-10-20, T16a). R18, 매일, 시간대 Asia/Seoul
   message_content_intent: enabled            # D-17, 확정(사용자 2026-10-18, T15): 특권 intent 켬. 원래 초안 값은 unverified. 실제 토글과 동작은 아직 실측하지 않았다(실연동 확인은 T16b)
 github:
   review_identity: dedicated_github_app      # D-16, 확정(사용자 2026-10-18, T15): 01 기본안(전용 리뷰 App + 격리 리뷰어 + 제한 게시 서버)
