@@ -149,7 +149,7 @@ capability는 발급 시각이 검증기보다 최대 1000ms 앞서는 것만 �
 
 T17의 GitHub 리뷰·설치/저장소 게이트와 PR 대조, T18의 실제 작업 실행·질문·재개·프로세스 격리,
 T20의 기억·예약 실행은 구현 범위 밖이다. 스키마의 예약 행은 보존만 하며 아직 실행하지 않는다.
-DM과 브리핑 시각은 사용자 결정 전 `null`이다. 상세 결정과 증거 범위는
+DM은 쓰지 않고(`dmEnabled: false`) 브리핑은 매일 08:50 Asia/Seoul이다(확정(사용자 2026-10-20, T16a)). 브리핑 실행은 T20이다. 상세 결정과 증거 범위는
 [ARCHITECTURE](docs/ai-bot/ARCHITECTURE.md), [VERIFICATION](docs/ai-bot/VERIFICATION.md)에 있다.
 
 복구 after 커서의 정렬/선택 범위 판정과 문서 근거는 [DISCORD_RECOVERY.md](docs/ai-bot/DISCORD_RECOVERY.md)에 있다.

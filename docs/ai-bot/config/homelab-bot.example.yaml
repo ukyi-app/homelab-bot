@@ -8,7 +8,7 @@
 # - null은 미결정이거나, 확정됐지만 설계에 값 이름이 없는 키다(주석에 확정 내용. 예: auto_merge_scope).
 #   빈 목록은 "모두 거부"다. 필수 값이 비면 시작을 거부하는 것이 기본이다.
 # - D-14~D-17, D-24는 확정(사용자 2026-10-18, T15)이다(DECISIONS.md). 확정 값은 값으로 적었다.
-#   결정 안에 남은 세부(D-17 DM·브리핑 시각은 T16a, D-24 세부는 T19, R08 연결 방식은 T18)는 null로 둔다.
+#   결정 안에 남은 세부(D-24 세부는 T19, R08 연결 방식은 T18)는 null로 둔다. D-17의 DM·브리핑 시각은 T16a에서 정했다(2026-10-20).
 #   "제안"이라고 적은 값은 에이전트 제안이고 담당 티켓에서 정한다.
 # - 허용 목록과 runtime policy의 실제 값, 비밀값은 Infisical /apps/homelab-bot/ 에 사람이 둔다(D-13).
 #   이 저장소(public)에는 키 이름만 둔다. Discord ID, 숫자 사용자 ID, 토큰을 여기에 쓰지 않는다.
@@ -51,16 +51,16 @@ discord:
   allowed_guilds: []                          # D-17 확정. 실제 값은 Infisical. 문자열 snowflake
   allowed_channels: []                        # D-17 확정: 2개(대화, 알림·리뷰·브리핑). 실제 값은 Infisical. 스레드는 parent_id로 대조
   allowed_users: []                           # D-17 확정: owner 1명. 실제 값은 Infisical. 문자열 snowflake
-  dm_enabled: null                            # D-17 남은 세부, T16a에서 정한다. DM 슬래시 명령은 전역 명령 + contexts BOT_DM 필요
+  dm_enabled: false                           # 확정(사용자 2026-10-20, T16a). 켜려면 DM 슬래시 명령용 전역 명령 + contexts BOT_DM도 필요
   alert_channel: null                         # R07. 알림·리뷰·브리핑 채널(D-17). 실제 ID는 Infisical
   review_notify_channel: null                 # 기능 7. 같은 채널. 실제 ID는 Infisical
   briefing_channel: null                      # R18. 같은 채널. 실제 ID는 Infisical
   activation: explicit_mention_or_command     # 00 §8 원래 값. D-17 확정: 멘션이나 / 명령으로 공개 스레드 시작, 스레드 안은 멘션 없이
   thread_type: public                         # D-17 확정. 메시지 없이 만들 때 type을 항상 명시
   auto_archive_minutes: 1440                  # D-17 확정. 허용 값 60 | 1440 | 4320 | 10080
-  briefing_time: null                         # D-17 남은 세부, T16a에서 정한다
+  briefing_time: "08:50"                     # 확정(사용자 2026-10-20, T16a). 위 timezone 기준, 매일
   message_content_intent: enabled             # D-17 확정: 켬. 00 §8 원래 초안 값은 unverified. 실연동 확인은 T16b
-  gateway_intents: null                       # 제안: 37377(GUILDS|GUILD_MESSAGES|DIRECT_MESSAGES|MESSAGE_CONTENT). DM을 안 쓰면 33281, intent를 끄면 4609
+  gateway_intents: null                       # 제안: 33281(GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT). DM 끔(T16a)이라 DIRECT_MESSAGES 뺌. intent를 끄면 4609
   bot_permissions: null                       # 제안 309237763136. D-17 확정: ADMINISTRATOR·MANAGE_THREADS·MENTION_EVERYONE 없음, 허용 채널 overwrite로
   allowed_mentions_parse: []                  # D-17 확정. 모든 봇 메시지의 멘션 파싱 끔(모델 출력 속 @everyone 차단)
 

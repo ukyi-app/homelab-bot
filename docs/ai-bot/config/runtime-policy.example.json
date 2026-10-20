@@ -5,7 +5,7 @@
   "guild": "DISCORD_GUILD_ID",
   "conversationChannel": "DISCORD_CONVERSATION_CHANNEL_ID",
   "notificationChannel": "DISCORD_NOTIFICATION_CHANNEL_ID",
-  "dmEnabled": null,
+  "dmEnabled": false,
   "services": [],
   "revocationRestores": []
 }

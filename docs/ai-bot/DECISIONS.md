@@ -1,10 +1,10 @@
 # DECISIONS: 봇 V1 DISCOVERY 결정 기록
 
-> T16a 갱신(2026-10-19): 사용자 결정은 유지한다. 구현 선택은 [ARCHITECTURE §11](ARCHITECTURE.md#11-t16a-확정-계약과-로컬-구현-2026-10-19)에 기록했다. 방안 1(작업자에서 대화·작업 합산 직렬 1), Node 24 런타임, 5분 정책 freshness, 승인 질의 상한, Ed25519 제어 계약, 최근 5분 Gateway 연결 조건의 하트비트를 채택했다. DM 허용 여부·브리핑 시각은 호출자의 사용자 답변 대기이며 `null`을 유지한다.
+> T16a 갱신(2026-10-19): 사용자 결정은 유지한다. 구현 선택은 [ARCHITECTURE §11](ARCHITECTURE.md#11-t16a-확정-계약과-로컬-구현-2026-10-19)에 기록했다. 방안 1(작업자에서 대화·작업 합산 직렬 1), Node 24 런타임, 5분 정책 freshness, 승인 질의 상한, Ed25519 제어 계약, 최근 5분 Gateway 연결 조건의 하트비트를 채택했다. DM 허용 여부·브리핑 시각은 2026-10-20 사용자가 정했다(아래 D-17).
 
 - 단계: `TARGET=V1`, `STAGE=DISCOVERY`, `MODE=plan` (homelab 티켓 T15). 작성일 2026-10-18. 초안.
 - **상태: D-14, D-15(남은 부분), D-16, D-17, D-24는 확정(사용자 2026-10-18, T15)이다.** 사용자가 2026-10-18 16:29 T15 질문에 답해 정했다. D-14는 에이전트 추천(B)이 아니라 A를 골랐다. D-15의 코드 읽기 축소는 에이전트 설명을 듣고 골랐다. 나머지는 에이전트 추천을 받아들였다. 결정 기록의 기준은 homelab spec §5.1이고, 이 문서는 선택지·근거·함께 지킬 조건을 남긴다.
-- 확정된 결정 안에 남은 미정 세부는 새 결정 ID 없이 담당 티켓에서 정한다(spec §5.3): D-17의 DM 허용 여부와 브리핑 시각은 T16a, D-24의 토큰 분리·ruleset E 여부·App 이름·설치 저장소·허용 파일 경로는 T19.
+- 확정된 결정 안에 남은 미정 세부는 새 결정 ID 없이 담당 티켓에서 정한다(spec §5.3): D-17의 DM 허용 여부와 브리핑 시각은 T16a(확정(사용자 2026-10-20): DM 끔, 브리핑 매일 08:50 Asia/Seoul), D-24의 토큰 분리·ruleset E 여부·App 이름·설치 저장소·허용 파일 경로는 T19.
 - 같은 응답에서 함께 정한 것: R08 연결 방식은 T18에서 다시 판단하고 그때까지 보류한다(아래 "R08"). V1 범위 조정은 안 3이다([V1_PLAN.md](V1_PLAN.md) §4). 둘 다 T15 질문에 에이전트 추천으로 제시한 안이고 사용자가 골랐다.
 - 같은 날 뒤이어 정한 것(사용자 2026-10-18): Codex Connector 설치 범위 축소는 `homelab-bot-ops`에 운영 산출물을 처음 올리기 전에 사람이 한다(아래 D-16 "Codex Connector 설치 범위"). 축소는 완료됐다(사람 2026-10-18 17:45, homelab `approvals.md`). 또 D-29의 비앱 저장소 처리를 `aiops`·`mac-uptime-guard` 제거, `aiops-autodeploy-canary` private 보관으로 바꿨다(사용자 2026-10-18 17:46, 실행 T22).
 - PR #3 리뷰 중 정한 것(사용자 2026-10-18): D-14에 T17 차단 조건을 더했다(아래 D-14 "차단 조건").
@@ -20,7 +20,7 @@
 | D-14 | 봇 모델 계정과 인증 | 봇 전용 ChatGPT 구독 계정 + 작업자 전용 CODEX_HOME, 함께 지킬 조건 다섯. 에이전트 추천(B, OpenAI API 프로젝트 키)과 다름 | OpenAI 확인 항목 셋 [미확인]. 공개 저장소 문구는 T17 차단 조건(허용 확인이나 공식 지원 인증 전환 전에는 공개 저장소 PR 내용으로 구독 모델을 부르지 않음. 모델을 부르지 않는 T17 로컬·mock 구현은 T16a 뒤 착수, 확정(사용자 2026-10-18, PR #3 리뷰)). T18도 같은 차단(확정(사용자 2026-10-18, PR #3 리뷰)). 계정 준비와 첫 시드: T16b 전(모델을 처음 쓰는 단계 전). 영속 쓰기 공간의 크기·백업(T08b) |
 | D-15 | 실행 호스트, 라벨·포트, 코드 읽기 호스트 | NUC 클러스터 안. 라벨 `homelab-bot`, 앱·작업자 포트 8080, 경보 수신 포트 8081. 작업자 코드 읽기는 `codeload.github.com` 압축본만 | U13·U29와 프록시 경유 압축본 받기 실측(T08b·T16b) |
 | D-16 | PR 리뷰 방식 | 기본안. 봇 리뷰 저장소의 Codex 자동 리뷰는 저장소별 설정에서 끔. Connector 설치는 선택 저장소로 줄이고 운영 저장소는 뺌(축소 완료, 사람 2026-10-18 17:45). 하위 결정: 허용 봇 작성자 목록 | 남긴 저장소 목록의 API 확인(사용자 보고만 있음). 리뷰 대상 저장소 목록과 리뷰 App 이름, 리뷰 App 권한 확인(Issues read 포함, 설계 세부)(T17) |
-| D-17 | Discord 서버, 채널, 허용 사용자 | 봇 전용 개인 서버 신설, 허용 사용자 owner 1명, 채널 2개, `MESSAGE_CONTENT` 켬 | DM 허용 여부, 브리핑 시각(T16a) |
+| D-17 | Discord 서버, 채널, 허용 사용자 | 봇 전용 개인 서버 신설, 허용 사용자 owner 1명, 채널 2개, `MESSAGE_CONTENT` 켬. DM 끔, 브리핑 매일 08:50 Asia/Seoul(확정(사용자 2026-10-20, T16a)) | 없음 |
 | D-24 | 봇 변경 PR 작성 신원 | 봇 전용 쓰기 GitHub App(Contents·Pull requests write, Metadata read) | 토큰 분리, ruleset E 여부, App 이름, 설치 저장소, 허용 파일 경로(T19) |
 
 ---
@@ -295,7 +295,7 @@ issue_comment (PR 댓글로 리뷰 요청):
 
 ## D-17 Discord 서버, 채널, 허용 사용자
 
-**상태:** 확정(사용자 2026-10-18, T15). **봇 전용 개인 서버를 새로 만든다.** 아래 표의 "결정" 칸 기본값도 함께 정했다(에이전트 추천 수락). DM 허용 여부와 브리핑 시각은 미정이고 T16a에서 정한다.
+**상태:** 확정(사용자 2026-10-18, T15). **봇 전용 개인 서버를 새로 만든다.** 아래 표의 "결정" 칸 기본값도 함께 정했다(에이전트 추천 수락). DM 허용 여부와 브리핑 시각은 T16a에서 정했다(확정(사용자 2026-10-20)): DM 끔, 브리핑 매일 08:50 Asia/Seoul.
 
 **질문:** 봇이 붙을 Discord 서버, 채널, 허용 사용자와 대화 방식. spec §5.3은 "사용자 제공"이었다.
 
@@ -314,7 +314,7 @@ issue_comment (PR 댓글로 리뷰 요청):
 | 활성화 | 허용 채널에서 멘션이나 `/` 명령으로 공개 스레드를 시작하고, 스레드 안 후속 메시지는 멘션 없이 처리한다. 구독 해제(R01)를 해제 명령으로 하는 것은 에이전트 제안이고 T16a에서 정한다 | R01, CHAT-01·02 [가정] |
 | 채널 | 2개: 대화 시작 채널, 알림·PR 리뷰·브리핑 채널 | 알림 폭주가 대화를 덮지 않게(OPS-01) [가정] |
 | 허용 사용자 | owner 1명 | D-14 A의 계정 공유 위험도 이때 가장 작다 [가정] |
-| DM | 미정(T16a) | 기능 1이 DM을 포함한다. DM에는 채널 경계가 없어 사용자 ID로만 판정한다. DM에서 슬래시 명령을 쓰려면 전역 명령과 `contexts`의 `BOT_DM`이 필요하다 [확인: https://docs.discord.com/developers/interactions/application-commands] |
+| DM | 끔(확정(사용자 2026-10-20, T16a)) | 기능 1은 DM을 포함할 수 있다. 서버 채널은 서버·채널·사용자 세 겹으로 판정하지만 DM에는 채널 경계가 없어 사용자 ID 하나로만 판정한다. 개인 서버 채널도 휴대폰에서 바로 쓸 수 있어 DM의 편의가 작다. 켜려면 runtime policy `dmEnabled`와 명령 등록을 함께 바꾼다. DM에서 슬래시 명령을 쓰려면 전역 명령과 `contexts`의 `BOT_DM`이 필요하다 [확인: https://docs.discord.com/developers/interactions/application-commands] |
 | 스레드 종류 | 공개 스레드 | 비공개 스레드는 봇이 멤버여야 동기화되고, 접근을 잃어도 Thread Delete가 오지 않는다 [확인: https://docs.discord.com/developers/topics/threads] |
 | `auto_archive_duration` | 1440분 | 허용 값은 60·1440·4320·10080분. 메시지를 보내면 보관이 풀린다(잠긴 스레드 제외) [확인: https://docs.discord.com/developers/topics/threads] |
 | 봇 권한 | 관리자·MANAGE_THREADS·MENTION_EVERYONE 없음. 서버 역할이 아니라 허용 채널 overwrite로 준다 | MANAGE_THREADS는 모든 비공개 스레드 보기를 포함한다. 권한 정수 제안값은 309237763136(VIEW_CHANNEL, SEND_MESSAGES, SEND_MESSAGES_IN_THREADS, CREATE_PUBLIC_THREADS, READ_MESSAGE_HISTORY, EMBED_LINKS, ADD_REACTIONS, ATTACH_FILES)이다 [실측: 비트 합 계산. 실제 동작은 미확인, T16b] |
@@ -326,7 +326,7 @@ issue_comment (PR 댓글로 리뷰 요청):
 
 ### 남은 것
 
-- T16a: DM 허용 여부, 브리핑 시각(R18, 기본 시간대 Asia/Seoul).
+- T16a에서 정함(사용자 2026-10-20): DM 끔, 브리핑 매일 08:50 Asia/Seoul(R18). 08:50은 밤사이 백업(homelab 설계: DB 03:00, Valkey 03:30) 결과가 나온 뒤다.
 - 실제 서버 ID, 채널 ID, 허용 사용자 ID(문자열 snowflake). **값은 Infisical `/apps/homelab-bot/`에만 두고 이 저장소와 공개 문서에는 쓰지 않는다.**
 - 사람 작업(`approvals.md` 기록, AC-X2): 서버 생성, Developer Portal 앱·봇 생성과 위 앱 설정, intent 토글, 봇 토큰 발급과 Infisical 등록, 설치 URL로 서버 추가, 허용 채널 overwrite, 슬래시 명령 사용자 허용.
 

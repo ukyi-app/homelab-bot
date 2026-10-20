@@ -1,7 +1,7 @@
 # PROJECT_STATUS: 홈랩 AI Discord 봇
 
 - 기준일: 2026-10-19. T16a 작업 트리 기준이며 커밋·PR·배포는 하지 않았다.
-- 한 줄 상태: **T16a FOUNDATION 로컬 구현·검증 완료, 실연동 대기(`LOCAL_VERIFIED_INTEGRATION_PENDING`). DM·브리핑 시각과 PR 처리는 호출자에게 인계한다.**
+- 한 줄 상태: **T16a FOUNDATION 로컬 구현·검증 완료, 실연동 대기(`LOCAL_VERIFIED_INTEGRATION_PENDING`). PR #5 병합(2026-10-20), DM 끔·브리핑 08:50 확정(사용자 2026-10-20).**
 
 ## 현재 단계
 
@@ -12,7 +12,7 @@
 | DISCOVERY 산출물 | 초안 작성: [DISCOVERY.md](DISCOVERY.md), [ARCHITECTURE.md](ARCHITECTURE.md), [DECISIONS.md](DECISIONS.md), [VERIFICATION.md](VERIFICATION.md), [V1_PLAN.md](V1_PLAN.md), 이 파일, [config/homelab-bot.example.yaml](config/homelab-bot.example.yaml). 이 저장소 병합 전(PR과 사람 승인 필요) |
 | 운영 산출물 | HANDOFF·evidence·내부판은 private 운영 저장소 몫이다(D-13). 그 저장소는 아직 비어 있다. 첫 커밋 전에 할 Codex Connector 설치 범위 축소(D-16)는 끝났다(사람 2026-10-18 17:45. 남긴 저장소 목록은 사용자 보고이고 API로는 확인하지 못함). 첫 커밋은 사람 승인 뒤다 |
 | 결정 | D-14, D-15(남은 부분), D-16(하위 결정 포함), D-17, D-24: 확정(사용자 2026-10-18, T15). D-14는 에이전트 추천(API 키)이 아니라 봇 전용 ChatGPT 구독 계정을 골랐다. D-14에 T17 차단 조건을 더했다(확정(사용자 2026-10-18, PR #3 리뷰)) |
-| 남은 미정 세부 | D-17의 DM 허용 여부·브리핑 시각(T16a), D-24의 토큰 분리·ruleset E·App 이름·설치 저장소·허용 파일 경로(T19), R08 연결 방식(T18, 보류) |
+| 남은 미정 세부 | D-24의 토큰 분리·ruleset E·App 이름·설치 저장소·허용 파일 경로(T19), R08 연결 방식(T18, 보류) |
 | 범위 조정 | 안 3(시범 운영 + 로컬 선행), 확정(사용자 2026-10-18, T15). T16을 T16a·T16b로 나눈다(V1_PLAN §4) |
 | 코드 | `src/`, PostgreSQL 마이그레이션, 로컬·mock 시험. Gateway·모델 실연동과 배포 진입점은 T16b |
 | CI | 없음. 템플릿 기반 `build.yaml`과 금지 패턴 검사는 플랫폼 E5·E9 뒤 |
@@ -23,7 +23,7 @@
 | STAGE | 티켓 | 상태 | 막는 것 |
 |---|---|---|---|
 | DISCOVERY | T15 | 초안, 결정 확정, 저장소 반영 대기 | 이 저장소 PR 병합과 운영 저장소 push(사람 승인) |
-| FOUNDATION 로컬·mock | T16a | 작업 트리 로컬 검증 완료 | DM·브리핑 시각 사용자 결정, 호출자의 PR 처리 |
+| FOUNDATION 로컬·mock | T16a | 완료(PR #5 병합 2026-10-20, DM·브리핑 확정) | 없음 |
 | FOUNDATION 실연동·첫 배포 | T16b | 대기 | T13(플랫폼), T16a, Discord 서버·봇 계정, 작업자 영속 쓰기 공간(설계 C.8 변경), 봇 전용 구독 계정·첫 시드(D-14) |
 | PR_REVIEW | T17 | 대기 | 착수 T16a, 완료 T16b. 작업별 세션 저장 공간 결정(ARCHITECTURE §5.1). 리뷰 App. D-14 차단 조건(OpenAI 허용 확인이나 API 키 등 공식 지원 인증 전환. 공개 저장소 PR 내용으로 구독 모델을 부르는 일만 막음) |
 | CODEX_BRIDGE | T18 | 대기 | 착수 T16a, 완료 T16b. R08 연결 방식 판단 |
@@ -45,7 +45,7 @@ V1 출시 판정: 없음(아직 판정 대상 아님). 시범 운영은 T16b 뒤
 
 ## 다음 행동
 
-T16a 이후: 호출자는 작업 트리와 보고서의 HANDOFF·검증 결과를 검토하고 커밋·PR을 처리한다. DM 허용 여부와 브리핑 시각을 확정한 뒤 설정에 반영한다. T16b는 VERIFICATION의 blocked 점검과 ARCHITECTURE §11의 연결 지점부터 시작한다. 아래 목록은 T15 당시 계획 기록이며, T16a를 다시 시작하라는 지시가 아니다.
+T16a 이후: 호출자는 작업 트리와 보고서의 HANDOFF·검증 결과를 검토하고 커밋·PR을 처리한다. DM 허용 여부와 브리핑 시각은 확정됐고(사용자 2026-10-20) 설정 예시에 반영했다. 실제 값은 Infisical runtime policy(`dmEnabled: false`)에 둔다. T16b는 VERIFICATION의 blocked 점검과 ARCHITECTURE §11의 연결 지점부터 시작한다. 아래 목록은 T15 당시 계획 기록이며, T16a를 다시 시작하라는 지시가 아니다.
 
 1. 이 산출물을 봇 저장소에 PR로 올리고, HANDOFF와 evidence를 private 운영 저장소에 push한다(각각 사람 승인, `approvals.md`). 그 전까지 초안이 세션 임시 위치에만 있어 유실 위험이 있다.
 2. 결정을 봇 문서 `docs/ai-bot/prompts/`의 자리에 반영한다(봇 저장소 PR, DECISIONS "결정 반영 자리"). homelab 쪽(spec, 설계 C.8, 플랫폼 프롬프트, T16~T22 티켓)은 homelab `rebuild` 변경으로 하고 커밋·push는 사람 승인 뒤다(V1_PLAN §5).
