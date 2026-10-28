@@ -676,3 +676,61 @@ test('MEM-01 [rev-t20 P2-4] 만료된 기억은 같은 주제 새 기억의 충�
   const replacement = await memory.remember('fixture-owner', thread, config('단독 주제 새 근거', { topic: 'expired:solo' }));
   assert.deepEqual([replacement.status, replacement.conflictsWith], ['active', []]);
 });
+// --- Codex 재리뷰 rev-t20b 회귀 시험 ---
+test('DATA-02 [rev-t20b P1] 디렉터리 fsync 장애가 이어지는 중 재기동해도 원장 재적용·삭제 재요청을 완료로 올리지 않음', async () => {
+  const ledgerDir = await mkdtemp('.local/ledger-restart-');
+  let failDir = true;
+  let dirFailures = 0;
+  const io = { readFile: (path: string, encoding: 'utf8') => readFile(path, encoding),
+    open: async (path: Parameters<typeof open>[0], flags?: Parameters<typeof open>[1]) => {
+      const handle = await open(path, flags);
+      if (path !== ledgerDir || !failDir) return handle;
+      return { sync: async () => { dirFailures++; throw new Error('EIO'); }, close: () => handle.close() } as unknown as FileHandle;
+    } } as unknown as ConstructorParameters<typeof FileDeletionLedger>[1];
+  const path = `${ledgerDir}/deletions.jsonl`;
+  const stored = async () => (await rows('memories'))[0]!;
+  try {
+    const first = new MemoryService(database.db, f.gate, new FileDeletionLedger(path, io), documents, f.now); await first.open();
+    const memoryRow = await first.remember('fixture-owner', thread, config('장애 중 재기동해도 남아야 할 기억'));
+    assert.deepEqual((await first.delete('fixture-owner', thread, memoryRow.id)).status, 'pending');
+    const failuresBeforeRestart = dirFailures;
+    // 장애를 풀지 않은 채 같은 DB·원장 파일로 새 프로세스를 띄운다.
+    const restarted = new MemoryService(database.db, f.gate, new FileDeletionLedger(path, io), documents, f.now);
+    const opened = await restarted.open();
+    assert.equal(opened.applied, 0);
+    assert.ok(dirFailures > failuresBeforeRestart);
+    assert.deepEqual([(await stored()).status, (await stored()).statement], ['active', '장애 중 재기동해도 남아야 할 기억']);
+    assert.deepEqual((await rows('memory_deletions')).map(d => [d.ledger_state, d.applied_at]), [['pending', null]]);
+    assert.deepEqual(await restarted.search('fixture-owner', thread, '재기동'), []);
+    const again = await restarted.delete('fixture-owner', thread, memoryRow.id);
+    assert.deepEqual([again.status, again.reason], ['pending', 'ledger_unconfirmed']);
+    assert.equal((await stored()).statement, '장애 중 재기동해도 남아야 할 기억');
+    failDir = false;
+    assert.equal(await restarted.resume(), 1);
+    assert.deepEqual([(await stored()).status, (await stored()).statement], ['deleted', '']);
+    assert.equal((await restarted.delete('fixture-owner', thread, memoryRow.id)).status, 'deleted');
+  } finally { await rm(ledgerDir, { recursive: true, force: true }); }
+});
+test('DATA-02 [rev-t20b P1] 복원으로 삭제 요청 행이 없어도 확인되지 않은 원장 항목은 숨기기만 하고, 확인 뒤 재적용', async () => {
+  const ledgerDir = await mkdtemp('.local/ledger-restore-');
+  let failDir = true;
+  const io = { readFile: (path: string, encoding: 'utf8') => readFile(path, encoding),
+    open: async (path: Parameters<typeof open>[0], flags?: Parameters<typeof open>[1]) => {
+      const handle = await open(path, flags);
+      if (path !== ledgerDir || !failDir) return handle;
+      return { sync: async () => { throw new Error('EIO'); }, close: () => handle.close() } as unknown as FileHandle;
+    } } as unknown as ConstructorParameters<typeof FileDeletionLedger>[1];
+  const path = `${ledgerDir}/deletions.jsonl`;
+  try {
+    const kept = await memory.remember('fixture-owner', thread, config('복원 뒤 확인 전 기억'));
+    const createdAt = Number((await rows('memories'))[0]!.created_at);
+    await writeFile(path, `${JSON.stringify({ memoryId: kept.id, createdAt, deletedAt: createdAt })}\n`);
+    const restored = new MemoryService(database.db, f.gate, new FileDeletionLedger(path, io), documents, f.now);
+    assert.deepEqual(await restored.open(), { entries: 1, applied: 0 });
+    assert.equal((await rows('memories'))[0]!.status, 'active');
+    assert.deepEqual(await restored.search('fixture-owner', thread, '확인 전'), []);
+    failDir = false;
+    await restored.resume();
+    assert.equal((await rows('memories'))[0]!.status, 'deleted');
+  } finally { await rm(ledgerDir, { recursive: true, force: true }); }
+});
