@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { bounded } from './format.js';
 
 // `codex exec --json` JSONL 이벤트. 문서에 있는 최상위 형태만 판정에 쓴다.
 // item 내부는 버전마다 필드가 늘 수 있어 아는 필드만 읽고 나머지는 둔다.
@@ -34,14 +35,15 @@ export function parseStream(lines: readonly string[]): ParsedStream {
 
 // --output-schema로 고정한 최종 메시지. 질문·완료는 이 구조로만 인정한다.
 // 로그나 agent_message의 "완료"·"질문" 문자열은 판정 근거가 아니다(`01` §6 완료 기준).
+// 긴 요약·질문은 끝난 작업을 실패로 만들지 않고 게시 전에 잘라 받는다. 상한은 비정상 크기만 거른다.
 export const TaskOutputSchema = z.strictObject({
   status: z.enum(['completed', 'needs_input', 'cannot_complete']),
-  summary: z.string().max(1500),
-  question: z.string().max(500),
+  summary: z.string().max(20_000),
+  question: z.string().max(4_000),
 }).refine(o => (o.status === 'needs_input') === (o.question.trim().length > 0), 'question_mismatch');
 export type TaskOutput = z.infer<typeof TaskOutputSchema>;
 // 구조화 출력은 루트 객체·전 필드 required·추가 필드 금지여야 해서 판별 유니온 대신 평평한 모양이다.
-// 길이 제한 키워드 지원 여부는 [미확인]이라 스키마에는 설명만 두고 길이는 봇이 TaskOutputSchema로 검사한다.
+// 길이 제한 키워드 지원 여부는 [미확인]이라 스키마에는 설명만 두고 길이는 봇이 자른다.
 export const TASK_OUTPUT_JSON_SCHEMA = Object.freeze({
   type: 'object', additionalProperties: false, required: ['status', 'summary', 'question'],
   properties: {
@@ -50,6 +52,12 @@ export const TASK_OUTPUT_JSON_SCHEMA = Object.freeze({
     question: { type: 'string', description: 'needs_input일 때만 채운다(500자 이하). 그 밖에는 빈 문자열.' },
   },
 });
+// 재개 인자로 쓰므로 '-'로 시작하면 CLI가 플래그로 읽는다. 질문을 받을 때 바로 거른다.
+export const THREAD_ID = /^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/;
+// 한도·인증 만료의 이벤트 모양은 공식 문서에 없다 [미확인]. 0.163.0 바이너리 문자열의 `usage_limit_reached`와
+// 일반 표현으로 고른 [가정]이다. 잘못 고르면 다른 계정으로 넘어가지 않고 사람 확인을 기다리는 쪽(대기)으로 틀린다.
+const LIMIT = /usage[_ ]limit|rate[_ ]limit|quota|too many requests|\b429\b/i;
+const AUTH = /unauthori[sz]ed|\b401\b|refresh[_ ]token|token (?:has )?expired|log ?in again|re-?authenticat/i;
 
 export interface RunReport {
   lines: string[];
@@ -58,26 +66,39 @@ export interface RunReport {
   // 작업 그룹 전체가 사라졌음을 확인했는지. null은 확인 수단 없음.
   survivors: number | null;
   aborted: boolean;
+  // 작업 공간 기준 커밋 대비 실제 변경 경로. null은 diff를 얻지 못함.
+  changes: string[] | null;
+  // 프로세스가 생기기 전 실패(인자 거부, 실행 파일 없음).
+  launchFailed?: boolean;
 }
 export type RunOutcome =
-  | { kind: 'completed'; threadId: string; turns: number; summary: string; changes: string[] }
+  | { kind: 'completed'; threadId: string; turns: number; summary: string; changes: string[]; reported: string[] }
   | { kind: 'question'; threadId: string; turns: number; summary: string; question: string }
+  | { kind: 'waiting'; reason: 'model_limit' | 'auth_expired'; threadId: string | null; turns: number }
   | { kind: 'failed'; reason: string; threadId: string | null; turns: number }
   | { kind: 'unknown'; reason: string; threadId: string | null; turns: number };
 
-// 판정 순서가 계약이다: 소멸 확인 → 흐름 무결성 → 실패 신호 → 종료 코드 → 턴 완료 → 구조화 출력.
+// 판정 순서가 계약이다: 소멸 확인 → 흐름 무결성 → 실패 신호 → 종료 코드 → 턴 완료 → 구조화 출력 → 실제 diff.
 export function interpretRun(report: RunReport, expectedThread: string | null, secrets: readonly string[] = []): RunOutcome {
   const { events, malformed } = parseStream(report.lines);
   const threads = [...new Set(events.flatMap(e => e.type === 'thread.started' ? [e.thread_id] : []))];
   const threadId = threads[0] ?? expectedThread;
   const turns = events.filter(e => e.type === 'turn.completed').length;
+  if (report.launchFailed && report.survivors === 0) return { kind: 'failed', reason: 'launch_failed', threadId: expectedThread, turns: 0 };
   // 종료 코드가 있어도 분리된 자식이 남으면 다음 작업이 인증 파일·egress에 닿을 수 있다.
   if (!report.exit || report.survivors !== 0) return { kind: 'unknown', reason: report.survivors === null ? 'stop_unverifiable' : report.exit ? 'survivors' : 'not_exited', threadId, turns };
   if (report.aborted) return { kind: 'failed', reason: 'aborted', threadId, turns };
   // `exec resume`이 thread.started를 다시 내는지는 [미확인]이라 재개 때는 없어도 받는다. 다른 스레드는 거부한다.
   if (expectedThread !== null && threads.some(t => t !== expectedThread)) return { kind: 'failed', reason: 'thread_mismatch', threadId, turns };
   if (malformed > 0 || threads.length > 1 || !threadId) return { kind: 'failed', reason: 'invalid_stream', threadId, turns };
-  if (events.some(e => e.type === 'turn.failed' || e.type === 'error')) return { kind: 'failed', reason: 'turn_failed', threadId, turns };
+  if (!THREAD_ID.test(threadId)) return { kind: 'failed', reason: 'invalid_thread', threadId: null, turns };
+  const failures = events.flatMap(e => e.type === 'turn.failed' ? [e.error?.message ?? ''] : e.type === 'error' ? [e.message ?? ''] : []);
+  if (failures.length) {
+    const text = failures.join('\n');
+    if (LIMIT.test(text)) return { kind: 'waiting', reason: 'model_limit', threadId, turns };
+    if (AUTH.test(text)) return { kind: 'waiting', reason: 'auth_expired', threadId, turns };
+    return { kind: 'failed', reason: 'turn_failed', threadId, turns };
+  }
   if (report.exit.code !== 0) return { kind: 'failed', reason: 'exit_nonzero', threadId, turns };
   const last = events.filter(e => e.type.startsWith('turn.')).at(-1);
   if (turns === 0 || last?.type !== 'turn.completed') return { kind: 'failed', reason: 'turn_incomplete', threadId, turns };
@@ -86,29 +107,41 @@ export function interpretRun(report: RunReport, expectedThread: string | null, s
   catch { return { kind: 'failed', reason: 'invalid_output', threadId, turns }; }
   if (echoesSecret(`${output.summary}\n${output.question}`, secrets)) return { kind: 'failed', reason: 'secret_echo', threadId, turns };
   if (output.status === 'cannot_complete') return { kind: 'failed', reason: 'model_cannot_complete', threadId, turns };
-  if (output.status === 'needs_input') return { kind: 'question', threadId, turns, summary: output.summary, question: output.question };
-  const changes = [...new Set(events.flatMap(e => e.type === 'item.completed' && e.item.type === 'file_change'
+  const summary = bounded(output.summary, 1500);
+  if (output.status === 'needs_input') return { kind: 'question', threadId, turns, summary, question: bounded(output.question, 500) };
+  // 완료는 실제 작업 공간 diff와 대조한다. 셸로 바꾼 파일은 Codex 보고에 없을 수 있어 실제 diff를 기준으로 싣고,
+  // Codex가 바꿨다고 보고한 파일이 실제 diff에 없으면 완료 보고를 믿지 않는다.
+  if (report.changes === null) return { kind: 'failed', reason: 'diff_unavailable', threadId, turns };
+  const reported = [...new Set(events.flatMap(e => e.type === 'item.completed' && e.item.type === 'file_change'
     && Array.isArray(e.item.changes) ? (e.item.changes as { path?: unknown }[]).flatMap(c => typeof c.path === 'string' ? [c.path] : []) : []))];
-  return { kind: 'completed', threadId, turns, summary: output.summary, changes };
+  if (reported.some(path => !report.changes!.includes(path))) return { kind: 'failed', reason: 'diff_mismatch', threadId, turns };
+  return { kind: 'completed', threadId, turns, summary, changes: report.changes, reported };
 }
 
 // 작업자는 자기 auth.json 값을 안다. 결과·질문에 그 값의 조각이 섞이면 게시하지 않는다.
-// 같은 파드의 비신뢰 코드가 파일을 읽는 것 자체는 막지 못한다(ARCHITECTURE §5.1). 게시 경로만 줄인다.
+// best-effort다: base64 같은 변형은 못 잡고, 같은 파드의 비신뢰 코드가 파일을 읽는 것 자체도 막지 못한다(ARCHITECTURE §5.1).
+// SEC-02 pass의 근거로 쓰지 않는다.
 export function authSecrets(authJson: string): string[] {
   const found: string[] = [];
   const walk = (value: unknown) => {
-    if (typeof value === 'string') { if (value.length >= 16) found.push(value); }
+    if (typeof value === 'string') {
+      const parts = value.split('.');
+      // JWT 헤더와 payload 앞부분은 같은 발급자 토큰끼리 같아 정상 인용을 오탐한다. 뒷부분과 서명만 본다.
+      if (parts.length === 3 && parts.every(part => /^[A-Za-z0-9_-]+$/.test(part))) found.push(parts[1]!.slice(48), parts[2]!);
+      else found.push(value);
+    }
     else if (Array.isArray(value)) value.forEach(walk);
     else if (typeof value === 'object' && value !== null) Object.values(value).forEach(walk);
   };
   try { walk(JSON.parse(authJson)); } catch { return []; }
-  return found;
+  return found.map(squash).filter(value => value.length >= 16);
 }
+// 띄어 쓰거나 기호를 끼워 넣은 반사도 잡도록 영숫자만 남겨 비교한다.
+const squash = (value: string) => value.replace(/[^A-Za-z0-9]/g, '');
 export function echoesSecret(text: string, secrets: readonly string[]): boolean {
-  for (const secret of secrets) {
-    const width = Math.min(secret.length, 24);
-    for (let start = 0; start + width <= secret.length; start += 8) if (text.includes(secret.slice(start, start + width))) return true;
-    if (text.includes(secret.slice(-width))) return true;
+  const haystack = squash(text);
+  for (const secret of secrets.map(squash)) {
+    for (let start = 0; start + 16 <= secret.length; start += 4) if (haystack.includes(secret.slice(start, start + 16))) return true;
   }
   return false;
 }

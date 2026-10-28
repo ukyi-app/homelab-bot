@@ -1,9 +1,11 @@
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { Denied, PolicyUnavailable } from './contracts.js';
 import type { Job, Scope } from './contracts.js';
 import { assertWorkerRoot, codexConfig, configToml, execArgs, launchEnvironment, taskPaths } from './codex-config.js';
 import { TASK_OUTPUT_JSON_SCHEMA, authSecrets, interpretRun } from './codex-events.js';
+import { changedPaths, fileWorkspace } from './codex-workspace.js';
+import type { CodexWorkspace, Snapshot } from './codex-workspace.js';
 import type { RunOutcome } from './codex-events.js';
 import { bounded } from './format.js';
 import type { PolicyGate } from './policy.js';
@@ -33,6 +35,8 @@ export function describeCapabilities(c: CodexCapabilities = CODEX_CAPABILITIES):
     '- 기존 Codex 세션 연결(attach): 연결 방식 결정 대기(미정)',
     '- 취소: 작업 프로세스 정리를 확인한 뒤에만 cancelled, 확인 못 하면 unknown'].join('\n');
 }
+// 프로세스가 생기기 전에 실패했다(실행 파일 없음 등). 남은 프로세스가 없으니 unknown이 아니다.
+export class LaunchFailed extends Error { constructor() { super('launch_failed'); } }
 export class CapabilityUnavailable extends Error {
   constructor(public readonly capability: string, public readonly state: 'false' | 'undecided') { super(`capability_${state}:${capability}`); }
 }
@@ -47,13 +51,14 @@ export interface CodexLauncher {
 }
 export interface CodexFiles {
   mkdir(path: string): Promise<void>; write(path: string, content: string): Promise<void>;
-  read(path: string): Promise<string | null>; remove(path: string): Promise<void>;
+  read(path: string): Promise<string | null>; remove(path: string): Promise<void>; resolve(path: string): Promise<string>;
 }
 export const nodeFiles: CodexFiles = {
   mkdir: async path => { await mkdir(path, { recursive: true, mode: 0o700 }); },
   write: (path, content) => writeFile(path, content, { mode: 0o600 }),
   read: async path => { try { return await readFile(path, 'utf8'); } catch { return null; } },
   remove: path => rm(path, { force: true }),
+  resolve: path => realpath(path),
 };
 export interface CodexTaskRequest { job: string; prompt: string; resume: string | null }
 export interface CodexTaskAdapter {
@@ -66,28 +71,52 @@ export interface CodexTaskAdapter {
 export class ExecCodexAdapter implements CodexTaskAdapter {
   private readonly root: string;
   constructor(root: string, private readonly launcher: CodexLauncher,
-    private readonly options: { files?: CodexFiles; homes?: string[]; proxy?: { https: string; noProxy: string } } = {}) {
+    private readonly options: { files?: CodexFiles; workspace?: CodexWorkspace; homes?: string[];
+      proxy?: { https: string; noProxy: string } } = {}) {
     this.root = assertWorkerRoot(root, options.homes);
   }
   capabilities(): CodexCapabilities { return CODEX_CAPABILITIES; }
   async execute(request: CodexTaskRequest, signal: AbortSignal): Promise<RunOutcome> {
     const files = this.options.files ?? nodeFiles;
+    const workspace = this.options.workspace ?? fileWorkspace;
     const paths = taskPaths(this.root, request.job);
-    for (const dir of [paths.home, paths.taskHome, paths.workspace, paths.run, paths.tmp]) await files.mkdir(dir);
+    // 루트는 생성자에서 실제 경로로 바꿨다. 그 아래 심링크(예: tasks → ~/.codex-work)로 밖에 쓰지 않게,
+    // 만드는 디렉터리마다 실제 경로가 그대로인지 확인한 뒤 다음 단계로 간다.
+    for (const dir of [join(this.root, 'tasks'), dirname(paths.home), paths.home, paths.taskHome, paths.workspace, paths.run, paths.tmp]) {
+      await files.mkdir(dir);
+      if (await files.resolve(dir) !== dir) throw new Denied();
+    }
     // 설정은 매 실행 다시 쓴다. 이전 턴 출력이 남아 이번 결과로 읽히지 않게 지운다.
     await files.write(join(paths.home, 'config.toml'), configToml(codexConfig(paths)));
     await files.write(join(paths.run, 'output.schema.json'), JSON.stringify(TASK_OUTPUT_JSON_SCHEMA));
     await files.remove(join(paths.run, 'last-message.json'));
+    // 기준 상태는 첫 실행 전에 한 번만 잡고 작업 공간 밖(run/)에 둔다. 재개 때도 같은 기준과 대조한다.
+    const baselinePath = join(paths.run, 'baseline.json');
+    let baseline = JSON.parse(await files.read(baselinePath) ?? 'null') as Snapshot | null;
+    if (!baseline) {
+      await workspace.prepare(paths.workspace);
+      baseline = await workspace.snapshot(paths.workspace);
+      if (!baseline) throw new Error('workspace_unavailable');
+      await files.write(baselinePath, JSON.stringify(baseline));
+    }
+    // 실행 중 갱신으로 토큰이 바뀌어도 옛 값의 반사를 잡도록 실행 전후를 모두 본다.
+    const before = authSecrets(await files.read(join(paths.home, 'auth.json')) ?? '');
+    let args: string[];
+    try { args = execArgs(paths, request.resume); }
+    catch { return { kind: 'failed', reason: 'launch_failed', threadId: request.resume, turns: 0 }; }
     let result: LaunchResult = { lines: [], exit: null };
+    let launchFailed = false;
     try {
-      result = await this.launcher.run({ job: request.job, args: execArgs(paths, request.resume), cwd: paths.workspace,
+      result = await this.launcher.run({ job: request.job, args, cwd: paths.workspace,
         env: launchEnvironment(paths, this.options.proxy), stdin: request.prompt }, signal);
-    } catch { /* 결과를 모르면 아래 정리·소멸 확인이 판정한다. */ }
+    } catch (error) { launchFailed = error instanceof LaunchFailed; }
     await this.launcher.terminate(request.job).catch(() => {});
     const survivors = await this.launcher.survivors(request.job).catch(() => null);
     const output = await files.read(join(paths.run, 'last-message.json'));
-    const secrets = authSecrets(await files.read(join(paths.home, 'auth.json')) ?? '');
-    return interpretRun({ lines: result.lines, exit: result.exit, output, survivors, aborted: signal.aborted }, request.resume, secrets);
+    const secrets = [...before, ...authSecrets(await files.read(join(paths.home, 'auth.json')) ?? '')];
+    const after = await workspace.snapshot(paths.workspace);
+    return interpretRun({ lines: result.lines, exit: result.exit, output, survivors, aborted: signal.aborted, launchFailed,
+      changes: after ? changedPaths(baseline, after) : null }, request.resume, secrets);
   }
   async confirmStop(job: string): Promise<{ stopped: boolean }> {
     await this.launcher.terminate(job).catch(() => {});
@@ -155,7 +184,8 @@ export class CodexBridge {
     let outcome: RunOutcome;
     let giveUp: ReturnType<typeof setTimeout> | undefined;
     try {
-      const executed = this.adapter.execute({ job: job.id, ...request }, abort.signal).catch(async (): Promise<RunOutcome> => {
+      // 원격 어댑터가 동기로 던져도 dispatch 뒤 오류로 다룬다. Runtime의 "실행 전" 분류로 새지 않게 한다.
+      const executed = Promise.resolve().then(() => this.adapter.execute({ job: job.id, ...request }, abort.signal)).catch(async (): Promise<RunOutcome> => {
         const confirmed = await this.adapter.confirmStop(job.id).catch(() => ({ stopped: false }));
         return confirmed.stopped ? { kind: 'failed', reason: 'adapter_error', threadId: null, turns: 0 }
           : { kind: 'unknown', reason: 'adapter_error', threadId: null, turns: 0 };
@@ -169,7 +199,7 @@ export class CodexBridge {
       clearInterval(monitor); clearTimeout(timeout); clearTimeout(giveUp);
       await checking;
     }
-    try { await this.settle(job, policy.revision, session, outcome, stop); }
+    try { await this.settle(job, policy.revision, session, outcome, stop, answered?.id); }
     catch {
       // 기록 실패는 결과를 모르는 것과 같다. lease가 끝나면 expire()가 unknown으로 둔다.
       await this.store.transition(job, 'unknown', 'record_failed').catch(() => {});
@@ -182,7 +212,8 @@ export class CodexBridge {
     catch (error) { if (error instanceof Denied) return 'revoked'; if (!(error instanceof PolicyUnavailable)) throw error; }
     return await this.store.heartbeat(job) ? undefined : 'lease';
   }
-  private async settle(job: Job, revision: string, before: Session | undefined, outcome: RunOutcome, stop: Stop | undefined): Promise<void> {
+  private async settle(job: Job, revision: string, before: Session | undefined, outcome: RunOutcome, stop: Stop | undefined,
+    answered?: string): Promise<void> {
     const stopped = outcome.kind !== 'unknown';
     const turn = (outcome.threadId && before?.thread_id === outcome.threadId ? before.turn : 0) + outcome.turns;
     const sessionState = async (state: string) => this.store.db.query(`UPDATE codex_sessions SET thread_id=COALESCE($2,thread_id),
@@ -211,6 +242,17 @@ export class CodexBridge {
       await this.store.fail(job, stop ? `codex_${stop}` : `codex_${outcome.kind === 'failed' ? outcome.reason : 'failed'}`);
       return;
     }
+    if (outcome.kind === 'waiting') {
+      // 한도·인증 만료는 다른 계정·인증으로 바꾸지 않고 사람 확인을 기다린다(D-14 조건 2). 재개 턴이었다면
+      // 그 답은 처리되지 않았으니 /resume-model 뒤 같은 답으로 같은 스레드를 다시 잇게 되돌린다.
+      await sessionState('waiting_model');
+      if (answered) await this.store.db.query("UPDATE codex_questions SET state='answered' WHERE id=$1 AND state='resumed'", [answered]);
+      await this.store.waitForUser(job, outcome.reason);
+      await this.store.enqueue({ key: `codex-wait:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id,
+        actor: job.owner_id, scope: job.target, revision, payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary',
+          content: `작업 ${job.id}이 ${outcome.reason === 'model_limit' ? '모델 사용 한도' : '모델 인증 만료'}로 멈췄습니다. 다른 계정·인증으로 바꾸지 않습니다. 원인을 해소한 뒤 /resume-model target:${job.id} 로 재개하거나 /cancel 하세요.` } });
+      return;
+    }
     if (outcome.kind === 'question') {
       await sessionState('waiting_answer');
       await this.ask(job, revision, outcome.threadId, turn, outcome.question);
@@ -218,9 +260,10 @@ export class CodexBridge {
     }
     await sessionState('completed');
     const content = [`Codex 작업 완료 (작업 ${job.id})`, bounded(outcome.summary || '요약 없음', 1500),
-      `변경 파일(Codex 보고 기준): ${outcome.changes.length}개`].join('\n');
+      `변경 파일(작업 공간 실제 diff 기준): ${outcome.changes.length}개`].join('\n');
     await this.store.finish(job, { summary: outcome.summary, changes: outcome.changes },
-      { source: 'codex_exec', threadId: outcome.threadId, turns: turn, exitCode: 0, stopConfirmed: true }, content, job.target);
+      { source: 'codex_exec', threadId: outcome.threadId, turns: turn, exitCode: 0, stopConfirmed: true,
+        diff: 'workspace_snapshot', reportedChanges: outcome.reported }, content, job.target);
   }
   private async ask(job: Job, revision: string, threadId: string, turn: number, question: string): Promise<void> {
     const id = `${job.id}:${threadId}:${turn}`;
@@ -271,6 +314,7 @@ export class CodexBridge {
         WHERE id=$1`, [q.id, input.text, input.actor, input.event, store.now()]);
       await store.db.query(`UPDATE jobs SET state='queued',wait_reason=NULL,available_at=$2,lease_token=NULL,lease_until=NULL,
         started_at=NULL,finished_at=NULL WHERE id=$1 AND state='waiting_user' AND wait_reason='clarification'`, [q.job_id, store.now()]);
+      await this.releaseScheduler(store);
       await store.audit('codex_answer_accepted', q.id, { actor: input.actor });
       return { ok: true, status: '답을 받았습니다. 같은 Codex 세션을 이어서 실행합니다.' };
     });
@@ -282,11 +326,25 @@ export class CodexBridge {
       WHERE id=$1 AND state='waiting_user' AND wait_reason='clarification' RETURNING *`, [q.job_id, store.now()])).rows[0];
     if (!job) return;
     await store.db.query("UPDATE codex_sessions SET state='cancelled',updated_at=$2 WHERE job_id=$1", [q.job_id, store.now()]);
+    await this.releaseScheduler(store);
     await store.enqueue({ key: `codex-expired:${q.id}`, job: job.id, conversation: job.conversation_id, actor: job.owner_id,
       scope: job.target, revision: job.revision.policy, payload: { kind: 'message', channel: job.target.channel,
         classification: 'safe_summary', content: `질문 ${q.id}의 답 기한이 지나 작업을 멈췄습니다(cancelled). 답 없이 진행하지 않습니다. 필요하면 새 작업으로 다시 요청하세요.` } });
   }
-  async sweep(): Promise<number> { return this.expireQuestions(); }
+  // T16a /cancel과 같은 해제 조건이다. 질문 대기 중 비상 중지가 풀렸다면 대기가 끝난 지금 스케줄러도 푼다.
+  private async releaseScheduler(store: Store): Promise<void> {
+    await store.db.query(`UPDATE controls SET value='false' WHERE key='scheduler'
+      AND NOT EXISTS (SELECT 1 FROM controls WHERE key='scheduler_emergency' AND value='true')
+      AND NOT EXISTS (SELECT 1 FROM jobs WHERE state='waiting_user')`);
+  }
+  // Runtime.tick이 claim 전에 부른다. lease 만료·기록 실패 등 settle 밖에서 생긴 unknown도 알림 없이 두지 않는다.
+  async sweep(): Promise<number> {
+    const expired = await this.expireQuestions();
+    const silent = (await this.store.db.query<Job>(`SELECT * FROM jobs j WHERE j.type='task' AND j.state='unknown'
+      AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.idempotency_key='codex-blocked:' || j.id)`)).rows;
+    for (const job of silent) await this.blocked(job, job.revision.policy);
+    return expired + silent.length;
+  }
   async expireQuestions(): Promise<number> {
     return this.store.atomic(async store => {
       const rows = (await store.db.query<Question>(`SELECT * FROM codex_questions WHERE state='open' AND expires_at<=$1 FOR UPDATE`, [store.now()])).rows;
@@ -313,7 +371,12 @@ export class CodexBridge {
     throw new CapabilityUnavailable('attach_task', 'undecided');
   }
   async release(actor: string, scope: Scope, jobId: string): Promise<{ ok: boolean; status: string }> {
-    const job = await this.owned(actor, scope, jobId);
+    const policy = await this.gate.authorize(actor, scope);
+    const job = (await this.store.db.query<Job>('SELECT * FROM jobs WHERE id=$1', [jobId])).rows[0];
+    // owner가 바뀌어 남은 막힘은 옛 owner가 풀 수 없다. 그 작업만 현재 정책 owner가 프로세스 0개 확인 뒤 풀 수 있다.
+    const own = job?.owner_id === actor && job.conversation_id === this.store.scopeId(scope);
+    const successor = !!job && job.owner_id !== policy.owner && actor === policy.owner;
+    if (!job || job.type !== 'task' || (!own && !successor)) throw new Denied();
     if (job.state !== 'unknown') return { ok: false, status: '종료를 확인하지 못한(unknown) 작업이 아닙니다.' };
     const confirmed = await this.adapter.confirmStop(jobId).catch(() => ({ stopped: false }));
     if (!confirmed.stopped) return { ok: false, status: '작업자 프로세스가 남아 있거나 확인할 수 없습니다. 작업자 파드를 다시 만든 뒤 확인하세요.' };

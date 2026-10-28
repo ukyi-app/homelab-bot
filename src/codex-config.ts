@@ -2,6 +2,7 @@ import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { Denied } from './contracts.js';
+import { THREAD_ID } from './codex-events.js';
 
 // 작업자가 쓰는 Codex 설정. 시작과 `exec resume`이 같은 정책을 갖도록 플래그가 아니라 설정 파일에 고정한다.
 // `exec resume`에는 -s·-C가 없다 [실측: codex-cli 0.163.0 `codex exec resume --help`, ARCHITECTURE §4].
@@ -99,7 +100,6 @@ export const FORBIDDEN_FLAGS = ['--dangerously-bypass-approvals-and-sandbox', '-
   '--ephemeral', '--ignore-user-config', '-a', '--ask-for-approval', '-s', '--sandbox', '-c', '--config', '--add-dir'];
 export function execArgs(paths: CodexPaths, resume: string | null): string[] {
   const common = ['--json', '--output-schema', join(paths.run, 'output.schema.json'), '-o', join(paths.run, 'last-message.json')];
-  // 스레드 ID가 '-'로 시작하면 CLI가 플래그로 읽는다.
-  if (resume !== null && !/^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/.test(resume)) throw new Denied();
+  if (resume !== null && !THREAD_ID.test(resume)) throw new Denied();
   return resume === null ? ['exec', ...common, '-'] : ['exec', 'resume', ...common, resume, '-'];
 }

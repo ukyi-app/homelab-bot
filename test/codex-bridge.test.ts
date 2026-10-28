@@ -8,7 +8,7 @@ import { CODEX_CAPABILITIES, CODEX_DEFAULTS, CapabilityUnavailable, CodexBridge,
 import type { CodexFiles, CodexLauncher, LaunchResult, LaunchSpec } from '../src/codex.js';
 import { FORBIDDEN_FLAGS, SECRET_NAME, TASK_MARKER, assertWorkerRoot, codexConfig, configToml, execArgs,
   launchEnvironment, taskPaths } from '../src/codex-config.js';
-import { interpretRun, parseStream } from '../src/codex-events.js';
+import { authSecrets, interpretRun, parseStream } from '../src/codex-events.js';
 import type { RunReport } from '../src/codex-events.js';
 import { ProcessGroupLauncher } from '../src/codex-process.js';
 import { Runtime } from '../src/runtime.js';
@@ -26,18 +26,25 @@ const edited = { type: 'item.completed', item: { id: 'item_2', type: 'file_chang
 const out = (status: string, summary: string, question = '') => JSON.stringify({ status, summary, question });
 const exit0 = { code: 0, signal: null };
 
-interface Script { lines: string[]; exit?: LaunchResult['exit']; output?: string; hang?: boolean }
+interface Script { lines: string[]; exit?: LaunchResult['exit']; output?: string; hang?: boolean;
+  files?: Record<string, string>; during?: (spec: LaunchSpec) => Promise<void> }
 const finished = (output: string, extra: unknown[] = [], id: string | null = THREAD): Script =>
   ({ lines: jsonl(...(id ? begin(id) : [{ type: 'turn.started' }]), ...extra, done), exit: exit0, output });
+// 정리(terminate) 전에는 프로세스가 살아 있다고 답한다. 정리 뒤 남은 수는 left다.
 class FakeLauncher implements CodexLauncher {
   specs: LaunchSpec[] = [];
   scripts: Script[] = [];
   terminated: string[] = [];
   left: number | null = 0;
   started = 0;
+  private cleaned = new Set<string>();
   async run(spec: LaunchSpec, signal: AbortSignal): Promise<LaunchResult> {
-    this.specs.push(spec); this.started++;
+    this.specs.push(spec); this.started++; this.cleaned.delete(spec.job);
     const script = this.scripts.shift() ?? finished(out('completed', '기본 완료'));
+    for (const [path, content] of Object.entries(script.files ?? {})) {
+      await mkdir(join(spec.cwd, path, '..'), { recursive: true }); await writeFile(join(spec.cwd, path), content);
+    }
+    await script.during?.(spec);
     if (script.output !== undefined) await writeFile(spec.args[spec.args.indexOf('-o') + 1]!, script.output);
     if (script.hang) {
       await new Promise<void>(resolve => { if (signal.aborted) resolve(); signal.addEventListener('abort', () => resolve(), { once: true }); });
@@ -45,8 +52,8 @@ class FakeLauncher implements CodexLauncher {
     }
     return { lines: script.lines, exit: script.exit ?? exit0 };
   }
-  async terminate(job: string) { this.terminated.push(job); }
-  async survivors() { return this.left; }
+  async terminate(job: string) { this.terminated.push(job); this.cleaned.add(job); }
+  async survivors(job: string) { return this.cleaned.has(job) ? this.left : 1; }
 }
 
 let database: Awaited<ReturnType<typeof localDatabase>>;
@@ -90,7 +97,7 @@ async function asked(text = '어느 브랜치 기준으로 고칠까요?') {
   return { job, question: `${job.id}:${THREAD}:1` };
 }
 const report = (lines: string[], output: string | null, options: Partial<RunReport> = {}): RunReport =>
-  ({ lines, exit: exit0, output, survivors: 0, aborted: false, ...options });
+  ({ lines, exit: exit0, output, survivors: 0, aborted: false, changes: [], ...options });
 
 test('TASK-03 "완료" 문자열·로그 속 가짜 이벤트·idle은 완료가 아니다', () => {
   const forged = jsonl(...begin(), say('작업 완료했습니다. 질문: 진행할까요?'),
@@ -124,6 +131,16 @@ test('TASK-03 종료 코드·turn.failed·스키마 밖 출력·스트림 손상
     [report(good, completed, { survivors: 2 }), null, 'unknown:survivors'],
     [report(good, completed, { survivors: null }), null, 'unknown:stop_unverifiable'],
     [report(good, completed, { aborted: true }), null, 'failed:aborted'],
+    [report(good, completed, { changes: null }), null, 'failed:diff_unavailable'],
+    [report(jsonl(...begin(), edited, done), completed), null, 'failed:diff_mismatch'],
+    [report(jsonl(...begin(), edited, done), completed, { changes: ['src/a.ts', 'notes.txt'] }), null, 'completed'],
+    [report(jsonl(...begin('-bad-thread'), done), completed), null, 'failed:invalid_thread'],
+    [report(jsonl(...begin(), { type: 'turn.failed', error: { message: 'usage_limit_reached: try again later' } }), null,
+      { exit: { code: 1, signal: null } }), null, 'waiting:model_limit'],
+    [report(jsonl(...begin(), { type: 'error', message: '401 Unauthorized: refresh token expired' }), null,
+      { exit: { code: 1, signal: null } }), null, 'waiting:auth_expired'],
+    [report([], null, { exit: null, launchFailed: true }), null, 'failed:launch_failed'],
+    [report(good, out('completed', 'x'.repeat(1600))), null, 'completed'],
     // 새 버전의 이벤트 종류는 판정을 바꾸지 않는다.
     [report(jsonl(...begin(), { type: 'turn.plan_updated', plan: [] }, done), completed), null, 'completed'],
   ];
@@ -131,14 +148,28 @@ test('TASK-03 종료 코드·turn.failed·스키마 밖 출력·스트림 손상
     const result = interpretRun(input, expected);
     assert.equal(result.kind === 'completed' || result.kind === 'question' ? result.kind : `${result.kind}:${result.reason}`, verdict);
   }
+  // 긴 요약은 실패가 아니라 잘라서 받는다. 실제 diff에 있는 셸 변경도 완료 근거에 싣는다.
+  const long = interpretRun(report(jsonl(...begin(), edited, done), out('completed', 'x'.repeat(1600)), { changes: ['notes.txt', 'src/a.ts'] }), null);
+  assert.ok(long.kind === 'completed' && long.summary.length <= 1500 && long.summary.endsWith('(일부 생략)'));
+  assert.ok(long.kind === 'completed' && long.changes.length === 2 && long.reported.length === 1);
 });
-test('SEC-02 결과·질문에 작업자 auth.json 값이나 그 조각이 섞이면 게시 대상이 되지 않음', () => {
+test('SEC-02 결과·질문에 작업자 auth.json 값이나 그 조각이 섞이면 게시 대상이 되지 않음(best-effort)', () => {
   const token = 'fixture-refresh-token-0123456789abcdefghijklmnop';
-  for (const output of [out('completed', `토큰은 ${token}`), out('needs_input', '조사', `이 값 맞나요 ${token.slice(10, 40)}`)]) {
-    assert.deepEqual(interpretRun(report(jsonl(...begin(), done), output), null, [token]),
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+  const header = encode({ alg: 'RS256', kid: 'fixture-key' });
+  const jwt = [header, encode({ aud: ['https://api.fixture'], client_id: 'fixture-client', exp: 1_800_000_000,
+    jti: 'fixture-jwt-0123456789', sub: 'fixture-account' }), encode('fixture-signature-0123456789')].join('.');
+  const secrets = authSecrets(JSON.stringify({ tokens: { refresh_token: token, access_token: jwt }, last_refresh: '2026-10-29T00:00:00Z' }));
+  const spaced = token.replace(/(.{10})/g, '$1 ');
+  for (const output of [out('completed', `토큰은 ${token}`), out('needs_input', '조사', `이 값 맞나요 ${token.slice(10, 40)}`),
+    out('completed', `띄어 쓴 값 ${spaced}`), out('completed', `서명 ${jwt.split('.')[2]}`)]) {
+    assert.deepEqual(interpretRun(report(jsonl(...begin(), done), output), null, secrets),
       { kind: 'failed', reason: 'secret_echo', threadId: THREAD, turns: 1 });
   }
-  assert.equal(interpretRun(report(jsonl(...begin(), done), out('completed', '안전한 요약')), null, [token]).kind, 'completed');
+  // 같은 발급자 JWT의 공통 헤더 인용은 오탐하지 않는다.
+  for (const output of [out('completed', '안전한 요약'), out('completed', `RS256 헤더 예: ${header}`)]) {
+    assert.equal(interpretRun(report(jsonl(...begin(), done), output), null, secrets).kind, 'completed');
+  }
 });
 
 test('SEC-02 작업자 Codex 설정은 shell_environment_policy inherit=none, 비밀 이름 변수·CODEX_HOME 노출 없음', () => {
@@ -208,6 +239,7 @@ test('D-14 개인 ~/.codex* 아래·위의 작업자 루트를 거부하고 실�
     const spy: CodexFiles = {
       mkdir: async p => { touched.push(p); await nodeFiles.mkdir(p); }, write: async (p, c) => { touched.push(p); await nodeFiles.write(p, c); },
       read: async p => { touched.push(p); return nodeFiles.read(p); }, remove: async p => { touched.push(p); await nodeFiles.remove(p); },
+      resolve: async p => { touched.push(p); return nodeFiles.resolve(p); },
     };
     const local = new FakeLauncher();
     const result = await new ExecCodexAdapter(workerRoot, local, { files: spy, homes: [home] })
@@ -220,7 +252,8 @@ test('D-14 개인 ~/.codex* 아래·위의 작업자 루트를 거부하고 실�
 });
 
 test('TASK-01 Discord 작업 요청 → codex exec 완료 → 결과 기록 → outbox → Discord 게시', async () => {
-  launcher.scripts.push(finished(out('completed', '실패 원인은 시간대 고정이었고 시험을 고쳤습니다.'), [ran('ok'), edited, say('완료')]));
+  launcher.scripts.push({ ...finished(out('completed', '실패 원인은 시간대 고정이었고 시험을 고쳤습니다.'), [ran('ok'), edited, say('완료')]),
+    files: { 'src/a.ts': 'export const fixed = true;\n' } });
   const job = await task('task', '실패하는 시험을 고쳐줘');
   assert.equal(await runtime.tick(), true);
   assert.equal((await jobs())[0]!.state, 'succeeded');
@@ -237,7 +270,10 @@ test('TASK-01 Discord 작업 요청 → codex exec 완료 → 결과 기록 → 
   assert.deepEqual(launcher.terminated, [job.id]);
   await f.publisher.deliver();
   assert.equal(f.rest.messages.length, 1);
-  assert.match(f.rest.messages[0]!.body.content, /Codex 작업 완료[\s\S]*시간대 고정[\s\S]*Codex 보고 기준/);
+  assert.match(f.rest.messages[0]!.body.content, /Codex 작업 완료[\s\S]*시간대 고정[\s\S]*실제 diff 기준\): 1개/);
+  assert.equal(result.evidence.diff, 'workspace_snapshot'); assert.deepEqual(result.evidence.reportedChanges, ['src/a.ts']);
+  // codex exec의 Git 저장소 요구: 첫 실행 전에 작업 공간을 git init·기준 커밋한다(D-15).
+  assert.ok(await nodeFiles.read(join(taskPaths(root, job.id).workspace, '.git', 'HEAD')));
   assert.equal((await outbox())[0]!.state, 'sent');
 });
 test('TASK-01 능력표: tool approval false, attach 미정, 타인·다른 스레드·미등록 작업 접근 차단', async () => {
@@ -289,6 +325,10 @@ test('TASK-02 중복·다른 사람·다른 스레드·없는 질문·지난 질
   const { question } = await asked();
   await assert.rejects(bridge.answer({ question, actor: 'intruder', scope: thread, text: 'main', event: 'x-1' }), Denied);
   await assert.rejects(owner(question, 'main', 'x-2', { ...thread, channel: 'fixture-other-thread' }), Denied);
+  // 정책 owner가 바뀌어 새 owner가 같은 스레드에서 답해도 질문의 응답자가 아니면 거부한다.
+  f.policy.owner = 'replacement';
+  await assert.rejects(bridge.answer({ question, actor: 'replacement', scope: thread, text: 'main', event: 'x-6' }), Denied);
+  f.policy.owner = 'fixture-owner';
   assert.equal((await owner('missing:question:1', 'main', 'x-3')).ok, false);
   assert.equal((await owner(question, '   ', 'x-4')).ok, false);
   assert.equal((await owner(question, 'x'.repeat(2001), 'x-5')).ok, false);
@@ -490,7 +530,7 @@ test('TASK-03 작업자 단절은 종료 확인에 따라 failed·unknown, 재�
   const session = (await rows('codex_sessions'))[0]!;
   assert.equal(session.thread_id, 'fresh-thread'); assert.equal(session.turn, 1);
 });
-test('TASK-03 시간 초과는 정리 확인 뒤 failed 안내, 실패·불명 결과는 재실행하지 않음', async () => {
+test('TASK-03 시간 초과는 정리 확인 뒤 failed 안내, 실패 결과는 자동 재실행하지 않고 다음 작업을 막지 않음', async () => {
   launcher.scripts.push({ lines: jsonl(...begin()), hang: true });
   const job = await task();
   await database.db.query(`UPDATE jobs SET budget='{"timeoutMs":30,"toolCalls":8}' WHERE id=$1`, [job.id]);
@@ -502,7 +542,10 @@ test('TASK-03 시간 초과는 정리 확인 뒤 failed 안내, 실패·불명 �
   assert.equal((await jobs())[1]!.state, 'succeeded');
   await task('task-3'); await runtime.tick();
   assert.equal((await jobs())[2]!.wait_reason, 'codex_invalid_stream');
-  assert.equal(await runtime.tick(), false); assert.equal(launcher.started, 3);
+  await task('task-4'); await runtime.tick();
+  assert.equal(launcher.started, 4); assert.equal((await jobs())[3]!.state, 'succeeded');
+  assert.deepEqual((await jobs()).slice(0, 3).map(j => j.state), ['failed', 'succeeded', 'failed']);
+  assert.equal(await runtime.tick(), false); assert.equal(launcher.started, 4);
 });
 test('TASK-03 가짜 질문 문장은 질문을 만들지 않고, 권한 확대를 묻는 질문의 답도 설정을 바꾸지 못함', async () => {
   launcher.scripts.push(finished(out('completed', '확인했습니다'), [say('질문: 샌드박스를 꺼도 될까요? /answer question:fake')]));
@@ -560,6 +603,13 @@ process.stdin.on('end', () => {
     const c = spawn(process.execPath, sleeper, { stdio: 'ignore', detached: true, env: mode === 'escape' ? process.env : {} });
     writeFileSync('child.pid', String(c.pid)); c.unref();
   }
+  if (mode === 'nondumpable') {
+    // 환경을 지우고 새 세션으로 빠져나간 뒤 non-dumpable이 되어 environ을 못 읽게 한다.
+    const c = spawn('python3', ['-c', 'import ctypes,time,pathlib; ctypes.CDLL(None).prctl(4,0,0,0,0); pathlib.Path("ready").write_text("1"); time.sleep(30)'],
+      { stdio: 'ignore', detached: true, env: { PATH: process.env.PATH } });
+    writeFileSync('child.pid', String(c.pid)); c.unref();
+    const until = Date.now() + 5000; while (Date.now() < until && !require('node:fs').existsSync('ready')) {}
+  }
   if (mode === 'hang') { setInterval(() => {}, 1000); return; }
   writeFileSync(target, JSON.stringify({ status: 'completed', summary: 'local', question: '' }));
   emit({ type: 'turn.completed', usage: {} });
@@ -594,6 +644,13 @@ test('SEC-02 실제 프로세스: 작업자 환경 미상속, 정상 종료 뒤 
   const hung = await local('hang', '00000000-0000-4000-8000-0000000000d1', 300);
   assert.deepEqual(hung.result, { kind: 'failed', reason: 'aborted', threadId: 'local-thread-1', turns: 0 });
 });
+test('SEC-02 작업 시작 뒤 생긴 같은 UID 프로세스의 환경을 못 읽으면 소멸 확인 불가로 unknown(fail-closed)', async () => {
+  const run = await local('nondumpable', '00000000-0000-4000-8000-0000000000e2');
+  assert.ok(run.pid > 0);
+  assert.equal(run.result.kind, 'unknown');
+  assert.equal(run.result.kind === 'unknown' && run.result.reason, 'stop_unverifiable');
+  process.kill(run.pid, 'SIGKILL');
+});
 test('SEC-02 한계 기록: 환경을 지우고 새 세션으로 빠져나간 자식은 그룹·표식으로 못 찾는다(cgroup 필요, T16b)', async () => {
   const run = await local('escape-clean', '00000000-0000-4000-8000-0000000000e1');
   // 이 결과가 바뀌면 confirm_stop 표시와 ARCHITECTURE §12의 한계 문장을 함께 고친다.
@@ -601,4 +658,109 @@ test('SEC-02 한계 기록: 환경을 지우고 새 세션으로 빠져나간 �
   assert.equal(alive(run.pid), true);
   assert.equal(CODEX_CAPABILITIES.confirm_stop, 'process_group_and_marker');
   process.kill(run.pid, 'SIGKILL');
+});
+
+test('OPS-02 settle 밖에서 생긴 unknown(lease 만료)도 sweep이 막힘 알림을 한 번만 넣음', async () => {
+  await task();
+  const claimed = (await f.store.claim())!;
+  f.advance(DEFAULTS.leaseMs + 1); f.policy.confirmedAt = f.now();
+  assert.equal(await runtime.tick(), false);
+  assert.equal((await jobs())[0]!.state, 'unknown'); assert.equal((await jobs())[0]!.wait_reason, 'lease_expired');
+  await runtime.tick();
+  assert.equal((await outbox()).filter(row => row.idempotency_key === `codex-blocked:${claimed.id}`).length, 1);
+  await f.publisher.deliver();
+  assert.match(f.rest.messages[0]!.body.content, new RegExp(`작업 ${claimed.id}의 Codex 프로세스 종료를 확인하지 못했습니다`));
+});
+test('AUTH-02 owner가 바뀌어 남은 unknown은 옛 owner가 못 풀고 현재 owner만 0개 확인 뒤 해제', async () => {
+  launcher.left = 1;
+  launcher.scripts.push({ lines: jsonl(...begin()), hang: true });
+  const job = await task();
+  const running = runtime.tick();
+  while (!launcher.started) await new Promise(resolve => setImmediate(resolve));
+  f.policy.owner = 'replacement';
+  await running;
+  assert.equal((await jobs())[0]!.state, 'unknown');
+  await assert.rejects(bridge.release('fixture-owner', thread, job.id), Denied);
+  const own = { ...thread, channel: 'fixture-replacement-thread' };
+  assert.equal((await bridge.release('replacement', own, job.id)).ok, false);
+  launcher.left = 0;
+  assert.equal((await bridge.release('replacement', own, job.id)).ok, true);
+  assert.equal((await jobs())[0]!.state, 'cancelled');
+  // 현재 owner의 다른 일반 작업 상태 조회 권한이 생기는 것은 아니다.
+  await assert.rejects(bridge.status('replacement', own, job.id), Denied);
+});
+test('TASK-03 Codex가 바꿨다고 보고한 파일이 실제 diff에 없으면 완료가 아니고, 셸로만 바꾼 파일은 실제 diff로 보고', async () => {
+  launcher.scripts.push(finished(out('completed', '고쳤습니다'), [edited]));
+  await task();
+  await runtime.tick();
+  assert.equal((await jobs())[0]!.state, 'failed'); assert.equal((await jobs())[0]!.wait_reason, 'codex_diff_mismatch');
+  launcher.scripts.push({ ...finished(out('completed', '셸로 고침'), [ran('sed -i')]), files: { 'notes.txt': 'changed\n' } });
+  await task('task-2');
+  await runtime.tick();
+  const result = (await rows('results'))[0]!;
+  assert.deepEqual(result.result.changes, ['notes.txt']); assert.deepEqual(result.evidence.reportedChanges, []);
+});
+test('TASK-03 한도 도달은 failed가 아니라 대기·스케줄러 정지·알림, 재개하면 같은 답으로 같은 스레드를 이음', async () => {
+  const { job, question } = await asked();
+  await owner(question, 'main', 'answer-1');
+  launcher.scripts.push({ lines: jsonl({ type: 'turn.started' }, { type: 'turn.failed', error: { message: 'usage_limit_reached' } }),
+    exit: { code: 1, signal: null } });
+  await runtime.tick();
+  const waiting = (await jobs())[0]!;
+  assert.equal(waiting.state, 'waiting_user'); assert.equal(waiting.wait_reason, 'model_limit');
+  assert.equal((await rows('codex_questions'))[0]!.state, 'answered');
+  assert.ok((await outbox()).some(row => row.payload.content.includes('다른 계정·인증으로 바꾸지 않습니다')));
+  await task('task-2');
+  assert.equal(await runtime.tick(), false); assert.equal(launcher.started, 2);
+  const resumed = await f.store.control('fixture-owner', f.store.scopeId(thread), 'resume-model', job.id) as { ok: boolean };
+  assert.equal(resumed.ok, true);
+  launcher.scripts.push(finished(out('completed', '끝'), [], null));
+  await runtime.tick();
+  assert.deepEqual(launcher.specs[2]!.args.slice(0, 2), ['exec', 'resume']);
+  assert.ok(launcher.specs[2]!.args.includes(THREAD)); assert.equal(launcher.specs[2]!.stdin, 'main');
+  assert.equal((await jobs())[0]!.state, 'succeeded');
+});
+test('TASK-02 질문 대기 중 비상 중지를 풀었으면 답한 뒤 스케줄러도 풀려 이어 감', async () => {
+  const { question } = await asked();
+  const conversation = f.store.scopeId(thread);
+  await f.store.control('fixture-owner', conversation, 'emergency-stop');
+  const released = await f.store.control('fixture-owner', conversation, 'resume-model', 'emergency-stop') as { paused: boolean };
+  assert.equal(released.paused, true);
+  assert.equal((await owner(question, 'main', 'answer-1')).ok, true);
+  launcher.scripts.push(finished(out('completed', '끝'), [], null));
+  assert.equal(await runtime.tick(), true);
+  assert.equal((await jobs())[0]!.state, 'succeeded');
+});
+test('TASK-03 실행 파일이 없거나 어댑터가 동기로 던지면 실행 전 실패로 막지 않고 종료 확인으로 판정', async () => {
+  const missing = new ExecCodexAdapter(root, new ProcessGroupLauncher(['/nonexistent/codex'], { graceMs: 50 }));
+  assert.deepEqual(await missing.execute({ job: '00000000-0000-4000-8000-0000000000f1', prompt: 'p', resume: null }, new AbortController().signal),
+    { kind: 'failed', reason: 'launch_failed', threadId: null, turns: 0 });
+  for (const stopped of [true, false]) {
+    await database.pg.exec('TRUNCATE events,conversations,jobs,results,outbox,denied_actors,controls,audit,codex_sessions,codex_questions RESTART IDENTITY CASCADE');
+    const throwing = new CodexBridge(f.store, f.gate, { capabilities: () => CODEX_CAPABILITIES,
+      execute: () => { throw new Error('sync'); }, confirmStop: async () => ({ stopped }) }, { monitorMs: 5 });
+    await task(`sync-${stopped}`);
+    await new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, throwing).tick();
+    const job = (await jobs())[0]!;
+    assert.equal(job.state, stopped ? 'failed' : 'unknown'); assert.equal(job.wait_reason, 'codex_adapter_error');
+  }
+});
+test('D-14 작업자 루트 아래 심링크가 개인 Codex 홈을 가리키면 그 아래에 쓰지 않음', async () => {
+  const home = resolve(await mkdtemp('.local/home-'));
+  const workerRoot = resolve(await mkdtemp('.local/root-'));
+  try {
+    await mkdir(join(home, '.codex-work', 'tasks'), { recursive: true });
+    await symlink(join(home, '.codex-work', 'tasks'), join(workerRoot, 'tasks'));
+    const local = new FakeLauncher();
+    const adapter = new ExecCodexAdapter(workerRoot, local, { homes: [home] });
+    await assert.rejects(adapter.execute({ job: '00000000-0000-4000-8000-0000000000f2', prompt: 'p', resume: null }, new AbortController().signal), Denied);
+    assert.equal(local.started, 0);
+    assert.equal(await nodeFiles.read(join(home, '.codex-work', 'tasks', '00000000-0000-4000-8000-0000000000f2', 'codex-home', 'config.toml')), null);
+  } finally {
+    await rm(home, { recursive: true, force: true }); await rm(workerRoot, { recursive: true, force: true });
+  }
+});
+test('SEC-02 작업자 설정은 프로젝트 신뢰([projects])를 주지 않음', () => {
+  const text = configToml(codexConfig(taskPaths(root, '00000000-0000-4000-8000-0000000000f3')));
+  assert.ok(!text.includes('[projects') && !text.includes('trust_level'));
 });
