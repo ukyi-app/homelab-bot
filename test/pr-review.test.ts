@@ -1236,3 +1236,15 @@ for (const reason of ['limited', 'auth_expired'] as const) {
     }
   });
 }
+test('r2 P2-01 REVIEW-02 게시 직전 draft로 바뀌면 자동 리뷰는 게시하지 않고, 댓글 명시 요청은 게시한다', async () => {
+  await opened(); await r.runtime.tick();
+  r.gh.pulls.set(7, pull({ draft: true }));
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['superseded', 'draft']]);
+  assert.equal(r.gh.writes.length, 0);
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,outbox CASCADE');
+  r.gh.pulls.set(7, pull({ draft: true, updated_at: '2026-10-29T04:10:00Z' }));
+  assert.equal((await hook('issue_comment', commentEvent())).outcome, 'queued');
+  await r.runtime.tick(); await r.publisher.deliver();
+  assert.equal(r.gh.writes.length, 1);
+});

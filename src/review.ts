@@ -701,6 +701,9 @@ export class ReviewPublisher {
         return true;
       }
       if (pr.head.repoId !== pr.base.repoId || !authorAllowed(pr.author, context.review)) { await this.state(row, 'blocked', 'author_denied'); return true; }
+      // draft는 기본 대기다. 늦거나 빠진 converted_to_draft를 기다리지 않고 게시 직전 live 상태로 본다. 댓글 명시 요청만 예외.
+      const trigger = (await this.store.db.query<{ trigger: string }>('SELECT trigger FROM pr_reviews WHERE job_id=$1', [row.job_id])).rows[0]?.trigger;
+      if (pr.draft && trigger !== 'comment' && !context.review.reviewDrafts) { await this.state(row, 'superseded', 'draft'); return true; }
       if (row.attempt > 1 && await this.existing(row)) return true;
       const request = { method: 'POST', path: `/repos/${repo.fullName}/pulls/${row.pr_number}/reviews`,
         body: { commit_id: row.head_sha, event: 'COMMENT', body: row.body, comments: row.comments } };
