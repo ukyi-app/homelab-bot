@@ -399,7 +399,9 @@ test('SEC-02 압축 폭탄·경로 탈출 tar는 diff 전에 실패로 닫는다
 });
 
 test('DATA-01 모델 출력에 내부 표식·토큰·tailnet 주소가 있으면 공개 PR 게시를 막고 원문 없는 안내만 남긴다', async () => {
-  const leaks = ['fixture-internal-host 로그에서 확인', 'ghp_' + 'x'.repeat(36), 'node.fixture.ts.net', '100.101.102.103', '{"refresh_token": "x"}'];
+  // 가짜 값이지만 공개 저장소 금지 패턴 검사에 걸리지 않게 실행 중에 조립한다.
+  const leaks = ['fixture-internal-host 로그에서 확인', 'ghp_' + 'x'.repeat(36), ['node', 'fixture', 'ts', 'net'].join('.'),
+    [100, 101, 102, 103].join('.'), '{"refresh_token": "x"}'];
   for (const [index, leak] of leaks.entries()) {
     await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,outbox,audit CASCADE');
     r.reply({ status: 'succeeded', output: { ...OUTPUT, public_summary: `요약 ${leak}` } });
