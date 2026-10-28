@@ -25,7 +25,7 @@
 | DISCOVERY | T15 | 초안, 결정 확정, 저장소 반영 대기 | 이 저장소 PR 병합과 운영 저장소 push(사람 승인) |
 | FOUNDATION 로컬·mock | T16a | 완료(PR #5 병합 2026-10-20, DM·브리핑 확정) | 없음 |
 | FOUNDATION 실연동·첫 배포 | T16b | 대기 | T13(플랫폼), T16a, Discord 서버·봇 계정, 작업자 영속 쓰기 공간(설계 C.8 변경), 봇 전용 구독 계정·첫 시드(D-14) |
-| PR_REVIEW | T17 | 로컬·mock 구현(2026-10-29, 브랜치 `feat/t17-pr-review-local`, 로컬 커밋만, 병합 전). r2(독립 Codex 리뷰 P1 2·P2 7) 수정·회귀 검증 뒤 배정 시험 12개 mock·local_integration pass(349/349), 모델 품질 평가·실연동·파드 격리 사례 blocked([VERIFICATION](VERIFICATION.md) "PR_REVIEW T17"). 리뷰 모델 대기 해제는 공유 제어 계약에 리뷰 전용 명령 추가로 해소(실제 명령 등록은 T16b) | 완료 T16b. 작업별 세션 저장 공간 결정(ARCHITECTURE §5.1). 리뷰 App(사람). D-14 차단 조건(OpenAI 허용 확인이나 API 키 등 공식 지원 인증 전환. 공개 저장소 PR 내용으로 구독 모델을 부르는 일만 막음). 결정 대기([DECISIONS](DECISIONS.md) "T17") |
+| PR_REVIEW | T17 | 로컬·mock 구현(2026-10-29, 브랜치 `feat/t17-pr-review-local`, 로컬 커밋만, 병합 전). r2·r3(독립 Codex 리뷰 r1의 P1 2·P2 7, 재리뷰 r2의 P2 3) 수정·회귀 검증 뒤 배정 시험 12개가 로컬·mock 범위에서 pass(352/352). 이벤트 순서는 `updated_at` 초 단위 기준, 마이그레이션 재적용은 r1 시점 스키마의 PGlite에서만 확인. 모델 품질 평가·실연동·파드 격리 사례 blocked([VERIFICATION](VERIFICATION.md) "PR_REVIEW T17"). 리뷰 모델 대기 해제는 공유 제어 계약에 리뷰 전용 명령 추가로 해소(실제 명령 등록은 T16b) | 완료 T16b. 작업별 세션 저장 공간 결정(ARCHITECTURE §5.1). 리뷰 App(사람). D-14 차단 조건(OpenAI 허용 확인이나 API 키 등 공식 지원 인증 전환. 공개 저장소 PR 내용으로 구독 모델을 부르는 일만 막음). 결정 대기([DECISIONS](DECISIONS.md) "T17") |
 | CODEX_BRIDGE | T18 | 대기 | 착수 T16a, 완료 T16b. R08 연결 방식 판단 |
 | MEMORY_BRIEFING | T20 | 대기 | 착수 T16a, 완료 T16b |
 | CHANGE_PR | T19 | 대기 | T17, T18, D-24 App |

@@ -419,11 +419,13 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 8. **게시 대조:** 응답을 잃은 게시는 다시 보내지 않고 marker(`<!-- homelab-bot-review:github-review:<job id>:<시도> -->`)와 검토 SHA로 PR 리뷰 목록을 대조한다. 못 찾으면 `unknown`을 유지하고 24시간 뒤 은퇴한다(T16a Discord 대조와 같은 원칙). 422(인라인 위치 무효)는 본문만으로 한 번 더 보낸다. 전송 전 일시 장애(정책 확인 불가, GitHub 5xx·429)는 재시도 횟수를 쓰지 않고 1초~60초 백오프로 기다린다.
 9. **공개 범위(DATA-01):** 마스킹이 아니라 게시 차단이다. 내부 표식 실제 값은 runtime policy `review.internalMarkers`에만 둔다. Discord 요약은 알림 채널(D-17)에 코드가 만든 숫자·리비전만 쓰고 모델 문장은 넣지 않는다.
 10. **변경 목록:** 게시 서버가 API로 열거한 목록이 기준이고 압축본은 blob 내용에만 쓴다(ARCHITECTURE §6). 열거 실패는 `failed`이고 압축본 비교로 대신하지 않는다. 429·5xx는 Retry-After와 지수 백오프로 기다리다 10회를 넘으면 `failed`다.
-11. **게시 직전 재확인(r2):** draft는 게시 직전 live PR로도 본다(댓글 명시 요청만 예외). 게시 상한(지적 수·인라인 수·본문 길이)은 저장된 구조화 결과를 게시 시점 정책으로 다시 렌더링해 적용한다.
-12. **이벤트 순서(r2):** `closed`·`converted_to_draft`도 admission 잠금과 `pr_updated_at` 비교를 거쳐, 오래된 이벤트는 `stale_event`로 무시한다.
+11. **게시 직전 재확인(r2·r3):** draft는 게시 직전 live PR로도 본다(댓글 명시 요청만 예외). 이때 게시 행과 세대 기록을 함께 보류로 두어, 뒤에 ready_for_review·재조정·댓글이 오면 다시 이을 수 있게 한다(16번). 게시 상한(지적 수·인라인 수·본문 길이)은 저장된 구조화 결과를 게시 시점 정책으로 다시 렌더링해 적용한다.
+12. **이벤트 순서(r2·r3):** admission과 같은 잠금 안에서 PR의 최신 관측 시각(`pr_updated_at`)을 기록한다. 같은 세대의 중복 이벤트(재개·draft 해제 등)에서도 단조 증가시킨다. `closed`·`converted_to_draft`를 포함해 그보다 오래된 이벤트는 `stale_event`로 무시한다. 한계: 판정은 webhook·live PR의 `updated_at`(초 단위)을 믿으므로 같은 초 안의 역순은 가리지 못한다. 남는 창은 실행 직전·게시 직전 live PR 재확인이 막는다.
 13. **diff 표현(r2):** 모드(실행 비트)·이름·새 파일·삭제는 git 형식 머리줄로, 파일 끝 개행 추가·삭제는 `\ No newline at end of file`로 전달한다. 변경 목록 계약에 `baseMode`·`headMode`를 두고, 없으면 압축본의 실행 비트를 쓴다. 보이는 차이가 없는 목록 항목은 `archive_mismatch`로 미검토다.
 14. **기준 지침 예산(r2):** base `AGENTS.md`도 파일 상한(`input.maxFileBytes`)과 모델 입력 예산(`input.maxDiffBytes`, diff보다 먼저 잡음)을 받는다. 넘으면 자르지 않고 빼고 `guidelines_limit`로 partial 표시한다.
 15. **권한 재확인 시점(r2):** GitHub 조회를 마친 뒤 capability 발급 직전에 최신 정책으로 저장소·설치·작성자·입력 정책 revision·리뷰 활성 여부를 다시 본다. 재조정의 실행당 상한은 새 작업과 되살린 작업을 함께 센다.
+16. **같은 세대 결과 재사용(r3):** 같은 세대(head·비교 기준·정책 revision이 같음)에 공개 가능한 결과가 이미 있는데 닫힘·draft·게시 직전 상태 변화로 게시만 못 했으면, 재개·ready_for_review·재조정·댓글에서 모델을 다시 부르지 않고 게시 행을 다시 대기시킨다(`resumed`, 재조정 예산에 세지 않음). 본문은 게시 직전 현재 정책으로 다시 렌더링된다. 이미 게시·대기·차단된 세대는 다시 잇지 않는다.
+17. **마이그레이션 008의 열 추가(r3):** 008은 아직 배포 전이지만, 앞선 008로 만든 표에도 같은 열이 생기도록 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`를 둔다(`positions`·`inline`·`defer_count`·`pause_count`).
 
 ### 결정 대기 (사용자 결정 필요)
 
