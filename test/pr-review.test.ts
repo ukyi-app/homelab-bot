@@ -815,3 +815,38 @@ test('migration 008은 다시 적용해도 기존 리뷰 기록을 바꾸지 않
   assert.deepEqual([await reviewJobs(), await deliveries()], before);
   assert.ok((await rows('schema_migrations')).some(m => m.version === 8));
 });
+
+test('AUTH-01 허용 철회: 실행 전 저장소 철회는 모델 호출 없이 취소, 게시 전 저장소·허용 봇 철회는 게시 차단', async () => {
+  await opened();
+  r.policy().repositories = [];
+  await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.wait_reason]), [['cancelled', 'authorization_revoked']]);
+  assert.equal(r.inputs.length, 0);
+  r.policy().repositories = [REPO];
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries CASCADE');
+  await opened(pull({ updated_at: '2026-10-29T00:08:00Z' })); await r.runtime.tick();
+  r.policy().repositories = [];
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['blocked', 'authorization_revoked']]);
+  r.policy().repositories = [REPO];
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries CASCADE');
+  await opened(pull({ ...bot(RENOVATE), updated_at: '2026-10-29T00:09:00Z' })); await r.runtime.tick();
+  r.policy().allowedBotAuthorIds = [WRITER_BOT];
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['blocked', 'author_denied']]);
+  assert.equal(r.gh.writes.length, 0);
+});
+test('EVENT-01 댓글 재요청은 확인된 실패만 같은 세대로 되살리고 재시도 한도 뒤에는 중복으로 둔다', async () => {
+  r.reply({ status: 'succeeded', output: { ...OUTPUT, approve: true } });
+  await opened(); await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => j.state), ['failed']);
+  assert.equal((await hook('pull_request', prEvent('reopened'))).outcome, 'duplicate_generation');
+  for (let attempt = 2; attempt <= DEFAULTS.maxRetries + 1; attempt++) {
+    assert.equal((await hook('issue_comment', commentEvent())).outcome, 'requeued');
+    await r.runtime.tick();
+    assert.deepEqual((await reviewJobs()).map(j => [j.state, j.attempt]), [['failed', attempt]]);
+  }
+  assert.equal((await hook('issue_comment', commentEvent())).outcome, 'duplicate_generation');
+  assert.equal(r.inputs.length, DEFAULTS.maxRetries + 1);
+  assert.equal((await reviewJobs()).length, 1);
+});
