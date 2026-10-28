@@ -184,7 +184,11 @@ export class ReviewQueue {
     const revive = existing && existing.attempt <= DEFAULTS.maxRetries && (existing.state === 'superseded'
       || (existing.state === 'succeeded' && existing.superseded_at !== null && !existing.delivered)
       || (trigger === 'comment' && ['failed', 'cancelled'].includes(existing.state)));
-    if (existing && !revive) return { outcome: 'duplicate_generation', key, job: existing.job_id };
+    if (existing && !revive) {
+      // 같은 세대라도 더 새 이벤트(재개·draft 해제 등)를 봤다는 사실은 남긴다. 늦게 온 옛 닫힘·draft가 이 시각과 비교된다.
+      await tx.query('UPDATE pr_reviews SET pr_updated_at=GREATEST(pr_updated_at,$2) WHERE job_id=$1', [existing.job_id, pr.updatedAt]);
+      return { outcome: 'duplicate_generation', key, job: existing.job_id };
+    }
     const latest = (await tx.query<ReviewRow>(`SELECT * FROM pr_reviews WHERE repo_id=$1 AND pr_number=$2
       ORDER BY pr_updated_at DESC,created_at DESC LIMIT 1`, [repo.id, pr.number])).rows[0];
     // 늦게 도착한 옛 이벤트가 새 세대를 밀어내지 않게 한다. 실행 직전 live 조회가 한 번 더 막는다.

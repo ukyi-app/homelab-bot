@@ -978,6 +978,8 @@ test('REVIEW-02 draft로 밀려난 세대를 댓글로 요청하면 draft 대기
   assert.deepEqual((await reviewJobs()).map(j => [j.state, j.wait_reason]), [['cancelled', 'cancel_before_dispatch']]);
   assert.equal(r.inputs.length, 1);
   assert.equal((await hook('pull_request', prEvent('reopened', pull({ updated_at: '2026-10-29T01:32:00Z' })))).outcome, 'duplicate_generation');
+  // live PR 시각은 이미 받은 webhook보다 앞설 수 없다.
+  r.gh.pulls.set(7, pull({ updated_at: '2026-10-29T01:32:00Z' }));
   assert.equal((await hook('issue_comment', commentEvent())).outcome, 'requeued');
 });
 test('D-14 PR·목록 조회 중 비상 중지가 오면 dispatch 전에 취소하고 모델을 부르지 않는다', async () => {
@@ -1420,4 +1422,17 @@ test('r3 R2-03 r1 시점 008로 만든 리뷰 표에 현재 008을 다시 적용
   assert.deepEqual((await reviewJobs()).map(j => [j.state, j.review_outcome]), [['succeeded', 'completed']]);
   assert.equal(r.gh.writes.length, 1);
   assert.deepEqual(r.gh.writes[0]!.body.comments.map(c => c.line), [2]);
+});
+test('r3 R2-01 EVENT-01 같은 세대의 reopened·ready_for_review 뒤 늦게 온 옛 closed·draft는 미게시 결과를 지우지 않는다', async () => {
+  await opened(pull({ updated_at: '2026-10-29T00:00:00Z' }));
+  await r.runtime.tick();
+  r.gh.pulls.set(7, pull({ updated_at: '2026-10-29T02:00:00Z' }));
+  assert.equal((await hook('pull_request', prEvent('reopened', pull({ updated_at: '2026-10-29T02:00:00Z' })))).outcome, 'duplicate_generation');
+  assert.equal((await hook('pull_request', prEvent('closed', pull({ state: 'closed', updated_at: '2026-10-29T01:00:00Z' })))).outcome, 'stale_event');
+  assert.equal((await hook('pull_request', prEvent('ready_for_review', pull({ updated_at: '2026-10-29T03:00:00Z' })))).outcome, 'duplicate_generation');
+  assert.equal((await hook('pull_request', prEvent('converted_to_draft', pull({ draft: true, updated_at: '2026-10-29T02:30:00Z' })))).outcome, 'stale_event');
+  assert.deepEqual((await deliveries()).map(d => d.state), ['pending']);
+  await r.publisher.deliver();
+  assert.equal(r.gh.writes.length, 1);
+  assert.equal(r.inputs.length, 1);
 });
