@@ -75,7 +75,7 @@ class FakeGitHub implements GitHubReader {
   writes: GitHubWrite[] = [];
   lose = false;
   fail: GitHubError | undefined;
-  compares = 0;
+  compares: [string, string][] = [];
   async pullRequest(_repository: string, number: number) {
     const value = this.pulls.get(number);
     if (value instanceof Error) throw value;
@@ -83,7 +83,11 @@ class FakeGitHub implements GitHubReader {
     return structuredClone(value);
   }
   async openPullRequests(_repository: string, page: number) { return page === 1 ? structuredClone(this.open) : []; }
-  async compare() { this.compares++; if (this.compareError) throw this.compareError; return structuredClone(this.compareResult); }
+  async compare(_repository: string, base: string, head: string) {
+    this.compares.push([base, head]);
+    if (this.compareError) throw this.compareError;
+    return structuredClone(this.compareResult);
+  }
   async reviews() { return structuredClone(this.remote); }
   transport: GitHubTransport = async request => {
     if (this.fail) { const error = this.fail; this.fail = undefined; throw error; }
@@ -900,4 +904,19 @@ test('EVENT-02 게시 직전 정책 확인 불가는 재시도 횟수를 쓰지 
   await r.publisher.deliver();
   assert.deepEqual((await deliveries()).map(d => d.state), ['sent']);
   assert.equal(r.gh.writes.length, 1);
+});
+
+test('REVIEW-03 열거 중 head가 움직여도 변경 목록과 압축본은 먼저 고정한 SHA 쌍 기준이고, 게시 직전 대조로 막는다', async () => {
+  await opened();
+  const compare = r.gh.compare.bind(r.gh);
+  r.gh.compare = async (repository, base, head) => {
+    r.gh.pulls.set(7, pull({ head: { sha: HEAD2, ref: "f", repo: repository }, updated_at: "2026-10-29T00:59:00Z" }));
+    return compare(repository, base, head);
+  };
+  await r.runtime.tick();
+  assert.deepEqual(r.gh.compares, [[BASE, HEAD]]);
+  assert.deepEqual(r.fetches.map(x => x.url.split('/').at(-1)), [BASE, HEAD]);
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['superseded', 'stale_head']]);
+  assert.equal(r.gh.writes.length, 0);
 });
