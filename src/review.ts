@@ -37,12 +37,15 @@ export const MODEL_CALL_ASSOCIATIONS = Object.freeze(['OWNER', 'MEMBER', 'COLLAB
 export function reviewRevision(review: ReviewPolicy): string {
   return `rp-${createHash('sha256').update(JSON.stringify([REVIEW_INSTRUCTIONS, review.input, review.comparison])).digest('hex').slice(0, 16)}`;
 }
+// 리뷰 정책이 없거나 결정 대기 값(comparison null)이면 새 요청만 받지 않는다. 철회(Denied)가 아니라
+// 일시 상태로 다뤄, 대기 작업과 미게시 결과를 지우지 않고 다시 켜질 때까지 기다린다.
+export class ReviewDisabled extends PolicyUnavailable {}
 export class ReviewPolicySource {
   constructor(private readonly gate: PolicyGate) {}
   async current(): Promise<ReviewContext> {
     const base = await this.gate.current();
     const parsed = ReviewPolicySchema.safeParse(base.review);
-    if (!parsed.success || parsed.data.comparison === null) throw new Denied();
+    if (!parsed.success || parsed.data.comparison === null) throw new ReviewDisabled();
     return { base, review: parsed.data, revision: reviewRevision(parsed.data) };
   }
 }
@@ -201,8 +204,14 @@ export class ReviewQueue {
       && latest.policy_revision === context.revision;
     // base만 움직였을 때 재리뷰를 건너뛰는 것은 이전 세대가 이미 게시됐거나 확인된 실패로 끝났을 때뿐이다.
     // 아직 리뷰가 한 번도 게시되지 않은 PR을 base 이동으로 버리지 않는다.
-    const concluded = !!latest && (await tx.query(`SELECT 1 FROM jobs j WHERE j.id=$1 AND (j.state='failed' OR EXISTS
-      (SELECT 1 FROM review_deliveries d WHERE d.job_id=j.id AND d.state IN ('sending','sent','unknown')))`, [latest.job_id])).rows.length > 0;
+    // 게시됐거나(차단 포함), 공개 범위 검사에서 막혔거나, 확인된 실패거나, 같은 head에서 이미 두 번 리뷰했으면 끝난 것으로 본다.
+    // base 머리 기준에서 base가 자주 움직여도 같은 head의 모델 호출이 계속 늘지 않게 한다.
+    const concluded = !!latest && (await tx.query(`SELECT 1 FROM pr_reviews p JOIN jobs j ON j.id=p.job_id
+      WHERE p.repo_id=$1 AND p.pr_number=$2 AND p.head_sha=$3 HAVING
+        bool_or(p.job_id=$4 AND j.state='failed')
+        OR bool_or(p.result->>'output_classification'='restricted')
+        OR bool_or(EXISTS (SELECT 1 FROM review_deliveries d WHERE d.job_id=p.job_id AND d.state IN ('sending','sent','unknown','blocked')))
+        OR count(p.result)>=2`, [repo.id, pr.number, pr.head.sha, latest.job_id])).rows.length > 0;
     const rereview = !baseOnly || !concluded || trigger === 'retarget' || trigger === 'comment' || context.review.rereviewOnBaseMove === true;
     if (rereview) {
       const queued = (await tx.query<{ count: string }>("SELECT count(*) FROM jobs WHERE state='queued'")).rows[0]!;
@@ -253,7 +262,7 @@ export class GitHubIngress {
     let context: ReviewContext;
     try { context = await this.policy.current(); }
     catch (error) {
-      if (error instanceof Denied) return this.record(delivery, event, null, { outcome: 'ignored', reason: 'review_disabled' });
+      if (error instanceof ReviewDisabled) return this.record(delivery, event, null, { outcome: 'ignored', reason: 'review_disabled' });
       return { status: 503, outcome: 'policy_unavailable' };
     }
     if (event === 'pull_request') {
@@ -406,6 +415,8 @@ export class ReviewRuntime {
     const review = (await this.store.db.query<ReviewRow>('SELECT * FROM pr_reviews WHERE job_id=$1', [job.id])).rows[0]!;
     let dispatched = false;
     let stopped = false;
+    // dispatch 전 GitHub 조회가 lease(30초)보다 길어질 수 있어 그동안에도 lease를 늘린다.
+    const keepalive = setInterval(() => { void this.store.heartbeat(asJob(job)).catch(() => {}); }, this.pollMs);
     try {
       const context = await this.policy.current();
       const repo = context.review.repositories.find(r => String(r.id) === String(review.repo_id)
@@ -488,15 +499,29 @@ export class ReviewRuntime {
       await this.finish(job, review, context, task, result);
     } catch (error) {
       if (error instanceof WorkerRejected) await this.close(job, review, 'failed', 'worker_rejected');
-      else if (!dispatched && error instanceof PolicyUnavailable) await this.store.defer(asJob(job));
+      else if (!dispatched && error instanceof PolicyUnavailable) {
+        await this.store.defer(asJob(job), error instanceof ReviewDisabled ? 'review_disabled' : 'policy_unavailable');
+        // 리뷰가 꺼진 동안은 1분 간격으로만 다시 본다.
+        if (error instanceof ReviewDisabled) await this.store.db.query(`UPDATE jobs SET available_at=$2 WHERE id=$1 AND state='queued'`, [job.id, this.store.now() + 60_000]);
+      }
       else if (!dispatched && error instanceof GitHubError && (error.status === 429 || error.status >= 500)) await this.backoff(job, review, error);
       else if (!dispatched) await this.close(job, review, error instanceof Denied ? 'cancelled' : 'failed',
         error instanceof Denied ? 'authorization_revoked' : error instanceof GitHubError ? 'github_access_lost' : 'before_dispatch');
       // 작업자가 멈춤을 확인한 뒤의 저장 오류는 실행 효과가 불명이 아니다. 슬롯을 잡지 않고 실패로 닫는다.
       else if (stopped) await this.close(job, review, 'failed', 'after_stop');
       else await this.store.transition(asJob(job), 'unknown', 'runtime_uncertain');
+    } finally {
+      clearInterval(keepalive);
+      // dispatch 전에 lease를 잃어 상태를 못 바꿨으면, 모델을 부르지 않은 것이 확실하므로 대기열로 되돌린다.
+      // 조기 return 경로도 지나가야 해서 finally에 둔다. 정상 종료된 작업은 상태 조건에 걸리지 않는다.
+      if (!dispatched) await this.releaseUndispatched(job).catch(() => {});
     }
     return true;
+  }
+  private async releaseUndispatched(job: Job): Promise<void> {
+    await this.store.db.query(`UPDATE jobs SET state='queued',attempt=GREATEST(0,attempt-1),available_at=$3,lease_token=NULL,
+      lease_until=NULL,started_at=NULL,wait_reason='lease_lost_before_dispatch' WHERE id=$1 AND lease_token=$2
+      AND (state='running' OR (state='unknown' AND wait_reason='lease_expired'))`, [job.id, job.lease_token, this.store.now() + DEFAULTS.retryDelayMs]);
   }
   private async finish(job: Job, review: ReviewRow, context: ReviewContext, task: ReviewTask,
     result: Extract<ReviewWorkerResult, { status: 'succeeded' }>): Promise<void> {

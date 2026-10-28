@@ -1088,3 +1088,63 @@ test('SEC-02 리뷰 레인 작업자에 연결조차 못 하면 unknown이 아�
   r.archives.set(HEAD2, r.archives.get(HEAD)!);
   assert.equal(await r.runtime.tick(), true);
 });
+
+test('D-14 dispatch 전 조회 중 lease를 잃으면(unknown으로 바뀌어도) 모델을 부르지 않은 작업은 대기열로 되돌린다', async () => {
+  await opened();
+  const compare = r.gh.compare.bind(r.gh);
+  r.gh.compare = async (name, base, head) => {
+    f.advance(DEFAULTS.leaseMs + 1);
+    await f.store.expire();
+    return compare(name, base, head);
+  };
+  await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.wait_reason, j.attempt]), [['queued', 'lease_lost_before_dispatch', 0]]);
+  assert.equal(r.inputs.length, 0);
+  r.gh.compare = compare;
+  f.advance(DEFAULTS.retryDelayMs);
+  assert.equal(await r.runtime.tick(), true);
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.attempt]), [['succeeded', 1]]);
+});
+test('REVIEW-02 base_head 기준에서 게시 차단·공개 범위 차단 결과나 같은 head 두 번째 리뷰 뒤에는 base 이동으로 다시 부르지 않는다', async () => {
+  r.policy().comparison = 'base_head';
+  r.policy().publish = null;
+  await fullReview();
+  assert.deepEqual((await deliveries()).map(d => d.state), ['blocked']);
+  r.gh.open = [pull({ base: { sha: BASE2, ref: 'main', repo: repository }, updated_at: '2026-10-29T03:00:00Z' })];
+  assert.deepEqual(await r.reconciler.run(), { admitted: 0, limited: false });
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,outbox,audit CASCADE');
+  r.policy().publish = POLICY.publish;
+  r.reply({ status: 'succeeded', output: { ...OUTPUT, public_summary: 'fixture-internal-host' } });
+  await fullReview(pull({ updated_at: '2026-10-29T03:01:00Z' }));
+  r.gh.open = [pull({ base: { sha: BASE2, ref: 'main', repo: repository }, updated_at: '2026-10-29T03:02:00Z' })];
+  assert.deepEqual(await r.reconciler.run(), { admitted: 0, limited: false });
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,outbox,audit CASCADE');
+  r.reply({ status: 'succeeded', output: OUTPUT });
+  const tips = [BASE, BASE2, 'e'.repeat(40), 'f'.repeat(40)];
+  for (const tip of tips) r.archives.set(tip, r.archives.get(BASE)!);
+  const calls = r.inputs.length;
+  await opened(pull({ updated_at: '2026-10-29T03:10:00Z' })); await r.runtime.tick();
+  for (const [index, tip] of tips.slice(1).entries()) {
+    // 리뷰가 끝난 뒤 게시 직전마다 base가 움직이는 저장소.
+    r.gh.pulls.set(7, pull({ base: { sha: tip, ref: 'main', repo: repository }, updated_at: `2026-10-29T03:1${index + 1}:00Z` }));
+    await r.publisher.deliver(); await r.runtime.tick();
+  }
+  assert.equal(r.inputs.length - calls, 2);
+  assert.equal(r.gh.writes.length, 0);
+});
+test('REVIEW-02 리뷰 정책이 꺼지거나 비교 기준이 미정이 되어도 대기 작업·미게시 결과를 지우지 않고 다시 켜지면 이어간다', async () => {
+  await opened();
+  r.policy().comparison = null;
+  await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.wait_reason]), [['queued', 'review_disabled']]);
+  r.policy().comparison = 'merge_base';
+  f.advance(60_000); f.policy.confirmedAt = f.now();
+  await r.runtime.tick();
+  delete f.policy.review;
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason, d.attempt]), [['pending', 'policy_unavailable', 0]]);
+  f.policy.review = structuredClone(POLICY);
+  f.advance(60_000); f.policy.confirmedAt = f.now();
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => d.state), ['sent']);
+});
