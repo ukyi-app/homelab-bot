@@ -577,7 +577,7 @@ POST 거부·GET 대조 거부·확정 ID 보존·인가 철회·local confirm �
 | `answer_question` | clarification만. 질문은 모델이 `status=needs_input`으로 턴을 끝낼 때만 생긴다 | TASK-02 | 없음 |
 | tool approval 중계 | **false.** 승인 플래그·`--approve-for-me`를 쓰지 않는다. 질문 종류 CHECK가 `clarification` 하나다 | TASK-01·03 | 없음 |
 | `request_cancel`, `confirm_stop` | 작업 그룹 SIGTERM → SIGKILL, 프로세스 그룹과 작업 표식(`HOMELAB_CODEX_TASK`)으로 남은 수 확인. 작업 시작 뒤 생긴 같은 UID 프로세스의 환경을 못 읽으면 확인 불가(`unknown`). 0개를 확인했을 때만 `cancelled`. `confirmStop`은 작업의 실행 세대를 올려, 아직 준비 중인 실행이 나중에 프로세스를 띄우지 못하게 한다 | TASK-03, SEC-02 | 환경을 지우고 새 세션으로 빠져나간 dumpable 자식은 못 찾는다(시험으로 기록). cgroup 또는 "파드 안 제어 프로세스 밖 0개" 확인은 T16b |
-| `resume_task` | 같은 작업의 같은 스레드만(`exec resume <thread> -`). 답한 질문이 있으면 그 답으로, 한도·인증 대기에서 `/resume-model`로 돌아왔으면 재개 프롬프트로 저장된 스레드를 잇는다. 재개가 실패하면 `failed`이고 새 스레드로 조용히 바꾸지 않는다. 처음부터 다시 하는 것은 owner의 `/retry`와, 스레드가 생기기 전에 멈춘 경우뿐이다 | TASK-02 | `exec resume`의 `--json`·`-o`·`--output-schema` 수용과 `thread.started` 재발행 [미확인], T16b |
+| `resume_task` | 같은 작업의 같은 스레드만(`exec resume <thread> -`). 세션이 대기 상태(`waiting_answer`·`waiting_model`)로 남은 경우에만 잇는다. 답한 질문이 있으면 그 답으로, 한도·인증 대기에서 `/resume-model`로 돌아왔으면 재개 프롬프트로 저장된 스레드를 잇는다. 예산 소진·사용량 미상으로 띄우지 않고 실패하면 세션을 `failed`로, 열린·답한 질문을 `cancelled`로 정리해 `/retry`가 새 스레드·새 예산으로 시작한다(rev r2 N3). 재개가 실패하면 `failed`이고 새 스레드로 조용히 바꾸지 않는다. 처음부터 다시 하는 것은 owner의 `/retry`와, 스레드가 생기기 전에 멈춘 경우뿐이다 | TASK-02 | `exec resume`의 `--json`·`-o`·`--output-schema` 수용과 `thread.started` 재발행 [미확인], T16b |
 
 ### 실행 흐름
 
@@ -601,8 +601,15 @@ POST 거부·GET 대조 거부·확정 ID 보존·인가 철회·local confirm �
 - **도구 호출 예산:** 어댑터가 JSONL 줄이 들어오는 즉시 도구 호출 항목(`command_execution`·`mcp_tool_call`·`web_search`·`file_change`, 항목 id 기준)을 센다. 예산을 넘는 호출의 시작을 보면 그 실행만의 중단 신호로 작업 그룹을 끝내고 `failed`(`codex_tool_budget_exceeded`)다. 남은 프로세스를 확인하지 못하면 `unknown`이다.
 - **한계:** CLI에 호출 수 제한 플래그가 없어 [미확인] 초과 호출을 시작 전에 막지는 못한다. 시작 이벤트를 본 순간 끝내므로 그 한 호출의 일부 효과는 남을 수 있다(실패로 끝내고 알린다). 어떤 항목 종류를 도구 호출로 셀지는 [가정]이다(T16b 실측).
 - **예산 값:** 8회는 T16a 기본값(§11)이다. 코딩 작업에는 작을 수 있고, 값은 runtime policy와 사용자 판단으로 바꾼다. 이 작업은 값을 바꾸지 않았다.
-- **출력 상한:** launcher는 stdout 줄을 모아 두지 않고 바로 넘긴다. 한 줄 1MiB, 전체 16MiB를 넘으면 더 읽지 않고 작업 그룹을 끝낸다. 어댑터는 이벤트 2만 개 상한을 두고, 판정에 쓰는 필드(종류·스레드 ID·오류 메시지 앞부분·항목 id·종류·상태·변경 경로)만 남겨 명령 출력·메시지 본문은 버린다. 넘으면 `failed`(`codex_output_limit_exceeded`)다. 상한 값은 [가정]이고 실제 CLI 출력 크기는 T16b에서 잰다.
+- **출력 상한:** launcher는 stdout 줄을 모아 두지 않고 바로 넘긴다. 한 줄 1MiB, 전체 16MiB를 넘으면 더 읽지 않고 작업 그룹을 끝낸다. 어댑터는 이벤트 2만 개 상한을 두고, 판정에 쓰는 필드(종류·스레드 ID·오류 메시지·항목 id·종류·상태·변경 경로)만 남겨 명령 출력·메시지 본문은 버린다. **남긴 필드는 자르지 않는다**(rev r2 N1·N2). 자른 뒤 판정하면 긴 오류 뒤쪽의 인증·한도 표식, 500번째 뒤의 작업 공간 밖 경로, 4096자 뒤의 상위 이동이 사라진다. 남긴 크기는 위 바이트 상한이 묶는다. 경로 수만 개도 판정은 경로 수에 비례한다(Set). 결과 행에 남기는 경로 목록만 판정 뒤에 1000개로 줄이고 전체 수를 함께 기록한다.
+- **파일 읽기 상한:** 실행 뒤 읽는 작업 공간 밖 파일(`-o` 최종 메시지 1MiB, `auth.json` 1MiB, 기준 스냅샷 64MiB)은 크기를 본 뒤 상한 안에서만 읽고, 심링크·FIFO를 따라가지 않는다. 최종 메시지가 상한을 넘으면 `failed`(`codex_output_too_large`)다. 넘으면 `failed`(`codex_output_limit_exceeded`)다. 상한 값은 [가정]이고 실제 CLI 출력 크기는 T16b에서 잰다.
 - **늦은 실행 차단(rev r1 R1):** 준비(작업 공간·설정)가 끝난 뒤 spawn 직전에 중단 신호와 실행 세대를 확인한다. 이 확인과 spawn 사이에는 await가 없다. 실제 launcher도 중단된 신호로는 spawn하지 않고, 그룹 기록과 중단 처리를 첫 await 전에 건다. 그래서 시간 초과로 `unknown`이 된 뒤 `release`로 해제한 작업은 준비가 늦게 끝나도 프로세스를 띄우지 않는다. 같은 프로세스 안 어댑터 기준이며, 작업자 HTTP 경계(변경 요청 3번)에서도 같은 세대 확인이 필요하다.
+
+### migration 009 업그레이드 (rev r2 N4)
+
+- 009는 이 브랜치 안에서 두 번 바뀌었다(`ac5581d` → `a008ca8`: `repository` 열·`waiting_model` 상태, `7b23166`: `tool_calls` 열). `CREATE TABLE IF NOT EXISTS`만으로는 이전판으로 만든 로컬 DB에 바뀐 부분이 들어가지 않는다.
+- 그래서 009 끝에서 `ADD COLUMN IF NOT EXISTS`와 상태 제약 교체를 멱등하게 한다. 운영 DB에는 아직 적용된 적이 없다(T16b).
+- 업그레이드 전 세션의 도구 사용량은 알 수 없어 `tool_calls`를 null로 둔다. 브리지는 null인 세션을 잇지 않고 `failed`(`codex_tool_usage_unknown`)로 정리한다. 0으로 보면 예산을 넘길 수 있어서다. owner는 `/retry`로 새 스레드를 시작한다.
 
 ### 질문 계약 (TASK-02, AUTH-02)
 
@@ -640,7 +647,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - argv: `exec --json --output-schema <run>/output.schema.json -o <run>/last-message.json -`, 재개는 `exec resume … <thread> -`. `--dangerously-bypass-approvals-and-sandbox`·`--approve-for-me`·`--full-auto`·`--ephemeral`·`--ignore-user-config`·`-a`·`-s`·`-c`·`--add-dir`를 쓰지 않는다. 스레드 ID는 영숫자로 시작해야 한다. 지시를 stdin `-`로 주는 것은 [가정: 0.163.0 `--help` 대조는 T16b].
 - 출력·스키마 파일(`run/`)은 모델 셸이 쓰는 `TMPDIR`·작업 공간과 떼고, 실행마다 이전 출력을 지운다.
 - 작업 공간: 첫 실행 전에 `git init`·기준 커밋을 한다(D-15, `codex exec`의 Git 저장소 요구). git은 이때만 쓰고 `GIT_DIR`를 못 박아 위쪽 저장소를 찾지 않으며 사용자·시스템 git 설정, hooks, fsmonitor를 쓰지 않는다. 이미 `.git`이 있으면 누가 쓴 config인지 몰라 거부한다. 그래서 작업 공간 원본을 푸는 단계(T16b·T19)는 `.git` 없이 풀어야 한다.
-- 실행 뒤 변경 대조는 git이 아니라 파일 해시와 git이 보는 실행 비트로 한다(내용이 같은 `chmod +x`도 변경이다). 실행 중 비신뢰 코드가 `.git/config`에 filter·fsmonitor를 심으면 제어 프로세스의 `git add`가 그 명령을 실행하기 때문이다. 기준 해시는 작업 공간 밖 `run/`에 둔다. 남은 프로세스가 있거나 모르면 작업 공간을 다시 읽지 않는다(결과는 어차피 unknown이고, 살아 있는 프로세스가 읽는 도중 바꿔치기할 수 있다). 읽을 때는 심링크를 따라가지 않고 파일은 `O_NOFOLLOW`·`O_NONBLOCK`으로 연다. 숨은 생존 프로세스가 디렉터리를 바꿔치기하는 경합은 남는다(아래 한계와 같은 원인).
+- 실행 뒤 변경 대조는 git이 아니라 파일 해시와 git이 보는 소유자 실행 비트(0o100, git의 100755/100644)로 한다. 내용이 같은 `chmod u+x`·`u-x`도 변경이고, 그룹·기타 실행 비트만 바뀐 것은 git처럼 변경이 아니다(rev r2 N5, 시험이 `git diff --summary`와 대조). 실행 중 비신뢰 코드가 `.git/config`에 filter·fsmonitor를 심으면 제어 프로세스의 `git add`가 그 명령을 실행하기 때문이다. 기준 해시는 작업 공간 밖 `run/`에 둔다. 남은 프로세스가 있거나 모르면 작업 공간을 다시 읽지 않는다(결과는 어차피 unknown이고, 살아 있는 프로세스가 읽는 도중 바꿔치기할 수 있다). 읽을 때는 심링크를 따라가지 않고 파일은 `O_NOFOLLOW`·`O_NONBLOCK`으로 연다. 숨은 생존 프로세스가 디렉터리를 바꿔치기하는 경합은 남는다(아래 한계와 같은 원인).
 - 설정에 프로젝트 신뢰(`[projects]`)를 넣지 않는다. 0.163.0이 작업 공간의 `.codex/config.toml`·rules 레이어를 신뢰한 프로젝트에서만 읽는다는 것은 리뷰가 바이너리 문자열로 본 것이고 [미확인]이다.
 - 작업 경로는 `<작업자 루트>/tasks/<job>/{codex-home,home,workspace,run,tmp}`다. 경로 자리일 뿐이고 인증 파일 배치(공유 원본인지 작업별 사본인지)는 결정 대기다. 그래서 지금 모양 그대로 실제 CLI를 돌리면 작업 CODEX_HOME에 `auth.json`이 없어 인증에 실패한다(결정 뒤 T16b).
 - 만드는 디렉터리마다 실제 경로가 그대로인지 확인한다. 루트 아래 심링크(예: `tasks` → 개인 Codex 홈)로 밖에 쓰지 않는다.
