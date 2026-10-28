@@ -32,11 +32,11 @@ const FINDING = { severity: 'P1', title: '0으로 나누기', path: 'src/app.ts'
   impact: 'NaN·Infinity가 호출자로 전파된다', evidence: 'return total / count;', suggestion: 'count 0을 먼저 거부한다' };
 const OUTPUT = { findings: [FINDING], open_questions: [], public_summary: '나눗셈 경계 조건을 확인하세요.' };
 
-type ArchiveFile = string | Buffer | { symlink: string };
+type ArchiveFile = string | Buffer | { symlink: string } | { data: string; mode: string };
 function tarGz(files: Record<string, ArchiveFile>, root = 'fixture-repo-sha'): Buffer {
-  const header = (name: string, size: number, type: string, link = '') => {
+  const header = (name: string, size: number, type: string, link = '', mode = '0000644') => {
     const h = Buffer.alloc(512);
-    h.write(name, 0, 100); h.write('0000644\0', 100); h.write('0000000\0', 108); h.write('0000000\0', 116);
+    h.write(name, 0, 100); h.write(`${mode}\0`, 100); h.write('0000000\0', 108); h.write('0000000\0', 116);
     h.write(`${size.toString(8).padStart(11, '0')}\0`, 124); h.write('00000000000\0', 136); h.write('        ', 148);
     h.write(type, 156); h.write(link, 157); h.write('ustar\0', 257); h.write('00', 263);
     let sum = 0; for (const b of h) sum += b;
@@ -47,7 +47,9 @@ function tarGz(files: Record<string, ArchiveFile>, root = 'fixture-repo-sha'): B
   const comment = Buffer.from(`52 comment=${BASE}\n`);
   const blocks = [header('pax_global_header', comment.length, 'g'), pad(comment), header(`${root}/`, 0, '5')];
   for (const [path, content] of Object.entries(files)) {
-    if (typeof content === 'object' && !Buffer.isBuffer(content)) blocks.push(header(`${root}/${path}`, 0, '2', content.symlink));
+    if (typeof content === 'object' && 'mode' in content) {
+      const data = Buffer.from(content.data); blocks.push(header(`${root}/${path}`, data.length, '0', '', content.mode), pad(data));
+    } else if (typeof content === 'object' && !Buffer.isBuffer(content)) blocks.push(header(`${root}/${path}`, 0, '2', content.symlink));
     else { const data = Buffer.from(content); blocks.push(header(`${root}/${path}`, data.length, '0'), pad(data)); }
   }
   blocks.push(Buffer.alloc(1024));
@@ -1263,4 +1265,27 @@ test('r2 P2-02 EVENT-01 늦게 도착한 옛 closed·converted_to_draft는 최�
   assert.equal(r.inputs.length, 1);
   const current = await hook('pull_request', prEvent('closed', pull({ state: 'closed', updated_at: '2026-10-29T02:00:00Z' })));
   assert.deepEqual([current.outcome, current.reason], ['superseded', 'pr_closed']);
+});
+
+test('r2 P2-03 REVIEW-03 실행 비트만 바뀐 파일은 모드 변경을 리뷰 입력에 넣고, 보이는 변경이 없으면 완전 검토로 세지 않는다', async () => {
+  const script = '#!/bin/sh\necho ok\n';
+  r.archives.set(BASE, tarGz({ 'run.sh': { data: script, mode: '0000755' } }));
+  r.archives.set(HEAD, tarGz({ 'run.sh': { data: script, mode: '0000644' } }));
+  r.gh.compareResult = { truncated: false, files: [{ path: 'run.sh', previousPath: null, status: 'modified', baseType: 'blob', headType: 'blob',
+    baseMode: '100755', headMode: '100644' }] };
+  r.reply({ status: 'succeeded', output: { findings: [], open_questions: [], public_summary: '실행 권한이 빠졌습니다.' } });
+  await fullReview();
+  const patch = r.inputs[0]!.untrusted.files.find(file => file.path === 'run.sh')!.patch;
+  assert.match(patch, /^old mode 100755\nnew mode 100644$/m);
+  // API가 모드를 주지 않아도 압축본의 실행 비트 차이로 드러낸다.
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,outbox CASCADE');
+  r.gh.compareResult = { truncated: false, files: [{ path: 'run.sh', previousPath: null, status: 'modified', baseType: 'blob', headType: 'blob' }] };
+  await fullReview(pull({ updated_at: '2026-10-29T04:20:00Z' }));
+  assert.match(r.inputs[1]!.untrusted.files[0]!.patch, /^old mode 100755\nnew mode 100644$/m);
+  // 목록은 변경이라는데 내용·모드 차이가 보이지 않으면 미검토로 표시한다.
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,outbox CASCADE');
+  r.archives.set(HEAD, tarGz({ 'run.sh': { data: script, mode: '0000755' } }));
+  await fullReview(pull({ updated_at: '2026-10-29T04:21:00Z' }));
+  const result = (await reviewJobs())[0]!.result as ReviewResult;
+  assert.deepEqual([result.review_outcome, result.coverage.omitted_files_with_reasons], ['partial', [{ path: 'run.sh', reason: 'archive_mismatch' }]]);
 });

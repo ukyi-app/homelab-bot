@@ -17,6 +17,8 @@ const ChangeSchema = z.strictObject({
   path: z.string().min(1).max(4096), previousPath: z.string().min(1).max(4096).nullable(),
   status: z.enum(['added', 'removed', 'modified', 'renamed', 'type_changed']),
   baseType: z.enum(['blob', 'commit', 'tree']).nullable(), headType: z.enum(['blob', 'commit', 'tree']).nullable(),
+  // Git 모드(100644·100755·120000 등). API가 주면 그것을, 없으면 압축본의 실행 비트로 정한다.
+  baseMode: z.string().regex(/^[0-7]{6}$/).nullable().optional(), headMode: z.string().regex(/^[0-7]{6}$/).nullable().optional(),
 });
 export type Change = z.infer<typeof ChangeSchema>;
 export const OMIT_REASONS = ['file_limit', 'diff_limit', 'file_too_large', 'large_lockfile', 'binary', 'submodule_pointer',
@@ -67,7 +69,8 @@ export type ReviewWorkerResult =
 // 압축본 받기는 자격 없는 GET 하나다. init에는 인증 헤더를 넣을 자리가 없다.
 export type ArchiveFetcher = (url: string, init: { credentials: 'omit'; redirect: 'error'; maxBytes: number; signal: AbortSignal }) => Promise<Uint8Array>;
 
-interface Entry { kind: 'file' | 'symlink' | 'other'; data: Buffer }
+interface Entry { kind: 'file' | 'symlink' | 'other'; data: Buffer; mode: number }
+const gitMode = (entry: Entry) => entry.kind === 'symlink' ? '120000' : entry.mode & 0o111 ? '100755' : '100644';
 export class ArchiveError extends Error {}
 const cstr = (block: Buffer, start: number, length: number) => {
   const raw = block.subarray(start, start + length);
@@ -109,8 +112,9 @@ export function readArchive(bytes: Uint8Array, maxBytes: number): Map<string, En
     if (parts[0] !== root) throw new ArchiveError('archive_unreadable');
     const path = parts.slice(1).join('/');
     if (!path || type === '5') continue;
-    entries.set(path, type === '0' || type === '\0' || type === '7' ? { kind: 'file', data: Buffer.from(data) }
-      : type === '2' ? { kind: 'symlink', data: Buffer.from(cstr(header, 157, 100)) } : { kind: 'other', data: Buffer.alloc(0) });
+    const mode = Number.parseInt(cstr(header, 100, 8).trim() || '0', 8) || 0;
+    entries.set(path, type === '0' || type === '\0' || type === '7' ? { kind: 'file', data: Buffer.from(data), mode }
+      : type === '2' ? { kind: 'symlink', data: Buffer.from(cstr(header, 157, 100)), mode } : { kind: 'other', data: Buffer.alloc(0), mode });
   }
   return entries;
 }
@@ -207,8 +211,18 @@ export function buildReviewFiles(changes: Change[], truncated: boolean, base: Ma
     }
     const left = text(before), right = text(after);
     if (left === null || right === null) { omit(change.path, 'binary'); continue; }
-    const diff = unifiedDiff(change.path, left, right);
-    if (!diff) { omit(change.path, 'diff_too_complex'); continue; }
+    const computed = unifiedDiff(change.path, left, right);
+    if (!computed) { omit(change.path, 'diff_too_complex'); continue; }
+    // 내용 밖의 변경(모드·이름·새 파일·삭제)도 리뷰 입력에 git 형식 머리줄로 드러낸다.
+    const baseMode = change.baseMode ?? (before ? gitMode(before) : null), headMode = change.headMode ?? (after ? gitMode(after) : null);
+    const meta: string[] = [];
+    if (change.status === 'renamed' && change.previousPath) meta.push(`rename from ${change.previousPath}`, `rename to ${change.path}`);
+    if (change.status === 'added') meta.push(`new file mode ${headMode}`);
+    else if (change.status === 'removed') meta.push(`deleted file mode ${baseMode}`);
+    else if (baseMode && headMode && baseMode !== headMode) meta.push(`old mode ${baseMode}`, `new mode ${headMode}`);
+    // 목록은 변경이라는데 내용·모드·이름 어느 것도 다르지 않으면 고정 SHA가 어긋난 것이다. 검토 완료로 세지 않는다.
+    if (!computed.patch.includes('\n@@ ') && !meta.length) { omit(change.path, 'archive_mismatch'); continue; }
+    const diff = { patch: meta.length ? `${meta.join('\n')}\n${computed.patch}` : computed.patch, rightLines: computed.rightLines };
     if (bytes + Buffer.byteLength(diff.patch) > limits.maxDiffBytes) { omit(change.path, 'diff_limit'); hit('diff_limit'); continue; }
     bytes += Buffer.byteLength(diff.patch);
     files.push({ path: change.path, status: change.status, ...diff });
