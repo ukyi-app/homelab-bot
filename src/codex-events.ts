@@ -41,12 +41,13 @@ export const TaskOutputSchema = z.strictObject({
 }).refine(o => (o.status === 'needs_input') === (o.question.trim().length > 0), 'question_mismatch');
 export type TaskOutput = z.infer<typeof TaskOutputSchema>;
 // 구조화 출력은 루트 객체·전 필드 required·추가 필드 금지여야 해서 판별 유니온 대신 평평한 모양이다.
+// 길이 제한 키워드 지원 여부는 [미확인]이라 스키마에는 설명만 두고 길이는 봇이 TaskOutputSchema로 검사한다.
 export const TASK_OUTPUT_JSON_SCHEMA = Object.freeze({
   type: 'object', additionalProperties: false, required: ['status', 'summary', 'question'],
   properties: {
     status: { type: 'string', enum: ['completed', 'needs_input', 'cannot_complete'] },
-    summary: { type: 'string', maxLength: 1500 },
-    question: { type: 'string', maxLength: 500, description: 'needs_input일 때만 채운다. 그 밖에는 빈 문자열.' },
+    summary: { type: 'string', description: '1500자 이하' },
+    question: { type: 'string', description: 'needs_input일 때만 채운다(500자 이하). 그 밖에는 빈 문자열.' },
   },
 });
 

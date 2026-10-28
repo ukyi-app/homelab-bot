@@ -8,13 +8,15 @@ import { workerRequest } from './worker.js';
 import type { WorkerClient, WorkerResult, WorkerSigner } from './worker.js';
 
 // T18: 봇 소유 Codex 작업 경로. dispatch 뒤의 오류는 스스로 상태로 기록하고 던지지 않는다.
-export interface TaskLane { run(job: Job): Promise<void> }
+export interface TaskLane { run(job: Job): Promise<void>; sweep?(): Promise<unknown> }
 export class Runtime {
   constructor(private readonly store: Store, private readonly gate: PolicyGate,
     private readonly worker: WorkerClient, private readonly signer: WorkerSigner,
     private readonly reader: ReadAdapter, private readonly tasks?: TaskLane) {}
   async tick(): Promise<boolean> {
     await this.store.expire();
+    // 기한 지난 질문 대기를 먼저 풀어야 슬롯을 잡은 waiting_user가 다음 작업을 막지 않는다.
+    await this.tasks?.sweep?.();
     const job = await this.store.claim();
     if (!job) return false;
     let dispatched = false;

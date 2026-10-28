@@ -20,13 +20,17 @@ export interface CodexConfig {
 
 // 개인 Codex 홈(~/.codex, ~/.codex-sub, ~/.codex-work와 심링크 ~/.codex2·~/.codex3)은 목록을 읽지 않고
 // 경로 모양만으로 막는다. realpath는 작업자 루트에만 쓴다. 홈 디렉터리를 열거하지 않는다(D-14, spec §4.5).
-export function assertWorkerRoot(root: string, home = homedir()): string {
+// 작업자가 사람과 다른 UID로 돌면 자기 홈만으로는 사람 홈을 모른다. 그때는 배치 설정이 사람 홈을 더 넘긴다.
+export function assertWorkerRoot(root: string, homes: readonly string[] = [homedir()]): string {
   if (!isAbsolute(root)) throw new Denied();
   let real: string;
   try { real = realpathSync(root); } catch { throw new Denied(); }
-  let realHome = home;
-  try { realHome = realpathSync(home); } catch { /* 홈이 없으면 문자열 비교만 한다. */ }
-  for (const base of new Set([resolve(home), realHome])) {
+  const bases = new Set<string>();
+  for (const home of homes) {
+    bases.add(resolve(home));
+    try { bases.add(realpathSync(home)); } catch { /* 홈이 없으면 문자열 비교만 한다. */ }
+  }
+  for (const base of bases) {
     for (const candidate of [resolve(root), real]) {
       const rel = relative(base, candidate);
       // 루트가 홈이거나 홈의 조상이면 그 아래 개인 Codex 홈을 품는다.

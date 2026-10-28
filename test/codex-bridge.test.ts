@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { DEFAULTS, Denied, PolicyUnavailable } from '../src/contracts.js';
-import { CODEX_CAPABILITIES, CapabilityUnavailable, CodexBridge, ExecCodexAdapter, TASK_INSTRUCTIONS,
+import { CODEX_CAPABILITIES, CODEX_DEFAULTS, CapabilityUnavailable, CodexBridge, ExecCodexAdapter, TASK_INSTRUCTIONS,
   describeCapabilities, nodeFiles } from '../src/codex.js';
 import type { CodexFiles, CodexLauncher, LaunchResult, LaunchSpec } from '../src/codex.js';
 import { FORBIDDEN_FLAGS, SECRET_NAME, TASK_MARKER, assertWorkerRoot, codexConfig, configToml, execArgs,
@@ -197,17 +197,20 @@ test('D-14 개인 ~/.codex* 아래·위의 작업자 루트를 거부하고 실�
     await writeFile(join(home, '.codex', 'auth.json'), '{"tokens":{"refresh_token":"personal-canary-0123456789abcdef"}}');
     for (const candidate of [home, join(home, '.codex'), join(home, '.codex-sub', 'tasks'), join(home, '.codex2'),
       join(home, '.codex3'), join(root, 'innocent-link'), resolve(home, '..'), '.local/relative', join(home, 'missing')]) {
-      assert.throws(() => assertWorkerRoot(candidate, home), Denied, candidate);
+      assert.throws(() => assertWorkerRoot(candidate, [home]), Denied, candidate);
     }
     const workerRoot = join(home, 'elsewhere');
-    assert.equal(assertWorkerRoot(workerRoot, home), workerRoot);
+    assert.equal(assertWorkerRoot(workerRoot, [home]), workerRoot);
+    // 작업자 UID의 홈이 사람 홈과 다르면 배치 설정이 넘긴 사람 홈도 막는다.
+    assert.throws(() => assertWorkerRoot(join(home, '.codex2'), [resolve('.local'), home]), Denied);
+    assert.equal(assertWorkerRoot(join(home, '.codex2'), [resolve('.local')]).endsWith('.codex-sub'), true);
     const touched: string[] = [];
     const spy: CodexFiles = {
       mkdir: async p => { touched.push(p); await nodeFiles.mkdir(p); }, write: async (p, c) => { touched.push(p); await nodeFiles.write(p, c); },
       read: async p => { touched.push(p); return nodeFiles.read(p); }, remove: async p => { touched.push(p); await nodeFiles.remove(p); },
     };
     const local = new FakeLauncher();
-    const result = await new ExecCodexAdapter(workerRoot, local, { files: spy, home })
+    const result = await new ExecCodexAdapter(workerRoot, local, { files: spy, homes: [home] })
       .execute({ job: '00000000-0000-4000-8000-000000000004', prompt: 'p', resume: null }, new AbortController().signal);
     assert.equal(result.kind, 'completed');
     assert.ok(touched.length > 0 && touched.every(p => p.startsWith(`${workerRoot}/`)), touched.join(','));
@@ -248,7 +251,7 @@ test('TASK-01 능력표: tool approval false, attach 미정, 타인·다른 스�
   await assert.rejects(bridge.attach('intruder', thread, 'personal-session-id'), Denied);
   const { job } = await asked();
   const status = await bridge.status('fixture-owner', thread, job.id);
-  assert.deepEqual(status, { state: 'waiting_user', waitReason: 'clarification', session: true, question: { id: `${job.id}:${THREAD}:1`, expiresAt: f.now() + 86_400_000 } });
+  assert.deepEqual(status, { state: 'waiting_user', waitReason: 'clarification', session: true, question: { id: `${job.id}:${THREAD}:1`, expiresAt: f.now() + CODEX_DEFAULTS.questionTtlMs } });
   const other = { ...thread, channel: 'fixture-other-thread' };
   await assert.rejects(bridge.status('intruder', thread, job.id), Denied);
   await assert.rejects(bridge.status('fixture-owner', other, job.id), Denied);
@@ -265,7 +268,7 @@ test('TASK-02 질문을 대화로 중계 → owner 답 → 같은 스레드 resu
   assert.equal(current.state, 'waiting_user'); assert.equal(current.wait_reason, 'clarification');
   const q = (await rows('codex_questions'))[0]!;
   assert.equal(q.id, question); assert.equal(q.kind, 'clarification'); assert.equal(q.responder_id, 'fixture-owner');
-  assert.equal(q.turn, 1); assert.equal(Number(q.expires_at), f.now() + 86_400_000);
+  assert.equal(q.turn, 1); assert.equal(Number(q.expires_at), f.now() + CODEX_DEFAULTS.questionTtlMs);
   await f.publisher.deliver();
   assert.match(f.rest.messages[0]!.body.content, new RegExp(`질문 ID: ${question}[\\s\\S]*어느 브랜치[\\s\\S]*권한을 바꿀 수 없습니다`));
   // 질문을 기다리는 동안 새 모델 실행은 없다.
@@ -306,22 +309,27 @@ test('TASK-02 중복·다른 사람·다른 스레드·없는 질문·지난 질
 });
 test('TASK-02 기한 지난 질문은 답을 거부하고 작업을 멈춤, 무응답 자동 진행 없음', async () => {
   const { question } = await asked();
-  f.advance(86_400_000); f.policy.confirmedAt = f.now();
+  f.advance(CODEX_DEFAULTS.questionTtlMs); f.policy.confirmedAt = f.now();
   assert.deepEqual(await owner(question, 'main', 'late'), { ok: false, status: '기한이 지난 질문입니다. 작업을 멈췄습니다.' });
   const job = (await jobs())[0]!;
   assert.equal(job.state, 'cancelled'); assert.equal(job.wait_reason, 'question_expired');
   assert.equal((await rows('codex_questions'))[0]!.state, 'expired');
   assert.equal(await runtime.tick(), false); assert.equal(launcher.started, 1);
 });
-test('TASK-02 만료 정리는 대기 슬롯을 풀고 다음 작업을 받음, 취소된 작업의 질문 답 거부', async () => {
+test('TASK-02 Runtime 정리가 기한 지난 질문을 닫아 대기 슬롯을 풀고 알림, 취소된 작업의 질문 답 거부', async () => {
   const { question } = await asked();
-  f.advance(86_400_001); f.policy.confirmedAt = f.now();
-  assert.equal(await bridge.expireQuestions(), 1);
-  assert.equal((await jobs())[0]!.state, 'cancelled');
-  assert.equal((await owner(question, 'main', 'late')).ok, false);
   launcher.scripts.push(finished(out('needs_input', '조사', '다른 질문'), [], 'second-thread'));
   await task('task-2');
-  await runtime.tick();
+  assert.equal(await runtime.tick(), false);
+  f.advance(CODEX_DEFAULTS.questionTtlMs - 1); f.policy.confirmedAt = f.now();
+  assert.equal(await runtime.tick(), false);
+  f.advance(1); f.policy.confirmedAt = f.now();
+  assert.equal(await runtime.tick(), true);
+  assert.equal((await jobs())[0]!.state, 'cancelled'); assert.equal((await jobs())[0]!.wait_reason, 'question_expired');
+  assert.equal(await bridge.expireQuestions(), 0);
+  assert.equal((await owner(question, 'main', 'late')).ok, false);
+  await f.publisher.deliver(); await f.publisher.deliver();
+  assert.ok(f.rest.messages.some(m => m.body.content.includes(`질문 ${question}의 답 기한이 지나`)));
   const waiting = (await jobs())[1]!;
   const next = `${waiting.id}:second-thread:1`;
   await f.store.control('fixture-owner', f.store.scopeId(thread), 'cancel', waiting.id);
@@ -405,6 +413,19 @@ test('TASK-03 취소·정상 종료 뒤 남은 프로세스는 unknown, 새 실�
   const third = (await jobs())[2]!;
   assert.equal(third.state, 'unknown'); assert.equal(third.wait_reason, 'codex_survivors');
   assert.equal((await database.db.query('SELECT * FROM results WHERE job_id=$1', [third.id])).rows.length, 0);
+});
+test('TASK-03 중단 신호 뒤에도 끝나지 않는 실행은 기다리지 않고 unknown·새 실행 차단', async () => {
+  const stuck = new CodexBridge(f.store, f.gate, { capabilities: () => CODEX_CAPABILITIES,
+    execute: () => new Promise(() => {}), confirmStop: async () => ({ stopped: false }) }, { monitorMs: 5, stopWaitMs: 20 });
+  const local = new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, stuck);
+  const job = await task();
+  const running = local.tick();
+  while ((await jobs())[0]!.state !== 'running') await new Promise(resolve => setImmediate(resolve));
+  await f.store.control('fixture-owner', f.store.scopeId(thread), 'cancel', job.id);
+  await running;
+  assert.equal((await jobs())[0]!.state, 'unknown');
+  await task('task-2');
+  assert.equal(await local.tick(), false);
 });
 test('TASK-03 시간 초과는 정리 확인 뒤 failed 안내, 실패·불명 결과는 재실행하지 않음', async () => {
   launcher.scripts.push({ lines: jsonl(...begin()), hang: true });
