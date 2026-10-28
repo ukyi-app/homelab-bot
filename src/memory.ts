@@ -153,7 +153,8 @@ export class MemoryService {
     return this.db.transaction(async tx => {
       const current = await this.gate.withDatabase(tx).authorize(actor, scope);
       const rows = (await tx.query<MemoryRow>('SELECT * FROM memories WHERE id=ANY($1::text[]) FOR UPDATE', [ids])).rows;
-      if (rows.length !== new Set(ids).size || !rows.every(row => this.visible(current, actor, scope, row))) throw new Denied();
+      if (rows.length !== new Set(ids).size || !rows.every(row => ['active', 'candidate'].includes(row.status)
+        && this.visible(current, actor, scope, row))) throw new Denied();
       const result = await this.insert(tx, actor, scope, input, access, evidence, ids, why.data);
       await tx.query("UPDATE memories SET status='superseded',updated_at=$2 WHERE id=ANY($1::text[])", [ids, this.now()]);
       await tx.query('DELETE FROM memory_terms WHERE memory_id=ANY($1::text[])', [ids]);
@@ -197,10 +198,9 @@ export class MemoryService {
     this.assertReady();
     const policy = await this.gate.authorize(actor, scope);
     const row = (await this.db.query<MemoryRow>('SELECT * FROM memories WHERE id=$1', [id])).rows[0];
-    // 남의 기억이나 다른 채널 기억은 존재 여부도 알리지 않는다.
-    if (!row || row.owner_id !== actor || (row.status !== 'deleted' && !row.access_channels.includes(parent(scope)))) throw new Denied();
+    // 남의 기억이나 다른 채널 기억은 존재 여부도 알리지 않는다. 지운 기억의 재요청은 같은 owner에게 멱등으로 답한다.
+    if (!row || row.owner_id !== actor || (row.status !== 'deleted' && !this.visible(policy, actor, scope, row, true))) throw new Denied();
     const createdAt = Number(row.created_at);
-    if (row.status !== 'deleted') this.allowed(policy, scope, row);
     await this.db.transaction(async tx => {
       await this.gate.withDatabase(tx).authorize(actor, scope);
       await tx.query(`INSERT INTO memory_deletions(memory_id,memory_created_at,requested_by,requested_at) VALUES ($1,$2,$3,$4)
@@ -355,9 +355,6 @@ export class MemoryService {
       if (error instanceof Denied) return false;
       throw error;
     }
-  }
-  private allowed(policy: Policy, scope: Scope, row: MemoryRow): void {
-    if (!this.visible(policy, row.owner_id, scope, row, true)) throw new Denied();
   }
   // 권한 철회는 저장 때가 아니라 매 접근에 다시 적용한다.
   private visible(policy: Policy, actor: string, scope: Scope, row: MemoryRow, pendingOk = false): boolean {

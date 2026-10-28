@@ -220,7 +220,8 @@ export class BriefingScheduler {
       let observation: Observation | undefined;
       try {
         const value = await deadline(source.read(), BRIEFING.sourceTimeoutMs);
-        if (Number.isFinite(value.observedAt) && value.observedAt <= now && ['ok', 'problem'].includes(value.status)) observation = value;
+        if (Number.isFinite(value.observedAt) && value.observedAt <= now && ['ok', 'problem'].includes(value.status)
+          && typeof value.summary === 'string' && (value.restoreVerifiedAt == null || Number.isFinite(value.restoreVerifiedAt))) observation = value;
       } catch { /* 아래에서 읽기 불가로 표시한다. */ }
       await this.db.query(`INSERT INTO briefing_observations VALUES ($1,$2,$3,$4) ON CONFLICT (source_id) DO UPDATE SET
         last_ok_at=COALESCE($2,briefing_observations.last_ok_at),last_attempt_at=$3,last_status=$4`,

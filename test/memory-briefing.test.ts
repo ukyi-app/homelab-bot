@@ -148,6 +148,7 @@ test('MEM-01 충돌 기억은 둘 다 확정하지 않고, 사유 있는 정정�
   const corrected = stored.find(m => m.id === c.id)!;
   assert.deepEqual(corrected.replaces, [a.id, b.id]); assert.equal(corrected.correction_reason, '설계 문서 확인');
   assert.equal((await rows('memory_terms')).filter(t => t.memory_id === a.id || t.memory_id === b.id).length, 0);
+  await assert.rejects(memory.correct('fixture-owner', thread, [a.id], config('대체된 기억 재정정'), '다시'), Denied);
 });
 test('MEM-01 일시 지시는 유효기간이 필요하고 지나면 검색되지 않으며, 오래된 설정은 재확인 표시', async () => {
   await f.ingress.receive(event('m-pref', { text: '오늘은 짧게 답해' })); f.advance(800);
@@ -429,6 +430,7 @@ test('BRIEF-01 읽기 불가·오래된 관측은 미확인, 정상은 현재 �
     source('backup', 'backup', async () => ({ observedAt: f.now() - 60_000, status: 'ok', summary: 'DB 백업 03:00 성공' })),
     source('certificate', 'certificate', async () => { if (certificate instanceof Error) throw certificate; return certificate; }),
     source('jobs', 'scheduled_job', async () => ({ observedAt: f.now() - 2 * 3_600_000, status: 'ok', summary: '예약 작업 정상' })),
+    source('malformed', 'scheduled_job', async () => ({ observedAt: f.now(), status: 'ok', summary: 42 }) as unknown as Observation),
   ];
   const s = scheduler(sources); await s.ensure();
   at(SLOT); await s.tick();
@@ -437,6 +439,7 @@ test('BRIEF-01 읽기 불가·오래된 관측은 미확인, 정상은 현재 �
   assert.match(first, /certificate: 읽기 불가 · 마지막 정상 수집 없음 · 미확인/);
   assert.match(first, /jobs: 오래된 관측\(관측 01-16 06:50\) · 현재 상태 미확인/);
   assert.doesNotMatch(first, /jobs: 정상/);
+  assert.match(first, /malformed: 읽기 불가 · 마지막 정상 수집 없음 · 미확인/);
   assert.match(first, /Codex 작업 상태·승인\/질문 대기: 연결 전\(T18\) · 미확인/);
   certificate = { observedAt: SLOT + DAY - 1000, status: 'problem', summary: '14일 뒤 만료' };
   at(SLOT + DAY); await s.tick();
