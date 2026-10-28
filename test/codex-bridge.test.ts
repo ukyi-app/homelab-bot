@@ -1250,3 +1250,24 @@ test('N8 실행 중 교체가 남아 있으면 실행 뒤 파일 본문을 한 �
     await rm(outside, { recursive: true, force: true });
   }
 });
+test('N9 한계 기록: 원래 디렉터리를 제자리로 되돌린 교체는 사후 확인으로 탐지하지 못함(별도 UID·마운트 격리 필요, T16b)', async () => {
+  const job = '00000000-0000-4000-8000-00000000f402';
+  const paths = taskPaths(root, job);
+  const alternate = resolve(await mkdtemp('.local/alt-home-'));
+  let sawAlternate = false;
+  try {
+    await writeFile(join(alternate, 'config.toml'), 'alternate-config-marker');
+    const local = new FakeLauncher();
+    local.scripts.push({ ...finished(out('completed', '끝')), during: async spec => {
+      await rename(paths.home, `${paths.home}.moved`);
+      await symlink(alternate, paths.home);
+      sawAlternate = (await readFile(join(spec.env.CODEX_HOME!, 'config.toml'), 'utf8')) === 'alternate-config-marker';
+      await rm(paths.home);
+      await rename(`${paths.home}.moved`, paths.home);
+    } });
+    const result = await new ExecCodexAdapter(root, local).execute({ job, prompt: 'p', resume: null, toolCalls: 8 }, new AbortController().signal);
+    // 이 결과가 바뀌면 ARCHITECTURE §12 "실행 뒤 파일 읽기 경계"의 한계 문장을 함께 고친다.
+    assert.equal(sawAlternate, true);
+    assert.equal(result.kind, 'completed');
+  } finally { await rm(alternate, { recursive: true, force: true }); }
+});

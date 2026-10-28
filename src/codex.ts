@@ -189,12 +189,13 @@ export class ExecCodexAdapter implements CodexTaskAdapter {
     // 남은 프로세스가 있거나 모르면 아무 파일도 읽지 않고 unknown으로 닫는다. 판정에 필요 없고, 살아 있는 프로세스가
     // 읽는 도중 파일을 키우거나 바꿔치기할 수 있다(rev r3 N7).
     if (survivors !== 0) return { ...interpretRun({ ...report, output: null, changes: null }, request.resume), tools: tools.size };
-    // 실행 중 경로의 디렉터리가 바뀌었으면(심링크·다른 디렉터리로 교체) 결과·증거를 하나도 읽지 않고 실패로 닫는다.
-    // 루트부터 이름 하나씩 다시 열어 고정한 inode와 비교한다. 경로를 그대로 따라가는 realpath 비교가 아니다.
+    // 확인 시점에 경로의 디렉터리가 바뀌어 있으면(심링크·다른 디렉터리로 교체) 결과·증거 본문을 하나도 읽지 않고
+    // 실패로 닫는다(rev r4 N8). 루트부터 이름 하나씩 다시 열어 고정한 inode와 비교한다. realpath 비교가 아니다.
+    // 원래 디렉터리를 제자리로 되돌린 교체(같은 inode)는 이 확인으로 알 수 없다(ARCHITECTURE §12 한계).
+    const tampered = { kind: 'failed' as const, reason: 'workspace_tampered', threadId: request.resume, turns: 0, tools: tools.size };
+    if (!await this.intact(pinned)) return tampered;
     const output = await readAt(pinned.run, 'last-message.json', READ_LIMITS.output);
-    if (!await this.intact(pinned) || output.status === 'refused') {
-      return { kind: 'failed', reason: 'workspace_tampered', threadId: request.resume, turns: 0, tools: tools.size };
-    }
+    if (output.status === 'refused') return tampered;
     const secrets = [...before, ...authSecrets(text(await readAt(pinned.home, 'auth.json', READ_LIMITS.auth)))];
     const after = await workspace.snapshot(pinned.workspace);
     return { ...interpretRun({ ...report, output: output.status === 'ok' ? output.text : null, outputTooLarge: output.status === 'too_large',
