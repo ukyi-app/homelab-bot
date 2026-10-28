@@ -42,6 +42,7 @@ export type MemoryInput = z.input<typeof MemoryInputSchema>;
 type Parsed = z.infer<typeof MemoryInputSchema>;
 type Kind = Parsed['kind'];
 export type SourceCheck = 'verified' | 'unverified' | 'inaccessible';
+interface Evidence { active: boolean; keys: string[] }
 export interface DocumentSource { check(actor: string, uri: string, revision: string | null): Promise<SourceCheck> }
 // 출처 링크가 있다고 정확하다는 뜻은 아니다. 종류마다 근거로 인정하는 출처만 active로 올린다.
 const EVIDENCE: Record<Kind, SourceRef['type'][]> = {
@@ -75,15 +76,25 @@ const EntrySchema = z.strictObject({ memoryId: z.string().min(1), createdAt: Tim
 // 로컬 대역이다. 실제 원장 위치(R2 등)는 결정 대기(DECISIONS T20).
 export class FileDeletionLedger implements DeletionLedger {
   constructor(private readonly path: string) {}
+  // 쓰는 프로세스는 하나라고 가정한다.
   async append(entry: DeletionEntry): Promise<void> {
+    const line = `${JSON.stringify(EntrySchema.parse(entry))}\n`;
     const created = await stat(this.path).then(() => false, () => true);
-    const handle = await open(this.path, 'a');
-    try { await handle.appendFile(`${JSON.stringify(EntrySchema.parse(entry))}\n`); await handle.sync(); }
-    finally { await handle.close(); }
+    const handle = await open(this.path, 'a+');
+    try {
+      // 끊긴 이전 append의 조각 뒤에 붙이면 원장이 손상된다. 확인되지 않은 조각이므로 잘라낸다.
+      const raw = await readFile(this.path, 'utf8');
+      if (raw.length && !raw.endsWith('\n')) await handle.truncate(Buffer.byteLength(raw.slice(0, raw.lastIndexOf('\n') + 1)));
+      await handle.appendFile(line); await handle.sync();
+    } finally { await handle.close(); }
     // 새 파일은 디렉터리 항목도 fsync해야 전원 차단 뒤 파일이 남는다.
     if (created) { const dir = await open(dirname(this.path), 'r'); try { await dir.sync(); } finally { await dir.close(); } }
   }
+  // 페이지 캐시에만 있는 항목을 기록됐다고 답하지 않도록 읽기 전에 fsync한다.
   async has(memoryId: string, createdAt: number): Promise<boolean> {
+    const handle = await open(this.path, 'r').catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return undefined; throw error; });
+    if (!handle) return false;
+    try { await handle.sync(); } finally { await handle.close(); }
     return (await this.entries()).some(e => e.memoryId === memoryId && e.createdAt === createdAt);
   }
   async entries(): Promise<DeletionEntry[]> {
@@ -162,11 +173,15 @@ export class MemoryService {
       return result;
     });
   }
-  async exclude(actor: string, scope: Scope, sourceKey: string): Promise<void> {
+  // 이미 저장한 기억도 다음 접근부터 검색·브리핑에서 뺀다. 저장소·백업에서 지우는 것은 delete다.
+  async exclude(actor: string, scope: Scope, sourceKey: string): Promise<{ hidden: number }> {
     this.assertReady();
     await this.gate.authorize(actor, scope);
     if (!/^(conversation|job|document|external|channel):.{1,500}$/s.test(sourceKey)) throw new MemoryRejected('memory_exclusion_invalid');
     await this.db.query('INSERT INTO memory_exclusions VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [sourceKey, actor, this.now()]);
+    const hidden = (await this.db.query<{ count: string | number }>(`SELECT count(*) AS count FROM memories
+      WHERE owner_id=$1 AND status IN ('active','candidate') AND source_keys ? $2`, [actor, sourceKey])).rows[0]!.count;
+    return { hidden: Number(hidden) };
   }
   async search(actor: string, scope: Scope, query: string): Promise<MemoryView[]> {
     this.assertReady();
@@ -181,6 +196,7 @@ export class MemoryService {
       AND m.status IN ('active','candidate') AND m.deletion_requested_at IS NULL
       AND m.valid_from<=$2 AND (m.expires_at IS NULL OR m.expires_at>$2) AND m.access_channels ? $3
       AND NOT EXISTS (SELECT 1 FROM memory_deletions d WHERE d.memory_id=m.id AND d.memory_created_at=m.created_at)
+      AND NOT EXISTS (SELECT 1 FROM memory_exclusions x WHERE x.owner_id=m.owner_id AND m.source_keys ? x.source_key)
       ${filters.join(' ')} ORDER BY m.updated_at DESC, m.id LIMIT 20`, params)).rows;
     return this.views(rows.filter(row => this.visible(policy, actor, scope, row)));
   }
@@ -188,11 +204,22 @@ export class MemoryService {
   async recheckDue(actor: string, scope: Scope): Promise<{ items: MemoryView[]; total: number }> {
     this.assertReady();
     const policy = await this.gate.authorize(actor, scope);
-    const rows = (await this.db.query<MemoryRow>(`SELECT * FROM memories WHERE owner_id=$1 AND status='active'
-      AND output_classification='safe_summary' AND deletion_requested_at IS NULL AND recheck_at<=$2
+    const rows = (await this.db.query<MemoryRow>(`SELECT * FROM memories m WHERE owner_id=$1 AND status='active'
+      AND output_classification='safe_summary' AND deletion_requested_at IS NULL AND recheck_at<=$2 AND valid_from<=$2
       AND (expires_at IS NULL OR expires_at>$2) AND access_channels ? $3
+      AND NOT EXISTS (SELECT 1 FROM memory_exclusions x WHERE x.owner_id=m.owner_id AND m.source_keys ? x.source_key)
       ORDER BY recheck_at, id LIMIT 50`, [actor, this.now(), parent(scope)])).rows.filter(row => this.visible(policy, actor, scope, row));
     return { items: (await this.views(rows)).slice(0, 5), total: rows.length };
+  }
+  // 브리핑을 큐에 넣는 transaction 안에서 부른다. FOR SHARE로 같은 행의 삭제 요청·정리·정정과 직렬화한다.
+  async live(tx: Database, items: Pick<MemoryView, 'id' | 'createdAt'>[]): Promise<boolean> {
+    if (!items.length) return true;
+    if (items.some(item => this.erased.has(erasedKey(item.id, item.createdAt)))) return false;
+    const rows = (await tx.query<{ id: string; created_at: string | number }>(`SELECT id,created_at FROM memories m
+      WHERE id=ANY($1::text[]) AND status='active' AND deletion_requested_at IS NULL
+      AND NOT EXISTS (SELECT 1 FROM memory_exclusions x WHERE x.owner_id=m.owner_id AND m.source_keys ? x.source_key)
+      FOR SHARE`, [items.map(item => item.id)])).rows;
+    return items.every(item => rows.some(row => row.id === item.id && Number(row.created_at) === item.createdAt));
   }
   async delete(actor: string, scope: Scope, id: string): Promise<DeletionResult> {
     this.assertReady();
@@ -242,7 +269,7 @@ export class MemoryService {
   private async purge(id: string, createdAt: number, deletedAt: number, replay: boolean): Promise<{ applied: boolean; publishedCopies: number }> {
     return this.db.transaction(async tx => {
       const now = this.now();
-      const applied = (await tx.query(`UPDATE memories SET status='deleted',statement='',topic=NULL,details='{}',source_refs='[]',
+      const applied = (await tx.query(`UPDATE memories SET status='deleted',statement='',topic=NULL,details='{}',source_refs='[]',source_keys='[]',
         source_revision=NULL,scope='{}',access_channels='[]',recheck_condition=NULL,correction_reason=NULL,
         deletion_requested_at=COALESCE(deletion_requested_at,$3),updated_at=$3
         WHERE id=$1 AND created_at=$2 AND status<>'deleted' RETURNING id`, [id, createdAt, now])).rows.length > 0;
@@ -260,11 +287,12 @@ export class MemoryService {
         WHERE outbox_key IS NOT NULL AND memory_ids ? $1`, [erasedKey(id, createdAt)])).rows.map(row => row.outbox_key);
       let publishedCopies = 0;
       if (keys.length) {
-        await tx.query(`UPDATE outbox SET state='blocked',payload=jsonb_set(payload,'{content}',to_jsonb($2::text))
-          WHERE message_key=ANY($1::text[]) AND state='pending'`, [keys, REDACTED]);
-        // 보낸 메시지는 Discord에서 지우지 않는다. 로컬 사본만 지운다. sending은 게시자가 쥔 행이라 건드리지 않는다.
+        // 발송 시작 전인 sending은 게시자의 dispatch 표시가 state='sending'을 요구하므로 blocked로 바꾸면 보내지 않는다.
+        await tx.query(`UPDATE outbox SET state='blocked' WHERE message_key=ANY($1::text[])
+          AND (state='pending' OR (state='sending' AND dispatch_started=false))`, [keys]);
+        // 이미 보냈거나 보내는 중인 메시지는 Discord에서 지우지 않는다. 로컬 사본만 가린다.
         await tx.query(`UPDATE outbox SET payload=jsonb_set(payload,'{content}',to_jsonb($2::text))
-          WHERE message_key=ANY($1::text[]) AND state IN ('sent','unknown','blocked')`, [keys, REDACTED]);
+          WHERE message_key=ANY($1::text[])`, [keys, REDACTED]);
         publishedCopies = Number((await tx.query<{ count: string }>(`SELECT count(DISTINCT message_key) AS count FROM outbox
           WHERE message_key=ANY($1::text[]) AND state IN ('sent','unknown','sending')`, [keys])).rows[0]!.count);
       }
@@ -279,28 +307,30 @@ export class MemoryService {
     await tx.query(`UPDATE memories SET conflicts_with=(SELECT COALESCE(jsonb_agg(v),'[]'::jsonb)
       FROM jsonb_array_elements_text(conflicts_with) v WHERE v<>ALL($1::text[])) WHERE conflicts_with ?| $1::text[]`, [ids]);
   }
-  private async insert(tx: Database, actor: string, scope: Scope, input: Parsed, access: string[], evidence: boolean,
+  private async insert(tx: Database, actor: string, scope: Scope, input: Parsed, access: string[], evidence: Evidence,
     replaces: string[], reason: string | null): Promise<{ id: string; status: 'active' | 'candidate'; conflictsWith: string[] }> {
     await this.gate.withDatabase(tx).authorize(actor, scope);
     const id = randomUUID();
     const now = this.now();
+    // 같은 주제를 동시에 저장하면 READ COMMITTED에서는 서로를 못 봐 둘 다 active가 된다. 주제별로 직렬화한다.
+    if (input.topic) await tx.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`memory-topic:${actor}:${input.topic}`]);
     // 같은 주제에 다른 진술이 살아 있으면 어느 쪽도 확정하지 않고 사람의 정정을 기다린다.
     const conflicts = input.topic ? (await tx.query<{ id: string }>(`SELECT id FROM memories WHERE owner_id=$1 AND topic=$2
       AND status IN ('active','candidate') AND deletion_requested_at IS NULL AND statement<>$3 AND id<>ALL($4::text[]) ORDER BY id`,
     [actor, input.topic, input.statement, replaces])).rows.map(row => row.id) : [];
-    const status = evidence && !conflicts.length ? 'active' : 'candidate';
+    const status = evidence.active && !conflicts.length ? 'active' : 'candidate';
     const { kind, statement, topic, sources, scope: about, classification, validFrom, expiresAt, recheckAt, recheckCondition } = input;
     const details = kind === 'configuration' ? { sourceRevision: input.sourceRevision ?? null }
       : kind === 'decision' ? { decidedBy: input.decidedBy, decidedAt: input.decidedAt, appliesTo: input.appliesTo }
         : kind === 'incident' ? { facts: input.facts, hypotheses: input.hypotheses, unconfirmedCauses: input.unconfirmedCauses }
           : { targetUser: input.targetUser, endCondition: input.endCondition };
-    await tx.query(`INSERT INTO memories(id,kind,statement,topic,details,source_refs,source_revision,observed_at,owner_id,scope,
+    await tx.query(`INSERT INTO memories(id,kind,statement,topic,details,source_refs,source_keys,source_revision,observed_at,owner_id,scope,
       access_channels,output_classification,valid_from,expires_at,recheck_at,recheck_condition,status,replaces,conflicts_with,
-      correction_reason,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$21)`,
+      correction_reason,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$22,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$21)`,
     [id, kind, statement, topic ?? null, JSON.stringify(details), JSON.stringify(sources),
       kind === 'configuration' ? input.sourceRevision ?? null : null, kind === 'configuration' ? input.observedAt : null,
       actor, JSON.stringify(about), JSON.stringify(access), classification, validFrom ?? now, expiresAt ?? null, recheckAt ?? null,
-      recheckCondition ?? null, status, JSON.stringify(replaces), JSON.stringify(conflicts), reason, now]);
+      recheckCondition ?? null, status, JSON.stringify(replaces), JSON.stringify(conflicts), reason, now, JSON.stringify(evidence.keys)]);
     if (conflicts.length) await tx.query(`UPDATE memories SET conflicts_with=conflicts_with || jsonb_build_array($1::text),updated_at=$2
       WHERE id=ANY($3::text[])`, [id, now, conflicts]);
     for (const term of terms(`${statement} ${topic ?? ''}`)) await tx.query('INSERT INTO memory_terms VALUES ($1,$2)', [id, term]);
@@ -324,9 +354,10 @@ export class MemoryService {
     return access;
   }
   // 원본에 접근할 수 없으면 저장하지 않는다. 확인된 출처가 근거 종류에 맞을 때만 active 후보가 된다.
-  private async evidence(actor: string, input: Parsed): Promise<boolean> {
+  private async evidence(actor: string, input: Parsed): Promise<Evidence> {
     const excluded = new Set((await this.db.query<{ source_key: string }>('SELECT source_key FROM memory_exclusions WHERE owner_id=$1', [actor])).rows.map(r => r.source_key));
     let evidence = false;
+    const all = new Set<string>();
     for (const source of input.sources) {
       const keys = [source.type === 'conversation' ? `conversation:${source.message}` : source.type === 'job' ? `job:${source.job}` : `${source.type}:${source.uri}`];
       let check: SourceCheck;
@@ -344,12 +375,13 @@ export class MemoryService {
         if (source.type === 'document' && source.revision === null && check === 'verified') check = 'unverified';
       }
       if (keys.some(key => excluded.has(key))) throw new MemoryRejected('memory_source_excluded');
+      for (const key of keys) all.add(key);
       if (check === 'inaccessible') throw new MemoryRejected('memory_source_inaccessible');
       if (check === 'verified' && EVIDENCE[input.kind].includes(source.type)) evidence = true;
     }
     if (input.kind === 'decision' && input.decidedBy !== actor && !input.sources.some(s => s.type === 'document')) evidence = false;
     if (input.kind === 'preference' && input.targetUser !== actor) evidence = false;
-    return evidence;
+    return { active: evidence, keys: [...all] };
   }
   private async reachable(actor: string, scope: Scope): Promise<boolean> {
     try { await this.gate.authorize(actor, scope); return true; } catch (error) {

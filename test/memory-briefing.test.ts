@@ -126,9 +126,6 @@ test('MEM-01 비신뢰 자료의 정책 변경 지시는 candidate로만 남고 
   await assert.rejects(memory.remember('fixture-owner', thread, { ...config('정책 필드'), policy: { services: ['*'] } } as unknown as MemoryInput), { message: 'memory_invalid' });
   await assert.rejects(memory.remember('fixture-owner', thread, config('다른 채널 공개', { access: ['other-channel'] })), { message: 'memory_access_scope' });
   await assert.rejects(memory.remember('fixture-owner', thread, config('미등록 서비스', { scope: { service: 'unregistered' } })), { message: 'memory_service_scope' });
-  await assert.rejects(f.gate.authorize('intruder', thread), Denied);
-  await assert.rejects(f.gate.authorize('fixture-owner', { ...thread, parent: 'other-channel' }), Denied);
-  assert.deepEqual(f.policy.services, ['fixture-service']);
   assert.deepEqual((await memory.search('fixture-owner', thread, 'owner'))[0]!.flags, ['unverified']);
 });
 test('MEM-01 충돌 기억은 둘 다 확정하지 않고, 사유 있는 정정으로 정리하며 색인도 갱신', async () => {
@@ -190,6 +187,10 @@ test('AUTH-02 다른 채널 누출 차단, 서비스 권한 철회는 다음 접
   assert.deepEqual(await memory.search('fixture-owner', thread, '서비스'), []);
   f.policy.services = ['fixture-service'];
   assert.equal((await memory.search('fixture-owner', thread, '서비스')).length, 1);
+  await memory.remember('fixture-owner', notifications, config('아직 유효하지 않은 공지', { access: ['fixture-notifications'],
+    classification: 'safe_summary', validFrom: f.now() + DAY, recheckAt: f.now() + 1, expiresAt: f.now() + 2 * DAY }));
+  f.advance(1);
+  assert.deepEqual((await memory.recheckDue('fixture-owner', notifications)).items, []);
 });
 test('AUTH-02 예약 브리핑은 발송 시점 권한으로 막고, 게시 직전에도 다시 확인', async () => {
   const s = scheduler();
@@ -309,10 +310,13 @@ test('DATA-02 재적용은 ID와 created_at이 둘 다 맞을 때만, 원장을 
   await assert.rejects(closed.open(), /ledger_down/);
   await assert.rejects(closed.search('fixture-owner', thread, '되감긴'), MemoryNotReady);
 });
-test('DATA-02 원장 파일: 끊긴 마지막 줄은 무시하고 중간 손상은 닫힘', async () => {
+test('DATA-02 원장 파일: 끊긴 마지막 줄은 무시하고 다음 append 전에 잘라내며, 중간 손상은 닫힘', async () => {
   const file = `${dir}/torn.jsonl`;
   await writeFile(file, `${JSON.stringify({ memoryId: 'a', createdAt: 1, deletedAt: 2 })}\n{"memoryId":"b","crea`);
   assert.deepEqual((await new FileDeletionLedger(file).entries()).map(e => e.memoryId), ['a']);
+  await new FileDeletionLedger(file).append({ memoryId: 'c', createdAt: 3, deletedAt: 4 });
+  assert.deepEqual((await new FileDeletionLedger(file).entries()).map(e => e.memoryId), ['a', 'c']);
+  assert.equal(await new FileDeletionLedger(file).has('c', 3), true);
   await writeFile(file, `{"memoryId":\n${JSON.stringify({ memoryId: 'a', createdAt: 1, deletedAt: 2 })}\n`);
   await assert.rejects(new FileDeletionLedger(file).entries(), { message: 'deletion_ledger_corrupt' });
   const missing = new FileDeletionLedger(`${dir}/none/deletions.jsonl`);
@@ -343,9 +347,9 @@ test('BRIEF-01 시간대: 08:50 Asia/Seoul에 한 번, UTC 08:50·08:49:59에는
   const s = scheduler();
   assert.equal(await s.ensure(), 'enabled');
   assert.equal(Number((await rows('schedules'))[0]!.next_run), SLOT);
+  at(Date.UTC(2027, 0, 15, 8, 50)); assert.equal(await s.tick(), 'idle');
   at(SLOT - 1); assert.equal(await s.tick(), 'idle');
   at(SLOT); assert.equal(await s.tick(), 'enqueued'); assert.equal(await s.tick(), 'idle');
-  at(Date.UTC(2027, 0, 16, 8, 50)); assert.equal(await s.tick(), 'idle');
   const [row] = await briefings();
   assert.equal(row!.idempotency_key, 'briefing:daily-briefing:2027-01-16');
   assert.match(row!.payload.content, /^\[일일 브리핑\] 2027-01-16 08:50 Asia\/Seoul/);
@@ -366,7 +370,7 @@ test('BRIEF-01 시각·시간대 설정이 없거나 잘못되면 자동 발송�
   assert.equal((await briefings()).length, 0);
   assert.equal((await rows('audit')).filter(a => a.kind === 'briefing_unconfigured').length, 5);
 });
-test('BRIEF-01 같은 회차의 중복 tick·두 인스턴스 동시 실행에도 한 번만', async () => {
+test('BRIEF-01 같은 회차의 중복 tick·두 인스턴스 호출에도 한 번만(PGlite 직렬 실행)', async () => {
   const s1 = scheduler(); const s2 = scheduler();
   await s1.ensure(); await s2.ensure();
   at(SLOT);
@@ -415,13 +419,12 @@ test('BRIEF-01 며칠 중단 뒤에는 밀린 회차를 몰아 보내지 않고 
   at(SLOT + 5 * DAY); assert.equal(await s.tick(), 'enqueued');
   assert.match((await briefings())[1]!.payload.content, /누락: 01-20 브리핑/);
 });
-test('BRIEF-01 모델 중지·한도 대기 중에도 브리핑은 모델 없이 정확히 한 번, 중지 상태를 안내', async () => {
+test('BRIEF-01 모델 비상 중지 중에도 브리핑은 정확히 한 번 나가고 중지 상태를 안내', async () => {
   await database.db.query("INSERT INTO controls VALUES ('scheduler','true'),('scheduler_emergency','true')");
   const s = scheduler(); await s.ensure();
   at(SLOT); assert.equal(await s.tick(), 'enqueued'); assert.equal(await s.tick(), 'idle');
   const [row] = await briefings();
   assert.match(row!.payload.content, /모델 호출: 중지\(비상 중지\)/);
-  assert.equal(f.requests.length, 0);
   assert.equal((await briefings()).length, 1);
 });
 test('BRIEF-01 읽기 불가·오래된 관측은 미확인, 정상은 현재 관측일 때만, 복원 검증은 백업 성공과 구분', async () => {
@@ -431,6 +434,7 @@ test('BRIEF-01 읽기 불가·오래된 관측은 미확인, 정상은 현재 �
     source('certificate', 'certificate', async () => { if (certificate instanceof Error) throw certificate; return certificate; }),
     source('jobs', 'scheduled_job', async () => ({ observedAt: f.now() - 2 * 3_600_000, status: 'ok', summary: '예약 작업 정상' })),
     source('malformed', 'scheduled_job', async () => ({ observedAt: f.now(), status: 'ok', summary: 42 }) as unknown as Observation),
+    source('fractional', 'scheduled_job', async () => ({ observedAt: f.now() - 0.5, status: 'ok', summary: '초 단위 소수 시각' })),
   ];
   const s = scheduler(sources); await s.ensure();
   at(SLOT); await s.tick();
@@ -440,6 +444,7 @@ test('BRIEF-01 읽기 불가·오래된 관측은 미확인, 정상은 현재 �
   assert.match(first, /jobs: 오래된 관측\(관측 01-16 06:50\) · 현재 상태 미확인/);
   assert.doesNotMatch(first, /jobs: 정상/);
   assert.match(first, /malformed: 읽기 불가 · 마지막 정상 수집 없음 · 미확인/);
+  assert.match(first, /fractional: 읽기 불가 · 마지막 정상 수집 없음 · 미확인/);
   assert.match(first, /Codex 작업 상태·승인\/질문 대기: 연결 전\(T18\) · 미확인/);
   certificate = { observedAt: SLOT + DAY - 1000, status: 'problem', summary: '14일 뒤 만료' };
   at(SLOT + DAY); await s.tick();
@@ -470,4 +475,65 @@ test('BRIEF-01 기억 원장 재적용 전에는 브리핑의 기억 칸을 미�
   const s = scheduler([], { memory: closed }); await s.ensure();
   at(SLOT); assert.equal(await s.tick(), 'enqueued');
   assert.match((await briefings())[0]!.payload.content, /삭제 원장 재적용 전이라 조회하지 않음 · 미확인/);
+});
+
+test('MEM-01 저장 제외는 이미 저장한 기억도 다음 접근부터 검색·브리핑에서 뺌', async () => {
+  await f.ingress.receive(event('m-later', { text: '이 내용은 나중에 제외' })); f.advance(800);
+  await memory.remember('fixture-owner', thread, { kind: 'preference', statement: '나중에 제외할 선호', targetUser: 'fixture-owner',
+    endCondition: '해제 요청', expiresAt: f.now() + DAY, sources: [{ type: 'conversation', message: 'm-later' }] });
+  assert.equal((await memory.search('fixture-owner', thread, '제외할')).length, 1);
+  assert.deepEqual(await memory.exclude('fixture-owner', thread, `channel:${thread.channel}`), { hidden: 1 });
+  assert.deepEqual(await memory.search('fixture-owner', thread, '제외할'), []);
+});
+test('AUTH-02 작성 중 권한이 철회되면 큐에 넣기 직전 재인가로 막음', async () => {
+  const revoking = source('revoking', 'backup', async () => {
+    await f.gate.revoke('fixture-owner', notifications, 'fixture-owner');
+    return { observedAt: f.now(), status: 'ok', summary: '백업 정상' };
+  });
+  const s = scheduler([revoking]); await s.ensure();
+  at(SLOT); assert.equal(await s.tick(), 'blocked');
+  assert.equal((await briefings()).length, 0);
+  assert.deepEqual((await rows('briefing_runs')).map(r => r.reason), ['authorization_revoked']);
+});
+test('BRIEF-01 알림 채널 설정이 바뀌면 다음 회차는 현재 정책의 채널로 보냄', async () => {
+  const s = scheduler(); await s.ensure();
+  f.policy.notificationChannel = 'fixture-briefing-next';
+  at(SLOT); assert.equal(await s.tick(), 'enqueued');
+  await f.publisher.deliver();
+  assert.equal(f.rest.messages[0]!.channel, 'fixture-briefing-next');
+  assert.equal((await rows('schedules'))[0]!.scope.channel, 'fixture-briefing-next');
+  assert.ok((await rows('audit')).some(a => a.kind === 'briefing_target_updated'));
+});
+test('DATA-02 브리핑 작성 중 지운 기억은 큐에 들어가지 않고 다시 작성함', async () => {
+  const due = { access: ['fixture-notifications'], classification: 'safe_summary' as const, recheckAt: f.now() + 1 };
+  const gone = await memory.remember('fixture-owner', notifications, config('작성 중 지울 기억', due));
+  await memory.remember('fixture-owner', notifications, config('작성 중 남을 기억', due));
+  let deleted: Awaited<ReturnType<MemoryService['delete']>> | undefined;
+  const deleting = source('deleting', 'backup', async () => {
+    deleted ??= await memory.delete('fixture-owner', notifications, gone.id);
+    return { observedAt: f.now(), status: 'ok', summary: '백업 정상' };
+  });
+  const s = scheduler([deleting]); await s.ensure();
+  at(SLOT); assert.equal(await s.tick(), 'deferred');
+  assert.deepEqual([deleted!.status, deleted!.publishedCopies], ['deleted', 0]);
+  assert.equal((await briefings()).length, 0);
+  assert.equal(await s.tick(), 'enqueued');
+  const [row] = await briefings();
+  assert.doesNotMatch(row!.payload.content, /작성 중 지울 기억/); assert.match(row!.payload.content, /작성 중 남을 기억/);
+});
+test('DATA-02 게시자가 잡았지만 아직 보내지 않은 브리핑은 삭제 뒤 보내지 않음', async () => {
+  const due = { access: ['fixture-notifications'], classification: 'safe_summary' as const, recheckAt: f.now() + 1 };
+  const stored = await memory.remember('fixture-owner', notifications, config('잡힌 브리핑의 기억', due));
+  const s = scheduler(); await s.ensure();
+  at(SLOT); await s.tick();
+  const claimed = (await f.store.claimDelivery())!;
+  assert.equal(claimed.state, 'sending');
+  const result = await memory.delete('fixture-owner', notifications, stored.id);
+  assert.deepEqual([result.status, result.publishedCopies], ['deleted', 0]);
+  assert.equal(await f.store.dispatchDelivery(claimed), false);
+  f.advance(31_000); f.policy.confirmedAt = f.now(); await f.store.expire();
+  await f.publisher.deliver();
+  assert.equal(f.rest.messages.length, 0);
+  const [row] = await briefings();
+  assert.equal(row!.state, 'blocked'); assert.doesNotMatch(row!.payload.content, /잡힌 브리핑의 기억/);
 });

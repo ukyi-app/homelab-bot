@@ -4,7 +4,7 @@ CREATE TABLE IF NOT EXISTS memories (
   id text PRIMARY KEY,
   kind text NOT NULL CHECK (kind IN ('configuration','decision','incident','preference')),
   statement text NOT NULL, topic text, details jsonb NOT NULL DEFAULT '{}',
-  source_refs jsonb NOT NULL, source_revision text, observed_at bigint,
+  source_refs jsonb NOT NULL, source_keys jsonb NOT NULL DEFAULT '[]', source_revision text, observed_at bigint,
   owner_id text NOT NULL, scope jsonb NOT NULL, access_channels jsonb NOT NULL,
   output_classification text NOT NULL CHECK (output_classification IN ('internal','safe_summary')),
   valid_from bigint NOT NULL, expires_at bigint, recheck_at bigint, recheck_condition text,

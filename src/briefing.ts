@@ -68,8 +68,14 @@ function validZone(zone: unknown): zone is string {
   if (typeof zone !== 'string' || !zone) return false;
   try { new Intl.DateTimeFormat('en-US', { timeZone: zone }); return true; } catch { return false; }
 }
+class StaleBriefing extends Error { constructor() { super('briefing_stale_memory'); } }
 const target = (policy: Policy): Scope => ({ guild: policy.guild, channel: policy.notificationChannel, parent: null, kind: 'channel' });
 const KIND: Record<MemoryView['kind'], string> = { configuration: '설정', decision: '결정', incident: '장애', preference: '선호' };
+// bigint 열에 들어가므로 정수 ms만 받는다. 형식이 틀린 관측은 읽기 불가로 다룬다.
+function valid(value: Observation, now: number): boolean {
+  return Number.isSafeInteger(value?.observedAt) && value.observedAt <= now && ['ok', 'problem'].includes(value.status)
+    && typeof value.summary === 'string' && (value.restoreVerifiedAt == null || Number.isSafeInteger(value.restoreVerifiedAt));
+}
 function deadline<T>(work: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   return Promise.race([work, new Promise<T>((_, reject) => { timer = setTimeout(() => reject(new Error('source_timeout')), ms); })])
@@ -141,34 +147,45 @@ export class BriefingScheduler {
   private async compose(claim: Claim): Promise<BriefingOutcome> {
     const { schedule } = claim;
     try {
-      const policy = await this.gate.authorize(schedule.owner_id, schedule.scope);
-      if (schedule.scope.kind !== 'channel' || schedule.scope.channel !== policy.notificationChannel) return await this.close(claim, 'target_changed');
-      const memory = await this.memoryLines(schedule);
+      // 대상은 저장된 값이 아니라 현재 정책의 owner·알림 채널이다. 철회는 막고 정책 확인 불가는 미룬다.
+      const policy = await this.gate.current();
+      const owner = policy.owner;
+      const scope = target(policy);
+      await this.gate.authorize(owner, scope);
+      if (owner !== schedule.owner_id || scope.guild !== schedule.scope.guild || scope.channel !== schedule.scope.channel) {
+        await this.store.atomic(async store => {
+          await store.db.query('UPDATE schedules SET owner_id=$2,scope=$3 WHERE id=$1', [schedule.id, owner, JSON.stringify(scope)]);
+          await store.audit('briefing_target_updated', schedule.id, { owner: owner !== schedule.owner_id, channel: scope.channel !== schedule.scope.channel });
+        });
+      }
+      const memory = await this.memoryLines(owner, scope, schedule.timezone);
       const content = [
         ...this.header(claim), ...await this.history(claim), '',
-        ...await this.observations(claim.schedule.timezone), '',
+        ...await this.observations(schedule.timezone), '',
         '■ 모델·작업', ...await this.modelLines(),
         '- Codex 작업 상태·승인/질문 대기: 연결 전(T18) · 미확인', '',
         '■ 다시 확인할 기억', ...memory.lines,
       ].join('\n');
       return await this.db.transaction(async tx => {
         // 큐에 넣기 직전에 최신 권한을 다시 본다. 게시 직전 검사는 게시자가 한 번 더 한다.
-        const current = await this.gate.withDatabase(tx).authorize(schedule.owner_id, schedule.scope);
-        if (schedule.scope.channel !== current.notificationChannel) throw new Denied();
+        const current = await this.gate.withDatabase(tx).authorize(owner, scope);
+        if (current.owner !== owner || current.guild !== scope.guild || current.notificationChannel !== scope.channel) throw new Denied();
+        // 작성하는 동안 지우거나 대체한 기억이 있으면 다시 작성한다. FOR SHARE가 그 행의 삭제 정리와 직렬화한다.
+        if (!await this.memory.live(tx, memory.items)) throw new StaleBriefing();
         const key = `briefing:${schedule.id}:${claim.date}`;
         const held = (await tx.query(`UPDATE briefing_runs SET state='enqueued',outbox_key=$4,memory_ids=$5,lease_token=NULL,lease_until=NULL,updated_at=$6
           WHERE schedule_id=$1 AND slot_date=$2 AND lease_token=$3 AND state='composing' AND lease_until>$6 RETURNING slot_date`,
-        [schedule.id, claim.date, claim.token, key, JSON.stringify(memory.keys), this.store.now()])).rows.length;
+        [schedule.id, claim.date, claim.token, key, JSON.stringify(memory.items.map(item => `${item.id}@${item.createdAt}`)), this.store.now()])).rows.length;
         if (!held) return 'idle';
-        await this.store.enqueue({ key, actor: schedule.owner_id, scope: schedule.scope, revision: current.revision,
-          services: memory.services, payload: { kind: 'message', channel: schedule.scope.channel, content, classification: 'safe_summary' } }, tx);
+        await this.store.enqueue({ key, actor: owner, scope, revision: current.revision,
+          services: memory.services, payload: { kind: 'message', channel: scope.channel, content, classification: 'safe_summary' } }, tx);
         return 'enqueued';
       });
     } catch (error) {
       if (error instanceof Denied) return this.close(claim, 'authorization_revoked');
-      if (error instanceof PolicyUnavailable) {
+      if (error instanceof PolicyUnavailable || error instanceof StaleBriefing) {
         await this.db.query(`UPDATE briefing_runs SET lease_until=$4 WHERE schedule_id=$1 AND slot_date=$2 AND lease_token=$3`,
-          [schedule.id, claim.date, claim.token, this.store.now() + BRIEFING.retryMs]);
+          [schedule.id, claim.date, claim.token, this.store.now() + (error instanceof StaleBriefing ? 0 : BRIEFING.retryMs)]);
         return 'deferred';
       }
       throw error;
@@ -199,7 +216,9 @@ export class BriefingScheduler {
     const lines: string[] = [];
     if (skipped.length) {
       const dates = skipped.map(row => row.slot_date.slice(5));
-      lines.push(`누락: ${dates.slice(0, 7).join(', ')}${dates.length > 7 ? ` 외 ${dates.length - 7}회` : ''} 브리핑은 보내지 않았습니다(재시작 뒤 몰아 보내지 않음).`);
+      // 누락 기록은 중단 한 번에 최대 maxMissed회라 그 이상은 하한으로만 말한다.
+      const more = dates.length > 7 ? ` 외 ${dates.length - 7}회${dates.length >= BRIEFING.maxMissed ? ' 이상' : ''}` : '';
+      lines.push(`누락: ${dates.slice(0, 7).join(', ')}${more} 브리핑은 보내지 않았습니다(재시작 뒤 몰아 보내지 않음).`);
     }
     if (previous) {
       const states = (await this.db.query<{ state: string }>('SELECT state FROM outbox WHERE message_key=$1', [previous.outbox_key])).rows.map(row => row.state);
@@ -216,13 +235,11 @@ export class BriefingScheduler {
     const now = this.store.now();
     const attention: string[] = [];
     const fine: string[] = [];
-    for (const source of this.sources) {
-      let observation: Observation | undefined;
-      try {
-        const value = await deadline(source.read(), BRIEFING.sourceTimeoutMs);
-        if (Number.isFinite(value.observedAt) && value.observedAt <= now && ['ok', 'problem'].includes(value.status)
-          && typeof value.summary === 'string' && (value.restoreVerifiedAt == null || Number.isFinite(value.restoreVerifiedAt))) observation = value;
-      } catch { /* 아래에서 읽기 불가로 표시한다. */ }
+    // 원본을 함께 읽어 작성 시간이 원본 수에 비례해 lease를 넘지 않게 한다.
+    const read = await Promise.all(this.sources.map(source => deadline(Promise.resolve().then(() => source.read()), BRIEFING.sourceTimeoutMs)
+      .then(value => valid(value, now) ? value : undefined, () => undefined)));
+    for (const [index, source] of this.sources.entries()) {
+      const observation = read[index];
       await this.db.query(`INSERT INTO briefing_observations VALUES ($1,$2,$3,$4) ON CONFLICT (source_id) DO UPDATE SET
         last_ok_at=COALESCE($2,briefing_observations.last_ok_at),last_attempt_at=$3,last_status=$4`,
       [source.id, observation?.observedAt ?? null, now, observation?.status ?? 'unavailable']);
@@ -256,19 +273,17 @@ export class BriefingScheduler {
     if (unknown) lines.push(`- 종료를 확인하지 못한 작업: ${unknown}건(unknown, 자동 재실행 안 함)`);
     return lines;
   }
-  private async memoryLines(schedule: ScheduleRow): Promise<{ lines: string[]; keys: string[]; services: string[] }> {
+  private async memoryLines(owner: string, scope: Scope, zone: string): Promise<{ lines: string[]; items: MemoryView[]; services: string[] }> {
     try {
-      const { items, total } = await this.memory.recheckDue(schedule.owner_id, schedule.scope);
-      if (!items.length) return { lines: ['- 없음'], keys: [], services: [] };
-      const zone = schedule.timezone;
+      const { items, total } = await this.memory.recheckDue(owner, scope);
+      if (!items.length) return { lines: ['- 없음'], items: [], services: [] };
       const lines = items.map(item => `- [${KIND[item.kind]}] ${bounded(item.statement.replace(/\s+/g, ' '), 200)}`
         + `${item.observedAt !== null ? ` · 확인 ${clock(item.observedAt, zone)}` : ''} · 현재 조회로 다시 확인 필요`);
       if (total > items.length) lines.push(`- 외 ${total - items.length}건`);
-      return { lines, keys: items.map(item => `${item.id}@${item.createdAt}`),
-        services: [...new Set(items.flatMap(item => item.service ? [item.service] : []))].sort() };
+      return { lines, items, services: [...new Set(items.flatMap(item => item.service ? [item.service] : []))].sort() };
     } catch (error) {
       if (error instanceof Denied || error instanceof PolicyUnavailable) throw error;
-      return { lines: [error instanceof MemoryNotReady ? '- 삭제 원장 재적용 전이라 조회하지 않음 · 미확인' : '- 기억 조회 실패 · 미확인'], keys: [], services: [] };
+      return { lines: [error instanceof MemoryNotReady ? '- 삭제 원장 재적용 전이라 조회하지 않음 · 미확인' : '- 기억 조회 실패 · 미확인'], items: [], services: [] };
     }
   }
 }
