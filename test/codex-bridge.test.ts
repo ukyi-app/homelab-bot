@@ -1216,3 +1216,37 @@ test('자체 점검: 실행 전 설정 쓰기는 기존 하드링크를 따라 �
     assert.match(await readFile(join(paths.home, 'config.toml'), 'utf8'), /inherit = "none"/);
   } finally { await rm(outside, { recursive: true, force: true }); }
 });
+
+// ---- rev-t18 r4 회귀 시험 ----
+test('N8 실행 중 교체가 남아 있으면 실행 뒤 파일 본문을 한 번도 읽지 않고 실패(원래 run의 출력 포함)', async () => {
+  const outside = await outsideDir();
+  const probe = await open(join(outside, 'secret.txt'), 'r');
+  const proto = Object.getPrototypeOf(probe) as Record<'read' | 'readFile' | 'readableWebStream', (...args: unknown[]) => unknown> & { fd?: number };
+  await probe.close();
+  const originals = { read: proto.read, readFile: proto.readFile, readableWebStream: proto.readableWebStream };
+  const reads: string[] = [];
+  let afterRun = false;
+  for (const key of ['read', 'readFile', 'readableWebStream'] as const) {
+    proto[key] = function (this: { fd: number }, ...args: unknown[]) {
+      if (afterRun) reads.push(`${key}:${this.fd}`);
+      return originals[key].apply(this, args);
+    };
+  }
+  try {
+    const job = '00000000-0000-4000-8000-00000000f401';
+    const paths = taskPaths(root, job);
+    const local = new FakeLauncher();
+    // 결과는 원래 run에 정상으로 쓰고, workspace만 바깥 심링크로 바꾼다. 실행이 끝난 뒤의 읽기만 센다.
+    local.scripts.push({ ...finished(out('completed', 'inside-output-marker')), during: async spec => {
+      await writeFile(spec.args[spec.args.indexOf('-o') + 1]!, out('completed', 'inside-output-marker'));
+      await swap(paths.workspace, outside)();
+      afterRun = true;
+    } });
+    const result = await new ExecCodexAdapter(root, local).execute({ job, prompt: 'p', resume: null, toolCalls: 8 }, new AbortController().signal);
+    assert.equal(result.kind === 'failed' && result.reason, 'workspace_tampered');
+    assert.deepEqual(reads, []);
+  } finally {
+    Object.assign(proto, originals);
+    await rm(outside, { recursive: true, force: true });
+  }
+});
