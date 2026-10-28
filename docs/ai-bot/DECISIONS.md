@@ -434,4 +434,4 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 
 - **리뷰 작업의 `waiting_user` 해제:** `Store.control`의 `resume-model`·`cancel`은 `conversation_id`로 묶여 있어 대화가 없는 리뷰 작업을 풀지 못한다. 리뷰 작업이 모델 한도·인증 만료에 걸리면 전역 모델 슬롯이 DB를 직접 고치기 전까지 묶인다. 후보: (a) control에 리뷰 작업 대상(알림 채널에서 owner가 job ID로 재개·포기)을 더한다 (b) 리뷰 작업은 한도 때 `failed`(`model_limit`)로 두고 전역 대기는 다음 대화 작업이 잡게 한다. 추천 (a)(D-14 조건 2의 "대기"를 지킨다). 모델을 부르기 전에 해소해야 한다.
 - **webhook 수신 연결:** `src/http.ts` 앱 서버(8080)에 `githubWebhook`을 붙이는 것. 지금은 404 그대로다.
-- **작업자 리뷰 레인:** `worker-http.ts`에 리뷰 요청 경로를 더하고 작업자 쪽 mutex를 `SerialWorker`와 공유하는 것. 지금은 게시 서버의 SQL 슬롯만 공유하고, 작업자 쪽 mutex는 `ReviewWorker`가 따로 가진다.
+- **작업자 쪽 mutex 공유:** 리뷰 레인 HTTP는 새 파일 `src/review-http.ts`(`/v1/review`, `/v1/review/cancel`)에 두었다. 작업자 쪽 mutex를 대화 레인 `SerialWorker`와 하나로 묶는 것은 `worker.ts` 변경이라 하지 않았다. 지금은 게시 서버의 SQL 슬롯만 두 레인이 공유하고, 작업자 쪽 mutex는 `ReviewWorker`가 따로 가진다. 한 작업자 프로세스에 두 레인을 올릴 때(T16b) 묶어야 한다.

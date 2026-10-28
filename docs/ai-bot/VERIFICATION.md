@@ -183,15 +183,15 @@ slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG �
 
 - 범위: homelab 티켓 T17의 할 일 2·3·4 코드다. 할 일 1·5(사람 작업: 리뷰 App 생성·설치와 키 등록, 봇 리뷰 저장소의 Codex 자동 리뷰 끄기와 끈 뒤 확인, 허용 봇 작성자 ID 등록)는 하지 않았다. 해당 확인은 `blocked`(사람 작업, 실연동은 T16b 뒤)다.
 - 브랜치 `feat/t17-pr-review-local`(origin/main `bf6a8e9` 기준), 로컬 커밋만 했다. push·PR·GitHub 쓰기는 없다.
-- `npm run check` 통과, `npm test` **317 tests / 317 pass / 0 fail / 0 skipped**(기준선 276 + 새 41개, `test/pr-review.test.ts`). Node 24.22.0, TypeScript 7.0.2, PGlite 0.5.10.
+- `npm run check` 통과, `npm test` **322 tests / 322 pass / 0 fail / 0 skipped**(기준선 276 + 새 46개, `test/pr-review.test.ts`). Node 24.22.0, TypeScript 7.0.2, PGlite 0.5.10.
 - 외부 호출 없음: GitHub API·webhook 발신·codeload·Discord·모델(Codex·OpenAI) 모두 모의다. 리뷰 모델 자리는 고정 출력 fake 리뷰어다(D-14 차단 조건). 허용 봇 작성자 ID는 시험용 가짜 숫자이고 실제 ID는 runtime policy 키(`review.allowed_bot_author_ids`, 코드에서는 `review.allowedBotAuthorIds`)에만 둔다.
-- 등급: `local_integration`은 실제 앱 코드 + PGlite + 실제 tar.gz 해석·diff 코드(+ AUTH-01 일부는 loopback HTTP)이고, 압축본 받기·GitHub 응답은 모의다. `mock`은 모의 API·fake 리뷰어 계약 시험이다.
-- 리뷰 작업은 공유 `jobs`에 `type='review'`(대화 없음)로 둔다. 대화 작업과 모델 슬롯 1개를 나눈다(D-14 직렬 1, `pr-review.test.ts` "D-14 직렬 1").
+- 등급: `local_integration`은 실제 앱 코드 + PGlite + 실제 tar.gz 해석·diff 코드(+ webhook 수신과 리뷰 레인 작업자는 loopback HTTP)이고, 압축본 받기·GitHub 응답은 모의다. `mock`은 모의 API·fake 리뷰어 계약 시험이다.
+- 리뷰 작업은 공유 `jobs`에 `type='review'`(대화 없음)로 둔다. 대화 작업과 모델 슬롯 1개를 양방향으로 나누고, 모델 한도 때 전역 대기, 비상 중지 때 실행 중 리뷰 호출을 중단하고 종료를 확인하지 못하면 `unknown`으로 슬롯을 잡는다(`pr-review.test.ts` "D-14" 시험 3개).
 
 | 시험 ID | 등급 / 판정 | 확인한 경계 | 남은 검증 / 해소 |
 |---|---|---|---|
-| AUTH-01 (PR 경로) | local_integration / pass | 원본 바이트 HMAC 서명(위조·변조·누락 401, 저장 없음), 설치·저장소 허용, `MEMBER`·`OWNER`·`COLLABORATOR` 통과, `NONE`·`CONTRIBUTOR`·`FIRST_TIME_CONTRIBUTOR`·`FIRST_TIMER` 차단, `type=Bot`이고 허용 숫자 ID일 때만 통과(허용 밖 봇·이름 위장·User 타입 차단), fork·삭제된 head 저장소 차단, Bot 댓글 무시, 댓글은 `comment.author_association`, 댓글 요청도 대상 PR을 조회해 fork·작성자 재확인, 조회 실패 시 모델 작업 없음, 리뷰 정책 없음·stale 정책 닫힘, loopback HTTP 401/202/413/404 | 실제 리뷰 App 설치·webhook 전달·Renovate/App PR의 `author_association` 실측 blocked(사람: 리뷰 App 생성·설치, webhook 경로 T08a, T16b) |
-| EVENT-01 | local_integration / pass | 같은 `X-GitHub-Delivery` 재전송, 같은 세대 `(repo_id, pr, head_sha, comparison_revision, policy_revision)`의 다른 delivery·댓글 요청은 작업 1건, 늦게 온 옛 `synchronize`가 새 세대를 밀어내지 않음 | 실제 GitHub 재전송 blocked(T16b) |
+| AUTH-01 (PR 경로) | local_integration / pass | 실행 직전·게시 직전 저장소·허용 봇 철회 반영, 원본 바이트 HMAC 서명(위조·변조·누락 401, 저장 없음), 설치·저장소 허용, `MEMBER`·`OWNER`·`COLLABORATOR` 통과, `NONE`·`CONTRIBUTOR`·`FIRST_TIME_CONTRIBUTOR`·`FIRST_TIMER` 차단, `type=Bot`이고 허용 숫자 ID일 때만 통과(허용 밖 봇·이름 위장·User 타입 차단), fork·삭제된 head 저장소 차단, Bot 댓글 무시, 댓글은 `comment.author_association`, 댓글 요청도 대상 PR을 조회해 fork·작성자 재확인, 조회 실패 시 모델 작업 없음, 리뷰 정책 없음·stale 정책 닫힘, loopback HTTP 401/202/413/404 | 실제 리뷰 App 설치·webhook 전달·Renovate/App PR의 `author_association` 실측 blocked(사람: 리뷰 App 생성·설치, webhook 경로 T08a, T16b) |
+| EVENT-01 | local_integration / pass | 댓글 재요청은 확인된 실패만 같은 세대로 되살리고 재시도 한도 뒤 중복, 같은 `X-GitHub-Delivery` 재전송, 같은 세대 `(repo_id, pr, head_sha, comparison_revision, policy_revision)`의 다른 delivery·댓글 요청은 작업 1건, 늦게 온 옛 `synchronize`가 새 세대를 밀어내지 않음 | 실제 GitHub 재전송 blocked(T16b) |
 | EVENT-02 | local_integration / pass | 게시 응답 유실 → `unknown`, PR 리뷰 목록에서 marker·검토 SHA로 대조해 `sent`(재게시 0, Discord 요약 1회), 못 찾으면 `unknown` 유지·24시간 뒤 은퇴, 재시도 전 기존 게시 대조, 게시 중 lease 만료(전송 전 재시도, 전송 뒤 unknown), 무효 인라인(422) → 본문만 1회, 401/403/404 차단, 429 대기 | 실제 GitHub 게시·목록 대조 blocked(리뷰 App, T16b) |
 | EVENT-03 | local_integration / pass | 열린 PR 대조로 놓친 세대 복구, `reviewSince` 이전 PR 제외, 실행당 상한·감사, 작성자·fork 게이트 유지, 이미 받은 세대 중복 없음, 새 head만 추가 | 실제 열린 PR 조회·수동 재전송 3일 한계 blocked(T16b) |
 | REVIEW-01 | mock / pass(평가 하네스만). **모델 품질 평가 blocked** | 정답을 모델 입력과 분리해 유효 지적·오탐·누락·미검토를 세는 하네스, fake 리뷰어 4사례(아래 품질 표). Renovate 의존성 갱신 PR 결과 1건(mock) | 실제 모델 평가 blocked: D-14 차단 조건(공개 저장소 PR 내용으로 구독 모델 호출 금지)과 인증 파일 격리·SEC-02 선행(ARCHITECTURE §5.1). 해소: 차단 조건 해제 뒤 T17 |
@@ -200,8 +200,8 @@ slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG �
 | REVIEW-04 | mock / pass | 게시 쓰기는 `restrictGitHubWrite`만 통과: `POST /repos/{저장소}/pulls/{번호}/reviews`, `event=COMMENT`, `commit_id`=검토 head, 인라인 `side=RIGHT`. APPROVE·REQUEST_CHANGES·event 없음(PENDING)·dismiss·submit·merge·auto-merge(GraphQL)·PR 수정·issue 댓글·merges·dispatches·다른 PR·다른 SHA는 전송 전 거부. 게시 상한 미설정·초과 → 게시 거부 | 실제 리뷰 App 권한·`authorized_external` blocked(사람: 리뷰 App, 시험 PR 게시 승인) |
 | REVIEW-05 | local_integration / pass | Bot 댓글(명령·자기 리뷰 본문 포함) 무시, `pull_request_review`는 구독 밖으로 무시, 허용 봇 ID가 연 PR은 정상 리뷰 | 실제 자기 이벤트 루프 blocked(T16b) |
 | SEC-01 | mock / pass | PR 본문·Renovate 릴리스 노트·PR이 바꾼 `AGENTS.md`의 지시는 `untrusted` 자료로만, 리뷰 기준은 고정 지침 + base 리비전 `AGENTS.md`만, 정책·허용 목록 불변. 모델 출력의 승인·병합·정책·확신 점수 필드, 검토 밖 파일 지적 → `invalid_output`, 게시 없음 | 실제 모델의 인젝션 저항성은 이 증거에 넣지 않는다(D-14 차단 조건) |
-| SEC-02 | mock / pass(작업자 입력·자격 경계). **파드 격리 사례 blocked** | 작업자는 서명 capability에 묶인 요청에서 고정 SHA `codeload.github.com` 주소만 받고(바뀐 주소·api.github.com·github.com·브랜치 이름 거부), 압축본 요청은 `credentials: omit`·`redirect: error`·인증 헤더 자리 없음, capability 재사용·본문 불일치 거부, 압축 해제 크기 상한 | `auth.json`·CODEX_HOME·환경 변수 읽기, 작업 레인 비신뢰 코드, `shell_environment_policy`, egress 프록시, 제어 끝점, 세션 디렉터리 격리, 남은 프로세스 blocked: 실제 작업자 파드 없음(T16b·T18), 인증 파일 분리·작업별 세션 저장 공간 결정 대기(ARCHITECTURE §5.1). **이 사례가 통과하기 전에는 T17이 모델을 부르지 않는다** |
-| DATA-01 | mock / pass(출력 분류·입력 분리). **세션 파일 사례 blocked** | `output_classification`: 내부 표식(runtime policy `review.internalMarkers`)·GitHub·OpenAI 토큰·개인 키·tailnet 주소·Tailscale 주소·refresh_token이 있으면 `restricted` → 공개 PR 게시 차단, Discord에는 원문 없는 안내만. 게시 직전 현재 정책으로 재분류. 리뷰 입력에 Discord 대화 없음, Discord 요약에 모델 문장 없음. 모델 문장의 멘션·HTML 주석 무력화 | 다른 작업·대화 레인의 세션 파일을 읽어 결과에 넣는 경로 blocked(작업별 세션 저장 공간 결정 대기, ARCHITECTURE §5.1, T18) |
+| SEC-02 | local_integration / pass(작업자 입력·자격·제어 끝점 경계). **파드 격리 사례 blocked** | 리뷰 레인 작업자 HTTP(loopback)는 capability 없음 401, 위조·재사용·본문 불일치 403으로 시작 전 거부. 작업자는 서명 capability에 묶인 요청에서 고정 SHA `codeload.github.com` 주소만 받고(바뀐 주소·api.github.com·github.com·브랜치 이름 거부), 압축본 요청은 `credentials: omit`·`redirect: error`·인증 헤더 자리 없음, capability 재사용·본문 불일치 거부, 압축 해제 크기 상한 | `auth.json`·CODEX_HOME·환경 변수 읽기, 작업 레인 비신뢰 코드, `shell_environment_policy`, egress 프록시, 같은 파드 프로세스의 제어 끝점 호출, 세션 디렉터리 격리, 남은 프로세스 blocked: 실제 작업자 파드 없음(T16b·T18), 인증 파일 분리·작업별 세션 저장 공간 결정 대기(ARCHITECTURE §5.1). **이 사례가 통과하기 전에는 T17이 모델을 부르지 않는다** |
+| DATA-01 | mock / pass(출력 분류·입력 분리). **세션 파일 사례 blocked** | `output_classification`: 내부 표식(runtime policy `review.internalMarkers`)·GitHub·OpenAI 토큰·개인 키·tailnet 주소·Tailscale 주소·refresh_token이 있으면 `restricted` → 공개 PR 게시 차단, Discord에는 원문 없는 안내만. 게시 직전 현재 정책으로 재분류. 리뷰 입력에 Discord 대화 없음, Discord 요약에 모델 문장 없음. 모델 문장과 PR 파일 경로의 멘션·HTML 주석·코드 칸 깨기 무력화 | 다른 작업·대화 레인의 세션 파일을 읽어 결과에 넣는 경로 blocked(작업별 세션 저장 공간 결정 대기, ARCHITECTURE §5.1, T18) |
 
 ### PR 자동 리뷰 품질 측정 (`04` §6, fake 리뷰어)
 
@@ -217,5 +217,5 @@ slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG �
 ### T17 남은 것
 
 - 리뷰 작업이 모델 한도·인증 만료로 `waiting_user`가 되면 전역 모델 슬롯을 잡는다. 그런데 재개·포기 명령(`Store.control`의 `resume-model`·`cancel`)은 `conversation_id`로 묶여 있어 대화가 없는 리뷰 작업을 풀지 못한다. 공유 파일(T16a 소유) 변경이 필요해 이번에는 고치지 않았다. 모델 호출 전(D-14 차단 조건 해제 전)에 해소해야 한다.
-- 실제 GitHub 리뷰 App 경로(설치 토큰 발급, REST 어댑터, `pull_request`·`issue_comment` 수신 연결, 작업자 HTTP 레인)는 아직 없다. 게시 서버 HTTP의 webhook 경로 연결은 `src/http.ts`(T16a 소유) 변경이라 하지 않았다.
+- 실제 GitHub 리뷰 App 경로(설치 토큰 발급, REST 어댑터, `pull_request`·`issue_comment` 수신 연결)와 실제 작업자 프로세스(codeload 받기, 모델 실행)는 아직 없다. 리뷰 레인 작업자 HTTP(`src/review-http.ts`)는 loopback 시험까지다. 게시 서버 HTTP의 webhook 경로 연결은 `src/http.ts`(T16a 소유) 변경이라 하지 않았다.
 - HANDOFF는 private 운영 저장소 몫이다(D-13). 이번 반환 보고가 그 원문이다.
