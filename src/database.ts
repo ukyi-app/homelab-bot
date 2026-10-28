@@ -58,4 +58,5 @@ export async function migrate(db: Database): Promise<void> {
   await db.query(await readFile(new URL('../../migrations/005_delivery_order.sql', import.meta.url), 'utf8'));
   await db.query(await readFile(new URL('../../migrations/006_alert_services.sql', import.meta.url), 'utf8'));
   await db.query(await readFile(new URL('../../migrations/007_execution_boundaries.sql', import.meta.url), 'utf8'));
+  await db.query(await readFile(new URL('../../migrations/010_memory_briefing.sql', import.meta.url), 'utf8'));
 }
