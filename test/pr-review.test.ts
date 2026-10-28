@@ -1152,3 +1152,32 @@ test('REVIEW-02 리뷰 정책이 꺼지거나 비교 기준이 미정이 되어�
   await r.publisher.deliver();
   assert.deepEqual((await deliveries()).map(d => d.state), ['sent']);
 });
+
+// ---- r2: 독립 Codex 리뷰(review-t17-r1) 지적별 회귀 ----
+test('r2 P1-01 AUTH-01 GitHub 조회 중 저장소·허용 봇 철회·정책 변경·리뷰 비활성은 capability 발급 전에 반영해 모델을 부르지 않는다', async () => {
+  const compare = r.gh.compare.bind(r.gh);
+  const during = (change: () => void) => { r.gh.compare = async (name, base, head) => { change(); return compare(name, base, head); }; };
+  await opened();
+  during(() => { r.policy().repositories = []; });
+  await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.wait_reason]), [['cancelled', 'authorization_revoked']]);
+  r.policy().repositories = [REPO];
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries CASCADE');
+  await opened(pull({ ...bot(RENOVATE), updated_at: '2026-10-29T04:00:00Z' }));
+  during(() => { r.policy().allowedBotAuthorIds = [WRITER_BOT]; });
+  await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.wait_reason]), [['cancelled', 'author_denied']]);
+  r.policy().allowedBotAuthorIds = [RENOVATE, WRITER_BOT];
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries CASCADE');
+  await opened(pull({ updated_at: '2026-10-29T04:01:00Z' }));
+  during(() => { r.policy().input = { ...POLICY.input, maxFiles: 5 }; });
+  await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.wait_reason]), [['superseded', 'policy_changed'], ['queued', null]]);
+  r.policy().input = POLICY.input;
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries CASCADE');
+  await opened(pull({ updated_at: '2026-10-29T04:02:00Z' }));
+  during(() => { r.policy().comparison = null; });
+  await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.wait_reason]), [['queued', 'review_disabled']]);
+  assert.equal(r.inputs.length, 0);
+});

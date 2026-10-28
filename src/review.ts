@@ -464,6 +464,17 @@ export class ReviewRuntime {
         archives: { base: contract.base, head: contract.head }, changes: compare.files, truncated: compare.truncated,
         pullRequest: { title: pr.title.slice(0, 1000), body: pr.body.slice(0, 65_536) }, limits: context.review.input,
         policyRevision: context.revision, instructions: REVIEW_INSTRUCTIONS, timeoutMs: DEFAULTS.taskTimeoutMs });
+      // 원격 조회 동안 바뀐 권한·정책을 capability 발급 직전에 최신 정책으로 다시 본다(D-16 모델 호출 전 허용 확인).
+      const fresh = await this.policy.current();
+      const freshRepo = fresh.review.repositories.find(r => r.id === repo.id && r.installationId === repo.installationId && r.fullName === repo.fullName);
+      if (!freshRepo) { await this.close(job, review, 'cancelled', 'authorization_revoked'); return true; }
+      if (fresh.revision !== review.policy_revision) {
+        await this.close(job, review, 'superseded', 'policy_changed');
+        await this.queue.admitLive(pr, freshRepo, fresh, 'live_check');
+        return true;
+      }
+      const revoked = pullRequestDecision(pr, freshRepo, fresh.review, review.trigger === 'comment');
+      if (revoked) { await this.close(job, review, revoked.outcome === 'denied' ? 'cancelled' : 'superseded', revoked.reason); return true; }
       // PR·목록 조회 동안 들어온 취소·비상 중지와 lease 만료를 dispatch 직전에 다시 본다.
       const live = (await this.store.db.query<{ state: string; lease_token: string; lease_until: string }>(
         'SELECT state,lease_token,lease_until FROM jobs WHERE id=$1', [job.id])).rows[0];
