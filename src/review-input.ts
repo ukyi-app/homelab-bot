@@ -257,7 +257,11 @@ export class ReviewWorker {
       } catch (error) {
         return { status: 'failed', stopped: true, reason: error instanceof ArchiveError ? error.message : 'archive_fetch_failed' };
       }
-      const { files, coverage } = buildReviewFiles(task.changes, task.truncated, base, head, task.limits);
+      let built: ReturnType<typeof buildReviewFiles>;
+      // 모델을 부르기 전의 실패는 실행이 없었다는 것이 확실하므로 unknown이 아니라 failed다.
+      try { built = buildReviewFiles(task.changes, task.truncated, base, head, task.limits); }
+      catch { return { status: 'failed', stopped: true, reason: 'input_build_failed' }; }
+      const { files, coverage } = built;
       const body = task.pullRequest.body.slice(0, task.limits.maxBodyChars);
       if (body.length < task.pullRequest.body.length) coverage.limits_hit.push('body_truncated');
       // 리뷰 기준 지침은 기준(base) 리비전의 것만. PR이 바꾼 AGENTS.md는 diff 안의 자료로만 남는다.
