@@ -1306,3 +1306,22 @@ test('r2 P2-04 REVIEW-03 파일 끝 개행의 추가·삭제를 diff에 남기�
   assert.match(r.inputs[0]!.untrusted.files[0]!.patch, /\\ No newline at end of file/);
   assert.equal(((await reviewJobs())[0]!.result as ReviewResult).review_outcome, 'completed');
 });
+test('r2 P2-05 EVENT-03 재조정에서 되살린 작업도 실행당 상한과 반환값·감사 기록에 센다', async () => {
+  r.policy().reconcile = { maxPages: 1, maxReviewsPerRun: 1 };
+  const sha = (n: number) => n.toString(16).padStart(40, '0');
+  const pr = (n: number, updated: string, extra: Record<string, unknown> = {}) =>
+    pull({ number: n, head: { sha: sha(n), ref: 'f', repo: repository }, updated_at: updated, ...extra });
+  for (const n of [1, 2, 3]) {
+    await hook('pull_request', prEvent('opened', pr(n, '2026-10-29T05:00:00Z')));
+    await hook('pull_request', prEvent('closed', pr(n, '2026-10-29T05:01:00Z', { state: 'closed' })));
+  }
+  assert.deepEqual((await reviewJobs()).map(j => j.state), ['superseded', 'superseded', 'superseded']);
+  r.gh.open = [1, 2, 3].map(n => pr(n, '2026-10-29T05:02:00Z'));
+  assert.deepEqual(await r.reconciler.run(), { admitted: 1, limited: true });
+  assert.equal((await reviewJobs()).filter(j => j.state === 'queued').length, 1);
+  assert.equal((await rows('audit')).filter(a => a.kind === 'review_reconcile_limit').length, 1);
+  // 새 작업과 되살린 작업이 섞여도 같은 예산이다.
+  r.gh.open = [pr(4, '2026-10-29T05:03:00Z'), ...[2, 3].map(n => pr(n, '2026-10-29T05:02:00Z'))];
+  assert.deepEqual(await r.reconciler.run(), { admitted: 1, limited: true });
+  assert.equal((await reviewJobs()).filter(j => j.state === 'queued').length, 2);
+});

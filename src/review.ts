@@ -805,7 +805,8 @@ export class ReviewReconciler {
             return { admitted, limited: true };
           }
           const result = await this.queue.admitLive(pr, repo, context, 'reconcile');
-          if (result.outcome === 'queued') admitted++;
+          // 되살린 세대도 모델 호출 후보라 같은 예산에 센다.
+          if (result.outcome === 'queued' || result.outcome === 'requeued') admitted++;
         }
         if (prs.length < 100) break;
       }
