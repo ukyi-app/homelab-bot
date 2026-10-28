@@ -13,6 +13,7 @@ import { GitHubError, GitHubIngress, githubWebhook, RestrictedGitHub, restrictGi
   ReviewPublisher, ReviewQueue, ReviewReconciler, ReviewRuntime } from '../src/review.js';
 import type { GitHubReader, GitHubTransport, GitHubWrite, ReviewPolicy, ReviewResult } from '../src/review.js';
 import { archiveContract } from '../src/worker.js';
+import { HttpReviewWorker, reviewWorkerServer } from '../src/review-http.js';
 import { event, fixture, localDatabase } from './helpers.js';
 
 const SECRET = 'fixture-webhook-secret';
@@ -855,4 +856,37 @@ test('EVENT-01 댓글 재요청은 확인된 실패만 같은 세대로 되살�
   assert.equal((await hook('issue_comment', commentEvent())).outcome, 'duplicate_generation');
   assert.equal(r.inputs.length, DEFAULTS.maxRetries + 1);
   assert.equal((await reviewJobs()).length, 1);
+});
+
+test('SEC-02 리뷰 레인 작업자 HTTP(loopback): capability 없음·위조·재사용·다른 본문은 시작 전 거부, 서명된 요청만 리뷰', async () => {
+  const server = reviewWorkerServer(r.worker);
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const client = new HttpReviewWorker(url, fetch);
+    await opened();
+    await new ReviewRuntime(f.store, r.source, r.queue, r.gh, client, f.signer, 5).tick();
+    await r.publisher.deliver();
+    assert.equal(r.gh.writes.length, 1);
+    const contract = archiveContract(REPO.fullName, BASE, HEAD);
+    const task: ReviewTask = { version: 1, job: randomUUID(), lease: randomUUID(), lane: 'review', repository: REPO.fullName,
+      base: BASE, head: HEAD, archives: { base: contract.base, head: contract.head }, changes: [], truncated: false,
+      pullRequest: { title: 't', body: 'b' }, limits: POLICY.input, policyRevision: 'rp-x', instructions: REVIEW_INSTRUCTIONS, timeoutMs: 1000 };
+    const job = { id: task.job, lease_token: task.lease } as Parameters<typeof f.signer.issue>[0];
+    const fetched = r.fetches.length;
+    const post = (path: string, body: unknown, authorization?: string) => fetch(`${url}${path}`, { method: 'POST', body: JSON.stringify(body),
+      headers: { 'content-type': 'application/json', ...(authorization ? { authorization } : {}) } });
+    assert.equal((await post('/v1/review', task)).status, 401);
+    assert.equal((await post('/v1/review', task, 'Capability forged.signature')).status, 403);
+    assert.equal((await post('/v1/review', { ...task, head: HEAD2 }, `Capability ${f.signer.issue(job, 'execute', task)}`)).status, 403);
+    assert.equal((await post('/v1/review/cancel', { job: task.job, lease: task.lease }, 'Capability forged.signature')).status, 403);
+    assert.equal((await fetch(`${url}/v1/review`)).status, 404);
+    const capability = f.signer.issue(job, 'execute', task);
+    assert.equal((await client.review(task, capability, new AbortController().signal)).status, 'succeeded');
+    await assert.rejects(client.review(task, capability, new AbortController().signal), WorkerRejected);
+    const other = { job: randomUUID(), lease: randomUUID() };
+    const otherJob = { id: other.job, lease_token: other.lease } as Parameters<typeof f.signer.issue>[0];
+    assert.deepEqual(await client.cancel(other, f.signer.issue(otherJob, 'cancel', other)), { stopped: false });
+    assert.equal(r.fetches.length, fetched + 2);
+  } finally { server.close(); }
 });
