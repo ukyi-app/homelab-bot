@@ -247,9 +247,10 @@ export class MemoryService {
         deletion_requested_at=COALESCE(deletion_requested_at,$3),updated_at=$3
         WHERE id=$1 AND created_at=$2 AND status<>'deleted' RETURNING id`, [id, createdAt, now])).rows.length > 0;
       if (replay && !applied) {
-        // 복원으로 ID가 되감겨 같은 ID의 다른 기억이 생겼다면 그 기억은 지우지 않는다.
+        // 이미 정리됐거나 그 기억이 없는 스냅숏이다. 복원으로 ID가 되감겨 같은 ID의 다른 기억이 생겼다면 그 기억은 지우지 않는다.
         const other = (await tx.query('SELECT id FROM memories WHERE id=$1 AND created_at<>$2', [id, createdAt])).rows.length;
         if (other) await this.audit('memory_ledger_id_mismatch', id, { createdAt }, tx);
+        return { applied, publishedCopies: 0 };
       }
       if (applied) {
         await tx.query('DELETE FROM memory_terms WHERE memory_id=$1', [id]);
@@ -270,7 +271,7 @@ export class MemoryService {
       await tx.query(`INSERT INTO memory_deletions(memory_id,memory_created_at,requested_by,requested_at,ledger_state,applied_at)
         VALUES ($1,$2,'deletion_ledger',$3,'recorded',$4) ON CONFLICT (memory_id,memory_created_at)
         DO UPDATE SET ledger_state='recorded',applied_at=COALESCE(memory_deletions.applied_at,$4)`, [id, createdAt, deletedAt, now]);
-      if (applied || !replay) await this.audit('memory_deleted', id, { replay, derivedDeliveries: keys.length, publishedCopies }, tx);
+      await this.audit('memory_deleted', id, { replay, derivedDeliveries: keys.length, publishedCopies }, tx);
       return { applied, publishedCopies };
     });
   }
