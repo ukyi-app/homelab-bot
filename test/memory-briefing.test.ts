@@ -53,7 +53,7 @@ function faulty(db: Database, match: (sql: string) => boolean) {
 before(async () => { database = await localDatabase(); await mkdir('.local', { recursive: true }); });
 beforeEach(async () => {
   await database.pg.exec(`TRUNCATE events,conversations,jobs,results,outbox,schedules,denied_actors,controls,audit,incidents,
-    memories,memory_terms,memory_exclusions,memory_deletions,briefing_runs,briefing_observations RESTART IDENTITY CASCADE`);
+    memories,memory_terms,memory_exclusions,memory_deletions,briefing_runs,briefing_copies,briefing_observations RESTART IDENTITY CASCADE`);
   f = await fixture(database.db);
   dir = await mkdtemp('.local/memory-');
   ledger = new FlakyLedger(new FileDeletionLedger(`${dir}/deletions.jsonl`));
@@ -774,7 +774,12 @@ test('DATA-02 [rev-t20c P1] 삭제 전 백업 복원·최신 회차 대기 브�
     await s.ensure(); await s.tick();
     for (let i = 0; i < 3; i++) await g.publisher.deliver();
     assert.ok(g.rest.messages.every(m => !m.body.content.includes('복원되면 안 될 비공개 기억')));
+    // 확인 전에는 발송만 막고 본문은 지우지 않는다. 확인 뒤에야 기억과 막아 둔 사본의 본문을 정리한다.
     assert.equal((await rows('memories', local.db))[0]!.statement, '복원되면 안 될 비공개 기억');
+    fault.state.fail = false;
+    assert.equal(await restored.resume(), 1);
+    assert.equal((await rows('memories', local.db))[0]!.status, 'deleted');
+    assert.ok((await rows('outbox', local.db)).every(o => !o.payload.content.includes('복원되면 안 될 비공개 기억')));
   } finally { await local.pg.close(); await rm(path, { recursive: true, force: true }); await rm(fault.dir, { recursive: true, force: true }); }
 });
 test('DATA-02 [rev-t20c P2] 요청 행 없는 복원에서 재적용 정리가 한 번 실패해도 다음 resume이 마무리', async () => {

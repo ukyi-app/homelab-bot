@@ -155,43 +155,60 @@ export class MemoryService {
   // 원장에서 본 삭제는 곧바로 숨긴다. 정리·완료로 올리는 것은 내구성이 확인된 항목(recorded)뿐이다.
   private readonly hidden = new Set<string>();
   private readonly recorded = new Set<string>();
-  private unconfirmed = false;
+  // 원장에서 읽었지만 아직 정리하지 못한 항목. 내구성 확인 실패나 정리 실패 뒤에도 남겨 resume()이 다시 시도한다.
+  private readonly replayPending = new Map<string, DeletionEntry>();
   constructor(private readonly db: Database, private readonly gate: PolicyGate, private readonly ledger: DeletionLedger,
     private readonly documents: DocumentSource, private readonly now: Clock = Date.now) {}
   // 기동 때마다 원장의 삭제를 다시 적용한 뒤에만 조회를 연다. 원장을 못 읽으면 닫힌 채로 둔다.
   // 원장 내구성을 확인하지 못하면 그 항목의 기억은 숨기기만 하고 정리·완료로 올리지 않는다. 확인은 resume()이 다시 시도한다.
   async open(): Promise<{ entries: number; applied: number }> {
     this.ready = false;
-    const entries = await this.ledger.entries();
-    const applied = await this.replay(entries);
-    await this.resume();
-    await this.audit('memory_ledger_replayed', 'memory', { entries: entries.length, applied, confirmed: !this.unconfirmed });
+    let entries: DeletionEntry[];
+    try { entries = await this.ledger.entries(); } catch (error) {
+      // 어떤 기억이 지워졌는지 모르므로 기억이 든 대기 브리핑을 모두 막는다. 게시자가 먼저 돌아도 새지 않게 한다.
+      await this.db.transaction(tx => this.reviseBriefings(tx, null, 'suppress'));
+      throw error;
+    }
+    for (const entry of entries) {
+      const key = erasedKey(entry.memoryId, entry.createdAt);
+      this.hidden.add(key);
+      this.replayPending.set(key, entry);
+    }
+    // 발송 차단은 내구성 확인과 따로 먼저 한다. 확인 전에는 기억 본문을 지우거나 완료로 올리지 않는다.
+    if (entries.length) await this.db.transaction(tx => this.reviseBriefings(tx, [...this.replayPending.keys()], 'suppress'));
+    const applied = await this.replay();
+    await this.finishRequests();
+    await this.audit('memory_ledger_replayed', 'memory', { entries: entries.length, applied, pending: this.replayPending.size });
     this.ready = true;
     return { entries: entries.length, applied };
   }
   // 이번 호출에서 정리를 마친 삭제 수를 돌려준다(원장 재적용 + 남은 삭제 요청).
   async resume(): Promise<number> {
-    let done = 0;
-    if (this.unconfirmed) done += await this.replay(await this.ledger.entries());
+    return await this.replay() + await this.finishRequests();
+  }
+  private async finishRequests(): Promise<number> {
     const rows = (await this.db.query<{ memory_id: string; memory_created_at: string | number }>(
       'SELECT memory_id,memory_created_at FROM memory_deletions WHERE applied_at IS NULL ORDER BY requested_at')).rows;
+    let done = 0;
     for (const row of rows) if ((await this.finish(row.memory_id, Number(row.memory_created_at))).status === 'deleted') done++;
     return done;
   }
-  private async replay(entries: DeletionEntry[]): Promise<number> {
-    for (const entry of entries) this.hidden.add(erasedKey(entry.memoryId, entry.createdAt));
-    if (!entries.length) { this.unconfirmed = false; return 0; }
+  // 정리에 성공한 항목만 재시도 목록에서 뺀다. 복원으로 요청 행이 없으면 이 목록이 유일한 재시도 근거다.
+  private async replay(): Promise<number> {
+    if (!this.replayPending.size) return 0;
     if (!await this.ledger.durable()) {
-      this.unconfirmed = true;
-      await this.audit('memory_ledger_unconfirmed', 'memory', { entries: entries.length });
+      await this.audit('memory_ledger_unconfirmed', 'memory', { pending: this.replayPending.size });
       return 0;
     }
-    this.unconfirmed = false;
     let applied = 0;
-    for (const entry of entries) {
-      this.recorded.add(erasedKey(entry.memoryId, entry.createdAt));
-      if ((await this.purge(entry.memoryId, entry.createdAt, entry.deletedAt, true)).applied) applied++;
+    for (const [key, entry] of [...this.replayPending]) {
+      this.recorded.add(key);
+      try {
+        if ((await this.purge(entry.memoryId, entry.createdAt, entry.deletedAt, true)).applied) applied++;
+        this.replayPending.delete(key);
+      } catch { /* 숨긴 채 다음 resume에서 다시 정리한다. */ }
     }
+    if (this.replayPending.size) await this.audit('memory_ledger_replay_retry', 'memory', { pending: this.replayPending.size }).catch(() => {});
     return applied;
   }
   async remember(actor: string, scope: Scope, raw: unknown): Promise<{ id: string; status: 'active' | 'candidate'; conflictsWith: string[] }> {
@@ -221,7 +238,7 @@ export class MemoryService {
       await tx.query("UPDATE memories SET status='superseded',updated_at=$2 WHERE id=ANY($1::text[])", [ids, this.now()]);
       await tx.query('DELETE FROM memory_terms WHERE memory_id=ANY($1::text[])', [ids]);
       await this.forget(tx, ids);
-      await this.reviseBriefings(tx, rows.map(row => erasedKey(row.id, Number(row.created_at))), false);
+      await this.reviseBriefings(tx, rows.map(row => erasedKey(row.id, Number(row.created_at))), 'revise');
       return result;
     });
   }
@@ -235,7 +252,7 @@ export class MemoryService {
       await tx.query('INSERT INTO memory_exclusions(source_key,owner_id,created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [sourceKey, actor, this.now()]);
       const hidden = (await tx.query<{ id: string; created_at: string | number }>(`SELECT id,created_at FROM memories
         WHERE owner_id=$1 AND status IN ('active','candidate') AND source_keys ? $2`, [actor, sourceKey])).rows;
-      await this.reviseBriefings(tx, hidden.map(row => erasedKey(row.id, Number(row.created_at))), false);
+      await this.reviseBriefings(tx, hidden.map(row => erasedKey(row.id, Number(row.created_at))), 'revise');
       return { hidden: hidden.length };
     });
   }
@@ -290,6 +307,8 @@ export class MemoryService {
         ON CONFLICT DO NOTHING`, [id, createdAt, actor, this.now()]);
       await tx.query('UPDATE memories SET deletion_requested_at=$3 WHERE id=$1 AND created_at=$2 AND deletion_requested_at IS NULL',
         [id, createdAt, this.now()]);
+      // 원장 기록 전이라도 조회에서 숨기는 것과 같은 수준으로 대기 브리핑 발송도 막는다. 본문 삭제는 원장 확인 뒤다.
+      await this.reviseBriefings(tx, [erasedKey(id, createdAt)], 'suppress');
     });
     return this.finish(id, createdAt);
   }
@@ -341,7 +360,7 @@ export class MemoryService {
         await tx.query('DELETE FROM memory_terms WHERE memory_id=$1', [id]);
         await this.forget(tx, [id]);
       }
-      const { derived, publishedCopies } = await this.reviseBriefings(tx, [erasedKey(id, createdAt)], true);
+      const { derived, publishedCopies } = await this.reviseBriefings(tx, [erasedKey(id, createdAt)], 'erase');
       await tx.query(`INSERT INTO memory_deletions(memory_id,memory_created_at,requested_by,requested_at,ledger_state,applied_at)
         VALUES ($1,$2,'deletion_ledger',$3,'recorded',$4) ON CONFLICT (memory_id,memory_created_at)
         DO UPDATE SET ledger_state='recorded',applied_at=COALESCE(memory_deletions.applied_at,$4)`, [id, createdAt, deletedAt, now]);
@@ -349,14 +368,18 @@ export class MemoryService {
       return { applied, publishedCopies };
     });
   }
-  // 정정·저장 제외·삭제를 이미 만든 브리핑에 반영한다. 발송을 시작하지 않은 회차는 막고 새 revision으로 다시 작성하게 되돌린다.
+  // 정정·저장 제외·삭제를 이미 만든 브리핑 사본에 반영한다. 발송을 시작하지 않은 사본은 막고, 그 회차는 새 revision으로 다시 작성하게 되돌린다.
   // 발송을 시작한 사본은 Discord에서 지우지 못한다. 분류를 safe_summary 밖으로 바꿔 429 등으로 대기열에 돌아와도 게시자가 거부하게 한다.
-  private async reviseBriefings(tx: Database, memoryKeys: string[], erase: boolean): Promise<{ derived: number; publishedCopies: number }> {
-    if (!memoryKeys.length) return { derived: 0, publishedCopies: 0 };
-    const runs = (await tx.query<{ schedule_id: string; slot_date: string; outbox_key: string; state: string }>(`SELECT schedule_id,slot_date,outbox_key,state
-      FROM briefing_runs WHERE outbox_key IS NOT NULL AND memory_ids ?| $1::text[] FOR UPDATE`, [memoryKeys])).rows;
-    if (!runs.length) return { derived: 0, publishedCopies: 0 };
-    const keys = runs.map(run => run.outbox_key);
+  // suppress는 발송 차단만 한다(원장 확인 전). 본문 가리기는 erase(원장 확인 뒤 삭제)와 다시 쓸 일이 없는 revise 사본뿐이다.
+  // memoryKeys가 null이면 기억이 든 사본 전부다(원장을 읽지 못한 기동).
+  private async reviseBriefings(tx: Database, memoryKeys: string[] | null, mode: 'erase' | 'revise' | 'suppress'): Promise<{ derived: number; publishedCopies: number }> {
+    if (memoryKeys && !memoryKeys.length) return { derived: 0, publishedCopies: 0 };
+    const keys = (await tx.query<{ message_key: string }>(memoryKeys
+      ? 'SELECT message_key FROM briefing_copies WHERE memory_ids ?| $1::text[]'
+      : "SELECT message_key FROM briefing_copies WHERE memory_ids<>'[]'::jsonb", memoryKeys ? [memoryKeys] : [])).rows.map(row => row.message_key);
+    if (!keys.length) return { derived: 0, publishedCopies: 0 };
+    const runs = (await tx.query<{ schedule_id: string; slot_date: string; outbox_key: string }>(`SELECT schedule_id,slot_date,outbox_key
+      FROM briefing_runs WHERE state='enqueued' AND outbox_key=ANY($1::text[]) FOR UPDATE`, [keys])).rows;
     // 발송 시작 전인 sending은 게시자의 dispatch 표시가 state='sending'을 요구하므로 blocked로 바꾸면 보내지 않는다.
     const blocked = new Set((await tx.query<{ message_key: string }>(`UPDATE outbox SET state='blocked' WHERE message_key=ANY($1::text[])
       AND (state='pending' OR (state='sending' AND dispatch_started=false)) RETURNING message_key`, [keys])).rows.map(row => row.message_key));
@@ -365,14 +388,13 @@ export class MemoryService {
     const publishedCopies = started.size;
     await tx.query(`UPDATE outbox SET payload=jsonb_set(payload,'{classification}','"redacted"')
       WHERE message_key=ANY($1::text[]) AND state='sending'`, [keys]);
-    const redo = runs.filter(run => run.state === 'enqueued' && blocked.has(run.outbox_key) && !started.has(run.outbox_key));
-    // 지울 내용이거나 다시 보낼 일이 없는 사본은 내용을 가린다.
-    const hide = erase ? keys : redo.map(run => run.outbox_key);
+    const redo = runs.filter(run => blocked.has(run.outbox_key) && !started.has(run.outbox_key));
+    const hide = mode === 'erase' ? keys : mode === 'revise' ? redo.map(run => run.outbox_key) : [];
     if (hide.length) await tx.query(`UPDATE outbox SET payload=jsonb_set(jsonb_set(payload,'{content}',to_jsonb($2::text)),'{classification}','"redacted"')
       WHERE message_key=ANY($1::text[])`, [hide, REDACTED]);
-    for (const run of redo) await tx.query(`UPDATE briefing_runs SET state='composing',revision=revision+1,outbox_key=NULL,memory_ids='[]',
+    for (const run of redo) await tx.query(`UPDATE briefing_runs SET state='composing',revision=revision+1,outbox_key=NULL,
       reason='memory_changed',lease_token=NULL,lease_until=NULL,updated_at=$3 WHERE schedule_id=$1 AND slot_date=$2`, [run.schedule_id, run.slot_date, this.now()]);
-    return { derived: runs.length, publishedCopies };
+    return { derived: keys.length, publishedCopies };
   }
   private async lockTopic(tx: Database, actor: string, topic: string | undefined): Promise<void> {
     if (topic) await tx.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`memory-topic:${actor}:${topic}`]);
@@ -389,10 +411,12 @@ export class MemoryService {
     // 같은 주제를 동시에 저장하면 READ COMMITTED에서는 서로를 못 봐 둘 다 active가 된다. 주제별로 직렬화한다.
     await this.lockTopic(tx, actor, input.topic);
     // 같은 주제에 다른 진술이 살아 있으면 어느 쪽도 확정하지 않고 사람의 정정을 기다린다.
-    const conflicts = input.topic ? (await tx.query<{ id: string }>(`SELECT id FROM memories WHERE owner_id=$1 AND topic=$2
+    // 원장에서 삭제를 본(정리 전) 기억은 충돌 상대가 아니다.
+    const conflicts = input.topic ? (await tx.query<{ id: string; created_at: string | number }>(`SELECT id,created_at FROM memories WHERE owner_id=$1 AND topic=$2
       AND status IN ('active','candidate') AND deletion_requested_at IS NULL AND statement<>$3 AND id<>ALL($4::text[])
       AND (expires_at IS NULL OR expires_at>$5) AND NOT EXISTS (SELECT 1 FROM memory_exclusions x WHERE x.owner_id=memories.owner_id AND memories.source_keys ? x.source_key) ORDER BY id`,
-    [actor, input.topic, input.statement, replaces, now])).rows.map(row => row.id) : [];
+    [actor, input.topic, input.statement, replaces, now])).rows
+      .filter(row => !this.hidden.has(erasedKey(row.id, Number(row.created_at)))).map(row => row.id) : [];
     const status = evidence.active && !conflicts.length ? 'active' : 'candidate';
     const { kind, statement, topic, sources, scope: about, classification, validFrom, expiresAt, recheckAt, recheckCondition } = input;
     const details = kind === 'configuration' ? { sourceRevision: input.sourceRevision ?? null }
@@ -478,9 +502,9 @@ export class MemoryService {
     const linked = [...new Set(rows.flatMap(row => row.conflicts_with))];
     const now = this.now();
     // 만료된 기억은 더 이상 현재 충돌이 아니다.
-    const live = new Set(linked.length ? (await this.db.query<{ id: string }>(`SELECT id FROM memories WHERE id=ANY($1::text[])
-      AND status IN ('active','candidate') AND deletion_requested_at IS NULL AND (expires_at IS NULL OR expires_at>$2)`,
-    [linked, now])).rows.map(row => row.id) : []);
+    const live = new Set(linked.length ? (await this.db.query<{ id: string; created_at: string | number }>(`SELECT id,created_at FROM memories
+      WHERE id=ANY($1::text[]) AND status IN ('active','candidate') AND deletion_requested_at IS NULL AND (expires_at IS NULL OR expires_at>$2)`,
+    [linked, now])).rows.filter(row => !this.hidden.has(erasedKey(row.id, Number(row.created_at)))).map(row => row.id) : []);
     return rows.map(row => {
       const flags: MemoryView['flags'] = [];
       if (row.status === 'candidate') flags.push('unverified');

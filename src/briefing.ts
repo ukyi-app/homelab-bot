@@ -188,10 +188,12 @@ export class BriefingScheduler {
         if (!await this.memory.live(tx, memory.items)) throw new StaleBriefing();
         // 기억 정정·제외·삭제로 다시 작성한 회차는 새 멱등 키를 쓴다. 막은 이전 사본과 겹치지 않게 한다.
         const key = `briefing:${schedule.id}:${claim.date}${claim.revision ? `:r${claim.revision}` : ''}`;
-        const held = (await tx.query(`UPDATE briefing_runs SET state='enqueued',outbox_key=$4,memory_ids=$5,lease_token=NULL,lease_until=NULL,updated_at=$6
-          WHERE schedule_id=$1 AND slot_date=$2 AND lease_token=$3 AND state='composing' AND lease_until>$6 RETURNING slot_date`,
-        [schedule.id, claim.date, claim.token, key, JSON.stringify(memory.items.map(item => `${item.id}@${item.createdAt}`)), this.store.now()])).rows.length;
+        const held = (await tx.query(`UPDATE briefing_runs SET state='enqueued',outbox_key=$4,lease_token=NULL,lease_until=NULL,updated_at=$5
+          WHERE schedule_id=$1 AND slot_date=$2 AND lease_token=$3 AND state='composing' AND lease_until>$5 RETURNING slot_date`,
+        [schedule.id, claim.date, claim.token, key, this.store.now()])).rows.length;
         if (!held) return 'idle';
+        await tx.query('INSERT INTO briefing_copies VALUES ($1,$2,$3,$4,$5)', [key, schedule.id, claim.date,
+          JSON.stringify(memory.items.map(item => `${item.id}@${item.createdAt}`)), this.store.now()]);
         await this.store.enqueue({ key, actor: owner, scope, revision: current.revision,
           services: memory.services, payload: { kind: 'message', channel: scope.channel, content, classification: 'safe_summary' } }, tx);
         return 'enqueued';

@@ -30,10 +30,16 @@ CREATE TABLE IF NOT EXISTS memory_deletions (
 CREATE TABLE IF NOT EXISTS briefing_runs (
   schedule_id text NOT NULL, slot_date text NOT NULL, slot_at bigint NOT NULL,
   state text NOT NULL CHECK (state IN ('composing','enqueued','blocked','missed')),
-  reason text, outbox_key text, memory_ids jsonb NOT NULL DEFAULT '[]', revision integer NOT NULL DEFAULT 0,
+  reason text, outbox_key text, revision integer NOT NULL DEFAULT 0,
   lease_token text, lease_until bigint, created_at bigint NOT NULL, updated_at bigint NOT NULL,
   PRIMARY KEY (schedule_id, slot_date)
 );
+-- 브리핑 사본마다 담은 기억을 남긴다. 회차를 다시 작성해도 이전 사본을 찾아 막거나 가릴 수 있다.
+CREATE TABLE IF NOT EXISTS briefing_copies (
+  message_key text PRIMARY KEY, schedule_id text NOT NULL, slot_date text NOT NULL,
+  memory_ids jsonb NOT NULL, created_at bigint NOT NULL
+);
+CREATE INDEX IF NOT EXISTS briefing_copies_memories ON briefing_copies USING gin (memory_ids);
 CREATE TABLE IF NOT EXISTS briefing_observations (
   source_id text PRIMARY KEY, last_ok_at bigint, last_attempt_at bigint NOT NULL, last_status text NOT NULL
 );
