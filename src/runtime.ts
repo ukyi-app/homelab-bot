@@ -7,10 +7,12 @@ import type { Store } from './store.js';
 import { workerRequest } from './worker.js';
 import type { WorkerClient, WorkerResult, WorkerSigner } from './worker.js';
 
+// T18: 봇 소유 Codex 작업 경로. dispatch 뒤의 오류는 스스로 상태로 기록하고 던지지 않는다.
+export interface TaskLane { run(job: Job): Promise<void> }
 export class Runtime {
   constructor(private readonly store: Store, private readonly gate: PolicyGate,
     private readonly worker: WorkerClient, private readonly signer: WorkerSigner,
-    private readonly reader: ReadAdapter) {}
+    private readonly reader: ReadAdapter, private readonly tasks?: TaskLane) {}
   async tick(): Promise<boolean> {
     await this.store.expire();
     const job = await this.store.claim();
@@ -34,6 +36,12 @@ export class Runtime {
         if (!await this.store.active(job.conversation_id)) { await this.store.transition(job, 'superseded'); return true; }
         await this.store.finish(job, result, { source: result.source, observedAt: result.observedAt }, readSummary(result), job.target,
           result.status === 'unregistered' ? [] : [result.service]);
+        return true;
+      }
+      // 연결하지 않으면 task도 기존 작업자 경로 그대로다.
+      if (job.type === 'task' && this.tasks) {
+        if (!await this.dispatchable(job)) return true;
+        await this.tasks.run(job);
         return true;
       }
       const request = workerRequest(job, await this.store.context(job.conversation_id, job.event_id));
