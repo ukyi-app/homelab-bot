@@ -73,13 +73,16 @@ export interface RunReport {
   workspace?: string;
   // 프로세스가 생기기 전 실패(인자 거부, 실행 파일 없음).
   launchFailed?: boolean;
+  // 실행 중 집행한 상한(도구 호출 예산, 출력 크기)을 넘어 작업 그룹을 끝냈다.
+  exceeded?: 'tool_budget_exceeded' | 'output_limit_exceeded';
 }
-export type RunOutcome =
+// tools: 이번 실행에서 시작한 도구 호출 수. 예산은 작업 단위로 브리지가 합산한다.
+export type RunOutcome = (
   | { kind: 'completed'; threadId: string; turns: number; summary: string; changes: string[]; reported: string[]; unconfirmed: string[] }
   | { kind: 'question'; threadId: string; turns: number; summary: string; question: string }
   | { kind: 'waiting'; reason: 'model_limit' | 'auth_expired'; threadId: string | null; turns: number }
   | { kind: 'failed'; reason: string; threadId: string | null; turns: number }
-  | { kind: 'unknown'; reason: string; threadId: string | null; turns: number };
+  | { kind: 'unknown'; reason: string; threadId: string | null; turns: number }) & { tools?: number };
 
 // 판정 순서가 계약이다: 소멸 확인 → 흐름 무결성 → 실패 신호 → 종료 코드 → 턴 완료 → 구조화 출력 → 실제 diff.
 export function interpretRun(report: RunReport, expectedThread: string | null, secrets: readonly string[] = []): RunOutcome {
@@ -90,20 +93,23 @@ export function interpretRun(report: RunReport, expectedThread: string | null, s
   if (report.launchFailed && report.survivors === 0) return { kind: 'failed', reason: 'launch_failed', threadId: expectedThread, turns: 0 };
   // 종료 코드가 있어도 분리된 자식이 남으면 다음 작업이 인증 파일·egress에 닿을 수 있다.
   if (!report.exit || report.survivors !== 0) return { kind: 'unknown', reason: report.survivors === null ? 'stop_unverifiable' : report.exit ? 'survivors' : 'not_exited', threadId, turns };
+  if (report.exceeded) return { kind: 'failed', reason: report.exceeded, threadId, turns };
   if (report.aborted) return { kind: 'failed', reason: 'aborted', threadId, turns };
   // `exec resume`이 thread.started를 다시 내는지는 [미확인]이라 재개 때는 없어도 받는다. 다른 스레드는 거부한다.
   if (expectedThread !== null && threads.some(t => t !== expectedThread)) return { kind: 'failed', reason: 'thread_mismatch', threadId, turns };
-  if (malformed > 0 || threads.length > 1 || !threadId) return { kind: 'failed', reason: 'invalid_stream', threadId, turns };
-  if (!THREAD_ID.test(threadId)) return { kind: 'failed', reason: 'invalid_thread', threadId: null, turns };
+  if (malformed > 0 || threads.length > 1) return { kind: 'failed', reason: 'invalid_stream', threadId, turns };
+  if (threadId && !THREAD_ID.test(threadId)) return { kind: 'failed', reason: 'invalid_thread', threadId: null, turns };
   const failures = events.flatMap(e => e.type === 'turn.failed' ? [e.error?.message ?? ''] : e.type === 'error' ? [e.message ?? ''] : []);
   const lastTurn = events.filter(e => e.type.startsWith('turn.')).at(-1);
   // 재연결 같은 일시 error 이벤트 뒤 턴이 끝나고 종료 코드 0이면 결과를 버리지 않는다 [미확인: 일시 오류도 error로 내는지, T16b].
+  // 세션(thread.started)이 생기기 전 오류도 판정한다. 인증·한도는 세션 전에 날 수 있고, 버리면 대기 대신 실패가 된다(D-14 조건 2).
   if (events.some(e => e.type === 'turn.failed') || (failures.length && (report.exit.code !== 0 || lastTurn?.type !== 'turn.completed'))) {
     const text = failures.join('\n');
     if (LIMIT.test(text)) return { kind: 'waiting', reason: 'model_limit', threadId, turns };
     if (AUTH.test(text)) return { kind: 'waiting', reason: 'auth_expired', threadId, turns };
     return { kind: 'failed', reason: 'turn_failed', threadId, turns };
   }
+  if (!threadId) return { kind: 'failed', reason: 'invalid_stream', threadId, turns };
   if (report.exit.code !== 0) return { kind: 'failed', reason: 'exit_nonzero', threadId, turns };
   if (turns === 0 || lastTurn?.type !== 'turn.completed') return { kind: 'failed', reason: 'turn_incomplete', threadId, turns };
   let output: TaskOutput;
@@ -160,4 +166,27 @@ export function echoesSecret(text: string, secrets: readonly string[]): boolean 
     for (let start = 0; start + 16 <= secret.length; start += 4) if (haystack.includes(secret.slice(start, start + 16))) return true;
   }
   return false;
+}
+
+// 판정에 쓰는 필드만 남긴다. 명령 출력·메시지 본문은 버려 수집 단계 메모리를 이벤트 수에 비례하게 묶는다(rev r1 S3).
+// 도구 호출 항목이면 그 id를 돌려 실행 중 예산 집행에 쓴다.
+export const TOOL_ITEMS = new Set(['command_execution', 'mcp_tool_call', 'web_search', 'file_change']);
+const cut = (value: unknown, size: number) => typeof value === 'string' ? value.slice(0, size) : undefined;
+export function compactEvent(line: string): { line: string; tool: string | null } {
+  let raw: unknown;
+  try { raw = JSON.parse(line); } catch { return { line: '<malformed>', tool: null }; }
+  if (typeof raw !== 'object' || raw === null) return { line: '<malformed>', tool: null };
+  const event = raw as Record<string, unknown>;
+  const item = typeof event.item === 'object' && event.item !== null ? event.item as Record<string, unknown> : undefined;
+  const error = typeof event.error === 'object' && event.error !== null ? event.error as Record<string, unknown> : undefined;
+  const compact = {
+    type: event.type, thread_id: cut(event.thread_id, 256), message: cut(event.message, 2000),
+    error: error ? { message: cut(error.message, 2000) } : undefined,
+    item: item ? { id: cut(item.id, 256), type: cut(item.type, 64), status: cut(item.status, 32),
+      changes: Array.isArray(item.changes) ? item.changes.slice(0, 500).map(change =>
+        ({ path: cut((change as { path?: unknown } | null)?.path, 4096) })) : undefined } : undefined,
+  };
+  const tool = typeof event.type === 'string' && event.type.startsWith('item.') && item && typeof item.id === 'string'
+    && typeof item.type === 'string' && TOOL_ITEMS.has(item.type) ? item.id : null;
+  return { line: JSON.stringify(compact), tool };
 }

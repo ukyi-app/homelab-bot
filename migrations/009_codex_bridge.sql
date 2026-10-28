@@ -2,6 +2,8 @@ BEGIN;
 -- 봇 소유 Codex 작업의 외부 세션 기록. 소유자·대화는 jobs 행이 기준이다(`01` §6 소유자 연결).
 CREATE TABLE IF NOT EXISTS codex_sessions (
   job_id text PRIMARY KEY REFERENCES jobs(id), thread_id text, turn integer NOT NULL DEFAULT 0,
+  -- 같은 스레드를 잇는 동안 쓴 도구 호출 수. 작업 budget.toolCalls와 대조한다.
+  tool_calls integer NOT NULL DEFAULT 0,
   -- 저장소는 작업 공간 원본(D-15 압축본)을 정하는 단계(T16b·T19)부터 채운다. 지금 작업 공간은 빈 저장소다.
   host text NOT NULL, repository text, capabilities jsonb NOT NULL,
   state text NOT NULL CHECK (state IN ('running','waiting_answer','waiting_model','completed','failed','cancelled','unknown')),

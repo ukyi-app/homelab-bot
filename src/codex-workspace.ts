@@ -52,7 +52,8 @@ export const fileWorkspace: CodexWorkspace = {
           if ((bytes += stat.size) > LIMITS.bytes) throw new Error('workspace_too_large');
           const hash = createHash('sha256');
           for await (const chunk of handle.readableWebStream()) hash.update(chunk as Uint8Array);
-          result[path] = hash.digest('hex');
+          // git이 보는 실행 비트도 함께 기록한다. 내용이 같은 chmod +x도 실제 변경이다(rev r1 R4).
+          result[path] = `${hash.digest('hex')}:${stat.mode & 0o111 ? '755' : '644'}`;
         } finally { await handle.close().catch(() => {}); }
       }
     };

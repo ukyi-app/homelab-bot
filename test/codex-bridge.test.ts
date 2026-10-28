@@ -40,7 +40,8 @@ class FakeLauncher implements CodexLauncher {
   left: number | null = 0;
   started = 0;
   private cleaned = new Set<string>();
-  async run(spec: LaunchSpec, signal: AbortSignal): Promise<LaunchResult> {
+  // 줄은 하나씩 넘긴다. 받는 쪽이 중단하면 나머지 줄을 내지 않고 죽은 것처럼 끝난다(실제 launcher와 같은 계약).
+  async run(spec: LaunchSpec, signal: AbortSignal, onLine: (line: string) => void): Promise<LaunchResult> {
     this.specs.push(spec); this.started++; this.cleaned.delete(spec.job);
     const script = this.scripts.shift() ?? finished(out('completed', '기본 완료'));
     for (const [path, content] of Object.entries(script.files ?? {})) {
@@ -48,11 +49,15 @@ class FakeLauncher implements CodexLauncher {
     }
     await script.during?.(spec);
     if (script.output !== undefined) await writeFile(spec.args[spec.args.indexOf('-o') + 1]!, script.output);
-    if (script.hang) {
-      await new Promise<void>(resolve => { if (signal.aborted) resolve(); signal.addEventListener('abort', () => resolve(), { once: true }); });
-      return { lines: script.lines, exit: this.left === 0 ? { code: null, signal: 'SIGTERM' } : null };
+    for (const line of script.lines) {
+      if (signal.aborted) break;
+      onLine(line);
     }
-    return { lines: script.lines, exit: script.exit ?? exit0 };
+    if (script.hang || signal.aborted) {
+      await new Promise<void>(resolve => { if (signal.aborted) resolve(); signal.addEventListener('abort', () => resolve(), { once: true }); });
+      return { exit: this.left === 0 ? { code: null, signal: 'SIGTERM' } : null };
+    }
+    return { exit: script.exit ?? exit0 };
   }
   async terminate(job: string) { this.terminated.push(job); this.cleaned.add(job); }
   async survivors(job: string) { return this.cleaned.has(job) ? this.left : 1; }
@@ -258,7 +263,7 @@ test('D-14 개인 ~/.codex* 아래·위의 작업자 루트를 거부하고 실�
     };
     const local = new FakeLauncher();
     const result = await new ExecCodexAdapter(workerRoot, local, { files: spy, homes: [home] })
-      .execute({ job: '00000000-0000-4000-8000-000000000004', prompt: 'p', resume: null }, new AbortController().signal);
+      .execute({ job: '00000000-0000-4000-8000-000000000004', prompt: 'p', resume: null, toolCalls: 8 }, new AbortController().signal);
     assert.equal(result.kind, 'completed');
     assert.ok(touched.length > 0 && touched.every(p => p.startsWith(`${workerRoot}/`)), touched.join(','));
     const spec = JSON.stringify(local.specs);
@@ -546,10 +551,14 @@ test('TASK-03 작업자 단절은 종료 확인에 따라 failed·unknown, 재�
   assert.equal(session.thread_id, 'fresh-thread'); assert.equal(session.turn, 1);
 });
 test('TASK-03 시간 초과는 정리 확인 뒤 failed 안내, 실패 결과는 자동 재실행하지 않고 다음 작업을 막지 않음', async () => {
+  // 준비(git init)가 30ms보다 길면 시간 초과가 실행 전에 와서 띄우지 않는다(R1). 실행 중 시간 초과를 보려고 준비를 없앤다.
+  const instant = new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, new CodexBridge(f.store, f.gate,
+    new ExecCodexAdapter(root, launcher, { workspace: { prepare: async () => {}, snapshot: async () => ({}) } }), { monitorMs: 5 }));
   launcher.scripts.push({ lines: jsonl(...begin()), hang: true });
   const job = await task();
   await database.db.query(`UPDATE jobs SET budget='{"timeoutMs":30,"toolCalls":8}' WHERE id=$1`, [job.id]);
-  await runtime.tick();
+  await instant.tick();
+  assert.equal(launcher.started, 1);
   assert.equal((await jobs())[0]!.state, 'failed'); assert.equal((await jobs())[0]!.wait_reason, 'codex_timeout');
   assert.match((await outbox())[0]!.payload.content, /작업 실패가 확인됐습니다/);
   launcher.scripts.push(finished(out('completed', '끝'), [], THREAD), { lines: ['broken'], exit: exit0, output: out('completed', '끝') });
@@ -627,8 +636,8 @@ process.stdin.on('end', () => {
   }
   const finish = () => {
     writeFileSync(target, JSON.stringify({ status: 'completed', summary: 'local', question: '' }));
-    emit({ type: 'turn.completed', usage: {} });
-    process.exit(0);
+    // 파이프 쓰기는 비동기라 바로 exit하면 앞선 출력이 잘린다. 마지막 쓰기가 비워진 뒤 끝낸다.
+    process.stdout.write(JSON.stringify({ type: 'turn.completed', usage: {} }) + '\\n', () => process.exit(0));
   };
   if (mode === 'hang') { setInterval(() => {}, 1000); return; }
   if (mode === 'tools') {
@@ -677,7 +686,7 @@ test('SEC-02 실제 프로세스: 작업자 환경 미상속, 정상 종료 뒤 
     assert.equal(alive(run.pid), false, mode);
   }
   const hung = await local('hang', '00000000-0000-4000-8000-0000000000d1', 300);
-  assert.deepEqual(hung.result, { kind: 'failed', reason: 'aborted', threadId: 'local-thread-1', turns: 0 });
+  assert.deepEqual(hung.result, { kind: 'failed', reason: 'aborted', threadId: 'local-thread-1', turns: 0, tools: 0 });
 });
 test('SEC-02 작업 시작 뒤 생긴 같은 UID 프로세스의 환경을 못 읽으면 소멸 확인 불가로 unknown(fail-closed)', async () => {
   const run = await local('nondumpable', '00000000-0000-4000-8000-0000000000e2');
@@ -771,8 +780,8 @@ test('TASK-02 질문 대기 중 비상 중지를 풀었으면 답한 뒤 스케�
 });
 test('TASK-03 실행 파일이 없거나 어댑터가 동기로 던지면 실행 전 실패로 막지 않고 종료 확인으로 판정', async () => {
   const missing = new ExecCodexAdapter(root, new ProcessGroupLauncher(['/nonexistent/codex'], { graceMs: 50 }));
-  assert.deepEqual(await missing.execute({ job: '00000000-0000-4000-8000-0000000000f1', prompt: 'p', resume: null }, new AbortController().signal),
-    { kind: 'failed', reason: 'launch_failed', threadId: null, turns: 0 });
+  assert.deepEqual(await missing.execute({ job: '00000000-0000-4000-8000-0000000000f1', prompt: 'p', resume: null, toolCalls: 8 }, new AbortController().signal),
+    { kind: 'failed', reason: 'launch_failed', threadId: null, turns: 0, tools: 0 });
   for (const stopped of [true, false]) {
     await database.pg.exec('TRUNCATE events,conversations,jobs,results,outbox,denied_actors,controls,audit,codex_sessions,codex_questions RESTART IDENTITY CASCADE');
     const throwing = new CodexBridge(f.store, f.gate, { capabilities: () => CODEX_CAPABILITIES,
@@ -791,7 +800,7 @@ test('D-14 작업자 루트 아래 심링크가 개인 Codex 홈을 가리키면
     await symlink(join(home, '.codex-work', 'tasks'), join(workerRoot, 'tasks'));
     const local = new FakeLauncher();
     const adapter = new ExecCodexAdapter(workerRoot, local, { homes: [home] });
-    assert.deepEqual(await adapter.execute({ job: '00000000-0000-4000-8000-0000000000f2', prompt: 'p', resume: null }, new AbortController().signal),
+    assert.deepEqual(await adapter.execute({ job: '00000000-0000-4000-8000-0000000000f2', prompt: 'p', resume: null, toolCalls: 8 }, new AbortController().signal),
       { kind: 'failed', reason: 'workspace_denied', threadId: null, turns: 0 });
     assert.equal(local.started, 0);
     assert.equal(await nodeFiles.read(join(home, '.codex-work', 'tasks', '00000000-0000-4000-8000-0000000000f2', 'codex-home', 'config.toml')), null);
@@ -809,7 +818,7 @@ test('SEC-02 남은 프로세스가 있으면 작업 공간을 다시 읽지 않
     snapshot: async (dir: string) => { calls.push('snapshot'); return fileWorkspace.snapshot(dir); } };
   const local = new FakeLauncher(); local.left = 1;
   const result = await new ExecCodexAdapter(root, local, { workspace: spyWorkspace })
-    .execute({ job: '00000000-0000-4000-8000-0000000000f4', prompt: 'p', resume: null }, new AbortController().signal);
+    .execute({ job: '00000000-0000-4000-8000-0000000000f4', prompt: 'p', resume: null, toolCalls: 8 }, new AbortController().signal);
   assert.equal(result.kind, 'unknown'); assert.deepEqual(calls, ['prepare', 'snapshot']);
   const dir = resolve(await mkdtemp('.local/snap-'));
   try {
@@ -828,7 +837,7 @@ test('TASK-03 실행 전 실패(이미 있는 .git)는 실제 launcher에서도 
   const job = '00000000-0000-4000-8000-0000000000f5';
   await mkdir(join(taskPaths(root, job).workspace, '.git'), { recursive: true });
   const real = new ExecCodexAdapter(root, new ProcessGroupLauncher([process.execPath, '-e', FAKE_CODEX, 'plain'], { graceMs: 50 }));
-  assert.deepEqual(await real.execute({ job, prompt: 'p', resume: null }, new AbortController().signal),
+  assert.deepEqual(await real.execute({ job, prompt: 'p', resume: null, toolCalls: 8 }, new AbortController().signal),
     { kind: 'failed', reason: 'prepare_failed', threadId: null, turns: 0 });
 });
 test('TASK-02 질문 대기 중 비상 중지를 풀었으면 기한 만료 정리도 스케줄러를 풀어 다음 작업을 받음', async () => {
@@ -904,7 +913,8 @@ test('R1 소멸 확인은 준비 중인 실행도 무효로 만들고, 이미 �
   assert.equal((await running).kind, 'failed'); assert.equal(launcher.started, 0);
   const real = new ProcessGroupLauncher([process.execPath, '-e', 'require("node:fs").writeFileSync(process.argv[1], "spawned")', join(root, 'spawned.txt')]);
   const aborted = new AbortController(); aborted.abort();
-  await assert.rejects(real.run({ job, args: [], cwd: root, env: { PATH: '/usr/bin:/bin' }, stdin: '' }, aborted.signal));
+  await assert.rejects(real.run({ job, args: [], cwd: root, env: { PATH: '/usr/bin:/bin' }, stdin: '',
+    limits: { lineBytes: 1024, outputBytes: 1024 } }, aborted.signal, () => {}));
   await new Promise(resolve => setTimeout(resolve, 200));
   assert.equal(await nodeFiles.read(join(root, 'spawned.txt')), null);
 });
