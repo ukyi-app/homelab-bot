@@ -4,6 +4,7 @@ import { createHmac, randomUUID } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
+import { readFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { DEFAULTS, Denied, WorkerRejected } from '../src/contracts.js';
 import { ArchiveError, readArchive, REVIEW_INSTRUCTIONS, ReviewWorker, unifiedDiff } from '../src/review-input.js';
@@ -793,4 +794,13 @@ test('D-14 비상 중지는 실행 중 리뷰 모델 호출을 중단하고, 멈
   await opened(pull({ head: { sha: HEAD2, ref: 'f', repo: repository }, updated_at: '2026-10-29T00:51:00Z' }));
   assert.equal(await r.runtime.tick(), false);
   assert.equal(r.inputs.length, 2);
+});
+
+test('migration 008은 다시 적용해도 기존 리뷰 기록을 바꾸지 않는다', async () => {
+  await fullReview();
+  const before = [await reviewJobs(), await deliveries()];
+  const sql = await readFile('migrations/008_pr_review.sql', 'utf8');
+  await database.pg.exec(sql); await database.pg.exec(sql);
+  assert.deepEqual([await reviewJobs(), await deliveries()], before);
+  assert.ok((await rows('schema_migrations')).some(m => m.version === 8));
 });
