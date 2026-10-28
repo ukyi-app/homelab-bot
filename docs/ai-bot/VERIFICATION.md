@@ -195,6 +195,7 @@ T16a 표의 AUTH-02 "예약/기억 접근 not_run"은 아래 T20 행으로 채�
 | DATA-02 | local_integration / pass | 원장 기록 확인 뒤에만 DB 정리·완료 응답(원장 append 시점에 DB는 아직 active), 내용·색인 비움·감사에 내용 없음, 원장 쓰기 실패는 미완료 응답·숨김·재시도, 응답 유실은 원장 재조회로 판단하고 못 읽으면 미완료, DB 정리 실패는 미완료·숨김·재기동 재적용, 삭제 전 디스크 DB 백업으로 복원해도 기동 때 재적용하고 그 전에는 조회 닫힘, ID가 같아도 `created_at`이 다르면 지우지 않음, 원장을 못 읽으면 닫힘, 끊긴 마지막 줄 무시·중간 손상 닫힘, 지운 기억이 든 대기 브리핑 차단, 이미 보낸 브리핑은 지우지 않았다고 안내 | 원장 저장소·자격·보존은 결정 대기([DECISIONS](DECISIONS.md) T20). 실제 R2 append와 CNPG 백업 복원 blocked, T16b(결정 뒤). PGlite 디렉터리 복사는 CNPG 복원 절차를 검증하지 않는다 |
 | AUTH-02 (T20 부분) | local_integration / pass | 기억 저장·검색·정정·삭제마다 현재 정책 재인가(owner 교체·DB 철회·5분 stale 차단), 다른 채널 누출 차단, 서비스 철회는 다음 접근부터 숨김, 예약 브리핑은 발송 시점 철회로 blocked·감사, 큐에 넣은 뒤 owner 교체는 게시자가 차단, 정책 확인 불가 동안 미루고 확인 뒤 한 번 | 질문 접근 not_run, T18. 실제 Infisical/ESO 전달 blocked, T16b |
 
+새 시험 27개는 프로세스 `TZ`를 `UTC`·`America/Los_Angeles`·`Pacific/Chatham`으로 바꿔 다시 돌려도 모두 통과했다(예약 계산이 서버 시간대와 무관).
 PGlite는 transaction을 직렬화하므로 두 인스턴스 동시 실행 시험은 잠금 순서와 회차 키만 검사한다.
 실제 PostgreSQL에서 bigint가 문자열로 오는 경로는 코드에서 `Number()`로 바꾸지만 실서버로는 실행하지 않았다.
 기억 저장·검색·삭제를 Discord 명령으로 여는 연결과 기동 순서(원장 재적용 → 브리핑 예약 확인 → tick 반복)의 진입점은 아직 없다(T16b).
