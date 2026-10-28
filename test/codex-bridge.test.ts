@@ -256,10 +256,10 @@ test('D-14 개인 ~/.codex* 아래·위의 작업자 루트를 거부하고 실�
     assert.throws(() => assertWorkerRoot(join(home, '.codex2'), [resolve('.local'), home]), Denied);
     assert.equal(assertWorkerRoot(join(home, '.codex2'), [resolve('.local')]).endsWith('.codex-sub'), true);
     const touched: string[] = [];
+    // 실행 전 경로 연산만 경로로 한다. 그 뒤 쓰기·읽기는 이 경로들 아래에서 고정한 디렉터리 핸들로만 한다.
     const spy: CodexFiles = {
-      mkdir: async p => { touched.push(p); await nodeFiles.mkdir(p); }, write: async (p, c) => { touched.push(p); await nodeFiles.write(p, c); },
-      read: async (p, max) => { touched.push(p); return nodeFiles.read(p, max); }, remove: async p => { touched.push(p); await nodeFiles.remove(p); },
-      resolve: async p => { touched.push(p); return nodeFiles.resolve(p); }, size: async p => { touched.push(p); return nodeFiles.size(p); },
+      mkdir: async p => { touched.push(p); await nodeFiles.mkdir(p); },
+      resolve: async p => { touched.push(p); return nodeFiles.resolve(p); },
     };
     const local = new FakeLauncher();
     const result = await new ExecCodexAdapter(workerRoot, local, { files: spy, homes: [home] })
@@ -1202,4 +1202,17 @@ test('N7 크기를 확인한 뒤 파일이 커져도 상한보다 많이 읽지 
   };
   try { assert.equal(await nodeFiles.read(file, 1024), null); }
   finally { proto.stat = original; }
+});
+test('자체 점검: 실행 전 설정 쓰기는 기존 하드링크를 따라 바깥 파일을 덮어쓰지 않음', async () => {
+  const outside = await outsideDir();
+  try {
+    const job = '00000000-0000-4000-8000-00000000e301';
+    const paths = taskPaths(root, job);
+    await mkdir(paths.home, { recursive: true });
+    await link(join(outside, 'secret.txt'), join(paths.home, 'config.toml'));
+    const result = await new ExecCodexAdapter(root, new FakeLauncher()).execute({ job, prompt: 'p', resume: null, toolCalls: 8 }, new AbortController().signal);
+    assert.equal(result.kind, 'completed');
+    assert.equal(await readFile(join(outside, 'secret.txt'), 'utf8'), 'outside-secret');
+    assert.match(await readFile(join(paths.home, 'config.toml'), 'utf8'), /inherit = "none"/);
+  } finally { await rm(outside, { recursive: true, force: true }); }
 });

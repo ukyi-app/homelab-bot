@@ -1,12 +1,14 @@
 import { constants } from 'node:fs';
-import { mkdir, open, realpath, rm, stat, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import type { FileHandle } from 'node:fs/promises';
+import { mkdir, open, readlink, realpath } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { DEFAULTS, Denied, PolicyUnavailable } from './contracts.js';
 import type { Job, Scope } from './contracts.js';
 import { assertWorkerRoot, codexConfig, configToml, execArgs, launchEnvironment, taskPaths } from './codex-config.js';
+import type { CodexPaths } from './codex-config.js';
 import { TASK_OUTPUT_JSON_SCHEMA, authSecrets, compactEvent, interpretRun } from './codex-events.js';
-import { changedPaths, fileWorkspace } from './codex-workspace.js';
-import type { CodexWorkspace, Snapshot } from './codex-workspace.js';
+import { changedPaths, fileWorkspace, openDir, openDirAt, readAt, readOpened, removeAt, writeAt } from './codex-workspace.js';
+import type { CodexWorkspace, ReadResult, Snapshot } from './codex-workspace.js';
 import type { RunOutcome, RunReport } from './codex-events.js';
 import { bounded } from './format.js';
 import type { PolicyGate } from './policy.js';
@@ -55,28 +57,23 @@ export interface CodexLauncher {
   terminate(job: string): Promise<void>;
   survivors(job: string): Promise<number | null>;
 }
-export interface CodexFiles {
-  mkdir(path: string): Promise<void>; write(path: string, content: string): Promise<void>;
-  // maxBytes를 넘거나 일반 파일이 아니면 null이다. 크기는 size로 따로 본다.
-  read(path: string, maxBytes?: number): Promise<string | null>; size(path: string): Promise<number | null>;
-  remove(path: string): Promise<void>; resolve(path: string): Promise<string>;
-}
-export const nodeFiles: CodexFiles = {
-  mkdir: async path => { await mkdir(path, { recursive: true, mode: 0o700 }); },
-  write: (path, content) => writeFile(path, content, { mode: 0o600 }),
-  // 심링크·FIFO를 따라가지 않고, 크기를 본 뒤에만 읽는다. 크기를 모르고 통째로 읽으면 실행이 만든 큰 파일이 메모리를 채운다.
-  read: async (path, maxBytes = Number.MAX_SAFE_INTEGER) => {
+// 실행 전 디렉터리 준비용 경로 연산. 실행 뒤 읽기·쓰기는 경로가 아니라 고정한 디렉터리 핸들로 한다(codex-workspace).
+export interface CodexFiles { mkdir(path: string): Promise<void>; resolve(path: string): Promise<string> }
+export const nodeFiles = {
+  mkdir: async (path: string) => { await mkdir(path, { recursive: true, mode: 0o700 }); },
+  resolve: (path: string) => realpath(path),
+  // 경로로 읽는 일반 도구다. 연 파일의 실제 경로가 요청 경로와 같을 때만 읽는다. 상위 디렉터리가 심링크면
+  // O_NOFOLLOW가 막지 못하므로 연 뒤 /proc/self/fd로 확인한다(rev r3 N6). 하드링크·FIFO·상한 초과는 null.
+  read: async (path: string, maxBytes = Number.MAX_SAFE_INTEGER): Promise<string | null> => {
     let handle;
     try { handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); } catch { return null; }
     try {
-      const info = await handle.stat();
-      return info.isFile() && info.size <= maxBytes ? await handle.readFile('utf8') : null;
+      if (await readlink(`/proc/self/fd/${handle.fd}`) !== resolve(path)) return null;
+      const result = await readOpened(handle, maxBytes);
+      return result.status === 'ok' ? result.text : null;
     } catch { return null; } finally { await handle.close().catch(() => {}); }
   },
-  size: async path => { try { return (await stat(path)).size; } catch { return null; } },
-  remove: path => rm(path, { force: true }),
-  resolve: path => realpath(path),
-};
+} satisfies CodexFiles & Record<string, unknown>;
 // toolCalls: 이번 실행에 남은 도구 호출 예산(작업 budget.toolCalls에서 앞 턴 사용분을 뺀 값).
 export interface CodexTaskRequest { job: string; prompt: string; resume: string | null; toolCalls: number }
 export interface CodexLimits { lineBytes: number; outputBytes: number; events: number }
@@ -86,6 +83,9 @@ export const CODEX_LIMITS: Readonly<CodexLimits> = Object.freeze({ lineBytes: 10
 const READ_LIMITS = Object.freeze({ output: 1024 * 1024, auth: 1024 * 1024, baseline: 64 * 1024 * 1024 });
 // 결과 행에 남기는 경로 수. 판정은 전체 목록으로 끝낸 뒤 보관할 때만 줄인다(rev r2 N2).
 const EVIDENCE_PATHS = 1000;
+interface PinnedLink { entry: string | null; parent: number; handle: FileHandle; dev: number; ino: number }
+interface Pinned { chain: PinnedLink[]; home: FileHandle; run: FileHandle; workspace: FileHandle }
+const text = (result: ReadResult) => result.status === 'ok' ? result.text : '';
 export interface CodexTaskAdapter {
   capabilities(): CodexCapabilities;
   execute(request: CodexTaskRequest, signal: AbortSignal): Promise<RunOutcome>;
@@ -109,6 +109,13 @@ export class ExecCodexAdapter implements CodexTaskAdapter {
     const limits = { ...CODEX_LIMITS, ...this.options.limits };
     const generation = this.generations.get(request.job) ?? 0;
     const paths = taskPaths(this.root, request.job);
+    let pinned: Pinned | undefined;
+    try { return await this.executePinned(request, signal, files, workspace, limits, generation, paths, p => { pinned = p; }); }
+    finally { if (pinned) for (const dir of pinned.chain) await dir.handle.close().catch(() => {}); }
+  }
+  private async executePinned(request: CodexTaskRequest, signal: AbortSignal, files: CodexFiles, workspace: CodexWorkspace,
+    limits: CodexLimits, generation: number, paths: CodexPaths, keep: (pinned: Pinned) => void): Promise<RunOutcome> {
+    let pinned: Pinned;
     let baseline: Snapshot;
     let before: string[];
     let args: string[];
@@ -121,22 +128,25 @@ export class ExecCodexAdapter implements CodexTaskAdapter {
         await files.mkdir(dir);
         if (await files.resolve(dir) !== dir) throw new Denied();
       }
+      // 실행 전에 루트부터 이름 하나씩 O_NOFOLLOW로 열어 디렉터리를 고정한다. 이후 쓰기·읽기는 이 핸들 아래에서만 한다(rev r3 N6).
+      pinned = await this.pin(paths);
+      keep(pinned);
       // 설정은 매 실행 다시 쓴다. 이전 턴 출력이 남아 이번 결과로 읽히지 않게 지운다.
-      await files.write(join(paths.home, 'config.toml'), configToml(codexConfig(paths)));
-      await files.write(join(paths.run, 'output.schema.json'), JSON.stringify(TASK_OUTPUT_JSON_SCHEMA));
-      await files.remove(join(paths.run, 'last-message.json'));
+      await writeAt(pinned.home, 'config.toml', configToml(codexConfig(paths)));
+      await writeAt(pinned.run, 'output.schema.json', JSON.stringify(TASK_OUTPUT_JSON_SCHEMA));
+      await removeAt(pinned.run, 'last-message.json');
       // 기준 상태는 첫 실행 전에 한 번만 잡고 작업 공간 밖(run/)에 둔다. 재개 때도 같은 기준과 대조한다.
-      const baselinePath = join(paths.run, 'baseline.json');
-      let saved = JSON.parse(await files.read(baselinePath, READ_LIMITS.baseline) ?? 'null') as Snapshot | null;
-      if (!saved) {
-        await workspace.prepare(paths.workspace);
-        saved = await workspace.snapshot(paths.workspace);
-        if (!saved) throw new Error('workspace_unavailable');
-        await files.write(baselinePath, JSON.stringify(saved));
-      }
-      baseline = saved;
+      const saved = await readAt(pinned.run, 'baseline.json', READ_LIMITS.baseline);
+      if (saved.status === 'ok') baseline = JSON.parse(saved.text) as Snapshot;
+      else if (saved.status === 'missing') {
+        await workspace.prepare(pinned.workspace);
+        const taken = await workspace.snapshot(pinned.workspace);
+        if (!taken) throw new Error('workspace_unavailable');
+        await writeAt(pinned.run, 'baseline.json', JSON.stringify(taken));
+        baseline = taken;
+      } else throw new Error('baseline_unreadable');
       // 실행 중 갱신으로 토큰이 바뀌어도 옛 값의 반사를 잡도록 실행 전후를 모두 본다.
-      before = authSecrets(await files.read(join(paths.home, 'auth.json'), READ_LIMITS.auth) ?? '');
+      before = authSecrets(text(await readAt(pinned.home, 'auth.json', READ_LIMITS.auth)));
       args = execArgs(paths, request.resume);
     } catch (error) {
       return { kind: 'failed', reason: error instanceof Denied ? 'workspace_denied' : 'prepare_failed', threadId: request.resume, turns: 0 };
@@ -175,15 +185,53 @@ export class ExecCodexAdapter implements CodexTaskAdapter {
     finally { signal.removeEventListener('abort', forward); }
     await this.launcher.terminate(request.job).catch(() => {});
     const survivors = await this.launcher.survivors(request.job).catch(() => null);
-    const outputPath = join(paths.run, 'last-message.json');
-    const outputTooLarge = (await files.size(outputPath) ?? 0) > READ_LIMITS.output;
-    const output = outputTooLarge ? null : await files.read(outputPath, READ_LIMITS.output);
-    const secrets = [...before, ...authSecrets(await files.read(join(paths.home, 'auth.json'), READ_LIMITS.auth) ?? '')];
-    // 남은 프로세스가 있거나 모르면 작업 공간을 읽지 않는다. 결과는 어차피 unknown이고, 살아 있는 프로세스가
-    // 읽는 도중 파일을 바꿔치기할 수 있다.
-    const after = survivors === 0 ? await workspace.snapshot(paths.workspace) : null;
-    return { ...interpretRun({ lines, exit: result.exit, output, outputTooLarge, survivors, aborted: signal.aborted, launchFailed, exceeded,
-      changes: after ? changedPaths(baseline, after) : null, workspace: paths.workspace }, request.resume, secrets), tools: tools.size };
+    const report = { lines, exit: result.exit, survivors, aborted: signal.aborted, launchFailed, exceeded, workspace: paths.workspace };
+    // 남은 프로세스가 있거나 모르면 아무 파일도 읽지 않고 unknown으로 닫는다. 판정에 필요 없고, 살아 있는 프로세스가
+    // 읽는 도중 파일을 키우거나 바꿔치기할 수 있다(rev r3 N7).
+    if (survivors !== 0) return { ...interpretRun({ ...report, output: null, changes: null }, request.resume), tools: tools.size };
+    // 실행 중 경로의 디렉터리가 바뀌었으면(심링크·다른 디렉터리로 교체) 결과·증거를 하나도 읽지 않고 실패로 닫는다.
+    // 루트부터 이름 하나씩 다시 열어 고정한 inode와 비교한다. 경로를 그대로 따라가는 realpath 비교가 아니다.
+    const output = await readAt(pinned.run, 'last-message.json', READ_LIMITS.output);
+    if (!await this.intact(pinned) || output.status === 'refused') {
+      return { kind: 'failed', reason: 'workspace_tampered', threadId: request.resume, turns: 0, tools: tools.size };
+    }
+    const secrets = [...before, ...authSecrets(text(await readAt(pinned.home, 'auth.json', READ_LIMITS.auth)))];
+    const after = await workspace.snapshot(pinned.workspace);
+    return { ...interpretRun({ ...report, output: output.status === 'ok' ? output.text : null, outputTooLarge: output.status === 'too_large',
+      changes: after ? changedPaths(baseline, after) : null }, request.resume, secrets), tools: tools.size };
+  }
+  private async pin(paths: CodexPaths): Promise<Pinned> {
+    const chain: PinnedLink[] = [];
+    const add = async (entry: string | null, parent: number) => {
+      const handle = entry === null ? await openDir(this.root) : await openDirAt(chain[parent]!.handle, entry);
+      const info = await handle.stat();
+      chain.push({ entry, parent, handle, dev: info.dev, ino: info.ino });
+      return handle;
+    };
+    try {
+      await add(null, -1);
+      await add('tasks', 0);
+      await add(paths.job, 1);
+      return { chain, home: await add('codex-home', 2), run: await add('run', 2), workspace: await add('workspace', 2) };
+    } catch (error) {
+      for (const link of chain) await link.handle.close().catch(() => {});
+      throw error;
+    }
+  }
+  // 고정한 사슬을 루트부터 이름 하나씩 다시 연다. 어느 단계든 심링크로 바뀌었으면 O_NOFOLLOW가 막고,
+  // 다른 디렉터리로 바뀌었으면 inode가 다르다. 확인 뒤의 읽기는 이 확인이 아니라 고정 핸들이 지킨다.
+  private async intact(pinned: Pinned): Promise<boolean> {
+    const fresh: FileHandle[] = [];
+    try {
+      for (const link of pinned.chain) {
+        const handle = link.entry === null ? await openDir(this.root) : await openDirAt(fresh[link.parent]!, link.entry);
+        fresh.push(handle);
+        const info = await handle.stat();
+        if (info.dev !== link.dev || info.ino !== link.ino) return false;
+      }
+      return true;
+    } catch { return false; }
+    finally { for (const handle of fresh) await handle.close().catch(() => {}); }
   }
   async confirmStop(job: string): Promise<{ stopped: boolean }> {
     this.generations.set(job, (this.generations.get(job) ?? 0) + 1);
