@@ -1248,3 +1248,19 @@ test('r2 P2-01 REVIEW-02 게시 직전 draft로 바뀌면 자동 리뷰는 게�
   await r.runtime.tick(); await r.publisher.deliver();
   assert.equal(r.gh.writes.length, 1);
 });
+test('r2 P2-02 EVENT-01 늦게 도착한 옛 closed·converted_to_draft는 최신 세대의 대기 작업과 미게시 결과를 지우지 않는다', async () => {
+  await opened(pull({ updated_at: '2026-10-29T01:00:00Z' }));
+  const lateDraft = await hook('pull_request', prEvent('converted_to_draft', pull({ draft: true, updated_at: '2026-10-29T00:30:00Z' })));
+  assert.equal(lateDraft.outcome, 'stale_event');
+  assert.deepEqual((await reviewJobs()).map(j => j.state), ['queued']);
+  r.gh.pulls.set(7, pull({ updated_at: '2026-10-29T01:00:00Z' }));
+  await r.runtime.tick();
+  const lateClose = await hook('pull_request', prEvent('closed', pull({ state: 'closed', updated_at: '2026-10-29T00:00:00Z' })));
+  assert.equal(lateClose.outcome, 'stale_event');
+  assert.deepEqual((await deliveries()).map(d => d.state), ['pending']);
+  await r.publisher.deliver();
+  assert.equal(r.gh.writes.length, 1);
+  assert.equal(r.inputs.length, 1);
+  const current = await hook('pull_request', prEvent('closed', pull({ state: 'closed', updated_at: '2026-10-29T02:00:00Z' })));
+  assert.deepEqual([current.outcome, current.reason], ['superseded', 'pr_closed']);
+});

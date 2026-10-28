@@ -248,6 +248,16 @@ export class ReviewQueue {
       trigger, pr.updatedAt, now]);
     return { outcome: 'queued', key, job };
   }
+  // 닫힘·draft 이벤트도 admission과 같은 잠금·시각 검사를 거친다. 기록보다 오래된 이벤트는 최신 세대를 지우지 못한다.
+  async close(tx: Database, repo: number, pr: PullRequest, reason: string): Promise<{ outcome: string; reason: string }> {
+    await tx.query(`INSERT INTO controls VALUES ('review_admission','false') ON CONFLICT DO NOTHING`);
+    await tx.query(`SELECT * FROM controls WHERE key='review_admission' FOR UPDATE`);
+    const latest = (await tx.query<{ updated: string | null }>('SELECT max(pr_updated_at) AS updated FROM pr_reviews WHERE repo_id=$1 AND pr_number=$2',
+      [repo, pr.number])).rows[0]?.updated;
+    if (latest !== null && latest !== undefined && Number(latest) > pr.updatedAt) return { outcome: 'stale_event', reason };
+    await this.supersede(tx, repo, pr.number, reason);
+    return { outcome: 'superseded', reason };
+  }
   // 새 세대·닫힘·병합이면 대기 작업과 미게시 결과를 superseded로. 실행 중인 작업은 끝날 때 결과가 superseded로 남는다.
   async supersede(tx: Database, repo: number, pr: number, reason: string, except = ''): Promise<void> {
     const now = this.store.now();
@@ -290,10 +300,7 @@ export class GitHubIngress {
       const target = { ...e, pr: pr.number };
       if (e.action === 'closed' || e.action === 'converted_to_draft') {
         const reason = e.action === 'converted_to_draft' ? 'draft' : pr.merged ? 'merged_before_review' : 'pr_closed';
-        return this.record(delivery, event, target, async tx => {
-          await this.queue.supersede(tx, repo.id, pr.number, reason);
-          return { outcome: 'superseded', reason };
-        });
+        return this.record(delivery, event, target, tx => this.queue.close(tx, repo.id, pr, reason));
       }
       const trigger = ['opened', 'reopened', 'ready_for_review', 'synchronize'].includes(e.action) ? e.action
         : e.action === 'edited' && e.changes?.base ? 'retarget' : undefined;
