@@ -11,6 +11,8 @@ const PolicySchema = z.strictObject({
   conversationChannel: z.string().min(1), notificationChannel: z.string().min(1),
   dmEnabled: z.boolean().nullable(), services: z.array(z.string()),
   revocationRestores: z.array(z.string().uuid()).optional(),
+  // PR 리뷰 정책(T17). 형식 검사는 review.ts가 하고, 없으면 리뷰 경로만 닫힌다.
+  review: z.unknown().optional(),
 });
 export type Policy = z.infer<typeof PolicySchema>;
 export class PolicyGate {
