@@ -464,6 +464,32 @@ test('TASK-03 중단 신호 뒤에도 끝나지 않는 실행은 기다리지 �
   await task('task-2');
   assert.equal(await local.tick(), false);
 });
+test('TASK-03 작업자 단절은 종료 확인에 따라 failed·unknown, 재개 실패는 새 스레드로 몰래 바꾸지 않고 /retry만 새로 시작', async () => {
+  for (const stopped of [true, false]) {
+    await database.pg.exec('TRUNCATE events,conversations,jobs,results,outbox,denied_actors,controls,audit,codex_sessions,codex_questions RESTART IDENTITY CASCADE');
+    const broken = new CodexBridge(f.store, f.gate, { capabilities: () => CODEX_CAPABILITIES,
+      execute: async () => { throw new Error('worker_disconnected'); }, confirmStop: async () => ({ stopped }) }, { monitorMs: 5 });
+    await task(`lost-${stopped}`);
+    await new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, broken).tick();
+    const job = (await jobs())[0]!;
+    assert.equal(job.state, stopped ? 'failed' : 'unknown'); assert.equal(job.wait_reason, 'codex_adapter_error');
+  }
+  await database.pg.exec('TRUNCATE events,conversations,jobs,results,outbox,denied_actors,controls,audit,codex_sessions,codex_questions RESTART IDENTITY CASCADE');
+  const { job, question } = await asked();
+  await owner(question, 'main', 'answer-1');
+  launcher.scripts.push({ lines: jsonl({ type: 'turn.started' }, { type: 'turn.failed', error: { message: 'session not found' } }), exit: { code: 1, signal: null } });
+  await runtime.tick();
+  assert.equal((await jobs())[0]!.state, 'failed'); assert.equal(launcher.started, 2);
+  assert.deepEqual(launcher.specs[1]!.args.slice(0, 2), ['exec', 'resume']);
+  assert.match((await f.store.control('fixture-owner', f.store.scopeId(thread), 'retry', job.id) as { status: string }).status, /재시도/);
+  launcher.scripts.push(finished(out('completed', '새로 시작해 끝냄'), [], 'fresh-thread'));
+  await runtime.tick();
+  assert.equal(launcher.specs[2]!.args.includes('resume'), false);
+  assert.ok(launcher.specs[2]!.stdin.startsWith(TASK_INSTRUCTIONS));
+  assert.equal((await jobs())[0]!.state, 'succeeded');
+  const session = (await rows('codex_sessions'))[0]!;
+  assert.equal(session.thread_id, 'fresh-thread'); assert.equal(session.turn, 1);
+});
 test('TASK-03 시간 초과는 정리 확인 뒤 failed 안내, 실패·불명 결과는 재실행하지 않음', async () => {
   launcher.scripts.push({ lines: jsonl(...begin()), hang: true });
   const job = await task();
