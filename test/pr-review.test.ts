@@ -909,9 +909,9 @@ test('EVENT-02 게시 직전 정책 확인 불가는 재시도 횟수를 쓰지 
 test('REVIEW-03 열거 중 head가 움직여도 변경 목록과 압축본은 먼저 고정한 SHA 쌍 기준이고, 게시 직전 대조로 막는다', async () => {
   await opened();
   const compare = r.gh.compare.bind(r.gh);
-  r.gh.compare = async (repository, base, head) => {
-    r.gh.pulls.set(7, pull({ head: { sha: HEAD2, ref: "f", repo: repository }, updated_at: "2026-10-29T00:59:00Z" }));
-    return compare(repository, base, head);
+  r.gh.compare = async (name, base, head) => {
+    r.gh.pulls.set(7, pull({ head: { sha: HEAD2, ref: 'f', repo: repository }, updated_at: '2026-10-29T00:59:00Z' }));
+    return compare(name, base, head);
   };
   await r.runtime.tick();
   assert.deepEqual(r.gh.compares, [[BASE, HEAD]]);
