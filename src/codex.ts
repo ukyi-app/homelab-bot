@@ -56,7 +56,7 @@ export interface CodexLauncher {
 }
 export interface CodexFiles {
   mkdir(path: string): Promise<void>; write(path: string, content: string): Promise<void>;
-  read(path: string): Promise<string | null>; remove(path: string): Promise<void>; resolve(path: string): Promise<string>;
+  read(path: string, maxBytes?: number): Promise<string | null>; remove(path: string): Promise<void>; resolve(path: string): Promise<string>;
 }
 export const nodeFiles: CodexFiles = {
   mkdir: async path => { await mkdir(path, { recursive: true, mode: 0o700 }); },

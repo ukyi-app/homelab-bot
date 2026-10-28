@@ -8,7 +8,7 @@ import { CODEX_CAPABILITIES, CODEX_DEFAULTS, CapabilityUnavailable, CodexBridge,
 import type { CodexFiles, CodexLauncher, CodexLimits, LaunchResult, LaunchSpec } from '../src/codex.js';
 import { FORBIDDEN_FLAGS, SECRET_NAME, TASK_MARKER, assertWorkerRoot, codexConfig, configToml, execArgs,
   launchEnvironment, taskPaths } from '../src/codex-config.js';
-import { authSecrets, interpretRun, parseStream } from '../src/codex-events.js';
+import { authSecrets, compactEvent, interpretRun, parseStream } from '../src/codex-events.js';
 import type { RunReport } from '../src/codex-events.js';
 import { ProcessGroupLauncher } from '../src/codex-process.js';
 import { changedPaths, fileWorkspace } from '../src/codex-workspace.js';
@@ -980,4 +980,139 @@ test('R4 실행 권한만 바뀐 파일도 실제 변경으로 기록', async ()
     await chmod(join(dir, 'run.sh'), 0o775);
     assert.deepEqual(changedPaths(executable, (await fileWorkspace.snapshot(dir))!), []);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+// ---- rev-t18 r2 회귀 시험: 수정 전 실패를 먼저 확인했다(VERIFICATION "r2 반영"). ----
+const longError = (message: string) => [
+  { type: 'error', message: `${'x'.repeat(2001)} ${message}` },
+  { type: 'turn.failed', error: { message: `${'context '.repeat(300)}${message}` } },
+];
+const streamed = (events: unknown[]) => jsonl(...events).map(line => compactEvent(line).line);
+test('N1 긴 오류 메시지 뒤쪽의 인증·한도 표식도 축약을 거친 뒤 대기로 판정', () => {
+  for (const [message, reason] of [['usage_limit_reached', 'model_limit'], ['401 unauthorized', 'auth_expired']] as const) {
+    for (const event of longError(message)) {
+      assert.deepEqual(interpretRun(report(streamed([event]), null, { exit: { code: 1, signal: null } }), null),
+        { kind: 'waiting', reason, threadId: null, turns: 0 }, JSON.stringify(event).slice(-40));
+    }
+  }
+});
+test('N1 실제 브리지: 긴 인증 만료 오류도 waiting_user·스케줄러 정지·다음 작업 차단', async () => {
+  launcher.scripts.push({ lines: jsonl({ type: 'error', message: `${'context '.repeat(300)}401 unauthorized` }), exit: { code: 1, signal: null } });
+  await task();
+  await runtime.tick();
+  const job = (await jobs())[0]!;
+  assert.equal(job.state, 'waiting_user'); assert.equal(job.wait_reason, 'auth_expired');
+  assert.equal((await rows('controls')).find(row => row.key === 'scheduler')!.value, true);
+  await task('task-2');
+  assert.equal(await runtime.tick(), false);
+});
+test('N2 경로 500개 뒤의 작업 공간 밖 변경 보고와 4096자 뒤의 상위 이동도 축약 뒤 실패', async () => {
+  const change = (paths: string[]) => ({ type: 'item.completed', item: { id: 'patch', type: 'file_change', status: 'completed',
+    changes: paths.map(path => ({ path, kind: 'update' })) } });
+  const inside = Array.from({ length: 500 }, (_, i) => `src/f${i}.ts`);
+  const deep = `${'a/'.repeat(2100)}${'../'.repeat(2101)}etc/passwd`;
+  for (const paths of [[...inside, '/etc/outside'], [deep]]) {
+    assert.equal(interpretRun(report(streamed([...begin(), change(paths), done]), out('completed', '끝'), { workspace: '/w' }), null).kind, 'failed');
+  }
+  launcher.scripts.push(finished(out('completed', '끝'), [change([...inside, '/etc/outside'])]));
+  await task();
+  await runtime.tick();
+  assert.equal((await jobs())[0]!.state, 'failed'); assert.equal((await jobs())[0]!.wait_reason, 'codex_change_outside_workspace');
+});
+test('N3 한도 대기 뒤 재개 예산이 없어 실패하면 세션도 실패로 정리하고 /retry는 새 스레드·새 예산으로 시작', async () => {
+  const tool = { type: 'item.started', item: { id: 'cmd_1', type: 'command_execution', command: 'echo', status: 'in_progress' } };
+  launcher.scripts.push({ lines: jsonl(...begin('thread-one'), tool, { type: 'turn.failed', error: { message: 'usage_limit_reached' } }), exit: { code: 1, signal: null } });
+  const job = await task();
+  await database.db.query(`UPDATE jobs SET budget='{"timeoutMs":1800000,"toolCalls":1}' WHERE id=$1`, [job.id]);
+  await runtime.tick();
+  assert.equal((await jobs())[0]!.wait_reason, 'model_limit');
+  await f.store.control('fixture-owner', f.store.scopeId(thread), 'resume-model', job.id);
+  await runtime.tick();
+  assert.equal((await jobs())[0]!.wait_reason, 'codex_tool_budget_exceeded');
+  assert.equal((await rows('codex_sessions'))[0]!.state, 'failed');
+  assert.match((await f.store.control('fixture-owner', f.store.scopeId(thread), 'retry', job.id) as { status: string }).status, /재시도/);
+  launcher.scripts.push(finished(out('completed', '새로 끝냄'), [], 'thread-two'));
+  await runtime.tick();
+  assert.equal(launcher.specs[1]!.args.includes('resume'), false); assert.ok(launcher.specs[1]!.stdin.startsWith(TASK_INSTRUCTIONS));
+  assert.equal((await jobs())[0]!.state, 'succeeded');
+});
+test('N3 질문 뒤 재개 예산이 없어 실패하면 답한 질문을 닫고 /retry는 새 스레드로 시작', async () => {
+  const tool = { type: 'item.started', item: { id: 'cmd_1', type: 'command_execution', command: 'echo', status: 'in_progress' } };
+  launcher.scripts.push(finished(out('needs_input', '조사', '어느 쪽?'), [tool]));
+  const job = await task();
+  await database.db.query(`UPDATE jobs SET budget='{"timeoutMs":1800000,"toolCalls":1}' WHERE id=$1`, [job.id]);
+  await runtime.tick();
+  await owner(`${job.id}:${THREAD}:1`, 'main', 'answer-1');
+  await runtime.tick();
+  assert.equal((await jobs())[0]!.wait_reason, 'codex_tool_budget_exceeded');
+  assert.equal((await rows('codex_questions'))[0]!.state, 'cancelled');
+  await f.store.control('fixture-owner', f.store.scopeId(thread), 'retry', job.id);
+  launcher.scripts.push(finished(out('completed', '새로 끝냄'), [], 'thread-two'));
+  await runtime.tick();
+  assert.equal(launcher.specs[1]!.args.includes('resume'), false);
+  assert.equal((await jobs())[0]!.state, 'succeeded');
+});
+// 커밋 ac5581d·c642fd9의 009 원문이다. 그 스키마로 만든 로컬 DB가 현재 009로 올라가는지 본다.
+const OLD_009: Record<string, string> = { ac5581d: "BEGIN;\n-- \ubd07 \uc18c\uc720 Codex \uc791\uc5c5\uc758 \uc678\ubd80 \uc138\uc158 \uae30\ub85d. \uc18c\uc720\uc790\u00b7\ub300\ud654\ub294 jobs \ud589\uc774 \uae30\uc900\uc774\ub2e4(`01` \u00a76 \uc18c\uc720\uc790 \uc5f0\uacb0).\nCREATE TABLE IF NOT EXISTS codex_sessions (\n  job_id text PRIMARY KEY REFERENCES jobs(id), thread_id text, turn integer NOT NULL DEFAULT 0,\n  host text NOT NULL, capabilities jsonb NOT NULL,\n  state text NOT NULL CHECK (state IN ('running','waiting_answer','completed','failed','cancelled','unknown')),\n  created_at bigint NOT NULL, updated_at bigint NOT NULL\n);\n-- \uc9c8\ubb38 ID = job_id + thread_id + \ud134 \uc21c\ubc88. \ub3c4\uad6c \uc2b9\uc778 \uc9c8\ubb38\uc740 \uc774 \uacbd\ub85c\uc5d0 \uc5c6\ub2e4(capability=false).\nCREATE TABLE IF NOT EXISTS codex_questions (\n  id text PRIMARY KEY, job_id text NOT NULL REFERENCES jobs(id),\n  conversation_id text NOT NULL REFERENCES conversations(id),\n  thread_id text NOT NULL, turn integer NOT NULL,\n  kind text NOT NULL CHECK (kind = 'clarification'),\n  responder_id text NOT NULL, prompt text NOT NULL,\n  state text NOT NULL CHECK (state IN ('open','answered','resumed','expired','cancelled')),\n  created_at bigint NOT NULL, expires_at bigint NOT NULL,\n  answer text, answered_by text, answer_event text, answered_at bigint,\n  UNIQUE (job_id, thread_id, turn)\n);\nCREATE UNIQUE INDEX IF NOT EXISTS codex_questions_one_open ON codex_questions(job_id) WHERE state='open';\nINSERT INTO schema_migrations VALUES (9) ON CONFLICT DO NOTHING;\nCOMMIT;\n", c642fd9: "BEGIN;\n-- \ubd07 \uc18c\uc720 Codex \uc791\uc5c5\uc758 \uc678\ubd80 \uc138\uc158 \uae30\ub85d. \uc18c\uc720\uc790\u00b7\ub300\ud654\ub294 jobs \ud589\uc774 \uae30\uc900\uc774\ub2e4(`01` \u00a76 \uc18c\uc720\uc790 \uc5f0\uacb0).\nCREATE TABLE IF NOT EXISTS codex_sessions (\n  job_id text PRIMARY KEY REFERENCES jobs(id), thread_id text, turn integer NOT NULL DEFAULT 0,\n  -- \uc800\uc7a5\uc18c\ub294 \uc791\uc5c5 \uacf5\uac04 \uc6d0\ubcf8(D-15 \uc555\ucd95\ubcf8)\uc744 \uc815\ud558\ub294 \ub2e8\uacc4(T16b\u00b7T19)\ubd80\ud130 \ucc44\uc6b4\ub2e4. \uc9c0\uae08 \uc791\uc5c5 \uacf5\uac04\uc740 \ube48 \uc800\uc7a5\uc18c\ub2e4.\n  host text NOT NULL, repository text, capabilities jsonb NOT NULL,\n  state text NOT NULL CHECK (state IN ('running','waiting_answer','waiting_model','completed','failed','cancelled','unknown')),\n  created_at bigint NOT NULL, updated_at bigint NOT NULL\n);\n-- \uc9c8\ubb38 ID = job_id + thread_id + \ud134 \uc21c\ubc88. \ub3c4\uad6c \uc2b9\uc778 \uc9c8\ubb38\uc740 \uc774 \uacbd\ub85c\uc5d0 \uc5c6\ub2e4(capability=false).\nCREATE TABLE IF NOT EXISTS codex_questions (\n  id text PRIMARY KEY, job_id text NOT NULL REFERENCES jobs(id),\n  conversation_id text NOT NULL REFERENCES conversations(id),\n  thread_id text NOT NULL, turn integer NOT NULL,\n  kind text NOT NULL CHECK (kind = 'clarification'),\n  responder_id text NOT NULL, prompt text NOT NULL,\n  state text NOT NULL CHECK (state IN ('open','answered','resumed','expired','cancelled')),\n  created_at bigint NOT NULL, expires_at bigint NOT NULL,\n  answer text, answered_by text, answer_event text, answered_at bigint,\n  UNIQUE (job_id, thread_id, turn)\n);\nCREATE UNIQUE INDEX IF NOT EXISTS codex_questions_one_open ON codex_questions(job_id) WHERE state='open';\nINSERT INTO schema_migrations VALUES (9) ON CONFLICT DO NOTHING;\nCOMMIT;\n" };
+test('N4 옛 009로 만든 DB에 현재 009를 다시 적용하면 열·상태 제약이 맞춰지고, 사용량을 모르는 세션은 재개하지 않음', async () => {
+  for (const [commit, sql] of Object.entries(OLD_009)) {
+    const old = await localDatabase();
+    try {
+      await old.pg.exec('DROP TABLE codex_questions; DROP TABLE codex_sessions;');
+      await old.pg.exec(sql);
+      const g = await fixture(old.db);
+      const fake = new FakeLauncher();
+      const b = new CodexBridge(g.store, g.gate, new ExecCodexAdapter(root, fake), { monitorMs: 5 });
+      const r = new Runtime(g.store, g.gate, g.worker, g.signer, g.reader, b);
+      await g.ingress.receive(event('legacy', { kind: 'command', command: 'task', text: '옛 작업' }));
+      const job = (await old.db.query<Record<string, any>>('SELECT * FROM jobs')).rows[0]!;
+      await old.db.query(`UPDATE jobs SET state='waiting_user',wait_reason='model_limit',attempt=1 WHERE id=$1`, [job.id]);
+      await old.db.query(`INSERT INTO codex_sessions(job_id,thread_id,turn,host,capabilities,state,created_at,updated_at)
+        VALUES ($1,'old-thread',1,'worker','{}','waiting_answer',0,0)`, [job.id]);
+      await old.pg.exec(await readFile('migrations/009_codex_bridge.sql', 'utf8'));
+      await old.pg.exec(await readFile('migrations/009_codex_bridge.sql', 'utf8'));
+      const columns = (await old.db.query<{ column_name: string }>(`SELECT column_name FROM information_schema.columns
+        WHERE table_name='codex_sessions'`)).rows.map(row => row.column_name);
+      assert.ok(columns.includes('tool_calls') && columns.includes('repository'), commit);
+      await old.db.query("UPDATE codex_sessions SET state='waiting_model' WHERE job_id=$1", [job.id]);
+      assert.equal((await old.db.query<Record<string, any>>('SELECT tool_calls FROM codex_sessions')).rows[0]!.tool_calls, null, commit);
+      assert.equal((await g.store.control('fixture-owner', g.store.scopeId(thread), 'resume-model', job.id) as { ok: boolean }).ok, true, commit);
+      await r.tick();
+      const failed = (await old.db.query<Record<string, any>>('SELECT * FROM jobs')).rows[0]!;
+      assert.equal(failed.wait_reason, 'codex_tool_usage_unknown', commit); assert.equal(fake.started, 0, commit);
+      await g.store.control('fixture-owner', g.store.scopeId(thread), 'retry', job.id);
+      await r.tick();
+      assert.equal(fake.specs[0]!.args.includes('resume'), false, commit);
+      assert.equal((await old.db.query<Record<string, any>>('SELECT * FROM jobs')).rows[0]!.state, 'succeeded', commit);
+      assert.equal((await old.db.query<Record<string, any>>('SELECT tool_calls FROM codex_sessions')).rows[0]!.tool_calls, 0, commit);
+    } finally { await old.pg.close(); }
+  }
+});
+test('N5 실행 비트는 git과 같이 소유자 비트로만 판정(git diff --summary와 대조)', async () => {
+  const dir = resolve(await mkdtemp('.local/gitmode-'));
+  const env = { PATH: '/usr/bin:/bin', HOME: dir, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_DIR: join(dir, '.git'), GIT_WORK_TREE: dir };
+  const git = (...args: string[]) => new Promise<string>((done, fail) => execFile('git', ['-c', 'core.filemode=true',
+    '-c', 'user.name=t', '-c', 'user.email=t@invalid', ...args], { cwd: dir, env }, (error, stdout) => error ? fail(error) : done(stdout)));
+  try {
+    await git('init', '-q');
+    for (const [from, to] of [[0o755, 0o655], [0o644, 0o744], [0o644, 0o655], [0o755, 0o744], [0o644, 0o755]] as const) {
+      await writeFile(join(dir, 'run.sh'), '#!/bin/sh\n');
+      await chmod(join(dir, 'run.sh'), from);
+      await git('add', '--all'); await git('commit', '-q', '--allow-empty', '-m', 'base');
+      const before = (await fileWorkspace.snapshot(dir))!;
+      await chmod(join(dir, 'run.sh'), to);
+      const gitSees = (await git('diff', '--summary')).includes('mode change');
+      assert.equal(changedPaths(before, (await fileWorkspace.snapshot(dir))!).includes('run.sh'), gitSees, `${from.toString(8)} → ${to.toString(8)}`);
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+test('자체 점검: 크기 제한 없이 읽던 실행 출력 파일은 상한을 넘으면 읽지 않고 실패', async () => {
+  const big = join(root, 'big.json');
+  await writeFile(big, 'x'.repeat(2 * 1024 * 1024));
+  assert.equal(await nodeFiles.read(big, 1024 * 1024), null);
+  assert.equal((await nodeFiles.read(big))?.length, 2 * 1024 * 1024);
+  launcher.scripts.push({ ...finished(out('completed', '끝')), output: JSON.stringify({ status: 'completed', summary: 'y'.repeat(1500), question: '' }) + ' '.repeat(2 * 1024 * 1024) });
+  await task();
+  await runtime.tick();
+  assert.equal((await jobs())[0]!.wait_reason, 'codex_output_too_large');
 });
