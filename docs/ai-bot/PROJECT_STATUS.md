@@ -27,7 +27,7 @@
 | FOUNDATION 실연동·첫 배포 | T16b | 대기 | T13(플랫폼), T16a, Discord 서버·봇 계정, 작업자 영속 쓰기 공간(설계 C.8 변경), 봇 전용 구독 계정·첫 시드(D-14) |
 | PR_REVIEW | T17 | 대기 | 착수 T16a, 완료 T16b. 작업별 세션 저장 공간 결정(ARCHITECTURE §5.1). 리뷰 App. D-14 차단 조건(OpenAI 허용 확인이나 API 키 등 공식 지원 인증 전환. 공개 저장소 PR 내용으로 구독 모델을 부르는 일만 막음) |
 | CODEX_BRIDGE | T18 | 대기 | 착수 T16a, 완료 T16b. R08 연결 방식 판단 |
-| MEMORY_BRIEFING | T20 | 로컬·mock 구현·검증(2026-10-29, 브랜치 `feat/t20-memory-briefing-local`, 병합 전). Codex 리뷰 rev-t20(P1 1·P2 4) 수정·회귀 검증 뒤 재판정: MEM-01·DATA-02·AUTH-02(기억·예약)·BRIEF-01 로컬 경로 pass, BRIEF-01 실채널 blocked | 완료: T16b(실제 브리핑 채널 전송 BRIEF-01 `authorized_external`), 삭제 원장 저장소·자격·보존 결정 대기([DECISIONS](DECISIONS.md) T20), Codex 작업 상태·질문 대기 칸 연결 T18 |
+| MEMORY_BRIEFING | T20 | 로컬·mock 구현·검증(2026-10-29, 브랜치 `feat/t20-memory-briefing-local`, 병합 전). Codex 리뷰 rev-t20(P1 1·P2 4)과 재리뷰 rev-t20b(잔여 P1 1: 재기동 원장 재적용) 수정·회귀 검증 뒤 재판정: MEM-01·DATA-02·AUTH-02(기억·예약)·BRIEF-01 로컬 경로 pass, BRIEF-01 실채널 blocked | 완료: T16b(실제 브리핑 채널 전송 BRIEF-01 `authorized_external`), 삭제 원장 저장소·자격·보존 결정 대기([DECISIONS](DECISIONS.md) T20), Codex 작업 상태·질문 대기 칸 연결 T18 |
 | CHANGE_PR | T19 | 대기 | T17, T18, D-24 App |
 | RELEASE_AUDIT | T21 | 대기 | T17~T20 |
 
