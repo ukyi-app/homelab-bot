@@ -115,17 +115,17 @@ async function setup() {
     return archive;
   };
   const inputs: ReviewerInput[] = [];
-  let reply: Awaited<ReturnType<ReviewerModel>> | (() => Promise<never>) = { status: 'succeeded', output: OUTPUT };
-  const model: ReviewerModel = async input => {
+  let reply: Awaited<ReturnType<ReviewerModel>> | ((signal: AbortSignal) => Promise<never>) = { status: 'succeeded', output: OUTPUT };
+  const model: ReviewerModel = async (input, signal) => {
     inputs.push(structuredClone(input));
-    return typeof reply === 'function' ? reply() : structuredClone(reply);
+    return typeof reply === 'function' ? reply(signal) : structuredClone(reply);
   };
   f.policy.review = structuredClone(POLICY);
   const source = new ReviewPolicySource(f.gate);
   const queue = new ReviewQueue(f.store);
   const ingress = new GitHubIngress(SECRET, f.store, source, queue, gh);
-  const worker = new ReviewWorker(f.verifier, fetcher, model);
-  const runtime = new ReviewRuntime(f.store, source, queue, gh, worker, f.signer);
+  const worker = new ReviewWorker(f.verifier, fetcher, model, 50);
+  const runtime = new ReviewRuntime(f.store, source, queue, gh, worker, f.signer, 5);
   const publisher = new ReviewPublisher(f.store, source, gh, new RestrictedGitHub(gh.transport));
   const reconciler = new ReviewReconciler(f.store, source, queue, gh);
   gh.pulls.set(7, pull());
@@ -770,4 +770,27 @@ test('REVIEW-01 평가 하네스(fake 리뷰어): 정답과 분리한 지적 판
   ]);
   assert.equal(r.gh.writes.length, 4);
   assert.ok(r.gh.writes.every(w => w.body.event === 'COMMENT'));
+});
+
+test('D-14 비상 중지는 실행 중 리뷰 모델 호출을 중단하고, 멈춤을 확인하면 cancelled, 못 하면 unknown으로 슬롯을 잡는다', async () => {
+  await opened();
+  r.reply((signal: AbortSignal) => new Promise(resolve => signal.addEventListener('abort', () => resolve({ status: 'failed' } as never), { once: true })) as never);
+  const running = r.runtime.tick();
+  while (!r.inputs.length) await new Promise(resolve => setImmediate(resolve));
+  await f.store.control(f.policy.owner, 'n/a', 'emergency-stop');
+  await running;
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.wait_reason]), [['cancelled', 'stop_confirmation']]);
+  assert.equal((await deliveries()).length, 0);
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,controls CASCADE');
+  await opened(pull({ updated_at: '2026-10-29T00:50:00Z' }));
+  r.reply(() => new Promise(() => {}) as never);
+  const stuck = r.runtime.tick();
+  while (r.inputs.length < 2) await new Promise(resolve => setImmediate(resolve));
+  await f.store.control(f.policy.owner, 'n/a', 'emergency-stop');
+  await stuck;
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.wait_reason]), [['unknown', 'stop_confirmation']]);
+  await database.db.query("UPDATE controls SET value='false'");
+  await opened(pull({ head: { sha: HEAD2, ref: 'f', repo: repository }, updated_at: '2026-10-29T00:51:00Z' }));
+  assert.equal(await r.runtime.tick(), false);
+  assert.equal(r.inputs.length, 2);
 });

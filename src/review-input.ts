@@ -1,8 +1,8 @@
 import { gunzipSync } from 'node:zlib';
 import { z } from 'zod';
 import { DEFAULTS, Denied, WorkerRejected } from './contracts.js';
-import { archiveContract } from './worker.js';
-import type { WorkerVerifier } from './worker.js';
+import { archiveContract, CancelRequestSchema } from './worker.js';
+import type { CancelRequest, WorkerVerifier } from './worker.js';
 
 // 리뷰 작업자 쪽: base·head 압축본 두 개로 diff를 만들고 리뷰 모델(지금은 fake)을 부른다.
 // 작업자에는 GitHub 자격이 없고(D-15), 변경 목록은 게시 서버가 API로 열거해 넘긴다(ARCHITECTURE §6).
@@ -226,9 +226,11 @@ export const reviewOutcome = (coverage: Coverage): 'completed' | 'partial' =>
 
 // 작업자 쪽 실행기. 서명된 capability가 이 요청 본문에 묶여 있을 때만 압축본을 받고 모델을 부른다.
 export class ReviewWorker {
-  private busy = false;
+  private active: { job: string; lease: string; abort: AbortController; done: Promise<boolean> } | undefined;
+  // 중단 신호를 받은 호출이 cancel보다 먼저 정상 반환할 수 있다. 그 종료도 멈춤 증거로 답한다.
+  private stopped: { job: string; lease: string } | undefined;
   constructor(private readonly verifier: WorkerVerifier, private readonly fetchArchive: ArchiveFetcher,
-    private readonly model: ReviewerModel) {}
+    private readonly model: ReviewerModel, private readonly stopWaitMs = 5000) {}
   async review(input: ReviewTask, capability: string, signal: AbortSignal): Promise<ReviewWorkerResult> {
     let task: ReviewTask;
     try {
@@ -238,8 +240,13 @@ export class ReviewWorker {
       // 게시 서버가 보낸 URL을 그대로 믿지 않는다. 고정 SHA의 codeload 주소만 받는다.
       if (task.archives.base !== contract.base || task.archives.head !== contract.head) throw new Denied();
     } catch { throw new WorkerRejected(); }
-    if (this.busy) throw new WorkerRejected('worker_busy');
-    this.busy = true;
+    if (this.active) throw new WorkerRejected('worker_busy');
+    const abort = new AbortController();
+    if (signal.aborted) abort.abort(); else signal.addEventListener('abort', () => abort.abort(), { once: true });
+    let settle!: (stopped: boolean) => void;
+    const active = { job: task.job, lease: task.lease, abort, done: new Promise<boolean>(resolve => { settle = resolve; }) };
+    this.active = active;
+    signal = abort.signal;
     let stopped = true;
     try {
       let base: Map<string, Entry>, head: Map<string, Entry>;
@@ -264,6 +271,23 @@ export class ReviewWorker {
       // 깨진 응답은 모델 실행이 멈췄다는 증거가 아니다. 다음 작업을 받지 않는다(SerialWorker와 같은 규칙).
       stopped = false;
       return { status: 'unknown', stopped: false };
-    } finally { if (stopped) this.busy = false; }
+    } finally {
+      settle(stopped);
+      if (stopped && this.active === active) { this.active = undefined; this.stopped = { job: task.job, lease: task.lease }; }
+    }
+  }
+  // 모델 호출이 중단 신호를 받고 정상 반환했을 때만 멈췄다고 답한다. 예외·무응답은 멈춤의 증거가 아니다.
+  async cancel(input: CancelRequest, capability: string): Promise<{ stopped: boolean }> {
+    const request = CancelRequestSchema.parse(input);
+    await this.verifier.check(capability, 'cancel', request);
+    const active = this.active;
+    if (active?.job !== request.job || active.lease !== request.lease) {
+      return { stopped: this.stopped?.job === request.job && this.stopped.lease === request.lease };
+    }
+    active.abort.abort();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const stopped = await Promise.race([active.done, new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), this.stopWaitMs); })]);
+    clearTimeout(timer);
+    return { stopped };
   }
 }

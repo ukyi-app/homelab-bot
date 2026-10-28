@@ -6,7 +6,7 @@ import type { Job, Scope } from './contracts.js';
 import type { Database } from './database.js';
 import type { Policy, PolicyGate } from './policy.js';
 import type { Store } from './store.js';
-import type { WorkerSigner } from './worker.js';
+import type { CancelRequest, WorkerSigner } from './worker.js';
 import { archiveContract } from './worker.js';
 import { CoverageSchema, FindingSchema, InputLimitsSchema, REVIEW_INSTRUCTIONS, ReviewOutputSchema, ReviewTaskSchema,
   reviewOutcome } from './review-input.js';
@@ -338,10 +338,12 @@ export const notificationScope = (policy: Policy): Scope => ({ guild: policy.gui
 
 export interface ReviewWorkerClient {
   review(task: ReviewTask, capability: string, signal: AbortSignal): Promise<ReviewWorkerResult>;
+  cancel(request: CancelRequest, capability: string): Promise<{ stopped: boolean }>;
 }
 export class ReviewRuntime {
   constructor(private readonly store: Store, private readonly policy: ReviewPolicySource, private readonly queue: ReviewQueue,
-    private readonly reader: GitHubReader, private readonly worker: ReviewWorkerClient, private readonly signer: WorkerSigner) {}
+    private readonly reader: GitHubReader, private readonly worker: ReviewWorkerClient, private readonly signer: WorkerSigner,
+    private readonly pollMs = 1000) {}
   // T16a의 claim과 같은 scheduler 잠금·전역 슬롯 조건을 쓴다. 리뷰도 대화와 같은 auth.json 직렬 1개다(D-14).
   async claim(): Promise<(Job & Record<string, unknown>) | undefined> {
     return this.store.db.transaction(async tx => {
@@ -396,16 +398,38 @@ export class ReviewRuntime {
         policyRevision: context.revision, instructions: REVIEW_INSTRUCTIONS, timeoutMs: DEFAULTS.taskTimeoutMs });
       const abort = new AbortController();
       let timeout: ReturnType<typeof setTimeout> | undefined;
-      const heartbeat = setInterval(() => { void this.store.heartbeat(asJob(job)).then(ok => { if (!ok) abort.abort(); }).catch(() => abort.abort()); }, 1000);
+      let checking: Promise<void> | undefined;
+      const interrupted = new Promise<ReviewWorkerResult>(resolve => {
+        abort.signal.addEventListener('abort', () => resolve({ status: 'unknown', stopped: false }), { once: true });
+      });
+      // 비상 중지·취소 요청·lease 상실을 실행 중에도 본다(T16a 대화 레인과 같은 규칙).
+      const monitor = setInterval(() => {
+        if (checking) return;
+        checking = (async () => {
+          const state = (await this.store.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0]?.state;
+          if (state === 'cancel_requested' || !await this.store.heartbeat(asJob(job))) abort.abort();
+        })().catch(() => abort.abort()).finally(() => { checking = undefined; });
+      }, this.pollMs);
       let result: ReviewWorkerResult;
       try {
         const capability = this.signer.issue(asJob(job), 'execute', task);
         dispatched = true;
-        result = await Promise.race([this.worker.review(task, capability, abort.signal),
+        result = await Promise.race([this.worker.review(task, capability, abort.signal), interrupted,
           new Promise<ReviewWorkerResult>(resolve => {
             timeout = setTimeout(() => { abort.abort(); resolve({ status: 'unknown', stopped: false }); }, task.timeoutMs);
           })]);
-      } finally { clearInterval(heartbeat); clearTimeout(timeout); }
+      } finally { clearInterval(monitor); clearTimeout(timeout); await checking; }
+      const current = (await this.store.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0]?.state;
+      if (current === 'cancel_requested' || abort.signal.aborted) {
+        const body = { job: job.id, lease: job.lease_token };
+        const confirmation = result.stopped ? { stopped: true }
+          : await this.worker.cancel(body, this.signer.issue(asJob(job), 'cancel', body)).catch(() => ({ stopped: false }));
+        // 멈춤을 확인하지 못하면 unknown으로 두어 전역 슬롯을 잡는다. 자동 재실행하지 않는다.
+        const state = !confirmation.stopped ? 'unknown' : current === 'cancel_requested' ? 'cancelled' : 'failed';
+        if (state === 'unknown') await this.store.transition(asJob(job), 'unknown', 'stop_confirmation');
+        else await this.close(job, review, state, 'stop_confirmation');
+        return true;
+      }
       if (!result.stopped) { await this.store.transition(asJob(job), 'unknown', 'worker_disconnected'); return true; }
       if (result.status === 'limited' || result.status === 'auth_expired') {
         await this.store.waitForUser(asJob(job), result.status === 'limited' ? 'model_limit' : 'auth_expired'); return true;
