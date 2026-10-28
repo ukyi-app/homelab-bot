@@ -337,6 +337,18 @@ test('TASK-02 Runtime 정리가 기한 지난 질문을 닫아 대기 슬롯을 
   assert.deepEqual(await owner(next, 'main', 'after-cancel'), { ok: false, status: '작업이 이 질문의 답을 기다리는 상태가 아닙니다.' });
   assert.equal(launcher.started, 2);
 });
+test('TASK-02 migration 009 반복 적용, 작업당 열린 질문 하나, 도구 승인 종류 질문 거부', async () => {
+  const sql = await readFile('migrations/009_codex_bridge.sql', 'utf8');
+  await database.pg.exec(sql); await database.pg.exec(sql);
+  assert.ok((await rows('schema_migrations')).some(row => row.version === 9));
+  const { job } = await asked();
+  const insert = (id: string, kind: string, turn: number) => database.db.query(`INSERT INTO codex_questions(id,job_id,conversation_id,
+    thread_id,turn,kind,responder_id,prompt,state,created_at,expires_at) VALUES ($1,$2,$3,$4,$5,$6,'fixture-owner','x','open',0,1)`,
+  [id, job.id, job.conversation_id, THREAD, turn, kind]);
+  await assert.rejects(insert('second-open', 'clarification', 2));
+  await assert.rejects(insert('approval', 'tool_approval', 3));
+  assert.equal((await rows('codex_questions')).length, 1);
+});
 test('AUTH-02 질문 답 직전 owner 교체·즉시 철회·정책 만료는 차단, 답 수락 뒤 철회는 resume 전에 차단', async () => {
   const { question } = await asked();
   f.policy.owner = 'replacement';
@@ -413,6 +425,31 @@ test('TASK-03 취소·정상 종료 뒤 남은 프로세스는 unknown, 새 실�
   const third = (await jobs())[2]!;
   assert.equal(third.state, 'unknown'); assert.equal(third.wait_reason, 'codex_survivors');
   assert.equal((await database.db.query('SELECT * FROM results WHERE job_id=$1', [third.id])).rows.length, 0);
+});
+test('TASK-03 unknown 막힘은 디스크 DB 재시작 뒤에도 유지되고, 해제 전에는 새 실행을 막음', async () => {
+  const dir = await mkdtemp('.local/codex-db-');
+  const boot = async (left: number) => {
+    const disk = await localDatabase(dir);
+    const g = await fixture(disk.db);
+    const fake = new FakeLauncher(); fake.left = left;
+    const b = new CodexBridge(g.store, g.gate, new ExecCodexAdapter(root, fake), { monitorMs: 5 });
+    return { disk, g, b, fake, r: new Runtime(g.store, g.gate, g.worker, g.signer, g.reader, b) };
+  };
+  try {
+    const first = await boot(1);
+    await first.g.ingress.receive(event('disk-1', { kind: 'command', command: 'task' }));
+    await first.r.tick();
+    const job = (await first.disk.db.query<Record<string, any>>('SELECT * FROM jobs')).rows[0]!;
+    assert.equal(job.state, 'unknown');
+    await first.disk.pg.close();
+    const second = await boot(0);
+    try {
+      await second.g.ingress.receive(event('disk-2', { kind: 'command', command: 'task' }));
+      assert.equal(await second.r.tick(), false); assert.equal(second.fake.started, 0);
+      assert.equal((await second.b.release('fixture-owner', thread, job.id)).ok, true);
+      assert.equal(await second.r.tick(), true); assert.equal(second.fake.started, 1);
+    } finally { await second.disk.pg.close(); }
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 test('TASK-03 중단 신호 뒤에도 끝나지 않는 실행은 기다리지 않고 unknown·새 실행 차단', async () => {
   const stuck = new CodexBridge(f.store, f.gate, { capabilities: () => CODEX_CAPABILITIES,
