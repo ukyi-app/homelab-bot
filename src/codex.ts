@@ -60,7 +60,8 @@ export const nodeFiles: CodexFiles = {
   remove: path => rm(path, { force: true }),
   resolve: path => realpath(path),
 };
-export interface CodexTaskRequest { job: string; prompt: string; resume: string | null }
+export interface CodexTaskRequest { job: string; prompt: string; resume: string | null; toolCalls?: number }
+export interface CodexLimits { lineBytes: number; outputBytes: number; events: number }
 export interface CodexTaskAdapter {
   capabilities(): CodexCapabilities;
   execute(request: CodexTaskRequest, signal: AbortSignal): Promise<RunOutcome>;
@@ -72,7 +73,7 @@ export class ExecCodexAdapter implements CodexTaskAdapter {
   private readonly root: string;
   constructor(root: string, private readonly launcher: CodexLauncher,
     private readonly options: { files?: CodexFiles; workspace?: CodexWorkspace; homes?: string[];
-      proxy?: { https: string; noProxy: string } } = {}) {
+      proxy?: { https: string; noProxy: string }; limits?: Partial<CodexLimits> } = {}) {
     this.root = assertWorkerRoot(root, options.homes);
   }
   capabilities(): CodexCapabilities { return CODEX_CAPABILITIES; }

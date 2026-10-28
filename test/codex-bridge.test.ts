@@ -1,17 +1,17 @@
 import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { DEFAULTS, Denied, PolicyUnavailable } from '../src/contracts.js';
 import { CODEX_CAPABILITIES, CODEX_DEFAULTS, CapabilityUnavailable, CodexBridge, ExecCodexAdapter, TASK_INSTRUCTIONS,
   describeCapabilities, nodeFiles } from '../src/codex.js';
-import type { CodexFiles, CodexLauncher, LaunchResult, LaunchSpec } from '../src/codex.js';
+import type { CodexFiles, CodexLauncher, CodexLimits, LaunchResult, LaunchSpec } from '../src/codex.js';
 import { FORBIDDEN_FLAGS, SECRET_NAME, TASK_MARKER, assertWorkerRoot, codexConfig, configToml, execArgs,
   launchEnvironment, taskPaths } from '../src/codex-config.js';
 import { authSecrets, interpretRun, parseStream } from '../src/codex-events.js';
 import type { RunReport } from '../src/codex-events.js';
 import { ProcessGroupLauncher } from '../src/codex-process.js';
-import { fileWorkspace } from '../src/codex-workspace.js';
+import { changedPaths, fileWorkspace } from '../src/codex-workspace.js';
 import { execFile } from 'node:child_process';
 import { Runtime } from '../src/runtime.js';
 import { localDatabase, fixture, event, thread } from './helpers.js';
@@ -625,17 +625,37 @@ process.stdin.on('end', () => {
     writeFileSync('child.pid', String(c.pid)); c.unref();
     const until = Date.now() + 5000; while (Date.now() < until && !require('node:fs').existsSync('ready')) {}
   }
+  const finish = () => {
+    writeFileSync(target, JSON.stringify({ status: 'completed', summary: 'local', question: '' }));
+    emit({ type: 'turn.completed', usage: {} });
+    process.exit(0);
+  };
   if (mode === 'hang') { setInterval(() => {}, 1000); return; }
-  writeFileSync(target, JSON.stringify({ status: 'completed', summary: 'local', question: '' }));
-  emit({ type: 'turn.completed', usage: {} });
-  process.exit(0);
+  if (mode === 'tools') {
+    // 도구 호출 시작을 150ms 간격으로 세 번 낸다. 셋째 호출이 시작되면 그 효과로 파일을 남긴다.
+    let n = 0;
+    const step = () => {
+      n++;
+      emit({ type: 'item.started', item: { id: 'cmd_' + n, type: 'command_execution', command: 'echo ' + n, aggregated_output: '', status: 'in_progress' } });
+      if (n === 3) { writeFileSync('third.txt', '3'); finish(); } else setTimeout(step, 150);
+    };
+    step(); return;
+  }
+  if (mode === 'bigline') {
+    process.stdout.write('{"type":"item.completed","item":{"id":"big","type":"command_execution","aggregated_output":"' + 'a'.repeat(3 * 1024 * 1024) + '"}}\\n');
+  }
+  if (mode === 'flood') {
+    for (let i = 0; i < 3000; i++) emit({ type: 'item.updated', item: { id: 'cmd_1', type: 'command_execution', aggregated_output: 'x'.repeat(80) } });
+  }
+  finish();
 });`;
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-async function local(mode: string, job: string, abortAfter?: number) {
-  const runner = new ExecCodexAdapter(root, new ProcessGroupLauncher([process.execPath, '-e', FAKE_CODEX, mode], { graceMs: 500 }));
+async function local(mode: string, job: string, abortAfter?: number, extra: { limits?: Partial<CodexLimits>; toolCalls?: number } = {}) {
+  const runner = new ExecCodexAdapter(root, new ProcessGroupLauncher([process.execPath, '-e', FAKE_CODEX, mode], { graceMs: 500 }),
+    { limits: extra.limits });
   const controller = new AbortController();
   if (abortAfter !== undefined) setTimeout(() => controller.abort(), abortAfter);
-  const result = await runner.execute({ job, prompt: '지시', resume: null }, controller.signal);
+  const result = await runner.execute({ job, prompt: '지시', resume: null, toolCalls: extra.toolCalls ?? 8 }, controller.signal);
   const workspace = taskPaths(root, job).workspace;
   const pid = Number(await nodeFiles.read(join(workspace, 'child.pid')) ?? 0);
   if (pid) spawned.push(pid);
@@ -833,4 +853,121 @@ test('TASK-03 질문 재개로 시도 한도에 닿은 뒤 한도 대기가 오�
   assert.equal((await jobs())[0]!.attempt, 3); assert.equal((await jobs())[0]!.wait_reason, 'model_limit');
   assert.ok((await outbox()).some(row => row.payload.content.includes('재시도 한도에 닿아 재개할 수 없습니다')));
   assert.equal((await f.store.control('fixture-owner', f.store.scopeId(thread), 'resume-model', job.id) as { ok: boolean }).ok, false);
+});
+
+// ---- rev-t18 r1 회귀 시험: 수정 전 실패를 먼저 확인했다(VERIFICATION "r1 반영"). ----
+test('S1·R2 스레드가 생기기 전 인증·한도 오류도 대기로 판정', () => {
+  for (const [message, reason] of [['401 unauthorized', 'auth_expired'], ['usage_limit_reached', 'model_limit']] as const) {
+    assert.deepEqual(interpretRun(report(jsonl({ type: 'error', message }), null, { exit: { code: 1, signal: null } }), null),
+      { kind: 'waiting', reason, threadId: null, turns: 0 });
+  }
+  // 흐름 손상·다른 스레드 검사는 그대로 앞선다.
+  assert.equal(interpretRun(report(['broken', ...jsonl({ type: 'error', message: '401 unauthorized' })], null, { exit: { code: 1, signal: null } }), null).kind, 'failed');
+});
+test('S1·R2 세션 전 인증 만료는 waiting_user·전역 모델 대기로 남고 다음 작업을 받지 않음', async () => {
+  launcher.scripts.push({ lines: jsonl({ type: 'error', message: '401 unauthorized' }), exit: { code: 1, signal: null } });
+  await task();
+  await runtime.tick();
+  const job = (await jobs())[0]!;
+  assert.equal(job.state, 'waiting_user'); assert.equal(job.wait_reason, 'auth_expired');
+  assert.equal((await rows('controls')).find(row => row.key === 'scheduler')!.value, true);
+  await task('task-2');
+  assert.equal(await runtime.tick(), false); assert.equal(launcher.started, 1);
+});
+test('R1 준비 중 중단·해제된 작업은 준비가 늦게 끝나도 프로세스를 띄우지 않음', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const slow = { prepare: async (dir: string) => { await gate; await fileWorkspace.prepare(dir); }, snapshot: (dir: string) => fileWorkspace.snapshot(dir) };
+  const slowAdapter = new ExecCodexAdapter(root, launcher, { workspace: slow });
+  const slowBridge = new CodexBridge(f.store, f.gate, slowAdapter, { monitorMs: 5, stopWaitMs: 5 });
+  const local = new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, slowBridge);
+  const job = await task();
+  await database.db.query(`UPDATE jobs SET budget='{"timeoutMs":5,"toolCalls":8}' WHERE id=$1`, [job.id]);
+  await local.tick();
+  assert.equal((await jobs())[0]!.state, 'unknown'); assert.equal(launcher.started, 0);
+  assert.equal((await slowBridge.release('fixture-owner', thread, job.id)).ok, true);
+  assert.equal((await jobs())[0]!.state, 'cancelled');
+  release();
+  for (let i = 0; i < 50; i++) await new Promise(resolve => setTimeout(resolve, 2));
+  assert.equal(launcher.started, 0);
+});
+test('R1 소멸 확인은 준비 중인 실행도 무효로 만들고, 이미 중단된 신호로는 실제 launcher가 spawn하지 않음', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const slow = { prepare: async (dir: string) => { await gate; await fileWorkspace.prepare(dir); }, snapshot: (dir: string) => fileWorkspace.snapshot(dir) };
+  const pending = new ExecCodexAdapter(root, launcher, { workspace: slow });
+  const job = '00000000-0000-4000-8000-0000000000a9';
+  const running = pending.execute({ job, prompt: 'p', resume: null, toolCalls: 8 }, new AbortController().signal);
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.deepEqual(await pending.confirmStop(job), { stopped: true });
+  release();
+  assert.equal((await running).kind, 'failed'); assert.equal(launcher.started, 0);
+  const real = new ProcessGroupLauncher([process.execPath, '-e', 'require("node:fs").writeFileSync(process.argv[1], "spawned")', join(root, 'spawned.txt')]);
+  const aborted = new AbortController(); aborted.abort();
+  await assert.rejects(real.run({ job, args: [], cwd: root, env: { PATH: '/usr/bin:/bin' }, stdin: '' }, aborted.signal));
+  await new Promise(resolve => setTimeout(resolve, 200));
+  assert.equal(await nodeFiles.read(join(root, 'spawned.txt')), null);
+});
+test('S2 도구 호출 예산을 넘는 작업은 완료로 보고하지 않음(작업 budget.toolCalls)', async () => {
+  const tool = (id: string) => ({ type: 'item.started', item: { id, type: 'command_execution', command: 'echo', status: 'in_progress' } });
+  launcher.scripts.push(finished(out('completed', '끝'), [tool('cmd_1'), tool('cmd_2')]));
+  const job = await task();
+  await database.db.query(`UPDATE jobs SET budget='{"timeoutMs":1800000,"toolCalls":1}' WHERE id=$1`, [job.id]);
+  await runtime.tick();
+  assert.equal((await jobs())[0]!.state, 'failed'); assert.equal((await jobs())[0]!.wait_reason, 'codex_tool_budget_exceeded');
+  assert.equal((await rows('results')).length, 0);
+});
+test('S2 도구 호출 예산은 질문 뒤 재개까지 합산', async () => {
+  const tool = (id: string) => ({ type: 'item.started', item: { id, type: 'command_execution', command: 'echo', status: 'in_progress' } });
+  launcher.scripts.push(finished(out('needs_input', '조사', '어느 쪽?'), [tool('cmd_1'), tool('cmd_2')]));
+  const job = await task();
+  await database.db.query(`UPDATE jobs SET budget='{"timeoutMs":1800000,"toolCalls":2}' WHERE id=$1`, [job.id]);
+  await runtime.tick();
+  assert.equal((await jobs())[0]!.state, 'waiting_user');
+  await owner(`${job.id}:${THREAD}:1`, 'main', 'answer-1');
+  launcher.scripts.push(finished(out('completed', '끝'), [tool('cmd_3')], null));
+  await runtime.tick();
+  assert.equal((await jobs())[0]!.wait_reason, 'codex_tool_budget_exceeded');
+});
+test('S2 실제 프로세스: 예산을 넘는 도구 호출 시작을 보는 즉시 작업 그룹을 끝내 다음 호출이 일어나지 않음', async () => {
+  const job = '00000000-0000-4000-8000-0000000000b9';
+  const run = await local('tools', job, undefined, { toolCalls: 1 });
+  assert.equal(run.result.kind === 'failed' && run.result.reason, 'tool_budget_exceeded');
+  assert.equal(await nodeFiles.read(join(taskPaths(root, job).workspace, 'third.txt')), null);
+});
+test('S3 실제 프로세스: 한 줄·전체 출력 상한을 넘으면 정리 뒤 실패, 출력을 쌓아 두지 않음', async () => {
+  const big = await local('bigline', '00000000-0000-4000-8000-0000000000c9', undefined, { limits: { lineBytes: 1024 * 1024 } });
+  assert.equal(big.result.kind === 'failed' && big.result.reason, 'output_limit_exceeded');
+  const flood = await local('flood', '00000000-0000-4000-8000-0000000000d9', undefined, { limits: { outputBytes: 64 * 1024 } });
+  assert.equal(flood.result.kind === 'failed' && flood.result.reason, 'output_limit_exceeded');
+  const normal = await local('flood', '00000000-0000-4000-8000-0000000000e9');
+  assert.equal(normal.result.kind, 'completed');
+});
+test('R3 첫 턴 한도 대기 뒤 /resume-model은 저장된 스레드를 재개하고 처음부터 다시 하지 않음', async () => {
+  launcher.scripts.push({ lines: jsonl(...begin('thread-one'), { type: 'turn.failed', error: { message: 'usage_limit_reached' } }), exit: { code: 1, signal: null } });
+  const job = await task();
+  await runtime.tick();
+  assert.equal((await jobs())[0]!.wait_reason, 'model_limit');
+  assert.equal((await f.store.control('fixture-owner', f.store.scopeId(thread), 'resume-model', job.id) as { ok: boolean }).ok, true);
+  launcher.scripts.push(finished(out('completed', '이어서 끝냄'), [], null));
+  await runtime.tick();
+  const resumed = launcher.specs[1]!;
+  assert.deepEqual(resumed.args.slice(0, 2), ['exec', 'resume']); assert.ok(resumed.args.includes('thread-one'));
+  assert.ok(!resumed.stdin.includes('실패하는 시험을 고쳐줘'));
+  assert.equal((await rows('codex_sessions'))[0]!.thread_id, 'thread-one');
+  assert.equal((await jobs())[0]!.state, 'succeeded');
+});
+test('R4 실행 권한만 바뀐 파일도 실제 변경으로 기록', async () => {
+  const dir = resolve(await mkdtemp('.local/mode-'));
+  try {
+    await writeFile(join(dir, 'run.sh'), '#!/bin/sh\n');
+    await chmod(join(dir, 'run.sh'), 0o644);
+    const before = (await fileWorkspace.snapshot(dir))!;
+    await chmod(join(dir, 'run.sh'), 0o755);
+    assert.deepEqual(changedPaths(before, (await fileWorkspace.snapshot(dir))!), ['run.sh']);
+    // git이 보지 않는 권한 비트(쓰기 등)만 바뀐 것은 변경으로 세지 않는다.
+    const executable = (await fileWorkspace.snapshot(dir))!;
+    await chmod(join(dir, 'run.sh'), 0o775);
+    assert.deepEqual(changedPaths(executable, (await fileWorkspace.snapshot(dir))!), []);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
