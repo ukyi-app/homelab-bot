@@ -99,17 +99,24 @@ export class FileDeletionLedger implements DeletionLedger {
       try { await handle.sync(); } catch (error) { this.syncFailed = true; throw error; }
     } finally { await handle.close(); }
     // 파일을 만든 직후뿐 아니라 이 프로세스에서 확인하기 전까지는 디렉터리 항목도 fsync해야 전원 차단 뒤 파일이 남는다.
-    if (!this.dirSynced) {
-      const dir = await this.io.open(dirname(this.path), 'r');
-      try { await dir.sync(); } finally { await dir.close(); }
-      this.dirSynced = true;
-    }
+    await this.syncDirectory();
   }
   // fsync가 한 번 실패하면 커널이 실패한 페이지를 clean으로 돌려 캐시만 보고 기록됐다고 답할 수 있다. 그 뒤로는 판정하지 않는다.
+  // 파일과 디렉터리 항목이 둘 다 fsync로 확인될 때만 기록됐다고 답한다. 새 파일의 디렉터리 항목이 없으면 전원 차단 뒤 파일째 사라진다.
   async has(memoryId: string, createdAt: number): Promise<boolean> {
     if (this.syncFailed) throw new Error('deletion_ledger_unsynced');
     await this.tail;
+    const handle = await this.io.open(this.path, 'r').catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return undefined; throw error; });
+    if (!handle) return false;
+    try { await handle.sync(); } catch (error) { this.syncFailed = true; throw error; } finally { await handle.close(); }
+    await this.syncDirectory();
     return (await this.entries()).some(e => e.memoryId === memoryId && e.createdAt === createdAt);
+  }
+  private async syncDirectory(): Promise<void> {
+    if (this.dirSynced) return;
+    const dir = await this.io.open(dirname(this.path), 'r');
+    try { await dir.sync(); } finally { await dir.close(); }
+    this.dirSynced = true;
   }
   async entries(): Promise<DeletionEntry[]> {
     let raw: string;
@@ -186,6 +193,7 @@ export class MemoryService {
       await tx.query("UPDATE memories SET status='superseded',updated_at=$2 WHERE id=ANY($1::text[])", [ids, this.now()]);
       await tx.query('DELETE FROM memory_terms WHERE memory_id=ANY($1::text[])', [ids]);
       await this.forget(tx, ids);
+      await this.reviseBriefings(tx, rows.map(row => erasedKey(row.id, Number(row.created_at))), false);
       return result;
     });
   }
@@ -194,10 +202,14 @@ export class MemoryService {
     this.assertReady();
     await this.gate.authorize(actor, scope);
     if (!/^(conversation|job|document|external|channel):.{1,500}$/s.test(sourceKey)) throw new MemoryRejected('memory_exclusion_invalid');
-    await this.db.query('INSERT INTO memory_exclusions(source_key,owner_id,created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [sourceKey, actor, this.now()]);
-    const hidden = (await this.db.query<{ count: string | number }>(`SELECT count(*) AS count FROM memories
-      WHERE owner_id=$1 AND status IN ('active','candidate') AND source_keys ? $2`, [actor, sourceKey])).rows[0]!.count;
-    return { hidden: Number(hidden) };
+    return this.db.transaction(async tx => {
+      await this.gate.withDatabase(tx).authorize(actor, scope);
+      await tx.query('INSERT INTO memory_exclusions(source_key,owner_id,created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [sourceKey, actor, this.now()]);
+      const hidden = (await tx.query<{ id: string; created_at: string | number }>(`SELECT id,created_at FROM memories
+        WHERE owner_id=$1 AND status IN ('active','candidate') AND source_keys ? $2`, [actor, sourceKey])).rows;
+      await this.reviseBriefings(tx, hidden.map(row => erasedKey(row.id, Number(row.created_at))), false);
+      return { hidden: hidden.length };
+    });
   }
   async search(actor: string, scope: Scope, query: string): Promise<MemoryView[]> {
     this.assertReady();
@@ -299,26 +311,38 @@ export class MemoryService {
         await tx.query('DELETE FROM memory_terms WHERE memory_id=$1', [id]);
         await this.forget(tx, [id]);
       }
-      const keys = (await tx.query<{ outbox_key: string }>(`SELECT outbox_key FROM briefing_runs
-        WHERE outbox_key IS NOT NULL AND memory_ids ? $1`, [erasedKey(id, createdAt)])).rows.map(row => row.outbox_key);
-      let publishedCopies = 0;
-      if (keys.length) {
-        // 발송 시작 전인 sending은 게시자의 dispatch 표시가 state='sending'을 요구하므로 blocked로 바꾸면 보내지 않는다.
-        await tx.query(`UPDATE outbox SET state='blocked' WHERE message_key=ANY($1::text[])
-          AND (state='pending' OR (state='sending' AND dispatch_started=false))`, [keys]);
-        // 이미 보냈거나 보내는 중인 메시지는 Discord에서 지우지 않는다. 로컬 사본만 가린다.
-        // 분류를 safe_summary 밖으로 바꿔 두면 429 등으로 pending에 돌아와도 게시자가 거부한다(src/discord.ts authorized).
-        await tx.query(`UPDATE outbox SET payload=jsonb_set(jsonb_set(payload,'{content}',to_jsonb($2::text)),'{classification}','"redacted"')
-          WHERE message_key=ANY($1::text[])`, [keys, REDACTED]);
-        publishedCopies = Number((await tx.query<{ count: string }>(`SELECT count(DISTINCT message_key) AS count FROM outbox
-          WHERE message_key=ANY($1::text[]) AND state IN ('sent','unknown','sending')`, [keys])).rows[0]!.count);
-      }
+      const { derived, publishedCopies } = await this.reviseBriefings(tx, [erasedKey(id, createdAt)], true);
       await tx.query(`INSERT INTO memory_deletions(memory_id,memory_created_at,requested_by,requested_at,ledger_state,applied_at)
         VALUES ($1,$2,'deletion_ledger',$3,'recorded',$4) ON CONFLICT (memory_id,memory_created_at)
         DO UPDATE SET ledger_state='recorded',applied_at=COALESCE(memory_deletions.applied_at,$4)`, [id, createdAt, deletedAt, now]);
-      await this.audit('memory_deleted', id, { replay, derivedDeliveries: keys.length, publishedCopies }, tx);
+      await this.audit('memory_deleted', id, { replay, derivedDeliveries: derived, publishedCopies }, tx);
       return { applied, publishedCopies };
     });
+  }
+  // 정정·저장 제외·삭제를 이미 만든 브리핑에 반영한다. 발송을 시작하지 않은 회차는 막고 새 revision으로 다시 작성하게 되돌린다.
+  // 발송을 시작한 사본은 Discord에서 지우지 못한다. 분류를 safe_summary 밖으로 바꿔 429 등으로 대기열에 돌아와도 게시자가 거부하게 한다.
+  private async reviseBriefings(tx: Database, memoryKeys: string[], erase: boolean): Promise<{ derived: number; publishedCopies: number }> {
+    if (!memoryKeys.length) return { derived: 0, publishedCopies: 0 };
+    const runs = (await tx.query<{ schedule_id: string; slot_date: string; outbox_key: string; state: string }>(`SELECT schedule_id,slot_date,outbox_key,state
+      FROM briefing_runs WHERE outbox_key IS NOT NULL AND memory_ids ?| $1::text[] FOR UPDATE`, [memoryKeys])).rows;
+    if (!runs.length) return { derived: 0, publishedCopies: 0 };
+    const keys = runs.map(run => run.outbox_key);
+    // 발송 시작 전인 sending은 게시자의 dispatch 표시가 state='sending'을 요구하므로 blocked로 바꾸면 보내지 않는다.
+    const blocked = new Set((await tx.query<{ message_key: string }>(`UPDATE outbox SET state='blocked' WHERE message_key=ANY($1::text[])
+      AND (state='pending' OR (state='sending' AND dispatch_started=false)) RETURNING message_key`, [keys])).rows.map(row => row.message_key));
+    const started = new Set((await tx.query<{ message_key: string }>(`SELECT DISTINCT message_key FROM outbox WHERE message_key=ANY($1::text[])
+      AND (state IN ('sent','sending','unknown') OR dispatch_started)`, [keys])).rows.map(row => row.message_key));
+    const publishedCopies = started.size;
+    await tx.query(`UPDATE outbox SET payload=jsonb_set(payload,'{classification}','"redacted"')
+      WHERE message_key=ANY($1::text[]) AND state='sending'`, [keys]);
+    const redo = runs.filter(run => run.state === 'enqueued' && blocked.has(run.outbox_key) && !started.has(run.outbox_key));
+    // 지울 내용이거나 다시 보낼 일이 없는 사본은 내용을 가린다.
+    const hide = erase ? keys : redo.map(run => run.outbox_key);
+    if (hide.length) await tx.query(`UPDATE outbox SET payload=jsonb_set(jsonb_set(payload,'{content}',to_jsonb($2::text)),'{classification}','"redacted"')
+      WHERE message_key=ANY($1::text[])`, [hide, REDACTED]);
+    for (const run of redo) await tx.query(`UPDATE briefing_runs SET state='composing',revision=revision+1,outbox_key=NULL,memory_ids='[]',
+      reason='memory_changed',lease_token=NULL,lease_until=NULL,updated_at=$3 WHERE schedule_id=$1 AND slot_date=$2`, [run.schedule_id, run.slot_date, this.now()]);
+    return { derived: runs.length, publishedCopies };
   }
   private async lockTopic(tx: Database, actor: string, topic: string | undefined): Promise<void> {
     if (topic) await tx.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`memory-topic:${actor}:${topic}`]);
@@ -337,8 +361,8 @@ export class MemoryService {
     // 같은 주제에 다른 진술이 살아 있으면 어느 쪽도 확정하지 않고 사람의 정정을 기다린다.
     const conflicts = input.topic ? (await tx.query<{ id: string }>(`SELECT id FROM memories WHERE owner_id=$1 AND topic=$2
       AND status IN ('active','candidate') AND deletion_requested_at IS NULL AND statement<>$3 AND id<>ALL($4::text[])
-      AND NOT EXISTS (SELECT 1 FROM memory_exclusions x WHERE x.owner_id=memories.owner_id AND memories.source_keys ? x.source_key) ORDER BY id`,
-    [actor, input.topic, input.statement, replaces])).rows.map(row => row.id) : [];
+      AND (expires_at IS NULL OR expires_at>$5) AND NOT EXISTS (SELECT 1 FROM memory_exclusions x WHERE x.owner_id=memories.owner_id AND memories.source_keys ? x.source_key) ORDER BY id`,
+    [actor, input.topic, input.statement, replaces, now])).rows.map(row => row.id) : [];
     const status = evidence.active && !conflicts.length ? 'active' : 'candidate';
     const { kind, statement, topic, sources, scope: about, classification, validFrom, expiresAt, recheckAt, recheckCondition } = input;
     const details = kind === 'configuration' ? { sourceRevision: input.sourceRevision ?? null }
@@ -389,6 +413,7 @@ export class MemoryService {
         check = event && event.accepted && event.actor_id === actor && await this.reachable(actor, event.scope) ? 'verified' : 'inaccessible';
       } else if (source.type === 'job') {
         const job = (await this.db.query<{ owner_id: string; state: string; target: Scope }>('SELECT owner_id,state,target FROM jobs WHERE id=$1', [source.job])).rows[0];
+        if (job) keys.push(`channel:${job.target.channel}`, `channel:${parent(job.target)}`);
         check = !job || job.owner_id !== actor || !await this.reachable(actor, job.target) ? 'inaccessible' : job.state === 'succeeded' ? 'verified' : 'unverified';
       } else {
         check = await this.documents.check(actor, source.uri, source.type === 'document' ? source.revision : null);
@@ -421,9 +446,11 @@ export class MemoryService {
   }
   private async views(rows: MemoryRow[]): Promise<MemoryView[]> {
     const linked = [...new Set(rows.flatMap(row => row.conflicts_with))];
-    const live = new Set(linked.length ? (await this.db.query<{ id: string }>(`SELECT id FROM memories WHERE id=ANY($1::text[])
-      AND status IN ('active','candidate') AND deletion_requested_at IS NULL`, [linked])).rows.map(row => row.id) : []);
     const now = this.now();
+    // 만료된 기억은 더 이상 현재 충돌이 아니다.
+    const live = new Set(linked.length ? (await this.db.query<{ id: string }>(`SELECT id FROM memories WHERE id=ANY($1::text[])
+      AND status IN ('active','candidate') AND deletion_requested_at IS NULL AND (expires_at IS NULL OR expires_at>$2)`,
+    [linked, now])).rows.map(row => row.id) : []);
     return rows.map(row => {
       const flags: MemoryView['flags'] = [];
       if (row.status === 'candidate') flags.push('unverified');

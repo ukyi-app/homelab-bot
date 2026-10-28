@@ -22,7 +22,7 @@ interface ScheduleRow {
   id: string; owner_id: string; scope: Scope; timezone: string; next_run: string | number;
   payload: { kind?: string; time?: string }; enabled: boolean;
 }
-interface Claim { schedule: ScheduleRow; slot: number; date: string; token: string; time: string }
+interface Claim { schedule: ScheduleRow; slot: number; date: string; token: string; time: string; revision: number }
 export type BriefingOutcome = 'idle' | 'enqueued' | 'blocked' | 'deferred';
 
 type Parts = { year: number; month: number; day: number; hour: number; minute: number; second: number };
@@ -118,6 +118,18 @@ export class BriefingScheduler {
       const now = this.store.now();
       const slot = latestSlot(now, time, zone);
       const date = localDate(slot, zone);
+      // 발송을 시작하지 않은 지난 회차와 12시간 넘게 못 보낸 회차는 막고 누락으로 남긴다. 최신 회차와 몰아 보내지 않는다.
+      // 게시자가 이 정리를 앞지르지 않도록 기동 때는 tick을 게시자보다 먼저 돌린다(DECISIONS T20 기동 순서).
+      const stale = (await tx.query<{ slot_date: string; slot_at: string | number; outbox_key: string }>(`SELECT slot_date,slot_at,outbox_key
+        FROM briefing_runs r WHERE schedule_id=$1 AND state='enqueued' AND (slot_at<$2 OR slot_at<$3)
+        AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.message_key=r.outbox_key AND (o.state IN ('sent','unknown') OR o.dispatch_started))
+        FOR UPDATE`, [schedule.id, slot, now - BRIEFING.skipAfterMs])).rows;
+      for (const run of stale) {
+        await tx.query(`UPDATE outbox SET state='blocked' WHERE message_key=$1
+          AND (state='pending' OR (state='sending' AND dispatch_started=false))`, [run.outbox_key]);
+        await tx.query('UPDATE briefing_runs SET state=$3,reason=$4,updated_at=$5 WHERE schedule_id=$1 AND slot_date=$2',
+          [schedule.id, run.slot_date, 'missed', Number(run.slot_at) < slot ? 'superseded_by_later_slot' : 'too_late', now]);
+      }
       if (Number(schedule.next_run) <= now) {
         // 중단 동안 지난 회차는 몰아 보내지 않는다. 누락으로만 남기고 최신 회차 하나에 표시한다.
         let count = 0;
@@ -138,10 +150,10 @@ export class BriefingScheduler {
       }
       // 같은 회차를 두 인스턴스가 함께 만들지 않게 lease를 잡는다. 만료된 composing은 재시작 뒤 다시 잡는다.
       const token = randomUUID();
-      const held = (await tx.query(`UPDATE briefing_runs SET lease_token=$3,lease_until=$4,updated_at=$5
-        WHERE schedule_id=$1 AND slot_date=$2 AND state='composing' AND (lease_until IS NULL OR lease_until<=$5) RETURNING slot_date`,
-      [schedule.id, date, token, now + BRIEFING.leaseMs, now])).rows.length;
-      return held ? { schedule, slot, date, token, time } : undefined;
+      const held = (await tx.query<{ revision: number }>(`UPDATE briefing_runs SET lease_token=$3,lease_until=$4,updated_at=$5
+        WHERE schedule_id=$1 AND slot_date=$2 AND state='composing' AND (lease_until IS NULL OR lease_until<=$5) RETURNING revision`,
+      [schedule.id, date, token, now + BRIEFING.leaseMs, now])).rows[0];
+      return held ? { schedule, slot, date, token, time, revision: Number(held.revision) } : undefined;
     });
   }
   private async compose(claim: Claim): Promise<BriefingOutcome> {
@@ -174,7 +186,8 @@ export class BriefingScheduler {
         const current = await this.gate.withDatabase(tx).authorize(owner, scope);
         // 작성하는 동안 지우거나 대체한 기억이 있으면 다시 작성한다. FOR SHARE가 그 행의 삭제 정리와 직렬화한다.
         if (!await this.memory.live(tx, memory.items)) throw new StaleBriefing();
-        const key = `briefing:${schedule.id}:${claim.date}`;
+        // 기억 정정·제외·삭제로 다시 작성한 회차는 새 멱등 키를 쓴다. 막은 이전 사본과 겹치지 않게 한다.
+        const key = `briefing:${schedule.id}:${claim.date}${claim.revision ? `:r${claim.revision}` : ''}`;
         const held = (await tx.query(`UPDATE briefing_runs SET state='enqueued',outbox_key=$4,memory_ids=$5,lease_token=NULL,lease_until=NULL,updated_at=$6
           WHERE schedule_id=$1 AND slot_date=$2 AND lease_token=$3 AND state='composing' AND lease_until>$6 RETURNING slot_date`,
         [schedule.id, claim.date, claim.token, key, JSON.stringify(memory.items.map(item => `${item.id}@${item.createdAt}`)), this.store.now()])).rows.length;

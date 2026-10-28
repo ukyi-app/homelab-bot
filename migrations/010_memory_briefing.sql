@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS memory_deletions (
 CREATE TABLE IF NOT EXISTS briefing_runs (
   schedule_id text NOT NULL, slot_date text NOT NULL, slot_at bigint NOT NULL,
   state text NOT NULL CHECK (state IN ('composing','enqueued','blocked','missed')),
-  reason text, outbox_key text, memory_ids jsonb NOT NULL DEFAULT '[]',
+  reason text, outbox_key text, memory_ids jsonb NOT NULL DEFAULT '[]', revision integer NOT NULL DEFAULT 0,
   lease_token text, lease_until bigint, created_at bigint NOT NULL, updated_at bigint NOT NULL,
   PRIMARY KEY (schedule_id, slot_date)
 );

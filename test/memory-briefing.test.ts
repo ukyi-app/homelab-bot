@@ -414,6 +414,8 @@ test('BRIEF-01 며칠 중단 뒤에는 밀린 회차를 몰아 보내지 않고 
   assert.equal(all[0]!.idempotency_key, 'briefing:daily-briefing:2027-01-19');
   assert.match(all[0]!.payload.content, /지연 발송: 예정 08:50, 작성 01-19 09:20/);
   assert.match(all[0]!.payload.content, /누락: 01-16, 01-17, 01-18 브리핑은 보내지 않았습니다/);
+  // 보낸 회차는 누락이 아니다. 보내지 않은 채 12시간이 지나면 누락으로 바뀐다(rev-t20 P2-2 시험).
+  await f.publisher.deliver();
   at(SLOT + 4 * DAY + BRIEFING.skipAfterMs + 1);
   assert.equal(await s.tick(), 'idle');
   assert.deepEqual((await rows('briefing_runs')).filter(r => r.slot_date === '2027-01-20').map(r => [r.state, r.reason]), [['missed', 'too_late']]);
