@@ -153,12 +153,15 @@ export class ReviewQueue {
     await tx.query(`INSERT INTO controls VALUES ('review_admission','false') ON CONFLICT DO NOTHING`);
     await tx.query(`SELECT * FROM controls WHERE key='review_admission' FOR UPDATE`);
     const key = generationKey(repo.id, pr.number, pr.head.sha, pr.base.sha, context.revision);
-    const existing = (await tx.query<{ job_id: string; state: string; attempt: number }>(`SELECT p.job_id,j.state,j.attempt
+    const existing = (await tx.query<{ job_id: string; state: string; attempt: number; superseded_at: string | null; delivered: boolean }>(
+      `SELECT p.job_id,j.state,j.attempt,p.superseded_at,EXISTS (SELECT 1 FROM review_deliveries d WHERE d.job_id=p.job_id
+        AND d.state IN ('pending','sending','sent','unknown')) AS delivered
       FROM pr_reviews p JOIN jobs j ON j.id=p.job_id WHERE p.generation_key=$1`, [key])).rows[0];
-    // 대기·진행·완료된 같은 세대는 다시 넣지 않는다(직렬 1개, D-14). 닫힘·draft·옛 이벤트로 밀려난 세대가
-    // 다시 live가 됐거나, 명시 요청이 확인된 실패를 다시 부를 때만 같은 작업을 되살린다. 세대당 모델 호출은 재시도 한도로 묶는다.
-    const revive = existing && existing.attempt <= DEFAULTS.maxRetries
-      && (existing.state === 'superseded' || (trigger === 'comment' && existing.state === 'failed'));
+    // 대기·진행·게시된 같은 세대는 다시 넣지 않는다(직렬 1개, D-14). 닫힘·draft·옛 이벤트로 밀려나 게시되지 못한 세대가
+    // 다시 live가 됐거나, 명시 요청이 확인된 실패·취소를 다시 부를 때만 같은 작업을 되살린다. 세대당 시도는 재시도 한도로 묶는다.
+    const revive = existing && existing.attempt <= DEFAULTS.maxRetries && (existing.state === 'superseded'
+      || (existing.state === 'succeeded' && existing.superseded_at !== null && !existing.delivered)
+      || (trigger === 'comment' && ['failed', 'cancelled'].includes(existing.state)));
     if (existing && !revive) return { outcome: 'duplicate_generation', key, job: existing.job_id };
     const latest = (await tx.query<ReviewRow>(`SELECT * FROM pr_reviews WHERE repo_id=$1 AND pr_number=$2
       ORDER BY pr_updated_at DESC,created_at DESC LIMIT 1`, [repo.id, pr.number])).rows[0];
@@ -169,14 +172,19 @@ export class ReviewQueue {
       if (Number(queued.count) >= DEFAULTS.maxQueue) throw new Error('queue_full');
       await this.supersede(tx, repo.id, pr.number, 'new_generation', key);
       await tx.query(`UPDATE jobs SET state='queued',available_at=$2,wait_reason=NULL,finished_at=NULL,lease_token=NULL,lease_until=NULL
-        WHERE id=$1 AND state IN ('superseded','failed')`, [existing.job_id, now]);
-      await tx.query(`UPDATE pr_reviews SET review_outcome=NULL,result=NULL,superseded_at=NULL,superseded_reason=NULL,pr_updated_at=$2
-        WHERE job_id=$1`, [existing.job_id, pr.updatedAt]);
+        WHERE id=$1 AND state IN ('superseded','failed','cancelled','succeeded')`, [existing.job_id, now]);
+      // 되살린 이유(댓글 명시 요청 등)가 draft 예외 판단에 쓰이므로 trigger도 바꾼다.
+      await tx.query(`UPDATE pr_reviews SET review_outcome=NULL,result=NULL,superseded_at=NULL,superseded_reason=NULL,pr_updated_at=$2,
+        trigger=$3,defer_count=0 WHERE job_id=$1`, [existing.job_id, pr.updatedAt, trigger]);
       return { outcome: 'requeued', key, job: existing.job_id };
     }
     const baseOnly = latest && latest.head_sha === pr.head.sha && latest.comparison_revision !== pr.base.sha
       && latest.policy_revision === context.revision;
-    const rereview = !baseOnly || trigger === 'retarget' || trigger === 'comment' || context.review.rereviewOnBaseMove === true;
+    // base만 움직였을 때 재리뷰를 건너뛰는 것은 이전 세대가 이미 게시됐거나 확인된 실패로 끝났을 때뿐이다.
+    // 아직 리뷰가 한 번도 게시되지 않은 PR을 base 이동으로 버리지 않는다.
+    const concluded = !!latest && (await tx.query(`SELECT 1 FROM jobs j WHERE j.id=$1 AND (j.state='failed' OR EXISTS
+      (SELECT 1 FROM review_deliveries d WHERE d.job_id=j.id AND d.state IN ('sending','sent','unknown')))`, [latest.job_id])).rows.length > 0;
+    const rereview = !baseOnly || !concluded || trigger === 'retarget' || trigger === 'comment' || context.review.rereviewOnBaseMove === true;
     if (rereview) {
       const queued = (await tx.query<{ count: string }>("SELECT count(*) FROM jobs WHERE state='queued'")).rows[0]!;
       if (Number(queued.count) >= DEFAULTS.maxQueue) throw new Error('queue_full');
@@ -334,6 +342,7 @@ export function classify(output: Pick<ReviewOutput, 'findings' | 'open_questions
   return 'public';
 }
 const asJob = (row: Record<string, unknown>) => row as unknown as Job;
+const MAX_DEFERS = 10;
 export const notificationScope = (policy: Policy): Scope => ({ guild: policy.guild, channel: policy.notificationChannel, parent: null, kind: 'channel' });
 
 export interface ReviewWorkerClient {
@@ -351,6 +360,10 @@ export class ReviewRuntime {
       const control = (await tx.query<{ value: boolean }>(`SELECT value FROM controls WHERE key='scheduler' FOR UPDATE`)).rows[0]!;
       if (control.value) return;
       if ((await tx.query(`SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown','waiting_user') LIMIT 1`)).rows.length) return;
+      // 대화가 리뷰보다 먼저다(F05). Store.claim이 지금 집을 수 있는 대화·작업이 있으면 양보한다.
+      if ((await tx.query(`SELECT j.id FROM jobs j JOIN events e ON e.id=j.event_id JOIN conversations c ON c.id=j.conversation_id
+        WHERE j.state='queued' AND e.accepted=true AND c.active=true AND c.gap=false AND c.owner_id=j.owner_id
+        AND e.actor_id=j.owner_id AND j.available_at<=$1 LIMIT 1`, [this.store.now()])).rows.length) return;
       const row = (await tx.query<{ id: string }>(`SELECT id FROM jobs WHERE type='review' AND state='queued' AND available_at<=$1
         ORDER BY priority,created_at FOR UPDATE SKIP LOCKED LIMIT 1`, [this.store.now()])).rows[0];
       if (!row) return;
@@ -364,6 +377,7 @@ export class ReviewRuntime {
     if (!job) return false;
     const review = (await this.store.db.query<ReviewRow>('SELECT * FROM pr_reviews WHERE job_id=$1', [job.id])).rows[0]!;
     let dispatched = false;
+    let stopped = false;
     try {
       const context = await this.policy.current();
       const repo = context.review.repositories.find(r => String(r.id) === String(review.repo_id)
@@ -386,7 +400,7 @@ export class ReviewRuntime {
       let compare: { files: Change[]; truncated: boolean };
       try { compare = CompareSchema.parse(await this.reader.compare(repo.fullName, review.comparison_revision, review.head_sha)); }
       catch (error) {
-        if (error instanceof GitHubError && (error.status === 429 || error.status >= 500)) { await this.store.defer(asJob(job), 'github_unavailable'); return true; }
+        if (error instanceof GitHubError && (error.status === 429 || error.status >= 500)) { await this.backoff(job, review, error); return true; }
         // 열거 실패를 압축본 비교로 대신하지 않는다(REVIEW-03).
         await this.close(job, review, 'failed', 'enumeration_failed'); return true;
       }
@@ -396,6 +410,12 @@ export class ReviewRuntime {
         archives: { base: contract.base, head: contract.head }, changes: compare.files, truncated: compare.truncated,
         pullRequest: { title: pr.title.slice(0, 1000), body: pr.body.slice(0, 65_536) }, limits: context.review.input,
         policyRevision: context.revision, instructions: REVIEW_INSTRUCTIONS, timeoutMs: DEFAULTS.taskTimeoutMs });
+      // PR·목록 조회 동안 들어온 취소·비상 중지와 lease 만료를 dispatch 직전에 다시 본다.
+      const live = (await this.store.db.query<{ state: string; lease_token: string; lease_until: string }>(
+        'SELECT state,lease_token,lease_until FROM jobs WHERE id=$1', [job.id])).rows[0];
+      if (!live || live.lease_token !== job.lease_token || Number(live.lease_until) <= this.store.now()) return true;
+      if (live.state === 'cancel_requested') { await this.close(job, review, 'cancelled', 'cancel_before_dispatch'); return true; }
+      if (live.state !== 'running' || !await this.store.heartbeat(asJob(job))) return true;
       const abort = new AbortController();
       let timeout: ReturnType<typeof setTimeout> | undefined;
       let checking: Promise<void> | undefined;
@@ -431,6 +451,7 @@ export class ReviewRuntime {
         return true;
       }
       if (!result.stopped) { await this.store.transition(asJob(job), 'unknown', 'worker_disconnected'); return true; }
+      stopped = true;
       if (result.status === 'limited' || result.status === 'auth_expired') {
         await this.store.waitForUser(asJob(job), result.status === 'limited' ? 'model_limit' : 'auth_expired'); return true;
       }
@@ -439,9 +460,11 @@ export class ReviewRuntime {
     } catch (error) {
       if (error instanceof WorkerRejected) await this.close(job, review, 'failed', 'worker_rejected');
       else if (!dispatched && error instanceof PolicyUnavailable) await this.store.defer(asJob(job));
-      else if (!dispatched && error instanceof GitHubError && (error.status === 429 || error.status >= 500)) await this.store.defer(asJob(job), 'github_unavailable');
+      else if (!dispatched && error instanceof GitHubError && (error.status === 429 || error.status >= 500)) await this.backoff(job, review, error);
       else if (!dispatched) await this.close(job, review, error instanceof Denied ? 'cancelled' : 'failed',
         error instanceof Denied ? 'authorization_revoked' : error instanceof GitHubError ? 'github_access_lost' : 'before_dispatch');
+      // 작업자가 멈춤을 확인한 뒤의 저장 오류는 실행 효과가 불명이 아니다. 슬롯을 잡지 않고 실패로 닫는다.
+      else if (stopped) await this.close(job, review, 'failed', 'after_stop');
       else await this.store.transition(asJob(job), 'unknown', 'runtime_uncertain');
     }
     return true;
@@ -480,13 +503,24 @@ export class ReviewRuntime {
         await this.notify(tx, context, `review-restricted:${job.id}`, `PR 리뷰 결과를 공개 범위 검사에서 차단했습니다: ${review.repo_full_name}#${review.pr_number}. 게시하지 않았습니다.`);
         return;
       }
-      const rendered = context.review.publish && render(reviewed, positions.data, context.review.publish, `github-review:${job.id}`);
+      // 되살린 세대가 다시 게시할 수 있게 시도마다 키를 나눈다. 대조 marker도 이 키다.
+      const key = `github-review:${job.id}:${job.attempt}`;
+      const rendered = context.review.publish && render(reviewed, positions.data, context.review.publish, key);
       await tx.query(`INSERT INTO review_deliveries(id,job_id,idempotency_key,repo_id,repo_full_name,pr_number,head_sha,comparison_revision,
         policy_revision,body,comments,state,reason,available_at,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14)
-        ON CONFLICT (idempotency_key) DO NOTHING`, [randomUUID(), job.id, `github-review:${job.id}`, review.repo_id, review.repo_full_name,
+        ON CONFLICT (idempotency_key) DO NOTHING`, [randomUUID(), job.id, key, review.repo_id, review.repo_full_name,
         review.pr_number, task.head, task.base, task.policyRevision, rendered ? rendered.body : '', json(rendered ? rendered.comments : []),
         rendered ? 'pending' : 'blocked', rendered ? null : context.review.publish ? 'publish_limit_exceeded' : 'publish_limits_unset', this.store.now()]);
     });
+  }
+  // GitHub 일시 장애는 Retry-After와 지수 백오프로 기다리고, 상한을 넘으면 실패로 닫는다(새 push·댓글로 다시 시작).
+  private async backoff(job: Job, review: ReviewRow, error: GitHubError): Promise<void> {
+    const count = (await this.store.db.query<{ defer_count: number }>(
+      'UPDATE pr_reviews SET defer_count=defer_count+1 WHERE job_id=$1 RETURNING defer_count', [review.job_id])).rows[0]!.defer_count;
+    if (count > MAX_DEFERS) { await this.close(job, review, 'failed', 'github_unavailable'); return; }
+    await this.store.defer(job, 'github_unavailable');
+    await this.store.db.query(`UPDATE jobs SET available_at=$2 WHERE id=$1 AND state='queued'`,
+      [job.id, this.store.now() + Math.max(error.retryAfterMs, Math.min(60_000, DEFAULTS.retryDelayMs * 2 ** (count - 1)))]);
   }
   private async close(job: Job, review: ReviewRow, state: 'failed' | 'cancelled' | 'superseded', reason: string): Promise<void> {
     if (!await this.store.transition(job, state, reason)) return;
@@ -542,7 +576,7 @@ interface DeliveryRow {
 }
 export class ReviewPublisher {
   constructor(private readonly store: Store, private readonly policy: ReviewPolicySource, private readonly reader: GitHubReader,
-    private readonly github: RestrictedGitHub) {}
+    private readonly github: RestrictedGitHub, private readonly queue?: ReviewQueue) {}
   async deliver(): Promise<boolean> {
     // 게시 중 죽은 프로세스의 lease를 회수한다. 전송을 시작했으면 결과를 모르므로 unknown(재게시 없이 대조).
     await this.store.db.query(`UPDATE review_deliveries SET state=CASE WHEN dispatch_started THEN 'unknown' ELSE 'pending' END,
@@ -572,7 +606,12 @@ export class ReviewPublisher {
       const pr = pullRequest(await this.reader.pullRequest(repo.fullName, row.pr_number));
       const stale = !pr.open ? (pr.merged ? 'merged_before_publish' : 'pr_closed')
         : pr.head.sha !== row.head_sha ? 'stale_head' : pr.base.sha !== row.comparison_revision ? 'base_moved' : undefined;
-      if (stale) { await this.state(row, 'superseded', stale); return true; }
+      if (stale) {
+        await this.state(row, 'superseded', stale);
+        // 게시하지 못한 채 밀려났으므로 live 세대를 같은 규칙으로 넣는다(아직 게시된 리뷰가 없으면 base 이동도 재리뷰).
+        if (pr.open && this.queue) await this.store.db.transaction<unknown>(tx => this.queue!.admit(pr, repo, context, 'live_check', `live:${randomUUID()}`, tx));
+        return true;
+      }
       if (pr.head.repoId !== pr.base.repoId || !authorAllowed(pr.author, context.review)) { await this.state(row, 'blocked', 'author_denied'); return true; }
       if (row.attempt > 1 && await this.existing(row)) return true;
       const request = { method: 'POST', path: `/repos/${repo.fullName}/pulls/${row.pr_number}/reviews`,
@@ -589,21 +628,27 @@ export class ReviewPublisher {
         // 응답을 잃은 게시는 다시 보내지 않고 기존 리뷰를 대조한다(EVENT-02).
         await this.state(row, 'unknown', 'response_lost');
       } else if (error instanceof Denied) await this.state(row, 'blocked', 'authorization_revoked');
-      else if (error instanceof PolicyUnavailable) {
-        // 정책 확인 불가는 일시 상태다. 재시도 횟수를 쓰지 않고 기다린다(T16a 게시 pause와 같은 규칙).
-        await this.store.db.query(`UPDATE review_deliveries SET state='pending',attempt=GREATEST(0,attempt-1),dispatch_started=false,
-          available_at=$3,reason='policy_unavailable' WHERE id=$1 AND lease_token=$2`, [row.id, row.lease_token, this.store.now() + DEFAULTS.retryDelayMs]);
-      } else if (error instanceof GitHubError && error.status === 422 && row.comments.length) {
+      else if (error instanceof PolicyUnavailable) await this.pause(row, 'policy_unavailable');
+      else if (error instanceof GitHubError && error.status === 422 && row.comments.length) {
         // 인라인 위치가 무효면 같은 내용을 본문만으로 한 번 더 시도한다.
         await this.store.db.query(`UPDATE review_deliveries SET state='pending',comments='[]',dispatch_started=false,available_at=$3
           WHERE id=$1 AND lease_token=$2`, [row.id, row.lease_token, this.store.now()]);
       } else if (error instanceof GitHubError && [401, 403, 404, 422].includes(error.status) && !error.retryAfterMs) await this.state(row, 'blocked', `github_${error.status}`);
+      // 전송 전 일시 장애(조회 5xx·429·연결 실패)는 재시도 횟수를 쓰지 않는다. retry_limit은 전송을 시작한 시도만 센다.
+      else if (!dispatched) await this.pause(row, 'before_dispatch', error instanceof GitHubError ? error.retryAfterMs : 0);
       else if (row.attempt > DEFAULTS.maxRetries) await this.state(row, 'blocked', 'retry_limit');
       else await this.store.db.query(`UPDATE review_deliveries SET state='pending',dispatch_started=false,available_at=$3,reason=$4
         WHERE id=$1 AND lease_token=$2`, [row.id, row.lease_token, this.store.now() + Math.max(DEFAULTS.retryDelayMs,
         error instanceof GitHubError ? error.retryAfterMs : 0), 'retry']);
     }
     return true;
+  }
+  // T16a 게시 pause와 같은 규칙: 시도 수를 되돌리고 1초부터 60초까지 늘려 기다린다.
+  private async pause(row: DeliveryRow, reason: string, retryAfterMs = 0): Promise<void> {
+    await this.store.db.query(`UPDATE review_deliveries SET state='pending',attempt=GREATEST(0,attempt-1),dispatch_started=false,
+      pause_count=LEAST(pause_count+1,7),available_at=$3+GREATEST($4::bigint,LEAST(60000,$5::bigint*power(2,LEAST(pause_count,6))::bigint)),
+      reason=$6 WHERE id=$1 AND lease_token=$2 AND state='sending'`,
+    [row.id, row.lease_token, this.store.now(), retryAfterMs, DEFAULTS.retryDelayMs, reason]);
   }
   // 응답 유실 뒤에는 PR의 리뷰 목록에서 marker와 검토 SHA로 찾는다. 못 찾아도 자동 재게시하지 않는다.
   async reconcile(): Promise<void> {

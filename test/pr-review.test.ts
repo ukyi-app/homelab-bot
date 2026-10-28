@@ -132,7 +132,7 @@ async function setup() {
   const ingress = new GitHubIngress(SECRET, f.store, source, queue, gh);
   const worker = new ReviewWorker(f.verifier, fetcher, model, 50);
   const runtime = new ReviewRuntime(f.store, source, queue, gh, worker, f.signer, 5);
-  const publisher = new ReviewPublisher(f.store, source, gh, new RestrictedGitHub(gh.transport));
+  const publisher = new ReviewPublisher(f.store, source, gh, new RestrictedGitHub(gh.transport), queue);
   const reconciler = new ReviewReconciler(f.store, source, queue, gh);
   gh.pulls.set(7, pull());
   archives.set(BASE, tarGz({ 'AGENTS.md': '기준 지침: 한국어로 리뷰한다.\n', 'src/app.ts': APP_BASE }));
@@ -147,7 +147,7 @@ async function hook(name: string, payload: unknown, delivery: string = randomUUI
 }
 async function rows(table: string) { return (await database.db.query<Record<string, any>>(`SELECT * FROM ${table}`)).rows; }
 async function reviewJobs() {
-  return (await database.db.query<Record<string, any>>(`SELECT j.*,p.head_sha,p.comparison_revision,p.review_outcome,p.superseded_reason,p.result
+  return (await database.db.query<Record<string, any>>(`SELECT j.*,p.head_sha,p.comparison_revision,p.review_outcome,p.superseded_reason,p.result,p.trigger
     FROM jobs j JOIN pr_reviews p ON p.job_id=j.id ORDER BY j.created_at,p.head_sha`)).rows;
 }
 async function deliveries() { return (await database.db.query<Record<string, any>>('SELECT * FROM review_deliveries ORDER BY created_at')).rows; }
@@ -656,11 +656,12 @@ test('EVENT-03 webhook으로 이미 받은 세대는 대조에서 다시 넣지 
 
 test('D-14 직렬 1: 리뷰와 대화 작업은 모델 슬롯 하나를 나누고 한도 도달 시 전체 대기', async () => {
   await opened();
-  await f.ingress.receive(event('chat-1')); f.advance(DEFAULTS.debounceMs);
   let release!: () => void;
   r.reply(() => new Promise(resolve => { release = () => resolve({ status: 'succeeded', output: OUTPUT } as never); }) as never);
   const running = r.runtime.tick();
   while (!release) await new Promise(resolve => setImmediate(resolve));
+  // 리뷰가 모델을 쓰는 동안 들어온 대화는 기다린다.
+  await f.ingress.receive(event('chat-1')); f.advance(DEFAULTS.debounceMs);
   assert.equal(await f.store.claim(), undefined);
   release(); await running;
   assert.equal(f.requests.length, 0);
@@ -898,7 +899,7 @@ test('SEC-02 리뷰 레인 작업자 HTTP(loopback): capability 없음·위조·
 test('EVENT-02 게시 직전 정책 확인 불가는 재시도 횟수를 쓰지 않고 기다렸다가 갱신 뒤 한 번 게시', async () => {
   await opened(); await r.runtime.tick();
   f.advance(DEFAULTS.policyMaxAgeMs + 1);
-  for (let i = 0; i < DEFAULTS.maxRetries + 3; i++) { await r.publisher.deliver(); f.advance(DEFAULTS.retryDelayMs); }
+  for (let i = 0; i < DEFAULTS.maxRetries + 3; i++) { await r.publisher.deliver(); f.advance(60_000); }
   assert.deepEqual((await deliveries()).map(d => [d.state, d.reason, d.attempt]), [['pending', 'policy_unavailable', 0]]);
   f.policy.confirmedAt = f.now();
   await r.publisher.deliver();
@@ -919,4 +920,110 @@ test('REVIEW-03 열거 중 head가 움직여도 변경 목록과 압축본은 �
   await r.publisher.deliver();
   assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['superseded', 'stale_head']]);
   assert.equal(r.gh.writes.length, 0);
+});
+
+test('REVIEW-02 아직 게시된 리뷰가 없으면 base 이동(실행 직전·게시 직전)도 재리뷰하고, 게시된 뒤의 base 이동만 건너뛴다', async () => {
+  await opened();
+  const moved = pull({ base: { sha: BASE2, ref: 'main', repo: repository }, updated_at: '2026-10-29T01:10:00Z' });
+  r.gh.pulls.set(7, moved);
+  r.archives.set(BASE2, r.archives.get(BASE)!);
+  await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.comparison_revision, j.state]), [[BASE, 'superseded'], [BASE2, 'queued']]);
+  await r.runtime.tick();
+  r.gh.pulls.set(7, pull({ base: { sha: BASE, ref: 'main', repo: repository }, updated_at: '2026-10-29T01:11:00Z' }));
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['superseded', 'base_moved']]);
+  const jobs = await reviewJobs();
+  assert.equal(jobs.at(-1)!.state, 'queued');
+  assert.equal(r.gh.writes.length, 0);
+});
+test('REVIEW-02 실행 중 닫힘·draft로 밀려 게시하지 못한 세대는 재개 때 다시 리뷰해 게시', async () => {
+  await opened();
+  r.reply(async () => {
+    await hook('pull_request', prEvent('closed', pull({ state: 'closed', updated_at: '2026-10-29T01:20:00Z' })));
+    return { status: 'succeeded', output: OUTPUT } as never;
+  });
+  await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.review_outcome]), [['succeeded', 'superseded']]);
+  r.reply({ status: 'succeeded', output: OUTPUT });
+  r.gh.pulls.set(7, pull({ updated_at: '2026-10-29T01:21:00Z' }));
+  assert.equal((await hook('pull_request', prEvent('reopened', pull({ updated_at: '2026-10-29T01:21:00Z' })))).outcome, 'requeued');
+  await r.runtime.tick(); await r.publisher.deliver();
+  assert.equal(r.gh.writes.length, 1);
+  assert.match(r.gh.writes[0]!.body.body, /homelab-bot-review:github-review:[0-9a-f-]+:2 -->/);
+  assert.equal((await hook('pull_request', prEvent('reopened', pull({ updated_at: '2026-10-29T01:22:00Z' })))).outcome, 'duplicate_generation');
+});
+test('REVIEW-02 draft로 밀려난 세대를 댓글로 요청하면 draft 대기 없이 실행하고, 취소된 세대도 댓글로 되살린다', async () => {
+  await opened();
+  await hook('pull_request', prEvent('converted_to_draft', pull({ draft: true, updated_at: '2026-10-29T01:30:00Z' })));
+  r.gh.pulls.set(7, pull({ draft: true, updated_at: '2026-10-29T01:30:00Z' }));
+  assert.equal((await hook('issue_comment', commentEvent())).outcome, 'requeued');
+  await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.trigger]), [['succeeded', 'comment']]);
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,controls CASCADE');
+  r.gh.pulls.set(7, pull({ updated_at: '2026-10-29T01:31:00Z' }));
+  await opened(pull({ updated_at: '2026-10-29T01:31:00Z' }));
+  r.gh.compare = async () => { await f.store.control(f.policy.owner, 'n/a', 'emergency-stop'); return structuredClone(r.gh.compareResult); };
+  await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.wait_reason]), [['cancelled', 'cancel_before_dispatch']]);
+  assert.equal(r.inputs.length, 1);
+  assert.equal((await hook('pull_request', prEvent('reopened', pull({ updated_at: '2026-10-29T01:32:00Z' })))).outcome, 'duplicate_generation');
+  assert.equal((await hook('issue_comment', commentEvent())).outcome, 'requeued');
+});
+test('D-14 PR·목록 조회 중 비상 중지가 오면 dispatch 전에 취소하고 모델을 부르지 않는다', async () => {
+  await opened();
+  r.gh.compare = async () => { await f.store.control(f.policy.owner, 'n/a', 'emergency-stop'); return structuredClone(r.gh.compareResult); };
+  await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.wait_reason]), [['cancelled', 'cancel_before_dispatch']]);
+  assert.equal(r.inputs.length, 0);
+  assert.equal(r.fetches.length, 0);
+});
+test('F05 지금 집을 수 있는 대화 작업이 있으면 리뷰가 슬롯을 양보한다', async () => {
+  await opened();
+  await f.ingress.receive(event('chat-first')); f.advance(DEFAULTS.debounceMs);
+  assert.equal(await r.runtime.tick(), false);
+  await f.runtime.tick();
+  assert.equal(f.requests.length, 1);
+  assert.equal(await r.runtime.tick(), true);
+  assert.equal(r.inputs.length, 1);
+});
+test('D-14 작업자 멈춤 확인 뒤 결과 저장이 실패하면 unknown이 아니라 failed로 닫아 슬롯을 풀어 준다', async () => {
+  await opened();
+  const transaction = database.db.transaction.bind(database.db);
+  let injected = false;
+  database.db.transaction = (fn, deadline) => transaction(tx => fn({ ...tx, query: async <T>(sql: string, params?: unknown[]) => {
+    if (!injected && sql.includes("ELSE 'succeeded' END")) { injected = true; throw new Error('injected_store_failure'); }
+    return tx.query<T>(sql, params);
+  } }), deadline);
+  try { await r.runtime.tick(); } finally { database.db.transaction = transaction; }
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.wait_reason]), [['failed', 'after_stop']]);
+  await opened(pull({ head: { sha: HEAD2, ref: 'f', repo: repository }, updated_at: '2026-10-29T01:40:00Z' }));
+  r.gh.pulls.set(7, pull({ head: { sha: HEAD2, ref: 'f', repo: repository }, updated_at: '2026-10-29T01:40:00Z' }));
+  r.archives.set(HEAD2, r.archives.get(HEAD)!);
+  assert.equal(await r.runtime.tick(), true);
+  assert.equal(r.inputs.length, 2);
+});
+test('REVIEW-03 열거 429·5xx는 Retry-After와 지수 백오프로 기다리고 상한 뒤 실패로 닫는다', async () => {
+  await opened();
+  r.gh.compareError = new GitHubError(429, 60_000);
+  await r.runtime.tick();
+  const [first] = await reviewJobs();
+  assert.deepEqual([first!.state, first!.wait_reason, Number(first!.available_at) - f.now()], ['queued', 'github_unavailable', 60_000]);
+  r.gh.compareError = new GitHubError(502);
+  for (let i = 0; i < 10; i++) { f.advance(60_000); f.policy.confirmedAt = f.now(); await r.runtime.tick(); }
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.wait_reason]), [['failed', 'github_unavailable']]);
+  assert.equal(r.inputs.length, 0);
+});
+test('EVENT-02 전송 전 GitHub 일시 장애는 재시도 횟수를 쓰지 않고 백오프 후 한 번 게시', async () => {
+  await opened(); await r.runtime.tick();
+  for (let i = 0; i < DEFAULTS.maxRetries + 3; i++) {
+    r.gh.pulls.set(7, new GitHubError(502));
+    await r.publisher.deliver();
+    f.advance(60_000); f.policy.confirmedAt = f.now();
+  }
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason, d.attempt]), [['pending', 'before_dispatch', 0]]);
+  r.gh.pulls.set(7, pull());
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => d.state), ['sent']);
+  assert.equal(r.gh.writes.length, 1);
 });

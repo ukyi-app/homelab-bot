@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS pr_reviews (
   head_sha text NOT NULL, comparison_revision text NOT NULL, base_ref text NOT NULL, policy_revision text NOT NULL,
   trigger text NOT NULL, pr_updated_at bigint NOT NULL, created_at bigint NOT NULL,
   review_outcome text CHECK (review_outcome IN ('completed','partial','failed','superseded')),
-  result jsonb, superseded_reason text, superseded_at bigint
+  result jsonb, superseded_reason text, superseded_at bigint, defer_count integer NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS pr_reviews_pr ON pr_reviews(repo_id, pr_number, created_at);
 CREATE TABLE IF NOT EXISTS review_deliveries (
@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS review_deliveries (
   body text NOT NULL, comments jsonb NOT NULL,
   state text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','sending','sent','unknown','blocked','superseded')),
   reason text, external_id text, attempt integer NOT NULL DEFAULT 0, dispatch_started boolean NOT NULL DEFAULT false,
-  available_at bigint NOT NULL, created_at bigint NOT NULL, lease_token text, lease_until bigint
+  pause_count integer NOT NULL DEFAULT 0, available_at bigint NOT NULL, created_at bigint NOT NULL, lease_token text, lease_until bigint
 );
 CREATE INDEX IF NOT EXISTS review_deliveries_queue ON review_deliveries(state, available_at);
 INSERT INTO schema_migrations VALUES (8) ON CONFLICT DO NOTHING;
