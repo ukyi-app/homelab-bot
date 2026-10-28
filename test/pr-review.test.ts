@@ -1131,6 +1131,10 @@ test('REVIEW-02 base_head 기준에서 게시 차단·공개 범위 차단 결�
   }
   assert.equal(r.inputs.length - calls, 2);
   assert.equal(r.gh.writes.length, 0);
+  const notices = (await rows('outbox')).filter(x => x.idempotency_key.startsWith('review-unpublished:'));
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0]!.scope.channel, f.policy.notificationChannel);
+  assert.ok(!notices[0]!.payload.content.includes(OUTPUT.public_summary));
 });
 test('REVIEW-02 리뷰 정책이 꺼지거나 비교 기준이 미정이 되어도 대기 작업·미게시 결과를 지우지 않고 다시 켜지면 이어간다', async () => {
   await opened();

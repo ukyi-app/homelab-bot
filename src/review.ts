@@ -206,12 +206,16 @@ export class ReviewQueue {
     // 아직 리뷰가 한 번도 게시되지 않은 PR을 base 이동으로 버리지 않는다.
     // 게시됐거나(차단 포함), 공개 범위 검사에서 막혔거나, 확인된 실패거나, 같은 head에서 이미 두 번 리뷰했으면 끝난 것으로 본다.
     // base 머리 기준에서 base가 자주 움직여도 같은 head의 모델 호출이 계속 늘지 않게 한다.
-    const concluded = !!latest && (await tx.query(`SELECT 1 FROM pr_reviews p JOIN jobs j ON j.id=p.job_id
-      WHERE p.repo_id=$1 AND p.pr_number=$2 AND p.head_sha=$3 HAVING
-        bool_or(p.job_id=$4 AND j.state='failed')
-        OR bool_or(p.result->>'output_classification'='restricted')
-        OR bool_or(EXISTS (SELECT 1 FROM review_deliveries d WHERE d.job_id=p.job_id AND d.state IN ('sending','sent','unknown','blocked')))
-        OR count(p.result)>=2`, [repo.id, pr.number, pr.head.sha, latest.job_id])).rows.length > 0;
+    const head = latest ? (await tx.query<{ failed: boolean; restricted: boolean; published: boolean; blocked: boolean; results: string }>(
+      `SELECT bool_or(p.job_id=$4 AND j.state='failed') AS failed,
+        bool_or(p.result->>'output_classification'='restricted') AS restricted,
+        bool_or(EXISTS (SELECT 1 FROM review_deliveries d WHERE d.job_id=p.job_id AND d.state IN ('sending','sent','unknown'))) AS published,
+        bool_or(EXISTS (SELECT 1 FROM review_deliveries d WHERE d.job_id=p.job_id AND d.state='blocked')) AS blocked,
+        count(p.result) AS results
+      FROM pr_reviews p JOIN jobs j ON j.id=p.job_id WHERE p.repo_id=$1 AND p.pr_number=$2 AND p.head_sha=$3`,
+    [repo.id, pr.number, pr.head.sha, latest.job_id])).rows[0] : undefined;
+    const capped = !!head && Number(head.results) >= 2;
+    const concluded = !!head && (!!head.failed || !!head.restricted || !!head.published || !!head.blocked || capped);
     const rereview = !baseOnly || !concluded || trigger === 'retarget' || trigger === 'comment' || context.review.rereviewOnBaseMove === true;
     if (rereview) {
       const queued = (await tx.query<{ count: string }>("SELECT count(*) FROM jobs WHERE state='queued'")).rows[0]!;
@@ -219,7 +223,17 @@ export class ReviewQueue {
     }
     const reason = baseOnly ? 'base_moved' : latest && latest.head_sha === pr.head.sha ? 'policy_changed' : 'new_head';
     await this.supersede(tx, repo.id, pr.number, reason, key);
-    if (!rereview) return { outcome: 'base_moved', key };
+    if (!rereview) {
+      // 상한 때문에 한 번도 게시하지 못한 채 멈추면 조용히 사라지지 않게 알린다. 모델 문장은 넣지 않는다.
+      if (capped && !head!.published && !head!.blocked && !head!.restricted && !head!.failed) {
+        const scope = notificationScope(context.base);
+        await this.store.enqueue({ key: `review-unpublished:${repo.id}:${pr.number}:${pr.head.sha}`, actor: context.base.owner, scope,
+          revision: context.base.revision, payload: { kind: 'message', channel: scope.channel, classification: 'safe_summary',
+            content: `PR 리뷰를 게시하지 못했습니다: ${repo.fullName}#${pr.number}, head ${pr.head.sha.slice(0, 12)}. `
+              + 'base가 움직여 결과가 오래됐고 같은 head의 재리뷰 상한에 걸렸습니다. 리뷰 명령 댓글로 다시 요청할 수 있습니다.' } }, tx);
+      }
+      return { outcome: 'base_moved', key };
+    }
     const event = randomUUID(), job = randomUUID();
     await tx.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,conversation_id,received_at,payload,accepted)
       VALUES ($1,'github',$2,$3,$4,$5,NULL,$6,$7,true)`, [event, deliveryId, key, `github:${pr.author.id}`,
