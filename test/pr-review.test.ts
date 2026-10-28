@@ -1289,3 +1289,20 @@ test('r2 P2-03 REVIEW-03 실행 비트만 바뀐 파일은 모드 변경을 리�
   const result = (await reviewJobs())[0]!.result as ReviewResult;
   assert.deepEqual([result.review_outcome, result.coverage.omitted_files_with_reasons], ['partial', [{ path: 'run.sh', reason: 'archive_mismatch' }]]);
 });
+test('r2 P2-04 REVIEW-03 파일 끝 개행의 추가·삭제를 diff에 남기고 검토 입력으로 전달한다', async () => {
+  const removed = unifiedDiff('file', 'data\n', 'data')!;
+  assert.equal(removed.patch, '--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-data\n+data\n\\ No newline at end of file\n');
+  assert.deepEqual(removed.rightLines, [1]);
+  const added = unifiedDiff('file', 'a\nb', 'a\nb\n')!;
+  assert.equal(added.patch, '--- a/file\n+++ b/file\n@@ -1,2 +1,2 @@\n a\n-b\n\\ No newline at end of file\n+b\n');
+  const both = unifiedDiff('file', 'a\nb\n', 'a\nc')!;
+  assert.equal(both.patch, '--- a/file\n+++ b/file\n@@ -1,2 +1,2 @@\n a\n-b\n+c\n\\ No newline at end of file\n');
+  assert.equal(unifiedDiff('file', 'x', 'x')!.patch, '--- a/file\n+++ b/file\n');
+  r.archives.set(BASE, tarGz({ 'records.txt': 'data\n' }));
+  r.archives.set(HEAD, tarGz({ 'records.txt': 'data' }));
+  r.gh.compareResult = { truncated: false, files: [{ path: 'records.txt', previousPath: null, status: 'modified', baseType: 'blob', headType: 'blob' }] };
+  r.reply({ status: 'succeeded', output: { findings: [], open_questions: [], public_summary: '마지막 개행이 빠졌습니다.' } });
+  await fullReview();
+  assert.match(r.inputs[0]!.untrusted.files[0]!.patch, /\\ No newline at end of file/);
+  assert.equal(((await reviewJobs())[0]!.result as ReviewResult).review_outcome, 'completed');
+});

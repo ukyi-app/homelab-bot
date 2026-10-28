@@ -126,7 +126,14 @@ function text(entry: Entry | undefined): string | null {
   if (entry.data.subarray(0, 8000).includes(0)) return null;
   try { return new TextDecoder('utf-8', { fatal: true }).decode(entry.data); } catch { return null; }
 }
-const lines = (value: string) => { const all = value.split('\n'); if (all.at(-1) === '') all.pop(); return all; };
+// 마지막 개행 유무도 변경이다. 개행 없는 마지막 줄에는 실제 줄이 담을 수 없는 '\n'을 붙여 비교하고,
+// 출력할 때 git 형식의 '\ No newline at end of file'로 바꾼다.
+const NO_EOL = '\n';
+const lines = (value: string) => {
+  const all = value.split('\n');
+  if (all.at(-1) === '') all.pop(); else all[all.length - 1] += NO_EOL;
+  return all;
+};
 const MAX_EDIT_DISTANCE = 2000;
 // Myers diff. trace는 d마다 필요한 대각선 범위만 복사해 메모리를 O(D^2)로 묶는다.
 function editScript(a: string[], b: string[]): { op: ' ' | '-' | '+'; line: string }[] | null {
@@ -176,7 +183,8 @@ export function unifiedDiff(path: string, before: string, after: string, context
     let leftCount = 0, rightCount = 0;
     for (let i = from; i <= to; i++) {
       const o = ops[i]!;
-      body.push(`${o.op}${o.line}`);
+      if (o.line.endsWith(NO_EOL)) body.push(`${o.op}${o.line.slice(0, -1)}`, '\\ No newline at end of file');
+      else body.push(`${o.op}${o.line}`);
       if (o.op !== '+') leftCount++;
       if (o.op !== '-') { rightLines.push(right + rightCount); rightCount++; }
     }
