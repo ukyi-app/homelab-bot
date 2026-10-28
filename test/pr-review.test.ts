@@ -7,6 +7,7 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { DEFAULTS, Denied, WorkerRejected } from '../src/contracts.js';
+import type { Scope } from '../src/contracts.js';
 import { ArchiveError, readArchive, REVIEW_INSTRUCTIONS, ReviewWorker, unifiedDiff } from '../src/review-input.js';
 import type { ArchiveFetcher, ReviewerInput, ReviewerModel, ReviewTask } from '../src/review-input.js';
 import { GitHubError, GitHubIngress, githubWebhook, RestrictedGitHub, restrictGitHubWrite, ReviewPolicySource,
@@ -14,7 +15,7 @@ import { GitHubError, GitHubIngress, githubWebhook, RestrictedGitHub, restrictGi
 import type { GitHubReader, GitHubTransport, GitHubWrite, ReviewPolicy, ReviewResult } from '../src/review.js';
 import { archiveContract } from '../src/worker.js';
 import { HttpReviewWorker, reviewWorkerServer } from '../src/review-http.js';
-import { event, fixture, localDatabase } from './helpers.js';
+import { event, fixture, localDatabase, thread } from './helpers.js';
 
 const SECRET = 'fixture-webhook-secret';
 const BASE = 'a'.repeat(40), HEAD = 'b'.repeat(40), HEAD2 = 'c'.repeat(40), BASE2 = 'd'.repeat(40);
@@ -1181,3 +1182,57 @@ test('r2 P1-01 AUTH-01 GitHub 조회 중 저장소·허용 봇 철회·정책 �
   assert.deepEqual((await reviewJobs()).map(j => [j.state, j.wait_reason]), [['queued', 'review_disabled']]);
   assert.equal(r.inputs.length, 0);
 });
+
+const notificationChannel: Scope = { guild: 'fixture-guild', channel: 'fixture-notifications', parent: null, kind: 'channel' };
+const chatChannel: Scope = { guild: 'fixture-guild', channel: 'fixture-chat', parent: null, kind: 'channel' };
+async function command(name: string, target?: string, scope: Scope = notificationChannel, actor = 'fixture-owner') {
+  const id = `${name}-${randomUUID()}`;
+  await f.ingress.receive(event(id, { scope, actor, kind: 'command', command: name, target, mention: false }));
+  const input = (await rows('events')).find(e => e.delivery_id === id)!;
+  return JSON.parse((await rows('outbox')).find(o => o.idempotency_key === `control:${input.id}`)!.payload.content);
+}
+const schedulerPaused = async () => (await rows('controls')).find(c => c.key === 'scheduler')!.value;
+for (const reason of ['limited', 'auth_expired'] as const) {
+  test(`r2 P1-02 D-14 리뷰 ${reason} 대기: 안내 → 알림 채널 owner 재개·포기 → 전역 슬롯 해제, 다른 채널·사용자·대화 명령은 거부`, async () => {
+    await opened();
+    r.reply({ status: reason });
+    await r.runtime.tick();
+    const [job] = await reviewJobs();
+    assert.deepEqual([job!.state, job!.wait_reason], ['waiting_user', reason === 'limited' ? 'model_limit' : 'auth_expired']);
+    assert.equal(await schedulerPaused(), true);
+    const notice = (await rows('outbox')).find(o => o.idempotency_key === `review-waiting:${job!.id}`)!;
+    assert.equal(notice.scope.channel, 'fixture-notifications');
+    assert.ok(notice.payload.content.includes(job!.id) && notice.payload.content.includes('review-resume'));
+    await f.ingress.receive(event('chat-waiting')); f.advance(DEFAULTS.debounceMs);
+    assert.equal(await f.store.claim(), undefined);
+    const status = await command('review-status');
+    assert.deepEqual(status.jobs.map((j: { id: string; state: string }) => [j.id, j.state]), [[job!.id, 'waiting_user']]);
+    for (const scope of [chatChannel, thread]) {
+      assert.equal((await command('review-resume', job!.id, scope)).ok, false);
+      assert.equal((await command('review-cancel', job!.id, scope)).ok, false);
+    }
+    await assert.rejects(command('review-resume', job!.id, notificationChannel, 'intruder'), Denied);
+    // 기존 대화 명령의 뜻은 그대로: 리뷰 job ID로는 풀리지 않는다.
+    assert.equal((await command('resume-model', job!.id)).ok, false);
+    assert.equal((await command('cancel', job!.id)).ok, false);
+    assert.deepEqual((await reviewJobs()).map(j => j.state), ['waiting_user']);
+    await f.store.control(f.policy.owner, 'n/a', 'emergency-stop');
+    assert.equal((await command('review-resume', job!.id)).ok, false);
+    assert.equal((await command('resume-model', 'emergency-stop')).ok, true);
+    assert.equal(await schedulerPaused(), true);
+    if (reason === 'limited') {
+      assert.equal((await command('review-resume', job!.id)).ok, true);
+      assert.equal(await schedulerPaused(), false);
+      r.reply({ status: 'succeeded', output: OUTPUT });
+      await f.runtime.tick();
+      assert.equal(await r.runtime.tick(), true);
+      assert.deepEqual((await reviewJobs()).map(j => j.state), ['succeeded']);
+    } else {
+      assert.equal((await command('review-cancel', job!.id)).ok, true);
+      assert.equal(await schedulerPaused(), false);
+      assert.deepEqual((await reviewJobs()).map(j => j.state), ['cancelled']);
+      assert.equal(await f.runtime.tick(), true);
+      assert.equal(f.requests.length, 1);
+    }
+  });
+}

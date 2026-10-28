@@ -309,8 +309,43 @@ export class Store {
       AND NOT EXISTS (SELECT 1 FROM jobs WHERE state='waiting_user')`);
     return (await this.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler'")).rows[0]!.value;
   }
-  async control(actor: string, conversation: string, action: string, target?: string, cursor?: string): Promise<unknown> {
+  // options.review는 호출자가 "정책 owner가 알림 채널에서 보낸 명령"임을 확인했을 때만 true다(T17 리뷰 작업 제어).
+  async control(actor: string, conversation: string, action: string, target?: string, cursor?: string,
+    options: { review?: boolean } = {}): Promise<unknown> {
+    if (action.startsWith('review-')) return this.atomic(store => store.reviewControlLocked(actor, action, target, options.review === true));
     return this.atomic(store => store.controlLocked(actor, conversation, action, target, cursor));
+  }
+  // T17: 리뷰 작업은 대화가 없어 기존 대화 명령으로 재개·포기할 수 없다. 별도 명령과 별도 권한 검사로만 다룬다.
+  private async reviewControlLocked(actor: string, action: string, target: string | undefined, allowed: boolean): Promise<unknown> {
+    if (!allowed) return { ok: false, status: '리뷰 작업 제어는 owner가 알림 채널에서만 할 수 있습니다.' };
+    if (action === 'review-status') {
+      const jobs = (await this.db.query(`SELECT id,state,wait_reason,target FROM jobs WHERE type='review'
+        AND state IN ('queued','running','verifying','cancel_requested','waiting_user','unknown') ORDER BY created_at LIMIT 20`)).rows;
+      return { ok: true, jobs, status: '한도·인증 원인을 사람이 해소한 뒤 /review-resume target:<job-id>, 포기는 /review-cancel target:<job-id>.' };
+    }
+    if (action !== 'review-resume' && action !== 'review-cancel') throw new Error('unsupported_control');
+    await this.lockScheduler();
+    if (action === 'review-resume') {
+      const emergency = (await this.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler_emergency'")).rows[0]!.value;
+      if (emergency) return { ok: false, status: '비상 또는 이전 중지가 유지되고 있습니다. /model-status로 확인하세요.' };
+      const count = (await this.db.query<{ count: string }>("SELECT count(*) FROM jobs WHERE state='queued'")).rows[0]!;
+      if (Number(count.count) >= DEFAULTS.maxQueue) return { ok: false, status: '대기열이 가득 찼습니다. 불필요한 작업을 취소한 뒤 재개하세요.' };
+      const changed = await this.db.query(`UPDATE jobs SET state='queued',available_at=$2,wait_reason=NULL,
+        lease_token=NULL,lease_until=NULL,started_at=NULL,finished_at=NULL
+        WHERE id=$1 AND type='review' AND state='waiting_user' AND wait_reason IN ('model_limit','auth_expired') AND attempt<$3 RETURNING id`,
+      [target, this.now(), DEFAULTS.maxRetries + 1]);
+      if (!changed.rows.length) return { ok: false, status: '한도·인증 대기 중인 리뷰 작업이 아니거나 재시도 한도에 도달했습니다. /review-status로 확인하세요.' };
+      const paused = await this.releaseScheduler();
+      await this.audit('review_wait_resumed', target!, { actor, paused });
+      return { ok: true, paused, status: '원인 해소 확인을 기록하고 리뷰 작업을 재개했습니다.' };
+    }
+    const changed = await this.db.query(`UPDATE jobs SET state=CASE WHEN state IN ('queued','waiting_user') THEN 'cancelled' ELSE 'cancel_requested' END,
+      finished_at=CASE WHEN state IN ('queued','waiting_user') THEN $2 ELSE finished_at END
+      WHERE id=$1 AND type='review' AND state IN ('queued','running','verifying','waiting_user') RETURNING id`, [target, this.now()]);
+    if (!changed.rows.length) return { ok: false, status: '취소할 리뷰 작업이 없거나 취소 가능한 상태가 아닙니다.' };
+    const paused = await this.releaseScheduler();
+    await this.audit('review_cancelled', target!, { actor, paused });
+    return { ok: true, paused, status: '리뷰 작업 취소 요청. 실행 중 작업의 종료 확인 전에는 cancelled로 표시하지 않습니다.' };
   }
   private async controlLocked(actor: string, conversation: string, action: string, target?: string, cursor?: string): Promise<unknown> {
     const current = (await this.db.query<Conversation>('SELECT * FROM conversations WHERE id=$1 FOR UPDATE', [conversation])).rows[0];

@@ -518,7 +518,15 @@ export class ReviewRuntime {
       if (!result.stopped) { await this.store.transition(asJob(job), 'unknown', 'worker_disconnected'); return true; }
       stopped = true;
       if (result.status === 'limited' || result.status === 'auth_expired') {
-        await this.store.waitForUser(asJob(job), result.status === 'limited' ? 'model_limit' : 'auth_expired'); return true;
+        await this.store.waitForUser(asJob(job), result.status === 'limited' ? 'model_limit' : 'auth_expired');
+        // 전역 모델 대기를 owner가 알림 채널에서 풀 수 있게 job ID와 명령을 알린다(원문 없음).
+        const scope = notificationScope(context.base);
+        await this.store.enqueue({ key: `review-waiting:${job.id}`, actor: context.base.owner, scope, revision: context.base.revision,
+          payload: { kind: 'message', channel: scope.channel, classification: 'safe_summary',
+            content: `PR 리뷰가 모델 ${result.status === 'limited' ? '한도' : '인증 만료'}로 대기 중이고 새 모델 호출이 멈췄습니다: `
+              + `${review.repo_full_name}#${review.pr_number}, job ${job.id}. 원인 해소 뒤 이 채널에서 /review-resume target:${job.id}, `
+              + `포기는 /review-cancel target:${job.id}.` } });
+        return true;
       }
       if (result.status !== 'succeeded') { await this.close(job, review, 'failed', result.reason ?? 'model_failed'); return true; }
       await this.finish(job, review, context, task, result);
