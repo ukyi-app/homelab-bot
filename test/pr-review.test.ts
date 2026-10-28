@@ -1344,3 +1344,34 @@ test('r2 P2-06 REVIEW-04 게시 대기 중 낮아진 지적 수·인라인 수·
   assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['blocked', 'publish_limit_exceeded']]);
   assert.equal(r.gh.writes.length, 1);
 });
+test('r2 P2-07 REVIEW-03 기준 AGENTS.md도 파일·총 입력 예산을 적용하고, 넘으면 보내지 않고 partial로 표시', async () => {
+  const big = `${'규칙 '.repeat(40_000)}\n`;
+  r.archives.set(BASE, tarGz({ 'AGENTS.md': big, 'src/app.ts': APP_BASE }));
+  r.archives.set(HEAD, tarGz({ 'AGENTS.md': big, 'src/app.ts': APP_HEAD }));
+  await fullReview();
+  assert.equal(r.inputs[0]!.guidelines, null);
+  const result = (await reviewJobs())[0]!.result as ReviewResult;
+  assert.deepEqual([result.review_outcome, result.coverage.limits_hit], ['partial', ['guidelines_limit']]);
+  assert.match(r.gh.writes[0]!.body.body, /guidelines_limit/);
+  // 지침은 총 입력 예산에서 먼저 잡는다. 남은 예산을 넘는 diff는 diff_limit로 미검토다.
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,outbox CASCADE');
+  const medium = `${'g'.repeat(5_000)}\n`;
+  r.archives.set(BASE, tarGz({ 'AGENTS.md': medium, 'src/app.ts': APP_BASE }));
+  r.archives.set(HEAD, tarGz({ 'AGENTS.md': medium, 'src/app.ts': APP_HEAD }));
+  r.policy().input = { ...POLICY.input, maxDiffBytes: 5_100 };
+  r.reply({ status: 'succeeded', output: { findings: [], open_questions: [], public_summary: '읽은 범위에서 지적 없음' } });
+  await fullReview(pull({ updated_at: '2026-10-29T05:20:00Z' }));
+  assert.equal(r.inputs[1]!.guidelines, medium);
+  const limited = (await reviewJobs())[0]!.result as ReviewResult;
+  assert.deepEqual(limited.coverage.omitted_files_with_reasons, [{ path: 'src/app.ts', reason: 'diff_limit' }]);
+  // 바뀐 큰 지침은 diff에서 file_too_large로 미검토, 기준 지침은 작은 base 것을 그대로 쓴다.
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,outbox CASCADE');
+  r.policy().input = POLICY.input;
+  r.archives.set(BASE, tarGz({ 'AGENTS.md': '기준 지침\n', 'src/app.ts': APP_BASE }));
+  r.archives.set(HEAD, tarGz({ 'AGENTS.md': big, 'src/app.ts': APP_HEAD }));
+  r.gh.compareResult = { truncated: false, files: ['AGENTS.md', 'src/app.ts'].map(path => ({ path, previousPath: null, status: 'modified', baseType: 'blob', headType: 'blob' })) };
+  await fullReview(pull({ updated_at: '2026-10-29T05:21:00Z' }));
+  assert.equal(r.inputs[2]!.guidelines, '기준 지침\n');
+  const changed = (await reviewJobs())[0]!.result as ReviewResult;
+  assert.deepEqual(changed.coverage.omitted_files_with_reasons, [{ path: 'AGENTS.md', reason: 'file_too_large' }]);
+});
