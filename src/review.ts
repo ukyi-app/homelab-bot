@@ -589,7 +589,8 @@ export class ReviewRuntime {
       const current = (await tx.query<ReviewRow>('SELECT * FROM pr_reviews WHERE job_id=$1 FOR UPDATE', [job.id])).rows[0]!;
       // 실행 중 새 세대가 들어왔으면 결과는 과거 기록으로만 남긴다(REVIEW-02).
       const outcome = current.superseded_at ? 'superseded' : reviewed.review_outcome;
-      await tx.query('UPDATE pr_reviews SET result=$2,review_outcome=$3 WHERE job_id=$1', [job.id, json({ ...reviewed, review_outcome: outcome }), outcome]);
+      await tx.query('UPDATE pr_reviews SET result=$2,review_outcome=$3,positions=$4 WHERE job_id=$1',
+        [job.id, json({ ...reviewed, review_outcome: outcome }), outcome, json(positions.data)]);
       if (current.superseded_at) return;
       if (classification === 'restricted') {
         await tx.query('INSERT INTO audit(kind,subject,detail,created_at) VALUES ($1,$2,$3,$4)',
@@ -665,7 +666,7 @@ export function render(result: ReviewResult, positions: { path: string; lines: n
 interface DeliveryRow {
   id: string; job_id: string; idempotency_key: string; repo_id: string; repo_full_name: string; pr_number: number;
   head_sha: string; comparison_revision: string; policy_revision: string; body: string;
-  comments: { path: string; line: number; side: 'RIGHT'; body: string }[]; state: string; attempt: number;
+  comments: { path: string; line: number; side: 'RIGHT'; body: string }[]; inline: boolean; state: string; attempt: number;
   lease_token: string; external_id: string | null;
 }
 export class ReviewPublisher {
@@ -690,12 +691,18 @@ export class ReviewPublisher {
       if (!repo) { await this.state(row, 'blocked', 'authorization_revoked'); return true; }
       if (context.revision !== row.policy_revision) { await this.state(row, 'superseded', 'policy_changed'); return true; }
       if (!context.review.publish) { await this.state(row, 'blocked', 'publish_limits_unset'); return true; }
-      if (row.body.length > context.review.publish.maxBodyChars || row.comments.length > context.review.publish.maxInlineComments) {
-        await this.state(row, 'blocked', 'publish_limit_exceeded'); return true;
-      }
       // 내부 표식 목록은 결과 저장 뒤에도 바뀔 수 있어 게시 직전 현재 정책으로 다시 분류한다(DATA-01).
-      const stored = (await this.store.db.query<{ result: ReviewResult }>('SELECT result FROM pr_reviews WHERE job_id=$1', [row.job_id])).rows[0]?.result;
+      const saved = (await this.store.db.query<{ result: ReviewResult | null; positions: { path: string; lines: number[] }[] | null }>(
+        'SELECT result,positions FROM pr_reviews WHERE job_id=$1', [row.job_id])).rows[0];
+      const stored = saved?.result;
       if (!stored || classify(stored, context.review) !== 'public') { await this.state(row, 'blocked', 'output_classification'); return true; }
+      // 게시 상한(지적 수·인라인 수·본문 길이)은 게시 시점 정책으로 저장된 구조화 결과를 다시 렌더링해 적용한다.
+      const rendered = render(stored, saved.positions ?? [], context.review.publish, row.idempotency_key);
+      if (!rendered) { await this.state(row, 'blocked', 'publish_limit_exceeded'); return true; }
+      row.body = rendered.body;
+      row.comments = row.inline ? rendered.comments : [];
+      await this.store.db.query('UPDATE review_deliveries SET body=$3,comments=$4 WHERE id=$1 AND lease_token=$2',
+        [row.id, row.lease_token, row.body, json(row.comments)]);
       // 게시 직전 최신 PR을 다시 본다. 오래된 리뷰를 최신 검증처럼 올리지 않는다(REVIEW-02).
       const pr = pullRequest(await this.reader.pullRequest(repo.fullName, row.pr_number));
       const current = pr.open && pr.head.sha === row.head_sha ? await this.queue.comparison(repo.fullName, pr, context.review) : undefined;
@@ -729,7 +736,7 @@ export class ReviewPublisher {
       else if (error instanceof PolicyUnavailable) await this.pause(row, 'policy_unavailable');
       else if (error instanceof GitHubError && error.status === 422 && row.comments.length) {
         // 인라인 위치가 무효면 같은 내용을 본문만으로 한 번 더 시도한다.
-        await this.store.db.query(`UPDATE review_deliveries SET state='pending',comments='[]',dispatch_started=false,available_at=$3
+        await this.store.db.query(`UPDATE review_deliveries SET state='pending',comments='[]',inline=false,dispatch_started=false,available_at=$3
           WHERE id=$1 AND lease_token=$2`, [row.id, row.lease_token, this.store.now()]);
       } else if (error instanceof GitHubError && [401, 403, 404, 422].includes(error.status) && !error.retryAfterMs) await this.state(row, 'blocked', `github_${error.status}`);
       // 전송 전 일시 장애(조회 5xx·429·연결 실패)는 재시도 횟수를 쓰지 않는다. retry_limit은 전송을 시작한 시도만 센다.

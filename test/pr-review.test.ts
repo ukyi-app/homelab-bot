@@ -1325,3 +1325,22 @@ test('r2 P2-05 EVENT-03 재조정에서 되살린 작업도 실행당 상한과 
   assert.deepEqual(await r.reconciler.run(), { admitted: 1, limited: true });
   assert.equal((await reviewJobs()).filter(j => j.state === 'queued').length, 2);
 });
+test('r2 P2-06 REVIEW-04 게시 대기 중 낮아진 지적 수·인라인 수·본문 길이 상한을 게시 시점 정책으로 적용', async () => {
+  const second = { ...FINDING, severity: 'P2', title: '두 번째 지적', line: 1 };
+  r.reply({ status: 'succeeded', output: { ...OUTPUT, findings: [FINDING, second] } });
+  await opened(); await r.runtime.tick();
+  r.policy().publish = { maxFindings: 1, maxInlineComments: 0, maxBodyChars: 20_000 };
+  await r.publisher.deliver();
+  const body = r.gh.writes[0]!.body.body;
+  assert.equal(body.match(/^\*\*\[P[0-3]\]/gm)!.length, 1);
+  assert.ok(!body.includes('두 번째 지적'));
+  assert.match(body, /상한으로 1건 생략/);
+  assert.deepEqual(r.gh.writes[0]!.body.comments, []);
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,outbox CASCADE');
+  r.policy().publish = POLICY.publish;
+  await opened(pull({ updated_at: '2026-10-29T05:10:00Z' })); await r.runtime.tick();
+  r.policy().publish = { ...POLICY.publish!, maxBodyChars: 100 };
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['blocked', 'publish_limit_exceeded']]);
+  assert.equal(r.gh.writes.length, 1);
+});
