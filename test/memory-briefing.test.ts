@@ -1,6 +1,7 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import { Denied, DiscordRejected, PolicyUnavailable } from '../src/contracts.js';
 import type { Scope } from '../src/contracts.js';
 import type { Database } from '../src/database.js';
@@ -580,4 +581,96 @@ test('BRIEF-01 작성 중에 알림 채널 설정이 바뀌면 막지 않고 새
   assert.equal(await s.tick(), 'enqueued');
   await f.publisher.deliver();
   assert.equal(f.rest.messages[0]!.channel, 'fixture-briefing-next');
+});
+
+// --- Codex 리뷰 rev-t20 회귀 시험 ---
+test('DATA-02 [rev-t20 P1] 원장 디렉터리 fsync를 확인하지 못하면 삭제 완료라 하지 않고, 확인 뒤 정리', async () => {
+  const ledgerDir = await mkdtemp('.local/ledger-dir-');
+  let failDir = true;
+  let dirFailures = 0;
+  const io = { readFile: (path: string, encoding: 'utf8') => readFile(path, encoding),
+    open: async (path: Parameters<typeof open>[0], flags?: Parameters<typeof open>[1]) => {
+      const handle = await open(path, flags);
+      if (path !== ledgerDir || !failDir) return handle;
+      return { sync: async () => { dirFailures++; throw new Error('EIO'); }, close: () => handle.close() } as unknown as FileHandle;
+    } } as unknown as ConstructorParameters<typeof FileDeletionLedger>[1];
+  try {
+    const fragile = new FileDeletionLedger(`${ledgerDir}/deletions.jsonl`, io);
+    const service = new MemoryService(database.db, f.gate, fragile, documents, f.now); await service.open();
+    const stored = await service.remember('fixture-owner', thread, config('디렉터리 fsync 실패 중 삭제'));
+    const result = await service.delete('fixture-owner', thread, stored.id);
+    assert.ok(dirFailures > 0);
+    assert.deepEqual([result.status, result.reason], ['pending', 'ledger_unconfirmed']);
+    assert.equal((await rows('memories'))[0]!.statement, '디렉터리 fsync 실패 중 삭제');
+    failDir = false;
+    assert.equal(await service.resume(), 1);
+    assert.equal((await rows('memories'))[0]!.status, 'deleted');
+  } finally { await rm(ledgerDir, { recursive: true, force: true }); }
+});
+test('DATA-02 [rev-t20 P2-1] 큐에 넣은 브리핑 뒤 정정하면 옛 진술은 보내지 않고 새 진술로 다시 작성', async () => {
+  const due = { access: ['fixture-notifications'], classification: 'safe_summary' as const, recheckAt: f.now() };
+  const old = await memory.remember('fixture-owner', notifications, config('정정 전 진술', due));
+  const s = scheduler(); await s.ensure();
+  at(SLOT); assert.equal(await s.tick(), 'enqueued');
+  await memory.correct('fixture-owner', notifications, [old.id], config('정정 후 진술', { ...due, recheckAt: f.now() }), '문서 확인');
+  await s.tick();
+  for (let i = 0; i < 3; i++) await f.publisher.deliver();
+  assert.equal(f.rest.messages.length, 1);
+  assert.doesNotMatch(f.rest.messages[0]!.body.content, /정정 전 진술/);
+  assert.match(f.rest.messages[0]!.body.content, /정정 후 진술/);
+});
+test('DATA-02 [rev-t20 P2-1] 큐에 넣은 브리핑 뒤 출처를 저장 제외하면 그 기억은 보내지 않음', async () => {
+  const due = { access: ['fixture-notifications'], classification: 'safe_summary' as const, recheckAt: f.now() };
+  await memory.remember('fixture-owner', notifications, config('제외할 문서의 기억', { ...due, sources: [doc('excluded.md')] }));
+  await memory.remember('fixture-owner', notifications, config('남길 문서의 기억', due));
+  const s = scheduler(); await s.ensure();
+  at(SLOT); assert.equal(await s.tick(), 'enqueued');
+  await memory.exclude('fixture-owner', notifications, 'document:repo://allowed/excluded.md');
+  await s.tick();
+  for (let i = 0; i < 3; i++) await f.publisher.deliver();
+  assert.equal(f.rest.messages.length, 1);
+  assert.doesNotMatch(f.rest.messages[0]!.body.content, /제외할 문서의 기억/);
+  assert.match(f.rest.messages[0]!.body.content, /남길 문서의 기억/);
+});
+test('BRIEF-01 [rev-t20 P2-2] 재시작 때 보내지 못한 지난 회차는 막고 최신 한 건만 보냄', async () => {
+  const s = scheduler(); await s.ensure();
+  at(SLOT); assert.equal(await s.tick(), 'enqueued');
+  at(SLOT + 3 * DAY + 1000);
+  const restarted = scheduler(); await restarted.ensure();
+  assert.equal(await restarted.tick(), 'enqueued');
+  for (let i = 0; i < 5; i++) await f.publisher.deliver();
+  assert.equal(f.rest.messages.length, 1);
+  assert.match(f.rest.messages[0]!.body.content, /^\[일일 브리핑\] 2027-01-19/);
+  assert.match(f.rest.messages[0]!.body.content, /누락: 01-16, 01-17, 01-18/);
+  assert.equal((await briefings()).find(b => b.idempotency_key.endsWith('2027-01-16'))!.state, 'blocked');
+});
+test('BRIEF-01 [rev-t20 P2-2] 12시간 넘게 보내지 못한 회차는 다음 회차 전이라도 보내지 않음', async () => {
+  const s = scheduler(); await s.ensure();
+  at(SLOT); assert.equal(await s.tick(), 'enqueued');
+  at(SLOT + BRIEFING.skipAfterMs + 1);
+  await s.tick();
+  for (let i = 0; i < 3; i++) await f.publisher.deliver();
+  assert.equal(f.rest.messages.length, 0);
+  assert.deepEqual((await rows('briefing_runs')).map(r => [r.state, r.reason]), [['missed', 'too_late']]);
+});
+test('MEM-01 [rev-t20 P2-3] 채널 저장 제외는 그 채널 작업을 출처로 한 기억에도 적용', async () => {
+  await f.ingress.receive(event('m-job-x', { text: '백업 상태 알려줘' })); f.advance(800); await f.runtime.tick();
+  const done = (await rows('jobs'))[0]!;
+  const incident = (statement: string) => ({ kind: 'incident' as const, statement, facts: ['03:00 지연'], hypotheses: [],
+    unconfirmedCauses: [], sources: [{ type: 'job' as const, job: done.id }] });
+  assert.equal((await memory.remember('fixture-owner', thread, incident('제외 전 작업 기억'))).status, 'active');
+  assert.deepEqual(await memory.exclude('fixture-owner', thread, `channel:${thread.channel}`), { hidden: 1 });
+  assert.deepEqual(await memory.search('fixture-owner', thread, '작업 기억'), []);
+  await assert.rejects(memory.remember('fixture-owner', thread, incident('제외 뒤 작업 기억')), { message: 'memory_source_excluded' });
+});
+test('MEM-01 [rev-t20 P2-4] 만료된 기억은 같은 주제 새 기억의 충돌로 남지 않음', async () => {
+  const old = await memory.remember('fixture-owner', thread, config('보존 7일', { topic: 'backup:days', expiresAt: f.now() + 1000 }));
+  const waiting = await memory.remember('fixture-owner', thread, config('보존 10일', { topic: 'backup:days' }));
+  assert.deepEqual([waiting.status, waiting.conflictsWith], ['candidate', [old.id]]);
+  at(f.now() + 1001);
+  assert.deepEqual((await memory.search('fixture-owner', thread, '10일'))[0]!.flags, ['unverified']);
+  await memory.remember('fixture-owner', thread, config('단독 주제 옛 진술', { topic: 'expired:solo', expiresAt: f.now() + 10 }));
+  at(f.now() + 11);
+  const replacement = await memory.remember('fixture-owner', thread, config('단독 주제 새 근거', { topic: 'expired:solo' }));
+  assert.deepEqual([replacement.status, replacement.conflictsWith], ['active', []]);
 });

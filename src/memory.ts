@@ -73,12 +73,14 @@ export interface DeletionLedger {
   entries(): Promise<DeletionEntry[]>;
 }
 const EntrySchema = z.strictObject({ memoryId: z.string().min(1), createdAt: Time, deletedAt: Time });
+export interface LedgerIo { open: typeof open; readFile: (path: string, encoding: 'utf8') => Promise<string> }
 // 로컬 대역이다. 실제 원장 위치(R2 등)는 결정 대기(DECISIONS T20).
 export class FileDeletionLedger implements DeletionLedger {
   private tail: Promise<unknown> = Promise.resolve();
   private dirSynced = false;
   private syncFailed = false;
-  constructor(private readonly path: string) {}
+  // 파일 I/O는 장애 주입 시험을 위해서만 바꿀 수 있다.
+  constructor(private readonly path: string, private readonly io: LedgerIo = { open, readFile }) {}
   // 프로세스 안의 append를 줄 세운다. 겹치면 한쪽의 조각 잘라내기가 다른 쪽의 확정된 줄을 지운다.
   // 쓰는 프로세스는 하나라고 가정한다.
   append(entry: DeletionEntry): Promise<void> {
@@ -88,17 +90,17 @@ export class FileDeletionLedger implements DeletionLedger {
   }
   private async write(entry: DeletionEntry): Promise<void> {
     const line = `${JSON.stringify(EntrySchema.parse(entry))}\n`;
-    const handle = await open(this.path, 'a+');
+    const handle = await this.io.open(this.path, 'a+');
     try {
       // 끊긴 이전 append의 조각 뒤에 붙이면 원장이 손상된다. 확인되지 않은 조각이므로 잘라낸다.
-      const raw = await readFile(this.path, 'utf8');
+      const raw = await this.io.readFile(this.path, 'utf8');
       if (raw.length && !raw.endsWith('\n')) await handle.truncate(Buffer.byteLength(raw.slice(0, raw.lastIndexOf('\n') + 1)));
       await handle.appendFile(line);
       try { await handle.sync(); } catch (error) { this.syncFailed = true; throw error; }
     } finally { await handle.close(); }
     // 파일을 만든 직후뿐 아니라 이 프로세스에서 확인하기 전까지는 디렉터리 항목도 fsync해야 전원 차단 뒤 파일이 남는다.
     if (!this.dirSynced) {
-      const dir = await open(dirname(this.path), 'r');
+      const dir = await this.io.open(dirname(this.path), 'r');
       try { await dir.sync(); } finally { await dir.close(); }
       this.dirSynced = true;
     }
@@ -111,7 +113,7 @@ export class FileDeletionLedger implements DeletionLedger {
   }
   async entries(): Promise<DeletionEntry[]> {
     let raw: string;
-    try { raw = await readFile(this.path, 'utf8'); } catch (error) {
+    try { raw = await this.io.readFile(this.path, 'utf8'); } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
       throw error;
     }
