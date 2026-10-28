@@ -178,3 +178,23 @@ REVIEW-8의 4개 ID에 회귀 **40개**를 추가해 최종 `npm run check`와 *
 emergency-stop rollback 시험은 verifying까지 중지 요청하는 SQL을 가리키도록 fault injection을 갱신했다.
 새 시험은 PGlite·실제 앱 코드·주입 API/worker의 local_integration/mock이다. 실제 Discord 3초 응답 수신,
 slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG 다중 연결 경합은 blocked(실연동 전), T16b/T18이다.
+
+
+## CODEX_BRIDGE T18 실행 결과 (2026-10-29, 로컬·mock)
+
+- 기준: 브랜치 `feat/t18-codex-bridge-local`(origin/main `bf6a8e9` 위 로컬 커밋, PR 전). 구현은 [ARCHITECTURE.md](ARCHITECTURE.md) §12, 결정 대기는 [DECISIONS.md](DECISIONS.md) "T18 결정 대기 (사용자)".
+- `npm run check` 통과, `npm test` **303 tests / 303 pass / 0 fail**(T16a 기준선 276 + T18 27, 시험 파일 `test/codex-bridge.test.ts`). Node 24.22.0, TypeScript 7.0.2, PGlite 0.5.10.
+- **실제 `codex` 실행과 모델 호출은 하지 않았다**(D-14 차단 조건). Codex 자리는 (1) JSONL fixture를 내보내는 fake launcher, (2) 같은 인자·stdin·환경으로 도는 로컬 node 스크립트다. JSONL fixture는 공식 문서의 이벤트 형태로 합성했고 실제 CLI 녹음이 아니다. 개인 `~/.codex*`, Discord, GitHub, 네트워크에 닿지 않았다.
+- 등급: `mock`은 봇 쪽 실제 코드(Store·Runtime·PolicyGate·DiscordPublisher, PGlite)에 Codex 자리만 fake다. `local_integration`은 실제 로컬 프로세스·파일시스템·디스크 DB 재시작을 포함한다.
+- **보안 경계 SEC-02는 이 경로에서 로컬로 시험할 수 있는 부분만 pass다.** 작업 레인 비신뢰 코드의 `auth.json` 읽기 격리와 세션 디렉터리 격리는 사용자 결정과 T16b 실측 전이라 `blocked`다. 그래서 T18 완료 조건(SEC-02 pass, R08 사용자 결정)은 아직 채우지 못했다.
+
+| 시험 ID | 등급 / 판정 | 확인한 경계 | 남은 검증 / 해소 |
+|---|---|---|---|
+| TASK-01 | mock / pass (봇 소유 경로·능력 표시). R08 사례 blocked | Discord task → exec → 결과·증거 기록 → outbox → 게시, `codex_sessions` 소유 기록(외부 스레드·실행 호스트·능력표), 능력표(tool approval false, attach 미정), 타인·다른 스레드·미등록·대화 작업의 상태 조회 거부, 지시·답은 stdin, 위험 플래그 없음, `-`로 시작하는 스레드 ID 거부 | R08 명시적 연결 사례 blocked(사유: 연결 방식 사용자 결정 대기. 해소: DECISIONS "T18 결정 대기" (1) 결정 뒤 T18). 실제 `codex exec` blocked(T16b, D-14) |
+| TASK-02 | mock / pass | 질문 ID `job:thread:turn`, owner만 답함, 다른 스레드·다른 사람 거부, 같은 이벤트 재전달은 한 번만 반영, 두 번째 답·이어 간 질문·기한 지난 질문·취소된 작업의 질문 거부, 만료 때 cancelled·알림·슬롯 해제(Runtime `sweep`), 작업당 열린 질문 하나, 도구 승인 종류 질문 DB 거부, migration 009 반복 적용 | Discord `/answer` 명령 연결 not_run(T16a 소유 ingress 변경 필요, ARCHITECTURE §12). 실제 `exec resume` blocked(T16b) |
+| TASK-03 | mock(JSONL fixture) / pass. 프로세스 정리는 local_integration / pass(한계 기록) | "완료" 문자열·로그 속 가짜 이벤트·idle 무시, 종료 코드·`turn.failed`·스키마 밖 출력·스트림 손상·스레드 불일치, 취소는 소멸 확인 뒤에만 cancelled, 남은 프로세스 → unknown·Discord 막힘 알림·새 실행 차단·owner 해제(0개 재확인), 중단 뒤 끝나지 않는 실행 → unknown, 시간 초과 → failed, 작업자 단절 → 종료 확인에 따라 failed·unknown, 재개 실패를 새 스레드로 바꾸지 않음, 디스크 DB 재시작 뒤 막힘 유지 | 환경을 지우고 새 세션으로 빠져나간 자식은 못 찾는다(시험으로 기록). cgroup 확인 blocked(T16b). codex의 SIGTERM 동작·종료 코드 blocked(T16b). Telegram 막힘 알림 blocked(T16b) |
+| SEC-02 | 부분: mock·local_integration / pass. `auth.json` 읽기 격리·세션 디렉터리 격리 blocked | `shell_environment_policy` inherit=none 설정 생성, codex 실행 환경 허용 목록(실제 프로세스에서 작업자 환경의 Discord·OpenAI·시드 값 미상속), 결과·질문의 `auth.json` 값 반사 차단, 이전 턴 출력 파일 삭제, 개인 `~/.codex*` 아래·위 루트와 심링크 거부, 실행 중 접근 경로가 작업자 루트 밖으로 나가지 않음, 정상 종료 뒤 배경 자식·새 세션 자식 정리 | 작업 레인 비신뢰 코드의 `auth.json` 읽기 → 거부: blocked(사유: 같은 UID라 지금 구조로는 읽힌다. 해소: DECISIONS "T18 결정 대기" (2) 결정 + T16b 실측). 다른 작업·대화 세션 디렉터리 읽기: blocked((4) 결정 + T16b). Codex가 정책을 실제로 적용하는지(모델 셸 환경): blocked(T16b, codex 실행 필요). `codeload.github.com` 밖 GitHub 차단: blocked(T16b egress). 제어 끝점 호출 거부: 이 경로 not_run(T16a capability 시험이 기준) |
+| AUTH-02 (질문 경로) | mock / pass | 답 직전 owner 교체·즉시 철회는 Denied, 정책 만료는 PolicyUnavailable(질문·작업 상태 불변), 답 수락 뒤 철회는 재개 전 cancelled, 실행 중 철회는 소멸 확인에 따라 cancelled·unknown | 실제 Infisical·ESO 반영 blocked(T16b) |
+| OPS-02 (막힘 알림 경로) | mock / pass(Discord만) | unknown 막힘의 Discord 알림 | Telegram 비AI 경로 blocked(T16b) |
+
+이 결과를 실연동 성공·AC-B5 완료로 쓰지 않는다. 시험 중 잡은 결함: `-`로 시작하는 스레드 ID가 재개 인자 검사를 통과하던 것(첫 실행 1건 실패 뒤 수정), 질문 기록 SQL의 매개변수 타입 추론 오류(9건 실패 뒤 수정).
