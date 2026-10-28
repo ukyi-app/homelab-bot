@@ -155,19 +155,25 @@ export class ReviewQueue {
     const key = generationKey(repo.id, pr.number, pr.head.sha, pr.base.sha, context.revision);
     const existing = (await tx.query<{ job_id: string; state: string; attempt: number }>(`SELECT p.job_id,j.state,j.attempt
       FROM pr_reviews p JOIN jobs j ON j.id=p.job_id WHERE p.generation_key=$1`, [key])).rows[0];
-    if (existing) {
-      // 명시 요청은 확인된 실패만 다시 넣는다. 대기·진행 중인 같은 세대는 넣지 않는다(직렬 1개, D-14).
-      if (trigger === 'comment' && existing.state === 'failed' && existing.attempt <= DEFAULTS.maxRetries) {
-        await tx.query(`UPDATE jobs SET state='queued',available_at=$2,wait_reason=NULL,finished_at=NULL WHERE id=$1 AND state='failed'`, [existing.job_id, now]);
-        await tx.query(`UPDATE pr_reviews SET review_outcome=NULL WHERE job_id=$1`, [existing.job_id]);
-        return { outcome: 'requeued', key, job: existing.job_id };
-      }
-      return { outcome: 'duplicate_generation', key, job: existing.job_id };
-    }
+    // 대기·진행·완료된 같은 세대는 다시 넣지 않는다(직렬 1개, D-14). 닫힘·draft·옛 이벤트로 밀려난 세대가
+    // 다시 live가 됐거나, 명시 요청이 확인된 실패를 다시 부를 때만 같은 작업을 되살린다. 세대당 모델 호출은 재시도 한도로 묶는다.
+    const revive = existing && existing.attempt <= DEFAULTS.maxRetries
+      && (existing.state === 'superseded' || (trigger === 'comment' && existing.state === 'failed'));
+    if (existing && !revive) return { outcome: 'duplicate_generation', key, job: existing.job_id };
     const latest = (await tx.query<ReviewRow>(`SELECT * FROM pr_reviews WHERE repo_id=$1 AND pr_number=$2
       ORDER BY pr_updated_at DESC,created_at DESC LIMIT 1`, [repo.id, pr.number])).rows[0];
     // 늦게 도착한 옛 이벤트가 새 세대를 밀어내지 않게 한다. 실행 직전 live 조회가 한 번 더 막는다.
     if (latest && Number(latest.pr_updated_at) > pr.updatedAt) return { outcome: 'stale_event', key };
+    if (existing) {
+      const queued = (await tx.query<{ count: string }>("SELECT count(*) FROM jobs WHERE state='queued'")).rows[0]!;
+      if (Number(queued.count) >= DEFAULTS.maxQueue) throw new Error('queue_full');
+      await this.supersede(tx, repo.id, pr.number, 'new_generation', key);
+      await tx.query(`UPDATE jobs SET state='queued',available_at=$2,wait_reason=NULL,finished_at=NULL,lease_token=NULL,lease_until=NULL
+        WHERE id=$1 AND state IN ('superseded','failed')`, [existing.job_id, now]);
+      await tx.query(`UPDATE pr_reviews SET review_outcome=NULL,result=NULL,superseded_at=NULL,superseded_reason=NULL,pr_updated_at=$2
+        WHERE job_id=$1`, [existing.job_id, pr.updatedAt]);
+      return { outcome: 'requeued', key, job: existing.job_id };
+    }
     const baseOnly = latest && latest.head_sha === pr.head.sha && latest.comparison_revision !== pr.base.sha
       && latest.policy_revision === context.revision;
     const rereview = !baseOnly || trigger === 'retarget' || trigger === 'comment' || context.review.rereviewOnBaseMove === true;
@@ -320,7 +326,7 @@ const PositionsSchema = z.array(z.strictObject({ path: z.string(), lines: z.arra
 const SECRET_PATTERNS = [/\b(?:ghp|gho|ghs|ghu|ghr|github_pat)_[A-Za-z0-9_]{20,}/, /\bsk-[A-Za-z0-9_-]{20,}/,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/, /\b[a-z0-9-]+\.ts\.net\b/i, /\b100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b/,
   /"refresh_token"\s*:/];
-export function classify(output: ReviewOutput, review: ReviewPolicy): ReviewResult['output_classification'] {
+export function classify(output: Pick<ReviewOutput, 'findings' | 'open_questions' | 'public_summary'>, review: ReviewPolicy): ReviewResult['output_classification'] {
   // JSON 문자열화는 따옴표를 이스케이프해 패턴을 피해 가므로 원문 문자열을 그대로 모은다.
   const text = [...output.findings.flatMap(f => Object.values(f).map(String)), ...output.open_questions, output.public_summary].join('\n');
   const lower = text.toLowerCase();
@@ -472,6 +478,8 @@ export class ReviewRuntime {
 }
 
 const SEVERITY = ['P0', 'P1', 'P2', 'P3'];
+// 모델 문장이 사람·팀을 멘션하거나 HTML 주석으로 대조 marker를 흉내 내지 못하게 한다.
+const inert = (value: string) => value.replace(/@(?=[A-Za-z0-9_-])/g, '@\u200b').replace(/<!--/g, '&lt;!--');
 export const reviewMarker = (key: string) => `<!-- homelab-bot-review:${key} -->`;
 // 게시 본문은 코드가 만든다. 모델 텍스트는 지적 칸 안의 자료로만 들어가고 event·대상은 상수다.
 export function render(result: ReviewResult, positions: { path: string; lines: number[] }[],
@@ -480,7 +488,7 @@ export function render(result: ReviewResult, positions: { path: string; lines: n
   const shown = findings.slice(0, limits.maxFindings);
   const comments: { path: string; line: number; side: 'RIGHT'; body: string }[] = [];
   const valid = new Map(positions.map(p => [p.path, new Set(p.lines)]));
-  const entry = (f: ReviewResult['findings'][number]) => `**[${f.severity}] ${f.title}**\n- 조건: ${f.condition}\n- 영향: ${f.impact}\n- 근거: ${f.evidence}\n- 개선: ${f.suggestion}`;
+  const entry = (f: ReviewResult['findings'][number]) => `**[${f.severity}] ${inert(f.title)}**\n- 조건: ${inert(f.condition)}\n- 영향: ${inert(f.impact)}\n- 근거: ${inert(f.evidence)}\n- 개선: ${inert(f.suggestion)}`;
   for (const f of shown) if (f.line && valid.get(f.path)?.has(f.line) && comments.length < limits.maxInlineComments) {
     comments.push({ path: f.path, line: f.line, side: 'RIGHT', body: entry(f) });
   }
@@ -491,11 +499,11 @@ export function render(result: ReviewResult, positions: { path: string; lines: n
       + (result.coverage.limits_hit.length ? `, 상한: ${result.coverage.limits_hit.join(', ')}` : ''),
     ...omitted.slice(0, 20).map(o => `  - 미검토 \`${o.path}\`: ${o.reason}`),
     ...(omitted.length > 20 ? [`  - 미검토 ${omitted.length - 20}개 더 있음`] : []),
-    '', result.public_summary, ''];
+    '', inert(result.public_summary), ''];
   lines.push(shown.length ? '### 지적' : '### 지적 없음');
-  for (const f of shown) lines.push(`${entry(f)}\n- 위치: \`${f.path}\`${f.line ? `:${f.line}` : ''}`);
+  for (const f of shown) lines.push(`${entry(f)}\n- 위치: \`${inert(f.path)}\`${f.line ? `:${f.line}` : ''}`);
   if (findings.length > shown.length) lines.push(`- 상한으로 ${findings.length - shown.length}건 생략`);
-  if (result.open_questions.length) lines.push('### 확인 질문', ...result.open_questions.map(q => `- ${q}`));
+  if (result.open_questions.length) lines.push('### 확인 질문', ...result.open_questions.map(q => `- ${inert(q)}`));
   const body = lines.join('\n');
   return body.length > limits.maxBodyChars ? null : { body, comments };
 }
@@ -510,6 +518,9 @@ export class ReviewPublisher {
   constructor(private readonly store: Store, private readonly policy: ReviewPolicySource, private readonly reader: GitHubReader,
     private readonly github: RestrictedGitHub) {}
   async deliver(): Promise<boolean> {
+    // 게시 중 죽은 프로세스의 lease를 회수한다. 전송을 시작했으면 결과를 모르므로 unknown(재게시 없이 대조).
+    await this.store.db.query(`UPDATE review_deliveries SET state=CASE WHEN dispatch_started THEN 'unknown' ELSE 'pending' END,
+      reason=CASE WHEN dispatch_started THEN 'lease_expired' ELSE reason END WHERE state='sending' AND lease_until<=$1`, [this.store.now()]);
     const row = await this.store.db.transaction(async tx => {
       const next = (await tx.query<{ id: string }>(`SELECT id FROM review_deliveries WHERE state='pending' AND available_at<=$1
         ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1`, [this.store.now()])).rows[0];
@@ -528,6 +539,9 @@ export class ReviewPublisher {
       if (row.body.length > context.review.publish.maxBodyChars || row.comments.length > context.review.publish.maxInlineComments) {
         await this.state(row, 'blocked', 'publish_limit_exceeded'); return true;
       }
+      // 내부 표식 목록은 결과 저장 뒤에도 바뀔 수 있어 게시 직전 현재 정책으로 다시 분류한다(DATA-01).
+      const stored = (await this.store.db.query<{ result: ReviewResult }>('SELECT result FROM pr_reviews WHERE job_id=$1', [row.job_id])).rows[0]?.result;
+      if (!stored || classify(stored, context.review) !== 'public') { await this.state(row, 'blocked', 'output_classification'); return true; }
       // 게시 직전 최신 PR을 다시 본다. 오래된 리뷰를 최신 검증처럼 올리지 않는다(REVIEW-02).
       const pr = pullRequest(await this.reader.pullRequest(repo.fullName, row.pr_number));
       const stale = !pr.open ? (pr.merged ? 'merged_before_publish' : 'pr_closed')
@@ -563,7 +577,10 @@ export class ReviewPublisher {
   }
   // 응답 유실 뒤에는 PR의 리뷰 목록에서 marker와 검토 SHA로 찾는다. 못 찾아도 자동 재게시하지 않는다.
   async reconcile(): Promise<void> {
-    for (const row of (await this.store.db.query<DeliveryRow>("SELECT * FROM review_deliveries WHERE state='unknown' ORDER BY created_at LIMIT 20")).rows) {
+    const retired = await this.store.db.query<{ id: string }>(`UPDATE review_deliveries SET state='blocked',reason='unknown_deadline'
+      WHERE state='unknown' AND created_at<=$1 RETURNING id`, [this.store.now() - DEFAULTS.unknownDeliveryMs]);
+    for (const row of retired.rows) await this.store.audit('review_delivery_unresolved_retired', row.id, { reason: 'unknown_deadline', resend: false });
+    for (const row of (await this.store.db.query<DeliveryRow>("SELECT * FROM review_deliveries WHERE state='unknown' ORDER BY created_at DESC LIMIT 20")).rows) {
       try { await this.existing(row); } catch { /* 다음 대조에서 다시 본다 */ }
     }
   }
