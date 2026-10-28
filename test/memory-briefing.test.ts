@@ -37,6 +37,7 @@ class FlakyLedger implements DeletionLedger {
   }
   async has(id: string, createdAt: number) { if (this.readFails) throw new Error('ledger_down'); return this.inner.has(id, createdAt); }
   async entries() { if (this.readFails) throw new Error('ledger_down'); return this.inner.entries(); }
+  async durable() { return !this.readFails && this.inner.durable(); }
 }
 function faulty(db: Database, match: (sql: string) => boolean) {
   let armed = true;

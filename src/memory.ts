@@ -67,10 +67,12 @@ export interface DeletionResult { status: 'deleted' | 'pending'; reason?: 'ledge
 
 export interface DeletionEntry { memoryId: string; createdAt: number; deletedAt: number }
 // 복원 대상 밖의 append-only 삭제 원장. append가 resolve되면 내구성 있게 기록된 것이다.
+// entries()는 지금 보이는 항목일 뿐이다. 그 항목으로 삭제를 완료로 올리기 전에는 durable()로 내구성을 확인한다.
 export interface DeletionLedger {
   append(entry: DeletionEntry): Promise<void>;
   has(memoryId: string, createdAt: number): Promise<boolean>;
   entries(): Promise<DeletionEntry[]>;
+  durable(): Promise<boolean>;
 }
 const EntrySchema = z.strictObject({ memoryId: z.string().min(1), createdAt: Time, deletedAt: Time });
 export interface LedgerIo { open: typeof open; readFile: (path: string, encoding: 'utf8') => Promise<string> }
@@ -101,16 +103,22 @@ export class FileDeletionLedger implements DeletionLedger {
     // 파일을 만든 직후뿐 아니라 이 프로세스에서 확인하기 전까지는 디렉터리 항목도 fsync해야 전원 차단 뒤 파일이 남는다.
     await this.syncDirectory();
   }
-  // fsync가 한 번 실패하면 커널이 실패한 페이지를 clean으로 돌려 캐시만 보고 기록됐다고 답할 수 있다. 그 뒤로는 판정하지 않는다.
-  // 파일과 디렉터리 항목이 둘 다 fsync로 확인될 때만 기록됐다고 답한다. 새 파일의 디렉터리 항목이 없으면 전원 차단 뒤 파일째 사라진다.
   async has(memoryId: string, createdAt: number): Promise<boolean> {
-    if (this.syncFailed) throw new Error('deletion_ledger_unsynced');
-    await this.tail;
-    const handle = await this.io.open(this.path, 'r').catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return undefined; throw error; });
-    if (!handle) return false;
-    try { await handle.sync(); } catch (error) { this.syncFailed = true; throw error; } finally { await handle.close(); }
-    await this.syncDirectory();
+    if (!await this.durable()) throw new Error('deletion_ledger_unsynced');
     return (await this.entries()).some(e => e.memoryId === memoryId && e.createdAt === createdAt);
+  }
+  // 파일과 디렉터리 항목이 둘 다 fsync로 확인될 때만 true다. 새 파일의 디렉터리 항목이 없으면 전원 차단 뒤 파일째 사라진다.
+  // fsync가 한 번 실패하면 커널이 실패한 페이지를 clean으로 돌려 캐시만 보일 수 있어, 이 프로세스에서는 다시 믿지 않는다.
+  async durable(): Promise<boolean> {
+    if (this.syncFailed) return false;
+    await this.tail;
+    try {
+      const handle = await this.io.open(this.path, 'r').catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return undefined; throw error; });
+      if (!handle) return true;
+      try { await handle.sync(); } catch { this.syncFailed = true; return false; } finally { await handle.close(); }
+      await this.syncDirectory();
+      return true;
+    } catch { return false; }
   }
   private async syncDirectory(): Promise<void> {
     if (this.dirSynced) return;
@@ -144,27 +152,47 @@ const REDACTED = '[삭제된 기억이 포함돼 로컬 사본을 지웠습니�
 
 export class MemoryService {
   private ready = false;
-  private readonly erased = new Set<string>();
+  // 원장에서 본 삭제는 곧바로 숨긴다. 정리·완료로 올리는 것은 내구성이 확인된 항목(recorded)뿐이다.
+  private readonly hidden = new Set<string>();
+  private readonly recorded = new Set<string>();
+  private unconfirmed = false;
   constructor(private readonly db: Database, private readonly gate: PolicyGate, private readonly ledger: DeletionLedger,
     private readonly documents: DocumentSource, private readonly now: Clock = Date.now) {}
   // 기동 때마다 원장의 삭제를 다시 적용한 뒤에만 조회를 연다. 원장을 못 읽으면 닫힌 채로 둔다.
+  // 원장 내구성을 확인하지 못하면 그 항목의 기억은 숨기기만 하고 정리·완료로 올리지 않는다. 확인은 resume()이 다시 시도한다.
   async open(): Promise<{ entries: number; applied: number }> {
     this.ready = false;
     const entries = await this.ledger.entries();
-    for (const entry of entries) this.erased.add(erasedKey(entry.memoryId, entry.createdAt));
-    let applied = 0;
-    for (const entry of entries) if ((await this.purge(entry.memoryId, entry.createdAt, entry.deletedAt, true)).applied) applied++;
+    const applied = await this.replay(entries);
     await this.resume();
-    await this.audit('memory_ledger_replayed', 'memory', { entries: entries.length, applied });
+    await this.audit('memory_ledger_replayed', 'memory', { entries: entries.length, applied, confirmed: !this.unconfirmed });
     this.ready = true;
     return { entries: entries.length, applied };
   }
+  // 이번 호출에서 정리를 마친 삭제 수를 돌려준다(원장 재적용 + 남은 삭제 요청).
   async resume(): Promise<number> {
+    let done = 0;
+    if (this.unconfirmed) done += await this.replay(await this.ledger.entries());
     const rows = (await this.db.query<{ memory_id: string; memory_created_at: string | number }>(
       'SELECT memory_id,memory_created_at FROM memory_deletions WHERE applied_at IS NULL ORDER BY requested_at')).rows;
-    let done = 0;
     for (const row of rows) if ((await this.finish(row.memory_id, Number(row.memory_created_at))).status === 'deleted') done++;
     return done;
+  }
+  private async replay(entries: DeletionEntry[]): Promise<number> {
+    for (const entry of entries) this.hidden.add(erasedKey(entry.memoryId, entry.createdAt));
+    if (!entries.length) { this.unconfirmed = false; return 0; }
+    if (!await this.ledger.durable()) {
+      this.unconfirmed = true;
+      await this.audit('memory_ledger_unconfirmed', 'memory', { entries: entries.length });
+      return 0;
+    }
+    this.unconfirmed = false;
+    let applied = 0;
+    for (const entry of entries) {
+      this.recorded.add(erasedKey(entry.memoryId, entry.createdAt));
+      if ((await this.purge(entry.memoryId, entry.createdAt, entry.deletedAt, true)).applied) applied++;
+    }
+    return applied;
   }
   async remember(actor: string, scope: Scope, raw: unknown): Promise<{ id: string; status: 'active' | 'candidate'; conflictsWith: string[] }> {
     this.assertReady();
@@ -242,7 +270,7 @@ export class MemoryService {
   // 브리핑을 큐에 넣는 transaction 안에서 부른다. FOR SHARE로 같은 행의 삭제 요청·정리·정정과 직렬화한다.
   async live(tx: Database, items: Pick<MemoryView, 'id' | 'createdAt'>[]): Promise<boolean> {
     if (!items.length) return true;
-    if (items.some(item => this.erased.has(erasedKey(item.id, item.createdAt)))) return false;
+    if (items.some(item => this.hidden.has(erasedKey(item.id, item.createdAt)))) return false;
     const rows = (await tx.query<{ id: string; created_at: string | number }>(`SELECT id,created_at FROM memories m
       WHERE id=ANY($1::text[]) AND status='active' AND deletion_requested_at IS NULL
       AND NOT EXISTS (SELECT 1 FROM memory_exclusions x WHERE x.owner_id=m.owner_id AND m.source_keys ? x.source_key)
@@ -271,7 +299,8 @@ export class MemoryService {
     if (!request) throw new Denied();
     if (request.applied_at !== null) return { status: 'deleted', publishedCopies: 0, message: '이미 삭제가 끝난 기억입니다.' };
     const key = erasedKey(id, createdAt);
-    if (request.ledger_state !== 'recorded' && !this.erased.has(key)) {
+    // DB의 recorded는 확인 뒤에만 쓰므로 믿는다. 원장에서 보기만 한 항목은 다시 써서 내구성을 확인한다.
+    if (request.ledger_state !== 'recorded' && !this.recorded.has(key)) {
       let recorded = false;
       const entry = { memoryId: id, createdAt, deletedAt: Number(request.requested_at) };
       // 중복 항목은 재적용에서 무해하므로 한 번 더 쓴다. 그래도 실패하면 응답만 잃었을 수 있어 원장을 다시 읽어 판단한다.
@@ -282,7 +311,8 @@ export class MemoryService {
         return { status: 'pending', reason: 'ledger_unconfirmed', publishedCopies: 0,
           message: '삭제 원장 기록을 확인하지 못해 아직 삭제하지 않았습니다. 조회에서는 숨기고 원장 기록을 다시 시도합니다.' };
       }
-      this.erased.add(key);
+      this.recorded.add(key);
+      this.hidden.add(key);
     }
     try {
       const { publishedCopies } = await this.purge(id, createdAt, Number(request.requested_at), false);
@@ -442,7 +472,7 @@ export class MemoryService {
       && [policy.conversationChannel, policy.notificationChannel].includes(channel)
       && (!row.scope.service || policy.services.includes(row.scope.service))
       && (!row.scope.guild || row.scope.guild === policy.guild)
-      && (pendingOk || (row.deletion_requested_at === null && !this.erased.has(erasedKey(row.id, Number(row.created_at)))));
+      && (pendingOk || (row.deletion_requested_at === null && !this.hidden.has(erasedKey(row.id, Number(row.created_at)))));
   }
   private async views(rows: MemoryRow[]): Promise<MemoryView[]> {
     const linked = [...new Set(rows.flatMap(row => row.conflicts_with))];
