@@ -178,3 +178,23 @@ REVIEW-8의 4개 ID에 회귀 **40개**를 추가해 최종 `npm run check`와 *
 emergency-stop rollback 시험은 verifying까지 중지 요청하는 SQL을 가리키도록 fault injection을 갱신했다.
 새 시험은 PGlite·실제 앱 코드·주입 API/worker의 local_integration/mock이다. 실제 Discord 3초 응답 수신,
 slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG 다중 연결 경합은 blocked(실연동 전), T16b/T18이다.
+
+## MEMORY_BRIEFING T20 실행 결과 (2026-10-29)
+
+로컬·mock 범위다. 기준은 `origin/main` `bf6a8e9`, 브랜치 `feat/t20-memory-briefing-local`이다.
+`npm run check`와 `npm test` 통과, **303 tests / 303 pass / 0 fail**(T16a 기준선 276 + T20 27).
+실행 환경은 Node 24.22.0, TypeScript 7.0.2, PGlite 0.5.10이다. 시험 코드는 `test/memory-briefing.test.ts`다.
+R2·Discord·모델·플랫폼은 호출하지 않았다. 삭제 원장은 로컬 파일 대역(`FileDeletionLedger`), Discord는 T16a 모의 REST,
+백업 복원은 PGlite 디스크 디렉터리 복사로 흉내 냈다. 이 단계에 배정된 보안 경계 시험은 없다(spec §7).
+T16a 표의 AUTH-02 "예약/기억 접근 not_run"은 아래 T20 행으로 채운다. 질문 접근은 여전히 T18이다.
+
+| 시험 ID | 등급 / 판정 | 확인한 경계 | 남은 검증 / 해소 티켓 |
+|---|---|---|---|
+| MEM-01 | local_integration / pass | 출처 없음·접근 불가 출처·저장 제외 출처 거부, 종류별 근거 출처가 없으면 candidate와 검색의 미확인 표시, 성공한 작업만 장애 근거, 비신뢰 PR 댓글의 정책 변경 지시는 candidate로만 남고 정책·권한 불변·정책 필드 거부, 같은 주제의 충돌은 양쪽 표시와 사유 있는 정정으로 정리·색인 갱신, 일시 지시의 유효기간 필수·만료 뒤 제외, 재확인 표시 | 기억을 모델 맥락으로 넘기는 경로는 아직 없다(연결 때 untrusted 표시 필요, not_run). 실제 문서 출처 확인기 blocked, T16b |
+| BRIEF-01 | local_integration / pass (로컬 경로). 실제 채널 전송 blocked | 08:50 Asia/Seoul에만 한 번(UTC 08:50·08:49:59에는 없음), 시각·시간대 누락·오류면 예약 끔, 동시 tick·두 인스턴스에서 한 번, 디스크 DB 재시작 뒤 중복 없음, 작성 중 중단은 lease 만료 뒤 한 번, 3일 중단 뒤 최신 한 건과 누락·지연 표시, 12시간 넘게 늦은 회차 미발송, 모델 비상 중지 중에도 모델 호출 0회로 한 번, 읽기 불가·오래된 관측은 미확인과 마지막 정상 수집 시각, 백업과 복원 검증 구분, 전달 실패는 다음 브리핑에 안내하고 재전송 없음, 원장 재적용 전 기억 칸 미확인 | 실제 Discord 브리핑 채널 전송(`authorized_external`) blocked: 배포된 봇·Discord 서버 필요, T16b. 실제 백업·인증서·예약 작업 관측 원본, 실제 시계·프로세스 재시작, PostgreSQL 다중 연결 blocked, T16b. Codex 작업 상태·승인/질문 대기 칸 not_run, T18 |
+| DATA-02 | local_integration / pass | 원장 기록 확인 뒤에만 DB 정리·완료 응답(원장 append 시점에 DB는 아직 active), 내용·색인 비움·감사에 내용 없음, 원장 쓰기 실패는 미완료 응답·숨김·재시도, 응답 유실은 원장 재조회로 판단하고 못 읽으면 미완료, DB 정리 실패는 미완료·숨김·재기동 재적용, 삭제 전 디스크 DB 백업으로 복원해도 기동 때 재적용하고 그 전에는 조회 닫힘, ID가 같아도 `created_at`이 다르면 지우지 않음, 원장을 못 읽으면 닫힘, 끊긴 마지막 줄 무시·중간 손상 닫힘, 지운 기억이 든 대기 브리핑 차단, 이미 보낸 브리핑은 지우지 않았다고 안내 | 원장 저장소·자격·보존은 결정 대기([DECISIONS](DECISIONS.md) T20). 실제 R2 append와 CNPG 백업 복원 blocked, T16b(결정 뒤). PGlite 디렉터리 복사는 CNPG 복원 절차를 검증하지 않는다 |
+| AUTH-02 (T20 부분) | local_integration / pass | 기억 저장·검색·정정·삭제마다 현재 정책 재인가(owner 교체·DB 철회·5분 stale 차단), 다른 채널 누출 차단, 서비스 철회는 다음 접근부터 숨김, 예약 브리핑은 발송 시점 철회로 blocked·감사, 큐에 넣은 뒤 owner 교체는 게시자가 차단, 정책 확인 불가 동안 미루고 확인 뒤 한 번 | 질문 접근 not_run, T18. 실제 Infisical/ESO 전달 blocked, T16b |
+
+PGlite는 transaction을 직렬화하므로 두 인스턴스 동시 실행 시험은 잠금 순서와 회차 키만 검사한다.
+실제 PostgreSQL에서 bigint가 문자열로 오는 경로는 코드에서 `Number()`로 바꾸지만 실서버로는 실행하지 않았다.
+기억 저장·검색·삭제를 Discord 명령으로 여는 연결과 기동 순서(원장 재적용 → 브리핑 예약 확인 → tick 반복)의 진입점은 아직 없다(T16b).
