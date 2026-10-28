@@ -578,7 +578,7 @@ export class ReviewPublisher {
       const request = { method: 'POST', path: `/repos/${repo.fullName}/pulls/${row.pr_number}/reviews`,
         body: { commit_id: row.head_sha, event: 'COMMENT', body: row.body, comments: row.comments } };
       const expected = { repository: repo.fullName, pr: row.pr_number, head: row.head_sha };
-      restrictGitHubWrite(request, expected);
+      try { restrictGitHubWrite(request, expected); } catch { await this.state(row, 'blocked', 'github_write_denied'); return true; }
       if (!(await this.store.db.query(`UPDATE review_deliveries SET dispatch_started=true WHERE id=$1 AND lease_token=$2
         AND state='sending' AND lease_until>$3 RETURNING id`, [row.id, row.lease_token, this.store.now()])).rows.length) return true;
       dispatched = true;
@@ -588,8 +588,12 @@ export class ReviewPublisher {
       if (dispatched && !(error instanceof GitHubError && error.status < 500 && error.status !== 408)) {
         // 응답을 잃은 게시는 다시 보내지 않고 기존 리뷰를 대조한다(EVENT-02).
         await this.state(row, 'unknown', 'response_lost');
-      } else if (error instanceof Denied) await this.state(row, 'blocked', 'github_write_denied');
-      else if (error instanceof GitHubError && error.status === 422 && row.comments.length) {
+      } else if (error instanceof Denied) await this.state(row, 'blocked', 'authorization_revoked');
+      else if (error instanceof PolicyUnavailable) {
+        // 정책 확인 불가는 일시 상태다. 재시도 횟수를 쓰지 않고 기다린다(T16a 게시 pause와 같은 규칙).
+        await this.store.db.query(`UPDATE review_deliveries SET state='pending',attempt=GREATEST(0,attempt-1),dispatch_started=false,
+          available_at=$3,reason='policy_unavailable' WHERE id=$1 AND lease_token=$2`, [row.id, row.lease_token, this.store.now() + DEFAULTS.retryDelayMs]);
+      } else if (error instanceof GitHubError && error.status === 422 && row.comments.length) {
         // 인라인 위치가 무효면 같은 내용을 본문만으로 한 번 더 시도한다.
         await this.store.db.query(`UPDATE review_deliveries SET state='pending',comments='[]',dispatch_started=false,available_at=$3
           WHERE id=$1 AND lease_token=$2`, [row.id, row.lease_token, this.store.now()]);
@@ -597,7 +601,7 @@ export class ReviewPublisher {
       else if (row.attempt > DEFAULTS.maxRetries) await this.state(row, 'blocked', 'retry_limit');
       else await this.store.db.query(`UPDATE review_deliveries SET state='pending',dispatch_started=false,available_at=$3,reason=$4
         WHERE id=$1 AND lease_token=$2`, [row.id, row.lease_token, this.store.now() + Math.max(DEFAULTS.retryDelayMs,
-        error instanceof GitHubError ? error.retryAfterMs : 0), error instanceof PolicyUnavailable ? 'policy_unavailable' : 'retry']);
+        error instanceof GitHubError ? error.retryAfterMs : 0), 'retry']);
     }
     return true;
   }

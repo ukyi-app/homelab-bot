@@ -890,3 +890,14 @@ test('SEC-02 리뷰 레인 작업자 HTTP(loopback): capability 없음·위조·
     assert.equal(r.fetches.length, fetched + 2);
   } finally { server.close(); }
 });
+
+test('EVENT-02 게시 직전 정책 확인 불가는 재시도 횟수를 쓰지 않고 기다렸다가 갱신 뒤 한 번 게시', async () => {
+  await opened(); await r.runtime.tick();
+  f.advance(DEFAULTS.policyMaxAgeMs + 1);
+  for (let i = 0; i < DEFAULTS.maxRetries + 3; i++) { await r.publisher.deliver(); f.advance(DEFAULTS.retryDelayMs); }
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason, d.attempt]), [['pending', 'policy_unavailable', 0]]);
+  f.policy.confirmedAt = f.now();
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => d.state), ['sent']);
+  assert.equal(r.gh.writes.length, 1);
+});
