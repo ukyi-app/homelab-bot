@@ -400,3 +400,38 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 | R08 보류 | `01` §3 질문 4, `01` §11 새 행, `00` §3 둘째 "> 참고:", `00` §8 `codex.adapters_to_verify` 주석(요구·계약 문구는 그대로) | spec §5.1, T18 |
 | 범위 조정(안 3) | `01` §0 아래 "실제 티켓 순서와 완료 조건", `01` §3 질문 1(플랫폼 등록은 T16b), `01` §11 새 행, `00` §3 둘째 "> 참고:" | spec §8.1 표·§8.2 그래프(T16을 T16a·T16b로), §10 6번, T16 분할, T17~T22 머리말([V1_PLAN.md](V1_PLAN.md) §5) |
 | 모든 결정 | spec §12대로 봇 문서 `00`~`04` 전체를 D-14~D-17·D-24로 다시 검색해 빠진 자리를 찾는다 | 같은 방법으로 플랫폼 프롬프트(`platform/design-prompt.md`)와 설계 C.8·F를 검색한다 |
+
+---
+
+## T17 PR_REVIEW 구현 선택과 결정 대기 (2026-10-29, 로컬·mock)
+
+**상태:** 에이전트의 구현 선택(사용자 결정 아님)과 결정 대기 목록이다. 결정 대기 항목은 결정과 무관한 부분만 구현했고 결정 결과를 지어내지 않았다. 코드는 `src/review.ts`·`src/review-input.ts`·`migrations/008_pr_review.sql`, 시험 결과는 [VERIFICATION.md](VERIFICATION.md) "PR_REVIEW T17".
+
+### 구현 선택 (사용자 결정 아님)
+
+1. **리뷰 작업 저장:** 공유 `jobs`에 `type='review'`, `conversation_id` NULL로 둔다. 대화 레인과 같은 `auth.json` 직렬 1(D-14 조건 3)을 공유 코드 변경 없이 지키려는 것이다. T16a `Store.claim`은 대화 join 때문에 리뷰 작업을 집지 않지만, 실행·`unknown`·`waiting_user` 검사로 리뷰 작업을 슬롯 점유로 본다. 세대 기록은 `pr_reviews`, GitHub 게시는 `review_deliveries`다(Discord outbox와 분리).
+2. **리뷰 정책 키:** runtime policy JSON의 `review` 아래에 둔다. 허용 봇 작성자 목록은 `review.allowedBotAuthorIds`(문서의 키 이름 예 `review.allowed_bot_author_ids`와 같은 값, JSON 정책은 T16a 관례대로 camelCase)다. 나머지는 `repositories`(id·fullName·installationId·visibility), `commentCommand`, `reviewDrafts`, `rereviewOnBaseMove`, `reviewSince`, `internalMarkers`, `input`·`publish`·`reconcile` 상한이다. `review`가 없거나 형식이 틀리면 리뷰 경로만 닫힌다. 실제 값은 Infisical runtime policy에만 둔다.
+3. **PR 본문(D-16 "빼기·격리 방식은 T17"):** 빼지 않고 `untrusted.pullRequest.body` 자료 블록으로 격리하고 `input.maxBodyChars`로 자른다(잘리면 `body_truncated`). Renovate 본문의 릴리스 노트는 호환성 판단 근거라 버리면 리뷰 가치가 준다. 지시 효력은 리뷰 기준을 고정 지침과 base 리비전 `AGENTS.md`로만 두는 것으로 막는다(SEC-01).
+4. **세대 키의 `policy_revision`:** 리뷰 지침 문구와 입력 상한의 해시(`rp-…`)다. 허용 목록·저장소 같은 권한 값은 세대 키에 넣지 않고 실행·게시 직전에 매번 다시 검사한다. 권한 값을 바꿀 때마다 열린 PR 전체가 다시 리뷰되는 모델 호출 폭주를 피한다.
+5. **Draft:** 기본 대기(설정 초안 `review_drafts_by_default: false`). 댓글 명령만 예외다.
+6. **같은 세대 재요청:** 대기·진행·완료된 세대는 다시 넣지 않는다. 확인된 실패의 댓글 재요청, 그리고 닫힘·draft·옛 이벤트로 밀려난 세대가 다시 live가 된 경우만 같은 작업을 되살린다. 세대당 시도는 재시도 한도(3)로 묶는다.
+7. **이벤트 순서:** `pull_request.updated_at`이 기록보다 오래된 이벤트는 `stale_event`로 무시한다. 실행 직전과 게시 직전에 live PR을 다시 읽는다.
+8. **게시 대조:** 응답을 잃은 게시는 다시 보내지 않고 marker(`<!-- homelab-bot-review:github-review:<job id> -->`)와 검토 SHA로 PR 리뷰 목록을 대조한다. 못 찾으면 `unknown`을 유지하고 24시간 뒤 은퇴한다(T16a Discord 대조와 같은 원칙). 422(인라인 위치 무효)는 본문만으로 한 번 더 보낸다.
+9. **공개 범위(DATA-01):** 마스킹이 아니라 게시 차단이다. 내부 표식 실제 값은 runtime policy `review.internalMarkers`에만 둔다. Discord 요약은 알림 채널(D-17)에 코드가 만든 숫자·리비전만 쓰고 모델 문장은 넣지 않는다.
+10. **변경 목록:** 게시 서버가 API로 열거한 목록이 기준이고 압축본은 blob 내용에만 쓴다(ARCHITECTURE §6). 열거 실패는 `failed`(429·5xx는 대기)이고 압축본 비교로 대신하지 않는다.
+
+### 결정 대기 (사용자 결정 필요)
+
+| 항목 | 후보 | 근거 | 추천 | 지금 구현 |
+|---|---|---|---|---|
+| `comparison_revision` 기준(ARCHITECTURE §7 "T17에서 정한다") | (a) PR `base.sha`(base 브랜치 머리) (b) merge base | (a)는 V1_PLAN 흐름 문구와 같고 단순하다. base가 앞서가면 PR이 바꾸지 않은 base 쪽 변경이 역방향 diff로 섞여 오탐이 생길 수 있다 [가정]. (b)는 GitHub "Files changed"와 같은 diff이고, base가 앞서가도 세대가 바뀌지 않아 모델 호출이 준다. 게시 서버가 compare API의 merge base를 고정해야 한다 | (b). base 머리는 따로 기록해 리뷰 본문에 적는다 | (a). 세대 키·압축본·게시 직전 재확인이 모두 PR `base.sha` 기준 |
+| head는 같고 base만 움직였을 때 다시 리뷰할지(`review.rereviewOnBaseMove`) | 다시 리뷰 / 결과만 `superseded` | 모델 직렬 1(D-14)이라 base 활동이 많은 저장소에서 대기열이 밀린다. 위에서 (b)를 고르면 거의 생기지 않는다 | 결과만 `superseded`, 재리뷰는 댓글 명령으로 | 값이 `null`이면 재리뷰하지 않고 결과만 `superseded`. base 재지정(`edited`)과 댓글 명령은 늘 새 세대 |
+| 댓글 리뷰 명령 문법(`review.commentCommand`, D-16 규칙 스케치 "문법은 T17") | 슬래시형 고정 문자열 / `@<리뷰 App>` 멘션형 | 멘션형은 아직 없는 App 이름에 묶이고 수동 `@codex review`와 헷갈린다 | 슬래시형 하나(예 `/homelab-review`) | 값이 `null`이면 댓글 트리거 끔. 앞뒤 공백만 무시하고 정확히 일치할 때만 |
+| 게시 상한 값(`review.publish`: 지적 수, 인라인 수, 본문 길이) | `01` §5대로 대표 평가 뒤 | 평가셋은 D-14 차단 조건 뒤다 | 평가 전 임시값 지적 10·인라인 5·본문 20,000자 [가정] | 값이 `null`이면 자동 게시 거부(`publish_limits_unset`) |
+| 입력 상한 값(`review.input`) | 운영 값 | 압축본 크기와 직렬 1 대기 시간 | 파일 200개, 파일 1MB, diff 1MB, 압축본 100MB, 본문 8,000자 [가정] | 정책 필수 값. 없으면 리뷰 경로가 닫힌다 |
+
+### 공유 파일(T16a 소유) 변경이 필요해 하지 않은 것
+
+- **리뷰 작업의 `waiting_user` 해제:** `Store.control`의 `resume-model`·`cancel`은 `conversation_id`로 묶여 있어 대화가 없는 리뷰 작업을 풀지 못한다. 리뷰 작업이 모델 한도·인증 만료에 걸리면 전역 모델 슬롯이 DB를 직접 고치기 전까지 묶인다. 후보: (a) control에 리뷰 작업 대상(알림 채널에서 owner가 job ID로 재개·포기)을 더한다 (b) 리뷰 작업은 한도 때 `failed`(`model_limit`)로 두고 전역 대기는 다음 대화 작업이 잡게 한다. 추천 (a)(D-14 조건 2의 "대기"를 지킨다). 모델을 부르기 전에 해소해야 한다.
+- **webhook 수신 연결:** `src/http.ts` 앱 서버(8080)에 `githubWebhook`을 붙이는 것. 지금은 404 그대로다.
+- **작업자 리뷰 레인:** `worker-http.ts`에 리뷰 요청 경로를 더하고 작업자 쪽 mutex를 `SerialWorker`와 공유하는 것. 지금은 게시 서버의 SQL 슬롯만 공유하고, 작업자 쪽 mutex는 `ReviewWorker`가 따로 가진다.
