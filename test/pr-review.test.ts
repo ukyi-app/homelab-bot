@@ -22,7 +22,7 @@ const REPO = { id: 101, fullName: 'fixture-org/fixture-repo', installationId: 50
 // 시험용 숫자 ID. 실제 Renovate·봇 ID는 runtime policy에만 둔다.
 const RENOVATE = 9001, WRITER_BOT = 9002, OTHER_BOT = 9003;
 const POLICY: ReviewPolicy = { repositories: [REPO], allowedBotAuthorIds: [RENOVATE, WRITER_BOT], commentCommand: '/fixture-review',
-  reviewDrafts: false, rereviewOnBaseMove: null, reviewSince: 0, internalMarkers: ['fixture-internal-host'],
+  reviewDrafts: false, rereviewOnBaseMove: null, comparison: 'merge_base', reviewSince: 0, internalMarkers: ['fixture-internal-host'],
   input: { maxFiles: 20, maxFileBytes: 100_000, maxDiffBytes: 200_000, maxArchiveBytes: 1_000_000, maxBodyChars: 4000 },
   publish: { maxFindings: 10, maxInlineComments: 5, maxBodyChars: 20_000 }, reconcile: { maxPages: 2, maxReviewsPerRun: 3 } };
 const APP_BASE = 'export function average(total: number, count: number) {\n  return total;\n}\n';
@@ -89,6 +89,13 @@ class FakeGitHub implements GitHubReader {
     return structuredClone(this.compareResult);
   }
   async reviews() { return structuredClone(this.remote); }
+  // 기본은 PR이 base 머리에서 갈라졌다고 본다(merge base = base 머리).
+  mergeBases = new Map<string, string | Error>();
+  async mergeBase(_repository: string, base: string, head: string) {
+    const value = this.mergeBases.get(`${base}..${head}`) ?? base;
+    if (value instanceof Error) throw value;
+    return value;
+  }
   transport: GitHubTransport = async request => {
     if (this.fail) { const error = this.fail; this.fail = undefined; throw error; }
     this.writes.push(structuredClone(request));
@@ -128,7 +135,7 @@ async function setup() {
   };
   f.policy.review = structuredClone(POLICY);
   const source = new ReviewPolicySource(f.gate);
-  const queue = new ReviewQueue(f.store);
+  const queue = new ReviewQueue(f.store, gh);
   const ingress = new GitHubIngress(SECRET, f.store, source, queue, gh);
   const worker = new ReviewWorker(f.verifier, fetcher, model, 50);
   const runtime = new ReviewRuntime(f.store, source, queue, gh, worker, f.signer, 5);
@@ -1026,4 +1033,45 @@ test('EVENT-02 전송 전 GitHub 일시 장애는 재시도 횟수를 쓰지 않
   await r.publisher.deliver();
   assert.deepEqual((await deliveries()).map(d => d.state), ['sent']);
   assert.equal(r.gh.writes.length, 1);
+});
+
+test('REVIEW-02 merge_base 기준: 뒤처진 PR은 merge base와 head로 diff를 만들고, base 머리만 앞서가면 같은 세대로 게시', async () => {
+  const BASE3 = 'e'.repeat(40);
+  r.gh.mergeBases.set(`${BASE2}..${HEAD}`, BASE); r.gh.mergeBases.set(`${BASE3}..${HEAD}`, BASE);
+  const behind = pull({ base: { sha: BASE2, ref: 'main', repo: repository } });
+  await opened(behind);
+  assert.deepEqual((await reviewJobs()).map(j => j.comparison_revision), [BASE]);
+  r.gh.pulls.set(7, pull({ base: { sha: BASE3, ref: 'main', repo: repository }, updated_at: '2026-10-29T02:00:00Z' }));
+  await r.runtime.tick();
+  assert.deepEqual(r.gh.compares, [[BASE, HEAD]]);
+  assert.deepEqual(r.fetches.map(x => x.url.split('/').at(-1)), [BASE, HEAD]);
+  await r.publisher.deliver();
+  assert.equal(r.gh.writes.length, 1);
+  assert.match(r.gh.writes[0]!.body.body, new RegExp(`기준 \`${BASE}\``));
+  r.gh.open = [pull({ base: { sha: BASE3, ref: 'main', repo: repository }, updated_at: '2026-10-29T02:01:00Z' })];
+  assert.deepEqual(await r.reconciler.run(), { admitted: 0, limited: false });
+  assert.equal((await reviewJobs()).length, 1);
+});
+test('REVIEW-02 base_head 기준: base 머리를 비교 기준으로 쓰고 base가 앞서가면 게시하지 않는다', async () => {
+  r.policy().comparison = 'base_head';
+  r.gh.mergeBases.set(`${BASE2}..${HEAD}`, BASE);
+  r.archives.set(BASE2, r.archives.get(BASE)!);
+  await opened(pull({ base: { sha: BASE2, ref: 'main', repo: repository } }));
+  assert.deepEqual((await reviewJobs()).map(j => j.comparison_revision), [BASE2]);
+  r.gh.pulls.set(7, pull({ base: { sha: BASE2, ref: 'main', repo: repository } }));
+  await r.runtime.tick();
+  assert.deepEqual(r.gh.compares, [[BASE2, HEAD]]);
+  r.gh.pulls.set(7, pull({ base: { sha: 'e'.repeat(40), ref: 'main', repo: repository }, updated_at: '2026-10-29T02:02:00Z' }));
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['superseded', 'base_moved']]);
+});
+test('AUTH-01 비교 기준이 정해지지 않았거나 merge base 조회가 실패하면 모델 작업을 만들지 않는다', async () => {
+  r.policy().comparison = null;
+  assert.equal((await opened()).reason, 'review_disabled');
+  r.policy().comparison = 'merge_base';
+  r.gh.mergeBases.set(`${BASE}..${HEAD}`, new GitHubError(502));
+  assert.equal((await hook('pull_request', prEvent('opened'))).reason, 'comparison_lookup_failed');
+  r.gh.mergeBases.set(`${BASE}..${HEAD}`, 'not-a-sha' as never);
+  assert.equal((await hook('pull_request', prEvent('opened'))).reason, 'comparison_lookup_failed');
+  assert.equal((await rows('jobs')).length, 0);
 });

@@ -22,6 +22,8 @@ export const ReviewPolicySchema = z.strictObject({
   allowedBotAuthorIds: z.array(z.number().int().positive()).max(20),
   commentCommand: z.string().trim().min(1).max(100).nullable(),
   reviewDrafts: z.boolean(), rereviewOnBaseMove: z.boolean().nullable(),
+  // 비교 기준(결정 대기, DECISIONS "T17"). null이면 리뷰 경로를 닫는다.
+  comparison: z.enum(['merge_base', 'base_head']).nullable(),
   reviewSince: z.number().int().nonnegative(), internalMarkers: z.array(z.string().min(4).max(200)).max(100),
   input: InputLimitsSchema,
   publish: z.strictObject({ maxFindings: z.number().int().positive().max(50),
@@ -33,14 +35,14 @@ export interface ReviewContext { base: Policy; review: ReviewPolicy; revision: s
 export const MODEL_CALL_ASSOCIATIONS = Object.freeze(['OWNER', 'MEMBER', 'COLLABORATOR']);
 // 권한 필드(허용 목록·저장소)는 매번 다시 검사하므로 세대 revision에는 리뷰 내용에 닿는 값만 넣는다.
 export function reviewRevision(review: ReviewPolicy): string {
-  return `rp-${createHash('sha256').update(JSON.stringify([REVIEW_INSTRUCTIONS, review.input])).digest('hex').slice(0, 16)}`;
+  return `rp-${createHash('sha256').update(JSON.stringify([REVIEW_INSTRUCTIONS, review.input, review.comparison])).digest('hex').slice(0, 16)}`;
 }
 export class ReviewPolicySource {
   constructor(private readonly gate: PolicyGate) {}
   async current(): Promise<ReviewContext> {
     const base = await this.gate.current();
     const parsed = ReviewPolicySchema.safeParse(base.review);
-    if (!parsed.success) throw new Denied();
+    if (!parsed.success || parsed.data.comparison === null) throw new Denied();
     return { base, review: parsed.data, revision: reviewRevision(parsed.data) };
   }
 }
@@ -104,7 +106,9 @@ export class GitHubError extends Error {
 export interface GitHubReader {
   pullRequest(repository: string, number: number): Promise<unknown>;
   openPullRequests(repository: string, page: number): Promise<unknown[]>;
+  // base와 head 두 커밋 사이의 정확한 변경 목록(two-dot). merge_base 기준이면 compare API 결과와 같다.
   compare(repository: string, base: string, head: string): Promise<unknown>;
+  mergeBase(repository: string, base: string, head: string): Promise<unknown>;
   reviews(repository: string, number: number, page: number): Promise<unknown[]>;
 }
 const CompareSchema = z.strictObject({ files: ReviewTaskSchema.shape.changes, truncated: z.boolean() });
@@ -143,16 +147,31 @@ export const generationKey = (repo: number, pr: number, head: string, comparison
   `github:review:${repo}:${pr}:${head}:${comparison}:${policy}`;
 const json = (value: unknown) => JSON.stringify(value);
 export class ReviewQueue {
-  constructor(private readonly store: Store) {}
+  constructor(private readonly store: Store, private readonly reader: GitHubReader) {}
+  // 비교 기준 SHA. merge_base는 GitHub "Files changed"와 같은 diff이고 base 머리가 앞서가도 바뀌지 않는다.
+  async comparison(repository: string, pr: PullRequest, review: ReviewPolicy): Promise<string> {
+    if (review.comparison === 'base_head') return pr.base.sha;
+    return Sha.parse(await this.reader.mergeBase(repository, pr.base.sha, pr.head.sha));
+  }
+  // 게이트 → 비교 기준 조회 → 세대 등록. 조회가 실패하면 모델 작업을 만들지 않는다.
+  async admitLive(pr: PullRequest, repo: ReviewPolicy['repositories'][number], context: ReviewContext, trigger: string,
+    deliveryId = `${trigger}:${randomUUID()}`): Promise<Admission | Decision> {
+    const decision = pullRequestDecision(pr, repo, context.review, trigger === 'comment');
+    if (decision) return decision;
+    let comparison: string;
+    try { comparison = await this.comparison(repo.fullName, pr, context.review); }
+    catch { return { outcome: 'denied', reason: 'comparison_lookup_failed' }; }
+    return this.store.db.transaction(tx => this.admit(pr, repo, context, comparison, trigger, deliveryId, tx));
+  }
   // 세대 키 (repo_id, pr, head_sha, comparison_revision, policy_revision)로 작업 한 건만 만든다(EVENT-01).
-  async admit(pr: PullRequest, repo: ReviewPolicy['repositories'][number], context: ReviewContext,
+  async admit(pr: PullRequest, repo: ReviewPolicy['repositories'][number], context: ReviewContext, comparison: string,
     trigger: string, deliveryId: string, tx: Database): Promise<Admission | Decision> {
     const decision = pullRequestDecision(pr, repo, context.review, trigger === 'comment');
     if (decision) return decision;
     const now = this.store.now();
     await tx.query(`INSERT INTO controls VALUES ('review_admission','false') ON CONFLICT DO NOTHING`);
     await tx.query(`SELECT * FROM controls WHERE key='review_admission' FOR UPDATE`);
-    const key = generationKey(repo.id, pr.number, pr.head.sha, pr.base.sha, context.revision);
+    const key = generationKey(repo.id, pr.number, pr.head.sha, comparison, context.revision);
     const existing = (await tx.query<{ job_id: string; state: string; attempt: number; superseded_at: string | null; delivered: boolean }>(
       `SELECT p.job_id,j.state,j.attempt,p.superseded_at,EXISTS (SELECT 1 FROM review_deliveries d WHERE d.job_id=p.job_id
         AND d.state IN ('pending','sending','sent','unknown')) AS delivered
@@ -178,7 +197,7 @@ export class ReviewQueue {
         trigger=$3,defer_count=0 WHERE job_id=$1`, [existing.job_id, pr.updatedAt, trigger]);
       return { outcome: 'requeued', key, job: existing.job_id };
     }
-    const baseOnly = latest && latest.head_sha === pr.head.sha && latest.comparison_revision !== pr.base.sha
+    const baseOnly = latest && latest.head_sha === pr.head.sha && latest.comparison_revision !== comparison
       && latest.policy_revision === context.revision;
     // base만 움직였을 때 재리뷰를 건너뛰는 것은 이전 세대가 이미 게시됐거나 확인된 실패로 끝났을 때뿐이다.
     // 아직 리뷰가 한 번도 게시되지 않은 PR을 base 이동으로 버리지 않는다.
@@ -198,11 +217,11 @@ export class ReviewQueue {
       json({ kind: 'github', repo: repo.id, pr: pr.number }), now, json({ command: 'review', trigger })]);
     await tx.query(`INSERT INTO jobs(id,event_id,conversation_id,type,owner_id,target,revision,budget,priority,available_at,created_at)
       VALUES ($1,$2,NULL,'review','github-review',$3,$4,$5,40,$6,$6)`, [job, event, json({ kind: 'github', repo: repo.id, pr: pr.number }),
-      json({ policy: context.revision, head: pr.head.sha, comparison: pr.base.sha }),
+      json({ policy: context.revision, head: pr.head.sha, comparison }),
       json({ timeoutMs: DEFAULTS.taskTimeoutMs, toolCalls: 0 }), now]);
     await tx.query(`INSERT INTO pr_reviews(job_id,generation_key,installation_id,repo_id,repo_full_name,pr_number,head_sha,
       comparison_revision,base_ref,policy_revision,trigger,pr_updated_at,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-    [job, key, repo.installationId, repo.id, repo.fullName, pr.number, pr.head.sha, pr.base.sha, pr.base.ref, context.revision,
+    [job, key, repo.installationId, repo.id, repo.fullName, pr.number, pr.head.sha, comparison, pr.base.ref, context.revision,
       trigger, pr.updatedAt, now]);
     return { outcome: 'queued', key, job };
   }
@@ -256,7 +275,7 @@ export class GitHubIngress {
       const trigger = ['opened', 'reopened', 'ready_for_review', 'synchronize'].includes(e.action) ? e.action
         : e.action === 'edited' && e.changes?.base ? 'retarget' : undefined;
       if (!trigger) return this.record(delivery, event, target, { outcome: 'ignored', reason: `action_${e.action}`.slice(0, 60) });
-      return this.record(delivery, event, target, tx => this.queue.admit(pr, repo, context, trigger, delivery, tx));
+      return this.enqueue(delivery, event, target, pr, repo, context, trigger);
     }
     if (event === 'issue_comment') {
       const parsed = CommentEvent.safeParse(payload);
@@ -277,9 +296,18 @@ export class GitHubIngress {
       // payload에는 PR head 저장소가 없어 PR을 조회한다. 조회 실패면 모델을 부르지 않는다.
       try { pr = pullRequest(await this.reader.pullRequest(repo.fullName, e.issue.number)); }
       catch { return this.record(delivery, event, target, { outcome: 'denied', reason: 'pr_lookup_failed' }); }
-      return this.record(delivery, event, target, tx => this.queue.admit(pr, repo, context, 'comment', delivery, tx));
+      return this.enqueue(delivery, event, target, pr, repo, context, 'comment');
     }
     return this.record(delivery, event, null, { outcome: 'ignored', reason: 'unsupported_event' });
+  }
+  private async enqueue(delivery: string, event: string, target: { action?: string; repository?: { id: number }; pr?: number },
+    pr: PullRequest, repo: ReviewPolicy['repositories'][number], context: ReviewContext, trigger: string): Promise<IngressResult> {
+    const decision = pullRequestDecision(pr, repo, context.review, trigger === 'comment');
+    if (decision) return this.record(delivery, event, target, decision);
+    let comparison: string;
+    try { comparison = await this.queue.comparison(repo.fullName, pr, context.review); }
+    catch { return this.record(delivery, event, target, { outcome: 'denied', reason: 'comparison_lookup_failed' }); }
+    return this.record(delivery, event, target, tx => this.queue.admit(pr, repo, context, comparison, trigger, delivery, tx));
   }
   private repository(context: ReviewContext, repo: number, installation: number) {
     return context.review.repositories.find(r => r.id === repo && r.installationId === installation);
@@ -386,13 +414,14 @@ export class ReviewRuntime {
       if (context.revision !== review.policy_revision) { await this.close(job, review, 'superseded', 'policy_changed'); return true; }
       // 실행 직전 live PR로 head·base·닫힘·작성자를 다시 본다. webhook 내용만 믿지 않는다.
       const pr = pullRequest(await this.reader.pullRequest(repo.fullName, review.pr_number));
+      const liveComparison = pr.open && pr.head.sha === review.head_sha ? await this.queue.comparison(repo.fullName, pr, context.review) : undefined;
       const stale = !pr.open ? (pr.merged ? 'merged_before_review' : 'pr_closed')
-        : pr.head.sha !== review.head_sha ? 'stale_head' : pr.base.sha !== review.comparison_revision ? 'base_moved' : undefined;
+        : pr.head.sha !== review.head_sha ? 'stale_head' : liveComparison !== review.comparison_revision ? 'base_moved' : undefined;
       if (stale) {
         await this.close(job, review, 'superseded', stale);
         // 늦게 온 옛 이벤트나 base 이동이면 live 세대를 같은 규칙으로 넣는다. 닫혔으면 남은 대기 작업도 정리한다.
-        await this.store.db.transaction<unknown>(tx => pr.open ? this.queue.admit(pr, repo, context, 'live_check', `live:${randomUUID()}`, tx)
-          : this.queue.supersede(tx, repo.id, pr.number, stale));
+        if (pr.open) await this.queue.admitLive(pr, repo, context, 'live_check');
+        else await this.store.db.transaction(tx => this.queue.supersede(tx, repo.id, pr.number, stale));
         return true;
       }
       const denied = pullRequestDecision(pr, repo, context.review, review.trigger === 'comment');
@@ -576,7 +605,7 @@ interface DeliveryRow {
 }
 export class ReviewPublisher {
   constructor(private readonly store: Store, private readonly policy: ReviewPolicySource, private readonly reader: GitHubReader,
-    private readonly github: RestrictedGitHub, private readonly queue?: ReviewQueue) {}
+    private readonly github: RestrictedGitHub, private readonly queue: ReviewQueue) {}
   async deliver(): Promise<boolean> {
     // 게시 중 죽은 프로세스의 lease를 회수한다. 전송을 시작했으면 결과를 모르므로 unknown(재게시 없이 대조).
     await this.store.db.query(`UPDATE review_deliveries SET state=CASE WHEN dispatch_started THEN 'unknown' ELSE 'pending' END,
@@ -604,12 +633,13 @@ export class ReviewPublisher {
       if (!stored || classify(stored, context.review) !== 'public') { await this.state(row, 'blocked', 'output_classification'); return true; }
       // 게시 직전 최신 PR을 다시 본다. 오래된 리뷰를 최신 검증처럼 올리지 않는다(REVIEW-02).
       const pr = pullRequest(await this.reader.pullRequest(repo.fullName, row.pr_number));
+      const current = pr.open && pr.head.sha === row.head_sha ? await this.queue.comparison(repo.fullName, pr, context.review) : undefined;
       const stale = !pr.open ? (pr.merged ? 'merged_before_publish' : 'pr_closed')
-        : pr.head.sha !== row.head_sha ? 'stale_head' : pr.base.sha !== row.comparison_revision ? 'base_moved' : undefined;
+        : pr.head.sha !== row.head_sha ? 'stale_head' : current !== row.comparison_revision ? 'base_moved' : undefined;
       if (stale) {
         await this.state(row, 'superseded', stale);
         // 게시하지 못한 채 밀려났으므로 live 세대를 같은 규칙으로 넣는다(아직 게시된 리뷰가 없으면 base 이동도 재리뷰).
-        if (pr.open && this.queue) await this.store.db.transaction<unknown>(tx => this.queue!.admit(pr, repo, context, 'live_check', `live:${randomUUID()}`, tx));
+        if (pr.open) await this.queue.admitLive(pr, repo, context, 'live_check');
         return true;
       }
       if (pr.head.repoId !== pr.base.repoId || !authorAllowed(pr.author, context.review)) { await this.state(row, 'blocked', 'author_denied'); return true; }
@@ -706,7 +736,7 @@ export class ReviewReconciler {
             await this.store.audit('review_reconcile_limit', repo.fullName, { admitted });
             return { admitted, limited: true };
           }
-          const result = await this.store.db.transaction(tx => this.queue.admit(pr, repo, context, 'reconcile', `reconcile:${randomUUID()}`, tx));
+          const result = await this.queue.admitLive(pr, repo, context, 'reconcile');
           if (result.outcome === 'queued') admitted++;
         }
         if (prs.length < 100) break;
