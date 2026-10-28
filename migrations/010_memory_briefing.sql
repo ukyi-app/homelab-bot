@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS memory_terms (
 );
 CREATE INDEX IF NOT EXISTS memory_terms_term ON memory_terms(term text_pattern_ops);
 CREATE TABLE IF NOT EXISTS memory_exclusions (
-  source_key text PRIMARY KEY, owner_id text NOT NULL, created_at bigint NOT NULL
+  source_key text NOT NULL, owner_id text NOT NULL, created_at bigint NOT NULL, PRIMARY KEY (owner_id, source_key)
 );
 -- 삭제 요청의 진행 상태만 둔다. 복원되면 이 표도 되돌아가므로 삭제의 근거는 외부 원장이다.
 CREATE TABLE IF NOT EXISTS memory_deletions (

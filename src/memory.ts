@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { open, readFile, stat } from 'node:fs/promises';
+import { open, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
 import { Denied } from './contracts.js';
@@ -75,26 +75,38 @@ export interface DeletionLedger {
 const EntrySchema = z.strictObject({ memoryId: z.string().min(1), createdAt: Time, deletedAt: Time });
 // 로컬 대역이다. 실제 원장 위치(R2 등)는 결정 대기(DECISIONS T20).
 export class FileDeletionLedger implements DeletionLedger {
+  private tail: Promise<unknown> = Promise.resolve();
+  private dirSynced = false;
+  private syncFailed = false;
   constructor(private readonly path: string) {}
+  // 프로세스 안의 append를 줄 세운다. 겹치면 한쪽의 조각 잘라내기가 다른 쪽의 확정된 줄을 지운다.
   // 쓰는 프로세스는 하나라고 가정한다.
-  async append(entry: DeletionEntry): Promise<void> {
+  append(entry: DeletionEntry): Promise<void> {
+    const run = this.tail.then(() => this.write(entry));
+    this.tail = run.catch(() => {});
+    return run;
+  }
+  private async write(entry: DeletionEntry): Promise<void> {
     const line = `${JSON.stringify(EntrySchema.parse(entry))}\n`;
-    const created = await stat(this.path).then(() => false, () => true);
     const handle = await open(this.path, 'a+');
     try {
       // 끊긴 이전 append의 조각 뒤에 붙이면 원장이 손상된다. 확인되지 않은 조각이므로 잘라낸다.
       const raw = await readFile(this.path, 'utf8');
       if (raw.length && !raw.endsWith('\n')) await handle.truncate(Buffer.byteLength(raw.slice(0, raw.lastIndexOf('\n') + 1)));
-      await handle.appendFile(line); await handle.sync();
+      await handle.appendFile(line);
+      try { await handle.sync(); } catch (error) { this.syncFailed = true; throw error; }
     } finally { await handle.close(); }
-    // 새 파일은 디렉터리 항목도 fsync해야 전원 차단 뒤 파일이 남는다.
-    if (created) { const dir = await open(dirname(this.path), 'r'); try { await dir.sync(); } finally { await dir.close(); } }
+    // 파일을 만든 직후뿐 아니라 이 프로세스에서 확인하기 전까지는 디렉터리 항목도 fsync해야 전원 차단 뒤 파일이 남는다.
+    if (!this.dirSynced) {
+      const dir = await open(dirname(this.path), 'r');
+      try { await dir.sync(); } finally { await dir.close(); }
+      this.dirSynced = true;
+    }
   }
-  // 페이지 캐시에만 있는 항목을 기록됐다고 답하지 않도록 읽기 전에 fsync한다.
+  // fsync가 한 번 실패하면 커널이 실패한 페이지를 clean으로 돌려 캐시만 보고 기록됐다고 답할 수 있다. 그 뒤로는 판정하지 않는다.
   async has(memoryId: string, createdAt: number): Promise<boolean> {
-    const handle = await open(this.path, 'r').catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return undefined; throw error; });
-    if (!handle) return false;
-    try { await handle.sync(); } finally { await handle.close(); }
+    if (this.syncFailed) throw new Error('deletion_ledger_unsynced');
+    await this.tail;
     return (await this.entries()).some(e => e.memoryId === memoryId && e.createdAt === createdAt);
   }
   async entries(): Promise<DeletionEntry[]> {
@@ -163,6 +175,8 @@ export class MemoryService {
     const access = this.access(policy, scope, input);
     return this.db.transaction(async tx => {
       const current = await this.gate.withDatabase(tx).authorize(actor, scope);
+      // remember와 같은 순서(주제 잠금 → 행 잠금)로 잡아야 교착하지 않는다.
+      await this.lockTopic(tx, actor, input.topic);
       const rows = (await tx.query<MemoryRow>('SELECT * FROM memories WHERE id=ANY($1::text[]) FOR UPDATE', [ids])).rows;
       if (rows.length !== new Set(ids).size || !rows.every(row => ['active', 'candidate'].includes(row.status)
         && this.visible(current, actor, scope, row))) throw new Denied();
@@ -178,7 +192,7 @@ export class MemoryService {
     this.assertReady();
     await this.gate.authorize(actor, scope);
     if (!/^(conversation|job|document|external|channel):.{1,500}$/s.test(sourceKey)) throw new MemoryRejected('memory_exclusion_invalid');
-    await this.db.query('INSERT INTO memory_exclusions VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [sourceKey, actor, this.now()]);
+    await this.db.query('INSERT INTO memory_exclusions(source_key,owner_id,created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [sourceKey, actor, this.now()]);
     const hidden = (await this.db.query<{ count: string | number }>(`SELECT count(*) AS count FROM memories
       WHERE owner_id=$1 AND status IN ('active','candidate') AND source_keys ? $2`, [actor, sourceKey])).rows[0]!.count;
     return { hidden: Number(hidden) };
@@ -245,10 +259,10 @@ export class MemoryService {
     const key = erasedKey(id, createdAt);
     if (request.ledger_state !== 'recorded' && !this.erased.has(key)) {
       let recorded = false;
-      try { await this.ledger.append({ memoryId: id, createdAt, deletedAt: Number(request.requested_at) }); recorded = true; } catch {
-        // 응답만 잃었을 수 있으니 원장을 다시 읽어 기록 여부로 안내를 정한다.
-        recorded = await this.ledger.has(id, createdAt).catch(() => false);
-      }
+      const entry = { memoryId: id, createdAt, deletedAt: Number(request.requested_at) };
+      // 중복 항목은 재적용에서 무해하므로 한 번 더 쓴다. 그래도 실패하면 응답만 잃었을 수 있어 원장을 다시 읽어 판단한다.
+      for (let attempt = 0; attempt < 2 && !recorded; attempt++) recorded = await this.ledger.append(entry).then(() => true, () => false);
+      if (!recorded) recorded = await this.ledger.has(id, createdAt).catch(() => false);
       if (!recorded) {
         await this.audit('memory_deletion_pending', id, { reason: 'ledger_unconfirmed' }).catch(() => {});
         return { status: 'pending', reason: 'ledger_unconfirmed', publishedCopies: 0,
@@ -291,7 +305,8 @@ export class MemoryService {
         await tx.query(`UPDATE outbox SET state='blocked' WHERE message_key=ANY($1::text[])
           AND (state='pending' OR (state='sending' AND dispatch_started=false))`, [keys]);
         // 이미 보냈거나 보내는 중인 메시지는 Discord에서 지우지 않는다. 로컬 사본만 가린다.
-        await tx.query(`UPDATE outbox SET payload=jsonb_set(payload,'{content}',to_jsonb($2::text))
+        // 분류를 safe_summary 밖으로 바꿔 두면 429 등으로 pending에 돌아와도 게시자가 거부한다(src/discord.ts authorized).
+        await tx.query(`UPDATE outbox SET payload=jsonb_set(jsonb_set(payload,'{content}',to_jsonb($2::text)),'{classification}','"redacted"')
           WHERE message_key=ANY($1::text[])`, [keys, REDACTED]);
         publishedCopies = Number((await tx.query<{ count: string }>(`SELECT count(DISTINCT message_key) AS count FROM outbox
           WHERE message_key=ANY($1::text[]) AND state IN ('sent','unknown','sending')`, [keys])).rows[0]!.count);
@@ -303,6 +318,9 @@ export class MemoryService {
       return { applied, publishedCopies };
     });
   }
+  private async lockTopic(tx: Database, actor: string, topic: string | undefined): Promise<void> {
+    if (topic) await tx.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`memory-topic:${actor}:${topic}`]);
+  }
   private async forget(tx: Database, ids: string[]): Promise<void> {
     await tx.query(`UPDATE memories SET conflicts_with=(SELECT COALESCE(jsonb_agg(v),'[]'::jsonb)
       FROM jsonb_array_elements_text(conflicts_with) v WHERE v<>ALL($1::text[])) WHERE conflicts_with ?| $1::text[]`, [ids]);
@@ -313,10 +331,11 @@ export class MemoryService {
     const id = randomUUID();
     const now = this.now();
     // 같은 주제를 동시에 저장하면 READ COMMITTED에서는 서로를 못 봐 둘 다 active가 된다. 주제별로 직렬화한다.
-    if (input.topic) await tx.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`memory-topic:${actor}:${input.topic}`]);
+    await this.lockTopic(tx, actor, input.topic);
     // 같은 주제에 다른 진술이 살아 있으면 어느 쪽도 확정하지 않고 사람의 정정을 기다린다.
     const conflicts = input.topic ? (await tx.query<{ id: string }>(`SELECT id FROM memories WHERE owner_id=$1 AND topic=$2
-      AND status IN ('active','candidate') AND deletion_requested_at IS NULL AND statement<>$3 AND id<>ALL($4::text[]) ORDER BY id`,
+      AND status IN ('active','candidate') AND deletion_requested_at IS NULL AND statement<>$3 AND id<>ALL($4::text[])
+      AND NOT EXISTS (SELECT 1 FROM memory_exclusions x WHERE x.owner_id=memories.owner_id AND memories.source_keys ? x.source_key) ORDER BY id`,
     [actor, input.topic, input.statement, replaces])).rows.map(row => row.id) : [];
     const status = evidence.active && !conflicts.length ? 'active' : 'candidate';
     const { kind, statement, topic, sources, scope: about, classification, validFrom, expiresAt, recheckAt, recheckCondition } = input;

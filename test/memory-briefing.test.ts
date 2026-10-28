@@ -537,3 +537,47 @@ test('DATA-02 게시자가 잡았지만 아직 보내지 않은 브리핑은 삭
   const [row] = await briefings();
   assert.equal(row!.state, 'blocked'); assert.doesNotMatch(row!.payload.content, /잡힌 브리핑의 기억/);
 });
+test('DATA-02 끊긴 조각이 있는 원장에 동시 append해도 확정된 항목을 잃지 않음', async () => {
+  // 경합은 확률적이다. 직렬화가 없으면 5개 동시 append에서 한 회차당 약 7%가 항목을 잃어 100회면 거의 확실히 드러난다.
+  for (let round = 0; round < 100; round++) {
+    const file = `${dir}/race-${round}.jsonl`;
+    await writeFile(file, `${JSON.stringify({ memoryId: 'old', createdAt: 1, deletedAt: 1 })}\n{"memoryId":"to`);
+    const shared = new FileDeletionLedger(file);
+    await Promise.all(['a', 'b', 'c', 'd', 'e'].map((id, i) => shared.append({ memoryId: id, createdAt: i + 1, deletedAt: i + 1 })));
+    assert.deepEqual((await shared.entries()).map(e => e.memoryId).sort(), ['a', 'b', 'c', 'd', 'e', 'old']);
+  }
+});
+test('DATA-02 발송을 시작한 브리핑이 429로 대기열에 돌아와도 삭제 뒤에는 다시 보내지 않음', async () => {
+  const due = { access: ['fixture-notifications'], classification: 'safe_summary' as const, recheckAt: f.now() + 1 };
+  const stored = await memory.remember('fixture-owner', notifications, config('발송 중 지운 기억', due));
+  const s = scheduler(); await s.ensure();
+  at(SLOT); await s.tick();
+  const claimed = (await f.store.claimDelivery())!;
+  assert.equal(await f.store.dispatchDelivery(claimed), true);
+  const result = await memory.delete('fixture-owner', notifications, stored.id);
+  assert.deepEqual([result.status, result.publishedCopies], ['deleted', 1]);
+  await f.store.deliveryState(claimed, 'pending');
+  await f.publisher.deliver();
+  assert.equal(f.rest.messages.length, 0);
+  assert.equal((await briefings())[0]!.state, 'blocked');
+});
+test('MEM-01 저장 제외로 숨긴 기억은 같은 주제의 새 기억을 충돌로 묶지 않음', async () => {
+  await f.ingress.receive(event('m-port', { text: '포트는 80' })); f.advance(800);
+  const hidden = await memory.remember('fixture-owner', thread, config('포트 80', { topic: 'service:port', sources: [{ type: 'conversation', message: 'm-port' }] }));
+  assert.equal(hidden.status, 'candidate');
+  await memory.exclude('fixture-owner', thread, `channel:${thread.channel}`);
+  const fresh = await memory.remember('fixture-owner', thread, config('포트 81', { topic: 'service:port' }));
+  assert.deepEqual([fresh.status, fresh.conflictsWith], ['active', []]);
+});
+test('BRIEF-01 작성 중에 알림 채널 설정이 바뀌면 막지 않고 새 채널로 다시 작성', async () => {
+  let changed = false;
+  const switching = source('switching', 'backup', async () => {
+    if (!changed) { changed = true; f.policy.notificationChannel = 'fixture-briefing-next'; }
+    return { observedAt: f.now(), status: 'ok', summary: '백업 정상' };
+  });
+  const s = scheduler([switching]); await s.ensure();
+  at(SLOT); assert.equal(await s.tick(), 'deferred');
+  assert.equal(await s.tick(), 'enqueued');
+  await f.publisher.deliver();
+  assert.equal(f.rest.messages[0]!.channel, 'fixture-briefing-next');
+});

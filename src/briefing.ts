@@ -168,8 +168,10 @@ export class BriefingScheduler {
       ].join('\n');
       return await this.db.transaction(async tx => {
         // 큐에 넣기 직전에 최신 권한을 다시 본다. 게시 직전 검사는 게시자가 한 번 더 한다.
+        // 작성 중에 대상 설정만 바뀌었으면 막지 않고 새 대상으로 다시 작성한다. 실제 철회는 authorize가 막는다.
+        const latest = await this.gate.current();
+        if (latest.owner !== owner || latest.guild !== scope.guild || latest.notificationChannel !== scope.channel) throw new StaleBriefing();
         const current = await this.gate.withDatabase(tx).authorize(owner, scope);
-        if (current.owner !== owner || current.guild !== scope.guild || current.notificationChannel !== scope.channel) throw new Denied();
         // 작성하는 동안 지우거나 대체한 기억이 있으면 다시 작성한다. FOR SHARE가 그 행의 삭제 정리와 직렬화한다.
         if (!await this.memory.live(tx, memory.items)) throw new StaleBriefing();
         const key = `briefing:${schedule.id}:${claim.date}`;
