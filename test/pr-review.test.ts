@@ -659,6 +659,12 @@ test('D-14 직렬 1: 리뷰와 대화 작업은 모델 슬롯 하나를 나누�
   assert.equal(await f.store.claim(), undefined);
   release(); await running;
   assert.equal(f.requests.length, 0);
+  // 반대 방향: 대화 작업이 슬롯을 잡으면 새 리뷰도 시작하지 않는다.
+  const chat = await f.store.claim();
+  assert.equal(chat?.type, 'chat');
+  await hook('pull_request', prEvent('synchronize', pull({ head: { sha: HEAD2, ref: 'f', repo: repository }, updated_at: '2026-10-29T00:39:00Z' })));
+  assert.equal(await r.runtime.tick(), false);
+  assert.equal(r.inputs.length, 1);
   await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,outbox,conversations CASCADE');
   await opened(pull({ updated_at: '2026-10-29T00:40:00Z' }));
   r.reply({ status: 'limited' });
