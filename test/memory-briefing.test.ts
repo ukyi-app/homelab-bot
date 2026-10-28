@@ -838,3 +838,20 @@ test('MEM-01 [자체 G3] 원장에서 본 삭제(정리 전) 기억은 같은 �
     assert.deepEqual([fresh.status, fresh.conflictsWith], ['active', []]);
   } finally { await rm(fault.dir, { recursive: true, force: true }); }
 });
+// --- Codex 재리뷰 rev-t20d 회귀 시험(PGlite로 재현되는 것). 경합 반례는 test/memory-briefing-pg.test.ts ---
+test('MEM-01 [rev-t20d P2] 충돌이 생긴 뒤 한쪽을 저장 제외하면 그 충돌 표시만 사라지고 다른 유효한 충돌은 남음', async () => {
+  const cfg = (statement: string, topic: string, source: string) => config(statement, { topic, sources: [doc(source)] });
+  const a = await memory.remember('fixture-owner', thread, cfg('포트 80', 'svc:port', 'old.md'));
+  const b = await memory.remember('fixture-owner', thread, cfg('포트 81', 'svc:port', 'new.md'));
+  const c = await memory.remember('fixture-owner', thread, cfg('포트 82', 'svc:port', 'third.md'));
+  assert.deepEqual(b.conflictsWith, [a.id]);
+  assert.deepEqual(c.conflictsWith.sort(), [a.id, b.id].sort());
+  await memory.remember('fixture-owner', thread, cfg('주소 old', 'svc:host', 'old.md'));
+  const d = await memory.remember('fixture-owner', thread, cfg('주소 new', 'svc:host', 'd.md'));
+  assert.equal(d.conflictsWith.length, 1);
+  assert.equal((await memory.exclude('fixture-owner', thread, 'document:repo://allowed/old.md')).hidden, 2);
+  const flags = async (word: string) => (await memory.search('fixture-owner', thread, word))[0]!.flags;
+  assert.deepEqual(await flags('new'), ['unverified']);
+  assert.ok((await flags('81')).includes('conflict'));
+  assert.ok((await flags('82')).includes('conflict'));
+});
