@@ -1,7 +1,7 @@
 import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { chmod, link, mkdir, mkdtemp, open, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { DEFAULTS, Denied, PolicyUnavailable } from '../src/contracts.js';
 import { CODEX_CAPABILITIES, CODEX_DEFAULTS, CODEX_LIMITS, CapabilityUnavailable, CodexBridge, ExecCodexAdapter, TASK_INSTRUCTIONS,
   describeCapabilities, nodeFiles } from '../src/codex.js';
@@ -1126,4 +1126,80 @@ test('자체 점검: 한 줄 상한 안의 수만 개 변경 경로도 판정이
     { workspace: '/w', changes: paths.slice(0, 22_500) }), null);
   assert.ok(Date.now() - started < 800, `${Date.now() - started}ms`);
   assert.ok(result.kind === 'completed' && result.reported.length === 45_000 && result.unconfirmed.length === 22_500);
+});
+
+// ---- rev-t18 r3 회귀 시험: 수정 전 실패를 먼저 확인했다(VERIFICATION "r3 반영"). ----
+async function outsideDir() {
+  const dir = resolve(await mkdtemp('.local/outside-'));
+  await writeFile(join(dir, 'last-message.json'), out('completed', 'outside-output-marker'));
+  await writeFile(join(dir, 'auth.json'), JSON.stringify({ tokens: { refresh_token: 'outside-token-0123456789abcdef' } }));
+  await writeFile(join(dir, 'secret.txt'), 'outside-secret');
+  return dir;
+}
+const swap = (target: string, outside: string) => async () => { await rename(target, `${target}.moved`); await symlink(outside, target); };
+test('N6 실행 중 run·workspace를 외부 디렉터리 심링크로 바꾸면 외부 파일을 읽지 않고 실패', async () => {
+  const outside = await outsideDir();
+  try {
+    for (const which of ['run', 'workspace', 'both', 'job'] as const) {
+      const job = `00000000-0000-4000-8000-00000000${({ run: 'a', workspace: 'b', both: 'c', job: 'd' })[which]}301`;
+      const paths = taskPaths(root, job);
+      const local = new FakeLauncher();
+      local.scripts.push({ ...finished(out('completed', 'inside')), during: async () => {
+        if (which === 'run' || which === 'both') await swap(paths.run, outside)();
+        if (which === 'workspace' || which === 'both') await swap(paths.workspace, outside)();
+        if (which === 'job') await swap(dirname(paths.home), outside)();
+      } });
+      const result = await new ExecCodexAdapter(root, local).execute({ job, prompt: 'p', resume: null, toolCalls: 8 }, new AbortController().signal);
+      assert.equal(result.kind, 'failed', which);
+      assert.equal(result.kind === 'failed' && result.reason, 'workspace_tampered', which);
+      assert.ok(!JSON.stringify(result).includes('outside-output-marker'), which);
+    }
+  } finally { await rm(outside, { recursive: true, force: true }); }
+});
+test('N6 실제 브리지: 교체된 작업 공간의 결과는 게시하지 않고 실패 안내만', async () => {
+  const outside = await outsideDir();
+  try {
+    const job = await task();
+    const paths = taskPaths(root, job.id);
+    launcher.scripts.push({ ...finished(out('completed', 'inside')), during: swap(paths.run, outside) });
+    await runtime.tick();
+    assert.equal((await jobs())[0]!.state, 'failed'); assert.equal((await jobs())[0]!.wait_reason, 'codex_workspace_tampered');
+    assert.equal((await rows('results')).length, 0);
+    assert.ok(!(await outbox()).some(row => row.payload.content.includes('outside-output-marker')));
+  } finally { await rm(outside, { recursive: true, force: true }); }
+});
+test('N6 작업 공간 루트 심링크는 스냅샷하지 않고, 상위 디렉터리 심링크를 거친 파일은 읽지 않음', async () => {
+  const outside = await outsideDir();
+  try {
+    await symlink(outside, join(root, 'root-link'));
+    assert.equal(await fileWorkspace.snapshot(join(root, 'root-link')), null);
+    assert.equal(await nodeFiles.read(join(root, 'root-link', 'auth.json'), 1024), null);
+    assert.ok((await nodeFiles.read(join(outside, 'auth.json'), 1024))?.includes('outside-token'));
+  } finally { await rm(outside, { recursive: true, force: true }); }
+});
+test('자체 점검: 작업 공간·결과 파일의 하드링크는 다른 inode를 가리킬 수 있어 내용을 읽지 않음', async () => {
+  const outside = await outsideDir();
+  const dir = resolve(await mkdtemp('.local/hard-'));
+  try {
+    await link(join(outside, 'secret.txt'), join(dir, 'linked.txt'));
+    const snap = (await fileWorkspace.snapshot(dir))!;
+    assert.equal(snap['linked.txt'], 'special:hardlink');
+    assert.equal(await nodeFiles.read(join(dir, 'linked.txt'), 1024), null);
+  } finally { await rm(outside, { recursive: true, force: true }); await rm(dir, { recursive: true, force: true }); }
+});
+test('N7 크기를 확인한 뒤 파일이 커져도 상한보다 많이 읽지 않음', async () => {
+  const file = join(root, 'grow.json');
+  await writeFile(file, 'x');
+  const probe = await open(file, 'r');
+  const proto = Object.getPrototypeOf(probe) as { stat: (...args: unknown[]) => Promise<{ size: number }> };
+  await probe.close();
+  const original = proto.stat;
+  // fstat이 1바이트를 본 직후 파일을 2MiB로 키운다. 스케줄링에 기대지 않고 그 순서를 고정한다.
+  proto.stat = async function (this: unknown, ...args: unknown[]) {
+    const info = await original.apply(this, args);
+    if (info.size === 1) await writeFile(file, 'x'.repeat(2 * 1024 * 1024));
+    return info;
+  };
+  try { assert.equal(await nodeFiles.read(file, 1024), null); }
+  finally { proto.stat = original; }
 });
