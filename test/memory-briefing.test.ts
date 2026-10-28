@@ -735,3 +735,101 @@ test('DATA-02 [rev-t20b P1] 복원으로 삭제 요청 행이 없어도 확인�
     assert.equal((await rows('memories'))[0]!.status, 'deleted');
   } finally { await rm(ledgerDir, { recursive: true, force: true }); }
 });
+// --- Codex 재리뷰 rev-t20c 회귀 시험과 같은 경로의 자체 점검 시험 ---
+async function dirFaultLedger(prefix: string) {
+  const ledgerDir = await mkdtemp(`.local/${prefix}-`);
+  const state = { fail: false };
+  const io = { readFile: (path: string, encoding: 'utf8') => readFile(path, encoding),
+    open: async (path: Parameters<typeof open>[0], flags?: Parameters<typeof open>[1]) => {
+      const handle = await open(path, flags);
+      if (path !== ledgerDir || !state.fail) return handle;
+      return { sync: async () => { throw new Error('EIO'); }, close: () => handle.close() } as unknown as FileHandle;
+    } } as unknown as ConstructorParameters<typeof FileDeletionLedger>[1];
+  return { dir: ledgerDir, state, make: () => new FileDeletionLedger(`${ledgerDir}/deletions.jsonl`, io) };
+}
+test('DATA-02 [rev-t20c P1] 삭제 전 백업 복원·최신 회차 대기 브리핑·디렉터리 장애에서 정상 기동해도 지운 기억을 보내지 않음', async () => {
+  const fault = await dirFaultLedger('ledger-restore-briefing');
+  const path = await mkdtemp('.local/restore-briefing-');
+  let local = await localDatabase(`${path}/db`);
+  try {
+    let g = await fixture(local.db);
+    const move = (ts: number) => { g.advance(ts - g.now()); g.policy.confirmedAt = g.now(); };
+    const due = { access: ['fixture-notifications'], classification: 'safe_summary' as const, recheckAt: g.now() };
+    let service = new MemoryService(local.db, g.gate, fault.make(), documents, g.now); await service.open();
+    const secret = await service.remember('fixture-owner', notifications, config('복원되면 안 될 비공개 기억', due));
+    await new BriefingScheduler(new Store(local.db, g.now), g.gate, service, [], seoul).ensure();
+    move(SLOT);
+    assert.equal(await new BriefingScheduler(new Store(local.db, g.now), g.gate, service, [], seoul).tick(), 'enqueued');
+    await local.pg.close(); await cp(`${path}/db`, `${path}/backup`, { recursive: true });
+    local = await localDatabase(`${path}/db`); g = await fixture(local.db); move(SLOT + 1000);
+    service = new MemoryService(local.db, g.gate, fault.make(), documents, g.now); await service.open();
+    assert.equal((await service.delete('fixture-owner', notifications, secret.id)).status, 'deleted');
+    await local.pg.close(); await rm(`${path}/db`, { recursive: true }); await cp(`${path}/backup`, `${path}/db`, { recursive: true });
+    local = await localDatabase(`${path}/db`); g = await fixture(local.db); move(SLOT + 2000);
+    fault.state.fail = true;
+    // 문서의 정상 기동 순서: 원장 재적용 → 예약 확인 → tick → 게시자.
+    const restored = new MemoryService(local.db, g.gate, fault.make(), documents, g.now);
+    assert.deepEqual(await restored.open(), { entries: 1, applied: 0 });
+    const s = new BriefingScheduler(new Store(local.db, g.now), g.gate, restored, [], seoul);
+    await s.ensure(); await s.tick();
+    for (let i = 0; i < 3; i++) await g.publisher.deliver();
+    assert.ok(g.rest.messages.every(m => !m.body.content.includes('복원되면 안 될 비공개 기억')));
+    assert.equal((await rows('memories', local.db))[0]!.statement, '복원되면 안 될 비공개 기억');
+  } finally { await local.pg.close(); await rm(path, { recursive: true, force: true }); await rm(fault.dir, { recursive: true, force: true }); }
+});
+test('DATA-02 [rev-t20c P2] 요청 행 없는 복원에서 재적용 정리가 한 번 실패해도 다음 resume이 마무리', async () => {
+  const fault = await dirFaultLedger('ledger-retry');
+  try {
+    const kept = await memory.remember('fixture-owner', thread, config('재시도로 지워야 할 기억'));
+    const createdAt = Number((await rows('memories'))[0]!.created_at);
+    await fault.make().append({ memoryId: kept.id, createdAt, deletedAt: createdAt });
+    fault.state.fail = true;
+    const broken = faulty(database.db, sql => sql.includes("UPDATE memories SET status='deleted'"));
+    const restored = new MemoryService(broken, f.gate, fault.make(), documents, f.now);
+    assert.deepEqual(await restored.open(), { entries: 1, applied: 0 });
+    fault.state.fail = false;
+    assert.equal(await restored.resume(), 0);
+    assert.equal(await restored.resume(), 1);
+    assert.equal(await restored.resume(), 0);
+    assert.equal((await rows('memories'))[0]!.status, 'deleted');
+    assert.equal((await rows('audit')).filter(a => a.kind === 'memory_deleted').length, 1);
+  } finally { await rm(fault.dir, { recursive: true, force: true }); }
+});
+test('DATA-02 [자체 G1] 원장 기록 실패로 삭제가 미완료여도 이미 큐에 든 브리핑 사본은 보내지 않음', async () => {
+  const due = { access: ['fixture-notifications'], classification: 'safe_summary' as const, recheckAt: f.now() };
+  const stored = await memory.remember('fixture-owner', notifications, config('삭제 요청 중인 기억', due));
+  const s = scheduler(); await s.ensure();
+  at(SLOT); assert.equal(await s.tick(), 'enqueued');
+  ledger.appendFails = 'before';
+  assert.equal((await memory.delete('fixture-owner', notifications, stored.id)).status, 'pending');
+  await s.tick();
+  for (let i = 0; i < 3; i++) await f.publisher.deliver();
+  assert.ok(f.rest.messages.every(m => !m.body.content.includes('삭제 요청 중인 기억')));
+  assert.equal((await rows('memories'))[0]!.statement, '삭제 요청 중인 기억');
+});
+test('DATA-02 [자체 G2] 원장을 읽지 못해 기억 기능이 닫혀도 기억이 든 대기 브리핑은 보내지 않음', async () => {
+  const due = { access: ['fixture-notifications'], classification: 'safe_summary' as const, recheckAt: f.now() };
+  await memory.remember('fixture-owner', notifications, config('원장 확인 전 숨길 기억', due));
+  const s = scheduler(); await s.ensure();
+  at(SLOT); assert.equal(await s.tick(), 'enqueued');
+  ledger.readFails = true;
+  const closed = new MemoryService(database.db, f.gate, ledger, documents, f.now);
+  await assert.rejects(closed.open(), /ledger_down/);
+  const restarted = scheduler([], { memory: closed });
+  await restarted.tick();
+  for (let i = 0; i < 3; i++) await f.publisher.deliver();
+  assert.ok(f.rest.messages.every(m => !m.body.content.includes('원장 확인 전 숨길 기억')));
+});
+test('MEM-01 [자체 G3] 원장에서 본 삭제(정리 전) 기억은 같은 주제 새 기억의 충돌로 묶지 않음', async () => {
+  const fault = await dirFaultLedger('ledger-conflict');
+  try {
+    const old = await memory.remember('fixture-owner', thread, config('삭제된 옛 포트 80', { topic: 'svc:port' }));
+    const createdAt = Number((await rows('memories'))[0]!.created_at);
+    await fault.make().append({ memoryId: old.id, createdAt, deletedAt: createdAt });
+    fault.state.fail = true;
+    const restored = new MemoryService(database.db, f.gate, fault.make(), documents, f.now);
+    await restored.open();
+    const fresh = await restored.remember('fixture-owner', thread, config('새 포트 81', { topic: 'svc:port' }));
+    assert.deepEqual([fresh.status, fresh.conflictsWith], ['active', []]);
+  } finally { await rm(fault.dir, { recursive: true, force: true }); }
+});
