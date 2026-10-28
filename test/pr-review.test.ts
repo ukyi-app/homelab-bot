@@ -1075,3 +1075,16 @@ test('AUTH-01 비교 기준이 정해지지 않았거나 merge base 조회가 �
   assert.equal((await hook('pull_request', prEvent('opened'))).reason, 'comparison_lookup_failed');
   assert.equal((await rows('jobs')).length, 0);
 });
+
+test('SEC-02 리뷰 레인 작업자에 연결조차 못 하면 unknown이 아니라 확정 실패로 닫아 슬롯을 잡지 않는다', async () => {
+  const server = createServer(); server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const port = (server.address() as AddressInfo).port;
+  server.close(); await once(server, 'close');
+  await opened();
+  await new ReviewRuntime(f.store, r.source, r.queue, r.gh, new HttpReviewWorker(`http://127.0.0.1:${port}`, fetch), f.signer, 5).tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.wait_reason]), [['failed', 'worker_rejected']]);
+  await opened(pull({ head: { sha: HEAD2, ref: 'f', repo: repository }, updated_at: '2026-10-29T02:10:00Z' }));
+  r.gh.pulls.set(7, pull({ head: { sha: HEAD2, ref: 'f', repo: repository }, updated_at: '2026-10-29T02:10:00Z' }));
+  r.archives.set(HEAD2, r.archives.get(HEAD)!);
+  assert.equal(await r.runtime.tick(), true);
+});

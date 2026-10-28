@@ -19,6 +19,12 @@ const ResultSchema = z.discriminatedUnion('status', [
 ]);
 const Denial = z.strictObject({ status: z.literal('rejected'), started: z.literal(false) });
 const MAX_TASK_BYTES = 2_097_152;
+// 연결 자체가 안 된 실패는 요청이 작업자에 닿지 않았다는 증거다(worker-http.ts와 같은 분류).
+const CONNECTION_FAILURES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
+function beforeConnection(error: unknown): boolean {
+  if (error instanceof AggregateError) return error.errors.length > 0 && error.errors.every(beforeConnection);
+  return typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string' && CONNECTION_FAILURES.has(error.code);
+}
 async function raw(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -43,7 +49,12 @@ export class HttpReviewWorker implements ReviewWorkerClient {
     try {
       const options = { method: 'POST', redirect: 'error' as const, signal, dispatcher,
         headers: { 'content-type': 'application/json', authorization: `Capability ${capability}` }, body };
-      const response = await this.send(`${this.origin}/v1/review`, options);
+      let response: Response;
+      try { response = await this.send(`${this.origin}/v1/review`, options); }
+      catch (error) {
+        if (error instanceof Error && beforeConnection(error.cause)) throw new WorkerRejected('worker_unreachable');
+        throw error;
+      }
       if (!response.ok) {
         if ([400, 401, 403, 409].includes(response.status) && Denial.safeParse(await response.json().catch(() => null)).success) throw new WorkerRejected();
         throw new Error('worker_response_uncertain');
