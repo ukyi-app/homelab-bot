@@ -52,8 +52,9 @@ export const fileWorkspace: CodexWorkspace = {
           if ((bytes += stat.size) > LIMITS.bytes) throw new Error('workspace_too_large');
           const hash = createHash('sha256');
           for await (const chunk of handle.readableWebStream()) hash.update(chunk as Uint8Array);
-          // git이 보는 실행 비트도 함께 기록한다. 내용이 같은 chmod +x도 실제 변경이다(rev r1 R4).
-          result[path] = `${hash.digest('hex')}:${stat.mode & 0o111 ? '755' : '644'}`;
+          // git이 일반 파일 모드에 반영하는 소유자 실행 비트만 기록한다(100755/100644). 그룹·기타 실행 비트는
+          // git이 보지 않으므로 세지 않는다. 내용이 같은 chmod u+x도 실제 변경이다(rev r1 R4, r2 N5).
+          result[path] = `${hash.digest('hex')}:${stat.mode & 0o100 ? '755' : '644'}`;
         } finally { await handle.close().catch(() => {}); }
       }
     };

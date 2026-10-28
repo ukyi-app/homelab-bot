@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { DEFAULTS, Denied, PolicyUnavailable } from '../src/contracts.js';
-import { CODEX_CAPABILITIES, CODEX_DEFAULTS, CapabilityUnavailable, CodexBridge, ExecCodexAdapter, TASK_INSTRUCTIONS,
+import { CODEX_CAPABILITIES, CODEX_DEFAULTS, CODEX_LIMITS, CapabilityUnavailable, CodexBridge, ExecCodexAdapter, TASK_INSTRUCTIONS,
   describeCapabilities, nodeFiles } from '../src/codex.js';
 import type { CodexFiles, CodexLauncher, CodexLimits, LaunchResult, LaunchSpec } from '../src/codex.js';
 import { FORBIDDEN_FLAGS, SECRET_NAME, TASK_MARKER, assertWorkerRoot, codexConfig, configToml, execArgs,
@@ -258,8 +258,8 @@ test('D-14 개인 ~/.codex* 아래·위의 작업자 루트를 거부하고 실�
     const touched: string[] = [];
     const spy: CodexFiles = {
       mkdir: async p => { touched.push(p); await nodeFiles.mkdir(p); }, write: async (p, c) => { touched.push(p); await nodeFiles.write(p, c); },
-      read: async p => { touched.push(p); return nodeFiles.read(p); }, remove: async p => { touched.push(p); await nodeFiles.remove(p); },
-      resolve: async p => { touched.push(p); return nodeFiles.resolve(p); },
+      read: async (p, max) => { touched.push(p); return nodeFiles.read(p, max); }, remove: async p => { touched.push(p); await nodeFiles.remove(p); },
+      resolve: async p => { touched.push(p); return nodeFiles.resolve(p); }, size: async p => { touched.push(p); return nodeFiles.size(p); },
     };
     const local = new FakeLauncher();
     const result = await new ExecCodexAdapter(workerRoot, local, { files: spy, homes: [home] })
@@ -1115,4 +1115,15 @@ test('자체 점검: 크기 제한 없이 읽던 실행 출력 파일은 상한�
   await task();
   await runtime.tick();
   assert.equal((await jobs())[0]!.wait_reason, 'codex_output_too_large');
+});
+test('자체 점검: 한 줄 상한 안의 수만 개 변경 경로도 판정이 경로 수에 비례(제곱 아님)', () => {
+  const paths = Array.from({ length: 45_000 }, (_, i) => `p${i}`);
+  const line = JSON.stringify({ type: 'item.completed', item: { id: 'patch', type: 'file_change', status: 'completed',
+    changes: paths.map(path => ({ path })) } });
+  assert.ok(Buffer.byteLength(line) < CODEX_LIMITS.lineBytes);
+  const started = Date.now();
+  const result = interpretRun(report([...streamed(begin()), compactEvent(line).line, ...streamed([done])], out('completed', '끝'),
+    { workspace: '/w', changes: paths.slice(0, 22_500) }), null);
+  assert.ok(Date.now() - started < 800, `${Date.now() - started}ms`);
+  assert.ok(result.kind === 'completed' && result.reported.length === 45_000 && result.unconfirmed.length === 22_500);
 });

@@ -1,4 +1,5 @@
-import { mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { mkdir, open, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { DEFAULTS, Denied, PolicyUnavailable } from './contracts.js';
 import type { Job, Scope } from './contracts.js';
@@ -56,12 +57,23 @@ export interface CodexLauncher {
 }
 export interface CodexFiles {
   mkdir(path: string): Promise<void>; write(path: string, content: string): Promise<void>;
-  read(path: string, maxBytes?: number): Promise<string | null>; remove(path: string): Promise<void>; resolve(path: string): Promise<string>;
+  // maxBytes를 넘거나 일반 파일이 아니면 null이다. 크기는 size로 따로 본다.
+  read(path: string, maxBytes?: number): Promise<string | null>; size(path: string): Promise<number | null>;
+  remove(path: string): Promise<void>; resolve(path: string): Promise<string>;
 }
 export const nodeFiles: CodexFiles = {
   mkdir: async path => { await mkdir(path, { recursive: true, mode: 0o700 }); },
   write: (path, content) => writeFile(path, content, { mode: 0o600 }),
-  read: async path => { try { return await readFile(path, 'utf8'); } catch { return null; } },
+  // 심링크·FIFO를 따라가지 않고, 크기를 본 뒤에만 읽는다. 크기를 모르고 통째로 읽으면 실행이 만든 큰 파일이 메모리를 채운다.
+  read: async (path, maxBytes = Number.MAX_SAFE_INTEGER) => {
+    let handle;
+    try { handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); } catch { return null; }
+    try {
+      const info = await handle.stat();
+      return info.isFile() && info.size <= maxBytes ? await handle.readFile('utf8') : null;
+    } catch { return null; } finally { await handle.close().catch(() => {}); }
+  },
+  size: async path => { try { return (await stat(path)).size; } catch { return null; } },
   remove: path => rm(path, { force: true }),
   resolve: path => realpath(path),
 };
@@ -70,6 +82,10 @@ export interface CodexTaskRequest { job: string; prompt: string; resume: string 
 export interface CodexLimits { lineBytes: number; outputBytes: number; events: number }
 // 한 줄 1MiB, 전체 16MiB, 이벤트 2만 개. 정상 작업의 명령 출력은 Codex 이벤트 한 줄에 실리므로 줄 상한을 넉넉히 둔다 [가정].
 export const CODEX_LIMITS: Readonly<CodexLimits> = Object.freeze({ lineBytes: 1024 * 1024, outputBytes: 16 * 1024 * 1024, events: 20_000 });
+// 작업 공간 밖 run/·CODEX_HOME 파일의 읽기 상한. 최종 메시지는 스키마상 수만 자라 1MiB면 넉넉하다 [가정].
+const READ_LIMITS = Object.freeze({ output: 1024 * 1024, auth: 1024 * 1024, baseline: 64 * 1024 * 1024 });
+// 결과 행에 남기는 경로 수. 판정은 전체 목록으로 끝낸 뒤 보관할 때만 줄인다(rev r2 N2).
+const EVIDENCE_PATHS = 1000;
 export interface CodexTaskAdapter {
   capabilities(): CodexCapabilities;
   execute(request: CodexTaskRequest, signal: AbortSignal): Promise<RunOutcome>;
@@ -111,7 +127,7 @@ export class ExecCodexAdapter implements CodexTaskAdapter {
       await files.remove(join(paths.run, 'last-message.json'));
       // 기준 상태는 첫 실행 전에 한 번만 잡고 작업 공간 밖(run/)에 둔다. 재개 때도 같은 기준과 대조한다.
       const baselinePath = join(paths.run, 'baseline.json');
-      let saved = JSON.parse(await files.read(baselinePath) ?? 'null') as Snapshot | null;
+      let saved = JSON.parse(await files.read(baselinePath, READ_LIMITS.baseline) ?? 'null') as Snapshot | null;
       if (!saved) {
         await workspace.prepare(paths.workspace);
         saved = await workspace.snapshot(paths.workspace);
@@ -120,7 +136,7 @@ export class ExecCodexAdapter implements CodexTaskAdapter {
       }
       baseline = saved;
       // 실행 중 갱신으로 토큰이 바뀌어도 옛 값의 반사를 잡도록 실행 전후를 모두 본다.
-      before = authSecrets(await files.read(join(paths.home, 'auth.json')) ?? '');
+      before = authSecrets(await files.read(join(paths.home, 'auth.json'), READ_LIMITS.auth) ?? '');
       args = execArgs(paths, request.resume);
     } catch (error) {
       return { kind: 'failed', reason: error instanceof Denied ? 'workspace_denied' : 'prepare_failed', threadId: request.resume, turns: 0 };
@@ -159,12 +175,14 @@ export class ExecCodexAdapter implements CodexTaskAdapter {
     finally { signal.removeEventListener('abort', forward); }
     await this.launcher.terminate(request.job).catch(() => {});
     const survivors = await this.launcher.survivors(request.job).catch(() => null);
-    const output = await files.read(join(paths.run, 'last-message.json'));
-    const secrets = [...before, ...authSecrets(await files.read(join(paths.home, 'auth.json')) ?? '')];
+    const outputPath = join(paths.run, 'last-message.json');
+    const outputTooLarge = (await files.size(outputPath) ?? 0) > READ_LIMITS.output;
+    const output = outputTooLarge ? null : await files.read(outputPath, READ_LIMITS.output);
+    const secrets = [...before, ...authSecrets(await files.read(join(paths.home, 'auth.json'), READ_LIMITS.auth) ?? '')];
     // 남은 프로세스가 있거나 모르면 작업 공간을 읽지 않는다. 결과는 어차피 unknown이고, 살아 있는 프로세스가
     // 읽는 도중 파일을 바꿔치기할 수 있다.
     const after = survivors === 0 ? await workspace.snapshot(paths.workspace) : null;
-    return { ...interpretRun({ lines, exit: result.exit, output, survivors, aborted: signal.aborted, launchFailed, exceeded,
+    return { ...interpretRun({ lines, exit: result.exit, output, outputTooLarge, survivors, aborted: signal.aborted, launchFailed, exceeded,
       changes: after ? changedPaths(baseline, after) : null, workspace: paths.workspace }, request.resume, secrets), tools: tools.size };
   }
   async confirmStop(job: string): Promise<{ stopped: boolean }> {
@@ -185,7 +203,8 @@ export interface CodexBridgeOptions { monitorMs: number; questionTtlMs: number; 
 // clarification을 점유에서 빼는 변경(T16a 소유) 전까지 막힘 시간을 이 값으로 묶는다.
 export const CODEX_DEFAULTS: Readonly<CodexBridgeOptions> = Object.freeze({ monitorMs: 1000, questionTtlMs: 3_600_000,
   answerChars: 2000, stopWaitMs: 15_000 });
-interface Session { job_id: string; thread_id: string | null; turn: number; tool_calls: number; state: string }
+// tool_calls가 null이면 사용량을 모른다(현재 009 이전 스키마에서 올라온 세션).
+interface Session { job_id: string; thread_id: string | null; turn: number; tool_calls: number | null; state: string }
 interface Question {
   id: string; job_id: string; conversation_id: string; thread_id: string; turn: number; responder_id: string;
   state: string; expires_at: number; answer: string | null; answer_event: string | null;
@@ -209,13 +228,15 @@ export class CodexBridge {
     if (current.state === 'cancel_requested') { await this.store.transition(job, 'cancelled', 'cancel_before_dispatch'); return; }
     if (current.state !== 'running') return;
     const session = (await db.query<Session>('SELECT * FROM codex_sessions WHERE job_id=$1', [job.id])).rows[0];
-    const answered = session?.thread_id ? (await db.query<Question>(`SELECT * FROM codex_questions
+    // 이어 가기는 세션이 대기 상태로 남은 경우뿐이다. 실패로 정리된 세션은 /retry에서 새 스레드로 시작한다(rev r2 N3).
+    const resumable = session?.state === 'waiting_answer' || session?.state === 'waiting_model';
+    const answered = resumable && session?.thread_id ? (await db.query<Question>(`SELECT * FROM codex_questions
       WHERE job_id=$1 AND thread_id=$2 AND turn=$3 AND state='answered'`, [job.id, session.thread_id, session.turn])).rows[0] : undefined;
     let request: { prompt: string; resume: string | null };
     if (answered) request = { prompt: answered.answer!, resume: answered.thread_id };
     // 한도·인증 대기에서 /resume-model로 돌아왔으면 저장된 스레드를 잇는다. 한도 전에 한 변경을 처음부터 다시 하지 않는다(rev r1 R3).
     // 재개가 실패하면 failed로 끝나고 새 스레드로 조용히 바꾸지 않는다. 처음부터 다시 하는 것은 owner의 /retry뿐이다.
-    else if (session?.state === 'waiting_model' && session.thread_id) request = { prompt: RESUME_AFTER_WAIT, resume: session.thread_id };
+    else if (resumable && session?.state === 'waiting_model' && session.thread_id) request = { prompt: RESUME_AFTER_WAIT, resume: session.thread_id };
     else {
       // 답할 질문도 이어 갈 세션도 없으면 새 스레드다(/retry, 세션이 생기기 전 대기 포함).
       const event = (await db.query<{ payload: { text: string } }>('SELECT payload FROM events WHERE id=$1', [job.event_id])).rows[0]!;
@@ -223,8 +244,10 @@ export class CodexBridge {
     }
     const keep = request.resume !== null;
     // 도구 호출 예산은 작업 단위다. 같은 스레드를 잇는 동안 앞 턴 사용분을 빼고, 새 스레드면 다시 센다.
+    // 사용량을 모르는 세션(옛 스키마)은 예산을 지킨다고 보장할 수 없어 잇지 않는다. 0으로 보면 예산을 넘길 수 있다.
+    if (keep && session?.tool_calls === null) { await this.abandon(job, 'codex_tool_usage_unknown'); return; }
     const remaining = job.budget.toolCalls - (keep ? Number(session?.tool_calls ?? 0) : 0);
-    if (remaining <= 0) { await this.store.fail(job, 'codex_tool_budget_exceeded'); return; }
+    if (remaining <= 0) { await this.abandon(job, 'codex_tool_budget_exceeded'); return; }
     await db.query(`INSERT INTO codex_sessions(job_id,thread_id,turn,tool_calls,host,capabilities,state,created_at,updated_at)
       VALUES ($1,NULL,0,0,'worker',$2,'running',$3,$3) ON CONFLICT (job_id) DO UPDATE SET state='running',updated_at=$3,
       thread_id=CASE WHEN $4 THEN codex_sessions.thread_id ELSE NULL END,turn=CASE WHEN $4 THEN codex_sessions.turn ELSE 0 END,
@@ -264,6 +287,14 @@ export class CodexBridge {
       // 기록 실패는 결과를 모르는 것과 같다. lease가 끝나면 expire()가 unknown으로 둔다.
       await this.store.transition(job, 'unknown', 'record_failed').catch(() => {});
     }
+  }
+  // 띄우지 않고 실패로 끝낼 때 세션·질문도 함께 닫는다. 남겨 두면 /retry가 같은 세션 재개로 읽혀 같은 이유로 다시 실패한다.
+  private async abandon(job: Job, reason: string): Promise<void> {
+    await this.store.atomic(async store => {
+      await store.db.query("UPDATE codex_sessions SET state='failed',updated_at=$2 WHERE job_id=$1", [job.id, store.now()]);
+      await store.db.query("UPDATE codex_questions SET state='cancelled' WHERE job_id=$1 AND state IN ('open','answered')", [job.id]);
+      await store.fail(job, reason);
+    });
   }
   private async check(job: Job): Promise<Stop | undefined> {
     const row = (await this.store.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0];
@@ -331,9 +362,11 @@ export class CodexBridge {
     const content = [`Codex 작업 완료 (작업 ${job.id})`, bounded(outcome.summary || '요약 없음', 1500),
       `변경 파일(작업 공간 실제 diff 기준): ${outcome.changes.length}개`
         + (outcome.unconfirmed.length ? ` (Codex 보고와 다름: ${outcome.unconfirmed.length}개)` : '')].join('\n');
-    await this.store.finish(job, { summary: outcome.summary, changes: outcome.changes },
-      { source: 'codex_exec', threadId: outcome.threadId, turns: turn, exitCode: 0, stopConfirmed: true,
-        diff: 'workspace_snapshot', reportedChanges: outcome.reported, unconfirmedReports: outcome.unconfirmed }, content, job.target);
+    const keepPaths = (paths: string[]) => paths.slice(0, EVIDENCE_PATHS);
+    await this.store.finish(job, { summary: outcome.summary, changes: keepPaths(outcome.changes), changeCount: outcome.changes.length },
+      { source: 'codex_exec', threadId: outcome.threadId, turns: turn, exitCode: 0, stopConfirmed: true, diff: 'workspace_snapshot',
+        reportedChanges: keepPaths(outcome.reported), reportedCount: outcome.reported.length,
+        unconfirmedReports: keepPaths(outcome.unconfirmed), unconfirmedCount: outcome.unconfirmed.length }, content, job.target);
   }
   private async ask(job: Job, revision: string, threadId: string, turn: number, question: string): Promise<void> {
     const id = `${job.id}:${threadId}:${turn}`;

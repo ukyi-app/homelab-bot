@@ -75,6 +75,8 @@ export interface RunReport {
   launchFailed?: boolean;
   // 실행 중 집행한 상한(도구 호출 예산, 출력 크기)을 넘어 작업 그룹을 끝냈다.
   exceeded?: 'tool_budget_exceeded' | 'output_limit_exceeded';
+  // -o 최종 메시지 파일이 읽기 상한을 넘었다. 읽지 않고 실패로 끝낸다.
+  outputTooLarge?: boolean;
 }
 // tools: 이번 실행에서 시작한 도구 호출 수. 예산은 작업 단위로 브리지가 합산한다.
 export type RunOutcome = (
@@ -112,6 +114,7 @@ export function interpretRun(report: RunReport, expectedThread: string | null, s
   if (!threadId) return { kind: 'failed', reason: 'invalid_stream', threadId, turns };
   if (report.exit.code !== 0) return { kind: 'failed', reason: 'exit_nonzero', threadId, turns };
   if (turns === 0 || lastTurn?.type !== 'turn.completed') return { kind: 'failed', reason: 'turn_incomplete', threadId, turns };
+  if (report.outputTooLarge) return { kind: 'failed', reason: 'output_too_large', threadId, turns };
   let output: TaskOutput;
   try { output = TaskOutputSchema.parse(JSON.parse(report.output ?? '')); }
   catch { return { kind: 'failed', reason: 'invalid_output', threadId, turns }; }
@@ -125,14 +128,16 @@ export function interpretRun(report: RunReport, expectedThread: string | null, s
   if (report.changes === null) return { kind: 'failed', reason: 'diff_unavailable', threadId, turns };
   const raw = events.flatMap(e => e.type === 'item.completed' && e.item.type === 'file_change' && e.item.status !== 'failed'
     && Array.isArray(e.item.changes) ? (e.item.changes as { path?: unknown }[]).flatMap(c => typeof c.path === 'string' ? [c.path] : []) : []);
-  const reported: string[] = [];
+  // 한 줄 상한 안에도 경로가 수만 개 올 수 있어 중복 제거·대조는 Set으로 한다(배열 includes면 경로 수의 제곱).
+  const reported = new Set<string>();
   for (const path of raw) {
     const relative = workspaceRelative(path, report.workspace);
     if (relative === null) return { kind: 'failed', reason: 'change_outside_workspace', threadId, turns };
-    if (!reported.includes(relative)) reported.push(relative);
+    reported.add(relative);
   }
-  return { kind: 'completed', threadId, turns, summary, changes: report.changes, reported,
-    unconfirmed: reported.filter(path => !report.changes!.includes(path)) };
+  const actual = new Set(report.changes);
+  return { kind: 'completed', threadId, turns, summary, changes: report.changes, reported: [...reported],
+    unconfirmed: [...reported].filter(path => !actual.has(path)) };
 }
 // Codex 보고 경로는 절대 경로일 수 있다 [미확인]. 작업 공간 기준 상대 경로로 맞추고 밖이면 null.
 function workspaceRelative(path: string, workspace?: string): string | null {
@@ -168,10 +173,10 @@ export function echoesSecret(text: string, secrets: readonly string[]): boolean 
   return false;
 }
 
-// 판정에 쓰는 필드만 남긴다. 명령 출력·메시지 본문은 버려 수집 단계 메모리를 이벤트 수에 비례하게 묶는다(rev r1 S3).
-// 도구 호출 항목이면 그 id를 돌려 실행 중 예산 집행에 쓴다.
+// 판정에 쓰는 필드만 남기고 명령 출력·메시지 본문(agent_message 등)은 버린다(rev r1 S3).
+// 남긴 필드는 자르지 않는다. 자른 뒤 판정하면 긴 오류 뒤쪽의 인증·한도 표식, 500번째 뒤의 작업 공간 밖 경로,
+// 4096자 뒤의 상위 이동이 사라진다(rev r2 N1·N2). 남긴 크기는 launcher의 줄·전체 바이트 상한이 묶는다.
 export const TOOL_ITEMS = new Set(['command_execution', 'mcp_tool_call', 'web_search', 'file_change']);
-const cut = (value: unknown, size: number) => typeof value === 'string' ? value.slice(0, size) : undefined;
 export function compactEvent(line: string): { line: string; tool: string | null } {
   let raw: unknown;
   try { raw = JSON.parse(line); } catch { return { line: '<malformed>', tool: null }; }
@@ -180,11 +185,11 @@ export function compactEvent(line: string): { line: string; tool: string | null 
   const item = typeof event.item === 'object' && event.item !== null ? event.item as Record<string, unknown> : undefined;
   const error = typeof event.error === 'object' && event.error !== null ? event.error as Record<string, unknown> : undefined;
   const compact = {
-    type: event.type, thread_id: cut(event.thread_id, 256), message: cut(event.message, 2000),
-    error: error ? { message: cut(error.message, 2000) } : undefined,
-    item: item ? { id: cut(item.id, 256), type: cut(item.type, 64), status: cut(item.status, 32),
-      changes: Array.isArray(item.changes) ? item.changes.slice(0, 500).map(change =>
-        ({ path: cut((change as { path?: unknown } | null)?.path, 4096) })) : undefined } : undefined,
+    type: event.type, thread_id: event.thread_id, message: event.message,
+    error: error ? { message: error.message } : undefined,
+    item: item ? { id: item.id, type: item.type, status: item.status,
+      changes: Array.isArray(item.changes) ? item.changes.map(change =>
+        ({ path: (change as { path?: unknown } | null)?.path })) : undefined } : undefined,
   };
   const tool = typeof event.type === 'string' && event.type.startsWith('item.') && item && typeof item.id === 'string'
     && typeof item.type === 'string' && TOOL_ITEMS.has(item.type) ? item.id : null;
