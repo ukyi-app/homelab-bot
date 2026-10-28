@@ -11,6 +11,8 @@ import { FORBIDDEN_FLAGS, SECRET_NAME, TASK_MARKER, assertWorkerRoot, codexConfi
 import { authSecrets, interpretRun, parseStream } from '../src/codex-events.js';
 import type { RunReport } from '../src/codex-events.js';
 import { ProcessGroupLauncher } from '../src/codex-process.js';
+import { fileWorkspace } from '../src/codex-workspace.js';
+import { execFile } from 'node:child_process';
 import { Runtime } from '../src/runtime.js';
 import { localDatabase, fixture, event, thread } from './helpers.js';
 
@@ -116,7 +118,9 @@ test('TASK-03 종료 코드·turn.failed·스키마 밖 출력·스트림 손상
     [report(good, completed), null, 'completed'],
     [report(good, completed, { exit: { code: 1, signal: null } }), null, 'failed:exit_nonzero'],
     [report(jsonl(...begin(), { type: 'turn.failed', error: { message: 'x' } }, done), completed), null, 'failed:turn_failed'],
-    [report(jsonl(...begin(), { type: 'error', message: 'stream' }, done), completed), null, 'failed:turn_failed'],
+    [report(jsonl(...begin(), { type: 'error', message: 'stream' }), completed, { exit: { code: 1, signal: null } }), null, 'failed:turn_failed'],
+    // 재연결 같은 일시 error 뒤 턴이 끝나고 종료 코드 0이면 결과를 버리지 않는다.
+    [report(jsonl(...begin(), { type: 'error', message: 'reconnecting after 429' }, done), completed), null, 'completed'],
     [report([...good, 'not json'], completed), null, 'failed:invalid_stream'],
     [report(jsonl(...begin(), ...begin('other-thread'), done), completed), null, 'failed:invalid_stream'],
     [report(jsonl({ type: 'turn.started' }, done), completed), null, 'failed:invalid_stream'],
@@ -132,7 +136,11 @@ test('TASK-03 종료 코드·turn.failed·스키마 밖 출력·스트림 손상
     [report(good, completed, { survivors: null }), null, 'unknown:stop_unverifiable'],
     [report(good, completed, { aborted: true }), null, 'failed:aborted'],
     [report(good, completed, { changes: null }), null, 'failed:diff_unavailable'],
-    [report(jsonl(...begin(), edited, done), completed), null, 'failed:diff_mismatch'],
+    [report(jsonl(...begin(), edited, done), completed), null, 'completed'],
+    [report(jsonl(...begin(), { type: 'item.completed', item: { id: 'i', type: 'file_change', status: 'completed',
+      changes: [{ path: '/etc/passwd', kind: 'update' }] } }, done), completed, { workspace: '/w' }), null, 'failed:change_outside_workspace'],
+    [report(jsonl(...begin(), { type: 'item.completed', item: { id: 'i', type: 'file_change', status: 'completed',
+      changes: [{ path: '../x', kind: 'add' }] } }, done), completed), null, 'failed:change_outside_workspace'],
     [report(jsonl(...begin(), edited, done), completed, { changes: ['src/a.ts', 'notes.txt'] }), null, 'completed'],
     [report(jsonl(...begin('-bad-thread'), done), completed), null, 'failed:invalid_thread'],
     [report(jsonl(...begin(), { type: 'turn.failed', error: { message: 'usage_limit_reached: try again later' } }), null,
@@ -152,6 +160,13 @@ test('TASK-03 종료 코드·turn.failed·스키마 밖 출력·스트림 손상
   const long = interpretRun(report(jsonl(...begin(), edited, done), out('completed', 'x'.repeat(1600)), { changes: ['notes.txt', 'src/a.ts'] }), null);
   assert.ok(long.kind === 'completed' && long.summary.length <= 1500 && long.summary.endsWith('(일부 생략)'));
   assert.ok(long.kind === 'completed' && long.changes.length === 2 && long.reported.length === 1);
+  // 보고 경로가 절대 경로여도 작업 공간 기준으로 맞춘다 [미확인 형식]. 실패한 패치·diff에 없는 보고는 증거로만 남긴다.
+  const absolute = interpretRun(report(jsonl(...begin(), { type: 'item.completed', item: { id: 'i', type: 'file_change', status: 'completed',
+    changes: [{ path: '/w/src/a.ts', kind: 'update' }, { path: '/w/tmp.txt', kind: 'add' }] } },
+  { type: 'item.completed', item: { id: 'j', type: 'file_change', status: 'failed', changes: [{ path: '/w/never.ts', kind: 'add' }] } }, done),
+  completed, { workspace: '/w', changes: ['src/a.ts'] }), null);
+  assert.ok(absolute.kind === 'completed');
+  assert.deepEqual(absolute.kind === 'completed' && [absolute.reported, absolute.unconfirmed], [['src/a.ts', 'tmp.txt'], ['tmp.txt']]);
 });
 test('SEC-02 결과·질문에 작업자 auth.json 값이나 그 조각이 섞이면 게시 대상이 되지 않음(best-effort)', () => {
   const token = 'fixture-refresh-token-0123456789abcdefghijklmnop';
@@ -689,16 +704,19 @@ test('AUTH-02 owner가 바뀌어 남은 unknown은 옛 owner가 못 풀고 현�
   // 현재 owner의 다른 일반 작업 상태 조회 권한이 생기는 것은 아니다.
   await assert.rejects(bridge.status('replacement', own, job.id), Denied);
 });
-test('TASK-03 Codex가 바꿨다고 보고한 파일이 실제 diff에 없으면 완료가 아니고, 셸로만 바꾼 파일은 실제 diff로 보고', async () => {
+test('TASK-03 게시하는 변경 목록은 실제 diff 기준: 보고만 있고 diff에 없는 파일은 증거로 표시, 셸로만 바꾼 파일도 보고', async () => {
   launcher.scripts.push(finished(out('completed', '고쳤습니다'), [edited]));
   await task();
   await runtime.tick();
-  assert.equal((await jobs())[0]!.state, 'failed'); assert.equal((await jobs())[0]!.wait_reason, 'codex_diff_mismatch');
+  const first = (await rows('results'))[0]!;
+  assert.deepEqual(first.result.changes, []); assert.deepEqual(first.evidence.unconfirmedReports, ['src/a.ts']);
+  await f.publisher.deliver();
+  assert.match(f.rest.messages[0]!.body.content, /실제 diff 기준\): 0개[\s\S]*Codex 보고와 다름: 1개/);
   launcher.scripts.push({ ...finished(out('completed', '셸로 고침'), [ran('sed -i')]), files: { 'notes.txt': 'changed\n' } });
   await task('task-2');
   await runtime.tick();
-  const result = (await rows('results'))[0]!;
-  assert.deepEqual(result.result.changes, ['notes.txt']); assert.deepEqual(result.evidence.reportedChanges, []);
+  const second = (await database.db.query<Record<string, any>>('SELECT * FROM results WHERE job_id=$1', [(await jobs())[1]!.id])).rows[0]!;
+  assert.deepEqual(second.result.changes, ['notes.txt']); assert.deepEqual(second.evidence.reportedChanges, []);
 });
 test('TASK-03 한도 도달은 failed가 아니라 대기·스케줄러 정지·알림, 재개하면 같은 답으로 같은 스레드를 이음', async () => {
   const { job, question } = await asked();
@@ -753,7 +771,8 @@ test('D-14 작업자 루트 아래 심링크가 개인 Codex 홈을 가리키면
     await symlink(join(home, '.codex-work', 'tasks'), join(workerRoot, 'tasks'));
     const local = new FakeLauncher();
     const adapter = new ExecCodexAdapter(workerRoot, local, { homes: [home] });
-    await assert.rejects(adapter.execute({ job: '00000000-0000-4000-8000-0000000000f2', prompt: 'p', resume: null }, new AbortController().signal), Denied);
+    assert.deepEqual(await adapter.execute({ job: '00000000-0000-4000-8000-0000000000f2', prompt: 'p', resume: null }, new AbortController().signal),
+      { kind: 'failed', reason: 'workspace_denied', threadId: null, turns: 0 });
     assert.equal(local.started, 0);
     assert.equal(await nodeFiles.read(join(home, '.codex-work', 'tasks', '00000000-0000-4000-8000-0000000000f2', 'codex-home', 'config.toml')), null);
   } finally {
@@ -763,4 +782,55 @@ test('D-14 작업자 루트 아래 심링크가 개인 Codex 홈을 가리키면
 test('SEC-02 작업자 설정은 프로젝트 신뢰([projects])를 주지 않음', () => {
   const text = configToml(codexConfig(taskPaths(root, '00000000-0000-4000-8000-0000000000f3')));
   assert.ok(!text.includes('[projects') && !text.includes('trust_level'));
+});
+test('SEC-02 남은 프로세스가 있으면 작업 공간을 다시 읽지 않고, 읽을 때는 심링크·FIFO를 따라가지 않음', async () => {
+  const calls: string[] = [];
+  const spyWorkspace = { prepare: async (dir: string) => { calls.push('prepare'); await fileWorkspace.prepare(dir); },
+    snapshot: async (dir: string) => { calls.push('snapshot'); return fileWorkspace.snapshot(dir); } };
+  const local = new FakeLauncher(); local.left = 1;
+  const result = await new ExecCodexAdapter(root, local, { workspace: spyWorkspace })
+    .execute({ job: '00000000-0000-4000-8000-0000000000f4', prompt: 'p', resume: null }, new AbortController().signal);
+  assert.equal(result.kind, 'unknown'); assert.deepEqual(calls, ['prepare', 'snapshot']);
+  const dir = resolve(await mkdtemp('.local/snap-'));
+  try {
+    await writeFile(join(dir, 'a.txt'), 'a');
+    await symlink('/dev/zero', join(dir, 'zero'));
+    await symlink('/etc', join(dir, 'outside'));
+    await new Promise<void>((done, fail) => execFile('mkfifo', [join(dir, 'pipe')], error => error ? fail(error) : done()));
+    const started = Date.now();
+    const snap = (await fileWorkspace.snapshot(dir))!;
+    assert.ok(Date.now() - started < 2000);
+    assert.equal(snap['zero'], 'link:/dev/zero'); assert.equal(snap['outside'], 'link:/etc'); assert.equal(snap['pipe'], 'special');
+    assert.equal(Object.keys(snap).some(path => path.startsWith('outside/')), false);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+test('TASK-03 실행 전 실패(이미 있는 .git)는 실제 launcher에서도 unknown이 아니라 failed', async () => {
+  const job = '00000000-0000-4000-8000-0000000000f5';
+  await mkdir(join(taskPaths(root, job).workspace, '.git'), { recursive: true });
+  const real = new ExecCodexAdapter(root, new ProcessGroupLauncher([process.execPath, '-e', FAKE_CODEX, 'plain'], { graceMs: 50 }));
+  assert.deepEqual(await real.execute({ job, prompt: 'p', resume: null }, new AbortController().signal),
+    { kind: 'failed', reason: 'prepare_failed', threadId: null, turns: 0 });
+});
+test('TASK-02 질문 대기 중 비상 중지를 풀었으면 기한 만료 정리도 스케줄러를 풀어 다음 작업을 받음', async () => {
+  await asked();
+  const conversation = f.store.scopeId(thread);
+  await f.store.control('fixture-owner', conversation, 'emergency-stop');
+  await f.store.control('fixture-owner', conversation, 'resume-model', 'emergency-stop');
+  await task('task-2');
+  f.advance(CODEX_DEFAULTS.questionTtlMs); f.policy.confirmedAt = f.now();
+  assert.equal(await runtime.tick(), true);
+  assert.equal((await jobs())[1]!.state, 'succeeded');
+});
+test('TASK-03 질문 재개로 시도 한도에 닿은 뒤 한도 대기가 오면 재개 대신 /cancel을 안내', async () => {
+  const { job, question } = await asked();
+  await owner(question, 'main', 'answer-1');
+  launcher.scripts.push(finished(out('needs_input', '조사', '하나 더 묻습니다'), [], null));
+  await runtime.tick();
+  await owner(`${job.id}:${THREAD}:2`, '네', 'answer-2');
+  launcher.scripts.push({ lines: jsonl({ type: 'turn.started' }, { type: 'turn.failed', error: { message: 'usage_limit_reached' } }),
+    exit: { code: 1, signal: null } });
+  await runtime.tick();
+  assert.equal((await jobs())[0]!.attempt, 3); assert.equal((await jobs())[0]!.wait_reason, 'model_limit');
+  assert.ok((await outbox()).some(row => row.payload.content.includes('재시도 한도에 닿아 재개할 수 없습니다')));
+  assert.equal((await f.store.control('fixture-owner', f.store.scopeId(thread), 'resume-model', job.id) as { ok: boolean }).ok, false);
 });

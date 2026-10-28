@@ -24,7 +24,7 @@ export class ProcessGroupLauncher implements CodexLauncher {
     // 이번 실행으로 생긴 프로세스가 없다는 기록이다. pgid 0은 쓰지 않는다(kill(0)은 자기 그룹이다).
     if (!child.pid) { await exited; this.groups.set(spec.job, { pgid: 0, since: Number.POSITIVE_INFINITY }); throw new LaunchFailed(); }
     const stat = await this.stat(child.pid);
-    this.groups.set(spec.job, { pgid: child.pid, since: stat?.start ?? 0 });
+    this.groups.set(spec.job, { pgid: child.pid, since: stat?.start ?? await this.uptimeTicks() });
     const lines: string[] = [];
     const reader = createInterface({ input: child.stdout });
     reader.on('line', line => lines.push(line));
@@ -46,9 +46,9 @@ export class ProcessGroupLauncher implements CodexLauncher {
   }
   async terminate(job: string): Promise<void> {
     const grace = this.options.graceMs ?? 2000;
-    const group = this.groups.get(job);
     for (const sig of ['SIGTERM', 'SIGKILL'] as const) {
-      if (group && group.pgid > 0) { try { process.kill(-group.pgid, sig); } catch { /* 이미 없는 그룹 */ } }
+      const group = await this.group(job);
+      if (group) { try { process.kill(-group, sig); } catch { /* 이미 없는 그룹 */ } }
       for (const pid of (await this.members(job)).found) { try { process.kill(pid, sig); } catch { /* 이미 끝남 */ } }
       const until = Date.now() + grace;
       while (Date.now() < until) {
@@ -71,9 +71,18 @@ export class ProcessGroupLauncher implements CodexLauncher {
       return { state: fields[0]!, pgrp: Number(fields[2]), start: Number(fields[19]) };
     } catch { return null; }
   }
+  // 기록한 그룹이 아직 이 작업 것일 때만 pgid를 돌려준다. 리더 pid가 다른 시작 시각으로 살아 있으면 재사용된 번호다.
+  // 리더가 끝났으면 그룹이 남아 있는 동안 그 번호는 재사용되지 않는다(Linux pid 할당 규칙).
+  private async group(job: string): Promise<number | null> {
+    const record = this.groups.get(job);
+    if (!record || record.pgid <= 0) return null;
+    const leader = await this.stat(record.pgid);
+    return leader && leader.start !== record.since ? null : record.pgid;
+  }
   private async members(job: string): Promise<{ found: number[]; complete: boolean }> {
     const proc = this.options.proc ?? '/proc';
-    const group = this.groups.get(job);
+    const record = this.groups.get(job);
+    const pgid = await this.group(job);
     const uid = process.getuid?.();
     let entries: string[];
     try { entries = await readdir(proc); } catch { return { found: [], complete: false }; }
@@ -83,16 +92,21 @@ export class ProcessGroupLauncher implements CodexLauncher {
       if (!/^\d+$/.test(entry) || Number(entry) === process.pid) continue;
       const stat = await this.stat(entry);
       if (!stat || stat.state === 'Z' || stat.state === 'X') continue;
-      if (group && group.pgid > 0 && stat.pgrp === group.pgid) { found.push(Number(entry)); continue; }
+      if (pgid && stat.pgrp === pgid) { found.push(Number(entry)); continue; }
       try {
         if ((await readFile(`${proc}/${entry}/environ`, 'utf8')).split('\0').includes(`${TASK_MARKER}=${job}`)) found.push(Number(entry));
       } catch {
         // 같은 UID인데 environ을 못 읽는 프로세스(non-dumpable 등)가 작업 시작 뒤에 생겼다면 이 작업 것일 수 있다.
         // 작업 전부터 있던 프로세스(sshd·systemd 등)는 셈에서 뺀다. 기록이 없으면(재시작 뒤) 모두 의심한다.
-        if (uid !== undefined && stat.start >= (group?.since ?? 0) && await this.owner(entry) === uid) complete = false;
+        if (uid !== undefined && stat.start >= (record?.since ?? 0) && await this.owner(entry) === uid) complete = false;
       }
     }
     return { found, complete };
+  }
+  // 자식이 stat을 읽기 전에 끝났을 때의 기준 시각. CLK_TCK=100 [가정]이고, 조금 이르게 잡혀도 더 많이 의심하는 쪽이다.
+  private async uptimeTicks(): Promise<number> {
+    try { return Math.floor(Number((await readFile(`${this.options.proc ?? '/proc'}/uptime`, 'utf8')).split(' ')[0]) * 100) - 1; }
+    catch { return 0; }
   }
   private async owner(pid: string): Promise<number | null> {
     try {

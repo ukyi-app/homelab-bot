@@ -1,3 +1,4 @@
+import { isAbsolute, normalize, relative, sep } from 'node:path';
 import { z } from 'zod';
 import { bounded } from './format.js';
 
@@ -68,11 +69,13 @@ export interface RunReport {
   aborted: boolean;
   // 작업 공간 기준 커밋 대비 실제 변경 경로. null은 diff를 얻지 못함.
   changes: string[] | null;
+  // Codex 보고 경로를 상대 경로로 맞출 작업 공간 절대 경로.
+  workspace?: string;
   // 프로세스가 생기기 전 실패(인자 거부, 실행 파일 없음).
   launchFailed?: boolean;
 }
 export type RunOutcome =
-  | { kind: 'completed'; threadId: string; turns: number; summary: string; changes: string[]; reported: string[] }
+  | { kind: 'completed'; threadId: string; turns: number; summary: string; changes: string[]; reported: string[]; unconfirmed: string[] }
   | { kind: 'question'; threadId: string; turns: number; summary: string; question: string }
   | { kind: 'waiting'; reason: 'model_limit' | 'auth_expired'; threadId: string | null; turns: number }
   | { kind: 'failed'; reason: string; threadId: string | null; turns: number }
@@ -93,15 +96,16 @@ export function interpretRun(report: RunReport, expectedThread: string | null, s
   if (malformed > 0 || threads.length > 1 || !threadId) return { kind: 'failed', reason: 'invalid_stream', threadId, turns };
   if (!THREAD_ID.test(threadId)) return { kind: 'failed', reason: 'invalid_thread', threadId: null, turns };
   const failures = events.flatMap(e => e.type === 'turn.failed' ? [e.error?.message ?? ''] : e.type === 'error' ? [e.message ?? ''] : []);
-  if (failures.length) {
+  const lastTurn = events.filter(e => e.type.startsWith('turn.')).at(-1);
+  // 재연결 같은 일시 error 이벤트 뒤 턴이 끝나고 종료 코드 0이면 결과를 버리지 않는다 [미확인: 일시 오류도 error로 내는지, T16b].
+  if (events.some(e => e.type === 'turn.failed') || (failures.length && (report.exit.code !== 0 || lastTurn?.type !== 'turn.completed'))) {
     const text = failures.join('\n');
     if (LIMIT.test(text)) return { kind: 'waiting', reason: 'model_limit', threadId, turns };
     if (AUTH.test(text)) return { kind: 'waiting', reason: 'auth_expired', threadId, turns };
     return { kind: 'failed', reason: 'turn_failed', threadId, turns };
   }
   if (report.exit.code !== 0) return { kind: 'failed', reason: 'exit_nonzero', threadId, turns };
-  const last = events.filter(e => e.type.startsWith('turn.')).at(-1);
-  if (turns === 0 || last?.type !== 'turn.completed') return { kind: 'failed', reason: 'turn_incomplete', threadId, turns };
+  if (turns === 0 || lastTurn?.type !== 'turn.completed') return { kind: 'failed', reason: 'turn_incomplete', threadId, turns };
   let output: TaskOutput;
   try { output = TaskOutputSchema.parse(JSON.parse(report.output ?? '')); }
   catch { return { kind: 'failed', reason: 'invalid_output', threadId, turns }; }
@@ -109,13 +113,25 @@ export function interpretRun(report: RunReport, expectedThread: string | null, s
   if (output.status === 'cannot_complete') return { kind: 'failed', reason: 'model_cannot_complete', threadId, turns };
   const summary = bounded(output.summary, 1500);
   if (output.status === 'needs_input') return { kind: 'question', threadId, turns, summary, question: bounded(output.question, 500) };
-  // 완료는 실제 작업 공간 diff와 대조한다. 셸로 바꾼 파일은 Codex 보고에 없을 수 있어 실제 diff를 기준으로 싣고,
-  // Codex가 바꿨다고 보고한 파일이 실제 diff에 없으면 완료 보고를 믿지 않는다.
+  // 완료 근거의 변경 목록은 실제 작업 공간 diff다. 셸로 바꾼 파일은 Codex 보고에 없을 수 있고, 임시로 만들었다
+  // 지운 파일은 보고에만 있을 수 있어 보고와 diff가 다른 것은 실패가 아니라 증거로 남긴다.
+  // 작업 공간 밖을 바꿨다는 보고는 샌드박스 경계를 넘은 것이라 완료로 보지 않는다.
   if (report.changes === null) return { kind: 'failed', reason: 'diff_unavailable', threadId, turns };
-  const reported = [...new Set(events.flatMap(e => e.type === 'item.completed' && e.item.type === 'file_change'
-    && Array.isArray(e.item.changes) ? (e.item.changes as { path?: unknown }[]).flatMap(c => typeof c.path === 'string' ? [c.path] : []) : []))];
-  if (reported.some(path => !report.changes!.includes(path))) return { kind: 'failed', reason: 'diff_mismatch', threadId, turns };
-  return { kind: 'completed', threadId, turns, summary, changes: report.changes, reported };
+  const raw = events.flatMap(e => e.type === 'item.completed' && e.item.type === 'file_change' && e.item.status !== 'failed'
+    && Array.isArray(e.item.changes) ? (e.item.changes as { path?: unknown }[]).flatMap(c => typeof c.path === 'string' ? [c.path] : []) : []);
+  const reported: string[] = [];
+  for (const path of raw) {
+    const relative = workspaceRelative(path, report.workspace);
+    if (relative === null) return { kind: 'failed', reason: 'change_outside_workspace', threadId, turns };
+    if (!reported.includes(relative)) reported.push(relative);
+  }
+  return { kind: 'completed', threadId, turns, summary, changes: report.changes, reported,
+    unconfirmed: reported.filter(path => !report.changes!.includes(path)) };
+}
+// Codex 보고 경로는 절대 경로일 수 있다 [미확인]. 작업 공간 기준 상대 경로로 맞추고 밖이면 null.
+function workspaceRelative(path: string, workspace?: string): string | null {
+  const rel = isAbsolute(path) ? (workspace ? relative(workspace, path) : '..') : normalize(path);
+  return !rel || rel.startsWith('..') || isAbsolute(rel) ? null : rel.split(sep).join('/');
 }
 
 // 작업자는 자기 auth.json 값을 안다. 결과·질문에 그 값의 조각이 섞이면 게시하지 않는다.

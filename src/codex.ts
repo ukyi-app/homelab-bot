@@ -1,6 +1,6 @@
 import { mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { Denied, PolicyUnavailable } from './contracts.js';
+import { DEFAULTS, Denied, PolicyUnavailable } from './contracts.js';
 import type { Job, Scope } from './contracts.js';
 import { assertWorkerRoot, codexConfig, configToml, execArgs, launchEnvironment, taskPaths } from './codex-config.js';
 import { TASK_OUTPUT_JSON_SCHEMA, authSecrets, interpretRun } from './codex-events.js';
@@ -80,30 +80,38 @@ export class ExecCodexAdapter implements CodexTaskAdapter {
     const files = this.options.files ?? nodeFiles;
     const workspace = this.options.workspace ?? fileWorkspace;
     const paths = taskPaths(this.root, request.job);
-    // 루트는 생성자에서 실제 경로로 바꿨다. 그 아래 심링크(예: tasks → ~/.codex-work)로 밖에 쓰지 않게,
-    // 만드는 디렉터리마다 실제 경로가 그대로인지 확인한 뒤 다음 단계로 간다.
-    for (const dir of [join(this.root, 'tasks'), dirname(paths.home), paths.home, paths.taskHome, paths.workspace, paths.run, paths.tmp]) {
-      await files.mkdir(dir);
-      if (await files.resolve(dir) !== dir) throw new Denied();
-    }
-    // 설정은 매 실행 다시 쓴다. 이전 턴 출력이 남아 이번 결과로 읽히지 않게 지운다.
-    await files.write(join(paths.home, 'config.toml'), configToml(codexConfig(paths)));
-    await files.write(join(paths.run, 'output.schema.json'), JSON.stringify(TASK_OUTPUT_JSON_SCHEMA));
-    await files.remove(join(paths.run, 'last-message.json'));
-    // 기준 상태는 첫 실행 전에 한 번만 잡고 작업 공간 밖(run/)에 둔다. 재개 때도 같은 기준과 대조한다.
-    const baselinePath = join(paths.run, 'baseline.json');
-    let baseline = JSON.parse(await files.read(baselinePath) ?? 'null') as Snapshot | null;
-    if (!baseline) {
-      await workspace.prepare(paths.workspace);
-      baseline = await workspace.snapshot(paths.workspace);
-      if (!baseline) throw new Error('workspace_unavailable');
-      await files.write(baselinePath, JSON.stringify(baseline));
-    }
-    // 실행 중 갱신으로 토큰이 바뀌어도 옛 값의 반사를 잡도록 실행 전후를 모두 본다.
-    const before = authSecrets(await files.read(join(paths.home, 'auth.json')) ?? '');
+    let baseline: Snapshot;
+    let before: string[];
     let args: string[];
-    try { args = execArgs(paths, request.resume); }
-    catch { return { kind: 'failed', reason: 'launch_failed', threadId: request.resume, turns: 0 }; }
+    // 프로세스를 띄우기 전 실패는 남은 프로세스가 없으므로 failed다. 밖으로 던지면 브리지가 소멸 확인을 다시 하는데,
+    // 이 작업의 실행 기록이 없는 launcher는 확인 불가(fail-closed)로 답해 전역 막힘(unknown)이 된다.
+    try {
+      // 루트는 생성자에서 실제 경로로 바꿨다. 그 아래 심링크(예: tasks → ~/.codex-work)로 밖에 쓰지 않게,
+      // 만드는 디렉터리마다 실제 경로가 그대로인지 확인한 뒤 다음 단계로 간다.
+      for (const dir of [join(this.root, 'tasks'), dirname(paths.home), paths.home, paths.taskHome, paths.workspace, paths.run, paths.tmp]) {
+        await files.mkdir(dir);
+        if (await files.resolve(dir) !== dir) throw new Denied();
+      }
+      // 설정은 매 실행 다시 쓴다. 이전 턴 출력이 남아 이번 결과로 읽히지 않게 지운다.
+      await files.write(join(paths.home, 'config.toml'), configToml(codexConfig(paths)));
+      await files.write(join(paths.run, 'output.schema.json'), JSON.stringify(TASK_OUTPUT_JSON_SCHEMA));
+      await files.remove(join(paths.run, 'last-message.json'));
+      // 기준 상태는 첫 실행 전에 한 번만 잡고 작업 공간 밖(run/)에 둔다. 재개 때도 같은 기준과 대조한다.
+      const baselinePath = join(paths.run, 'baseline.json');
+      let saved = JSON.parse(await files.read(baselinePath) ?? 'null') as Snapshot | null;
+      if (!saved) {
+        await workspace.prepare(paths.workspace);
+        saved = await workspace.snapshot(paths.workspace);
+        if (!saved) throw new Error('workspace_unavailable');
+        await files.write(baselinePath, JSON.stringify(saved));
+      }
+      baseline = saved;
+      // 실행 중 갱신으로 토큰이 바뀌어도 옛 값의 반사를 잡도록 실행 전후를 모두 본다.
+      before = authSecrets(await files.read(join(paths.home, 'auth.json')) ?? '');
+      args = execArgs(paths, request.resume);
+    } catch (error) {
+      return { kind: 'failed', reason: error instanceof Denied ? 'workspace_denied' : 'prepare_failed', threadId: request.resume, turns: 0 };
+    }
     let result: LaunchResult = { lines: [], exit: null };
     let launchFailed = false;
     try {
@@ -114,9 +122,11 @@ export class ExecCodexAdapter implements CodexTaskAdapter {
     const survivors = await this.launcher.survivors(request.job).catch(() => null);
     const output = await files.read(join(paths.run, 'last-message.json'));
     const secrets = [...before, ...authSecrets(await files.read(join(paths.home, 'auth.json')) ?? '')];
-    const after = await workspace.snapshot(paths.workspace);
+    // 남은 프로세스가 있거나 모르면 작업 공간을 읽지 않는다. 결과는 어차피 unknown이고, 살아 있는 프로세스가
+    // 읽는 도중 파일을 바꿔치기할 수 있다.
+    const after = survivors === 0 ? await workspace.snapshot(paths.workspace) : null;
     return interpretRun({ lines: result.lines, exit: result.exit, output, survivors, aborted: signal.aborted, launchFailed,
-      changes: after ? changedPaths(baseline, after) : null }, request.resume, secrets);
+      changes: after ? changedPaths(baseline, after) : null, workspace: paths.workspace }, request.resume, secrets);
   }
   async confirmStop(job: string): Promise<{ stopped: boolean }> {
     await this.launcher.terminate(job).catch(() => {});
@@ -246,11 +256,19 @@ export class CodexBridge {
       // 한도·인증 만료는 다른 계정·인증으로 바꾸지 않고 사람 확인을 기다린다(D-14 조건 2). 재개 턴이었다면
       // 그 답은 처리되지 않았으니 /resume-model 뒤 같은 답으로 같은 스레드를 다시 잇게 되돌린다.
       await sessionState('waiting_model');
-      if (answered) await this.store.db.query("UPDATE codex_questions SET state='answered' WHERE id=$1 AND state='resumed'", [answered]);
       await this.store.waitForUser(job, outcome.reason);
+      // waitForUser는 취소 경합이나 lease 상실이면 다른 상태로 끝내거나 아무것도 안 한다. 실제로 대기에 들어갔을 때만 되돌리고 알린다.
+      const now = (await this.store.db.query<{ state: string; wait_reason: string | null; attempt: number }>(
+        'SELECT state,wait_reason,attempt FROM jobs WHERE id=$1', [job.id])).rows[0];
+      if (now?.state !== 'waiting_user' || now.wait_reason !== outcome.reason) return;
+      if (answered) await this.store.db.query("UPDATE codex_questions SET state='answered' WHERE id=$1 AND state='resumed'", [answered]);
+      // clarification 재개도 claim마다 attempt를 올린다. T16a /resume-model의 시도 한도에 닿았으면 재개를 안내하지 않는다.
+      const resumable = Number(now.attempt) < DEFAULTS.maxRetries + 1;
       await this.store.enqueue({ key: `codex-wait:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id,
         actor: job.owner_id, scope: job.target, revision, payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary',
-          content: `작업 ${job.id}이 ${outcome.reason === 'model_limit' ? '모델 사용 한도' : '모델 인증 만료'}로 멈췄습니다. 다른 계정·인증으로 바꾸지 않습니다. 원인을 해소한 뒤 /resume-model target:${job.id} 로 재개하거나 /cancel 하세요.` } });
+          content: `작업 ${job.id}이 ${outcome.reason === 'model_limit' ? '모델 사용 한도' : '모델 인증 만료'}로 멈췄습니다. 다른 계정·인증으로 바꾸지 않습니다. `
+            + (resumable ? `원인을 해소한 뒤 /resume-model target:${job.id} 로 재개하거나 /cancel 하세요.`
+              : `재시도 한도에 닿아 재개할 수 없습니다. /cancel 뒤 새 작업으로 요청하세요.`) } });
       return;
     }
     if (outcome.kind === 'question') {
@@ -260,10 +278,11 @@ export class CodexBridge {
     }
     await sessionState('completed');
     const content = [`Codex 작업 완료 (작업 ${job.id})`, bounded(outcome.summary || '요약 없음', 1500),
-      `변경 파일(작업 공간 실제 diff 기준): ${outcome.changes.length}개`].join('\n');
+      `변경 파일(작업 공간 실제 diff 기준): ${outcome.changes.length}개`
+        + (outcome.unconfirmed.length ? ` (Codex 보고와 다름: ${outcome.unconfirmed.length}개)` : '')].join('\n');
     await this.store.finish(job, { summary: outcome.summary, changes: outcome.changes },
       { source: 'codex_exec', threadId: outcome.threadId, turns: turn, exitCode: 0, stopConfirmed: true,
-        diff: 'workspace_snapshot', reportedChanges: outcome.reported }, content, job.target);
+        diff: 'workspace_snapshot', reportedChanges: outcome.reported, unconfirmedReports: outcome.unconfirmed }, content, job.target);
   }
   private async ask(job: Job, revision: string, threadId: string, turn: number, question: string): Promise<void> {
     const id = `${job.id}:${threadId}:${turn}`;
@@ -296,6 +315,7 @@ export class CodexBridge {
     await this.gate.authorize(input.actor, input.scope);
     if (!input.text.trim() || input.text.length > this.options.answerChars) return { ok: false, status: '답이 비었거나 너무 깁니다.' };
     return this.store.atomic(async store => {
+      await this.lockScheduler(store);
       const q = (await store.db.query<Question & { job_state: string; wait_reason: string | null; owner_id: string }>(`SELECT q.*,
         j.state AS job_state,j.wait_reason,j.owner_id FROM codex_questions q JOIN jobs j ON j.id=q.job_id WHERE q.id=$1 FOR UPDATE`, [input.question])).rows[0];
       if (!q) return { ok: false, status: '질문을 찾을 수 없습니다.' };
@@ -331,6 +351,14 @@ export class CodexBridge {
       scope: job.target, revision: job.revision.policy, payload: { kind: 'message', channel: job.target.channel,
         classification: 'safe_summary', content: `질문 ${q.id}의 답 기한이 지나 작업을 멈췄습니다(cancelled). 답 없이 진행하지 않습니다. 필요하면 새 작업으로 다시 요청하세요.` } });
   }
+  // T16a lockScheduler와 같은 순서(스케줄러 행 → 작업 행)로 잠근다. 순서가 다르면 /cancel·비상 중지와 교착하거나,
+  // 비상 중지를 기다린 뒤 옛 스냅샷으로 스케줄러를 풀어 버릴 수 있다.
+  private async lockScheduler(store: Store): Promise<void> {
+    await store.db.query(`INSERT INTO controls VALUES ('scheduler','false') ON CONFLICT DO NOTHING`);
+    await store.db.query(`SELECT * FROM controls WHERE key='scheduler' FOR UPDATE`);
+    await store.db.query(`INSERT INTO controls(key,value) SELECT 'scheduler_emergency',value FROM controls WHERE key='scheduler'
+      ON CONFLICT DO NOTHING`);
+  }
   // T16a /cancel과 같은 해제 조건이다. 질문 대기 중 비상 중지가 풀렸다면 대기가 끝난 지금 스케줄러도 푼다.
   private async releaseScheduler(store: Store): Promise<void> {
     await store.db.query(`UPDATE controls SET value='false' WHERE key='scheduler'
@@ -346,7 +374,10 @@ export class CodexBridge {
     return expired + silent.length;
   }
   async expireQuestions(): Promise<number> {
+    // 매 tick 잠그지 않도록 먼저 잠금 없이 본다. 실제 정리는 스케줄러 행을 먼저 잠근 트랜잭션에서 다시 고른다.
+    if (!(await this.store.db.query("SELECT 1 FROM codex_questions WHERE state='open' AND expires_at<=$1 LIMIT 1", [this.store.now()])).rows.length) return 0;
     return this.store.atomic(async store => {
+      await this.lockScheduler(store);
       const rows = (await store.db.query<Question>(`SELECT * FROM codex_questions WHERE state='open' AND expires_at<=$1 FOR UPDATE`, [store.now()])).rows;
       for (const q of rows) await this.close(store, q, 'expired');
       return rows.length;
