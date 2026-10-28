@@ -86,6 +86,8 @@
 
 `01` §6 추상 계약 기준. 경로 (A) `codex exec`를 쓸 때다. 최종 값은 T18이 실측으로 정한다.
 
+> T18 로컬·mock 값(2026-10-29)은 §12다. 실제 CLI 실측은 아직 없다(T16b, D-14 차단 조건).
+
 | 계약 | V1 값 | 근거 |
 |---|---|---|
 | `capabilities()` | true. 고정 버전 + `--help` 대조 | [실측: `codex --version`, `codex exec --help`] |
@@ -544,3 +546,128 @@ unknown만 100건/24시간 폐기 한도를 적용한다. 확정 증거는 이 �
 POST 거부·GET 대조 거부·확정 ID 보존·인가 철회·local confirm 실패를 점검했다. 복구와 capability는
 이미 절대 시각/lease 검사를 사용하고 worker cancel은 별도 5초 예산을 갖는다. unknown worker는 종료
 증거 없이 해제하지 않는 기존 안전 경계를 유지한다.
+
+## 12. T18 CODEX_BRIDGE 로컬 계약 (2026-10-29)
+
+- 범위: 봇 소유 Codex 작업(R10)의 실행 경로, 질문(clarification)·완료 중계(R09), 취소·`unknown` 막힘(R03), 작업자 Codex 설정(T18 할 일 4). **로컬·mock이다.** 실제 `codex` 실행과 모델 호출은 하지 않았다(D-14 차단 조건, 실행은 T16b).
+- 정하지 않은 것: R08 연결 방식(할 일 1), 인증 파일 분리·레인 분리(할 일 5), 작업별 세션 저장 공간. 후보·근거·추천은 [DECISIONS.md](DECISIONS.md) "T18 결정 대기 (사용자)"다.
+- JSONL fixture는 공식 문서의 `codex exec --json` 이벤트 형태로 합성했다. 실제 CLI 녹음이 아니다.
+
+### 구성
+
+| 파일 | 역할 |
+|---|---|
+| `src/codex.ts` | 능력표 `CODEX_CAPABILITIES`, 어댑터 계약(`CodexTaskAdapter`·`CodexLauncher`), 작업자 쪽 `ExecCodexAdapter`, 게시 서버 쪽 `CodexBridge`(실행·질문·답·만료·상태·해제) |
+| `src/codex-events.ts` | JSONL 해석, 완료 판정 `interpretRun`, 최종 출력 스키마, `auth.json` 값 반사 검사 |
+| `src/codex-config.ts` | 작업 경로, `config.toml` 생성, codex 실행 환경, argv, 개인 Codex 홈 거부 |
+| `src/codex-process.ts` | 작업마다 새 프로세스 그룹으로 띄우고 그룹·작업 표식으로 정리·소멸을 확인하는 launcher |
+| `migrations/009_codex_bridge.sql` | `codex_sessions`(외부 스레드 ID·턴·실행 호스트·능력표), `codex_questions` |
+| `src/runtime.ts` (T16a, 추가만) | 선택적 `TaskLane { run, sweep? }`. 연결하지 않으면 task도 기존 작업자 경로 그대로다 |
+
+### 어댑터 능력표 (T18 로컬 값)
+
+| 계약 | 값 | 로컬 시험 | 남은 실측·결정 |
+|---|---|---|---|
+| `capabilities()` | `CODEX_CAPABILITIES` 고정 표, 버전 0.163.0. 작업마다 `codex_sessions`에 기록 | TASK-01 | 설치 CLI `--help` 대조(T16b) |
+| `start_task` | true. `codex exec --json --output-schema … -o … -`, 지시는 stdin | TASK-01 | 실제 실행(T16b) |
+| `attach_task` | **미정**(`undecided`). 부르면 `CapabilityUnavailable(undecided)`. `false`로 정한 것이 아니다 | TASK-01 | R08 연결 방식 사용자 결정 |
+| `read_status`, `read_events` | true. `status()`는 owner·같은 대화만. 이벤트는 판정에만 쓰고 원문 로그를 Discord로 흘리지 않는다 | TASK-01 | 없음 |
+| `read_final_result` | true. 완료 = 종료 코드 0 + 마지막 turn 이벤트가 `turn.completed` + `-o` 파일이 출력 스키마 `completed` + 작업 그룹 소멸 확인. "완료" 문자열·로그는 근거가 아니다 | TASK-03 | 작업 공간 diff 대조는 작업 공간이 생긴 뒤(T16b·T19). 지금 변경 파일 수는 "Codex 보고 기준"이라고 표시한다 |
+| `answer_question` | clarification만. 질문은 모델이 `status=needs_input`으로 턴을 끝낼 때만 생긴다 | TASK-02 | 없음 |
+| tool approval 중계 | **false.** 승인 플래그·`--approve-for-me`를 쓰지 않는다. 질문 종류 CHECK가 `clarification` 하나다 | TASK-01·03 | 없음 |
+| `request_cancel`, `confirm_stop` | 작업 그룹 SIGTERM → SIGKILL, 프로세스 그룹과 작업 표식(`HOMELAB_CODEX_TASK`)으로 남은 수 확인. 0개일 때만 `cancelled` | TASK-03, SEC-02 | 환경을 지우고 새 세션으로 빠져나간 자식은 못 찾는다(시험으로 기록). cgroup 확인은 T16b |
+| `resume_task` | 같은 작업의 같은 스레드만(`exec resume <thread> -`). 답할 질문이 없으면 새 스레드로 시작한다(`/retry` 포함) | TASK-02 | `exec resume`의 `--json`·`-o`·`--output-schema` 수용과 `thread.started` 재발행 [미확인], T16b |
+
+### 실행 흐름
+
+1. Discord `task` 명령 → T16a `accept`(type `task`) → `Runtime.tick`이 claim·인가·`dispatchable` 뒤 `TaskLane.run(job)`.
+2. 브리지는 다시 인가하고 lease를 확인한다. 답한 질문이 있으면 그 답으로 재개하고, 없으면 `TASK_INSTRUCTIONS` + 요청으로 새 스레드를 시작한다. `codex_sessions`에 외부 스레드 ID·턴·실행 호스트(`worker`)·능력표를 남긴다(`01` §6 소유자 연결).
+3. 실행 중 `monitorMs`(기본 1초)마다 취소 요청·현재 정책·lease를 본다. 취소·철회·lease 상실·시간 초과는 중단 신호다. 중단 뒤 `stopWaitMs`(기본 15초) 안에 끝나지 않으면 기다리지 않고 `unknown`이다. 기다리며 lease만 늘리면 막힘을 숨기기 때문이다.
+4. 판정 순서(`interpretRun`): 소멸 확인 → 흐름 무결성(깨진 줄, 스레드 여럿·불일치) → `turn.failed`·`error` → 종료 코드 → 마지막 turn 이벤트 → 출력 스키마 → `auth.json` 값 반사.
+
+| 판정 | 작업 상태 | Discord |
+|---|---|---|
+| 완료 | `succeeded`(`store.finish`, 결과·증거 기록) | 완료 요약(1500자 이하) |
+| 질문 | `waiting_user`·`clarification`, `codex_questions` open | 질문 ID·기한·답하는 방법 |
+| 실패(소멸 확인) | `failed`(`codex_<사유>`) | T16a 실패 안내(`/retry` 가능) |
+| 취소·철회(소멸 확인) | `cancelled` | 없음 |
+| 소멸 미확인 | `unknown`. 자동 재실행 없음, T16a `claim()`이 새 모델 실행을 막음 | 막힘 안내 |
+
+### 질문 계약 (TASK-02, AUTH-02)
+
+- 질문 ID = `job_id:thread_id:턴 순번`. 턴은 이 작업 스레드에서 누적한 `turn.completed` 수다.
+- 기한은 기본 1시간, 응답자는 작업 owner 하나다. 1시간인 이유는 아래 "T16a 소유 변경 요청" 1번이다.
+- 답을 받을 때마다 현재 정책으로 다시 인가한다. owner 교체·즉시 철회는 `Denied`, 정책이 없거나 오래되면 `PolicyUnavailable`이고 질문·작업 상태는 그대로다.
+- 다른 대화(스레드)의 답, 다른 사람의 답은 `Denied`다.
+- 같은 Discord 이벤트의 재전달은 한 번만 반영한다. 두 번째 다른 답, 이미 이어 간 질문, 기한 지난 질문, 취소된 작업의 질문은 거부한다.
+- 기한이 지나면 작업을 `cancelled`(`question_expired`)로 두고 알린다. 무응답을 승인이나 진행으로 보지 않는다. `Runtime.tick`이 claim 전에 `sweep()`으로 닫는다.
+- 답은 argv가 아니라 stdin으로만 넘긴다. 답이 `--`로 시작해도 플래그가 되지 않고, 설정 파일·argv·샌드박스는 답과 무관하게 같다.
+- 답을 받은 뒤 재개 전에 권한이 철회되면 `Runtime.tick`의 인가에서 `cancelled`(`authorization_revoked`)로 끝나고 재개하지 않는다.
+
+### 작업자 Codex 설정 (할 일 4)
+
+작업마다 CODEX_HOME의 `config.toml`을 다시 쓴다. `exec resume`에는 `-s`·`-C`가 없어서 [실측: 0.163.0 `exec resume --help`, §4] 시작과 재개가 같은 정책을 갖도록 플래그가 아니라 설정 파일에 고정한다.
+
+```toml
+sandbox_mode = "workspace-write"
+approval_policy = "never"
+
+[sandbox_workspace_write]
+network_access = false
+
+[shell_environment_policy]
+inherit = "none"
+ignore_default_excludes = false
+exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*CREDENTIAL*", "*AUTH*", "CODEX_*", "OPENAI_*", "GITHUB_*", "DISCORD_*", "KUBECONFIG", "SSH_AUTH_SOCK"]
+set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C.UTF-8", TMPDIR = "<작업 tmp>", HOMELAB_CODEX_TASK = "<job>" }
+```
+
+- 기준은 `inherit = "none"`이다. `exclude`는 누가 `inherit`을 바꿔도 이름 필터가 남게 둔 것이다. `set`에 비밀 이름 변수나 CODEX_HOME 경로가 들어가면 코드가 거부한다.
+- `approval_policy = "never"`는 승인을 묻지 않는다는 뜻이고 샌드박스 밖 실행을 허용하는 뜻이 아니다 [가정]. exec에서 샌드박스 밖 동작이 필요할 때의 처리는 [DISCOVERY.md](DISCOVERY.md)의 미확인 항목이다(T16b).
+- codex 프로세스 자체의 환경은 작업자 환경을 병합하지 않는다. `PATH`·`HOME`(작업 HOME)·`LANG`·`TMPDIR`·`CODEX_HOME`·작업 표식과 선택적 `HTTPS_PROXY`·`NO_PROXY`만 둔다. 작업자 환경의 시드 `auth.json`(`CODEX_AUTH_JSON`)·Discord·GitHub·OpenAI 값은 넘어가지 않는다(실제 프로세스 시험).
+- argv: `exec --json --output-schema <run>/output.schema.json -o <run>/last-message.json -`, 재개는 `exec resume … <thread> -`. `--dangerously-bypass-approvals-and-sandbox`·`--approve-for-me`·`--full-auto`·`--ephemeral`·`--ignore-user-config`·`-a`·`-s`·`-c`·`--add-dir`를 쓰지 않는다. 스레드 ID는 영숫자로 시작해야 한다. 지시를 stdin `-`로 주는 것은 [가정: 0.163.0 `--help` 대조는 T16b].
+- 출력·스키마 파일(`run/`)은 모델 셸이 쓰는 `TMPDIR`·작업 공간과 떼고, 실행마다 이전 출력을 지운다.
+- 작업 경로는 `<작업자 루트>/tasks/<job>/{codex-home,home,workspace,run,tmp}`다. 경로 자리일 뿐이고 인증 파일 배치(공유 원본인지 작업별 사본인지)는 결정 대기다. `auth.json` 값 반사 검사는 작업 CODEX_HOME의 `auth.json`을 읽는다.
+
+### 개인 Codex 홈 금지 (D-14, spec §4.5)
+
+- 작업자 루트는 절대 경로여야 한다. realpath가 사람 홈의 `.codex*` 아래이거나, 사람 홈 자체나 그 조상이면 거부한다. 심링크(`~/.codex2` → `~/.codex-sub`)도 realpath로 막는다.
+- 홈 디렉터리를 열거하지 않고 경로 모양으로만 판단한다. 작업자 UID가 사람과 다르면 배치 설정이 사람 홈을 `homes`로 더 넘긴다. 공개 저장소라 코드에 실제 경로를 적지 않는다.
+- 시험은 실행 한 번 동안 어댑터가 건드린 모든 경로가 작업자 루트 아래인지, launcher에 넘긴 argv·env·cwd에 `.codex`가 없는지 본다.
+
+### 작업 정리와 `unknown` 막힘 (§4 "작업 정리")
+
+- 종료 사유(정상·실패·시간 초과·취소)와 무관하게 실행 뒤 작업 그룹을 끝내고 남은 수를 확인한다. 남으면 완료 출력이 있어도 `unknown`이다.
+- 확인 수단은 프로세스 그룹(pgid)과 작업 표식 환경 변수다. 표식은 codex 프로세스 환경과 `shell_environment_policy.set` 양쪽에 넣어, 새 세션으로 빠져나간 자식도 환경을 지우지 않았다면 찾는다.
+- **한계(시험으로 기록):** 환경을 지우고 새 세션으로 빠져나간 자식은 찾지 못한다. 그래서 `confirm_stop` 값은 `process_group_and_marker`다. 이 한계가 풀리기 전에는 작업 레인에서 비신뢰 코드를 돌리는 단계(T19)의 소멸 확인 근거로 충분하지 않다. cgroup 위임·PID namespace 실측은 T16b다.
+- 막힘 기록: `jobs.state='unknown'`이 DB에 남고(재시작 뒤 유지) T16a `claim()`이 새 모델 실행을 막는다. Discord 알림을 보낸다. 비AI 경로(Telegram) 알림은 플랫폼 경보 연결이 필요해 T16b다.
+- 해제: owner의 `release`는 작업자 프로세스 0개를 다시 확인한 뒤에만 `cancelled`(`stop_confirmed_after_unknown`)로 바꾸고 작업은 다시 실행하지 않는다. 남아 있으면 거부하고 파드 재생성을 안내한다.
+
+### 재시드 절차 초안 (할 일 3, 사람 작업)
+
+전제: 첫 시드는 T16b 전에 사람이 했다. 작업자는 영속 공간에 `auth.json`이 없을 때만 시드를 복사한다(D-14 조건 4, 설계 C.8 변경).
+
+1. 언제: 작업이 `waiting_user`(`auth_expired`)로 멈추고 갱신으로 풀리지 않을 때, 영속 공간의 `auth.json`을 잃거나 손상됐을 때, 계정 쪽에서 세션을 끊었을 때. 봇은 다른 계정·인증으로 바꾸지 않고 기다린다(D-14 조건 2).
+2. 멈춤: `/emergency-stop`으로 새 모델 실행을 막고 `/model-status`로 실행 중·`unknown` 작업이 없음을 확인한다.
+3. 로그인: 신뢰하는 기계에서 빈 임시 디렉터리를 CODEX_HOME으로 잡고 봇 전용 계정으로 로그인한다(예: `CODEX_HOME=$(mktemp -d) codex login --device-auth`). 개인 `~/.codex*`를 쓰거나 복사하지 않는다.
+4. 등록: 새 `auth.json`을 Infisical `/apps/homelab-bot/worker`의 `CODEX_AUTH_JSON` 새 버전으로 올리고 임시 디렉터리를 지운다.
+5. 교체: 작업자 영속 공간의 옛 `auth.json`을 사람이 지운 뒤 작업자 파드를 다시 만든다. 파일이 없으므로 시드가 복사된다. 옛 파일이 남아 있으면 시드는 쓰이지 않는다. 반대로 정상인 갱신본을 시드로 덮으면 회전된 갱신 토큰과 어긋난다 [확인: https://learn.chatgpt.com/docs/auth/ci-cd-auth].
+6. 확인: 작업자 readiness와 모델을 부르지 않는 로그인 상태 확인 [가정: `codex login status`, T16b 실측]. 그 뒤 `/resume-model target:<job>`과 `/resume-model target:emergency-stop`.
+7. 기록: homelab `approvals.md`에 시각·사유·한 사람을 적는다(AC-X2).
+
+열린 점: 영속 공간의 파일을 지우는 수단(사람의 `kubectl exec` 권한 또는 유지보수 Job)은 T16b가 정한다. 작업별 `auth.json` 사본을 쓰기로 정하면(결정 대기) 5단계에서 지울 대상이 공유 원본 하나인지 다시 본다.
+
+### T16a 소유 변경 요청 (바꾸지 않았다)
+
+1. **질문 대기가 전체 모델 슬롯을 잡는다.** T16a `Store.claim()`은 `waiting_user`를 모두 슬롯 점유로 본다(한도·인증 대기용). clarification 대기에는 실행 중인 모델 호출이 없는데도 대화와 다른 작업이 질문 기한까지 멈춘다. 제안: 점유 조건에서 `wait_reason='clarification'`을 뺀다. 바뀌면 질문 기한을 늘릴 수 있다.
+2. **Discord 명령 연결.** 질문 답(`/answer question:<id>`)과 막힘 해제(`/codex-release target:<job>`)는 `CodexBridge.answer`·`release`로 구현했지만 `DiscordIngress` 명령 목록과 slash 등록에는 넣지 않았다(T16a 소유 `discord.ts`). 안내 문구는 이 이름을 쓴다.
+3. **작업자 HTTP 계약.** 지금 어댑터는 같은 프로세스에서 부른다. 배치에서는 게시 서버 → 작업자 HTTP(T16a `WorkerRequest`, Ed25519 capability)로 task 요청(지시·재개 스레드·답)을 보내야 하는데 현재 스키마에 그 필드가 없다. 스키마 확장이나 task 전용 끝점이 필요하다(T16b 전).
+4. **배치 진입점.** `Runtime`에 `CodexBridge`를 `TaskLane`으로 넘기는 본 루프는 T16b다.
+
+### [가정]·[미확인] (T16b 실측 목록에 더함)
+
+- `codex exec`·`exec resume`이 PROMPT `-`에서 stdin을 읽는지, `exec resume`이 `--json`·`-o`·`--output-schema`를 받는지, 재개 때 `thread.started`를 다시 내는지(내지 않아도 받게 했다).
+- 한도·인증 만료의 `turn.failed`·`error` 모양. 구분할 수 없어 지금은 `failed`(`codex_turn_failed`)로 끝내고 다른 계정·인증으로 바꾸지 않는다. 모양을 확인하면 T16a의 `limited`·`auth_expired` 대기로 잇는다.
+- `--output-schema`가 받는 JSON Schema 키워드 범위. 길이 제한은 봇이 검사한다.
+- exec에서 `approval_policy = "never"`의 실제 동작, Codex Linux 샌드박스가 모델 셸의 CODEX_HOME 읽기를 막는지.
+- SIGTERM 때 codex의 종료 코드·마지막 이벤트·세션 파일 정합성.
