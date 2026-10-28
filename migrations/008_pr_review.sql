@@ -23,5 +23,10 @@ CREATE TABLE IF NOT EXISTS review_deliveries (
   pause_count integer NOT NULL DEFAULT 0, available_at bigint NOT NULL, created_at bigint NOT NULL, lease_token text, lease_until bigint
 );
 CREATE INDEX IF NOT EXISTS review_deliveries_queue ON review_deliveries(state, available_at);
+-- 008은 배포 전에 열이 늘었다. 앞선 008로 이미 만든 표에도 같은 열이 생기게 멱등하게 더한다.
+ALTER TABLE pr_reviews ADD COLUMN IF NOT EXISTS positions jsonb;
+ALTER TABLE pr_reviews ADD COLUMN IF NOT EXISTS defer_count integer NOT NULL DEFAULT 0;
+ALTER TABLE review_deliveries ADD COLUMN IF NOT EXISTS inline boolean NOT NULL DEFAULT true;
+ALTER TABLE review_deliveries ADD COLUMN IF NOT EXISTS pause_count integer NOT NULL DEFAULT 0;
 INSERT INTO schema_migrations VALUES (8) ON CONFLICT DO NOTHING;
 COMMIT;

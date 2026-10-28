@@ -1375,3 +1375,49 @@ test('r2 P2-07 REVIEW-03 기준 AGENTS.md도 파일·총 입력 예산을 적용
   const changed = (await reviewJobs())[0]!.result as ReviewResult;
   assert.deepEqual(changed.coverage.omitted_files_with_reasons, [{ path: 'AGENTS.md', reason: 'file_too_large' }]);
 });
+
+// ---- r3: 재리뷰(review-t17-r2) 지적별 회귀 ----
+// r1 반환 시점(0daf892)의 마이그레이션 008 원문. 이미 그 스키마로 만든 DB를 흉내 낸다.
+const R1_MIGRATION_008 = `BEGIN;
+-- PR 리뷰 작업은 jobs(type='review', conversation_id NULL)에 둔다. 대화 작업과 모델 슬롯 1개를 같은 표로 나눈다.
+CREATE TABLE IF NOT EXISTS github_deliveries (
+  delivery_id text PRIMARY KEY, event text NOT NULL, action text, repo_id bigint, pr_number integer,
+  outcome text NOT NULL, reason text, generation_key text, received_at bigint NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pr_reviews (
+  job_id text PRIMARY KEY REFERENCES jobs(id), generation_key text NOT NULL UNIQUE,
+  installation_id bigint NOT NULL, repo_id bigint NOT NULL, repo_full_name text NOT NULL, pr_number integer NOT NULL,
+  head_sha text NOT NULL, comparison_revision text NOT NULL, base_ref text NOT NULL, policy_revision text NOT NULL,
+  trigger text NOT NULL, pr_updated_at bigint NOT NULL, created_at bigint NOT NULL,
+  review_outcome text CHECK (review_outcome IN ('completed','partial','failed','superseded')),
+  result jsonb, superseded_reason text, superseded_at bigint, defer_count integer NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS pr_reviews_pr ON pr_reviews(repo_id, pr_number, created_at);
+CREATE TABLE IF NOT EXISTS review_deliveries (
+  id text PRIMARY KEY, job_id text NOT NULL REFERENCES jobs(id), idempotency_key text NOT NULL UNIQUE,
+  repo_id bigint NOT NULL, repo_full_name text NOT NULL, pr_number integer NOT NULL,
+  head_sha text NOT NULL, comparison_revision text NOT NULL, policy_revision text NOT NULL,
+  body text NOT NULL, comments jsonb NOT NULL,
+  state text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','sending','sent','unknown','blocked','superseded')),
+  reason text, external_id text, attempt integer NOT NULL DEFAULT 0, dispatch_started boolean NOT NULL DEFAULT false,
+  pause_count integer NOT NULL DEFAULT 0, available_at bigint NOT NULL, created_at bigint NOT NULL, lease_token text, lease_until bigint
+);
+CREATE INDEX IF NOT EXISTS review_deliveries_queue ON review_deliveries(state, available_at);
+INSERT INTO schema_migrations VALUES (8) ON CONFLICT DO NOTHING;
+COMMIT;
+`;
+test('r3 R2-03 r1 시점 008로 만든 리뷰 표에 현재 008을 다시 적용하면 새 열이 생기고 기존 작업을 저장·게시한다', async () => {
+  await database.pg.exec('DROP TABLE review_deliveries; DROP TABLE pr_reviews; DROP TABLE github_deliveries; DELETE FROM schema_migrations WHERE version=8;');
+  await database.pg.exec(R1_MIGRATION_008);
+  await opened();
+  const sql = await readFile('migrations/008_pr_review.sql', 'utf8');
+  await database.pg.exec(sql); await database.pg.exec(sql);
+  const columns = (await database.db.query<{ table_name: string; column_name: string }>(`SELECT table_name,column_name FROM information_schema.columns
+    WHERE (table_name='pr_reviews' AND column_name='positions') OR (table_name='review_deliveries' AND column_name='inline')
+    ORDER BY table_name`)).rows.map(c => `${c.table_name}.${c.column_name}`);
+  assert.deepEqual(columns, ['pr_reviews.positions', 'review_deliveries.inline']);
+  await r.runtime.tick(); await r.publisher.deliver();
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.review_outcome]), [['succeeded', 'completed']]);
+  assert.equal(r.gh.writes.length, 1);
+  assert.deepEqual(r.gh.writes[0]!.body.comments.map(c => c.line), [2]);
+});
