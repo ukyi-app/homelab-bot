@@ -419,6 +419,11 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 8. **게시 대조:** 응답을 잃은 게시는 다시 보내지 않고 marker(`<!-- homelab-bot-review:github-review:<job id>:<시도> -->`)와 검토 SHA로 PR 리뷰 목록을 대조한다. 못 찾으면 `unknown`을 유지하고 24시간 뒤 은퇴한다(T16a Discord 대조와 같은 원칙). 422(인라인 위치 무효)는 본문만으로 한 번 더 보낸다. 전송 전 일시 장애(정책 확인 불가, GitHub 5xx·429)는 재시도 횟수를 쓰지 않고 1초~60초 백오프로 기다린다.
 9. **공개 범위(DATA-01):** 마스킹이 아니라 게시 차단이다. 내부 표식 실제 값은 runtime policy `review.internalMarkers`에만 둔다. Discord 요약은 알림 채널(D-17)에 코드가 만든 숫자·리비전만 쓰고 모델 문장은 넣지 않는다.
 10. **변경 목록:** 게시 서버가 API로 열거한 목록이 기준이고 압축본은 blob 내용에만 쓴다(ARCHITECTURE §6). 열거 실패는 `failed`이고 압축본 비교로 대신하지 않는다. 429·5xx는 Retry-After와 지수 백오프로 기다리다 10회를 넘으면 `failed`다.
+11. **게시 직전 재확인(r2):** draft는 게시 직전 live PR로도 본다(댓글 명시 요청만 예외). 게시 상한(지적 수·인라인 수·본문 길이)은 저장된 구조화 결과를 게시 시점 정책으로 다시 렌더링해 적용한다.
+12. **이벤트 순서(r2):** `closed`·`converted_to_draft`도 admission 잠금과 `pr_updated_at` 비교를 거쳐, 오래된 이벤트는 `stale_event`로 무시한다.
+13. **diff 표현(r2):** 모드(실행 비트)·이름·새 파일·삭제는 git 형식 머리줄로, 파일 끝 개행 추가·삭제는 `\ No newline at end of file`로 전달한다. 변경 목록 계약에 `baseMode`·`headMode`를 두고, 없으면 압축본의 실행 비트를 쓴다. 보이는 차이가 없는 목록 항목은 `archive_mismatch`로 미검토다.
+14. **기준 지침 예산(r2):** base `AGENTS.md`도 파일 상한(`input.maxFileBytes`)과 모델 입력 예산(`input.maxDiffBytes`, diff보다 먼저 잡음)을 받는다. 넘으면 자르지 않고 빼고 `guidelines_limit`로 partial 표시한다.
+15. **권한 재확인 시점(r2):** GitHub 조회를 마친 뒤 capability 발급 직전에 최신 정책으로 저장소·설치·작성자·입력 정책 revision·리뷰 활성 여부를 다시 본다. 재조정의 실행당 상한은 새 작업과 되살린 작업을 함께 센다.
 
 ### 결정 대기 (사용자 결정 필요)
 
@@ -432,6 +437,6 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 
 ### 공유 파일(T16a 소유) 변경이 필요해 하지 않은 것
 
-- **리뷰 작업의 `waiting_user` 해제:** `Store.control`의 `resume-model`·`cancel`은 `conversation_id`로 묶여 있어 대화가 없는 리뷰 작업을 풀지 못한다. 리뷰 작업이 모델 한도·인증 만료에 걸리면 전역 모델 슬롯이 DB를 직접 고치기 전까지 묶인다. 후보: (a) control에 리뷰 작업 대상(알림 채널에서 owner가 job ID로 재개·포기)을 더한다 (b) 리뷰 작업은 한도 때 `failed`(`model_limit`)로 두고 전역 대기는 다음 대화 작업이 잡게 한다. 추천 (a)(D-14 조건 2의 "대기"를 지킨다). 모델을 부르기 전에 해소해야 한다.
+- **리뷰 작업의 `waiting_user` 해제(r2에서 해소, lead 허용 2026-10-29):** `Store.control`에 리뷰 전용 명령 `review-status`·`review-resume`·`review-cancel`을 **추가**했다. `DiscordIngress`는 현재 정책의 owner가 알림 채널(부모 없는 채널)에서 보낸 명령일 때만 리뷰 제어를 허용한다. 재개·포기 뒤 전역 scheduler 해제는 기존 `releaseScheduler` 규칙(비상 중지·다른 대기 우선)을 그대로 쓴다. 기존 대화 명령(`resume-model`·`cancel`·`list`·`model-status`)의 뜻·동작은 바꾸지 않았다. 리뷰가 대기에 들어가면 알림 채널에 job ID와 명령을 안내한다. 실제 슬래시 명령 등록은 T16b다.
 - **webhook 수신 연결:** `src/http.ts` 앱 서버(8080)에 `githubWebhook`을 붙이는 것. 지금은 404 그대로다.
 - **작업자 쪽 mutex 공유:** 리뷰 레인 HTTP는 새 파일 `src/review-http.ts`(`/v1/review`, `/v1/review/cancel`)에 두었다. 작업자 쪽 mutex를 대화 레인 `SerialWorker`와 하나로 묶는 것은 `worker.ts` 변경이라 하지 않았다. 지금은 게시 서버의 SQL 슬롯만 두 레인이 공유하고, 작업자 쪽 mutex는 `ReviewWorker`가 따로 가진다. 한 작업자 프로세스에 두 레인을 올릴 때(T16b) 묶어야 한다.
