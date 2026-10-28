@@ -504,6 +504,8 @@ export class ReviewRuntime {
 const SEVERITY = ['P0', 'P1', 'P2', 'P3'];
 // 모델 문장이 사람·팀을 멘션하거나 HTML 주석으로 대조 marker를 흉내 내지 못하게 한다.
 const inert = (value: string) => value.replace(/@(?=[A-Za-z0-9_-])/g, '@\u200b').replace(/<!--/g, '&lt;!--');
+// 파일 경로도 PR 작성자가 정한 자료다. 코드 칸을 깨거나 줄을 바꾸지 못하게 한다.
+const code = (value: string) => `\`${inert(value.replace(/[`\r\n]/g, '?'))}\``;
 export const reviewMarker = (key: string) => `<!-- homelab-bot-review:${key} -->`;
 // 게시 본문은 코드가 만든다. 모델 텍스트는 지적 칸 안의 자료로만 들어가고 event·대상은 상수다.
 export function render(result: ReviewResult, positions: { path: string; lines: number[] }[],
@@ -521,11 +523,11 @@ export function render(result: ReviewResult, positions: { path: string; lines: n
     `- 검토 리비전: head \`${result.head_sha}\`, 기준 \`${result.comparison_revision}\`, 정책 \`${result.policy_revision}\``,
     `- 결과: ${result.review_outcome === 'partial' ? '부분 검토' : '검토 완료'}. 확인 파일 ${result.coverage.checked_files.length}개, 제외 ${omitted.length}개`
       + (result.coverage.limits_hit.length ? `, 상한: ${result.coverage.limits_hit.join(', ')}` : ''),
-    ...omitted.slice(0, 20).map(o => `  - 미검토 \`${o.path}\`: ${o.reason}`),
+    ...omitted.slice(0, 20).map(o => `  - 미검토 ${code(o.path)}: ${o.reason}`),
     ...(omitted.length > 20 ? [`  - 미검토 ${omitted.length - 20}개 더 있음`] : []),
     '', inert(result.public_summary), ''];
   lines.push(shown.length ? '### 지적' : '### 지적 없음');
-  for (const f of shown) lines.push(`${entry(f)}\n- 위치: \`${inert(f.path)}\`${f.line ? `:${f.line}` : ''}`);
+  for (const f of shown) lines.push(`${entry(f)}\n- 위치: ${code(f.path)}${f.line ? `:${f.line}` : ''}`);
   if (findings.length > shown.length) lines.push(`- 상한으로 ${findings.length - shown.length}건 생략`);
   if (result.open_questions.length) lines.push('### 확인 질문', ...result.open_questions.map(q => `- ${inert(q)}`));
   const body = lines.join('\n');

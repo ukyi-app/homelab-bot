@@ -734,6 +734,17 @@ test('DATA-01 게시 직전 현재 내부 표식으로 다시 분류하고, 모�
   assert.ok(body.includes('@​fixture-org/admins'));
   assert.equal(body.match(/<!--/g)!.length, 1);
   assert.ok(body.startsWith('<!-- homelab-bot-review:github-review:'));
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,outbox,audit CASCADE');
+  r.gh.writes = [];
+  const hostile = 'x`@fixture-org/admins\n<!--.bin';
+  r.archives.set(BASE, tarGz({ 'src/app.ts': APP_BASE, [hostile]: Buffer.from([0, 1]) }));
+  r.archives.set(HEAD, tarGz({ 'src/app.ts': APP_HEAD, [hostile]: Buffer.from([0, 2]) }));
+  r.gh.compareResult = { truncated: false, files: ['src/app.ts', hostile].map(path => ({ path, previousPath: null, status: 'modified', baseType: 'blob', headType: 'blob' })) };
+  r.reply({ status: 'succeeded', output: OUTPUT });
+  await fullReview(pull({ updated_at: '2026-10-29T00:07:00Z' }));
+  const hostileBody = r.gh.writes[0]!.body.body;
+  assert.ok(hostileBody.includes('- 미검토 `x?@\u200bfixture-org/admins?&lt;!--.bin`: binary'));
+  assert.equal(hostileBody.match(/<!--/g)!.length, 1);
 });
 
 test('REVIEW-01 평가 하네스(fake 리뷰어): 정답과 분리한 지적 판정, 정상 PR 오탐·버그 PR 근거·Renovate PR 결과 기록', async () => {
