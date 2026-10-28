@@ -947,7 +947,7 @@ test('REVIEW-02 아직 게시된 리뷰가 없으면 base 이동(실행 직전·
   assert.equal(jobs.at(-1)!.state, 'queued');
   assert.equal(r.gh.writes.length, 0);
 });
-test('REVIEW-02 실행 중 닫힘·draft로 밀려 게시하지 못한 세대는 재개 때 다시 리뷰해 게시', async () => {
+test('REVIEW-02 실행 중 닫힘·draft로 밀려 게시하지 못한 세대는 재개 때 저장 결과로 게시(r3부터 모델 재호출 없음)', async () => {
   await opened();
   r.reply(async () => {
     await hook('pull_request', prEvent('closed', pull({ state: 'closed', updated_at: '2026-10-29T01:20:00Z' })));
@@ -957,10 +957,13 @@ test('REVIEW-02 실행 중 닫힘·draft로 밀려 게시하지 못한 세대는
   assert.deepEqual((await reviewJobs()).map(j => [j.state, j.review_outcome]), [['succeeded', 'superseded']]);
   r.reply({ status: 'succeeded', output: OUTPUT });
   r.gh.pulls.set(7, pull({ updated_at: '2026-10-29T01:21:00Z' }));
-  assert.equal((await hook('pull_request', prEvent('reopened', pull({ updated_at: '2026-10-29T01:21:00Z' })))).outcome, 'requeued');
-  await r.runtime.tick(); await r.publisher.deliver();
+  assert.equal((await hook('pull_request', prEvent('reopened', pull({ updated_at: '2026-10-29T01:21:00Z' })))).outcome, 'resumed');
+  assert.equal(await r.runtime.tick(), false);
+  await r.publisher.deliver();
   assert.equal(r.gh.writes.length, 1);
-  assert.match(r.gh.writes[0]!.body.body, /homelab-bot-review:github-review:[0-9a-f-]+:2 -->/);
+  assert.equal(r.inputs.length, 1);
+  assert.match(r.gh.writes[0]!.body.body, /homelab-bot-review:github-review:[0-9a-f-]+:1 -->/);
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.review_outcome]), [['succeeded', 'completed']]);
   assert.equal((await hook('pull_request', prEvent('reopened', pull({ updated_at: '2026-10-29T01:22:00Z' })))).outcome, 'duplicate_generation');
 });
 test('REVIEW-02 draft로 밀려난 세대를 댓글로 요청하면 draft 대기 없이 실행하고, 취소된 세대도 댓글로 되살린다', async () => {
@@ -1435,4 +1438,34 @@ test('r3 R2-01 EVENT-01 같은 세대의 reopened·ready_for_review 뒤 늦게 �
   await r.publisher.deliver();
   assert.equal(r.gh.writes.length, 1);
   assert.equal(r.inputs.length, 1);
+});
+test('r3 R2-02 REVIEW-02 게시 직전 draft로 보류한 세대는 ready_for_review·재조정·댓글로 저장 결과를 모델 재호출 없이 게시', async () => {
+  const held = async (base: number) => {
+    const at = (m: number) => `2026-10-29T${String(base).padStart(2, '0')}:${String(m).padStart(2, '0')}:00Z`;
+    await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,outbox CASCADE');
+    await opened(pull({ updated_at: at(0) })); await r.runtime.tick();
+    r.gh.pulls.set(7, pull({ draft: true, updated_at: at(1) }));
+    await r.publisher.deliver();
+    assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['superseded', 'draft']]);
+    return at;
+  };
+  let at = await held(6);
+  r.gh.pulls.set(7, pull({ updated_at: at(2) }));
+  assert.equal((await hook('pull_request', prEvent('ready_for_review', pull({ updated_at: at(2) })))).outcome, 'resumed');
+  await r.publisher.deliver();
+  assert.equal(r.gh.writes.length, 1);
+  assert.equal((await hook('pull_request', prEvent('ready_for_review', pull({ updated_at: at(3) })))).outcome, 'duplicate_generation');
+  at = await held(7);
+  r.gh.pulls.set(7, pull({ updated_at: at(2) }));
+  r.gh.open = [pull({ updated_at: at(2) })];
+  assert.deepEqual(await r.reconciler.run(), { admitted: 0, limited: false });
+  await r.publisher.deliver();
+  assert.equal(r.gh.writes.length, 2);
+  at = await held(8);
+  r.gh.pulls.set(7, pull({ draft: true, updated_at: at(2) }));
+  assert.equal((await hook('issue_comment', commentEvent())).outcome, 'resumed');
+  await r.publisher.deliver();
+  assert.equal(r.gh.writes.length, 3);
+  assert.equal(r.inputs.length, 3);
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.review_outcome]), [['succeeded', 'completed']]);
 });

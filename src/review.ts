@@ -145,7 +145,7 @@ export interface ReviewRow {
   trigger: string; pr_updated_at: string; review_outcome: string | null; result: ReviewResult | null;
   superseded_reason: string | null; superseded_at: string | null;
 }
-type Admission = { outcome: 'queued' | 'requeued' | 'duplicate_generation' | 'stale_event' | 'base_moved'; key: string; job?: string };
+type Admission = { outcome: 'queued' | 'requeued' | 'resumed' | 'duplicate_generation' | 'stale_event' | 'base_moved'; key: string; job?: string };
 export const generationKey = (repo: number, pr: number, head: string, comparison: string, policy: string) =>
   `github:review:${repo}:${pr}:${head}:${comparison}:${policy}`;
 const json = (value: unknown) => JSON.stringify(value);
@@ -175,16 +175,23 @@ export class ReviewQueue {
     await tx.query(`INSERT INTO controls VALUES ('review_admission','false') ON CONFLICT DO NOTHING`);
     await tx.query(`SELECT * FROM controls WHERE key='review_admission' FOR UPDATE`);
     const key = generationKey(repo.id, pr.number, pr.head.sha, comparison, context.revision);
-    const existing = (await tx.query<{ job_id: string; state: string; attempt: number; superseded_at: string | null; delivered: boolean }>(
-      `SELECT p.job_id,j.state,j.attempt,p.superseded_at,EXISTS (SELECT 1 FROM review_deliveries d WHERE d.job_id=p.job_id
-        AND d.state IN ('pending','sending','sent','unknown')) AS delivered
+    const existing = (await tx.query<{ job_id: string; state: string; attempt: number; superseded_at: string | null; delivered: boolean;
+      held: boolean; blocked: boolean; result: ReviewResult | null; head_sha: string; comparison_revision: string; policy_revision: string }>(
+      `SELECT p.job_id,j.state,j.attempt,p.superseded_at,p.result,p.head_sha,p.comparison_revision,p.policy_revision,
+        EXISTS (SELECT 1 FROM review_deliveries d WHERE d.job_id=p.job_id AND d.state IN ('pending','sending','sent','unknown')) AS delivered,
+        EXISTS (SELECT 1 FROM review_deliveries d WHERE d.job_id=p.job_id AND d.state='superseded') AS held,
+        EXISTS (SELECT 1 FROM review_deliveries d WHERE d.job_id=p.job_id AND d.state='blocked') AS blocked
       FROM pr_reviews p JOIN jobs j ON j.id=p.job_id WHERE p.generation_key=$1`, [key])).rows[0];
+    // 같은 세대의 공개 가능한 결과가 이미 있는데 닫힘·draft·게시 직전 상태 변화로 게시만 못 했으면, 모델을 다시 부르지 않고
+    // 그 결과의 게시를 이어간다(세대가 같으면 head·base·정책이 같아 결과가 유효하다).
+    const resume = !!existing && existing.state === 'succeeded' && existing.result?.output_classification === 'public'
+      && !existing.delivered && !existing.blocked && (existing.superseded_at !== null || existing.held);
     // 대기·진행·게시된 같은 세대는 다시 넣지 않는다(직렬 1개, D-14). 닫힘·draft·옛 이벤트로 밀려나 게시되지 못한 세대가
     // 다시 live가 됐거나, 명시 요청이 확인된 실패·취소를 다시 부를 때만 같은 작업을 되살린다. 세대당 시도는 재시도 한도로 묶는다.
-    const revive = existing && existing.attempt <= DEFAULTS.maxRetries && (existing.state === 'superseded'
+    const revive = existing && !resume && existing.attempt <= DEFAULTS.maxRetries && (existing.state === 'superseded'
       || (existing.state === 'succeeded' && existing.superseded_at !== null && !existing.delivered)
       || (trigger === 'comment' && ['failed', 'cancelled'].includes(existing.state)));
-    if (existing && !revive) {
+    if (existing && !revive && !resume) {
       // 같은 세대라도 더 새 이벤트(재개·draft 해제 등)를 봤다는 사실은 남긴다. 늦게 온 옛 닫힘·draft가 이 시각과 비교된다.
       await tx.query('UPDATE pr_reviews SET pr_updated_at=GREATEST(pr_updated_at,$2) WHERE job_id=$1', [existing.job_id, pr.updatedAt]);
       return { outcome: 'duplicate_generation', key, job: existing.job_id };
@@ -193,6 +200,24 @@ export class ReviewQueue {
       ORDER BY pr_updated_at DESC,created_at DESC LIMIT 1`, [repo.id, pr.number])).rows[0];
     // 늦게 도착한 옛 이벤트가 새 세대를 밀어내지 않게 한다. 실행 직전 live 조회가 한 번 더 막는다.
     if (latest && Number(latest.pr_updated_at) > pr.updatedAt) return { outcome: 'stale_event', key };
+    if (existing && resume) {
+      await this.supersede(tx, repo.id, pr.number, 'new_generation', key);
+      const result = existing.result!;
+      const outcome = reviewOutcome(result.coverage);
+      await tx.query(`UPDATE pr_reviews SET review_outcome=$2,result=$3,superseded_at=NULL,superseded_reason=NULL,
+        pr_updated_at=GREATEST(pr_updated_at,$4),trigger=CASE WHEN $5='comment' THEN 'comment' ELSE trigger END WHERE job_id=$1`,
+      [existing.job_id, outcome, json({ ...result, review_outcome: outcome }), pr.updatedAt, trigger]);
+      const reopened = await tx.query(`UPDATE review_deliveries SET state='pending',reason=NULL,attempt=0,pause_count=0,dispatch_started=false,
+        available_at=$2,lease_token=NULL,lease_until=NULL WHERE id=(SELECT id FROM review_deliveries WHERE job_id=$1 AND state='superseded'
+        ORDER BY created_at DESC LIMIT 1) RETURNING id`, [existing.job_id, now]);
+      // 실행 중 밀려 게시 행이 없었으면 새로 만든다. 본문은 게시 직전 현재 정책으로 다시 렌더링된다.
+      if (!reopened.rows.length) await tx.query(`INSERT INTO review_deliveries(id,job_id,idempotency_key,repo_id,repo_full_name,pr_number,
+        head_sha,comparison_revision,policy_revision,body,comments,state,available_at,created_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'','[]','pending',$10,$10) ON CONFLICT (idempotency_key) DO NOTHING`,
+      [randomUUID(), existing.job_id, `github-review:${existing.job_id}:${existing.attempt}`, repo.id, repo.fullName, pr.number,
+        existing.head_sha, existing.comparison_revision, existing.policy_revision, now]);
+      return { outcome: 'resumed', key, job: existing.job_id };
+    }
     if (existing) {
       const queued = (await tx.query<{ count: string }>("SELECT count(*) FROM jobs WHERE state='queued'")).rows[0]!;
       if (Number(queued.count) >= DEFAULTS.maxQueue) throw new Error('queue_full');
@@ -721,7 +746,14 @@ export class ReviewPublisher {
       if (pr.head.repoId !== pr.base.repoId || !authorAllowed(pr.author, context.review)) { await this.state(row, 'blocked', 'author_denied'); return true; }
       // draft는 기본 대기다. 늦거나 빠진 converted_to_draft를 기다리지 않고 게시 직전 live 상태로 본다. 댓글 명시 요청만 예외.
       const trigger = (await this.store.db.query<{ trigger: string }>('SELECT trigger FROM pr_reviews WHERE job_id=$1', [row.job_id])).rows[0]?.trigger;
-      if (pr.draft && trigger !== 'comment' && !context.review.reviewDrafts) { await this.state(row, 'superseded', 'draft'); return true; }
+      if (pr.draft && trigger !== 'comment' && !context.review.reviewDrafts) {
+        await this.state(row, 'superseded', 'draft');
+        // 세대 기록도 보류 상태로 둔다. ready_for_review·재조정·댓글이 오면 저장된 결과로 게시를 잇는다.
+        await this.store.db.query(`UPDATE pr_reviews SET superseded_at=COALESCE(superseded_at,$2),superseded_reason='draft',
+          review_outcome=CASE WHEN review_outcome IN ('completed','partial') THEN 'superseded' ELSE review_outcome END WHERE job_id=$1`,
+        [row.job_id, this.store.now()]);
+        return true;
+      }
       if (row.attempt > 1 && await this.existing(row)) return true;
       const request = { method: 'POST', path: `/repos/${repo.fullName}/pulls/${row.pr_number}/reviews`,
         body: { commit_id: row.head_sha, event: 'COMMENT', body: row.body, comments: row.comments } };
