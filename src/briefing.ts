@@ -185,7 +185,7 @@ export class BriefingScheduler {
         if (latest.owner !== owner || latest.guild !== scope.guild || latest.notificationChannel !== scope.channel) throw new StaleBriefing();
         const current = await this.gate.withDatabase(tx).authorize(owner, scope);
         // 작성하는 동안 지우거나 대체한 기억이 있으면 다시 작성한다. FOR SHARE가 그 행의 삭제 정리와 직렬화한다.
-        if (!await this.memory.live(tx, memory.items)) throw new StaleBriefing();
+        if (!await this.memory.live(tx, owner, memory.items)) throw new StaleBriefing();
         // 기억 정정·제외·삭제로 다시 작성한 회차는 새 멱등 키를 쓴다. 막은 이전 사본과 겹치지 않게 한다.
         const key = `briefing:${schedule.id}:${claim.date}${claim.revision ? `:r${claim.revision}` : ''}`;
         const held = (await tx.query(`UPDATE briefing_runs SET state='enqueued',outbox_key=$4,lease_token=NULL,lease_until=NULL,updated_at=$5

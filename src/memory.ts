@@ -249,6 +249,8 @@ export class MemoryService {
     if (!/^(conversation|job|document|external|channel):.{1,500}$/s.test(sourceKey)) throw new MemoryRejected('memory_exclusion_invalid');
     return this.db.transaction(async tx => {
       await this.gate.withDatabase(tx).authorize(actor, scope);
+      // 저장 제외는 기억 행을 바꾸지 않아 브리핑의 FOR SHARE와 부딪히지 않는다. 큐 등록과 같은 잠금으로 줄 세운다.
+      await this.lockDerived(tx, actor);
       await tx.query('INSERT INTO memory_exclusions(source_key,owner_id,created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [sourceKey, actor, this.now()]);
       const hidden = (await tx.query<{ id: string; created_at: string | number }>(`SELECT id,created_at FROM memories
         WHERE owner_id=$1 AND status IN ('active','candidate') AND source_keys ? $2`, [actor, sourceKey])).rows;
@@ -285,9 +287,11 @@ export class MemoryService {
     return { items: (await this.views(rows)).slice(0, 5), total: rows.length };
   }
   // 브리핑을 큐에 넣는 transaction 안에서 부른다. FOR SHARE로 같은 행의 삭제 요청·정리·정정과 직렬화한다.
-  async live(tx: Database, items: Pick<MemoryView, 'id' | 'createdAt'>[]): Promise<boolean> {
+  async live(tx: Database, owner: string, items: Pick<MemoryView, 'id' | 'createdAt'>[]): Promise<boolean> {
     if (!items.length) return true;
     if (items.some(item => this.hidden.has(erasedKey(item.id, item.createdAt)))) return false;
+    // 저장 제외와 같은 잠금을 먼저 잡는다. 잠금을 얻은 뒤의 새 문장이어야 그 사이 끝난 저장 제외가 보인다.
+    await this.lockDerived(tx, owner);
     const rows = (await tx.query<{ id: string; created_at: string | number }>(`SELECT id,created_at FROM memories m
       WHERE id=ANY($1::text[]) AND status='active' AND deletion_requested_at IS NULL
       AND NOT EXISTS (SELECT 1 FROM memory_exclusions x WHERE x.owner_id=m.owner_id AND m.source_keys ? x.source_key)
@@ -396,6 +400,10 @@ export class MemoryService {
       reason='memory_changed',lease_token=NULL,lease_until=NULL,updated_at=$3 WHERE schedule_id=$1 AND slot_date=$2`, [run.schedule_id, run.slot_date, this.now()]);
     return { derived: keys.length, publishedCopies };
   }
+  // 브리핑 사본 등록과 저장 제외를 owner별로 줄 세운다. 정정·삭제는 기억 행 잠금이 FOR SHARE와 부딪혀 따로 잡지 않는다.
+  private async lockDerived(tx: Database, owner: string): Promise<void> {
+    await tx.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`memory-derived:${owner}`]);
+  }
   private async lockTopic(tx: Database, actor: string, topic: string | undefined): Promise<void> {
     if (topic) await tx.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`memory-topic:${actor}:${topic}`]);
   }
@@ -501,9 +509,10 @@ export class MemoryService {
   private async views(rows: MemoryRow[]): Promise<MemoryView[]> {
     const linked = [...new Set(rows.flatMap(row => row.conflicts_with))];
     const now = this.now();
-    // 만료된 기억은 더 이상 현재 충돌이 아니다.
+    // 만료·저장 제외·원장에서 삭제를 본 기억은 더 이상 현재 충돌이 아니다.
     const live = new Set(linked.length ? (await this.db.query<{ id: string; created_at: string | number }>(`SELECT id,created_at FROM memories
-      WHERE id=ANY($1::text[]) AND status IN ('active','candidate') AND deletion_requested_at IS NULL AND (expires_at IS NULL OR expires_at>$2)`,
+      WHERE id=ANY($1::text[]) AND status IN ('active','candidate') AND deletion_requested_at IS NULL AND (expires_at IS NULL OR expires_at>$2)
+      AND NOT EXISTS (SELECT 1 FROM memory_exclusions x WHERE x.owner_id=memories.owner_id AND memories.source_keys ? x.source_key)`,
     [linked, now])).rows.filter(row => !this.hidden.has(erasedKey(row.id, Number(row.created_at)))).map(row => row.id) : []);
     return rows.map(row => {
       const flags: MemoryView['flags'] = [];

@@ -61,7 +61,15 @@ async function setup() {
     classification: 'safe_summary', sources: [{ type: 'document', uri: SOURCE, revision: 'r1' }], observedAt: f.now(), recheckAt: f.now() });
   const move = (ts: number) => { f.advance(ts - f.now()); f.policy.confirmedAt = f.now(); };
   return { db, f, memory, move, close: async () => {
-    await pool.end(); await admin.query(`DROP DATABASE ${name} WITH (FORCE)`); await admin.end();
+    await pool.end();
+    // FORCE로 지우면 풀이 닫은 직후 남은 소켓에 종료 오류가 날아와 시험이 흔들린다. 세션이 빠질 때까지 다시 시도한다.
+    for (let attempt = 0; ; attempt++) {
+      try { await admin.query(`DROP DATABASE ${name}`); break; } catch (error) {
+        if (attempt >= 50 || !/being accessed by other users/.test((error as Error).message)) throw error;
+        await sleep(100);
+      }
+    }
+    await admin.end();
   } };
 }
 async function sentStatements(env: Awaited<ReturnType<typeof setup>>, scheduler: BriefingScheduler) {
