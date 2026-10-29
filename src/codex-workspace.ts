@@ -89,7 +89,8 @@ export const fileWorkspace: CodexWorkspace = {
     // 바뀌면 O_NOFOLLOW가 열기를 막아 스냅샷 전체가 실패(null)한다. 그 결과 diff를 얻지 못해 작업이 실패로 끝난다.
     let root: FileHandle;
     try { root = typeof dir === 'string' ? await openDir(dir) : dir; } catch { return null; }
-    const result: Snapshot = {};
+    // 파일 이름이 키다. 일반 객체면 루트의 `__proto__` 파일이 상속 setter에 먹혀 기록되지 않는다.
+    const result: Snapshot = Object.create(null);
     let files = 0;
     let bytes = 0;
     const walk = async (handle: FileHandle, rel: string): Promise<void> => {

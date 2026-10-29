@@ -331,6 +331,11 @@ export class CodexBridge {
       clearInterval(monitor); clearTimeout(timeout); clearTimeout(giveUp);
       await checking;
     }
+    // 마지막 모니터 검사 뒤에 철회·owner 교체가 있었을 수 있다. 결과를 확정하기 전에 다시 인가하고, 철회면
+    // 완료·질문·한도 대기보다 취소를 앞세운다(Runtime.tick 작업자 경로와 같다). 대기로 두면 스케줄러가 멈춘 채
+    // 옛 owner도 새 owner도 /cancel·/resume-model로 풀 수 없다.
+    try { await this.gate.authorize(job.owner_id, job.target); }
+    catch (error) { if (error instanceof Denied) stop = 'revoked'; else if (!(error instanceof PolicyUnavailable)) stop ??= 'monitor'; }
     try { await this.settle(job, policy.revision, session, outcome, stop, answered?.id); }
     catch {
       // 기록 실패는 결과를 모르는 것과 같다. lease가 끝나면 expire()가 unknown으로 둔다.
@@ -448,6 +453,8 @@ export class CodexBridge {
     await this.gate.authorize(input.actor, input.scope);
     if (!input.text.trim() || input.text.length > this.options.answerChars) return { ok: false, status: '답이 비었거나 너무 깁니다.' };
     return this.store.atomic(async store => {
+      // 다른 대화의 질문은 아래에서 Denied라 기한이 지나 닫으며 알림을 넣는 대화는 이 대화뿐이다.
+      await store.db.query('SELECT id FROM conversations WHERE id=$1 FOR UPDATE', [store.scopeId(input.scope)]);
       await this.lockScheduler(store);
       const q = (await store.db.query<Question & { job_state: string; wait_reason: string | null; owner_id: string }>(`SELECT q.*,
         j.state AS job_state,j.wait_reason,j.owner_id FROM codex_questions q JOIN jobs j ON j.id=q.job_id WHERE q.id=$1 FOR UPDATE`, [input.question])).rows[0];
@@ -484,8 +491,9 @@ export class CodexBridge {
       scope: job.target, revision: job.revision.policy, payload: { kind: 'message', channel: job.target.channel,
         classification: 'safe_summary', content: `질문 ${q.id}의 답 기한이 지나 작업을 멈췄습니다(cancelled). 답 없이 진행하지 않습니다. 필요하면 새 작업으로 다시 요청하세요.` } });
   }
-  // T16a lockScheduler와 같은 순서(스케줄러 행 → 작업 행)로 잠근다. 순서가 다르면 /cancel·비상 중지와 교착하거나,
-  // 비상 중지를 기다린 뒤 옛 스냅샷으로 스케줄러를 풀어 버릴 수 있다.
+  // T16a 제어 경로와 같은 순서(대화 행 → 스케줄러 행 → 작업 행)로 잠근다. 부르는 쪽이 대화 행을 먼저 잠근다.
+  // 만료 알림 outbox 삽입의 외래 키 검사도 대화 행을 잡으므로(KEY SHARE), 스케줄러를 먼저 잡으면 같은 대화의
+  // /cancel·/model-status와 교착한다. 순서가 다르면 비상 중지를 기다린 뒤 옛 스냅샷으로 스케줄러를 풀어 버릴 수도 있다.
   private async lockScheduler(store: Store): Promise<void> {
     await store.db.query(`INSERT INTO controls VALUES ('scheduler','false') ON CONFLICT DO NOTHING`);
     await store.db.query(`SELECT * FROM controls WHERE key='scheduler' FOR UPDATE`);
@@ -507,11 +515,15 @@ export class CodexBridge {
     return expired + silent.length;
   }
   async expireQuestions(): Promise<number> {
-    // 매 tick 잠그지 않도록 먼저 잠금 없이 본다. 실제 정리는 스케줄러 행을 먼저 잠근 트랜잭션에서 다시 고른다.
+    // 매 tick 잠그지 않도록 먼저 잠금 없이 본다. 실제 정리는 잠근 트랜잭션에서 다시 고른다.
     if (!(await this.store.db.query("SELECT 1 FROM codex_questions WHERE state='open' AND expires_at<=$1 LIMIT 1", [this.store.now()])).rows.length) return 0;
     return this.store.atomic(async store => {
+      // 대화 행을 스케줄러보다 먼저, 여러 개면 id 순으로 잠근다. 잠근 뒤에 만료된 다른 대화의 질문은 다음 정리로 미룬다.
+      const conversations = (await store.db.query<{ id: string }>(`SELECT id FROM conversations WHERE id IN
+        (SELECT conversation_id FROM codex_questions WHERE state='open' AND expires_at<=$1) ORDER BY id FOR UPDATE`, [store.now()])).rows.map(row => row.id);
       await this.lockScheduler(store);
-      const rows = (await store.db.query<Question>(`SELECT * FROM codex_questions WHERE state='open' AND expires_at<=$1 FOR UPDATE`, [store.now()])).rows;
+      const rows = (await store.db.query<Question>(`SELECT * FROM codex_questions WHERE state='open' AND expires_at<=$1
+        AND conversation_id=ANY($2::text[]) FOR UPDATE`, [store.now(), conversations])).rows;
       for (const q of rows) await this.close(store, q, 'expired');
       return rows.length;
     });

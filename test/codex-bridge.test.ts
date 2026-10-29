@@ -1299,6 +1299,25 @@ test('PR9 4407854998 마지막 모니터 검사 뒤 철회·owner 교체는 완�
     assert.equal((await rows('codex_sessions'))[0]!.state, 'cancelled');
   }
 });
+test('PR9 4407854998 결과 확정 전 재인가가 정책 밖 오류면 완료로 확정하지 않고 failed, 정책 만료(PolicyUnavailable)는 Runtime처럼 진행', async () => {
+  let broken = false;
+  const gate = { authorize: (...args: Parameters<typeof f.gate.authorize>) => broken ? Promise.reject(new Error('policy_store_down'))
+    : f.gate.authorize(...args) } as unknown as typeof f.gate;
+  const quiet = new CodexBridge(f.store, gate, adapter, { monitorMs: 3_600_000 });
+  launcher.scripts.push({ ...finished(out('completed', '끝')), during: async () => { broken = true; } });
+  await task('broken');
+  await new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, quiet).tick();
+  assert.equal((await jobs())[0]!.state, 'failed'); assert.equal((await jobs())[0]!.wait_reason, 'codex_monitor');
+  assert.equal((await rows('results')).length, 0);
+  await database.pg.exec(RESET);
+  broken = false;
+  // 게시 서버가 게시 직전에 다시 인가하므로 정책을 잠시 못 읽는 것만으로 확인된 결과를 버리지 않는다(Runtime.tick과 같다).
+  launcher.scripts.push({ ...finished(out('completed', '끝')), during: async () => { f.policy.confirmedAt = f.now() - DEFAULTS.policyMaxAgeMs - 1; } });
+  await task('stale');
+  await new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, quiet).tick();
+  f.policy.confirmedAt = f.now();
+  assert.equal((await jobs())[0]!.state, 'succeeded');
+});
 test('PR9 4407855007 작업 공간 루트의 __proto__ 파일도 생성·수정·삭제가 실제 변경으로 잡힘', async () => {
   const dir = resolve(await mkdtemp('.local/proto-'));
   try {
