@@ -584,7 +584,7 @@ POST 거부·GET 대조 거부·확정 ID 보존·인가 철회·local confirm �
 1. Discord `task` 명령 → T16a `accept`(type `task`) → `Runtime.tick`이 claim·인가·`dispatchable` 뒤 `TaskLane.run(job)`.
 2. 브리지는 다시 인가하고 lease를 확인한다. 답한 질문이 있으면 그 답으로 재개하고, 없으면 `TASK_INSTRUCTIONS` + 요청으로 새 스레드를 시작한다. `codex_sessions`에 외부 스레드 ID·턴·실행 호스트(`worker`)·능력표를 남긴다(`01` §6 소유자 연결).
 3. 도구 호출 예산은 작업 단위다. 작업 `budget.toolCalls`(T16a 기본 8)에서 같은 스레드의 앞 턴 사용분을 뺀 값을 실행에 넘기고, 남은 예산이 없으면 띄우지 않고 실패로 끝낸다. 새 스레드(`/retry`)는 다시 센다.
-4. 실행 중 `monitorMs`(기본 1초)마다 취소 요청·현재 정책·lease를 본다. 취소·철회·lease 상실·시간 초과는 중단 신호다. 중단 뒤 `stopWaitMs`(기본 15초) 안에 끝나지 않으면 기다리지 않고 `unknown`이다. 기다리며 lease만 늘리면 막힘을 숨기기 때문이다.
+4. 실행 중 `monitorMs`(기본 1초)마다 취소 요청·현재 정책·lease를 본다. 취소·철회·lease 상실·시간 초과는 중단 신호다. 중단 뒤 `stopWaitMs`(기본 15초) 안에 끝나지 않으면 기다리지 않고 `unknown`이다. 기다리며 lease만 늘리면 막힘을 숨기기 때문이다. 실행이 끝나 모니터를 멈춘 뒤, 결과를 확정하기 전에 한 번 더 인가한다. 마지막 검사 뒤의 철회·owner 교체면 완료·질문·한도 대기보다 취소(`authorization_revoked`, 소멸 확인에 따라 `cancelled`·`unknown`)가 앞선다(PR #9 4407854998, `Runtime.tick` 작업자 경로와 같다). 한도 대기로 두면 스케줄러가 멈춘 채 옛 owner도 새 owner도 `/cancel`·`/resume-model`로 풀 수 없기 때문이다.
 5. 판정 순서(`interpretRun`): 실행 전 실패 → 소멸 확인 → 실행 중 상한 초과(도구 예산·출력) → 흐름 무결성(깨진 줄, 스레드 여럿·불일치, 스레드 ID 형식) → `turn.failed` 또는 끝나지 못한 턴의 `error`(한도·인증이면 대기, 세션이 생기기 전 오류 포함) → 세션 없음 → 종료 코드 → 마지막 turn 이벤트 → 출력 스키마 → `auth.json` 값 반사 → 실제 diff. 턴이 끝나고 종료 코드 0인 실행의 일시 `error` 이벤트는 결과를 버리지 않는다. 프로세스를 띄우기 전 실패(작업 공간 준비, 경로 거부, 인자 거부, 실행 파일 없음)는 남은 프로세스가 없으므로 `failed`다.
 
 | 판정 | 작업 상태 | Discord |
@@ -640,7 +640,7 @@ POST 거부·GET 대조 거부·확정 ID 보존·인가 철회·local confirm �
 ### 질문 계약 (TASK-02, AUTH-02)
 
 - 질문 ID = `job_id:thread_id:턴 순번`. 턴은 이 작업 스레드에서 누적한 `turn.completed` 수다. 스레드 ID 형식은 질문을 받을 때 검사한다.
-- 답·만료 정리는 T16a `lockScheduler`와 같은 순서(스케줄러 행 → 질문·작업 행)로 잠그고, 끝나면 T16a `/cancel`과 같은 조건으로 스케줄러 정지를 푼다(질문 대기 중 비상 중지를 이미 풀었던 경우).
+- 답·만료 정리는 T16a 제어 경로(`controlLocked`)와 같은 순서(대화 행 → 스케줄러 행 → 질문·작업 행)로 잠근다. 만료 알림의 outbox 삽입은 `conversation_id` 외래 키 검사로 대화 행 KEY SHARE를 잡는데, 스케줄러를 먼저 잡으면 같은 대화의 `/cancel`·`/model-status`(대화 행 FOR UPDATE 뒤 스케줄러 대기)와 교착한다(PR #9 4407855013, PostgreSQL 18.6에서 재현: 수정 전 한쪽이 잠금 시간 초과로 롤백). 만료 정리는 대화 행을 id 순으로 잠그고, 잠근 뒤 새로 만료된 다른 대화의 질문은 다음 정리로 미룬다. 그리고 끝나면 T16a `/cancel`과 같은 조건으로 스케줄러 정지를 푼다(질문 대기 중 비상 중지를 이미 풀었던 경우).
 - 기한은 기본 1시간, 응답자는 작업 owner 하나다. 1시간인 이유는 아래 "T16a 소유 변경 요청" 1번이다.
 - 답을 받을 때마다 현재 정책으로 다시 인가한다. owner 교체·즉시 철회는 `Denied`, 정책이 없거나 오래되면 `PolicyUnavailable`이고 질문·작업 상태는 그대로다.
 - 다른 대화(스레드)의 답, 다른 사람의 답은 `Denied`다.
@@ -673,7 +673,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - argv: `exec --json --output-schema <run>/output.schema.json -o <run>/last-message.json -`, 재개는 `exec resume … <thread> -`. `--dangerously-bypass-approvals-and-sandbox`·`--approve-for-me`·`--full-auto`·`--ephemeral`·`--ignore-user-config`·`-a`·`-s`·`-c`·`--add-dir`를 쓰지 않는다. 스레드 ID는 영숫자로 시작해야 한다. 지시를 stdin `-`로 주는 것은 [가정: 0.163.0 `--help` 대조는 T16b].
 - 출력·스키마 파일(`run/`)은 모델 셸이 쓰는 `TMPDIR`·작업 공간과 떼고, 실행마다 이전 출력을 지운다.
 - 작업 공간: 첫 실행 전에 `git init`·기준 커밋을 한다(D-15, `codex exec`의 Git 저장소 요구). git은 이때만 쓰고 `GIT_DIR`를 못 박아 위쪽 저장소를 찾지 않으며 사용자·시스템 git 설정, hooks, fsmonitor를 쓰지 않는다. 이미 `.git`이 있으면 누가 쓴 config인지 몰라 거부한다. 그래서 작업 공간 원본을 푸는 단계(T16b·T19)는 `.git` 없이 풀어야 한다.
-- 실행 뒤 변경 대조는 git이 아니라 파일 해시와 git이 보는 소유자 실행 비트(0o100, git의 100755/100644)로 한다. 내용이 같은 `chmod u+x`·`u-x`도 변경이고, 그룹·기타 실행 비트만 바뀐 것은 git처럼 변경이 아니다(rev r2 N5, 시험이 `git diff --summary`와 대조). 실행 중 비신뢰 코드가 `.git/config`에 filter·fsmonitor를 심으면 제어 프로세스의 `git add`가 그 명령을 실행하기 때문이다. 기준 해시는 작업 공간 밖 `run/`에 둔다. 남은 프로세스가 있거나 모르면 작업 공간을 다시 읽지 않는다(결과는 어차피 unknown이고, 살아 있는 프로세스가 읽는 도중 바꿔치기할 수 있다). 읽기의 경로 경계와 남는 한계는 위 "실행 뒤 파일 읽기 경계"다.
+- 실행 뒤 변경 대조는 git이 아니라 파일 해시와 git이 보는 소유자 실행 비트(0o100, git의 100755/100644)로 한다. 내용이 같은 `chmod u+x`·`u-x`도 변경이고, 그룹·기타 실행 비트만 바뀐 것은 git처럼 변경이 아니다(rev r2 N5, 시험이 `git diff --summary`와 대조). 실행 중 비신뢰 코드가 `.git/config`에 filter·fsmonitor를 심으면 제어 프로세스의 `git add`가 그 명령을 실행하기 때문이다. 스냅샷은 프로토타입 없는 객체에 파일 이름을 키로 담는다. 일반 객체면 루트의 `__proto__` 파일이 상속 setter에 먹혀 생성·수정·삭제가 증거에서 빠졌다(PR #9 4407855007). 기준 해시는 작업 공간 밖 `run/`에 둔다. 남은 프로세스가 있거나 모르면 작업 공간을 다시 읽지 않는다(결과는 어차피 unknown이고, 살아 있는 프로세스가 읽는 도중 바꿔치기할 수 있다). 읽기의 경로 경계와 남는 한계는 위 "실행 뒤 파일 읽기 경계"다.
 - 설정에 프로젝트 신뢰(`[projects]`)를 넣지 않는다. 0.163.0이 작업 공간의 `.codex/config.toml`·rules 레이어를 신뢰한 프로젝트에서만 읽는다는 것은 리뷰가 바이너리 문자열로 본 것이고 [미확인]이다.
 - 작업 경로는 `<작업자 루트>/tasks/<job>/{codex-home,home,workspace,run,tmp}`다. 경로 자리일 뿐이고 인증 파일 배치(공유 원본인지 작업별 사본인지)는 결정 대기다. 그래서 지금 모양 그대로 실제 CLI를 돌리면 작업 CODEX_HOME에 `auth.json`이 없어 인증에 실패한다(결정 뒤 T16b).
 - 만드는 디렉터리마다 실제 경로가 그대로인지 확인한다. 루트 아래 심링크(예: `tasks` → 개인 Codex 홈)로 밖에 쓰지 않는다.
@@ -716,6 +716,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 3. **작업자 HTTP 계약.** 지금 어댑터는 같은 프로세스에서 부른다. 배치에서는 게시 서버 → 작업자 HTTP(T16a `WorkerRequest`, Ed25519 capability)로 task 요청(지시·재개 스레드·답)을 보내야 하는데 현재 스키마에 그 필드가 없다. 스키마 확장이나 task 전용 끝점이 필요하다(T16b 전).
 4. **배치 진입점.** `Runtime`에 `CodexBridge`를 `TaskLane`으로 넘기는 본 루프는 T16b다.
 5. **unknown의 비AI 알림.** `health.ts`에 task `unknown` 수 지표를 내서 Alertmanager → Telegram이 잡게 한다(OPS-02, T16b 스크레이프 규칙과 함께).
+6. **`Store.accept()`의 잠금 순서.** PR #9 4407855013과 같은 역전이 T16a `accept()`에도 있다. 스케줄러 행을 먼저 잡은 뒤 `INSERT INTO jobs`의 `conversation_id` 외래 키 검사로 대화 행 KEY SHARE를 기다린다. 같은 대화의 `/cancel`·`/model-status`·`/resume-model`·`/emergency-stop`(대화 행 FOR UPDATE → 스케줄러)과 겹치면 교착한다. PostgreSQL 18.6 로컬 재현에서 `/model-status`가 대화 행을 잡은 사이 `accept()`가 `55P03`(잠금 시간 초과)으로 롤백됐다. 제안: `accept()`가 스케줄러보다 먼저 그 event의 대화 행을 잠근다. T18은 바꾸지 않았다.
 
 ### [가정]·[미확인] (T16b 실측 목록에 더함)
 

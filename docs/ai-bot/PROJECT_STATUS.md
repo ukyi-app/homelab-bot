@@ -26,7 +26,7 @@
 | FOUNDATION 로컬·mock | T16a | 완료(PR #5 병합 2026-10-20, DM·브리핑 확정) | 없음 |
 | FOUNDATION 실연동·첫 배포 | T16b | 대기 | T13(플랫폼), T16a, Discord 서버·봇 계정, 작업자 영속 쓰기 공간(설계 C.8 변경), 봇 전용 구독 계정·첫 시드(D-14) |
 | PR_REVIEW | T17 | 대기 | 착수 T16a, 완료 T16b. 작업별 세션 저장 공간 결정(ARCHITECTURE §5.1). 리뷰 App. D-14 차단 조건(OpenAI 허용 확인이나 API 키 등 공식 지원 인증 전환. 공개 저장소 PR 내용으로 구독 모델을 부르는 일만 막음) |
-| CODEX_BRIDGE | T18 | 로컬·mock 진행(2026-10-29, 브랜치 `feat/t18-codex-bridge-local`, 로컬 커밋만·PR 전). 봇 소유 작업 경로, 질문·완료 중계, 작업자 Codex 설정 생성, 어댑터 능력표, 도구 호출 예산·출력 상한 집행. rev-t18 r1 지적 6건·재리뷰 r2 지적 5건·r3 지적 2건·r4 지적 2건과 자체 점검 반영, 343/343([ARCHITECTURE](ARCHITECTURE.md) §12, [VERIFICATION](VERIFICATION.md) "CODEX_BRIDGE T18"). AC-B5 완료 아님 | 완료 T16b(실제 `codex exec`·작업자 파드). 사용자 결정 대기: R08 연결 방식, 인증 파일 분리, 레인 분리, 작업별 세션 저장 공간([DECISIONS](DECISIONS.md) "T18 결정 대기"). SEC-02 `auth.json` 읽기·세션 디렉터리 격리 blocked(로컬 시험 가능 부분만 pass). 소멸 확인 완전성(cgroup) blocked. T16a 소유 변경 요청(Discord 명령 연결 등, ARCHITECTURE §12). D-14 차단 조건 |
+| CODEX_BRIDGE | T18 | 로컬·mock 진행(2026-10-29, 브랜치 `feat/t18-codex-bridge-local`, PR #9). 봇 소유 작업 경로, 질문·완료 중계, 작업자 Codex 설정 생성, 어댑터 능력표, 도구 호출 예산·출력 상한 집행. rev-t18 r1 지적 6건·재리뷰 r2 지적 5건·r3 지적 2건·r4 지적 2건과 자체 점검, PR #9 Codex Connector 리뷰 1라운드 3건 반영, 347/347([ARCHITECTURE](ARCHITECTURE.md) §12, [VERIFICATION](VERIFICATION.md) "CODEX_BRIDGE T18"). AC-B5 완료 아님 | 완료 T16b(실제 `codex exec`·작업자 파드). 사용자 결정 대기: R08 연결 방식, 인증 파일 분리, 레인 분리, 작업별 세션 저장 공간([DECISIONS](DECISIONS.md) "T18 결정 대기"). SEC-02 `auth.json` 읽기·세션 디렉터리 격리 blocked(로컬 시험 가능 부분만 pass). 소멸 확인 완전성(cgroup) blocked. T16a 소유 변경 요청(Discord 명령 연결 등, ARCHITECTURE §12). D-14 차단 조건 |
 | MEMORY_BRIEFING | T20 | 대기 | 착수 T16a, 완료 T16b |
 | CHANGE_PR | T19 | 대기 | T17, T18, D-24 App |
 | RELEASE_AUDIT | T21 | 대기 | T17~T20 |
