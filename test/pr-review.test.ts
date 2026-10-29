@@ -1469,3 +1469,41 @@ test('r3 R2-02 REVIEW-02 게시 직전 draft로 보류한 세대는 ready_for_re
   assert.equal(r.inputs.length, 3);
   assert.deepEqual((await reviewJobs()).map(j => [j.state, j.review_outcome]), [['succeeded', 'completed']]);
 });
+test('4407851847 REVIEW-02 reviewDrafts가 켜져 있으면 converted_to_draft가 대기 작업·미게시 결과를 지우지 않는다', async () => {
+  r.policy().reviewDrafts = true;
+  await opened(pull({ updated_at: '2026-10-29T00:00:00Z' }));
+  r.gh.pulls.set(7, pull({ draft: true, updated_at: '2026-10-29T00:01:00Z' }));
+  const queued = await hook('pull_request', prEvent('converted_to_draft', pull({ draft: true, updated_at: '2026-10-29T00:01:00Z' })));
+  assert.deepEqual([queued.outcome, queued.reason], ['ignored', 'draft_allowed']);
+  assert.deepEqual((await reviewJobs()).map(j => j.state), ['queued']);
+  await r.runtime.tick();
+  assert.deepEqual((await deliveries()).map(d => d.state), ['pending']);
+  assert.equal((await hook('pull_request', prEvent('ready_for_review', pull({ updated_at: '2026-10-29T00:02:00Z' })))).outcome, 'duplicate_generation');
+  const pending = await hook('pull_request', prEvent('converted_to_draft', pull({ draft: true, updated_at: '2026-10-29T00:03:00Z' })));
+  assert.deepEqual([pending.outcome, pending.reason], ['ignored', 'draft_allowed']);
+  r.gh.pulls.set(7, pull({ draft: true, updated_at: '2026-10-29T00:03:00Z' }));
+  await r.publisher.deliver();
+  assert.equal(r.gh.writes.length, 1);
+  assert.equal(r.inputs.length, 1);
+});
+test('4407851847 REVIEW-02 draft 리뷰가 꺼져 있어도 댓글 명시 요청 세대는 converted_to_draft로 버리지 않고, 자동 세대만 정리한다', async () => {
+  r.gh.pulls.set(7, pull({ updated_at: '2026-10-29T00:00:00Z' }));
+  assert.equal((await hook('issue_comment', commentEvent())).outcome, 'queued');
+  r.gh.pulls.set(7, pull({ draft: true, updated_at: '2026-10-29T00:01:00Z' }));
+  await hook('pull_request', prEvent('converted_to_draft', pull({ draft: true, updated_at: '2026-10-29T00:01:00Z' })));
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.trigger]), [['queued', 'comment']]);
+  await r.runtime.tick();
+  await hook('pull_request', prEvent('converted_to_draft', pull({ draft: true, updated_at: '2026-10-29T00:02:00Z' })));
+  assert.deepEqual((await deliveries()).map(d => d.state), ['pending']);
+  r.gh.pulls.set(7, pull({ draft: true, updated_at: '2026-10-29T00:02:00Z' }));
+  await r.publisher.deliver();
+  assert.equal(r.gh.writes.length, 1);
+  // 자동 세대는 여전히 draft 전환으로 정리된다.
+  const next = pull({ head: { sha: HEAD2, ref: 'feature', repo: repository }, updated_at: '2026-10-29T00:03:00Z' });
+  r.gh.pulls.set(7, next);
+  assert.equal((await hook('pull_request', prEvent('ready_for_review', next))).outcome, 'queued');
+  const draft = await hook('pull_request', prEvent('converted_to_draft', { ...next, draft: true, updated_at: '2026-10-29T00:04:00Z' }));
+  assert.deepEqual([draft.outcome, draft.reason], ['superseded', 'draft']);
+  assert.deepEqual((await reviewJobs()).filter(j => j.head_sha === HEAD2).map(j => [j.state, j.wait_reason]), [['superseded', 'draft']]);
+  assert.equal(r.inputs.length, 1);
+});
