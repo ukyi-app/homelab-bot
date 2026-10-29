@@ -855,3 +855,64 @@ test('MEM-01 [rev-t20d P2] 충돌이 생긴 뒤 한쪽을 저장 제외하면 �
   assert.ok((await flags('81')).includes('conflict'));
   assert.ok((await flags('82')).includes('conflict'));
 });
+// --- PR #8 Codex Connector 리뷰 1라운드(rev-pr8) 회귀 시험 ---
+test('AUTH-02 [rev-pr8 P2-1] 서비스 권한을 철회한 기억이 앞을 채워도 검색·재확인 브리핑은 접근 가능한 기억을 돌려줌', async () => {
+  const due = (extra: Partial<MemoryInput>) => ({ access: ['fixture-notifications'], classification: 'safe_summary' as const, ...extra });
+  f.policy.services = ['fixture-service', 'retired-service'];
+  const base = f.now();
+  const kept = await memory.remember('fixture-owner', notifications, config('공지 백업 경로', due({ recheckAt: base + 1_000 })));
+  // 철회될 서비스의 기억이 검색 정렬(최근 갱신순)과 재확인 정렬(재확인 시각순) 모두에서 앞선다.
+  for (let i = 0; i < 60; i++) {
+    f.advance(1);
+    await memory.remember('fixture-owner', notifications, config(`공지 철회 서비스 ${i}`, due({ scope: { service: 'retired-service' }, recheckAt: base + 1 })));
+  }
+  f.policy.services = ['fixture-service'];
+  at(base + 1_000);
+  const found = await memory.search('fixture-owner', notifications, '공지');
+  const recheck = await memory.recheckDue('fixture-owner', notifications);
+  assert.deepEqual([found.map(m => m.id), recheck.items.map(m => m.id), recheck.total], [[kept.id], [kept.id], 1]);
+  const s = scheduler();
+  assert.equal(await s.ensure(), 'enabled');
+  at(SLOT); await s.tick();
+  const [sent] = await briefings();
+  assert.ok(sent!.payload.content.includes('공지 백업 경로'));
+  assert.ok(!sent!.payload.content.includes('철회 서비스'));
+});
+test('AUTH-02 [rev-pr8 P2-1] guild가 바뀐 기억이 앞을 채워도 검색은 접근 가능한 기억을 돌려줌', async () => {
+  const kept = await memory.remember('fixture-owner', thread, config('길드 무관 대시보드'));
+  for (let i = 0; i < 25; i++) {
+    f.advance(1);
+    await memory.remember('fixture-owner', thread, config(`길드 대시보드 ${i}`, { scope: { guild: 'fixture-guild' } }));
+  }
+  f.policy.guild = 'moved-guild';
+  const moved: Scope = { ...thread, guild: 'moved-guild' };
+  assert.deepEqual((await memory.search('fixture-owner', moved, '대시보드')).map(m => m.id), [kept.id]);
+});
+test('DATA-02 [rev-pr8 P2-1] 원장에서 본 삭제(정리 전) 기억이 앞을 채워도 검색은 남은 기억을 돌려줌', async () => {
+  const fault = await dirFaultLedger('ledger-hidden-limit');
+  try {
+    const kept = await memory.remember('fixture-owner', thread, config('복원 뒤 남은 경로'));
+    const erased: DeletionEntry[] = [];
+    for (let i = 0; i < 25; i++) {
+      f.advance(1);
+      const { id } = await memory.remember('fixture-owner', thread, config(`복원 뒤 지울 경로 ${i}`));
+      erased.push({ memoryId: id, createdAt: f.now(), deletedAt: f.now() });
+    }
+    await writeFile(`${fault.dir}/deletions.jsonl`, erased.map(entry => `${JSON.stringify(entry)}\n`).join(''));
+    fault.state.fail = true;
+    const restored = new MemoryService(database.db, f.gate, fault.make(), documents, f.now);
+    assert.deepEqual(await restored.open(), { entries: 25, applied: 0 });
+    assert.deepEqual((await restored.search('fixture-owner', thread, '경로')).map(m => m.id), [kept.id]);
+  } finally { await rm(fault.dir, { recursive: true, force: true }); }
+});
+test('MEM-01 [rev-pr8 P2-2] 다른 결정자의 결정은 확인된 문서가 있어야 active, 미확인 문서를 더해도 candidate', async () => {
+  await f.ingress.receive(event('m-decided', { text: '배포 담당자가 금요일 배포 금지로 정했어' })); f.advance(800);
+  const said = { type: 'conversation' as const, message: 'm-decided' };
+  const decision = (sources: MemoryInput['sources']): MemoryInput => ({ kind: 'decision', statement: '금요일에는 배포하지 않는다',
+    decidedBy: 'release-manager', decidedAt: f.now(), appliesTo: '배포 일정', sources });
+  assert.equal((await memory.remember('fixture-owner', thread, decision([said]))).status, 'candidate');
+  assert.equal((await memory.remember('fixture-owner', thread, decision([said, { type: 'document', uri: 'repo://allowed/release.md', revision: null }]))).status, 'candidate');
+  assert.equal((await memory.remember('fixture-owner', thread, decision([said, { type: 'document', uri: 'repo://draft/release.md', revision: 'r1' }]))).status, 'candidate');
+  assert.equal((await memory.remember('fixture-owner', thread, decision([said, doc('release.md')]))).status, 'active');
+  assert.equal((await memory.remember('fixture-owner', thread, decision([doc('release.md')]))).status, 'active');
+});
