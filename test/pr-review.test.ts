@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createHmac, randomUUID } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 import { once } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
@@ -142,7 +143,7 @@ async function setup() {
   const ingress = new GitHubIngress(SECRET, f.store, source, queue, gh);
   const worker = new ReviewWorker(f.verifier, fetcher, model, 50);
   const runtime = new ReviewRuntime(f.store, source, queue, gh, worker, f.signer, 5);
-  const publisher = new ReviewPublisher(f.store, source, gh, new RestrictedGitHub(gh.transport), queue);
+  const publisher = new ReviewPublisher(f.store, source, gh, new RestrictedGitHub(gh.transport), queue, 5);
   const reconciler = new ReviewReconciler(f.store, source, queue, gh);
   gh.pulls.set(7, pull());
   archives.set(BASE, tarGz({ 'AGENTS.md': '기준 지침: 한국어로 리뷰한다.\n', 'src/app.ts': APP_BASE }));
@@ -1556,4 +1557,27 @@ test('4407851854 EVENT-02 오래된 게시 행이 전송 중 lease를 잃어도 
   await r.publisher.reconcile();
   assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['blocked', 'unknown_deadline']]);
   assert.equal(r.gh.writes.length, 0);
+});
+test('4407851858 EVENT-02 게시 전 PR·비교 기준 조회가 lease(30초)보다 길어도 현재 lease를 갱신해 그 시도에서 게시', async () => {
+  await opened(); await r.runtime.tick();
+  const pullRequest = r.gh.pullRequest.bind(r.gh), mergeBase = r.gh.mergeBase.bind(r.gh);
+  // 조회마다 20초가 걸린다. 합계 40초로 lease 30초를 넘는다.
+  r.gh.pullRequest = async (repository: string, number: number) => { f.advance(20_000); await delay(30); return pullRequest(repository, number); };
+  r.gh.mergeBase = async (repository: string, base: string, head: string) => { f.advance(20_000); await delay(30); return mergeBase(repository, base, head); };
+  assert.equal(await r.publisher.deliver(), true);
+  assert.equal(r.gh.writes.length, 1);
+  assert.deepEqual((await deliveries()).map(d => d.state), ['sent']);
+});
+test('4407851858 EVENT-02 조회 중 다른 lease로 넘어간 게시 행은 갱신하지 않고 보내지 않는다', async () => {
+  await opened(); await r.runtime.tick();
+  const pullRequest = r.gh.pullRequest.bind(r.gh);
+  const until = f.now() + 5_000;
+  r.gh.pullRequest = async (repository: string, number: number) => {
+    await database.db.query(`UPDATE review_deliveries SET lease_token='fixture-other-lease',lease_until=$1`, [until]);
+    await delay(30);
+    return pullRequest(repository, number);
+  };
+  await r.publisher.deliver();
+  assert.equal(r.gh.writes.length, 0);
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.lease_token, Number(d.lease_until)]), [['sending', 'fixture-other-lease', until]]);
 });

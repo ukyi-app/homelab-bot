@@ -709,7 +709,7 @@ interface DeliveryRow {
 }
 export class ReviewPublisher {
   constructor(private readonly store: Store, private readonly policy: ReviewPolicySource, private readonly reader: GitHubReader,
-    private readonly github: RestrictedGitHub, private readonly queue: ReviewQueue) {}
+    private readonly github: RestrictedGitHub, private readonly queue: ReviewQueue, private readonly pollMs = 1000) {}
   async deliver(): Promise<boolean> {
     // 게시 중 죽은 프로세스의 lease를 회수한다. 전송을 시작했으면 결과를 모르므로 unknown(재게시 없이 대조).
     // unknown의 available_at은 진입 시각이다(T16a outbox와 같은 관례). 대조 기한을 생성 시각이 아니라 여기서부터 센다.
@@ -725,6 +725,12 @@ export class ReviewPublisher {
     });
     if (!row) return false;
     let dispatched = false;
+    // 게시 전 PR·비교 기준·기존 리뷰 조회 합계가 lease(30초)보다 길어질 수 있어 그동안에도 이 lease만 늘린다.
+    // 만료됐거나 다른 lease로 넘어간 행은 건드리지 않는다(Store.heartbeat와 같은 조건).
+    const keepalive = setInterval(() => {
+      void this.store.db.query(`UPDATE review_deliveries SET lease_until=$3 WHERE id=$1 AND lease_token=$2 AND state='sending' AND lease_until>$4`,
+        [row.id, row.lease_token, this.store.now() + DEFAULTS.leaseMs, this.store.now()]).catch(() => {});
+    }, this.pollMs);
     try {
       const context = await this.policy.current();
       const repo = context.review.repositories.find(r => String(r.id) === String(row.repo_id) && r.fullName === row.repo_full_name);
@@ -792,7 +798,7 @@ export class ReviewPublisher {
       else await this.store.db.query(`UPDATE review_deliveries SET state='pending',dispatch_started=false,available_at=$3,reason=$4
         WHERE id=$1 AND lease_token=$2`, [row.id, row.lease_token, this.store.now() + Math.max(DEFAULTS.retryDelayMs,
         error instanceof GitHubError ? error.retryAfterMs : 0), 'retry']);
-    }
+    } finally { clearInterval(keepalive); }
     return true;
   }
   // T16a 게시 pause와 같은 규칙: 시도 수를 되돌리고 1초부터 60초까지 늘려 기다린다.
