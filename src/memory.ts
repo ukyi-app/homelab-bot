@@ -272,18 +272,19 @@ export class MemoryService {
       AND m.valid_from<=$2 AND (m.expires_at IS NULL OR m.expires_at>$2) AND m.access_channels ? $3
       AND NOT EXISTS (SELECT 1 FROM memory_deletions d WHERE d.memory_id=m.id AND d.memory_created_at=m.created_at)
       AND NOT EXISTS (SELECT 1 FROM memory_exclusions x WHERE x.owner_id=m.owner_id AND m.source_keys ? x.source_key)
-      ${filters.join(' ')} ORDER BY m.updated_at DESC, m.id LIMIT 20`, params)).rows;
+      ${this.accessible(policy, params)} ${filters.join(' ')} ORDER BY m.updated_at DESC, m.id LIMIT 20`, params)).rows;
     return this.views(rows.filter(row => this.visible(policy, actor, scope, row)));
   }
   // 브리핑에는 그 채널에 공개해도 되는 active 기억 중 다시 확인할 것만 넣는다.
   async recheckDue(actor: string, scope: Scope): Promise<{ items: MemoryView[]; total: number }> {
     this.assertReady();
     const policy = await this.gate.authorize(actor, scope);
+    const params: unknown[] = [actor, this.now(), parent(scope)];
     const rows = (await this.db.query<MemoryRow>(`SELECT * FROM memories m WHERE owner_id=$1 AND status='active'
       AND output_classification='safe_summary' AND deletion_requested_at IS NULL AND recheck_at<=$2 AND valid_from<=$2
       AND (expires_at IS NULL OR expires_at>$2) AND access_channels ? $3
       AND NOT EXISTS (SELECT 1 FROM memory_exclusions x WHERE x.owner_id=m.owner_id AND m.source_keys ? x.source_key)
-      ORDER BY recheck_at, id LIMIT 50`, [actor, this.now(), parent(scope)])).rows.filter(row => this.visible(policy, actor, scope, row));
+      ${this.accessible(policy, params)} ORDER BY recheck_at, id LIMIT 50`, params)).rows.filter(row => this.visible(policy, actor, scope, row));
     return { items: (await this.views(rows)).slice(0, 5), total: rows.length };
   }
   // 브리핑을 큐에 넣는 transaction 안에서 부른다. FOR SHARE로 같은 행의 삭제 요청·정리·정정과 직렬화한다.
@@ -464,6 +465,7 @@ export class MemoryService {
   private async evidence(actor: string, input: Parsed): Promise<Evidence> {
     const excluded = new Set((await this.db.query<{ source_key: string }>('SELECT source_key FROM memory_exclusions WHERE owner_id=$1', [actor])).rows.map(r => r.source_key));
     let evidence = false;
+    let documented = false;
     const all = new Set<string>();
     for (const source of input.sources) {
       const keys = [source.type === 'conversation' ? `conversation:${source.message}` : source.type === 'job' ? `job:${source.job}` : `${source.type}:${source.uri}`];
@@ -486,8 +488,10 @@ export class MemoryService {
       for (const key of keys) all.add(key);
       if (check === 'inaccessible') throw new MemoryRejected('memory_source_inaccessible');
       if (check === 'verified' && EVIDENCE[input.kind].includes(source.type)) evidence = true;
+      if (check === 'verified' && source.type === 'document') documented = true;
     }
-    if (input.kind === 'decision' && input.decidedBy !== actor && !input.sources.some(s => s.type === 'document')) evidence = false;
+    // 다른 사람의 결정은 owner 대화만으로 확정하지 않는다. 문서가 있기만 한 것이 아니라 확인(verified)돼야 한다.
+    if (input.kind === 'decision' && input.decidedBy !== actor && !documented) evidence = false;
     if (input.kind === 'preference' && input.targetUser !== actor) evidence = false;
     return { active: evidence, keys: [...all] };
   }
@@ -496,6 +500,15 @@ export class MemoryService {
       if (error instanceof Denied) return false;
       throw error;
     }
+  }
+  // visible()의 행별 조건(서비스·guild 권한, 원장 숨김)을 LIMIT 전에 SQL로 건다.
+  // LIMIT 뒤에만 거르면 철회된 서비스의 기억이 앞자리를 채워 접근 가능한 기억이 결과에서 빠진다.
+  private accessible(policy: Policy, params: unknown[]): string {
+    params.push(policy.services, policy.guild, [...this.hidden]);
+    const n = params.length;
+    return `AND (m.scope->>'service' IS NULL OR m.scope->>'service'=ANY($${n - 2}::text[]))
+      AND (m.scope->>'guild' IS NULL OR m.scope->>'guild'=$${n - 1})
+      AND NOT (m.id || '@' || m.created_at)=ANY($${n}::text[])`;
   }
   // 권한 철회는 저장 때가 아니라 매 접근에 다시 적용한다.
   private visible(policy: Policy, actor: string, scope: Scope, row: MemoryRow, pendingOk = false): boolean {
