@@ -33,7 +33,9 @@ export async function localDatabase(path?: string): Promise<{ db: Database; pg: 
   await pg.exec(await readFile('migrations/005_delivery_order.sql', 'utf8'));
   await pg.exec(await readFile('migrations/006_alert_services.sql', 'utf8'));
   await pg.exec(await readFile('migrations/007_execution_boundaries.sql', 'utf8'));
+  await pg.exec(await readFile('migrations/008_pr_review.sql', 'utf8'));
   await pg.exec(await readFile('migrations/009_codex_bridge.sql', 'utf8'));
+  await pg.exec(await readFile('migrations/010_memory_briefing.sql', 'utf8'));
   return { db, pg };
 }
 export const thread: Scope = { guild: 'fixture-guild', channel: 'fixture-thread', parent: 'fixture-chat', kind: 'thread' };

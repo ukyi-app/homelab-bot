@@ -13,7 +13,8 @@ export interface DiscordRest {
   history(channel: string, after: string | null, limit: 100): Promise<EventInput[]>;
 }
 const noMentions = { allowed_mentions: { parse: [] as never[] } };
-const controls = new Set(['stop', 'resume', 'list', 'cancel', 'retry', 'emergency-stop', 'resume-model', 'model-status', 'revoke']);
+const controls = new Set(['stop', 'resume', 'list', 'cancel', 'retry', 'emergency-stop', 'resume-model', 'model-status', 'revoke',
+  'review-status', 'review-resume', 'review-cancel']);
 const EventSchema = z.strictObject({
   id: z.string().min(1), actor: z.string().min(1), scope: ScopeSchema,
   text: z.string().max(DEFAULTS.maxInputChars), kind: z.enum(['message', 'command', 'button']),
@@ -38,7 +39,7 @@ export class DiscordIngress {
     if ((!conversation || !conversation.active) && !explicit && !isControl) return;
     // Unsupported commands cannot acquire model or control authority.
     if (event.kind !== 'message' && !['chat', 'urgent', 'task', 'read', ...controls].includes(event.command ?? '')) throw new Denied();
-    if (['cancel', 'retry', 'resume-model', 'revoke', 'read'].includes(event.command ?? '') && !event.target) throw new Denied();
+    if (['cancel', 'retry', 'resume-model', 'revoke', 'read', 'review-resume', 'review-cancel'].includes(event.command ?? '') && !event.target) throw new Denied();
     if (event.command === 'read' && !event.text.trim()) throw new Denied();
     const started = this.store.now();
     const saved = await this.store.save(event, p.revision, !!explicit && (!isControl || event.command === 'resume'));
@@ -78,7 +79,10 @@ export class DiscordIngress {
       if (durableControl) {
         const result = event.command === 'revoke'
           ? await gate.revoke(event.actor, event.scope, event.target!)
-          : await store.control(event.actor, conversationId, event.command!, event.target, event.id);
+          : await store.control(event.actor, conversationId, event.command!, event.target, event.id,
+            // T17 리뷰 작업 제어의 별도 권한: 현재 정책의 owner가 알림 채널(부모 없는 채널)에서 보낸 명령만.
+            { review: event.scope.kind === 'channel' && event.scope.parent === null && event.scope.channel === current.notificationChannel
+              && event.actor === current.owner });
         if (event.command !== 'revoke') await store.enqueue({ key: `control:${saved.id}`, actor: event.actor,
           scope: event.scope, revision: current.revision, payload: { kind: 'message', channel: event.scope.channel,
             content: JSON.stringify(result), classification: 'safe_summary' } });
