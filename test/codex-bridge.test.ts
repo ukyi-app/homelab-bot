@@ -14,6 +14,8 @@ import { ProcessGroupLauncher } from '../src/codex-process.js';
 import { changedPaths, fileWorkspace } from '../src/codex-workspace.js';
 import { execFile } from 'node:child_process';
 import { Runtime } from '../src/runtime.js';
+import { Store } from '../src/store.js';
+import type { Database } from '../src/database.js';
 import { localDatabase, fixture, event, thread } from './helpers.js';
 
 // JSONL fixture는 공식 문서의 `codex exec --json` 이벤트 형태로 합성했다. 실제 CLI 녹음은 모델 호출이라 T16b다(D-14).
@@ -1270,4 +1272,107 @@ test('N9 한계 기록: 원래 디렉터리를 제자리로 되돌린 교체는 
     assert.equal(sawAlternate, true);
     assert.equal(result.kind, 'completed');
   } finally { await rm(alternate, { recursive: true, force: true }); }
+});
+
+const RESET = 'TRUNCATE events,conversations,jobs,results,outbox,denied_actors,controls,audit,codex_sessions,codex_questions RESTART IDENTITY CASCADE';
+test('PR9 4407854998 마지막 모니터 검사 뒤 철회·owner 교체는 완료·질문·한도 대기로 확정하지 않고 취소, 스케줄러를 멈추지 않음', async () => {
+  const limited: Script = { lines: jsonl({ type: 'turn.started' }, { type: 'turn.failed', error: { message: 'usage_limit_reached' } }),
+    exit: { code: 1, signal: null } };
+  const outcomes: [string, Script][] = [['completed', finished(out('completed', '끝'))],
+    ['question', finished(out('needs_input', '조사', '어느 브랜치 기준으로 고칠까요?'))], ['limit', limited]];
+  for (const how of ['owner', 'revoke'] as const) for (const [name, script] of outcomes) {
+    await database.pg.exec(RESET);
+    f.policy.owner = 'fixture-owner';
+    // 실행 중 모니터가 한 번도 돌지 않게 해 "마지막 검사 뒤, 다음 검사 전" 철회만 남긴다.
+    const quiet = new CodexBridge(f.store, f.gate, adapter, { monitorMs: 3_600_000 });
+    launcher.scripts.push({ ...script, during: async () => {
+      if (how === 'owner') f.policy.owner = 'replacement';
+      else await f.gate.revoke('fixture-owner', thread, 'fixture-owner');
+    } });
+    await task(`${how}-${name}`);
+    await new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, quiet).tick();
+    const job = (await jobs())[0]!;
+    assert.equal(job.state, 'cancelled', `${how}/${name}`); assert.equal(job.wait_reason, 'authorization_revoked', `${how}/${name}`);
+    assert.equal((await rows('results')).length, 0); assert.equal((await rows('codex_questions')).length, 0);
+    assert.deepEqual((await outbox()).map(row => row.idempotency_key), [], `${how}/${name}`);
+    assert.equal((await rows('controls')).find(row => row.key === 'scheduler')?.value, false, `${how}/${name}`);
+    assert.equal((await rows('codex_sessions'))[0]!.state, 'cancelled');
+  }
+});
+test('PR9 4407855007 작업 공간 루트의 __proto__ 파일도 생성·수정·삭제가 실제 변경으로 잡힘', async () => {
+  const dir = resolve(await mkdtemp('.local/proto-'));
+  try {
+    const empty = (await fileWorkspace.snapshot(dir))!;
+    await writeFile(join(dir, '__proto__'), 'a');
+    const created = (await fileWorkspace.snapshot(dir))!;
+    assert.deepEqual(changedPaths(empty, created), ['__proto__']);
+    await writeFile(join(dir, '__proto__'), 'b');
+    const modified = (await fileWorkspace.snapshot(dir))!;
+    assert.deepEqual(changedPaths(created, modified), ['__proto__']);
+    // 기준 상태는 run/baseline.json으로 저장했다가 다음 턴에 읽는다. 왕복한 기준에서도 같은 이름을 잃지 않는다.
+    assert.deepEqual(changedPaths(JSON.parse(JSON.stringify(modified)), empty), ['__proto__']);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+  // 실제 브리지: 실행 전부터 있던 __proto__를 지우거나 새로 만들면 완료 결과의 변경 목록에 들어간다.
+  for (const kind of ['deleted', 'created'] as const) {
+    await database.pg.exec(RESET);
+    const job = await task(`proto-${kind}`);
+    const paths = taskPaths(root, job.id);
+    await rm(paths.workspace, { recursive: true, force: true });
+    await mkdir(paths.workspace, { recursive: true });
+    if (kind === 'deleted') await writeFile(join(paths.workspace, '__proto__'), 'before');
+    launcher.scripts.push({ ...finished(out('completed', '끝')), during: async spec => {
+      if (kind === 'deleted') await rm(join(spec.cwd, '__proto__'));
+      else await writeFile(join(spec.cwd, '__proto__'), 'after');
+    } });
+    await runtime.tick();
+    assert.equal((await jobs())[0]!.state, 'succeeded', kind);
+    const result = (await rows('results'))[0]!;
+    assert.deepEqual(result.result.changes, ['__proto__'], kind);
+    assert.equal(result.result.changeCount, 1, kind);
+  }
+});
+// PGlite는 연결이 하나라 두 트랜잭션의 행 잠금 대기(교착)를 재현할 수 없다. 그래서 트랜잭션마다 잠금을 잡는 문장의 순서를 기록해
+// T16a 제어 경로(대화 행 FOR UPDATE → 스케줄러 행)와 같은 순서인지 본다. outbox·질문 행 삽입은 conversation_id 외래 키 검사로
+// 대화 행 KEY SHARE를 잡고, 이것은 제어 경로가 먼저 잡은 대화 행 FOR UPDATE와 충돌하므로 대화 행에 닿는 문장으로 센다.
+function lockLog(db: Database) {
+  const transactions: string[][] = [];
+  const kind = (sql: string) => /FROM controls WHERE key='scheduler' FOR UPDATE/.test(sql) ? 'scheduler'
+    : /FROM conversations\b[\s\S]*FOR UPDATE/.test(sql) ? 'conversation'
+      : /INSERT INTO (outbox|codex_questions)\b/.test(sql) ? 'conversation_fk' : undefined;
+  const recorded: Database = {
+    query: (sql, params) => db.query(sql, params),
+    transaction: (fn, deadline) => db.transaction(tx => {
+      const log: string[] = [];
+      transactions.push(log);
+      return fn({ query: (sql, params) => { const k = kind(sql); if (k) log.push(k); return tx.query(sql, params); },
+        transaction: inner => tx.transaction(inner) });
+    }, deadline),
+  };
+  // 스케줄러 행을 잡은 뒤 대화 행에 닿는 트랜잭션은 스케줄러보다 먼저 대화 행을 잡았어야 한다.
+  const inverted = () => transactions.filter(log => {
+    const scheduler = log.indexOf('scheduler');
+    return scheduler >= 0 && log.slice(scheduler + 1).some(k => k !== 'scheduler') && !log.slice(0, scheduler).includes('conversation');
+  });
+  return { db: recorded, transactions, inverted };
+}
+test('PR9 4407855013 질문 만료 정리는 T16a 제어 경로와 같은 순서(대화 행 → 스케줄러 행)로 잠금(Runtime 정리·답 경로)', async () => {
+  const log = lockLog(database.db);
+  const store = new Store(log.db, f.now);
+  const watched = new CodexBridge(store, f.gate, adapter, { monitorMs: 5 });
+  // 기준: T16a /model-status·/cancel은 대화 행을 먼저 잠그고 스케줄러를 기다린다.
+  const first = await asked();
+  await store.control('fixture-owner', store.scopeId(thread), 'model-status');
+  assert.deepEqual(log.transactions.at(-1), ['conversation', 'scheduler']);
+  f.advance(CODEX_DEFAULTS.questionTtlMs); f.policy.confirmedAt = f.now();
+  assert.equal(await watched.expireQuestions(), 1);
+  assert.equal((await jobs())[0]!.wait_reason, 'question_expired');
+  assert.ok((await outbox()).some(row => row.idempotency_key === `codex-expired:${first.question}`));
+  assert.deepEqual(log.inverted(), []);
+  await database.pg.exec(RESET);
+  const second = await asked();
+  f.advance(CODEX_DEFAULTS.questionTtlMs); f.policy.confirmedAt = f.now();
+  assert.deepEqual(await watched.answer({ question: second.question, actor: 'fixture-owner', scope: thread, text: 'main', event: 'late' }),
+    { ok: false, status: '기한이 지난 질문입니다. 작업을 멈췄습니다.' });
+  assert.ok((await outbox()).some(row => row.idempotency_key === `codex-expired:${second.question}`));
+  assert.deepEqual(log.inverted(), []);
 });
