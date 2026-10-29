@@ -712,8 +712,10 @@ export class ReviewPublisher {
     private readonly github: RestrictedGitHub, private readonly queue: ReviewQueue) {}
   async deliver(): Promise<boolean> {
     // 게시 중 죽은 프로세스의 lease를 회수한다. 전송을 시작했으면 결과를 모르므로 unknown(재게시 없이 대조).
+    // unknown의 available_at은 진입 시각이다(T16a outbox와 같은 관례). 대조 기한을 생성 시각이 아니라 여기서부터 센다.
     await this.store.db.query(`UPDATE review_deliveries SET state=CASE WHEN dispatch_started THEN 'unknown' ELSE 'pending' END,
-      reason=CASE WHEN dispatch_started THEN 'lease_expired' ELSE reason END WHERE state='sending' AND lease_until<=$1`, [this.store.now()]);
+      reason=CASE WHEN dispatch_started THEN 'lease_expired' ELSE reason END,
+      available_at=CASE WHEN dispatch_started THEN $1 ELSE available_at END WHERE state='sending' AND lease_until<=$1`, [this.store.now()]);
     const row = await this.store.db.transaction(async tx => {
       const next = (await tx.query<{ id: string }>(`SELECT id FROM review_deliveries WHERE state='pending' AND available_at<=$1
         ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1`, [this.store.now()])).rows[0];
@@ -802,10 +804,11 @@ export class ReviewPublisher {
   }
   // 응답 유실 뒤에는 PR의 리뷰 목록에서 marker와 검토 SHA로 찾는다. 못 찾아도 자동 재게시하지 않는다.
   async reconcile(): Promise<void> {
+    // 기한은 unknown 진입 시각(available_at)부터다. 정책 비활성·조회 장애·draft 보류로 오래 기다린 행도 대조 기회를 온전히 받는다.
     const retired = await this.store.db.query<{ id: string }>(`UPDATE review_deliveries SET state='blocked',reason='unknown_deadline'
-      WHERE state='unknown' AND created_at<=$1 RETURNING id`, [this.store.now() - DEFAULTS.unknownDeliveryMs]);
+      WHERE state='unknown' AND available_at<=$1 RETURNING id`, [this.store.now() - DEFAULTS.unknownDeliveryMs]);
     for (const row of retired.rows) await this.store.audit('review_delivery_unresolved_retired', row.id, { reason: 'unknown_deadline', resend: false });
-    for (const row of (await this.store.db.query<DeliveryRow>("SELECT * FROM review_deliveries WHERE state='unknown' ORDER BY created_at DESC LIMIT 20")).rows) {
+    for (const row of (await this.store.db.query<DeliveryRow>("SELECT * FROM review_deliveries WHERE state='unknown' ORDER BY available_at DESC LIMIT 20")).rows) {
       try { await this.existing(row); } catch { /* 다음 대조에서 다시 본다 */ }
     }
   }
@@ -834,8 +837,8 @@ export class ReviewPublisher {
     });
   }
   private async state(row: DeliveryRow, state: string, reason: string): Promise<void> {
-    await this.store.db.query(`UPDATE review_deliveries SET state=$3,reason=$4 WHERE id=$1 AND lease_token=$2 AND state='sending'`,
-      [row.id, row.lease_token, state, reason]);
+    await this.store.db.query(`UPDATE review_deliveries SET state=$3,reason=$4,available_at=CASE WHEN $3='unknown' THEN $5 ELSE available_at END
+      WHERE id=$1 AND lease_token=$2 AND state='sending'`, [row.id, row.lease_token, state, reason, this.store.now()]);
     if (state === 'blocked') await this.store.audit('review_delivery_blocked', row.id, { reason, resend: false });
   }
 }

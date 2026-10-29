@@ -11,7 +11,7 @@ import type { Scope } from '../src/contracts.js';
 import { ArchiveError, readArchive, REVIEW_INSTRUCTIONS, ReviewWorker, unifiedDiff } from '../src/review-input.js';
 import type { ArchiveFetcher, ReviewerInput, ReviewerModel, ReviewTask } from '../src/review-input.js';
 import { GitHubError, GitHubIngress, githubWebhook, RestrictedGitHub, restrictGitHubWrite, ReviewPolicySource,
-  ReviewPublisher, ReviewQueue, ReviewReconciler, ReviewRuntime } from '../src/review.js';
+  ReviewPublisher, ReviewQueue, ReviewReconciler, ReviewRuntime, reviewMarker } from '../src/review.js';
 import type { GitHubReader, GitHubTransport, GitHubWrite, ReviewPolicy, ReviewResult } from '../src/review.js';
 import { archiveContract } from '../src/worker.js';
 import { HttpReviewWorker, reviewWorkerServer } from '../src/review-http.js';
@@ -1506,4 +1506,54 @@ test('4407851847 REVIEW-02 draft 리뷰가 꺼져 있어도 댓글 명시 요청
   assert.deepEqual([draft.outcome, draft.reason], ['superseded', 'draft']);
   assert.deepEqual((await reviewJobs()).filter(j => j.head_sha === HEAD2).map(j => [j.state, j.wait_reason]), [['superseded', 'draft']]);
   assert.equal(r.inputs.length, 1);
+});
+test('4407851854 EVENT-02 하루 넘게 대기한 게시 행도 응답 유실 기한은 unknown 진입 시각부터 세고 그 사이 marker로 sent', async () => {
+  await opened(); await r.runtime.tick();
+  // GitHub 조회 장애로 게시 행이 하루 넘게 기다린 뒤 전송되고 응답만 잃는다.
+  r.gh.pulls.set(7, new GitHubError(503));
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['pending', 'before_dispatch']]);
+  f.advance(DEFAULTS.unknownDeliveryMs + 60_000); f.policy.confirmedAt = f.now();
+  r.gh.pulls.set(7, pull());
+  r.gh.lose = true;
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['unknown', 'response_lost']]);
+  const remote = r.gh.remote;
+  r.gh.remote = [];
+  await r.publisher.reconcile();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['unknown', 'response_lost']]);
+  r.gh.remote = remote;
+  await r.publisher.reconcile();
+  const [row] = await deliveries();
+  assert.deepEqual([row!.state, row!.external_id], ['sent', '1001']);
+  assert.equal((await rows('outbox')).filter(o => o.idempotency_key.startsWith('review-summary:')).length, 1);
+  assert.equal(r.gh.writes.length, 1);
+});
+test('4407851854 EVENT-02 오래된 게시 행이 전송 중 lease를 잃어도 기한은 unknown 진입부터, 기한 뒤에는 은퇴', async () => {
+  await opened(); await r.runtime.tick();
+  f.advance(DEFAULTS.unknownDeliveryMs + 60_000); f.policy.confirmedAt = f.now();
+  const [created] = await deliveries();
+  // 전송을 시작한 프로세스가 죽었다. 게시는 GitHub에 올라갔지만 응답을 기록하지 못했다.
+  await database.db.query(`UPDATE review_deliveries SET state='sending',dispatch_started=true,lease_token=$1,lease_until=$2`, [randomUUID(), f.now() - 1]);
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['unknown', 'lease_expired']]);
+  await r.publisher.reconcile();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['unknown', 'lease_expired']]);
+  r.gh.remote.push({ id: 2001, commit_id: HEAD, body: `${reviewMarker(created!.idempotency_key)}\n본문` });
+  await r.publisher.reconcile();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.external_id]), [['sent', '2001']]);
+  // 못 찾으면 unknown 진입 뒤 기한이 지나야 은퇴한다.
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,outbox,audit CASCADE');
+  r.gh.remote = [];
+  await opened(pull({ updated_at: '2026-10-29T00:05:00Z' })); await r.runtime.tick();
+  f.advance(DEFAULTS.unknownDeliveryMs + 60_000); f.policy.confirmedAt = f.now();
+  await database.db.query(`UPDATE review_deliveries SET state='sending',dispatch_started=true,lease_token=$1,lease_until=$2`, [randomUUID(), f.now() - 1]);
+  await r.publisher.deliver();
+  f.advance(DEFAULTS.unknownDeliveryMs - 1); f.policy.confirmedAt = f.now();
+  await r.publisher.reconcile();
+  assert.deepEqual((await deliveries()).map(d => d.state), ['unknown']);
+  f.advance(1); f.policy.confirmedAt = f.now();
+  await r.publisher.reconcile();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['blocked', 'unknown_deadline']]);
+  assert.equal(r.gh.writes.length, 0);
 });
