@@ -349,6 +349,7 @@ export class DiscordPublisher {
       } catch (error) {
         if (error instanceof RateLimited) {
           await this.store.recordRateLimit(error, row.payload.channel);
+          // GREATEST의 controls.value는 충돌한 discord_reconcile_after 한 행뿐이고 늘 숫자로만 쓴다(다른 키 값과 무관).
           await this.store.db.query(`INSERT INTO controls VALUES ('discord_reconcile_after',to_jsonb($1::bigint))
             ON CONFLICT (key) DO UPDATE SET value=to_jsonb(GREATEST(controls.value::bigint,$1::bigint))`,
           [this.store.now() + Math.max(1000, error.retryAfterMs)]);
@@ -408,6 +409,7 @@ export async function gatewayMessage(frame: GatewayFrame, botId: string,
   const kind = channel.type === 1 ? 'dm' : channel.type === 11 ? 'thread' : channel.type === 0 ? 'channel' : undefined;
   if (!kind || (kind !== 'dm' && (!frame.guild_id || channel.guild_id !== frame.guild_id))) throw new Denied();
   return { id: frame.id, actor: frame.author.id, bot: frame.author.bot, webhook: !!frame.webhook_id,
-    scope: { kind, guild: frame.guild_id ?? null, channel: frame.channel_id, parent: channel.parent_id ?? null },
+    // 일반 채널(type 0)의 parent_id는 카테고리다. scope.parent는 스레드의 부모 채널만 뜻한다.
+    scope: { kind, guild: frame.guild_id ?? null, channel: frame.channel_id, parent: kind === 'thread' ? channel.parent_id ?? null : null },
     text: frame.content ?? '', kind: 'message', mention: frame.mentions?.some(m => m.id === botId) };
 }

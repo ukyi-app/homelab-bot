@@ -140,3 +140,24 @@ test('P2-5 실제 진입 프로세스: 8081 listen 실패면 열었던 8080을 �
     assert.ok(failedAt !== undefined && Date.now() - failedAt < 3000, `실패 로그 뒤 ${failedAt === undefined ? '-' : Date.now() - failedAt}ms`);
   } finally { blocker.close(); await d.close(); }
 });
+
+// 운영 장애(2026-10-30): controls에 숫자가 아닌 값(scheduler·alert_admission=false)이 있고 대기 글이 있으면
+// 실행기가 value::bigint를 key 비교보다 먼저 평가해 claimDelivery가 22023으로 실패했다. ANALYZE 뒤라야 그 순서가 나온다.
+test('t16b-hotfix 실제 PostgreSQL: controls에 boolean 값이 있어도 대기 글을 꺼내고, 숫자 pause는 그대로 지킴', { skip }, async () => {
+  const d = await database();
+  try {
+    await runMigrations(d.pool());
+    const db = new Postgres(d.pool(2));
+    await db.query(`INSERT INTO controls VALUES ('scheduler','false'),('alert_admission','false') ON CONFLICT (key) DO UPDATE SET value='false'`);
+    await pendingAlert(db);
+    await db.query('ANALYZE controls'); await db.query('ANALYZE outbox');
+    const store = new Store(db);
+    await db.query(`INSERT INTO controls VALUES ($1,to_jsonb($2::bigint))`, [`discord_channel_after:${thread.channel}`, Date.now() + 60_000]);
+    assert.equal(await store.claimDelivery(), undefined, '채널 pause 중에는 꺼내지 않음');
+    await db.query(`UPDATE controls SET value=to_jsonb($1::bigint) WHERE key=$2`, [Date.now() - 1000, `discord_channel_after:${thread.channel}`]);
+    await db.query(`INSERT INTO controls VALUES ('discord_global_after',to_jsonb($1::bigint))`, [Date.now() - 1000]);
+    await db.query('ANALYZE controls');
+    const claimed = await store.claimDelivery();
+    assert.equal(claimed?.state, 'sending');
+  } finally { await d.close(); }
+});

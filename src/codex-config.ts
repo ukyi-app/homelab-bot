@@ -3,13 +3,15 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { Denied } from './contracts.js';
 import { THREAD_ID } from './codex-events.js';
+import { isPersonalEntry } from './personal-homes.js';
+import { TASK_MARKER } from './process-launcher.js';
 
 // 작업자가 쓰는 Codex 설정. 시작과 `exec resume`이 같은 정책을 갖도록 플래그가 아니라 설정 파일에 고정한다.
 // `exec resume`에는 -s·-C가 없다 [실측: codex-cli 0.163.0 `codex exec resume --help`, ARCHITECTURE §4].
 export const SECRET_NAME = /KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|AUTH|COOKIE|SESSION|PRIVATE/i;
 export interface CodexPaths { job: string; root: string; home: string; taskHome: string; workspace: string; run: string; tmp: string }
-// 작업이 띄운 프로세스를 찾는 표식. 새 세션으로 빠져나간 자식도 환경을 지우지 않았다면 찾는다.
-export const TASK_MARKER = 'HOMELAB_CODEX_TASK';
+// 작업이 띄운 프로세스를 찾는 표식은 실행기 공통이다(process-launcher). 작업 레인 셸 env에도 같은 이름으로 넣는다.
+export { TASK_MARKER };
 export interface ShellPolicy {
   inherit: 'none'; ignore_default_excludes: false; exclude: readonly string[]; set: Readonly<Record<string, string>>;
 }
@@ -21,8 +23,8 @@ export interface CodexConfig {
   shell_environment_policy: ShellPolicy;
 }
 
-// 개인 Codex 홈(~/.codex, ~/.codex-sub, ~/.codex-work와 심링크 ~/.codex2·~/.codex3)은 목록을 읽지 않고
-// 경로 모양만으로 막는다. realpath는 작업자 루트에만 쓴다. 홈 디렉터리를 열거하지 않는다(D-14, spec §4.5).
+// 개인 Codex·Claude 홈(~/.codex, ~/.codex-sub, ~/.codex-work와 심링크 ~/.codex2·~/.codex3, ~/.claude*)은 목록을 읽지 않고
+// 경로 모양만으로 막는다(personal-homes). realpath는 작업자 루트에만 쓴다. 홈 디렉터리를 열거하지 않는다(D-14, spec §4.5).
 // 작업자가 사람과 다른 UID로 돌면 자기 홈만으로는 사람 홈을 모른다. 그때는 배치 설정이 사람 홈을 더 넘긴다.
 export function assertWorkerRoot(root: string, homes: readonly string[] = [homedir()]): string {
   if (!isAbsolute(root)) throw new Denied();
@@ -37,7 +39,7 @@ export function assertWorkerRoot(root: string, homes: readonly string[] = [homed
     for (const candidate of [resolve(root), real]) {
       const rel = relative(base, candidate);
       // 루트가 홈이거나 홈의 조상이면 그 아래 개인 Codex 홈을 품는다.
-      if (rel === '' || (!rel.startsWith('..') && rel.split(sep)[0]!.startsWith('.codex')) || !relative(candidate, base).startsWith('..')) throw new Denied();
+      if (rel === '' || (!rel.startsWith('..') && isPersonalEntry(rel.split(sep)[0]!)) || !relative(candidate, base).startsWith('..')) throw new Denied();
     }
   }
   return real;

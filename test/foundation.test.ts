@@ -46,6 +46,27 @@ test('AUTH-01 Gateway의 검증된 채널 메타데이터로 parent를 결정', 
   const normalized = await gatewayMessage(frame, 'fixture-bot', async () => ({ type: 11, parent_id: thread.parent!, guild_id: thread.guild! }));
   assert.deepEqual(normalized.scope, thread);
 });
+// 운영 장애(2026-10-30): 일반 채널(type 0)의 parent_id는 카테고리라 parent로 넣으면 authorize가 조용히 거부했다.
+test('t16b-hotfix 카테고리 안 일반 채널은 parent null, 스레드는 부모 채널을 parent로', async () => {
+  const frame = { id: 'fixture-message', channel_id: 'fixture-chat', guild_id: thread.guild!, author: { id: 'fixture-owner' } };
+  const channel = await gatewayMessage(frame, 'fixture-bot', async () => ({ type: 0, parent_id: 'fixture-category', guild_id: thread.guild! }));
+  assert.deepEqual(channel.scope, { kind: 'channel', guild: thread.guild, channel: 'fixture-chat', parent: null });
+  const inThread = await gatewayMessage({ ...frame, channel_id: thread.channel }, 'fixture-bot',
+    async () => ({ type: 11, parent_id: thread.parent!, guild_id: thread.guild! }));
+  assert.deepEqual(inThread.scope, thread);
+});
+test('t16b-hotfix 카테고리 안 대화 채널의 /chat이 인그레스에서 거부되지 않고 저장됨', async () => {
+  const protocol = new DiscordProtocol({ request: async (method, path) => {
+    if (method === 'GET') return { id: 'fixture-chat', type: 0, guild_id: 'fixture-guild', parent_id: 'fixture-category' };
+    if (path.endsWith('/callback')) return;
+    throw new Error('unexpected_route');
+  } }, 'fixture-bot', f.now);
+  const ingress = new DiscordIngress(f.store, f.gate, protocol);
+  await protocol.gateway('INTERACTION_CREATE', { id: 'fixture-interaction', token: 'fixture-ephemeral-token', type: 2,
+    channel_id: 'fixture-chat', guild_id: 'fixture-guild', member: { user: { id: 'fixture-owner' } },
+    data: { name: 'chat', options: [{ name: 'text', value: '안녕' }] } }, ingress);
+  assert.equal((await rows('events')).length, 1);
+});
 test('AUTH-02 큐 실행·게시 직전 정책 revision 재확인', async () => {
   await queued(); f.policy.revision = 'fixture-v2'; f.policy.owner = 'replacement'; await f.runtime.tick();
   assert.equal(f.requests.length, 0); assert.equal((await rows('jobs'))[0]!.state, 'cancelled');

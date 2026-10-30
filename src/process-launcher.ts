@@ -1,17 +1,36 @@
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { readdir, readFile } from 'node:fs/promises';
-import { TASK_MARKER } from './codex-config.js';
-import { LaunchFailed } from './codex.js';
-import type { CodexLauncher, LaunchResult, LaunchSpec } from './codex.js';
 
-// 작업마다 새 프로세스 그룹으로 띄우고, 그룹과 작업 표식으로 남은 프로세스를 찾는다.
+// 작업자의 공통 실행 제어: 모델 CLI를 작업마다 새 프로세스 그룹으로 띄우고, 그룹과 작업 표식으로 남은 프로세스를
+// 찾아 끝내고 센다. 실행기(Claude·Codex)와 무관하다. 실행기 어댑터는 argv·env·stdin만 넘기고 직접 spawn하지 않는다.
 // 한계: 환경을 지우고 새 세션으로 빠져나간 자식은 찾지 못한다. cgroup의 cgroup.procs 확인은 T16b 실측 뒤다.
+
+// 작업이 띄운 프로세스를 찾는 표식(env 이름). 새 세션으로 빠져나간 자식도 환경을 지우지 않았다면 찾는다.
+export const TASK_MARKER = 'HOMELAB_WORKER_TASK';
+
+// 프로세스가 생기기 전에 실패했다(실행 파일 없음 등). 남은 프로세스가 없으니 unknown이 아니다.
+export class LaunchFailed extends Error { constructor() { super('launch_failed'); } }
+
+export interface LaunchSpec {
+  job: string; args: string[]; cwd: string; env: Record<string, string>; stdin: string;
+  // stdout 바이트 상한. 넘으면 launcher가 작업 그룹을 끝내고 overflow로 알린다(rev r1 S3).
+  limits: { lineBytes: number; outputBytes: number };
+}
+export interface LaunchResult { exit: { code: number | null; signal: string | null } | null; overflow?: boolean }
+export interface ProcessLauncher {
+  // 줄은 모아 두지 않고 onLine으로 바로 넘긴다. 중단 신호는 spawn 전에도 확인한다.
+  run(spec: LaunchSpec, signal: AbortSignal, onLine: (line: string) => void): Promise<LaunchResult>;
+  // 종료 사유와 무관하게 작업 그룹 전체를 끝낸다. 남은 수를 모르면 null.
+  terminate(job: string): Promise<void>;
+  survivors(job: string): Promise<number | null>;
+}
+
 // 시작 시각을 아직 읽지 못한 그룹. 막 띄운 자식이라 재사용 번호 확인을 건너뛴다.
 const PENDING = -1;
-export class ProcessGroupLauncher implements CodexLauncher {
+export class ProcessGroupLauncher implements ProcessLauncher {
   private readonly groups = new Map<string, { pgid: number; since: number }>();
-  constructor(private readonly command: readonly [string, ...string[]] = ['codex'],
+  constructor(private readonly command: readonly [string, ...string[]],
     private readonly options: { graceMs?: number; proc?: string } = {}) {}
   async run(spec: LaunchSpec, signal: AbortSignal, onLine: (line: string) => void): Promise<LaunchResult> {
     // 이미 중단된 실행은 띄우지 않는다. 기록을 남겨 소멸 확인이 "이 실행으로 생긴 프로세스 없음"을 안다(rev r1 R1).
