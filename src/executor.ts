@@ -59,6 +59,7 @@ export interface AdapterRun {
   // 프로세스 소멸을 확인한 뒤에만 부른다. 살아 있는 프로세스가 결과 파일을 바꿔치기할 수 있다.
   finish(lines: readonly string[], exit: ExitStatus): Promise<EngineOutcome>;
   // 항상 부른다(열어 둔 핸들 닫기). confirmed(남은 프로세스 0개)일 때만 실행기 고유 잔여물을 지운다.
+  // 지우지 못하면 throw한다(숨기지 않는다). 공통부가 그 실행을 기록 정리 실패로 다루고 나중에 다시 부를 수 있다.
   cleanup(confirmed: boolean): Promise<void>;
 }
 export interface ChatAdapter {

@@ -55,6 +55,11 @@ process.stdin.on('end', () => {
     fs.writeFileSync(path.join(process.env.HOME, '.claude.json'), '{}');
     fs.writeFileSync(path.join(process.env.TMPDIR, 'scratch'), 'x');
   }
+  // 실행 디렉터리 삭제가 실패하는 경우를 흉내 낸다: 기록을 남긴 디렉터리를 쓰기 금지로 바꾼다(비root에서만 막힌다).
+  if (mode.lock) {
+    const dir = path.join(process.env.CLAUDE_CONFIG_DIR, 'projects', 'locked');
+    fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, 'session.jsonl'), '{}\\n'); fs.chmodSync(dir, 0o500);
+  }
   fs.writeFileSync(path.join(__dirname, 'seen.json'), JSON.stringify({ args, cwd: process.cwd(), entries: fs.readdirSync('.'),
     env: process.env, input, files, root }));
   const emit = e => process.stdout.write(JSON.stringify({ session_id: 'fixture-session', ...e }) + '\\n');
@@ -63,19 +68,27 @@ process.stdin.on('end', () => {
     permissionMode: 'dontAsk', apiKeySource: 'none', claude_code_version: '2.1.308', slash_commands: [], output_style: 'default',
     skills: [], plugins: [], uuid: 'u0', ...(mode.init || {}) });
   if (mode.kind === 'hang') { setInterval(() => {}, 1000); return; }
+  // Opus 5.5 자동 모델 전환(refusal fallback) 이벤트 뒤 멈추지 않고 계속 도는 경우.
+  if (mode.kind === 'fallback') {
+    emit({ type: 'system', subtype: 'model_refusal_fallback', trigger: 'refusal', direction: 'sticky', scope: 'session',
+      original_model: model, fallback_model: 'claude-opus-4-8', request_id: null, uuid: 'u1' });
+    setInterval(() => {}, 1000); return;
+  }
   if (mode.kind === 'tool') {
     emit({ type: 'assistant', parent_tool_use_id: null, uuid: 'u1',
-      message: { content: [{ type: 'tool_use', id: 'toolu_bash', name: 'Bash', input: { command: 'cat /etc/hostname' } }] } });
+      message: { model, content: [{ type: 'tool_use', id: 'toolu_bash', name: 'Bash', input: { command: 'cat /etc/hostname' } }] } });
     setInterval(() => {}, 1000); return;
   }
   if (mode.kind === 'error') {
+    // API 오류는 CLI가 만든 합성 assistant 메시지다(모델 표식 <synthetic>, 2.1.308 바이너리).
     emit({ type: 'assistant', parent_tool_use_id: null, uuid: 'u1', error: mode.error, api_error_status: mode.status,
-      message: { content: [{ type: 'text', text: 'API Error' }] } });
+      message: { model: '<synthetic>', content: [{ type: 'text', text: 'API Error' }] } });
     emit({ type: 'result', subtype: mode.subtype || 'success', is_error: true, api_error_status: mode.status, result: 'API Error',
       num_turns: 1, uuid: 'u2' });
     process.stdout.write('', () => process.exit(1)); return;
   }
-  emit({ type: 'assistant', parent_tool_use_id: null, uuid: 'u1', message: { content: [{ type: 'text', text: '모델 본문' },
+  // 답한 모델: 보통은 요청한 모델이고, mode.answeredBy로 다른 모델을 흉내 낸다(전환 이벤트 없이 바뀐 경우).
+  emit({ type: 'assistant', parent_tool_use_id: null, uuid: 'u1', message: { model: mode.answeredBy || model, content: [{ type: 'text', text: '모델 본문' },
     { type: 'tool_use', id: 'toolu_out', name: 'StructuredOutput', input: mode.answer }] } });
   emit({ type: 'user', parent_tool_use_id: null, uuid: 'u2',
     message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_out', content: 'Structured output provided successfully' }] } });
@@ -251,7 +264,7 @@ test('CLD-05 결과 해석: structured_output만 답, 한도·인증은 구조�
   const bad = { code: 1, signal: null };
   const line = (value: unknown) => JSON.stringify(value);
   const assistantError = (error: string | undefined, status?: number) => line({ type: 'assistant', error, api_error_status: status,
-    message: { content: [{ type: 'text', text: 'API Error: 401 rate limit' }] } });
+    message: { model: '<synthetic>', content: [{ type: 'text', text: 'API Error: 401 rate limit' }] } });
   const errorResult = (status?: number, subtype = 'success') => line({ type: 'result', subtype, is_error: true, api_error_status: status, result: 'x' });
   const success = (value: unknown) => line({ type: 'result', subtype: 'success', is_error: false, result: '429 Too Many Requests', structured_output: value });
   const cases: [string[], { code: number | null; signal: string | null }, string, string?][] = [
@@ -539,4 +552,76 @@ test('CLD-14 진입점 프로세스: 토큰이 틀리거나 사람 홈 경로면
     assert.deepEqual(JSON.parse(run.output().trim()), { component: 'worker', level: 'error', event: 'worker_start_failed', reason });
     assert.ok(!run.output().includes(TOKEN.slice(0, 20)) && !run.output().includes('BEGIN PUBLIC KEY'), reason);
   }
+});
+
+// ---- 리뷰 exec-r1 회귀 시험(수정 전 실패를 먼저 확인했다) ----
+test('CLD-15 [r1 P1] Opus 5.5 자동 모델 전환: 끄는 env를 넘기고, 전환 이벤트·다른 모델의 답은 즉시 중단·실패', { timeout: 20_000 }, async () => {
+  // 자동 전환을 끄는 공식 변수 [확인: 공식 env 문서, 2.1.308 바이너리의 전환 조건].
+  const launcher = new SpawnLauncher(fakeBin);
+  assert.equal((await claudeLane(launcher).run(chatRequest(job()), new AbortController().signal)).status, 'succeeded');
+  assert.equal((await seen()).env.CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK, '1');
+  const expect = { model: MODEL, apiKeySource: 'none', version: '2.1.308' };
+  const ok = { code: 0, signal: null };
+  const line = (value: unknown) => JSON.stringify(value);
+  const init = line({ type: 'system', subtype: 'init', tools: ['StructuredOutput'], mcp_servers: [], model: MODEL, apiKeySource: 'none',
+    claude_code_version: '2.1.308' });
+  const assistant = (model: unknown) => line({ type: 'assistant', message: { model, content: [{ type: 'text', text: 'x' }] } });
+  const success = line({ type: 'result', subtype: 'success', is_error: false, structured_output: ANSWER });
+  const fallback = line({ type: 'system', subtype: 'model_refusal_fallback', trigger: 'refusal', direction: 'sticky', scope: 'session',
+    original_model: MODEL, fallback_model: 'claude-opus-4-8' });
+  const cases: [string[], string, string?][] = [
+    [[init, assistant(MODEL), success], 'output'],
+    // 날짜가 붙은 같은 모델 ID는 같은 모델이다.
+    [[init, assistant(`${MODEL}-20261001`), success], 'output'],
+    // 리뷰어 재현: init은 고정 모델, 전환 이벤트 뒤 다른 모델이 답하고 결과는 성공.
+    [[init, fallback, assistant('claude-opus-4-8'), success], 'failed', 'policy_violation'],
+    [[init, fallback, success], 'failed', 'policy_violation'],
+    // 전환 이벤트 없이 다른 모델이 답해도 실패다.
+    [[init, assistant('claude-opus-4-8'), success], 'failed', 'policy_violation'],
+    [[init, assistant(`${MODEL}x`), success], 'failed', 'policy_violation'],
+    [[init, assistant(undefined), success], 'failed', 'policy_violation'],
+  ];
+  for (const [lines, kind, reason] of cases) {
+    const outcome = interpretClaudeStream(lines, ok, expect);
+    assert.equal(outcome.kind, kind, lines.join(' | '));
+    if (reason) assert.equal(outcome.kind === 'failed' && outcome.reason, reason, lines.join(' | '));
+  }
+  // 실행 중: 전환 이벤트가 오면 기한을 기다리지 않고 바로 멈춘다. 다른 모델이 답하면 결과가 성공이어도 실패다.
+  for (const value of [{ kind: 'fallback' }, { kind: 'answer', answer: ANSWER, answeredBy: 'claude-opus-4-8' }]) {
+    await mode(value);
+    const watched = new SpawnLauncher(fakeBin);
+    const j = job();
+    assert.deepEqual(await claudeLane(watched).run(chatRequest(j), new AbortController().signal), { status: 'failed', stopped: true },
+      JSON.stringify(value));
+    assert.deepEqual(watched.aborted, [j.id], JSON.stringify(value));
+  }
+});
+
+test('CLD-16 [r1 P2] 실행 디렉터리 삭제 실패: 성공으로 내지 않고, 남은 동안 readiness 503·새 실행 안 띄움, 지워지면 재개', async t => {
+  if (process.getuid?.() === 0) { t.skip('root는 쓰기 금지 디렉터리도 지운다'); return; }
+  await mode({ kind: 'answer', answer: ANSWER, lock: true });
+  const launcher = new SpawnLauncher(fakeBin);
+  const events: unknown[] = [];
+  const lane = claudeLane(launcher, { onEvent: event => { events.push(event); } });
+  let locked: string | undefined;
+  try {
+    const first = await lane.run(chatRequest(job()), new AbortController().signal);
+    // 단언보다 먼저 잠근 경로를 잡아 둔다. 회귀로 실패해도 finally가 풀어 시험 디렉터리를 지울 수 있다.
+    locked = join((await seen()).env.CLAUDE_CONFIG_DIR!, 'projects', 'locked');
+    assert.deepEqual(first, { status: 'failed', stopped: true });
+    assert.equal((await runs()).length, 1);
+    assert.equal(await lane.ready(), false);
+    // 잔여물이 있는 동안 다음 실행은 띄우지 않는다.
+    await mode({ kind: 'answer', answer: ANSWER });
+    assert.deepEqual(await lane.run(chatRequest(job()), new AbortController().signal), { status: 'failed', stopped: true });
+    assert.equal(launcher.specs.length, 1);
+    // 원인이 풀리면 다음 확인 때 다시 지우고 재개한다.
+    await chmod(locked, 0o700);
+    assert.equal(await lane.ready(), true);
+    assert.deepEqual(await runs(), []);
+    assert.equal((await lane.run(chatRequest(job()), new AbortController().signal)).status, 'succeeded');
+    assert.equal(launcher.specs.length, 2);
+    // 값 없는 사유만 알린다(경로·내용 없음).
+    assert.deepEqual(events, [{ event: 'chat_cleanup_failed' }, { event: 'chat_cleanup_recovered' }]);
+  } finally { if (locked) await chmod(locked, 0o700).catch(() => {}); }
 });

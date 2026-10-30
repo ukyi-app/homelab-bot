@@ -14,6 +14,8 @@ import type { AdapterRun, ChatAdapter, ChatRun, EngineOutcome, ExecutorCapabilit
 //   디렉터리이고 공통부가 실행 뒤 통째로 지운다(플래그가 모든 파일 쓰기를 막는다는 보증은 아니다).
 // - `--bare`는 쓰지 않는다: bare는 CLAUDE_CODE_OAUTH_TOKEN을 읽지 않는다 [확인: --help "OAuth and keychain are never read"].
 // - `--fallback-model`을 쓰지 않는다. 한도·인증 때 다른 모델·계정·실행기로 넘어가지 않는다(D-14 조건 2).
+// - Opus 5.5의 내용 기반 자동 모델 전환(refusal fallback)은 `--fallback-model`과 별개로 기본 켜져 있다. env로 끄고,
+//   그래도 전환 이벤트나 다른 모델의 응답이 보이면 정책 위반으로 즉시 멈춘다. 모델 고정은 사용자 결정이다(리뷰 exec-r1 P1).
 export const CLAUDE_CLI_VERSION = '2.1.308';
 export const CLAUDE_CHAT_CAPABILITIES: ExecutorCapabilities = Object.freeze({
   executor: 'claude', cliVersion: CLAUDE_CLI_VERSION, lanes: Object.freeze({ chat: true, task: false }),
@@ -22,12 +24,15 @@ export const CLAUDE_CHAT_CAPABILITIES: ExecutorCapabilities = Object.freeze({
 } as const);
 // 출력 전달용 내부 도구. 작업 도구가 아니라 구조화 출력 프로토콜이라 도구 예산에서 뺀다 [확인: 바이너리의 도구 이름].
 export const STRUCTURED_OUTPUT_TOOL = 'StructuredOutput';
-// 비밀이 아닌 고정 env. 부가 통신(텔레메트리·오류 보고·업데이트·피드백)과 claude.ai connector를 끈다.
+// 비밀이 아닌 고정 env. 부가 통신(텔레메트리·오류 보고·업데이트·피드백)과 claude.ai connector, 자동 모델 전환을 끈다.
+// CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK [확인: 공식 env 문서, 2.1.308 바이너리의 전환 조건이 이 값을 본다].
 export const CLAUDE_FIXED_ENV: Readonly<Record<string, string>> = Object.freeze({
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', DISABLE_TELEMETRY: '1', DISABLE_ERROR_REPORTING: '1',
   DISABLE_FEEDBACK_COMMAND: '1', CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: '1', ENABLE_CLAUDEAI_MCP_SERVERS: 'false',
-  DISABLE_UPDATES: '1',
+  DISABLE_UPDATES: '1', CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK: '1',
 });
+// API 오류를 알리려고 CLI가 만드는 assistant 메시지의 모델 표식. 모델이 쓴 답이 아니다 [확인: 2.1.308 바이너리].
+export const SYNTHETIC_MODEL = '<synthetic>';
 // 인증 방식별 자격 변수와 init 이벤트의 apiKeySource 기대값. 지금은 구독 장기 토큰 하나만 있다(사용자 결정).
 // API 키 방식을 더하려면 `ANTHROPIC_API_KEY`·apiKeySource `ANTHROPIC_API_KEY`·`--bare` 검토와 프로필 항목이 함께 필요하다.
 // `-p`에서는 API 키가 OAuth 토큰보다 우선하므로 [확인: 공식 인증 문서] 한 실행에 자격 변수는 하나만 넣는다.
@@ -55,6 +60,7 @@ interface Compact {
   tools?: unknown; mcp_servers?: unknown; model?: unknown; apiKeySource?: unknown; claude_code_version?: unknown;
   error?: unknown; api_error_status?: unknown; api_error?: unknown; tool_uses?: { id: unknown; name: unknown }[];
   is_error?: unknown; structured_output?: unknown; num_turns?: unknown;
+  original_model?: unknown; fallback_model?: unknown;
 }
 const record = (value: unknown): Record<string, unknown> | null =>
   typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -78,7 +84,11 @@ export function compactClaudeEvent(line: string): Compact | null {
         const b = record(block);
         return b && typeof b.type === 'string' && b.type.endsWith('tool_use') ? [{ id: b.id, name: b.name }] : [];
       }) : [];
-    Object.assign(compact, { error: event.error, api_error_status: event.api_error_status, tool_uses: uses });
+    // 응답한 모델(API 응답의 message.model). 줄인 줄에는 model로 남는다.
+    const model = record(event.message)?.model ?? event.model;
+    Object.assign(compact, { model, error: event.error, api_error_status: event.api_error_status, tool_uses: uses });
+  } else if (event.type === 'system' && event.subtype === 'model_refusal_fallback') {
+    Object.assign(compact, { original_model: event.original_model, fallback_model: event.fallback_model });
   } else if (event.type === 'result') {
     Object.assign(compact, { is_error: event.is_error, api_error_status: event.api_error_status, api_error: event.api_error,
       structured_output: event.structured_output, num_turns: event.num_turns });
@@ -96,6 +106,17 @@ export function initViolation(init: Compact, expect: ClaudeExpectation): string 
   if (init.apiKeySource !== expect.apiKeySource) return 'credential_source_mismatch';
   if (init.claude_code_version !== expect.version) return 'version_mismatch';
   return null;
+}
+
+// init 뒤 이벤트의 모델 정책. 자동 모델 전환 이벤트는 그 자체로 위반이다(env로 껐는데 왔다). assistant 메시지는
+// 요청한 모델(날짜가 붙은 같은 ID 포함)이나 CLI 합성 오류 메시지여야 한다. 모델이 없거나 다르면 위반이다.
+export function modelViolation(event: Compact, expect: ClaudeExpectation): string | null {
+  if (event.type === 'system' && event.subtype === 'model_refusal_fallback') return 'model_fallback';
+  if (event.type !== 'assistant') return null;
+  const model = event.model;
+  if (model === SYNTHETIC_MODEL || model === expect.model) return null;
+  return typeof model === 'string' && model.startsWith(`${expect.model}-`) && /^\d{8}$/.test(model.slice(expect.model.length + 1))
+    ? null : 'model_mismatch';
 }
 
 // 한도·인증 분류. 근거는 CLI가 낸 구조화 필드뿐이다(assistant `error` 종류, HTTP 상태). 모델 답이나 결과 텍스트에
@@ -127,6 +148,7 @@ export function interpretClaudeStream(lines: readonly string[], exit: ExitStatus
   const inits = events.filter(e => e.type === 'system' && e.subtype === 'init');
   if (inits.length !== 1) return failed('invalid_stream');
   if (initViolation(inits[0]!, expect)) return failed('policy_violation');
+  if (events.some(event => modelViolation(event, expect))) return failed('policy_violation');
   const results = events.filter(e => e.type === 'result');
   if (results.length > 1) return failed('invalid_stream');
   const apiErrors = events.filter(e => e.type === 'assistant' && e.error !== undefined);
@@ -171,6 +193,7 @@ export class ClaudeChatAdapter implements ChatAdapter {
           initChecked = true;
           violation = initViolation(compact, expect);
         }
+        violation ??= modelViolation(compact, expect);
         const use = compact.tool_uses?.find(u => u.name !== STRUCTURED_OUTPUT_TOOL);
         const tool = use ? (typeof use.id === 'string' && use.id ? use.id : `unnamed-${String(use.name)}`) : null;
         return { line: JSON.stringify(compact), tool, violation };

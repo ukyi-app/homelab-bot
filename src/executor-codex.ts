@@ -93,11 +93,13 @@ export class CodexChatAdapter implements ChatAdapter {
           outputTooLarge: output.status === 'too_large' });
       },
       async cleanup(confirmed) {
+        // 여러 번 불릴 수 있다(공통부가 지우지 못한 기록을 다시 지울 때). 이미 닫힌 핸들의 닫기 오류는 무시한다.
         await dir.close().catch(() => {});
         if (!confirmed) return;
         // `--ephemeral`이 남긴 것이 있으면 지운다. 이 CODEX_HOME의 세션은 대화 레인 것뿐이다(작업 레인 미연결).
-        // 세션 위치 `sessions/`·`archived_sessions/`는 [가정: Codex 기본 배치]다.
-        for (const name of ['sessions', 'archived_sessions']) await rm(join(home, name), { recursive: true, force: true }).catch(() => {});
+        // 세션 위치 `sessions/`·`archived_sessions/`는 [가정: Codex 기본 배치]다. 지우지 못하면 오류를 올려 보내
+        // 공통부가 실패로 다루고 다시 지운다(리뷰 exec-r1 P2: 예전에는 오류를 숨겼다).
+        for (const name of ['sessions', 'archived_sessions']) await rm(join(home, name), { recursive: true, force: true });
       },
     };
   }

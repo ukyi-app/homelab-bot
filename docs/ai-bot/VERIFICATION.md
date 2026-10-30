@@ -476,3 +476,19 @@ PGlite는 transaction을 직렬화한다. 실제 PostgreSQL 다중 연결 경합
 - **시험이 잡는지(일부러 망가뜨려 봄, 각각 되돌림).** init 위반 즉시 중단 제거 → CLD-07, 공통 유출 검사 제거 → CLD-09, 토큰을 argv에도 → CLD-03 등, 작업자 env 상속 → CLD-03, 실행 디렉터리 삭제 제거 → CLD-03·04·06·09, 토큰을 기동 때 한 번만 읽기 → CLD-10, `.claude*` 개인 경로 검사 제거 → CLD-11, `--bare` 추가 → CLD-02, 도구 끈 실행기에 요청 도구 예산 적용 → CLD-07, 결과 텍스트로 한도 분류 → CLD-05, 모델 별칭 허용 → CLD-01·14, API 키 조합을 첫 프로필로 몰래 허용 → CLD-01·14, init 모델 대조 제거 → CLD-05·07, Codex 세션 정리 제거 → WRK-06, 소멸 미확인에도 결과 사용 → CLD-08. 15개 모두 실패로 잡혔다. 처음 돌렸을 때 두 경우(토큰을 argv에, 별칭 허용)는 실패 대신 시험 파일이 끝나지 않았다(실행이 뜨기를 기다리는 루프, 회귀로 기동해 버린 진입점). 기다림을 횟수로 끊고 진입점 시험에 10초 상한을 둬 실패로 잡히게 고쳤다.
 - **이미지(로컬 podman, `nice -n 10`).** 최종 이미지 **972MB**(이전 679MB, +293MB = Claude 플랫폼 실행 파일). 빌드 중 `claude --version`이 정확히 `2.1.308 (Claude Code)`이고 `/tmp`에 아무것도 남기지 않는지 확인한다. 네트워크 없음·읽기 전용 루트·uid 10001·합성 토큰으로: `/usr/local/bin/claude` → 플랫폼 실행 파일, `/app` 아래 남이 못 읽는 파일 0개·그룹/기타 쓰기 가능한 일반 파일 0개, 공개 키 없음·API 키 프로필·별칭 모델 → 종료 코드 1과 사유 코드, 정상 기동(이미지 안 실제 `claude --version` 대조) → `{"profile":"claude-subscription","cli":"2.1.308","model":"claude-opus-5-5","credential":"present"}` → `/readyz` 200 → 서명한 작업 레인 요청 200 `failed`(CLI 미실행) → 재사용 403 → 토큰 파일 치움 503·복구 200 → SIGTERM 종료 코드 0. 로그에 토큰 없음. 대기 메모리 35.3MB, 프로세스는 PID 1 하나, `/tmp` 비어 있음. 로컬 digest는 CI와 다르므로 sandbox는 main 빌드의 GHCR digest를 쓴다.
 - **남은 검증(S11·S12, 승인 뒤).** 실제 stream-json 모양과 init 값(`model` 글자 그대로, `apiKeySource` `none`, `tools`에 `StructuredOutput`만), `--tools ""`와 구조화 출력의 동시 동작, 한도·인증 오류 필드, 최소 egress(`api.anthropic.com` 외 필요 여부, DNS 없는 파드의 프록시 경유), 대화 중 메모리·`/tmp`·응답 시간, CLI가 실행 디렉터리 밖에 쓰는 파일.
+
+### 리뷰 exec-r1 반영 (2026-10-30, 로컬)
+
+- 지적 3건(P1 2, P2 1)을 모두 고쳤다. 지적마다 리뷰어 재현을 회귀 시험으로 옮겨 **수정 전 실패를 먼저 확인**했다(그 4개만 실패, 나머지 38개 통과). 모델 호출·로그인 없음, 합성 자격만.
+- `npm run check` 통과, `npm test` **633 tests / 624 pass / 0 fail / 9 skipped**(직전 629 / 620 / 0 / 9에 회귀 시험 4개). Dockerfile·의존성은 바뀌지 않아 이미지는 다시 빌드하지 않았다.
+
+| 시험 ID | 등급 / 판정 | 수정 전 실패(리뷰어 재현) | 고친 것 |
+|---|---|---|---|
+| WRK-20 [r1 P1] Codex 홈 별칭 | local_integration / pass | `CODEX_HOME`이 작업자 디렉터리를 가리키는 정상 심링크면 시드·readiness는 성공하는데 자격 객체가 별칭 경로를 `O_NOFOLLOW`로 못 열어 비밀 0개 → 갱신 토큰이 섞인 답이 `succeeded`로 나감 | 공장 함수가 홈을 한 번 해석해 어댑터·자격에 같은 실제 경로. 실행 전·후 자격을 못 읽거나 비밀이 0개면 `failed`(실행 전이면 띄우지 않음). 공통 실행 전 검사도 비밀 0개면 거부. 실행 중 auth.json이 망가져 실행 뒤 못 읽는 경우도 `failed` |
+| CLD-15 [r1 P1] 자동 모델 전환 | mock·local_integration / pass | 자동 전환을 끄는 env 없음. init 뒤 `system/model_refusal_fallback`, 다른 모델(`claude-opus-4-8`)의 assistant 응답, 모델 없는 응답이 모두 무시돼 결과 `output` | env `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1`. 전환 이벤트·요청 모델이 아닌 응답(날짜 접미어는 같은 모델, CLI 합성 오류 `<synthetic>`은 예외)은 실행 중 즉시 중단·판정 실패 |
+| CLD-16 [r1 P2] 실행 디렉터리 삭제 실패 | local_integration / pass(비root) | 남긴 기록 디렉터리를 쓰기 금지로 바꾸면 삭제 실패를 숨겨 두 실행 모두 `succeeded`, readiness true, 실행 디렉터리 2개가 남음 | 결과 확정 전에 삭제·부재를 확인. 실패하면 답을 게시하지 않고 `failed`, 잔여물로 추적, 남은 동안 새 실행 안 띄움·readiness 503, 확인 때마다 다시 지워 풀리면 재개. 값 없는 사건 로그 |
+| WRK-21 [r1 P2] Codex 세션 정리 실패 | local_integration / pass(비root) | Codex 어댑터가 `sessions/` 삭제 오류를 숨겨 `succeeded` | 어댑터 정리 오류를 올려 보내 공통부가 같은 방식으로 처리 |
+
+- 리뷰어 재현 스크립트를 고친 빌드에 그대로 돌림: 전환 흐름 위반 `[null, model_fallback, model_mismatch, null]`·결과 `failed`, 정리 실패 `first=failed, second=failed(미실행), ready=false, 남은 디렉터리 1`, Codex 별칭 `secrets=1, status=failed, secretPublished=false`.
+- 시험이 잡는지(고친 곳을 하나씩 되돌림): 별칭 경로를 자격에 넘김, 파일 자격 읽기 실패를 빈 목록으로(공통 검사 제거와 함께도), 실행 뒤 자격 읽기 실패 무시 → WRK-20. 전환 끄는 env 제거, 실행 중·판정의 모델 확인 제거, assistant 모델 대조 제거 → CLD-15. 정리 실패해도 결과 그대로, 실행 전 잔여물 확인 제거, readiness가 잔여물 무시 → CLD-16·WRK-21. Codex 세션 정리 오류 숨김 → WRK-21. 12가지 모두 실패로 잡혔다.
+- 고쳐 둔 것: 리뷰가 짚은 대로 "시작 실패가 stdout에 구조화돼 온다"는 직전 보고는 조건부였다. 2.1.308은 일부 시작 실패 결과를 `CLAUDE_CODE_STARTUP_FAILURE_RESULTS` opt-in에서만 낸다. 넣지 않았고, 그런 실패는 결과 없음 → `failed`로 닫힌다(ARCHITECTURE §12 남는 것).

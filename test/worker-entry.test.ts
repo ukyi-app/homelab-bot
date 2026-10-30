@@ -15,7 +15,7 @@ import { FORBIDDEN_FLAGS } from '../src/codex-config.js';
 import { FileMutableCredential } from '../src/credentials.js';
 import { CodexChatAdapter, chatArgs, interpretCodexChat } from '../src/executor-codex.js';
 import type { CodexChatReport } from '../src/executor-codex.js';
-import { executorVersion } from '../src/executor-profiles.js';
+import { createExecutor, executorVersion, selectProfile } from '../src/executor-profiles.js';
 import type { ProcessLauncher } from '../src/process-launcher.js';
 import { SerialWorker, WorkerSigner, WorkerVerifier } from '../src/worker.js';
 import type { WorkerRequest } from '../src/worker.js';
@@ -50,7 +50,11 @@ process.stdin.on('end', () => {
   if (mode.session) {
     const dir = path.join(home, 'sessions', '2026', '10', '30');
     fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, 'rollout-fixture.jsonl'), '{}\\n');
+    // 세션 정리가 실패하는 경우를 흉내 낸다(비root에서만 막힌다).
+    if (mode.lock) fs.chmodSync(dir, 0o500);
   }
+  // 실행 중 auth.json이 망가지는 경우(갱신 실패 등)를 흉내 낸다.
+  if (mode.breakAuth) { fs.rmSync(path.join(home, 'auth.json')); fs.mkdirSync(path.join(home, 'auth.json')); }
   const emit = e => process.stdout.write(JSON.stringify(e) + '\\n');
   emit({ type: 'thread.started', thread_id: 'chat-thread-1' }); emit({ type: 'turn.started' });
   if (mode.kind === 'hang') { setInterval(() => {}, 1000); return; }
@@ -602,4 +606,64 @@ test('WRK-19 [r1 P2] nonce 파일을 만든 뒤 시각 기록·닫기 I/O가 실
     // 표식은 남아 있어도 된다(재사용은 계속 거부).
     assert.equal(await store.consume(nonce), false, method);
   }
+});
+
+// ---- 리뷰 exec-r1 회귀 시험(수정 전 실패를 먼저 확인했다) ----
+test('WRK-20 [r1 P1] CODEX_HOME이 작업자 디렉터리의 정상 별칭(심링크)이어도 시드·readiness·반사 차단이 같은 실제 경로로 동작', async () => {
+  const alias = join(base, 'codex-home-alias');
+  await symlink(codexHome, alias);
+  const launcher = new SpawnLauncher(fakeBin);
+  const worker = await startWorker(workerConfig(env({ CODEX_HOME: alias })), { port: 0, host: '127.0.0.1', launcher });
+  const signer = new WorkerSigner(keys.privateKey);
+  const client = new HttpWorker(`http://127.0.0.1:${(worker.server.address() as AddressInfo).port}/`, fetch);
+  const call = async () => { const j = job(); const request = chatRequest(j);
+    return client.execute(request, signer.issue(j, 'execute', request), new AbortController().signal); };
+  try {
+    assert.equal(worker.credential, 'seeded');
+    assert.equal(await readFile(join(codexHome, 'auth.json'), 'utf8'), SEED);
+    assert.equal((await fetch(`http://127.0.0.1:${(worker.server.address() as AddressInfo).port}/readyz`)).status, 200);
+    // 리뷰어 재현: 답에 자격(갱신 토큰)이 섞이면 게시하지 않는다.
+    await mode({ kind: 'answer', answer: { ...ANSWER, facts: [`토큰 ${FAKE_TOKEN}`] } });
+    assert.deepEqual(await call(), { status: 'failed', stopped: true });
+    await mode({ kind: 'answer', answer: ANSWER });
+    assert.equal((await call()).status, 'succeeded');
+    assert.equal((await seen()).env.CODEX_HOME, codexHome);
+    // 실행 뒤 자격(갱신본)을 다시 읽지 못하면 반사 검사를 끝낼 수 없어 게시하지 않는다.
+    await mode({ kind: 'answer', answer: ANSWER, breakAuth: true });
+    assert.deepEqual(await call(), { status: 'failed', stopped: true });
+    // 실행에 쓸 자격을 읽지 못하면 반사 검사 없이 띄우지 않는다(위 실행이 auth.json을 디렉터리로 바꿔 두었다).
+    await mode({ kind: 'answer', answer: ANSWER });
+    const spawned = launcher.specs.length;
+    assert.deepEqual(await call(), { status: 'failed', stopped: true });
+    assert.equal(launcher.specs.length, spawned);
+  } finally { await worker.close(); }
+  // 같은 조립(공장 함수)을 직접 써도 어댑터와 자격이 같은 실제 경로를 본다.
+  await rm(join(codexHome, 'auth.json'), { recursive: true });
+  const executor = createExecutor(selectProfile('codex', 'CODEX_AUTH_JSON', 'cli-default'),
+    { codexHome: alias, credentialFile: join(seedDir, 'CODEX_AUTH_JSON') }, []);
+  assert.equal(await executor.credential.open(), 'seeded');
+  assert.ok((await executor.credential.forRun()).secrets.length > 0);
+});
+
+test('WRK-21 [r1 P2] Codex 세션 정리 실패: 성공으로 내지 않고, 남은 동안 readiness 503·새 실행 안 띄움, 지워지면 재개', async t => {
+  if (process.getuid?.() === 0) { t.skip('root는 쓰기 금지 디렉터리도 지운다'); return; }
+  await seedAuth(codexHome, join(seedDir, 'CODEX_AUTH_JSON'));
+  await mode({ kind: 'answer', answer: ANSWER, session: true, lock: true });
+  const launcher = new SpawnLauncher(fakeBin);
+  const events: unknown[] = [];
+  const lane = codexLane(launcher, { onEvent: event => { events.push(event); } });
+  const locked = join(codexHome, 'sessions', '2026', '10', '30');
+  try {
+    assert.deepEqual(await lane.run(chatRequest(job()), new AbortController().signal), { status: 'failed', stopped: true });
+    assert.equal(await lane.ready(), false);
+    await mode({ kind: 'answer', answer: ANSWER });
+    assert.deepEqual(await lane.run(chatRequest(job()), new AbortController().signal), { status: 'failed', stopped: true });
+    assert.equal(launcher.specs.length, 1);
+    await chmod(locked, 0o700);
+    assert.equal(await lane.ready(), true);
+    assert.deepEqual((await readdir(codexHome)).sort(), ['auth.json', 'config.toml']);
+    assert.deepEqual((await readdir(base)).filter(name => name.startsWith('homelab-chat-')), []);
+    assert.equal((await lane.run(chatRequest(job()), new AbortController().signal)).status, 'succeeded');
+    assert.deepEqual(events, [{ event: 'chat_cleanup_failed' }, { event: 'chat_cleanup_recovered' }]);
+  } finally { await chmod(locked, 0o700).catch(() => {}); }
 });

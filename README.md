@@ -218,7 +218,9 @@ WORKER_EXECUTOR=codex WORKER_MODEL=cli-default WORKER_CREDENTIAL_KEY=CODEX_AUTH_
 - Claude 토큰은 Secret 파일을 실행마다 다시 읽어 그 실행의 `claude` 자식 env(`CLAUDE_CODE_OAUTH_TOKEN`) 한 곳에만 넣는다. 파일·argv·로그에 쓰지 않고 영속 공간에 복사하지 않는다.
   Secret 값이 바뀌면 파드 재시작 없이 다음 실행부터 새 값이다. `GET /readyz`는 토큰 파일이 쓸 수 있는 모양으로 있으면 200이다(모델 호출 없음).
 - Claude 대화는 `claude -p --output-format stream-json`에 구조화 출력 스키마, 고정 모델, 도구·MCP 끔, 세션 기록 없음, `--safe-mode`로 돈다.
-  실행마다 빈 임시 HOME·`CLAUDE_CONFIG_DIR`·작업 공간을 쓰고 끝나면 지운다. 실행 중 도구 호출이나 다른 모델·자격 출처가 보이면 바로 멈추고 `failed`다.
+  Opus 5.5의 자동 모델 전환은 env(`CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1`)로 끈다. 실행마다 빈 임시 HOME·`CLAUDE_CONFIG_DIR`·작업 공간을 쓰고 끝나면 지운다.
+  실행 중 도구 호출, 자동 모델 전환 이벤트, 다른 모델의 응답, 다른 자격 출처가 보이면 바로 멈추고 `failed`다.
+  실행 기록을 지우지 못하면 그 답은 게시하지 않고(`failed`), 지워질 때까지 새 실행을 띄우지 않으며 `/readyz`는 503이다.
   한도는 `limited`, 인증 만료는 `auth_expired`로 답하고 다른 계정·모델·실행기로 넘어가지 않는다.
 - 개인 `~/.claude*`·`~/.codex*`를 자격·홈으로 쓰지 않는다(경로가 그 아래면 기동 실패). 로컬에서 돌려 볼 때도 빈 임시 디렉터리와 봇 전용 자격만 쓴다.
   실제 모델 호출은 첫 대화(T16b S12)에서 승인 뒤 한다. 작업 레인(`/task`)은 어떤 실행기에도 연결하지 않았다(T18 결정 대기).

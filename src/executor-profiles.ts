@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { assertWorkerRoot } from './codex-config.js';
 import { FileMutableCredential, StaticEnvCredential } from './credentials.js';
 import type { CredentialKind, WorkerCredential } from './credentials.js';
 import { CLAUDE_CHAT_CAPABILITIES, ClaudeChatAdapter } from './executor-claude.js';
@@ -60,9 +61,11 @@ export function createExecutor(profile: ExecutorProfile, paths: { credentialFile
     case 'claude':
       return { adapter: new ClaudeChatAdapter('subscription-token'), credential: new StaticEnvCredential(paths.credentialFile, homes) };
     case 'codex': {
-      let adapter: CodexChatAdapter;
-      try { adapter = new CodexChatAdapter(paths.codexHome ?? '', homes); } catch { throw new WorkerStartError('codex_home_unavailable'); }
-      return { adapter, credential: new FileMutableCredential(paths.codexHome!, paths.credentialFile, homes) };
+      // 홈을 여기서 한 번 검증·해석해 어댑터와 자격이 같은 실제 경로를 쓴다. 정상 별칭(심링크) 경로를 자격에 그대로
+      // 넘기면 O_NOFOLLOW 읽기가 실패해 반사 검사가 비밀을 모른 채 실행됐다(리뷰 exec-r1 P1).
+      let home: string;
+      try { home = assertWorkerRoot(paths.codexHome ?? '', homes); } catch { throw new WorkerStartError('codex_home_unavailable'); }
+      return { adapter: new CodexChatAdapter(home, homes), credential: new FileMutableCredential(home, paths.credentialFile, homes) };
     }
   }
 }

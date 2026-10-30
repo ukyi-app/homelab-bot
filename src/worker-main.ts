@@ -69,7 +69,8 @@ export interface RunningWorker {
   server: Server; profile: string; cliVersion: string; credential: 'seeded' | 'kept' | 'present'; close(): Promise<void>;
 }
 export async function startWorker(config: WorkerConfig,
-  options: { port?: number; host?: string; launcher?: ProcessLauncher; homes?: string[] } = {}): Promise<RunningWorker> {
+  options: { port?: number; host?: string; launcher?: ProcessLauncher; homes?: string[];
+    log?: (fields: Record<string, unknown>) => void } = {}): Promise<RunningWorker> {
   const homes = options.homes ?? humanHomes();
   assertNotPersonal('WORKER_CREDENTIAL_DIR', dirname(config.credentialFile), homes);
   assertNotPersonal('WORKER_NONCE_DIR', config.nonceDir, homes);
@@ -81,7 +82,9 @@ export async function startWorker(config: WorkerConfig,
   const nonces = new FileNonceStore(config.nonceDir);
   await nonces.open();
   const chat = new ChatLane(adapter, credential, options.launcher ?? new ProcessGroupLauncher([config.executorBin]),
-    { model: config.model, homes, ...(config.proxy ? { proxy: config.proxy } : {}) });
+    { model: config.model, homes, ...(config.proxy ? { proxy: config.proxy } : {}),
+      // 실행 기록 정리 실패는 readiness를 닫는다. 운영자가 원인을 보도록 값 없는 사건 이름만 남긴다.
+      onEvent: event => options.log?.({ level: event.event === 'chat_cleanup_failed' ? 'error' : 'info', ...event }) });
   const verifier = new WorkerVerifier(config.publicKey, nonce => nonces.consume(nonce));
   const worker = new SerialWorker(verifier, (request, signal) => chat.run(request, signal), request => chat.stop(request));
   // 종료가 시작되면 새 실행 요청은 실행 전에 거부한다(취소는 계속 받는다).
@@ -109,7 +112,7 @@ export async function main(env: Record<string, string | undefined> = process.env
   let config: WorkerConfig;
   try {
     config = workerConfig(env);
-    worker = await startWorker(config);
+    worker = await startWorker(config, { log });
   } catch (error) {
     // 예상한 사유는 코드만, 그 밖은 오류 종류 이름만 남긴다. 메시지에는 입력 조각이 실릴 수 있다.
     const reason = error instanceof WorkerStartError ? error.code

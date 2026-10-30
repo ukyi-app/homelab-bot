@@ -873,16 +873,18 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 **자격 방식.**
 
 - env-static(Claude 토큰): `<WORKER_CREDENTIAL_DIR>/<WORKER_CREDENTIAL_KEY>`(Secret 볼륨 파일). 읽기는 Codex 시드와 같은 `readSecretFile`이다: 링크의 최종 대상이 사람 홈 `.codex*`·`.claude*`면 거부, 검사한 경로와 연 파일 대조, 일반 파일·16KiB 이하. 앞뒤 공백·줄바꿈을 떼고 인쇄 가능한 ASCII 한 줄(16~8192자)이어야 한다. 토큰 접두어는 공식 형식이 없어 [미확인] 보지 않는다. 기동 때, readiness 때, **실행 준비 때마다** 다시 읽는다. 그래서 ESO가 값을 바꾸면 파드 재시작 없이 다음 실행부터 새 값이다(이미 실행 중인 자식은 옛 값). 영속 공간에 복사하거나 되쓰지 않는다. 사유 코드는 `credential_missing`·`credential_unreadable`·`credential_personal_path`·`credential_invalid`다.
-- file-mutable(Codex auth.json): 위 "T16b 작업자 진입점"의 시드 복사 그대로다.
+- file-mutable(Codex auth.json): 위 "T16b 작업자 진입점"의 시드 복사 그대로다. `CODEX_HOME`은 공장 함수(`createExecutor`)가 한 번 검증·해석한 실제 경로를 어댑터와 자격이 함께 쓴다. 정상 별칭(심링크) 경로를 자격에 그대로 넘기면 `O_NOFOLLOW` 읽기가 실패해 반사 검사가 비밀을 모른 채 돌았다(리뷰 exec-r1 P1).
+- 두 방식 모두 실행 준비 때나 실행 뒤 자격을 읽지 못하면(파일 자격은 비밀 문자열이 하나도 안 나와도) `credential_unreadable`로 그 실행을 `failed`로 닫는다. 빈 비밀 목록으로 반사 검사를 건너뛰지 않는다.
 
-**공통 실행 전 검사(`assertLaunchSafe`).** 다음이면 띄우지 않고 `failed`(남은 프로세스 없음)다: 어댑터 env 이름이 선언 목록 밖이거나 공통 기본 이름을 덮음, 자격 값이 어댑터의 자격 변수 밖(argv, 다른 env 값, 실행 디렉터리의 파일)에 있음, 정적 자격인데 자격 변수에 그 값이 없음. 작업자 프로세스 env는 읽거나 병합하지 않는다. 어댑터가 잘못돼도 공통부가 막는다(시험 CLD-09).
+**공통 실행 전 검사(`assertLaunchSafe`).** 다음이면 띄우지 않고 `failed`(남은 프로세스 없음)다: 어댑터 env 이름이 선언 목록 밖이거나 공통 기본 이름을 덮음, 자격 값이 어댑터의 자격 변수 밖(argv, 다른 env 값, 실행 디렉터리의 파일)에 있음, 정적 자격인데 자격 변수에 그 값이 없음, 반사 검사에 쓸 비밀이 하나도 없음. 작업자 프로세스 env는 읽거나 병합하지 않는다. 어댑터가 잘못돼도 공통부가 막는다(시험 CLD-09).
 
 **Claude 어댑터.** 플래그는 고정 바이너리 2.1.308 `claude --help`에서 모두 확인했다[실측]. 이벤트 모양은 같은 바이너리에 든 SDK 메시지 스키마(정적 읽기)와 공식 headless 문서다[가정: 실제 출력 대조는 S12].
 
 - argv: `-p --output-format stream-json --verbose --json-schema <CHAT_OUTPUT_JSON_SCHEMA> --model <WORKER_MODEL> --tools "" --strict-mcp-config --mcp-config {"mcpServers":{}} --no-session-persistence --permission-mode dontAsk --disable-slash-commands --safe-mode`. 프롬프트는 stdin이다(argv·파일에 두지 않음).
 - 쓰지 않는 플래그(`CLAUDE_FORBIDDEN_FLAGS`, 시험이 확인): `--bare`(OAuth 토큰을 읽지 않는다 [확인: --help]), `--fallback-model`, `--dangerously-skip-permissions`, `--resume`·`--continue`, `--add-dir`, `--allowedTools`, `--settings`·`--setting-sources`, `--system-prompt`, `--plugin-dir`, `--debug-file` 등.
-- env: 공통 기본 + `CLAUDE_CONFIG_DIR`(실행별 임시) + `CLAUDE_CODE_OAUTH_TOKEN`(토큰) + 고정 7개 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`·`DISABLE_TELEMETRY=1`·`DISABLE_ERROR_REPORTING=1`·`DISABLE_FEEDBACK_COMMAND=1`·`CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1`·`ENABLE_CLAUDEAI_MCP_SERVERS=false`·`DISABLE_UPDATES=1`. `-p`에서는 API 키가 OAuth 토큰보다 우선하므로 [확인: 공식 인증 문서] 자격 변수는 하나만 넣는다.
+- env: 공통 기본 + `CLAUDE_CONFIG_DIR`(실행별 임시) + `CLAUDE_CODE_OAUTH_TOKEN`(토큰) + 고정 8개 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`·`DISABLE_TELEMETRY=1`·`DISABLE_ERROR_REPORTING=1`·`DISABLE_FEEDBACK_COMMAND=1`·`CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1`·`ENABLE_CLAUDEAI_MCP_SERVERS=false`·`DISABLE_UPDATES=1`·`CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1`. 마지막 값은 Opus 5.5의 내용 기반 자동 모델 전환(Opus 5·Opus 4.8로 다시 실행)을 끈다. 이 전환은 `--fallback-model`과 별개로 기본 켜져 있다 [확인: 공식 모델 설정·env 문서, 2.1.308 바이너리의 전환 조건이 이 값을 봄](리뷰 exec-r1 P1). `-p`에서는 API 키가 OAuth 토큰보다 우선하므로 [확인: 공식 인증 문서] 자격 변수는 하나만 넣는다.
 - 실행마다 첫 `system/init` 확인: `tools`가 출력 전달용 `StructuredOutput`뿐(또는 없음), `mcp_servers` 0개, `model` = `WORKER_MODEL`, `apiKeySource` = `none`(OAuth 토큰. API 키가 쓰였다면 `ANTHROPIC_API_KEY`), `claude_code_version` = 2.1.308. 하나라도 다르면 기한을 기다리지 않고 즉시 멈추고 `failed`다.
+- init 뒤에도 모델을 본다(모델 고정은 사용자 결정): `system/model_refusal_fallback`(자동 전환) 이벤트가 오거나, assistant 메시지의 `message.model`이 `WORKER_MODEL`(날짜가 붙은 같은 ID 포함)이나 CLI 합성 오류 표식 `<synthetic>`이 아니면(없음 포함) 즉시 멈추고 `failed`다. 판정에서도 같은 조건을 다시 본다.
 - 판정: init 하나·result 최대 하나가 아니거나 깨진 줄 → `failed`. 오류 결과(`is_error`가 false가 아니거나 subtype이 success가 아님)는 assistant 메시지의 `error` 종류로 가른다: `authentication_failed`·`oauth_org_not_allowed`·`account_on_hold`·`verification_required` → `auth_expired`, `rate_limit`·`billing_error` → `limited`, 그 밖 종류(`overloaded`·`server_error` 등) → `failed`. 종류가 없거나 `unknown`일 때만 HTTP 상태(401·403 → `auth_expired`, 429·402 → `limited`)를 본다. 성공은 `is_error=false` + subtype success + 종료 코드 0 + `structured_output`이 있어야 한다. 모델 답·`result` 텍스트에 "401"·"rate limit"이 있어도 보지 않는다. 중간 `system/api_retry` 뒤 성공한 실행은 성공이다.
 - 출력 줄은 판정 필드만 남긴다(모델 본문·thinking·도구 입력·`result` 텍스트는 버림). 상한은 공통 `CHAT_LIMITS`(줄 1MiB, 전체 16MiB, 이벤트 2만 개)다.
 
@@ -900,7 +902,9 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 | `WORKER_EXECUTOR_BIN` | 아니오 | 실행 파일 경로를 바꾼다(시험용). 기본은 프로필의 이미지 경로 |
 | `HTTPS_PROXY`, `NO_PROXY` | 아니오 | 모델 CLI 프로세스 env에만 넘긴다 |
 
-**readiness.** `GET /readyz`는 선택한 자격이 쓸 수 있는 모양으로 있으면 200이다. Claude: 토큰 파일 읽기·모양(없어지거나 틀리면 503, 돌아오면 200). Codex: 영속 공간의 일반 파일 `auth.json`. 모델을 부르지 않는다. readiness 200은 인증 서버가 토큰을 받는다는 뜻이 아니다.
+**실행 기록 정리 실패(리뷰 exec-r1 P2).** 프로세스 소멸을 확인한 실행은 어댑터 고유 잔여물(Codex `sessions/`·`archived_sessions/`)과 실행 디렉터리를 지우고, 실행 디렉터리가 정말 없어졌는지 확인한 뒤에 결과를 확정한다. 지우지 못하면(권한·파일시스템 오류) 그 실행의 답은 게시하지 않고 `failed`(`stopped: true`, 프로세스는 끝났으니 `unknown`이 아님)이며, 한도·인증·실패 결과는 그대로 둔다. 지우지 못한 실행은 잔여물로 추적한다. 잔여물이 남은 동안 새 실행은 띄우지 않고(`failed`) readiness는 503이다. readiness 확인과 새 실행 직전마다 다시 지워 보고, 모두 지워지면 자동으로 돌아온다. 소멸을 확인하지 못한 실행은 살아 있는 프로세스가 쓰는 중일 수 있어 지우지 않는다(그 실행은 `unknown`이고 SerialWorker가 막는다). 기동 로그와 같은 줄 형식으로 값 없는 사건 `{"event":"chat_cleanup_failed"}`·`{"event":"chat_cleanup_recovered"}`만 남긴다(경로·내용 없음).
+
+**readiness.** `GET /readyz`는 앞 실행의 기록이 모두 지워졌고 선택한 자격이 쓸 수 있는 모양으로 있으면 200이다. Claude: 토큰 파일 읽기·모양(없어지거나 틀리면 503, 돌아오면 200). Codex: 영속 공간의 일반 파일 `auth.json`. 모델을 부르지 않는다. readiness 200은 인증 서버가 토큰을 받는다는 뜻이 아니다.
 
 **준비된 프로필 사이 전환(설정 PR 하나 + 자격 하나).**
 
@@ -913,8 +917,9 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 **남는 것 [미확인]·[가정] (S11·S12 실측).**
 
-- 실제 stream-json 모양: `system/init`의 `model` 값이 `--model`로 준 ID와 글자 그대로 같은지, `apiKeySource`가 `none`인지, `--tools ""`일 때 `tools`에 `StructuredOutput`이 남고 구조화 출력이 되는지, 한도·인증 오류가 assistant `error` 종류로 오는지. 다르면 첫 대화가 `failed`(정책 위반 또는 결과 없음)로 닫히는 쪽으로 틀린다(fail-closed).
+- 실제 stream-json 모양: `system/init`의 `model` 값과 assistant `message.model`이 `--model`로 준 ID와 글자 그대로(또는 날짜 접미어만 붙어) 같은지, `apiKeySource`가 `none`인지, `--tools ""`일 때 `tools`에 `StructuredOutput`이 남고 구조화 출력이 되는지, 한도·인증 오류가 assistant `error` 종류로 오는지. 다르면 첫 대화가 `failed`(정책 위반 또는 결과 없음)로 닫히는 쪽으로 틀린다(fail-closed).
 - egress: 모델 요청은 `api.anthropic.com:443` [확인: 공식 네트워크 문서]. 장기 토큰 사용 때 `claude.ai`·`platform.claude.com`(OAuth 교환·갱신)이 필요한지는 [미확인]이다. DNS 없는 파드에서 `HTTPS_PROXY`만으로 되는지도 [미확인]이고, 안 되면 먼저 볼 후보는 2.1.308에 있는 `CLAUDE_CODE_PROXY_RESOLVES_HOSTS`다(값의 뜻은 미확인이라 지금 넣지 않았다).
+- 시작 실패 분류: 2.1.308은 일부 시작 실패를 stderr에만 쓰고, 구조화된 `startup_failure_reason` 결과는 `CLAUDE_CODE_STARTUP_FAILURE_RESULTS` opt-in이 있어야 낸다 [확인: 바이너리 스키마 설명, 리뷰 exec-r1]. 이 값은 넣지 않았다. 그런 실패는 결과 없음 → `failed`로 닫히고 한도·인증으로 분류되지 않는다.
 - `--safe-mode`·`--strict-mcp-config`·`--disable-slash-commands`와 OAuth 토큰·구조화 출력의 조합이 실제로 함께 도는지. CLI가 실행 디렉터리 밖(`/tmp` 직접 등)에 쓰는 파일이 있는지.
 - 메모리·`/tmp`(256Mi) 사용량, 첫 응답 시간(대화 기한 60초 안인지).
 - Claude 토큰도 같은 UID에서 `/proc/<pid>/environ`으로 읽힌다. 대화 레인에는 비신뢰 코드가 없어 받아들인 위험이고, 작업 레인을 열기 전에 T18 결정 (2)·(4)가 필요하다.

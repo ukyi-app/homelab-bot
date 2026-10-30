@@ -25,8 +25,10 @@ export interface WorkerCredential {
   open(): Promise<'seeded' | 'kept' | 'present'>;
   // readiness. 모델을 부르지 않고 자격이 쓸 수 있는 모양으로 있는지만 본다.
   ready(): Promise<boolean>;
+  // 실행 준비 때. 읽지 못하면 throw다(실행하지 않는다).
   forRun(): Promise<RunCredential>;
   // 실행 뒤 다시 읽은 비밀(회전 파일이면 갱신본). 반사 검사에 실행 전 값과 함께 쓴다.
+  // 읽지 못하거나 비어 있으면 throw다. 빈 목록으로 반사 검사를 건너뛰지 않는다(리뷰 exec-r1 P1).
   secrets(): Promise<string[]>;
 }
 
@@ -43,7 +45,7 @@ export class StaticEnvCredential implements WorkerCredential {
     const value = await this.read();
     return { value, secrets: [value] };
   }
-  async secrets(): Promise<string[]> { return this.read().then(value => [value], () => []); }
+  async secrets(): Promise<string[]> { return [await this.read()]; }
   private async read(): Promise<string> {
     const raw = await readSecretFile(this.file, this.homes, { prefix: 'credential', limit: STATIC_LIMIT });
     const value = raw.toString('utf8').replace(/^\s+|\s+$/g, '');
@@ -63,13 +65,17 @@ export class FileMutableCredential implements WorkerCredential {
     try { return (await lstat(join(this.home, 'auth.json'))).isFile(); } catch { return false; }
   }
   async forRun(): Promise<RunCredential> { return { secrets: await this.secrets() }; }
-  // 고정한 디렉터리 핸들 아래에서 읽는다. auth.json 자리에 심링크가 있으면 따라가지 않는다.
+  // 고정한 디렉터리 핸들 아래에서 읽는다. auth.json 자리에 심링크가 있으면 따라가지 않는다. home은 공장 함수가
+  // 해석한 실제 경로여야 한다(openDir이 O_NOFOLLOW라 별칭 경로면 열리지 않는다).
   async secrets(): Promise<string[]> {
     let dir: FileHandle | undefined;
+    let found: string[] = [];
     try {
       dir = await openDir(this.home);
       const result = await readAt(dir, 'auth.json', AUTH_LIMIT);
-      return result.status === 'ok' ? authSecrets(result.text) : [];
-    } catch { return []; } finally { await dir?.close().catch(() => {}); }
+      if (result.status === 'ok') found = authSecrets(result.text);
+    } catch { /* 아래에서 실패로 처리한다 */ } finally { await dir?.close().catch(() => {}); }
+    if (!found.length) throw new WorkerStartError('credential_unreadable');
+    return found;
   }
 }

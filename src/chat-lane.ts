@@ -1,5 +1,5 @@
 import type { Dirent } from 'node:fs';
-import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
@@ -106,6 +106,8 @@ export async function assertLaunchSafe(adapter: ChatAdapter, plan: AdapterRun, e
   if (credential.value !== undefined) {
     if (!adapter.credentialEnv || plan.env[adapter.credentialEnv] !== credential.value) throw new Error('credential_env_missing');
   }
+  // 반사 검사에 쓸 비밀이 없으면 띄우지 않는다. 자격을 못 읽은 채 검사 없이 실행하지 않는다(리뷰 exec-r1 P1).
+  if (!credential.secrets.length) throw new Error('credential_secrets_missing');
   const secrets = credential.secrets.filter(secret => secret.length >= 16);
   const leaks = (text: string) => secrets.some(secret => text.includes(secret));
   if (plan.args.some(leaks)) throw new Error('credential_in_argv');
@@ -134,21 +136,31 @@ export interface ChatLaneOptions {
   // 실행마다 임시 디렉터리를 만드는 곳. 파드에서는 emptyDir(/tmp)이다.
   tmp?: string; homes?: string[]; proxy?: { https: string; noProxy: string };
   limits?: { lineBytes: number; outputBytes: number; events: number };
+  // 값 없는 운영 사건(실행 기록 정리 실패·복구). 경로·내용은 싣지 않는다.
+  onEvent?: (event: { event: 'chat_cleanup_failed' | 'chat_cleanup_recovered' }) => void;
 }
 interface Active { job: string; controller: AbortController; done: Promise<void> }
+// 한 실행이 남긴 것. 프로세스 소멸을 확인한 뒤에만 지운다.
+interface RunState { base?: string; plan?: AdapterRun; survivors: number | null }
+// 소멸을 확인했지만 지우지 못한 실행의 기록(실행 디렉터리, 어댑터 고유 잔여물).
+interface Residue { root?: string; plan?: AdapterRun }
 
 export class ChatLane {
   private readonly tmp: string;
   private active: Active | undefined;
   // 종료가 시작되면 true. 그 뒤에 들어온 실행은 띄우지 않는다.
   private closed = false;
+  // 실행 뒤 기록을 지우지 못한 실행들. 남아 있는 동안 새 실행을 띄우지 않고 readiness도 닫는다(리뷰 exec-r1 P2).
+  private readonly residues: Residue[] = [];
+  private scrubbing: Promise<boolean> | undefined;
   constructor(private readonly adapter: ChatAdapter, private readonly credential: WorkerCredential,
     private readonly launcher: ProcessLauncher, private readonly options: ChatLaneOptions) {
     // 실행 디렉터리 루트가 사람 홈이나 개인 CLI 홈(~/.codex*·~/.claude*)이면 거부한다(D-14 조건 1).
     this.tmp = assertWorkerRoot(options.tmp ?? tmpdir(), options.homes);
   }
-  // readiness: 선택한 자격이 쓸 수 있는 모양으로 있어야 모델을 부를 수 있다. 모델을 부르지 않는다.
-  ready(): Promise<boolean> { return this.credential.ready(); }
+  // readiness: 앞 실행의 기록이 모두 지워졌고, 선택한 자격이 쓸 수 있는 모양으로 있어야 한다. 모델을 부르지 않는다.
+  // 지우지 못한 기록은 확인할 때마다 다시 지워 본다(원인이 풀리면 자동으로 돌아온다).
+  async ready(): Promise<boolean> { return await this.clean() && await this.credential.ready(); }
   accepting(): boolean { return !this.closed; }
   async run(request: WorkerRequest, signal: AbortSignal): Promise<WorkerResult> {
     // 종료가 시작된 뒤 들어온 실행(본문 수신·서명 확인이 늦게 끝난 요청)은 띄우지 않는다. 띄운 적이 없으니 failed다.
@@ -190,71 +202,116 @@ export class ChatLane {
     await active.done;
   }
   private async execute(request: WorkerRequest, signal: AbortSignal): Promise<WorkerResult> {
-    let base: string | undefined;
-    let plan: AdapterRun | undefined;
-    let survivors: number | null = null;
+    // 앞 실행의 기록이 남아 있으면 새 실행을 띄우지 않는다. 띄운 적이 없으니 failed다.
+    if (!await this.clean()) return FAILED;
+    const state: RunState = { survivors: null };
+    let result: WorkerResult;
+    try { result = await this.attempt(request, signal, state); }
+    catch (error) { await this.release(state); throw error; }
+    // 기록 정리는 결과를 확정하기 전에 확인한다. 지우지 못했으면 답을 게시하지 않는다(실행 뒤 기록 제거 계약).
+    // 프로세스 소멸은 확인했으므로 unknown이 아니라 failed다. 한도·인증·실패 결과는 게시할 답이 없어 그대로 둔다.
+    const released = await this.release(state);
+    return released || result.status !== 'succeeded' ? result : FAILED;
+  }
+  // 이 실행의 잔여물을 정리한다. 소멸을 확인하지 못했으면 살아 있는 프로세스가 쓰는 중일 수 있어 지우지 않는다
+  // (그 실행은 unknown이고 작업자는 SerialWorker가 막는다). 지우지 못하면 잔여물로 남기고 false다.
+  private async release(state: RunState): Promise<boolean> {
+    if (state.survivors !== 0) { await state.plan?.cleanup(false).catch(() => {}); return true; }
+    if (!state.base && !state.plan) return true;
+    const residue: Residue = { ...(state.base ? { root: state.base } : {}), ...(state.plan ? { plan: state.plan } : {}) };
+    if (await this.scrub(residue)) return true;
+    this.residues.push(residue);
+    this.options.onEvent?.({ event: 'chat_cleanup_failed' });
+    return false;
+  }
+  // 어댑터 고유 잔여물(Codex 세션 디렉터리 등)과 실행 디렉터리를 지우고, 실행 디렉터리가 정말 없어졌는지 본다.
+  private async scrub(residue: Residue): Promise<boolean> {
     try {
-      let env: Record<string, string>;
-      let credential: RunCredential;
-      try {
-        base = await mkdtemp(join(this.tmp, 'homelab-chat-'));
-        const dirs: RunDirs = { root: base, home: join(base, 'home'), config: join(base, 'config'),
-          workspace: join(base, 'workspace'), run: join(base, 'run'), tmp: join(base, 'tmp') };
-        for (const dir of [dirs.home, dirs.config, dirs.workspace, dirs.run, dirs.tmp]) await mkdir(dir, { mode: 0o700 });
-        credential = await this.credential.forRun();
-        plan = await this.adapter.start({ job: request.job, model: this.options.model, dirs, credential,
-          schema: CHAT_OUTPUT_JSON_SCHEMA });
-        // 작업자 프로세스 env를 읽거나 병합하지 않는다. 작업자 env에는 다른 자격·공개 키·플랫폼 값이 있을 수 있다.
-        env = { ...plan.env, ...baseEnvironment(dirs, request.job, this.options.proxy) };
-        await assertLaunchSafe(this.adapter, plan, env, credential, base);
-      } catch {
-        // 프로세스를 띄우기 전 실패다. 남은 프로세스가 없으니 unknown이 아니다.
-        survivors = 0;
-        return FAILED;
+      await residue.plan?.cleanup(true);
+      if (residue.root) {
+        await rm(residue.root, { recursive: true, force: true });
+        const remains = await lstat(residue.root).then(() => true, (error: { code?: string }) => error.code !== 'ENOENT');
+        if (remains) return false;
       }
-      const limits = this.options.limits ?? CHAT_LIMITS;
-      // 도구를 끈 실행기는 예산 0이다. 도구 호출이 하나라도 보이면 멈춘다.
-      const budget = this.adapter.capabilities.tools === 'none' ? 0 : request.toolCalls;
-      const lines: string[] = [];
-      const tools = new Set<string>();
-      let exceeded: ChatReport['exceeded'];
-      const inner = new AbortController();
-      const forward = () => inner.abort();
-      signal.addEventListener('abort', forward, { once: true });
-      const stop = (reason: NonNullable<ChatReport['exceeded']>) => { exceeded ??= reason; inner.abort(); };
-      const running = plan;
-      const onLine = (line: string) => {
-        if (exceeded) return;
-        if (lines.length >= limits.events) { stop('output_limit_exceeded'); return; }
-        const seen = running.observe(line);
-        lines.push(seen.line);
-        if (seen.violation) { stop('policy_violation'); return; }
-        if (seen.tool && !tools.has(seen.tool)) {
-          tools.add(seen.tool);
-          if (tools.size > budget) stop('tool_budget_exceeded');
-        }
-      };
-      let result: LaunchResult = { exit: null };
-      let launchFailed = false;
-      try {
-        // 준비하는 동안 중단·종료가 시작됐으면 띄우지 않는다. 이 확인과 launcher의 spawn 사이에는 await가 없다.
-        if (signal.aborted || this.closed) { survivors = 0; return FAILED; }
-        result = await this.launcher.run({ job: request.job, args: [...running.args], cwd: join(base, 'workspace'), env,
-          stdin: chatPrompt(request), limits: { lineBytes: limits.lineBytes, outputBytes: limits.outputBytes } }, inner.signal, onLine);
-        if (result.overflow) exceeded ??= 'output_limit_exceeded';
-      } catch (error) { launchFailed = error instanceof LaunchFailed; }
-      finally { signal.removeEventListener('abort', forward); }
-      await this.launcher.terminate(request.job).catch(() => {});
-      survivors = await this.launcher.survivors(request.job).catch(() => null);
-      const report: ChatReport = { exit: result.exit, survivors, aborted: signal.aborted, launchFailed, exceeded };
-      // 남은 프로세스가 있거나 모르면 결과 파일을 읽지 않는다. 살아 있는 프로세스가 바꿔치기할 수 있다.
-      if (survivors !== 0 || !result.exit || exceeded || signal.aborted) return interpretChat(report);
-      const outcome = await running.finish(lines, result.exit as ExitStatus).catch((): EngineOutcome => ({ kind: 'failed', reason: 'finish_failed' }));
-      const secrets = [...credential.secrets, ...await this.credential.secrets().catch(() => [])];
-      return interpretChat({ ...report, outcome, secrets });
-    } finally {
-      await plan?.cleanup(survivors === 0).catch(() => {});
-      if (survivors === 0 && base) await rm(base, { recursive: true, force: true }).catch(() => {});
+      return true;
+    } catch { return false; }
+  }
+  // 앞서 지우지 못한 기록을 다시 지운다. 모두 지웠으면 true. readiness와 새 실행이 함께 불러도 한 번만 돈다.
+  // 진행 표시는 끝난 뒤 비동기로 지운다(동기로 끝나는 경우에도 끝난 약속이 남지 않게).
+  private clean(): Promise<boolean> {
+    if (!this.scrubbing) this.scrubbing = this.cleanNow().finally(() => { this.scrubbing = undefined; });
+    return this.scrubbing;
+  }
+  private async cleanNow(): Promise<boolean> {
+    if (!this.residues.length) return true;
+    for (const residue of [...this.residues]) {
+      if (await this.scrub(residue)) this.residues.splice(this.residues.indexOf(residue), 1);
     }
+    if (this.residues.length) return false;
+    this.options.onEvent?.({ event: 'chat_cleanup_recovered' });
+    return true;
+  }
+  private async attempt(request: WorkerRequest, signal: AbortSignal, state: RunState): Promise<WorkerResult> {
+    let env: Record<string, string>;
+    let credential: RunCredential;
+    let plan: AdapterRun;
+    let base: string;
+    try {
+      base = state.base = await mkdtemp(join(this.tmp, 'homelab-chat-'));
+      const dirs: RunDirs = { root: base, home: join(base, 'home'), config: join(base, 'config'),
+        workspace: join(base, 'workspace'), run: join(base, 'run'), tmp: join(base, 'tmp') };
+      for (const dir of [dirs.home, dirs.config, dirs.workspace, dirs.run, dirs.tmp]) await mkdir(dir, { mode: 0o700 });
+      credential = await this.credential.forRun();
+      plan = state.plan = await this.adapter.start({ job: request.job, model: this.options.model, dirs, credential,
+        schema: CHAT_OUTPUT_JSON_SCHEMA });
+      // 작업자 프로세스 env를 읽거나 병합하지 않는다. 작업자 env에는 다른 자격·공개 키·플랫폼 값이 있을 수 있다.
+      env = { ...plan.env, ...baseEnvironment(dirs, request.job, this.options.proxy) };
+      await assertLaunchSafe(this.adapter, plan, env, credential, base);
+    } catch {
+      // 프로세스를 띄우기 전 실패다. 남은 프로세스가 없으니 unknown이 아니다.
+      state.survivors = 0;
+      return FAILED;
+    }
+    const limits = this.options.limits ?? CHAT_LIMITS;
+    // 도구를 끈 실행기는 예산 0이다. 도구 호출이 하나라도 보이면 멈춘다.
+    const budget = this.adapter.capabilities.tools === 'none' ? 0 : request.toolCalls;
+    const lines: string[] = [];
+    const tools = new Set<string>();
+    let exceeded: ChatReport['exceeded'];
+    const inner = new AbortController();
+    const forward = () => inner.abort();
+    signal.addEventListener('abort', forward, { once: true });
+    const stop = (reason: NonNullable<ChatReport['exceeded']>) => { exceeded ??= reason; inner.abort(); };
+    const onLine = (line: string) => {
+      if (exceeded) return;
+      if (lines.length >= limits.events) { stop('output_limit_exceeded'); return; }
+      const seen = plan.observe(line);
+      lines.push(seen.line);
+      if (seen.violation) { stop('policy_violation'); return; }
+      if (seen.tool && !tools.has(seen.tool)) {
+        tools.add(seen.tool);
+        if (tools.size > budget) stop('tool_budget_exceeded');
+      }
+    };
+    let result: LaunchResult = { exit: null };
+    let launchFailed = false;
+    try {
+      // 준비하는 동안 중단·종료가 시작됐으면 띄우지 않는다. 이 확인과 launcher의 spawn 사이에는 await가 없다.
+      if (signal.aborted || this.closed) { state.survivors = 0; return FAILED; }
+      result = await this.launcher.run({ job: request.job, args: [...plan.args], cwd: join(base, 'workspace'), env,
+        stdin: chatPrompt(request), limits: { lineBytes: limits.lineBytes, outputBytes: limits.outputBytes } }, inner.signal, onLine);
+      if (result.overflow) exceeded ??= 'output_limit_exceeded';
+    } catch (error) { launchFailed = error instanceof LaunchFailed; }
+    finally { signal.removeEventListener('abort', forward); }
+    await this.launcher.terminate(request.job).catch(() => {});
+    const survivors = state.survivors = await this.launcher.survivors(request.job).catch(() => null);
+    const report: ChatReport = { exit: result.exit, survivors, aborted: signal.aborted, launchFailed, exceeded };
+    // 남은 프로세스가 있거나 모르면 결과 파일을 읽지 않는다. 살아 있는 프로세스가 바꿔치기할 수 있다.
+    if (survivors !== 0 || !result.exit || exceeded || signal.aborted) return interpretChat(report);
+    const outcome = await plan.finish(lines, result.exit as ExitStatus).catch((): EngineOutcome => ({ kind: 'failed', reason: 'finish_failed' }));
+    // 실행 뒤 자격을 다시 읽지 못하면(회전 파일 갱신본 포함) 반사 검사를 할 수 없어 게시하지 않는다(리뷰 exec-r1 P1).
+    let after: string[];
+    try { after = await this.credential.secrets(); } catch { return FAILED; }
+    return interpretChat({ ...report, outcome, secrets: [...credential.secrets, ...after] });
   }
 }
