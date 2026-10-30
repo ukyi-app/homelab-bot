@@ -13,7 +13,7 @@ let session: GatewaySession | undefined;
 let database: Awaited<ReturnType<typeof localDatabase>>;
 before(async () => { database = await localDatabase(); });
 after(async () => { await database.pg.close(); });
-// 시험 속도를 위해 간격을 줄인다(가짜 Gateway 200ms, 대역 예산 250ms). 실제 값 5초·5.5초는 P2-3 시험이 본다.
+// 시험 속도를 위해 간격을 줄인다(가짜 Gateway 200ms, 대역 예산 300ms·창 50ms). 실제 값 5초·5.5초는 P2-3·R2-3 시험이 본다.
 beforeEach(async () => { gw = new FakeGateway(); gw.options.identifyIntervalMs = 200; await gw.start(); });
 afterEach(async () => {
   await session?.stop(200); session = undefined; await gw.close();
@@ -26,8 +26,10 @@ function start(overrides: Partial<GatewayOptions> = {}) {
   let last = -Infinity;
   session = new GatewaySession({
     token: 'fixture-token', gatewayUrl: async () => ({ url: gw.url }),
-    budget: { next: async () => Math.max(Date.now(), last + 250),
-      reserve: async () => { record.identifies++; last = Math.max(Date.now(), last + 250); return last; }, backoff: () => 10 },
+    // 대역 예산: 간격 300ms, 전송 창 50ms → 실제 전송 간격 250ms 이상(가짜 Gateway 제한 200ms).
+    budget: { next: async () => Math.max(Date.now(), last + 300),
+      reserve: async () => { record.identifies++; last = Math.max(Date.now(), last + 300); return { at: last, deadline: last + 50 }; },
+      backoff: () => 10 },
     health: { gateway: connected => record.health.push(connected) },
     dispatch: async (type, data) => { record.events.push([type, data]); },
     onReady: ready => { record.readies.push(ready); },
@@ -158,22 +160,50 @@ test('P2-3 IDENTIFY는 일일 예산과 함께 직전 IDENTIFY에서 5초 뒤에
   assert.ok(gw.identifies[1]! - gw.identifies[0]! >= 5000, `간격 ${gw.identifies[1]! - gw.identifies[0]!}ms`);
 });
 
+test('R2-3 예약 응답이 늦어져도 실제 IDENTIFY 전송 간격 5초를 지킴(첫 COMMIT 응답 900ms 지연, 가짜 Gateway 5초 제한)', { timeout: 30_000 }, async () => {
+  await database.pg.exec('TRUNCATE audit,controls RESTART IDENTITY CASCADE');
+  gw.options.identifyIntervalMs = 5000;
+  let first = true;
+  // 실제 transaction은 그대로 실행하고 첫 결과 전달만 늦춘다(예약 시각보다 늦게 전송되는 상황).
+  const db = { query: database.db.query.bind(database.db), transaction: (async (fn, deadline) => {
+    const result = await database.db.transaction(fn, deadline);
+    if (first) { first = false; await new Promise(resolve => setTimeout(resolve, 900)); }
+    return result;
+  }) as typeof database.db.transaction };
+  const record = start({ budget: new GatewayBudget(new Store(db)) });
+  await until(() => record.readies.length === 1, 8000);
+  gw.latest.send({ op: 9, d: false });
+  await until(() => record.readies.length === 2, 15_000);
+  assert.equal(gw.identifyViolations, 0);
+  const accepted = gw.identifies.slice(-2);
+  assert.ok(accepted[1]! - accepted[0]! >= 5000, `간격 ${accepted[1]! - accepted[0]!}ms`);
+  // 첫 예약은 전송 창을 놓쳐 쓰지 않고 풀었다. 남은 예약은 실제로 보낸 둘뿐이다.
+  assert.ok(record.logs.includes('identify_slot_missed'));
+  assert.equal(Number((await database.db.query<{ count: string }>("SELECT count(*) FROM audit WHERE kind='identify'")).rows[0]!.count), 2);
+});
+
 test('P2-3 GatewayBudget: 예약은 직전 예약에서 5.5초 뒤, 새 인스턴스(재시작)도 DB 기록을 이어 받고 일일 900회에서 멈춤', async () => {
   await database.pg.exec('TRUNCATE audit,controls RESTART IDENTITY CASCADE');
   let time = 1_800_000_000_000;
   const budget = new GatewayBudget(new Store(database.db, () => time));
   assert.equal(await budget.next(), time);
-  assert.equal(await budget.reserve(), time);
+  assert.deepEqual(await budget.reserve().then(s => s && [s.at, s.deadline]), [time, time + 400]);
   assert.equal(await budget.next(), time + 5500);
-  assert.equal(await budget.reserve(), time + 5500);
+  assert.equal((await budget.reserve())?.at, time + 5500);
   const restarted = new GatewayBudget(new Store(database.db, () => time));
-  assert.equal(await restarted.reserve(), time + 11_000);
+  const third = await restarted.reserve();
+  assert.equal(third?.at, time + 11_000);
+  // 보내지 않은 예약을 풀면 다음 예약 기준은 직전에 보낸 예약(time+5500)으로 돌아간다(풀지 않으면 time+16500).
+  assert.equal(await restarted.next(), time + 16_500);
+  await restarted.release(third!);
+  assert.equal(await restarted.next(), time + 11_000);
+  assert.equal((await restarted.reserve())?.at, time + 11_000);
   time += 60_000;
-  assert.equal(await restarted.reserve(), time);
+  assert.equal((await restarted.reserve())?.at, time);
   await database.pg.query(`INSERT INTO audit(kind,subject,detail,created_at) SELECT 'identify','gateway','{}',$1 FROM generate_series(1,896)`, [time - 1000]);
   assert.equal(await restarted.next(), undefined); assert.equal(await restarted.reserve(), undefined);
   time += 86_400_000;
-  assert.equal(await restarted.reserve(), time);
+  assert.equal((await restarted.reserve())?.at, time);
 });
 
 test('로그 정제: Gateway 주소 조회 오류의 외부 메시지는 로그에 싣지 않음', async () => {

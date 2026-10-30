@@ -92,7 +92,7 @@ beforeEach(async () => {
   const tables = (await database.pg.query<{ tablename: string }>(
     "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename<>'schema_migrations'")).rows.map(r => r.tablename);
   await database.pg.exec(`TRUNCATE ${tables.join(',')} RESTART IDENTITY CASCADE`);
-  // 시험 속도를 위해 IDENTIFY 간격을 줄인다(가짜 Gateway 250ms, 진입점 예산 300ms). 실제 값은 gateway 시험이 본다.
+  // 시험 속도를 위해 IDENTIFY 간격을 줄인다(가짜 Gateway 250ms, 진입점 예산 spacing 250ms + 창·여유 500ms). 실제 값은 gateway 시험이 본다.
   gw = new FakeGateway(); gw.options.identifyIntervalMs = 250; await gw.start();
   rest = new FakeRest(); auxCalls = [];
 });
@@ -110,7 +110,7 @@ async function boot(options: { heartbeatEveryMs?: number; gateway?: boolean; por
   };
   publisher = await startPublisher(config, { db: database.db, discord: rest, gatewayUrl: options.gateway === false ? () => new Promise(() => {}) : async () => ({ url: gw.url }),
     allowGatewayUrl: url => url.hostname === '127.0.0.1', serviceAccount: { tokenFile: '/nonexistent', caFile: null },
-    ports: options.ports ?? { app: 0, alerts: 0 }, idleMs: 20, identifyIntervalMs: 300, recoveryBackoff: () => 200, registerDelaysMs: [0, 20, 20], heartbeatEveryMs: options.heartbeatEveryMs ?? 60_000, stopTimeoutMs: 3000, log: () => {} });
+    ports: options.ports ?? { app: 0, alerts: 0 }, idleMs: 20, identifySpacingMs: 250, recoveryBackoff: () => 200, registerDelaysMs: [0, 20, 20], heartbeatEveryMs: options.heartbeatEveryMs ?? 60_000, stopTimeoutMs: 3000, log: () => {} });
   return publisher;
 }
 const app = (p: Publisher, path: string, init?: RequestInit) => fetch(`http://127.0.0.1:${p.ports.app}${path}`, init);

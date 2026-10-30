@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { DiscordApi } from './discord-protocol.js';
+import type { IdentifySlot } from './health.js';
 import { errorInfo } from './log.js';
 
 // Discord Gateway v10 세션(JSON, 압축 없음). Node 24 내장 WebSocket을 쓴다(새 의존성 없음).
@@ -22,8 +23,10 @@ export interface GatewayOptions {
   intents?: number;
   // 새 세션(IDENTIFY)마다 부른다. retryAfterMs가 있으면 그만큼 기다린 뒤 다시 묻는다(session_start_limit 소진).
   gatewayUrl: () => Promise<{ url: string; retryAfterMs?: number }>;
-  // next: 다음 IDENTIFY 가능 시각(읽기만), reserve: 한 번 예약(일일 예산·5초 간격을 원자적으로). 둘 다 예산이 없으면 undefined.
-  budget: { next(): Promise<number | undefined>; reserve(): Promise<number | undefined>; backoff(attempt: number, random?: number): number };
+  // next: 다음 IDENTIFY 가능 시각(읽기만), reserve: 한 번 예약(일일 예산·간격을 원자적으로, 전송 마감 포함),
+  // release: 보내지 않은 예약 풀기. next·reserve는 예산이 없으면 undefined.
+  budget: { next(): Promise<number | undefined>; reserve(): Promise<IdentifySlot | undefined>; release?(slot: IdentifySlot): Promise<void>;
+    backoff(attempt: number, random?: number): number };
   health: { gateway(connected: boolean): void };
   dispatch: (type: string, data: unknown) => Promise<void>;
   onReady?: (ready: { applicationId: string; userId: string }) => Promise<void> | void;
@@ -157,21 +160,35 @@ export class GatewaySession {
       this.heartbeat(socket, interval, false);
     });
   }
-  // IDENTIFY 직전에 예약한다. 예약 시각과 실제 전송 시각이 붙어 있어야 연결 지연이 달라도 5초 간격이 지켜진다.
+  // IDENTIFY 직전에 예약하고 그 예약의 전송 창(at~deadline) 안에서만 보낸다. 예약 응답이 늦어 창을 놓치면 풀고 다시 예약한다.
+  // 그래야 예약 간격이 실제 전송 간격을 보장한다(예약 시각보다 늦게 보낸 IDENTIFY가 다음 예약의 기준을 앞당기지 않음).
   private async identify(socket: GatewaySocket): Promise<void> {
-    let at: number | undefined;
-    try { at = await this.options.budget.reserve(); }
-    catch (error) {
-      this.log('identify_reserve_failed', errorInfo(error));
-      if (this.socket === socket) this.drop(socket, 'identify_reserve_failed');
-      return;
+    const release = (slot: IdentifySlot) => this.options.budget.release?.(slot)
+      .catch(error => { this.log('identify_release_failed', errorInfo(error)); });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let slot: IdentifySlot | undefined;
+      try { slot = await this.options.budget.reserve(); }
+      catch (error) {
+        this.log('identify_reserve_failed', errorInfo(error));
+        if (this.socket === socket) this.drop(socket, 'identify_reserve_failed');
+        return;
+      }
+      if (slot === undefined) {
+        if (this.socket === socket) { this.nextDelayMs = 60_000; this.drop(socket, 'identify_budget'); }
+        return;
+      }
+      if (this.socket !== socket || this.stopped) { await release(slot); return; }
+      if (slot.at > this.now()) await this.pause(slot.at - this.now());
+      if (this.socket !== socket || this.stopped) { await release(slot); return; }
+      if (this.now() <= slot.deadline) {
+        this.send(socket, { op: 2, d: { token: this.options.token, intents: this.options.intents ?? GATEWAY_INTENTS,
+          properties: { os: 'linux', browser: 'homelab-bot', device: 'homelab-bot' } } });
+        return;
+      }
+      this.log('identify_slot_missed', { lateMs: this.now() - slot.deadline });
+      await release(slot);
     }
-    if (this.socket !== socket) return;
-    if (at === undefined) { this.nextDelayMs = 60_000; this.drop(socket, 'identify_budget'); return; }
-    if (at > this.now()) await this.pause(at - this.now());
-    if (this.socket !== socket || this.stopped) return;
-    this.send(socket, { op: 2, d: { token: this.options.token, intents: this.options.intents ?? GATEWAY_INTENTS,
-      properties: { os: 'linux', browser: 'homelab-bot', device: 'homelab-bot' } } });
+    if (this.socket === socket) this.drop(socket, 'identify_slot_missed');
   }
   private handle(socket: GatewaySocket, payload: z.infer<typeof Payload>, identify: boolean) {
     if (typeof payload.s === 'number') this.seq = payload.s;

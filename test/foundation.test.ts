@@ -296,7 +296,7 @@ test('OPS-01 429는 retry_after 대기, IDENTIFY 예산과 백오프', async () 
   await f.publisher.deliver(); assert.equal(await f.publisher.deliver(), false);
   f.advance(2001); await f.publisher.deliver(); assert.equal(f.rest.messages.length, 1);
   const budget = new GatewayBudget(f.store);
-  assert.equal(await budget.reserve(), f.now());
+  assert.equal((await budget.reserve())?.at, f.now());
   await database.db.query("INSERT INTO audit(kind,subject,detail,created_at) SELECT 'identify','gateway','{}',$1 FROM generate_series(1,899)", [f.now()]);
   assert.equal(await budget.next(), undefined); assert.equal(await budget.reserve(), undefined);
   assert.ok(budget.backoff(10, 0.5) <= 61000); assert.ok(budget.backoff(2, 0) > budget.backoff(1, 0));

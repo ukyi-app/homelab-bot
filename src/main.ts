@@ -64,7 +64,7 @@ export interface PublisherDeps {
   stopTimeoutMs?: number;
   registerDelaysMs?: readonly number[];
   recoveryBackoff?: (attempt: number) => number;
-  identifyIntervalMs?: number;
+  identifySpacingMs?: number;
 }
 export interface Publisher {
   health: Health; gateway: GatewaySession; ports: { app: number; alerts: number };
@@ -167,7 +167,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   const gateway = new GatewaySession({
     token: config.discordToken,
     gatewayUrl: deps.gatewayUrl ?? discordGatewayUrl(api),
-    budget: new GatewayBudget(store, deps.identifyIntervalMs),
+    budget: new GatewayBudget(store, { spacingMs: deps.identifySpacingMs }),
     health,
     log,
     connect: deps.connect,
