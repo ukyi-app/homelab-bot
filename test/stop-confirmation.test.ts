@@ -39,6 +39,16 @@ function cancelOnce() {
   f.worker.cancel = async () => { at.push(Date.now()); return { stopped: at.length === 1 }; };
   return at;
 }
+// 한 번만 던지는 DB 쓰기 오류.
+function failOnce<K extends 'fail' | 'requeueAfterShutdown'>(name: K, times = 1) {
+  const original = f.store[name].bind(f.store) as (...args: unknown[]) => Promise<unknown>;
+  let left = times;
+  (f.store as any)[name] = async (...args: unknown[]) => {
+    if (left-- > 0) throw new Error('db_blip');
+    return original(...args);
+  };
+}
+
 for (const slow of ['reauthorize', 'monitor'] as const) {
   test(`F2 드레인 기한에 cancel이 바로 나감(${slow} 지연 중) → 확인된 chat은 queued`, async () => {
     await queued();
@@ -68,3 +78,44 @@ for (const slow of ['reauthorize', 'monitor'] as const) {
     assert.equal(job.state, 'queued'); assert.equal(job.wait_reason, 'publisher_shutdown');
   });
 }
+
+test('F3 첫 cancel 확인 → fail 1회 DB 오류 → 복구: cancel 다시 안 묻고 failed(stop_confirmation)', async () => {
+  await queued();
+  f.setRun(async () => ({ status: 'unknown', stopped: false }));
+  const cancels = cancelOnce();
+  failOnce('fail');
+  await runtime().tick();
+  const job = (await rows('jobs'))[0]!;
+  assert.equal(cancels.length, 1, 'cancel을 다시 물음');
+  assert.equal(job.state, 'failed'); assert.equal(job.wait_reason, 'stop_confirmation');
+  assert.ok((await rows('outbox')).some(o => o.idempotency_key === `failure:${job.id}:1`));
+});
+
+test('F3 드레인 종료: 확인 뒤 되돌리기 1회 DB 오류 → 복구: cancel 다시 안 묻고 queued', async () => {
+  await queued();
+  const stop = new AbortController();
+  const running = holding();
+  const cancels = cancelOnce();
+  failOnce('requeueAfterShutdown');
+  const tick = runtime(stop).tick();
+  await running;
+  stop.abort();
+  await tick;
+  const job = (await rows('jobs'))[0]!;
+  assert.equal(cancels.length, 1, 'cancel을 다시 물음');
+  assert.equal(job.state, 'queued'); assert.equal(job.wait_reason, 'publisher_shutdown'); assert.equal(job.attempt, 1);
+});
+
+test('F3 확인 뒤 상태 쓰기가 끝내 실패해도 unknown으로 적지 않고 로그·감사를 남김', async () => {
+  await queued();
+  f.setRun(async () => ({ status: 'unknown', stopped: false }));
+  const cancels = cancelOnce();
+  failOnce('fail', 100);
+  await runtime().tick();
+  const job = (await rows('jobs'))[0]!;
+  assert.equal(cancels.length, 1, 'cancel을 다시 물음');
+  assert.notEqual(job.state, 'unknown');
+  assert.equal(job.state, 'running', 'lease가 끝나면 expire가 처리한다');
+  assert.ok(logs.some(l => l.event === 'stop_confirmed_write_failed' && l.detail?.job === job.id));
+  assert.ok((await rows('audit')).some(a => a.kind === 'stop_confirmed_write_failed' && a.subject === job.id));
+});

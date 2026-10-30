@@ -7,23 +7,30 @@ import { ReadRuntime, dispatchable } from './read-runtime.js';
 import type { Store } from './store.js';
 import { workerRequest } from './worker.js';
 import type { WorkerClient, WorkerResult, WorkerSigner } from './worker.js';
+import { errorInfo, jsonLog } from './log.js';
+import type { Log } from './log.js';
 
 // T18: 봇 소유 Codex 작업 경로. dispatch 뒤의 오류는 스스로 상태로 기록하고 던지지 않는다.
 export interface TaskLane { run(job: Job): Promise<void>; sweep?(): Promise<unknown> }
 // shutdown: 게시 서버 종료 신호(SIGTERM). drainMs: 신호 뒤 실행 중 작업의 자연 완료를 기다리는 시간.
 // 기본 10초 + cancel 응답 상한 5초가 main.ts의 전체 종료 기한(20초)과 kubelet 유예(30초) 안에 들어간다.
 // cancel은 드레인 기한에 바로 나가므로 DB 지연은 cancel이 아니라 그 뒤의 상태 확정만 늦춘다.
-export interface RuntimeOptions { shutdown?: AbortSignal; drainMs?: number }
+export interface RuntimeOptions { shutdown?: AbortSignal; drainMs?: number; log?: Log }
 export const DRAIN_MS = 10_000;
+// 멈춤이 확인된 뒤의 상태 쓰기 시도 횟수. 간격은 200ms, 400ms로 짧게 둔다(종료 기한 안에 들어가야 한다).
+export const STOPPED_WRITE_ATTEMPTS = 3;
+const STOPPED_WRITE_DELAY_MS = 200;
 export class Runtime {
   private readonly reads: ReadRuntime;
   private readonly shutdown?: AbortSignal;
   private readonly drainMs: number;
+  private readonly log: Log;
   constructor(private readonly store: Store, private readonly gate: PolicyGate,
     private readonly worker: WorkerClient, private readonly signer: WorkerSigner,
     reader: ReadAdapter, private readonly tasks?: TaskLane, options: RuntimeOptions = {}) {
     this.shutdown = options.shutdown;
     this.drainMs = options.drainMs ?? DRAIN_MS;
+    this.log = options.log ?? jsonLog;
     this.reads = new ReadRuntime(store, gate, reader, options.shutdown);
   }
   // read 레인 한 바퀴. 모델 tick과 다른 루프에서 부른다.
@@ -45,6 +52,9 @@ export class Runtime {
     let drained = false;
     // 드레인 기한에 보낸 cancel. 작업자는 첫 확인 뒤 job을 놓아 두 번째 cancel은 stopped:false이므로 이 결과를 다시 쓴다.
     let cancelling: Promise<boolean> | undefined;
+    // 작업자 cancel이 멈춤을 확인했는지(result.stopped와 구분한다). 확인 결과는 상태 쓰기 전에 남겨,
+    // 쓰기가 실패해도 catch가 cancel을 다시 묻지 않게 한다.
+    let confirmed = false;
     try {
       // 종료 신호 전에 시작한 claim이 늦게 돌아온 경우. 작업자에 보내기 전이라 시도 횟수를 쓰지 않고 되돌린다.
       if (await this.deferOnShutdown(job)) return true;
@@ -119,14 +129,16 @@ export class Runtime {
         && (result.status === 'limited' || result.status === 'auth_expired')) {
         await this.store.waitForUser(job, result.status === 'limited' ? 'model_limit' : 'auth_expired');
       } else if (current.state === 'cancel_requested' || abort.signal.aborted || authorizationRevoked) {
-        stopped = result.stopped || await (cancelling ?? this.confirmStop(job));
-        if (authorizationRevoked) await this.store.transition(job, stopped ? 'cancelled' : 'unknown', 'authorization_revoked');
+        if (!result.stopped) stopped = confirmed = await (cancelling ?? this.confirmStop(job));
+        const settle = (write: () => Promise<unknown>) => stopped ? this.afterStop(job, write) : write();
+        if (authorizationRevoked) await settle(() => this.store.transition(job, stopped ? 'cancelled' : 'unknown', 'authorization_revoked'));
         else if (drained && current.state !== 'cancel_requested') await this.shutdownOutcome(job, stopped);
-        else if (stopped && current.state !== 'cancel_requested') await this.store.fail(job, 'stop_confirmation');
-        else await this.store.transition(job, stopped ? 'cancelled' : 'unknown', 'stop_confirmation');
+        else if (stopped && current.state !== 'cancel_requested') await settle(() => this.store.fail(job, 'stop_confirmation'));
+        else await settle(() => this.store.transition(job, stopped ? 'cancelled' : 'unknown', 'stop_confirmation'));
       } else if (!result.stopped) {
         // unknown으로 막기 전에, 작업자가 아직 이 job을 잡고 있을 때 한 번 멈춤을 확인한다.
-        if (await this.confirmStop(job)) await this.store.fail(job, 'stop_confirmation');
+        stopped = confirmed = await this.confirmStop(job);
+        if (confirmed) await this.afterStop(job, () => this.store.fail(job, 'stop_confirmation'));
         else await this.store.transition(job, 'unknown', 'worker_disconnected');
       } else if (result.status === 'failed') await this.store.fail(job, 'model_failed');
       else if (result.status === 'succeeded') {
@@ -141,13 +153,19 @@ export class Runtime {
     } catch (error) {
       // A known limit retains the slot even if subsequent policy/state reads or writes fail.
       if (waiting && !authorizationRevoked && !(error instanceof Denied)) return true;
+      // 판정 전에 실패해도 드레인 cancel이 이미 멈춤을 확인했으면 그 결과를 쓴다.
+      if (!stopped && cancelling && await cancelling) stopped = confirmed = true;
       if (authorizationRevoked || error instanceof Denied) {
-        const confirmed = !dispatched || stopped || error instanceof WorkerRejected;
-        await this.store.transition(job, confirmed ? 'cancelled' : 'unknown', 'authorization_revoked');
+        const ended = !dispatched || stopped || error instanceof WorkerRejected;
+        const write = () => this.store.transition(job, ended ? 'cancelled' : 'unknown', 'authorization_revoked');
+        await (confirmed ? this.afterStop(job, write) : write());
       } else if (error instanceof PolicyUnavailable && !dispatched) await this.store.defer(job);
       else if (error instanceof WorkerRejected) await this.store.fail(job, 'worker_rejected');
-      else if (!dispatched || stopped) await this.store.fail(job, dispatched ? 'invalid_result' : 'before_dispatch');
-      else if (await (cancelling ?? this.confirmStop(job))) await this.store.fail(job, 'stop_confirmation');
+      else if (!dispatched) await this.store.fail(job, 'before_dispatch');
+      else if (confirmed && drained) await this.shutdownOutcome(job, true);
+      else if (confirmed) await this.afterStop(job, () => this.store.fail(job, 'stop_confirmation'));
+      else if (stopped) await this.store.fail(job, 'invalid_result');
+      else if (await this.confirmStop(job)) await this.afterStop(job, () => this.store.fail(job, 'stop_confirmation'));
       else await this.store.transition(job, 'unknown', 'runtime_uncertain');
     }
     return true;
@@ -183,10 +201,27 @@ export class Runtime {
     let outcome: string;
     if (!stopped) { await this.store.transition(job, 'unknown', 'publisher_shutdown'); outcome = 'unknown'; }
     else if (job.type === 'chat' && job.attempt < DEFAULTS.maxRetries + 1) {
-      const state = await this.store.requeueAfterShutdown(job);
-      outcome = state === 'queued' ? 'requeued' : state ?? 'stale';
-    } else { await this.store.fail(job, 'stop_confirmation'); outcome = 'failed'; }
+      const written = await this.afterStop(job, () => this.store.requeueAfterShutdown(job));
+      outcome = !written ? 'write_failed' : written.value === 'queued' ? 'requeued' : written.value ?? 'stale';
+    } else outcome = await this.afterStop(job, () => this.store.fail(job, 'stop_confirmation')) ? 'failed' : 'write_failed';
     await this.store.audit('publisher_shutdown', job.id, { type: job.type, attempt: job.attempt, outcome });
+  }
+  // 작업자가 멈춤을 확인한 뒤의 상태 쓰기. 일시 DB 오류에 cancel을 다시 묻지 않는다. 작업자는 첫 확인 뒤 job을 놓아
+  // 두 번째 cancel은 stopped:false이고, 그러면 확인된 멈춤이 풀 수 없는 unknown이 된다. 쓰기는 lease CAS라
+  // lease가 끝난 뒤의 재시도는 아무것도 바꾸지 않는다. 끝내 못 쓰면 던지지 않고 로그·감사를 남긴다(그 job은 lease 만료 뒤
+  // expire가 unknown으로 둔다. 감사의 stop_confirmed_write_failed가 실제로는 멈췄다는 근거다).
+  private async afterStop<T>(job: Job, write: () => Promise<T>): Promise<{ value: T } | undefined> {
+    for (let attempt = 1; ; attempt++) {
+      try { return { value: await write() }; }
+      catch (error) {
+        if (attempt >= STOPPED_WRITE_ATTEMPTS) {
+          this.log('stop_confirmed_write_failed', { job: job.id, attempts: attempt, ...errorInfo(error) });
+          await this.store.audit('stop_confirmed_write_failed', job.id, { type: job.type, attempt: job.attempt }).catch(() => {});
+          return undefined;
+        }
+        await new Promise(resolve => setTimeout(resolve, STOPPED_WRITE_DELAY_MS * attempt));
+      }
+    }
   }
   private async monitor(job: Job): Promise<boolean> {
     const current = (await this.store.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0]!;
