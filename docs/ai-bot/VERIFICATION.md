@@ -315,3 +315,12 @@ PGlite는 transaction을 직렬화한다. 실제 PostgreSQL 다중 연결 경합
 - 독립 리뷰 1회(읽기 전용 에이전트): 13건(P1 1, P2 6, P3 6). 12건을 고치고 회귀 시험을 더했다. 남은 1건은 Discord 명령 연결이고, T16a 소유 ingress 흐름을 바꿔야 해서 변경 요청으로 남겼다. 리뷰가 고친 판정: 알림 없는 unknown, 해제할 수 없는 unknown, environ을 못 읽는 프로세스를 0개로 세던 것(fail-open), diff 대조 없음, 한도를 failed로 보던 것, 반사 검사 우회·오탐.
 - 2차 독립 리뷰(1차 반영 커밋 대상): 8건(P1 1, P2 3, P3 4)을 모두 고치고 회귀 시험을 더했다. 리뷰가 고친 판정: 실제 CLI가 `file_change` 경로를 절대 경로로 내면 정상 완료가 모두 실패하던 것([미확인] 형식이라 보고 차이는 증거로만 남김), 생존 프로세스가 있을 때 작업 공간 읽기, 스케줄러 잠금 순서, 실행 전 실패가 개발 기계에서 전역 unknown이 되던 것, 대기 알림 조건, 일시 error 이벤트, pgid 재사용, 이미 있는 `.git`.
 - 반영 중 시험 fixture의 JWT 헤더·payload 끝이 우연히 같아 반사 검사가 오탐한 1건은 fixture를 실제 모양으로 고쳤다. non-dumpable 시험은 처음에 고정 300ms 대기에 기대 반복 실행 중 1회 흔들렸고, 준비 파일을 기다리게 고친 뒤 전체 3회 연속 통과했다.
+
+## T16b 선행 보안 수정: capability nonce 정규화 (2026-10-30, 로컬)
+
+- 기준: 브랜치 `fix/t16b-capability-nonce`(origin/main `1dba78e` 위). PR #5 Codex 리뷰 지적 4316750309의 이월분이다(구현은 [ARCHITECTURE.md](ARCHITECTURE.md) 작업자 제어 인증).
+- `npm run check` 통과, `npm test` **489 tests / 487 pass / 0 fail / 2 skipped**(새 시험 3개 포함, 건너뜀 2개는 로컬 PostgreSQL 소켓이 필요한 기존 DATA-02 PG 시험). Node 24.22.2, TypeScript 7.0.2, PGlite 0.5.10. 외부 서비스 호출 없음.
+
+| 시험 ID | 등급 / 판정 | 확인한 경계 | 남은 검증 / 해소 |
+|---|---|---|---|
+| SEC-02 (capability 재생) | local_integration / pass | execute·cancel capability를 한 번 쓴 뒤 같은 payload·서명 바이트의 다른 base64url 표기(`=`·`==`·`!` 덧붙임, 중간 `!`, 표준 base64 `+/`, 서명 끝 글자의 남는 비트, payload 뒤 `=`)로 다시 보내면 거부, 비정규 표기를 먼저 보내도 nonce를 쓰지 않음, 작업자 HTTP(loopback)는 변형 재전송에 403·실행 1회. 수정 전 같은 시험 3/3 fail(정상 1회 뒤 서명 변형이 모두 통과, HTTP 200으로 같은 작업 재실행) | 재시작 뒤에도 남는 원자적 nonce 저장소, T16b |

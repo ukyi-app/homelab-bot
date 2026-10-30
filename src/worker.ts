@@ -38,6 +38,9 @@ export class WorkerSigner {
   }
 }
 const digest = (body: unknown) => createHash('sha256').update(JSON.stringify(body)).digest('hex');
+// Node's base64url decoder skips padding, foreign characters and unused trailing bits, so one capability
+// has many spellings. Only the spelling that re-encodes to itself is accepted.
+const canonical = (part: string) => Buffer.from(part, 'base64url').toString('base64url') === part;
 export class WorkerVerifier {
   constructor(private readonly publicKey: KeyObject,
     private readonly consume: (nonce: string) => Promise<boolean>, private readonly now: Clock = Date.now) {}
@@ -46,12 +49,17 @@ export class WorkerVerifier {
       const pieces = token.split('.');
       if (pieces.length !== 2) throw new Denied();
       const [payload, signature] = pieces as [string, string];
-      if (!verify(null, Buffer.from(payload), this.publicKey, Buffer.from(signature, 'base64url'))) throw new Denied();
+      if (!canonical(payload) || !canonical(signature)) throw new Denied();
+      const signed = Buffer.from(payload);
+      if (!verify(null, signed, this.publicKey, Buffer.from(signature, 'base64url'))) throw new Denied();
       const c = CapabilitySchema.parse(JSON.parse(Buffer.from(payload, 'base64url').toString()));
       const now = this.now();
+      // The nonce is the signed payload, not the token text: Ed25519 gives one signature per payload,
+      // so a capability is spent once however its signature is spelled.
       if (c.operation !== operation || c.job !== body.job || c.lease !== body.lease
         || c.digest !== digest(body) || c.issued > now + DEFAULTS.capabilitySkewMs || c.expires <= now
-        || c.expires <= c.issued || c.expires - c.issued > 30_000 || !await this.consume(digest(token))) throw new Denied();
+        || c.expires <= c.issued || c.expires - c.issued > 30_000
+        || !await this.consume(createHash('sha256').update(signed).digest('hex'))) throw new Denied();
     } catch { throw new Denied(); }
   }
 }

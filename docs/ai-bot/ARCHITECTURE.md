@@ -421,6 +421,7 @@ IDENTIFY는 rolling 24시간 **900회**를 로컬 상한으로 두고 1000회 �
 capability는 audience·operation·job·lease·body digest·발급/만료 시각에 묶이고 유효기간은 **30초**다.
 발급 시각은 한 번만 읽어 만료를 정확히 30초 뒤로 계산한다.
 `execute`와 `cancel`을 구분하며 일회 사용 consume 저장소를 주입한다.
+토큰의 두 부분은 canonical base64url(디코드 뒤 다시 인코드해 같은 표기)만 받고, nonce는 토큰 문자열이 아니라 서명이 덮는 payload의 SHA-256이다. 그래서 서명 표기를 바꿔 같은 capability를 다시 쓸 수 없다(T16b 선행 수정, PR #5 지적 4316750309).
 cancel body는 `{job, lease}`가 필수이며 서명 lease·현재 busy lease와 모두 일치해야 중단한다.
 실제 중단 어댑터에도 job/lease를 함께 전달해 이전 시도가 새 시도를 중단하지 못하게 한다. 로컬은 메모리 모의이고,
 작업자 재시작 뒤에도 남는 nonce 저장소는 T16b에서 제공해야 한다. 게시 토큰·GitHub 자격은 worker 요청에 없다.
