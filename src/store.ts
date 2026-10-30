@@ -23,6 +23,9 @@ const json = (value: unknown) => JSON.stringify(value);
 // 전역 상한 중 read 몫. contracts.ts의 DEFAULTS는 공용 계약이라 여기 둔다.
 export const READ_QUEUE_RESERVE = 10;
 export const MODEL_QUEUE_LIMIT = DEFAULTS.maxQueue - READ_QUEUE_RESERVE;
+// unknown chat 조사 간격: 처음 조사 뒤 30초, 이후 두 배씩, 상한 10분.
+export const UNKNOWN_PROBE_FIRST_MS = 30_000;
+export const UNKNOWN_PROBE_MAX_MS = 600_000;
 export class Store {
   constructor(public readonly db: Database, public readonly now: Clock = Date.now) {}
   async atomic<T>(fn: (store: Store) => Promise<T>, deadline?: TransactionDeadline): Promise<T> {
@@ -258,6 +261,49 @@ export class Store {
       await this.enqueue({ key: `result:${job.id}`, job: job.id, conversation: job.conversation_id,
         actor: job.owner_id, scope, revision: job.revision.policy, services,
         payload: { kind: 'message', channel: scope.channel, content, classification: 'safe_summary' } }, tx);
+    });
+  }
+  // chat unknown 조사 예약. 다음 조사 시각은 마이그레이션 없이 controls 행(unknown_probe:<job>)에 둔다.
+  // 같은 행을 잠그고 시각이 된 것만 다음 시각으로 미뤄 돌려주므로 게시 서버 둘이 같은 job을 동시에 조사하지 않는다.
+  // lease가 바뀌었으면(다시 실행된 뒤 다시 unknown) backoff를 처음부터 센다. 경과 시간만으로 상태를 바꾸지 않는다.
+  async reserveUnknownProbes(limit = 3): Promise<Job[]> {
+    return this.db.transaction(async tx => {
+      await tx.query(`DELETE FROM controls WHERE key LIKE 'unknown_probe:%' AND NOT EXISTS
+        (SELECT 1 FROM jobs WHERE id=substr(controls.key,15) AND type='chat' AND state='unknown')`);
+      const jobs = (await tx.query<Job>(`SELECT * FROM jobs WHERE type='chat' AND state='unknown' AND lease_token IS NOT NULL
+        ORDER BY id LIMIT 50`)).rows;
+      const due: Job[] = [];
+      for (const job of jobs) {
+        if (due.length >= limit) break;
+        const key = `unknown_probe:${job.id}`;
+        await tx.query(`INSERT INTO controls VALUES ($1,$2) ON CONFLICT DO NOTHING`, [key, json({ lease: job.lease_token, count: 0, next: 0 })]);
+        const stored = (await tx.query<{ value: { lease: string; count: number; next: number } }>(
+          'SELECT value FROM controls WHERE key=$1 FOR UPDATE', [key])).rows[0]!.value;
+        const probe = stored.lease === job.lease_token ? stored : { lease: job.lease_token, count: 0, next: 0 };
+        if (probe.next > this.now()) continue;
+        const count = probe.count + 1;
+        await tx.query('UPDATE controls SET value=$2 WHERE key=$1', [key, json({ lease: job.lease_token, count,
+          next: this.now() + Math.min(UNKNOWN_PROBE_MAX_MS, UNKNOWN_PROBE_FIRST_MS * 2 ** (count - 1)) })]);
+        due.push(job);
+      }
+      return due;
+    });
+  }
+  // 작업자가 멈춤을 확인한 unknown chat을 확정 실패로 끝낸다. 관측한 lease일 때만 바꾸고(CAS), 상태·감사·안내를 함께 쓴다.
+  // 새 실행은 시작하지 않는다. owner가 /retry로 다시 실행한다.
+  async resolveUnknown(job: Job): Promise<boolean> {
+    return this.db.transaction(async tx => {
+      const row = (await tx.query<Job>(`UPDATE jobs SET state='failed',wait_reason='stop_confirmed_after_unknown',finished_at=$3
+        WHERE id=$1 AND type='chat' AND state='unknown' AND lease_token=$2 RETURNING *`, [job.id, job.lease_token, this.now()])).rows[0];
+      if (!row) return false;
+      await tx.query('DELETE FROM controls WHERE key=$1', [`unknown_probe:${row.id}`]);
+      await tx.query('INSERT INTO audit(kind,subject,detail,created_at) VALUES ($1,$2,$3,$4)',
+        ['unknown_stop_confirmed', row.id, json({ attempt: row.attempt }), this.now()]);
+      await this.enqueue({ key: `unknown-resolved:${row.id}:${row.attempt}`, job: row.id, conversation: row.conversation_id,
+        actor: row.owner_id, scope: row.target, revision: row.revision.policy,
+        payload: { kind: 'message', channel: row.target.channel, classification: 'safe_summary',
+          content: `이전 작업이 멈춘 것을 확인했습니다. /retry target:${row.id}으로 다시 실행할 수 있습니다.` } }, tx);
+      return true;
     });
   }
   async enqueue(input: { key: string; job?: string; conversation?: string; actor: string; scope: Scope; revision: string; services?: string[]; payload: Delivery['payload'] }, tx?: Database): Promise<void> {

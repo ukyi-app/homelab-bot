@@ -32,6 +32,8 @@ export class Runtime {
     await this.store.expire();
     // 기한 지난 질문 대기를 먼저 풀어야 슬롯을 잡은 waiting_user가 다음 작업을 막지 않는다.
     await this.tasks?.sweep?.();
+    // chat unknown이 있으면 모델 claim은 어차피 막혀 있으므로 여기서 조사해도 모델 실행을 늦추지 않는다.
+    await this.probeUnknown();
     const job = await this.store.claim();
     if (!job) return false;
     let dispatched = false;
@@ -150,6 +152,17 @@ export class Runtime {
       const body = { job: job.id, lease: job.lease_token };
       return (await this.worker.cancel(body, this.signer.issue(job, 'cancel', body))).stopped;
     } catch { return false; }
+  }
+  // 이전 실행이 unknown으로 남긴 chat에 새 cancel capability로 멈춤을 묻는다(네트워크는 DB 트랜잭션 밖).
+  // 지금 작업자는 그 job을 아직 잡고 있을 때만 stopped:true를 준다. 이미 끝냈거나 재시작한 작업자의 job은 풀리지 않는다.
+  async probeUnknown(): Promise<number> {
+    if (this.shutdown?.aborted) return 0;
+    let resolved = 0;
+    for (const job of await this.store.reserveUnknownProbes()) {
+      if (this.shutdown?.aborted) break;
+      if (await this.confirmStop(job) && await this.store.resolveUnknown(job)) resolved++;
+    }
+    return resolved;
   }
   private async deferOnShutdown(job: Job): Promise<boolean> {
     if (!this.shutdown?.aborted) return false;
