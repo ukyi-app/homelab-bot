@@ -62,23 +62,34 @@ export class HttpWorker implements WorkerClient {
     return z.strictObject({ stopped: z.boolean() }).parse(await response.json());
   }
 }
-export function workerServer(worker: WorkerClient) {
+// ready를 넘기면 GET /readyz를 연다(kubelet readiness, 인증 없음. 응답에 상태 본문을 싣지 않는다).
+// accepting이 false를 돌려주면(종료 중) 새 실행 요청을 실행 전에 거부한다(403, started:false). 취소는 계속 받는다.
+export function workerServer(worker: WorkerClient, ready?: () => Promise<boolean>, accepting?: () => boolean) {
   const server = createServer(async (req, res) => {
+    if (ready && req.method === 'GET' && req.url === '/readyz') {
+      const ok = await ready().catch(() => false);
+      res.writeHead(ok ? 200 : 503).end(); return;
+    }
     if (req.method !== 'POST' || !['/v1/execute', '/v1/cancel'].includes(req.url ?? '')) { res.writeHead(404).end(); return; }
     const auth = req.headers.authorization;
     if (!auth?.startsWith('Capability ')) {
       res.writeHead(401, { 'content-type': 'application/json' }).end(JSON.stringify({ status: 'rejected', started: false })); return;
     }
     let started = false;
+    // 종료 중의 응답은 연결을 이어 두지 않는다. keep-alive면 서버 종료가 그 연결을 기다린다.
+    const closing = () => { if (accepting && !accepting()) res.shouldKeepAlive = false; };
     try {
       const input = await body(req);
       const validated = req.url === '/v1/execute' ? WorkerRequestSchema.parse(input) : CancelRequestSchema.parse(input);
+      if (req.url === '/v1/execute' && accepting && !accepting()) throw new WorkerRejected('worker_closing');
       started = true;
       const result = req.url === '/v1/execute'
         ? await worker.execute(validated as WorkerRequest, auth.slice(11), new AbortController().signal)
         : await worker.cancel(validated, auth.slice(11));
+      closing();
       res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(result));
     } catch (error) {
+      closing();
       const rejected = !started || error instanceof WorkerRejected;
       res.writeHead(rejected ? 403 : 500, { 'content-type': 'application/json' })
         .end(JSON.stringify(rejected ? { status: 'rejected', started: false } : { status: 'unknown', stopped: false }));

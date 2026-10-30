@@ -120,9 +120,11 @@ export function archiveContract(repository: string, base: string, head: string) 
 }
 
 // Declarative launch contract only: this module never starts a CLI or reads a home directory.
+// 실제 대화 레인 argv는 codex-chat.ts의 chatArgs다. 샌드박스(read-only)는 플래그가 아니라 config.toml에 둔다.
 export const CODEX_CONTRACT = Object.freeze({
   pinnedVersion: '0.163.0',
-  command: ['codex', 'exec', '--json', '--sandbox', 'read-only', '--output-schema', 'answer.schema.json'],
+  command: ['codex', 'exec', '--json', '--ephemeral', '--skip-git-repo-check', '--output-schema', 'answer.schema.json',
+    '-o', 'last-message.json', '-'],
   codeSource: 'codeload.github.com', home: 'worker_dedicated_persistent',
   seed: 'only_if_auth_json_missing', environmentInheritance: 'none',
   githubCredentials: false, concurrency: 1, authFallback: 'none',

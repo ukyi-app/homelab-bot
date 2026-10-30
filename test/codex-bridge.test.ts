@@ -1,5 +1,6 @@
 import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { chmod, link, mkdir, mkdtemp, open, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { DEFAULTS, Denied, PolicyUnavailable } from '../src/contracts.js';
@@ -552,15 +553,23 @@ test('TASK-03 작업자 단절은 종료 확인에 따라 failed·unknown, 재�
   const session = (await rows('codex_sessions'))[0]!;
   assert.equal(session.thread_id, 'fresh-thread'); assert.equal(session.turn, 1);
 });
-test('TASK-03 시간 초과는 정리 확인 뒤 failed 안내, 실패 결과는 자동 재실행하지 않고 다음 작업을 막지 않음', async () => {
+test('TASK-03 시간 초과는 정리 확인 뒤 failed 안내, 실패 결과는 자동 재실행하지 않고 다음 작업을 막지 않음', async t => {
   // 준비(git init)가 30ms보다 길면 시간 초과가 실행 전에 와서 띄우지 않는다(R1). 실행 중 시간 초과를 보려고 준비를 없앤다.
   const instant = new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, new CodexBridge(f.store, f.gate,
     new ExecCodexAdapter(root, launcher, { workspace: { prepare: async () => {}, snapshot: async () => ({}) } }), { monitorMs: 5 }));
   launcher.scripts.push({ lines: jsonl(...begin()), hang: true });
   const job = await task();
   await database.db.query(`UPDATE jobs SET budget='{"timeoutMs":30,"toolCalls":8}' WHERE id=$1`, [job.id]);
-  await instant.tick();
+  // 시간 초과 타이머는 가짜 시계로 실행이 시작된 뒤에 넘긴다. 실제 30ms 타이머는 부하에서 준비(디렉터리·설정 쓰기)가
+  // 끝나기 전에 울려 프로세스를 띄우지 않았다(launcher.started 0, 부하 14에서 12회 중 7회).
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let settled = false;
+  const ticking = instant.tick().finally(() => { settled = true; });
+  while (launcher.started === 0 && !settled) await new Promise(resolve => setImmediate(resolve));
   assert.equal(launcher.started, 1);
+  t.mock.timers.tick(30);
+  await ticking;
+  t.mock.timers.reset();
   assert.equal((await jobs())[0]!.state, 'failed'); assert.equal((await jobs())[0]!.wait_reason, 'codex_timeout');
   assert.match((await outbox())[0]!.payload.content, /작업 실패가 확인됐습니다/);
   launcher.scripts.push(finished(out('completed', '끝'), [], THREAD), { lines: ['broken'], exit: exit0, output: out('completed', '끝') });
@@ -623,6 +632,11 @@ process.stdin.on('end', () => {
   const emit = e => process.stdout.write(JSON.stringify(e) + '\\n');
   emit({ type: 'thread.started', thread_id: 'local-thread-1' }); emit({ type: 'turn.started' });
   writeFileSync('env.json', JSON.stringify({ keys: Object.keys(process.env), input }));
+  const finish = () => {
+    writeFileSync(target, JSON.stringify({ status: 'completed', summary: 'local', question: '' }));
+    // 파이프 쓰기는 비동기라 바로 exit하면 앞선 출력이 잘린다. 마지막 쓰기가 비워진 뒤 끝낸다.
+    process.stdout.write(JSON.stringify({ type: 'turn.completed', usage: {} }) + '\\n', () => process.exit(0));
+  };
   const sleeper = ['-e', 'setInterval(() => {}, 1000)'];
   if (mode === 'background') { const c = spawn(process.execPath, sleeper, { stdio: 'ignore' }); writeFileSync('child.pid', String(c.pid)); c.unref(); }
   if (mode === 'escape' || mode === 'escape-clean') {
@@ -634,23 +648,19 @@ process.stdin.on('end', () => {
     const c = spawn('python3', ['-c', 'import ctypes,time,pathlib; ctypes.CDLL(None).prctl(4,0,0,0,0); pathlib.Path("ready").write_text("1"); time.sleep(30)'],
       { stdio: 'ignore', detached: true, env: { PATH: process.env.PATH } });
     writeFileSync('child.pid', String(c.pid)); c.unref();
-    const until = Date.now() + 5000; while (Date.now() < until && !require('node:fs').existsSync('ready')) {}
+    // 자식이 non-dumpable이 된 뒤(ready)에 끝낸다. 시간 상한 없이 상태를 기다리고, 자식이 먼저 죽으면 바로 끝낸다.
+    let gone = false; c.once('exit', () => { gone = true; });
+    const wait = () => { if (gone || require('node:fs').existsSync('ready')) finish(); else setTimeout(wait, 10); };
+    wait(); return;
   }
-  const finish = () => {
-    writeFileSync(target, JSON.stringify({ status: 'completed', summary: 'local', question: '' }));
-    // 파이프 쓰기는 비동기라 바로 exit하면 앞선 출력이 잘린다. 마지막 쓰기가 비워진 뒤 끝낸다.
-    process.stdout.write(JSON.stringify({ type: 'turn.completed', usage: {} }) + '\\n', () => process.exit(0));
-  };
   if (mode === 'hang') { setInterval(() => {}, 1000); return; }
   if (mode === 'tools') {
-    // 도구 호출 시작을 150ms 간격으로 세 번 낸다. 셋째 호출이 시작되면 그 효과로 파일을 남긴다.
-    let n = 0;
-    const step = () => {
-      n++;
-      emit({ type: 'item.started', item: { id: 'cmd_' + n, type: 'command_execution', command: 'echo ' + n, aggregated_output: '', status: 'in_progress' } });
-      if (n === 3) { writeFileSync('third.txt', '3'); finish(); } else setTimeout(step, 150);
-    };
-    step(); return;
+    // 도구 호출 시작 두 번을 바로 낸다. 예산(1)을 넘는 둘째를 본 작업자가 그룹을 끝내야 한다. 끝내지 않으면 셋째
+    // 호출을 하고 그 효과로 파일을 남긴다. 30초는 끝내지 못한 경우를 실패로 드러내는 상한이고 통과 경로는 기다리지 않는다.
+    const tool = n => emit({ type: 'item.started', item: { id: 'cmd_' + n, type: 'command_execution', command: 'echo ' + n, aggregated_output: '', status: 'in_progress' } });
+    tool(1); tool(2);
+    setTimeout(() => { tool(3); writeFileSync('third.txt', '3'); finish(); }, 30000);
+    return;
   }
   if (mode === 'bigline') {
     process.stdout.write('{"type":"item.completed","item":{"id":"big","type":"command_execution","aggregated_output":"' + 'a'.repeat(3 * 1024 * 1024) + '"}}\\n');
@@ -661,11 +671,26 @@ process.stdin.on('end', () => {
   finish();
 });`;
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-async function local(mode: string, job: string, abortAfter?: number, extra: { limits?: Partial<CodexLimits>; toolCalls?: number } = {}) {
-  const runner = new ExecCodexAdapter(root, new ProcessGroupLauncher([process.execPath, '-e', FAKE_CODEX, mode], { graceMs: 500 }),
-    { limits: extra.limits });
+// 실제 ProcessGroupLauncher가 어댑터에 넘긴 줄을 시험도 본다. 시간이 아니라 "어댑터가 이 줄을 받았다"는 상태로 중단한다.
+class WatchedLauncher extends ProcessGroupLauncher {
+  constructor(command: readonly [string, ...string[]], options: { graceMs?: number }, private readonly watch?: (line: string) => void) {
+    super(command, options);
+  }
+  override run(spec: LaunchSpec, signal: AbortSignal, onLine: (line: string) => void): Promise<LaunchResult> {
+    return super.run(spec, signal, line => { onLine(line); this.watch?.(line); });
+  }
+}
+// 실제 프로세스 시험의 작업 ID는 실행마다 새로 만든다(randomUUID). launcher는 같은 UID의 모든 프로세스에서 작업 표식
+// (HOMELAB_CODEX_TASK=<job>)을 찾아 끝내고 센다. 고정 ID면 같은 기계에서 동시에 도는 다른 시험 실행(다른 worktree·에이전트)의
+// 같은 시험 프로세스를 자기 것으로 보고 죽이거나 남은 프로세스로 셌다(두 벌 동시 실행에서 S2가 8회 중 3회 exit_nonzero).
+// graceMs는 정리 신호 뒤 프로세스가 사라지기를 기다리는 상한이다. 사라지면 바로 끝나므로 넉넉히 둔다(부하에서 정리가 늦어도
+// 남은 프로세스로 오판하지 않게). 확인 불가가 계속되는 non-dumpable 시험만 짧게 준다.
+async function local(mode: string, job: string,
+  extra: { abortOn?: (line: string) => boolean; limits?: Partial<CodexLimits>; toolCalls?: number; graceMs?: number } = {}) {
   const controller = new AbortController();
-  if (abortAfter !== undefined) setTimeout(() => controller.abort(), abortAfter);
+  const watch = extra.abortOn ? (line: string) => { if (extra.abortOn!(line)) controller.abort(); } : undefined;
+  const runner = new ExecCodexAdapter(root, new WatchedLauncher([process.execPath, '-e', FAKE_CODEX, mode], { graceMs: extra.graceMs ?? 5000 }, watch),
+    { limits: extra.limits });
   const result = await runner.execute({ job, prompt: '지시', resume: null, toolCalls: extra.toolCalls ?? 8 }, controller.signal);
   const workspace = taskPaths(root, job).workspace;
   const pid = Number(await nodeFiles.read(join(workspace, 'child.pid')) ?? 0);
@@ -676,29 +701,30 @@ test('SEC-02 실제 프로세스: 작업자 환경 미상속, 정상 종료 뒤 
   const saved = { ...process.env };
   Object.assign(process.env, { DISCORD_BOT_TOKEN: 'fixture-discord', CODEX_AUTH_JSON: 'fixture-auth', OPENAI_API_KEY: 'fixture-key' });
   try {
-    const plain = await local('plain', '00000000-0000-4000-8000-0000000000a1');
+    const plain = await local('plain', randomUUID());
     assert.equal(plain.result.kind, 'completed');
     assert.deepEqual(plain.env.keys.sort(), ['CODEX_HOME', 'HOME', 'LANG', 'PATH', TASK_MARKER, 'TMPDIR'].sort());
     assert.equal(plain.env.input, '지시');
   } finally { process.env = saved; }
   for (const mode of ['background', 'escape']) {
-    const run = await local(mode, `00000000-0000-4000-8000-0000000000${mode === 'background' ? 'b1' : 'c1'}`);
+    const run = await local(mode, randomUUID());
     assert.ok(run.pid > 0, mode);
     assert.equal(run.result.kind, 'completed', mode);
     assert.equal(alive(run.pid), false, mode);
   }
-  const hung = await local('hang', '00000000-0000-4000-8000-0000000000d1', 300);
+  // 어댑터가 thread.started를 받은 뒤 중단한다(실행 중 중단). 고정 300ms면 부하에서 준비(git init)가 끝나기 전에 와서 띄우지 않았다.
+  const hung = await local('hang', randomUUID(), { abortOn: line => line.includes('"thread.started"') });
   assert.deepEqual(hung.result, { kind: 'failed', reason: 'aborted', threadId: 'local-thread-1', turns: 0, tools: 0 });
 });
 test('SEC-02 작업 시작 뒤 생긴 같은 UID 프로세스의 환경을 못 읽으면 소멸 확인 불가로 unknown(fail-closed)', async () => {
-  const run = await local('nondumpable', '00000000-0000-4000-8000-0000000000e2');
+  const run = await local('nondumpable', randomUUID(), { graceMs: 500 });
   assert.ok(run.pid > 0);
   assert.equal(run.result.kind, 'unknown');
   assert.equal(run.result.kind === 'unknown' && run.result.reason, 'stop_unverifiable');
   process.kill(run.pid, 'SIGKILL');
 });
 test('SEC-02 한계 기록: 환경을 지우고 새 세션으로 빠져나간 자식은 그룹·표식으로 못 찾는다(cgroup 필요, T16b)', async () => {
-  const run = await local('escape-clean', '00000000-0000-4000-8000-0000000000e1');
+  const run = await local('escape-clean', randomUUID());
   // 이 결과가 바뀌면 confirm_stop 표시와 ARCHITECTURE §12의 한계 문장을 함께 고친다.
   assert.equal(run.result.kind, 'completed');
   assert.equal(alive(run.pid), true);
@@ -782,7 +808,7 @@ test('TASK-02 질문 대기 중 비상 중지를 풀었으면 답한 뒤 스케�
 });
 test('TASK-03 실행 파일이 없거나 어댑터가 동기로 던지면 실행 전 실패로 막지 않고 종료 확인으로 판정', async () => {
   const missing = new ExecCodexAdapter(root, new ProcessGroupLauncher(['/nonexistent/codex'], { graceMs: 50 }));
-  assert.deepEqual(await missing.execute({ job: '00000000-0000-4000-8000-0000000000f1', prompt: 'p', resume: null, toolCalls: 8 }, new AbortController().signal),
+  assert.deepEqual(await missing.execute({ job: randomUUID(), prompt: 'p', resume: null, toolCalls: 8 }, new AbortController().signal),
     { kind: 'failed', reason: 'launch_failed', threadId: null, turns: 0, tools: 0 });
   for (const stopped of [true, false]) {
     await database.pg.exec('TRUNCATE events,conversations,jobs,results,outbox,denied_actors,controls,audit,codex_sessions,codex_questions RESTART IDENTITY CASCADE');
@@ -828,9 +854,11 @@ test('SEC-02 남은 프로세스가 있으면 작업 공간을 다시 읽지 않
     await symlink('/dev/zero', join(dir, 'zero'));
     await symlink('/etc', join(dir, 'outside'));
     await new Promise<void>((done, fail) => execFile('mkfifo', [join(dir, 'pipe')], error => error ? fail(error) : done()));
-    const started = Date.now();
-    const snap = (await fileWorkspace.snapshot(dir))!;
-    assert.ok(Date.now() - started < 2000);
+    // FIFO·/dev/zero를 따라가 열거나 읽으면 스냅샷이 끝나지 않는다. 걸린 시간이 아니라 끝나는지를 본다.
+    // 30초는 멈춤을 실패로 드러내는 상한일 뿐이고 통과 경로는 기다리지 않는다.
+    let guard: ReturnType<typeof setTimeout> | undefined;
+    const snap = (await Promise.race([fileWorkspace.snapshot(dir),
+      new Promise<never>((_, fail) => { guard = setTimeout(() => fail(new Error('snapshot_blocked')), 30_000); })]).finally(() => clearTimeout(guard)))!;
     assert.equal(snap['zero'], 'link:/dev/zero'); assert.equal(snap['outside'], 'link:/etc'); assert.equal(snap['pipe'], 'special');
     assert.equal(Object.keys(snap).some(path => path.startsWith('outside/')), false);
   } finally { await rm(dir, { recursive: true, force: true }); }
@@ -890,7 +918,11 @@ test('R1 준비 중 중단·해제된 작업은 준비가 늦게 끝나도 프�
   const gate = new Promise<void>(resolve => { release = resolve; });
   const slow = { prepare: async (dir: string) => { await gate; await fileWorkspace.prepare(dir); }, snapshot: (dir: string) => fileWorkspace.snapshot(dir) };
   const slowAdapter = new ExecCodexAdapter(root, launcher, { workspace: slow });
-  const slowBridge = new CodexBridge(f.store, f.gate, slowAdapter, { monitorMs: 5, stopWaitMs: 5 });
+  // 준비가 늦게 끝난 실행이 실제로 끝날 때까지 기다리려고 어댑터 호출을 잡아 둔다(고정 대기 대신).
+  let executing: Promise<unknown> | undefined;
+  const watched = { capabilities: () => slowAdapter.capabilities(), confirmStop: (id: string) => slowAdapter.confirmStop(id),
+    execute: (request: Parameters<typeof slowAdapter.execute>[0], signal: AbortSignal) => (executing = slowAdapter.execute(request, signal)) as ReturnType<typeof slowAdapter.execute> };
+  const slowBridge = new CodexBridge(f.store, f.gate, watched, { monitorMs: 5, stopWaitMs: 5 });
   const local = new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, slowBridge);
   const job = await task();
   await database.db.query(`UPDATE jobs SET budget='{"timeoutMs":5,"toolCalls":8}' WHERE id=$1`, [job.id]);
@@ -899,7 +931,8 @@ test('R1 준비 중 중단·해제된 작업은 준비가 늦게 끝나도 프�
   assert.equal((await slowBridge.release('fixture-owner', thread, job.id)).ok, true);
   assert.equal((await jobs())[0]!.state, 'cancelled');
   release();
-  for (let i = 0; i < 50; i++) await new Promise(resolve => setTimeout(resolve, 2));
+  assert.ok(executing);
+  assert.equal(((await executing) as { kind: string }).kind, 'failed');
   assert.equal(launcher.started, 0);
 });
 test('R1 소멸 확인은 준비 중인 실행도 무효로 만들고, 이미 중단된 신호로는 실제 launcher가 spawn하지 않음', async () => {
@@ -942,17 +975,17 @@ test('S2 도구 호출 예산은 질문 뒤 재개까지 합산', async () => {
   assert.equal((await jobs())[0]!.wait_reason, 'codex_tool_budget_exceeded');
 });
 test('S2 실제 프로세스: 예산을 넘는 도구 호출 시작을 보는 즉시 작업 그룹을 끝내 다음 호출이 일어나지 않음', async () => {
-  const job = '00000000-0000-4000-8000-0000000000b9';
-  const run = await local('tools', job, undefined, { toolCalls: 1 });
+  const job = randomUUID();
+  const run = await local('tools', job, { toolCalls: 1 });
   assert.equal(run.result.kind === 'failed' && run.result.reason, 'tool_budget_exceeded');
   assert.equal(await nodeFiles.read(join(taskPaths(root, job).workspace, 'third.txt')), null);
 });
 test('S3 실제 프로세스: 한 줄·전체 출력 상한을 넘으면 정리 뒤 실패, 출력을 쌓아 두지 않음', async () => {
-  const big = await local('bigline', '00000000-0000-4000-8000-0000000000c9', undefined, { limits: { lineBytes: 1024 * 1024 } });
+  const big = await local('bigline', randomUUID(), { limits: { lineBytes: 1024 * 1024 } });
   assert.equal(big.result.kind === 'failed' && big.result.reason, 'output_limit_exceeded');
-  const flood = await local('flood', '00000000-0000-4000-8000-0000000000d9', undefined, { limits: { outputBytes: 64 * 1024 } });
+  const flood = await local('flood', randomUUID(), { limits: { outputBytes: 64 * 1024 } });
   assert.equal(flood.result.kind === 'failed' && flood.result.reason, 'output_limit_exceeded');
-  const normal = await local('flood', '00000000-0000-4000-8000-0000000000e9');
+  const normal = await local('flood', randomUUID());
   assert.equal(normal.result.kind, 'completed');
 });
 test('R3 첫 턴 한도 대기 뒤 /resume-model은 저장된 스레드를 재개하고 처음부터 다시 하지 않음', async () => {
@@ -1123,10 +1156,20 @@ test('자체 점검: 한 줄 상한 안의 수만 개 변경 경로도 판정이
   const line = JSON.stringify({ type: 'item.completed', item: { id: 'patch', type: 'file_change', status: 'completed',
     changes: paths.map(path => ({ path })) } });
   assert.ok(Buffer.byteLength(line) < CODEX_LIMITS.lineBytes);
-  const started = Date.now();
+  // 벽시계가 아니라 일의 양으로 본다. 실제 변경 목록을 경로마다 훑으면(제곱) 원소 읽기가 목록 길이의 몇 배를 넘는다.
+  // 상한을 넘는 순간 던져 오래 돌지 않고 실패한다. 보고 경로 쪽은 이 프로세스의 CPU 시간으로 본다(다른 프로세스 부하와 무관).
+  const actual = paths.slice(0, 22_500);
+  let reads = 0;
+  const counted = new Proxy(actual, { get(target, key, receiver) {
+    if (typeof key === 'string' && /^\d+$/.test(key) && ++reads > 3 * actual.length) throw new Error(`quadratic_scan:${reads}`);
+    return Reflect.get(target, key, receiver);
+  } });
+  const cpu = process.cpuUsage();
   const result = interpretRun(report([...streamed(begin()), compactEvent(line).line, ...streamed([done])], out('completed', '끝'),
-    { workspace: '/w', changes: paths.slice(0, 22_500) }), null);
-  assert.ok(Date.now() - started < 800, `${Date.now() - started}ms`);
+    { workspace: '/w', changes: counted }), null);
+  const used = process.cpuUsage(cpu);
+  assert.ok((used.user + used.system) / 1000 < 800, `${(used.user + used.system) / 1000}ms CPU`);
+  assert.ok(reads <= 3 * actual.length, `${reads}`);
   assert.ok(result.kind === 'completed' && result.reported.length === 45_000 && result.unconfirmed.length === 22_500);
 });
 

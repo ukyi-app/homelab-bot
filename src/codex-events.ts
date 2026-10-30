@@ -59,6 +59,10 @@ export const THREAD_ID = /^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/;
 // 일반 표현으로 고른 [가정]이다. 잘못 고르면 다른 계정으로 넘어가지 않고 사람 확인을 기다리는 쪽(대기)으로 틀린다.
 const LIMIT = /usage[_ ]limit|rate[_ ]limit|quota|too many requests|\b429\b/i;
 const AUTH = /unauthori[sz]ed|\b401\b|refresh[_ ]token|token (?:has )?expired|log ?in again|re-?authenticat/i;
+// 실패 메시지가 한도·인증 만료인지. 작업 레인(interpretRun)과 대화 레인(codex-chat)이 같은 기준을 쓴다.
+export function waitReason(text: string): 'model_limit' | 'auth_expired' | null {
+  return LIMIT.test(text) ? 'model_limit' : AUTH.test(text) ? 'auth_expired' : null;
+}
 
 export interface RunReport {
   lines: string[];
@@ -106,9 +110,8 @@ export function interpretRun(report: RunReport, expectedThread: string | null, s
   // 재연결 같은 일시 error 이벤트 뒤 턴이 끝나고 종료 코드 0이면 결과를 버리지 않는다 [미확인: 일시 오류도 error로 내는지, T16b].
   // 세션(thread.started)이 생기기 전 오류도 판정한다. 인증·한도는 세션 전에 날 수 있고, 버리면 대기 대신 실패가 된다(D-14 조건 2).
   if (events.some(e => e.type === 'turn.failed') || (failures.length && (report.exit.code !== 0 || lastTurn?.type !== 'turn.completed'))) {
-    const text = failures.join('\n');
-    if (LIMIT.test(text)) return { kind: 'waiting', reason: 'model_limit', threadId, turns };
-    if (AUTH.test(text)) return { kind: 'waiting', reason: 'auth_expired', threadId, turns };
+    const reason = waitReason(failures.join('\n'));
+    if (reason) return { kind: 'waiting', reason, threadId, turns };
     return { kind: 'failed', reason: 'turn_failed', threadId, turns };
   }
   if (!threadId) return { kind: 'failed', reason: 'invalid_stream', threadId, turns };
