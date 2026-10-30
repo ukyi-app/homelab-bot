@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { chatContext } from './chat-context.js';
 import { DEFAULTS, Denied, RateLimited } from './contracts.js';
 import type { Clock, EventInput, Job, Scope, State } from './contracts.js';
 import { remaining } from './database.js';
@@ -290,19 +291,7 @@ export class Store {
         content: '상호작용 응답이 만료됐거나 확인되지 않았지만 요청 기록은 저장했습니다. 다시 보내기 전에 이 대화의 /list로 처리 상태를 확인하세요.' } });
   }
   async context(conversation: string, event: string): Promise<unknown[]> {
-    const rows = (await this.db.query<{ payload: unknown }>(`SELECT payload FROM events WHERE conversation_id=$1 AND accepted=true
-      AND actor_id=(SELECT owner_id FROM conversations WHERE id=$1)
-      AND event_order<=(SELECT e.event_order FROM events e JOIN conversations c ON c.id=e.conversation_id
-        WHERE e.id=$3 AND e.conversation_id=$1 AND e.actor_id=c.owner_id)
-      ORDER BY event_order DESC LIMIT $2`, [conversation, DEFAULTS.contextMessages, event])).rows;
-    const context: unknown[] = [];
-    let bytes = 0;
-    for (const row of rows) {
-      bytes += Buffer.byteLength(JSON.stringify(row.payload));
-      if (bytes > 32768) break;
-      context.unshift(row.payload);
-    }
-    return context;
+    return chatContext(this.db, conversation, event);
   }
   async checkpoint(conversation: string, message: string, recovering = false): Promise<void> {
     if (!/^\d+$/.test(message)) return;
