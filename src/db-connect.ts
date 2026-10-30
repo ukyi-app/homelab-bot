@@ -3,9 +3,18 @@
 // 프로세스 안에서 연결 단계 오류만 짧게 다시 시도한다. 인증·SQL 오류는 다시 해도 같아서 바로 던진다.
 const TRANSIENT = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH', 'EAI_AGAIN']);
 
+// node-pg는 연결 시간 초과·연결 중 끊김을 코드 없이 이 문구로 낸다(pg 8.23 client.js, pg-pool index.js).
+// 운영에서 새 파드가 연결은 열었는데 인증 전에 멈춰 5초 연결 시간 초과로 끝난 적이 있다(서버 로그 57014).
+// SQLSTATE 코드가 붙은 오류(인증 28P01 등)는 문구와 상관없이 다시 하지 않는다.
+const TRANSIENT_MESSAGES = [/^Connection terminated due to connection timeout$/, /^timeout expired$/, /^Connection terminated unexpectedly$/];
+
 export function transientConnectError(error: unknown): boolean {
-  const code = (error as { code?: unknown } | null)?.code ?? ((error as { cause?: { code?: unknown } } | null)?.cause)?.code;
-  return typeof code === 'string' && TRANSIENT.has(code);
+  const e = error as { code?: unknown; message?: unknown; cause?: unknown } | null;
+  if (!e || typeof e !== 'object') return false;
+  const code = e.code ?? (e.cause as { code?: unknown } | undefined)?.code;
+  if (typeof code === 'string') return TRANSIENT.has(code);
+  if (typeof e.message === 'string' && TRANSIENT_MESSAGES.some(re => re.test(e.message as string))) return true;
+  return e.cause !== undefined && transientConnectError(e.cause);
 }
 
 export interface RetryOptions {
