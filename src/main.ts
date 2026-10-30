@@ -11,6 +11,7 @@ import { z } from 'zod';
 import { Denied, DiscordRejected, RateLimited } from './contracts.js';
 import type { Clock, Scope } from './contracts.js';
 import { MIGRATIONS, Postgres, appliedMigrations, migrationVersion } from './database.js';
+import { withConnectRetry } from './db-connect.js';
 import type { Database } from './database.js';
 import { DiscordIngress, DiscordPublisher } from './discord.js';
 import { DiscordProtocol, discordHttpApi } from './discord-protocol.js';
@@ -248,7 +249,8 @@ async function main(): Promise<void> {
   pool.on('error', error => log('database_pool_error', errorInfo(error)));
   const db = new Postgres(pool);
   try {
-    const applied = await appliedMigrations(db);
+    const applied = await withConnectRetry(() => appliedMigrations(db), {
+      onRetry: (attempt, error) => log('database_connect_retry', { attempt: String(attempt), ...errorInfo(error) }) });
     const missing = MIGRATIONS.map(migrationVersion).filter(version => !applied.has(version));
     if (missing.length) { log('schema_not_migrated', { missing }); await pool.end(); process.exitCode = 1; return; }
   } catch (error) { log('database_unavailable', errorInfo(error)); await pool.end().catch(() => {}); process.exitCode = 1; return; }
