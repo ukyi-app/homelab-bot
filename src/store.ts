@@ -162,30 +162,36 @@ export class Store {
       AND lease_until>$4 AND state IN ('running','verifying','cancel_requested') RETURNING id`,
     [job.id, job.lease_token, this.now() + DEFAULTS.leaseMs, this.now()])).rows.length === 1;
   }
+  // 한 번의 만료 처리는 기준 시각 하나를 쓴다. 후보 job을 그 시각으로 먼저 정하고 그 대화 행을 잠근 뒤,
+  // 그 ID에 한해서만 만료 조건을 다시 확인해 바꾼다. 선잠금 뒤에 새로 만료된 job까지 UPDATE가 잡으면
+  // 잠그지 않은 대화의 안내 INSERT가 같은 대화의 /cancel(대화 행 → job)과 순환한다. 그런 job은 다음 tick이 처리한다.
   async expire(): Promise<void> {
-    await this.expireReads();
+    const now = this.now();
+    await this.expireReads(now);
     // 바꾼 행마다 같은 트랜잭션에서 unknown 안내를 넣는다(chat만).
     await this.db.transaction(async tx => {
-      await this.lockConversations(tx, `state IN ('running','verifying','cancel_requested') AND lease_until<=$1 AND type<>'read'`);
+      const ids = await this.lockExpiring(tx, `state IN ('running','verifying','cancel_requested') AND lease_until<=$1 AND type<>'read'`, now);
+      if (!ids.length) return;
       const expired = (await tx.query<Job>(`UPDATE jobs SET state='unknown',wait_reason='lease_expired'
-        WHERE state IN ('running','verifying','cancel_requested') AND lease_until<=$1 AND type<>'read' RETURNING *`, [this.now()])).rows;
+        WHERE id=ANY($2) AND state IN ('running','verifying','cancel_requested') AND lease_until<=$1 AND type<>'read' RETURNING *`, [now, ids])).rows;
       for (const job of expired) await this.unknownNotice(job, tx);
     });
     await this.db.query(`UPDATE outbox SET state=CASE WHEN dispatch_started THEN 'unknown' ELSE 'pending' END,
       attempt=CASE WHEN dispatch_started THEN attempt ELSE GREATEST(0,attempt-1) END,
       available_at=CASE WHEN dispatch_started THEN $1 ELSE $1+$2 END
-      WHERE state='sending' AND lease_until<=$1`, [this.now(), DEFAULTS.retryDelayMs]);
+      WHERE state='sending' AND lease_until<=$1`, [now, DEFAULTS.retryDelayMs]);
     await this.retireUnknownDeliveries();
   }
   // read에는 외부 쓰기가 없어 lease 만료가 불확실성이 아니다. unknown 대신 확정 실패로 끝내고 다시 요청하도록 안내한다.
   // 구버전이 남긴 unknown read도 같은 이유로 정리한다. owner가 /cancel한 것은 cancelled로 끝낸다.
-  private async expireReads(): Promise<void> {
+  private async expireReads(now: number): Promise<void> {
+    const where = `type='read' AND ((state IN ('running','verifying','cancel_requested') AND lease_until<=$1) OR state='unknown')`;
     await this.db.transaction(async tx => {
-      await this.lockConversations(tx, `type='read' AND ((state IN ('running','verifying','cancel_requested') AND lease_until<=$1) OR state='unknown')`);
+      const ids = await this.lockExpiring(tx, where, now);
+      if (!ids.length) return;
       const expired = (await tx.query<Job>(`UPDATE jobs SET
         state=CASE WHEN state='cancel_requested' THEN 'cancelled' ELSE 'failed' END,wait_reason='lease_expired',finished_at=$1
-        WHERE type='read' AND ((state IN ('running','verifying','cancel_requested') AND lease_until<=$1) OR state='unknown')
-        RETURNING *`, [this.now()])).rows;
+        WHERE id=ANY($2) AND ${where} RETURNING *`, [now, ids])).rows;
       for (const job of expired) {
         if (job.state !== 'failed') continue;
         await this.enqueue({ key: `read-expired:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id,
@@ -272,9 +278,12 @@ export class Store {
   private async lockConversation(job: Job, tx = this.db): Promise<void> {
     if (job.conversation_id) await tx.query('SELECT id FROM conversations WHERE id=$1 FOR KEY SHARE', [job.conversation_id]);
   }
-  private async lockConversations(tx: Database, where: string): Promise<void> {
-    await tx.query(`SELECT id FROM conversations WHERE id IN (SELECT conversation_id FROM jobs WHERE ${where})
-      ORDER BY id FOR KEY SHARE`, [this.now()]);
+  // 만료 후보 job ID를 정하고 그 대화 행을 id 순서로 잠근다. 돌려준 ID 밖의 job은 이 트랜잭션에서 바꾸지 않는다.
+  private async lockExpiring(tx: Database, where: string, now: number): Promise<string[]> {
+    const ids = (await tx.query<{ id: string }>(`SELECT id FROM jobs WHERE ${where} ORDER BY id`, [now])).rows.map(row => row.id);
+    if (ids.length) await tx.query(`SELECT id FROM conversations WHERE id IN (SELECT conversation_id FROM jobs WHERE id=ANY($1))
+      ORDER BY id FOR KEY SHARE`, [ids]);
+    return ids;
   }
   private async unknownNotice(job: Job, tx: Database): Promise<void> {
     if (job.type !== 'chat') return;
