@@ -1,28 +1,31 @@
 import { afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import type { ChildProcess } from 'node:child_process';
 import { generateKeyPairSync, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { connect } from 'node:net';
 import type { AddressInfo } from 'node:net';
 import { join, resolve } from 'node:path';
-import { createInterface } from 'node:readline';
 import { Denied, SYSTEM_INSTRUCTIONS } from '../src/contracts.js';
 import type { Job } from '../src/contracts.js';
-import { CHAT_OUTPUT_JSON_SCHEMA, ChatLane, chatArgs, chatDeadline, interpretChat } from '../src/codex-chat.js';
-import type { ChatReport } from '../src/codex-chat.js';
+import { CHAT_OUTPUT_JSON_SCHEMA, ChatLane, chatDeadline, interpretChat } from '../src/chat-lane.js';
+import type { ChatLaneOptions, ChatReport } from '../src/chat-lane.js';
 import { FORBIDDEN_FLAGS } from '../src/codex-config.js';
-import { LaunchFailed } from '../src/codex.js';
-import type { CodexLauncher, LaunchResult, LaunchSpec } from '../src/codex.js';
+import { FileMutableCredential } from '../src/credentials.js';
+import { CodexChatAdapter, chatArgs, interpretCodexChat } from '../src/executor-codex.js';
+import type { CodexChatReport } from '../src/executor-codex.js';
+import { executorVersion } from '../src/executor-profiles.js';
+import type { ProcessLauncher } from '../src/process-launcher.js';
 import { SerialWorker, WorkerSigner, WorkerVerifier } from '../src/worker.js';
 import type { WorkerRequest } from '../src/worker.js';
 import { HttpWorker } from '../src/worker-http.js';
-import { WORKER_ENV, codexVersion, startWorker, workerConfig } from '../src/worker-main.js';
+import { WORKER_ENV, startWorker, workerConfig } from '../src/worker-main.js';
 import { FileNonceStore, NONCE_RETENTION_MS, WorkerStartError, seedAuth } from '../src/worker-state.js';
+import { SpawnLauncher } from './spawn-launcher.js';
 
-// 작업자 진입점(T16b S4). 모델 호출 없음: codex 자리에 같은 인자·stdin·env로 도는 가짜 실행 파일을 둔다.
+// 작업자 진입점(T16b S4)과 Codex 프로필(codex-subscription, file-mutable 자격). Claude 프로필은 worker-claude.test.ts다.
+// 모델 호출 없음: codex 자리에 같은 인자·stdin·env로 도는 가짜 실행 파일을 둔다.
 // 시드 값은 시험용 가짜다. 개인 ~/.codex*는 쓰지 않고 저장소 .local/ 아래 임시 CODEX_HOME만 쓴다.
 const FAKE_TOKEN = 'fixture-refresh-token-abcdefghijklmnopqrstuvwxyz0123';
 const SEED = JSON.stringify({ auth_mode: 'chatgpt', OPENAI_API_KEY: null,
@@ -58,41 +61,6 @@ process.stdin.on('end', () => {
 });
 `;
 
-// 실제 프로세스를 띄우지만 /proc 전체를 훑지 않는 launcher. 정리는 자식 하나만 본다.
-// ProcessGroupLauncher의 /proc 검사는 codex-bridge 시험이 맡는다. 여기서 쓰면 병렬로 도는 다른 시험 파일의
-// 같은 UID 프로세스(예: non-dumpable 시험 자식)를 의심해 판정이 흔들릴 수 있다.
-class SpawnLauncher implements CodexLauncher {
-  specs: LaunchSpec[] = [];
-  // 중단 신호를 받은 job. 신호를 받는 즉시(동기) 남긴다.
-  aborted: string[] = [];
-  left: number | null = 0;
-  private readonly children = new Map<string, { child: ChildProcess; exited: Promise<unknown> }>();
-  constructor(private readonly bin: string) {}
-  async run(spec: LaunchSpec, signal: AbortSignal, onLine: (line: string) => void): Promise<LaunchResult> {
-    this.specs.push(spec);
-    if (signal.aborted) throw new LaunchFailed();
-    const child = spawn(this.bin, spec.args, { cwd: spec.cwd, env: spec.env, stdio: ['pipe', 'pipe', 'ignore'] });
-    const exited = new Promise<LaunchResult['exit']>(done => child.once('exit', (code, sig) => done({ code, signal: sig })));
-    this.children.set(spec.job, { child, exited });
-    const kill = () => { this.aborted.push(spec.job); child.kill('SIGKILL'); };
-    signal.addEventListener('abort', kill, { once: true });
-    const lines = createInterface({ input: child.stdout! });
-    const closed = once(lines, 'close').catch(() => {});
-    lines.on('line', onLine);
-    child.stdin!.end(spec.stdin);
-    try {
-      const exit = await exited;
-      await closed;
-      return { exit };
-    } finally { signal.removeEventListener('abort', kill); }
-  }
-  async terminate(job: string) {
-    const entry = this.children.get(job);
-    if (entry && entry.child.exitCode === null && entry.child.signalCode === null) { entry.child.kill('SIGKILL'); await entry.exited; }
-  }
-  async survivors(_job: string) { return this.left; }
-}
-
 let base: string;
 let codexHome: string;
 let seedDir: string;
@@ -124,8 +92,13 @@ const job = (): Job => ({ id: randomUUID(), lease_token: randomUUID() }) as Job;
 const chatRequest = (j: Job, overrides: Partial<WorkerRequest> = {}): WorkerRequest => ({ version: 1, job: j.id, lease: j.lease_token,
   lane: 'chat', policyRevision: 'fixture-v1', instructions: SYSTEM_INSTRUCTIONS, untrusted: [{ text: '상태 알려줘' }],
   timeoutMs: 60_000, toolCalls: 8, ...overrides });
-const env = (overrides: Record<string, string | undefined> = {}) => ({ CODEX_HOME: codexHome, WORKER_SEED_DIR: seedDir,
-  WORKER_SEED_KEY: 'CODEX_AUTH_JSON', WORKER_NONCE_DIR: nonceDir, WORKER_CONTROL_PUBLIC_KEY: publicPem, WORKER_CODEX_BIN: fakeBin, ...overrides });
+const env = (overrides: Record<string, string | undefined> = {}) => ({ WORKER_EXECUTOR: 'codex', WORKER_MODEL: 'cli-default',
+  WORKER_CREDENTIAL_DIR: seedDir, WORKER_CREDENTIAL_KEY: 'CODEX_AUTH_JSON', CODEX_HOME: codexHome, WORKER_NONCE_DIR: nonceDir,
+  WORKER_CONTROL_PUBLIC_KEY: publicPem, WORKER_EXECUTOR_BIN: fakeBin, ...overrides });
+// Codex 프로필의 대화 레인(진입점과 같은 조립): Codex 어댑터 + file-mutable 자격 + 공통 ChatLane.
+const codexLane = (launcher: ProcessLauncher, options: Omit<ChatLaneOptions, 'model'> = {}) =>
+  new ChatLane(new CodexChatAdapter(codexHome), new FileMutableCredential(codexHome, join(seedDir, 'CODEX_AUTH_JSON'), []),
+    launcher, { model: 'cli-default', tmp: base, ...options });
 const code = async (promise: Promise<unknown>) => { try { await promise; return 'ok'; } catch (error) { return error instanceof WorkerStartError ? error.code : `other:${String(error)}`; } };
 // 기동이 뜻밖에 성공하면 서버를 닫고 'ok'를 돌려준다. 열린 채 두면 시험 프로세스가 끝나지 않는다.
 const startCode = (vars: Record<string, string | undefined> = {}) => code(startWorker(workerConfig(env(vars)), { port: 0, host: '127.0.0.1' })
@@ -230,7 +203,7 @@ test('WRK-04 nonce 디렉터리를 쓸 수 없으면 기동 실패', async () =>
 test('WRK-05 대화 레인: --ephemeral·--skip-git-repo-check·read-only 설정, 빈 작업 공간, 작업자 env 비상속', async () => {
   await seedAuth(codexHome, join(seedDir, 'CODEX_AUTH_JSON'));
   const launcher = new SpawnLauncher(fakeBin);
-  const lane = new ChatLane(codexHome, launcher, { tmp: base, proxy: { https: 'http://10.43.0.28:3128', noProxy: '127.0.0.1,localhost' } });
+  const lane = codexLane(launcher, { proxy: { https: 'http://10.43.0.28:3128', noProxy: '127.0.0.1,localhost' } });
   const secretEnv = { CODEX_AUTH_JSON: SEED, DISCORD_BOT_TOKEN: 'fixture-discord', WORKER_CONTROL_PUBLIC_KEY: publicPem, OPENAI_API_KEY: 'fixture' };
   const saved = { ...process.env };
   Object.assign(process.env, secretEnv);
@@ -244,7 +217,7 @@ test('WRK-05 대화 레인: --ephemeral·--skip-git-repo-check·read-only 설정
   assert.ok(s.args.includes('--ephemeral') && s.args.includes('--skip-git-repo-check') && s.args.at(-1) === '-');
   for (const flag of FORBIDDEN_FLAGS.filter(flag => flag !== '--ephemeral')) assert.ok(!s.args.includes(flag), flag);
   assert.deepEqual(Object.keys(s.env).filter(name => !['PWD', 'SHLVL', '_'].includes(name)).sort(),
-    ['CODEX_HOME', 'HOME', 'HOMELAB_CODEX_TASK', 'HTTPS_PROXY', 'LANG', 'NO_PROXY', 'PATH', 'TMPDIR']);
+    ['CODEX_HOME', 'HOME', 'HOMELAB_WORKER_TASK', 'HTTPS_PROXY', 'LANG', 'NO_PROXY', 'PATH', 'TMPDIR']);
   assert.equal(s.env.CODEX_HOME, codexHome);
   assert.notEqual(s.env.HOME, codexHome);
   assert.deepEqual(s.entries, []);
@@ -261,48 +234,67 @@ test('WRK-05 대화 레인: --ephemeral·--skip-git-repo-check·read-only 설정
 test('WRK-06 대화 레인은 세션 파일을 남기지 않고 auth.json은 그대로 둠', async () => {
   await seedAuth(codexHome, join(seedDir, 'CODEX_AUTH_JSON'));
   await mode({ kind: 'answer', answer: ANSWER, session: true });
-  const lane = new ChatLane(codexHome, new SpawnLauncher(fakeBin), { tmp: base });
+  const lane = codexLane(new SpawnLauncher(fakeBin));
   assert.equal((await lane.run(chatRequest(job()), new AbortController().signal)).status, 'succeeded');
   assert.ok((await seen()).args.includes('--ephemeral'));
   assert.deepEqual((await readdir(codexHome)).sort(), ['auth.json', 'config.toml']);
   assert.equal(await readFile(join(codexHome, 'auth.json'), 'utf8'), SEED);
 });
-test('WRK-07 대화 결과 판정: 한도·인증 대기, 스키마 밖·반사·중단은 failed, 긴 답은 잘라 받음, 남은 프로세스는 unknown', () => {
-  const good = ['{"type":"thread.started","thread_id":"t"}', '{"type":"turn.started"}', '{"type":"turn.completed"}'];
-  const report = (overrides: Partial<ChatReport>): ChatReport => ({ lines: good, exit: { code: 0, signal: null }, survivors: 0,
-    aborted: false, output: JSON.stringify(ANSWER), ...overrides });
-  const failedTurn = (message: string) => [good[0]!, good[1]!, JSON.stringify({ type: 'turn.failed', error: { message } })];
+test('WRK-07 대화 결과 판정(공통): 한도·인증 대기, 스키마 밖·반사·중단·정책 위반은 failed, 긴 답은 잘라 받음, 남은 프로세스는 unknown', () => {
+  const report = (overrides: Partial<ChatReport>): ChatReport => ({ exit: { code: 0, signal: null }, survivors: 0,
+    aborted: false, outcome: { kind: 'output', value: ANSWER }, ...overrides });
+  const output = (value: unknown): Partial<ChatReport> => ({ outcome: { kind: 'output', value } });
   const cases: [Partial<ChatReport>, string][] = [
     [{}, 'succeeded'],
+    [{ outcome: { kind: 'limited' } }, 'limited'],
+    [{ outcome: { kind: 'auth_expired' } }, 'auth_expired'],
+    [{ outcome: { kind: 'failed', reason: 'turn_failed' } }, 'failed'],
+    [output({ ...ANSWER, extra: 'x' }), 'failed'],
+    [output({ facts: 'x', hypotheses: [], unknowns: [], checks: [] }), 'failed'],
+    [output(null), 'failed'],
+    [{ ...output({ ...ANSWER, facts: [`토큰 ${FAKE_TOKEN}`] }), secrets: [FAKE_TOKEN] }, 'failed'],
+    [{ aborted: true }, 'failed'],
+    [{ exceeded: 'tool_budget_exceeded' }, 'failed'],
+    [{ exceeded: 'policy_violation' }, 'failed'],
+    // 소멸을 확인했는데 실행기 결과가 없으면(어댑터가 해석하지 않음) 성공으로 보지 않는다.
+    [{ outcome: undefined }, 'failed'],
+    [{ launchFailed: true, exit: null }, 'failed'],
+    // 한도 결과여도 남은 프로세스가 있으면 unknown이다(소멸 확인이 먼저다).
+    [{ survivors: 1, outcome: { kind: 'limited' } }, 'unknown'],
+    [{ survivors: null }, 'unknown'],
+    [{ exit: null }, 'unknown'],
+  ];
+  for (const [overrides, expected] of cases) assert.equal(interpretChat(report(overrides)).status, expected, JSON.stringify(overrides));
+  assert.equal(interpretChat(report({ survivors: 1 })).stopped, false);
+  const long = interpretChat(report(output({ facts: Array.from({ length: 12 }, () => '가'.repeat(900)),
+    hypotheses: [], unknowns: [], checks: [] })));
+  assert.equal(long.status, 'succeeded');
+  assert.ok(long.status === 'succeeded' && long.answer.facts.length === 8 && long.answer.facts.every(fact => fact.length <= 500));
+});
+test('WRK-07 Codex 어댑터 해석: 한도·인증 문구는 대기, 실패 턴·종료 코드·미완료 턴·깨진 줄·출력 없음은 failed', () => {
+  const good = ['{"type":"thread.started","thread_id":"t"}', '{"type":"turn.started"}', '{"type":"turn.completed"}'];
+  const report = (overrides: Partial<CodexChatReport>): CodexChatReport => ({ lines: good, exit: { code: 0, signal: null },
+    output: JSON.stringify(ANSWER), ...overrides });
+  const failedTurn = (message: string) => [good[0]!, good[1]!, JSON.stringify({ type: 'turn.failed', error: { message } })];
+  const cases: [Partial<CodexChatReport>, string][] = [
+    [{}, 'output'],
     [{ lines: failedTurn('usage_limit_reached'), exit: { code: 1, signal: null } }, 'limited'],
     [{ lines: failedTurn('401 Unauthorized: refresh token expired'), exit: { code: 1, signal: null } }, 'auth_expired'],
     [{ lines: failedTurn('boom'), exit: { code: 1, signal: null } }, 'failed'],
     [{ exit: { code: 1, signal: null } }, 'failed'],
     [{ lines: good.slice(0, 2) }, 'failed'],
     [{ lines: [...good, 'not json'] }, 'failed'],
-    [{ output: JSON.stringify({ ...ANSWER, extra: 'x' }) }, 'failed'],
-    [{ output: JSON.stringify({ facts: 'x', hypotheses: [], unknowns: [], checks: [] }) }, 'failed'],
     [{ output: null }, 'failed'],
+    [{ output: '{"facts":' }, 'failed'],
     [{ outputTooLarge: true }, 'failed'],
-    [{ output: JSON.stringify({ ...ANSWER, facts: [`토큰 ${FAKE_TOKEN}`] }), secrets: [FAKE_TOKEN] }, 'failed'],
-    [{ aborted: true }, 'failed'],
-    [{ exceeded: 'tool_budget_exceeded' }, 'failed'],
-    [{ launchFailed: true, exit: null }, 'failed'],
-    [{ survivors: 1 }, 'unknown'],
-    [{ survivors: null }, 'unknown'],
-    [{ exit: null }, 'unknown'],
   ];
-  for (const [overrides, expected] of cases) assert.equal(interpretChat(report(overrides)).status, expected, JSON.stringify(overrides));
-  assert.equal(interpretChat(report({ survivors: 1 })).stopped, false);
-  const long = interpretChat(report({ output: JSON.stringify({ facts: Array.from({ length: 12 }, () => '가'.repeat(900)),
-    hypotheses: [], unknowns: [], checks: [] }) }));
-  assert.equal(long.status, 'succeeded');
-  assert.ok(long.status === 'succeeded' && long.answer.facts.length === 8 && long.answer.facts.every(fact => fact.length <= 500));
+  for (const [overrides, expected] of cases) assert.equal(interpretCodexChat(report(overrides)).kind, expected, JSON.stringify(overrides));
+  assert.deepEqual(interpretCodexChat(report({})), { kind: 'output', value: ANSWER });
 });
 test('WRK-08 작업 레인 요청은 띄우지 않고 failed, 한도 실패는 limited, 도구 예산 초과는 failed', async () => {
   await seedAuth(codexHome, join(seedDir, 'CODEX_AUTH_JSON'));
   const launcher = new SpawnLauncher(fakeBin);
-  const lane = new ChatLane(codexHome, launcher, { tmp: base });
+  const lane = codexLane(launcher);
   assert.deepEqual(await lane.run(chatRequest(job(), { lane: 'task' }), new AbortController().signal), { status: 'failed', stopped: true });
   assert.equal(launcher.specs.length, 0);
   await mode({ kind: 'limit' });
@@ -315,7 +307,7 @@ test('WRK-09 시간 초과는 게시 서버보다 먼저 멈춰 failed, 취소�
   await seedAuth(codexHome, join(seedDir, 'CODEX_AUTH_JSON'));
   await mode({ kind: 'hang' });
   const launcher = new SpawnLauncher(fakeBin);
-  const lane = new ChatLane(codexHome, launcher, { tmp: base });
+  const lane = codexLane(launcher);
   // 작업자 기한은 가짜 시계로 본다. 게시 서버의 60초보다 5초 먼저(55초) 스스로 멈춘다.
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const timed = lane.run(chatRequest(job()), new AbortController().signal);
@@ -350,28 +342,31 @@ test('WRK-09 시간 초과는 게시 서버보다 먼저 멈춰 failed, 취소�
 test('WRK-10 작업자 env는 키 이름만 알리고, 공개 키·경로 모양이 틀리면 기동 실패', async () => {
   assert.equal(await code(Promise.resolve().then(() => workerConfig({}))), `config_missing:${WORKER_ENV.join(',')}`);
   const config = workerConfig(env({ HTTPS_PROXY: 'http://10.43.0.28:3128' }));
-  assert.equal(config.seedFile, join(seedDir, 'CODEX_AUTH_JSON'));
+  assert.equal(config.credentialFile, join(seedDir, 'CODEX_AUTH_JSON'));
+  assert.equal(config.profile.id, 'codex-subscription');
+  assert.equal(config.codexHome, codexHome);
   assert.deepEqual(config.proxy, { https: 'http://10.43.0.28:3128', noProxy: '127.0.0.1,localhost' });
-  assert.equal(workerConfig(env({ WORKER_CODEX_BIN: undefined })).codexBin, '/usr/local/bin/codex');
+  assert.equal(workerConfig(env({ WORKER_EXECUTOR_BIN: undefined })).executorBin, '/usr/local/bin/codex');
   // 한 줄로 넣은 PEM(\n 이스케이프)도 받는다.
   assert.equal(workerConfig(env({ WORKER_CONTROL_PUBLIC_KEY: publicPem.replace(/\n/g, '\\n') })).publicKey.asymmetricKeyType, 'ed25519');
   const rsa = generateKeyPairSync('rsa', { modulusLength: 2048 }).publicKey.export({ type: 'spki', format: 'pem' }).toString();
-  const invalid: [Record<string, string>, string][] = [
+  const invalid: [Record<string, string | undefined>, string][] = [
     [{ WORKER_CONTROL_PUBLIC_KEY: 'not a key' }, 'config_invalid:WORKER_CONTROL_PUBLIC_KEY'],
     [{ WORKER_CONTROL_PUBLIC_KEY: rsa }, 'config_invalid:WORKER_CONTROL_PUBLIC_KEY'],
     [{ WORKER_CONTROL_PUBLIC_KEY: keys.privateKey.export({ type: 'pkcs8', format: 'pem' }).toString() }, 'config_invalid:WORKER_CONTROL_PUBLIC_KEY'],
     [{ CODEX_HOME: 'relative/home' }, 'config_invalid:CODEX_HOME'],
-    [{ WORKER_SEED_KEY: '../auth.json' }, 'config_invalid:WORKER_SEED_KEY'],
+    [{ WORKER_CREDENTIAL_KEY: '../auth.json' }, 'config_invalid:WORKER_CREDENTIAL_KEY'],
+    [{ CODEX_HOME: undefined }, 'config_missing:CODEX_HOME'],
     [{ WORKER_NONCE_DIR: codexHome }, 'config_invalid:WORKER_NONCE_DIR'],
   ];
   for (const [overrides, expected] of invalid) assert.equal(await code(Promise.resolve().then(() => workerConfig(env(overrides)))), expected);
 });
 test('WRK-11 readiness: codex 0.163.0 확인·시드 복사 뒤 GET /readyz 200, 다른 버전·시드 없음이면 기동 실패', async () => {
-  assert.equal(await codexVersion(fakeBin), '0.163.0');
+  assert.equal(await executorVersion(new CodexChatAdapter(codexHome), fakeBin), '0.163.0');
   await writeFile(join(fakeDir, 'version.txt'), 'codex-cli 0.162.0\n');
-  assert.equal(await startCode(), 'codex_version_mismatch');
+  assert.equal(await startCode(), 'executor_version_mismatch');
   await writeFile(join(fakeDir, 'version.txt'), 'something else\n');
-  assert.equal(await startCode(), 'codex_version_unavailable');
+  assert.equal(await startCode(), 'executor_version_unavailable');
   await writeFile(join(fakeDir, 'version.txt'), 'codex-cli 0.163.0\n');
   await rm(join(seedDir, 'CODEX_AUTH_JSON'));
   assert.equal(await startCode(), 'seed_missing');
@@ -379,7 +374,7 @@ test('WRK-11 readiness: codex 0.163.0 확인·시드 복사 뒤 GET /readyz 200,
   await writeFile(join(seedDir, 'CODEX_AUTH_JSON'), SEED);
   const worker = await startWorker(workerConfig(env()), { port: 0, host: '127.0.0.1', launcher: new SpawnLauncher(fakeBin) });
   try {
-    assert.equal(worker.seed, 'seeded');
+    assert.equal(worker.credential, 'seeded');
     const url = `http://127.0.0.1:${(worker.server.address() as AddressInfo).port}`;
     assert.equal((await fetch(`${url}/readyz`)).status, 200);
     assert.equal((await fetch(`${url}/`)).status, 404);
@@ -405,7 +400,7 @@ test('WRK-12 HTTP 끝까지: 서명한 요청으로 대화 실행, 같은 capabi
   } finally { await first.close(); }
   const second = await boot();
   try {
-    assert.equal(second.seed, 'kept');
+    assert.equal(second.credential, 'kept');
     await assert.rejects(call(second, token), /worker_rejected/);
     assert.equal(launcher.specs.length, 1);
     const k = job(); const next = chatRequest(k);
@@ -445,7 +440,7 @@ test('WRK-13 진입점 프로세스: env 누락·시드 없음은 종료 코드 
     if (running.child.exitCode !== null) assert.fail(running.output());
     await new Promise(resolve => setTimeout(resolve, 20));
   }
-  assert.match(running.output(), /"seed":"seeded"/);
+  assert.match(running.output(), /"profile":"codex-subscription","cli":"0.163.0","model":"cli-default","credential":"seeded"/);
   assert.equal((await fetch('http://127.0.0.1:8080/readyz')).status, 200);
   running.child.kill('SIGTERM');
   assert.equal(await running.exit, 0);
@@ -456,9 +451,9 @@ test('WRK-14 시드·nonce 디렉터리가 사람 홈이나 그 아래 .codex*(�
   await writeFile(join(human, '.codex', 'CODEX_AUTH_JSON'), SEED);
   await symlink(join(human, '.codex'), join(base, 'innocent-looking'));
   const cases: [Record<string, string>, string][] = [
-    [{ WORKER_SEED_DIR: join(human, '.codex') }, 'config_invalid:WORKER_SEED_DIR'],
-    [{ WORKER_SEED_DIR: join(base, 'innocent-looking') }, 'config_invalid:WORKER_SEED_DIR'],
-    [{ WORKER_SEED_DIR: human }, 'config_invalid:WORKER_SEED_DIR'],
+    [{ WORKER_CREDENTIAL_DIR: join(human, '.codex') }, 'config_invalid:WORKER_CREDENTIAL_DIR'],
+    [{ WORKER_CREDENTIAL_DIR: join(base, 'innocent-looking') }, 'config_invalid:WORKER_CREDENTIAL_DIR'],
+    [{ WORKER_CREDENTIAL_DIR: human }, 'config_invalid:WORKER_CREDENTIAL_DIR'],
     [{ WORKER_NONCE_DIR: join(human, '.codex-work', 'nonces') }, 'config_invalid:WORKER_NONCE_DIR'],
     [{ WORKER_NONCE_DIR: join(base, 'innocent-looking', 'nonces') }, 'config_invalid:WORKER_NONCE_DIR'],
   ];
@@ -526,7 +521,7 @@ test('WRK-17 [r1 P1] 시드 파일 자체가 사람 홈 .codex*를 가리키는 
   const linked = join(base, 'seed-linked');
   await mkdir(linked);
   await symlink(join(human, '.codex', 'auth.json'), join(linked, 'CODEX_AUTH_JSON'));
-  assert.equal(await code(startWorker(workerConfig(env({ WORKER_SEED_DIR: linked })), { port: 0, host: '127.0.0.1', homes: [human] })
+  assert.equal(await code(startWorker(workerConfig(env({ WORKER_CREDENTIAL_DIR: linked })), { port: 0, host: '127.0.0.1', homes: [human] })
     .then(worker => worker.close())), 'seed_personal_path');
   await assert.rejects(lstat(join(codexHome, 'auth.json')));
   // Secret 볼륨 모양이어도 ..data가 개인 홈을 가리키면 거부한다.
@@ -574,7 +569,7 @@ test('WRK-18 [r1 P2] 종료가 시작되면 본문 수신 중인 요청은 codex
 });
 test('WRK-18 [r1 P2] 종료가 시작될 때 서명·nonce 확인 중이던 요청도 codex를 띄우지 않고 failed로 끝냄', async () => {
   const launcher = new SpawnLauncher(fakeBin);
-  const lane = new ChatLane(codexHome, launcher, { tmp: base });
+  const lane = codexLane(launcher);
   await seedAuth(codexHome, join(seedDir, 'CODEX_AUTH_JSON'));
   let reached!: () => void;
   let release!: () => void;

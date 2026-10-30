@@ -12,6 +12,8 @@ import type { CodexWorkspace, ReadResult, Snapshot } from './codex-workspace.js'
 import type { RunOutcome, RunReport } from './codex-events.js';
 import { bounded } from './format.js';
 import type { PolicyGate } from './policy.js';
+import { LaunchFailed } from './process-launcher.js';
+import type { LaunchResult, LaunchSpec, ProcessLauncher } from './process-launcher.js';
 import type { Store } from './store.js';
 
 // `01` §6 추상 계약의 V1 값. 경로 (A) `codex exec --json`. 실제 CLI 대조는 T16b다.
@@ -38,25 +40,14 @@ export function describeCapabilities(c: CodexCapabilities = CODEX_CAPABILITIES):
     '- 기존 Codex 세션 연결(attach): 연결 방식 결정 대기(미정)',
     '- 취소: 작업 프로세스 정리를 확인한 뒤에만 cancelled, 확인 못 하면 unknown'].join('\n');
 }
-// 프로세스가 생기기 전에 실패했다(실행 파일 없음 등). 남은 프로세스가 없으니 unknown이 아니다.
-export class LaunchFailed extends Error { constructor() { super('launch_failed'); } }
 export class CapabilityUnavailable extends Error {
   constructor(public readonly capability: string, public readonly state: 'false' | 'undecided') { super(`capability_${state}:${capability}`); }
 }
 
-export interface LaunchSpec {
-  job: string; args: string[]; cwd: string; env: Record<string, string>; stdin: string;
-  // stdout 바이트 상한. 넘으면 launcher가 작업 그룹을 끝내고 overflow로 알린다(rev r1 S3).
-  limits: { lineBytes: number; outputBytes: number };
-}
-export interface LaunchResult { exit: { code: number | null; signal: string | null } | null; overflow?: boolean }
-export interface CodexLauncher {
-  // 줄은 모아 두지 않고 onLine으로 바로 넘긴다. 중단 신호는 spawn 전에도 확인한다.
-  run(spec: LaunchSpec, signal: AbortSignal, onLine: (line: string) => void): Promise<LaunchResult>;
-  // 종료 사유와 무관하게 작업 그룹 전체를 끝낸다. 남은 수를 모르면 null.
-  terminate(job: string): Promise<void>;
-  survivors(job: string): Promise<number | null>;
-}
+// 프로세스 실행 계약은 실행기 공통(process-launcher)이다. T18 작업 레인은 같은 계약을 이 이름으로 쓴다.
+export { LaunchFailed };
+export type { LaunchResult, LaunchSpec };
+export type CodexLauncher = ProcessLauncher;
 // 실행 전 디렉터리 준비용 경로 연산. 실행 뒤 읽기·쓰기는 경로가 아니라 고정한 디렉터리 핸들로 한다(codex-workspace).
 export interface CodexFiles { mkdir(path: string): Promise<void>; resolve(path: string): Promise<string> }
 export const nodeFiles = {
