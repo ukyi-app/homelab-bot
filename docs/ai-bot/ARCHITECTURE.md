@@ -74,7 +74,7 @@
 |---|---|---|---|
 | 언어·런타임 | TypeScript 7.0.2, **Node 24.22.0** | T16a 선택. DISCOVERY의 Node 24 대안과 로컬 검증 환경 유지. Bun 재연결 위험을 분리하며 Bun은 채택하지 않음 | T16a 확정, 실연동 T16b |
 | Discord | **`DiscordProtocol` + 주입 REST(`discordHttpApi`)**. SDK 캐시 없이 PostgreSQL을 상태 원본으로 사용 | T16a는 Gateway frame 정규화·REST·history·게시 대조를 직접 계약 시험. `@discordjs/*`는 채택하지 않음 | T16a 어댑터 확정. 인증된 WebSocket 세션·heartbeat·RESUME 연결 구현은 T16b |
-| Discord intents | `GUILDS` + `GUILD_MESSAGES` + `DIRECT_MESSAGES` + `MESSAGE_CONTENT` = 37377. intent를 끄면 4609와 명령/버튼 모드(DM 끔이면 513). DM을 쓰지 않으므로(확정(사용자 2026-10-20, T16a)) T16b는 `DIRECT_MESSAGES`를 뺀 33281로 연결한다 [가정: 실연동 T16b] | [실측: discord.js bitfield], D-17 확정 | DM 끔(T16a), 실연동 T16b |
+| Discord intents | `GUILDS` + `GUILD_MESSAGES` + `DIRECT_MESSAGES` + `MESSAGE_CONTENT` = 37377. intent를 끄면 4609와 명령/버튼 모드(DM 끔이면 513). DM을 쓰지 않으므로(확정(사용자 2026-10-20, T16a)) T16b는 `DIRECT_MESSAGES`를 뺀 33281로 연결했고, 개선안 v2(§13)부터 입력 중 힌트용 비특권 `GUILD_MESSAGE_TYPING`(2048)을 더한 35329로 연결한다 [가정: 실연동 T16b] | [실측: discord.js bitfield], D-17 확정 | DM 끔(T16a), 실연동 T16b |
 | GitHub | App JWT → 작업마다 저장소 하나·필요 권한만의 1시간 설치 토큰. webhook은 원본 바이트 HMAC 상수 시간 비교 | [확인: https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app , https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries] | T17 |
 | Codex | codex-cli 버전 고정(0.163.0 기준), `codex exec --json -o --output-schema`. JSONL fixture 계약 시험. 인증은 작업자 전용 CODEX_HOME의 `auth.json`(D-14) | [확인: https://learn.chatgpt.com/docs/non-interactive-mode / 실측: `codex exec --help`] | 대화 레인 T16a, 작업 레인 T18 |
 | DB | 공유 CNPG `pg`의 봇 전용 DB·역할. 큐는 `FOR UPDATE SKIP LOCKED` + lease·heartbeat | [확인: spec §5.1 D-05·D-06] / 큐 방식은 [가정] | T16a |
@@ -280,11 +280,11 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 ### 호출 경로·직렬 대기·측정
 
 Discord Gateway → `DiscordProtocol` → `DiscordIngress` → PostgreSQL 이벤트 저장 →
-처리 경로(job/outbox/제어 결과) 영속 저장 → 수신 ACK → `Runtime` → 서명 capability를 붙인 작업자 Service:8080의 `/v1/execute` →
+처리 경로(job/outbox/제어 결과) 영속 저장 → 수신 ACK(일반 메시지는 👀 리액션, §13) → `Runtime` → 서명 capability를 붙인 작업자 Service:8080의 `/v1/execute` →
 `SerialWorker` → `codex exec` 계약 → 구조화 결과 → `results/outbox` → `DiscordPublisher`다.
-`/read`는 모델을 부르지 않고 승인 템플릿 조회를 실행한다. Gateway 연결 루프는 T16b `src/gateway.ts`(아래), 모델 프로세스는 작업자 진입점(T16b)이다.
+`/read`는 모델을 부르지 않고 승인 템플릿 조회를 실행하며, 모델 슬롯과 분리된 read 레인에서 돈다(§13). Gateway 연결 루프는 T16b `src/gateway.ts`(아래), 모델 프로세스는 작업자 진입점(T16b)이다.
 런타임은 Node 24.22.0이며, Discord 클라이언트는 SDK 없이 주입 가능한 `DiscordProtocol`을 선택했다.
-인증된 WebSocket 세션은 T16b `GatewaySession`(Node 24 내장 WebSocket, intents 33281)이 이 어댑터에 잇는다. 봇 사용자 ID는 첫 READY에서 받고,
+인증된 WebSocket 세션은 T16b `GatewaySession`(Node 24 내장 WebSocket, intents 35329. §13 전에는 33281)이 이 어댑터에 잇는다. 봇 사용자 ID는 첫 READY에서 받고,
 그 전에는 Discord 수신·게시를 하지 않는다(8080·8081 수신은 계속). 새 IDENTIFY(READY)마다 **live 이벤트를 처리하기 전에**
 모든 활성 스레드·DM에 `gap=true`(복구 장벽)를 한 문장으로 세우고, 같은 문장에서 진행 중인 이전 복구의 `recovery_token`을 지워 새 복구 세대를 연다.
 이전 세대의 복구는 다음 확인에서 토큰이 달라 손을 떼므로(`skipped`) 이전 history 스냅샷으로 새 장벽의 gap·checkpoint를 바꾸지 못하고,
@@ -305,7 +305,8 @@ live 메시지 하나가 일시 장애(DB·REST·429 등)로 처리되지 못하
 전역 명령은 비운다. 수신도 같은 목록만 받는다. 재연결·RESUME 실측은 실연동(S16)이다.
 
 작업자 모델 호출은 **대화·작업 레인 합쳐 1개**다. DB의 scheduler 행 잠금과 작업자의 별도 mutex가
-중복 실행을 막는다. lease가 끝나거나 호스트 결과를 모르면 `unknown`이 전체 모델 슬롯을 잡는다.
+중복 실행을 막는다. lease가 끝나거나 호스트 결과를 모르면 `unknown`이 전체 모델 슬롯을 잡는다(read 레인은 막지 않는다).
+개선안 v2(§13)부터 결과가 불확실하면 unknown 전에 cancel로 한 번 확인하고, chat unknown은 작업자의 종료 확인으로만 주기적으로 푼다.
 한도·인증 만료는 `waiting_user` + `model_limit/auth_expired`와 스케줄러 정지를 원자적으로 기록한다.
 이 기록이 실패하면 실행 슬롯을 유지하고 lease 만료 뒤 unknown으로 남긴다. waiting_user 자체도
 새 claim을 차단한다. 자동 인증 전환은 없다. 완료 전이와 cancel_requested가 경합하면
@@ -408,8 +409,8 @@ Runtime의 /read는 ReadAdapter.recent를 통해 한 번 읽은 현재 시각을
 fingerprint 계산에 서비스 ID도 포함해 같은 fingerprint 문자열의 서비스 변경을 놓치지 않는다.
 006 이전 경보는 건수만 남아 서비스 범위를 재구성할 수 없으므로 미전달·범위 없는 행은 blocked와 감사로 닫는다.
 이미 sent인 전달과 범위를 가진 행은 바꾸지 않으며 과거 경보의 범위를 현재 허용 목록으로 추정하지 않는다.
-요약 예산은 대상/출처 각 120자, 사실 600자, 미확인/권장 확인 각 350자다. 항목 수가 넘으면 생략 건수를
-표시한다. 긴 작업 목록은 유효한 JSON 배열로 1800자 이하 페이지를 만들어 별도 멱등 키로 게시한다.
+read 요약 예산은 대상/출처 각 120자, 사실 600자, 미확인/권장 확인 각 350자다. 항목 수가 넘으면 생략 건수를
+표시한다. 대화(chat) 답은 이 섹션 예산을 쓰지 않고 모든 항목을 싣는다(§13 답 형식). 긴 작업 목록은 유효한 JSON 배열로 1800자 이하 페이지를 만들어 별도 멱등 키로 게시한다.
 논리 메시지 key와 0부터 시작하는 page_index를 저장하고 선행 페이지가 모두 sent인 경우에만 다음 페이지를 claim한다.
 첫 페이지의 429/unknown/blocked 때문에 뒤 페이지가 추월하지 않으며 공유 rate limit이 없는 다른 메시지는 계속 처리한다.
 페이지 생성 전체도 한 transaction이다. migration 005는 기존 :page:N 키를 순서로 옮기고 경보 전달 참조를 복원한다.
@@ -426,7 +427,7 @@ Kubernetes는 SA 토큰을 요청마다 다시 읽고 SA CA로 TLS를 검증하�
 부모 채널의 스레드 생성 뒤에도 저장된 urgent command/flag를 전달한다.
 스레드/DM/부모 채널에서 받은 `/read`는 type=read, debounce 0이며 queued-chat supersede 대상에서 제외한다.
 기존 read job도 migration 005로 유형을 옮긴다. 이미 종결된 superseded 작업은 임의로 재실행하지 않는다.
-기본 debounce **750ms**, urgent **0ms**, 큐 **100건**, lease **30초**, 대화 모델 **60초**,
+기본 debounce **2초**(owner 입력 중이면 작업 생성 뒤 최대 15초, §13. 이전 750ms), urgent **0ms**, 큐 **100건**(그중 read 몫 10), lease **30초**, 대화 모델 **60초**,
 작업 레인 **1800초**, 도구 예산 **8회**, 확인된 실패의 사용자 재시도 **2회**다.
 FOUNDATION 모델 경로에는 실행 가능한 셸/도구 dispatch가 없다. 실제 도구 카운터·작업 실행은 T18 계약으로 구현한다.
 입력 오류는 수신 단계에서 거부한다. dispatch 전 확정 실패·작업자 실행 전 거부·중단 확인된 무효 출력은
@@ -461,7 +462,7 @@ T16a 작업에서는 Git 초기화나 커밋을 실행하지 않았다. 실제 a
 
 readiness는 두 수신기와 DB **쓰기 성공**만 본다. Gateway 연결, 모델 waiting, 큐 지연은 넣지 않는다.
 앱 수신 8080과 경보 수신 8081은 별도 HTTP 서버이며 Gateway 단절 시험 중에도 저장에 성공했다.
-`homelab_bot_gateway_connected`, `homelab_bot_outbox_oldest_seconds`, `homelab_bot_outbox_unknown`을 노출한다.
+`homelab_bot_gateway_connected`, `homelab_bot_outbox_oldest_seconds`, `homelab_bot_outbox_unknown`과 §13의 작업·gap·outbox·제어·Gateway 정지 gauge를 노출한다.
 service 없는 플랫폼 경보·미등록 service·지원하지 않는 severity는 제외 건수만 감사 후 202로 무시한다.
 혼합 그룹은 지원 항목의 fingerprint·건수만으로 계속 처리한다. 잘못된 요청 형식은 400이다.
 
@@ -727,6 +728,8 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - 막힘 기록: `jobs.state='unknown'`이 DB에 남고(재시작 뒤 유지) T16a `claim()`이 새 모델 실행을 막는다. Discord 알림을 보낸다. settle 밖에서 생긴 unknown(lease 만료, 기록 실패)도 `Runtime.tick`의 `sweep()`이 알림을 한 번 넣는다. 비AI 경로(Telegram) 알림은 아래 T16a 변경 요청 5번이다.
 - 해제: owner의 `release`는 작업자 프로세스 0개를 다시 확인한 뒤에만 `cancelled`(`stop_confirmed_after_unknown`)로 바꾸고 작업은 다시 실행하지 않는다. 남아 있으면 거부하고 파드 재생성을 안내한다. owner가 바뀌어 남은 막힘은 옛 owner가 풀 수 없으므로 그 작업에 한해 현재 정책 owner가 같은 확인 뒤 푼다(상태 조회 권한은 생기지 않는다).
 
+- 대화 레인(chat)의 unknown은 §13 "불확실한 결과와 chat unknown"이 다룬다(종료 직전 취소 확인, 주기 조사). 위 `release`는 작업 레인(T18) 경로다.
+
 ### 재시드 절차 초안 (할 일 3, 사람 작업)
 
 전제: 첫 시드는 T16b 전에 사람이 했다. 작업자는 영속 공간에 `auth.json`이 없을 때만 시드를 복사한다(D-14 조건 4, 설계 C.8 변경).
@@ -810,3 +813,85 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - codex는 CODEX_HOME 아래에 보조 실행 파일(PATH alias)을 만든다 [실측: 임시 디렉터리 CODEX_HOME에서 `--version`이 "Refusing to create helper binaries under temporary dir" 경고]. 영속 공간 크기(1Gi)에 들어가는지와 `--ephemeral` 실행 뒤 CODEX_HOME에 남는 파일 이름은 S12 첫 대화 뒤 이름만 확인한다.
 - 이미지는 `node`가 PID 1이다. SIGTERM은 직접 받아 정리한다. 고아 손자 프로세스(zombie)는 거두지 않는다(tini 없음, 빌드에서 apt를 쓰지 않음). 정상 종료한 codex는 자기 자식을 거두므로 쌓이는 경우는 강제 종료 때뿐이다 [가정].
 - `SerialWorker.cancel`(T16a)은 이미 끝나 바쁘지 않은 작업의 취소에 `stopped: false`를 답한다. 게시 서버의 시간 초과와 작업자 완료가 겹치면 `unknown`이 될 수 있어 위 기한 여유를 뒀다.
+
+## 13. 개선안 v2 적용 (2026-10-30)
+
+출처: [IMPROVEMENTS_V2.md](IMPROVEMENTS_V2.md)(사용자 개선안)를 코드와 대조해 게시 서버 쪽만 바꿨다. 항목별 판정은 그 문서 끝 "적용 상태"에 있다. 작업자 HTTP v1 계약(`WorkerRequestSchema`·`SYSTEM_INSTRUCTIONS`·`AnswerSchema`)과 작업자 파일(`src/codex*.ts`, `src/worker*.ts`)은 바꾸지 않았다. 실행기 전환(Codex → 교체 가능한 구조) 작업과 겹치지 않게 하고, 게시 서버(자동 배포)와 작업자(사람 배포)가 따로 배포돼도 맞게 하기 위해서다.
+
+### read 레인
+
+- 모델 claim(`Store.claim()`)은 `type<>'read'`만 고르고, 막힘 조건(실행 중·`unknown`·`waiting_user`)에서도 read를 세지 않는다.
+- read는 `Store.claimRead()`가 `controls.read_lane` 행 아래에서 잡는다. 전체 게시 서버에서 동시 1개다. 대화 행·scheduler 행은 잡지 않고 job은 `SKIP LOCKED`라 기존 잠금 순서(대화 → scheduler → job)를 거꾸로 잡는 경로가 없다.
+- read는 모델 슬롯·scheduler 정지(한도·인증 대기, 비상 중지)·`unknown`에 막히지 않는다. `/emergency-stop`은 "모델 호출" 중지라 실행 중 read를 취소하지 않는다. 구독 중지·gap·owner·권한 철회·서비스 정책은 모델과 같이 지킨다.
+- 실행은 `src/read-runtime.ts`의 `ReadRuntime`(`Runtime.tickRead()`)이 별도 루프(`read`, 생존 근거)에서 한다. 순서·오류 처리는 이전 read 분기와 같다. 모델 `tick()`이 read를 받으면(구버전 claim 등) 같은 경로로 처리한다.
+- lease가 끝난 read는 `unknown`이 아니라 `failed`(`lease_expired`) + 안내다. read에는 외부 쓰기가 없어 불확실성이 아니다. 구버전이 남긴 `unknown` read도 같은 이유로 정리한다. owner가 `/cancel`한 read는 `cancelled`.
+- 대기열 상한 100건 중 read 몫 10건: 모델 계열(chat·task·review)은 read가 아닌 queued가 90건 미만일 때만 받는다. `/retry`·`/resume-model`·`/review-resume`도 같은 모델 상한이다(`Store.queueFull(type)`).
+- 같은 대화 안에서 뒤에 요청한 read 답이 앞선 긴 chat 답보다 먼저 게시될 수 있다(대화 안 job 순서 계약은 없다).
+
+### 정상 종료 (SIGTERM)
+
+- `stop()` 첫 줄의 종료 신호가 runtime 종료 신호다. 신호 뒤에는 claim하지 않는다. 신호 전에 시작한 claim이 늦게 돌아오거나 dispatch 직전이면 `defer(job,'publisher_shutdown')`(attempt 소모 없음).
+- 실행 중이면 드레인 10초(`DRAIN_MS`) 안의 자연 완료를 기다린다. 넘으면 abort하고 기존 cancel(서명 capability)로 멈춤을 확인한다.
+  - 확인된 **chat**은 queued로 되돌린다(`publisher_shutdown`, `available_at=now`, attempt는 소모된 채). 새 게시 서버가 이어서 실행해 owner가 `/retry` 없이 답을 받는다. attempt가 상한(`maxRetries+1`)이면 `fail`.
+  - 확인된 **task·review**는 외부 효과가 있을 수 있어 자동 재실행하지 않고 `fail(stop_confirmation)`.
+  - 확인 실패는 `unknown`(`publisher_shutdown`). owner가 이미 `/cancel`했으면 `cancelled`.
+  - 감사 `publisher_shutdown`(`outcome`: deferred·requeued·failed·unknown·stale).
+- 전체 기한 하나(`stopTimeoutMs` 기본 20초)에서 남은 시간을 나눈다. Gateway 정지·수신 서버 닫기는 드레인·cancel과 동시에 돈다. 최악 약 23초(기한 20초 + k8s close 1초 + pool.end 2초)라 kubelet 종료 유예 30초를 바꾸지 않는다.
+- 문서 제안(60초 대화를 끝까지 기다리고 유예 90초)과 다르게 한 이유: 끊기기 전에 작업자가 아직 job을 잡고 있을 때 취소를 확인해야 `unknown`이 남지 않는다. 비용은 드레인을 넘긴 chat의 모델 실행 한 번 더(attempt 하나)다.
+- 이 변경이 처음 배포될 때 종료되는 구 파드는 구 코드의 종료 동작을 쓴다. 효과는 그다음 배포부터다.
+
+### 불확실한 결과와 chat unknown
+
+- 작업자 응답이 `stopped:false`(`worker_disconnected`)이거나 실행 중 예외(`runtime_uncertain`)면 `unknown`을 쓰기 직전에 cancel을 한 번 보낸다. 확인되면 `fail(stop_confirmation)`(실패 안내 → `/retry`).
+- chat `unknown`은 모델 `tick()`의 claim 직전에 주기적으로 조사한다(`Runtime.probeUnknown()`). chat unknown이 있으면 모델 claim이 어차피 막혀 있어 모델 실행을 늦추지 않는다.
+  - 예약은 `controls` 행 `unknown_probe:<job>`(`{lease,count,next}`)이고 마이그레이션은 없다. 행을 잠그고 시각이 된 것만 미뤄 돌려주므로 게시 서버 둘이 같은 job을 동시에 조사하지 않는다. backoff 즉시 → 30초 → 1분 → … → 상한 10분, 한 바퀴 3건.
+  - 저장된 job ID·lease로 새 cancel capability를 만들어 DB 트랜잭션 밖에서 보낸다. 확인되면 짧은 트랜잭션의 CAS(`type='chat' AND state='unknown' AND lease_token=<관측값>`)로 `failed`(`stop_confirmed_after_unknown`) + 감사 `unknown_stop_confirmed` + 안내.
+  - 경과 시간만으로 풀지 않는다. 새 모델 실행을 자동으로 시작하지 않는다. task·review는 조사하지 않는다(작업 레인 소멸 확인 한계, §12).
+- **한계:** 작업자 `SerialWorker.cancel`은 그 job·lease를 **아직 잡고 있을 때만** `stopped:true`다. 이미 끝냈거나(응답 유실 포함) 재시작한 작업자의 job은 조사로도 풀리지 않는다. 작업자가 "잡고 있지 않은 job의 cancel"을 "실행 중 아님"으로 답하게 바뀌면(작업자 Recreate·replicas 1, capability 30초 만료라 안전한 조건) 게시 서버 수정 없이 이 조사가 그대로 푼다. 작업자 쪽 변경은 실행기 전환 작업의 몫이다.
+
+### 상태 안내 (멘션 없음)
+
+| 상황 | 멱등 키 | 내용 |
+|---|---|---|
+| chat `waiting_user` | `waiting:<job>:<attempt>` | 모델 사용 한도/인증 만료, `/resume-model target:<job>`, `/model-status` |
+| chat `unknown`(runtime 경로·lease 만료) | `unknown:<job>:<attempt>` | 종료 미확인으로 새 모델 실행 정지, 봇이 확인을 계속 시도, `/model-status` |
+| chat unknown 해소 | `unknown-resolved:<job>:<attempt>` | 멈춤 확인, `/retry target:<job>` |
+| read lease 만료 | `read-expired:<job>:<attempt>` | `/read`로 다시 요청 |
+
+권한 철회로 생긴 unknown은 안내하지 않는다(게시도 막힌다). 모두 `safe_summary`, `allowed_mentions.parse=[]`다. owner를 부르는 개입 알림(개선안 5-3)은 아직 넣지 않았다.
+
+### 수신·진행 신호
+
+- 일반 메시지의 수신 ACK는 텍스트 메시지 대신 원문에 👀 리액션(`PUT .../reactions/%F0%9F%91%80/@me`)이다. 이전에는 메시지마다 "수신·처리 기록 저장됨…"을 게시해 대화가 덮였다.
+- 리액션이 403/404(채널에 Add Reactions·Read Message History 없음 등)면 기존 텍스트 ACK로 한 번 대체하고 감사 `ack_reaction_fallback`을 남긴다. 429는 rate limit만 기록하고 대체하지 않는다. 상호작용(slash·버튼)은 ephemeral 응답 그대로다.
+- ACK 단계의 오류(실패를 기록하는 DB 쓰기 포함)는 `receive()` 밖으로 나가지 않는다(`ack_failure_unrecorded` 로그). 나가면 `guard()`가 그 대화에 history gap 장벽을 세운다.
+- 모델이 running인 chat의 채널(구독 켜짐·gap 아님·owner 일치)에 8초마다 `POST /channels/{id}/typing`(Discord 표시 10초)을 보낸다(`src/activity.ts`, 루프 `typing`, 생존 근거 아님). rate limit pause·정책 거부면 건너뛰고, 429는 채널 pause로 기록하며, 실패는 다음 주기에 다시 본다.
+
+### 입력 중 디바운스
+
+- 일반 chat 디바운스 2초. owner의 `TYPING_START`(10초 안, 정책 owner·guild, 활성·gap 아닌 대화, 정책 재인가)는 그 대화의 queued·비긴급 chat을 `now+8초`로 늦추되 작업 생성 + 15초를 넘기지 않는다. 앞당기지 않는다(`src/typing.ts`, 한 UPDATE의 `state='queued'` CAS).
+- 새 메시지가 오면 기존 대체 로직이 앞 작업을 superseded로 바꾸고 새 작업의 15초 상한이 다시 시작된다. 그래서 owner가 메시지를 계속 보내는 동안에만 늘어난다. `/urgent`·read·task·running은 영향이 없다.
+- typing은 잃어도 되는 힌트다. 처리 오류는 `typing_hint_failed` 로그만 남기고 history gap 장벽을 세우지 않는다. 재연결 뒤 지난 힌트를 복원하지 않는다. 구 파드(intents 33281)와 함께 도는 동안은 미룸이 반쯤만 동작한다(해 없음).
+
+### 대화 답 형식 (출력 스키마는 그대로)
+
+- 이전에는 네 배열을 섹션당 350자 예산으로 줄여, 첫 항목이 325자를 넘으면 그 섹션이 "(1개 생략)"만 남았다(항목은 최대 500자). 빈 섹션도 "없음"으로 네 줄을 채웠다.
+- 지금(`src/chat-format.ts`): 사실 → 가설 → 미확인 → 권장 확인 순서, 빈 섹션 생략, 모든 항목을 그대로 싣는다(스키마가 8/4/8/4개 × 500자로 묶는다). 사실 한 개뿐이면 라벨 없이 그 문장(JSON으로 읽히면 라벨 유지: 게시 표식이 JSON 본문을 다시 감싸기 때문). 모두 비면 결정적 안내. 긴 답은 기존 1800자 페이지 분할(최악 약 7개 메시지).
+- read 요약(`summaryItems`)은 그대로다. `reply/risks/details/noReply` 스키마와 "자세히" 버튼은 작업자 출력 계약과 같이 정한다.
+
+### 봇 답 문맥 (`untrusted`)
+
+- `Store.context()` → `chatContext()`(`src/chat-context.ts`). owner 항목은 이벤트 payload에 `from:'owner'`, 봇 항목은 `{from:'bot', text, partial?}`.
+- 봇 항목은 같은 대화·owner의 **chat 결과 중 Discord 게시가 확정된(sent) 본문**만이다. 현재 입력보다 먼저 게시된 것만 넣는다(owner 메시지 ID와 게시 메시지 ID, 둘 다 snowflake로 비교. 불확실하면 뺀다). 일부 페이지만 sent면 `partial`. read·task·실패 안내·제어·스레드·경보는 넣지 않는다.
+- 전체 20개(작업자 스키마 상한)·배열 JSON 32KiB(라벨 포함). 현재 owner 메시지는 항상 마지막, 다음은 직전 봇 답, 나머지는 최신부터 채우고 처음 넘치는 곳에서 멈춘다. 넘치는 봇 답은 앞 페이지만 `partial`로 넣는다.
+- **남은 것:** 작업자 프롬프트(`chatPrompt`)는 이 배열을 아직 "owner 메시지 기록"이라 설명한다. `from`으로 항목이 스스로 설명되지만, 실행기 전환 작업에서 "owner(`from:'owner'`)와 봇이 이미 게시한 답(`from:'bot'`, `partial`이면 일부)" 설명으로 바꿔야 의미가 정확하다. 되돌리려면 `Store.context()`만 owner 전용으로 바꾸면 된다(DB 변경 없음).
+
+### 지표 (`/metrics`, DB gauge)
+
+- 기존 3개는 그대로. 더한 것: `homelab_bot_jobs{type,state}`(비종결 6상태 × chat·task·read·review, 0 포함), `homelab_bot_conversation_gaps`, `homelab_bot_outbox{state}`(pending·sending·unknown·blocked), `homelab_bot_scheduler_paused`, `homelab_bot_emergency_stop`, `homelab_bot_gateway_halted`(fatal close로 다시 연결하지 않는 상태, 첫 연결 fatal 포함).
+- 라벨은 코드의 고정 목록에서만 만든다(ID·본문 없음). 쿼리는 상수 3번이다. readiness 정의는 바꾸지 않았다(Gateway 장애에도 Ready).
+- RollingUpdate 동안 두 파드가 같은 DB 값을 낸다. 경보 룰은 `max()`로 묶는다(sum 금지). 스크레이프·룰·Telegram 경로는 플랫폼 D7 후속이다.
+
+### 잠금 순서 보강
+
+상태 안내를 outbox에 넣으면 외래 키로 대화 행 KEY SHARE를 잡는다. job·scheduler 행을 쥔 뒤 대화 행을 기다리면 제어 경로(대화 행 FOR UPDATE → scheduler → job)와 교착한다(실제 PostgreSQL에서 3건 모두 lock timeout으로 재현). 그래서 상태를 바꾸기 전에 대화 행을 `FOR KEY SHARE`로 먼저 잡는다: `transition(unknown)`, `waitForUser`(scheduler보다 먼저), `expire`(대상 대화를 id 순서로), `resolveUnknown`, 기존 `fail()`. `fail()`은 원래 job → outbox 순서였는데 종료 경로가 이 경로를 더 자주 타게 돼 함께 고쳤다.
