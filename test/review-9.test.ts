@@ -164,3 +164,71 @@ test('4316750328 제때 끝난 read는 signal을 abort하지 않음', async () =
   assert.ok(signal); assert.equal(signal.aborted, false);
 });
 
+test('4316750325 /retry도 scheduler 잠금 아래 queued 상한을 지키고 실패 작업은 그대로', async () => {
+  await queue(); const job = (await rows('jobs'))[0]!; const conversation = f.store.scopeId(thread);
+  await database.db.query("UPDATE jobs SET state='failed',attempt=1");
+  for (let i = 0; i < DEFAULTS.maxQueue; i++) {
+    const saved = await f.store.save(event(`queue-${i}`, { kind: 'command', command: 'task' }), f.policy.revision, false);
+    await f.store.accept(saved.id, 'task', f.policy.revision);
+  }
+  const retry = () => f.store.control(f.policy.owner, conversation, 'retry', job.id) as Promise<{ ok?: boolean; status: string }>;
+  const full = await retry();
+  assert.equal(full.ok, false); assert.match(full.status, /대기열이 가득/);
+  assert.equal((await rows('jobs')).find(j => j.id === job.id)!.state, 'failed'); assert.equal(await queued(), DEFAULTS.maxQueue);
+  await database.db.query("UPDATE jobs SET state='cancelled' WHERE id=(SELECT id FROM jobs WHERE state='queued' ORDER BY created_at LIMIT 1)");
+  assert.notEqual((await retry()).ok, false);
+  assert.equal((await rows('jobs')).find(j => j.id === job.id)!.state, 'queued'); assert.equal(await queued(), DEFAULTS.maxQueue);
+});
+
+// PGlite는 연결이 하나라 행 잠금 대기(교착)를 재현할 수 없다. 트랜잭션마다 잠금을 잡는 문장의 순서를 기록해
+// T16a 제어 경로(대화 행 FOR UPDATE → 스케줄러 행)와 같은지 본다. jobs·outbox 삽입은 conversation_id 외래 키 검사로
+// 대화 행 KEY SHARE를 잡고 이것은 제어 경로가 먼저 잡은 FOR UPDATE와 충돌하므로 대화 행에 닿는 문장으로 센다.
+// 실제 다중 연결 재현은 test/review-9-pg.test.ts다(HOMELAB_TEST_PG_SOCKET).
+function lockLog(db: Database) {
+  const transactions: string[][] = [];
+  const kind = (sql: string) => /FROM controls WHERE key='scheduler' FOR UPDATE/.test(sql) ? 'scheduler'
+    : /FROM conversations\b[\s\S]*FOR UPDATE/.test(sql) ? 'conversation'
+      : /INSERT INTO (jobs|outbox)\b/.test(sql) ? 'conversation_fk' : undefined;
+  const recorded: Database = {
+    query: (sql, params) => db.query(sql, params),
+    transaction: (fn, deadline) => db.transaction(tx => {
+      const log: string[] = [];
+      transactions.push(log);
+      return fn({ query: (sql, params) => { const k = kind(sql); if (k) log.push(k); return tx.query(sql, params); },
+        transaction: inner => tx.transaction(inner) });
+    }, deadline),
+  };
+  const inverted = () => transactions.filter(log => {
+    const scheduler = log.indexOf('scheduler');
+    return scheduler >= 0 && log.slice(scheduler + 1).some(k => k !== 'scheduler') && !log.slice(0, scheduler).includes('conversation');
+  });
+  return { db: recorded, transactions, inverted };
+}
+test('T16a 변경 요청 6 accept()는 대화 행을 스케줄러 행보다 먼저 잠금(/model-status·/retry와 같은 순서)', async () => {
+  const log = lockLog(database.db);
+  const store = new Store(log.db, f.now);
+  const conversation = f.store.scopeId(thread);
+  const first = await f.store.save(event('lock-first'), f.policy.revision, true);
+  await store.control(f.policy.owner, conversation, 'model-status');
+  assert.deepEqual(log.transactions.at(-1), ['conversation', 'scheduler']);
+  const id = await store.accept(first.id, 'chat', f.policy.revision);
+  assert.deepEqual(log.transactions.at(-1), ['conversation', 'scheduler', 'conversation_fk']);
+  await database.db.query("UPDATE jobs SET state='failed',attempt=1 WHERE id=$1", [id]);
+  await store.control(f.policy.owner, conversation, 'retry', id);
+  assert.deepEqual(log.transactions.at(-1), ['conversation', 'scheduler']);
+  assert.deepEqual(log.inverted(), []);
+  // 이미 수락한 event의 재수락도 같은 순서이고 기존 ID를 돌려준다.
+  assert.equal(await store.accept(first.id, 'chat', f.policy.revision), id);
+  assert.deepEqual(log.transactions.at(-1), ['conversation', 'scheduler']);
+});
+test('T16a 변경 요청 6 ingress·스레드 확정 안의 accept()도 순서 역전 없이 작업 하나', async () => {
+  const log = lockLog(database.db);
+  const store = new Store(log.db, f.now);
+  const ingress = new DiscordIngress(store, f.gate.withDatabase(log.db), f.rest);
+  await ingress.receive(event('ingress-direct'));
+  await ingress.receive(event('ingress-parent', { scope: { ...thread, kind: 'channel', channel: thread.parent!, parent: null }, kind: 'command', command: 'chat' }));
+  const publisher = new DiscordPublisher(store, f.gate.withDatabase(log.db), f.rest);
+  while (await publisher.deliver()) { /* 스레드 생성 확정이 accept()를 부른다 */ }
+  assert.equal((await rows('jobs')).length, 2);
+  assert.deepEqual(log.inverted(), []);
+});

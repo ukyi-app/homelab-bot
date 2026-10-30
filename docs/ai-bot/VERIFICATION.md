@@ -61,15 +61,15 @@
 | AUTH-01 | local_integration / pass | owner·guild·채널·스레드 parent·DM·버튼, bot/webhook 무시, Gateway 메타데이터 | 실제 Discord 권한 blocked(실연동 전), T16b. GitHub 설치·저장소 게이트 not_run(후속 단계), T17 |
 | AUTH-02 | local_integration / pass | 정책 누락·5분 초과 시 대기와 갱신 후 재개, 현재 revision 재인가, DB 즉시 철회·명시 해제 ID 승인, 실행 중 stale은 heartbeat 유지, 대기 read 서비스 철회 차단 | 실제 Infisical/ESO freshness 전달 blocked, T16b. 질문/예약/기억 접근 not_run, T18/T20 |
 | EVENT-01 | local_integration / pass | ACK 전 처리 경로 저장, ACK 유실·재시작 뒤 작업 한 건, interaction 만료 안내, 저장/큐 실패 ACK 없음, 최종 UPDATE 지연 rollback·COMMIT 잔여 예산 모의 검사 | PostgreSQL 서버 timeout·연결 유실 blocked, T16b. GitHub 세대 키 not_run, T17 |
-| EVENT-02 | local_integration / pass | 실제 DiscordProtocol + 모의 API: 게시자 marker·페이지·보관 스레드 대조, 응답 유실 뒤 재게시 없음·429 대조 중단/영속 대기 | 실제 Discord 서버 nonce 유효 창·게시/대조·보관 스레드 응답 blocked, T16b. GitHub 게시 대조 not_run, T17/T19 |
+| EVENT-02 | local_integration / pass | 실제 DiscordProtocol + 모의 API: 게시자 marker·페이지·보관 스레드 대조, 응답 유실 뒤 재게시 없음·429 대조 중단/영속 대기, JSON 본문(목록 페이지·제어 결과)은 marker를 JSON 필드(`{"ref","data"}`)로 실어 메시지 전체가 파싱됨(T16b 이월), 외부 ID 없는 unknown의 검색 miss·오류는 다음 대조 시각을 1초부터 두 배씩 15분까지 늦추고 24시간 폐기 기한은 그대로(T16b 이월) | 실제 Discord 서버 nonce 유효 창·게시/대조·보관 스레드 응답 blocked, T16b. GitHub 게시 대조 not_run, T17/T19 |
 | EVENT-03 | local_integration / pass | 실제 DiscordProtocol + 모의 API + DB scope로 101건 페이지 복구, 1000건 gap, checkpoint 후퇴 방지 | 실제 RESUME/IDENTIFY와 30초 실측 blocked, T16b. PR·base 이동 대조 not_run, T17 |
 | EVENT-04 | local_integration / pass | lease 만료 unknown, stale 결과 거부, 새 모델 호출 차단, 디스크 DB 재시작 | 실제 파드 소멸·프로세스 종료 증거 blocked, T16b/T18 |
-| CHAT-01 | local_integration / pass | 부모 채널 매번 멘션/명령 요구, 공개 스레드 1440분, 활성 스레드 후속·debounce·DM 분리, intent off, 실제 payload 형식의 모의 Gateway/REST | 실제 Gateway·slash 등록·스레드 후속 메시지 blocked, T16b |
+| CHAT-01 | local_integration / pass | 부모 채널 매번 멘션/명령 요구, 공개 스레드 1440분, 활성 스레드 후속·debounce·DM 분리, intent off, 실제 payload 형식의 모의 Gateway/REST, 모델 응답 섹션은 완결 항목만 싣고 생략 건수 표시(T16b 이월) | 실제 Gateway·slash 등록·스레드 후속 메시지 blocked, T16b |
 | CHAT-02 | local_integration / pass | 구독 해제 뒤 수집 중단·명시 재개, 작업 유지, DB 재시작 보존 | 실제 archive/unarchive·권한 상실 이벤트 blocked, T16b |
-| READ-01 | local_integration / pass | 등록 서비스→승인 질의→근거/시각/미조회→맞는 스레드, 미등록/관측 불가/오래된 정상 구분, 요약 항목 보존·생략 표시 | 라이브 Grafana/K8s/Argo CD 응답 투영·현재 상태 blocked, T16b |
+| READ-01 | local_integration / pass | 등록 서비스→승인 질의→근거/시각/미조회→맞는 스레드, 미등록/관측 불가/오래된 정상 구분, 요약 항목 보존·생략 표시, 5초 시간 초과 때 `ReadTransport`의 `AbortSignal`을 abort(T16b 이월) | 라이브 Grafana/K8s/Argo CD 응답 투영·현재 상태 blocked, T16b |
 | READ-02 | local_integration / pass | 임의 query·datasource·namespace·shell·Secret·ConfigMap·pods/log/exec 거부, 시간·응답행 상한 | 플랫폼 RBAC·Grafana Viewer·Argo CD live ConfigMap 노출 blocked, T16b |
 | SEC-01 | local_integration / pass | 로그 지시는 비신뢰 자료, 원문 공개 금지. PR/기억/AGENTS 지시는 untrusted, 모델 tool/policy 필드 거부·실패 안내, 이후 미허용 조회 거부·효과 없음 | 실제 모델의 인젝션 저항성은 이 증거에 포함하지 않음. PR 수집 경로 확장은 not_run, T17 |
-| OPS-01 | local_integration / pass | 긴 작업 중 ACK 지속·직렬 1, 대기 기록 ≥5초(모의 시계), 한도/인증 대기 원자성·실패 후 슬롯 보존, 연결 거부 failed·응답 단절 unknown, 취소 확인·timeout 실패 안내, 비상 중단·owner 대기 재개/포기·비상 해제·429·IDENTIFY 예산 | 실제 대화 지연·재연결 루프·자원·도구 호출 계수 blocked, T16b/T18 |
+| OPS-01 | local_integration / pass | 긴 작업 중 ACK 지속·직렬 1, 대기 기록 ≥5초(모의 시계), 한도/인증 대기 원자성·실패 후 슬롯 보존, 연결 거부 failed·응답 단절 unknown, 취소 확인·timeout 실패 안내, 비상 중단·owner 대기 재개/포기·비상 해제·429·IDENTIFY 예산, `/retry`도 스케줄러 잠금 아래 queued 100 상한(T16b 이월), `accept()` 잠금 순서 대화 행 → 스케줄러(T16a 변경 요청 6, 실제 PostgreSQL 다중 연결 포함) | 실제 대화 지연·재연결 루프·자원·도구 호출 계수 blocked, T16b/T18 |
 | OPS-02 | local_integration / pass | Gateway 단절 중 Ready·실제 로컬 HTTP 경보 저장, 5분 뒤 heartbeat 중단, Gateway gauge, 경보 중복/재발 요약·모델 0회, unknown 별도 상한·기한, 혼합 그룹 필터·미지원 라벨 감사/202, 게시 pause 감사 중복 억제·backoff, 경보 공통 admission 잠금 | 실제 healthchecks·스크레이프·Telegram·replicas 0·NUC 중단 blocked(실연동 전), T16b |
 
 추가 계약 시험: Ed25519 scope·body·만료·재생 거부, loopback worker HTTP 인증,
@@ -78,6 +78,8 @@
 모의 API가 Discord 서버 동작까지 증명하지는 않는다. 300초 초과 loopback HTTP 시험 명령은
 `npm run build && HOMELAB_WORKER_SLOW_MS=301500 node --test --test-name-pattern=R1-06 dist/test/review-1.test.js`다.
 1차 수정 때 이 별도 시험은 1/1 pass였고, 301.5초 지연 응답을 수집했다(시험 실행 303057.193158ms, DB 준비 포함).
+
+T16b 이월 수정(2026-10-30): PR #5 마지막 재리뷰에서 넘긴 P2 5개와 T16a 변경 요청 6번의 회귀 시험은 `test/review-9.test.ts`(PGlite, 12개)와 `test/review-9-pg.test.ts`(실제 PostgreSQL, 2개, `HOMELAB_TEST_PG_SOCKET` 없으면 건너뜀)다. 수정 전 코드에서 PGlite 10개·PG 2개가 지적한 증상으로 실패했고 수정 뒤 모두 통과했다. 외부 ID 없는 unknown의 다음 검색 시각은 migration 011의 `outbox.reconcile_after`다(로컬 DB에만 적용, 운영 적용은 T16b 배포). 실제 Discord·Grafana 응답은 모의이고 실연동은 T16b다.
 보안상 자격 파일·운영 계정은 전혀 읽지 않았다. 실제 worker filesystem/egress·영속 nonce는 검증하지 않았다.
 
 최초 실행은 33개 중 재시작 시험 1개 실패였다. 모의 시계가 재기동 때 과거로 돌아가 outbox의

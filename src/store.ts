@@ -80,6 +80,10 @@ export class Store {
   }
   async accept(id: string, type: Job['type'], revision: string, urgent = false, debounce = DEFAULTS.debounceMs): Promise<string> {
     return this.db.transaction(async tx => {
+      const event = (await tx.query<{ actor_id: string; scope: Scope; conversation_id: string }>('SELECT * FROM events WHERE id=$1', [id])).rows[0]!;
+      // 제어 경로와 같은 순서(대화 행 → 스케줄러 행)로 잠근다. jobs 삽입의 외래 키 검사가 대화 행을 잡으므로,
+      // 스케줄러를 먼저 쥐면 같은 대화의 /cancel·/model-status(대화 행 → 스케줄러)와 교착한다.
+      await tx.query('SELECT id FROM conversations WHERE id=$1 FOR UPDATE', [event.conversation_id]);
       // A common row serializes admission and model claims across publisher instances.
       await tx.query(`INSERT INTO controls VALUES ('scheduler','false') ON CONFLICT DO NOTHING`);
       await tx.query(`SELECT * FROM controls WHERE key='scheduler' FOR UPDATE`);
@@ -87,7 +91,6 @@ export class Store {
       if (existing) return existing.id;
       const queued = (await tx.query<{ count: string }>("SELECT count(*) FROM jobs WHERE state='queued'")).rows[0]!;
       if (Number(queued.count) >= DEFAULTS.maxQueue) throw new Error('queue_full');
-      const event = (await tx.query<{ actor_id: string; scope: Scope; conversation_id: string }>('SELECT * FROM events WHERE id=$1', [id])).rows[0]!;
       const jobId = randomUUID();
       const inserted = await tx.query<{ id: string }>(`INSERT INTO jobs(id,event_id,conversation_id,type,owner_id,target,revision,budget,
         priority,available_at,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
@@ -378,7 +381,7 @@ export class Store {
       const jobs = (await this.db.query('SELECT id,state,wait_reason FROM jobs WHERE owner_id=$1 AND conversation_id=$2 ORDER BY created_at', [actor, conversation])).rows;
       return jobs.length ? jobs : { ok: false, status: '현재 대화에 작업이 없습니다. 작업을 시작한 스레드에서 확인하세요.' };
     }
-    if (['cancel', 'emergency-stop', 'resume-model', 'model-status'].includes(action)) await this.lockScheduler();
+    if (['cancel', 'retry', 'emergency-stop', 'resume-model', 'model-status'].includes(action)) await this.lockScheduler();
     if (action === 'model-status') {
       const paused = (await this.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler'")).rows[0]!.value;
       const emergency = (await this.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler_emergency'")).rows[0]!.value;
@@ -420,6 +423,9 @@ export class Store {
       return { status: '취소 요청. 실행 중 작업의 종료 확인 전에는 cancelled로 표시하지 않습니다.' };
     }
     if (action === 'retry') {
+      // accept()·resume-model과 같이 스케줄러 행 잠금 아래에서 세어 동시 재시도도 상한을 넘지 않는다.
+      const count = (await this.db.query<{ count: string }>("SELECT count(*) FROM jobs WHERE state='queued'")).rows[0]!;
+      if (Number(count.count) >= DEFAULTS.maxQueue) return { ok: false, status: '대기열이 가득 찼습니다. 불필요한 작업을 취소한 뒤 재시도하세요.' };
       const changed = await this.db.query(`UPDATE jobs SET state='queued',available_at=$4,wait_reason=NULL
         WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND state='failed' AND attempt<$5 RETURNING id`,
       [target, actor, conversation, this.now(), DEFAULTS.maxRetries + 1]);
