@@ -401,3 +401,22 @@ PGlite는 transaction을 직렬화한다. 실제 PostgreSQL 다중 연결 경합
 |---|---|---|
 | 4420612638 P1: 재시작 때 남은 queued 작업이 첫 READY 장벽보다 먼저 claim돼 이전 입력으로 모델을 부름 | `Runtime` 루프를 첫 READY 장벽이 선 뒤에 시작한다. 이후 READY의 장벽은 claim의 gap 조건이 막는다 | `PR12-2 Gateway가 붙기 전(첫 READY 장벽 전)에는 남아 있던 queued 작업을 claim하지 않음`(수정 전 `failed`, 작업자 호출), `PR12-2 재시작 뒤 첫 READY 복구가 중단 중 메시지를 먼저 읽어 이전 queued 작업을 supersede`(수정 전 `failed`, 기대 `superseded`) |
 | 4420612644 P2: 대기 항목 없는 복구 루프가 DB 없이 하트비트 생존을 기록해 DB 장애 중에도 ping | 루프마다 "한 바퀴 성공 = DB에 닿음"인지 표시하고, 그런 루프(runtime·publisher)만 `health.loop()`. 복구 루프는 세지 않는다 | `PR12-3 DB가 끊기면 DB에 닿지 못한 루프는 하트비트 생존으로 치지 않아 60초 뒤 ping이 멈춤`(시계 61초 전진, 수정 전 DB 장애 중 ping 1회) |
+
+## T16b 작업자 진입점·이미지 (2026-10-30, 로컬)
+
+- 기준: 브랜치 `feat/t16b-worker-entry`(origin/main `3fb389a` 위). 구현은 [ARCHITECTURE.md](ARCHITECTURE.md) §12 "T16b 작업자 진입점", 결정은 D2·D3·D4(사용자 2026-10-30).
+- 모델 호출 없음. codex는 `--help`·`--version`만 실행했다. 시험의 codex 자리는 같은 인자·stdin·env로 도는 가짜 실행 파일이다. 시드는 합성 값이고 개인 `~/.codex*`는 쓰지 않았다.
+- `npm run check` 통과, `npm test` **521 tests / 517 pass / 0 fail / 4 skipped**(건너뜀 4개는 로컬 PostgreSQL 소켓이 필요한 기존 PG 시험). Node 24.22.2(로컬), 컨테이너 시험 단계는 Node 24.22.0.
+- 이미지: `docker build --target test .` 안에서 같은 결과(521 / 517 / 0 / 4, 비root `node` 사용자). 최종 이미지 로컬 빌드 679MB(대부분 codex linux-x64 패키지 약 411MB). 로컬 digest는 CI(`app-build`, 캐시 없음)와 다르므로 sandbox는 main 빌드의 GHCR digest를 쓴다.
+
+| 시험 ID | 등급 / 판정 | 확인한 경계 | 남은 검증 / 해소 |
+|---|---|---|---|
+| TASK-03 시간 초과 시험 안정화 | local_integration / pass | 실제 30ms 타이머가 준비 단계(디렉터리·설정 쓰기) 중에 울려 프로세스를 띄우지 않던 흔들림. 바쁜 루프 14개(코어 14)에서 수정 전 12회 중 7회 실패, 가짜 시계로 바꾼 뒤 20회 모두 통과 | 없음 |
+| 시드 복사 (WRK-01·02·14) | local_integration / pass | `auth.json`이 없을 때만 0600 복사(임시 파일 → fsync → rename), 있으면 내용·권한 그대로(갱신본을 새 시드로 덮지 않음), Secret 볼륨 `..data` 심링크 시드, 없음·빈 파일·JSON 아님·갱신 토큰 없음·디렉터리 → 기동 실패하고 `auth.json`·임시 파일 없음, 오류에 값 없음, `auth.json` 심링크·디렉터리는 따라가지 않고 실패, 시드·nonce 경로가 사람 홈이나 `.codex*`(심링크 포함)면 읽기·쓰기 전에 실패 | 실제 Secret 볼륨·PVC에서 1회 복사와 파드 재생성 뒤 유지(`sha256sum` 비교만), S11 |
+| SEC-02 capability 재생 (WRK-03·04·12) | local_integration / pass | 영속 nonce 디렉터리: 쓴 capability는 프로세스를 새로 띄워도 거부, 같은 nonce 동시 사용 10건 중 1건만 통과, nonce 모양이 아니면 파일을 만들지 않고 거부, 62초 뒤 기록 정리, 쓸 수 없는 디렉터리면 기동 실패. HTTP 끝까지(서명 → 실행 → 재사용 거부 → 작업자 재기동 → 재사용 거부) | 실제 PVC에서 파드 재생성 뒤 거부, S11 |
+| 대화 레인 (WRK-05~09) | local_integration / pass | argv `--ephemeral`·`--skip-git-repo-check`·`--output-schema`·`-o`·stdin `-`, `sandbox_mode = "read-only"`·`inherit = "none"`, 빈 임시 작업 공간, codex env 허용 목록(부모 env의 시드·Discord·공개 키·OpenAI 값 미상속), 세션 파일이 남지 않음(가짜 codex가 플래그를 무시하고 써도 지움), `auth.json` 유지, 한도 → `limited`, 인증 만료 → `auth_expired`, 스키마 밖·반사·중단·도구 예산 초과 → `failed`, 긴 답은 잘라 받음, 남은 프로세스 모름 → `unknown`과 이후 `worker_busy`, 작업 레인 요청은 띄우지 않음, 기한은 게시 서버보다 5초 먼저(가짜 시계로 54.999초 미중단·55초 중단), 취소는 정리 확인 뒤 `stopped: true` | 실제 codex 첫 대화(모델·인증 호스트 실측, `--ephemeral` 실제 동작, CODEX_HOME에 남는 파일 이름), S12 |
+| 작업자 기동·readiness (WRK-10·11·13·15) | local_integration / pass | 필수 env 다섯, 키 이름만 알림, 개인 키·RSA·깨진 PEM 거부, `codex --version` 0.163.0 아니면 실패, `GET /readyz` 200(`auth.json` 없어지면 503), 그 밖 경로 404, 인증 없는 실행 401, 진입점 프로세스 종료 코드 1·사유 한 줄, SIGTERM → 0, 종료 중 실행은 codex를 멈추고 `failed`로 답함 | 파드 readiness 경로 `/readyz`로 바꾸기, S11 |
+| 이미지 (Dockerfile, 로컬 podman) | local_integration / pass | uid 65532·10001, 읽기 전용 루트, 네트워크 없음에서: `codex --version` → `codex-cli 0.163.0`, `/app` 아래 남이 못 읽는 파일 0개·남이 쓸 수 있는 파일 0개, git 없음, env 없음·시드 없음 → 종료 코드 1(`config_missing:…`·`seed_missing`), 합성 시드로 기동(`seeded`, `auth.json` 0600·uid 10001) → `/readyz` 200 → 서명한 작업 레인 요청 200(`failed`, codex 미실행) → 재사용·위조 403 → 같은 볼륨으로 재기동(`kept`) → 재사용 403 → SIGTERM 종료 코드 0. 대기 메모리: cgroup 35.6MB, PID 1 RSS 85MB. codex 최대 RSS `--version` 26MB, `exec --help` 60MB | 기본 CMD(게시 서버 `dist/src/main.js`)는 이 브랜치에 없어 기동 확인 대상이 아니다(MODULE_NOT_FOUND). 대화 실행 중 메모리는 모델 호출이 필요해 S12 |
+
+- 시험이 잡는지 확인: 코드를 일부러 망가뜨려(`--ephemeral` 빼기, 세션 정리 빼기, 시드 덮어쓰기, nonce 메모리 저장, 개인 키 허용, env 상속, 버전 확인 빼기, workspace-write, 기한 여유 빼기, 0644, 작업 레인 실행, `/readyz` 빼기, 개인 경로 검사 빼기, 연결 먼저 끊기) 각각 해당 WRK 시험이 실패하는 것을 봤다.
+- 관찰한 기존 흔들림(이번 변경 밖): `S2 실제 프로세스: 예산을 넘는 도구 호출…`(`test/codex-bridge.test.ts`)이 load average 13~19(다른 작업자 동시 실행)에서 전체 실행 10회 중 2회 실패했다. 새 시험 파일이 있을 때 1회(결과가 `failed`가 아님, 종류는 기록 못 함), 뺐을 때 1회(`exit_nonzero`: 도구 호출 1개만 본 채 가짜 codex가 0 아닌 코드로 끝남). 단독 실행 8회는 모두 통과했다. 실제 150ms 간격 타이머에 기대는 시험이다. 원인은 보지 않았다. Docker test 단계(app-build)에서 같은 흔들림이 날 수 있다.

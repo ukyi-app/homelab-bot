@@ -37,7 +37,7 @@ node dist/src/main.js           # 게시 서버. 8080(/readyz·/metrics·/github
 ## 버전
 
 직접 의존성과 개발 도구는 `package.json`, 전이 의존성은 `package-lock.json`에 정확히 고정했다.
-설치 시 npm registry의 stable version을 확인했다. Codex 패키지는 계약 버전 고정용이며 시험에서 실행하지 않는다.
+설치 시 npm registry의 stable version을 확인했다. Codex 패키지는 이미지에 들어가는 실행 의존성이다(작업자가 기동 때 버전을 확인한다). 시험은 실제 codex를 실행하지 않고 같은 인자·stdin·env로 도는 가짜 실행 파일을 쓴다.
 
 - Node **24.22.0**: 최신 major보다 낮게 고정. DISCOVERY에서 정한 Node 24 대안과 현재 로컬 검증 환경을 유지한다.
   Bun의 재연결 위험을 FOUNDATION 로직과 분리하려는 선택이다. 런타임 major 변경은 T16b 연동 검증 뒤 한다.
@@ -200,3 +200,5 @@ node dist/src/worker-main.js
 - 개인 `~/.codex*`를 CODEX_HOME으로 쓰지 않는다. 로컬에서 돌려 볼 때도 빈 임시 디렉터리와 봇 전용 시드만 쓴다. 실제 모델 호출은 첫 대화(T16b S12)에서 승인 뒤 한다.
 - 대화 레인은 `--ephemeral`·`--skip-git-repo-check`·빈 임시 작업 공간·`read-only` 샌드박스로 돌고 세션 기록을 남기지 않는다. 작업 레인(`/task`)은 연결하지 않았다(T18 결정 대기).
 - 상세 계약은 [ARCHITECTURE §12 "T16b 작업자 진입점"](docs/ai-bot/ARCHITECTURE.md), 결과는 [VERIFICATION](docs/ai-bot/VERIFICATION.md)에 있다.
+
+이미지는 `docker build --target test .`(시험 단계)와 `docker build .`(최종)로 만든다. CI는 homelab `app-build`가 같은 두 빌드를 돈다.
