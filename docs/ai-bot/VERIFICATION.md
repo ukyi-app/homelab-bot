@@ -360,3 +360,15 @@ PGlite는 transaction을 직렬화한다. 실제 PostgreSQL 다중 연결 경합
 | P2-5 8081 listen 실패 시 8080이 남아 프로세스가 반쪽으로 생존 | listen 실패면 두 서버·K8s 연결 풀을 닫고 다시 던짐. 진입점은 종료 코드 1, 남은 것이 있어도 5초 뒤 끝내는 안전 타이머(unref) | `P2-5 8081 listen이 실패하면 먼저 연 8080도 닫고…`(수정 전 거부 없이 기동), `P2-5 실제 진입 프로세스: …종료 코드 1로 끝남`(PG, 실제 `dist/src/main.js`, 자식의 fetch·WebSocket은 시험 장치로 막음, 실패 로그 뒤 3초 안 종료 확인. 수정 전 10초 뒤에도 살아 있음) |
 | P3-6 정책의 모르는 키 이름이 오류·로그에 실림 | 모르는 키는 `unknown_field(개수)`만, 고정 필드 `confirmedAt`만 이름으로 | `P3-6 정책의 모르는 키 이름은…`. 수정 전 `runtime_policies_invalid: fixture-secret-used-as-key` |
 | 남는 한계: `src/gateway.ts`가 외부 오류 `message`를 그대로 로그에 씀 | `gateway_open_failed`·`gateway_event_failed`도 `errorInfo()` 규칙(우리 코드 형식 메시지·code만) | `로그 정제: Gateway 주소 조회 오류…`, `로그 정제: Gateway 이벤트 처리 오류…`. 수정 전 URL·메시지 원문이 로그에 있음 |
+
+### 리뷰 2라운드 반영 (rev-pub-r2, 2026-10-30)
+
+리뷰(`17b738d` 기준) 발견 3건을 고쳤다. 리뷰어 재현을 회귀 시험으로 옮겨 **수정 전 코드에서 7개 모두 실패**를 먼저 확인했고, 고친 부분을 하나씩 빼는 변형에서도 해당 시험이 실패함을 확인했다(원복). `npm run check` 통과, `npm test` **569 tests / 560 pass / 0 fail / 9 skipped**(PG 소켓 없음). PostgreSQL 18.6 소켓 포함은 이 브랜치 5회 중 2회 569/569, 3회는 기존 `TASK-03`(실행 예산 30ms의 실시간 시험) 1건 실패다. 같은 코드의 사본은 3/3 통과했고, 작업자 브랜치의 TASK-03 수정(`bfd8f04`)을 얹은 사본도 3/3 통과했다(호스트 부하에 따른 흔들림, 병합 때 해소).
+
+| 발견 | 고친 방식 | 회귀 시험 / 수정 전 |
+|---|---|---|
+| P1 새 READY의 장벽·대기 항목을 이전 복구가 풀거나 지움 | 장벽 UPDATE가 같은 문장에서 기존 `recovery_token`을 지워 새 복구 세대를 연다(이전 복구는 토큰이 달라 `skipped`). 스케줄러는 자기가 시작한 대기 항목일 때만 완료·재시도·삭제를 반영 | `R2-1 마지막 정리 중 새 READY…`(수정 전 대기 항목 0), `R2-1 history 처리 중 새 READY…`(수정 전 이전 스냅샷으로 gap 해제), `R2-1 진입점: history 대기 중 새 READY…`(실제 Gateway 재IDENTIFY, 수정 전 메시지 200 유실). 토큰 무효화만 빼면 history 시험, 소유 확인만 빼면 정리 시험이 실패 |
+| P2 30초 lease 만료를 재시도 가능한 skipped로 반환 | `recover()`의 확인이 `stale`(토큰·구독 세대 변경)과 `expired`(자기 lease 만료)를 구분, 만료는 페이지·버퍼·checkpoint 어디서든 `budget` + `history_gap` 감사 | `R2-2 history 페이지 처리 중 30초…`(수정 전 `['skipped','skipped','skipped']`), `R2-2 마지막 checkpoint 갱신에서…`, `R2-2 버퍼 처리 중…`(둘 다 수정 전 `skipped`) |
+| P2 예약 응답 지연 때 실제 IDENTIFY 간격 위반 | 예약에 전송 창(0.4초)을 두고 창 안에서만 전송, 창을 놓친 예약은 지우고 다시 예약(연결당 3번). 간격 5.5초 = 5초 + 창 + 망 여유 0.1초라 실제 전송 간격 5.1초 이상 | `R2-3 예약 응답이 늦어져도…`(첫 COMMIT 응답 900ms 지연, 가짜 5초 제한. 수정 전 위반 1회). 창 확인만 빼면 실패 |
+
+리뷰가 짚은 시험 흔들림 위험 중 `P1-2 일시적인 history 조회 실패…`의 `calls === 1` 폴링은 `calls >= 1`로 바꿨다. 빠른 Gateway 시험의 대역 예산은 간격 300ms·창 50ms로 실제 전송 간격 250ms 이상(가짜 제한 200ms)이다.

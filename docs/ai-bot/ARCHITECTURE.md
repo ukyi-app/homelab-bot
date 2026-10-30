@@ -285,11 +285,14 @@ Discord Gateway → `DiscordProtocol` → `DiscordIngress` → PostgreSQL 이벤
 런타임은 Node 24.22.0이며, Discord 클라이언트는 SDK 없이 주입 가능한 `DiscordProtocol`을 선택했다.
 인증된 WebSocket 세션은 T16b `GatewaySession`(Node 24 내장 WebSocket, intents 33281)이 이 어댑터에 잇는다. 봇 사용자 ID는 첫 READY에서 받고,
 그 전에는 Discord 수신·게시를 하지 않는다(8080·8081 수신은 계속). 새 IDENTIFY(READY)마다 **live 이벤트를 처리하기 전에**
-모든 활성 스레드·DM에 `gap=true`(복구 장벽)를 한 문장으로 세운다. 그 뒤 live 메시지는 버퍼에 들어가 checkpoint를 올리지 못하므로
+모든 활성 스레드·DM에 `gap=true`(복구 장벽)를 한 문장으로 세우고, 같은 문장에서 진행 중인 이전 복구의 `recovery_token`을 지워 새 복구 세대를 연다.
+이전 세대의 복구는 다음 확인에서 토큰이 달라 손을 떼므로(`skipped`) 이전 history 스냅샷으로 새 장벽의 gap·checkpoint를 바꾸지 못하고,
+스케줄러는 자기가 시작한 대기 항목일 때만 결과를 반영해 새 READY의 항목을 지우지 않는다. 그 뒤 live 메시지는 버퍼에 들어가 checkpoint를 올리지 못하므로
 복구 차례를 기다리는 대화도 단절 중 메시지를 건너뛰지 않는다. 장벽 UPDATE가 실패하면 설 때까지 다시 시도하고 그동안 이벤트는 기다린다.
 history 대조는 `RecoveryScheduler`(`src/recovery.ts`)가 대화별로 이벤트 처리 밖에서 돌린다. 일시적인 실패(시간 초과·429·서버 오류·정책 확인 불가)는
 대화별 지수 백오프(1초부터 5분까지, 429·영속 pause면 `retry_after` 이상)로 READY 없이 다시 시도하고, 복구 한도(100건×10쪽/30초)를 넘은 경우만
-수동 처리할 gap으로 남긴다(`recover()`가 `done`·`budget`·`skipped`를 돌려준다). 정책 거부는 재시도하지 않는다. 대기 목록은 메모리이고
+수동 처리할 gap으로 남긴다(`recover()`가 `done`·`budget`·`skipped`를 돌려준다. 자기 토큰이 그대로인데 30초 lease가 지난 경우는
+페이지 처리·버퍼 처리·checkpoint 갱신 어디서든 `budget`과 `history_gap` 감사이고, 토큰·구독 세대가 바뀐 경우만 `skipped`). 정책 거부는 재시도하지 않는다. 대기 목록은 메모리이고
 재시작하면 새 READY가 다시 만든다. RESUMED면 Discord 재생에 맡긴다. slash 명령은 READY마다 guild 단위로 FOUNDATION 12개에 맞추고(`task`·`review-*` 없음, 같으면 쓰지 않음)
 전역 명령은 비운다. 수신도 같은 목록만 받는다. 재연결·RESUME 실측은 실연동(S16)이다.
 
@@ -427,8 +430,10 @@ dispatch 전 PolicyUnavailable의 defer는 최신 cancel_requested를 원자적�
 unknown은 자동 재시도 0회다. Discord 429는 retry_after를 지키고 총 3회 뒤 blocked다.
 IDENTIFY는 rolling 24시간 **900회**를 로컬 상한으로 두고 1000회 문서 한도에 여유를 남긴다.
 재연결 backoff는 1~60초 + 0~1초 jitter 계약이다. T16b `GatewaySession`은 새 IDENTIFY 직전에 `GatewayBudget.reserve()`로 일일 900회와
-IDENTIFY 간격(Discord 5초 + 지연 차이 여유 0.5초 = 5.5초, 단일 shard)을 같은 잠금 아래에서 함께 예약하고 그 시각까지 기다린다.
-예약 시각은 audit에 남아 재시작에도 이어진다. 연결 전에는 `next()`로 소진·대기 시간을 보고(소진되면 연결하지 않음), RESUME은 예약하지 않는다.
+IDENTIFY 간격(단일 shard)을 같은 잠금 아래에서 함께 예약하고 그 시각까지 기다린다. 예약마다 전송 창(예약 시각부터 0.4초)이 있고
+그 안에서만 보낸다. 예약 응답(DB)이 늦어 창을 놓치면 그 예약은 지우고(보내지 않았으니) 다시 예약한다(연결당 3번, 넘으면 끊고 재연결).
+다음 예약은 직전 예약 + 5초 + 창 0.4초 + 망 지연 여유 0.1초 = 5.5초 뒤라, 실제 전송 간격은 늘 5.1초 이상이다.
+예약은 audit에 남아 재시작에도 이어진다. 연결 전에는 `next()`로 소진·대기 시간을 보고(소진되면 연결하지 않음), RESUME은 예약하지 않는다.
 다중 shard가 되면 `max_concurrency` 버킷마다 간격을 따로 둔다. 재연결 간격에는 이 backoff를 쓴다.
 
 작업자 제어 인증은 **Ed25519**다. 게시 서버에만 개인 키, 작업자에는 공개 키만 둔다.
