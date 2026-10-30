@@ -130,7 +130,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   let runtimeStarted = false;
   const background = new Set<Promise<void>>();
   const track = (task: Promise<void>) => { background.add(task); void task.finally(() => background.delete(task)); };
-  const typingHint = typingHints(store, gate, log, track);
+  const typingHint = typingHints(store, gate, log, track, { shutdown: stop.signal });
   const loops: Promise<void>[] = [];
   // alive: 이 루프의 한 바퀴가 성공했다는 것이 DB에 닿았다는 증거인지. 하트비트 조건(조율 루프가 최근 60초 안에 돎)은
   // 그런 루프로만 잰다. runtime(store.expire)·publisher(claimDelivery)는 늘 DB를 거친다. 복구 루프는 대기 항목이 없으면

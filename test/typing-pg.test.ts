@@ -23,6 +23,7 @@ test('TYP-PG-01 실제 PostgreSQL: job 행이 잠겨 있으면 1.5초 안에 힌
     const logs: string[] = [];
     const log = (name: string) => { logs.push(name); };
     await f.ingress.receive(event('m1'));
+    f.advance(1000);
     const hint = { channel_id: 'fixture-thread', guild_id: 'fixture-guild', user_id: 'fixture-owner', timestamp: Math.floor(f.now() / 1000) };
     const before = (await db.query<{ available_at: string }>('SELECT available_at FROM jobs')).rows[0]!.available_at;
     // 다른 연결이 job 행을 쥔다(claim·accept가 잡고 있는 상황).

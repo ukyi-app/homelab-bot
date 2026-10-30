@@ -238,6 +238,8 @@ test('TYP-11 진입점: typing DB가 느려도 뒤 MESSAGE_CREATE·상호작용�
 
 test('TYP-12 늦게 끝난 힌트도 자기 뒤에 만든 작업은 늘리지 않음(받은 시각 기준), 앞의 작업은 받은 시각+8초까지', async () => {
   await f.ingress.receive(event('m1'));
+  // 같은 ms의 작업은 앞뒤를 가릴 수 없어 제외하므로(TYP-15) 앞 작업은 힌트보다 1ms라도 먼저 만든다.
+  f.advance(1);
   const receivedAt = f.now();
   f.advance(1000);
   await f.ingress.receive(event('m2', { mention: false }));
@@ -278,7 +280,7 @@ test('TYP-14 처리 기한(기본 1.5초)을 넘기면 힌트를 버리고 로�
   const before = await jobs();
   const slow = stallTyping(database.db);
   const tasks: Promise<void>[] = [];
-  const hint = typingHints(new Store(slow.db, f.now), f.gate, log, task => { tasks.push(task); }, 50);
+  const hint = typingHints(new Store(slow.db, f.now), f.gate, log, task => { tasks.push(task); }, { budgetMs: 50 });
   slow.arm();
   hint(typing());
   await slow.paused;
@@ -287,4 +289,100 @@ test('TYP-14 처리 기한(기본 1.5초)을 넘기면 힌트를 버리고 로�
   await Promise.all(tasks);
   assert.deepEqual(await jobs(), before);
   assert.deepEqual(logs.map(l => l.event), ['typing_hint_expired']);
+});
+
+test('TYP-15 같은 ms: 힌트를 보류한 사이 시계를 밀지 않고 만든 후속 메시지 작업은 힌트가 풀려도 기본 2초 그대로', async () => {
+  await f.ingress.receive(event('m1'));
+  f.advance(1000);
+  const slow = stallTyping(database.db);
+  const tasks: Promise<void>[] = [];
+  const hint = typingHints(new Store(slow.db, f.now), f.gate, log, task => { tasks.push(task); });
+  slow.arm();
+  hint(typing());
+  await slow.paused;
+  // 힌트를 받은 바로 그 ms에 후속 메시지가 작업을 만든다(앞 작업은 대체된다).
+  await f.ingress.receive(event('m2', { mention: false }));
+  const next = (await jobs()).find(job => job.state === 'queued')!;
+  assert.equal(next.created_at, f.now());
+  slow.release();
+  await Promise.all(tasks);
+  assert.equal((await jobs()).find(job => job.state === 'queued')!.available_at, next.created_at + DEFAULTS.debounceMs);
+  assert.deepEqual(logs, []);
+});
+
+// 이 채널 조회(GET /channels/{thread}) 하나를 붙잡아 앞 MESSAGE_CREATE dispatch를 늦춘다.
+class HoldingRest extends SignalRest {
+  armed = false;
+  private reach!: () => void;
+  private free!: () => void;
+  readonly reached = new Promise<void>(resolve => { this.reach = resolve; });
+  private readonly held = new Promise<void>(resolve => { this.free = resolve; });
+  release() { this.free(); }
+  override async request(method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown): Promise<unknown> {
+    if (this.armed && method === 'GET' && path === `/channels/${THREAD}`) { this.armed = false; this.reach(); await this.held; }
+    return super.request(method, path, body);
+  }
+}
+
+test('TYP-16 진입점: 앞 dispatch가 stop()의 Gateway 대기 기한을 넘긴 뒤 풀려도, 큐에 있던 typing은 DB 작업 0건', async () => {
+  let typingDb = 0;
+  let stopped = false;
+  const counting: Database = {
+    query: async <T>(sql: string, params?: unknown[]) => {
+      if (stopped && /typingStart/.test(new Error().stack ?? '')) typingDb++;
+      return database.db.query<T>(sql, params);
+    },
+    transaction: (fn, deadline) => {
+      if (stopped && /typingStart/.test(new Error().stack ?? '')) typingDb++;
+      return database.db.transaction(fn, deadline);
+    },
+  };
+  gw = new FakeGateway(); gw.options.identifyIntervalMs = 250; await gw.start();
+  const rest = new HoldingRest();
+  publisher = await bootSignal({ db: counting, rest, gw, logs });
+  await database.db.query(`INSERT INTO conversations(id,owner_id,scope,channel_id,created_at,active)
+    VALUES ($1,$2,$3,$4,0,true)`, [`thread:${GUILD}:${THREAD}`, OWNER, JSON.stringify({ kind: 'thread', guild: GUILD, channel: THREAD, parent: 'fixture-chat' }), THREAD]);
+  rest.armed = true;
+  gw.dispatch(gw.latest, 2, 'MESSAGE_CREATE', { id: '1000', channel_id: THREAD, guild_id: GUILD, author: { id: OWNER }, content: 'fixture-message' });
+  await rest.reached;
+  gatewayTyping(3, { channel_id: THREAD, guild_id: GUILD, user_id: OWNER, timestamp: Math.floor(Date.now() / 1000) });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  // stop()의 Gateway 이벤트 대기(최대 2초)와 남은 기한이 모두 지나 stop()이 끝난 뒤에 앞 dispatch를 푼다.
+  await publisher.stop(); publisher = undefined;
+  stopped = true;
+  rest.release();
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.equal(typingDb, 0);
+});
+
+test('TYP-17 연결을 기다리는 사이 종료되면 업무 질의 없이 끝나고, 종료 뒤 힌트는 등록하지 않음', async () => {
+  await f.ingress.receive(event('m1'));
+  f.advance(1000);
+  const before = await jobs();
+  let inside = 0;
+  let reached!: () => void, release!: () => void;
+  const paused = new Promise<void>(resolve => { reached = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  // 트랜잭션 시작(운영의 연결 획득)을 붙잡고, 트랜잭션 안 질의 수를 센다.
+  const db: Database = {
+    query: (sql, params) => database.db.query(sql, params),
+    transaction: async (fn, deadline) => {
+      reached(); await held;
+      return database.db.transaction(tx => fn({ query: (sql, params) => { inside++; return tx.query(sql, params); },
+        transaction: () => { throw new Error('nested'); } }), deadline);
+    },
+  };
+  const shutdown = new AbortController();
+  const tasks: Promise<void>[] = [];
+  const hint = typingHints(new Store(db, f.now), f.gate, log, task => { tasks.push(task); }, { shutdown: shutdown.signal });
+  hint(typing());
+  await paused;
+  shutdown.abort();
+  release();
+  await Promise.all(tasks);
+  assert.equal(inside, 0);
+  hint(typing());
+  assert.equal(tasks.length, 1);
+  assert.deepEqual(await jobs(), before);
+  assert.deepEqual(logs, []);
 });
