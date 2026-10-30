@@ -61,4 +61,5 @@ export async function migrate(db: Database): Promise<void> {
   await db.query(await readFile(new URL('../../migrations/008_pr_review.sql', import.meta.url), 'utf8'));
   await db.query(await readFile(new URL('../../migrations/009_codex_bridge.sql', import.meta.url), 'utf8'));
   await db.query(await readFile(new URL('../../migrations/010_memory_briefing.sql', import.meta.url), 'utf8'));
+  await db.query(await readFile(new URL('../../migrations/011_reconcile_backoff.sql', import.meta.url), 'utf8'));
 }

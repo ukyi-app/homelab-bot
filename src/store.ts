@@ -249,6 +249,19 @@ export class Store {
         WHERE id=$1 AND lease_token=$2`, [row.id, row.lease_token, count, store.now() + Math.min(60_000, DEFAULTS.retryDelayMs * 2 ** (count - 1))]);
     });
   }
+  // 외부 ID 없는 unknown의 marker 검색이 못 찾았거나 실패했을 때 다음 검색 시각을 1초부터 두 배씩 상한까지 늦춘다.
+  // available_at(unknown 진입 시각)은 건드리지 않아 24시간 폐기 기한은 그대로다.
+  async deferSearch(row: Delivery): Promise<void> {
+    await this.atomic(async store => {
+      const current = (await store.db.query<{ pause_reason: string | null; pause_count: number }>(`SELECT pause_reason,pause_count FROM outbox
+        WHERE id=$1 AND lease_token=$2 AND state='unknown' AND external_id IS NULL FOR UPDATE`, [row.id, row.lease_token])).rows[0];
+      if (!current) return;
+      const count = current.pause_reason === 'marker_not_found' ? Math.min(current.pause_count + 1, 11) : 1;
+      await store.db.query(`UPDATE outbox SET pause_reason='marker_not_found',pause_count=$3,reconcile_after=$4
+        WHERE id=$1 AND lease_token=$2`, [row.id, row.lease_token, count,
+        store.now() + Math.min(DEFAULTS.reconcileSearchMaxMs, DEFAULTS.retryDelayMs * 2 ** (count - 1))]);
+    });
+  }
   async pauseDelivery(row: Delivery, reason: string): Promise<void> {
     await this.atomic(async store => {
       const previous = (await store.db.query<{ pause_reason: string | null; pause_count: number }>(

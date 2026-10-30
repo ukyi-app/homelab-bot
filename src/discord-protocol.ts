@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { Denied, DiscordRejected, DiscordUnauthorized, RateLimited } from './contracts.js';
 import type { Clock, EventInput } from './contracts.js';
-import { gatewayMessage } from './discord.js';
+import { gatewayMessage, hasMarker } from './discord.js';
 import type { DiscordIngress, DiscordRest, GatewayFrame } from './discord.js';
 
 export interface DiscordApi {
@@ -78,7 +78,7 @@ export class DiscordProtocol implements DiscordRest {
     let before = '';
     for (let page = 0; page < 10; page++) {
       const messages = z.array(MessageSchema).parse(await this.api.request('GET', `/channels/${part(channel)}/messages?limit=100${before ? `&before=${part(before)}` : ''}`));
-      const found = messages.find(m => m.author.id === this.botId && m.content?.endsWith(`[ref:${marker}]`));
+      const found = messages.find(m => m.author.id === this.botId && m.content !== undefined && hasMarker(m.content, marker));
       if (found) return found;
       if (messages.length < 100) return;
       before = messages[messages.length - 1]!.id;

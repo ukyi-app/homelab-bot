@@ -214,7 +214,8 @@ test('4313740796 큰 list는 모든 작업을 유효한 JSON 페이지로 전달
   assert.ok(f.rest.messages.length > 1);
   const delivered = f.rest.messages.flatMap(message => {
     assert.ok(message.body.content.length <= 2000);
-    return JSON.parse(message.body.content.split('\n[ref:')[0]!) as { id: string }[];
+    // marker는 JSON 필드다(4316750293). 메시지 전체를 그대로 파싱한다.
+    return (JSON.parse(message.body.content) as { data: { id: string }[] }).data;
   });
   assert.equal(delivered.length, ids.size); assert.deepEqual(new Set(delivered.map(job => job.id)), ids);
   assert.equal(new Set(f.rest.messages.map(message => message.body.nonce)).size, f.rest.messages.length);
