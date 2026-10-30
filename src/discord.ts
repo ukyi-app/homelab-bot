@@ -190,15 +190,26 @@ export class DiscordIngress {
           // The same conversation lock decides whether a live event is buffered or routed directly.
           for (let drained = 0; drained <= DEFAULTS.recoveryPages * 100; drained++) {
             if (this.store.now() - started >= DEFAULTS.recoveryMs) break;
-            const next = await this.store.atomic(async store => {
-              const current = await check(store);
-              if (current !== 'ok') return { done: true, cleared: false, state: current };
-              const event = (await store.db.query<{ delivery_id: string; actor_id: string; scope: Scope; payload: EventInput }>(
-                'SELECT * FROM events WHERE conversation_id=$1 AND buffered=true ORDER BY event_order LIMIT 1', [conversation.id])).rows[0];
-              if (event) return { event };
-              await store.db.query('UPDATE conversations SET gap=false WHERE id=$1', [conversation.id]);
-              return { done: true, cleared: true };
-            });
+            // gap을 푸는 마지막 transaction은 lease 마감 안에서만 commit한다. check() 뒤의 조회·UPDATE 왕복 중에 마감을 넘기면
+            // (마감 전달로 다음 질의 전 또는 마지막 확인에서) 되돌려 gap을 남기고 budget으로 끝낸다. 토큰·구독 변경은 그대로 skipped다.
+            const lease = { expiresAt: started + DEFAULTS.recoveryMs, now: this.store.now };
+            let next;
+            try {
+              next = await this.store.atomic(async store => {
+                const current = await check(store);
+                if (current !== 'ok') return { done: true, cleared: false, state: current };
+                const event = (await store.db.query<{ delivery_id: string; actor_id: string; scope: Scope; payload: EventInput }>(
+                  'SELECT * FROM events WHERE conversation_id=$1 AND buffered=true ORDER BY event_order LIMIT 1', [conversation.id])).rows[0];
+                if (event) return { event };
+                await store.db.query('UPDATE conversations SET gap=false WHERE id=$1', [conversation.id]);
+                if (store.now() >= lease.expiresAt) throw new Error('recovery_expired');
+                return { done: true, cleared: true };
+              }, lease);
+            } catch (error) {
+              // 마감을 넘겨 실패했으면(우리 확인·마감 검사·DB의 transaction/statement timeout 무엇이든) 한도 초과다.
+              if (this.store.now() >= lease.expiresAt) break pages;
+              throw error;
+            }
             if (next.done) {
               if (next.cleared) return 'done';
               if (next.state === 'expired') break pages;

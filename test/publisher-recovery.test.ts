@@ -232,3 +232,69 @@ test('R2-2 버퍼 처리 중 30초를 넘겨도 budget', async () => {
   assert.equal(await historyGaps(), 1);
   assert.equal((await threadRow()).gap, true);
 });
+
+// ---- 리뷰 3라운드(rev-pub-r3): gap을 푸는 마지막 transaction의 check() 뒤 DB 왕복 경계 ----
+// 지정한 질의의 응답이 돌아온 직후 시계를 당긴다. 마지막 check()는 이미 통과한 뒤다.
+function advancingDatabase(f: Awaited<ReturnType<typeof fixture>>, match: (sql: string) => boolean, ms: () => number) {
+  let fired = false;
+  const wrap = (inner: Database): Database => ({
+    query: async <T>(sql: string, params?: unknown[]) => {
+      const result = await inner.query<T>(sql, params);
+      if (!fired && match(sql)) { fired = true; f.advance(ms()); }
+      return result;
+    },
+    transaction: (fn, deadline) => inner.transaction(tx => fn(wrap(tx)), deadline),
+  });
+  return { db: wrap(database.db), fired: () => fired };
+}
+const emptyBufferSelect = (sql: string) => sql.startsWith('SELECT * FROM events WHERE conversation_id=$1 AND buffered=true');
+const gapRelease = (sql: string) => sql.startsWith('UPDATE conversations SET gap=false WHERE id=$1');
+
+test('R3-1 리뷰어 재현: 인가 왕복 누적 + 마지막 빈 버퍼 조회 응답에서 30초를 넘기면 done이 아니라 budget', async () => {
+  const f = await fixture(database.db);
+  await seedThread(f);
+  const authorize = f.gate.authorize.bind(f.gate);
+  f.gate.authorize = async (...args: Parameters<typeof authorize>) => { const policy = await authorize(...args); f.advance(365); return policy; };
+  setHistory(f, async () => Array.from({ length: 80 }, (_, i) => historyMessage(String(101 + i))));
+  const advancing = advancingDatabase(f, emptyBufferSelect, () => 500);
+  const store = new Store(advancing.db, f.now);
+  const ingress = new DiscordIngress(store, f.gate, f.rest);
+  const outcomes: string[] = [];
+  const scheduler = new RecoveryScheduler(store, async (s, o) => { const r = await ingress.recover(s, o); outcomes.push(r); return r; }, () => {});
+  await scheduler.barrier();
+  await scheduler.runDue();
+  assert.equal(advancing.fired(), true);
+  assert.deepEqual(outcomes, ['budget']);
+  assert.equal(scheduler.size, 0);
+  assert.equal(await historyGaps(), 1);
+  // 처리한 메시지의 checkpoint는 남고, gap 해제만 되돌린다.
+  assert.deepEqual(await threadRow(), { checkpoint: '180', gap: true, recovery_token: null });
+});
+
+for (const [name, match] of [['빈 버퍼 조회 응답', emptyBufferSelect], ['gap 해제 UPDATE 응답', gapRelease]] as const) {
+  test(`R3-1 마지막 check() 뒤 ${name}에서 30초를 넘기면 gap 해제를 되돌리고 budget`, async () => {
+    const f = await fixture(database.db);
+    await seedThread(f);
+    setHistory(f, async () => [historyMessage('101')]);
+    const started = f.now();
+    // recover()의 lease는 시작 시각(이 시험은 인가 지연 없음) + 30초다. 응답 직후 그 경계를 1ms 넘긴다.
+    const advancing = advancingDatabase(f, match, () => started + 30_001 - f.now());
+    const ingress = new DiscordIngress(new Store(advancing.db, f.now), f.gate.withDatabase(advancing.db), f.rest);
+    assert.equal(await ingress.recover(thread, f.policy.owner), 'budget');
+    assert.equal(advancing.fired(), true);
+    assert.equal(await historyGaps(), 1);
+    assert.deepEqual(await threadRow(), { checkpoint: '101', gap: true, recovery_token: null });
+  });
+}
+
+test('R3-1 경계 안에서 끝나면 그대로 done(마지막 왕복이 lease 1ms 전)', async () => {
+  const f = await fixture(database.db);
+  await seedThread(f);
+  setHistory(f, async () => [historyMessage('101')]);
+  const started = f.now();
+  const advancing = advancingDatabase(f, gapRelease, () => started + 29_999 - f.now());
+  const ingress = new DiscordIngress(new Store(advancing.db, f.now), f.gate.withDatabase(advancing.db), f.rest);
+  assert.equal(await ingress.recover(thread, f.policy.owner), 'done');
+  assert.equal(await historyGaps(), 0);
+  assert.deepEqual(await threadRow(), { checkpoint: '101', gap: false, recovery_token: null });
+});
