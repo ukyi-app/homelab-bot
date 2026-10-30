@@ -2,11 +2,15 @@ import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { DEFAULTS, Denied, DiscordRejected, DiscordUnauthorized, HistoryGap, PolicyUnavailable, RateLimited, ScopeSchema } from './contracts.js';
 import type { EventInput, Scope } from './contracts.js';
+import { errorInfo, jsonLog } from './log.js';
+import type { Log } from './log.js';
 import type { PolicyGate } from './policy.js';
 import type { Delivery, Store } from './store.js';
 
+// 일반 메시지 수신 표시가 리액션 대신 텍스트로 대체됐을 때의 거부 상태(권한 점검 신호).
+export interface AckOutcome { fallback: 403 | 404 }
 export interface DiscordRest {
-  acknowledge(event: EventInput, content: string, options: { allowed_mentions: { parse: never[] } }): Promise<void>;
+  acknowledge(event: EventInput, content: string, options: { allowed_mentions: { parse: never[] } }): Promise<AckOutcome | void>;
   createThread(channel: string, body: { name: string; type: 11; auto_archive_duration: 1440 }): Promise<{ id: string }>;
   sendMessage(channel: string, body: { content: string; nonce: string; enforce_nonce: true; allowed_mentions: { parse: never[] } }): Promise<{ id: string }>;
   findDelivery(channel: string, marker: string, kind: 'message' | 'thread'): Promise<{ id: string } | undefined>;
@@ -27,7 +31,7 @@ const EventSchema = z.strictObject({
 export class DiscordIngress {
   constructor(private readonly store: Store, private readonly gate: PolicyGate,
     private readonly rest: DiscordRest, public readonly messageContent = true,
-    private readonly commands: ReadonlySet<string> = ALL_COMMANDS) {}
+    private readonly commands: ReadonlySet<string> = ALL_COMMANDS, private readonly log: Log = jsonLog) {}
   async receive(input: EventInput, recovered = false, recovery?: { token: string; epoch: number }): Promise<string | undefined> {
     const event = EventSchema.parse(input);
     if (event.bot || event.webhook) return;
@@ -105,26 +109,37 @@ export class DiscordIngress {
       await store.db.query('UPDATE events SET buffered=false WHERE id=$1', [saved.id]);
       return true;
     }, recovered ? undefined : { expiresAt: started + DEFAULTS.inboxTimeoutMs, now: this.store.now });
-    if (routed && !recovered) {
+    if (routed && !recovered) await this.acknowledge(event, saved.id);
+    return saved.id;
+  }
+  // 처리는 이미 영속됐다. 여기서 나는 오류(ACK 실패를 기록하는 DB 쓰기 포함)는 수신 결과를 바꾸지 않는다.
+  // 메시지 이벤트에서 던지면 main의 guard()가 그 대화에 history gap 장벽을 세운다.
+  private async acknowledge(event: EventInput, id: string): Promise<void> {
+    let outcome: AckOutcome | void;
+    try {
       try {
         await this.gate.authorize(event.actor, event.scope);
         await this.store.ownedConversation(event.scope, event.actor);
         const pause = await this.store.discordPauseUntil(event.scope.channel);
         if (pause > this.store.now()) throw new Error('discord_global_pause');
-        await this.rest.acknowledge(event,
+        // 일반 메시지는 👀 리액션이고 이 문구는 권한 거부 때의 대체 텍스트로만 쓰인다.
+        outcome = await this.rest.acknowledge(event,
           this.messageContent ? '수신·처리 기록 저장됨. 처리·대기 상태는 별도로 안내합니다.' : '명령/버튼 모드: 수신·처리 기록 저장됨.', noMentions);
       } catch (error) {
         if (error instanceof RateLimited) await this.store.recordRateLimit(error, event.scope.channel);
         await this.store.atomic(async store => {
-          await store.audit('ack_uncertain', saved.id, { processing: 'durable' });
+          await store.audit('ack_uncertain', id, { processing: 'durable' });
           if (event.kind !== 'message') {
-            await store.db.query(`UPDATE events SET payload=payload || '{"ackUncertain":true}'::jsonb WHERE id=$1`, [saved.id]);
-            await store.ackNotice(saved.id);
+            await store.db.query(`UPDATE events SET payload=payload || '{"ackUncertain":true}'::jsonb WHERE id=$1`, [id]);
+            await store.ackNotice(id);
           }
         });
+        return;
       }
+      if (outcome) await this.store.audit('ack_reaction_fallback', id, { status: outcome.fallback });
+    } catch (error) {
+      this.log('ack_failure_unrecorded', { kind: event.kind, ...errorInfo(error) });
     }
-    return saved.id;
   }
   // 결과: done(빈틈 없이 따라잡고 gap 해제), budget(쪽 수·30초 복구 한도를 넘어 gap 유지, 수동 처리. 도중 lease 만료 포함),
   // skipped(구독 꺼짐·다른 복구 진행 중·도중에 토큰이나 구독 세대가 바뀜. 이 복구는 손을 뗀다). 일시적인 통신 실패는 예외로 던진다.
