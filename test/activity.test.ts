@@ -4,6 +4,7 @@ import { RateLimited } from '../src/contracts.js';
 import type { Database } from '../src/database.js';
 import type { DiscordApi } from '../src/discord-protocol.js';
 import type { Publisher } from '../src/main.js';
+import { PolicyGate } from '../src/policy.js';
 import { Store } from '../src/store.js';
 import { TYPING_REFRESH_MS, typingActivity } from '../src/activity.js';
 import { FakeGateway } from './fake-gateway.js';
@@ -131,10 +132,90 @@ test('ACT-06 DB 조회 오류도 step 밖으로 던지지 않고 다음 주기�
   assert.equal(logs[0]?.event, 'typing_activity_failed');
 });
 
+// 정책 검사(authorize 안의 정책 읽기) 하나를 붙잡는 gate. 조회는 끝났고 전송 직전 단계에서 기다리는 상황이다.
+function holdingGate() {
+  let armed = true;
+  let reached!: () => void, release!: () => void;
+  const paused = new Promise<void>(resolve => { reached = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const gate = new PolicyGate(async () => {
+    if (armed) { armed = false; reached(); await held; }
+    return f.policy;
+  }, database.db, f.now);
+  return { gate, paused, release: () => release() };
+}
+
+test('ACT-09 정책 검사 대기 중 종료 신호가 오면 대기가 풀려도 새 REST 호출 0건', async () => {
+  const hold = holdingGate();
+  const shutdown = new AbortController();
+  const step = typingActivity(f.store, hold.gate, api, log, shutdown.signal);
+  await running();
+  const pending = step();
+  await hold.paused;
+  shutdown.abort();
+  hold.release();
+  assert.equal(await pending, false);
+  // 종료 뒤에는 시계가 흘러도 바퀴를 시작하지 않는다.
+  f.advance(TYPING_REFRESH_MS); await step();
+  assert.deepEqual(calls, []);
+  assert.deepEqual(logs, []);
+});
+
+test('ACT-10 조회 뒤 정책 검사 대기 사이에 작업이 끝나면 표시를 갱신하지 않음', async () => {
+  const hold = holdingGate();
+  const step = typingActivity(f.store, hold.gate, api, log);
+  await running();
+  const pending = step();
+  await hold.paused;
+  await database.db.query("UPDATE jobs SET state='succeeded'");
+  hold.release();
+  await pending;
+  assert.deepEqual(calls, []);
+});
+
 // 진입점 배선: onReady에서 한 번 등록, 종료 신호에 멈춤.
 let gw: FakeGateway;
 let publisher: Publisher | undefined;
 afterEach(async () => { await publisher?.stop(); publisher = undefined; await gw?.close(); });
+
+async function bootRunning(db: Database, rest: SignalRest, now?: () => number) {
+  gw = new FakeGateway(); gw.options.identifyIntervalMs = 250; await gw.start();
+  publisher = await bootSignal({ db, rest, gw, logs, now });
+  const scope = JSON.stringify({ kind: 'thread', guild: GUILD, channel: THREAD, parent: 'fixture-chat' });
+  await database.db.query(`INSERT INTO conversations(id,owner_id,scope,channel_id,created_at,active)
+    VALUES ($1,$2,$3,$4,0,true)`, [`thread:${GUILD}:${THREAD}`, OWNER, scope, THREAD]);
+  await database.db.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,conversation_id,received_at,payload,accepted)
+    VALUES ('fixture-event','discord','1000','discord:1000',$1,$2,$3,0,'{}',true)`, [OWNER, scope, `thread:${GUILD}:${THREAD}`]);
+  await database.db.query(`INSERT INTO jobs(id,event_id,conversation_id,type,owner_id,target,revision,budget,state,priority,available_at,created_at,lease_token,lease_until,started_at,attempt)
+    VALUES ('fixture-job','fixture-event',$1,'chat',$2,$3,'{"policy":"fixture-v1"}','{}','running',10,0,0,'fixture-lease',$4,0,1)`,
+  [`thread:${GUILD}:${THREAD}`, OWNER, scope, Date.now() + 3_600_000]);
+}
+
+test('ACT-08 진입점: typing 단계가 DB 대기 중일 때 stop()하면 대기가 풀려도 새 POST /typing을 보내지 않음', async () => {
+  let offset = 0;
+  let armed = false;
+  let reached!: () => void, release!: () => void;
+  const paused = new Promise<void>(resolve => { reached = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  // 이 채널의 rate limit pause 조회(typing 단계만 부른다) 하나를 붙잡는다.
+  const slow: Database = {
+    query: async <T>(sql: string, params?: unknown[]) => {
+      const result = await database.db.query<T>(sql, params);
+      if (armed && params?.[0] === `discord_channel_after:${THREAD}`) { armed = false; reached(); await held; }
+      return result;
+    },
+    transaction: (fn, deadline) => database.db.transaction(fn, deadline),
+  };
+  const rest = new SignalRest();
+  await bootRunning(slow, rest, () => Date.now() + offset);
+  armed = true;
+  offset += TYPING_REFRESH_MS;
+  await paused;
+  const stopping = publisher!.stop(); publisher = undefined;
+  release();
+  await stopping;
+  assert.equal(rest.typingCalls(), 0);
+});
 
 test('ACT-07 진입점: running chat이 있으면 typing을 보내고, stop() 뒤에는 시계가 흘러도 보내지 않음', async () => {
   let offset = 0;
