@@ -19,6 +19,7 @@ import type { DiscordApi } from './discord-protocol.js';
 import { GatewaySession, discordGatewayUrl } from './gateway.js';
 import type { GatewaySocket } from './gateway.js';
 import { GatewayBudget, Health } from './health.js';
+import { typingActivity } from './activity.js';
 import { typingStart } from './typing.js';
 import { PORTS, receivers } from './http.js';
 import { errorInfo, jsonLog } from './log.js';
@@ -215,6 +216,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
           return publisher.deliver();
         });
         loop('recovery', () => recovery.runDue(), false);
+        loop('typing', typingActivity(store, gate, api, log), false);
       }
       await barrier();
       // 작업 claim은 첫 장벽이 선 뒤에 시작한다. 재시작 때 남은 queued 작업이 중단 중 메시지를 history로 복구하기 전에
