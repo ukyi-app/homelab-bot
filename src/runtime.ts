@@ -1,6 +1,6 @@
+import { chatAnswerContent } from './chat-format.js';
 import { AnswerSchema, DEFAULTS, Denied, PolicyUnavailable, WorkerRejected } from './contracts.js';
 import type { Job } from './contracts.js';
-import { summaryItems } from './format.js';
 import type { PolicyGate } from './policy.js';
 import { readSummary } from './read.js';
 import type { ReadAdapter } from './read.js';
@@ -106,10 +106,7 @@ export class Runtime {
         const answer = AnswerSchema.parse(result.answer);
         // Completed results remain durable while the publisher waits for fresh policy.
         if (!await this.store.active(job.conversation_id)) { await this.store.transition(job, 'superseded'); return true; }
-        // 완결 항목 단위로 줄이고 생략 건수를 적는다(read 요약과 같은 방식). 전체 답은 results에 남는다.
-        const section = (values: string[]) => summaryItems(values, 350);
-        const content = [`사실: ${section(answer.facts)}`, `가설: ${section(answer.hypotheses)}`,
-          `미확인: ${section(answer.unknowns)}`, `권장 확인: ${section(answer.checks)}`].join('\n');
+        const content = chatAnswerContent(answer);
         await this.store.finish(job, answer, { source: 'worker', policyRevision: job.revision.policy }, content, job.target);
       }
       await this.store.audit('model_timing', job.id, { queueWaitMs: Number(job.started_at) - Number(job.created_at),
