@@ -12,6 +12,7 @@ import type { WorkerClient, WorkerResult, WorkerSigner } from './worker.js';
 export interface TaskLane { run(job: Job): Promise<void>; sweep?(): Promise<unknown> }
 // shutdown: 게시 서버 종료 신호(SIGTERM). drainMs: 신호 뒤 실행 중 작업의 자연 완료를 기다리는 시간.
 // 기본 10초 + cancel 응답 상한 5초가 main.ts의 전체 종료 기한(20초)과 kubelet 유예(30초) 안에 들어간다.
+// cancel은 드레인 기한에 바로 나가므로 DB 지연은 cancel이 아니라 그 뒤의 상태 확정만 늦춘다.
 export interface RuntimeOptions { shutdown?: AbortSignal; drainMs?: number }
 export const DRAIN_MS = 10_000;
 export class Runtime {
@@ -42,6 +43,8 @@ export class Runtime {
     let authorizationRevoked = false;
     // 종료 신호 뒤 드레인 창이 지나 이 게시 서버가 실행을 끊었는지.
     let drained = false;
+    // 드레인 기한에 보낸 cancel. 작업자는 첫 확인 뒤 job을 놓아 두 번째 cancel은 stopped:false이므로 이 결과를 다시 쓴다.
+    let cancelling: Promise<boolean> | undefined;
     try {
       // 종료 신호 전에 시작한 claim이 늦게 돌아온 경우. 작업자에 보내기 전이라 시도 횟수를 쓰지 않고 되돌린다.
       if (await this.deferOnShutdown(job)) return true;
@@ -81,7 +84,11 @@ export class Runtime {
           }).finally(() => { monitorTask = undefined; });
       }, 1000);
       let drain: ReturnType<typeof setTimeout> | undefined;
-      const onShutdown = () => { drain = setTimeout(() => { drained = true; abort.abort(); }, this.drainMs); };
+      // 드레인 기한이 되면 그 자리에서 cancel을 보낸다. 진행 중 monitor·재인가·상태 조회를 기다렸다 보내면
+      // DB가 느릴 때(statement timeout 10초) 종료 기한 안에 못 나가 lease 만료로 unknown이 된다. 판정은 아래에서 합친다.
+      const onShutdown = () => {
+        drain = setTimeout(() => { drained = true; cancelling = this.confirmStop(job); abort.abort(); }, this.drainMs);
+      };
       this.shutdown?.addEventListener('abort', onShutdown, { once: true });
       let result: WorkerResult;
       try {
@@ -112,7 +119,7 @@ export class Runtime {
         && (result.status === 'limited' || result.status === 'auth_expired')) {
         await this.store.waitForUser(job, result.status === 'limited' ? 'model_limit' : 'auth_expired');
       } else if (current.state === 'cancel_requested' || abort.signal.aborted || authorizationRevoked) {
-        stopped = result.stopped || await this.confirmStop(job);
+        stopped = result.stopped || await (cancelling ?? this.confirmStop(job));
         if (authorizationRevoked) await this.store.transition(job, stopped ? 'cancelled' : 'unknown', 'authorization_revoked');
         else if (drained && current.state !== 'cancel_requested') await this.shutdownOutcome(job, stopped);
         else if (stopped && current.state !== 'cancel_requested') await this.store.fail(job, 'stop_confirmation');
@@ -140,7 +147,7 @@ export class Runtime {
       } else if (error instanceof PolicyUnavailable && !dispatched) await this.store.defer(job);
       else if (error instanceof WorkerRejected) await this.store.fail(job, 'worker_rejected');
       else if (!dispatched || stopped) await this.store.fail(job, dispatched ? 'invalid_result' : 'before_dispatch');
-      else if (await this.confirmStop(job)) await this.store.fail(job, 'stop_confirmation');
+      else if (await (cancelling ?? this.confirmStop(job))) await this.store.fail(job, 'stop_confirmation');
       else await this.store.transition(job, 'unknown', 'runtime_uncertain');
     }
     return true;
