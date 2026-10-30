@@ -552,15 +552,23 @@ test('TASK-03 작업자 단절은 종료 확인에 따라 failed·unknown, 재�
   const session = (await rows('codex_sessions'))[0]!;
   assert.equal(session.thread_id, 'fresh-thread'); assert.equal(session.turn, 1);
 });
-test('TASK-03 시간 초과는 정리 확인 뒤 failed 안내, 실패 결과는 자동 재실행하지 않고 다음 작업을 막지 않음', async () => {
+test('TASK-03 시간 초과는 정리 확인 뒤 failed 안내, 실패 결과는 자동 재실행하지 않고 다음 작업을 막지 않음', async t => {
   // 준비(git init)가 30ms보다 길면 시간 초과가 실행 전에 와서 띄우지 않는다(R1). 실행 중 시간 초과를 보려고 준비를 없앤다.
   const instant = new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, new CodexBridge(f.store, f.gate,
     new ExecCodexAdapter(root, launcher, { workspace: { prepare: async () => {}, snapshot: async () => ({}) } }), { monitorMs: 5 }));
   launcher.scripts.push({ lines: jsonl(...begin()), hang: true });
   const job = await task();
   await database.db.query(`UPDATE jobs SET budget='{"timeoutMs":30,"toolCalls":8}' WHERE id=$1`, [job.id]);
-  await instant.tick();
+  // 시간 초과 타이머는 가짜 시계로 실행이 시작된 뒤에 넘긴다. 실제 30ms 타이머는 부하에서 준비(디렉터리·설정 쓰기)가
+  // 끝나기 전에 울려 프로세스를 띄우지 않았다(launcher.started 0, 부하 14에서 12회 중 7회).
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let settled = false;
+  const ticking = instant.tick().finally(() => { settled = true; });
+  while (launcher.started === 0 && !settled) await new Promise(resolve => setImmediate(resolve));
   assert.equal(launcher.started, 1);
+  t.mock.timers.tick(30);
+  await ticking;
+  t.mock.timers.reset();
   assert.equal((await jobs())[0]!.state, 'failed'); assert.equal((await jobs())[0]!.wait_reason, 'codex_timeout');
   assert.match((await outbox())[0]!.payload.content, /작업 실패가 확인됐습니다/);
   launcher.scripts.push(finished(out('completed', '끝'), [], THREAD), { lines: ['broken'], exit: exit0, output: out('completed', '끝') });
