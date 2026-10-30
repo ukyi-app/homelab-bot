@@ -178,3 +178,25 @@ DM은 쓰지 않고(`dmEnabled: false`) 브리핑은 매일 08:50 Asia/Seoul이�
 
 복구 after 커서의 정렬/선택 범위 판정과 문서 근거는 [DISCORD_RECOVERY.md](docs/ai-bot/DISCORD_RECOVERY.md)에 있다.
 checkpoint가 없을 때도 after=0을 명시해 최초 페이지를 건너뛰지 않는다. 서버 실측은 T16b다.
+
+## 작업자 실행 (T16b)
+
+게시 서버와 작업자는 같은 이미지다(D2). 기본 CMD는 게시 서버 `node dist/src/main.js`이고, sandbox 작업자는
+command를 `node dist/src/worker-main.js`로 바꾼다. 작업자는 기동 때 `codex --version`이 0.163.0인지,
+영속 공간에 `auth.json`이 있는지(없으면 시드 복사) 확인한 뒤 8080에서 `/v1/execute`·`/v1/cancel`·`GET /readyz`를 받는다.
+
+```sh
+npm run build
+CODEX_HOME=/codex-home \
+WORKER_SEED_DIR=/run/worker-seed WORKER_SEED_KEY=CODEX_AUTH_JSON \
+WORKER_NONCE_DIR=/codex-home/.homelab-worker/nonces \
+WORKER_CONTROL_PUBLIC_KEY="$(cat worker-control.pub.pem)" \
+node dist/src/worker-main.js
+```
+
+- 필수 env 다섯 개 중 하나라도 없거나, 시드가 없거나 깨졌거나, codex 버전이 다르면 사유 코드 한 줄을 남기고 종료 코드 1로 끝난다. 값은 출력하지 않는다.
+- `WORKER_CONTROL_PUBLIC_KEY`는 게시 서버 `WORKER_CONTROL_PRIVATE_KEY`의 Ed25519 공개 키 PEM이다(비밀 아님). 개인 키를 넣으면 거부한다.
+- 선택: `WORKER_CODEX_BIN`(기본 `/usr/local/bin/codex`), `HTTPS_PROXY`·`NO_PROXY`(codex 프로세스에만 넘김).
+- 개인 `~/.codex*`를 CODEX_HOME으로 쓰지 않는다. 로컬에서 돌려 볼 때도 빈 임시 디렉터리와 봇 전용 시드만 쓴다. 실제 모델 호출은 첫 대화(T16b S12)에서 승인 뒤 한다.
+- 대화 레인은 `--ephemeral`·`--skip-git-repo-check`·빈 임시 작업 공간·`read-only` 샌드박스로 돌고 세션 기록을 남기지 않는다. 작업 레인(`/task`)은 연결하지 않았다(T18 결정 대기).
+- 상세 계약은 [ARCHITECTURE §12 "T16b 작업자 진입점"](docs/ai-bot/ARCHITECTURE.md), 결과는 [VERIFICATION](docs/ai-bot/VERIFICATION.md)에 있다.

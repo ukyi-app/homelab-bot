@@ -62,8 +62,13 @@ export class HttpWorker implements WorkerClient {
     return z.strictObject({ stopped: z.boolean() }).parse(await response.json());
   }
 }
-export function workerServer(worker: WorkerClient) {
+// ready를 넘기면 GET /readyz를 연다(kubelet readiness, 인증 없음. 응답에 상태 본문을 싣지 않는다).
+export function workerServer(worker: WorkerClient, ready?: () => Promise<boolean>) {
   const server = createServer(async (req, res) => {
+    if (ready && req.method === 'GET' && req.url === '/readyz') {
+      const ok = await ready().catch(() => false);
+      res.writeHead(ok ? 200 : 503).end(); return;
+    }
     if (req.method !== 'POST' || !['/v1/execute', '/v1/cancel'].includes(req.url ?? '')) { res.writeHead(404).end(); return; }
     const auth = req.headers.authorization;
     if (!auth?.startsWith('Capability ')) {

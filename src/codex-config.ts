@@ -13,8 +13,10 @@ export const TASK_MARKER = 'HOMELAB_CODEX_TASK';
 export interface ShellPolicy {
   inherit: 'none'; ignore_default_excludes: false; exclude: readonly string[]; set: Readonly<Record<string, string>>;
 }
+// 작업 레인은 workspace-write, 대화 레인(codex-chat)은 read-only다. 그 밖(danger-full-access)은 만들지 않는다.
+export type SandboxMode = 'workspace-write' | 'read-only';
 export interface CodexConfig {
-  sandbox_mode: 'workspace-write'; approval_policy: 'never';
+  sandbox_mode: SandboxMode; approval_policy: 'never';
   sandbox_workspace_write: { network_access: false };
   shell_environment_policy: ShellPolicy;
 }
@@ -48,11 +50,11 @@ export function taskPaths(root: string, job: string): CodexPaths {
     run: join(base, 'run'), tmp: join(base, 'tmp') };
 }
 
-export function codexConfig(paths: CodexPaths): CodexConfig {
+export function codexConfig(paths: CodexPaths, sandbox: SandboxMode = 'workspace-write'): CodexConfig {
   const set = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: paths.taskHome, LANG: 'C.UTF-8', TMPDIR: paths.tmp, [TASK_MARKER]: paths.job };
   assertShellSet(set, paths);
   return {
-    sandbox_mode: 'workspace-write', approval_policy: 'never',
+    sandbox_mode: sandbox, approval_policy: 'never',
     sandbox_workspace_write: { network_access: false },
     // 기본값은 KEY·SECRET·TOKEN 이름 변수까지 모델이 띄우는 명령에 넘긴다 [확인: config-advanced, 2026-10-18].
     // inherit=none이면 exclude는 쓰이지 않지만, 누가 inherit을 바꿔도 이름 필터가 남게 둔다.
@@ -95,7 +97,7 @@ export function launchEnvironment(paths: CodexPaths, proxy?: { https: string; no
 }
 
 // 답·작업 지시는 argv에 넣지 않고 stdin(`-`)으로 준다. `--`로 시작하는 답이 플래그가 되지 않게 하고
-// 프로세스 목록에 남지 않게 한다 [가정: PROMPT `-`는 stdin, 0.163.0 `--help` 대조는 T16b].
+// 프로세스 목록에 남지 않게 한다 [확인: 0.163.0 `codex exec --help`, PROMPT `-`는 stdin].
 export const FORBIDDEN_FLAGS = ['--dangerously-bypass-approvals-and-sandbox', '--approve-for-me', '--full-auto',
   '--ephemeral', '--ignore-user-config', '-a', '--ask-for-approval', '-s', '--sandbox', '-c', '--config', '--add-dir'];
 export function execArgs(paths: CodexPaths, resume: string | null): string[] {

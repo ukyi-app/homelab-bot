@@ -699,7 +699,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - 기준은 `inherit = "none"`이다. `exclude`는 누가 `inherit`을 바꿔도 이름 필터가 남게 둔 것이다. `set`에 비밀 이름 변수나 CODEX_HOME 경로가 들어가면 코드가 거부한다.
 - `approval_policy = "never"`는 승인을 묻지 않는다는 뜻이고 샌드박스 밖 실행을 허용하는 뜻이 아니다 [가정]. exec에서 샌드박스 밖 동작이 필요할 때의 처리는 [DISCOVERY.md](DISCOVERY.md)의 미확인 항목이다(T16b).
 - codex 프로세스 자체의 환경은 작업자 환경을 병합하지 않는다. `PATH`·`HOME`(작업 HOME)·`LANG`·`TMPDIR`·`CODEX_HOME`·작업 표식과 선택적 `HTTPS_PROXY`·`NO_PROXY`만 둔다. 작업자 환경의 시드 `auth.json`(`CODEX_AUTH_JSON`)·Discord·GitHub·OpenAI 값은 넘어가지 않는다(실제 프로세스 시험).
-- argv: `exec --json --output-schema <run>/output.schema.json -o <run>/last-message.json -`, 재개는 `exec resume … <thread> -`. `--dangerously-bypass-approvals-and-sandbox`·`--approve-for-me`·`--full-auto`·`--ephemeral`·`--ignore-user-config`·`-a`·`-s`·`-c`·`--add-dir`를 쓰지 않는다. 스레드 ID는 영숫자로 시작해야 한다. 지시를 stdin `-`로 주는 것은 [가정: 0.163.0 `--help` 대조는 T16b].
+- argv: `exec --json --output-schema <run>/output.schema.json -o <run>/last-message.json -`, 재개는 `exec resume … <thread> -`. `--dangerously-bypass-approvals-and-sandbox`·`--approve-for-me`·`--full-auto`·`--ephemeral`·`--ignore-user-config`·`-a`·`-s`·`-c`·`--add-dir`를 쓰지 않는다. 스레드 ID는 영숫자로 시작해야 한다. 지시는 stdin `-`로 준다 [확인: 0.163.0 `codex exec --help` "if `-` is used, instructions are read from stdin", 2026-10-30].
 - 출력·스키마 파일(`run/`)은 모델 셸이 쓰는 `TMPDIR`·작업 공간과 떼고, 실행마다 이전 출력을 지운다.
 - 작업 공간: 첫 실행 전에 `git init`·기준 커밋을 한다(D-15, `codex exec`의 Git 저장소 요구). git은 이때만 쓰고 `GIT_DIR`를 못 박아 위쪽 저장소를 찾지 않으며 사용자·시스템 git 설정, hooks, fsmonitor를 쓰지 않는다. 이미 `.git`이 있으면 누가 쓴 config인지 몰라 거부한다. 그래서 작업 공간 원본을 푸는 단계(T16b·T19)는 `.git` 없이 풀어야 한다.
 - 실행 뒤 변경 대조는 git이 아니라 파일 해시와 git이 보는 소유자 실행 비트(0o100, git의 100755/100644)로 한다. 내용이 같은 `chmod u+x`·`u-x`도 변경이고, 그룹·기타 실행 비트만 바뀐 것은 git처럼 변경이 아니다(rev r2 N5, 시험이 `git diff --summary`와 대조). 실행 중 비신뢰 코드가 `.git/config`에 filter·fsmonitor를 심으면 제어 프로세스의 `git add`가 그 명령을 실행하기 때문이다. 스냅샷은 프로토타입 없는 객체에 파일 이름을 키로 담는다. 일반 객체면 루트의 `__proto__` 파일이 상속 setter에 먹혀 생성·수정·삭제가 증거에서 빠졌다(PR #9 4407855007). 기준 해시는 작업 공간 밖 `run/`에 둔다. 남은 프로세스가 있거나 모르면 작업 공간을 다시 읽지 않는다(결과는 어차피 unknown이고, 살아 있는 프로세스가 읽는 도중 바꿔치기할 수 있다). 읽기의 경로 경계와 남는 한계는 위 "실행 뒤 파일 읽기 경계"다.
@@ -749,8 +749,61 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 ### [가정]·[미확인] (T16b 실측 목록에 더함)
 
-- `codex exec`·`exec resume`이 PROMPT `-`에서 stdin을 읽는지, `exec resume`이 `--json`·`-o`·`--output-schema`를 받는지, 재개 때 `thread.started`를 다시 내는지(내지 않아도 받게 했다).
+- 재개 때 `thread.started`를 다시 내는지(내지 않아도 받게 했다). PROMPT `-`의 stdin 읽기와 `exec resume`의 `--json`·`-o`·`--output-schema`는 0.163.0 `--help`로 확인했다(T16b, 2026-10-30).
 - 한도·인증 만료의 `turn.failed`·`error` 모양과, 세션(`thread.started`) 전에 오류가 나는 순서. 지금은 메시지에 `usage_limit`·`rate limit`·`429` 등이 있으면 한도, `401`·`unauthorized`·`refresh token` 등이 있으면 인증 만료로 보고 대기로 보낸다 [가정: 리뷰가 0.163.0 바이너리 문자열 `usage_limit_reached`를 확인]. 잘못 고르면 다른 계정으로 넘어가지 않고 사람 확인을 기다리는 쪽으로 틀린다. 그 밖은 `failed`(`codex_turn_failed`).
 - `--output-schema`가 받는 JSON Schema 키워드 범위. 길이 제한은 봇이 검사한다.
 - exec에서 `approval_policy = "never"`의 실제 동작, Codex Linux 샌드박스가 모델 셸의 CODEX_HOME 읽기를 막는지.
 - SIGTERM 때 codex의 종료 코드·마지막 이벤트·세션 파일 정합성.
+
+### T16b 작업자 진입점 (2026-10-30)
+
+- 결정: D2(이미지 하나 공유, sandbox digest는 사람 PR), D3(공개 키는 env, nonce는 영속 PVC 안 별도 디렉터리), D4(대화 레인은 공유 CODEX_HOME + 세션 기록 없음). 모두 사용자 2026-10-30, 기록은 [DECISIONS.md](DECISIONS.md) "T16b 결정".
+- 플래그 확인 [실측: 설치한 codex-cli 0.163.0 `codex exec --help`, 모델 호출 없음]: `--ephemeral`("Run without persisting session files to disk"), `--skip-git-repo-check`, `--output-schema <FILE>`, `-o/--output-last-message`, `--json`, PROMPT `-`는 stdin. `exec resume`도 `--json`·`-o`·`--output-schema`·`--ephemeral`을 받는다. `codex login status`가 있다(재시드 절차 6단계).
+
+| 파일 | 역할 |
+|---|---|
+| `src/worker-main.ts` | 진입점. env 읽기(`workerConfig`), `codex --version` 확인(`codexVersion`), 기동(`startWorker`), SIGTERM 정리(`main`) |
+| `src/worker-state.ts` | 시드 복사(`seedAuth`), 영속 nonce 저장소(`FileNonceStore`), 값 없는 기동 실패 사유(`WorkerStartError`) |
+| `src/codex-chat.ts` | 대화 레인 실행기(`ChatLane`), argv(`chatArgs`), 결과 판정(`interpretChat`). config·env는 T18 `codex-config`를 그대로 쓴다 |
+| `src/worker-http.ts` | `workerServer(worker, ready)`에 `GET /readyz`(인증 없음, 본문 없음) |
+| `Dockerfile`, `.github/workflows/build.yaml` | 이미지(test 단계 포함)와 app-build 호출. 템플릿 그대로 |
+
+**기동 순서.** env 확인 → CODEX_HOME·시드 디렉터리·nonce 디렉터리가 사람 홈 자체나 그 아래 `.codex*`(심링크로 가리키는 경우 포함)가 아닌지(경로 모양, D-14 조건 1. 개인 `auth.json`을 시드로 복사하지 않는다) → `codex --version`이 `CODEX_CAPABILITIES.version`(0.163.0)과 같은지 → 시드 복사 → nonce 디렉터리 쓰기 확인 → 8080 수신. 어느 단계든 실패하면 `{"event":"worker_start_failed","reason":"<코드>"}` 한 줄과 종료 코드 1로 끝난다. 사유는 코드와 env 키 이름만이고 값(시드, 키, 오류 메시지 속 입력 조각)은 싣지 않는다. 버전 확인은 빈 임시 HOME·CODEX_HOME으로 돌려 영속 공간을 건드리지 않는다.
+
+| env | 필수 | 내용 |
+|---|---|---|
+| `CODEX_HOME` | 예 | 작업자 영속 공간(PVC)의 Codex 홈. `auth.json` 갱신본이 여기에 남는다 |
+| `WORKER_SEED_DIR`, `WORKER_SEED_KEY` | 예 | 시드 Secret 볼륨 디렉터리와 키 이름. 시드 파일은 `<DIR>/<KEY>` |
+| `WORKER_NONCE_DIR` | 예 | 영속 공간 안 nonce 디렉터리. `CODEX_HOME`과 같으면 거부 |
+| `WORKER_CONTROL_PUBLIC_KEY` | 예 | Ed25519 공개 키 PEM(SPKI). 한 줄의 `\n` 표기도 받는다. 개인 키 PEM은 거부(Node는 개인 키에서 공개 키를 뽑아 주므로 따로 막는다) |
+| `WORKER_CODEX_BIN` | 아니오 | 기본 `/usr/local/bin/codex`(이미지의 실제 실행 파일 심링크) |
+| `HTTPS_PROXY`, `NO_PROXY` | 아니오 | 있으면 codex 프로세스 env에만 넘긴다. 모델 셸(`shell_environment_policy.set`)에는 넘기지 않는다 |
+
+**시드 복사.** `CODEX_HOME/auth.json`이 없을 때만 한다. 시드는 Secret 볼륨 심링크(`..data/키`)를 따라 열고 일반 파일·1MiB 이하·JSON 객체·`tokens.refresh_token` 문자열이 있는지만 본다 [가정: 필드 이름은 0.163.0 바이너리 문자열과 `codex login` 결과 모양]. 같은 디렉터리의 임시 파일(0600, `O_EXCL|O_NOFOLLOW`)에 쓰고 fsync한 뒤 rename한다. rename은 덮어쓰므로 "없을 때만"은 확인 시점 기준이다. 기동 중에는 codex가 돌지 않고 작업자는 replicas 1·`Recreate`라 그 사이에 쓰는 주체가 없다. 이미 있는 `auth.json`은 내용·권한을 손대지 않는다. 심링크·디렉터리면 따라가거나 고치지 않고 기동 실패(`auth_not_regular`)다. 시드가 없거나 깨졌으면 `seed_missing`·`seed_invalid`·`seed_unreadable`로 기동 실패하고 `auth.json`을 만들지 않는다.
+
+**nonce 저장소.** `WorkerVerifier`가 넘기는 nonce(서명 payload의 SHA-256 hex 64자)를 파일 이름으로 `O_EXCL` 생성한다. 이미 있으면 재사용으로 거부하고, 그 밖의 생성 오류도 거부한다(fail-closed). 기록 시각은 mtime이고 보관은 62초(capability 수명 30초 + 시계 오차 1초의 두 배)다. 그 뒤 기록은 다음 사용 때 지운다. 한 프로세스 안의 사용은 차례로 처리한다. 디렉터리 항목은 fsync하지 않는다: 페이지 캐시를 잃는 사고(노드 정전)는 복구에 capability 수명보다 오래 걸린다. 프로세스·파드 재시작에는 기록이 남아 같은 capability를 거부한다.
+
+**대화 레인.**
+
+- argv: `exec --json --ephemeral --skip-git-repo-check --output-schema <run>/answer.schema.json -o <run>/last-message.json -`. 지시는 stdin(시스템 지시 + owner 메시지 기록 JSON).
+- `config.toml`은 공유 CODEX_HOME에 실행마다 원자적으로 다시 쓴다. 값은 작업 레인과 같고 `sandbox_mode`만 `read-only`다(`codexConfig(paths, 'read-only')`). `shell_environment_policy.inherit = "none"`.
+- codex 프로세스 env는 허용 목록(`launchEnvironment`): `PATH`·`HOME`(실행별 임시)·`LANG`·`TMPDIR`(실행별 임시)·`CODEX_HOME`·작업 표식과 선택적 `HTTPS_PROXY`·`NO_PROXY`. 작업자 env(시드, 공개 키 등)는 넘어가지 않는다.
+- 작업 공간은 실행마다 `/tmp` 아래 새 빈 디렉터리다. git이 필요 없어 이미지에 git을 넣지 않았다. 실행이 끝나고 남은 프로세스 0개를 확인하면 지운다.
+- 세션 기록: `--ephemeral`에 더해, 남은 프로세스 0개를 확인한 뒤 CODEX_HOME의 `sessions/`·`archived_sessions/`를 지운다 [가정: Codex 기본 세션 위치]. 플래그가 실제로 지키는지는 모델 호출 전이라 [미확인]이고, 이 정리는 플래그가 지키면 아무 일도 하지 않는다. 이 CODEX_HOME의 세션은 대화 레인 것뿐이다(작업 레인 미연결). 작업 레인을 같은 CODEX_HOME에 연결하는 결정(T18)이 나면 다시 본다.
+- 기한: 작업자는 `timeoutMs - 5초`(최소 절반)에 스스로 멈춘다. 게시 서버는 같은 `timeoutMs`에서 포기하고 `unknown`으로 두므로, 그보다 먼저 정리(SIGTERM 2초 + SIGKILL 2초)까지 끝내야 `failed`로 확정된다.
+- 판정(`interpretChat`): 작업 레인과 같은 순서다. 남은 프로세스가 있거나 모르면 `unknown`(작업자는 이후 실행을 `worker_busy`로 거부), 한도·인증 만료 문구는 `limited`·`auth_expired`(다른 인증으로 바꾸지 않음), 구조화 출력이 `facts`·`hypotheses`·`unknowns`·`checks` 문자열 배열이 아니면 `failed`. 개수·길이 상한(8·4·8·4개, 500자)을 넘긴 답은 잘라 받는다. `auth.json` 값 반사는 `failed`(best-effort).
+- 도구 호출 예산(`toolCalls`)과 출력 상한은 작업 레인과 같이 줄이 들어오는 즉시 집행한다.
+- 작업 레인 요청(`lane: 'task'`)은 띄우지 않고 `failed`로 답한다. 배치는 T18 결정 대기다.
+- 취소(`/v1/cancel`): 실행 중이면 멈추고 정리를 최대 4초 기다린 뒤 남은 프로세스 0개일 때만 `stopped: true`. `unknown`으로 막힌 작업은 다시 정리해 0개면 풀린다.
+
+**종료.** SIGTERM·SIGINT를 직접 받는다(`node`가 PID 1이라 기본 동작이 없다). 새 연결을 받지 않고, 실행 중인 codex를 멈춘 뒤 그 요청에 `failed`(`stopped: true`)를 답하고 닫는다. 연결을 먼저 끊으면 게시 서버가 결과를 몰라 `unknown`으로 둔다. 20초 안에 못 끝내면 강제 종료한다(kubelet 유예 30초).
+
+**readiness.** `GET /readyz`는 기동 확인을 마친 뒤 영속 공간에 일반 파일 `auth.json`이 있으면 200, 없으면 503이다. 실행 중(바쁨)이어도 200이다. kubelet 프로브는 노드에서 오고 인증이 없으며 본문을 싣지 않는다.
+
+**남는 것 [미확인]·[가정] (S11·S12 실측).**
+
+- 대화 레인은 `read-only` 샌드박스를 쓴다. Codex Linux 샌드박스는 번들 bwrap(`codex-resources/bwrap`)을 쓰고 [실측: 0.163.0 패키지 구성], 파드의 `seccompProfile: RuntimeDefault`·비특권 user namespace에서 도는지는 [미확인]이다. S11의 `codex sandbox -- true`가 실패하면 D5다.
+- 같은 UID의 모델 셸은 `read-only`에서도 공유 CODEX_HOME의 `auth.json`을 읽을 수 있다. D4가 받아들인 위험이다(T16b에는 비신뢰 코드 실행이 없고 대화 입력은 owner 한 명). 작업 레인을 열기 전에 T18 결정 (2)·(4)가 필요하다.
+- codex는 CODEX_HOME 아래에 보조 실행 파일(PATH alias)을 만든다 [실측: 임시 디렉터리 CODEX_HOME에서 `--version`이 "Refusing to create helper binaries under temporary dir" 경고]. 영속 공간 크기(1Gi)에 들어가는지와 `--ephemeral` 실행 뒤 CODEX_HOME에 남는 파일 이름은 S12 첫 대화 뒤 이름만 확인한다.
+- 이미지는 `node`가 PID 1이다. SIGTERM은 직접 받아 정리한다. 고아 손자 프로세스(zombie)는 거두지 않는다(tini 없음, 빌드에서 apt를 쓰지 않음). 정상 종료한 codex는 자기 자식을 거두므로 쌓이는 경우는 강제 종료 때뿐이다 [가정].
+- `SerialWorker.cancel`(T16a)은 이미 끝나 바쁘지 않은 작업의 취소에 `stopped: false`를 답한다. 게시 서버의 시간 초과와 작업자 완료가 겹치면 `unknown`이 될 수 있어 위 기한 여유를 뒀다.
