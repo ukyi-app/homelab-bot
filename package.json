@@ -13,6 +13,7 @@
     "test": "npm run build && node --test dist/test/*.test.js"
   },
   "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.308",
     "@openai/codex": "0.163.0",
     "pg": "8.23.1",
     "undici": "7.30.1",
@@ -27,6 +28,7 @@
   "packageManager": "npm@11.19.1",
   "_packageManagerPinReason": "Node 24 환경의 설치 도구를 유지한다. npm 12 전환은 런타임 major와 함께 검증한다.",
   "_dependencyPinReasons": {
+    "@anthropic-ai/claude-code": "작업자 Claude 프로필이 기동 때 `claude --version`이 이 버전인지 확인한다(CLAUDE_CLI_VERSION). npm `stable` 태그(2026-10-30 조회)다. .npmrc ignore-scripts라 래퍼 postinstall이 돌지 않아 Dockerfile이 플랫폼 패키지(linux-x64)의 실제 실행 파일을 심링크한다. 올리면 `claude --help`로 대화 레인 플래그와 바이너리에 든 SDK 메시지 스키마(init·assistant error·result)를 다시 확인한다.",
     "@openai/codex": "작업자 진입점이 기동 때 `codex --version`이 이 버전인지 확인한다(CODEX_CAPABILITIES.version). 게시 서버와 작업자가 이미지 하나를 써서(D2) 실행 의존성이다. 올리면 `codex exec --help`로 대화 레인 플래그를 다시 확인한다.",
     "@types/node": "최신 24.x로 Node 24 런타임 API 범위를 검사한다. 26.x 타입은 런타임 밖 API를 허용하므로 사용하지 않는다.",
     "undici": "최신 7.x로 Node 24 내장 fetch의 dispatcher 계약과 맞춘다. 8.x Agent는 내장 fetch와 invalid onRequestStart method 오류가 발생해 제외했다."

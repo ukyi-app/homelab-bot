@@ -4,10 +4,10 @@ import type { CredentialKind, RunCredential } from './credentials.js';
 // 게시 서버와의 HTTP v1(worker.ts)은 실행기 이름·플래그·자격을 담지 않는다. 그 아래에서
 //   공통 실행 제어(chat-lane, process-launcher): 직렬·기한·취소·프로세스 그룹 정리·빈 작업 공간·env 허용 목록·
 //     자격 유출 검사·구조화 결과 검증·반사 검사·결과 분류(succeeded/limited/auth_expired/failed/unknown)
-//   실행기 어댑터(executor-codex 등): argv·env·설정 파일·출력 해석·CLI 오류 분류만
+//   실행기 어댑터(executor-claude, executor-codex): argv·env·설정 파일·출력 해석·CLI 오류 분류만
 // 로 나눈다. 어떤 실행기를 쓸지는 기동 때 프로필(executor-profiles)이 고르고, 실행 중에는 바꾸지 않는다.
 
-export type ExecutorId = 'codex';
+export type ExecutorId = 'claude' | 'codex';
 
 // 프로필에서 내는 능력표. 값이 불명확하면 지원한다고 적지 않는다.
 export interface ExecutorCapabilities {

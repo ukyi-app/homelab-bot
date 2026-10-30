@@ -3,8 +3,9 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { FileMutableCredential } from './credentials.js';
+import { FileMutableCredential, StaticEnvCredential } from './credentials.js';
 import type { CredentialKind, WorkerCredential } from './credentials.js';
+import { CLAUDE_CHAT_CAPABILITIES, ClaudeChatAdapter } from './executor-claude.js';
 import { CODEX_CHAT_CAPABILITIES, CodexChatAdapter } from './executor-codex.js';
 import type { ChatAdapter, ExecutorCapabilities, ExecutorId } from './executor.js';
 import { WorkerStartError } from './worker-state.js';
@@ -30,12 +31,15 @@ export interface ExecutorProfile {
   readonly requiredEnv: readonly string[];
 }
 export const PROFILES: readonly ExecutorProfile[] = Object.freeze([
+  Object.freeze({ id: 'claude-subscription', executor: 'claude', credentialKey: 'CLAUDE_CODE_OAUTH_TOKEN',
+    auth: 'subscription-token', credential: 'env-static', bin: '/usr/local/bin/claude',
+    model: /^claude-[a-z0-9]+(?:-[a-z0-9]+){1,8}$/, capabilities: CLAUDE_CHAT_CAPABILITIES, requiredEnv: Object.freeze([]) }),
   // 기존 Codex 대화 경로(D4). 모델은 CLI 기본값(`cli-default`, -m 없음)이다.
   Object.freeze({ id: 'codex-subscription', executor: 'codex', credentialKey: 'CODEX_AUTH_JSON',
     auth: 'subscription-auth-json', credential: 'file-mutable', bin: '/usr/local/bin/codex',
     model: /^cli-default$/, capabilities: CODEX_CHAT_CAPABILITIES, requiredEnv: Object.freeze(['CODEX_HOME']) }),
 ] as const satisfies readonly ExecutorProfile[]);
-const EXECUTORS: readonly string[] = ['codex'];
+const EXECUTORS: readonly string[] = ['claude', 'codex'];
 const KEY = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 // 값은 오류에 싣지 않는다. env 키 이름과 사유 코드만이다.
@@ -53,6 +57,8 @@ export interface Executor { adapter: ChatAdapter; credential: WorkerCredential }
 export function createExecutor(profile: ExecutorProfile, paths: { credentialFile: string; codexHome?: string },
   homes: readonly string[]): Executor {
   switch (profile.executor) {
+    case 'claude':
+      return { adapter: new ClaudeChatAdapter('subscription-token'), credential: new StaticEnvCredential(paths.credentialFile, homes) };
     case 'codex': {
       let adapter: CodexChatAdapter;
       try { adapter = new CodexChatAdapter(paths.codexHome ?? '', homes); } catch { throw new WorkerStartError('codex_home_unavailable'); }

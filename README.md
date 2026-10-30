@@ -39,13 +39,13 @@ node dist/src/main.js           # 게시 서버. 8080(/readyz·/metrics·/github
 ## 버전
 
 직접 의존성과 개발 도구는 `package.json`, 전이 의존성은 `package-lock.json`에 정확히 고정했다.
-설치 시 npm registry의 stable version을 확인했다. Codex 패키지는 이미지에 들어가는 실행 의존성이다(작업자가 기동 때 버전을 확인한다). 시험은 실제 codex를 실행하지 않고 같은 인자·stdin·env로 도는 가짜 실행 파일을 쓴다.
+설치 시 npm registry의 stable version을 확인했다. 모델 CLI 패키지(Claude Code·Codex)는 이미지에 들어가는 실행 의존성이다(작업자가 기동 때 선택한 실행기의 버전을 확인한다). 시험은 실제 CLI를 실행하지 않고 같은 인자·stdin·env로 도는 가짜 실행 파일을 쓴다.
 
 - Node **24.22.0**: 최신 major보다 낮게 고정. DISCOVERY에서 정한 Node 24 대안과 현재 로컬 검증 환경을 유지한다.
   Bun의 재연결 위험을 FOUNDATION 로직과 분리하려는 선택이다. 런타임 major 변경은 T16b 연동 검증 뒤 한다.
 - npm **11.19.1**: 현재 Node 24 환경의 설치 도구를 고정했다. 최신 npm 12로 바꾸는 것은 런타임 major와 함께 검증한다.
 - TypeScript **7.0.2**, pg **8.23.1**, zod **4.6.7**, PGlite **0.5.10**,
-  @types/node **24.19.2**, @types/pg **8.23.1**, @openai/codex **0.163.0**, undici **7.30.1**.
+  @types/node **24.19.2**, @types/pg **8.23.1**, @openai/codex **0.163.0**, @anthropic-ai/claude-code **2.1.308**(npm `stable` 태그, 2026-10-30 조회), undici **7.30.1**.
   Node 타입은 최신 24.x로 런타임 범위에 맞춘다. undici는 최신 7.x로 Node 24 내장 fetch와 호환한다.
   8.x Agent는 내장 fetch와 `invalid onRequestStart method` 오류가 발생해 제외했다.
   작업자 HTTP의 headers/body timeout은 요청 예산 + 30초이며 호출자 취소 신호는 그대로 적용한다.
@@ -184,23 +184,44 @@ checkpoint가 없을 때도 after=0을 명시해 최초 페이지를 건너뛰�
 ## 작업자 실행 (T16b)
 
 게시 서버와 작업자는 같은 이미지다(D2). 기본 CMD는 게시 서버 `node dist/src/main.js`이고, sandbox 작업자는
-command를 `node dist/src/worker-main.js`로 바꾼다. 작업자는 기동 때 `codex --version`이 0.163.0인지,
-영속 공간에 `auth.json`이 있는지(없으면 시드 복사) 확인한 뒤 8080에서 `/v1/execute`·`/v1/cancel`·`GET /readyz`를 받는다.
+command를 `node dist/src/worker-main.js`로 바꾼다. 모델 실행기는 **프로필**로 고른다(D-14 변경, 사용자 2026-10-30).
+첫 운영 프로필은 Claude Code CLI + 구독 장기 토큰 + Opus 5.5이고, 기존 Codex 경로도 프로필로 남아 있다.
+이미지에 두 CLI가 고정 버전으로 들어 있어 프로필 사이 전환은 설정 PR 하나 + 자격 하나다.
 
 ```sh
 npm run build
-CODEX_HOME=/codex-home \
-WORKER_SEED_DIR=/run/worker-seed WORKER_SEED_KEY=CODEX_AUTH_JSON \
-WORKER_NONCE_DIR=/codex-home/.homelab-worker/nonces \
+# Claude 프로필(claude-subscription)
+WORKER_EXECUTOR=claude WORKER_MODEL=claude-opus-5-5 \
+WORKER_CREDENTIAL_DIR=/run/worker-credential WORKER_CREDENTIAL_KEY=CLAUDE_CODE_OAUTH_TOKEN \
+WORKER_NONCE_DIR=/worker-state/.homelab-worker/nonces \
 WORKER_CONTROL_PUBLIC_KEY="$(cat worker-control.pub.pem)" \
 node dist/src/worker-main.js
+
+# Codex 프로필(codex-subscription): 실행기·자격 키·모델과 CODEX_HOME만 다르다
+WORKER_EXECUTOR=codex WORKER_MODEL=cli-default WORKER_CREDENTIAL_KEY=CODEX_AUTH_JSON CODEX_HOME=/codex-home ...
 ```
 
-- 필수 env 다섯 개 중 하나라도 없거나, 시드가 없거나 깨졌거나, codex 버전이 다르면 사유 코드 한 줄을 남기고 종료 코드 1로 끝난다. 값은 출력하지 않는다.
-- `WORKER_CONTROL_PUBLIC_KEY`는 게시 서버 `WORKER_CONTROL_PRIVATE_KEY`의 Ed25519 공개 키 PEM이다(비밀 아님). 개인 키를 넣으면 거부한다.
-- 선택: `WORKER_CODEX_BIN`(기본 `/usr/local/bin/codex`), `HTTPS_PROXY`·`NO_PROXY`(codex 프로세스에만 넘김).
-- 개인 `~/.codex*`를 CODEX_HOME으로 쓰지 않는다. 로컬에서 돌려 볼 때도 빈 임시 디렉터리와 봇 전용 시드만 쓴다. 실제 모델 호출은 첫 대화(T16b S12)에서 승인 뒤 한다.
-- 대화 레인은 `--ephemeral`·`--skip-git-repo-check`·빈 임시 작업 공간·`read-only` 샌드박스로 돌고 세션 기록을 남기지 않는다. 작업 레인(`/task`)은 연결하지 않았다(T18 결정 대기).
-- 상세 계약은 [ARCHITECTURE §12 "T16b 작업자 진입점"](docs/ai-bot/ARCHITECTURE.md), 결과는 [VERIFICATION](docs/ai-bot/VERIFICATION.md)에 있다.
+| env | 필수 | 내용 |
+|---|---|---|
+| `WORKER_EXECUTOR` | 예 | `claude` 또는 `codex` |
+| `WORKER_MODEL` | 예 | Claude는 전체 모델 ID(`claude-opus-5-5`, 별칭 `opus` 거부), Codex는 `cli-default`(CLI 기본 모델) |
+| `WORKER_CREDENTIAL_DIR` | 예 | 자격 Secret 볼륨 디렉터리 |
+| `WORKER_CREDENTIAL_KEY` | 예 | 자격 키 이름 = Secret 파일 이름 = 인증 방식. `CLAUDE_CODE_OAUTH_TOKEN`(Claude 구독 장기 토큰) 또는 `CODEX_AUTH_JSON`(Codex 시드 auth.json) |
+| `WORKER_NONCE_DIR` | 예 | 영속 공간(PVC) 안 nonce 디렉터리(D3). 어느 프로필에도 필요하다 |
+| `WORKER_CONTROL_PUBLIC_KEY` | 예 | 게시 서버 `WORKER_CONTROL_PRIVATE_KEY`의 Ed25519 공개 키 PEM(비밀 아님). 개인 키를 넣으면 거부 |
+| `CODEX_HOME` | Codex만 | 영속 공간의 Codex 홈(auth.json 갱신본이 남는 곳) |
+| `WORKER_EXECUTOR_BIN` | 아니오 | 실행 파일 경로(기본: 프로필의 `/usr/local/bin/claude`·`/usr/local/bin/codex`). 시험용 |
+| `HTTPS_PROXY`, `NO_PROXY` | 아니오 | 모델 CLI 프로세스에만 넘긴다 |
+
+- 표에 없는 실행기·자격 조합(예: `claude` + `ANTHROPIC_API_KEY`), 모양이 틀린 모델, 필수 env 누락, 자격 없음·모양 틀림, 실행 파일 버전 다름이면
+  사유 코드 한 줄(`profile_unsupported`·`config_invalid:WORKER_MODEL`·`credential_missing`·`executor_version_mismatch` 등)을 남기고 종료 코드 1로 끝난다. 값(토큰·키)은 출력하지 않는다.
+- Claude 토큰은 Secret 파일을 실행마다 다시 읽어 그 실행의 `claude` 자식 env(`CLAUDE_CODE_OAUTH_TOKEN`) 한 곳에만 넣는다. 파일·argv·로그에 쓰지 않고 영속 공간에 복사하지 않는다.
+  Secret 값이 바뀌면 파드 재시작 없이 다음 실행부터 새 값이다. `GET /readyz`는 토큰 파일이 쓸 수 있는 모양으로 있으면 200이다(모델 호출 없음).
+- Claude 대화는 `claude -p --output-format stream-json`에 구조화 출력 스키마, 고정 모델, 도구·MCP 끔, 세션 기록 없음, `--safe-mode`로 돈다.
+  실행마다 빈 임시 HOME·`CLAUDE_CONFIG_DIR`·작업 공간을 쓰고 끝나면 지운다. 실행 중 도구 호출이나 다른 모델·자격 출처가 보이면 바로 멈추고 `failed`다.
+  한도는 `limited`, 인증 만료는 `auth_expired`로 답하고 다른 계정·모델·실행기로 넘어가지 않는다.
+- 개인 `~/.claude*`·`~/.codex*`를 자격·홈으로 쓰지 않는다(경로가 그 아래면 기동 실패). 로컬에서 돌려 볼 때도 빈 임시 디렉터리와 봇 전용 자격만 쓴다.
+  실제 모델 호출은 첫 대화(T16b S12)에서 승인 뒤 한다. 작업 레인(`/task`)은 어떤 실행기에도 연결하지 않았다(T18 결정 대기).
+- 상세 계약은 [ARCHITECTURE §12 "T16b 실행기 프로필"](docs/ai-bot/ARCHITECTURE.md), 결정은 [DECISIONS D-14 "변경"](docs/ai-bot/DECISIONS.md), 결과는 [VERIFICATION](docs/ai-bot/VERIFICATION.md)에 있다.
 
 이미지는 `docker build --target test .`(시험 단계)와 `docker build .`(최종)로 만든다. CI는 homelab `app-build`가 같은 두 빌드를 돈다.

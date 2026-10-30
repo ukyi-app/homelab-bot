@@ -1,5 +1,7 @@
 # 봇 이미지 계약(homelab 공유 차트와 app-build, 템플릿 homelab-app-template의 Dockerfile을 Node로 옮김):
-# - amd64 단일 빌드. app-build가 --platform linux/amd64로 부른다. codex는 npm의 linux-x64 패키지가 들어간다.
+# - amd64 단일 빌드. app-build가 --platform linux/amd64로 부른다. 모델 CLI(claude·codex)는 npm의 linux-x64 패키지가 들어간다.
+# - 작업자 실행기는 프로필로 고른다(WORKER_EXECUTOR, D-14 변경 사용자 2026-10-30). 이미지에는 지원하는 실행기 CLI를 모두
+#   고정 버전으로 넣어, 준비된 프로필 사이 전환에 이미지 재빌드가 필요 없게 한다. 런타임에 CLI를 받거나 갱신하지 않는다.
 # - test 단계가 있어야 한다. app-build가 --target test로 시험(npm ci → npm run check → npm test)을 돌린다.
 # - 이미지 하나를 게시 서버와 작업자가 함께 쓴다(D2, 사용자 2026-10-30). 기본 CMD는 게시 서버이고,
 #   sandbox 작업자는 command를 ["node", "dist/src/worker-main.js"]로 바꾼다. ENTRYPOINT는 비워 두어 command가 그대로 돈다.
@@ -24,7 +26,7 @@ FROM deps AS runtime
 COPY --chown=node:node tsconfig.json ./
 COPY --chown=node:node src ./src
 COPY --chown=node:node migrations ./migrations
-# 실행 의존성만 남긴다(codex 포함, package.json dependencies). 다른 UID가 읽고 실행하게, 그룹·기타 쓰기는 없게
+# 실행 의존성만 남긴다(claude·codex 포함, package.json dependencies). 다른 UID가 읽고 실행하게, 그룹·기타 쓰기는 없게
 # 권한을 맞춘다. 원본 파일의 모드(빌드 기계 umask)가 그대로 들어오지 않도록 최종 이미지에 넣는 것 전부에 건다.
 RUN npm run build \
   && npm prune --omit=dev \
@@ -42,6 +44,14 @@ COPY --from=runtime --chown=root:root /app/migrations ./migrations
 # 빌드 확인은 빈 /tmp를 HOME·CODEX_HOME으로 줘서 이미지에 Codex 파일을 남기지 않는다.
 RUN ln -s /app/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex /usr/local/bin/codex \
   && test "$(env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/tmp CODEX_HOME=/tmp codex --version 2>/dev/null)" = "codex-cli 0.163.0" \
+  && test -z "$(ls -A /tmp)"
+# claude도 npm 래퍼가 아니라 플랫폼 패키지의 실제 실행 파일을 쓴다. .npmrc의 ignore-scripts로 래퍼의 postinstall(실행 파일을
+# 래퍼 자리에 복사)이 돌지 않으므로 직접 심링크한다(glibc 이미지라 linux-x64, musl 패키지는 설치되지 않는다).
+# 작업자는 /usr/local/bin/claude를 부르고 기동 때 버전을 다시 확인한다. 빌드 확인은 빈 /tmp를 HOME·CLAUDE_CONFIG_DIR로 주고
+# 업데이트·부가 통신을 끈 채 --version만 부른다(모델 호출·로그인 없음). 이미지에 Claude 설정 파일을 남기지 않는다.
+RUN ln -s /app/node_modules/@anthropic-ai/claude-code-linux-x64/claude /usr/local/bin/claude \
+  && test "$(env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/tmp CLAUDE_CONFIG_DIR=/tmp TMPDIR=/tmp DISABLE_UPDATES=1 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 claude --version 2>/dev/null)" = "2.1.308 (Claude Code)" \
   && test -z "$(ls -A /tmp)"
 USER 65532:65532
 EXPOSE 8080 8081
