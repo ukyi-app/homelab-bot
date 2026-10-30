@@ -20,7 +20,7 @@ import { GatewaySession, discordGatewayUrl } from './gateway.js';
 import type { GatewaySocket } from './gateway.js';
 import { GatewayBudget, Health } from './health.js';
 import { typingActivity } from './activity.js';
-import { typingStart } from './typing.js';
+import { typingHints } from './typing.js';
 import { PORTS, receivers } from './http.js';
 import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
@@ -130,6 +130,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   let runtimeStarted = false;
   const background = new Set<Promise<void>>();
   const track = (task: Promise<void>) => { background.add(task); void task.finally(() => background.delete(task)); };
+  const typingHint = typingHints(store, gate, log, track);
   const loops: Promise<void>[] = [];
   // alive: 이 루프의 한 바퀴가 성공했다는 것이 DB에 닿았다는 증거인지. 하트비트 조건(조율 루프가 최근 60초 안에 돎)은
   // 그런 루프로만 잰다. runtime(store.expire)·publisher(claimDelivery)는 늘 DB를 거친다. 복구 루프는 대기 항목이 없으면
@@ -190,8 +191,8 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     connect: deps.connect,
     allowUrl: deps.allowGatewayUrl,
     dispatch: async (type, data) => {
-      // 입력 중 힌트. 오류를 스스로 삼키므로 아래 guard(history gap 장벽)로 가지 않는다.
-      if (type === 'TYPING_START') { await typingStart(store, gate, data, log); return; }
+      // 입력 중 힌트. 기다리지 않고(뒤 이벤트를 막지 않게) 백그라운드로 돌린다. 오류를 스스로 삼키므로 guard로 가지 않는다.
+      if (type === 'TYPING_START') { typingHint(data); return; }
       if (!discord || (type !== 'MESSAGE_CREATE' && type !== 'INTERACTION_CREATE')) return;
       try { await protocol!.gateway(type, data, discord.ingress); }
       catch (error) {
