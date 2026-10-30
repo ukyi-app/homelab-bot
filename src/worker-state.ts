@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { constants } from 'node:fs';
+import { constants, existsSync, realpathSync } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
-import { lstat, mkdir, open, readdir, rename, rm, stat } from 'node:fs/promises';
-import { isAbsolute, join } from 'node:path';
+import { link, lstat, mkdir, open, readdir, readlink, realpath, rm, stat } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DEFAULTS } from './contracts.js';
 import type { Clock } from './contracts.js';
 
@@ -14,6 +15,29 @@ export class WorkerStartError extends Error {
 }
 const SEED_LIMIT = 1024 * 1024;
 const NOFOLLOW_NEW = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
+
+// 경로가 사람 홈 자체나 그 아래 `.codex*`(심링크로 가리키는 경우 포함)면 거부한다.
+// 개인 auth.json을 시드로 복사하거나 개인 Codex 홈에 쓰지 않는다(D-14 조건 1). 홈을 열거하지 않고 경로 모양만 본다.
+export function assertNotPersonal(name: string, path: string, homes: readonly string[]): void {
+  let existing = resolve(path);
+  while (!existsSync(existing) && dirname(existing) !== existing) existing = dirname(existing);
+  const candidates = new Set([resolve(path)]);
+  try { candidates.add(join(realpathSync(existing), relative(existing, resolve(path)))); } catch { /* 모양 검사만 */ }
+  for (const home of homes) {
+    const bases = new Set([resolve(home)]);
+    try { bases.add(realpathSync(home)); } catch { /* 홈이 없으면 문자열 비교만 */ }
+    for (const base of bases) for (const candidate of candidates) {
+      const rel = relative(base, candidate);
+      if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel) && rel.split(sep)[0]!.startsWith('.codex'))) {
+        throw new WorkerStartError(`config_invalid:${name}`);
+      }
+    }
+  }
+}
+export function humanHomes(): string[] {
+  // 파드에서 passwd에 없는 UID면 HOME이 없을 수 있다. 그때는 경로 모양 검사만 한다.
+  try { return [homedir()]; } catch { return []; }
+}
 
 // 구독 로그인 auth.json의 최소 모양. tokens.refresh_token이 없으면 갱신할 수 없어 쓸모가 없다.
 // 필드 이름은 0.163.0 바이너리 문자열과 `codex login` 결과 모양 [가정: 전체 스키마는 공식 문서에 없음].
@@ -28,12 +52,19 @@ function plausibleAuth(text: string): boolean {
   return typeof refresh === 'string' && refresh.trim().length > 0;
 }
 
-async function readSeed(path: string): Promise<Buffer> {
-  // Secret 볼륨 파일은 kubelet이 만든 심링크(..data/키)라 O_NOFOLLOW로 열지 않는다. 연 뒤 일반 파일인지 본다.
+async function readSeed(path: string, homes: readonly string[]): Promise<Buffer> {
+  // Secret 볼륨 파일은 kubelet이 만든 심링크(..data/키)라 링크를 따라간다. 대신 최종 대상을 먼저 해석해
+  // 개인 Codex 홈(.codex*)이면 읽지 않는다(디렉터리만 보면 파일 자체의 심링크로 개인 auth.json을 복사할 수 있었다, r1 P1).
+  let real: string;
+  try { real = await realpath(path); }
+  catch (error) { throw new WorkerStartError((error as { code?: string }).code === 'ENOENT' ? 'seed_missing' : 'seed_unreadable'); }
+  try { assertNotPersonal('WORKER_SEED_KEY', real, homes); } catch { throw new WorkerStartError('seed_personal_path'); }
   let handle: FileHandle;
-  try { handle = await open(path, constants.O_RDONLY | constants.O_NONBLOCK); }
+  try { handle = await open(real, constants.O_RDONLY | constants.O_NONBLOCK); }
   catch (error) { throw new WorkerStartError((error as { code?: string }).code === 'ENOENT' ? 'seed_missing' : 'seed_unreadable'); }
   try {
+    // 검사한 경로와 실제로 연 파일이 같은지 본다. 그 사이 경로 구성 요소가 심링크로 바뀌었으면 읽지 않는다.
+    if (await readlink(`/proc/self/fd/${handle.fd}`) !== real) throw new WorkerStartError('seed_unreadable');
     const info = await handle.stat();
     if (!info.isFile()) throw new WorkerStartError('seed_unreadable');
     if (info.size === 0) throw new WorkerStartError('seed_invalid');
@@ -49,10 +80,12 @@ async function readSeed(path: string): Promise<Buffer> {
 
 // CODEX_HOME/auth.json이 없을 때만 시드를 복사한다. 있으면 내용·권한 모두 손대지 않는다.
 // Codex가 갱신한 auth.json을 옛 시드로 덮으면 회전된 갱신 토큰과 어긋나 사람이 다시 시드해야 한다(D-14).
-// 원자성: 같은 디렉터리의 임시 파일(0600)에 쓰고 fsync한 뒤 rename한다. 중간에 죽어도 반쯤 쓴 auth.json은 없다.
-// rename은 덮어쓰므로 "없을 때만"은 확인 시점 기준이다. 기동 중에는 codex가 돌지 않고 작업자는 replicas 1·Recreate라
-// 확인과 rename 사이에 auth.json을 만들 다른 쓰기 주체가 없다.
-export async function seedAuth(codexHome: string, seedFile: string): Promise<'seeded' | 'kept'> {
+// 원자성: 같은 디렉터리의 임시 파일(0600)에 쓰고 fsync한 뒤 link로 설치한다. link는 이름이 이미 있으면 EEXIST로
+// 실패하므로 "없을 때만"이 설치 순간에 지켜진다(rename은 덮어써서, 확인 뒤 생긴 갱신본·동시 기동의 설치를 잃었다, r1 P1).
+// 중간에 죽어도 반쯤 쓴 auth.json은 없다. 남는 것은 임시 이름뿐이다.
+// options.homes: 사람 홈 목록(개인 Codex 홈 검사). options.beforeInstall: 시험이 설치 직전 경합을 끼워 넣는 자리.
+export interface SeedOptions { homes?: readonly string[]; beforeInstall?: () => Promise<void> }
+export async function seedAuth(codexHome: string, seedFile: string, options: SeedOptions = {}): Promise<'seeded' | 'kept'> {
   if (!isAbsolute(codexHome) || !isAbsolute(seedFile)) throw new WorkerStartError('config_invalid');
   try { if (!(await stat(codexHome)).isDirectory()) throw new Error(); }
   catch { throw new WorkerStartError('codex_home_unavailable'); }
@@ -66,9 +99,10 @@ export async function seedAuth(codexHome: string, seedFile: string): Promise<'se
     if (error instanceof WorkerStartError) throw error;
     if ((error as { code?: string }).code !== 'ENOENT') throw new WorkerStartError('auth_unreadable');
   }
-  const seed = await readSeed(seedFile);
+  const seed = await readSeed(seedFile, options.homes ?? humanHomes());
   if (!plausibleAuth(seed.toString('utf8'))) throw new WorkerStartError('seed_invalid');
   const temporary = join(codexHome, `.auth.json.seed-${randomUUID()}`);
+  let installed = false;
   try {
     const handle = await open(temporary, NOFOLLOW_NEW, 0o600);
     try {
@@ -77,12 +111,20 @@ export async function seedAuth(codexHome: string, seedFile: string): Promise<'se
       await handle.chmod(0o600);
       await handle.sync();
     } finally { await handle.close(); }
-    await rename(temporary, target);
+    await options.beforeInstall?.();
+    try { await link(temporary, target); installed = true; }
+    catch (error) { if ((error as { code?: string }).code !== 'EEXIST') throw error; }
   } catch {
-    await rm(temporary, { force: true }).catch(() => {});
     throw new WorkerStartError('seed_write_failed');
+  } finally { await rm(temporary, { force: true }).catch(() => {}); }
+  if (!installed) {
+    // 확인 뒤 다른 쓰기 주체(먼저 뜬 작업자, 그 작업자의 codex 갱신)가 만들었다. 그것을 보존한다.
+    let existing;
+    try { existing = await lstat(target); } catch { throw new WorkerStartError('auth_unreadable'); }
+    if (!existing.isFile()) throw new WorkerStartError('auth_not_regular');
+    return 'kept';
   }
-  // 이름 바꾸기 자체를 디스크에 남긴다. 실패해도 파일은 이미 제자리다.
+  // 설치한 이름을 디스크에 남긴다. 실패해도 파일은 이미 제자리다.
   const dir = await open(codexHome, constants.O_RDONLY | constants.O_DIRECTORY).catch(() => null);
   if (dir) { await dir.sync().catch(() => {}); await dir.close().catch(() => {}); }
   return 'seeded';
@@ -99,7 +141,8 @@ export const NONCE_RETENTION_MS = 2 * (30_000 + DEFAULTS.capabilitySkewMs);
 export class FileNonceStore {
   private queue: Promise<unknown> = Promise.resolve();
   private ready: Promise<void> | undefined;
-  constructor(private readonly dir: string, private readonly now: Clock = Date.now) {
+  // io: 시험이 기록 중 I/O 오류를 넣는 자리. 기본은 node:fs/promises open이다.
+  constructor(private readonly dir: string, private readonly now: Clock = Date.now, private readonly io: { open: typeof open } = { open }) {
     if (!isAbsolute(dir)) throw new WorkerStartError('config_invalid');
   }
   // 기동 때 한 번 부른다. 디렉터리를 만들고 쓸 수 있는지 확인한다. 못 쓰면 기동 실패다(모든 요청을 거부하게 된다).
@@ -127,17 +170,17 @@ export class FileNonceStore {
     const now = this.now();
     await this.prune(now);
     let handle: FileHandle;
-    try { handle = await open(join(this.dir, nonce), NOFOLLOW_NEW, 0o600); }
+    try { handle = await this.io.open(join(this.dir, nonce), NOFOLLOW_NEW, 0o600); }
     // EEXIST는 재사용이고, 그 밖의 오류도 기록을 남겼는지 모르니 거부한다(fail-closed).
     catch { return false; }
-    try {
-      await handle.utimes(now / 1000, now / 1000);
-      // 디렉터리 항목까지 남기지 않아도 된다: 페이지 캐시를 잃는 사고(노드 정전)는 복구에 수명 31초보다 오래 걸린다.
-      return true;
-    } catch {
-      // 시각을 못 남긴 기록은 지우지 않고 둔다. 다음 prune이 실제 mtime으로 판단한다.
-      return true;
-    } finally { await handle.close().catch(() => {}); }
+    // 기록 과정의 I/O 오류는 이번 사용을 거부한다(fail-closed, r1 P2). 남은 표식은 지우지 않는다: 같은 nonce의 재사용은
+    // 계속 거부되고, 다음 prune이 실제 mtime으로 정리한다.
+    // 보장 범위: 프로세스·파드 재시작 뒤에도 남는다(페이지 캐시). fsync는 하지 않는다. 페이지 캐시를 잃는 사고(노드 정전)는
+    // 복구에 capability 수명(31초)보다 오래 걸려, 그때는 기록이 없어도 검증기가 만료로 거부한다.
+    let recorded = false;
+    try { await handle.utimes(now / 1000, now / 1000); recorded = true; } catch { /* 거부 */ }
+    try { await handle.close(); } catch { recorded = false; }
+    return recorded;
   }
   private async prune(now: number): Promise<void> {
     let names: string[];

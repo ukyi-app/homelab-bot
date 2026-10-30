@@ -1,11 +1,11 @@
 import { execFile } from 'node:child_process';
 import { createPublicKey } from 'node:crypto';
 import type { KeyObject } from 'node:crypto';
-import { existsSync, realpathSync } from 'node:fs';
+import { realpathSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import type { Server } from 'node:http';
-import { homedir, tmpdir } from 'node:os';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { tmpdir } from 'node:os';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { once } from 'node:events';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
@@ -17,7 +17,7 @@ import type { CodexLauncher } from './codex.js';
 import { PORTS } from './http.js';
 import { SerialWorker, WorkerVerifier } from './worker.js';
 import { workerServer } from './worker-http.js';
-import { FileNonceStore, WorkerStartError, seedAuth } from './worker-state.js';
+import { FileNonceStore, WorkerStartError, assertNotPersonal, humanHomes, seedAuth } from './worker-state.js';
 
 // 작업자 진입점(ns sandbox 상주 파드, D-15). 게시 서버와 같은 이미지이고 sandbox가 command만 이 파일로 바꾼다(D2).
 // 기동 순서: env 확인 → codex 버전 확인 → 시드 복사(없을 때만) → nonce 저장소 → 8080 수신.
@@ -75,30 +75,6 @@ export async function codexVersion(bin: string): Promise<string> {
   finally { await rm(scratch, { recursive: true, force: true }).catch(() => {}); }
 }
 
-// 시드·nonce 디렉터리가 사람 홈 자체나 그 아래 `.codex*`(심링크로 가리키는 경우 포함)면 거부한다.
-// 개인 auth.json을 시드로 복사하거나 개인 Codex 홈에 쓰지 않는다(D-14 조건 1). 홈을 열거하지 않고 경로 모양만 본다.
-export function assertNotPersonal(name: string, path: string, homes: readonly string[]): void {
-  let existing = resolve(path);
-  while (!existsSync(existing) && dirname(existing) !== existing) existing = dirname(existing);
-  const candidates = new Set([resolve(path)]);
-  try { candidates.add(join(realpathSync(existing), relative(existing, resolve(path)))); } catch { /* 모양 검사만 */ }
-  for (const home of homes) {
-    const bases = new Set([resolve(home)]);
-    try { bases.add(realpathSync(home)); } catch { /* 홈이 없으면 문자열 비교만 */ }
-    for (const base of bases) for (const candidate of candidates) {
-      const rel = relative(base, candidate);
-      if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel) && rel.split(sep)[0]!.startsWith('.codex'))) {
-        throw new WorkerStartError(`config_invalid:${name}`);
-      }
-    }
-  }
-}
-
-function humanHomes(): string[] {
-  // 파드에서 passwd에 없는 UID면 HOME이 없을 수 있다. 그때는 경로 모양 검사만 한다.
-  try { return [homedir()]; } catch { return []; }
-}
-
 export interface RunningWorker { server: Server; seed: 'seeded' | 'kept'; close(): Promise<void> }
 export async function startWorker(config: WorkerConfig,
   options: { port?: number; host?: string; launcher?: CodexLauncher; homes?: string[] } = {}): Promise<RunningWorker> {
@@ -108,22 +84,25 @@ export async function startWorker(config: WorkerConfig,
   assertNotPersonal('WORKER_SEED_DIR', dirname(config.seedFile), homes);
   assertNotPersonal('WORKER_NONCE_DIR', config.nonceDir, homes);
   if (await codexVersion(config.codexBin) !== CODEX_CAPABILITIES.version) throw new WorkerStartError('codex_version_mismatch');
-  const seed = await seedAuth(codexHome, config.seedFile);
+  const seed = await seedAuth(codexHome, config.seedFile, { homes });
   const nonces = new FileNonceStore(config.nonceDir);
   await nonces.open();
   const chat = new ChatLane(codexHome, options.launcher ?? new ProcessGroupLauncher([config.codexBin]),
     { homes, ...(config.proxy ? { proxy: config.proxy } : {}) });
   const verifier = new WorkerVerifier(config.publicKey, nonce => nonces.consume(nonce));
   const worker = new SerialWorker(verifier, (request, signal) => chat.run(request, signal), request => chat.stop(request));
-  const server = workerServer(worker, () => chat.ready());
+  // 종료가 시작되면 새 실행 요청은 실행 전에 거부한다(취소는 계속 받는다).
+  const server = workerServer(worker, () => chat.ready(), () => chat.accepting());
   server.listen(options.port ?? PORTS.worker, options.host);
   await once(server, 'listening');
   return { server, seed, async close() {
-    // 새 연결을 받지 않고, 실행 중인 codex를 멈춘 뒤 그 요청의 응답(failed)을 보내고 닫는다.
+    // 먼저 새 실행을 닫는다(동기). 이미 받은 요청이 본문 수신·서명 확인 중이어도 이 뒤에는 codex를 띄우지 않는다(r1 P2).
+    // 그다음 새 연결을 받지 않고, 실행 중인 codex를 멈춘 뒤 그 요청의 응답(failed)을 보내고 닫는다.
     // 연결을 먼저 끊으면 게시 서버는 결과를 몰라 unknown으로 둔다.
+    const stopping = chat.shutdown();
     const closed = new Promise<void>(resolve => server.close(() => resolve()));
     server.closeIdleConnections();
-    await chat.shutdown();
+    await stopping;
     await Promise.race([closed, new Promise(resolve => { setTimeout(resolve, 3000).unref(); })]);
     server.closeAllConnections();
     await closed;

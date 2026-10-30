@@ -23,10 +23,12 @@ RUN npm run check && npm test
 FROM deps AS runtime
 COPY --chown=node:node tsconfig.json ./
 COPY --chown=node:node src ./src
-# 실행 의존성만 남긴다(codex 포함, package.json dependencies). 다른 UID가 읽고 실행하게 권한을 맞춘다.
+COPY --chown=node:node migrations ./migrations
+# 실행 의존성만 남긴다(codex 포함, package.json dependencies). 다른 UID가 읽고 실행하게, 그룹·기타 쓰기는 없게
+# 권한을 맞춘다. 원본 파일의 모드(빌드 기계 umask)가 그대로 들어오지 않도록 최종 이미지에 넣는 것 전부에 건다.
 RUN npm run build \
   && npm prune --omit=dev \
-  && chmod -R a+rX,go-w node_modules dist
+  && chmod -R a+rX,go-w node_modules dist package.json migrations
 
 FROM docker.io/library/node:24.22.0-trixie-slim@sha256:a6155384446670e9719bdc4fd0ebe4d4b29fb32a8d6aa523da3547a6cfbcf22c
 WORKDIR /app
@@ -34,7 +36,7 @@ COPY --from=runtime --chown=root:root /app/node_modules ./node_modules
 COPY --from=runtime --chown=root:root /app/dist/src ./dist/src
 COPY --from=runtime --chown=root:root /app/package.json ./
 # 게시 서버 마이그레이션이 dist/src/database.js 기준 ../../migrations를 읽는다.
-COPY --chown=root:root migrations ./migrations
+COPY --from=runtime --chown=root:root /app/migrations ./migrations
 # codex는 npm 래퍼(node 프로세스 하나 더)가 아니라 실제 실행 파일을 쓴다. 실행 파일은 자기 위치의 codex-package.json으로
 # 번들(bwrap, rg)을 찾으므로 심링크로 둔다. 작업자는 /usr/local/bin/codex를 부르고 기동 때 버전을 다시 확인한다.
 # 빌드 확인은 빈 /tmp를 HOME·CODEX_HOME으로 줘서 이미지에 Codex 파일을 남기지 않는다.

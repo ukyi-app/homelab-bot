@@ -4,7 +4,8 @@ import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { generateKeyPairSync, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { connect } from 'node:net';
 import type { AddressInfo } from 'node:net';
 import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -481,4 +482,129 @@ test('WRK-15 종료 신호 때 실행 중인 대화는 codex를 멈추고 failed
   await worker.close();
   assert.deepEqual(await running, { status: 'failed', stopped: true });
   assert.deepEqual(launcher.aborted, [j.id]);
+});
+
+// ---- 리뷰 wrk-r1 회귀 시험(수정 전 실패를 먼저 확인했다) ----
+test('WRK-16 [r1 P1] 시드 설치는 "없을 때만" 원자적: 확인 뒤 생긴 갱신본·심링크를 덮지 않고, 동시 기동 둘 중 하나만 설치', async () => {
+  const target = join(codexHome, 'auth.json');
+  const seedFile = join(seedDir, 'CODEX_AUTH_JSON');
+  // 없음을 확인한 뒤 설치 직전에 다른 쓰기 주체(먼저 뜬 작업자의 갱신)가 auth.json을 만든다.
+  const refreshed = SEED.replace('2026-10-30T00:00:00Z', '2026-11-07T00:00:00Z');
+  assert.equal(await seedAuth(codexHome, seedFile, { beforeInstall: () => writeFile(target, refreshed) }), 'kept');
+  assert.equal(await readFile(target, 'utf8'), refreshed);
+  assert.deepEqual(await leftovers(), []);
+  // 그 사이 생긴 것이 심링크면 따라가거나 바꾸지 않고 실패한다.
+  await rm(target);
+  const outside = join(base, 'outside.json');
+  await writeFile(outside, 'outside');
+  assert.equal(await code(seedAuth(codexHome, seedFile, { beforeInstall: () => symlink(outside, target) })), 'auth_not_regular');
+  assert.ok((await lstat(target)).isSymbolicLink());
+  assert.equal(await readFile(outside, 'utf8'), 'outside');
+  assert.deepEqual(await leftovers(), []);
+  // 같은 CODEX_HOME에 기동 둘이 겹친다. 둘 다 "없음"을 본 뒤 설치에 들어가게 맞춘다.
+  await rm(target);
+  const otherDir = join(base, 'seed-b');
+  await mkdir(otherDir);
+  const otherSeed = SEED.replace(FAKE_TOKEN, `${FAKE_TOKEN}-b`);
+  await writeFile(join(otherDir, 'CODEX_AUTH_JSON'), otherSeed);
+  let arrived = 0;
+  let open2!: () => void;
+  const both = new Promise<void>(resolve => { open2 = resolve; });
+  const barrier = async () => { if (++arrived === 2) open2(); await both; };
+  const results = await Promise.all([seedAuth(codexHome, seedFile, { beforeInstall: barrier }),
+    seedAuth(codexHome, join(otherDir, 'CODEX_AUTH_JSON'), { beforeInstall: barrier })]);
+  assert.deepEqual([...results].sort(), ['kept', 'seeded']);
+  assert.equal(await readFile(target, 'utf8'), results[0] === 'seeded' ? SEED : otherSeed);
+  assert.equal((await stat(target)).mode & 0o777, 0o600);
+  assert.deepEqual(await leftovers(), []);
+});
+test('WRK-17 [r1 P1] 시드 파일 자체가 사람 홈 .codex*를 가리키는 심링크면 읽지 않고 기동 실패, Secret 볼륨 링크는 허용', async () => {
+  const human = join(base, 'human');
+  await mkdir(join(human, '.codex'), { recursive: true });
+  const personal = SEED.replace(FAKE_TOKEN, 'personal-refresh-token-0123456789abcdef');
+  await writeFile(join(human, '.codex', 'auth.json'), personal);
+  const linked = join(base, 'seed-linked');
+  await mkdir(linked);
+  await symlink(join(human, '.codex', 'auth.json'), join(linked, 'CODEX_AUTH_JSON'));
+  assert.equal(await code(startWorker(workerConfig(env({ WORKER_SEED_DIR: linked })), { port: 0, host: '127.0.0.1', homes: [human] })
+    .then(worker => worker.close())), 'seed_personal_path');
+  await assert.rejects(lstat(join(codexHome, 'auth.json')));
+  // Secret 볼륨 모양이어도 ..data가 개인 홈을 가리키면 거부한다.
+  const volume = join(base, 'volume-personal');
+  await mkdir(volume);
+  await symlink(join(human, '.codex'), join(volume, '..data'));
+  await symlink(join('..data', 'auth.json'), join(volume, 'CODEX_AUTH_JSON'));
+  assert.equal(await code(seedAuth(codexHome, join(volume, 'CODEX_AUTH_JSON'), { homes: [human] })), 'seed_personal_path');
+  await assert.rejects(lstat(join(codexHome, 'auth.json')));
+  // 정상 Secret 볼륨(..data → 타임스탬프 디렉터리)은 같은 homes에서도 통과한다.
+  const good = join(base, 'volume-good');
+  await mkdir(join(good, '..2026_10_30'), { recursive: true });
+  await writeFile(join(good, '..2026_10_30', 'CODEX_AUTH_JSON'), SEED);
+  await symlink('..2026_10_30', join(good, '..data'));
+  await symlink(join('..data', 'CODEX_AUTH_JSON'), join(good, 'CODEX_AUTH_JSON'));
+  assert.equal(await seedAuth(codexHome, join(good, 'CODEX_AUTH_JSON'), { homes: [human] }), 'seeded');
+  assert.equal(await readFile(join(codexHome, 'auth.json'), 'utf8'), SEED);
+});
+test('WRK-18 [r1 P2] 종료가 시작되면 본문 수신 중인 요청은 codex를 띄우지 않고 거부(started:false)', async () => {
+  const launcher = new SpawnLauncher(fakeBin);
+  const worker = await startWorker(workerConfig(env()), { port: 0, host: '127.0.0.1', launcher });
+  const signer = new WorkerSigner(keys.privateKey);
+  const j = job(); const request = chatRequest(j);
+  const body = JSON.stringify(request);
+  const socket = connect((worker.server.address() as AddressInfo).port, '127.0.0.1');
+  await once(socket, 'connect');
+  let response = '';
+  socket.setEncoding('utf8');
+  socket.on('data', chunk => { response += chunk; });
+  const ended = once(socket, 'close');
+  // 헤더와 본문 한 글자만 보낸 상태에서(요청 처리는 시작됨) 종료를 시작하고, 그 뒤에 나머지 본문을 보낸다.
+  const received = once(worker.server, 'request');
+  socket.write(`POST /v1/execute HTTP/1.1\r\nHost: worker\r\nContent-Type: application/json\r\n`
+    + `Authorization: Capability ${signer.issue(j, 'execute', request)}\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body.slice(0, 1)}`);
+  await received;
+  const closing = worker.close();
+  socket.write(body.slice(1));
+  await closing;
+  await ended;
+  assert.equal(launcher.specs.length, 0);
+  assert.match(response, /^HTTP\/1\.1 403 /);
+  assert.ok(response.includes(JSON.stringify({ status: 'rejected', started: false })), response);
+  // 종료 중 응답은 연결을 닫아 서버 종료가 연결 정리 상한(3초)까지 기다리지 않는다.
+  assert.match(response, /\r\nConnection: close\r\n/i);
+});
+test('WRK-18 [r1 P2] 종료가 시작될 때 서명·nonce 확인 중이던 요청도 codex를 띄우지 않고 failed로 끝냄', async () => {
+  const launcher = new SpawnLauncher(fakeBin);
+  const lane = new ChatLane(codexHome, launcher, { tmp: base });
+  await seedAuth(codexHome, join(seedDir, 'CODEX_AUTH_JSON'));
+  let reached!: () => void;
+  let release!: () => void;
+  const atConsume = new Promise<void>(resolve => { reached = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const worker = new SerialWorker(new WorkerVerifier(keys.publicKey, async () => { reached(); await gate; return true; }),
+    (request, signal) => lane.run(request, signal), request => lane.stop(request));
+  const signer = new WorkerSigner(keys.privateKey);
+  const j = job(); const request = chatRequest(j);
+  const running = worker.execute(request, signer.issue(j, 'execute', request), new AbortController().signal);
+  await atConsume;
+  await lane.shutdown();
+  release();
+  assert.deepEqual(await running, { status: 'failed', stopped: true });
+  assert.equal(launcher.specs.length, 0);
+});
+test('WRK-19 [r1 P2] nonce 파일을 만든 뒤 시각 기록·닫기 I/O가 실패하면 사용을 거부(fail-closed)', async () => {
+  const eio = () => Object.assign(new Error('injected EIO'), { code: 'EIO' });
+  for (const method of ['utimes', 'close'] as const) {
+    const io = { open: (async (...args: Parameters<typeof open>) => {
+      const handle = await open(...args);
+      if (method === 'utimes') handle.utimes = async () => { throw eio(); };
+      else { const real = handle.close.bind(handle); handle.close = async () => { await real(); throw eio(); }; }
+      return handle;
+    }) as typeof open };
+    const store = new FileNonceStore(join(nonceDir, method), Date.now, io);
+    await store.open();
+    const nonce = (method === 'utimes' ? 'e' : 'f').repeat(64);
+    assert.equal(await store.consume(nonce), false, method);
+    // 표식은 남아 있어도 된다(재사용은 계속 거부).
+    assert.equal(await store.consume(nonce), false, method);
+  }
 });

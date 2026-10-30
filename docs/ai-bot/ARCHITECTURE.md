@@ -779,9 +779,9 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 | `WORKER_CODEX_BIN` | 아니오 | 기본 `/usr/local/bin/codex`(이미지의 실제 실행 파일 심링크) |
 | `HTTPS_PROXY`, `NO_PROXY` | 아니오 | 있으면 codex 프로세스 env에만 넘긴다. 모델 셸(`shell_environment_policy.set`)에는 넘기지 않는다 |
 
-**시드 복사.** `CODEX_HOME/auth.json`이 없을 때만 한다. 시드는 Secret 볼륨 심링크(`..data/키`)를 따라 열고 일반 파일·1MiB 이하·JSON 객체·`tokens.refresh_token` 문자열이 있는지만 본다 [가정: 필드 이름은 0.163.0 바이너리 문자열과 `codex login` 결과 모양]. 같은 디렉터리의 임시 파일(0600, `O_EXCL|O_NOFOLLOW`)에 쓰고 fsync한 뒤 rename한다. rename은 덮어쓰므로 "없을 때만"은 확인 시점 기준이다. 기동 중에는 codex가 돌지 않고 작업자는 replicas 1·`Recreate`라 그 사이에 쓰는 주체가 없다. 이미 있는 `auth.json`은 내용·권한을 손대지 않는다. 심링크·디렉터리면 따라가거나 고치지 않고 기동 실패(`auth_not_regular`)다. 시드가 없거나 깨졌으면 `seed_missing`·`seed_invalid`·`seed_unreadable`로 기동 실패하고 `auth.json`을 만들지 않는다.
+**시드 복사.** `CODEX_HOME/auth.json`이 없을 때만 한다. 시드는 Secret 볼륨 심링크(`..data/키`)를 따라 열고 일반 파일·1MiB 이하·JSON 객체·`tokens.refresh_token` 문자열이 있는지만 본다 [가정: 필드 이름은 0.163.0 바이너리 문자열과 `codex login` 결과 모양]. 시드 파일의 최종 대상(링크를 모두 따라간 실제 경로)이 사람 홈의 `.codex*` 아래면 읽지 않고 기동 실패(`seed_personal_path`)다. 디렉터리만 보면 파일 자체의 심링크로 개인 `auth.json`을 복사할 수 있었다(리뷰 wrk-r1 P1). 검사한 경로와 실제로 연 파일이 같은지도 `/proc/self/fd`로 확인한다. 같은 디렉터리의 임시 파일(0600, `O_EXCL|O_NOFOLLOW`)에 쓰고 fsync한 뒤 `link`로 설치하고 임시 이름을 지운다. `link`는 이름이 이미 있으면 실패하므로 "없을 때만"이 설치 순간에 지켜진다. 확인 뒤 다른 쓰기 주체(먼저 뜬 작업자나 그 codex의 갱신)가 만든 `auth.json`은 보존하고 `kept`다. 처음 rename으로 설치했을 때는 덮어써서 갱신본·동시 기동의 설치를 잃었다(리뷰 wrk-r1 P1). 이미 있는 `auth.json`은 내용·권한을 손대지 않는다. 심링크·디렉터리면 따라가거나 고치지 않고 기동 실패(`auth_not_regular`)다. 시드가 없거나 깨졌으면 `seed_missing`·`seed_invalid`·`seed_unreadable`로 기동 실패하고 `auth.json`을 만들지 않는다.
 
-**nonce 저장소.** `WorkerVerifier`가 넘기는 nonce(서명 payload의 SHA-256 hex 64자)를 파일 이름으로 `O_EXCL` 생성한다. 이미 있으면 재사용으로 거부하고, 그 밖의 생성 오류도 거부한다(fail-closed). 기록 시각은 mtime이고 보관은 62초(capability 수명 30초 + 시계 오차 1초의 두 배)다. 그 뒤 기록은 다음 사용 때 지운다. 한 프로세스 안의 사용은 차례로 처리한다. 디렉터리 항목은 fsync하지 않는다: 페이지 캐시를 잃는 사고(노드 정전)는 복구에 capability 수명보다 오래 걸린다. 프로세스·파드 재시작에는 기록이 남아 같은 capability를 거부한다.
+**nonce 저장소.** `WorkerVerifier`가 넘기는 nonce(서명 payload의 SHA-256 hex 64자)를 파일 이름으로 `O_EXCL` 생성한다. 이미 있으면 재사용으로 거부하고, 그 밖의 생성 오류도 거부한다(fail-closed). 기록 시각은 mtime이고 보관은 62초(capability 수명 30초 + 시계 오차 1초의 두 배)다. 그 뒤 기록은 다음 사용 때 지운다. 한 프로세스 안의 사용은 차례로 처리한다. 파일을 만든 뒤의 시각 기록·닫기에서 I/O 오류가 나면 이번 사용도 거부한다(fail-closed, 리뷰 wrk-r1 P2). 남은 표식은 지우지 않는다. 보장 범위는 프로세스·파드 재시작까지다(페이지 캐시에 남은 기록으로 같은 capability를 거부한다). fsync는 하지 않는다: 페이지 캐시를 잃는 사고(노드 정전)는 복구에 capability 수명(31초)보다 오래 걸려, 그때는 기록이 없어도 검증기가 만료로 거부한다.
 
 **대화 레인.**
 
@@ -796,7 +796,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - 작업 레인 요청(`lane: 'task'`)은 띄우지 않고 `failed`로 답한다. 배치는 T18 결정 대기다.
 - 취소(`/v1/cancel`): 실행 중이면 멈추고 정리를 최대 4초 기다린 뒤 남은 프로세스 0개일 때만 `stopped: true`. `unknown`으로 막힌 작업은 다시 정리해 0개면 풀린다.
 
-**종료.** SIGTERM·SIGINT를 직접 받는다(`node`가 PID 1이라 기본 동작이 없다). 새 연결을 받지 않고, 실행 중인 codex를 멈춘 뒤 그 요청에 `failed`(`stopped: true`)를 답하고 닫는다. 연결을 먼저 끊으면 게시 서버가 결과를 몰라 `unknown`으로 둔다. 20초 안에 못 끝내면 강제 종료한다(kubelet 유예 30초).
+**종료.** SIGTERM·SIGINT를 직접 받는다(`node`가 PID 1이라 기본 동작이 없다). 먼저 새 실행을 닫는다(동기). 그 뒤 들어온 `/v1/execute`는 실행 전에 403 `{"status":"rejected","started":false}`로 거부하고, 이미 받아 본문 수신·서명 확인 중이던 요청도 codex를 띄우지 않고 `failed`로 끝낸다(리뷰 wrk-r1 P2: 종료 시작 뒤에 검증을 마친 요청이 새 codex를 띄웠다). `/v1/cancel`은 계속 받는다. 새 연결을 받지 않고, 실행 중인 codex를 멈춘 뒤 그 요청에 `failed`(`stopped: true`)를 답하고 닫는다. 종료 중의 응답은 `Connection: close`라 연결 정리를 기다리지 않는다. 연결을 먼저 끊으면 게시 서버가 결과를 몰라 `unknown`으로 둔다. 20초 안에 못 끝내면 강제 종료한다(kubelet 유예 30초).
 
 **readiness.** `GET /readyz`는 기동 확인을 마친 뒤 영속 공간에 일반 파일 `auth.json`이 있으면 200, 없으면 503이다. 실행 중(바쁨)이어도 200이다. kubelet 프로브는 노드에서 오고 인증이 없으며 본문을 싣지 않는다.
 

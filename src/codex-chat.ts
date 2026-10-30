@@ -124,6 +124,8 @@ export class ChatLane {
   private readonly home: string;
   private readonly tmp: string;
   private active: Active | undefined;
+  // 종료가 시작되면 true. 그 뒤에 들어온 실행은 띄우지 않는다.
+  private closed = false;
   constructor(codexHome: string, private readonly launcher: CodexLauncher, private readonly options: ChatLaneOptions = {}) {
     // 개인 Codex 홈(~/.codex*)이나 사람 홈 자체는 거부한다(D-14 조건 1). 경로 모양으로만 본다.
     this.home = assertWorkerRoot(codexHome, options.homes);
@@ -133,8 +135,10 @@ export class ChatLane {
   async ready(): Promise<boolean> {
     try { return (await lstat(join(this.home, 'auth.json'))).isFile(); } catch { return false; }
   }
+  accepting(): boolean { return !this.closed; }
   async run(request: WorkerRequest, signal: AbortSignal): Promise<WorkerResult> {
-    if (request.lane !== 'chat') return FAILED;
+    // 종료가 시작된 뒤 들어온 실행(본문 수신·서명 확인이 늦게 끝난 요청)은 띄우지 않는다. 띄운 적이 없으니 failed다.
+    if (request.lane !== 'chat' || this.closed) return FAILED;
     const controller = new AbortController();
     const forward = () => controller.abort();
     signal.addEventListener('abort', forward, { once: true });
@@ -163,8 +167,9 @@ export class ChatLane {
     } else await this.launcher.terminate(request.job).catch(() => {});
     return await this.launcher.survivors(request.job).catch(() => null) === 0;
   }
-  // 종료 신호 때 실행 중인 codex를 멈추고 정리를 기다린다.
+  // 종료 신호 때 새 실행을 닫고(동기, 첫 await 전), 실행 중인 codex를 멈추고 정리를 기다린다.
   async shutdown(): Promise<void> {
+    this.closed = true;
     const active = this.active;
     if (!active) return;
     active.controller.abort();
@@ -215,7 +220,8 @@ export class ChatLane {
       let result: LaunchResult = { exit: null };
       let launchFailed = false;
       try {
-        if (signal.aborted) { survivors = 0; return FAILED; }
+        // 준비하는 동안 중단·종료가 시작됐으면 띄우지 않는다. 이 확인과 launcher의 spawn 사이에는 await가 없다.
+        if (signal.aborted || this.closed) { survivors = 0; return FAILED; }
         result = await this.launcher.run({ job: request.job, args: chatArgs(paths.run), cwd: paths.workspace,
           env: launchEnvironment(paths, this.options.proxy), stdin: chatPrompt(request),
           limits: { lineBytes: limits.lineBytes, outputBytes: limits.outputBytes } }, inner.signal, onLine);
