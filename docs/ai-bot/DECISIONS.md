@@ -536,6 +536,20 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 
 ### 공유 파일(T16a 소유) 변경이 필요해 하지 않은 것
 
-- **리뷰 작업의 `waiting_user` 해제(r2에서 해소, lead 허용 2026-10-29):** `Store.control`에 리뷰 전용 명령 `review-status`·`review-resume`·`review-cancel`을 **추가**했다. `DiscordIngress`는 현재 정책의 owner가 알림 채널(부모 없는 채널)에서 보낸 명령일 때만 리뷰 제어를 허용한다. 재개·포기 뒤 전역 scheduler 해제는 기존 `releaseScheduler` 규칙(비상 중지·다른 대기 우선)을 그대로 쓴다. 기존 대화 명령(`resume-model`·`cancel`·`list`·`model-status`)의 뜻·동작은 바꾸지 않았다. 리뷰가 대기에 들어가면 알림 채널에 job ID와 명령을 안내한다. 실제 슬래시 명령 등록은 T16b다.
-- **webhook 수신 연결:** `src/http.ts` 앱 서버(8080)에 `githubWebhook`을 붙이는 것. 지금은 404 그대로다.
+- **리뷰 작업의 `waiting_user` 해제(r2에서 해소, lead 허용 2026-10-29):** `Store.control`에 리뷰 전용 명령 `review-status`·`review-resume`·`review-cancel`을 **추가**했다. `DiscordIngress`는 현재 정책의 owner가 알림 채널(부모 없는 채널)에서 보낸 명령일 때만 리뷰 제어를 허용한다. 재개·포기 뒤 전역 scheduler 해제는 기존 `releaseScheduler` 규칙(비상 중지·다른 대기 우선)을 그대로 쓴다. 기존 대화 명령(`resume-model`·`cancel`·`list`·`model-status`)의 뜻·동작은 바꾸지 않았다. 리뷰가 대기에 들어가면 알림 채널에 job ID와 명령을 안내한다. 실제 슬래시 명령 등록은 T16b다. → T16b 배포 진입점은 `review-*`를 등록하지 않고 수신에서도 닫는다(FOUNDATION 범위).
+- **webhook 수신 연결:** `src/http.ts` 앱 서버(8080)에 `githubWebhook`을 붙이는 것. 지금은 404 그대로다. → T16b에서 `POST /github`을 리뷰 비활성으로 연결했다(아래 "T16b 결정" D6).
 - **작업자 쪽 mutex 공유:** 리뷰 레인 HTTP는 새 파일 `src/review-http.ts`(`/v1/review`, `/v1/review/cancel`)에 두었다. 작업자 쪽 mutex를 대화 레인 `SerialWorker`와 하나로 묶는 것은 `worker.ts` 변경이라 하지 않았다. 지금은 게시 서버의 SQL 슬롯만 두 레인이 공유하고, 작업자 쪽 mutex는 `ReviewWorker`가 따로 가진다. 한 작업자 프로세스에 두 레인을 올릴 때(T16b) 묶어야 한다.
+
+## T16b 결정 (사용자 2026-10-30)
+
+출처: T16b 실행 계획 4절(비공개 작업 문서)의 후보와 추천을 사용자가 골랐다. 반영 위치를 함께 적는다. D5(작업자 파드 안 Codex 샌드박스 실패 시)는 실측 결과에 따른 조건부 결정이라 아직 없다.
+
+| ID | 결정 | 반영 |
+|---|---|---|
+| D1 런타임 정책 | 정책은 공유 차트가 넣는 env `RUNTIME_POLICIES`(Infisical)를 **기동 때 한 번** 읽는다. 값을 바꾸면 `homelab secret set`이 파드를 다시 시작해 반영한다. 즉시 차단은 `/revoke`(DB 거부 목록). T16a의 "파일 매 접근 재읽기 + `confirmedAt` 300초" 검사는 없애고 `confirmedAt`은 봇이 읽은 시각으로 채운다 | `src/policy.ts`, [ARCHITECTURE](ARCHITECTURE.md) §11, AUTH-02 시험 |
+| D2 작업자 이미지 | 작업자는 봇 이미지 하나를 공유한다. sandbox는 사람 PR로 그 digest를 고정하고 command만 작업자 진입점으로 바꾼다 | 작업자 진입점·Dockerfile(T16b S4·S5) |
+| D3 작업자 공개 키·nonce | 공개 키는 `platform/sandbox` values(Git)의 env, nonce 저장소는 영속 PVC 안 별도 디렉터리(30초 만료, 재기동 뒤에도 재사용 거부) | 작업자 진입점(T16b S4) |
+| D4 대화 레인 세션 | 대화 레인은 영속 CODEX_HOME을 직접 쓰고 세션 기록을 남기지 않는다(`--ephemeral`, 안 되면 실행마다 세션 디렉터리 삭제). 빈 임시 작업 공간 + `--skip-git-repo-check`. 작업·리뷰 레인 배치는 T18 결정으로 남긴다 | 작업자 진입점(T16b S4). 게시 서버는 해당 없음 |
+| D6 공개 webhook | 공유 차트 그대로(`public.host`, `/` Prefix)를 받는다. 봇은 `POST /github`에 `githubWebhook`을 **리뷰 비활성**으로 연결해(정책에 리뷰 설정이 있어도) `review_disabled`로 기록하고, 서명이 틀리면 401이다. 8080의 그 밖 경로는 `/readyz`·`/metrics` 말고 404. 비밀 키는 `GITHUB_REVIEW_WEBHOOK_SECRET`(시험 webhook과 T17 리뷰 App이 같은 값). 남는 위험: 클러스터 안에서 Traefik에 공개 host로 오는 요청은 `/readyz`·`/metrics`에 닿는다(WAF 규칙이 밖에서 막음) | `src/main.ts`, `src/http.ts` |
+| D7 봇 지표 스크레이프 | `vmsingle/scrape.yaml`에 봇 job, `platform/bot-slot`에 vmsingle → 봇 8080 ingress | 플랫폼 PR(T16b S15) |
+| D8 Kubernetes API 경로 | 봇 파드 → Kubernetes API 길은 플랫폼 PR이 연다. 읽기 transport의 K8s 출처는 in-cluster SA 토큰(`/var/run/secrets/kubernetes.io/serviceaccount`)으로 `https://kubernetes.default.svc`를 부른다 | `src/read-transports.ts`, 주소는 env `KUBERNETES_API_URL` |

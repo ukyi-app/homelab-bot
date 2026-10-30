@@ -281,9 +281,12 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 Discord Gateway → `DiscordProtocol` → `DiscordIngress` → PostgreSQL 이벤트 저장 →
 처리 경로(job/outbox/제어 결과) 영속 저장 → 수신 ACK → `Runtime` → 서명 capability를 붙인 작업자 Service:8080의 `/v1/execute` →
 `SerialWorker` → `codex exec` 계약 → 구조화 결과 → `results/outbox` → `DiscordPublisher`다.
-`/read`는 모델을 부르지 않고 승인 템플릿 조회를 실행한다. 실제 Gateway 연결 루프·모델 프로세스는 T16b다.
+`/read`는 모델을 부르지 않고 승인 템플릿 조회를 실행한다. Gateway 연결 루프는 T16b `src/gateway.ts`(아래), 모델 프로세스는 작업자 진입점(T16b)이다.
 런타임은 Node 24.22.0이며, Discord 클라이언트는 SDK 없이 주입 가능한 `DiscordProtocol`을 선택했다.
-인증된 WebSocket 세션은 T16b에서 이 어댑터에 연결하고 재연결·RESUME를 실측한다.
+인증된 WebSocket 세션은 T16b `GatewaySession`(Node 24 내장 WebSocket, intents 33281)이 이 어댑터에 잇는다. 봇 사용자 ID는 첫 READY에서 받고,
+그 전에는 Discord 수신·게시를 하지 않는다(8080·8081 수신은 계속). 새 IDENTIFY(READY)마다 활성 스레드의 누락 대조를 돌리고,
+RESUMED면 Discord 재생에 맡긴다. slash 명령은 READY마다 guild 단위로 FOUNDATION 12개에 맞추고(`task`·`review-*` 없음, 같으면 쓰지 않음)
+전역 명령은 비운다. 수신도 같은 목록만 받는다. 재연결·RESUME 실측은 실연동(S16)이다.
 
 작업자 모델 호출은 **대화·작업 레인 합쳐 1개**다. DB의 scheduler 행 잠금과 작업자의 별도 mutex가
 중복 실행을 막는다. lease가 끝나거나 호스트 결과를 모르면 `unknown`이 전체 모델 슬롯을 잡는다.
@@ -398,7 +401,8 @@ fingerprint 계산에 서비스 ID도 포함해 같은 fingerprint 문자열의 
 일반 텍스트도 1800자씩 손실 없이 나눈다. 게시자가 끝 1900자를 조용히 버리는 처리는 없다.
 004 이전의 비정상적인 큰 pending 메시지는 자동 절단하지 않고 blocked로 둔다.
 임의 질의·Secret·ConfigMap·pods/log/exec의 요청 이름과 추가 필드를 거부한다.
-라이브 API 응답 투영·플랫폼 권한 증거는 T16b다.
+라이브 API 응답 투영은 T16b `src/read-transports.ts`다(Grafana `POST /api/ds/query` 메트릭·VictoriaLogs, Argo CD 앱 객체, Kubernetes Deployment·StatefulSet,
+응답 4MiB 상한, 고정 경로 모양만). 서비스·템플릿은 `src/catalog.ts`, 여는 서비스 ID는 정책이다. 플랫폼 권한 증거는 실연동(S16)이다.
 
 부모 채널의 스레드 생성 뒤에도 저장된 urgent command/flag를 전달한다.
 스레드/DM/부모 채널에서 받은 `/read`는 type=read, debounce 0이며 queued-chat supersede 대상에서 제외한다.
@@ -416,7 +420,7 @@ dispatch 전 PolicyUnavailable의 defer는 최신 cancel_requested를 원자적�
 종료가 확인되지 않은 worker만 unknown으로 남아 전역 슬롯을 유지한다.
 unknown은 자동 재시도 0회다. Discord 429는 retry_after를 지키고 총 3회 뒤 blocked다.
 IDENTIFY는 rolling 24시간 **900회**를 로컬 상한으로 두고 1000회 문서 한도에 여유를 남긴다.
-재연결 backoff는 1~60초 + 0~1초 jitter 계약이다. 실제 Gateway 연결 루프에 예산을 연결하는 것은 T16b다.
+재연결 backoff는 1~60초 + 0~1초 jitter 계약이다. T16b `GatewaySession`은 새 IDENTIFY 전에 이 예산을 통과하고(소진되면 연결하지 않음), 재연결 간격에 이 backoff를 쓴다.
 
 작업자 제어 인증은 **Ed25519**다. 게시 서버에만 개인 키, 작업자에는 공개 키만 둔다.
 capability는 audience·operation·job·lease·body digest·발급/만료 시각에 묶이고 유효기간은 **30초**다.
