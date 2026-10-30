@@ -30,7 +30,7 @@ beforeEach(async () => {
 });
 after(async () => { await database.pg.close(); });
 async function rows(table: string) { return (await database.db.query<Record<string, any>>(`SELECT * FROM ${table}`)).rows; }
-async function queue(id = 'first') { await f.ingress.receive(event(id)); f.advance(800); }
+async function queue(id = 'first') { await f.ingress.receive(event(id)); f.advance(DEFAULTS.debounceMs + 50); }
 async function enqueue(key = 'delivery') {
   await f.store.enqueue({ key, actor: f.policy.owner, scope: thread, revision: f.policy.revision,
     payload: { kind: 'message', channel: thread.channel, content: '확인된 요약', classification: 'safe_summary' } });
@@ -162,7 +162,7 @@ test('R1-05 ACK가 보인 뒤 응답 유실/재시작에도 작업 하나가 남
   };
   await f.ingress.receive(event('lost')); await f.ingress.receive(event('lost'));
   const restarted = new Runtime(new Store(database.db, f.now), f.gate, f.worker, f.signer, f.reader);
-  f.advance(800); await restarted.tick();
+  f.advance(DEFAULTS.debounceMs + 50); await restarted.tick();
   assert.equal(f.rest.acks.length, 1); assert.equal(f.requests.length, 1); assert.equal((await rows('jobs')).length, 1);
 });
 test('R1-05 queue_full·outbox 저장 실패는 ACK 전에 실패하고 수락하지 않음', async () => {

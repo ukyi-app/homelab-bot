@@ -10,7 +10,7 @@ export const STATES = ['queued', 'running', 'waiting_user', 'verifying', 'succee
 export type State = typeof STATES[number];
 export type Clock = () => number;
 export const DEFAULTS = Object.freeze({
-  debounceMs: 750, inboxTimeoutMs: 1500, leaseMs: 30_000, chatTimeoutMs: 60_000,
+  debounceMs: 2000, inboxTimeoutMs: 1500, leaseMs: 30_000, chatTimeoutMs: 60_000,
   taskTimeoutMs: 1_800_000, maxQueue: 100, contextMessages: 20,
   maxInputChars: 8000, maxToolCalls: 8, maxRetries: 2,
   recoveryPages: 10, recoveryMs: 30_000,

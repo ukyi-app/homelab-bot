@@ -2,7 +2,7 @@ import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { cp, mkdir, mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { Denied, DiscordRejected, PolicyUnavailable } from '../src/contracts.js';
+import { DEFAULTS, Denied, DiscordRejected, PolicyUnavailable } from '../src/contracts.js';
 import type { Scope } from '../src/contracts.js';
 import type { Database } from '../src/database.js';
 import { FileDeletionLedger, MemoryNotReady, MemoryRejected, MemoryService } from '../src/memory.js';
@@ -90,7 +90,7 @@ test('MEM-01 출처 없음·접근 불가·저장 제외 출처는 저장하지 
   assert.equal((await rows('memories')).length, 0);
 });
 test('MEM-01 근거가 종류에 맞지 않으면 candidate·미확인으로 검색, 맞으면 active', async () => {
-  await f.ingress.receive(event('m-claim', { text: '백업 보존은 30일이야' })); f.advance(800);
+  await f.ingress.receive(event('m-claim', { text: '백업 보존은 30일이야' })); f.advance(DEFAULTS.debounceMs + 50);
   const claim = await memory.remember('fixture-owner', thread, config('백업 보존 30일', { sources: [{ type: 'conversation', message: 'm-claim' }] }));
   assert.equal(claim.status, 'candidate');
   const decision = await memory.remember('fixture-owner', thread, { kind: 'decision', statement: '브리핑은 08:50에 보낸다',
@@ -106,13 +106,13 @@ test('MEM-01 근거가 종류에 맞지 않으면 candidate·미확인으로 검
   assert.deepEqual(found.map(m => [m.statement, m.flags]).sort(), [['백업 보존 14일', []], ['백업 보존 30일', ['unverified']]]);
 });
 test('MEM-01 성공한 작업 결과는 장애 근거, 끝나지 않은 작업은 candidate', async () => {
-  await f.ingress.receive(event('m-job', { text: '백업 상태 알려줘' })); f.advance(800); await f.runtime.tick();
+  await f.ingress.receive(event('m-job', { text: '백업 상태 알려줘' })); f.advance(DEFAULTS.debounceMs + 50); await f.runtime.tick();
   const done = (await rows('jobs'))[0]!;
   assert.equal(done.state, 'succeeded');
   const incident = { kind: 'incident' as const, statement: '백업 지연', facts: ['03:00 작업 지연'], hypotheses: ['디스크 포화'],
     unconfirmedCauses: ['원인 미확정'], sources: [{ type: 'job' as const, job: done.id }] };
   assert.equal((await memory.remember('fixture-owner', thread, incident)).status, 'active');
-  await f.ingress.receive(event('m-running', { text: '다른 조회' })); f.advance(800);
+  await f.ingress.receive(event('m-running', { text: '다른 조회' })); f.advance(DEFAULTS.debounceMs + 50);
   const queued = (await rows('jobs')).find(j => j.state === 'queued')!;
   const pending = await memory.remember('fixture-owner', thread, { ...incident, sources: [{ type: 'job', job: queued.id }] });
   assert.equal(pending.status, 'candidate');
@@ -150,7 +150,7 @@ test('MEM-01 충돌 기억은 둘 다 확정하지 않고, 사유 있는 정정�
   await assert.rejects(memory.correct('fixture-owner', thread, [a.id], config('대체된 기억 재정정'), '다시'), Denied);
 });
 test('MEM-01 일시 지시는 유효기간이 필요하고 지나면 검색되지 않으며, 오래된 설정은 재확인 표시', async () => {
-  await f.ingress.receive(event('m-pref', { text: '오늘은 짧게 답해' })); f.advance(800);
+  await f.ingress.receive(event('m-pref', { text: '오늘은 짧게 답해' })); f.advance(DEFAULTS.debounceMs + 50);
   const preference = { kind: 'preference' as const, statement: '답변을 짧게', targetUser: 'fixture-owner', endCondition: '오늘 끝',
     sources: [{ type: 'conversation' as const, message: 'm-pref' }] };
   await assert.rejects(memory.remember('fixture-owner', thread, preference as unknown as MemoryInput), { message: 'memory_invalid' });
@@ -482,7 +482,7 @@ test('BRIEF-01 기억 원장 재적용 전에는 브리핑의 기억 칸을 미�
 });
 
 test('MEM-01 저장 제외는 이미 저장한 기억도 다음 접근부터 검색·브리핑에서 뺌', async () => {
-  await f.ingress.receive(event('m-later', { text: '이 내용은 나중에 제외' })); f.advance(800);
+  await f.ingress.receive(event('m-later', { text: '이 내용은 나중에 제외' })); f.advance(DEFAULTS.debounceMs + 50);
   await memory.remember('fixture-owner', thread, { kind: 'preference', statement: '나중에 제외할 선호', targetUser: 'fixture-owner',
     endCondition: '해제 요청', expiresAt: f.now() + DAY, sources: [{ type: 'conversation', message: 'm-later' }] });
   assert.equal((await memory.search('fixture-owner', thread, '제외할')).length, 1);
@@ -566,7 +566,7 @@ test('DATA-02 발송을 시작한 브리핑이 429로 대기열에 돌아와도 
   assert.equal((await briefings())[0]!.state, 'blocked');
 });
 test('MEM-01 저장 제외로 숨긴 기억은 같은 주제의 새 기억을 충돌로 묶지 않음', async () => {
-  await f.ingress.receive(event('m-port', { text: '포트는 80' })); f.advance(800);
+  await f.ingress.receive(event('m-port', { text: '포트는 80' })); f.advance(DEFAULTS.debounceMs + 50);
   const hidden = await memory.remember('fixture-owner', thread, config('포트 80', { topic: 'service:port', sources: [{ type: 'conversation', message: 'm-port' }] }));
   assert.equal(hidden.status, 'candidate');
   await memory.exclude('fixture-owner', thread, `channel:${thread.channel}`);
@@ -657,7 +657,7 @@ test('BRIEF-01 [rev-t20 P2-2] 12시간 넘게 보내지 못한 회차는 다음 
   assert.deepEqual((await rows('briefing_runs')).map(r => [r.state, r.reason]), [['missed', 'too_late']]);
 });
 test('MEM-01 [rev-t20 P2-3] 채널 저장 제외는 그 채널 작업을 출처로 한 기억에도 적용', async () => {
-  await f.ingress.receive(event('m-job-x', { text: '백업 상태 알려줘' })); f.advance(800); await f.runtime.tick();
+  await f.ingress.receive(event('m-job-x', { text: '백업 상태 알려줘' })); f.advance(DEFAULTS.debounceMs + 50); await f.runtime.tick();
   const done = (await rows('jobs'))[0]!;
   const incident = (statement: string) => ({ kind: 'incident' as const, statement, facts: ['03:00 지연'], hypotheses: [],
     unconfirmedCauses: [], sources: [{ type: 'job' as const, job: done.id }] });
@@ -906,7 +906,7 @@ test('DATA-02 [rev-pr8 P2-1] 원장에서 본 삭제(정리 전) 기억이 앞�
   } finally { await rm(fault.dir, { recursive: true, force: true }); }
 });
 test('MEM-01 [rev-pr8 P2-2] 다른 결정자의 결정은 확인된 문서가 있어야 active, 미확인 문서를 더해도 candidate', async () => {
-  await f.ingress.receive(event('m-decided', { text: '배포 담당자가 금요일 배포 금지로 정했어' })); f.advance(800);
+  await f.ingress.receive(event('m-decided', { text: '배포 담당자가 금요일 배포 금지로 정했어' })); f.advance(DEFAULTS.debounceMs + 50);
   const said = { type: 'conversation' as const, message: 'm-decided' };
   const decision = (sources: MemoryInput['sources']): MemoryInput => ({ kind: 'decision', statement: '금요일에는 배포하지 않는다',
     decidedBy: 'release-manager', decidedAt: f.now(), appliesTo: '배포 일정', sources });

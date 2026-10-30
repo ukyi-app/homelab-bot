@@ -22,7 +22,7 @@ beforeEach(async () => {
 });
 after(async () => { await database.pg.close(); });
 async function rows(table: string) { return (await database.db.query<Record<string, any>>(`SELECT * FROM ${table}`)).rows; }
-async function queue(id = 'first') { await f.ingress.receive(event(id)); f.advance(800); }
+async function queue(id = 'first') { await f.ingress.receive(event(id)); f.advance(DEFAULTS.debounceMs + 50); }
 async function enqueue(key = 'delivery', content = '확인된 요약') {
   await f.store.enqueue({ key, actor: f.policy.owner, scope: thread, revision: f.policy.revision,
     payload: { kind: 'message', channel: thread.channel, content, classification: 'safe_summary' } });
@@ -141,7 +141,7 @@ test('4314215638 기존 페이지·read migration을 두 번 실행해도 순서
 });
 
 for (const lane of ['chat', 'read']) test(`4314215647 복구 gap 중 ${lane} 완료 결과 보존, gap 해제 후 게시`, async () => {
-  await f.ingress.receive(event(lane, lane === 'read' ? { kind: 'command', command: 'read', target: service.id, text: template.id } : {})); f.advance(800);
+  await f.ingress.receive(event(lane, lane === 'read' ? { kind: 'command', command: 'read', target: service.id, text: template.id } : {})); f.advance(DEFAULTS.debounceMs + 50);
   const setGap = () => database.db.query('UPDATE conversations SET gap=true');
   f.setRun(async () => { await setGap(); return { status: 'succeeded', stopped: true, answer: { facts: [], hypotheses: [], unknowns: [], checks: [] } }; });
   const reader = new ReadAdapter([service], [template], f.gate, { query: async () => {
@@ -200,7 +200,7 @@ for (const scope of [thread, { guild: null, channel: 'fixture-dm', parent: null,
     const jobs = await rows('jobs'); assert.equal(jobs.filter(j => j.type === 'read' && j.state === 'queued').length, 2);
     assert.equal(jobs.filter(j => j.state === 'superseded').length, 1);
     await f.runtime.tickRead(); await f.runtime.tickRead(); assert.equal(f.queries.length, 2); assert.equal(f.requests.length, 0);
-    f.advance(800); await f.runtime.tick(); assert.equal(f.requests.length, 1);
+    f.advance(DEFAULTS.debounceMs + 50); await f.runtime.tick(); assert.equal(f.requests.length, 1);
   });
 }
 test('4314215667 부모 채널 read도 thread 확정 뒤 즉시 실행 가능한 read 유형', async () => {
@@ -233,7 +233,7 @@ test('4314215673 route rollback 뒤 history 복구는 job 저장 후 checkpoint 
   f.rest.pages = [[event('300')]]; await f.ingress.recover(thread, f.policy.owner);
   assert.equal((await rows('jobs')).length, 1); assert.equal((await rows('events'))[0]!.accepted, true);
   assert.equal((await f.store.conversation(thread))!.checkpoint, '300'); assert.equal((await f.store.conversation(thread))!.gap, false);
-  f.advance(800); await f.runtime.tick(); assert.equal(f.requests.length, 1);
+  f.advance(DEFAULTS.debounceMs + 50); await f.runtime.tick(); assert.equal(f.requests.length, 1);
 });
 test('4314215673 미수락 재전달은 저장된 명령을 사용하고 다른 actor는 거부', async () => {
   const original = event('durable', { kind: 'command', command: 'read', target: service.id, text: template.id });

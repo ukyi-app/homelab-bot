@@ -19,6 +19,7 @@ import type { DiscordApi } from './discord-protocol.js';
 import { GatewaySession, discordGatewayUrl } from './gateway.js';
 import type { GatewaySocket } from './gateway.js';
 import { GatewayBudget, Health } from './health.js';
+import { typingStart } from './typing.js';
 import { PORTS, receivers } from './http.js';
 import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
@@ -188,6 +189,8 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     connect: deps.connect,
     allowUrl: deps.allowGatewayUrl,
     dispatch: async (type, data) => {
+      // 입력 중 힌트. 오류를 스스로 삼키므로 아래 guard(history gap 장벽)로 가지 않는다.
+      if (type === 'TYPING_START') { await typingStart(store, gate, data, log); return; }
       if (!discord || (type !== 'MESSAGE_CREATE' && type !== 'INTERACTION_CREATE')) return;
       try { await protocol!.gateway(type, data, discord.ingress); }
       catch (error) {

@@ -26,7 +26,7 @@ beforeEach(async () => {
 });
 after(async () => { await database.pg.close(); });
 async function rows(table: string) { return (await database.db.query<Record<string, any>>(`SELECT * FROM ${table}`)).rows; }
-async function queue(id = 'first') { await f.ingress.receive(event(id)); f.advance(800); }
+async function queue(id = 'first') { await f.ingress.receive(event(id)); f.advance(DEFAULTS.debounceMs + 50); }
 async function enqueue() {
   await f.store.enqueue({ key: 'delivery', actor: f.policy.owner, scope: thread, revision: f.policy.revision,
     payload: { kind: 'message', channel: thread.channel, content: '확인된 요약', classification: 'safe_summary' } });
@@ -164,7 +164,7 @@ for (const parent of [true, false]) test(`R2-07 interaction ACK 만료는 처리
   assert.equal(f.rest.messages.length, 1); assert.match(f.rest.messages[0]!.body.content, /다시 보내기 전에/);
   assert.equal(f.rest.messages[0]!.channel, parent ? f.rest.threads[0]!.id : thread.channel);
   assert.equal((await rows('jobs')).length, 1);
-  f.advance(800); await f.runtime.tick(); assert.equal(f.requests.length, 1);
+  f.advance(DEFAULTS.debounceMs + 50); await f.runtime.tick(); assert.equal(f.requests.length, 1);
 });
 test('R2-08 작은 transport 기본 timeout을 예산 설정으로 덮어 느린 headers/body 수집', async () => {
   await queue(); const job = (await f.store.claim())!; job.budget.timeoutMs = 5000;
