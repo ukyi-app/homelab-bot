@@ -226,6 +226,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       track(register(ready.applicationId));
     },
   });
+  health.watchGateway(() => gateway.state);
   const heartbeat = setInterval(() => { health.heartbeat().catch(error => log('heartbeat_failed', errorInfo(error))); },
     deps.heartbeatEveryMs ?? 10_000);
   gateway.start();
