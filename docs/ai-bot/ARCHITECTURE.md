@@ -292,7 +292,9 @@ Discord Gateway → `DiscordProtocol` → `DiscordIngress` → PostgreSQL 이벤
 history 대조는 `RecoveryScheduler`(`src/recovery.ts`)가 대화별로 이벤트 처리 밖에서 돌린다. 일시적인 실패(시간 초과·429·서버 오류·정책 확인 불가)는
 대화별 지수 백오프(1초부터 5분까지, 429·영속 pause면 `retry_after` 이상)로 READY 없이 다시 시도하고, 복구 한도(100건×10쪽/30초)를 넘은 경우만
 수동 처리할 gap으로 남긴다(`recover()`가 `done`·`budget`·`skipped`를 돌려준다. 자기 토큰이 그대로인데 30초 lease가 지난 경우는
-페이지 처리·버퍼 처리·checkpoint 갱신 어디서든 `budget`과 `history_gap` 감사이고, 토큰·구독 세대가 바뀐 경우만 `skipped`). 정책 거부는 재시도하지 않는다. 대기 목록은 메모리이고
+페이지 처리·버퍼 처리·checkpoint 갱신 어디서든 `budget`과 `history_gap` 감사이고, 토큰·구독 세대가 바뀐 경우만 `skipped`.
+gap을 푸는 마지막 transaction은 lease 마감을 transaction 마감으로 받고 마지막 UPDATE 뒤에도 마감을 확인해, 확인 뒤 조회·UPDATE 왕복 중
+마감을 넘기면 되돌려 gap을 남기고 `budget`으로 끝낸다. commit이 마감 안에 끝나면 `done`이다). 정책 거부는 재시도하지 않는다. 대기 목록은 메모리이고
 재시작하면 새 READY가 다시 만든다. RESUMED면 Discord 재생에 맡긴다. slash 명령은 READY마다 guild 단위로 FOUNDATION 12개에 맞추고(`task`·`review-*` 없음, 같으면 쓰지 않음)
 전역 명령은 비운다. 수신도 같은 목록만 받는다. 재연결·RESUME 실측은 실연동(S16)이다.
 
