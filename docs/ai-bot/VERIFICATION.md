@@ -326,3 +326,78 @@ PGlite는 transaction을 직렬화한다. 실제 PostgreSQL 다중 연결 경합
 | 시험 ID | 등급 / 판정 | 확인한 경계 | 남은 검증 / 해소 |
 |---|---|---|---|
 | SEC-02 (capability 재생) | local_integration / pass | execute·cancel capability를 한 번 쓴 뒤 같은 payload·서명 바이트의 다른 base64url 표기(`=`·`==`·`!` 덧붙임, 중간 `!`, 표준 base64 `+/`, 서명 끝 글자의 남는 비트, payload 뒤 `=`)로 다시 보내면 거부, 비정규 표기를 먼저 보내도 nonce를 쓰지 않음, 작업자 HTTP(loopback)는 변형 재전송에 403·실행 1회. 수정 전 같은 시험 3/3 fail(정상 1회 뒤 서명 변형이 모두 통과, HTTP 200으로 같은 작업 재실행) | 재시작 뒤에도 남는 원자적 nonce 저장소, T16b |
+
+## T16b 게시 서버 진입점 (2026-10-30, 로컬·mock)
+
+- 기준: 브랜치 `feat/t16b-publisher-entry`(origin/main `3fb389a` 위). 결정은 [DECISIONS.md](DECISIONS.md) "T16b 결정"(D1·D6·D8). 실제 Discord·Grafana·Argo CD·클러스터·모델에는 연결하지 않았다.
+- `npm run check` 통과. `npm test` **548 tests / 540 pass / 0 fail / 8 skipped**(건너뜀 8개는 `HOMELAB_TEST_PG_SOCKET`이 필요한 실제 PostgreSQL 시험, 새 4개 포함). 로컬 `postgres:18-alpine`(PostgreSQL **18.6**, `--pull=never --network none`, 데이터 tmpfs, 소켓 디렉터리 바인드)을 주면 **547/547 pass**를 3회 연속, 등록 재시도 시험을 더한 마지막 상태에서 **548/548 pass**를 확인했다. Node 24.22.2, TypeScript 7.0.2, PGlite 0.5.10.
+- 흔들림: 전체 병렬 실행에서 T18 실제 프로세스 시험(`S2`·`S3`·`SEC-02`)이 19회 중 4회 한 건씩 실패했다(단독 실행은 매번 통과). 기준 커밋 `3fb389a`도 4회 중 1회 `TASK-03`이 실패했다. 모두 실제 하위 프로세스와 짧은 실시간 대기(예: `test/codex-bridge.test.ts` `graceMs: 500`)에 기대는 시험이다. 이번 변경은 T18 코드를 바꾸지 않았고 새 시험 파일이 병렬 부하를 늘렸다. Docker test 단계가 같은 시험을 돌리므로 PLAN 위험 13과 같은 문제다.
+- 시험 파일: `test/publisher-{migrate,policy,config,read,gateway,main,pg}.test.ts`, 가짜 Gateway `test/fake-gateway.ts`(RFC 6455 최소 구현, 실제 Node 24 WebSocket 클라이언트가 붙음).
+
+| 시험 ID | 등급 / 판정 | 확인한 경계 | 남은 검증 / 해소 |
+|---|---|---|---|
+| AUTH-02 (D1) | local_integration / pass | env `RUNTIME_POLICIES`를 기동 때 한 번 읽고 300.001초·하루 뒤에도 열림, `confirmedAt`은 읽은 시각(사람이 넣으면 거부), JSON·구조 오류는 기동 실패이고 오류에는 필드 경로만, `/revoke`는 같은 값 재시작에도 유지, 해제는 새 revision + `revocationRestores` + 철회 뒤 기동일 때만. 정책 확인 불가 방어 경로(대기·backoff·heartbeat 유지)는 기존 시험이 명시 스위치로 계속 본다. 수정 전 기동 시각 정책은 300.001초 뒤 `PolicyUnavailable`이었다 | 실제 Infisical → ESO → 파드 재시작 반영, S16 |
+| AUTH-01 (명령 범위) | local_integration / pass | 등록이 한 번 실패해도 다음 READY를 기다리지 않고 몇 번 더 시도. 진입점 수신은 FOUNDATION 12개(`chat`·`urgent`·`read`·`stop`·`resume`·`list`·`cancel`·`retry`·`emergency-stop`·`resume-model`·`model-status`·`revoke`)만 받아 `/task`·`/review-status`는 저장·ACK 없음. 등록은 guild 단위 12개, 전역 명령은 비움, 같으면 다시 쓰지 않음. 진입점이 목록을 넘기지 않으면 `/task`·`/review-status`가 저장돼 실패함을 확인 | 실제 Discord 명령 등록·권한, S16 |
+| webhook 경로 (D6, 점검 11) | local_integration / pass | `POST /github`은 정책에 리뷰 설정이 있어도 `review_disabled`로 기록하고 202, 서명이 틀리면 401·저장 없음, `GET /github`·그 밖 경로 404(`/readyz`·`/metrics` 제외) | Cloudflare WAF·Traefik 경유 403·401·ping 200, S13 |
+| EVENT-03 (Gateway) | mock / pass | 실제 WebSocket 클라이언트 + 가짜 Gateway: `v=10&encoding=json`, IDENTIFY intents 33281(DM 끔), heartbeat, READY, 끊기면 `resume_gateway_url`로 RESUME(session_id·마지막 seq, IDENTIFY 예산 미사용), ACK 없음·op 7은 4900으로 끊고 RESUME, INVALID_SESSION(false)은 1~5초 뒤 새 IDENTIFY, 4004·4014는 멈춤, `stop()`은 1000으로 닫고 재연결 없음. 진입점은 READY 뒤 활성 스레드를 checkpoint 다음부터 history로 대조하고 gap을 푼다 | 실제 Discord RESUME·재IDENTIFY·중단 중 메시지 `after=` 대조 30초, S16 |
+| OPS-01 (IDENTIFY 예산) | local_integration / pass | 24시간 900회가 차면 연결하지 않고 대기(감사 행 수 그대로), `session_start_limit.remaining=0`이면 `reset_after`만큼 대기, Gateway 주소는 discord.gg의 wss만 | 실제 크래시 루프에서 IDENTIFY 수, S16 |
+| READ-01 | mock / pass (transport), local_integration / pass (진입점 경로) | Grafana `POST /api/ds/query` 메트릭(uid `victoriametrics`, instant, 계열별 마지막 값)·로그(uid `victorialogs`, 줄 수는 사실, 원문은 1000자로 잘라 untrusted), Argo CD 앱 객체(Healthy·Synced → healthy), Kubernetes Deployment(SA 토큰 요청마다 다시 읽기), HTTP 오류·질의 오류·다른 이름 객체는 관측 불가. 세 transport 모두 `AbortSignal`로 응답 없는 요청과 서버 쪽 연결을 끊음(신호를 빼면 `hung`으로 실패 확인). 진입점에서 `/read` → 스레드 → read 작업 → Argo CD → 결과 게시, 작업자 호출 0 | 라이브 응답 모양, VictoriaLogs 질의 필드 [미확인], S16 |
+| READ-02 | mock / pass | transport가 고정 경로 모양만 만든다: `secret/`·`configmap/`·`pods/…/log`·`exec`·경로 조작·`../` namespace·Argo CD 하위 경로·모르는 datasource(`__proto__` 포함)는 요청 없이 거부. 응답 4MiB 초과(선언 길이·chunked)는 끝까지 담지 않고 관측 불가 | 플랫폼 RBAC·Grafana Viewer·Argo CD live ConfigMap 노출, S8·S16 |
+| OPS-02 (진입점) | local_integration / pass | 8080·8081은 Discord 연결 전에도 받는다(경보 저장, pending 유지). Gateway 연결·루프가 돌 때 healthchecks ping, `stop()` 뒤 수신 닫힘·재연결 없음. 실제 PostgreSQL 풀로 `/readyz` 200(DB 쓰기) | 실제 healthchecks·Telegram·replicas 0, S16 |
+| 위험 5 마이그레이션 | local_integration / pass (PGlite + PostgreSQL 18.6) | 재실행은 적용된 버전을 건너뜀(006이 대기 경보를 다시 막지 않음), 010까지 적용된 기존 DB는 011만, 마이그레이션 Job 셋이 겹쳐도 advisory lock으로 한 번(잠금을 빼면 실패 확인), 목록과 디렉터리·버전 기록 대조. 수정 전 재실행은 대기 경보를 `blocked`로 바꿨다 | 실제 CNPG·Sync hook Job, S10 |
+| 설정 | mock / pass | 비밀 8개·주소 4개 중 하나라도 없거나 틀리면 기동 실패, 오류에 키 이름·사유만(값 없음), `PORT`는 8080만, 작업자 키는 Ed25519. 차트의 `sslmode=require`는 node-pg 기본이 verify-full이라 `uselibpqcompat=true`로 libpq 의미(암호화, 검증 없음)로 맞춤 | 실제 차트 env·CNPG 인증서로 연결, S10 |
+
+### 리뷰 1라운드 반영 (rev-pub-r1, 2026-10-30)
+
+리뷰(`3e28b0b` 기준) 발견 6건과 남는 한계 1건을 고쳤다. 항목마다 리뷰어 재현을 회귀 시험으로 옮겨 **수정 전 코드에서 실패**를 먼저 확인했다. `npm run check` 통과, `npm test` **562 tests / 553 pass / 0 fail / 9 skipped**(건너뜀은 PG 소켓 시험), PostgreSQL 18.6 소켓을 주면 **562/562 pass** 3회 연속.
+
+| 발견 | 고친 방식 | 회귀 시험 / 수정 전 |
+|---|---|---|
+| P1-1 새 READY에서 복구 차례를 기다리는 스레드의 체크포인트가 live 입력으로 올라가 단절 중 메시지 유실 | READY 처리(이벤트 순서 안)에서 live 이벤트보다 먼저 모든 활성 스레드·DM에 `gap=true` 장벽, history 대조는 그 뒤 대화별로 | `P1-1 새 READY: 모든 활성 스레드를 live 입력보다 먼저 막아…`(진입점, 두 스레드 + 동시 live). 수정 전 thread-b history가 `after=300`이고 메시지 200 없음 |
+| P1-2 일시적인 history 실패 뒤 재시도 없음(gap 유지, 버퍼 정지) | `RecoveryScheduler`: 대화별 지수 백오프(429·영속 pause는 `retry_after` 이상), `recover()` 결과 `done`·`budget`·`skipped`로 한도 초과(수동 gap)와 구분 | `P1-2 일시적인 history 조회 실패 뒤 새 READY 없이…`, `P1-2 영속 Discord pause 동안은 history를 부르지 않고…`(진입점), 스케줄러 단위 시험 3개. 수정 전 history 1회·`gap=true`·이벤트 `buffered=true, accepted=false`. 재시도를 빼는 변형에서도 진입점 두 시험 실패 확인 |
+| P2-3 IDENTIFY 5초 간격 미보장 | `GatewayBudget.reserve()`가 일일 900회와 간격 5.5초(5초 + 지연 여유)를 같은 잠금에서 예약해 audit에 남김(재시작에도 유지). IDENTIFY 직전에 예약하고 그 시각까지 대기, 연결 전 `next()`로 대기·소진 확인, RESUME은 예약 없음. 가짜 Gateway에 Discord처럼 간격 위반 시 op 9를 넣고 모든 Gateway·진입점 시험에서 위반 0을 확인 | `P2-3 IDENTIFY는 일일 예산과 함께 직전 IDENTIFY에서 5초 뒤에만…`(실제 `GatewayBudget` + 가짜 5초 제한), `P2-3 GatewayBudget: 예약은 직전 예약에서 5.5초 뒤…`. 수정 전 간격 위반 4회 |
+| P2-4 K8s 이전 세대 상태를 healthy로 판정 | `observedGeneration`이 `generation`보다 작거나 둘 중 하나가 없으면 `unknown` | `P2-4 Kubernetes: 컨트롤러가 최신 세대를 관측하지 않았으면…`(Deployment·StatefulSet 각 5경우). 수정 전 `healthy` |
+| P2-5 8081 listen 실패 시 8080이 남아 프로세스가 반쪽으로 생존 | listen 실패면 두 서버·K8s 연결 풀을 닫고 다시 던짐. 진입점은 종료 코드 1, 남은 것이 있어도 5초 뒤 끝내는 안전 타이머(unref) | `P2-5 8081 listen이 실패하면 먼저 연 8080도 닫고…`(수정 전 거부 없이 기동), `P2-5 실제 진입 프로세스: …종료 코드 1로 끝남`(PG, 실제 `dist/src/main.js`, 자식의 fetch·WebSocket은 시험 장치로 막음, 실패 로그 뒤 3초 안 종료 확인. 수정 전 10초 뒤에도 살아 있음) |
+| P3-6 정책의 모르는 키 이름이 오류·로그에 실림 | 모르는 키는 `unknown_field(개수)`만, 고정 필드 `confirmedAt`만 이름으로 | `P3-6 정책의 모르는 키 이름은…`. 수정 전 `runtime_policies_invalid: fixture-secret-used-as-key` |
+| 남는 한계: `src/gateway.ts`가 외부 오류 `message`를 그대로 로그에 씀 | `gateway_open_failed`·`gateway_event_failed`도 `errorInfo()` 규칙(우리 코드 형식 메시지·code만) | `로그 정제: Gateway 주소 조회 오류…`, `로그 정제: Gateway 이벤트 처리 오류…`. 수정 전 URL·메시지 원문이 로그에 있음 |
+
+### 리뷰 2라운드 반영 (rev-pub-r2, 2026-10-30)
+
+리뷰(`17b738d` 기준) 발견 3건을 고쳤다. 리뷰어 재현을 회귀 시험으로 옮겨 **수정 전 코드에서 7개 모두 실패**를 먼저 확인했고, 고친 부분을 하나씩 빼는 변형에서도 해당 시험이 실패함을 확인했다(원복). `npm run check` 통과, `npm test` **569 tests / 560 pass / 0 fail / 9 skipped**(PG 소켓 없음). PostgreSQL 18.6 소켓 포함은 이 브랜치 5회 중 2회 569/569, 3회는 기존 `TASK-03`(실행 예산 30ms의 실시간 시험) 1건 실패다. 같은 코드의 사본은 3/3 통과했고, 작업자 브랜치의 TASK-03 수정(`bfd8f04`)을 얹은 사본도 3/3 통과했다(호스트 부하에 따른 흔들림, 병합 때 해소).
+
+| 발견 | 고친 방식 | 회귀 시험 / 수정 전 |
+|---|---|---|
+| P1 새 READY의 장벽·대기 항목을 이전 복구가 풀거나 지움 | 장벽 UPDATE가 같은 문장에서 기존 `recovery_token`을 지워 새 복구 세대를 연다(이전 복구는 토큰이 달라 `skipped`). 스케줄러는 자기가 시작한 대기 항목일 때만 완료·재시도·삭제를 반영 | `R2-1 마지막 정리 중 새 READY…`(수정 전 대기 항목 0), `R2-1 history 처리 중 새 READY…`(수정 전 이전 스냅샷으로 gap 해제), `R2-1 진입점: history 대기 중 새 READY…`(실제 Gateway 재IDENTIFY, 수정 전 메시지 200 유실). 토큰 무효화만 빼면 history 시험, 소유 확인만 빼면 정리 시험이 실패 |
+| P2 30초 lease 만료를 재시도 가능한 skipped로 반환 | `recover()`의 확인이 `stale`(토큰·구독 세대 변경)과 `expired`(자기 lease 만료)를 구분, 만료는 페이지·버퍼·checkpoint 어디서든 `budget` + `history_gap` 감사 | `R2-2 history 페이지 처리 중 30초…`(수정 전 `['skipped','skipped','skipped']`), `R2-2 마지막 checkpoint 갱신에서…`, `R2-2 버퍼 처리 중…`(둘 다 수정 전 `skipped`) |
+| P2 예약 응답 지연 때 실제 IDENTIFY 간격 위반 | 예약에 전송 창(0.4초)을 두고 창 안에서만 전송, 창을 놓친 예약은 지우고 다시 예약(연결당 3번). 간격 5.5초 = 5초 + 창 + 망 여유 0.1초라 실제 전송 간격 5.1초 이상 | `R2-3 예약 응답이 늦어져도…`(첫 COMMIT 응답 900ms 지연, 가짜 5초 제한. 수정 전 위반 1회). 창 확인만 빼면 실패 |
+
+리뷰가 짚은 시험 흔들림 위험 중 `P1-2 일시적인 history 조회 실패…`의 `calls === 1` 폴링은 `calls >= 1`로 바꿨다. 빠른 Gateway 시험의 대역 예산은 간격 300ms·창 50ms로 실제 전송 간격 250ms 이상(가짜 제한 200ms)이다.
+
+### 리뷰 3라운드 반영 (rev-pub-r3, 2026-10-30)
+
+리뷰(`828172e` 기준)의 P2 1건을 고쳤다. `npm run check` 통과, `npm test` **573 tests / 564 pass / 0 fail / 9 skipped**(PG 소켓 없음, 3회 중 1회는 기존 `TASK-03` 1건 실패), PostgreSQL 18.6 소켓 포함 **573/573 pass** 3회 연속.
+
+| 발견 | 고친 방식 | 회귀 시험 / 수정 전 |
+|---|---|---|
+| P2 gap을 푸는 마지막 transaction에서 `check()` 뒤 빈 버퍼 조회·gap UPDATE 왕복 중 30초를 넘겨도 `done`(수동 gap·감사 생략) | 그 transaction에 lease 마감(`started + 30초`)을 transaction 마감으로 넘기고, gap UPDATE 뒤에도 마감을 확인한다. 넘으면 되돌려 gap을 남기고 `history_gap` 감사와 `budget`. 실패 원인이 무엇이든 그 시점에 마감을 넘겼으면 한도 초과로 본다. 토큰·구독 변경은 그대로 `skipped` | `R3-1 리뷰어 재현: 인가 왕복 누적 + 마지막 빈 버퍼 조회 응답…`(수정 전 `['done']`), `R3-1 마지막 check() 뒤 빈 버퍼 조회 응답에서…`, `R3-1 마지막 check() 뒤 gap 해제 UPDATE 응답에서…`(둘 다 수정 전 `done`), 대조 `R3-1 경계 안에서 끝나면 그대로 done`. 두 장치(transaction 마감, 마지막 확인)는 겹치는 방어라 하나만 빼면 시험이 통과하고 둘 다 빼면 세 시험이 실패한다 |
+
+리뷰가 짚은 대로 R2-2의 "마지막 checkpoint 갱신" 시험은 마지막 `check()` **전**에 시간을 넘기고, 버퍼 시험은 `check()` 안의 행 잠금 응답에서 넘긴다. 이번 R3-1 시험이 마지막 `check()` **뒤** 경계를 본다.
+
+### PR #12 Codex 리뷰 P1 반영 (4420530263, 2026-10-30)
+
+지적: 활성 스레드 메시지 처리가 DB 일시 끊김이나 `DiscordProtocol.channel()` REST 실패로 끝나면 이벤트를 로그만 남기고 버렸다. Gateway sequence는 이미 지나 RESUME으로도 다시 오지 않고, 뒤 메시지가 checkpoint를 올리면 다음 READY 복구도 그 메시지를 건너뛴다. 타당하다고 판단해 고쳤다. `npm run check` 통과, `npm test` **578 tests / 569 pass / 0 fail / 9 skipped**(PG 소켓 없음), PostgreSQL 18.6 소켓 포함 3회 중 2회 **578/578**, 1회는 기존 `TASK-03` 1건 실패.
+
+| 고친 방식 | 회귀 시험 / 수정 전 |
+|---|---|
+| 진입점 dispatch가 실패를 나눈다. 확정 거부(`Denied`, `ZodError`, `DiscordRejected` 403/404)는 버린다. 그 밖(일시 장애)이고 메시지면 그 채널의 활성 스레드·DM에 `RecoveryScheduler.guard()`로 장벽(gap, 진행 중 복구 토큰 무효화, 대기 항목)을 세우고 history 대조로 메운다. 장벽 UPDATE가 실패하면 설 때까지 다시 시도하고 그동안 다음 이벤트는 기다린다. 상호작용은 되살리지 않는다 | `PR12 활성 스레드 메시지가 일시 장애(채널 REST 조회)로…`, `…(DB 쓰기)로…`(둘 다 수정 전 201 없음·checkpoint 202·gap 해제), `PR12 장벽 UPDATE도 일시 실패하면…`(장벽을 기다리지 않는 변형에서 실패), `PR12 확정 거부(허용되지 않은 사용자)는 장벽을 세우지 않고…`(확정 거부도 장벽을 세우는 변형에서 실패), `PR12 guard()는 그 채널의 활성 스레드·DM에만…`(단위) |
+
+남는 범위: 부모 채널의 멘션 메시지와 상호작용은 history 대조 대상이 아니라 일시 장애 때 되살리지 않는다(ACK가 없으니 사용자가 다시 보낸다). 활성 대화가 없는 스레드의 메시지도 같다.
+
+### PR #12 Codex 재리뷰 반영 (4420612638 P1, 4420612644 P2, 2026-10-30)
+
+두 지적 모두 타당하다고 판단해 고쳤다. 4420592975(P2, DB TLS 검증)는 플랫폼 전체의 `sslmode=require` 선택이라 이번 범위에서 바꾸지 않았다(lead가 스레드에서 다룸). `npm run check` 통과, `npm test` **581 tests / 572 pass / 0 fail / 9 skipped**(PG 소켓 없음), PostgreSQL 18.6 소켓 포함 5회 중 2회 **581/581**, 3회는 기존 `TASK-03` 1건만 실패.
+
+| 지적 | 고친 방식 | 회귀 시험 / 수정 전 |
+|---|---|---|
+| 4420612638 P1: 재시작 때 남은 queued 작업이 첫 READY 장벽보다 먼저 claim돼 이전 입력으로 모델을 부름 | `Runtime` 루프를 첫 READY 장벽이 선 뒤에 시작한다. 이후 READY의 장벽은 claim의 gap 조건이 막는다 | `PR12-2 Gateway가 붙기 전(첫 READY 장벽 전)에는 남아 있던 queued 작업을 claim하지 않음`(수정 전 `failed`, 작업자 호출), `PR12-2 재시작 뒤 첫 READY 복구가 중단 중 메시지를 먼저 읽어 이전 queued 작업을 supersede`(수정 전 `failed`, 기대 `superseded`) |
+| 4420612644 P2: 대기 항목 없는 복구 루프가 DB 없이 하트비트 생존을 기록해 DB 장애 중에도 ping | 루프마다 "한 바퀴 성공 = DB에 닿음"인지 표시하고, 그런 루프(runtime·publisher)만 `health.loop()`. 복구 루프는 세지 않는다 | `PR12-3 DB가 끊기면 DB에 닿지 못한 루프는 하트비트 생존으로 치지 않아 60초 뒤 ping이 멈춤`(시계 61초 전진, 수정 전 DB 장애 중 ping 1회) |

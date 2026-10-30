@@ -130,9 +130,9 @@ test('R7-AUDIT 조회 중 서비스 철회도 일반 실패가 아닌 취소로 
   await assertRevoked(true); assert.equal(queries, 1); assert.equal(f.requests.length, 0);
 });
 
-for (const status of ['failed', 'limited', 'auth_expired'] as const) test(`R7-AUDIT ${status} 결과에서 정책 stale은 철회로 오인하지 않음`, async () => {
+for (const status of ['failed', 'limited', 'auth_expired'] as const) test(`R7-AUDIT ${status} 결과에서 정책 확인 불가는 철회로 오인하지 않음`, async () => {
   await queue(); f.setRun(async () => {
-    f.policy.confirmedAt -= DEFAULTS.policyMaxAgeMs + 1; return { status, stopped: true };
+    f.setPolicyUnavailable(true); return { status, stopped: true };
   });
   await f.runtime.tick(); const job = (await rows('jobs'))[0]!;
   assert.equal(job.state, status === 'failed' ? 'failed' : 'waiting_user');

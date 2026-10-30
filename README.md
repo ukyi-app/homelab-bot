@@ -2,7 +2,7 @@
 
 T16a FOUNDATION 구현. Discord 수신 → 권한 검사 → PostgreSQL 저장 → 제한 조회 또는
 직렬 모의 작업자 → outbox → Discord 게시를 로컬에서 검증한다.
-상태는 `LOCAL_VERIFIED_INTEGRATION_PENDING`이다. 운영 실행·배포 진입점은 아직 없다.
+상태는 `LOCAL_VERIFIED_INTEGRATION_PENDING`이다. 게시 서버 진입점(T16b)은 아래 "게시 서버 실행"에 있고, 실연동·배포는 아직이다.
 
 ```sh
 npm ci --ignore-scripts --no-audit --no-fund
@@ -14,6 +14,25 @@ npm test
 PGlite와 임시 디스크 DB, loopback HTTP 서버, 주입한 Gateway/REST·관측·모델 모의를 쓴다.
 시험 데이터는 합성 값이다. 임시 파일은 무시되는 `.local/` 안에서 만들고 지운다.
 패키지 설치 외 네트워크는 필요하지 않다. 실제 PostgreSQL 서버의 다중 연결·CNPG·RBAC는 T16b 검증이다.
+
+## 게시 서버 실행 (T16b)
+
+```sh
+npm run build
+node dist/src/migrate-main.js   # DATABASE_URL만 필요. 적용된 버전은 건너뛴다
+node dist/src/main.js           # 게시 서버. 8080(/readyz·/metrics·/github), 8081(/alerts)
+```
+
+- 비밀 env(Infisical `/apps/homelab-bot/`): `DATABASE_URL`(차트가 넣음), `DISCORD_BOT_TOKEN`, `RUNTIME_POLICIES`,
+  `GRAFANA_READER_TOKEN`, `ARGOCD_READER_TOKEN`, `HEALTHCHECKS_PING_URL`, `WORKER_CONTROL_PRIVATE_KEY`(Ed25519 PKCS8 PEM),
+  `GITHUB_REVIEW_WEBHOOK_SECRET`(16자 이상).
+- 주소 env(차트 values, 기본값 없음): `WORKER_URL`(http, 경로 `/`), `GRAFANA_URL`, `ARGOCD_URL`, `KUBERNETES_API_URL`(https).
+  차트가 넣는 `PORT`가 있으면 8080이어야 한다.
+- 하나라도 없거나 틀리면 기동하지 않고 키 이름·사유만 로그에 남긴다. 값은 남기지 않는다.
+- `RUNTIME_POLICIES` 모양은 [runtime-policy.example.json](docs/ai-bot/config/runtime-policy.example.json)이다. `confirmedAt`은 넣지 않는다.
+  값을 바꾸면 파드를 다시 시작해야 반영된다(D1). 즉시 차단은 `/revoke`다.
+- Kubernetes 읽기는 파드의 SA 토큰·CA(`/var/run/secrets/kubernetes.io/serviceaccount`)를 쓴다. 차트 `serviceAccountName: bot-reader`가 필요하다.
+- 로컬에서 실제 Discord·플랫폼에 붙이지 않는다. 진입점 시험은 `test/publisher-*.test.ts`(가짜 Gateway·REST·HTTP)다.
 
 ## 버전
 
@@ -34,19 +53,23 @@ PGlite와 임시 디스크 DB, loopback HTTP 서버, 주입한 Gateway/REST·관
 | 모듈 | 책임 |
 |---|---|
 | `src/database.ts`, `src/store.ts`, `migrations/001_foundation.sql` | PostgreSQL 트랜잭션, inbox·jobs·outbox·대화·예약 기반, lease·fencing·재시작 |
-| `src/policy.ts` | 매 접근 때 정책 파일 재읽기, 5분 freshness, owner·scope 검사, 영속 즉시 거부 목록 |
+| `src/policy.ts` | env `RUNTIME_POLICIES`를 기동 때 한 번 읽기(D1), owner·scope 검사, 영속 즉시 거부 목록 |
 | `src/discord.ts`, `src/discord-protocol.ts` | Gateway payload 정규화, 명령·버튼, 1440분 공개 스레드, ACK·REST·대조 |
 | `src/read.ts` | 등록 서비스와 승인 템플릿, namespace·시간·행·바이트 제한, 현재 근거와 미확인 구분 |
 | `src/worker.ts`, `src/worker-http.ts`, `src/runtime.ts` | 서명 capability, 포트 8080 HTTP 계약, 두 레인 합산 직렬 1, 취소·한도·unknown |
 | `src/alerts.ts`, `src/health.ts`, `src/http.ts` | Alertmanager 사건 요약, 8080/8081 수신기, readiness·Gateway 지표·조건부 하트비트 |
+| `src/main.ts`, `src/config.ts`, `src/log.ts` | 게시 서버 진입점(T16b): env 설정, pg Pool, 수신기·루프·Gateway 조립, SIGTERM 정리 |
+| `src/migrate-main.ts` | 마이그레이션 진입점(차트 `migration.command`), advisory lock |
+| `src/gateway.ts`, `src/commands.ts` | Gateway 세션(IDENTIFY·heartbeat·RESUME·재연결·예산), FOUNDATION slash 명령 등록 |
+| `src/read-transports.ts`, `src/catalog.ts` | Grafana·Argo CD·Kubernetes 읽기 transport와 응답 투영, 서비스·질의 템플릿 |
 
 외부 SDK와 인증은 주입 경계다. `DiscordProtocol.gateway()`에 인증된 Gateway frame을 전달하고,
 REST는 `discordHttpApi(token, fetch)`를 주입한다. 직접 호출하지 않는 한 네트워크를 열지 않는다.
 `receivers()`·`workerServer()`도 반환만 하며 호출자가 명시적으로 listen해야 한다.
 게시 서버 수신 포트는 8080, 경보는 8081, 작업자 Service는 8080이다.
 
-`Postgres`에는 전용 DB/역할의 `pg.Pool`을 주입한다. `migrate()`는 빌드 결과에서 호출한다.
-운영 마이그레이션은 T16b의 Sync hook Job에서 실행한다. `001`은 초기 스키마, `002`는 철회 당시 정책 revision, `003`은 철회 ID·게시 일시 중지 상태, `004`는 결과별 서비스 접근 범위, `005`는 메시지 페이지 순서·경보 전달 키·기존 read 유형을 보완한다.
+`Postgres`에는 전용 DB/역할의 `pg.Pool`을 주입한다. `migrate()`는 `schema_migrations`에 기록된 버전을 건너뛴다(T16b).
+운영 마이그레이션은 Sync hook Job이 `node dist/src/migrate-main.js`로 매 sync마다 실행한다. `001`은 초기 스키마, `002`는 철회 당시 정책 revision, `003`은 철회 ID·게시 일시 중지 상태, `004`는 결과별 서비스 접근 범위, `005`는 메시지 페이지 순서·경보 전달 키·기존 read 유형을 보완한다.
 `006`은 서비스 범위를 복원할 수 없는 기존 미전달 경보를 blocked로 두고 감사한다. 새 경보 수신은 서비스 범위를 가진 새 세대를 만든다.
 `007`은 복구 buffer·구독 세대/활성화 커서·복구 lease·게시 dispatch 표식을 추가한다. 기존 sending/unknown은 전송 가능성이 있는 것으로 이관한다.
 후속 티켓도 기존 파일을 변경하지 않고 expand/contract 후속 파일을 추가한다.
@@ -54,7 +77,7 @@ REST는 `discordHttpApi(token, fetch)`를 주입한다. 직접 호출하지 않�
 ## 사용 계약
 
 허용 채널에서 멘션 또는 `/chat`으로 시작한다. `/read text:<template-id> target:<service-id>`는
-최근 min(60초, 템플릿 상한)의 승인 템플릿을 실행한다. 시간창 상한은 유한한 1초 이상이어야 한다. `/task`는 모의 작업 레인 계약이다.
+최근 min(60초, 템플릿 상한)의 승인 템플릿을 실행한다. 시간창 상한은 유한한 1초 이상이어야 한다. `/task`는 모의 작업 레인 계약이다(배포 진입점은 `/task`·`/review-*`를 등록하지 않고 수신에서도 닫는다, T16b).
 `/read`는 독립 job으로 즉시 대기열에 들어가며, 후속 chat/read가 앞선 조회를 합치거나 폐기하지 않는다.
 활성 스레드 후속 메시지는 멘션 없이 받고, intent를 끄면 명령/버튼만 받는다. `/urgent`는 debounce를 건너뛰고 후속 일반 chat에도 priority 0을 유지한다.
 `/stop`, `/resume`, `/list`, `/cancel target:<job-id>`, `/retry target:<job-id>`,
@@ -138,9 +161,9 @@ unknown 게시 대조가 429를 만나면 루프를 중단하고 retry_after까�
 
 ## 후속 작업의 경계
 
-T16b는 실제 PostgreSQL·Gateway 세션 연결, 라이브 조회 응답 투영, 실제 Codex 실행기,
-전용 CODEX_HOME·네트워크 격리, 지속 capability 재생 방지 저장소, 정책 갱신 확인,
-Gateway 재연결·경보 규칙·하트비트 연결과 첫 배포를 맡는다.
+T16b 게시 서버 진입점은 Gateway 세션·재연결, 라이브 조회 transport·투영, 정책 env 읽기(D1), 마이그레이션 진입점,
+하트비트 연결을 로컬·mock으로 갖췄다. 실제 Codex 실행기, 전용 CODEX_HOME·네트워크 격리, 지속 capability
+재생 방지 저장소는 작업자 진입점(T16b), 경보 규칙·실연동·첫 배포는 T16b 뒤 단계다.
 작업자 /v1/cancel은 `{job, lease}`를 필수로 받고 capability·현재 실행·중단 어댑터 모두 같은 lease를 사용한다.
 capability는 발급 시각이 검증기보다 최대 1000ms 앞서는 것만 허용한다. 발급→만료 30초 상한과
 만료 시각·서명·본문·job/lease·일회 사용 검증은 유지한다.

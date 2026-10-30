@@ -15,6 +15,9 @@ export interface DiscordRest {
 const noMentions = { allowed_mentions: { parse: [] as never[] } };
 const controls = new Set(['stop', 'resume', 'list', 'cancel', 'retry', 'emergency-stop', 'resume-model', 'model-status', 'revoke',
   'review-status', 'review-resume', 'review-cancel']);
+// 수신이 아는 명령 전체. 배포 진입점은 단계에 맞춰 더 좁은 목록(FOUNDATION_COMMANDS)을 넘긴다.
+export type RecoveryOutcome = 'done' | 'budget' | 'skipped';
+export const ALL_COMMANDS: ReadonlySet<string> = new Set(['chat', 'urgent', 'task', 'read', ...controls]);
 const EventSchema = z.strictObject({
   id: z.string().min(1), actor: z.string().min(1), scope: ScopeSchema,
   text: z.string().max(DEFAULTS.maxInputChars), kind: z.enum(['message', 'command', 'button']),
@@ -23,10 +26,13 @@ const EventSchema = z.strictObject({
 });
 export class DiscordIngress {
   constructor(private readonly store: Store, private readonly gate: PolicyGate,
-    private readonly rest: DiscordRest, public readonly messageContent = true) {}
+    private readonly rest: DiscordRest, public readonly messageContent = true,
+    private readonly commands: ReadonlySet<string> = ALL_COMMANDS) {}
   async receive(input: EventInput, recovered = false, recovery?: { token: string; epoch: number }): Promise<string | undefined> {
     const event = EventSchema.parse(input);
     if (event.bot || event.webhook) return;
+    // 이 단계에서 열지 않은 명령·버튼은 저장·권한 확인 전에 닫는다(T16b: task·review-*는 FOUNDATION 밖).
+    if (event.kind !== 'message' && !this.commands.has(event.command ?? '')) throw new Denied();
     const p = await this.gate.authorize(event.actor, event.scope);
     if (!this.messageContent && event.kind === 'message') return;
     const conversation = await this.store.conversation(event.scope);
@@ -120,7 +126,9 @@ export class DiscordIngress {
     }
     return saved.id;
   }
-  async recover(scope: Scope, actor: string): Promise<void> {
+  // 결과: done(빈틈 없이 따라잡고 gap 해제), budget(쪽 수·30초 복구 한도를 넘어 gap 유지, 수동 처리. 도중 lease 만료 포함),
+  // skipped(구독 꺼짐·다른 복구 진행 중·도중에 토큰이나 구독 세대가 바뀜. 이 복구는 손을 뗀다). 일시적인 통신 실패는 예외로 던진다.
+  async recover(scope: Scope, actor: string): Promise<RecoveryOutcome> {
     await this.gate.authorize(actor, scope);
     const token = randomUUID();
     const started = this.store.now();
@@ -131,55 +139,82 @@ export class DiscordIngress {
         [row.id, token, started + DEFAULTS.recoveryMs]);
       return row;
     });
-    if (!conversation) return;
-    const valid = async (store: Store) => {
+    if (!conversation) return 'skipped';
+    // 토큰·구독 세대가 바뀌었으면(구독 중지, 새 READY 장벽) 이 복구는 끝(stale). 자기 토큰이 그대로인데 시각만 지났으면
+    // 30초 복구 한도를 쓴 것(expired)이라 수동 gap(budget)으로 남긴다. 둘을 섞으면 한도 초과가 재시도로 반복된다.
+    const check = async (store: Store): Promise<'ok' | 'stale' | 'expired'> => {
       await this.gate.withDatabase(store.db).authorize(actor, scope);
       const row = await store.ownedConversation(scope, actor, true);
-      return row.active && row.subscription_epoch === conversation.subscription_epoch && row.recovery_token === token
-        && Number(row.recovery_until) > store.now();
+      if (!row.active || row.subscription_epoch !== conversation.subscription_epoch || row.recovery_token !== token) return 'stale';
+      return Number(row.recovery_until) > store.now() ? 'ok' : 'expired';
     };
     let after = conversation.checkpoint;
     try {
-      for (let page = 0; page < DEFAULTS.recoveryPages; page++) {
+      pages: for (let page = 0; page < DEFAULTS.recoveryPages; page++) {
         await this.gate.authorize(actor, scope);
         if (this.store.now() - started >= DEFAULTS.recoveryMs) break;
-        if (!await this.store.atomic(valid)) return;
+        let state = await this.store.atomic(check);
+        if (state === 'stale') return 'skipped';
+        if (state === 'expired') break;
         const pause = await this.store.discordPauseUntil(scope.channel);
         if (pause > this.store.now()) throw new RateLimited(pause - this.store.now());
         const messages = await this.rest.history(scope.channel, after, 100).catch(async error => {
           if (error instanceof RateLimited) await this.store.recordRateLimit(error, scope.channel);
           throw error;
         });
-        if (!await this.store.atomic(valid)) return;
+        state = await this.store.atomic(check);
+        if (state === 'stale') return 'skipped';
+        if (state === 'expired') break;
         if (messages.length > 100) throw new Error('history_page_overflow');
         messages.sort((a, b) => BigInt(a.id) < BigInt(b.id) ? -1 : 1);
         for (const message of messages) {
           if (message.scope.kind !== scope.kind || message.scope.guild !== scope.guild
             || message.scope.channel !== scope.channel || message.scope.parent !== scope.parent) throw new Denied();
           if (after && BigInt(message.id) <= BigInt(after)) throw new Error('history_not_advancing');
-          if (!await this.store.atomic(valid)) return;
+          state = await this.store.atomic(check);
+          if (state === 'stale') return 'skipped';
+          if (state === 'expired') break pages;
           try { await this.receive(message, true, { token, epoch: conversation.subscription_epoch }); } catch (error) { if (!(error instanceof Denied)) throw error; }
           after = message.id;
         }
-        if (!await this.store.atomic(async store => {
-          if (!await valid(store)) return false;
+        state = await this.store.atomic(async store => {
+          const current = await check(store);
+          if (current !== 'ok') return current;
           await store.db.query(`UPDATE conversations SET checkpoint=$2 WHERE id=$1 AND $2::text IS NOT NULL
             AND (checkpoint IS NULL OR checkpoint::numeric<$2::numeric)`, [conversation.id, after]);
-          return true;
-        })) return;
+          return current;
+        });
+        if (state === 'stale') return 'skipped';
+        if (state === 'expired') break;
         if (messages.length < 100) {
           // The same conversation lock decides whether a live event is buffered or routed directly.
           for (let drained = 0; drained <= DEFAULTS.recoveryPages * 100; drained++) {
             if (this.store.now() - started >= DEFAULTS.recoveryMs) break;
-            const next = await this.store.atomic(async store => {
-              if (!await valid(store)) return { done: true };
-              const event = (await store.db.query<{ delivery_id: string; actor_id: string; scope: Scope; payload: EventInput }>(
-                'SELECT * FROM events WHERE conversation_id=$1 AND buffered=true ORDER BY event_order LIMIT 1', [conversation.id])).rows[0];
-              if (event) return { event };
-              await store.db.query('UPDATE conversations SET gap=false WHERE id=$1', [conversation.id]);
-              return { done: true };
-            });
-            if (next.done) return;
+            // gap을 푸는 마지막 transaction은 lease 마감 안에서만 commit한다. check() 뒤의 조회·UPDATE 왕복 중에 마감을 넘기면
+            // (마감 전달로 다음 질의 전 또는 마지막 확인에서) 되돌려 gap을 남기고 budget으로 끝낸다. 토큰·구독 변경은 그대로 skipped다.
+            const lease = { expiresAt: started + DEFAULTS.recoveryMs, now: this.store.now };
+            let next;
+            try {
+              next = await this.store.atomic(async store => {
+                const current = await check(store);
+                if (current !== 'ok') return { done: true, cleared: false, state: current };
+                const event = (await store.db.query<{ delivery_id: string; actor_id: string; scope: Scope; payload: EventInput }>(
+                  'SELECT * FROM events WHERE conversation_id=$1 AND buffered=true ORDER BY event_order LIMIT 1', [conversation.id])).rows[0];
+                if (event) return { event };
+                await store.db.query('UPDATE conversations SET gap=false WHERE id=$1', [conversation.id]);
+                if (store.now() >= lease.expiresAt) throw new Error('recovery_expired');
+                return { done: true, cleared: true };
+              }, lease);
+            } catch (error) {
+              // 마감을 넘겨 실패했으면(우리 확인·마감 검사·DB의 transaction/statement timeout 무엇이든) 한도 초과다.
+              if (this.store.now() >= lease.expiresAt) break pages;
+              throw error;
+            }
+            if (next.done) {
+              if (next.cleared) return 'done';
+              if (next.state === 'expired') break pages;
+              return 'skipped';
+            }
             const buffered = next.event!;
             try { await this.receive({ id: buffered.delivery_id, actor: buffered.actor_id, scope: buffered.scope, text: buffered.payload.text,
               kind: buffered.payload.kind, command: buffered.payload.command, target: buffered.payload.target, mention: buffered.payload.mention, urgent: buffered.payload.urgent }, true, { token, epoch: conversation.subscription_epoch }); }
@@ -192,6 +227,7 @@ export class DiscordIngress {
         }
       }
       await this.store.audit('history_gap', conversation.id, { reason: 'recovery_budget' });
+      return 'budget';
     } finally {
       await this.store.db.query('UPDATE conversations SET recovery_token=NULL,recovery_until=NULL WHERE id=$1 AND recovery_token=$2', [conversation.id, token]);
     }

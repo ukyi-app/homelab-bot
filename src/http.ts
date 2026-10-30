@@ -15,14 +15,16 @@ export async function body(request: IncomingMessage): Promise<unknown> {
   }
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
-export function receivers(health: Health, alerts: AlertIngress) {
+// routes.github: 공개 webhook(POST /github, D6). 없으면 404 그대로다. 8080의 그 밖 경로는 /readyz·/metrics만 연다.
+export function receivers(health: Health, alerts: AlertIngress, routes: { github?: (req: IncomingMessage, res: ServerResponse) => Promise<void> } = {}) {
   const app = createServer(async (req, res) => {
-    if (req.method === 'GET' && req.url === '/readyz') {
+    if (req.url === '/github' && routes.github) await routes.github(req, res);
+    else if (req.method === 'GET' && req.url === '/readyz') {
       const ready = await health.ready(); res.writeHead(ready ? 200 : 503).end();
     } else if (req.method === 'GET' && req.url === '/metrics') {
       try { res.writeHead(200, { 'content-type': 'text/plain' }).end(await health.metrics()); }
       catch { res.writeHead(503).end(); }
-    } else res.writeHead(404).end(); // GitHub ingestion belongs to T17; no permissive placeholder.
+    } else res.writeHead(404).end();
   });
   const alertServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method !== 'POST' || req.url !== '/alerts') { res.writeHead(404).end(); return; }

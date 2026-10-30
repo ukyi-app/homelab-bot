@@ -5,7 +5,7 @@ import { gatewayMessage, hasMarker } from './discord.js';
 import type { DiscordIngress, DiscordRest, GatewayFrame } from './discord.js';
 
 export interface DiscordApi {
-  request(method: 'GET' | 'POST', path: string, body?: unknown, options?: { expiresAt: number }): Promise<unknown>;
+  request(method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown, options?: { expiresAt: number }): Promise<unknown>;
 }
 const ChannelSchema = z.object({ id: z.string(), type: z.number(), parent_id: z.string().nullable().optional(), guild_id: z.string().optional() });
 const MessageSchema = z.object({ id: z.string(), channel_id: z.string(), guild_id: z.string().optional(),
@@ -27,7 +27,7 @@ export class DiscordProtocol implements DiscordRest {
     if (c.id !== id) throw new Denied();
     return { type: c.type, parent_id: c.parent_id ?? undefined, guild_id: c.guild_id };
   }
-  async gateway(type: 'MESSAGE_CREATE' | 'INTERACTION_CREATE', raw: unknown, ingress: DiscordIngress): Promise<void> {
+  async gateway(type: 'MESSAGE_CREATE' | 'INTERACTION_CREATE', raw: unknown, ingress: Pick<DiscordIngress, 'receive'>): Promise<void> {
     const receivedAt = this.now();
     if (type === 'MESSAGE_CREATE') {
       const frame = MessageSchema.parse(raw);

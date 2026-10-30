@@ -229,7 +229,7 @@ test('AUTH-01 댓글 트리거: Bot 댓글 무시, comment.author_association �
   r.policy().commentCommand = null;
   assert.equal((await hook('issue_comment', commentEvent())).reason, 'comment_trigger_disabled');
 });
-test('AUTH-01 서명 위조·헤더 누락·리뷰 정책 없음·stale 정책은 저장 없이 거부', async () => {
+test('AUTH-01 서명 위조·헤더 누락·리뷰 정책 없음·정책 확인 불가는 저장 없이 거부', async () => {
   assert.equal((await hook('pull_request', prEvent('opened'), randomUUID(), 'wrong-secret')).status, 401);
   const raw = Buffer.from(JSON.stringify(prEvent('opened')));
   const signature = `sha256=${createHmac('sha256', SECRET).update(raw).digest('hex')}`;
@@ -238,9 +238,9 @@ test('AUTH-01 서명 위조·헤더 누락·리뷰 정책 없음·stale 정책�
   assert.equal((await r.ingress.receive({ 'x-github-delivery': 'd2', 'x-github-event': 'pull_request' }, raw)).status, 401);
   assert.equal((await r.ingress.receive({ 'x-hub-signature-256': signature, 'x-github-event': 'pull_request' }, raw)).status, 400);
   assert.equal((await rows('github_deliveries')).length, 0);
-  f.advance(DEFAULTS.policyMaxAgeMs + 1);
+  f.setPolicyUnavailable(true);
   assert.equal((await hook('pull_request', prEvent('opened'))).status, 503);
-  f.advance(-(DEFAULTS.policyMaxAgeMs + 1));
+  f.setPolicyUnavailable(false);
   delete f.policy.review;
   assert.equal((await hook('pull_request', prEvent('opened'))).reason, 'review_disabled');
   assert.equal((await rows('jobs')).length, 0);
@@ -909,10 +909,10 @@ test('SEC-02 리뷰 레인 작업자 HTTP(loopback): capability 없음·위조·
 
 test('EVENT-02 게시 직전 정책 확인 불가는 재시도 횟수를 쓰지 않고 기다렸다가 갱신 뒤 한 번 게시', async () => {
   await opened(); await r.runtime.tick();
-  f.advance(DEFAULTS.policyMaxAgeMs + 1);
+  f.setPolicyUnavailable(true);
   for (let i = 0; i < DEFAULTS.maxRetries + 3; i++) { await r.publisher.deliver(); f.advance(60_000); }
   assert.deepEqual((await deliveries()).map(d => [d.state, d.reason, d.attempt]), [['pending', 'policy_unavailable', 0]]);
-  f.policy.confirmedAt = f.now();
+  f.setPolicyUnavailable(false);
   await r.publisher.deliver();
   assert.deepEqual((await deliveries()).map(d => d.state), ['sent']);
   assert.equal(r.gh.writes.length, 1);

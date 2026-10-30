@@ -134,10 +134,10 @@ safety:
   execute_untrusted_pr_code_by_default: false
   public_output_from_private_source: deny_without_declassification
   allow_policy_self_edit: false
-  runtime_policy_source: mounted_secret_file  # T16a 확정. 매 접근 재읽기. 실측·마운트는 T16b
-                                              # 공유 차트 변경 필요(설계 C.4.5는 env만)
-  runtime_policy_max_age_seconds: 300         # T16a. trusted updater의 원본 revision 확인 시각 기준. updater 연결은 T16b
-                                              # Infisical에서만 철회하면 ESO 갱신 주기만큼 통과할 수 있다. 즉시 철회는 owner 거부 목록 명령으로만
+  runtime_policy_source: env_at_startup      # D1(사용자 2026-10-30, T16b). env RUNTIME_POLICIES를 기동 때 한 번 읽는다
+                                              # 값 변경은 homelab secret set의 파드 재시작으로 반영. 모양은 runtime-policy.example.json
+  runtime_policy_max_age_seconds: null        # D1로 없앰(T16a의 300초 검사). confirmedAt은 봇이 읽은 시각으로 채운다
+                                              # Infisical에서만 철회하면 ESO 갱신 주기와 재시작까지 통과할 수 있다. 즉시 철회는 owner 거부 목록 명령으로만
                                               # (owner ID 검사 슬래시 명령, 모델 경유 없음, 거부 추가만. 해제는 새 revision·철회 이후 확인·owner/scope 허용·revocationRestores에 해당 denial_id 명시가 모두 필요)
   worker_control_auth: ed25519_capability     # T16a: 30초, job·lease·operation·body 결합. 영속 nonce 저장소는 T16b
 
@@ -179,7 +179,6 @@ secret_keys:
     - ARGOCD_READER_TOKEN
     - HEALTHCHECKS_PING_URL
     - WORKER_CONTROL_PRIVATE_KEY              # T16a Ed25519. 작업자에는 공개 키만 설정으로 전달
-    - RUNTIME_POLICIES                        # 허용 목록·runtime policy 실제 값(JSON). T16a 마운트 파일 계약
-                                              # 공유 차트 변경 필요(설계 C.4.5는 env만)
+    - RUNTIME_POLICIES                        # 허용 목록·runtime policy 실제 값(JSON). D1: 차트 env, 기동 때 한 번 읽음
   worker:                                     # Infisical /apps/homelab-bot/worker (작업자만, 모델 자격 하나)
     - CODEX_AUTH_JSON                         # 이름 제안. D-14 A의 시드 auth.json. 영속 CODEX_HOME에 없을 때만 시드로 쓴다

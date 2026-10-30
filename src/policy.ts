@@ -1,7 +1,6 @@
-import { readFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { DEFAULTS, Denied, PolicyUnavailable, ScopeSchema } from './contracts.js';
+import { Denied, PolicyUnavailable, ScopeSchema } from './contracts.js';
 import type { Clock, Scope } from './contracts.js';
 import type { Database } from './database.js';
 
@@ -15,17 +14,49 @@ const PolicySchema = z.strictObject({
   review: z.unknown().optional(),
 });
 export type Policy = z.infer<typeof PolicySchema>;
+// 사람이 Infisical에 두는 값(env RUNTIME_POLICIES)의 모양. confirmedAt은 봇이 읽은 시각으로 채우므로 받지 않는다.
+const RuntimePolicyInputSchema = PolicySchema.omit({ confirmedAt: true });
+function frozen<T>(value: T): T {
+  if (value !== null && typeof value === 'object') {
+    for (const child of Object.values(value)) frozen(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+// D1(사용자 2026-10-30): 정책은 기동 때 env에서 한 번 읽는다. 값 변경은 `homelab secret set`의 파드 재시작으로 반영되고,
+// 즉시 차단은 /revoke(DB 거부 목록)다. confirmedAt은 이 읽은 시각이고, 거부 해제(revocationRestores)가
+// "철회 뒤 확인한 정책"인지 가리는 기준이다. 오류 메시지에는 알려진 필드 경로만 넣고 값·모르는 키 이름은 넣지 않는다(비밀일 수 있다).
+export function loadRuntimePolicy(raw: string, loadedAt: number): Policy {
+  let input: unknown;
+  try { input = JSON.parse(raw); } catch { throw new Error('runtime_policies_invalid: json'); }
+  const parsed = RuntimePolicyInputSchema.safeParse(input);
+  if (!parsed.success) {
+    // 모르는 키의 이름은 env 원문에서 온 임의 문자열이라(비밀을 키로 잘못 넣을 수 있다) 이름 대신 개수만 남긴다.
+    // 나머지 경로는 스키마가 아는 필드 이름과 배열 위치뿐이다.
+    // confirmedAt은 봇이 채우는 고정 필드라 이름을 그대로 알려 준다.
+    const fields = [...new Set(parsed.error.issues.flatMap(issue => {
+      const path = issue.path.map(String).join('.');
+      if (issue.code !== 'unrecognized_keys') return [path || '(root)'];
+      const known = issue.keys.filter(key => !path && key === 'confirmedAt');
+      const unknown = issue.keys.length - known.length;
+      return [...known, ...(unknown ? [`${path ? `${path}.` : ''}unknown_field(${unknown})`] : [])];
+    }))];
+    throw new Error(`runtime_policies_invalid: ${fields.join(',')}`);
+  }
+  return frozen({ ...parsed.data, confirmedAt: loadedAt });
+}
 export class PolicyGate {
   constructor(private readonly source: () => Promise<unknown>, private readonly db: Database,
     private readonly now: Clock = Date.now) {}
-  static mounted(path: string, db: Database, now?: Clock): PolicyGate {
-    return new PolicyGate(async () => JSON.parse(await readFile(path, 'utf8')), db, now);
+  static fixed(policy: Policy, db: Database, now?: Clock): PolicyGate {
+    return new PolicyGate(async () => policy, db, now);
   }
   withDatabase(db: Database): PolicyGate { return new PolicyGate(this.source, db, this.now); }
   async current(): Promise<Policy> {
     try {
       const p = PolicySchema.parse(await this.source());
-      if (p.confirmedAt > this.now() || this.now() - p.confirmedAt > DEFAULTS.policyMaxAgeMs) throw new PolicyUnavailable();
+      // 읽은 시각이 미래면(시계 역행) 해제 판단의 기준이 틀어지므로 닫는다. 나이는 보지 않는다(D1).
+      if (p.confirmedAt > this.now()) throw new PolicyUnavailable();
       return p;
     } catch { throw new PolicyUnavailable(); }
   }
