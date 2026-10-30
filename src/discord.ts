@@ -201,6 +201,23 @@ export class DiscordIngress {
 export function deliveryMarker(row: Delivery): string {
   return createHash('sha256').update(row.idempotency_key).digest('hex').slice(0, 24);
 }
+function jsonBody(content: string): object | undefined {
+  try {
+    const value: unknown = JSON.parse(content);
+    return value !== null && typeof value === 'object' ? value : undefined;
+  } catch { return undefined; }
+}
+// JSON 본문(목록 페이지·제어 결과)은 marker를 JSON 필드로 넣어 메시지 전체가 그대로 파싱되게 한다.
+// 일반 문장은 끝 줄에 붙인다. 감싸기는 42자를 더해 본문 상한 1900자에서도 Discord 2000자 안이다.
+export function markedContent(content: string, marker: string): string {
+  const data = jsonBody(content);
+  return data === undefined ? `${content}\n[ref:${marker}]` : JSON.stringify({ ref: marker, data });
+}
+export function hasMarker(content: string, marker: string): boolean {
+  if (content.endsWith(`[ref:${marker}]`)) return true;
+  const body = jsonBody(content) as { ref?: unknown; data?: unknown } | undefined;
+  return !!body && !Array.isArray(body) && body.ref === marker && 'data' in body;
+}
 export class DiscordPublisher {
   constructor(private readonly store: Store, private readonly gate: PolicyGate, private readonly rest: DiscordRest) {}
   private async authorized(row: Delivery): Promise<void> {
@@ -235,7 +252,7 @@ export class DiscordPublisher {
       dispatched = true;
       const sent = row.payload.kind === 'thread'
         ? await this.rest.createThread(row.payload.channel, { name: `homelab-${marker}`, type: 11, auto_archive_duration: 1440 })
-        : await this.rest.sendMessage(row.payload.channel, { content: `${row.payload.content}\n[ref:${marker}]`,
+        : await this.rest.sendMessage(row.payload.channel, { content: markedContent(row.payload.content, marker),
           nonce: marker, enforce_nonce: true, ...noMentions });
       remoteId = sent.id;
       await this.confirm(row, sent.id);
@@ -262,14 +279,22 @@ export class DiscordPublisher {
     await this.store.retireUnknownDeliveries();
     const pause = (await this.store.db.query<{ value: number }>("SELECT value FROM controls WHERE key='discord_reconcile_after'")).rows[0];
     const searchPaused = !!pause && pause.value > this.store.now();
-    for (const row of (await this.store.db.query<Delivery>("SELECT * FROM outbox WHERE state='unknown' AND (external_id IS NULL OR available_at<=$1) ORDER BY (external_id IS NOT NULL) DESC,created_at LIMIT 100", [this.store.now()])).rows) {
+    // 외부 ID가 없는 행은 available_at이 unknown 진입 시각(24시간 폐기 기준)이라, 검색 간격은 reconcile_after로 따로 본다.
+    for (const row of (await this.store.db.query<Delivery>(`SELECT * FROM outbox WHERE state='unknown'
+      AND (external_id IS NOT NULL AND available_at<=$1 OR external_id IS NULL AND COALESCE(reconcile_after,0)<=$1)
+      ORDER BY (external_id IS NOT NULL) DESC,created_at LIMIT 100`, [this.store.now()])).rows) {
       if (!row.external_id && (searchPaused || await this.store.discordPauseUntil(row.payload.channel) > this.store.now())) continue;
+      let searched = false;
       try {
         await this.authorized(row);
-        const found = row.external_id ? { id: row.external_id }
-          : await this.rest.findDelivery(row.payload.channel, deliveryMarker(row), row.payload.kind);
+        let found: { id: string } | undefined = row.external_id ? { id: row.external_id } : undefined;
+        if (!found) {
+          searched = true;
+          found = await this.rest.findDelivery(row.payload.channel, deliveryMarker(row), row.payload.kind);
+        }
         if (found) await this.confirm(row, found.id);
         // A bounded search miss is not proof of absence; keep unknown, never auto-resend.
+        else await this.store.deferSearch(row);
       } catch (error) {
         if (error instanceof RateLimited) {
           await this.store.recordRateLimit(error, row.payload.channel);
@@ -281,6 +306,7 @@ export class DiscordPublisher {
         }
         if (error instanceof Denied) await this.store.deliveryState(row, 'blocked');
         else if (row.external_id) await this.store.deferConfirmation(row);
+        else if (searched) await this.store.deferSearch(row);
       }
     }
   }

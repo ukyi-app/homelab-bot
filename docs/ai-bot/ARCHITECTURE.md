@@ -717,7 +717,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 3. **작업자 HTTP 계약.** 지금 어댑터는 같은 프로세스에서 부른다. 배치에서는 게시 서버 → 작업자 HTTP(T16a `WorkerRequest`, Ed25519 capability)로 task 요청(지시·재개 스레드·답)을 보내야 하는데 현재 스키마에 그 필드가 없다. 스키마 확장이나 task 전용 끝점이 필요하다(T16b 전).
 4. **배치 진입점.** `Runtime`에 `CodexBridge`를 `TaskLane`으로 넘기는 본 루프는 T16b다.
 5. **unknown의 비AI 알림.** `health.ts`에 task `unknown` 수 지표를 내서 Alertmanager → Telegram이 잡게 한다(OPS-02, T16b 스크레이프 규칙과 함께).
-6. **`Store.accept()`의 잠금 순서.** PR #9 4407855013과 같은 역전이 T16a `accept()`에도 있다. 스케줄러 행을 먼저 잡은 뒤 `INSERT INTO jobs`의 `conversation_id` 외래 키 검사로 대화 행 KEY SHARE를 기다린다. 같은 대화의 `/cancel`·`/model-status`·`/resume-model`·`/emergency-stop`(대화 행 FOR UPDATE → 스케줄러)과 겹치면 교착한다. PostgreSQL 18.6 로컬 재현에서 `/model-status`가 대화 행을 잡은 사이 `accept()`가 `55P03`(잠금 시간 초과)으로 롤백됐다. 제안: `accept()`가 스케줄러보다 먼저 그 event의 대화 행을 잠근다. T18은 바꾸지 않았다.
+6. **`Store.accept()`의 잠금 순서.** PR #9 4407855013과 같은 역전이 T16a `accept()`에도 있다. 스케줄러 행을 먼저 잡은 뒤 `INSERT INTO jobs`의 `conversation_id` 외래 키 검사로 대화 행 KEY SHARE를 기다린다. 같은 대화의 `/cancel`·`/model-status`·`/resume-model`·`/emergency-stop`(대화 행 FOR UPDATE → 스케줄러)과 겹치면 교착한다. PostgreSQL 18.6 로컬 재현에서 `/model-status`가 대화 행을 잡은 사이 `accept()`가 `55P03`(잠금 시간 초과)으로 롤백됐다. 제안: `accept()`가 스케줄러보다 먼저 그 event의 대화 행을 잠근다. T18은 바꾸지 않았다. **해소(T16b, 2026-10-30):** `accept()`가 그 event의 대화 행을 `FOR UPDATE`로 먼저 잠근 뒤 스케줄러를 잡는다. 회귀 시험은 `test/review-9.test.ts`(잠금 문장 순서 기록, PGlite)와 `test/review-9-pg.test.ts`(PostgreSQL 18.6 다중 연결: 수정 전 `accept()`가 `55P03`으로 롤백, 수정 뒤 두 트랜잭션 모두 완료)다.
 
 ### [가정]·[미확인] (T16b 실측 목록에 더함)
 

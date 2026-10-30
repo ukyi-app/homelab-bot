@@ -16,7 +16,7 @@ export const DEFAULTS = Object.freeze({
   policyMaxAgeMs: 300_000, recoveryPages: 10, recoveryMs: 30_000,
   gatewayGraceMs: 300_000, heartbeatMs: 60_000,
   retryDelayMs: 1000, unknownDeliveryMs: 86_400_000, maxUnknownDeliveries: 100,
-  capabilitySkewMs: 1000,
+  capabilitySkewMs: 1000, reconcileSearchMaxMs: 900_000,
 });
 export class Denied extends Error { constructor() { super('denied'); } }
 export class PolicyUnavailable extends Error { constructor() { super('policy_unavailable'); } }
