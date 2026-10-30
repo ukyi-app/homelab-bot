@@ -960,7 +960,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - **확인된 멈춤은 거짓 `unknown`이 되지 않는다.** 확인 결과를 상태 쓰기 전에 보존하고, 뒤의 기록(fail·되돌리기·취소)이 일시 오류로 실패하면 cancel을 다시 묻지 않고 lease CAS 아래 최대 3번(200ms·400ms 간격) 다시 쓴다. 끝내 못 쓰면 로그·감사 `stop_confirmed_write_failed`를 남긴다. 그 뒤 lease가 끝나면 `expire()`가 `unknown`으로 두므로, 이 감사가 실제로 멈췄다는 근거다.
 - chat `unknown`은 모델 `tick()`의 claim 직전에 주기적으로 조사한다(`Runtime.probeUnknown()`). chat unknown이 있으면 모델 claim이 어차피 막혀 있어 모델 실행을 늦추지 않는다.
   - 예약은 `controls` 행 `unknown_probe:<job>`(`{lease,count,next}`)이고 마이그레이션은 없다. 행을 잠그고 시각이 된 것만 미뤄 돌려주므로 게시 서버 둘이 같은 job을 동시에 조사하지 않는다. backoff 즉시 → 30초 → 1분 → … → 상한 10분, 한 바퀴 3건.
-  - 저장된 job ID·lease로 새 cancel capability를 만들어 DB 트랜잭션 밖에서 보낸다. 확인되면 짧은 트랜잭션의 CAS(`type='chat' AND state='unknown' AND lease_token=<관측값>`)로 `failed`(`stop_confirmed_after_unknown`) + 감사 `unknown_stop_confirmed` + 안내.
+  - 저장된 job ID·lease로 새 cancel capability를 만들어 DB 트랜잭션 밖에서 보낸다. 확인되면 짧은 트랜잭션의 CAS(`type='chat' AND state='unknown' AND lease_token=<관측값>`)로 `failed`(`stop_confirmed_after_unknown`) + 감사 `unknown_stop_confirmed` + 안내. 이 쓰기가 일시 DB 오류로 실패하면 확인 결과를 유지한 채 쓰기만 재시도한다(정상 종료의 `afterStop`과 같음). 작업자는 첫 확인 뒤 job을 놓아 다음 조사의 cancel은 `stopped:false`라, 확인을 버리면 풀 수 없는 unknown이 모델 슬롯을 막는다(Codex 리뷰 지적).
   - 경과 시간만으로 풀지 않는다. 새 모델 실행을 자동으로 시작하지 않는다. task·review는 조사하지 않는다(작업 레인 소멸 확인 한계, §12).
 - **한계:** 작업자 `SerialWorker.cancel`은 그 job·lease를 **아직 잡고 있을 때만** `stopped:true`다. 이미 끝냈거나(응답 유실 포함) 재시작한 작업자의 job은 조사로도 풀리지 않는다. 작업자가 "잡고 있지 않은 job의 cancel"을 "실행 중 아님"으로 답하게 바뀌면(작업자 Recreate·replicas 1, capability 30초 만료라 안전한 조건) 게시 서버 수정 없이 이 조사가 그대로 푼다. 실행기 전환 뒤에도 이 의미는 같다(`ChatLane.stop()`이 옛 `codex-chat.ts`와 같은 본문). 작업자 쪽 변경은 남은 후속이다.
 

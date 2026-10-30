@@ -50,6 +50,27 @@ test('S3 작업자가 멈춤을 확인하면 unknown chat은 failed + 안내 1�
   assert.notEqual(((await f.store.control(f.policy.owner, job.conversation_id, 'retry', job.id)) as { ok?: boolean }).ok, false);
 });
 
+// Codex r(50531b7) P2: 실제 작업자는 첫 확인 뒤 job을 놓아 두 번째 cancel에 stopped:false다. 확인 직후 쓰기가 일시 실패해도
+// 확인 결과를 유지한 채 쓰기만 다시 해야 한다. 아니면 풀 수 없는 unknown이 모델 슬롯을 계속 막는다.
+test('S3 확인 뒤 resolveUnknown 일시 DB 오류: cancel 다시 안 묻고 쓰기만 재시도해 failed', async () => {
+  const job = await unknownJob();
+  let held = true;
+  const calls = cancels(() => { const answer = held; held = false; return answer; });
+  const original = f.store.resolveUnknown.bind(f.store);
+  let failures = 1;
+  f.store.resolveUnknown = async (...args: Parameters<typeof original>) => {
+    if (failures-- > 0) throw new Error('db_blip');
+    return original(...args);
+  };
+  await f.runtime.tick().catch(() => {});
+  f.advance(3_600_000); await f.runtime.tick().catch(() => {});
+  assert.equal(calls.length, 1, 'cancel을 다시 물음');
+  assert.deepEqual(calls[0], { job: job.id, lease: job.lease_token });
+  const row = (await rows('jobs'))[0]!;
+  assert.equal(row.state, 'failed'); assert.equal(row.wait_reason, 'stop_confirmed_after_unknown');
+  assert.equal((await notices('unknown-resolved:')).length, 1);
+});
+
 test('S3 확인하지 못하면 unknown 유지, 작업별 backoff 30초→1분→2분… 상한 10분', async () => {
   await unknownJob();
   const calls = cancels(() => false);

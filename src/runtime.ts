@@ -199,12 +199,14 @@ export class Runtime {
   }
   // 이전 실행이 unknown으로 남긴 chat에 새 cancel capability로 멈춤을 묻는다(네트워크는 DB 트랜잭션 밖).
   // 지금 작업자는 그 job을 아직 잡고 있을 때만 stopped:true를 준다. 이미 끝냈거나 재시작한 작업자의 job은 풀리지 않는다.
+  // 확인 뒤 쓰기는 afterStop으로 재시도한다. 작업자는 첫 확인 뒤 job을 놓아 다음 조사의 cancel은 stopped:false다.
   async probeUnknown(): Promise<number> {
     if (this.shutdown?.aborted) return 0;
     let resolved = 0;
     for (const job of await this.store.reserveUnknownProbes()) {
       if (this.shutdown?.aborted) break;
-      if (await this.confirmStop(job) && await this.store.resolveUnknown(job)) resolved++;
+      if (!await this.confirmStop(job)) continue;
+      if ((await this.afterStop(job, () => this.store.resolveUnknown(job)))?.value) resolved++;
     }
     return resolved;
   }
