@@ -25,16 +25,21 @@ function frozen<T>(value: T): T {
 }
 // D1(사용자 2026-10-30): 정책은 기동 때 env에서 한 번 읽는다. 값 변경은 `homelab secret set`의 파드 재시작으로 반영되고,
 // 즉시 차단은 /revoke(DB 거부 목록)다. confirmedAt은 이 읽은 시각이고, 거부 해제(revocationRestores)가
-// "철회 뒤 확인한 정책"인지 가리는 기준이다. 오류 메시지에는 필드 경로만 넣고 값은 넣지 않는다(값이 비밀일 수 있다).
+// "철회 뒤 확인한 정책"인지 가리는 기준이다. 오류 메시지에는 알려진 필드 경로만 넣고 값·모르는 키 이름은 넣지 않는다(비밀일 수 있다).
 export function loadRuntimePolicy(raw: string, loadedAt: number): Policy {
   let input: unknown;
   try { input = JSON.parse(raw); } catch { throw new Error('runtime_policies_invalid: json'); }
   const parsed = RuntimePolicyInputSchema.safeParse(input);
   if (!parsed.success) {
+    // 모르는 키의 이름은 env 원문에서 온 임의 문자열이라(비밀을 키로 잘못 넣을 수 있다) 이름 대신 개수만 남긴다.
+    // 나머지 경로는 스키마가 아는 필드 이름과 배열 위치뿐이다.
+    // confirmedAt은 봇이 채우는 고정 필드라 이름을 그대로 알려 준다.
     const fields = [...new Set(parsed.error.issues.flatMap(issue => {
       const path = issue.path.map(String).join('.');
-      const keys = issue.code === 'unrecognized_keys' ? issue.keys.map(key => path ? `${path}.${key}` : key) : [];
-      return keys.length ? keys : [path || '(root)'];
+      if (issue.code !== 'unrecognized_keys') return [path || '(root)'];
+      const known = issue.keys.filter(key => !path && key === 'confirmedAt');
+      const unknown = issue.keys.length - known.length;
+      return [...known, ...(unknown ? [`${path ? `${path}.` : ''}unknown_field(${unknown})`] : [])];
     }))];
     throw new Error(`runtime_policies_invalid: ${fields.join(',')}`);
   }

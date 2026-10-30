@@ -47,7 +47,7 @@ test('AUTH-02 D1 RUNTIME_POLICIES 형식 오류는 기동 실패, 오류에는 �
     [policyJson({ owner: undefined }), 'owner'],
     [policyJson({ guild: 7 }), 'guild'],
     [policyJson({ confirmedAt: 1 }), 'confirmedAt'],
-    [policyJson({ extra: secretLike }), 'extra'],
+    [policyJson({ extra: secretLike }), 'unknown_field(1)'],
     [policyJson({ services: [secretLike, 3] }), 'services.1'],
     [JSON.stringify([secretLike]), '(root)'],
   ] as const) {
@@ -55,6 +55,23 @@ test('AUTH-02 D1 RUNTIME_POLICIES 형식 오류는 기동 실패, 오류에는 �
       assert.match(error.message, /^runtime_policies_invalid: /);
       assert.ok(error.message.includes(field), `${error.message} / ${field}`);
       assert.ok(!error.message.includes(secretLike) && !error.message.includes('fixture-guild'), error.message);
+      return true;
+    });
+  }
+});
+
+test('P3-6 정책의 모르는 키 이름은 값처럼 다뤄 오류에 싣지 않고 unknown_field 개수만 남김', () => {
+  const leak = 'fixture-secret-used-as-key';
+  for (const [raw, expected] of [
+    [policyJson({ [leak]: true }), 'runtime_policies_invalid: unknown_field(1)'],
+    [policyJson({ [leak]: true, [`${leak}-2`]: 1 }), 'runtime_policies_invalid: unknown_field(2)'],
+    [policyJson({ [leak]: true, owner: '' }), 'runtime_policies_invalid: unknown_field(1),owner'],
+  ] as const) {
+    assert.throws(() => loadRuntimePolicy(raw, f.now()), (error: Error) => {
+      assert.ok(!error.message.includes(leak), error.message);
+      const fields = (message: string) => message.replace(/^runtime_policies_invalid: /, '').split(',').sort();
+      assert.match(error.message, /^runtime_policies_invalid: /);
+      assert.deepEqual(fields(error.message), fields(expected));
       return true;
     });
   }
