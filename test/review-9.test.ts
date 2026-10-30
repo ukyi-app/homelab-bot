@@ -118,3 +118,49 @@ test('4316750315 검색 오류도 backoff, 간격은 상한에서 멈추고 unkn
   assert.equal(f.rest.messages.length, 0);
 });
 
+test('4316750301 모델 응답 섹션은 완결 항목만 싣고 생략 건수를 표시', async () => {
+  const unknowns = Array.from({ length: 8 }, (_, i) => `미확인 항목 ${i} ${'가'.repeat(80)}`);
+  f.setRun(async () => ({ status: 'succeeded', stopped: true, answer: { facts: [], hypotheses: [], unknowns, checks: ['짧은 확인'] } }));
+  await queue(); await f.runtime.tick(); await f.publisher.deliver();
+  const content = f.rest.messages[0]!.body.content;
+  const line = content.split('\n').find(l => l.startsWith('미확인: '))!;
+  const match = /^미확인: (.*) \((\d+)개 생략\)$/.exec(line);
+  assert.ok(match, line);
+  const shown = match[1]!.split('; ');
+  assert.ok(shown.length >= 1); assert.deepEqual(shown, unknowns.slice(0, shown.length));
+  assert.equal(shown.length + Number(match[2]), unknowns.length);
+  assert.match(content, /^사실: 없음$/m); assert.match(content, /^권장 확인: 짧은 확인$/m);
+  assert.deepEqual((await rows('results'))[0]!.result.unknowns, unknowns);
+});
+
+test('4316750328 read 5초 시간 초과는 전송에 AbortSignal을 넘겨 실제 요청을 중단', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let signal: AbortSignal | undefined; let aborted = false; let started!: () => void;
+  const called = new Promise<void>(resolve => { started = resolve; });
+  const transport: ReadTransport = { query: request => new Promise<Uint8Array>((_, reject) => {
+    signal = (request as { signal?: AbortSignal }).signal;
+    signal?.addEventListener('abort', () => { aborted = true; reject(signal!.reason); }, { once: true });
+    started();
+  }) };
+  // DB를 쓰지 않는 gate라 가짜 시계 아래에서도 조회까지 마이크로태스크만으로 닿는다.
+  const gate = { authorize: async () => f.policy } as unknown as PolicyGate;
+  const reader = new ReadAdapter([service], [template], gate, transport, f.now);
+  const pending = reader.recent(f.policy.owner, thread, { service: service.id, template: template.id });
+  await called;
+  assert.ok(signal, 'ReadTransport가 AbortSignal을 받지 못함'); assert.equal(signal.aborted, false);
+  t.mock.timers.tick(4999); assert.equal(signal.aborted, false);
+  t.mock.timers.tick(1);
+  const result = await pending;
+  assert.equal(signal.aborted, true); assert.equal(aborted, true);
+  assert.equal(result.status, 'unobservable'); assert.deepEqual(result.unknowns, ['현재 관측 자료를 확인할 수 없음']);
+});
+test('4316750328 제때 끝난 read는 signal을 abort하지 않음', async () => {
+  let signal: AbortSignal | undefined;
+  const reader = new ReadAdapter([service], [template], f.gate, { query: async request => {
+    signal = (request as { signal?: AbortSignal }).signal;
+    return new TextEncoder().encode(JSON.stringify({ observedAt: f.now(), rows: [{ status: 'healthy' }] }));
+  } }, f.now);
+  assert.equal((await reader.recent(f.policy.owner, thread, { service: service.id, template: template.id })).status, 'observed');
+  assert.ok(signal); assert.equal(signal.aborted, false);
+});
+

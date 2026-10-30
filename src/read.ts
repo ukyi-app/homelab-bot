@@ -13,10 +13,13 @@ export interface QueryTemplate {
   kind: 'status' | 'metrics' | 'logs'; query: string;
   maxWindowSeconds: number; maxBytes: number; maxRows: number;
 }
+// timeoutMs가 지나면 ReadAdapter가 signal을 abort한다. 구현은 signal로 실제 요청·연결을 끊어야 한다.
+// 끊지 않으면 Runtime은 다음 작업으로 넘어가도 조회가 직렬성 밖에 남는다.
 export interface ReadTransport {
   query(request: { datasource: string; namespace: string; query: string;
-    from: number; to: number; limit: number; maxBytes: number; timeoutMs: number }): Promise<Uint8Array>;
+    from: number; to: number; limit: number; maxBytes: number; timeoutMs: number; signal: AbortSignal }): Promise<Uint8Array>;
 }
+const READ_TIMEOUT_MS = 5000;
 const RequestSchema = z.strictObject({ service: z.string(), template: z.string(), from: z.number().finite(), to: z.number().finite() });
 const ObservationSchema = z.strictObject({ observedAt: z.number().finite(),
   rows: z.array(z.strictObject({ status: z.enum(['healthy', 'degraded', 'unknown']).optional(),
@@ -64,11 +67,15 @@ export class ReadAdapter {
     try {
       let timeout: ReturnType<typeof setTimeout> | undefined;
       let bytes: Uint8Array;
+      const abort = new AbortController();
       try {
         bytes = await Promise.race([
           this.transport.query({ datasource: t.datasource, namespace: t.namespace, query: t.query,
-            from: r.from, to: r.to, limit: t.maxRows, maxBytes: t.maxBytes, timeoutMs: 5000 }),
-          new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error('read_timeout')), 5000); }),
+            from: r.from, to: r.to, limit: t.maxRows, maxBytes: t.maxBytes, timeoutMs: READ_TIMEOUT_MS, signal: abort.signal }),
+          new Promise<never>((_, reject) => { timeout = setTimeout(() => {
+            const error = new Error('read_timeout');
+            abort.abort(error); reject(error);
+          }, READ_TIMEOUT_MS); }),
         ]);
       } finally { clearTimeout(timeout); }
       if (bytes.byteLength > t.maxBytes) throw new Error('response_budget');
