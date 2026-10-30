@@ -164,8 +164,13 @@ export class Store {
   }
   async expire(): Promise<void> {
     await this.expireReads();
-    await this.db.query(`UPDATE jobs SET state='unknown',wait_reason='lease_expired'
-      WHERE state IN ('running','verifying','cancel_requested') AND lease_until<=$1 AND type<>'read'`, [this.now()]);
+    // 바꾼 행마다 같은 트랜잭션에서 unknown 안내를 넣는다(chat만).
+    await this.db.transaction(async tx => {
+      await this.lockConversations(tx, `state IN ('running','verifying','cancel_requested') AND lease_until<=$1 AND type<>'read'`);
+      const expired = (await tx.query<Job>(`UPDATE jobs SET state='unknown',wait_reason='lease_expired'
+        WHERE state IN ('running','verifying','cancel_requested') AND lease_until<=$1 AND type<>'read' RETURNING *`, [this.now()])).rows;
+      for (const job of expired) await this.unknownNotice(job, tx);
+    });
     await this.db.query(`UPDATE outbox SET state=CASE WHEN dispatch_started THEN 'unknown' ELSE 'pending' END,
       attempt=CASE WHEN dispatch_started THEN attempt ELSE GREATEST(0,attempt-1) END,
       available_at=CASE WHEN dispatch_started THEN $1 ELSE $1+$2 END
@@ -176,6 +181,7 @@ export class Store {
   // 구버전이 남긴 unknown read도 같은 이유로 정리한다. owner가 /cancel한 것은 cancelled로 끝낸다.
   private async expireReads(): Promise<void> {
     await this.db.transaction(async tx => {
+      await this.lockConversations(tx, `type='read' AND ((state IN ('running','verifying','cancel_requested') AND lease_until<=$1) OR state='unknown')`);
       const expired = (await tx.query<Job>(`UPDATE jobs SET
         state=CASE WHEN state='cancel_requested' THEN 'cancelled' ELSE 'failed' END,wait_reason='lease_expired',finished_at=$1
         WHERE type='read' AND ((state IN ('running','verifying','cancel_requested') AND lease_until<=$1) OR state='unknown')
@@ -223,6 +229,7 @@ export class Store {
   }
   async fail(job: Job, reason: string): Promise<void> {
     await this.atomic(async store => {
+      await store.lockConversation(job);
       if (await store.complete(job, 'failed', reason) !== 'failed') return;
       await store.enqueue({ key: `failure:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id,
         actor: job.owner_id, scope: job.target, revision: job.revision.policy,
@@ -237,17 +244,47 @@ export class Store {
   }
   async waitForUser(job: Job, reason: string): Promise<void> {
     await this.db.transaction(async tx => {
+      await this.lockConversation(job, tx);
       await this.lockScheduler(tx);
       if (await this.complete(job, 'waiting_user', reason, tx) !== 'waiting_user') return;
       await tx.query(`UPDATE controls SET value='true' WHERE key='scheduler'`);
+      // task는 작업 레인(codex.ts)이 따로 알린다. 여기서는 chat만.
+      if (job.type === 'chat') await this.notice(job, `waiting:${job.id}:${job.attempt}`,
+        `${reason === 'auth_expired' ? '모델 인증이 만료돼' : '모델 사용 한도에 걸려'} 작업이 멈췄습니다. `
+        + `원인을 해소한 뒤 /resume-model target:${job.id}로 재개하세요. 상태는 /model-status로 확인할 수 있습니다.`, tx);
     });
   }
   async transition(job: Job, state: State, reason: string | null = null): Promise<boolean> {
     // Only an uncertain worker may override cancellation with unknown.
     if (state !== 'unknown') return (await this.complete(job, state, reason)) !== undefined;
-    return (await this.db.query(`UPDATE jobs SET state=$3,wait_reason=$4,finished_at=$5
-      WHERE id=$1 AND lease_token=$2 AND lease_until>$5 AND state IN ('running','verifying','cancel_requested') RETURNING id`,
-    [job.id, job.lease_token, state, reason, this.now()])).rows.length === 1;
+    return this.db.transaction(async tx => {
+      await this.lockConversation(job, tx);
+      const row = (await tx.query<Job>(`UPDATE jobs SET state=$3,wait_reason=$4,finished_at=$5
+        WHERE id=$1 AND lease_token=$2 AND lease_until>$5 AND state IN ('running','verifying','cancel_requested') RETURNING *`,
+      [job.id, job.lease_token, state, reason, this.now()])).rows[0];
+      // 권한 철회로 멈춘 대화에는 안내하지 않는다(게시도 막힌다).
+      if (row && reason !== 'authorization_revoked') await this.unknownNotice(row, tx);
+      return !!row;
+    });
+  }
+  // 안내 삽입(outbox 외래 키)은 대화 행 KEY SHARE를 잡는다. job 행이나 scheduler 행을 쥔 뒤에 대화 행을 기다리면
+  // 제어 경로(대화 행 FOR UPDATE → scheduler → job)와 교착하므로, 상태를 바꾸기 전에 대화 행부터 잡는다.
+  private async lockConversation(job: Job, tx = this.db): Promise<void> {
+    if (job.conversation_id) await tx.query('SELECT id FROM conversations WHERE id=$1 FOR KEY SHARE', [job.conversation_id]);
+  }
+  private async lockConversations(tx: Database, where: string): Promise<void> {
+    await tx.query(`SELECT id FROM conversations WHERE id IN (SELECT conversation_id FROM jobs WHERE ${where})
+      ORDER BY id FOR KEY SHARE`, [this.now()]);
+  }
+  private async unknownNotice(job: Job, tx: Database): Promise<void> {
+    if (job.type !== 'chat') return;
+    await this.notice(job, `unknown:${job.id}:${job.attempt}`, '작업 종료를 확인하지 못해 새 모델 실행을 멈췄습니다. '
+      + '봇이 작업자에게 종료 확인을 계속 시도합니다. 상태는 /model-status로 확인하세요.', tx);
+  }
+  // 상태 알림. 멱등 키로 한 번만 넣고 멘션하지 않는다(게시는 allowed_mentions parse 빈 배열).
+  private async notice(job: Job, key: string, content: string, tx: Database): Promise<void> {
+    await this.enqueue({ key, job: job.id, conversation: job.conversation_id, actor: job.owner_id, scope: job.target,
+      revision: job.revision.policy, payload: { kind: 'message', channel: job.target.channel, content, classification: 'safe_summary' } }, tx);
   }
   async finish(job: Job, result: unknown, evidence: unknown, content: string, scope: Scope, services: string[] = []): Promise<void> {
     await this.db.transaction(async tx => {
@@ -293,6 +330,7 @@ export class Store {
   // 새 실행은 시작하지 않는다. owner가 /retry로 다시 실행한다.
   async resolveUnknown(job: Job): Promise<boolean> {
     return this.db.transaction(async tx => {
+      await this.lockConversation(job, tx);
       const row = (await tx.query<Job>(`UPDATE jobs SET state='failed',wait_reason='stop_confirmed_after_unknown',finished_at=$3
         WHERE id=$1 AND type='chat' AND state='unknown' AND lease_token=$2 RETURNING *`, [job.id, job.lease_token, this.now()])).rows[0];
       if (!row) return false;

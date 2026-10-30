@@ -115,7 +115,8 @@ for (const stage of ['scheduler', 'outbox']) test(`4316099215 재개 중 ${stage
   await failOnce(sql => stage === 'scheduler' ? sql.startsWith("UPDATE controls SET value='false' WHERE key='scheduler'") : sql.includes('INSERT INTO outbox'),
     () => assert.rejects(control('resume-model', job.id), /injected_commit_failure/));
   assert.equal((await rows('jobs'))[0]!.state, 'waiting_user'); assert.equal(await flag(), true);
-  assert.equal((await rows('outbox')).length, 0);
+  // impl-sched S4: waiting_user 안내는 대기 진입 때 이미 들어가 있다. 재개 실패가 남긴 것만 센다.
+  assert.equal((await rows('outbox')).filter(o => !/^(waiting|unknown):/.test(o.idempotency_key)).length, 0);
   assert.equal((await control('resume-model', job.id)).ok, true); assert.equal(await flag(), false);
 });
 test('4316099215 동시 재개 요청은 하나만 재수락, 나머지는 상태 불일치', async () => {
