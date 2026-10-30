@@ -50,8 +50,10 @@ export class Runtime {
     let authorizationRevoked = false;
     // 종료 신호 뒤 드레인 창이 지나 이 게시 서버가 실행을 끊었는지.
     let drained = false;
-    // 드레인 기한에 보낸 cancel. 작업자는 첫 확인 뒤 job을 놓아 두 번째 cancel은 stopped:false이므로 이 결과를 다시 쓴다.
+    // 이 실행의 cancel은 한 번만 보낸다. 작업자는 첫 확인 뒤 job을 놓아 두 번째 cancel은 stopped:false이고,
+    // 첫 요청이 false·오류였어도 다시 물으면 판정 경로마다 결과가 달라진다. 모든 경로가 이 결과(false 포함)를 다시 쓴다.
     let cancelling: Promise<boolean> | undefined;
+    const stopRequest = () => (cancelling ??= this.confirmStop(job));
     // 작업자 cancel이 멈춤을 확인했는지(result.stopped와 구분한다). 확인 결과는 상태 쓰기 전에 남겨,
     // 쓰기가 실패해도 catch가 cancel을 다시 묻지 않게 한다.
     let confirmed = false;
@@ -94,13 +96,15 @@ export class Runtime {
           }).finally(() => { monitorTask = undefined; });
       }, 1000);
       let drain: ReturnType<typeof setTimeout> | undefined;
-      // 드레인 기한이 되면 그 자리에서 cancel을 보낸다. 진행 중 monitor·재인가·상태 조회를 기다렸다 보내면
-      // DB가 느릴 때(statement timeout 10초) 종료 기한 안에 못 나가 lease 만료로 unknown이 된다. 판정은 아래에서 합친다.
+      // cancel은 DB 후처리(진행 중 monitor·재인가·상태 조회)를 기다리지 않고 보낸다. 기다렸다 보내면 DB가 느릴 때
+      // (statement timeout 10초) 종료 기한 안에 못 나가 lease 만료로 unknown이 된다. 판정은 아래에서 그 결과를 합친다.
+      // 드레인 기한이 되면 그 자리에서 보낸다.
       const onShutdown = () => {
-        drain = setTimeout(() => { drained = true; cancelling = this.confirmStop(job); abort.abort(); }, this.drainMs);
+        drain = setTimeout(() => { drained = true; void stopRequest(); abort.abort(); }, this.drainMs);
       };
       this.shutdown?.addEventListener('abort', onShutdown, { once: true });
-      let result: WorkerResult;
+      let result: WorkerResult | undefined;
+      let rejected = false;
       try {
         const capability = this.signer.issue(job, 'execute', request);
         dispatched = true;
@@ -111,8 +115,16 @@ export class Runtime {
             timeout = setTimeout(() => { abort.abort(); resolve({ status: 'unknown', stopped: false }); }, job.budget.timeoutMs);
           }),
         ]);
+      } catch (error) {
+        // 작업자가 거부한 요청은 실행되지 않았으니 물을 것이 없다.
+        rejected = error instanceof WorkerRejected;
+        throw error;
       } finally {
-        clearInterval(monitor); clearTimeout(timeout); clearTimeout(drain);
+        clearInterval(monitor); clearTimeout(timeout);
+        // 불확실하게 끝났으면(불확실 응답·예외·monitor abort·시간 초과) 어느 판정이든 결국 cancel을 보내므로 지금 보낸다.
+        // 드레인 기한은 그 뒤에야 할 일이 없어지므로 이 다음에 정리한다.
+        if (dispatched && !rejected && !result?.stopped) void stopRequest();
+        clearTimeout(drain);
         this.shutdown?.removeEventListener('abort', onShutdown);
         // An in-flight authorization check must settle before choosing a terminal state.
         await monitorTask;
@@ -129,17 +141,13 @@ export class Runtime {
         && (result.status === 'limited' || result.status === 'auth_expired')) {
         await this.store.waitForUser(job, result.status === 'limited' ? 'model_limit' : 'auth_expired');
       } else if (current.state === 'cancel_requested' || abort.signal.aborted || authorizationRevoked) {
-        if (!result.stopped) stopped = confirmed = await (cancelling ?? this.confirmStop(job));
-        const settle = (write: () => Promise<unknown>) => stopped ? this.afterStop(job, write) : write();
-        if (authorizationRevoked) await settle(() => this.store.transition(job, stopped ? 'cancelled' : 'unknown', 'authorization_revoked'));
-        else if (drained && current.state !== 'cancel_requested') await this.shutdownOutcome(job, stopped);
-        else if (stopped && current.state !== 'cancel_requested') await settle(() => this.store.fail(job, 'stop_confirmation'));
-        else await settle(() => this.store.transition(job, stopped ? 'cancelled' : 'unknown', 'stop_confirmation'));
+        if (!result.stopped) stopped = confirmed = await stopRequest();
+        await this.stopOutcome(job, stopped, { revoked: authorizationRevoked, ownerCancel: current.state === 'cancel_requested',
+          drained, unknownReason: 'stop_confirmation' });
       } else if (!result.stopped) {
-        // unknown으로 막기 전에, 작업자가 아직 이 job을 잡고 있을 때 한 번 멈춤을 확인한다.
-        stopped = confirmed = await this.confirmStop(job);
-        if (confirmed) await this.afterStop(job, () => this.store.fail(job, 'stop_confirmation'));
-        else await this.store.transition(job, 'unknown', 'worker_disconnected');
+        // unknown으로 막기 전에, 작업자가 아직 이 job을 잡고 있을 때 멈춤을 확인한다(이미 보낸 요청의 결과).
+        stopped = confirmed = await stopRequest();
+        await this.stopOutcome(job, stopped, { revoked: false, ownerCancel: false, drained, unknownReason: 'worker_disconnected' });
       } else if (result.status === 'failed') await this.store.fail(job, 'model_failed');
       else if (result.status === 'succeeded') {
         const answer = AnswerSchema.parse(result.answer);
@@ -153,24 +161,35 @@ export class Runtime {
     } catch (error) {
       // A known limit retains the slot even if subsequent policy/state reads or writes fail.
       if (waiting && !authorizationRevoked && !(error instanceof Denied)) return true;
-      // 판정 전에 실패해도 드레인 cancel이 이미 멈춤을 확인했으면 그 결과를 쓴다.
-      if (!stopped && cancelling && await cancelling) stopped = confirmed = true;
-      if (authorizationRevoked || error instanceof Denied) {
-        const ended = !dispatched || stopped || error instanceof WorkerRejected;
-        const write = () => this.store.transition(job, ended ? 'cancelled' : 'unknown', 'authorization_revoked');
-        await (confirmed ? this.afterStop(job, write) : write());
-      } else if (error instanceof PolicyUnavailable && !dispatched) await this.store.defer(job);
-      else if (error instanceof WorkerRejected) await this.store.fail(job, 'worker_rejected');
-      else if (!dispatched) await this.store.fail(job, 'before_dispatch');
-      else if (confirmed && drained) await this.shutdownOutcome(job, true);
-      else if (confirmed) await this.afterStop(job, () => this.store.fail(job, 'stop_confirmation'));
-      else if (stopped) await this.store.fail(job, 'invalid_result');
-      else if (await this.confirmStop(job)) await this.afterStop(job, () => this.store.fail(job, 'stop_confirmation'));
-      else await this.store.transition(job, 'unknown', 'runtime_uncertain');
+      const revoked = authorizationRevoked || error instanceof Denied;
+      if (!dispatched || error instanceof WorkerRejected) {
+        if (revoked) await this.store.transition(job, 'cancelled', 'authorization_revoked');
+        else if (error instanceof PolicyUnavailable && !dispatched) await this.store.defer(job);
+        else await this.store.fail(job, dispatched ? 'worker_rejected' : 'before_dispatch');
+        return true;
+      }
+      // 판정 전·중에 실패해도 이미 보낸 cancel의 결과(false 포함)를 쓰고 다시 묻지 않는다.
+      if (!stopped) stopped = confirmed = await stopRequest();
+      // 작업자가 스스로 멈췄다고 답한 뒤의 실패는 결과 처리 실패다.
+      if (stopped && !confirmed && !revoked) await this.store.fail(job, 'invalid_result');
+      else await this.stopOutcome(job, stopped, { revoked, ownerCancel: false, drained, unknownReason: 'runtime_uncertain' });
     }
     return true;
   }
   private dispatchable(job: Job): Promise<boolean> { return dispatchable(this.store, job); }
+  // 멈춤을 물은 뒤의 최종 상태. 정상 판정과 catch가 같이 쓴다. ownerCancel을 모르는 catch도 저장소의 CASE가
+  // cancel_requested를 cancelled로 바꾸므로 의미가 같다.
+  // 권한 철회: 확인되면 cancelled, 아니면 unknown. 드레인(owner 취소 아님): shutdownOutcome(확인된 chat은 되돌림).
+  // owner 취소: 확인되면 cancelled, 아니면 unknown. 그 밖: 확인되면 failed(stop_confirmation), 아니면 unknown(unknownReason).
+  private async stopOutcome(job: Job, stopped: boolean,
+    why: { revoked: boolean; ownerCancel: boolean; drained: boolean; unknownReason: string }): Promise<void> {
+    const settle = (write: () => Promise<unknown>) => stopped ? this.afterStop(job, write) : write();
+    if (why.revoked) await settle(() => this.store.transition(job, stopped ? 'cancelled' : 'unknown', 'authorization_revoked'));
+    else if (why.drained && !why.ownerCancel) await this.shutdownOutcome(job, stopped);
+    else if (why.ownerCancel) await settle(() => this.store.transition(job, stopped ? 'cancelled' : 'unknown', 'stop_confirmation'));
+    else if (stopped) await this.afterStop(job, () => this.store.fail(job, 'stop_confirmation'));
+    else await this.store.transition(job, 'unknown', why.unknownReason);
+  }
   // 작업자의 cancel은 자기가 지금 잡고 있는 job·lease일 때만 stopped:true를 준다. 그래서 끊기 직전에 확인한다.
   private async confirmStop(job: Job): Promise<boolean> {
     try {

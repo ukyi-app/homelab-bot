@@ -119,3 +119,83 @@ test('F3 확인 뒤 상태 쓰기가 끝내 실패해도 unknown으로 적지 �
   assert.ok(logs.some(l => l.event === 'stop_confirmed_write_failed' && l.detail?.job === job.id));
   assert.ok((await rows('audit')).some(a => a.kind === 'stop_confirmed_write_failed' && a.subject === job.id));
 });
+
+// rev-a2 후속. 실행 대기가 stopped:false(불확실 응답·예외)로 끝나면 DB 후처리를 기다리지 않고 그 자리에서 공유 cancel을 보낸다.
+// cancel은 한 실행에 한 번이다. false·오류도 결과로 다시 쓰고, catch도 같은 판정(드레인이면 shutdownOutcome)을 거친다.
+function cancelSequence(answers: (boolean | 'error')[]) {
+  const at: number[] = [];
+  f.worker.cancel = async () => {
+    const answer = answers[at.length] ?? false;
+    at.push(Date.now());
+    if (answer === 'error') throw new Error('cancel_http');
+    return { stopped: answer };
+  };
+  return at;
+}
+for (const outcome of ['unknown_response', 'execute_error'] as const) {
+  test(`F2 후속: 드레인 전에 실행 대기가 끝나면(${outcome}) DB 후처리가 느려도 cancel이 바로 나감`, async () => {
+    await queued();
+    const stop = new AbortController();
+    const cancels = cancelOnce();
+    let slowed = false;
+    let finished = 0;
+    if (outcome === 'unknown_response') {
+      // 종료 신호 뒤 50ms에 불확실 응답, 이후 재인가가 1.5초 느리다.
+      f.setRun(async () => { await sleep(50); slowed = true; finished = Date.now(); return { status: 'unknown', stopped: false }; });
+      const authorize = f.gate.authorize.bind(f.gate);
+      f.gate.authorize = async (...args: Parameters<typeof authorize>) => { if (slowed) await sleep(1500); return authorize(...args); };
+    } else {
+      // 1초에 시작한 monitor가 1.5초 걸리는 동안(1.1초) execute가 예외로 끝난다.
+      f.setRun(async () => { await sleep(1100); finished = Date.now(); throw new Error('worker_connection_lost'); });
+      const heartbeat = f.store.heartbeat.bind(f.store);
+      f.store.heartbeat = async job => { await sleep(1500); return heartbeat(job); };
+    }
+    const tick = runtime(stop, 5000).tick();
+    await sleep(10);
+    stop.abort();
+    await tick;
+    assert.equal(cancels.length, 1, 'cancel은 한 번');
+    const delay = cancels[0]! - finished;
+    assert.ok(delay < 300, `cancel이 실행 대기 종료 뒤 ${delay}ms 늦게 나감`);
+    const job = (await rows('jobs'))[0]!;
+    // 드레인 전에 끝난 불확실 실행은 일반 불확실 판정 그대로다(확인되면 failed).
+    assert.equal(job.state, 'failed'); assert.equal(job.wait_reason, 'stop_confirmation');
+  });
+}
+for (const first of [false, 'error'] as const) {
+  test(`F2 후속: 드레인 cancel ${first === false ? 'false' : '오류'} + 후처리 DB 오류 → cancel 1번, unknown(publisher_shutdown)`, async () => {
+    await queued();
+    const stop = new AbortController();
+    const running = holding();
+    // 두 번째 cancel이 있었다면 확인했을 것이다. 한 번만 보내야 한다.
+    const cancels = cancelSequence([first, true]);
+    let broken = false;
+    const authorize = f.gate.authorize.bind(f.gate);
+    f.gate.authorize = async (...args: Parameters<typeof authorize>) => { if (broken) throw new Error('db_blip'); return authorize(...args); };
+    const tick = runtime(stop).tick();
+    await running;
+    broken = true;
+    stop.abort();
+    await tick;
+    assert.equal(cancels.length, 1, 'cancel을 다시 보냄');
+    const job = (await rows('jobs'))[0]!;
+    assert.equal(job.state, 'unknown'); assert.equal(job.wait_reason, 'publisher_shutdown');
+  });
+}
+test('F2 후속: 드레인 cancel 확인 + 후처리 DB 오류 → cancel 1번, chat은 queued(shutdownOutcome)', async () => {
+  await queued();
+  const stop = new AbortController();
+  const running = holding();
+  const cancels = cancelSequence([true]);
+  let broken = false;
+  const authorize = f.gate.authorize.bind(f.gate);
+  f.gate.authorize = async (...args: Parameters<typeof authorize>) => { if (broken) throw new Error('db_blip'); return authorize(...args); };
+  const tick = runtime(stop).tick();
+  await running;
+  broken = true;
+  stop.abort();
+  await tick;
+  assert.equal(cancels.length, 1);
+  const job = (await rows('jobs'))[0]!;
+  assert.equal(job.state, 'queued'); assert.equal(job.wait_reason, 'publisher_shutdown');
+});
