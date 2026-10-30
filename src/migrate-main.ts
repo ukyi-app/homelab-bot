@@ -1,6 +1,7 @@
 import { pathToFileURL } from 'node:url';
 import pg from 'pg';
 import { databasePoolConfig } from './config.js';
+import { withConnectRetry } from './db-connect.js';
 import { migrate } from './database.js';
 import type { Database, QueryResult } from './database.js';
 import { errorInfo, jsonLog } from './log.js';
@@ -10,7 +11,8 @@ import { errorInfo, jsonLog } from './log.js';
 const LOCK = 'homelab-bot:migrate';
 export async function runMigrations(pool: pg.Pool): Promise<number[]> {
   // 세션 advisory lock은 같은 연결에서만 풀린다. 연결 하나를 잡고 그 위에서 끝까지 돈다.
-  const client = await pool.connect();
+  const client = await withConnectRetry(() => pool.connect(), {
+    onRetry: (attempt, error) => jsonLog('database_connect_retry', { attempt: String(attempt), ...errorInfo(error) }) });
   try {
     // 기존 파드가 쓰는 표를 ALTER할 때 잠금을 오래 기다리며 그 파드를 막지 않게 짧게 실패한다(Job이 다시 돈다).
     await client.query("SET lock_timeout = '5s'");
