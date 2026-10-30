@@ -11,7 +11,7 @@ import { FORBIDDEN_FLAGS, SECRET_NAME, TASK_MARKER, assertWorkerRoot, codexConfi
   launchEnvironment, taskPaths } from '../src/codex-config.js';
 import { authSecrets, compactEvent, interpretRun, parseStream } from '../src/codex-events.js';
 import type { RunReport } from '../src/codex-events.js';
-import { ProcessGroupLauncher } from '../src/codex-process.js';
+import { ProcessGroupLauncher } from '../src/process-launcher.js';
 import { changedPaths, fileWorkspace } from '../src/codex-workspace.js';
 import { execFile } from 'node:child_process';
 import { Runtime } from '../src/runtime.js';
@@ -681,7 +681,7 @@ class WatchedLauncher extends ProcessGroupLauncher {
   }
 }
 // 실제 프로세스 시험의 작업 ID는 실행마다 새로 만든다(randomUUID). launcher는 같은 UID의 모든 프로세스에서 작업 표식
-// (HOMELAB_CODEX_TASK=<job>)을 찾아 끝내고 센다. 고정 ID면 같은 기계에서 동시에 도는 다른 시험 실행(다른 worktree·에이전트)의
+// (HOMELAB_WORKER_TASK=<job>)을 찾아 끝내고 센다. 고정 ID면 같은 기계에서 동시에 도는 다른 시험 실행(다른 worktree·에이전트)의
 // 같은 시험 프로세스를 자기 것으로 보고 죽이거나 남은 프로세스로 셌다(두 벌 동시 실행에서 S2가 8회 중 3회 exit_nonzero).
 // graceMs는 정리 신호 뒤 프로세스가 사라지기를 기다리는 상한이다. 사라지면 바로 끝나므로 넉넉히 둔다(부하에서 정리가 늦어도
 // 남은 프로세스로 오판하지 않게). 확인 불가가 계속되는 non-dumpable 시험만 짧게 준다.

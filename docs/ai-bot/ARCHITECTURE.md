@@ -2,6 +2,7 @@
 
 - 단계: `TARGET=V1`, `STAGE=FOUNDATION`, `MODE=build` (T16a), 갱신 2026-10-19.
 - **상태: 로컬 코드·mock/local_integration 검증, 실연동·배포 대기.** T15 설계 중 T16a가 확정한 부분은 §11이 기준이다. §1~10의 T16a 미정·제안 표시는 당시 기록이며 §11의 결정으로 대체한다. T17~T20의 열린 항목은 유지한다. D-14~D-17·D-24는 [DECISIONS.md](DECISIONS.md)를 따른다.
+- **T16b 실행기 프로필(2026-10-30, D-14 변경):** 모델 실행기는 작업자 env로 고르는 프로필이다. 첫 운영 프로필은 Claude Code CLI + 구독 장기 토큰 + Opus 5.5이고, 기존 Codex 경로는 전환 가능한 프로필로 남았다. 아래 §0~§5의 Codex·`auth.json` 서술은 Codex 프로필 기준 기록이다. 작업자 실행기의 현재 기준은 §12 "T16b 실행기 프로필"이다.
 - 근거 꼬리표는 [DISCOVERY.md](DISCOVERY.md)와 같다. 확인일은 모두 2026-10-18이라 꼬리표마다 다시 적지 않는다.
 - 기준: 역할 경계는 `01` §1, 보안 경계는 `00` §6, 공통 계약은 `01` §2(F01~F09), 플랫폼 자리는 platform/design.md C.8. 이 문서는 이것들을 바꾸지 않는다.
 
@@ -87,6 +88,7 @@
 `01` §6 추상 계약 기준. 경로 (A) `codex exec`를 쓸 때다. 최종 값은 T18이 실측으로 정한다.
 
 > T18 로컬·mock 값(2026-10-29)은 §12다. 실제 CLI 실측은 아직 없다(T16b, D-14 차단 조건).
+> T16b(2026-10-30): 대화 레인의 실행기는 프로필로 고른다(§12 "T16b 실행기 프로필", Claude가 첫 운영 프로필). 이 표는 T18 Codex 작업 어댑터의 기준이고, 작업 레인은 아직 어떤 실행기에도 연결하지 않았다.
 
 | 계약 | V1 값 | 근거 |
 |---|---|---|
@@ -126,7 +128,7 @@
 | | `GRAFANA_READER_TOKEN` | 읽기 어댑터(Grafana). 설계에 보관 위치가 없던 자리. Argo CD 토큰은 두지 않는다(아래 D9) |
 | | `HEALTHCHECKS_PING_URL` | 봇 하트비트(§8) |
 | | `RUNTIME_POLICIES` | 허용 목록·runtime policy 실제 값(JSON). 모양은 [config/runtime-policy.example.json](config/runtime-policy.example.json). 공유 차트가 env로 넣고 봇은 기동 때 한 번 읽는다(D1, 사용자 2026-10-30, §11). §6 "허용 목록 반영" |
-| `/apps/homelab-bot/worker` | `CODEX_AUTH_JSON` (D-14 A의 시드 `auth.json`) | 작업자만. 영속 CODEX_HOME에 `auth.json`이 없을 때만 시드로 쓴다 |
+| `/apps/homelab-bot/worker` | 활성 프로필의 키 **하나**(D-14 변경, 사용자 2026-10-30): `CLAUDE_CODE_OAUTH_TOKEN`(Claude 구독 장기 토큰, `claude-subscription`) 또는 `CODEX_AUTH_JSON`(Codex 시드 `auth.json`, `codex-subscription`) | 작업자만. Claude 토큰은 실행마다 Secret 파일에서 읽어 그 실행의 자식 env 한 변수에만 넣는다(영속 공간 복사·되쓰기 없음). Codex 시드는 영속 CODEX_HOME에 `auth.json`이 없을 때만 쓴다. 두 키를 함께 넣어 인증 우선순위에 맡기지 않는다 |
 
 - 작업자 경로에는 모델 자격 외에 아무것도 두지 않는다 [확인: 설계 C.8]. Kubernetes SA `bot-reader` 토큰은 Infisical이 아니라 공유 차트의 `serviceAccountName`으로 받는다 [확인: 설계 C.4.5].
 - `ARGOCD_READER_TOKEN`(과 주소 `ARGOCD_URL`)은 없앴다(D9, 사용자 2026-10-30). `argocd-server`는 설계상 자체 서명 TLS만 써서 봇이 서버 인증서를 검증할 수 없고(사람용 Tailscale 프록시도 https+insecure로 붙는다), 봇이 읽는 것은 앱 객체 하나다. 그래서 Argo CD 앱 상태는 SA `bot-reader`(`get applications.argoproj.io -n argocd`)로 Kubernetes API의 Application CR을 읽는다. Kubernetes API는 SA의 클러스터 CA로 TLS를 검증한다. Infisical에 이미 넣은 값이 있으면 봇은 읽지 않으니 지워도 된다.
@@ -135,6 +137,8 @@
 - 남는 위험: Infisical Free에는 경로 RBAC가 없다 [확인: 설계 C.6.3]. 작업자 store는 `/apps/homelab-bot/worker`로 묶이지만 같은 identity가 다른 경로도 읽을 수 있다.
 
 ### 5.1 작업자에 구독 인증 파일이 있는 구조 (D-14·D-15)
+
+> D-14 변경(사용자 2026-10-30) 뒤 첫 운영 프로필은 Claude 구독 장기 토큰이다. 토큰은 회전 파일이 아니라 Secret 볼륨 파일 + 실행 중 모델 CLI 자식의 env 변수 하나에 있다(§12 "T16b 실행기 프로필"). 아래 대책과 남는 위험(같은 파드·UID의 비신뢰 코드가 자격을 읽을 수 있음, 작업별 세션 분리, 인증 파일 분리)은 토큰에도 같은 뜻으로 적용된다. T16b 대화 레인은 Claude 도구를 모두 끄고(`--tools ""`, MCP 없음, 실행 중 도구 호출 = 즉시 중단) 비신뢰 코드를 실행하지 않는다. 갱신본 되쓰기 항목은 Codex 프로필에만 해당한다.
 
 D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 있다. 같은 파드에서 PR 코드의 패키지 설치·시험과 Codex가 띄우는 셸 명령이 돈다. 공식 문서는 비대화 실행에 키를 줄 때 같은 환경에서 비신뢰 코드가 돌지 않게 하라고 하고, 빌드 스크립트·시험·의존성 lifecycle 훅이 그 환경 변수를 읽을 수 있다고 적는다 [확인: https://learn.chatgpt.com/docs/non-interactive-mode]. 이 경고는 API 키 환경 변수에 대한 것이지만 같은 파일시스템의 `auth.json`에도 같은 이치가 적용된다 [가정].
 
@@ -608,7 +612,7 @@ POST 거부·GET 대조 거부·확정 ID 보존·인가 철회·local confirm �
 | `read_final_result` | true. 완료 = 종료 코드 0 + 마지막 turn 이벤트가 `turn.completed` + `-o` 파일이 출력 스키마 `completed` + 작업 그룹 소멸 확인 + 작업 공간 실제 diff를 얻음. 게시하는 변경 목록은 실제 diff 기준이고, Codex 보고와 다른 파일은 증거(`unconfirmedReports`)와 안내 문구로 남긴다. 작업 공간 밖을 바꿨다는 보고는 실패다. "완료" 문자열·로그는 근거가 아니다 | TASK-03 | 실제 저장소 압축본 작업 공간(T16b·T19), `file_change` 경로 형식 [미확인] |
 | `answer_question` | clarification만. 질문은 모델이 `status=needs_input`으로 턴을 끝낼 때만 생긴다 | TASK-02 | 없음 |
 | tool approval 중계 | **false.** 승인 플래그·`--approve-for-me`를 쓰지 않는다. 질문 종류 CHECK가 `clarification` 하나다 | TASK-01·03 | 없음 |
-| `request_cancel`, `confirm_stop` | 작업 그룹 SIGTERM → SIGKILL, 프로세스 그룹과 작업 표식(`HOMELAB_CODEX_TASK`)으로 남은 수 확인. 작업 시작 뒤 생긴 같은 UID 프로세스의 환경을 못 읽으면 확인 불가(`unknown`). 0개를 확인했을 때만 `cancelled`. `confirmStop`은 작업의 실행 세대를 올려, 아직 준비 중인 실행이 나중에 프로세스를 띄우지 못하게 한다 | TASK-03, SEC-02 | 환경을 지우고 새 세션으로 빠져나간 dumpable 자식은 못 찾는다(시험으로 기록). cgroup 또는 "파드 안 제어 프로세스 밖 0개" 확인은 T16b |
+| `request_cancel`, `confirm_stop` | 작업 그룹 SIGTERM → SIGKILL, 프로세스 그룹과 작업 표식(`HOMELAB_WORKER_TASK`, T16b 전 이름 `HOMELAB_CODEX_TASK`)으로 남은 수 확인. 작업 시작 뒤 생긴 같은 UID 프로세스의 환경을 못 읽으면 확인 불가(`unknown`). 0개를 확인했을 때만 `cancelled`. `confirmStop`은 작업의 실행 세대를 올려, 아직 준비 중인 실행이 나중에 프로세스를 띄우지 못하게 한다 | TASK-03, SEC-02 | 환경을 지우고 새 세션으로 빠져나간 dumpable 자식은 못 찾는다(시험으로 기록). cgroup 또는 "파드 안 제어 프로세스 밖 0개" 확인은 T16b |
 | `resume_task` | 같은 작업의 같은 스레드만(`exec resume <thread> -`). 세션이 대기 상태(`waiting_answer`·`waiting_model`)로 남은 경우에만 잇는다. 답한 질문이 있으면 그 답으로, 한도·인증 대기에서 `/resume-model`로 돌아왔으면 재개 프롬프트로 저장된 스레드를 잇는다. 예산 소진·사용량 미상으로 띄우지 않고 실패하면 세션을 `failed`로, 열린·답한 질문을 `cancelled`로 정리해 `/retry`가 새 스레드·새 예산으로 시작한다(rev r2 N3). 재개가 실패하면 `failed`이고 새 스레드로 조용히 바꾸지 않는다. 처음부터 다시 하는 것은 owner의 `/retry`와, 스레드가 생기기 전에 멈춘 경우뿐이다 | TASK-02 | `exec resume`의 `--json`·`-o`·`--output-schema` 수용과 `thread.started` 재발행 [미확인], T16b |
 
 ### 실행 흐름
@@ -696,7 +700,7 @@ network_access = false
 inherit = "none"
 ignore_default_excludes = false
 exclude = ["*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*CREDENTIAL*", "*AUTH*", "CODEX_*", "OPENAI_*", "GITHUB_*", "DISCORD_*", "KUBECONFIG", "SSH_AUTH_SOCK"]
-set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C.UTF-8", TMPDIR = "<작업 tmp>", HOMELAB_CODEX_TASK = "<job>" }
+set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C.UTF-8", TMPDIR = "<작업 tmp>", HOMELAB_WORKER_TASK = "<job>" }
 ```
 
 - 기준은 `inherit = "none"`이다. `exclude`는 누가 `inherit`을 바꿔도 이름 필터가 남게 둔 것이다. `set`에 비밀 이름 변수나 CODEX_HOME 경로가 들어가면 코드가 거부한다.
@@ -760,6 +764,8 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 ### T16b 작업자 진입점 (2026-10-30)
 
+> 같은 날 실행기 프로필 구조로 바뀌었다(아래 "T16b 실행기 프로필", D-14 변경). 파일 `codex-chat.ts`·`codex-process.ts`와 env `CODEX_HOME`(필수)·`WORKER_SEED_DIR`·`WORKER_SEED_KEY`·`WORKER_CODEX_BIN`, 사유 코드 `codex_version_*`는 그 절의 것으로 대체됐다. 이 절의 nonce 저장소·종료·취소 서술은 공통 실행 제어에, 시드 복사·Codex 대화 레인 서술은 Codex 프로필에 그대로 적용된다.
+
 - 결정: D2(이미지 하나 공유, sandbox digest는 사람 PR), D3(공개 키는 env, nonce는 영속 PVC 안 별도 디렉터리), D4(대화 레인은 공유 CODEX_HOME + 세션 기록 없음). 모두 사용자 2026-10-30, 기록은 [DECISIONS.md](DECISIONS.md) "T16b 결정".
 - 플래그 확인 [실측: 설치한 codex-cli 0.163.0 `codex exec --help`, 모델 호출 없음]: `--ephemeral`("Run without persisting session files to disk"), `--skip-git-repo-check`, `--output-schema <FILE>`, `-o/--output-last-message`, `--json`, PROMPT `-`는 stdin. `exec resume`도 `--json`·`-o`·`--output-schema`·`--ephemeral`을 받는다. `codex login status`가 있다(재시드 절차 6단계).
 
@@ -810,3 +816,110 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - codex는 CODEX_HOME 아래에 보조 실행 파일(PATH alias)을 만든다 [실측: 임시 디렉터리 CODEX_HOME에서 `--version`이 "Refusing to create helper binaries under temporary dir" 경고]. 영속 공간 크기(1Gi)에 들어가는지와 `--ephemeral` 실행 뒤 CODEX_HOME에 남는 파일 이름은 S12 첫 대화 뒤 이름만 확인한다.
 - 이미지는 `node`가 PID 1이다. SIGTERM은 직접 받아 정리한다. 고아 손자 프로세스(zombie)는 거두지 않는다(tini 없음, 빌드에서 apt를 쓰지 않음). 정상 종료한 codex는 자기 자식을 거두므로 쌓이는 경우는 강제 종료 때뿐이다 [가정].
 - `SerialWorker.cancel`(T16a)은 이미 끝나 바쁘지 않은 작업의 취소에 `stopped: false`를 답한다. 게시 서버의 시간 초과와 작업자 완료가 겹치면 `unknown`이 될 수 있어 위 기한 여유를 뒀다.
+
+### T16b 실행기 프로필 (2026-10-30, D-14 변경)
+
+- 결정: D-14 변경(사용자 2026-10-30, [DECISIONS.md](DECISIONS.md) D-14 "변경"). Claude Code CLI, 구독 장기 토큰, 첫 모델 Opus 5.5, 실행기를 설정으로 바꾸는 구조. 설계는 T16b 조사(실행기 어댑터·Claude 인증·Claude 전환 영향, 비공개 작업 문서)의 추천안 "공통 실행 제어 + 작은 실행기 어댑터 + 프로필 선택 + 이미지 하나"를 따랐다.
+- 범위: 대화 레인만. 작업 레인(T18)·리뷰(T17)는 어떤 실행기에도 연결하지 않았다(능력표 `lanes.task=false`). 게시 서버와의 HTTP v1(요청·응답·서명·nonce)은 바꾸지 않았다. 실행기 이름·플래그·자격은 그 계약에 들어가지 않는다.
+- 모델 호출·로그인 없음. Claude CLI는 고정 바이너리의 `--version`·`--help`만 실행했다. 시험의 CLI 자리는 같은 인자·stdin·env로 도는 가짜 실행 파일이다.
+
+```text
+게시 서버 ── 서명된 HTTP v1(변경 없음) ──▶ 작업자
+  SerialWorker: 서명·nonce·직렬 1
+  ChatLane(chat-lane.ts): 공통 실행 제어
+    ├ 실행마다 빈 /tmp/homelab-chat-*/{home,config,workspace,run,tmp}, 끝나고 소멸 확인 뒤 통째 삭제
+    ├ 자식 env = 공통 기본(PATH·HOME·LANG·TMPDIR·작업 표식·프록시) + 어댑터가 선언한 이름만
+    ├ 실행 전: 자격 유출 검사 / 실행 중: 도구 예산·정책 위반 즉시 중단 / 기한·취소·종료
+    ├ ProcessGroupLauncher(process-launcher.ts): 그룹 정리·소멸 확인
+    └ 판정: 소멸 확인 → 상한·위반·중단 → 어댑터 결과(대기·실패·답) → 공통 스키마 → 반사 검사
+  ChatAdapter: argv·env 이름·설정 파일·출력 해석·CLI 오류 분류만
+    ├ ClaudeChatAdapter(executor-claude.ts)
+    └ CodexChatAdapter(executor-codex.ts, 기존 D4 경로)
+  WorkerCredential: StaticEnvCredential(env-static) / FileMutableCredential(file-mutable)
+```
+
+| 파일 | 역할 |
+|---|---|
+| `src/executor.ts` | 내부 계약: `ChatAdapter`·`AdapterRun`·`ExecutorCapabilities`·`EngineOutcome` |
+| `src/executor-profiles.ts` | 프로필 표 `PROFILES`, 선택 `selectProfile`, 조립 `createExecutor`, `--version` 확인 `executorVersion` |
+| `src/chat-lane.ts` | 공통 실행 제어 `ChatLane`, 판정 `interpretChat`, 실행 전 검사 `assertLaunchSafe`, 출력 스키마 `CHAT_OUTPUT_JSON_SCHEMA` |
+| `src/executor-claude.ts` | Claude 어댑터: `claudeArgs`, `CLAUDE_FIXED_ENV`, `initViolation`, `classifyClaudeError`, `interpretClaudeStream` |
+| `src/executor-codex.ts` | Codex 어댑터(옛 `codex-chat.ts`의 실행기 부분): `chatArgs`, `interpretCodexChat` |
+| `src/credentials.ts` | 자격 방식 `StaticEnvCredential`·`FileMutableCredential` |
+| `src/process-launcher.ts` | 공통 프로세스 그룹 실행(옛 `codex-process.ts`). 작업 표식 env 이름 `HOMELAB_WORKER_TASK` |
+| `src/personal-homes.ts` | 개인 CLI 홈 이름(`.codex*`·`.claude*`). `assertWorkerRoot`·`assertNotPersonal`이 함께 쓴다 |
+
+**프로필.** 작업자 env 세 개가 고른다. 표에 없는 조합은 기동 실패이고 다른 프로필로 몰래 돌아가지 않는다.
+
+| 프로필 | `WORKER_EXECUTOR` | `WORKER_CREDENTIAL_KEY` | 자격 방식 | `WORKER_MODEL` | 실행 파일(이미지) | 추가 env |
+|---|---|---|---|---|---|---|
+| `claude-subscription` | `claude` | `CLAUDE_CODE_OAUTH_TOKEN` | env-static | `claude-`로 시작하는 전체 ID만(첫 값 `claude-opus-5-5`). 별칭(`opus`)·접미어(`[1m]`)는 거부 | `/usr/local/bin/claude` 2.1.308 | 없음 |
+| `codex-subscription` | `codex` | `CODEX_AUTH_JSON` | file-mutable | `cli-default`만(`-m`을 넘기지 않음, CLI 기본 모델) | `/usr/local/bin/codex` 0.163.0 | `CODEX_HOME` |
+
+거부 사유 코드: 모르는 실행기 `config_invalid:WORKER_EXECUTOR`, 키 이름 모양 `config_invalid:WORKER_CREDENTIAL_KEY`, 표에 없는 실행기·자격 조합(예: `claude` + `ANTHROPIC_API_KEY`) `profile_unsupported`, 모델 모양 `config_invalid:WORKER_MODEL`, 프로필 추가 env 없음 `config_missing:<이름>`. 같은 프로필 안 모델 바꾸기(예: `claude-sonnet-5-5`)는 설정만 바꾸면 된다.
+
+**능력표(프로필에서 냄, `ExecutorCapabilities`).**
+
+| | `claude-subscription` | `codex-subscription` |
+|---|---|---|
+| 레인 | 대화만 | 대화만 |
+| 구조화 출력 | `--json-schema` → 마지막 `result.structured_output` | `--output-schema` → `-o` 파일 |
+| 도구 | none: `--tools ""`, MCP 없음, 실행 중 도구 호출이 보이면 즉시 중단(예산 0) | read-only 샌드박스 + 요청 도구 예산(D4) |
+| 세션 기록 | `--no-session-persistence` + 실행 디렉터리(HOME·CLAUDE_CONFIG_DIR·TMPDIR) 통째 삭제 | `--ephemeral` + CODEX_HOME `sessions/`·`archived_sessions/` 삭제 |
+| 모델 고정 | 예(`--model`, 실행마다 init 이벤트와 대조) | 아니오(CLI 기본) |
+| 자격 | env-static | file-mutable |
+| 근거 수준 | 가짜 CLI 시험 | 가짜 CLI 시험 |
+
+**자격 방식.**
+
+- env-static(Claude 토큰): `<WORKER_CREDENTIAL_DIR>/<WORKER_CREDENTIAL_KEY>`(Secret 볼륨 파일). 읽기는 Codex 시드와 같은 `readSecretFile`이다: 링크의 최종 대상이 사람 홈 `.codex*`·`.claude*`면 거부, 검사한 경로와 연 파일 대조, 일반 파일·16KiB 이하. 앞뒤 공백·줄바꿈을 떼고 인쇄 가능한 ASCII 한 줄(16~8192자)이어야 한다. 토큰 접두어는 공식 형식이 없어 [미확인] 보지 않는다. 기동 때, readiness 때, **실행 준비 때마다** 다시 읽는다. 그래서 ESO가 값을 바꾸면 파드 재시작 없이 다음 실행부터 새 값이다(이미 실행 중인 자식은 옛 값). 영속 공간에 복사하거나 되쓰지 않는다. 사유 코드는 `credential_missing`·`credential_unreadable`·`credential_personal_path`·`credential_invalid`다.
+- file-mutable(Codex auth.json): 위 "T16b 작업자 진입점"의 시드 복사 그대로다. `CODEX_HOME`은 공장 함수(`createExecutor`)가 한 번 검증·해석한 실제 경로를 어댑터와 자격이 함께 쓴다. 정상 별칭(심링크) 경로를 자격에 그대로 넘기면 `O_NOFOLLOW` 읽기가 실패해 반사 검사가 비밀을 모른 채 돌았다(리뷰 exec-r1 P1).
+- 두 방식 모두 실행 준비 때나 실행 뒤 자격을 읽지 못하면(파일 자격은 비밀 문자열이 하나도 안 나와도) `credential_unreadable`로 그 실행을 `failed`로 닫는다. 빈 비밀 목록으로 반사 검사를 건너뛰지 않는다.
+
+**공통 실행 전 검사(`assertLaunchSafe`).** 다음이면 띄우지 않고 `failed`(남은 프로세스 없음)다: 어댑터 env 이름이 선언 목록 밖이거나 공통 기본 이름을 덮음, 자격 값이 어댑터의 자격 변수 밖(argv, 다른 env 값, 실행 디렉터리의 파일)에 있음, 정적 자격인데 자격 변수에 그 값이 없음, 반사 검사에 쓸 비밀이 하나도 없음. 작업자 프로세스 env는 읽거나 병합하지 않는다. 어댑터가 잘못돼도 공통부가 막는다(시험 CLD-09).
+
+**Claude 어댑터.** 플래그는 고정 바이너리 2.1.308 `claude --help`에서 모두 확인했다[실측]. 이벤트 모양은 같은 바이너리에 든 SDK 메시지 스키마(정적 읽기)와 공식 headless 문서다[가정: 실제 출력 대조는 S12].
+
+- argv: `-p --output-format stream-json --verbose --json-schema <CHAT_OUTPUT_JSON_SCHEMA> --model <WORKER_MODEL> --tools "" --strict-mcp-config --mcp-config {"mcpServers":{}} --no-session-persistence --permission-mode dontAsk --disable-slash-commands --safe-mode`. 프롬프트는 stdin이다(argv·파일에 두지 않음).
+- 쓰지 않는 플래그(`CLAUDE_FORBIDDEN_FLAGS`, 시험이 확인): `--bare`(OAuth 토큰을 읽지 않는다 [확인: --help]), `--fallback-model`, `--dangerously-skip-permissions`, `--resume`·`--continue`, `--add-dir`, `--allowedTools`, `--settings`·`--setting-sources`, `--system-prompt`, `--plugin-dir`, `--debug-file` 등.
+- env: 공통 기본 + `CLAUDE_CONFIG_DIR`(실행별 임시) + `CLAUDE_CODE_OAUTH_TOKEN`(토큰) + 고정 8개 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`·`DISABLE_TELEMETRY=1`·`DISABLE_ERROR_REPORTING=1`·`DISABLE_FEEDBACK_COMMAND=1`·`CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1`·`ENABLE_CLAUDEAI_MCP_SERVERS=false`·`DISABLE_UPDATES=1`·`CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1`. 마지막 값은 Opus 5.5의 내용 기반 자동 모델 전환(Opus 5·Opus 4.8로 다시 실행)을 끈다. 이 전환은 `--fallback-model`과 별개로 기본 켜져 있다 [확인: 공식 모델 설정·env 문서, 2.1.308 바이너리의 전환 조건이 이 값을 봄](리뷰 exec-r1 P1). `-p`에서는 API 키가 OAuth 토큰보다 우선하므로 [확인: 공식 인증 문서] 자격 변수는 하나만 넣는다.
+- 실행마다 첫 `system/init` 확인: `tools`가 출력 전달용 `StructuredOutput`뿐(또는 없음), `mcp_servers` 0개, `model` = `WORKER_MODEL`, `apiKeySource` = `none`(OAuth 토큰. API 키가 쓰였다면 `ANTHROPIC_API_KEY`), `claude_code_version` = 2.1.308. 하나라도 다르면 기한을 기다리지 않고 즉시 멈추고 `failed`다.
+- init 뒤에도 모델을 본다(모델 고정은 사용자 결정): `system/model_refusal_fallback`(자동 전환) 이벤트가 오거나, assistant 메시지의 `message.model`이 `WORKER_MODEL`(날짜가 붙은 같은 ID 포함)이나 CLI 합성 오류 표식 `<synthetic>`이 아니면(없음 포함) 즉시 멈추고 `failed`다. 판정에서도 같은 조건을 다시 본다.
+- 판정: init 하나·result 최대 하나가 아니거나 깨진 줄 → `failed`. 오류 결과(`is_error`가 false가 아니거나 subtype이 success가 아님)는 assistant 메시지의 `error` 종류로 가른다: `authentication_failed`·`oauth_org_not_allowed`·`account_on_hold`·`verification_required` → `auth_expired`, `rate_limit`·`billing_error` → `limited`, 그 밖 종류(`overloaded`·`server_error` 등) → `failed`. 종류가 없거나 `unknown`일 때만 HTTP 상태(401·403 → `auth_expired`, 429·402 → `limited`)를 본다. 성공은 `is_error=false` + subtype success + 종료 코드 0 + `structured_output`이 있어야 한다. 모델 답·`result` 텍스트에 "401"·"rate limit"이 있어도 보지 않는다. 중간 `system/api_retry` 뒤 성공한 실행은 성공이다.
+- 출력 줄은 판정 필드만 남긴다(모델 본문·thinking·도구 입력·`result` 텍스트는 버림). 상한은 공통 `CHAT_LIMITS`(줄 1MiB, 전체 16MiB, 이벤트 2만 개)다.
+
+**기동 순서.** env 확인(공통 여섯) → 프로필 선택 → 프로필 추가 env → 경로·공개 키 → 자격 디렉터리·nonce 디렉터리가 사람 홈이나 `.codex*`·`.claude*` 아래면 거부 → 어댑터·자격 조립(Codex는 CODEX_HOME 개인 경로 거부) → `<실행 파일> --version`(빈 임시 HOME·설정 디렉터리, 자격 없음, 모델 호출 없음)이 프로필 버전과 같은지(`executor_version_mismatch`·`executor_version_unavailable`) → 자격 준비(`present`·`seeded`·`kept`) → nonce 저장소 → 8080. 기동 로그는 `{"event":"worker_started","profile":…,"cli":…,"model":…,"credential":…}`이고 값(토큰·키)은 싣지 않는다.
+
+| env | 필수 | 내용 |
+|---|---|---|
+| `WORKER_EXECUTOR` | 예 | `claude` 또는 `codex` |
+| `WORKER_MODEL` | 예 | Claude는 전체 모델 ID(`claude-opus-5-5`), Codex는 `cli-default` |
+| `WORKER_CREDENTIAL_DIR` | 예 | 자격 Secret 볼륨 디렉터리(절대 경로) |
+| `WORKER_CREDENTIAL_KEY` | 예 | 자격 키 이름 = Secret 파일 이름 = 인증 방식(`CLAUDE_CODE_OAUTH_TOKEN`·`CODEX_AUTH_JSON`) |
+| `WORKER_NONCE_DIR` | 예 | 영속 공간(PVC) 안 nonce 디렉터리. 프로필과 무관하게 필요하다(D3) |
+| `WORKER_CONTROL_PUBLIC_KEY` | 예 | Ed25519 공개 키 PEM(위 절 그대로) |
+| `CODEX_HOME` | Codex만 | 영속 공간의 Codex 홈(auth.json 갱신본). `WORKER_NONCE_DIR`과 같으면 거부 |
+| `WORKER_EXECUTOR_BIN` | 아니오 | 실행 파일 경로를 바꾼다(시험용). 기본은 프로필의 이미지 경로 |
+| `HTTPS_PROXY`, `NO_PROXY` | 아니오 | 모델 CLI 프로세스 env에만 넘긴다 |
+
+**실행 기록 정리 실패(리뷰 exec-r1 P2).** 프로세스 소멸을 확인한 실행은 어댑터 고유 잔여물(Codex `sessions/`·`archived_sessions/`)과 실행 디렉터리를 지우고, 실행 디렉터리가 정말 없어졌는지 확인한 뒤에 결과를 확정한다. 지우지 못하면(권한·파일시스템 오류) 그 실행의 답은 게시하지 않고 `failed`(`stopped: true`, 프로세스는 끝났으니 `unknown`이 아님)이며, 한도·인증·실패 결과는 그대로 둔다. 지우지 못한 실행은 잔여물로 추적한다. 잔여물이 남은 동안 새 실행은 띄우지 않고(`failed`) readiness는 503이다. readiness 확인과 새 실행 직전마다 다시 지워 보고, 모두 지워지면 자동으로 돌아온다. 소멸을 확인하지 못한 실행은 살아 있는 프로세스가 쓰는 중일 수 있어 지우지 않는다(그 실행은 `unknown`이고 SerialWorker가 막는다). 기동 로그와 같은 줄 형식으로 값 없는 사건 `{"event":"chat_cleanup_failed"}`·`{"event":"chat_cleanup_recovered"}`만 남긴다(경로·내용 없음).
+
+**readiness.** `GET /readyz`는 앞 실행의 기록이 모두 지워졌고 선택한 자격이 쓸 수 있는 모양으로 있으면 200이다. Claude: 토큰 파일 읽기·모양(없어지거나 틀리면 503, 돌아오면 200). Codex: 영속 공간의 일반 파일 `auth.json`. 모델을 부르지 않는다. readiness 200은 인증 서버가 토큰을 받는다는 뜻이 아니다.
+
+**준비된 프로필 사이 전환(설정 PR 하나 + 자격 하나).**
+
+1. 사람이 대상 프로필의 자격 하나를 Infisical `/apps/homelab-bot/worker`의 그 키에 넣는다.
+2. sandbox values PR: `WORKER_EXECUTOR`·`WORKER_MODEL`·`WORKER_CREDENTIAL_KEY` 세 값, ExternalSecret의 키 하나, 프로필 egress 호스트. 이미지 digest는 그대로다(두 CLI가 이미 들어 있다).
+3. 배포 전 모델 실행을 멈추고 실행 중 작업을 drain한다. `unknown`이면 새 실행기로 넘기지 않는다. 프록시와 작업자 롤아웃은 원자적이지 않다.
+4. 병합 뒤 버전·프로필·readiness를 보고, 승인된 최소 실제 대화로 확인한 뒤 사람이 재개한다.
+
+롤백은 이전 프로필을 고르는 PR이다. Codex로 돌아갈 때는 PVC의 갱신본 `auth.json`을 쓰고 옛 시드로 덮지 않는다(시드 규칙이 이미 그렇다). 새 실행기(OpenCode 등)나 새 인증 방식(Claude API 키 등)은 어댑터·이미지·시험을 더한 뒤 프로필 표에 한 줄을 더하는 코드 PR이 먼저다.
+
+**남는 것 [미확인]·[가정] (S11·S12 실측).**
+
+- 실제 stream-json 모양: `system/init`의 `model` 값과 assistant `message.model`이 `--model`로 준 ID와 글자 그대로(또는 날짜 접미어만 붙어) 같은지, `apiKeySource`가 `none`인지, `--tools ""`일 때 `tools`에 `StructuredOutput`이 남고 구조화 출력이 되는지, 한도·인증 오류가 assistant `error` 종류로 오는지. 다르면 첫 대화가 `failed`(정책 위반 또는 결과 없음)로 닫히는 쪽으로 틀린다(fail-closed).
+- egress: 모델 요청은 `api.anthropic.com:443` [확인: 공식 네트워크 문서]. 장기 토큰 사용 때 `claude.ai`·`platform.claude.com`(OAuth 교환·갱신)이 필요한지는 [미확인]이다. DNS 없는 파드에서 `HTTPS_PROXY`만으로 되는지도 [미확인]이고, 안 되면 먼저 볼 후보는 2.1.308에 있는 `CLAUDE_CODE_PROXY_RESOLVES_HOSTS`다(값의 뜻은 미확인이라 지금 넣지 않았다).
+- 시작 실패 분류: 2.1.308은 일부 시작 실패를 stderr에만 쓰고, 구조화된 `startup_failure_reason` 결과는 `CLAUDE_CODE_STARTUP_FAILURE_RESULTS` opt-in이 있어야 낸다 [확인: 바이너리 스키마 설명, 리뷰 exec-r1]. 이 값은 넣지 않았다. 그런 실패는 결과 없음 → `failed`로 닫히고 한도·인증으로 분류되지 않는다.
+- `--safe-mode`·`--strict-mcp-config`·`--disable-slash-commands`와 OAuth 토큰·구조화 출력의 조합이 실제로 함께 도는지. CLI가 실행 디렉터리 밖(`/tmp` 직접 등)에 쓰는 파일이 있는지.
+- 메모리·`/tmp`(256Mi) 사용량, 첫 응답 시간(대화 기한 60초 안인지).
+- Claude 토큰도 같은 UID에서 `/proc/<pid>/environ`으로 읽힌다. 대화 레인에는 비신뢰 코드가 없어 받아들인 위험이고, 작업 레인을 열기 전에 T18 결정 (2)·(4)가 필요하다.

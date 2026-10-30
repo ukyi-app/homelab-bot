@@ -6,8 +6,10 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DEFAULTS } from './contracts.js';
 import type { Clock } from './contracts.js';
+import { isPersonalEntry } from './personal-homes.js';
 
-// 작업자 영속 공간(PVC)의 상태: 모델 자격 시드 복사(D-14 조건 4)와 capability nonce 저장소(D3).
+// 작업자 영속 공간(PVC)의 상태: 파일 자격(Codex auth.json) 시드 복사(D-14 조건 4)와 capability nonce 저장소(D3).
+// nonce 저장소는 실행기·자격 방식과 무관하게 필요하다(정적 토큰 프로필도 PVC를 유지한다).
 
 // 기동 실패 사유. 값(시드 내용, 토큰)은 담지 않는다. 진입점은 이 code만 로그에 남긴다.
 export class WorkerStartError extends Error {
@@ -16,8 +18,8 @@ export class WorkerStartError extends Error {
 const SEED_LIMIT = 1024 * 1024;
 const NOFOLLOW_NEW = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
 
-// 경로가 사람 홈 자체나 그 아래 `.codex*`(심링크로 가리키는 경우 포함)면 거부한다.
-// 개인 auth.json을 시드로 복사하거나 개인 Codex 홈에 쓰지 않는다(D-14 조건 1). 홈을 열거하지 않고 경로 모양만 본다.
+// 경로가 사람 홈 자체나 그 아래 `.codex*`·`.claude*`(심링크로 가리키는 경우 포함)면 거부한다.
+// 개인 자격(auth.json, Claude 토큰·설정)을 읽거나 개인 CLI 홈에 쓰지 않는다(D-14 조건 1). 홈을 열거하지 않고 경로 모양만 본다.
 export function assertNotPersonal(name: string, path: string, homes: readonly string[]): void {
   let existing = resolve(path);
   while (!existsSync(existing) && dirname(existing) !== existing) existing = dirname(existing);
@@ -28,7 +30,7 @@ export function assertNotPersonal(name: string, path: string, homes: readonly st
     try { bases.add(realpathSync(home)); } catch { /* 홈이 없으면 문자열 비교만 */ }
     for (const base of bases) for (const candidate of candidates) {
       const rel = relative(base, candidate);
-      if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel) && rel.split(sep)[0]!.startsWith('.codex'))) {
+      if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel) && isPersonalEntry(rel.split(sep)[0]!))) {
         throw new WorkerStartError(`config_invalid:${name}`);
       }
     }
@@ -52,29 +54,33 @@ function plausibleAuth(text: string): boolean {
   return typeof refresh === 'string' && refresh.trim().length > 0;
 }
 
-async function readSeed(path: string, homes: readonly string[]): Promise<Buffer> {
-  // Secret 볼륨 파일은 kubelet이 만든 심링크(..data/키)라 링크를 따라간다. 대신 최종 대상을 먼저 해석해
-  // 개인 Codex 홈(.codex*)이면 읽지 않는다(디렉터리만 보면 파일 자체의 심링크로 개인 auth.json을 복사할 수 있었다, r1 P1).
+// Secret 볼륨의 자격 파일 하나를 읽는다(Codex 시드, Claude 토큰 공통). 실패 사유는 `<prefix>_missing|unreadable|
+// personal_path|invalid` 코드뿐이고 내용은 싣지 않는다.
+// Secret 볼륨 파일은 kubelet이 만든 심링크(..data/키)라 링크를 따라간다. 대신 최종 대상을 먼저 해석해
+// 개인 CLI 홈(.codex*·.claude*)이면 읽지 않는다(디렉터리만 보면 파일 자체의 심링크로 개인 자격을 복사할 수 있었다, r1 P1).
+export async function readSecretFile(path: string, homes: readonly string[],
+  options: { prefix: string; limit: number } = { prefix: 'seed', limit: SEED_LIMIT }): Promise<Buffer> {
+  const { prefix, limit } = options;
   let real: string;
   try { real = await realpath(path); }
-  catch (error) { throw new WorkerStartError((error as { code?: string }).code === 'ENOENT' ? 'seed_missing' : 'seed_unreadable'); }
-  try { assertNotPersonal('WORKER_SEED_KEY', real, homes); } catch { throw new WorkerStartError('seed_personal_path'); }
+  catch (error) { throw new WorkerStartError((error as { code?: string }).code === 'ENOENT' ? `${prefix}_missing` : `${prefix}_unreadable`); }
+  try { assertNotPersonal('WORKER_CREDENTIAL_KEY', real, homes); } catch { throw new WorkerStartError(`${prefix}_personal_path`); }
   let handle: FileHandle;
   try { handle = await open(real, constants.O_RDONLY | constants.O_NONBLOCK); }
-  catch (error) { throw new WorkerStartError((error as { code?: string }).code === 'ENOENT' ? 'seed_missing' : 'seed_unreadable'); }
+  catch (error) { throw new WorkerStartError((error as { code?: string }).code === 'ENOENT' ? `${prefix}_missing` : `${prefix}_unreadable`); }
   try {
     // 검사한 경로와 실제로 연 파일이 같은지 본다. 그 사이 경로 구성 요소가 심링크로 바뀌었으면 읽지 않는다.
-    if (await readlink(`/proc/self/fd/${handle.fd}`) !== real) throw new WorkerStartError('seed_unreadable');
+    if (await readlink(`/proc/self/fd/${handle.fd}`) !== real) throw new WorkerStartError(`${prefix}_unreadable`);
     const info = await handle.stat();
-    if (!info.isFile()) throw new WorkerStartError('seed_unreadable');
-    if (info.size === 0) throw new WorkerStartError('seed_invalid');
-    if (info.size > SEED_LIMIT) throw new WorkerStartError('seed_invalid');
+    if (!info.isFile()) throw new WorkerStartError(`${prefix}_unreadable`);
+    if (info.size === 0) throw new WorkerStartError(`${prefix}_invalid`);
+    if (info.size > limit) throw new WorkerStartError(`${prefix}_invalid`);
     const data = await handle.readFile();
-    if (data.length > SEED_LIMIT) throw new WorkerStartError('seed_invalid');
+    if (data.length > limit) throw new WorkerStartError(`${prefix}_invalid`);
     return data;
   } catch (error) {
     if (error instanceof WorkerStartError) throw error;
-    throw new WorkerStartError('seed_unreadable');
+    throw new WorkerStartError(`${prefix}_unreadable`);
   } finally { await handle.close().catch(() => {}); }
 }
 
@@ -99,7 +105,7 @@ export async function seedAuth(codexHome: string, seedFile: string, options: See
     if (error instanceof WorkerStartError) throw error;
     if ((error as { code?: string }).code !== 'ENOENT') throw new WorkerStartError('auth_unreadable');
   }
-  const seed = await readSeed(seedFile, options.homes ?? humanHomes());
+  const seed = await readSecretFile(seedFile, options.homes ?? humanHomes());
   if (!plausibleAuth(seed.toString('utf8'))) throw new WorkerStartError('seed_invalid');
   const temporary = join(codexHome, `.auth.json.seed-${randomUUID()}`);
   let installed = false;
