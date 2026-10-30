@@ -260,12 +260,34 @@ test('P1-1 새 READY: 모든 활성 스레드를 live 입력보다 먼저 막아
   assert.equal((await conversation('fixture-thread-b')).checkpoint, '300');
 });
 
+test('R2-1 진입점: history 대기 중 새 READY가 오면 이전 복구가 새 장벽을 풀지 않고 새 세대가 단절 중 메시지를 다시 읽음', async () => {
+  await thread('fixture-thread-a', '100');
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const calls: string[] = [];
+  rest.history = async (channel, after) => {
+    calls.push(after);
+    if (calls.length === 1) { await held; return []; }
+    return [message('200', channel)].filter(m => BigInt(m.id) > BigInt(after));
+  };
+  await boot();
+  await until(() => calls.length === 1);
+  // 세션을 잃고 새 IDENTIFY → 새 READY(새 장벽). 그 뒤 이전 history 응답이 늦게 돌아온다.
+  gw.latest.send({ op: 9, d: false });
+  await until(() => gw.connections.length === 2 && gw.latest.received.some(p => p.op === 2), 8000);
+  assert.ok(await waitFor(async () => rest.calls.filter(c => c.method === 'GET' && c.path.endsWith('/commands')).length >= 2, 8000), '두 번째 READY');
+  release();
+  const recovered = await waitFor(async () => !!(await event('200'))?.accepted && !(await conversation('fixture-thread-a')).gap, 8000);
+  assert.ok(recovered, `history ${JSON.stringify(calls)}, 대화 ${JSON.stringify(await conversation('fixture-thread-a'))}`);
+  assert.equal((await conversation('fixture-thread-a')).checkpoint, '200');
+});
+
 test('P1-2 일시적인 history 조회 실패 뒤 새 READY 없이 대화별로 다시 시도해 버퍼를 처리', async () => {
   await thread('fixture-thread-a', '100');
   let calls = 0;
   rest.history = async () => { calls++; if (calls === 1) throw new Error('fixture_transient_history_timeout'); return []; };
   await boot();
-  await until(() => calls === 1);
+  await until(() => calls >= 1);
   // 실패 뒤 gap이 남아 있는 동안 들어온 live 메시지는 버퍼에 들어간다.
   assert.ok(await waitFor(async () => (await conversation('fixture-thread-a')).recovery_token === null));
   gw.dispatch(gw.latest, 2, 'MESSAGE_CREATE', message('400', 'fixture-thread-a'));
