@@ -299,7 +299,8 @@ gap을 푸는 마지막 transaction은 lease 마감을 transaction 마감으로 
 live 메시지 하나가 일시 장애(DB·REST·429 등)로 처리되지 못하면 그 이벤트는 sequence가 지나 다시 오지 않으므로, 그 채널의 활성 스레드·DM에만
 같은 장벽(`RecoveryScheduler.guard()`, 진행 중 복구 토큰도 지움)을 세워 history 대조로 메운다. 장벽이 설 때까지 다음 이벤트는 기다려
 뒤 메시지가 checkpoint를 먼저 올리지 못한다. 확정 거부(`Denied`·형식 오류·채널 403/404)는 장벽 없이 버린다. 상호작용은 토큰이 3초라
-되살리지 않는다(사용자가 다시 보낸다). slash 명령은 READY마다 guild 단위로 FOUNDATION 12개에 맞추고(`task`·`review-*` 없음, 같으면 쓰지 않음)
+되살리지 않는다(사용자가 다시 보낸다). 작업 claim(`Runtime` 루프)은 첫 READY 장벽이 선 뒤에 시작한다. 재시작 때 남은 queued 작업이
+중단 중 메시지를 history로 복구하기 전에 이전 입력으로 모델을 부르지 않고, 복구된 최신 메시지가 그 작업을 먼저 supersede할 수 있다. slash 명령은 READY마다 guild 단위로 FOUNDATION 12개에 맞추고(`task`·`review-*` 없음, 같으면 쓰지 않음)
 전역 명령은 비운다. 수신도 같은 목록만 받는다. 재연결·RESUME 실측은 실연동(S16)이다.
 
 작업자 모델 호출은 **대화·작업 레인 합쳐 1개**다. DB의 scheduler 행 잠금과 작업자의 별도 mutex가
@@ -464,6 +465,8 @@ service 없는 플랫폼 경보·미등록 service·지원하지 않는 severity
 하트비트 대안은 **채택**한다. 조율 루프가 최근 **60초** 안에 돌고 Gateway가 최근 **5분** 안에 연결됐을 때만
 최소 **60초** 간격으로 ping한다. 기동 뒤 한 번도 연결되지 않았으면 ping하지 않는다.
 따라서 Gateway 룰 스크레이프가 준비되기 전에도 오래 단절된 봇의 ping이 멈춘다.
+T16b 진입점의 "조율 루프가 돎"은 한 바퀴가 DB에 닿은 루프(runtime의 `store.expire`, publisher의 `claimDelivery`)로만 잰다.
+복구 루프는 대기 항목이 없으면 DB 없이 끝나므로 세지 않는다. 그래서 DB가 끊기면 60초 뒤 ping이 멈춘다.
 실제 healthchecks 체크 생성·유예 시간·Telegram 도착·replicas 0은 T16b에서 확인한다.
 기존 Alertmanager→Telegram 경로는 이 코드에 의존하지 않는다.
 
