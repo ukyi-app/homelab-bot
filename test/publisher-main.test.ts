@@ -7,6 +7,7 @@ import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import { DiscordRejected } from '../src/contracts.js';
 import type { PublisherConfig } from '../src/config.js';
+import type { Database } from '../src/database.js';
 import type { DiscordApi } from '../src/discord-protocol.js';
 import { FOUNDATION_COMMANDS } from '../src/commands.js';
 import { startPublisher } from '../src/main.js';
@@ -29,6 +30,8 @@ class FakeRest implements DiscordApi {
     ['fixture-thread', { id: 'fixture-thread', type: 11, guild_id: GUILD, parent_id: CHAT }]]);
   guildCommands: unknown[] = [];
   failCommandReads = 0;
+  // 채널 메타데이터 조회를 일시적으로 실패시킬 횟수(채널 ID별).
+  failChannelReads = new Map<string, number>();
   // 스레드 history 응답. 기본은 빈 페이지.
   history: (channel: string, after: string) => Promise<unknown[]> = async () => [];
   globalCommands: unknown[] = [{ name: 'task', type: 1, description: '이전 등록' }];
@@ -37,7 +40,10 @@ class FakeRest implements DiscordApi {
     this.calls.push({ method, path, body });
     let m: RegExpMatchArray | null;
     if (method === 'GET' && (m = path.match(/^\/channels\/([^/?]+)$/))) {
-      const channel = this.channels.get(decodeURIComponent(m[1]!));
+      const id = decodeURIComponent(m[1]!);
+      const failures = this.failChannelReads.get(id) ?? 0;
+      if (failures > 0) { this.failChannelReads.set(id, failures - 1); throw new Error('discord_request_failed'); }
+      const channel = this.channels.get(id);
       if (!channel) throw new DiscordRejected(404);
       return channel;
     }
@@ -99,7 +105,7 @@ beforeEach(async () => {
 afterEach(async () => { await publisher?.stop(); publisher = undefined; await gw.close(); assert.equal(gw.identifyViolations, 0); });
 
 const SECRET = 'fixture-webhook-secret-value';
-async function boot(options: { heartbeatEveryMs?: number; gateway?: boolean; ports?: { app: number; alerts: number } } = {}) {
+async function boot(options: { heartbeatEveryMs?: number; gateway?: boolean; ports?: { app: number; alerts: number }; db?: Database } = {}) {
   const config: PublisherConfig = {
     databaseUrl: 'postgresql://unused', discordToken: 'fixture-discord-token',
     policy: loadRuntimePolicy(JSON.stringify({ revision: 'fixture-v1', owner: OWNER, guild: GUILD, conversationChannel: CHAT,
@@ -108,7 +114,7 @@ async function boot(options: { heartbeatEveryMs?: number; gateway?: boolean; por
     kubernetes: { url: auxBase }, workerUrl: `${auxBase}/`, healthchecksUrl: `${auxBase}/ping`,
     workerKey: generateKeyPairSync('ed25519').privateKey, githubWebhookSecret: SECRET,
   };
-  publisher = await startPublisher(config, { db: database.db, discord: rest, gatewayUrl: options.gateway === false ? () => new Promise(() => {}) : async () => ({ url: gw.url }),
+  publisher = await startPublisher(config, { db: options.db ?? database.db, discord: rest, gatewayUrl: options.gateway === false ? () => new Promise(() => {}) : async () => ({ url: gw.url }),
     allowGatewayUrl: url => url.hostname === '127.0.0.1', serviceAccount: { tokenFile: '/nonexistent', caFile: null },
     ports: options.ports ?? { app: 0, alerts: 0 }, idleMs: 20, identifySpacingMs: 250, recoveryBackoff: () => 200, registerDelaysMs: [0, 20, 20], heartbeatEveryMs: options.heartbeatEveryMs ?? 60_000, stopTimeoutMs: 3000, log: () => {} });
   return publisher;
@@ -306,6 +312,85 @@ test('P1-2 영속 Discord pause 동안은 history를 부르지 않고, pause가 
   assert.ok(await waitFor(async () => calledAt !== undefined && !(await conversation('fixture-thread-a')).gap, 8000), 'pause 뒤 복구');
   assert.ok(calledAt !== undefined && calledAt >= pauseUntil, `history ${calledAt} / pause ${pauseUntil}`);
   assert.equal(gw.connections.length, 1);
+});
+
+// PR #12 리뷰 4420530263(P1): 활성 스레드 메시지가 일시 장애로 실패하면 그 이벤트는 RESUME으로도 다시 오지 않는다.
+// 다음 메시지가 checkpoint를 올리면 history 복구도 그 메시지를 건너뛴다.
+for (const failure of ['channel_rest', 'database'] as const) {
+  test(`PR12 활성 스레드 메시지가 일시 장애(${failure === 'channel_rest' ? '채널 REST 조회' : 'DB 쓰기'})로 실패해도 다음 메시지가 checkpoint를 넘기지 못하고, 복구가 실패한 메시지를 결국 수락`, async () => {
+    await thread('fixture-thread-a', '100');
+    const posted: ReturnType<typeof message>[] = [];
+    rest.history = async (channel, after) => posted.filter(m => m.channel_id === channel && BigInt(m.id) > BigInt(after));
+    let failInsert = false;
+    const wrap = (inner: Database): Database => ({
+      query: async <T>(sql: string, params?: unknown[]) => {
+        if (failInsert && sql.startsWith('INSERT INTO events') && params?.[1] === '201') { failInsert = false; throw new Error('fixture_connection_lost'); }
+        return inner.query<T>(sql, params);
+      },
+      transaction: (fn, deadline) => inner.transaction(tx => fn(wrap(tx)), deadline),
+    });
+    await boot({ db: wrap(database.db) });
+    // 첫 READY의 복구가 끝난 뒤(gap 해제) live 메시지를 보낸다.
+    assert.ok(await waitFor(async () => rest.calls.some(c => c.path.startsWith('/channels/fixture-thread-a/messages?'))
+      && !(await conversation('fixture-thread-a')).gap));
+    if (failure === 'channel_rest') rest.failChannelReads.set('fixture-thread-a', 1); else failInsert = true;
+    let seq = 2;
+    for (const id of ['201', '202']) {
+      posted.push(message(id, 'fixture-thread-a'));
+      gw.dispatch(gw.latest, seq++, 'MESSAGE_CREATE', message(id, 'fixture-thread-a'));
+    }
+    const recovered = await waitFor(async () => !!(await event('201'))?.accepted && !!(await event('202'))?.accepted
+      && !(await conversation('fixture-thread-a')).gap, 8000);
+    assert.ok(recovered, `201 ${JSON.stringify(await event('201'))}, 202 ${JSON.stringify(await event('202'))}, 대화 ${JSON.stringify(await conversation('fixture-thread-a'))}`);
+    assert.equal((await conversation('fixture-thread-a')).checkpoint, '202');
+  });
+}
+
+test('PR12 장벽 UPDATE도 일시 실패하면 설 때까지 다시 시도하고, 그동안 다음 메시지를 먼저 처리하지 않음', async () => {
+  await thread('fixture-thread-a', '100');
+  const posted: ReturnType<typeof message>[] = [];
+  rest.history = async (channel, after) => posted.filter(m => m.channel_id === channel && BigInt(m.id) > BigInt(after));
+  let failInsert = false, failGuard = false;
+  const wrap = (inner: Database): Database => ({
+    query: async <T>(sql: string, params?: unknown[]) => {
+      if (failInsert && sql.startsWith('INSERT INTO events') && params?.[1] === '201') { failInsert = false; throw new Error('fixture_connection_lost'); }
+      if (failGuard && sql.includes('WHERE channel_id=$1 AND active=true')) { failGuard = false; throw new Error('fixture_connection_lost'); }
+      return inner.query<T>(sql, params);
+    },
+    transaction: (fn, deadline) => inner.transaction(tx => fn(wrap(tx)), deadline),
+  });
+  await boot({ db: wrap(database.db) });
+  assert.ok(await waitFor(async () => rest.calls.some(c => c.path.startsWith('/channels/fixture-thread-a/messages?'))
+    && !(await conversation('fixture-thread-a')).gap));
+  failInsert = true; failGuard = true;
+  let seq = 2;
+  for (const id of ['201', '202']) {
+    posted.push(message(id, 'fixture-thread-a'));
+    gw.dispatch(gw.latest, seq++, 'MESSAGE_CREATE', message(id, 'fixture-thread-a'));
+  }
+  // 장벽 재시도(1초) 동안 202가 먼저 처리돼 checkpoint를 올리면 안 된다.
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.equal((await conversation('fixture-thread-a')).checkpoint, '100');
+  assert.equal(await event('202'), undefined);
+  const recovered = await waitFor(async () => !!(await event('201'))?.accepted && !!(await event('202'))?.accepted
+    && !(await conversation('fixture-thread-a')).gap, 8000);
+  assert.ok(recovered, `201 ${JSON.stringify(await event('201'))}, 202 ${JSON.stringify(await event('202'))}`);
+  assert.equal((await conversation('fixture-thread-a')).checkpoint, '202');
+});
+
+test('PR12 확정 거부(허용되지 않은 사용자)는 장벽을 세우지 않고 다음 메시지가 그대로 처리됨', async () => {
+  await thread('fixture-thread-a', '100');
+  await boot();
+  assert.ok(await waitFor(async () => rest.calls.some(c => c.path.startsWith('/channels/fixture-thread-a/messages?'))
+    && !(await conversation('fixture-thread-a')).gap));
+  const histories = () => rest.calls.filter(c => c.path.startsWith('/channels/fixture-thread-a/messages?')).length;
+  const before = histories();
+  gw.dispatch(gw.latest, 2, 'MESSAGE_CREATE', { ...message('301', 'fixture-thread-a'), author: { id: 'fixture-intruder' } });
+  gw.dispatch(gw.latest, 3, 'MESSAGE_CREATE', message('302', 'fixture-thread-a'));
+  assert.ok(await waitFor(async () => !!(await event('302'))?.accepted));
+  assert.equal(await event('301'), undefined);
+  assert.deepEqual([(await conversation('fixture-thread-a')).gap, (await conversation('fixture-thread-a')).checkpoint], [false, '302']);
+  assert.equal(histories(), before);
 });
 
 test('P2-5 8081 listen이 실패하면 먼저 연 8080도 닫고 오류를 다시 던짐', async () => {

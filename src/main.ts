@@ -7,7 +7,8 @@ import { GRAFANA_DATASOURCES, SERVICES, TEMPLATES } from './catalog.js';
 import { FOUNDATION_COMMANDS, registerCommands } from './commands.js';
 import { ConfigError, databasePoolConfig, loadPublisherConfig } from './config.js';
 import type { PublisherConfig } from './config.js';
-import { Denied, RateLimited } from './contracts.js';
+import { z } from 'zod';
+import { Denied, DiscordRejected, RateLimited } from './contracts.js';
 import type { Clock, Scope } from './contracts.js';
 import { MIGRATIONS, Postgres, appliedMigrations, migrationVersion } from './database.js';
 import type { Database } from './database.js';
@@ -39,6 +40,7 @@ class ReviewOff extends ReviewPolicySource {
   constructor(private readonly base: PolicyGate) { super(base); }
   override async current(): Promise<ReviewContext> { await this.base.current(); throw new ReviewDisabled(); }
 }
+const MessageChannel = z.object({ channel_id: z.string().min(1) });
 const closedReader: GitHubReader = {
   pullRequest: async () => { throw new Error('review_disabled'); },
   openPullRequests: async () => { throw new Error('review_disabled'); },
@@ -141,6 +143,12 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   }, log, deps.recoveryBackoff);
   // 새 READY의 복구 장벽. live 이벤트는 이 처리 뒤에 차례로 들어오므로(Gateway 이벤트 순서) 장벽이 서기 전에 처리되지 않는다.
   // DB가 잠시 안 되면 장벽이 설 때까지 다시 시도한다(그동안 이벤트는 기다린다).
+  const guard = async (channel: string) => {
+    for (let attempt = 0; !stop.signal.aborted; attempt++) {
+      try { log('recovery_guard', { conversations: await recovery.guard(channel) }); return; }
+      catch (error) { log('recovery_guard_failed', errorInfo(error)); await pause(Math.min(30_000, 1000 * 2 ** Math.min(attempt, 5))); }
+    }
+  };
   const barrier = async () => {
     for (let attempt = 0; !stop.signal.aborted; attempt++) {
       try { log('recovery_barrier', { conversations: await recovery.barrier() }); return; }
@@ -175,7 +183,15 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     dispatch: async (type, data) => {
       if (!discord || (type !== 'MESSAGE_CREATE' && type !== 'INTERACTION_CREATE')) return;
       try { await protocol!.gateway(type, data, discord.ingress); }
-      catch (error) { if (!(error instanceof Denied)) log('discord_event_failed', { type, ...errorInfo(error) }); }
+      catch (error) {
+        // 확정 거부(권한·채널 종류, 잘못된 payload·입력, 채널 403/404)는 다시 해도 같다. 버린다.
+        if (error instanceof Denied || error instanceof z.ZodError || error instanceof DiscordRejected) return;
+        log('discord_event_failed', { type, ...errorInfo(error) });
+        // 일시 장애(DB·REST·429·정책 확인 불가 등). 상호작용은 토큰이 3초라 되살릴 수 없고 checkpoint와도 무관하다.
+        // 메시지는 그 대화에 장벽을 세워 history 대조로 메운다. 장벽이 설 때까지 다음 이벤트는 기다린다(순서 유지).
+        const channel = MessageChannel.safeParse(data);
+        if (type === 'MESSAGE_CREATE' && channel.success) await guard(channel.data.channel_id);
+      }
     },
     onReady: async ready => {
       if (!discord) {

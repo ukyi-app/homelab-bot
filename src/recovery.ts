@@ -29,6 +29,17 @@ export class RecoveryScheduler {
     for (const row of rows) this.pending.set(row.id, { scope: row.scope, owner: row.owner_id, attempt: 0, at: now });
     return rows.length;
   }
+  // live 메시지 하나가 일시 장애로 처리되지 못했을 때 그 채널의 활성 대화에만 같은 장벽을 세운다(PR #12 리뷰 4420530263).
+  // 그 이벤트는 Gateway sequence가 이미 지나 RESUME으로도 다시 오지 않는다. 장벽 뒤 메시지는 버퍼에 들어가 checkpoint를
+  // 올리지 못하므로, history 대조가 실패한 메시지부터 순서대로 다시 읽는다. 진행 중인 복구는 토큰을 지워 새 세대로 바꾼다.
+  async guard(channel: string): Promise<number> {
+    const rows = (await this.store.db.query<{ id: string; scope: Scope; owner_id: string }>(`UPDATE conversations
+      SET gap=true,recovery_token=NULL,recovery_until=NULL
+      WHERE channel_id=$1 AND active=true AND scope->>'kind'<>'channel' RETURNING id,scope,owner_id`, [channel])).rows;
+    const now = this.store.now();
+    for (const row of rows) this.pending.set(row.id, { scope: row.scope, owner: row.owner_id, attempt: 0, at: now });
+    return rows.length;
+  }
   // 기한이 된 대화 하나를 처리했으면 true. 하나씩 차례로 돌린다(복구 하나가 최대 30초).
   async runDue(): Promise<boolean> {
     const now = this.store.now();

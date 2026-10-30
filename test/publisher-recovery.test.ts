@@ -38,6 +38,19 @@ test('P1-1 장벽은 활성 스레드·DM에만 gap을 세우고 체크포인트
   assert.equal(scheduler.size, 2);
 });
 
+test('PR12 guard()는 그 채널의 활성 스레드·DM에만 장벽을 세우고 진행 중 복구 토큰을 지움(다른 대화·부모 채널은 그대로)', async () => {
+  await conversation('a'); await conversation('b'); await conversation('parent', { kind: 'channel' }); await conversation('off', { active: false });
+  await database.db.query("UPDATE conversations SET recovery_token='old-token',recovery_until=$1 WHERE channel_id='a'", [time + 30_000]);
+  const scheduler = new RecoveryScheduler(store, async () => 'done', () => {});
+  assert.equal(await scheduler.guard('a'), 1);
+  assert.equal(await scheduler.guard('parent'), 0);
+  assert.equal(await scheduler.guard('off'), 0);
+  assert.deepEqual([await gap('a'), await gap('b'), await gap('parent'), await gap('off')], [true, false, false, false]);
+  assert.equal((await database.db.query<{ recovery_token: string | null }>("SELECT recovery_token FROM conversations WHERE channel_id='a'")).rows[0]!.recovery_token, null);
+  assert.equal(scheduler.size, 1);
+  assert.equal(await scheduler.runDue(), true); assert.equal(scheduler.size, 0);
+});
+
 test('P1-2 일시 실패는 대화별 지수 백오프, 429는 retry_after 이상, 한도 초과(budget)·정책 거부는 다시 돌리지 않음', async () => {
   await conversation('a'); await conversation('b'); await conversation('c');
   const plans: Record<string, (RecoveryOutcome | Error)[]> = {
