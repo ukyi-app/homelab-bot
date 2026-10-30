@@ -4,7 +4,7 @@ import { DEFAULTS, Denied, DiscordRejected, RateLimited } from '../src/contracts
 import { DiscordIngress, DiscordPublisher } from '../src/discord.js';
 import { DiscordProtocol, discordHttpApi } from '../src/discord-protocol.js';
 import { Runtime } from '../src/runtime.js';
-import { Store } from '../src/store.js';
+import { MODEL_QUEUE_LIMIT, Store } from '../src/store.js';
 import { event, fixture, localDatabase, thread } from './helpers.js';
 
 let database: Awaited<ReturnType<typeof localDatabase>>;
@@ -103,7 +103,7 @@ test('4316099215 resume 대상 누락·재시도 상한·큐 상한은 차단하
   await database.db.query('UPDATE jobs SET attempt=$1', [DEFAULTS.maxRetries + 1]);
   assert.equal((await control('resume-model', job.id, 'exhausted')).ok, false);
   await database.db.query('UPDATE jobs SET attempt=1');
-  for (let i = 0; i < DEFAULTS.maxQueue; i++) {
+  for (let i = 0; i < MODEL_QUEUE_LIMIT; i++) {
     const saved = await f.store.save(event(`queue-${i}`, { kind: 'command', command: 'task' }), f.policy.revision, false);
     await f.store.accept(saved.id, 'task', f.policy.revision);
   }

@@ -6,6 +6,7 @@ import type { Agent } from 'undici';
 import { AlertIngress } from '../src/alerts.js';
 import { DEFAULTS, Denied, RateLimited, WorkerRejected } from '../src/contracts.js';
 import type { Scope } from '../src/contracts.js';
+import { MODEL_QUEUE_LIMIT } from '../src/store.js';
 import { DiscordIngress, DiscordPublisher } from '../src/discord.js';
 import { discordHttpApi } from '../src/discord-protocol.js';
 import { Health } from '../src/health.js';
@@ -338,7 +339,7 @@ test('R6-AUDIT migration 007은 기존 sending을 보수적으로 이관하고 �
 for (const failure of ['queue_full', 'inbox_deadline']) test(`4314746194 ${failure}도 재활성화 부분 커밋 없음`, async () => {
   await f.ingress.receive(event('100')); await f.store.control(f.policy.owner, f.store.scopeId(thread), 'stop');
   if (failure === 'queue_full') {
-    for (let i = 0; i < DEFAULTS.maxQueue - 1; i++) {
+    for (let i = 0; i < MODEL_QUEUE_LIMIT - 1; i++) {
       const saved = await f.store.save(event(`queued-${i}`, { kind: 'command', command: 'task' }), f.policy.revision, false);
       await f.store.accept(saved.id, 'task', f.policy.revision);
     }

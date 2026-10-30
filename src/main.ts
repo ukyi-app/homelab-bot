@@ -213,7 +213,12 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       await barrier();
       // 작업 claim은 첫 장벽이 선 뒤에 시작한다. 재시작 때 남은 queued 작업이 중단 중 메시지를 history로 복구하기 전에
       // 이전 입력으로 모델을 부르지 않게 한다(PR #12 재리뷰 4420612638). 이후 READY의 장벽은 claim의 gap 조건이 막는다.
-      if (!runtimeStarted && !stop.signal.aborted) { runtimeStarted = true; loop('runtime', () => runtime.tick()); }
+      // read는 모델 응답을 기다리지 않게 따로 돈다. 늘 DB를 거치므로 생존 근거다.
+      if (!runtimeStarted && !stop.signal.aborted) {
+        runtimeStarted = true;
+        loop('runtime', () => runtime.tick());
+        loop('read', () => runtime.tickRead());
+      }
       // 명령 등록과 history 대조 자체는 이벤트 처리 순서 밖에서 돈다(대조가 30초까지 걸려도 상호작용 ACK가 밀리지 않게).
       track(register(ready.applicationId));
     },

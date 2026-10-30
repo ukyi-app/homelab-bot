@@ -126,7 +126,7 @@ test('R7-AUDIT 조회 중 서비스 철회도 일반 실패가 아닌 취소로 
     queries++; f.policy.services = [];
     return new TextEncoder().encode(JSON.stringify({ observedAt: f.now(), rows: [{ status: 'healthy' }] }));
   } }, f.now);
-  await new Runtime(f.store, f.gate, f.worker, f.signer, reader).tick();
+  await new Runtime(f.store, f.gate, f.worker, f.signer, reader).tickRead();
   await assertRevoked(true); assert.equal(queries, 1); assert.equal(f.requests.length, 0);
 });
 

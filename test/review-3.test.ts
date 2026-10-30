@@ -37,7 +37,7 @@ async function enqueue(key = 'delivery') {
 
 for (const state of ['pending', 'unknown']) test(`4313740724 read 서비스 철회는 ${state} 결과 게시·대조 차단`, async () => {
   await f.ingress.receive(event('read', { kind: 'command', command: 'read', target: service.id, text: template.id }));
-  f.advance(800); await f.runtime.tick();
+  f.advance(800); await f.runtime.tickRead();
   assert.deepEqual((await rows('outbox'))[0]!.service_ids, [service.id]);
   await database.db.query('UPDATE outbox SET state=$1,lease_token=$2', [state, randomUUID()]);
   f.policy.services = []; f.policy.revision = 'removed-service';
@@ -49,9 +49,9 @@ for (const state of ['pending', 'unknown']) test(`4313740724 read 서비스 철�
 });
 test('4313740724 이전 read outbox도 migration으로 서비스 경계 복원', async () => {
   await f.ingress.receive(event('read', { kind: 'command', command: 'read', target: service.id, text: template.id }));
-  f.advance(800); await f.runtime.tick(); await database.db.query("UPDATE outbox SET service_ids='[]'");
+  f.advance(800); await f.runtime.tickRead(); await database.db.query("UPDATE outbox SET service_ids='[]'");
   await f.ingress.receive(event('unregistered', { kind: 'command', command: 'read', target: 'unregistered', text: template.id }));
-  f.advance(800); await f.runtime.tick();
+  f.advance(800); await f.runtime.tickRead();
   const sql = await readFile('migrations/004_delivery_services.sql', 'utf8');
   await database.pg.exec(sql); await database.pg.exec(sql);
   const deliveries = await rows('outbox');
@@ -199,7 +199,7 @@ test('4313740796 큰 read도 미확인·권장 확인을 보존한 완결 요약
     query: async () => new TextEncoder().encode(JSON.stringify({ observedAt: f.now(), rows: Array.from({ length: 200 }, () => ({ status: 'degraded', value: 123456789 })) })),
   }, f.now);
   await f.ingress.receive(event('read', { kind: 'command', command: 'read', target: service.id, text: template.id })); f.advance(800);
-  await new Runtime(f.store, f.gate, f.worker, f.signer, reader).tick(); await f.publisher.deliver();
+  await new Runtime(f.store, f.gate, f.worker, f.signer, reader).tickRead(); await f.publisher.deliver();
   const content = f.rest.messages[0]!.body.content;
   assert.ok(content.length < 2000); assert.match(content, /개 생략/); assert.match(content, /미확인:.*복원 가능/); assert.match(content, /권장 확인: 없음/);
   const raw = (await rows('results'))[0]!.result;

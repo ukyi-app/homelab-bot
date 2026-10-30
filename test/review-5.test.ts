@@ -86,7 +86,7 @@ for (const seconds of [1, 15, 60, 120]) test(`4314491278 템플릿 ${seconds}초
     requests.push(request); return new TextEncoder().encode(JSON.stringify({ observedAt: request.to, rows: [{ status: 'healthy' }] }));
   } }, f.now);
   await f.ingress.receive(event('read', { kind: 'command', command: 'read', target: service.id, text: template.id }));
-  await new Runtime(f.store, f.gate, f.worker, f.signer, reader).tick();
+  await new Runtime(f.store, f.gate, f.worker, f.signer, reader).tickRead();
   assert.equal((await rows('jobs'))[0]!.state, 'succeeded'); assert.equal(f.requests.length, 0); assert.equal(requests.length, 1);
   const window = { from: f.now() - Math.min(60, seconds) * 1000, to: f.now() };
   assert.deepEqual((await rows('results'))[0]!.result.window, window);

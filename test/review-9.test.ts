@@ -8,7 +8,7 @@ import { DiscordProtocol } from '../src/discord-protocol.js';
 import type { PolicyGate } from '../src/policy.js';
 import { ReadAdapter } from '../src/read.js';
 import type { ReadTransport } from '../src/read.js';
-import { Store } from '../src/store.js';
+import { MODEL_QUEUE_LIMIT, Store } from '../src/store.js';
 import type { Delivery } from '../src/store.js';
 import { event, fixture, localDatabase, service, template, thread } from './helpers.js';
 
@@ -165,17 +165,17 @@ test('4316750328 제때 끝난 read는 signal을 abort하지 않음', async () =
 test('4316750325 /retry도 scheduler 잠금 아래 queued 상한을 지키고 실패 작업은 그대로', async () => {
   await queue(); const job = (await rows('jobs'))[0]!; const conversation = f.store.scopeId(thread);
   await database.db.query("UPDATE jobs SET state='failed',attempt=1");
-  for (let i = 0; i < DEFAULTS.maxQueue; i++) {
+  for (let i = 0; i < MODEL_QUEUE_LIMIT; i++) {
     const saved = await f.store.save(event(`queue-${i}`, { kind: 'command', command: 'task' }), f.policy.revision, false);
     await f.store.accept(saved.id, 'task', f.policy.revision);
   }
   const retry = () => f.store.control(f.policy.owner, conversation, 'retry', job.id) as Promise<{ ok?: boolean; status: string }>;
   const full = await retry();
   assert.equal(full.ok, false); assert.match(full.status, /대기열이 가득/);
-  assert.equal((await rows('jobs')).find(j => j.id === job.id)!.state, 'failed'); assert.equal(await queued(), DEFAULTS.maxQueue);
+  assert.equal((await rows('jobs')).find(j => j.id === job.id)!.state, 'failed'); assert.equal(await queued(), MODEL_QUEUE_LIMIT);
   await database.db.query("UPDATE jobs SET state='cancelled' WHERE id=(SELECT id FROM jobs WHERE state='queued' ORDER BY created_at LIMIT 1)");
   assert.notEqual((await retry()).ok, false);
-  assert.equal((await rows('jobs')).find(j => j.id === job.id)!.state, 'queued'); assert.equal(await queued(), DEFAULTS.maxQueue);
+  assert.equal((await rows('jobs')).find(j => j.id === job.id)!.state, 'queued'); assert.equal(await queued(), MODEL_QUEUE_LIMIT);
 });
 
 // PGlite는 연결이 하나라 행 잠금 대기(교착)를 재현할 수 없다. 트랜잭션마다 잠금을 잡는 문장의 순서를 기록해
