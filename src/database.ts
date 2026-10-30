@@ -50,16 +50,27 @@ export class Postgres implements Database {
     } finally { client.release(); }
   }
 }
-export async function migrate(db: Database): Promise<void> {
-  await db.query(await readFile(new URL('../../migrations/001_foundation.sql', import.meta.url), 'utf8'));
-  await db.query(await readFile(new URL('../../migrations/002_denial_revision.sql', import.meta.url), 'utf8'));
-  await db.query(await readFile(new URL('../../migrations/003_recovery_controls.sql', import.meta.url), 'utf8'));
-  await db.query(await readFile(new URL('../../migrations/004_delivery_services.sql', import.meta.url), 'utf8'));
-  await db.query(await readFile(new URL('../../migrations/005_delivery_order.sql', import.meta.url), 'utf8'));
-  await db.query(await readFile(new URL('../../migrations/006_alert_services.sql', import.meta.url), 'utf8'));
-  await db.query(await readFile(new URL('../../migrations/007_execution_boundaries.sql', import.meta.url), 'utf8'));
-  await db.query(await readFile(new URL('../../migrations/008_pr_review.sql', import.meta.url), 'utf8'));
-  await db.query(await readFile(new URL('../../migrations/009_codex_bridge.sql', import.meta.url), 'utf8'));
-  await db.query(await readFile(new URL('../../migrations/010_memory_briefing.sql', import.meta.url), 'utf8'));
-  await db.query(await readFile(new URL('../../migrations/011_reconcile_backoff.sql', import.meta.url), 'utf8'));
+// 파일마다 자기 버전을 같은 transaction 안에서 schema_migrations에 남긴다. 새 파일은 이 목록에도 더한다
+// (시험이 디렉터리와 대조한다).
+export const MIGRATIONS = Object.freeze(['001_foundation.sql', '002_denial_revision.sql', '003_recovery_controls.sql',
+  '004_delivery_services.sql', '005_delivery_order.sql', '006_alert_services.sql', '007_execution_boundaries.sql',
+  '008_pr_review.sql', '009_codex_bridge.sql', '010_memory_briefing.sql', '011_reconcile_backoff.sql']);
+export const migrationVersion = (file: string) => Number.parseInt(file.slice(0, 3), 10);
+export async function appliedMigrations(db: Database): Promise<Set<number>> {
+  const table = (await db.query<{ name: string | null }>("SELECT to_regclass('schema_migrations')::text AS name")).rows[0];
+  if (!table?.name) return new Set();
+  return new Set((await db.query<{ version: number }>('SELECT version FROM schema_migrations')).rows.map(r => Number(r.version)));
+}
+// 차트의 마이그레이션 Job은 매 sync마다 돈다(D-22). 적용된 버전은 건너뛴다. 006처럼 데이터를 바꾸는 파일이
+// 다시 돌면 그 순간 대기 중인 전달을 막는다(T16b 위험 5). 반환값은 이번에 적용한 버전이다.
+export async function migrate(db: Database): Promise<number[]> {
+  const applied = await appliedMigrations(db);
+  const ran: number[] = [];
+  for (const file of MIGRATIONS) {
+    const version = migrationVersion(file);
+    if (applied.has(version)) continue;
+    await db.query(await readFile(new URL(`../../migrations/${file}`, import.meta.url), 'utf8'));
+    ran.push(version);
+  }
+  return ran;
 }
