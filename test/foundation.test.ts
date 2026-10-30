@@ -54,18 +54,20 @@ test('AUTH-02 큐 실행·게시 직전 정책 revision 재확인', async () => 
   await f.publisher.deliver(); assert.equal(f.rest.messages.length, 0);
   assert.equal((await rows('outbox'))[0]!.state, 'blocked');
 });
-test('AUTH-02 정책 파일 재읽기·stale·누락은 실패 시 닫힘', async () => {
-  await mkdir('.local', { recursive: true }); const path = await mkdtemp('.local/policy-');
-  try {
-    const file = `${path}/policy.json`; await writeFile(file, JSON.stringify(f.policy));
-    const gate = PolicyGate.mounted(file, database.db, f.now);
-    await gate.authorize('fixture-owner', thread);
-    await writeFile(file, JSON.stringify({ ...f.policy, owner: 'replacement' }));
-    await assert.rejects(gate.authorize('fixture-owner', thread), Denied);
-    await writeFile(file, JSON.stringify({ ...f.policy, confirmedAt: f.now() - 300001 }));
-    await assert.rejects(gate.authorize('fixture-owner', thread), PolicyUnavailable);
-    await rm(file); await assert.rejects(gate.authorize('fixture-owner', thread), PolicyUnavailable);
-  } finally { await rm(path, { recursive: true, force: true }); }
+// D1(사용자 2026-10-30) 뒤 정책 원천은 기동 때 읽은 env 값이고 나이로 닫지 않는다(test/publisher-policy.test.ts).
+// 원천이 주는 값이 틀리거나 읽히지 않으면 닫히는 규칙은 그대로다.
+test('AUTH-02 정책 원천의 값이 바뀌면 현재 값으로, 형식 오류·읽기 실패·미래 시각은 실패 시 닫힘', async () => {
+  let value: unknown = { ...f.policy };
+  const gate = new PolicyGate(async () => { if (value instanceof Error) throw value; return value; }, database.db, f.now);
+  await gate.authorize('fixture-owner', thread);
+  value = { ...f.policy, owner: 'replacement' };
+  await assert.rejects(gate.authorize('fixture-owner', thread), Denied);
+  value = { ...f.policy, owner: '' };
+  await assert.rejects(gate.authorize('fixture-owner', thread), PolicyUnavailable);
+  value = { ...f.policy, confirmedAt: f.now() + 1 };
+  await assert.rejects(gate.authorize('fixture-owner', thread), PolicyUnavailable);
+  value = new Error('missing');
+  await assert.rejects(gate.authorize('fixture-owner', thread), PolicyUnavailable);
 });
 test('AUTH-02 owner 철회는 DB에 남아 새 gate에도 즉시 적용', async () => {
   await f.gate.revoke('fixture-owner', thread, 'fixture-owner');

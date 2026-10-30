@@ -13,7 +13,7 @@ export const DEFAULTS = Object.freeze({
   debounceMs: 750, inboxTimeoutMs: 1500, leaseMs: 30_000, chatTimeoutMs: 60_000,
   taskTimeoutMs: 1_800_000, maxQueue: 100, contextMessages: 20,
   maxInputChars: 8000, maxToolCalls: 8, maxRetries: 2,
-  policyMaxAgeMs: 300_000, recoveryPages: 10, recoveryMs: 30_000,
+  recoveryPages: 10, recoveryMs: 30_000,
   gatewayGraceMs: 300_000, heartbeatMs: 60_000,
   retryDelayMs: 1000, unknownDeliveryMs: 86_400_000, maxUnknownDeliveries: 100,
   capabilitySkewMs: 1000, reconcileSearchMaxMs: 900_000,

@@ -163,7 +163,7 @@ test('MEM-01 일시 지시는 유효기간이 필요하고 지나면 검색되�
   assert.deepEqual((await memory.search('fixture-owner', thread, '인증서'))[0]!.flags, ['recheck_due']);
 });
 
-test('AUTH-02 기억 접근마다 최신 권한 재확인: 철회·owner 교체·stale 정책은 차단', async () => {
+test('AUTH-02 기억 접근마다 최신 권한 재확인: 철회·owner 교체·정책 확인 불가는 차단', async () => {
   const stored = await memory.remember('fixture-owner', thread, config('대시보드 주소'));
   f.policy.owner = 'replacement';
   await assert.rejects(memory.search('fixture-owner', thread, '대시보드'), Denied);
@@ -172,9 +172,9 @@ test('AUTH-02 기억 접근마다 최신 권한 재확인: 철회·owner 교체�
   await assert.rejects(memory.delete('replacement', thread, stored.id), Denied);
   f.policy.owner = 'fixture-owner';
   assert.equal((await memory.search('fixture-owner', thread, '대시보드')).length, 1);
-  f.advance(300_001);
+  f.setPolicyUnavailable(true);
   await assert.rejects(memory.search('fixture-owner', thread, '대시보드'), PolicyUnavailable);
-  at(f.now());
+  f.setPolicyUnavailable(false);
   await f.gate.revoke('fixture-owner', thread, 'fixture-owner');
   await assert.rejects(memory.search('fixture-owner', thread, '대시보드'), Denied);
   await assert.rejects(memory.remember('fixture-owner', thread, config('철회 뒤 저장')), Denied);
@@ -211,10 +211,10 @@ test('AUTH-02 예약 브리핑은 발송 시점 권한으로 막고, 게시 직�
 });
 test('AUTH-02 정책을 확인할 수 없으면 브리핑을 미루고 확인 뒤 한 번만 보냄', async () => {
   const s = scheduler(); await s.ensure();
-  f.advance(SLOT - f.now());
+  f.advance(SLOT - f.now()); f.setPolicyUnavailable(true);
   assert.equal(await s.tick(), 'deferred');
   assert.equal(await s.tick(), 'idle');
-  f.advance(BRIEFING.retryMs); f.policy.confirmedAt = f.now();
+  f.advance(BRIEFING.retryMs); f.setPolicyUnavailable(false);
   assert.equal(await s.tick(), 'enqueued');
   assert.equal(await s.tick(), 'idle');
   assert.equal((await briefings()).length, 1);

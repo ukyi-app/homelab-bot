@@ -120,12 +120,12 @@ test('R1-03/EVENT-03 실제 Protocol.history와 DB jsonb scope로 101건 복구'
   assert.equal((await f.store.conversation(thread))!.gap, false);
   await f.ingress.receive(event('103', { mention: false })); assert.equal((await rows('events')).length, 103);
 });
-test('R1-04 정책 stale은 queued/pending 유지, 갱신 뒤 같은 작업과 게시 재개', async () => {
-  await queue(); await enqueue(); f.advance(300001);
+test('R1-04 정책 확인 불가는 queued/pending 유지, 갱신 뒤 같은 작업과 게시 재개', async () => {
+  await queue(); await enqueue(); f.setPolicyUnavailable(true); f.advance(300001);
   await f.runtime.tick(); await f.publisher.deliver();
   assert.equal((await rows('jobs'))[0]!.state, 'queued'); assert.equal((await rows('outbox'))[0]!.state, 'pending');
   assert.equal(f.requests.length, 0); assert.equal(f.rest.messages.length, 0);
-  f.advance(1001); f.policy.confirmedAt = f.now(); f.policy.revision = 'fixture-v2';
+  f.advance(1001); f.setPolicyUnavailable(false); f.policy.confirmedAt = f.now(); f.policy.revision = 'fixture-v2';
   await f.runtime.tick(); await f.publisher.deliver();
   assert.equal((await rows('jobs'))[0]!.state, 'succeeded'); assert.equal(f.requests.length, 1);
   assert.equal(f.requests[0]!.policyRevision, 'fixture-v2'); assert.equal(f.rest.messages.length, 1);
@@ -138,12 +138,12 @@ test('R1-04 정책 파일 일시 누락도 queued 유지, 실제 철회만 cance
   missing = false; f.advance(1001); f.policy.owner = 'replacement'; f.policy.confirmedAt = f.now();
   await runtime.tick(); assert.equal((await rows('jobs'))[0]!.state, 'cancelled'); assert.equal(f.requests.length, 0);
 });
-test('R1-04 revision만 바뀌면 현재 정책으로 허용, 완료 결과는 stale 동안 재실행 없이 대기', async () => {
+test('R1-04 revision만 바뀌면 현재 정책으로 허용, 완료 결과는 정책 확인 불가 동안 재실행 없이 대기', async () => {
   await queue(); f.policy.revision = 'fixture-v2';
-  f.setRun(async () => { f.policy.confirmedAt = f.now() - 300001; return { status: 'succeeded', stopped: true, answer }; });
+  f.setRun(async () => { f.setPolicyUnavailable(true); return { status: 'succeeded', stopped: true, answer }; });
   await f.runtime.tick(); assert.equal((await rows('jobs'))[0]!.state, 'succeeded');
   await f.publisher.deliver(); assert.equal((await rows('outbox'))[0]!.state, 'pending');
-  f.advance(1001); f.policy.confirmedAt = f.now(); await f.publisher.deliver();
+  f.advance(1001); f.setPolicyUnavailable(false); await f.publisher.deliver();
   assert.equal(f.rest.messages.length, 1); assert.equal(f.requests.length, 1);
 });
 test('R1-04 Discord 401은 정책 거부와 구분, 새 자격 어댑터로 pending 게시 재개', async () => {

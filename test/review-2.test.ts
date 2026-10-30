@@ -65,21 +65,21 @@ test('R2-01 실제 응답 도중 단절은 unknown으로 슬롯 유지', async (
     assert.equal((await rows('jobs'))[0]!.state, 'unknown'); assert.equal(await f.runtime.tick(), false);
   } finally { server.close(); await once(server, 'close'); }
 });
-for (const stopConfirmed of [true, false]) test(`R2-02 실행 중 stale은 중단하지 않고 heartbeat·완료 보존 (stop=${stopConfirmed})`, async () => {
+for (const stopConfirmed of [true, false]) test(`R2-02 실행 중 정책 확인 불가는 중단하지 않고 heartbeat·완료 보존 (stop=${stopConfirmed})`, async () => {
   let finish!: (r: WorkerResult) => void; let started!: () => void; let cancels = 0;
   const ready = new Promise<void>(resolve => { started = resolve; });
   f.setRun(() => { started(); return new Promise(resolve => { finish = resolve; }); });
   f.worker.cancel = async () => { cancels++; return { stopped: stopConfirmed }; };
   await queue(); const running = f.runtime.tick(); await ready;
   const initialLease = Number((await rows('jobs'))[0]!.lease_until);
-  f.policy.confirmedAt -= DEFAULTS.policyMaxAgeMs + 1; f.advance(1000);
+  f.setPolicyUnavailable(true); f.advance(1000);
   await delay(1150);
   assert.equal((await rows('jobs'))[0]!.state, 'running'); assert.equal(cancels, 0);
   assert.ok(Number((await rows('jobs'))[0]!.lease_until) > initialLease);
   finish(success); await running;
   assert.equal((await rows('jobs'))[0]!.state, 'succeeded');
   await f.publisher.deliver(); assert.equal(f.rest.messages.length, 0);
-  f.policy.confirmedAt = f.now(); f.advance(1000); await f.publisher.deliver();
+  f.setPolicyUnavailable(false); f.advance(1000); await f.publisher.deliver();
   assert.equal(f.rest.messages.length, 1); assert.equal(f.requests.length, 1);
 });
 test('R2-02 실제 권한 철회는 종료 확인 뒤 취소, 실패 안내 없음', async () => {
@@ -132,7 +132,7 @@ test('R2-05 혼합 경보 그룹은 지원 항목만 게시하고 제외 건수 
   await f.publisher.deliver(); assert.equal(f.rest.messages.length, 1); assert.equal(f.requests.length, 0);
 });
 test('R2-06 일시 중지는 변화 때만 감사, 재시작에도 backoff 유지·복구', async () => {
-  await enqueue(); f.policy.confirmedAt -= DEFAULTS.policyMaxAgeMs + 1;
+  await enqueue(); f.setPolicyUnavailable(true);
   let publisher = f.publisher;
   for (let i = 0; i < 9; i++) {
     await publisher.deliver();
@@ -144,7 +144,7 @@ test('R2-06 일시 중지는 변화 때만 감사, 재시작에도 backoff 유�
     publisher = new DiscordPublisher(f.store, f.gate, f.rest);
   }
   assert.equal((await rows('audit')).filter(r => r.kind === 'delivery_paused').length, 1);
-  f.policy.confirmedAt = f.now(); f.rest.rateLimit = new DiscordUnauthorized(); await publisher.deliver();
+  f.setPolicyUnavailable(false); f.rest.rateLimit = new DiscordUnauthorized(); await publisher.deliver();
   assert.equal((await rows('audit')).filter(r => r.kind === 'delivery_paused').length, 2);
   for (let i = 0; i < 3; i++) {
     f.advance(Number((await rows('outbox'))[0]!.available_at) - f.now());

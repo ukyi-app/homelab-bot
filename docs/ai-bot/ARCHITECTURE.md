@@ -125,7 +125,7 @@
 | | `GITHUB_WRITER_APP_ID`, `GITHUB_WRITER_APP_PRIVATE_KEY` | 봇 쓰기 App(D-24) |
 | | `GRAFANA_READER_TOKEN`, `ARGOCD_READER_TOKEN` | 읽기 어댑터. 설계에 보관 위치가 없던 자리 |
 | | `HEALTHCHECKS_PING_URL` | 봇 하트비트(§8) |
-| | `RUNTIME_POLICIES` | 허용 목록·runtime policy 실제 값(JSON). 키 구조는 [config/homelab-bot.example.yaml](config/homelab-bot.example.yaml). 마운트한 Secret 파일로 읽는 것은 제안 [가정], T16a. 공유 차트 변경 필요(설계 C.4.5는 env만). §6 "허용 목록 반영" |
+| | `RUNTIME_POLICIES` | 허용 목록·runtime policy 실제 값(JSON). 모양은 [config/runtime-policy.example.json](config/runtime-policy.example.json). 공유 차트가 env로 넣고 봇은 기동 때 한 번 읽는다(D1, 사용자 2026-10-30, §11). §6 "허용 목록 반영" |
 | `/apps/homelab-bot/worker` | `CODEX_AUTH_JSON` (D-14 A의 시드 `auth.json`) | 작업자만. 영속 CODEX_HOME에 `auth.json`이 없을 때만 시드로 쓴다 |
 
 - 작업자 경로에는 모델 자격 외에 아무것도 두지 않는다 [확인: 설계 C.8]. Kubernetes SA `bot-reader` 토큰은 Infisical이 아니라 공유 차트의 `serviceAccountName`으로 받는다 [확인: 설계 C.4.5].
@@ -185,7 +185,7 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 
 **Discord 입력:** 매 이벤트마다 사용자 ID(문자열 snowflake)·guild·채널(스레드는 `parent_id`) 허용 검사. 봇·webhook 메시지 무시. 버튼은 누른 사람 ID를 질문 대상·작업 소유자와 대조. 모든 봇 메시지에 `allowed_mentions: {"parse": []}`(D-17).
 
-**허용 목록 반영(F01, AUTH-02):** Infisical에서 허용 목록을 바꾸면 ESO 동기화를 거쳐야 봇에 닿는다. 정책을 확인할 수 없거나 오래됐으면 거부하도록 **실패 시 닫힘**으로 설계한다. 다만 이것이 철회의 즉시 효력을 보장하지는 않는다(아래 "남는 창"). 아래는 제안이고 값은 T16a에서 정한다 [가정]:
+**허용 목록 반영(F01, AUTH-02):** T16b D1(사용자 2026-10-30)로 아래 제안 중 파일 마운트·최대 나이는 채택하지 않았다. 지금 계약은 §11이다(env를 기동 때 읽기, 즉시 차단은 `/revoke`). 아래는 당시 기록이다. Infisical에서 허용 목록을 바꾸면 ESO 동기화를 거쳐야 봇에 닿는다. 정책을 확인할 수 없거나 오래됐으면 거부하도록 **실패 시 닫힘**으로 설계한다. 다만 이것이 철회의 즉시 효력을 보장하지는 않는다(아래 "남는 창"). 아래는 제안이고 값은 T16a에서 정한다 [가정]:
 
 - 제안 [가정], T16a: runtime policy는 환경 변수가 아니라 마운트한 Secret 파일로 읽고, 파일이 바뀌면 다시 읽는다. 환경 변수는 파드를 다시 시작해야 반영된다 [확인: 설계 C.6.5]. 공유 차트 변경이 필요하다. 설계 C.4.5는 Secret을 키마다 환경 변수로만 넣는다 [확인: 설계 C.4.5]. 차트 대신 봇 쪽 추가 매니페스트로 할 수도 있다(T16a·T16b).
 - 정책에 revision과 최대 나이를 둔다. 나이는 그 revision이 현재 값임을 마지막으로 확인한 때부터 잰다. 현재 revision을 확인할 수 없거나 최대 나이를 넘으면 접근을 거부한다. 확인 방법은 [미확인]이고 T16a에서 정한다.
@@ -267,7 +267,7 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 - Grafana 질의 템플릿 목록, 시간창 상한, 응답량 상한 수치 [T16a].
 - 앱 지표 스크레이프 규칙과 Gateway 단절·큐 적체 봇 룰 [T08b 또는 T16b]. 정해지기 전에는 Gateway만 끊긴 봇을 알리는 경보가 없다(§8).
 - 하트비트를 Gateway 연결에 묶는 대안의 채택 여부와 N(§8 "대안") [T16a].
-- runtime policy의 현재 revision 확인 방법과 최대 나이(§6 "허용 목록 반영") [T16a].
+- runtime policy의 현재 revision 확인 방법과 최대 나이(§6 "허용 목록 반영") [T16a]. → T16b D1로 정함: 기동 때 env 읽기, 나이 검사 없음(§11).
 - 삭제 원장의 저장소·자격·보존, 쓰기 순서와 부분 실패 처리(§7) [T20].
 - R08 연결 방식 [T18].
 
@@ -332,20 +332,21 @@ Discord REST의 1초 전송 제한은 상호작용 첫 응답 3초에 맞춰 유
 작업 event ID를 경계로 반드시 전달하며 다른 대화의 경계나 존재하지 않는 event는 빈 맥락을 반환한다.
 동일 수신 시각이나 작업 claim 뒤 도착한 후속 요청이 앞 작업의 맥락에 섞이지 않는다.
 
-runtime policy는 파일을 접근마다 다시 읽는다. trusted updater가 원본 revision을 확인한 `confirmedAt`이
-**300초**를 넘거나 미래 시각이거나 파일/구조가 잘못되면 닫힌다. 파일을 읽었다는 이유로 freshness를 갱신하지 않는다.
-원본 확인 updater와 마운트 방식은 T16b에서 연결한다. ESO 동기화 지연 창은 남으며,
-owner의 `/revoke`가 영속 거부 목록에 즉시 추가한다. 실행·조회·게시 전에 현재 owner·scope를 재검사한다.
-누락·stale은 queued/pending을 보존한다. queued는 1초 뒤, pending은 1초부터 최대 60초까지
+runtime policy는 env `RUNTIME_POLICIES`(Infisical → 공유 차트 env)를 **기동 때 한 번** 읽는다(D1, 사용자 2026-10-30, T16b).
+`confirmedAt`은 사람이 넣지 않고 봇이 읽은 시각으로 채운다. JSON·구조가 잘못되면 기동이 실패하고, 오류에는 필드 이름만 남긴다.
+값을 바꾸면 `homelab secret set`이 파드를 다시 시작해 반영한다. 읽은 뒤 시간이 지났다는 이유로 닫지 않는다(300초 검사는 없앴다).
+`confirmedAt`이 미래 시각(시계 역행)이거나 정책 원천을 읽지 못하면 닫힌다. ESO 동기화(1시간)와 재시작까지의 창은 남으며,
+즉시 차단은 owner의 `/revoke`가 영속 거부 목록에 추가하는 것이다. 실행·조회·게시 전에 현재 owner·scope를 재검사한다.
+정책 확인 불가는 queued/pending을 보존한다. queued는 1초 뒤, pending은 1초부터 최대 60초까지
 지수 backoff한다. 일시 중지 사유·횟수는 DB에 남기고 감사는 사유 변화 때만 기록한다. 새 revision 자체로 거부하지 않는다.
 실제 권한 철회는 작업 종료 확인 뒤 cancelled, 종료가 불명하면 unknown이며 게시는 blocked로 막는다. 완료된 모델 결과는 게시 정책 확인을 기다리며 재실행하지 않는다.
-이미 인가해 실행 중인 모델은 정책 누락·stale만으로 중단하지 않고 lease heartbeat를 유지한다.
+이미 인가해 실행 중인 모델은 정책 확인 불가만으로 중단하지 않고 lease heartbeat를 유지한다.
 모델은 게시 권한이 없고, 완료 결과의 게시·새 작업은 최신 정책을 다시 확인한다.
 실제 Denied·사용자 취소·예산 초과·lease 유지 실패는 중단을 요청한다. 확인된 실패는 실패 안내
 outbox를 함께 기록하고 종료 불확실만 unknown이다. monitor에서 확인한 Denied는 실행 종료 처리까지
 보존한다. 종료 확인 뒤 cancelled/authorization_revoked, 종료가 불명하면 unknown/authorization_revoked로
 기록하고 실패 안내 outbox 자체를 만들지 않는다. /retry는 두 상태 모두 거부한다.
-거부 목록 해제는 §6의 명시적 `revocationRestores` 승인과 새 revision/confirmedAt 조건을 모두 요구한다.
+거부 목록 해제는 §6의 명시적 `revocationRestores` 승인과 새 revision, 철회 뒤 기동(읽은 시각 `confirmedAt` > 철회 시각) 조건을 모두 요구한다.
 Discord 401은 별도 오류로 pending을 유지한다. 토큰 갱신 후 새 REST 어댑터를 주입해 재개한다.
 
 부모 채널은 비활성이며 매번 멘션/명령이 필요하다. 활성 스레드만 멘션 없는 후속 메시지를 수집한다.
