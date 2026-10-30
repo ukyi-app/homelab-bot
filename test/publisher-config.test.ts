@@ -14,20 +14,18 @@ export function publisherEnv(overrides: Record<string, string | undefined> = {})
     DISCORD_BOT_TOKEN: 'fixture-discord-token-value',
     RUNTIME_POLICIES: JSON.stringify(policy),
     GRAFANA_READER_TOKEN: 'fixture-grafana-token-value',
-    ARGOCD_READER_TOKEN: 'fixture-argocd-token-value',
     HEALTHCHECKS_PING_URL: 'https://hc-ping.example/fixture-check-uuid',
     WORKER_CONTROL_PRIVATE_KEY: ed25519(),
     GITHUB_REVIEW_WEBHOOK_SECRET: 'fixture-webhook-secret-value',
     WORKER_URL: 'http://worker.sandbox:8080/',
     GRAFANA_URL: 'http://grafana.observability:3000',
-    ARGOCD_URL: 'http://argocd-server.argocd:80',
     KUBERNETES_API_URL: 'https://kubernetes.default.svc',
     PORT: '8080',
     ...overrides,
   };
 }
 const SECRET_VALUES = ['fixture-db-password', 'fixture-discord-token-value', 'fixture-owner-id', 'fixture-grafana-token-value',
-  'fixture-argocd-token-value', 'fixture-check-uuid', 'PRIVATE KEY', 'fixture-webhook-secret-value'];
+  'fixture-check-uuid', 'PRIVATE KEY', 'fixture-webhook-secret-value'];
 const problems = (env: Record<string, string | undefined>) => {
   try { loadPublisherConfig(env, 1_800_000_000_000); } catch (error) {
     assert.ok(error instanceof ConfigError);
@@ -42,7 +40,16 @@ test('T16b 설정: 키가 모두 맞으면 읽고, 정책 confirmedAt은 기동 
   assert.equal(config.policy.confirmedAt, 1_800_000_000_000); assert.equal(config.policy.owner, 'fixture-owner-id');
   assert.equal(config.workerKey.asymmetricKeyType, 'ed25519');
   assert.equal(config.workerUrl, 'http://worker.sandbox:8080/'); assert.equal(config.kubernetes.url, 'https://kubernetes.default.svc');
-  assert.deepEqual([...SECRET_KEYS, ...ADDRESS_KEYS].length, 12);
+  // README·ARCHITECTURE §5의 env 목록과 같다. Argo CD 토큰·주소는 없다(D9: Kubernetes API의 Application CR로 읽음).
+  assert.deepEqual([...SECRET_KEYS], ['DATABASE_URL', 'DISCORD_BOT_TOKEN', 'RUNTIME_POLICIES', 'GRAFANA_READER_TOKEN',
+    'HEALTHCHECKS_PING_URL', 'WORKER_CONTROL_PRIVATE_KEY', 'GITHUB_REVIEW_WEBHOOK_SECRET']);
+  assert.deepEqual([...ADDRESS_KEYS], ['WORKER_URL', 'GRAFANA_URL', 'KUBERNETES_API_URL']);
+  assert.ok(!('argocd' in config));
+});
+
+test('D9 설정: 차트에 ARGOCD_URL·ARGOCD_READER_TOKEN이 남아 있어도(값이 틀려도) 읽지 않고 기동에 영향 없음', () => {
+  assert.deepEqual(problems(publisherEnv({ ARGOCD_URL: 'not a url', ARGOCD_READER_TOKEN: 'a b' })), []);
+  assert.deepEqual(problems(publisherEnv({ ARGOCD_URL: undefined, ARGOCD_READER_TOKEN: undefined })), []);
 });
 
 test('T16b 설정: 키 하나라도 없으면 기동 실패, 오류에는 키 이름만 있고 값은 없음(주소도 기본값 없음)', () => {

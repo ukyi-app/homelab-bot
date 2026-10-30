@@ -4,7 +4,10 @@ import { createHmac, generateKeyPairSync } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { Server } from 'node:http';
 import { once } from 'node:events';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { DiscordRejected } from '../src/contracts.js';
 import type { PublisherConfig } from '../src/config.js';
 import type { Database } from '../src/database.js';
@@ -18,7 +21,8 @@ import { FakeGateway, until } from './fake-gateway.js';
 import { localDatabase } from './helpers.js';
 
 // 게시 서버 진입점 배선 시험(local_integration). 실제 Discord·Grafana·Argo CD·클러스터에는 연결하지 않는다.
-// Gateway는 loopback 가짜 서버, Discord REST는 메모리 대역, 그 밖 HTTP(Argo CD·healthchecks·작업자)는 loopback 가짜 서버다.
+// Gateway는 loopback 가짜 서버, Discord REST는 메모리 대역, 그 밖 HTTP(Kubernetes API·healthchecks·작업자)는 loopback 가짜 서버다.
+// SA 토큰은 임시 파일이다(D9: Argo CD 앱 상태도 SA 토큰으로 Kubernetes API의 Application CR을 읽는다).
 const GUILD = 'fixture-guild', CHAT = 'fixture-chat', NOTIFY = 'fixture-notifications', OWNER = 'fixture-owner';
 const REVIEW = { repositories: [{ id: 101, fullName: 'fixture-org/fixture-repo', installationId: 501, visibility: 'public' }],
   allowedBotAuthorIds: [], commentCommand: null, reviewDrafts: false, rereviewOnBaseMove: null, comparison: 'merge_base',
@@ -76,16 +80,19 @@ let gw: FakeGateway;
 let aux: Server;
 let auxBase: string;
 let auxCalls: string[];
+let serviceAccountDir: string;
 let rest: FakeRest;
 let publisher: Publisher | undefined;
 before(async () => {
   database = await localDatabase();
+  serviceAccountDir = await mkdtemp(join(tmpdir(), 'homelab-bot-sa-'));
+  await writeFile(join(serviceAccountDir, 'token'), 'fixture-sa-token\n');
   aux = createServer((req, res) => {
     auxCalls.push(`${req.method} ${req.url} ${req.headers.authorization ?? ''}`);
     if (req.url === '/ping') { res.writeHead(200).end('OK'); return; }
-    if (req.url === '/api/v1/applications/homelab-bot') {
-      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ metadata: { name: 'homelab-bot' },
-        status: { health: { status: 'Healthy' }, sync: { status: 'Synced' } } }));
+    if (req.url === '/apis/argoproj.io/v1alpha1/namespaces/argocd/applications/homelab-bot') {
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ apiVersion: 'argoproj.io/v1alpha1', kind: 'Application',
+        metadata: { name: 'homelab-bot', namespace: 'argocd' }, status: { health: { status: 'Healthy' }, sync: { status: 'Synced' } } }));
       return;
     }
     // 작업자 대역: 실행 전 거부(모델 호출 없음).
@@ -94,7 +101,10 @@ before(async () => {
   aux.listen(0, '127.0.0.1'); await once(aux, 'listening');
   auxBase = `http://127.0.0.1:${(aux.address() as AddressInfo).port}`;
 });
-after(async () => { aux.closeAllConnections(); aux.close(); await database.pg.close(); });
+after(async () => {
+  aux.closeAllConnections(); aux.close(); await database.pg.close();
+  await rm(serviceAccountDir, { recursive: true, force: true });
+});
 beforeEach(async () => {
   const tables = (await database.pg.query<{ tablename: string }>(
     "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename<>'schema_migrations'")).rows.map(r => r.tablename);
@@ -112,12 +122,11 @@ async function boot(options: { heartbeatEveryMs?: number; gateway?: boolean; por
     databaseUrl: 'postgresql://unused', discordToken: 'fixture-discord-token',
     policy: loadRuntimePolicy(JSON.stringify({ revision: 'fixture-v1', owner: OWNER, guild: GUILD, conversationChannel: CHAT,
       notificationChannel: NOTIFY, dmEnabled: false, services: ['homelab-bot'], review: REVIEW }), Date.now()),
-    grafana: { url: auxBase, token: 'fixture-grafana-token' }, argocd: { url: auxBase, token: 'fixture-argocd-token' },
-    kubernetes: { url: auxBase }, workerUrl: `${auxBase}/`, healthchecksUrl: `${auxBase}/ping`,
+    grafana: { url: auxBase, token: 'fixture-grafana-token' }, kubernetes: { url: auxBase }, workerUrl: `${auxBase}/`, healthchecksUrl: `${auxBase}/ping`,
     workerKey: generateKeyPairSync('ed25519').privateKey, githubWebhookSecret: SECRET,
   };
   publisher = await startPublisher(config, { db: options.db ?? database.db, now: options.now, discord: rest, gatewayUrl: options.gateway === false ? () => new Promise(() => {}) : async () => ({ url: gw.url }),
-    allowGatewayUrl: url => url.hostname === '127.0.0.1', serviceAccount: { tokenFile: '/nonexistent', caFile: null },
+    allowGatewayUrl: url => url.hostname === '127.0.0.1', serviceAccount: { tokenFile: join(serviceAccountDir, 'token'), caFile: null },
     ports: options.ports ?? { app: 0, alerts: 0 }, idleMs: 20, identifySpacingMs: 250, recoveryBackoff: () => 200, registerDelaysMs: [0, 20, 20], heartbeatEveryMs: options.heartbeatEveryMs ?? 60_000, stopTimeoutMs: 3000, log: () => {} });
   return publisher;
 }
@@ -214,7 +223,7 @@ test('T16b 진입점: /chat은 저장 뒤 ACK, /task·/review-status는 수신�
   assert.equal(saved.payload.command, 'chat');
 });
 
-test('READ-01 진입점 전체 경로: /read → 스레드 생성 → read 작업 → Argo CD transport → 결과 게시(모델 호출 없음)', async () => {
+test('READ-01 진입점 전체 경로: /read → 스레드 생성 → read 작업 → Kubernetes API의 Argo CD Application → 결과 게시(모델 호출 없음)', async () => {
   await boot();
   await ready();
   gw.dispatch(gw.latest, 2, 'INTERACTION_CREATE', interaction('9101', 'read', { target: 'homelab-bot', text: 'homelab-bot-argocd' }));
@@ -223,7 +232,10 @@ test('READ-01 진입점 전체 경로: /read → 스레드 생성 → read 작�
   const content = (posted.body as { content: string }).content;
   assert.match(content, /대상: homelab-bot/); assert.match(content, /출처: homelab-bot-argocd/); assert.match(content, /사실: 상태: healthy/);
   assert.deepEqual((posted.body as { allowed_mentions: unknown }).allowed_mentions, { parse: [] });
-  assert.ok(auxCalls.includes('GET /api/v1/applications/homelab-bot Bearer fixture-argocd-token'));
+  // D9: argocd-server API가 아니라 Kubernetes API 경로, Argo CD 토큰이 아니라 SA 토큰이다.
+  assert.ok(auxCalls.includes('GET /apis/argoproj.io/v1alpha1/namespaces/argocd/applications/homelab-bot Bearer fixture-sa-token'),
+    JSON.stringify(auxCalls));
+  assert.ok(!auxCalls.some(call => call.includes('/api/v1/applications')));
   assert.ok(!auxCalls.some(call => call.startsWith('POST /v1/execute')));
 });
 

@@ -6,11 +6,11 @@ import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import { ReadAdapter } from '../src/read.js';
 import type { ReadTransport } from '../src/read.js';
-import { GRAFANA_DATASOURCES, SERVICES, TEMPLATES } from '../src/catalog.js';
-import { RESPONSE_LIMIT_BYTES, argoCdTransport, grafanaTransport, kubernetesTransport, routedTransport } from '../src/read-transports.js';
+import { ARGOCD_APPLICATIONS, GRAFANA_DATASOURCES, SERVICES, TEMPLATES } from '../src/catalog.js';
+import { ARGOCD_NAMESPACE, RESPONSE_LIMIT_BYTES, grafanaTransport, kubernetesTransport, routedTransport } from '../src/read-transports.js';
 import { localDatabase, fixture, thread } from './helpers.js';
 
-// 가짜 Grafana·Argo CD·Kubernetes API(loopback HTTP). 실제 서비스에는 연결하지 않는다.
+// 가짜 Grafana·Kubernetes API(loopback HTTP). Argo CD 앱 상태도 가짜 Kubernetes API의 Application CR이다(D9). 실제 서비스에는 연결하지 않는다.
 interface Seen { method: string; url: string; auth: string | undefined; body: string }
 let database: Awaited<ReturnType<typeof localDatabase>>;
 let f: Awaited<ReturnType<typeof fixture>>;
@@ -42,10 +42,11 @@ beforeEach(async () => {
 });
 const json = (res: ServerResponse, value: unknown, status = 200) => res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(value));
 function transports() {
-  const k8s = kubernetesTransport({ base, tokenFile: '/fixture/token', caFile: null, readText: async () => `${token}\n` });
+  const k8s = kubernetesTransport({ base, tokenFile: '/fixture/token', caFile: null, applications: ARGOCD_APPLICATIONS,
+    readText: async () => `${token}\n` });
   const transport = routedTransport({
     kubernetes: k8s,
-    argocd: argoCdTransport({ base, token: 'fixture-argocd-token' }),
+    argocd: k8s,
     victoriametrics: grafanaTransport({ base, token: 'fixture-grafana-token', datasources: GRAFANA_DATASOURCES }),
     victorialogs: grafanaTransport({ base, token: 'fixture-grafana-token', datasources: GRAFANA_DATASOURCES }),
   });
@@ -55,6 +56,16 @@ const request = (overrides: Partial<Parameters<ReadTransport['query']>[0]> = {})
   query: 'homelab-bot', from: f.now() - 60_000, to: f.now(), limit: 10, maxBytes: 8192, timeoutMs: 5000,
   signal: new AbortController().signal, ...overrides });
 const frame = (fields: { name: string; type: string }[], values: unknown[][]) => ({ schema: { fields }, data: { values } });
+// Kubernetes API가 돌려주는 Argo CD Application CR 모양. spec·status.resources 등 투영하지 않는 필드를 일부러 넣는다.
+const APPLICATION_PATH = '/apis/argoproj.io/v1alpha1/namespaces/argocd/applications/homelab-bot';
+const application = (status: Record<string, unknown> | undefined, metadata: { name?: string; namespace?: string } = {}) => ({
+  apiVersion: 'argoproj.io/v1alpha1', kind: 'Application',
+  metadata: { name: 'homelab-bot', namespace: 'argocd', resourceVersion: '1', ...metadata },
+  spec: { project: 'default', source: { repoURL: 'https://example.invalid/repo', helm: { values: 'secret: not-projected' } },
+    destination: { namespace: 'app-homelab-bot' } },
+  ...(status ? { status: { ...status, resources: [{ kind: 'ConfigMap', name: 'not-projected-cm', status: 'Synced' }],
+    operationState: { message: 'not-projected-operation' } } } : {}) });
+const appStatus = (health: string, sync: string) => application({ health: { status: health }, sync: { status: sync, revision: 'fixture-rev' } });
 
 test('READ-01 코드 카탈로그는 ReadAdapter 상한 검사를 통과하고 모든 datasource에 transport 경로가 있음', () => {
   const { transport } = transports();
@@ -93,17 +104,66 @@ test('READ-01 Grafana 로그(uid victorialogs): 줄 수만 사실, 원문은 unt
   assert.deepEqual(query.datasource, { uid: 'victorialogs' }); assert.equal(query.expr, '{namespace="app-homelab-bot"}');
 });
 
-test('READ-01 Argo CD: Bearer 토큰으로 앱 하나만 GET, Healthy·Synced는 healthy, OutOfSync·Degraded는 degraded', async () => {
+test('READ-01 Argo CD(D9): SA 토큰으로 Kubernetes API의 Application CR 하나만 GET, Healthy·Synced는 healthy, OutOfSync·Degraded는 degraded', async () => {
   const { adapter } = transports();
   for (const [health, sync, expected] of [['Healthy', 'Synced', 'healthy'], ['Healthy', 'OutOfSync', 'degraded'],
-    ['Degraded', 'Synced', 'degraded'], ['Progressing', 'Synced', 'unknown']] as const) {
-    handler = (_req, res) => json(res, { metadata: { name: 'homelab-bot' }, spec: { source: { helm: { values: 'secret: not-projected' } } },
-      status: { health: { status: health }, sync: { status: sync } } });
+    ['Degraded', 'Synced', 'degraded'], ['Missing', 'OutOfSync', 'degraded'], ['Progressing', 'Synced', 'unknown'],
+    ['Suspended', 'Synced', 'unknown']] as const) {
+    handler = (_req, res) => json(res, appStatus(health, sync));
     const result = await adapter.recent('fixture-owner', thread, { service: 'homelab-bot', template: 'homelab-bot-argocd' });
+    assert.equal(result.status, 'observed'); assert.equal(result.observedAt, f.now());
     assert.deepEqual(result.facts, [`상태: ${expected}`]);
+    assert.deepEqual(result.untrusted, [`health=${health} sync=${sync}`]);
     assert.ok(!JSON.stringify(result).includes('not-projected'));
   }
-  assert.deepEqual(new Set(seen.map(s => `${s.method} ${s.url} ${s.auth}`)), new Set(['GET /api/v1/applications/homelab-bot Bearer fixture-argocd-token']));
+  // 컨트롤러가 아직 status를 쓰지 않은 앱은 Unknown이다(정상·비정상을 말하지 않음).
+  token = 'rotated-sa-token';
+  handler = (_req, res) => json(res, application(undefined));
+  const empty = await adapter.recent('fixture-owner', thread, { service: 'homelab-bot', template: 'homelab-bot-argocd' });
+  assert.deepEqual(empty.facts, ['상태: unknown']); assert.deepEqual(empty.untrusted, ['health=Unknown sync=Unknown']);
+  // 경로는 namespace argocd 고정(템플릿 namespace app-homelab-bot이 아님), 토큰은 SA 토큰을 요청마다 다시 읽은 값이다.
+  assert.equal(ARGOCD_NAMESPACE, 'argocd');
+  assert.deepEqual(new Set(seen.map(s => `${s.method} ${s.url} ${s.auth}`)), new Set([
+    `GET ${APPLICATION_PATH} Bearer fixture-sa-token`, `GET ${APPLICATION_PATH} Bearer rotated-sa-token`]));
+  assert.equal(seen.at(-1)!.auth, 'Bearer rotated-sa-token');
+});
+
+test('READ-02 Argo CD(D9): 앱 이름은 카탈로그 고정값만, 그 밖 이름·하위 경로·모르는 datasource는 요청 없이 거부', async () => {
+  assert.deepEqual(ARGOCD_APPLICATIONS, ['homelab-bot']);
+  const k8s = kubernetesTransport({ base, tokenFile: '/fixture/token', caFile: null, applications: ARGOCD_APPLICATIONS,
+    readText: async () => { throw new Error('토큰을 읽으면 안 됨'); } });
+  for (const query of ['argocd', 'other-app', 'homelab-bot-x', 'Homelab-Bot', '', 'homelab-bot/', 'homelab-bot/resource-tree',
+    'homelab-bot/managed-resources', 'homelab-bot?refresh=hard', '../settings', '..', '%2e%2e', 'homelab-bot%2F..']) {
+    await assert.rejects(k8s.query(request({ datasource: 'argocd', query })), /unsupported_query/, JSON.stringify(query));
+  }
+  // 카탈로그에 없는 이름은 정규식 모양이 맞아도 막는다. 모양이 틀린 허용 목록 값은 처음부터 버린다.
+  const odd = kubernetesTransport({ base, tokenFile: '/fixture/token', caFile: null, applications: ['../x', 'Other'],
+    readText: async () => { throw new Error('토큰을 읽으면 안 됨'); } });
+  for (const query of ['../x', 'Other', 'homelab-bot']) await assert.rejects(odd.query(request({ datasource: 'argocd', query })), /unsupported_query/);
+  for (const datasource of ['victoriametrics', 'argo-cd', '__proto__', '']) {
+    await assert.rejects(k8s.query(request({ datasource, query: 'homelab-bot' })), /unsupported_query/, datasource);
+  }
+  assert.equal(seen.length, 0);
+});
+
+test('READ-01 Argo CD(D9): HTTP 오류·다른 이름이나 다른 namespace의 객체·모양이 틀린 응답은 관측 불가', async () => {
+  const { adapter } = transports();
+  const cases: [string, (req: IncomingMessage, res: ServerResponse) => void][] = [
+    ['403', (_req, res) => json(res, { kind: 'Status', reason: 'Forbidden', code: 403 }, 403)],
+    ['404', (_req, res) => json(res, { kind: 'Status', reason: 'NotFound', code: 404 }, 404)],
+    ['다른 이름', (_req, res) => json(res, application({ health: { status: 'Healthy' }, sync: { status: 'Synced' } }, { name: 'other' }))],
+    ['다른 namespace', (_req, res) => json(res, application({ health: { status: 'Healthy' }, sync: { status: 'Synced' } }, { namespace: 'app-homelab-bot' }))],
+    ['namespace 없음', (_req, res) => json(res, { metadata: { name: 'homelab-bot' }, status: { health: { status: 'Healthy' }, sync: { status: 'Synced' } } })],
+    ['JSON 아님', (_req, res) => res.writeHead(200, { 'content-type': 'application/json' }).end('{')],
+    ['redirect', (_req, res) => res.writeHead(302, { location: '/api/v1/namespaces/argocd/secrets/argocd-secret' }).end()],
+  ];
+  for (const [label, respond] of cases) {
+    handler = respond;
+    const result = await adapter.recent('fixture-owner', thread, { service: 'homelab-bot', template: 'homelab-bot-argocd' });
+    assert.equal(result.status, 'unobservable', label); assert.deepEqual(result.facts, [], label);
+  }
+  // redirect를 따라가지 않는다(Secret 경로 요청 없음).
+  assert.ok(seen.every(s => s.url === APPLICATION_PATH), JSON.stringify(seen.map(s => s.url)));
 });
 
 test('READ-01 Kubernetes: SA 토큰을 요청마다 다시 읽고 Deployment 하나만 GET, 준비 수가 모자라면 degraded', async () => {
@@ -132,8 +192,8 @@ test('P2-4 Kubernetes: 컨트롤러가 최신 세대를 관측하지 않았으�
     for (const [meta, status, expected] of cases) {
       const body = { metadata: { name: 'homelab-bot', namespace: 'app-homelab-bot', ...meta }, spec: { replicas: 1 },
         status: { readyReplicas: 1, availableReplicas: 1, updatedReplicas: 1, ...status } };
-      const k8s = kubernetesTransport({ base: 'https://fixture.invalid', tokenFile: '/fixture', caFile: null, readText: async () => 'fixture-token',
-        send: async () => Response.json(body) });
+      const k8s = kubernetesTransport({ base: 'https://fixture.invalid', tokenFile: '/fixture', caFile: null, applications: [],
+        readText: async () => 'fixture-token', send: async () => Response.json(body) });
       const bytes = await k8s.query(request({ datasource: 'kubernetes', query: `${kind}/homelab-bot` }));
       const rows = (JSON.parse(new TextDecoder().decode(bytes)) as { rows: { status: string; value: number }[] }).rows;
       assert.deepEqual(rows, [{ status: expected, value: 1 }], `${kind} ${JSON.stringify([meta, status])}`);
@@ -152,6 +212,7 @@ test('READ-02 transport는 고정 모양 밖 질의를 요청 없이 거부(Secr
     request({ datasource: 'kubernetes', query: 'deployment/homelab-bot', namespace: '../kube-system' }),
     request({ datasource: 'argocd', query: 'homelab-bot/resource-tree' }),
     request({ datasource: 'argocd', query: '../settings' }),
+    request({ datasource: 'argocd', query: 'other-app' }),
     request({ datasource: 'loki', query: '{namespace="x"}' }),
     request({ datasource: '__proto__', query: 'x' }),
     request({ datasource: 'victoriametrics', query: '' }),
@@ -175,12 +236,40 @@ test('READ-02 응답 4MiB 초과는 끝까지 담지 않고 관측 불가(선언
   assert.equal(chunked.status, 'unobservable');
 });
 
+test('READ-02 Argo CD(D9): Application CR 응답 4MiB 초과는 끝까지 담지 않고 관측 불가(선언 길이·chunked), 4MiB 안은 관측', async () => {
+  const { adapter, transport } = transports();
+  const read = () => adapter.recent('fixture-owner', thread, { service: 'homelab-bot', template: 'homelab-bot-argocd' });
+  handler = (_req, res) => { res.writeHead(200, { 'content-type': 'application/json', 'content-length': String(RESPONSE_LIMIT_BYTES + 1) }); res.write('{'); };
+  assert.equal((await read()).status, 'unobservable');
+  // 앞부분은 정상 Application JSON이고 뒤가 6MiB 넘게 이어지는 chunked 응답. 상한에서 끊는다.
+  handler = (_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.write(`${JSON.stringify(appStatus('Healthy', 'Synced')).slice(0, -1)},"padding":"`);
+    const chunk = Buffer.alloc(1024 * 1024, 0x61);
+    let sent = 0;
+    const push = () => { while (sent < 6 && res.write(chunk)) sent++; if (sent < 6) res.once('drain', () => { sent++; push(); }); else res.end('"}'); };
+    push();
+  };
+  assert.equal((await read()).status, 'unobservable');
+  // 상한 바로 아래(전체 4MiB 이하)는 그대로 읽어 투영한다.
+  handler = (_req, res) => {
+    const body = { ...appStatus('Healthy', 'Synced'), padding: '' };
+    body.padding = 'a'.repeat(RESPONSE_LIMIT_BYTES - Buffer.byteLength(JSON.stringify(body)));
+    const text = JSON.stringify(body);
+    assert.equal(Buffer.byteLength(text), RESPONSE_LIMIT_BYTES);
+    res.writeHead(200, { 'content-type': 'application/json' }).end(text);
+  };
+  const ok = await read();
+  assert.equal(ok.status, 'observed'); assert.deepEqual(ok.facts, ['상태: healthy']);
+  assert.ok(transport.routes.includes('argocd'));
+});
+
 test('READ-01 HTTP 오류·Grafana 질의 오류·다른 이름의 객체는 관측 불가', async () => {
   const { adapter } = transports();
   const cases: [string, (req: IncomingMessage, res: ServerResponse) => void][] = [
     ['homelab-bot-argocd', (_req, res) => json(res, { message: 'denied' }, 403)],
     ['homelab-bot-available', (_req, res) => json(res, { results: { A: { status: 400, error: 'bad expr' } } })],
-    ['homelab-bot-argocd', (_req, res) => json(res, { metadata: { name: 'other' }, status: { health: { status: 'Healthy' }, sync: { status: 'Synced' } } })],
+    ['homelab-bot-argocd', (_req, res) => json(res, application({ health: { status: 'Healthy' }, sync: { status: 'Synced' } }, { name: 'other' }))],
     ['homelab-bot-deployment', (_req, res) => json(res, { metadata: { name: 'homelab-bot', namespace: 'other' }, status: {} })],
     ['homelab-bot-available', (_req, res) => json(res, { results: { A: { frames: [] } } })],
   ];

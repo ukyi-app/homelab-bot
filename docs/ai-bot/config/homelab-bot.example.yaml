@@ -30,7 +30,7 @@ platform:
   auto_merge_scope: null                      # D-07, 확정. 배포 App의 한 앱 image.yaml digest·revision PR만. 설계에 값 이름이 없어 null
   webhook_ingress: "https://hooks.ukyi.app/github"  # 설계 C.8. POST 한 경로, HMAC 검증은 봇. 구축 T08a
   observability_read_endpoints: []            # 설계 C.8: Grafana 서비스 계정 bot-reader(Viewer)로만. 주소는 T16b에서
-  cluster_read_account: "bot-reader"          # 설계 C.8: Kubernetes SA와 Argo CD 로컬 계정. 구축 T08b
+  cluster_read_account: "bot-reader"          # 설계 C.8: Kubernetes SA. Argo CD 앱 상태도 이 SA로 Application CR을 읽는다(D9). 구축 T08b
   alertmanager_receiver: "bot"                # 설계 C.8: 라우트(continue: true) → receiver bot → 클러스터 안 봇 Service
   isolated_workspace: "sandbox_pod"           # 기본 방식 확정(T05): ns sandbox + ns egress. 남은 부분은 D-15 확정(T15)
   bot_slot_target:                            # platform/bot-slot values.yaml의 target 입력(설계 C.8, E9)
@@ -175,8 +175,7 @@ secret_keys:
     - GITHUB_REVIEW_WEBHOOK_SECRET
     - GITHUB_WRITER_APP_ID
     - GITHUB_WRITER_APP_PRIVATE_KEY
-    - GRAFANA_READER_TOKEN
-    - ARGOCD_READER_TOKEN
+    - GRAFANA_READER_TOKEN                    # Argo CD 토큰은 없다(D9: Kubernetes API로 읽음)
     - HEALTHCHECKS_PING_URL
     - WORKER_CONTROL_PRIVATE_KEY              # T16a Ed25519. 작업자에는 공개 키만 설정으로 전달
     - RUNTIME_POLICIES                        # 허용 목록·runtime policy 실제 값(JSON). D1: 차트 env, 기동 때 한 번 읽음
