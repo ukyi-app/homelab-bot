@@ -392,6 +392,48 @@ test('작업자 HTTP 계약은 로컬 서버에서 서명 검증하고 잘못된
     assert.equal(f.requests.length, 1);
   } finally { server.close(); await once(server, 'close'); }
 });
+// 4316750309: 같은 payload·서명 바이트로 디코드되는 다른 base64url 표기. Node 디코더는 패딩, 허용 밖 문자,
+// 표준 base64 문자, 서명 끝 글자의 남는 4비트를 그냥 넘긴다.
+function capabilityVariants(token: string) {
+  const [payload, signature] = token.split('.') as [string, string];
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  const lastBits = alphabet[alphabet.indexOf(signature.at(-1)!) ^ 1]!;
+  return [`${signature}=`, `${signature}==`, `${signature}!`, `${signature.slice(0, 10)}!${signature.slice(10)}`,
+    signature.replaceAll('-', '+').replaceAll('_', '/'), `${signature.slice(0, -1)}${lastBits}`]
+    .filter(variant => variant !== signature).map(variant => `${payload}.${variant}`).concat(`${payload}=.${signature}`);
+}
+for (const operation of ['execute', 'cancel'] as const) test(`4316750309 ${operation} capability를 비정규 base64url로 다시 보내면 재생으로 거부`, async () => {
+  await queued(); const job = (await f.store.claim())!;
+  const body = operation === 'execute' ? workerRequest(job, []) : { job: job.id, lease: job.lease_token };
+  const token = f.signer.issue(job, operation, body);
+  const variants = capabilityVariants(token);
+  const bytes = (value: string) => value.split('.').map(part => Buffer.from(part, 'base64url'));
+  for (const variant of variants) assert.deepEqual(bytes(variant), bytes(token));
+  await f.verifier.check(token, operation, body);
+  for (const variant of variants) await assert.rejects(f.verifier.check(variant, operation, body), Denied);
+  await assert.rejects(f.verifier.check(token, operation, body), Denied);
+  // 비정규 표기는 nonce를 쓰지 않고 거부된다. 같은 작업에 새로 발급한 capability는 한 번 통과한다.
+  f.advance(1); const next = f.signer.issue(job, operation, body);
+  for (const variant of capabilityVariants(next)) await assert.rejects(f.verifier.check(variant, operation, body), Denied);
+  await f.verifier.check(next, operation, body);
+  await assert.rejects(f.verifier.check(next, operation, body), Denied);
+});
+test('4316750309 작업자 HTTP는 끝난 실행의 capability를 비정규 표기로 다시 받아도 작업을 다시 돌리지 않음', async () => {
+  const server = workerServer(f.worker); server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  try {
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    await queued(); const job = (await f.store.claim())!; const request = workerRequest(job, []);
+    const post = async (capability: string) => {
+      const response = await fetch(`${url}/v1/execute`, { method: 'POST', body: JSON.stringify(request),
+        headers: { 'content-type': 'application/json', authorization: `Capability ${capability}` } });
+      await response.arrayBuffer(); return response.status;
+    };
+    const token = f.signer.issue(job, 'execute', request);
+    assert.equal(await post(token), 200);
+    for (const variant of capabilityVariants(token)) assert.equal(await post(variant), 403);
+    assert.equal(f.requests.length, 1);
+  } finally { server.close(); await once(server, 'close'); }
+});
 test('작업자 취소 뒤 늦은 완료가 다음 실행의 mutex를 풀지 않음', async () => {
   const completions: ((value: any) => void)[] = [];
   f.setRun(async () => new Promise(resolve => { completions.push(resolve); }));
