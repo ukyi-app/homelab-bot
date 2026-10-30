@@ -24,7 +24,7 @@
  ┌──────────────── ns app-homelab-bot : 게시 서버 (공유 차트, replicas 1) ────────────────┐
  │ 수신 어댑터: 서명·설치·저장소·작성자·사용자·채널 검사 → inbox 저장 → ACK                  │
  │ 조율자: 대화·작업 상태, 예약, 예산, 우선순위, 비상 중단                                    │
- │ 읽기 어댑터: Grafana(bot-reader Viewer) / Argo CD(bot-reader get) / K8s(SA bot-reader)    │
+ │ 읽기 어댑터: Grafana(bot-reader Viewer) / K8s(SA bot-reader, Argo CD 앱 CR 포함, D9)      │
  │ 검증 계층: 리비전·공개 범위·허용 API·최종 효과 검사                                        │
  │ 제한 게시: Discord(봇 토큰) / GitHub 리뷰 App(COMMENT만) / 봇 쓰기 App(bot/ 브랜치·PR만)  │
  │ 자격: /apps/homelab-bot/ 경로만. 모델 자격 없음                                            │
@@ -41,7 +41,7 @@
  └──────────────────────────────────────────────────────────────────┘
 ```
 
-- 게시 서버가 닿는 클러스터 안 목적지는 `platform/bot-slot`이 연 셋(작업자 Service, Grafana, `argocd-server`)과 PostgreSQL뿐이다. vmsingle·VictoriaLogs·Alertmanager API에는 닿지 않는다 [확인: 설계 C.8]. Kubernetes API는 노드 로컬 경로라 읽기 전용 SA가 경계다.
+- 게시 서버가 닿는 클러스터 안 목적지는 `platform/bot-slot`이 연 셋(작업자 Service, Grafana, `argocd-server`)과 PostgreSQL뿐이다. vmsingle·VictoriaLogs·Alertmanager API에는 닿지 않는다 [확인: 설계 C.8]. Kubernetes API는 노드 로컬 경로라 읽기 전용 SA가 경계다. D9(사용자 2026-10-30) 뒤 봇 코드는 `argocd-server`를 부르지 않는다(Argo CD 앱 상태도 Kubernetes API로 읽음, §5).
 - 게시 서버의 인터넷 443은 공유 차트 규칙(IPv4, 사설·tailnet 대역 제외)을 따른다. Discord·GitHub·healthchecks.io 호출이 여기로 나간다 [확인: 설계 C.4.5 / IPv4만으로 되는지는 미확인, T16b].
 - replicas 1인 이유: Discord Gateway는 shard 하나에 연결 하나이고, 큐 소비의 중복을 lease로만 막기보다 단일 소비자가 단순하다 [가정]. 재시작 중 짧은 공백은 §7의 대조로 메운다.
 - T16a 확정: 대화도 작업자 Service:8080 → `codex exec` 계약을 따른다. 합산 모델 동시성은 1이다. 로컬 실행은 모의 작업자이며 실제 CLI 호출은 T16b다(§11).
@@ -123,12 +123,13 @@
 | `/apps/homelab-bot/` | `DISCORD_BOT_TOKEN` | 게시 서버 Discord 어댑터 |
 | | `GITHUB_REVIEW_APP_ID`, `GITHUB_REVIEW_APP_PRIVATE_KEY`, `GITHUB_REVIEW_WEBHOOK_SECRET` | 리뷰 App(D-16) |
 | | `GITHUB_WRITER_APP_ID`, `GITHUB_WRITER_APP_PRIVATE_KEY` | 봇 쓰기 App(D-24) |
-| | `GRAFANA_READER_TOKEN`, `ARGOCD_READER_TOKEN` | 읽기 어댑터. 설계에 보관 위치가 없던 자리 |
+| | `GRAFANA_READER_TOKEN` | 읽기 어댑터(Grafana). 설계에 보관 위치가 없던 자리. Argo CD 토큰은 두지 않는다(아래 D9) |
 | | `HEALTHCHECKS_PING_URL` | 봇 하트비트(§8) |
 | | `RUNTIME_POLICIES` | 허용 목록·runtime policy 실제 값(JSON). 모양은 [config/runtime-policy.example.json](config/runtime-policy.example.json). 공유 차트가 env로 넣고 봇은 기동 때 한 번 읽는다(D1, 사용자 2026-10-30, §11). §6 "허용 목록 반영" |
 | `/apps/homelab-bot/worker` | `CODEX_AUTH_JSON` (D-14 A의 시드 `auth.json`) | 작업자만. 영속 CODEX_HOME에 `auth.json`이 없을 때만 시드로 쓴다 |
 
 - 작업자 경로에는 모델 자격 외에 아무것도 두지 않는다 [확인: 설계 C.8]. Kubernetes SA `bot-reader` 토큰은 Infisical이 아니라 공유 차트의 `serviceAccountName`으로 받는다 [확인: 설계 C.4.5].
+- `ARGOCD_READER_TOKEN`(과 주소 `ARGOCD_URL`)은 없앴다(D9, 사용자 2026-10-30). `argocd-server`는 설계상 자체 서명 TLS만 써서 봇이 서버 인증서를 검증할 수 없고(사람용 Tailscale 프록시도 https+insecure로 붙는다), 봇이 읽는 것은 앱 객체 하나다. 그래서 Argo CD 앱 상태는 SA `bot-reader`(`get applications.argoproj.io -n argocd`)로 Kubernetes API의 Application CR을 읽는다. Kubernetes API는 SA의 클러스터 CA로 TLS를 검증한다. Infisical에 이미 넣은 값이 있으면 봇은 읽지 않으니 지워도 된다.
 - App ID는 비밀이 아니지만 값 목록을 한곳에 모으려고 같은 경로에 둔다 [가정].
 - ESO는 Infisical → Secret 한 방향이라 Codex가 갱신한 `auth.json`은 Infisical로 돌아가지 않는다 [가정: 설계 C.6.3의 읽기 전용 identity]. 갱신본의 원본은 작업자 영속 공간이고, 그 공간을 잃으면 사람이 다시 시드한다(D-14 남는 위험).
 - 남는 위험: Infisical Free에는 경로 RBAC가 없다 [확인: 설계 C.6.3]. 작업자 store는 `/apps/homelab-bot/worker`로 묶이지만 같은 identity가 다른 경로도 읽을 수 있다.
@@ -171,7 +172,7 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 
 | `00` §6 경계 | 이 구조의 장치 | 남는 것·시험 |
 |---|---|---|
-| 조회 vs 변경 | 읽기 계정 셋(`bot-reader`)과 NetworkPolicy. **로그 제외는 플랫폼 권한으로 서지 않으므로**(Grafana OSS Viewer가 모든 데이터소스 질의) 읽기 어댑터가 사전 승인 질의 템플릿만 보낸다. 템플릿마다 데이터소스·네임스페이스·시간창 상한·응답량 상한. 시간창 상한은 보존 기간(메트릭 30일, 로그 14일, 설계 C.3.7)과 따로 T16a에서 정한다 | READ-02에 "허용 밖 LogsQL·MetricsQL 거부" 사례를 넣는다. 더 강하게는 데이터소스 API 앞 읽기 프록시(U12 대안). Argo CD live ConfigMap 노출 여부는 T08b·T16b 시험 |
+| 조회 vs 변경 | 읽기 계정(`bot-reader`: Grafana Viewer, Kubernetes SA. Argo CD 앱 상태도 SA로 Kubernetes API에서 읽는다, D9)과 NetworkPolicy. **로그 제외는 플랫폼 권한으로 서지 않으므로**(Grafana OSS Viewer가 모든 데이터소스 질의) 읽기 어댑터가 사전 승인 질의 템플릿만 보낸다. 템플릿마다 데이터소스·네임스페이스·시간창 상한·응답량 상한. 시간창 상한은 보존 기간(메트릭 30일, 로그 14일, 설계 C.3.7)과 따로 T16a에서 정한다 | READ-02에 "허용 밖 LogsQL·MetricsQL 거부" 사례를 넣는다. 더 강하게는 데이터소스 API 앞 읽기 프록시(U12 대안). Argo CD live ConfigMap 노출 질문은 D9로 봇 경로에서 빠졌다(봇에 Argo CD API 자격 없음). SA는 `argocd` ns Application CR 전체(spec의 인라인 Helm values 포함)를 읽을 수 있고, transport는 `status.health`·`status.sync`만 투영한다 |
 | 모델 vs 게시 | 모델은 작업자에만(방안 1), 게시 자격은 게시 서버에만. 작업자는 SA 토큰·kubeconfig·SSH agent·호스트 소켓·GitHub 자격 없음. 구독 인증 파일은 작업자 영속 공간에만(§5.1) | SEC-02: 작업자에서 환경 변수·CODEX_HOME·`auth.json`·SA 경로 접근, 다른 작업의 세션 디렉터리 읽기 시험 |
 | 리뷰 | 전용 리뷰 App(D-16 확정). 게시 서버가 `event=COMMENT`만, `commit_id`는 검토한 head SHA. APPROVE·REQUEST_CHANGES·dismiss·merge·auto-merge 거부 | REVIEW-04 |
 | 코드 수정 | 작업 공간은 고정 SHA의 `codeload.github.com` 압축본 + `git init` 한 번 커밋(D-15). diff는 base·head 압축본으로 만든다. 다만 리뷰 입력의 변경 목록은 압축본 비교로 정하지 않는다. 압축본에는 submodule 포인터(gitlink) 변경이 파일 내용으로 나타나지 않는다 [가정]. 게시 서버가 웹훅이나 조회로 head·base SHA를 먼저 고정하고, 같은 SHA 쌍으로 리뷰 App 토큰으로 Git tree API(recursive)나 compare API를 불러 경로·mode·object ID 차이(submodule gitlink 변경 포함)를 열거한 뒤, 같은 SHA의 압축본을 받아 blob 내용 수집에만 쓴다 [가정]. 기준 SHA는 `comparison_revision`과 같게 둔다. PR files API는 head SHA 대조에만 쓴다. 상한 초과나 `truncated`는 `partial`, 조회 실패는 `failed` 또는 `unknown`이고 압축본 비교로 대신하지 않는다. submodule 포인터 변경은 `01` §5의 누락 표시 규칙대로 결과에 드러낸다. 작업자에는 여전히 GitHub 자격이 없다(D-15) [가정]. 커밋·브랜치·PR은 게시 서버가 D-24 App(git data API)으로 만든다. 패키지 설치·시험은 비신뢰 코드 실행으로 본다 | SEC-02, CHANGE-01, REVIEW-03(submodule 포인터만 바뀐 PR, 열거 중 head 이동, 상한 초과) |
@@ -416,8 +417,10 @@ fingerprint 계산에 서비스 ID도 포함해 같은 fingerprint 문자열의 
 일반 텍스트도 1800자씩 손실 없이 나눈다. 게시자가 끝 1900자를 조용히 버리는 처리는 없다.
 004 이전의 비정상적인 큰 pending 메시지는 자동 절단하지 않고 blocked로 둔다.
 임의 질의·Secret·ConfigMap·pods/log/exec의 요청 이름과 추가 필드를 거부한다.
-라이브 API 응답 투영은 T16b `src/read-transports.ts`다(Grafana `POST /api/ds/query` 메트릭·VictoriaLogs, Argo CD 앱 객체, Kubernetes Deployment·StatefulSet,
-응답 4MiB 상한, 고정 경로 모양만. Kubernetes는 `status.observedGeneration`이 `metadata.generation`보다 뒤처지거나 없으면 `unknown`).
+라이브 API 응답 투영은 T16b `src/read-transports.ts`다(Grafana `POST /api/ds/query` 메트릭·VictoriaLogs, Kubernetes API의 Deployment·StatefulSet과
+Argo CD Application CR(D9: `argocd-server` API가 아니라 SA `bot-reader`로 `/apis/argoproj.io/v1alpha1/namespaces/argocd/applications/{이름}`,
+이름은 카탈로그 고정값만, `status.health`·`status.sync`만 투영), 응답 4MiB 상한, redirect 거부, 고정 경로 모양만.
+Kubernetes는 SA 토큰을 요청마다 다시 읽고 SA CA로 TLS를 검증하며, `status.observedGeneration`이 `metadata.generation`보다 뒤처지거나 없으면 `unknown`).
 서비스·템플릿은 `src/catalog.ts`, 여는 서비스 ID는 정책이다. 플랫폼 권한 증거는 실연동(S16)이다.
 
 부모 채널의 스레드 생성 뒤에도 저장된 urgent command/flag를 전달한다.

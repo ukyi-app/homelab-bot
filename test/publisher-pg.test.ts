@@ -84,7 +84,7 @@ test('T16b 실제 PostgreSQL: 진입점은 실제 풀로 /readyz 200(DB 쓰기),
     const config: PublisherConfig = { databaseUrl: 'unused', discordToken: 'fixture-discord-token',
       policy: loadRuntimePolicy(JSON.stringify({ revision: 'fixture-v1', owner: 'fixture-owner', guild: 'fixture-guild',
         conversationChannel: 'fixture-chat', notificationChannel: 'fixture-notifications', dmEnabled: false, services: ['homelab-bot'] }), Date.now()),
-      grafana: { url: 'http://127.0.0.1:9', token: 'x' }, argocd: { url: 'http://127.0.0.1:9', token: 'x' }, kubernetes: { url: 'http://127.0.0.1:9' },
+      grafana: { url: 'http://127.0.0.1:9', token: 'x' }, kubernetes: { url: 'http://127.0.0.1:9' },
       workerUrl: 'http://127.0.0.1:9/', healthchecksUrl: 'http://127.0.0.1:9/ping', workerKey: generateKeyPairSync('ed25519').privateKey,
       githubWebhookSecret: 'fixture-webhook-secret-value' };
     const p = await startPublisher(config, { db, gatewayUrl: () => new Promise(() => {}), ports: { app: 0, alerts: 0 },
@@ -119,10 +119,10 @@ test('P2-5 실제 진입 프로세스: 8081 listen 실패면 열었던 8080을 �
       DATABASE_URL: `postgresql://postgres@localhost/${d.name}?host=${encodeURIComponent(socket!)}`,
       DISCORD_BOT_TOKEN: 'fixture-discord-token', RUNTIME_POLICIES: JSON.stringify({ revision: 'fixture-v1', owner: 'fixture-owner',
         guild: 'fixture-guild', conversationChannel: 'fixture-chat', notificationChannel: 'fixture-notifications', dmEnabled: false, services: [] }),
-      GRAFANA_READER_TOKEN: 'fixture-grafana', ARGOCD_READER_TOKEN: 'fixture-argocd', HEALTHCHECKS_PING_URL: 'https://hc-ping.invalid/fixture',
+      GRAFANA_READER_TOKEN: 'fixture-grafana', HEALTHCHECKS_PING_URL: 'https://hc-ping.invalid/fixture',
       WORKER_CONTROL_PRIVATE_KEY: generateKeyPairSync('ed25519').privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
       GITHUB_REVIEW_WEBHOOK_SECRET: 'fixture-webhook-secret-value', WORKER_URL: 'http://worker.invalid:8080/',
-      GRAFANA_URL: 'http://grafana.invalid:3000', ARGOCD_URL: 'http://argocd.invalid:80', KUBERNETES_API_URL: 'https://kubernetes.invalid' };
+      GRAFANA_URL: 'http://grafana.invalid:3000', KUBERNETES_API_URL: 'https://kubernetes.invalid' };
     // 시험 장치: 자식이 기동에 성공해도 외부로 나가지 못하게 fetch·WebSocket을 막는다.
     const block = 'data:text/javascript,globalThis.fetch=async()=>{throw new Error("blocked")};globalThis.WebSocket=class{constructor(){throw new Error("blocked")}};';
     const child = spawn(process.execPath, ['--import', block, 'dist/src/main.js'], { env, stdio: ['ignore', 'pipe', 'pipe'] });

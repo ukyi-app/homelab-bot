@@ -3,7 +3,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import type { Server } from 'node:http';
 import pg from 'pg';
 import { AlertIngress } from './alerts.js';
-import { GRAFANA_DATASOURCES, SERVICES, TEMPLATES } from './catalog.js';
+import { ARGOCD_APPLICATIONS, GRAFANA_DATASOURCES, SERVICES, TEMPLATES } from './catalog.js';
 import { FOUNDATION_COMMANDS, registerCommands } from './commands.js';
 import { ConfigError, databasePoolConfig, loadPublisherConfig } from './config.js';
 import type { PublisherConfig } from './config.js';
@@ -23,7 +23,7 @@ import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
 import { PolicyGate } from './policy.js';
 import { ReadAdapter } from './read.js';
-import { SERVICE_ACCOUNT, argoCdTransport, grafanaTransport, kubernetesTransport, routedTransport } from './read-transports.js';
+import { SERVICE_ACCOUNT, grafanaTransport, kubernetesTransport, routedTransport } from './read-transports.js';
 import { GitHubIngress, ReviewDisabled, ReviewPolicySource, ReviewQueue, githubWebhook } from './review.js';
 import type { GitHubReader, ReviewContext } from './review.js';
 import { RecoveryScheduler } from './recovery.js';
@@ -98,10 +98,10 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     if (!response.ok) throw new Error(`heartbeat_http_${response.status}`);
   });
   const kubernetes = kubernetesTransport({ base: config.kubernetes.url, tokenFile: deps.serviceAccount?.tokenFile ?? SERVICE_ACCOUNT.token,
-    caFile: deps.serviceAccount ? deps.serviceAccount.caFile : SERVICE_ACCOUNT.ca, send });
+    caFile: deps.serviceAccount ? deps.serviceAccount.caFile : SERVICE_ACCOUNT.ca, applications: ARGOCD_APPLICATIONS, send });
   const grafana = grafanaTransport({ base: config.grafana.url, token: config.grafana.token, datasources: GRAFANA_DATASOURCES, send });
-  const reader = new ReadAdapter([...SERVICES], [...TEMPLATES], gate, routedTransport({ kubernetes,
-    argocd: argoCdTransport({ base: config.argocd.url, token: config.argocd.token, send }),
+  // Argo CD 앱 상태도 Kubernetes API의 Application CR로 읽는다(D9). argocd-server(자체 서명 TLS)에는 닿지 않는다.
+  const reader = new ReadAdapter([...SERVICES], [...TEMPLATES], gate, routedTransport({ kubernetes, argocd: kubernetes,
     victoriametrics: grafana, victorialogs: grafana }), now);
   const runtime = new Runtime(store, gate, new HttpWorker(config.workerUrl, send), new WorkerSigner(config.workerKey, now), reader);
   const github = new GitHubIngress(config.githubWebhookSecret, store, new ReviewOff(gate), new ReviewQueue(store, closedReader), closedReader);

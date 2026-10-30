@@ -24,14 +24,16 @@ node dist/src/main.js           # 게시 서버. 8080(/readyz·/metrics·/github
 ```
 
 - 비밀 env(Infisical `/apps/homelab-bot/`): `DATABASE_URL`(차트가 넣음), `DISCORD_BOT_TOKEN`, `RUNTIME_POLICIES`,
-  `GRAFANA_READER_TOKEN`, `ARGOCD_READER_TOKEN`, `HEALTHCHECKS_PING_URL`, `WORKER_CONTROL_PRIVATE_KEY`(Ed25519 PKCS8 PEM),
+  `GRAFANA_READER_TOKEN`, `HEALTHCHECKS_PING_URL`, `WORKER_CONTROL_PRIVATE_KEY`(Ed25519 PKCS8 PEM),
   `GITHUB_REVIEW_WEBHOOK_SECRET`(16자 이상).
-- 주소 env(차트 values, 기본값 없음): `WORKER_URL`(http, 경로 `/`), `GRAFANA_URL`, `ARGOCD_URL`, `KUBERNETES_API_URL`(https).
+- 주소 env(차트 values, 기본값 없음): `WORKER_URL`(http, 경로 `/`), `GRAFANA_URL`, `KUBERNETES_API_URL`(https).
   차트가 넣는 `PORT`가 있으면 8080이어야 한다.
 - 하나라도 없거나 틀리면 기동하지 않고 키 이름·사유만 로그에 남긴다. 값은 남기지 않는다.
 - `RUNTIME_POLICIES` 모양은 [runtime-policy.example.json](docs/ai-bot/config/runtime-policy.example.json)이다. `confirmedAt`은 넣지 않는다.
   값을 바꾸면 파드를 다시 시작해야 반영된다(D1). 즉시 차단은 `/revoke`다.
 - Kubernetes 읽기는 파드의 SA 토큰·CA(`/var/run/secrets/kubernetes.io/serviceaccount`)를 쓴다. 차트 `serviceAccountName: bot-reader`가 필요하다.
+  Argo CD 앱 상태도 같은 SA로 Kubernetes API의 Application CR을 읽는다(D9). 그래서 `ARGOCD_URL`·`ARGOCD_READER_TOKEN`은 없고,
+  SA에 `get applications.argoproj.io -n argocd`가 필요하다.
 - 로컬에서 실제 Discord·플랫폼에 붙이지 않는다. 진입점 시험은 `test/publisher-*.test.ts`(가짜 Gateway·REST·HTTP)다.
 
 ## 버전
@@ -61,7 +63,7 @@ node dist/src/main.js           # 게시 서버. 8080(/readyz·/metrics·/github
 | `src/main.ts`, `src/config.ts`, `src/log.ts` | 게시 서버 진입점(T16b): env 설정, pg Pool, 수신기·루프·Gateway 조립, SIGTERM 정리 |
 | `src/migrate-main.ts` | 마이그레이션 진입점(차트 `migration.command`), advisory lock |
 | `src/gateway.ts`, `src/commands.ts` | Gateway 세션(IDENTIFY·heartbeat·RESUME·재연결·예산), FOUNDATION slash 명령 등록 |
-| `src/read-transports.ts`, `src/catalog.ts` | Grafana·Argo CD·Kubernetes 읽기 transport와 응답 투영, 서비스·질의 템플릿 |
+| `src/read-transports.ts`, `src/catalog.ts` | Grafana·Kubernetes API(Argo CD Application CR 포함) 읽기 transport와 응답 투영, 서비스·질의 템플릿 |
 
 외부 SDK와 인증은 주입 경계다. `DiscordProtocol.gateway()`에 인증된 Gateway frame을 전달하고,
 REST는 `discordHttpApi(token, fetch)`를 주입한다. 직접 호출하지 않는 한 네트워크를 열지 않는다.

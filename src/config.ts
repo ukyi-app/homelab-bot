@@ -7,15 +7,16 @@ import { PORTS } from './http.js';
 
 // 게시 서버 env. 비밀은 Infisical /apps/homelab-bot/ → 공유 차트 secretKeyRef, 주소는 차트 values env.
 // 주소도 기본값을 두지 않는다. 하나라도 없거나 틀리면 기동하지 않고, 오류에는 키 이름과 사유만 남긴다(값은 남기지 않는다).
+// Argo CD 앱 상태는 Kubernetes API(SA bot-reader)로 읽어 Argo CD 토큰·주소가 없다(D9).
 export const SECRET_KEYS = Object.freeze(['DATABASE_URL', 'DISCORD_BOT_TOKEN', 'RUNTIME_POLICIES', 'GRAFANA_READER_TOKEN',
-  'ARGOCD_READER_TOKEN', 'HEALTHCHECKS_PING_URL', 'WORKER_CONTROL_PRIVATE_KEY', 'GITHUB_REVIEW_WEBHOOK_SECRET'] as const);
-export const ADDRESS_KEYS = Object.freeze(['WORKER_URL', 'GRAFANA_URL', 'ARGOCD_URL', 'KUBERNETES_API_URL'] as const);
+  'HEALTHCHECKS_PING_URL', 'WORKER_CONTROL_PRIVATE_KEY', 'GITHUB_REVIEW_WEBHOOK_SECRET'] as const);
+export const ADDRESS_KEYS = Object.freeze(['WORKER_URL', 'GRAFANA_URL', 'KUBERNETES_API_URL'] as const);
 export class ConfigError extends Error {
   constructor(readonly problems: readonly string[]) { super(`config_invalid: ${problems.join(', ')}`); }
 }
 export interface PublisherConfig {
   databaseUrl: string; discordToken: string; policy: Policy;
-  grafana: { url: string; token: string }; argocd: { url: string; token: string }; kubernetes: { url: string };
+  grafana: { url: string; token: string }; kubernetes: { url: string };
   workerUrl: string; healthchecksUrl: string; workerKey: KeyObject; githubWebhookSecret: string;
 }
 type Env = Readonly<Record<string, string | undefined>>;
@@ -47,7 +48,6 @@ export function loadPublisherConfig(env: Env, loadedAt: number): PublisherConfig
     catch (error) { problems.push(`RUNTIME_POLICIES(${error instanceof Error ? error.message.replace(/^runtime_policies_invalid: /, 'invalid: ') : 'invalid'})`); }
   }
   const grafanaToken = read('GRAFANA_READER_TOKEN', token);
-  const argocdToken = read('ARGOCD_READER_TOKEN', token);
   const healthchecksUrl = read('HEALTHCHECKS_PING_URL', value => url(value, ['https:'], false));
   let workerKey: KeyObject | undefined;
   const rawKey = read('WORKER_CONTROL_PRIVATE_KEY', () => true);
@@ -62,11 +62,10 @@ export function loadPublisherConfig(env: Env, loadedAt: number): PublisherConfig
   const githubWebhookSecret = read('GITHUB_REVIEW_WEBHOOK_SECRET', value => value.length >= 16);
   const workerUrl = read('WORKER_URL', value => url(value, ['http:'], true));
   const grafanaUrl = read('GRAFANA_URL', value => url(value, ['http:', 'https:'], true));
-  const argocdUrl = read('ARGOCD_URL', value => url(value, ['http:', 'https:'], true));
   const kubernetesUrl = read('KUBERNETES_API_URL', value => url(value, ['https:'], true));
   if (problems.length || !policy || !workerKey) throw new ConfigError(problems.length ? problems : ['unknown']);
   return { databaseUrl, discordToken, policy, grafana: { url: grafanaUrl, token: grafanaToken },
-    argocd: { url: argocdUrl, token: argocdToken }, kubernetes: { url: kubernetesUrl }, workerUrl, healthchecksUrl,
+    kubernetes: { url: kubernetesUrl }, workerUrl, healthchecksUrl,
     workerKey, githubWebhookSecret };
 }
 // 공유 차트의 DATABASE_URL은 sslmode=require다. node-pg는 libpq와 달리 require를 verify-full로 다뤄,

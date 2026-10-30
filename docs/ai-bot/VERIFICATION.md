@@ -29,9 +29,9 @@
 ## T16b 시작 때 다시 볼 것 (blocked 해소 점검)
 
 1. `kubectl auth can-i --as=system:serviceaccount:app-homelab-bot:bot-reader`로 `get secrets -A`, `get configmaps -A`, `get pods --subresource=log -A` → 모두 no.
-2. Argo CD `bot-reader` 토큰으로 시험 앱 ConfigMap의 live 매니페스트 조회 결과 기록.
+2. ~~Argo CD `bot-reader` 토큰으로 시험 앱 ConfigMap의 live 매니페스트 조회 결과 기록.~~ D9(사용자 2026-10-30)로 봇에 Argo CD API 자격이 없다. 대신 같은 `kubectl auth can-i --as=…:bot-reader`로 `get applications.argoproj.io -n argocd` → yes, 다른 ns의 `applications.argoproj.io`와 `patch`·`update`·`delete applications.argoproj.io -n argocd` → no.
 3. Grafana `bot-reader` 토큰으로 `POST /api/ds/query`에 VictoriaLogs 임의 질의 결과 기록, `POST /api/dashboards/db` → 403(U12).
-4. 봇 파드에서 vmsingle·VictoriaLogs·Alertmanager API → 실패, Grafana·`argocd-server`·작업자 Service → 연결.
+4. 봇 파드에서 vmsingle·VictoriaLogs·Alertmanager API → 실패, Grafana·작업자 Service·Kubernetes API(D8) → 연결. `argocd-server`는 D9 뒤 봇 코드가 부르지 않는다.
 5. 봇 replicas 0에서 무엇이 울리는지 기록.
 6. 호스팅형 Renovate PR과 시험 App PR의 `author_association`.
 7. 봇 파드에서 Discord Gateway·REST(IPv4 443) 연결, 네트워크 차단·복구 뒤 RESUME 또는 재IDENTIFY와 프로세스 생존. 차단 동안 봇 파드가 Ready를 유지해 webhook(8080)·경보 수신(8081)이 계속 받는지, Gateway 연결 지표가 끊김을 보이는지.
@@ -427,3 +427,15 @@ PGlite는 transaction을 직렬화한다. 실제 PostgreSQL 다중 연결 경합
   - 결과: `npm run check` 통과, `npm test` 526 / 522 pass / 0 fail / 4 skipped, 로컬 PostgreSQL 18.6 소켓(`HOMELAB_TEST_PG_SOCKET`)을 주면 526 / 526 pass. 재빌드한 이미지에서 합성 시드로 첫 기동 `seeded`(0600, 링크 수 1, 임시 파일 없음) → 재기동 `kept`, SIGTERM 종료 코드 0.
 - 시험이 잡는지 확인: 코드를 일부러 망가뜨려(`--ephemeral` 빼기, 세션 정리 빼기, 시드 덮어쓰기, nonce 메모리 저장, 개인 키 허용, env 상속, 버전 확인 빼기, workspace-write, 기한 여유 빼기, 0644, 작업 레인 실행, `/readyz` 빼기, 개인 경로 검사 빼기, 연결 먼저 끊기) 각각 해당 WRK 시험이 실패하는 것을 봤다.
 - T18 실제 프로세스 시험의 흔들림(`test/codex-bridge.test.ts`, 2차 수정): 주원인은 **고정 작업 ID**였다. launcher는 같은 UID의 모든 프로세스에서 작업 표식을 찾아 끝내고 세므로, 같은 기계에서 동시에 도는 다른 시험 실행의 같은 시험 프로세스를 자기 것으로 죽였다. 부하 없이 두 벌 동시 실행만으로 `S2`가 8회 중 3회 `exit_nonzero`(관찰된 증상과 같음)로 재현했다. 실제 프로세스 시험의 작업 ID를 실행마다 `randomUUID()`로 바꾼 뒤 두 벌 동시 실행 12회 모두 통과. 함께 없앤 시간 의존: S2 가짜 codex의 150ms 간격 도구 호출(둘째를 바로 내고 셋째는 정리 실패 때만 30초 뒤), SEC-02 hang의 300ms 중단(어댑터가 `thread.started`를 받은 뒤 중단), non-dumpable 자식의 5초 상한 바쁜 대기(상태 기다리기), 정리 유예 500ms(5초, 사라지면 바로 끝남), 스냅샷 `< 2000ms`(멈추는지만 봄), 경로 판정 `< 800ms` 벽시계(원소 읽기 수 + 이 프로세스 CPU 시간), R1의 고정 100ms 대기(실제 실행이 끝나기를 기다림). 확인: 부하 생성기 8개(`nice -n 19`, 운영 k3s 보호를 위한 lead 제한) 아래 전체 `npm test` 12회 모두 521 / 517 / 0 / 4(load 8.6~20). 바꾼 시험이 계속 잡는지 코드를 망가뜨려 봤다(예산 미집행 → S2 실패, 제곱 판정 → 경로 시험 실패, 실행 전 중단 확인 제거 → R1 두 시험 실패). 남는 것: non-dumpable 시험의 자식은 그 시험 동안 같은 UID의 다른 시험 실행이 "확인 불가"(`unknown`)로 판정하게 만들 수 있다(설계상 fail-closed). 한 실행 안에서는 실제 프로세스 시험이 차례로 돌아 겹치지 않고, 컨테이너 test 단계에는 해당이 없다. 런처의 실행 뒤 출력 마저 읽기 200ms 상한(`src/codex-process.ts`)도 시간 의존이지만 `src/` 동작이라 바꾸지 않았다.
+
+## T16b D9: Argo CD 앱 상태를 Kubernetes API로 (2026-10-30, 로컬·mock)
+
+- 기준: 브랜치 `feat/t16b-argocd-via-k8s`(origin/main `8ae9294` 위). 결정은 [DECISIONS.md](DECISIONS.md) "T16b 결정" D9. 실제 클러스터·Argo CD·Infisical·Discord·모델에는 연결하지 않았다.
+- `npm run check` 통과. `npm test` **608 tests / 599 pass / 0 fail / 9 skipped**(PG 소켓 없음. 기준선 `8ae9294`는 604 / 595 / 0 / 9). 로컬 `postgres:18-alpine`(PostgreSQL **18.6**, `--pull=never --network none`, 데이터 tmpfs, 소켓 디렉터리 바인드)을 주면 3회 중 2회 **608/608**, 1회는 T18 실제 프로세스 시험 `SEC-02 실제 프로세스: …배경 자식…` 1건 실패다(호스트 load 13, 같은 시험 단독 3회 통과. 이번 변경과 무관한 기존 흔들림). Node 24.22.2.
+- 시험이 잡는지: transport에서 앱 이름 허용 목록 검사, 응답 객체 namespace 검사, `AbortSignal` 전달을 하나씩 빼면 각각 해당 시험이 실패함을 확인했다(원복).
+
+| 시험 ID | 등급 / 판정 | 확인한 경계 | 남은 검증 / 해소 |
+|---|---|---|---|
+| READ-01 (Argo CD, D9) | mock / pass (transport), local_integration / pass (진입점 경로) | 가짜 Kubernetes API에 `GET /apis/argoproj.io/v1alpha1/namespaces/argocd/applications/homelab-bot`, SA 토큰을 요청마다 다시 읽음(교체 반영). Healthy·Synced → healthy, Healthy·OutOfSync·Degraded·Missing → degraded, Progressing·Suspended·status 없음 → unknown, 관측 시각은 요청 시각, untrusted는 `health=… sync=…`(D9 전과 같은 의미). spec(Helm values)·`status.resources`·`operationState`는 결과에 없음. 403·404·다른 이름·다른 namespace·namespace 없음·JSON 아님·redirect(따라가지 않음)는 관측 불가. 진입점 `/read` → 스레드 → read 작업 → Application CR(SA 토큰) → 결과 게시, `/api/v1/applications` 호출 0 | 라이브 Application CR 모양과 SA 권한, S8·S16 |
+| READ-02 (Argo CD, D9) | mock / pass | 앱 이름은 카탈로그 고정값(`ARGOCD_APPLICATIONS` = `homelab-bot`)만. 다른 앱 이름·대문자·빈 값·하위 경로(`resource-tree`·`managed-resources`)·query 문자열·`..`·퍼센트 인코딩·모르는 datasource는 SA 토큰도 읽지 않고 요청 없이 거부, 모양이 틀린 허용 목록 값은 버림. 경로 namespace는 템플릿 namespace와 상관없이 `argocd` 고정. 응답 4MiB 초과(선언 길이·chunked)는 끝까지 담지 않고 관측 불가, 정확히 4MiB는 관측. 시간 초과 신호로 응답 없는 요청과 서버 쪽 연결을 끊음(kubernetes·argocd·Grafana 경로) | 플랫폼 RBAC(다른 ns·쓰기 no), S8 |
+| 설정 (D9) | mock / pass (PG 진입 프로세스 포함) | 비밀 7개·주소 3개(목록을 순서까지 고정), `ARGOCD_URL`·`ARGOCD_READER_TOKEN`은 없어도·값이 틀려도 기동에 영향 없음. 실제 진입 프로세스 시험(PostgreSQL)도 두 키 없는 env로 설정을 통과 | 차트 env·Infisical에서 두 키 정리(사람·플랫폼), S10 |
