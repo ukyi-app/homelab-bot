@@ -54,3 +54,20 @@ test('T16b runMigrations는 첫 연결이 거부돼도 같은 프로세스에서
   await assert.rejects(runMigrations(pool), stop);
   assert.equal(connects, 2);
 });
+
+test('T16b node-pg 연결 시간 초과·연결 중 끊김(코드 없음)도 다시 시도, SQLSTATE 오류는 아님', async () => {
+  for (const message of ['Connection terminated due to connection timeout', 'timeout expired', 'Connection terminated unexpectedly']) {
+    assert.equal(transientConnectError(new Error(message)), true, message);
+  }
+  // pg-pool은 원인을 cause에 싣는다.
+  assert.equal(transientConnectError(new Error('wrapper', { cause: new Error('timeout expired') })), true);
+  assert.equal(transientConnectError(Object.assign(new Error('Connection terminated unexpectedly'), { code: '57P01' })), false);
+  assert.equal(transientConnectError(new Error('relation "x" does not exist')), false);
+  const c = clock(); let calls = 0;
+  const value = await withConnectRetry(async () => {
+    if (++calls < 2) throw new Error('Connection terminated due to connection timeout');
+    return 'ok';
+  }, { now: c.now, sleep: c.sleep });
+  assert.equal(value, 'ok');
+  assert.deepEqual(c.waits, [250]);
+});
