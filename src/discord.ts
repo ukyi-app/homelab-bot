@@ -15,6 +15,8 @@ export interface DiscordRest {
 const noMentions = { allowed_mentions: { parse: [] as never[] } };
 const controls = new Set(['stop', 'resume', 'list', 'cancel', 'retry', 'emergency-stop', 'resume-model', 'model-status', 'revoke',
   'review-status', 'review-resume', 'review-cancel']);
+// 수신이 아는 명령 전체. 배포 진입점은 단계에 맞춰 더 좁은 목록(FOUNDATION_COMMANDS)을 넘긴다.
+export const ALL_COMMANDS: ReadonlySet<string> = new Set(['chat', 'urgent', 'task', 'read', ...controls]);
 const EventSchema = z.strictObject({
   id: z.string().min(1), actor: z.string().min(1), scope: ScopeSchema,
   text: z.string().max(DEFAULTS.maxInputChars), kind: z.enum(['message', 'command', 'button']),
@@ -23,10 +25,13 @@ const EventSchema = z.strictObject({
 });
 export class DiscordIngress {
   constructor(private readonly store: Store, private readonly gate: PolicyGate,
-    private readonly rest: DiscordRest, public readonly messageContent = true) {}
+    private readonly rest: DiscordRest, public readonly messageContent = true,
+    private readonly commands: ReadonlySet<string> = ALL_COMMANDS) {}
   async receive(input: EventInput, recovered = false, recovery?: { token: string; epoch: number }): Promise<string | undefined> {
     const event = EventSchema.parse(input);
     if (event.bot || event.webhook) return;
+    // 이 단계에서 열지 않은 명령·버튼은 저장·권한 확인 전에 닫는다(T16b: task·review-*는 FOUNDATION 밖).
+    if (event.kind !== 'message' && !this.commands.has(event.command ?? '')) throw new Denied();
     const p = await this.gate.authorize(event.actor, event.scope);
     if (!this.messageContent && event.kind === 'message') return;
     const conversation = await this.store.conversation(event.scope);
