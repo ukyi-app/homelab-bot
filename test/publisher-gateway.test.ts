@@ -13,14 +13,21 @@ let session: GatewaySession | undefined;
 let database: Awaited<ReturnType<typeof localDatabase>>;
 before(async () => { database = await localDatabase(); });
 after(async () => { await database.pg.close(); });
-beforeEach(async () => { gw = new FakeGateway(); await gw.start(); });
-afterEach(async () => { await session?.stop(200); session = undefined; await gw.close(); });
+// 시험 속도를 위해 간격을 줄인다(가짜 Gateway 200ms, 대역 예산 250ms). 실제 값 5초·5.5초는 P2-3 시험이 본다.
+beforeEach(async () => { gw = new FakeGateway(); gw.options.identifyIntervalMs = 200; await gw.start(); });
+afterEach(async () => {
+  await session?.stop(200); session = undefined; await gw.close();
+  // 어떤 시험에서도 가짜 Gateway의 IDENTIFY 간격 제한을 어기지 않는다.
+  assert.equal(gw.identifyViolations, 0);
+});
 
 function start(overrides: Partial<GatewayOptions> = {}) {
   const record = { events: [] as [string, unknown][], health: [] as boolean[], readies: [] as unknown[], identifies: 0, logs: [] as string[] };
+  let last = -Infinity;
   session = new GatewaySession({
     token: 'fixture-token', gatewayUrl: async () => ({ url: gw.url }),
-    budget: { identify: async () => { record.identifies++; return true; }, backoff: () => 10 },
+    budget: { next: async () => Math.max(Date.now(), last + 250),
+      reserve: async () => { record.identifies++; last = Math.max(Date.now(), last + 250); return last; }, backoff: () => 10 },
     health: { gateway: connected => record.health.push(connected) },
     dispatch: async (type, data) => { record.events.push([type, data]); },
     onReady: ready => { record.readies.push(ready); },
@@ -108,7 +115,7 @@ test('OPS-01 IDENTIFY 예산(24시간 900회)이 다 차면 연결하지 않고 
   await database.pg.query(`INSERT INTO audit(kind,subject,detail,created_at)
     SELECT 'identify','gateway','{}',$1 FROM generate_series(1,900)`, [now - 3_600_000]);
   const budget = new GatewayBudget(store);
-  const record = start({ budget: { identify: () => budget.identify(), backoff: () => 10 } });
+  const record = start({ budget: { next: () => budget.next(), reserve: () => budget.reserve(), backoff: () => 10 } });
   await until(() => record.logs.includes('gateway_retry'));
   await new Promise(resolve => setTimeout(resolve, 100));
   assert.equal(gw.connections.length, 0); assert.deepEqual(record.health, []);
@@ -136,6 +143,55 @@ for (const code of [4004, 4014]) test(`EVENT-03 치명 close 코드 ${code}(인�
   await until(() => record.logs.includes('gateway_halted'));
   await new Promise(resolve => setTimeout(resolve, 100));
   assert.equal(gw.connections.length, 1); assert.equal(session!.state.halted, true);
+});
+
+test('P2-3 IDENTIFY는 일일 예산과 함께 직전 IDENTIFY에서 5초 뒤에만(실제 GatewayBudget, 가짜 Gateway 5초 제한)', { timeout: 20_000 }, async () => {
+  await database.pg.exec('TRUNCATE audit,controls RESTART IDENTITY CASCADE');
+  gw.options.identifyIntervalMs = 5000;
+  const budget = new GatewayBudget(new Store(database.db));
+  const record = start({ budget });
+  await until(() => record.readies.length === 1);
+  // 첫 READY 직후 세션을 잃는다(INVALID_SESSION false). 다시 IDENTIFY해야 하지만 5초 창 안에서는 안 된다.
+  gw.latest.send({ op: 9, d: false });
+  await until(() => record.readies.length === 2, 12_000);
+  assert.equal(gw.identifyViolations, 0);
+  assert.ok(gw.identifies[1]! - gw.identifies[0]! >= 5000, `간격 ${gw.identifies[1]! - gw.identifies[0]!}ms`);
+});
+
+test('P2-3 GatewayBudget: 예약은 직전 예약에서 5.5초 뒤, 새 인스턴스(재시작)도 DB 기록을 이어 받고 일일 900회에서 멈춤', async () => {
+  await database.pg.exec('TRUNCATE audit,controls RESTART IDENTITY CASCADE');
+  let time = 1_800_000_000_000;
+  const budget = new GatewayBudget(new Store(database.db, () => time));
+  assert.equal(await budget.next(), time);
+  assert.equal(await budget.reserve(), time);
+  assert.equal(await budget.next(), time + 5500);
+  assert.equal(await budget.reserve(), time + 5500);
+  const restarted = new GatewayBudget(new Store(database.db, () => time));
+  assert.equal(await restarted.reserve(), time + 11_000);
+  time += 60_000;
+  assert.equal(await restarted.reserve(), time);
+  await database.pg.query(`INSERT INTO audit(kind,subject,detail,created_at) SELECT 'identify','gateway','{}',$1 FROM generate_series(1,896)`, [time - 1000]);
+  assert.equal(await restarted.next(), undefined); assert.equal(await restarted.reserve(), undefined);
+  time += 86_400_000;
+  assert.equal(await restarted.reserve(), time);
+});
+
+test('로그 정제: Gateway 주소 조회 오류의 외부 메시지는 로그에 싣지 않음', async () => {
+  const details: unknown[] = [];
+  start({ gatewayUrl: async () => { throw new Error('https://user:fixture-leak@example.invalid/?token=fixture-leak'); },
+    log: (event, detail) => { details.push([event, detail]); } });
+  await until(() => details.some(entry => (entry as [string])[0] === 'gateway_open_failed'));
+  assert.ok(!JSON.stringify(details).includes('fixture-leak'), JSON.stringify(details));
+});
+
+test('로그 정제: Gateway 이벤트 처리 오류의 외부 메시지는 로그에 싣지 않음', async () => {
+  const details: unknown[] = [];
+  const record = start({ dispatch: async () => { throw new Error('fixture-leak content of a message'); },
+    log: (event, detail) => { details.push([event, detail]); } });
+  await until(() => record.readies.length === 1);
+  gw.dispatch(gw.latest, 2, 'MESSAGE_CREATE', { id: 'm-2' });
+  await until(() => details.some(entry => (entry as [string])[0] === 'gateway_event_failed'));
+  assert.ok(!JSON.stringify(details).includes('fixture-leak'), JSON.stringify(details));
 });
 
 test('EVENT-03 stop()은 타이머를 정리하고 1000으로 닫은 뒤 다시 연결하지 않음', async () => {

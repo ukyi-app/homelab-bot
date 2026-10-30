@@ -67,10 +67,16 @@ export interface FakeGatewayOptions {
   resume: 'resumed' | 'invalid';
   // HELLO 직후 이 코드로 닫는다(치명 오류 흉내).
   closeAfterHello?: number;
+  // Discord는 같은 rate_limit_key(단일 shard는 하나)에서 5초에 IDENTIFY 하나만 받고 넘으면 op 9로 거절한다.
+  identifyIntervalMs: number;
 }
 export class FakeGateway {
   readonly connections: FakeConnection[] = [];
-  readonly options: FakeGatewayOptions = { heartbeatInterval: 45_000, ack: true, resume: 'resumed' };
+  readonly options: FakeGatewayOptions = { heartbeatInterval: 45_000, ack: true, resume: 'resumed', identifyIntervalMs: 5000 };
+  // 받은 IDENTIFY 시각과 간격 제한 위반 수. 시험은 위반 0을 확인한다.
+  readonly identifies: number[] = [];
+  identifyViolations = 0;
+  private lastAccepted: number | undefined;
   private server: Server;
   private sessions = 0;
   url = '';
@@ -101,6 +107,14 @@ export class FakeGateway {
   private respond(connection: FakeConnection, payload: GatewayPayload): void {
     if (payload.op === 1 && this.options.ack) connection.send({ op: 11 });
     if (payload.op === 2) {
+      const now = Date.now();
+      this.identifies.push(now);
+      if (this.lastAccepted !== undefined && now - this.lastAccepted < this.options.identifyIntervalMs) {
+        this.identifyViolations++;
+        connection.send({ op: 9, d: false });
+        return;
+      }
+      this.lastAccepted = now;
       this.sessions++;
       connection.send({ op: 0, s: 1, t: 'READY', d: { v: 10, session_id: `session-${this.sessions}`,
         resume_gateway_url: `${this.url}/resume`, user: { id: 'fixture-bot' }, application: { id: 'fixture-app' }, guilds: [] } });

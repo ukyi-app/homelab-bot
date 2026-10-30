@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { DiscordApi } from './discord-protocol.js';
+import { errorInfo } from './log.js';
 
 // Discord Gateway v10 세션(JSON, 압축 없음). Node 24 내장 WebSocket을 쓴다(새 의존성 없음).
 // GUILDS(1) | GUILD_MESSAGES(512) | MESSAGE_CONTENT(32768). DM을 끄므로 DIRECT_MESSAGES는 뺀다(T16a 확정).
@@ -21,7 +22,8 @@ export interface GatewayOptions {
   intents?: number;
   // 새 세션(IDENTIFY)마다 부른다. retryAfterMs가 있으면 그만큼 기다린 뒤 다시 묻는다(session_start_limit 소진).
   gatewayUrl: () => Promise<{ url: string; retryAfterMs?: number }>;
-  budget: { identify(): Promise<boolean>; backoff(attempt: number, random?: number): number };
+  // next: 다음 IDENTIFY 가능 시각(읽기만), reserve: 한 번 예약(일일 예산·5초 간격을 원자적으로). 둘 다 예산이 없으면 undefined.
+  budget: { next(): Promise<number | undefined>; reserve(): Promise<number | undefined>; backoff(attempt: number, random?: number): number };
   health: { gateway(connected: boolean): void };
   dispatch: (type: string, data: unknown) => Promise<void>;
   onReady?: (ready: { applicationId: string; userId: string }) => Promise<void> | void;
@@ -30,6 +32,7 @@ export interface GatewayOptions {
   allowUrl?: (url: URL) => boolean;
   random?: () => number;
   helloTimeoutMs?: number;
+  now?: () => number;
 }
 const Payload = z.object({ op: z.number().int(), d: z.unknown().optional(), s: z.number().int().nullable().optional(),
   t: z.string().nullable().optional() });
@@ -73,6 +76,9 @@ export class GatewaySession {
     const timer = setTimeout(() => { this.timers.delete(timer); fn(); }, ms);
     this.timers.add(timer);
   }
+  // stop()이 타이머를 지우면 끝나지 않고 버려진다(핸들을 잡지 않는다).
+  private pause(ms: number): Promise<void> { return new Promise(resolve => this.later(ms, resolve)); }
+  private now(): number { return (this.options.now ?? Date.now)(); }
   private clearTimers() { for (const timer of this.timers) clearTimeout(timer); this.timers.clear(); }
   private setConnected(value: boolean) {
     if (this.connected === value) return;
@@ -100,11 +106,13 @@ export class GatewaySession {
           this.nextDelayMs = Math.max(1000, target.retryAfterMs);
           this.retry('session_start_limit'); return;
         }
-        // 실제 IDENTIFY 전에 센다. 연결이 그 전에 실패하면 한 번 더 센 것이 되지만 상한 쪽으로만 틀린다.
-        if (!await this.options.budget.identify()) {
+        // 예산이 없으면 연결하지 않는다. 5초 간격 안이면 연결 전에 기다린다. 실제 예약은 HELLO 뒤 IDENTIFY 직전에 한다.
+        const next = await this.options.budget.next();
+        if (next === undefined) {
           this.nextDelayMs = 60_000;
           this.retry('identify_budget'); return;
         }
+        if (next > this.now()) await this.pause(next - this.now());
         url = target.url; identify = true;
       }
       const parsed = new URL(url);
@@ -112,7 +120,7 @@ export class GatewaySession {
       parsed.searchParams.set('v', '10'); parsed.searchParams.set('encoding', 'json');
       url = parsed.toString();
     } catch (error) {
-      this.log('gateway_open_failed', { reason: error instanceof Error ? error.message : 'unknown' });
+      this.log('gateway_open_failed', errorInfo(error));
       this.retry('open_failed'); return;
     }
     if (this.stopped) return;
@@ -149,6 +157,22 @@ export class GatewaySession {
       this.heartbeat(socket, interval, false);
     });
   }
+  // IDENTIFY 직전에 예약한다. 예약 시각과 실제 전송 시각이 붙어 있어야 연결 지연이 달라도 5초 간격이 지켜진다.
+  private async identify(socket: GatewaySocket): Promise<void> {
+    let at: number | undefined;
+    try { at = await this.options.budget.reserve(); }
+    catch (error) {
+      this.log('identify_reserve_failed', errorInfo(error));
+      if (this.socket === socket) this.drop(socket, 'identify_reserve_failed');
+      return;
+    }
+    if (this.socket !== socket) return;
+    if (at === undefined) { this.nextDelayMs = 60_000; this.drop(socket, 'identify_budget'); return; }
+    if (at > this.now()) await this.pause(at - this.now());
+    if (this.socket !== socket || this.stopped) return;
+    this.send(socket, { op: 2, d: { token: this.options.token, intents: this.options.intents ?? GATEWAY_INTENTS,
+      properties: { os: 'linux', browser: 'homelab-bot', device: 'homelab-bot' } } });
+  }
   private handle(socket: GatewaySocket, payload: z.infer<typeof Payload>, identify: boolean) {
     if (typeof payload.s === 'number') this.seq = payload.s;
     switch (payload.op) {
@@ -156,8 +180,7 @@ export class GatewaySession {
         const hello = Hello.safeParse(payload.d);
         if (!hello.success) { this.drop(socket, 'bad_hello'); return; }
         this.heartbeat(socket, hello.data.heartbeat_interval, true);
-        if (identify) this.send(socket, { op: 2, d: { token: this.options.token, intents: this.options.intents ?? GATEWAY_INTENTS,
-          properties: { os: 'linux', browser: 'homelab-bot', device: 'homelab-bot' } } });
+        if (identify) void this.identify(socket);
         else if (this.session) this.send(socket, { op: 6, d: { token: this.options.token, session_id: this.session.id, seq: this.seq } });
         return;
       }
@@ -190,7 +213,7 @@ export class GatewaySession {
     const type = payload.t, data = payload.d;
     // 이벤트는 받은 순서대로 하나씩 처리한다(메시지 checkpoint가 순서에 기댄다). heartbeat는 타이머라 막히지 않는다.
     this.events = this.events.then(() => this.options.dispatch(type, data))
-      .catch(error => { this.log('gateway_event_failed', { type, reason: error instanceof Error ? error.message : 'unknown' }); });
+      .catch(error => { this.log('gateway_event_failed', { type, ...errorInfo(error) }); });
   }
   private onClose(socket: GatewaySocket, code: number) {
     if (this.socket !== socket) return;
