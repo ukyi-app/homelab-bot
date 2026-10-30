@@ -29,6 +29,8 @@ class FakeRest implements DiscordApi {
     ['fixture-thread', { id: 'fixture-thread', type: 11, guild_id: GUILD, parent_id: CHAT }]]);
   guildCommands: unknown[] = [];
   failCommandReads = 0;
+  // 스레드 history 응답. 기본은 빈 페이지.
+  history: (channel: string, after: string) => Promise<unknown[]> = async () => [];
   globalCommands: unknown[] = [{ name: 'task', type: 1, description: '이전 등록' }];
   private next = 0;
   async request(method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown): Promise<unknown> {
@@ -46,7 +48,9 @@ class FakeRest implements DiscordApi {
       return { id };
     }
     if (method === 'POST' && /^\/channels\/[^/]+\/messages$/.test(path)) return { id: `fixture-message-${++this.next}` };
-    if (method === 'GET' && /^\/channels\/[^/]+\/messages\?/.test(path)) return [];
+    if (method === 'GET' && (m = path.match(/^\/channels\/([^/]+)\/messages\?(.*)$/))) {
+      return this.history(decodeURIComponent(m[1]!), new URLSearchParams(m[2]).get('after') ?? '0');
+    }
     if (method === 'GET' && /\/threads\/(active|archived\/public)/.test(path)) return { threads: [] };
     if (path === `/applications/fixture-app/guilds/${GUILD}/commands`) {
       if (method === 'GET' && this.failCommandReads > 0) { this.failCommandReads--; throw new Error('discord_request_failed'); }
@@ -88,13 +92,14 @@ beforeEach(async () => {
   const tables = (await database.pg.query<{ tablename: string }>(
     "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename<>'schema_migrations'")).rows.map(r => r.tablename);
   await database.pg.exec(`TRUNCATE ${tables.join(',')} RESTART IDENTITY CASCADE`);
-  gw = new FakeGateway(); await gw.start();
+  // 시험 속도를 위해 IDENTIFY 간격을 줄인다(가짜 Gateway 250ms, 진입점 예산 300ms). 실제 값은 gateway 시험이 본다.
+  gw = new FakeGateway(); gw.options.identifyIntervalMs = 250; await gw.start();
   rest = new FakeRest(); auxCalls = [];
 });
-afterEach(async () => { await publisher?.stop(); publisher = undefined; await gw.close(); });
+afterEach(async () => { await publisher?.stop(); publisher = undefined; await gw.close(); assert.equal(gw.identifyViolations, 0); });
 
 const SECRET = 'fixture-webhook-secret-value';
-async function boot(options: { heartbeatEveryMs?: number; gateway?: boolean } = {}) {
+async function boot(options: { heartbeatEveryMs?: number; gateway?: boolean; ports?: { app: number; alerts: number } } = {}) {
   const config: PublisherConfig = {
     databaseUrl: 'postgresql://unused', discordToken: 'fixture-discord-token',
     policy: loadRuntimePolicy(JSON.stringify({ revision: 'fixture-v1', owner: OWNER, guild: GUILD, conversationChannel: CHAT,
@@ -105,7 +110,7 @@ async function boot(options: { heartbeatEveryMs?: number; gateway?: boolean } = 
   };
   publisher = await startPublisher(config, { db: database.db, discord: rest, gatewayUrl: options.gateway === false ? () => new Promise(() => {}) : async () => ({ url: gw.url }),
     allowGatewayUrl: url => url.hostname === '127.0.0.1', serviceAccount: { tokenFile: '/nonexistent', caFile: null },
-    ports: { app: 0, alerts: 0 }, idleMs: 20, registerDelaysMs: [0, 20, 20], heartbeatEveryMs: options.heartbeatEveryMs ?? 60_000, stopTimeoutMs: 3000, log: () => {} });
+    ports: options.ports ?? { app: 0, alerts: 0 }, idleMs: 20, identifyIntervalMs: 300, recoveryBackoff: () => 200, registerDelaysMs: [0, 20, 20], heartbeatEveryMs: options.heartbeatEveryMs ?? 60_000, stopTimeoutMs: 3000, log: () => {} });
   return publisher;
 }
 const app = (p: Publisher, path: string, init?: RequestInit) => fetch(`http://127.0.0.1:${p.ports.app}${path}`, init);
@@ -113,6 +118,22 @@ const ready = () => until(() => rest.calls.some(c => c.method === 'GET' && c.pat
 const interaction = (id: string, name: string, options: Record<string, string> = {}, channel = CHAT) => ({
   id, token: `fixture-token-${id}`, type: 2, channel_id: channel, guild_id: GUILD, member: { user: { id: OWNER } },
   data: { name, options: Object.entries(options).map(([key, value]) => ({ name: key, value })) } });
+const message = (id: string, channel: string) => ({ id, channel_id: channel, guild_id: GUILD, author: { id: OWNER }, content: `fixture-message-${id}` });
+async function thread(channel: string, checkpoint: string, order = 0) {
+  rest.channels.set(channel, { id: channel, type: 11, guild_id: GUILD, parent_id: CHAT });
+  const scope = { kind: 'thread', guild: GUILD, channel, parent: CHAT };
+  await database.db.query(`INSERT INTO conversations(id,owner_id,scope,channel_id,created_at,active,checkpoint)
+    VALUES ($1,$2,$3,$4,$5,true,$6)`, [`thread:${GUILD}:${channel}`, OWNER, JSON.stringify(scope), channel, 1_700_000_000_000 + order, checkpoint]);
+}
+async function waitFor(check: () => Promise<boolean>, timeoutMs = 6000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) { if (await check()) return true; await new Promise(resolve => setTimeout(resolve, 20)); }
+  return check();
+}
+const conversation = async (channel: string) => (await database.db.query<{ checkpoint: string | null; gap: boolean; recovery_token: string | null }>(
+  'SELECT checkpoint,gap,recovery_token FROM conversations WHERE channel_id=$1', [channel])).rows[0]!;
+const event = async (id: string) => (await database.db.query<{ accepted: boolean; buffered: boolean }>(
+  "SELECT accepted,buffered FROM events WHERE delivery_id=$1 AND provider='discord'", [id])).rows[0];
 const count = async (table: string) => Number((await database.db.query<{ count: string }>(`SELECT count(*) FROM ${table}`)).rows[0]!.count);
 
 test('T16b 진입점 8080: /readyz 200·/metrics, 그 밖 404, /github은 리뷰 정책이 있어도 리뷰 비활성(202 review_disabled)·서명 틀림 401', async () => {
@@ -213,6 +234,70 @@ test('EVENT-03 진입점: 새 IDENTIFY(READY) 뒤 활성 스레드를 checkpoint
     await new Promise(resolve => setTimeout(resolve, 10));
   } while (Date.now() < deadline);
   assert.deepEqual(row, { gap: false, recovery_token: null });
+});
+
+test('P1-1 새 READY: 모든 활성 스레드를 live 입력보다 먼저 막아, 복구 차례를 기다리는 스레드의 단절 중 메시지를 잃지 않음', async () => {
+  await thread('fixture-thread-a', '100', 0);
+  await thread('fixture-thread-b', '100', 1);
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  rest.history = async (channel, after) => {
+    if (channel === 'fixture-thread-a') { await held; return []; }
+    // 200은 단절 중 메시지, 300은 아래 live로도 들어온다.
+    return [message('200', channel), message('300', channel)].filter(m => BigInt(m.id) > BigInt(after));
+  };
+  await boot();
+  await until(() => rest.calls.some(c => c.path.startsWith('/channels/fixture-thread-a/messages?')));
+  gw.dispatch(gw.latest, 2, 'MESSAGE_CREATE', message('300', 'fixture-thread-b'));
+  assert.ok(await waitFor(async () => (await event('300')) !== undefined), 'live 메시지 저장');
+  release();
+  const recovered = await waitFor(async () => !!(await event('200'))?.accepted && !(await conversation('fixture-thread-b')).gap
+    && !(await conversation('fixture-thread-a')).gap);
+  const historyB = rest.calls.filter(c => c.path.startsWith('/channels/fixture-thread-b/messages?')).map(c => c.path);
+  assert.deepEqual(historyB, ['/channels/fixture-thread-b/messages?limit=100&after=100']);
+  assert.ok(recovered, '단절 중 메시지 200 복구');
+  assert.equal((await event('300'))!.accepted, true);
+  assert.equal((await conversation('fixture-thread-b')).checkpoint, '300');
+});
+
+test('P1-2 일시적인 history 조회 실패 뒤 새 READY 없이 대화별로 다시 시도해 버퍼를 처리', async () => {
+  await thread('fixture-thread-a', '100');
+  let calls = 0;
+  rest.history = async () => { calls++; if (calls === 1) throw new Error('fixture_transient_history_timeout'); return []; };
+  await boot();
+  await until(() => calls === 1);
+  // 실패 뒤 gap이 남아 있는 동안 들어온 live 메시지는 버퍼에 들어간다.
+  assert.ok(await waitFor(async () => (await conversation('fixture-thread-a')).recovery_token === null));
+  gw.dispatch(gw.latest, 2, 'MESSAGE_CREATE', message('400', 'fixture-thread-a'));
+  const processed = await waitFor(async () => !!(await event('400'))?.accepted && !(await conversation('fixture-thread-a')).gap, 8000);
+  assert.ok(processed, `history 호출 ${calls}회, 대화 ${JSON.stringify(await conversation('fixture-thread-a'))}, 이벤트 ${JSON.stringify(await event('400'))}`);
+  assert.ok(calls >= 2); assert.equal(gw.connections.length, 1);
+});
+
+test('P1-2 영속 Discord pause 동안은 history를 부르지 않고, pause가 끝난 뒤 READY 없이 복구', async () => {
+  await thread('fixture-thread-a', '100');
+  const pauseUntil = Date.now() + 1500;
+  await database.db.query(`INSERT INTO controls VALUES ('discord_global_after',to_jsonb($1::bigint))`, [pauseUntil]);
+  let calledAt: number | undefined;
+  rest.history = async () => { calledAt ??= Date.now(); return []; };
+  await boot();
+  assert.ok(await waitFor(async () => calledAt !== undefined && !(await conversation('fixture-thread-a')).gap, 8000), 'pause 뒤 복구');
+  assert.ok(calledAt !== undefined && calledAt >= pauseUntil, `history ${calledAt} / pause ${pauseUntil}`);
+  assert.equal(gw.connections.length, 1);
+});
+
+test('P2-5 8081 listen이 실패하면 먼저 연 8080도 닫고 오류를 다시 던짐', async () => {
+  const blocker = createServer();
+  blocker.listen(0); await once(blocker, 'listening');
+  const probe = createServer();
+  probe.listen(0); await once(probe, 'listening');
+  const appPort = (probe.address() as AddressInfo).port;
+  await new Promise(resolve => probe.close(resolve));
+  try {
+    await assert.rejects(boot({ ports: { app: appPort, alerts: (blocker.address() as AddressInfo).port } }), { code: 'EADDRINUSE' });
+    publisher = undefined;
+    await assert.rejects(fetch(`http://127.0.0.1:${appPort}/readyz`));
+  } finally { blocker.close(); }
 });
 
 test('OPS-02 진입점: Gateway 연결·루프가 돌면 healthchecks ping, stop()은 수신기를 닫고 다시 연결하지 않음', async () => {

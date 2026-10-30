@@ -2,6 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID, generateKeyPairSync } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { createServer } from 'node:http';
+import type { Server } from 'node:http';
+import { once } from 'node:events';
 import pg from 'pg';
 import { databasePoolConfig } from '../src/config.js';
 import type { PublisherConfig } from '../src/config.js';
@@ -93,4 +97,46 @@ test('T16b 실제 PostgreSQL: 진입점은 실제 풀로 /readyz 200(DB 쓰기),
     } finally { await p.stop(); }
     await assert.rejects(fetch(`http://127.0.0.1:${p.ports.app}/readyz`));
   } finally { await d.close(); }
+});
+
+// 고정 포트가 비어 있고(:: 이중 스택으로 묶임) 막아 둔 포트가 정말 충돌할 때만 돈다. 아니면 건너뛴다.
+async function hold(port: number): Promise<Server | undefined> {
+  const server = createServer();
+  try { server.listen(port); await once(server, 'listening'); return server; } catch { return undefined; }
+}
+test('P2-5 실제 진입 프로세스: 8081 listen 실패면 열었던 8080을 닫고 종료 코드 1로 끝남', { skip, timeout: 30_000 }, async t => {
+  const free = await hold(8080);
+  if (!free) { t.skip('8080 사용 중'); return; }
+  await new Promise(resolve => free.close(resolve));
+  const blocker = await hold(8081);
+  if (!blocker) { t.skip('8081 사용 중'); return; }
+  const probe = await hold(8081);
+  if (probe) { probe.close(); blocker.close(); t.skip('8081 충돌을 만들 수 없음'); return; }
+  const d = await database();
+  try {
+    await runMigrations(d.pool());
+    const env = { PATH: process.env.PATH ?? '',
+      DATABASE_URL: `postgresql://postgres@localhost/${d.name}?host=${encodeURIComponent(socket!)}`,
+      DISCORD_BOT_TOKEN: 'fixture-discord-token', RUNTIME_POLICIES: JSON.stringify({ revision: 'fixture-v1', owner: 'fixture-owner',
+        guild: 'fixture-guild', conversationChannel: 'fixture-chat', notificationChannel: 'fixture-notifications', dmEnabled: false, services: [] }),
+      GRAFANA_READER_TOKEN: 'fixture-grafana', ARGOCD_READER_TOKEN: 'fixture-argocd', HEALTHCHECKS_PING_URL: 'https://hc-ping.invalid/fixture',
+      WORKER_CONTROL_PRIVATE_KEY: generateKeyPairSync('ed25519').privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
+      GITHUB_REVIEW_WEBHOOK_SECRET: 'fixture-webhook-secret-value', WORKER_URL: 'http://worker.invalid:8080/',
+      GRAFANA_URL: 'http://grafana.invalid:3000', ARGOCD_URL: 'http://argocd.invalid:80', KUBERNETES_API_URL: 'https://kubernetes.invalid' };
+    // 시험 장치: 자식이 기동에 성공해도 외부로 나가지 못하게 fetch·WebSocket을 막는다.
+    const block = 'data:text/javascript,globalThis.fetch=async()=>{throw new Error("blocked")};globalThis.WebSocket=class{constructor(){throw new Error("blocked")}};';
+    const child = spawn(process.execPath, ['--import', block, 'dist/src/main.js'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '';
+    let failedAt: number | undefined;
+    const collect = (chunk: unknown) => { output += String(chunk); if (failedAt === undefined && output.includes('publisher_start_failed')) failedAt = Date.now(); };
+    child.stdout.on('data', collect);
+    child.stderr.on('data', collect);
+    const exited = new Promise<number | null>(resolve => child.once('exit', code => resolve(code)));
+    const code = await Promise.race([exited, sleep(10_000).then(() => 'timeout' as const)]);
+    if (code === 'timeout') child.kill('SIGKILL');
+    assert.equal(code, 1, output);
+    assert.match(output, /"event":"publisher_start_failed".*"code":"EADDRINUSE"/);
+    // 열린 자원이 없어 곧바로 끝나야 한다. 5초 안전 타이머로 끝난 것이면 무언가 남은 것이다.
+    assert.ok(failedAt !== undefined && Date.now() - failedAt < 3000, `실패 로그 뒤 ${failedAt === undefined ? '-' : Date.now() - failedAt}ms`);
+  } finally { blocker.close(); await d.close(); }
 });

@@ -25,6 +25,7 @@ import { ReadAdapter } from './read.js';
 import { SERVICE_ACCOUNT, argoCdTransport, grafanaTransport, kubernetesTransport, routedTransport } from './read-transports.js';
 import { GitHubIngress, ReviewDisabled, ReviewPolicySource, ReviewQueue, githubWebhook } from './review.js';
 import type { GitHubReader, ReviewContext } from './review.js';
+import { RecoveryScheduler } from './recovery.js';
 import { Runtime } from './runtime.js';
 import { Store } from './store.js';
 import { WorkerSigner } from './worker.js';
@@ -62,6 +63,8 @@ export interface PublisherDeps {
   reconcileEveryMs?: number;
   stopTimeoutMs?: number;
   registerDelaysMs?: readonly number[];
+  recoveryBackoff?: (attempt: number) => number;
+  identifyIntervalMs?: number;
 }
 export interface Publisher {
   health: Health; gateway: GatewaySession; ports: { app: number; alerts: number };
@@ -101,8 +104,16 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   const runtime = new Runtime(store, gate, new HttpWorker(config.workerUrl, send), new WorkerSigner(config.workerKey, now), reader);
   const github = new GitHubIngress(config.githubWebhookSecret, store, new ReviewOff(gate), new ReviewQueue(store, closedReader), closedReader);
   const servers = receivers(health, new AlertIngress(store, gate), { github: githubWebhook(github) });
-  const ports = { app: await listen(servers.app, deps.ports?.app ?? PORTS.publisher),
-    alerts: await listen(servers.alerts, deps.ports?.alerts ?? PORTS.alerts) };
+  let ports: { app: number; alerts: number };
+  try {
+    ports = { app: await listen(servers.app, deps.ports?.app ?? PORTS.publisher),
+      alerts: await listen(servers.alerts, deps.ports?.alerts ?? PORTS.alerts) };
+  } catch (error) {
+    // 한쪽만 열린 채 남으면 프로세스가 반쪽으로 살아 있다(이벤트 루프를 붙잡음). 연 것을 모두 닫고 다시 던진다.
+    await Promise.all([closeServer(servers.app, 1000), closeServer(servers.alerts, 1000)]);
+    await kubernetes.close();
+    throw error;
+  }
 
   // Discord 쪽은 첫 READY에서 봇 사용자 ID를 받은 뒤 만든다. 그 전에는 수신·게시를 하지 않는다(경보·webhook 수신은 계속).
   const api = deps.discord ?? discordHttpApi(config.discordToken, send, now);
@@ -124,15 +135,17 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       }
     }
   })());
-  const recoverAll = async () => {
-    const rows = (await deps.db.query<{ scope: Scope; owner_id: string }>(`SELECT scope,owner_id FROM conversations
-      WHERE active=true AND scope->>'kind'<>'channel' ORDER BY created_at`)).rows;
-    for (const row of rows) {
-      if (stop.signal.aborted || !discord) return;
-      try { await discord.ingress.recover(row.scope, row.owner_id); }
-      catch (error) { log('recovery_failed', errorInfo(error)); }
+  const recovery = new RecoveryScheduler(store, (scope: Scope, owner: string) => {
+    if (!discord) throw new Error('discord_not_ready');
+    return discord.ingress.recover(scope, owner);
+  }, log, deps.recoveryBackoff);
+  // 새 READY의 복구 장벽. live 이벤트는 이 처리 뒤에 차례로 들어오므로(Gateway 이벤트 순서) 장벽이 서기 전에 처리되지 않는다.
+  // DB가 잠시 안 되면 장벽이 설 때까지 다시 시도한다(그동안 이벤트는 기다린다).
+  const barrier = async () => {
+    for (let attempt = 0; !stop.signal.aborted; attempt++) {
+      try { log('recovery_barrier', { conversations: await recovery.barrier() }); return; }
+      catch (error) { log('recovery_barrier_failed', errorInfo(error)); await pause(Math.min(30_000, 1000 * 2 ** Math.min(attempt, 5))); }
     }
-    log('recovery_done', { conversations: rows.length });
   };
   // REST는 요청마다 1초 제한이라 등록이 한 번 실패할 수 있다. 다음 READY(며칠 뒤일 수도)까지 미루지 않고 몇 번 더 시도한다.
   let registering: string | undefined;
@@ -154,7 +167,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   const gateway = new GatewaySession({
     token: config.discordToken,
     gatewayUrl: deps.gatewayUrl ?? discordGatewayUrl(api),
-    budget: new GatewayBudget(store),
+    budget: new GatewayBudget(store, deps.identifyIntervalMs),
     health,
     log,
     connect: deps.connect,
@@ -164,7 +177,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       try { await protocol!.gateway(type, data, discord.ingress); }
       catch (error) { if (!(error instanceof Denied)) log('discord_event_failed', { type, ...errorInfo(error) }); }
     },
-    onReady: ready => {
+    onReady: async ready => {
       if (!discord) {
         protocol = new DiscordProtocol(api, ready.userId, now);
         discord = { ingress: new DiscordIngress(store, gate, protocol, true, new Set(FOUNDATION_COMMANDS)),
@@ -175,10 +188,11 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
           if (now() - reconciled >= (deps.reconcileEveryMs ?? 30_000)) { reconciled = now(); await publisher.reconcile(); }
           return publisher.deliver();
         });
+        loop('recovery', () => recovery.runDue());
       }
-      // 명령 등록·누락 대조는 이벤트 처리 순서 밖에서 돈다(대조가 30초까지 걸려도 상호작용 ACK가 밀리지 않게).
+      await barrier();
+      // 명령 등록과 history 대조 자체는 이벤트 처리 순서 밖에서 돈다(대조가 30초까지 걸려도 상호작용 ACK가 밀리지 않게).
       track(register(ready.applicationId));
-      track(recoverAll().catch(error => log('recovery_failed', errorInfo(error))));
     },
   });
   loop('runtime', () => runtime.tick());
@@ -219,7 +233,14 @@ async function main(): Promise<void> {
   } catch (error) { log('database_unavailable', errorInfo(error)); await pool.end().catch(() => {}); process.exitCode = 1; return; }
   let publisher: Publisher;
   try { publisher = await startPublisher(config, { db, log }); }
-  catch (error) { log('publisher_start_failed', errorInfo(error)); await pool.end().catch(() => {}); process.exitCode = 1; return; }
+  catch (error) {
+    log('publisher_start_failed', errorInfo(error));
+    await pool.end().catch(() => {});
+    process.exitCode = 1;
+    // 열린 자원은 startPublisher가 닫는다. 그래도 무언가 남아 프로세스가 반쪽으로 살아 있지 않게 5초 뒤 끝낸다.
+    setTimeout(() => process.exit(1), 5000).unref();
+    return;
+  }
   let shutting = false;
   const shutdown = (signal: string) => {
     if (shutting) return;

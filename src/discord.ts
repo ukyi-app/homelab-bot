@@ -16,6 +16,7 @@ const noMentions = { allowed_mentions: { parse: [] as never[] } };
 const controls = new Set(['stop', 'resume', 'list', 'cancel', 'retry', 'emergency-stop', 'resume-model', 'model-status', 'revoke',
   'review-status', 'review-resume', 'review-cancel']);
 // 수신이 아는 명령 전체. 배포 진입점은 단계에 맞춰 더 좁은 목록(FOUNDATION_COMMANDS)을 넘긴다.
+export type RecoveryOutcome = 'done' | 'budget' | 'skipped';
 export const ALL_COMMANDS: ReadonlySet<string> = new Set(['chat', 'urgent', 'task', 'read', ...controls]);
 const EventSchema = z.strictObject({
   id: z.string().min(1), actor: z.string().min(1), scope: ScopeSchema,
@@ -125,7 +126,9 @@ export class DiscordIngress {
     }
     return saved.id;
   }
-  async recover(scope: Scope, actor: string): Promise<void> {
+  // 결과: done(빈틈 없이 따라잡고 gap 해제), budget(복구 한도를 넘어 gap 유지, 수동 처리), skipped(구독 꺼짐·다른 복구 진행 중·
+  // 도중에 구독 세대가 바뀜. gap은 그대로라 호출자가 다시 시도한다). 일시적인 통신 실패는 예외로 던진다.
+  async recover(scope: Scope, actor: string): Promise<RecoveryOutcome> {
     await this.gate.authorize(actor, scope);
     const token = randomUUID();
     const started = this.store.now();
@@ -136,7 +139,7 @@ export class DiscordIngress {
         [row.id, token, started + DEFAULTS.recoveryMs]);
       return row;
     });
-    if (!conversation) return;
+    if (!conversation) return 'skipped';
     const valid = async (store: Store) => {
       await this.gate.withDatabase(store.db).authorize(actor, scope);
       const row = await store.ownedConversation(scope, actor, true);
@@ -148,21 +151,21 @@ export class DiscordIngress {
       for (let page = 0; page < DEFAULTS.recoveryPages; page++) {
         await this.gate.authorize(actor, scope);
         if (this.store.now() - started >= DEFAULTS.recoveryMs) break;
-        if (!await this.store.atomic(valid)) return;
+        if (!await this.store.atomic(valid)) return 'skipped';
         const pause = await this.store.discordPauseUntil(scope.channel);
         if (pause > this.store.now()) throw new RateLimited(pause - this.store.now());
         const messages = await this.rest.history(scope.channel, after, 100).catch(async error => {
           if (error instanceof RateLimited) await this.store.recordRateLimit(error, scope.channel);
           throw error;
         });
-        if (!await this.store.atomic(valid)) return;
+        if (!await this.store.atomic(valid)) return 'skipped';
         if (messages.length > 100) throw new Error('history_page_overflow');
         messages.sort((a, b) => BigInt(a.id) < BigInt(b.id) ? -1 : 1);
         for (const message of messages) {
           if (message.scope.kind !== scope.kind || message.scope.guild !== scope.guild
             || message.scope.channel !== scope.channel || message.scope.parent !== scope.parent) throw new Denied();
           if (after && BigInt(message.id) <= BigInt(after)) throw new Error('history_not_advancing');
-          if (!await this.store.atomic(valid)) return;
+          if (!await this.store.atomic(valid)) return 'skipped';
           try { await this.receive(message, true, { token, epoch: conversation.subscription_epoch }); } catch (error) { if (!(error instanceof Denied)) throw error; }
           after = message.id;
         }
@@ -171,20 +174,20 @@ export class DiscordIngress {
           await store.db.query(`UPDATE conversations SET checkpoint=$2 WHERE id=$1 AND $2::text IS NOT NULL
             AND (checkpoint IS NULL OR checkpoint::numeric<$2::numeric)`, [conversation.id, after]);
           return true;
-        })) return;
+        })) return 'skipped';
         if (messages.length < 100) {
           // The same conversation lock decides whether a live event is buffered or routed directly.
           for (let drained = 0; drained <= DEFAULTS.recoveryPages * 100; drained++) {
             if (this.store.now() - started >= DEFAULTS.recoveryMs) break;
             const next = await this.store.atomic(async store => {
-              if (!await valid(store)) return { done: true };
+              if (!await valid(store)) return { done: true, cleared: false };
               const event = (await store.db.query<{ delivery_id: string; actor_id: string; scope: Scope; payload: EventInput }>(
                 'SELECT * FROM events WHERE conversation_id=$1 AND buffered=true ORDER BY event_order LIMIT 1', [conversation.id])).rows[0];
               if (event) return { event };
               await store.db.query('UPDATE conversations SET gap=false WHERE id=$1', [conversation.id]);
-              return { done: true };
+              return { done: true, cleared: true };
             });
-            if (next.done) return;
+            if (next.done) return next.cleared ? 'done' : 'skipped';
             const buffered = next.event!;
             try { await this.receive({ id: buffered.delivery_id, actor: buffered.actor_id, scope: buffered.scope, text: buffered.payload.text,
               kind: buffered.payload.kind, command: buffered.payload.command, target: buffered.payload.target, mention: buffered.payload.mention, urgent: buffered.payload.urgent }, true, { token, epoch: conversation.subscription_epoch }); }
@@ -197,6 +200,7 @@ export class DiscordIngress {
         }
       }
       await this.store.audit('history_gap', conversation.id, { reason: 'recovery_budget' });
+      return 'budget';
     } finally {
       await this.store.db.query('UPDATE conversations SET recovery_token=NULL,recovery_until=NULL WHERE id=$1 AND recovery_token=$2', [conversation.id, token]);
     }
