@@ -126,10 +126,10 @@ export function argoCdTransport(options: { base: string; token: string; send?: t
   } };
 }
 
-const Workload = z.object({ metadata: z.object({ name: z.string(), namespace: z.string() }),
+const Workload = z.object({ metadata: z.object({ name: z.string(), namespace: z.string(), generation: z.number().int().optional() }),
   spec: z.object({ replicas: z.number().int().nonnegative().optional() }).optional(),
-  status: z.object({ readyReplicas: z.number().int().optional(), availableReplicas: z.number().int().optional(),
-    updatedReplicas: z.number().int().optional() }).optional() });
+  status: z.object({ observedGeneration: z.number().int().optional(), readyReplicas: z.number().int().optional(),
+    availableReplicas: z.number().int().optional(), updatedReplicas: z.number().int().optional() }).optional() });
 const workload = /^(deployment|statefulset)\/([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$/;
 export const SERVICE_ACCOUNT = Object.freeze({
   token: '/var/run/secrets/kubernetes.io/serviceaccount/token',
@@ -158,8 +158,11 @@ export function kubernetesTransport(options: { base: string; tokenFile: string; 
       if (raw.metadata.name !== object || raw.metadata.namespace !== request.namespace) throw new Error('unexpected_object');
       const desired = raw.spec?.replicas ?? 1, ready = raw.status?.readyReplicas ?? 0;
       const available = raw.status?.availableReplicas ?? 0, updated = raw.status?.updatedReplicas ?? 0;
+      // 컨트롤러가 최신 spec 세대를 관측하기 전의 replica 수는 이전 세대 기준이다. 그때는 정상·비정상을 말하지 않는다.
+      const generation = raw.metadata.generation, observed = raw.status?.observedGeneration;
+      const current = generation !== undefined && observed !== undefined && observed >= generation;
       const healthy = desired >= 1 && ready >= desired && available >= desired && updated >= desired;
-      return encodeObservation(request.to, [{ status: healthy ? 'healthy' : 'degraded', value: ready }], request);
+      return encodeObservation(request.to, [{ status: !current ? 'unknown' : healthy ? 'healthy' : 'degraded', value: ready }], request);
     },
     async close() { const current = await dispatcher?.catch(() => undefined); await current?.close().catch(() => {}); },
   };

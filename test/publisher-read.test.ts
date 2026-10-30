@@ -108,8 +108,8 @@ test('READ-01 Argo CD: Bearer 토큰으로 앱 하나만 GET, Healthy·Synced는
 
 test('READ-01 Kubernetes: SA 토큰을 요청마다 다시 읽고 Deployment 하나만 GET, 준비 수가 모자라면 degraded', async () => {
   const { adapter } = transports();
-  const deployment = (ready: number) => ({ metadata: { name: 'homelab-bot', namespace: 'app-homelab-bot' }, spec: { replicas: 1 },
-    status: { readyReplicas: ready, availableReplicas: ready, updatedReplicas: 1 } });
+  const deployment = (ready: number) => ({ metadata: { name: 'homelab-bot', namespace: 'app-homelab-bot', generation: 3 }, spec: { replicas: 1 },
+    status: { observedGeneration: 3, readyReplicas: ready, availableReplicas: ready, updatedReplicas: 1 } });
   handler = (_req, res) => json(res, deployment(1));
   assert.deepEqual((await adapter.recent('fixture-owner', thread, { service: 'homelab-bot', template: 'homelab-bot-deployment' })).facts, ['상태: healthy', '값: 1']);
   token = 'rotated-sa-token';
@@ -118,6 +118,27 @@ test('READ-01 Kubernetes: SA 토큰을 요청마다 다시 읽고 Deployment 하
   assert.deepEqual(seen.map(s => [s.method, s.url, s.auth]), [
     ['GET', '/apis/apps/v1/namespaces/app-homelab-bot/deployments/homelab-bot', 'Bearer fixture-sa-token'],
     ['GET', '/apis/apps/v1/namespaces/app-homelab-bot/deployments/homelab-bot', 'Bearer rotated-sa-token']]);
+});
+
+test('P2-4 Kubernetes: 컨트롤러가 최신 세대를 관측하지 않았으면 healthy가 아니라 unknown(Deployment·StatefulSet)', async () => {
+  for (const kind of ['deployment', 'statefulset'] as const) {
+    const cases: [Record<string, number>, Record<string, number>, string][] = [
+      [{ generation: 2 }, { observedGeneration: 1 }, 'unknown'],
+      [{ generation: 2 }, {}, 'unknown'],
+      [{}, { observedGeneration: 2 }, 'unknown'],
+      [{ generation: 2 }, { observedGeneration: 2 }, 'healthy'],
+      [{ generation: 2 }, { observedGeneration: 3 }, 'healthy'],
+    ];
+    for (const [meta, status, expected] of cases) {
+      const body = { metadata: { name: 'homelab-bot', namespace: 'app-homelab-bot', ...meta }, spec: { replicas: 1 },
+        status: { readyReplicas: 1, availableReplicas: 1, updatedReplicas: 1, ...status } };
+      const k8s = kubernetesTransport({ base: 'https://fixture.invalid', tokenFile: '/fixture', caFile: null, readText: async () => 'fixture-token',
+        send: async () => Response.json(body) });
+      const bytes = await k8s.query(request({ datasource: 'kubernetes', query: `${kind}/homelab-bot` }));
+      const rows = (JSON.parse(new TextDecoder().decode(bytes)) as { rows: { status: string; value: number }[] }).rows;
+      assert.deepEqual(rows, [{ status: expected, value: 1 }], `${kind} ${JSON.stringify([meta, status])}`);
+    }
+  }
 });
 
 test('READ-02 transport는 고정 모양 밖 질의를 요청 없이 거부(Secret·ConfigMap·pods/log·exec·경로 조작·모르는 datasource)', async () => {
