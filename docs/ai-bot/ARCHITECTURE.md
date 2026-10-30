@@ -827,11 +827,12 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - lease가 끝난 read는 `unknown`이 아니라 `failed`(`lease_expired`) + 안내다. read에는 외부 쓰기가 없어 불확실성이 아니다. 구버전이 남긴 `unknown` read도 같은 이유로 정리한다. owner가 `/cancel`한 read는 `cancelled`.
 - 대기열 상한 100건 중 read 몫 10건: 모델 계열(chat·task·review)은 read가 아닌 queued가 90건 미만일 때만 받는다. `/retry`·`/resume-model`·`/review-resume`도 같은 모델 상한이다(`Store.queueFull(type)`).
 - 같은 대화 안에서 뒤에 요청한 read 답이 앞선 긴 chat 답보다 먼저 게시될 수 있다(대화 안 job 순서 계약은 없다).
+- **받아들인 전환기 동작:** 배포 중 구버전(scheduler 행만 잠금)과 신버전(read_lane 행만 잠금)이 겹치는 몇 초 동안은 서로 다른 read 두 개가 동시에 돌 수 있다. 같은 job의 이중 실행은 아니고 read는 읽기 전용이라 받아들였다(독립 리뷰 지적, 2026-10-30).
 
 ### 정상 종료 (SIGTERM)
 
 - `stop()` 첫 줄의 종료 신호가 runtime 종료 신호다. 신호 뒤에는 claim하지 않는다. 신호 전에 시작한 claim이 늦게 돌아오거나 dispatch 직전이면 `defer(job,'publisher_shutdown')`(attempt 소모 없음).
-- 실행 중이면 드레인 10초(`DRAIN_MS`) 안의 자연 완료를 기다린다. 넘으면 abort하고 기존 cancel(서명 capability)로 멈춤을 확인한다.
+- 실행 중이면 드레인 10초(`DRAIN_MS`) 안의 자연 완료를 기다린다. 넘으면 **그 자리에서** 작업자 cancel(서명 capability)을 보내고 abort한다. 진행 중이던 인가 검사·상태 조회는 그 뒤에 끝나 최종 판정에 합친다. cancel 송신이 DB 지연을 기다리지 않게 하려는 것이다(독립 리뷰 지적).
   - 확인된 **chat**은 queued로 되돌린다(`publisher_shutdown`, `available_at=now`, attempt는 소모된 채). 새 게시 서버가 이어서 실행해 owner가 `/retry` 없이 답을 받는다. attempt가 상한(`maxRetries+1`)이면 `fail`.
   - 확인된 **task·review**는 외부 효과가 있을 수 있어 자동 재실행하지 않고 `fail(stop_confirmation)`.
   - 확인 실패는 `unknown`(`publisher_shutdown`). owner가 이미 `/cancel`했으면 `cancelled`.
@@ -842,7 +843,8 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 ### 불확실한 결과와 chat unknown
 
-- 작업자 응답이 `stopped:false`(`worker_disconnected`)이거나 실행 중 예외(`runtime_uncertain`)면 `unknown`을 쓰기 직전에 cancel을 한 번 보낸다. 확인되면 `fail(stop_confirmation)`(실패 안내 → `/retry`).
+- 실행 대기가 `stopped:false`로 끝나면(불확실 응답 `worker_disconnected`, 실행 중 예외 `runtime_uncertain`, monitor abort, 시간 초과, 드레인) 인가 재검사·상태 조회 같은 DB 후처리 **전에** 그 자리에서 cancel을 보낸다. 한 실행에 cancel은 한 번이고(정상 판정·예외 처리가 같은 결과를 쓴다, 실패·오류 포함) 최종 상태는 공통 판정이다: 권한 철회면 확인 시 `cancelled`, 드레인이면 확인된 chat은 되돌리기, owner `/cancel`이면 `cancelled`, 그 밖은 확인 시 `fail(stop_confirmation)`(실패 안내 → `/retry`). 확인 실패는 모두 `unknown`. 작업자에 보내기 전 오류와 작업자가 받지 않은 요청(`WorkerRejected`)은 cancel하지 않는다.
+- **확인된 멈춤은 거짓 `unknown`이 되지 않는다.** 확인 결과를 상태 쓰기 전에 보존하고, 뒤의 기록(fail·되돌리기·취소)이 일시 오류로 실패하면 cancel을 다시 묻지 않고 lease CAS 아래 최대 3번(200ms·400ms 간격) 다시 쓴다. 끝내 못 쓰면 로그·감사 `stop_confirmed_write_failed`를 남긴다. 그 뒤 lease가 끝나면 `expire()`가 `unknown`으로 두므로, 이 감사가 실제로 멈췄다는 근거다.
 - chat `unknown`은 모델 `tick()`의 claim 직전에 주기적으로 조사한다(`Runtime.probeUnknown()`). chat unknown이 있으면 모델 claim이 어차피 막혀 있어 모델 실행을 늦추지 않는다.
   - 예약은 `controls` 행 `unknown_probe:<job>`(`{lease,count,next}`)이고 마이그레이션은 없다. 행을 잠그고 시각이 된 것만 미뤄 돌려주므로 게시 서버 둘이 같은 job을 동시에 조사하지 않는다. backoff 즉시 → 30초 → 1분 → … → 상한 10분, 한 바퀴 3건.
   - 저장된 job ID·lease로 새 cancel capability를 만들어 DB 트랜잭션 밖에서 보낸다. 확인되면 짧은 트랜잭션의 CAS(`type='chat' AND state='unknown' AND lease_token=<관측값>`)로 `failed`(`stop_confirmed_after_unknown`) + 감사 `unknown_stop_confirmed` + 안내.
@@ -865,12 +867,13 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - 일반 메시지의 수신 ACK는 텍스트 메시지 대신 원문에 👀 리액션(`PUT .../reactions/%F0%9F%91%80/@me`)이다. 이전에는 메시지마다 "수신·처리 기록 저장됨…"을 게시해 대화가 덮였다.
 - 리액션이 403/404(채널에 Add Reactions·Read Message History 없음 등)면 기존 텍스트 ACK로 한 번 대체하고 감사 `ack_reaction_fallback`을 남긴다. 429는 rate limit만 기록하고 대체하지 않는다. 상호작용(slash·버튼)은 ephemeral 응답 그대로다.
 - ACK 단계의 오류(실패를 기록하는 DB 쓰기 포함)는 `receive()` 밖으로 나가지 않는다(`ack_failure_unrecorded` 로그). 나가면 `guard()`가 그 대화에 history gap 장벽을 세운다.
-- 모델이 running인 chat의 채널(구독 켜짐·gap 아님·owner 일치)에 8초마다 `POST /channels/{id}/typing`(Discord 표시 10초)을 보낸다(`src/activity.ts`, 루프 `typing`, 생존 근거 아님). rate limit pause·정책 거부면 건너뛰고, 429는 채널 pause로 기록하며, 실패는 다음 주기에 다시 본다.
+- 모델이 running인 chat의 채널(구독 켜짐·gap 아님·owner 일치)에 8초마다 `POST /channels/{id}/typing`(Discord 표시 10초)을 보낸다(`src/activity.ts`, 루프 `typing`, 생존 근거 아님). rate limit pause·정책 거부면 건너뛰고, 429는 채널 pause로 기록하며, 실패는 다음 주기에 다시 본다. 종료 신호를 받으면 진행 중인 바퀴도 대기 뒤·전송 직전에 멈추고, 전송 직전에 그 채널의 running chat이 아직 있는지 다시 확인한다.
 
 ### 입력 중 디바운스
 
 - 일반 chat 디바운스 2초. owner의 `TYPING_START`(10초 안, 정책 owner·guild, 활성·gap 아닌 대화, 정책 재인가)는 그 대화의 queued·비긴급 chat을 `now+8초`로 늦추되 작업 생성 + 15초를 넘기지 않는다. 앞당기지 않는다(`src/typing.ts`, 한 UPDATE의 `state='queued'` CAS).
 - 새 메시지가 오면 기존 대체 로직이 앞 작업을 superseded로 바꾸고 새 작업의 15초 상한이 다시 시작된다. 그래서 owner가 메시지를 계속 보내는 동안에만 늘어난다. `/urgent`·read·task·running은 영향이 없다.
+- Gateway dispatch는 힌트를 **기다리지 않는다**(이벤트를 하나씩 처리하므로 기다리면 뒤의 메시지·상호작용의 3초 응답 기한이 밀린다). 백그라운드(종료 때 `stop()`이 기다리는 집합)에서 처리하고, 같은 채널 힌트가 처리 중이면 새 힌트는 버린다. 처리 전체에 1500ms 기한(트랜잭션 statement·transaction·lock timeout)을 두고, 넘으면 `typing_hint_expired` 로그만 남긴다. 판단은 **받은 시각** 기준이다: 미룸 목표 `받은 시각+8초`, 대상은 `created_at < 받은 시각`인 작업만이라 늦게 끝난 힌트가 뒤 메시지의 작업을 늘리지 않는다(같은 ms는 앞뒤를 가릴 수 없어 제외, 힌트는 잃어도 된다). 종료 신호 뒤에는 새 힌트를 등록하지 않고, 이미 등록된 힌트도 연결을 얻은 뒤 종료면 업무 질의 없이 끝난다(종료 뒤 늦게 dispatch된 힌트가 `stop()`이 기다리는 집합 밖에서 DB를 쓰지 않게).
 - typing은 잃어도 되는 힌트다. 처리 오류는 `typing_hint_failed` 로그만 남기고 history gap 장벽을 세우지 않는다. 재연결 뒤 지난 힌트를 복원하지 않는다. 구 파드(intents 33281)와 함께 도는 동안은 미룸이 반쯤만 동작한다(해 없음).
 
 ### 대화 답 형식 (출력 스키마는 그대로)
@@ -884,6 +887,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - `Store.context()` → `chatContext()`(`src/chat-context.ts`). owner 항목은 이벤트 payload에 `from:'owner'`, 봇 항목은 `{from:'bot', text, partial?}`.
 - 봇 항목은 같은 대화·owner의 **chat 결과 중 Discord 게시가 확정된(sent) 본문**만이다. 현재 입력보다 먼저 게시된 것만 넣는다(owner 메시지 ID와 게시 메시지 ID, 둘 다 snowflake로 비교. 불확실하면 뺀다). 일부 페이지만 sent면 `partial`. read·task·실패 안내·제어·스레드·경보는 넣지 않는다.
 - 전체 20개(작업자 스키마 상한)·배열 JSON 32KiB(라벨 포함). 현재 owner 메시지는 항상 마지막, 다음은 직전 봇 답, 나머지는 최신부터 채우고 처음 넘치는 곳에서 멈춘다. 넘치는 봇 답은 앞 페이지만 `partial`로 넣는다.
+- **받아들인 예외:** 현재 메시지 하나가 32KiB를 넘으면(입력 8000자 상한 안에서 제어 문자 등 JSON 이스케이프가 큰 극단 입력, 최대 약 48KB) 그것만 넣는다. 작업자 본문 상한 64KiB 안이고, 이전 코드는 이때 빈 문맥을 보냈다.
 - **남은 것:** 작업자 프롬프트(`chatPrompt`)는 이 배열을 아직 "owner 메시지 기록"이라 설명한다. `from`으로 항목이 스스로 설명되지만, 실행기 전환 작업에서 "owner(`from:'owner'`)와 봇이 이미 게시한 답(`from:'bot'`, `partial`이면 일부)" 설명으로 바꿔야 의미가 정확하다. 되돌리려면 `Store.context()`만 owner 전용으로 바꾸면 된다(DB 변경 없음).
 
 ### 지표 (`/metrics`, DB gauge)
@@ -893,5 +897,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - RollingUpdate 동안 두 파드가 같은 DB 값을 낸다. 경보 룰은 `max()`로 묶는다(sum 금지). 스크레이프·룰·Telegram 경로는 플랫폼 D7 후속이다.
 
 ### 잠금 순서 보강
+
+한 번의 만료 처리(`expire()`)는 기준 시각 하나로 **후보 job ID를 먼저 정하고**, 그 대화 행을 id 순으로 `FOR KEY SHARE` 잠근 뒤 `id=ANY(후보)`에 한해 만료 조건을 다시 확인해 바꾼다. 선잠금 뒤 새로 만료된 job은 다음 바퀴가 처리한다(선잠금과 UPDATE의 시각이 달라 잠그지 않은 대화의 job이 끼어들던 문제, 독립 리뷰 지적).
 
 상태 안내를 outbox에 넣으면 외래 키로 대화 행 KEY SHARE를 잡는다. job·scheduler 행을 쥔 뒤 대화 행을 기다리면 제어 경로(대화 행 FOR UPDATE → scheduler → job)와 교착한다(실제 PostgreSQL에서 3건 모두 lock timeout으로 재현). 그래서 상태를 바꾸기 전에 대화 행을 `FOR KEY SHARE`로 먼저 잡는다: `transition(unknown)`, `waitForUser`(scheduler보다 먼저), `expire`(대상 대화를 id 순서로), `resolveUnknown`, 기존 `fail()`. `fail()`은 원래 job → outbox 순서였는데 종료 경로가 이 경로를 더 자주 타게 돼 함께 고쳤다.
