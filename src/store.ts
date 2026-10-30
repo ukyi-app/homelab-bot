@@ -569,7 +569,10 @@ export class Store {
     }
     if (action === 'retry') {
       // accept()·resume-model과 같이 스케줄러 행 잠금 아래에서 세어 동시 재시도도 상한을 넘지 않는다.
-      if (await this.queueFull('chat')) return { ok: false, status: '대기열이 가득 찼습니다. 불필요한 작업을 취소한 뒤 재시도하세요.' };
+      // 상한은 대상의 실제 종류로 센다. read는 모델 몫(90)이 아니라 전체 상한만 보므로 모델이 정체해도 조회를 다시 돌 수 있다.
+      const kind = (await this.db.query<{ type: Job['type'] }>('SELECT type FROM jobs WHERE id=$1 AND owner_id=$2 AND conversation_id=$3',
+        [target, actor, conversation])).rows[0]?.type ?? 'chat';
+      if (await this.queueFull(kind)) return { ok: false, status: '대기열이 가득 찼습니다. 불필요한 작업을 취소한 뒤 재시도하세요.' };
       const changed = await this.db.query(`UPDATE jobs SET state='queued',available_at=$4,wait_reason=NULL
         WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND state='failed' AND attempt<$5 RETURNING id`,
       [target, actor, conversation, this.now(), DEFAULTS.maxRetries + 1]);

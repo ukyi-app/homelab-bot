@@ -129,3 +129,23 @@ test('S1 대기열 몫: 모델 계열이 상한(100-10)에 닿아도 read는 100
   assert.equal((await rows('jobs')).filter(j => j.type === 'read' && j.state === 'queued').length, 10);
   await assert.rejects(read('read-over'), /queue_full/);
 });
+
+// Codex r(f733420) P2: /retry도 대상 작업의 실제 종류로 상한을 센다. 모델이 정체해도 실패한 조회는 다시 돌 수 있어야 한다.
+test('S1 대기열 몫: 모델 계열이 상한에 닿아도 실패한 read의 /retry는 들어오고, chat 재시도는 막힘', async () => {
+  await read('read-1');
+  await chat('chat-1');
+  await database.db.query(`UPDATE jobs SET state='failed',wait_reason='lease_expired',attempt=1`);
+  const other = { ...thread, channel: 'fixture-thread-2' };
+  for (let i = 0; i < DEFAULTS.maxQueue - 10; i++) {
+    const saved = await f.store.save(event(`task-${i}`, { kind: 'command', command: 'task', scope: other }), f.policy.revision, false);
+    await f.store.accept(saved.id, 'task', f.policy.revision);
+  }
+  const failedRead = await job('read');
+  const failedChat = await job('chat');
+  const retried = await f.store.control(f.policy.owner, failedRead.conversation_id, 'retry', failedRead.id) as { ok?: boolean; status: string };
+  assert.notEqual(retried.ok, false, retried.status);
+  assert.equal((await job('read')).state, 'queued');
+  const blocked = await f.store.control(f.policy.owner, failedChat.conversation_id, 'retry', failedChat.id) as { ok?: boolean; status: string };
+  assert.equal(blocked.ok, false); assert.match(blocked.status, /대기열이 가득/);
+  assert.equal((await job('chat')).state, 'failed');
+});

@@ -938,7 +938,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - read는 모델 슬롯·scheduler 정지(한도·인증 대기, 비상 중지)·`unknown`에 막히지 않는다. `/emergency-stop`은 "모델 호출" 중지라 실행 중 read를 취소하지 않는다. 구독 중지·gap·owner·권한 철회·서비스 정책은 모델과 같이 지킨다.
 - 실행은 `src/read-runtime.ts`의 `ReadRuntime`(`Runtime.tickRead()`)이 별도 루프(`read`, 생존 근거)에서 한다. 순서·오류 처리는 이전 read 분기와 같다. 모델 `tick()`이 read를 받으면(구버전 claim 등) 같은 경로로 처리한다.
 - lease가 끝난 read는 `unknown`이 아니라 `failed`(`lease_expired`) + 안내다. read에는 외부 쓰기가 없어 불확실성이 아니다. 구버전이 남긴 `unknown` read도 같은 이유로 정리한다. owner가 `/cancel`한 read는 `cancelled`.
-- 대기열 상한 100건 중 read 몫 10건: 모델 계열(chat·task·review)은 read가 아닌 queued가 90건 미만일 때만 받는다. `/retry`·`/resume-model`·`/review-resume`도 같은 모델 상한이다(`Store.queueFull(type)`).
+- 대기열 상한 100건 중 read 몫 10건: 모델 계열(chat·task·review)은 read가 아닌 queued가 90건 미만일 때만 받는다. `/resume-model`·`/review-resume`도 같은 모델 상한이다(`Store.queueFull(type)`). `/retry`는 대상 작업의 실제 종류로 센다. 실패한 read의 재시도는 전체 상한만 보므로 모델이 정체해도 조회를 다시 돌 수 있다(Codex 리뷰 지적).
 - 같은 대화 안에서 뒤에 요청한 read 답이 앞선 긴 chat 답보다 먼저 게시될 수 있다(대화 안 job 순서 계약은 없다).
 - **받아들인 전환기 동작:** 배포 중 구버전(scheduler 행만 잠금)과 신버전(read_lane 행만 잠금)이 겹치는 몇 초 동안은 서로 다른 read 두 개가 동시에 돌 수 있다. 같은 job의 이중 실행은 아니고 read는 읽기 전용이라 받아들였다(독립 리뷰 지적, 2026-10-30).
 
