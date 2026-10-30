@@ -295,7 +295,11 @@ history 대조는 `RecoveryScheduler`(`src/recovery.ts`)가 대화별로 이벤�
 페이지 처리·버퍼 처리·checkpoint 갱신 어디서든 `budget`과 `history_gap` 감사이고, 토큰·구독 세대가 바뀐 경우만 `skipped`.
 gap을 푸는 마지막 transaction은 lease 마감을 transaction 마감으로 받고 마지막 UPDATE 뒤에도 마감을 확인해, 확인 뒤 조회·UPDATE 왕복 중
 마감을 넘기면 되돌려 gap을 남기고 `budget`으로 끝낸다. commit이 마감 안에 끝나면 `done`이다). 정책 거부는 재시도하지 않는다. 대기 목록은 메모리이고
-재시작하면 새 READY가 다시 만든다. RESUMED면 Discord 재생에 맡긴다. slash 명령은 READY마다 guild 단위로 FOUNDATION 12개에 맞추고(`task`·`review-*` 없음, 같으면 쓰지 않음)
+재시작하면 새 READY가 다시 만든다. RESUMED면 Discord 재생에 맡긴다.
+live 메시지 하나가 일시 장애(DB·REST·429 등)로 처리되지 못하면 그 이벤트는 sequence가 지나 다시 오지 않으므로, 그 채널의 활성 스레드·DM에만
+같은 장벽(`RecoveryScheduler.guard()`, 진행 중 복구 토큰도 지움)을 세워 history 대조로 메운다. 장벽이 설 때까지 다음 이벤트는 기다려
+뒤 메시지가 checkpoint를 먼저 올리지 못한다. 확정 거부(`Denied`·형식 오류·채널 403/404)는 장벽 없이 버린다. 상호작용은 토큰이 3초라
+되살리지 않는다(사용자가 다시 보낸다). slash 명령은 READY마다 guild 단위로 FOUNDATION 12개에 맞추고(`task`·`review-*` 없음, 같으면 쓰지 않음)
 전역 명령은 비운다. 수신도 같은 목록만 받는다. 재연결·RESUME 실측은 실연동(S16)이다.
 
 작업자 모델 호출은 **대화·작업 레인 합쳐 1개**다. DB의 scheduler 행 잠금과 작업자의 별도 mutex가

@@ -382,3 +382,13 @@ PGlite는 transaction을 직렬화한다. 실제 PostgreSQL 다중 연결 경합
 | P2 gap을 푸는 마지막 transaction에서 `check()` 뒤 빈 버퍼 조회·gap UPDATE 왕복 중 30초를 넘겨도 `done`(수동 gap·감사 생략) | 그 transaction에 lease 마감(`started + 30초`)을 transaction 마감으로 넘기고, gap UPDATE 뒤에도 마감을 확인한다. 넘으면 되돌려 gap을 남기고 `history_gap` 감사와 `budget`. 실패 원인이 무엇이든 그 시점에 마감을 넘겼으면 한도 초과로 본다. 토큰·구독 변경은 그대로 `skipped` | `R3-1 리뷰어 재현: 인가 왕복 누적 + 마지막 빈 버퍼 조회 응답…`(수정 전 `['done']`), `R3-1 마지막 check() 뒤 빈 버퍼 조회 응답에서…`, `R3-1 마지막 check() 뒤 gap 해제 UPDATE 응답에서…`(둘 다 수정 전 `done`), 대조 `R3-1 경계 안에서 끝나면 그대로 done`. 두 장치(transaction 마감, 마지막 확인)는 겹치는 방어라 하나만 빼면 시험이 통과하고 둘 다 빼면 세 시험이 실패한다 |
 
 리뷰가 짚은 대로 R2-2의 "마지막 checkpoint 갱신" 시험은 마지막 `check()` **전**에 시간을 넘기고, 버퍼 시험은 `check()` 안의 행 잠금 응답에서 넘긴다. 이번 R3-1 시험이 마지막 `check()` **뒤** 경계를 본다.
+
+### PR #12 Codex 리뷰 P1 반영 (4420530263, 2026-10-30)
+
+지적: 활성 스레드 메시지 처리가 DB 일시 끊김이나 `DiscordProtocol.channel()` REST 실패로 끝나면 이벤트를 로그만 남기고 버렸다. Gateway sequence는 이미 지나 RESUME으로도 다시 오지 않고, 뒤 메시지가 checkpoint를 올리면 다음 READY 복구도 그 메시지를 건너뛴다. 타당하다고 판단해 고쳤다. `npm run check` 통과, `npm test` **578 tests / 569 pass / 0 fail / 9 skipped**(PG 소켓 없음), PostgreSQL 18.6 소켓 포함 3회 중 2회 **578/578**, 1회는 기존 `TASK-03` 1건 실패.
+
+| 고친 방식 | 회귀 시험 / 수정 전 |
+|---|---|
+| 진입점 dispatch가 실패를 나눈다. 확정 거부(`Denied`, `ZodError`, `DiscordRejected` 403/404)는 버린다. 그 밖(일시 장애)이고 메시지면 그 채널의 활성 스레드·DM에 `RecoveryScheduler.guard()`로 장벽(gap, 진행 중 복구 토큰 무효화, 대기 항목)을 세우고 history 대조로 메운다. 장벽 UPDATE가 실패하면 설 때까지 다시 시도하고 그동안 다음 이벤트는 기다린다. 상호작용은 되살리지 않는다 | `PR12 활성 스레드 메시지가 일시 장애(채널 REST 조회)로…`, `…(DB 쓰기)로…`(둘 다 수정 전 201 없음·checkpoint 202·gap 해제), `PR12 장벽 UPDATE도 일시 실패하면…`(장벽을 기다리지 않는 변형에서 실패), `PR12 확정 거부(허용되지 않은 사용자)는 장벽을 세우지 않고…`(확정 거부도 장벽을 세우는 변형에서 실패), `PR12 guard()는 그 채널의 활성 스레드·DM에만…`(단위) |
+
+남는 범위: 부모 채널의 멘션 메시지와 상호작용은 history 대조 대상이 아니라 일시 장애 때 되살리지 않는다(ACK가 없으니 사용자가 다시 보낸다). 활성 대화가 없는 스레드의 메시지도 같다.
