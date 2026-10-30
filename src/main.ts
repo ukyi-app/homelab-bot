@@ -121,15 +121,18 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   const api = deps.discord ?? discordHttpApi(config.discordToken, send, now);
   let discord: { ingress: DiscordIngress; publisher: DiscordPublisher } | undefined;
   let protocol: DiscordProtocol | undefined;
+  let runtimeStarted = false;
   const background = new Set<Promise<void>>();
   const track = (task: Promise<void>) => { background.add(task); void task.finally(() => background.delete(task)); };
   const loops: Promise<void>[] = [];
-  const loop = (name: string, step: () => Promise<boolean>) => loops.push((async () => {
+  // alive: 이 루프의 한 바퀴가 성공했다는 것이 DB에 닿았다는 증거인지. 하트비트 조건(조율 루프가 최근 60초 안에 돎)은
+  // 그런 루프로만 잰다. runtime(store.expire)·publisher(claimDelivery)는 늘 DB를 거친다. 복구 루프는 대기 항목이 없으면
+  // DB 없이 끝나므로 생존 근거가 아니다(DB 장애 중에도 정상 ping이 나가지 않게, PR #12 재리뷰 4420612644).
+  const loop = (name: string, step: () => Promise<boolean>, alive = true) => loops.push((async () => {
     while (!stop.signal.aborted) {
       try {
         const busy = await step();
-        // 하트비트 조건(조율 루프가 최근 60초 안에 돎)은 DB까지 닿는 루프 한 바퀴로 잰다.
-        health.loop();
+        if (alive) health.loop();
         if (!busy) await pause(deps.idleMs ?? 500);
       } catch (error) {
         log(`${name}_failed`, errorInfo(error));
@@ -204,14 +207,16 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
           if (now() - reconciled >= (deps.reconcileEveryMs ?? 30_000)) { reconciled = now(); await publisher.reconcile(); }
           return publisher.deliver();
         });
-        loop('recovery', () => recovery.runDue());
+        loop('recovery', () => recovery.runDue(), false);
       }
       await barrier();
+      // 작업 claim은 첫 장벽이 선 뒤에 시작한다. 재시작 때 남은 queued 작업이 중단 중 메시지를 history로 복구하기 전에
+      // 이전 입력으로 모델을 부르지 않게 한다(PR #12 재리뷰 4420612638). 이후 READY의 장벽은 claim의 gap 조건이 막는다.
+      if (!runtimeStarted && !stop.signal.aborted) { runtimeStarted = true; loop('runtime', () => runtime.tick()); }
       // 명령 등록과 history 대조 자체는 이벤트 처리 순서 밖에서 돈다(대조가 30초까지 걸려도 상호작용 ACK가 밀리지 않게).
       track(register(ready.applicationId));
     },
   });
-  loop('runtime', () => runtime.tick());
   const heartbeat = setInterval(() => { health.heartbeat().catch(error => log('heartbeat_failed', errorInfo(error))); },
     deps.heartbeatEveryMs ?? 10_000);
   gateway.start();

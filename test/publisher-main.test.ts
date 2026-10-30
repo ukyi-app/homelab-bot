@@ -13,6 +13,7 @@ import { FOUNDATION_COMMANDS } from '../src/commands.js';
 import { startPublisher } from '../src/main.js';
 import type { Publisher } from '../src/main.js';
 import { loadRuntimePolicy } from '../src/policy.js';
+import { Store } from '../src/store.js';
 import { FakeGateway, until } from './fake-gateway.js';
 import { localDatabase } from './helpers.js';
 
@@ -105,7 +106,8 @@ beforeEach(async () => {
 afterEach(async () => { await publisher?.stop(); publisher = undefined; await gw.close(); assert.equal(gw.identifyViolations, 0); });
 
 const SECRET = 'fixture-webhook-secret-value';
-async function boot(options: { heartbeatEveryMs?: number; gateway?: boolean; ports?: { app: number; alerts: number }; db?: Database } = {}) {
+async function boot(options: { heartbeatEveryMs?: number; gateway?: boolean; ports?: { app: number; alerts: number }; db?: Database;
+  now?: () => number } = {}) {
   const config: PublisherConfig = {
     databaseUrl: 'postgresql://unused', discordToken: 'fixture-discord-token',
     policy: loadRuntimePolicy(JSON.stringify({ revision: 'fixture-v1', owner: OWNER, guild: GUILD, conversationChannel: CHAT,
@@ -114,7 +116,7 @@ async function boot(options: { heartbeatEveryMs?: number; gateway?: boolean; por
     kubernetes: { url: auxBase }, workerUrl: `${auxBase}/`, healthchecksUrl: `${auxBase}/ping`,
     workerKey: generateKeyPairSync('ed25519').privateKey, githubWebhookSecret: SECRET,
   };
-  publisher = await startPublisher(config, { db: options.db ?? database.db, discord: rest, gatewayUrl: options.gateway === false ? () => new Promise(() => {}) : async () => ({ url: gw.url }),
+  publisher = await startPublisher(config, { db: options.db ?? database.db, now: options.now, discord: rest, gatewayUrl: options.gateway === false ? () => new Promise(() => {}) : async () => ({ url: gw.url }),
     allowGatewayUrl: url => url.hostname === '127.0.0.1', serviceAccount: { tokenFile: '/nonexistent', caFile: null },
     ports: options.ports ?? { app: 0, alerts: 0 }, idleMs: 20, identifySpacingMs: 250, recoveryBackoff: () => 200, registerDelaysMs: [0, 20, 20], heartbeatEveryMs: options.heartbeatEveryMs ?? 60_000, stopTimeoutMs: 3000, log: () => {} });
   return publisher;
@@ -391,6 +393,65 @@ test('PR12 확정 거부(허용되지 않은 사용자)는 장벽을 세우지 �
   assert.equal(await event('301'), undefined);
   assert.deepEqual([(await conversation('fixture-thread-a')).gap, (await conversation('fixture-thread-a')).checkpoint], [false, '302']);
   assert.equal(histories(), before);
+});
+
+// PR #12 재리뷰 4420612638(P1): 재시작 때 queued 작업이 첫 READY의 복구 장벽보다 먼저 claim되면,
+// 중단 중 메시지를 history로 복구하기 전에 이전 입력으로 모델을 부른다.
+async function queuedChat(channel: string, id: string) {
+  const store = new Store(database.db);
+  const saved = await store.save({ id, actor: OWNER, scope: { kind: 'thread', guild: GUILD, channel, parent: CHAT }, text: `fixture-${id}`,
+    kind: 'message', mention: false }, 'fixture-v1', false);
+  await store.accept(saved.id, 'chat', 'fixture-v1');
+  // 오래전에 쌓인 작업: 대기 시간이 이미 지났다.
+  await database.db.query('UPDATE jobs SET available_at=0 WHERE event_id=$1', [saved.id]);
+  return saved.id;
+}
+const jobState = async (eventId: string) => (await database.db.query<{ state: string }>('SELECT state FROM jobs WHERE event_id=$1', [eventId])).rows[0]!.state;
+
+test('PR12-2 Gateway가 붙기 전(첫 READY 장벽 전)에는 남아 있던 queued 작업을 claim하지 않음', async () => {
+  await thread('fixture-thread-a', '100');
+  const old = await queuedChat('fixture-thread-a', '100');
+  await boot({ gateway: false });
+  await new Promise(resolve => setTimeout(resolve, 400));
+  assert.equal(await jobState(old), 'queued');
+  assert.ok(!auxCalls.some(call => call.startsWith('POST /v1/execute')), JSON.stringify(auxCalls));
+});
+
+test('PR12-2 재시작 뒤 첫 READY 복구가 중단 중 메시지를 먼저 읽어 이전 queued 작업을 supersede(모델 호출 없음)', async () => {
+  await thread('fixture-thread-a', '100');
+  const old = await queuedChat('fixture-thread-a', '100');
+  // 중단 중에 들어온 최신 메시지 150. 첫 READY의 history 복구가 읽는다.
+  rest.history = async (channel, after) => [message('150', channel)].filter(m => BigInt(m.id) > BigInt(after));
+  await boot();
+  assert.ok(await waitFor(async () => !!(await event('150'))?.accepted, 8000), '150 복구');
+  assert.equal(await jobState(old), 'superseded');
+  // 실행됐다면 새 작업(150) 하나뿐이다. 이전 작업은 모델에 가지 않았다.
+  assert.ok(auxCalls.filter(call => call.startsWith('POST /v1/execute')).length <= 1, JSON.stringify(auxCalls));
+});
+
+// PR #12 재리뷰 4420612644(P2): 복구 대기 항목이 없는 RecoveryScheduler.runDue()는 DB 없이 false를 돌려준다.
+// 그 루프가 하트비트 생존을 기록하면 DB 장애 중에도 healthchecks에 정상 ping이 나간다.
+test('PR12-3 DB가 끊기면 DB에 닿지 못한 루프는 하트비트 생존으로 치지 않아 60초 뒤 ping이 멈춤', async () => {
+  let offset = 0;
+  const clock = () => Date.now() + offset;
+  let down = false;
+  const wrap = (inner: Database): Database => ({
+    query: async <T>(sql: string, params?: unknown[]) => { if (down) throw new Error('fixture_db_down'); return inner.query<T>(sql, params); },
+    transaction: (fn, deadline) => down ? Promise.reject(new Error('fixture_db_down')) : inner.transaction(tx => fn(wrap(tx)), deadline),
+  });
+  await boot({ db: wrap(database.db), now: clock, heartbeatEveryMs: 20 });
+  await ready();
+  const pings = () => auxCalls.filter(call => call.startsWith('GET /ping')).length;
+  assert.ok(await waitFor(async () => pings() >= 1), '정상일 때 ping');
+  down = true;
+  await new Promise(resolve => setTimeout(resolve, 100));
+  const before = pings();
+  // 마지막 ping과 DB에 닿은 마지막 루프 둘 다 60초보다 오래전이 되게 시계를 당긴다(Gateway는 계속 연결).
+  offset += 61_000;
+  await new Promise(resolve => setTimeout(resolve, 400));
+  const after = pings();
+  down = false;
+  assert.equal(after, before, `DB 장애 중 ping ${after - before}회`);
 });
 
 test('P2-5 8081 listen이 실패하면 먼저 연 8080도 닫고 오류를 다시 던짐', async () => {
