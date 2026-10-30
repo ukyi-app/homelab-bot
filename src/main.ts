@@ -7,7 +7,7 @@ import { GRAFANA_DATASOURCES, SERVICES, TEMPLATES } from './catalog.js';
 import { FOUNDATION_COMMANDS, registerCommands } from './commands.js';
 import { ConfigError, databasePoolConfig, loadPublisherConfig } from './config.js';
 import type { PublisherConfig } from './config.js';
-import { Denied } from './contracts.js';
+import { Denied, RateLimited } from './contracts.js';
 import type { Clock, Scope } from './contracts.js';
 import { MIGRATIONS, Postgres, appliedMigrations, migrationVersion } from './database.js';
 import type { Database } from './database.js';
@@ -61,6 +61,7 @@ export interface PublisherDeps {
   heartbeatEveryMs?: number;
   reconcileEveryMs?: number;
   stopTimeoutMs?: number;
+  registerDelaysMs?: readonly number[];
 }
 export interface Publisher {
   health: Health; gateway: GatewaySession; ports: { app: number; alerts: number };
@@ -133,6 +134,23 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     }
     log('recovery_done', { conversations: rows.length });
   };
+  // REST는 요청마다 1초 제한이라 등록이 한 번 실패할 수 있다. 다음 READY(며칠 뒤일 수도)까지 미루지 않고 몇 번 더 시도한다.
+  let registering: string | undefined;
+  const register = async (applicationId: string) => {
+    if (registering === applicationId) return;
+    registering = applicationId;
+    try {
+      for (const delay of deps.registerDelaysMs ?? [0, 5000, 30_000, 120_000, 300_000]) {
+        if (delay) await pause(delay);
+        if (stop.signal.aborted) return;
+        try { log('commands_registered', await registerCommands(api, applicationId, config.policy.guild)); return; }
+        catch (error) {
+          log('commands_register_failed', errorInfo(error));
+          if (error instanceof RateLimited) await pause(error.retryAfterMs);
+        }
+      }
+    } finally { registering = undefined; }
+  };
   const gateway = new GatewaySession({
     token: config.discordToken,
     gatewayUrl: deps.gatewayUrl ?? discordGatewayUrl(api),
@@ -159,8 +177,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
         });
       }
       // 명령 등록·누락 대조는 이벤트 처리 순서 밖에서 돈다(대조가 30초까지 걸려도 상호작용 ACK가 밀리지 않게).
-      track(registerCommands(api, ready.applicationId, config.policy.guild)
-        .then(result => log('commands_registered', result), error => log('commands_register_failed', errorInfo(error))));
+      track(register(ready.applicationId));
       track(recoverAll().catch(error => log('recovery_failed', errorInfo(error))));
     },
   });
@@ -200,7 +217,9 @@ async function main(): Promise<void> {
     const missing = MIGRATIONS.map(migrationVersion).filter(version => !applied.has(version));
     if (missing.length) { log('schema_not_migrated', { missing }); await pool.end(); process.exitCode = 1; return; }
   } catch (error) { log('database_unavailable', errorInfo(error)); await pool.end().catch(() => {}); process.exitCode = 1; return; }
-  const publisher = await startPublisher(config, { db, log });
+  let publisher: Publisher;
+  try { publisher = await startPublisher(config, { db, log }); }
+  catch (error) { log('publisher_start_failed', errorInfo(error)); await pool.end().catch(() => {}); process.exitCode = 1; return; }
   let shutting = false;
   const shutdown = (signal: string) => {
     if (shutting) return;

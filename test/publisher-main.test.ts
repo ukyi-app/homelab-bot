@@ -28,6 +28,7 @@ class FakeRest implements DiscordApi {
     [CHAT, { id: CHAT, type: 0, guild_id: GUILD }], [NOTIFY, { id: NOTIFY, type: 0, guild_id: GUILD }],
     ['fixture-thread', { id: 'fixture-thread', type: 11, guild_id: GUILD, parent_id: CHAT }]]);
   guildCommands: unknown[] = [];
+  failCommandReads = 0;
   globalCommands: unknown[] = [{ name: 'task', type: 1, description: '이전 등록' }];
   private next = 0;
   async request(method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown): Promise<unknown> {
@@ -48,6 +49,7 @@ class FakeRest implements DiscordApi {
     if (method === 'GET' && /^\/channels\/[^/]+\/messages\?/.test(path)) return [];
     if (method === 'GET' && /\/threads\/(active|archived\/public)/.test(path)) return { threads: [] };
     if (path === `/applications/fixture-app/guilds/${GUILD}/commands`) {
+      if (method === 'GET' && this.failCommandReads > 0) { this.failCommandReads--; throw new Error('discord_request_failed'); }
       if (method === 'PUT') { this.guildCommands = body as unknown[]; return this.guildCommands; }
       return this.guildCommands;
     }
@@ -103,7 +105,7 @@ async function boot(options: { heartbeatEveryMs?: number; gateway?: boolean } = 
   };
   publisher = await startPublisher(config, { db: database.db, discord: rest, gatewayUrl: options.gateway === false ? () => new Promise(() => {}) : async () => ({ url: gw.url }),
     allowGatewayUrl: url => url.hostname === '127.0.0.1', serviceAccount: { tokenFile: '/nonexistent', caFile: null },
-    ports: { app: 0, alerts: 0 }, idleMs: 20, heartbeatEveryMs: options.heartbeatEveryMs ?? 60_000, stopTimeoutMs: 3000, log: () => {} });
+    ports: { app: 0, alerts: 0 }, idleMs: 20, registerDelaysMs: [0, 20, 20], heartbeatEveryMs: options.heartbeatEveryMs ?? 60_000, stopTimeoutMs: 3000, log: () => {} });
   return publisher;
 }
 const app = (p: Publisher, path: string, init?: RequestInit) => fetch(`http://127.0.0.1:${p.ports.app}${path}`, init);
@@ -160,6 +162,14 @@ test('T16b 진입점: READY 뒤 guild 명령을 FOUNDATION 12개로 맞추고 �
   gw.latest.send({ op: 9, d: false });
   await until(() => rest.calls.filter(c => c.method === 'GET' && c.path === '/applications/fixture-app/commands').length === 2, 8000);
   assert.equal(rest.calls.filter(c => c.method === 'PUT').length, puts);
+});
+
+test('T16b 진입점: 명령 등록이 한 번 실패해도 다음 READY를 기다리지 않고 다시 시도', async () => {
+  rest.failCommandReads = 1;
+  await boot();
+  await until(() => rest.calls.some(c => c.method === 'PUT' && c.path === `/applications/fixture-app/guilds/${GUILD}/commands`));
+  assert.equal(rest.calls.filter(c => c.method === 'GET' && c.path === `/applications/fixture-app/guilds/${GUILD}/commands`).length, 2);
+  assert.equal(gw.connections.length, 1);
 });
 
 test('T16b 진입점: /chat은 저장 뒤 ACK, /task·/review-status는 수신에서 닫혀 저장·ACK 없음', async () => {
