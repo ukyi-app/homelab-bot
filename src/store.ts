@@ -213,15 +213,20 @@ export class Store {
   }
   async recordRateLimit(error: RateLimited, channel?: string): Promise<void> {
     if (!error.global && !channel) throw new Error('rate_limit_resource_required');
+    // GREATEST의 controls.value는 충돌한 같은 키(pause 시각) 한 행뿐이고 이 함수만 숫자로 쓴다. 다른 키의 boolean은 닿지 않는다.
     await this.db.query(`INSERT INTO controls VALUES ($2,to_jsonb($1::bigint))
       ON CONFLICT (key) DO UPDATE SET value=to_jsonb(GREATEST(controls.value::bigint,$1::bigint))`,
     [this.now() + Math.max(1000, error.retryAfterMs), error.global ? 'discord_global_after' : `discord_channel_after:${channel}`]);
   }
   async claimDelivery(): Promise<Delivery | undefined> {
     return this.db.transaction(async tx => {
+      // 실행기는 WHERE 조건 순서를 보장하지 않아 key 비교 전에 다른 키의 boolean(scheduler 등)을 bigint로 바꾸다 22023이 났다.
+      // CASE 안에서만 형 변환하면 숫자가 아닌 값은 평가되지 않는다.
       const row = (await tx.query<Delivery>(`SELECT o.* FROM outbox o WHERE o.state='pending' AND o.available_at<=$1
-        AND NOT EXISTS (SELECT 1 FROM controls WHERE key='discord_global_after' AND value::bigint>$1)
-        AND NOT EXISTS (SELECT 1 FROM controls WHERE key='discord_channel_after:' || (o.payload->>'channel') AND value::bigint>$1)
+        AND NOT EXISTS (SELECT 1 FROM controls WHERE key='discord_global_after'
+          AND CASE WHEN jsonb_typeof(value)='number' THEN value::bigint>$1 ELSE false END)
+        AND NOT EXISTS (SELECT 1 FROM controls WHERE key='discord_channel_after:' || (o.payload->>'channel')
+          AND CASE WHEN jsonb_typeof(value)='number' THEN value::bigint>$1 ELSE false END)
         AND (o.page_index=0 OR EXISTS (SELECT 1 FROM outbox predecessor WHERE predecessor.message_key=o.message_key
           AND predecessor.page_index=o.page_index-1 AND predecessor.state='sent'))
         AND NOT EXISTS (SELECT 1 FROM outbox previous WHERE previous.message_key=o.message_key
