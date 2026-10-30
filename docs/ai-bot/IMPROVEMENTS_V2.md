@@ -325,7 +325,7 @@ PR·댓글은 owner 계정이 아닌 전용 GitHub App으로 남긴다. 배포 A
 - 1-1의 "새 게시 서버가 cancel로 확인해 푼다"는 지금 작업자로는 동작하지 않는다. `SerialWorker.cancel`은 그 job·lease를 아직 잡고 있을 때만 `stopped:true`이고, 배포 중 끊긴 대화는 작업자가 그 사이 끝내 버린다.
 - 2-2: 일반 메시지에는 이미 텍스트 ACK가 있었다(메시지마다 게시). 👀는 추가가 아니라 교체다.
 - 2-5: 350자는 항목당이 아니라 섹션 전체 예산이었다. 첫 항목이 길면 섹션 내용이 통째로 사라졌다(버그).
-- 2-1: 작업자 계약이 `untrusted` 최대 20개라 owner·봇 비율 분할 대신 20개·32KiB를 함께 쓴다. 작업자 프롬프트는 이 배열을 "owner 메시지 기록"이라 설명한다.
+- 2-1: 작업자 계약이 `untrusted` 최대 20개라 owner·봇 비율 분할 대신 20개·32KiB를 함께 쓴다. 작업자 프롬프트는 이 배열을 "owner 메시지 기록"이라 설명했다(실행기 전환을 합친 뒤 `chatPrompt` 문구를 owner·봇 항목 설명으로 바꿈).
 - 1-3: 가장 오래된 outbox 지표는 이미 있었다. Gateway 장애에도 Ready인 것은 의도된 경계다(§8).
 - 6-2: 지금 봇에는 공개 ingress가 없다(공개 webhook은 시험 수신기의 `/github` Exact + WAF). `/stop`이 gap을 지운다(버퍼는 버림). ID 없는 outbox unknown은 100개를 넘어도 blocked가 된다.
 - 2-6: T18에 질문 경로(`CodexBridge.ask/answer`)가 있다(미연결).
