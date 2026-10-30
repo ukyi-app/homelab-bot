@@ -346,3 +346,17 @@ PGlite는 transaction을 직렬화한다. 실제 PostgreSQL 다중 연결 경합
 | OPS-02 (진입점) | local_integration / pass | 8080·8081은 Discord 연결 전에도 받는다(경보 저장, pending 유지). Gateway 연결·루프가 돌 때 healthchecks ping, `stop()` 뒤 수신 닫힘·재연결 없음. 실제 PostgreSQL 풀로 `/readyz` 200(DB 쓰기) | 실제 healthchecks·Telegram·replicas 0, S16 |
 | 위험 5 마이그레이션 | local_integration / pass (PGlite + PostgreSQL 18.6) | 재실행은 적용된 버전을 건너뜀(006이 대기 경보를 다시 막지 않음), 010까지 적용된 기존 DB는 011만, 마이그레이션 Job 셋이 겹쳐도 advisory lock으로 한 번(잠금을 빼면 실패 확인), 목록과 디렉터리·버전 기록 대조. 수정 전 재실행은 대기 경보를 `blocked`로 바꿨다 | 실제 CNPG·Sync hook Job, S10 |
 | 설정 | mock / pass | 비밀 8개·주소 4개 중 하나라도 없거나 틀리면 기동 실패, 오류에 키 이름·사유만(값 없음), `PORT`는 8080만, 작업자 키는 Ed25519. 차트의 `sslmode=require`는 node-pg 기본이 verify-full이라 `uselibpqcompat=true`로 libpq 의미(암호화, 검증 없음)로 맞춤 | 실제 차트 env·CNPG 인증서로 연결, S10 |
+
+### 리뷰 1라운드 반영 (rev-pub-r1, 2026-10-30)
+
+리뷰(`3e28b0b` 기준) 발견 6건과 남는 한계 1건을 고쳤다. 항목마다 리뷰어 재현을 회귀 시험으로 옮겨 **수정 전 코드에서 실패**를 먼저 확인했다. `npm run check` 통과, `npm test` **562 tests / 553 pass / 0 fail / 9 skipped**(건너뜀은 PG 소켓 시험), PostgreSQL 18.6 소켓을 주면 **562/562 pass** 3회 연속.
+
+| 발견 | 고친 방식 | 회귀 시험 / 수정 전 |
+|---|---|---|
+| P1-1 새 READY에서 복구 차례를 기다리는 스레드의 체크포인트가 live 입력으로 올라가 단절 중 메시지 유실 | READY 처리(이벤트 순서 안)에서 live 이벤트보다 먼저 모든 활성 스레드·DM에 `gap=true` 장벽, history 대조는 그 뒤 대화별로 | `P1-1 새 READY: 모든 활성 스레드를 live 입력보다 먼저 막아…`(진입점, 두 스레드 + 동시 live). 수정 전 thread-b history가 `after=300`이고 메시지 200 없음 |
+| P1-2 일시적인 history 실패 뒤 재시도 없음(gap 유지, 버퍼 정지) | `RecoveryScheduler`: 대화별 지수 백오프(429·영속 pause는 `retry_after` 이상), `recover()` 결과 `done`·`budget`·`skipped`로 한도 초과(수동 gap)와 구분 | `P1-2 일시적인 history 조회 실패 뒤 새 READY 없이…`, `P1-2 영속 Discord pause 동안은 history를 부르지 않고…`(진입점), 스케줄러 단위 시험 3개. 수정 전 history 1회·`gap=true`·이벤트 `buffered=true, accepted=false`. 재시도를 빼는 변형에서도 진입점 두 시험 실패 확인 |
+| P2-3 IDENTIFY 5초 간격 미보장 | `GatewayBudget.reserve()`가 일일 900회와 간격 5.5초(5초 + 지연 여유)를 같은 잠금에서 예약해 audit에 남김(재시작에도 유지). IDENTIFY 직전에 예약하고 그 시각까지 대기, 연결 전 `next()`로 대기·소진 확인, RESUME은 예약 없음. 가짜 Gateway에 Discord처럼 간격 위반 시 op 9를 넣고 모든 Gateway·진입점 시험에서 위반 0을 확인 | `P2-3 IDENTIFY는 일일 예산과 함께 직전 IDENTIFY에서 5초 뒤에만…`(실제 `GatewayBudget` + 가짜 5초 제한), `P2-3 GatewayBudget: 예약은 직전 예약에서 5.5초 뒤…`. 수정 전 간격 위반 4회 |
+| P2-4 K8s 이전 세대 상태를 healthy로 판정 | `observedGeneration`이 `generation`보다 작거나 둘 중 하나가 없으면 `unknown` | `P2-4 Kubernetes: 컨트롤러가 최신 세대를 관측하지 않았으면…`(Deployment·StatefulSet 각 5경우). 수정 전 `healthy` |
+| P2-5 8081 listen 실패 시 8080이 남아 프로세스가 반쪽으로 생존 | listen 실패면 두 서버·K8s 연결 풀을 닫고 다시 던짐. 진입점은 종료 코드 1, 남은 것이 있어도 5초 뒤 끝내는 안전 타이머(unref) | `P2-5 8081 listen이 실패하면 먼저 연 8080도 닫고…`(수정 전 거부 없이 기동), `P2-5 실제 진입 프로세스: …종료 코드 1로 끝남`(PG, 실제 `dist/src/main.js`, 자식의 fetch·WebSocket은 시험 장치로 막음, 실패 로그 뒤 3초 안 종료 확인. 수정 전 10초 뒤에도 살아 있음) |
+| P3-6 정책의 모르는 키 이름이 오류·로그에 실림 | 모르는 키는 `unknown_field(개수)`만, 고정 필드 `confirmedAt`만 이름으로 | `P3-6 정책의 모르는 키 이름은…`. 수정 전 `runtime_policies_invalid: fixture-secret-used-as-key` |
+| 남는 한계: `src/gateway.ts`가 외부 오류 `message`를 그대로 로그에 씀 | `gateway_open_failed`·`gateway_event_failed`도 `errorInfo()` 규칙(우리 코드 형식 메시지·code만) | `로그 정제: Gateway 주소 조회 오류…`, `로그 정제: Gateway 이벤트 처리 오류…`. 수정 전 URL·메시지 원문이 로그에 있음 |

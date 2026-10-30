@@ -284,8 +284,13 @@ Discord Gateway → `DiscordProtocol` → `DiscordIngress` → PostgreSQL 이벤
 `/read`는 모델을 부르지 않고 승인 템플릿 조회를 실행한다. Gateway 연결 루프는 T16b `src/gateway.ts`(아래), 모델 프로세스는 작업자 진입점(T16b)이다.
 런타임은 Node 24.22.0이며, Discord 클라이언트는 SDK 없이 주입 가능한 `DiscordProtocol`을 선택했다.
 인증된 WebSocket 세션은 T16b `GatewaySession`(Node 24 내장 WebSocket, intents 33281)이 이 어댑터에 잇는다. 봇 사용자 ID는 첫 READY에서 받고,
-그 전에는 Discord 수신·게시를 하지 않는다(8080·8081 수신은 계속). 새 IDENTIFY(READY)마다 활성 스레드의 누락 대조를 돌리고,
-RESUMED면 Discord 재생에 맡긴다. slash 명령은 READY마다 guild 단위로 FOUNDATION 12개에 맞추고(`task`·`review-*` 없음, 같으면 쓰지 않음)
+그 전에는 Discord 수신·게시를 하지 않는다(8080·8081 수신은 계속). 새 IDENTIFY(READY)마다 **live 이벤트를 처리하기 전에**
+모든 활성 스레드·DM에 `gap=true`(복구 장벽)를 한 문장으로 세운다. 그 뒤 live 메시지는 버퍼에 들어가 checkpoint를 올리지 못하므로
+복구 차례를 기다리는 대화도 단절 중 메시지를 건너뛰지 않는다. 장벽 UPDATE가 실패하면 설 때까지 다시 시도하고 그동안 이벤트는 기다린다.
+history 대조는 `RecoveryScheduler`(`src/recovery.ts`)가 대화별로 이벤트 처리 밖에서 돌린다. 일시적인 실패(시간 초과·429·서버 오류·정책 확인 불가)는
+대화별 지수 백오프(1초부터 5분까지, 429·영속 pause면 `retry_after` 이상)로 READY 없이 다시 시도하고, 복구 한도(100건×10쪽/30초)를 넘은 경우만
+수동 처리할 gap으로 남긴다(`recover()`가 `done`·`budget`·`skipped`를 돌려준다). 정책 거부는 재시도하지 않는다. 대기 목록은 메모리이고
+재시작하면 새 READY가 다시 만든다. RESUMED면 Discord 재생에 맡긴다. slash 명령은 READY마다 guild 단위로 FOUNDATION 12개에 맞추고(`task`·`review-*` 없음, 같으면 쓰지 않음)
 전역 명령은 비운다. 수신도 같은 목록만 받는다. 재연결·RESUME 실측은 실연동(S16)이다.
 
 작업자 모델 호출은 **대화·작업 레인 합쳐 1개**다. DB의 scheduler 행 잠금과 작업자의 별도 mutex가
@@ -336,7 +341,7 @@ Discord REST의 1초 전송 제한은 상호작용 첫 응답 3초에 맞춰 유
 동일 수신 시각이나 작업 claim 뒤 도착한 후속 요청이 앞 작업의 맥락에 섞이지 않는다.
 
 runtime policy는 env `RUNTIME_POLICIES`(Infisical → 공유 차트 env)를 **기동 때 한 번** 읽는다(D1, 사용자 2026-10-30, T16b).
-`confirmedAt`은 사람이 넣지 않고 봇이 읽은 시각으로 채운다. JSON·구조가 잘못되면 기동이 실패하고, 오류에는 필드 이름만 남긴다.
+`confirmedAt`은 사람이 넣지 않고 봇이 읽은 시각으로 채운다. JSON·구조가 잘못되면 기동이 실패하고, 오류에는 알려진 필드 이름만 남긴다(모르는 키는 이름 대신 `unknown_field(개수)`).
 값을 바꾸면 `homelab secret set`이 파드를 다시 시작해 반영한다. 읽은 뒤 시간이 지났다는 이유로 닫지 않는다(300초 검사는 없앴다).
 `confirmedAt`이 미래 시각(시계 역행)이거나 정책 원천을 읽지 못하면 닫힌다. ESO 동기화(1시간)와 재시작까지의 창은 남으며,
 즉시 차단은 owner의 `/revoke`가 영속 거부 목록에 추가하는 것이다. 실행·조회·게시 전에 현재 owner·scope를 재검사한다.
@@ -402,7 +407,8 @@ fingerprint 계산에 서비스 ID도 포함해 같은 fingerprint 문자열의 
 004 이전의 비정상적인 큰 pending 메시지는 자동 절단하지 않고 blocked로 둔다.
 임의 질의·Secret·ConfigMap·pods/log/exec의 요청 이름과 추가 필드를 거부한다.
 라이브 API 응답 투영은 T16b `src/read-transports.ts`다(Grafana `POST /api/ds/query` 메트릭·VictoriaLogs, Argo CD 앱 객체, Kubernetes Deployment·StatefulSet,
-응답 4MiB 상한, 고정 경로 모양만). 서비스·템플릿은 `src/catalog.ts`, 여는 서비스 ID는 정책이다. 플랫폼 권한 증거는 실연동(S16)이다.
+응답 4MiB 상한, 고정 경로 모양만. Kubernetes는 `status.observedGeneration`이 `metadata.generation`보다 뒤처지거나 없으면 `unknown`).
+서비스·템플릿은 `src/catalog.ts`, 여는 서비스 ID는 정책이다. 플랫폼 권한 증거는 실연동(S16)이다.
 
 부모 채널의 스레드 생성 뒤에도 저장된 urgent command/flag를 전달한다.
 스레드/DM/부모 채널에서 받은 `/read`는 type=read, debounce 0이며 queued-chat supersede 대상에서 제외한다.
@@ -420,7 +426,10 @@ dispatch 전 PolicyUnavailable의 defer는 최신 cancel_requested를 원자적�
 종료가 확인되지 않은 worker만 unknown으로 남아 전역 슬롯을 유지한다.
 unknown은 자동 재시도 0회다. Discord 429는 retry_after를 지키고 총 3회 뒤 blocked다.
 IDENTIFY는 rolling 24시간 **900회**를 로컬 상한으로 두고 1000회 문서 한도에 여유를 남긴다.
-재연결 backoff는 1~60초 + 0~1초 jitter 계약이다. T16b `GatewaySession`은 새 IDENTIFY 전에 이 예산을 통과하고(소진되면 연결하지 않음), 재연결 간격에 이 backoff를 쓴다.
+재연결 backoff는 1~60초 + 0~1초 jitter 계약이다. T16b `GatewaySession`은 새 IDENTIFY 직전에 `GatewayBudget.reserve()`로 일일 900회와
+IDENTIFY 간격(Discord 5초 + 지연 차이 여유 0.5초 = 5.5초, 단일 shard)을 같은 잠금 아래에서 함께 예약하고 그 시각까지 기다린다.
+예약 시각은 audit에 남아 재시작에도 이어진다. 연결 전에는 `next()`로 소진·대기 시간을 보고(소진되면 연결하지 않음), RESUME은 예약하지 않는다.
+다중 shard가 되면 `max_concurrency` 버킷마다 간격을 따로 둔다. 재연결 간격에는 이 backoff를 쓴다.
 
 작업자 제어 인증은 **Ed25519**다. 게시 서버에만 개인 키, 작업자에는 공개 키만 둔다.
 capability는 audience·operation·job·lease·body digest·발급/만료 시각에 묶이고 유효기간은 **30초**다.
