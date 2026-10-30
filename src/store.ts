@@ -207,6 +207,17 @@ export class Store {
       AND lease_until>$4 AND state IN ('running','cancel_requested')`,
     [job.id, job.lease_token, this.now() + DEFAULTS.retryDelayMs, this.now(), reason]);
   }
+  // 게시 서버 종료 중 멈춤이 확인된 chat을 대기열로 되돌린다. defer와 달리 시도 횟수는 쓴 것으로 둔다(실제로 실행했다).
+  // 그 사이 owner가 /cancel했으면 cancelled로 끝낸다. lease CAS가 실패하면 아무것도 바꾸지 않는다(expire가 처리).
+  async requeueAfterShutdown(job: Job): Promise<State | undefined> {
+    return (await this.db.query<{ state: State }>(`UPDATE jobs SET
+      state=CASE WHEN state='cancel_requested' THEN 'cancelled' ELSE 'queued' END,
+      wait_reason=CASE WHEN state='cancel_requested' THEN 'stop_confirmation' ELSE 'publisher_shutdown' END,
+      finished_at=CASE WHEN state='cancel_requested' THEN $3 ELSE NULL END,
+      available_at=$3,lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2
+      AND lease_until>$3 AND state IN ('running','cancel_requested') RETURNING state`,
+    [job.id, job.lease_token, this.now()])).rows[0]?.state;
+  }
   async fail(job: Job, reason: string): Promise<void> {
     await this.atomic(async store => {
       if (await store.complete(job, 'failed', reason) !== 'failed') return;
