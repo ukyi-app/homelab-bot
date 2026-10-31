@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { chatContext } from './chat-context.js';
 import { DEFAULTS, Denied, RateLimited } from './contracts.js';
 import type { Clock, EventInput, Job, Scope, State } from './contracts.js';
 import { remaining } from './database.js';
@@ -19,6 +20,12 @@ export interface Delivery {
   state: string; external_id: string | null; lease_token: string; attempt: number;
 }
 const json = (value: unknown) => JSON.stringify(value);
+// 전역 상한 중 read 몫. contracts.ts의 DEFAULTS는 공용 계약이라 여기 둔다.
+export const READ_QUEUE_RESERVE = 10;
+export const MODEL_QUEUE_LIMIT = DEFAULTS.maxQueue - READ_QUEUE_RESERVE;
+// unknown chat 조사 간격: 처음 조사 뒤 30초, 이후 두 배씩, 상한 10분.
+export const UNKNOWN_PROBE_FIRST_MS = 30_000;
+export const UNKNOWN_PROBE_MAX_MS = 600_000;
 export class Store {
   constructor(public readonly db: Database, public readonly now: Clock = Date.now) {}
   async atomic<T>(fn: (store: Store) => Promise<T>, deadline?: TransactionDeadline): Promise<T> {
@@ -89,8 +96,7 @@ export class Store {
       await tx.query(`SELECT * FROM controls WHERE key='scheduler' FOR UPDATE`);
       const existing = (await tx.query<{ id: string }>('SELECT id FROM jobs WHERE event_id=$1', [id])).rows[0];
       if (existing) return existing.id;
-      const queued = (await tx.query<{ count: string }>("SELECT count(*) FROM jobs WHERE state='queued'")).rows[0]!;
-      if (Number(queued.count) >= DEFAULTS.maxQueue) throw new Error('queue_full');
+      if (await this.queueFull(type, tx)) throw new Error('queue_full');
       const jobId = randomUUID();
       const inserted = await tx.query<{ id: string }>(`INSERT INTO jobs(id,event_id,conversation_id,type,owner_id,target,revision,budget,
         priority,available_at,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
@@ -111,9 +117,11 @@ export class Store {
       const control = (await tx.query<{ value: boolean }>(`SELECT value FROM controls WHERE key='scheduler' FOR UPDATE`)).rows[0]!;
       if (control.value) return;
       // Unknown hosts may still be executing; they hold the global model slot.
-      if ((await tx.query(`SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown','waiting_user') LIMIT 1`)).rows.length) return;
+      // read는 모델을 부르지 않아 슬롯을 잡지도, 슬롯에 막히지도 않는다(claimRead가 따로 고른다).
+      if ((await tx.query(`SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown','waiting_user')
+        AND type<>'read' LIMIT 1`)).rows.length) return;
       const row = (await tx.query<Job>(`SELECT j.* FROM jobs j JOIN events e ON e.id=j.event_id
-        JOIN conversations c ON c.id=j.conversation_id WHERE j.state='queued' AND e.accepted=true
+        JOIN conversations c ON c.id=j.conversation_id WHERE j.state='queued' AND j.type<>'read' AND e.accepted=true
         AND c.active=true AND c.gap=false AND c.owner_id=j.owner_id AND e.actor_id=j.owner_id AND j.available_at<=$1
         ORDER BY j.priority,j.created_at,e.event_order FOR UPDATE OF j SKIP LOCKED LIMIT 1`, [this.now()])).rows[0];
       if (!row) return;
@@ -122,19 +130,76 @@ export class Store {
       [row.id, randomUUID(), this.now() + DEFAULTS.leaseMs, this.now()])).rows[0];
     });
   }
+  // read 레인. 모델 슬롯·scheduler 행(대기·비상 중지)·unknown에 막히지 않는다. /emergency-stop은 모델 호출 중지다.
+  // 대화 장벽(구독 중지·gap·owner 불일치)은 모델과 같다. 동시 실행은 게시 서버 전체에서 1개이며 read_lane 행으로 직렬화한다.
+  // 잠금 순서: read_lane 행만 기다린다. job은 SKIP LOCKED라 기다리지 않고, 대화·scheduler 행은 잡지 않는다.
+  async claimRead(): Promise<Job | undefined> {
+    return this.db.transaction(async tx => {
+      await tx.query(`INSERT INTO controls VALUES ('read_lane','false') ON CONFLICT DO NOTHING`);
+      await tx.query(`SELECT key FROM controls WHERE key='read_lane' FOR UPDATE`);
+      if ((await tx.query(`SELECT id FROM jobs WHERE type='read' AND state IN ('running','verifying','cancel_requested') LIMIT 1`)).rows.length) return;
+      const row = (await tx.query<Job>(`SELECT j.* FROM jobs j JOIN events e ON e.id=j.event_id
+        JOIN conversations c ON c.id=j.conversation_id WHERE j.state='queued' AND j.type='read' AND e.accepted=true
+        AND c.active=true AND c.gap=false AND c.owner_id=j.owner_id AND e.actor_id=j.owner_id AND j.available_at<=$1
+        ORDER BY j.priority,j.created_at,e.event_order FOR UPDATE OF j SKIP LOCKED LIMIT 1`, [this.now()])).rows[0];
+      if (!row) return;
+      return (await tx.query<Job>(`UPDATE jobs SET state='running',attempt=attempt+1,
+        lease_token=$2,lease_until=$3,started_at=$4 WHERE id=$1 RETURNING *`,
+      [row.id, randomUUID(), this.now() + DEFAULTS.leaseMs, this.now()])).rows[0];
+    });
+  }
+  // 대기열 상한은 전역 DEFAULTS.maxQueue다. 모델 계열(chat·task·review)은 READ_QUEUE_RESERVE만큼 덜 받아,
+  // 모델이 멈춘 채 대기열이 차도 /read는 들어올 수 있다.
+  async queueFull(type: Job['type'] | 'review', tx = this.db): Promise<boolean> {
+    const total = (await tx.query<{ count: string }>("SELECT count(*) FROM jobs WHERE state='queued'")).rows[0]!;
+    if (Number(total.count) >= DEFAULTS.maxQueue) return true;
+    if (type === 'read') return false;
+    const model = (await tx.query<{ count: string }>("SELECT count(*) FROM jobs WHERE state='queued' AND type<>'read'")).rows[0]!;
+    return Number(model.count) >= MODEL_QUEUE_LIMIT;
+  }
   async heartbeat(job: Job): Promise<boolean> {
     return (await this.db.query(`UPDATE jobs SET lease_until=$3 WHERE id=$1 AND lease_token=$2
       AND lease_until>$4 AND state IN ('running','verifying','cancel_requested') RETURNING id`,
     [job.id, job.lease_token, this.now() + DEFAULTS.leaseMs, this.now()])).rows.length === 1;
   }
+  // 한 번의 만료 처리는 기준 시각 하나를 쓴다. 후보 job을 그 시각으로 먼저 정하고 그 대화 행을 잠근 뒤,
+  // 그 ID에 한해서만 만료 조건을 다시 확인해 바꾼다. 선잠금 뒤에 새로 만료된 job까지 UPDATE가 잡으면
+  // 잠그지 않은 대화의 안내 INSERT가 같은 대화의 /cancel(대화 행 → job)과 순환한다. 그런 job은 다음 tick이 처리한다.
   async expire(): Promise<void> {
-    await this.db.query(`UPDATE jobs SET state='unknown',wait_reason='lease_expired'
-      WHERE state IN ('running','verifying','cancel_requested') AND lease_until<=$1`, [this.now()]);
+    const now = this.now();
+    await this.expireReads(now);
+    // 바꾼 행마다 같은 트랜잭션에서 unknown 안내를 넣는다(chat만).
+    await this.db.transaction(async tx => {
+      const ids = await this.lockExpiring(tx, `state IN ('running','verifying','cancel_requested') AND lease_until<=$1 AND type<>'read'`, now);
+      if (!ids.length) return;
+      const expired = (await tx.query<Job>(`UPDATE jobs SET state='unknown',wait_reason='lease_expired'
+        WHERE id=ANY($2) AND state IN ('running','verifying','cancel_requested') AND lease_until<=$1 AND type<>'read' RETURNING *`, [now, ids])).rows;
+      for (const job of expired) await this.unknownNotice(job, tx);
+    });
     await this.db.query(`UPDATE outbox SET state=CASE WHEN dispatch_started THEN 'unknown' ELSE 'pending' END,
       attempt=CASE WHEN dispatch_started THEN attempt ELSE GREATEST(0,attempt-1) END,
       available_at=CASE WHEN dispatch_started THEN $1 ELSE $1+$2 END
-      WHERE state='sending' AND lease_until<=$1`, [this.now(), DEFAULTS.retryDelayMs]);
+      WHERE state='sending' AND lease_until<=$1`, [now, DEFAULTS.retryDelayMs]);
     await this.retireUnknownDeliveries();
+  }
+  // read에는 외부 쓰기가 없어 lease 만료가 불확실성이 아니다. unknown 대신 확정 실패로 끝내고 다시 요청하도록 안내한다.
+  // 구버전이 남긴 unknown read도 같은 이유로 정리한다. owner가 /cancel한 것은 cancelled로 끝낸다.
+  private async expireReads(now: number): Promise<void> {
+    const where = `type='read' AND ((state IN ('running','verifying','cancel_requested') AND lease_until<=$1) OR state='unknown')`;
+    await this.db.transaction(async tx => {
+      const ids = await this.lockExpiring(tx, where, now);
+      if (!ids.length) return;
+      const expired = (await tx.query<Job>(`UPDATE jobs SET
+        state=CASE WHEN state='cancel_requested' THEN 'cancelled' ELSE 'failed' END,wait_reason='lease_expired',finished_at=$1
+        WHERE id=ANY($2) AND ${where} RETURNING *`, [now, ids])).rows;
+      for (const job of expired) {
+        if (job.state !== 'failed') continue;
+        await this.enqueue({ key: `read-expired:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id,
+          actor: job.owner_id, scope: job.target, revision: job.revision.policy,
+          payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary',
+            content: '조회가 시간 안에 끝나지 않았습니다. /read로 다시 요청하세요.' } }, tx);
+      }
+    });
   }
   async retireUnknownDeliveries(): Promise<void> {
     await this.db.transaction(async tx => {
@@ -157,8 +222,20 @@ export class Store {
       AND lease_until>$4 AND state IN ('running','cancel_requested')`,
     [job.id, job.lease_token, this.now() + DEFAULTS.retryDelayMs, this.now(), reason]);
   }
+  // 게시 서버 종료 중 멈춤이 확인된 chat을 대기열로 되돌린다. defer와 달리 시도 횟수는 쓴 것으로 둔다(실제로 실행했다).
+  // 그 사이 owner가 /cancel했으면 cancelled로 끝낸다. lease CAS가 실패하면 아무것도 바꾸지 않는다(expire가 처리).
+  async requeueAfterShutdown(job: Job): Promise<State | undefined> {
+    return (await this.db.query<{ state: State }>(`UPDATE jobs SET
+      state=CASE WHEN state='cancel_requested' THEN 'cancelled' ELSE 'queued' END,
+      wait_reason=CASE WHEN state='cancel_requested' THEN 'stop_confirmation' ELSE 'publisher_shutdown' END,
+      finished_at=CASE WHEN state='cancel_requested' THEN $3 ELSE NULL END,
+      available_at=$3,lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2
+      AND lease_until>$3 AND state IN ('running','cancel_requested') RETURNING state`,
+    [job.id, job.lease_token, this.now()])).rows[0]?.state;
+  }
   async fail(job: Job, reason: string): Promise<void> {
     await this.atomic(async store => {
+      await store.lockConversation(job);
       if (await store.complete(job, 'failed', reason) !== 'failed') return;
       await store.enqueue({ key: `failure:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id,
         actor: job.owner_id, scope: job.target, revision: job.revision.policy,
@@ -173,17 +250,50 @@ export class Store {
   }
   async waitForUser(job: Job, reason: string): Promise<void> {
     await this.db.transaction(async tx => {
+      await this.lockConversation(job, tx);
       await this.lockScheduler(tx);
       if (await this.complete(job, 'waiting_user', reason, tx) !== 'waiting_user') return;
       await tx.query(`UPDATE controls SET value='true' WHERE key='scheduler'`);
+      // task는 작업 레인(codex.ts)이 따로 알린다. 여기서는 chat만.
+      if (job.type === 'chat') await this.notice(job, `waiting:${job.id}:${job.attempt}`,
+        `${reason === 'auth_expired' ? '모델 인증이 만료돼' : '모델 사용 한도에 걸려'} 작업이 멈췄습니다. `
+        + `원인을 해소한 뒤 /resume-model target:${job.id}로 재개하세요. 상태는 /model-status로 확인할 수 있습니다.`, tx);
     });
   }
   async transition(job: Job, state: State, reason: string | null = null): Promise<boolean> {
     // Only an uncertain worker may override cancellation with unknown.
     if (state !== 'unknown') return (await this.complete(job, state, reason)) !== undefined;
-    return (await this.db.query(`UPDATE jobs SET state=$3,wait_reason=$4,finished_at=$5
-      WHERE id=$1 AND lease_token=$2 AND lease_until>$5 AND state IN ('running','verifying','cancel_requested') RETURNING id`,
-    [job.id, job.lease_token, state, reason, this.now()])).rows.length === 1;
+    return this.db.transaction(async tx => {
+      await this.lockConversation(job, tx);
+      const row = (await tx.query<Job>(`UPDATE jobs SET state=$3,wait_reason=$4,finished_at=$5
+        WHERE id=$1 AND lease_token=$2 AND lease_until>$5 AND state IN ('running','verifying','cancel_requested') RETURNING *`,
+      [job.id, job.lease_token, state, reason, this.now()])).rows[0];
+      // 권한 철회로 멈춘 대화에는 안내하지 않는다(게시도 막힌다).
+      if (row && reason !== 'authorization_revoked') await this.unknownNotice(row, tx);
+      return !!row;
+    });
+  }
+  // 안내 삽입(outbox 외래 키)은 대화 행 KEY SHARE를 잡는다. job 행이나 scheduler 행을 쥔 뒤에 대화 행을 기다리면
+  // 제어 경로(대화 행 FOR UPDATE → scheduler → job)와 교착하므로, 상태를 바꾸기 전에 대화 행부터 잡는다.
+  private async lockConversation(job: Job, tx = this.db): Promise<void> {
+    if (job.conversation_id) await tx.query('SELECT id FROM conversations WHERE id=$1 FOR KEY SHARE', [job.conversation_id]);
+  }
+  // 만료 후보 job ID를 정하고 그 대화 행을 id 순서로 잠근다. 돌려준 ID 밖의 job은 이 트랜잭션에서 바꾸지 않는다.
+  private async lockExpiring(tx: Database, where: string, now: number): Promise<string[]> {
+    const ids = (await tx.query<{ id: string }>(`SELECT id FROM jobs WHERE ${where} ORDER BY id`, [now])).rows.map(row => row.id);
+    if (ids.length) await tx.query(`SELECT id FROM conversations WHERE id IN (SELECT conversation_id FROM jobs WHERE id=ANY($1))
+      ORDER BY id FOR KEY SHARE`, [ids]);
+    return ids;
+  }
+  private async unknownNotice(job: Job, tx: Database): Promise<void> {
+    if (job.type !== 'chat') return;
+    await this.notice(job, `unknown:${job.id}:${job.attempt}`, '작업 종료를 확인하지 못해 새 모델 실행을 멈췄습니다. '
+      + '봇이 작업자에게 종료 확인을 계속 시도합니다. 상태는 /model-status로 확인하세요.', tx);
+  }
+  // 상태 알림. 멱등 키로 한 번만 넣고 멘션하지 않는다(게시는 allowed_mentions parse 빈 배열).
+  private async notice(job: Job, key: string, content: string, tx: Database): Promise<void> {
+    await this.enqueue({ key, job: job.id, conversation: job.conversation_id, actor: job.owner_id, scope: job.target,
+      revision: job.revision.policy, payload: { kind: 'message', channel: job.target.channel, content, classification: 'safe_summary' } }, tx);
   }
   async finish(job: Job, result: unknown, evidence: unknown, content: string, scope: Scope, services: string[] = []): Promise<void> {
     await this.db.transaction(async tx => {
@@ -197,6 +307,50 @@ export class Store {
       await this.enqueue({ key: `result:${job.id}`, job: job.id, conversation: job.conversation_id,
         actor: job.owner_id, scope, revision: job.revision.policy, services,
         payload: { kind: 'message', channel: scope.channel, content, classification: 'safe_summary' } }, tx);
+    });
+  }
+  // chat unknown 조사 예약. 다음 조사 시각은 마이그레이션 없이 controls 행(unknown_probe:<job>)에 둔다.
+  // 같은 행을 잠그고 시각이 된 것만 다음 시각으로 미뤄 돌려주므로 게시 서버 둘이 같은 job을 동시에 조사하지 않는다.
+  // lease가 바뀌었으면(다시 실행된 뒤 다시 unknown) backoff를 처음부터 센다. 경과 시간만으로 상태를 바꾸지 않는다.
+  async reserveUnknownProbes(limit = 3): Promise<Job[]> {
+    return this.db.transaction(async tx => {
+      await tx.query(`DELETE FROM controls WHERE key LIKE 'unknown_probe:%' AND NOT EXISTS
+        (SELECT 1 FROM jobs WHERE id=substr(controls.key,15) AND type='chat' AND state='unknown')`);
+      const jobs = (await tx.query<Job>(`SELECT * FROM jobs WHERE type='chat' AND state='unknown' AND lease_token IS NOT NULL
+        ORDER BY id LIMIT 50`)).rows;
+      const due: Job[] = [];
+      for (const job of jobs) {
+        if (due.length >= limit) break;
+        const key = `unknown_probe:${job.id}`;
+        await tx.query(`INSERT INTO controls VALUES ($1,$2) ON CONFLICT DO NOTHING`, [key, json({ lease: job.lease_token, count: 0, next: 0 })]);
+        const stored = (await tx.query<{ value: { lease: string; count: number; next: number } }>(
+          'SELECT value FROM controls WHERE key=$1 FOR UPDATE', [key])).rows[0]!.value;
+        const probe = stored.lease === job.lease_token ? stored : { lease: job.lease_token, count: 0, next: 0 };
+        if (probe.next > this.now()) continue;
+        const count = probe.count + 1;
+        await tx.query('UPDATE controls SET value=$2 WHERE key=$1', [key, json({ lease: job.lease_token, count,
+          next: this.now() + Math.min(UNKNOWN_PROBE_MAX_MS, UNKNOWN_PROBE_FIRST_MS * 2 ** (count - 1)) })]);
+        due.push(job);
+      }
+      return due;
+    });
+  }
+  // 작업자가 멈춤을 확인한 unknown chat을 확정 실패로 끝낸다. 관측한 lease일 때만 바꾸고(CAS), 상태·감사·안내를 함께 쓴다.
+  // 새 실행은 시작하지 않는다. owner가 /retry로 다시 실행한다.
+  async resolveUnknown(job: Job): Promise<boolean> {
+    return this.db.transaction(async tx => {
+      await this.lockConversation(job, tx);
+      const row = (await tx.query<Job>(`UPDATE jobs SET state='failed',wait_reason='stop_confirmed_after_unknown',finished_at=$3
+        WHERE id=$1 AND type='chat' AND state='unknown' AND lease_token=$2 RETURNING *`, [job.id, job.lease_token, this.now()])).rows[0];
+      if (!row) return false;
+      await tx.query('DELETE FROM controls WHERE key=$1', [`unknown_probe:${row.id}`]);
+      await tx.query('INSERT INTO audit(kind,subject,detail,created_at) VALUES ($1,$2,$3,$4)',
+        ['unknown_stop_confirmed', row.id, json({ attempt: row.attempt }), this.now()]);
+      await this.enqueue({ key: `unknown-resolved:${row.id}:${row.attempt}`, job: row.id, conversation: row.conversation_id,
+        actor: row.owner_id, scope: row.target, revision: row.revision.policy,
+        payload: { kind: 'message', channel: row.target.channel, classification: 'safe_summary',
+          content: `이전 작업이 멈춘 것을 확인했습니다. /retry target:${row.id}으로 다시 실행할 수 있습니다.` } }, tx);
+      return true;
     });
   }
   async enqueue(input: { key: string; job?: string; conversation?: string; actor: string; scope: Scope; revision: string; services?: string[]; payload: Delivery['payload'] }, tx?: Database): Promise<void> {
@@ -295,19 +449,7 @@ export class Store {
         content: '상호작용 응답이 만료됐거나 확인되지 않았지만 요청 기록은 저장했습니다. 다시 보내기 전에 이 대화의 /list로 처리 상태를 확인하세요.' } });
   }
   async context(conversation: string, event: string): Promise<unknown[]> {
-    const rows = (await this.db.query<{ payload: unknown }>(`SELECT payload FROM events WHERE conversation_id=$1 AND accepted=true
-      AND actor_id=(SELECT owner_id FROM conversations WHERE id=$1)
-      AND event_order<=(SELECT e.event_order FROM events e JOIN conversations c ON c.id=e.conversation_id
-        WHERE e.id=$3 AND e.conversation_id=$1 AND e.actor_id=c.owner_id)
-      ORDER BY event_order DESC LIMIT $2`, [conversation, DEFAULTS.contextMessages, event])).rows;
-    const context: unknown[] = [];
-    let bytes = 0;
-    for (const row of rows) {
-      bytes += Buffer.byteLength(JSON.stringify(row.payload));
-      if (bytes > 32768) break;
-      context.unshift(row.payload);
-    }
-    return context;
+    return chatContext(this.db, conversation, event);
   }
   async checkpoint(conversation: string, message: string, recovering = false): Promise<void> {
     if (!/^\d+$/.test(message)) return;
@@ -349,8 +491,7 @@ export class Store {
     if (action === 'review-resume') {
       const emergency = (await this.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler_emergency'")).rows[0]!.value;
       if (emergency) return { ok: false, status: '비상 또는 이전 중지가 유지되고 있습니다. /model-status로 확인하세요.' };
-      const count = (await this.db.query<{ count: string }>("SELECT count(*) FROM jobs WHERE state='queued'")).rows[0]!;
-      if (Number(count.count) >= DEFAULTS.maxQueue) return { ok: false, status: '대기열이 가득 찼습니다. 불필요한 작업을 취소한 뒤 재개하세요.' };
+      if (await this.queueFull('review')) return { ok: false, status: '대기열이 가득 찼습니다. 불필요한 작업을 취소한 뒤 재개하세요.' };
       const changed = await this.db.query(`UPDATE jobs SET state='queued',available_at=$2,wait_reason=NULL,
         lease_token=NULL,lease_until=NULL,started_at=NULL,finished_at=NULL
         WHERE id=$1 AND type='review' AND state='waiting_user' AND wait_reason IN ('model_limit','auth_expired') AND attempt<$3 RETURNING id`,
@@ -392,12 +533,12 @@ export class Store {
       const emergency = (await this.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler_emergency'")).rows[0]!.value;
       const waiting = (await this.db.query(`SELECT id,wait_reason FROM jobs WHERE owner_id=$1 AND conversation_id=$2
         AND state='waiting_user' ORDER BY created_at LIMIT 5`, [actor, conversation])).rows;
-      const executionPending = (await this.db.query("SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown') LIMIT 1")).rows.length > 0;
+      const executionPending = (await this.db.query("SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown') AND type<>'read' LIMIT 1")).rows.length > 0;
       return { paused, emergency, waiting, executionPending, status: '한도·인증 원인을 사람이 해소한 뒤 /resume-model target:<job-id>, 포기는 /cancel target:<job-id>. 비상/이전 중지는 /resume-model target:emergency-stop으로 확인하세요.' };
     }
     if (action === 'resume-model') {
       if (target === 'emergency-stop') {
-        if ((await this.db.query("SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown') LIMIT 1")).rows.length)
+        if ((await this.db.query("SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown') AND type<>'read' LIMIT 1")).rows.length)
           return { ok: false, status: '실행 중이거나 종료를 확인하지 못한 작업이 있습니다. 중지 확인 전에는 재개할 수 없습니다.' };
         await this.db.query("UPDATE controls SET value='false' WHERE key='scheduler_emergency'");
         const paused = await this.releaseScheduler();
@@ -407,8 +548,7 @@ export class Store {
       const emergency = (await this.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler_emergency'")).rows[0]!.value;
       if (emergency) return { ok: false, status: '비상 또는 이전 중지가 유지되고 있습니다. /model-status로 확인하세요.' };
       if (!current?.active || current.gap) return { ok: false, status: '현재 대화의 구독과 누락 복구를 먼저 확인하세요.' };
-      const count = (await this.db.query<{ count: string }>("SELECT count(*) FROM jobs WHERE state='queued'")).rows[0]!;
-      if (Number(count.count) >= DEFAULTS.maxQueue) return { ok: false, status: '대기열이 가득 찼습니다. 불필요한 작업을 취소한 뒤 재개하세요.' };
+      if (await this.queueFull('chat')) return { ok: false, status: '대기열이 가득 찼습니다. 불필요한 작업을 취소한 뒤 재개하세요.' };
       const changed = await this.db.query(`UPDATE jobs SET state='queued',available_at=$4,wait_reason=NULL,
         lease_token=NULL,lease_until=NULL,started_at=NULL,finished_at=NULL
         WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND state='waiting_user'
@@ -429,8 +569,10 @@ export class Store {
     }
     if (action === 'retry') {
       // accept()·resume-model과 같이 스케줄러 행 잠금 아래에서 세어 동시 재시도도 상한을 넘지 않는다.
-      const count = (await this.db.query<{ count: string }>("SELECT count(*) FROM jobs WHERE state='queued'")).rows[0]!;
-      if (Number(count.count) >= DEFAULTS.maxQueue) return { ok: false, status: '대기열이 가득 찼습니다. 불필요한 작업을 취소한 뒤 재시도하세요.' };
+      // 상한은 대상의 실제 종류로 센다. read는 모델 몫(90)이 아니라 전체 상한만 보므로 모델이 정체해도 조회를 다시 돌 수 있다.
+      const kind = (await this.db.query<{ type: Job['type'] }>('SELECT type FROM jobs WHERE id=$1 AND owner_id=$2 AND conversation_id=$3',
+        [target, actor, conversation])).rows[0]?.type ?? 'chat';
+      if (await this.queueFull(kind)) return { ok: false, status: '대기열이 가득 찼습니다. 불필요한 작업을 취소한 뒤 재시도하세요.' };
       const changed = await this.db.query(`UPDATE jobs SET state='queued',available_at=$4,wait_reason=NULL
         WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND state='failed' AND attempt<$5 RETURNING id`,
       [target, actor, conversation, this.now(), DEFAULTS.maxRetries + 1]);
@@ -440,7 +582,7 @@ export class Store {
     if (action === 'emergency-stop') {
       await this.db.query("UPDATE controls SET value='true' WHERE key='scheduler_emergency'");
       await this.db.query(`INSERT INTO controls VALUES ('scheduler','true') ON CONFLICT (key) DO UPDATE SET value='true'`);
-      await this.db.query(`UPDATE jobs SET state='cancel_requested' WHERE state IN ('running','verifying')`);
+      await this.db.query(`UPDATE jobs SET state='cancel_requested' WHERE state IN ('running','verifying') AND type<>'read'`);
       return { status: '새 모델 호출 차단, 실행 중 작업 취소 요청' };
     }
     throw new Error('unsupported_control');

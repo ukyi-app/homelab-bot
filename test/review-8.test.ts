@@ -4,7 +4,7 @@ import { DEFAULTS, Denied, DiscordRejected, RateLimited } from '../src/contracts
 import { DiscordIngress, DiscordPublisher } from '../src/discord.js';
 import { DiscordProtocol, discordHttpApi } from '../src/discord-protocol.js';
 import { Runtime } from '../src/runtime.js';
-import { Store } from '../src/store.js';
+import { MODEL_QUEUE_LIMIT, Store } from '../src/store.js';
 import { event, fixture, localDatabase, thread } from './helpers.js';
 
 let database: Awaited<ReturnType<typeof localDatabase>>;
@@ -103,7 +103,7 @@ test('4316099215 resume 대상 누락·재시도 상한·큐 상한은 차단하
   await database.db.query('UPDATE jobs SET attempt=$1', [DEFAULTS.maxRetries + 1]);
   assert.equal((await control('resume-model', job.id, 'exhausted')).ok, false);
   await database.db.query('UPDATE jobs SET attempt=1');
-  for (let i = 0; i < DEFAULTS.maxQueue; i++) {
+  for (let i = 0; i < MODEL_QUEUE_LIMIT; i++) {
     const saved = await f.store.save(event(`queue-${i}`, { kind: 'command', command: 'task' }), f.policy.revision, false);
     await f.store.accept(saved.id, 'task', f.policy.revision);
   }
@@ -115,7 +115,8 @@ for (const stage of ['scheduler', 'outbox']) test(`4316099215 재개 중 ${stage
   await failOnce(sql => stage === 'scheduler' ? sql.startsWith("UPDATE controls SET value='false' WHERE key='scheduler'") : sql.includes('INSERT INTO outbox'),
     () => assert.rejects(control('resume-model', job.id), /injected_commit_failure/));
   assert.equal((await rows('jobs'))[0]!.state, 'waiting_user'); assert.equal(await flag(), true);
-  assert.equal((await rows('outbox')).length, 0);
+  // impl-sched S4: waiting_user 안내는 대기 진입 때 이미 들어가 있다. 재개 실패가 남긴 것만 센다.
+  assert.equal((await rows('outbox')).filter(o => !/^(waiting|unknown):/.test(o.idempotency_key)).length, 0);
   assert.equal((await control('resume-model', job.id)).ok, true); assert.equal(await flag(), false);
 });
 test('4316099215 동시 재개 요청은 하나만 재수락, 나머지는 상태 불일치', async () => {

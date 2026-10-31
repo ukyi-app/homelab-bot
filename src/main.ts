@@ -19,6 +19,8 @@ import type { DiscordApi } from './discord-protocol.js';
 import { GatewaySession, discordGatewayUrl } from './gateway.js';
 import type { GatewaySocket } from './gateway.js';
 import { GatewayBudget, Health } from './health.js';
+import { typingActivity } from './activity.js';
+import { typingHints } from './typing.js';
 import { PORTS, receivers } from './http.js';
 import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
@@ -65,6 +67,7 @@ export interface PublisherDeps {
   heartbeatEveryMs?: number;
   reconcileEveryMs?: number;
   stopTimeoutMs?: number;
+  drainMs?: number;
   registerDelaysMs?: readonly number[];
   recoveryBackoff?: (attempt: number) => number;
   identifySpacingMs?: number;
@@ -104,7 +107,9 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   // Argo CD 앱 상태도 Kubernetes API의 Application CR로 읽는다(D9). argocd-server(자체 서명 TLS)에는 닿지 않는다.
   const reader = new ReadAdapter([...SERVICES], [...TEMPLATES], gate, routedTransport({ kubernetes, argocd: kubernetes,
     victoriametrics: grafana, victorialogs: grafana }), now);
-  const runtime = new Runtime(store, gate, new HttpWorker(config.workerUrl, send), new WorkerSigner(config.workerKey, now), reader);
+  // stop 신호가 곧 runtime의 종료 신호다. 새 claim을 멈추고 실행 중 작업의 드레인·취소 확인을 바로 시작한다.
+  const runtime = new Runtime(store, gate, new HttpWorker(config.workerUrl, send), new WorkerSigner(config.workerKey, now), reader,
+    undefined, { shutdown: stop.signal, drainMs: deps.drainMs });
   const github = new GitHubIngress(config.githubWebhookSecret, store, new ReviewOff(gate), new ReviewQueue(store, closedReader), closedReader);
   const servers = receivers(health, new AlertIngress(store, gate), { github: githubWebhook(github) });
   let ports: { app: number; alerts: number };
@@ -125,6 +130,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   let runtimeStarted = false;
   const background = new Set<Promise<void>>();
   const track = (task: Promise<void>) => { background.add(task); void task.finally(() => background.delete(task)); };
+  const typingHint = typingHints(store, gate, log, track, { shutdown: stop.signal });
   const loops: Promise<void>[] = [];
   // alive: 이 루프의 한 바퀴가 성공했다는 것이 DB에 닿았다는 증거인지. 하트비트 조건(조율 루프가 최근 60초 안에 돎)은
   // 그런 루프로만 잰다. runtime(store.expire)·publisher(claimDelivery)는 늘 DB를 거친다. 복구 루프는 대기 항목이 없으면
@@ -185,6 +191,8 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     connect: deps.connect,
     allowUrl: deps.allowGatewayUrl,
     dispatch: async (type, data) => {
+      // 입력 중 힌트. 기다리지 않고(뒤 이벤트를 막지 않게) 백그라운드로 돌린다. 오류를 스스로 삼키므로 guard로 가지 않는다.
+      if (type === 'TYPING_START') { typingHint(data); return; }
       if (!discord || (type !== 'MESSAGE_CREATE' && type !== 'INTERACTION_CREATE')) return;
       try { await protocol!.gateway(type, data, discord.ingress); }
       catch (error) {
@@ -209,15 +217,22 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
           return publisher.deliver();
         });
         loop('recovery', () => recovery.runDue(), false);
+        loop('typing', typingActivity(store, gate, api, log, stop.signal), false);
       }
       await barrier();
       // 작업 claim은 첫 장벽이 선 뒤에 시작한다. 재시작 때 남은 queued 작업이 중단 중 메시지를 history로 복구하기 전에
       // 이전 입력으로 모델을 부르지 않게 한다(PR #12 재리뷰 4420612638). 이후 READY의 장벽은 claim의 gap 조건이 막는다.
-      if (!runtimeStarted && !stop.signal.aborted) { runtimeStarted = true; loop('runtime', () => runtime.tick()); }
+      // read는 모델 응답을 기다리지 않게 따로 돈다. 늘 DB를 거치므로 생존 근거다.
+      if (!runtimeStarted && !stop.signal.aborted) {
+        runtimeStarted = true;
+        loop('runtime', () => runtime.tick());
+        loop('read', () => runtime.tickRead());
+      }
       // 명령 등록과 history 대조 자체는 이벤트 처리 순서 밖에서 돈다(대조가 30초까지 걸려도 상호작용 ACK가 밀리지 않게).
       track(register(ready.applicationId));
     },
   });
+  health.watchGateway(() => gateway.state);
   const heartbeat = setInterval(() => { health.heartbeat().catch(error => log('heartbeat_failed', errorInfo(error))); },
     deps.heartbeatEveryMs ?? 10_000);
   gateway.start();
@@ -225,14 +240,17 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
 
   let stopped: Promise<void> | undefined;
   return { health, gateway, ports, stop: () => stopped ??= (async () => {
-    const limit = deps.stopTimeoutMs ?? 20_000;
+    // 전체 종료 기한 하나(기본 20초, kubelet 유예 30초 안). 단계별 대기를 차례로 더하지 않고 남은 시간을 나눈다.
+    // 최악: Gateway 정리(≤4초)·수신 서버(≤5초)는 runtime의 드레인(10초)+cancel(5초)과 동시에 돌아 기한 안에 끝난다.
+    const deadline = Date.now() + (deps.stopTimeoutMs ?? 20_000);
+    const left = () => Math.max(0, deadline - Date.now());
     stop.abort();
     clearInterval(heartbeat);
-    await gateway.stop();
-    await Promise.all([closeServer(servers.app, Math.min(5000, limit)), closeServer(servers.alerts, Math.min(5000, limit))]);
-    // 진행 중인 작업 한 바퀴는 끝까지 기다린다(상한 안에서). 넘으면 lease 만료가 unknown으로 남긴다.
-    await Promise.race([Promise.all([...loops, ...background]), sleep(limit)]);
-    await kubernetes.close();
+    await Promise.all([gateway.stop(Math.min(2000, left())),
+      closeServer(servers.app, Math.min(5000, left())), closeServer(servers.alerts, Math.min(5000, left()))]);
+    // 진행 중인 한 바퀴(드레인·취소 확인 포함)는 기한까지 기다린다. 넘으면 lease 만료가 unknown으로 남긴다.
+    await Promise.race([Promise.all([...loops, ...background]), sleep(left())]);
+    await Promise.race([kubernetes.close(), sleep(1000)]);
     log('publisher_stopped');
   })() };
 }
@@ -269,7 +287,8 @@ async function main(): Promise<void> {
     if (shutting) return;
     shutting = true;
     log('shutdown', { signal });
-    void publisher.stop().finally(async () => { await pool.end().catch(() => {}); process.exit(0); });
+    // 기한을 넘긴 작업이 연결을 쥐고 있으면 pool.end()가 끝나지 않는다. 오래 기다리지 않는다.
+    void publisher.stop().finally(async () => { await Promise.race([pool.end().catch(() => {}), sleep(2000)]); process.exit(0); });
   };
   process.once('SIGTERM', () => shutdown('SIGTERM'));
   process.once('SIGINT', () => shutdown('SIGINT'));

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { AlertIngress } from '../src/alerts.js';
-import { Denied } from '../src/contracts.js';
+import { DEFAULTS, Denied } from '../src/contracts.js';
 import { DiscordIngress } from '../src/discord.js';
 import { DiscordProtocol } from '../src/discord-protocol.js';
 import { ReadAdapter } from '../src/read.js';
@@ -86,7 +86,7 @@ for (const seconds of [1, 15, 60, 120]) test(`4314491278 템플릿 ${seconds}초
     requests.push(request); return new TextEncoder().encode(JSON.stringify({ observedAt: request.to, rows: [{ status: 'healthy' }] }));
   } }, f.now);
   await f.ingress.receive(event('read', { kind: 'command', command: 'read', target: service.id, text: template.id }));
-  await new Runtime(f.store, f.gate, f.worker, f.signer, reader).tick();
+  await new Runtime(f.store, f.gate, f.worker, f.signer, reader).tickRead();
   assert.equal((await rows('jobs'))[0]!.state, 'succeeded'); assert.equal(f.requests.length, 0); assert.equal(requests.length, 1);
   const window = { from: f.now() - Math.min(60, seconds) * 1000, to: f.now() };
   assert.deepEqual((await rows('results'))[0]!.result.window, window);
@@ -111,13 +111,13 @@ test('4314491292 task A의 맥락은 같은 시각에 수락한 후속 task B를
   assert.deepEqual(texts(f.requests[1]!.untrusted), ['작업 A', '작업 B']);
 });
 test('4314491292 chat claim 뒤 맥락 조회 전에 들어온 이벤트도 제외', async () => {
-  await f.ingress.receive(event('A', { text: '응답 A' })); f.advance(800);
+  await f.ingress.receive(event('A', { text: '응답 A' })); f.advance(DEFAULTS.debounceMs + 50);
   const context = f.store.context.bind(f.store); let arrived = false;
   f.store.context = async (...args) => {
     if (!arrived) { arrived = true; await f.ingress.receive(event('B', { text: '응답 B' })); }
     return context(...args);
   };
-  await f.runtime.tick(); f.advance(800); await f.runtime.tick();
+  await f.runtime.tick(); f.advance(DEFAULTS.debounceMs + 50); await f.runtime.tick();
   assert.deepEqual(texts(f.requests[0]!.untrusted), ['응답 A']);
   assert.deepEqual(texts(f.requests[1]!.untrusted), ['응답 A', '응답 B']);
 });

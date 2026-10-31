@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { DEFAULTS, PolicyUnavailable, RateLimited } from '../src/contracts.js';
+import { MODEL_QUEUE_LIMIT } from '../src/store.js';
 import { DiscordIngress, DiscordPublisher } from '../src/discord.js';
 import { discordHttpApi } from '../src/discord-protocol.js';
 import { AlertIngress } from '../src/alerts.js';
@@ -21,7 +22,7 @@ beforeEach(async () => {
 });
 after(async () => { await database.pg.close(); });
 async function rows(table: string) { return (await database.db.query<Record<string, any>>(`SELECT * FROM ${table}`)).rows; }
-async function queue(id = 'first') { await f.ingress.receive(event(id)); f.advance(800); }
+async function queue(id = 'first') { await f.ingress.receive(event(id)); f.advance(DEFAULTS.debounceMs + 50); }
 async function enqueue(key = 'delivery', content = '확인된 요약') {
   await f.store.enqueue({ key, actor: f.policy.owner, scope: thread, revision: f.policy.revision,
     payload: { kind: 'message', channel: thread.channel, content, classification: 'safe_summary' } });
@@ -140,13 +141,13 @@ test('4314215638 기존 페이지·read migration을 두 번 실행해도 순서
 });
 
 for (const lane of ['chat', 'read']) test(`4314215647 복구 gap 중 ${lane} 완료 결과 보존, gap 해제 후 게시`, async () => {
-  await f.ingress.receive(event(lane, lane === 'read' ? { kind: 'command', command: 'read', target: service.id, text: template.id } : {})); f.advance(800);
+  await f.ingress.receive(event(lane, lane === 'read' ? { kind: 'command', command: 'read', target: service.id, text: template.id } : {})); f.advance(DEFAULTS.debounceMs + 50);
   const setGap = () => database.db.query('UPDATE conversations SET gap=true');
   f.setRun(async () => { await setGap(); return { status: 'succeeded', stopped: true, answer: { facts: [], hypotheses: [], unknowns: [], checks: [] } }; });
   const reader = new ReadAdapter([service], [template], f.gate, { query: async () => {
     await setGap(); return new TextEncoder().encode(JSON.stringify({ observedAt: f.now(), rows: [{ status: 'healthy' }] }));
   } }, f.now);
-  await new Runtime(f.store, f.gate, f.worker, f.signer, reader).tick();
+  const runtime = new Runtime(f.store, f.gate, f.worker, f.signer, reader); await (lane === 'read' ? runtime.tickRead() : runtime.tick());
   assert.equal((await rows('jobs'))[0]!.state, 'succeeded'); assert.equal((await rows('results')).length, 1);
   await f.publisher.deliver(); assert.equal(f.rest.messages.length, 0);
   const delivery = (await rows('outbox'))[0]!; assert.equal(delivery.state, 'pending'); assert.equal(delivery.pause_reason, 'history_gap'); assert.equal(delivery.attempt, 0);
@@ -198,14 +199,14 @@ for (const scope of [thread, { guild: null, channel: 'fixture-dm', parent: null,
     await f.ingress.receive(event('chat-1', { scope })); await f.ingress.receive(event('chat-2', { scope }));
     const jobs = await rows('jobs'); assert.equal(jobs.filter(j => j.type === 'read' && j.state === 'queued').length, 2);
     assert.equal(jobs.filter(j => j.state === 'superseded').length, 1);
-    await f.runtime.tick(); await f.runtime.tick(); assert.equal(f.queries.length, 2); assert.equal(f.requests.length, 0);
-    f.advance(800); await f.runtime.tick(); assert.equal(f.requests.length, 1);
+    await f.runtime.tickRead(); await f.runtime.tickRead(); assert.equal(f.queries.length, 2); assert.equal(f.requests.length, 0);
+    f.advance(DEFAULTS.debounceMs + 50); await f.runtime.tick(); assert.equal(f.requests.length, 1);
   });
 }
 test('4314215667 부모 채널 read도 thread 확정 뒤 즉시 실행 가능한 read 유형', async () => {
   await f.ingress.receive(event('parent-read', { scope: parent, kind: 'command', command: 'read', target: service.id, text: template.id }));
   await f.publisher.deliver(); const job = (await rows('jobs'))[0]!;
-  assert.equal(job.type, 'read'); assert.equal(Number(job.available_at), f.now()); await f.runtime.tick(); assert.equal(f.queries.length, 1);
+  assert.equal(job.type, 'read'); assert.equal(Number(job.available_at), f.now()); await f.runtime.tickRead(); assert.equal(f.queries.length, 1);
 });
 
 for (const route of ['chat', 'thread', 'control']) test(`4314215673 save 직후 종료된 ${route} 미수락 inbox를 동시 재전달해도 한 번 라우팅`, async () => {
@@ -232,7 +233,7 @@ test('4314215673 route rollback 뒤 history 복구는 job 저장 후 checkpoint 
   f.rest.pages = [[event('300')]]; await f.ingress.recover(thread, f.policy.owner);
   assert.equal((await rows('jobs')).length, 1); assert.equal((await rows('events'))[0]!.accepted, true);
   assert.equal((await f.store.conversation(thread))!.checkpoint, '300'); assert.equal((await f.store.conversation(thread))!.gap, false);
-  f.advance(800); await f.runtime.tick(); assert.equal(f.requests.length, 1);
+  f.advance(DEFAULTS.debounceMs + 50); await f.runtime.tick(); assert.equal(f.requests.length, 1);
 });
 test('4314215673 미수락 재전달은 저장된 명령을 사용하고 다른 actor는 거부', async () => {
   const original = event('durable', { kind: 'command', command: 'read', target: service.id, text: template.id });
@@ -243,12 +244,12 @@ test('4314215673 미수락 재전달은 저장된 명령을 사용하고 다른 
 });
 test('4314215673 기존 job 재수락은 queue full에서도 기존 ID 반환·다른 chat 유지', async () => {
   await queue(); const original = (await rows('jobs'))[0]!;
-  for (let i = 0; i < 99; i++) {
+  for (let i = 0; i < MODEL_QUEUE_LIMIT - 1; i++) {
     const saved = await f.store.save(event(`task-${i}`, { kind: 'command', command: 'task' }), f.policy.revision, true);
     await f.store.accept(saved.id, 'task', f.policy.revision);
   }
   assert.equal(await f.store.accept(original.event_id, 'chat', f.policy.revision), original.id);
-  assert.equal((await rows('jobs')).filter(j => j.state === 'queued').length, 100);
+  assert.equal((await rows('jobs')).filter(j => j.state === 'queued').length, MODEL_QUEUE_LIMIT);
 });
 
 test('4314215604 기존 스레드 요약도 blocked 뒤 같은 fingerprint를 새 세대로 전달', async () => {
@@ -277,15 +278,16 @@ test('4314215638 중간 페이지 enqueue 실패는 논리 메시지 전체 roll
   try { await assert.rejects(enqueue('atomic', '내용'.repeat(2000)), /page_write_failed/); } finally { database.db.transaction = transaction; }
   assert.equal((await rows('outbox')).length, 0);
 });
-test('4314215667 모델 실행 중 연속 read도 완료 뒤 둘 다 관측', async () => {
+// impl-sched S1: read 레인 분리 뒤에는 모델 실행이 끝나기 전에 두 read가 모두 끝난다.
+test('4314215667 모델 실행 중 연속 read도 둘 다 관측(read 레인 분리)', async () => {
   await queue(); let ready!: () => void; let release!: () => void;
   const started = new Promise<void>(resolve => { ready = resolve; });
   const held = new Promise<void>(resolve => { release = resolve; });
   f.setRun(async () => { ready(); await held; return { status: 'succeeded', stopped: true, answer: { facts: [], hypotheses: [], unknowns: [], checks: [] } }; });
   const running = f.runtime.tick(); await started;
   for (const id of ['busy-read-1', 'busy-read-2']) await f.ingress.receive(event(id, { kind: 'command', command: 'read', target: service.id, text: template.id }));
-  assert.equal(await f.runtime.tick(), false); release(); await running;
-  await f.runtime.tick(); await f.runtime.tick(); assert.equal(f.queries.length, 2);
+  assert.equal(await f.runtime.tickRead(), true); assert.equal(await f.runtime.tickRead(), true);
+  assert.equal(f.queries.length, 2); release(); await running;
   assert.ok((await rows('jobs')).every(job => job.state === 'succeeded'));
 });
 

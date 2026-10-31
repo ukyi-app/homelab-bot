@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { Denied, DiscordRejected, DiscordUnauthorized, RateLimited } from './contracts.js';
 import type { Clock, EventInput } from './contracts.js';
 import { gatewayMessage, hasMarker } from './discord.js';
-import type { DiscordIngress, DiscordRest, GatewayFrame } from './discord.js';
+import type { AckOutcome, DiscordIngress, DiscordRest, GatewayFrame } from './discord.js';
 
 export interface DiscordApi {
   request(method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown, options?: { expiresAt: number }): Promise<unknown>;
@@ -19,6 +19,7 @@ const InteractionSchema = z.object({ id: z.string(), token: z.string(), type: z.
     options: z.array(z.object({ name: z.string(), value: z.string() })).optional() }),
 });
 const part = encodeURIComponent;
+const RECEIVED = '👀';
 export class DiscordProtocol implements DiscordRest {
   private readonly interactions = new Map<string, { token: string; expires: number }>();
   constructor(private readonly api: DiscordApi, private readonly botId: string, private readonly now: Clock = Date.now) {}
@@ -51,14 +52,26 @@ export class DiscordProtocol implements DiscordRest {
     this.interactions.set(input.id, { token: interaction.token, expires: receivedAt + 2500 });
     try { await ingress.receive(input); } finally { this.interactions.delete(input.id); }
   }
-  async acknowledge(event: EventInput, content: string, options: Parameters<DiscordRest['acknowledge']>[2]): Promise<void> {
+  async acknowledge(event: EventInput, content: string, options: Parameters<DiscordRest['acknowledge']>[2]): Promise<AckOutcome | void> {
     if (event.kind !== 'message') {
       const interaction = this.interactions.get(event.id);
       if (!interaction || this.now() >= interaction.expires) throw new Error('interaction_expired');
       await this.api.request('POST', `/interactions/${part(event.id)}/${part(interaction.token)}/callback`,
         { type: 4, data: { content, flags: 64, ...options } }, { expiresAt: interaction.expires });
-    } else await this.api.request('POST', `/channels/${part(event.scope.channel)}/messages`,
-      { content, nonce: event.id, enforce_nonce: true, ...options });
+      return;
+    }
+    // 일반 메시지는 원문에 👀만 단다. 텍스트 ACK는 대화를 덮는다. 같은 봇·메시지·emoji의 PUT은 다시 해도 하나다.
+    try {
+      await this.api.request('PUT', `/channels/${part(event.scope.channel)}/messages/${part(event.id)}/reactions/${part(RECEIVED)}/@me`);
+      return;
+    } catch (error) {
+      // 403/404는 채널에 Add Reactions·Read Message History가 없거나 원문이 지워진 경우다. 수신 신호가 아예 없지 않게
+      // 기존 텍스트 ACK로 한 번만 대체한다. 429·일시 오류는 그대로 던져 호출자가 rate limit을 기록하게 한다.
+      if (!(error instanceof DiscordRejected) || error.status === 400) throw error;
+      await this.api.request('POST', `/channels/${part(event.scope.channel)}/messages`,
+        { content, nonce: event.id, enforce_nonce: true, ...options });
+      return { fallback: error.status };
+    }
   }
   async createThread(channel: string, body: Parameters<DiscordRest['createThread']>[1]) {
     return IdSchema.parse(await this.api.request('POST', `/channels/${part(channel)}/threads`, body));

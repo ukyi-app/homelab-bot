@@ -8,7 +8,7 @@ import { DiscordProtocol } from '../src/discord-protocol.js';
 import type { PolicyGate } from '../src/policy.js';
 import { ReadAdapter } from '../src/read.js';
 import type { ReadTransport } from '../src/read.js';
-import { Store } from '../src/store.js';
+import { MODEL_QUEUE_LIMIT, Store } from '../src/store.js';
 import type { Delivery } from '../src/store.js';
 import { event, fixture, localDatabase, service, template, thread } from './helpers.js';
 
@@ -50,7 +50,8 @@ test('4316750293 짧은 제어 결과 JSON도 그대로 파싱, 일반 문장은
   const control = f.rest.messages.find(message => message.body.content.startsWith('{'))!;
   const parsed = JSON.parse(control.body.content) as { ref: string; data: { paused: boolean } };
   assert.equal(parsed.ref, control.body.nonce); assert.equal(parsed.data.paused, false);
-  const answer = f.rest.messages.find(message => message.body.content.startsWith('사실:'))!;
+  // 대화 답은 빈 섹션을 생략한다(개선안 v2 C1). fixture 답은 미확인 한 항목뿐이다.
+  const answer = f.rest.messages.find(message => message.body.content.startsWith('미확인:'))!;
   assert.ok(answer.body.content.endsWith(`\n[ref:${answer.body.nonce}]`));
 });
 test('4316750293 실제 Protocol 대조는 JSON 본문의 marker 필드로 찾고 다른 작성자·다른 marker는 무시', async () => {
@@ -118,18 +119,15 @@ test('4316750315 검색 오류도 backoff, 간격은 상한에서 멈추고 unkn
   assert.equal(f.rest.messages.length, 0);
 });
 
-test('4316750301 모델 응답 섹션은 완결 항목만 싣고 생략 건수를 표시', async () => {
+// 개선안 v2 C1: 섹션 예산으로 항목을 버리던 방식을 바꿔 모든 항목을 완결 그대로 싣고 빈 섹션은 생략한다.
+test('4316750301 모델 응답 섹션은 완결 항목을 모두 싣고 빈 섹션은 생략', async () => {
   const unknowns = Array.from({ length: 8 }, (_, i) => `미확인 항목 ${i} ${'가'.repeat(80)}`);
   f.setRun(async () => ({ status: 'succeeded', stopped: true, answer: { facts: [], hypotheses: [], unknowns, checks: ['짧은 확인'] } }));
   await queue(); await f.runtime.tick(); await f.publisher.deliver();
   const content = f.rest.messages[0]!.body.content;
-  const line = content.split('\n').find(l => l.startsWith('미확인: '))!;
-  const match = /^미확인: (.*) \((\d+)개 생략\)$/.exec(line);
-  assert.ok(match, line);
-  const shown = match[1]!.split('; ');
-  assert.ok(shown.length >= 1); assert.deepEqual(shown, unknowns.slice(0, shown.length));
-  assert.equal(shown.length + Number(match[2]), unknowns.length);
-  assert.match(content, /^사실: 없음$/m); assert.match(content, /^권장 확인: 짧은 확인$/m);
+  const lines = content.split('\n');
+  assert.deepEqual(lines.slice(lines.indexOf('미확인:') + 1, lines.indexOf('미확인:') + 1 + unknowns.length), unknowns.map(u => `- ${u}`));
+  assert.doesNotMatch(content, /생략|^사실:|없음/m); assert.match(content, /^권장 확인:\n- 짧은 확인$/m);
   assert.deepEqual((await rows('results'))[0]!.result.unknowns, unknowns);
 });
 
@@ -167,17 +165,17 @@ test('4316750328 제때 끝난 read는 signal을 abort하지 않음', async () =
 test('4316750325 /retry도 scheduler 잠금 아래 queued 상한을 지키고 실패 작업은 그대로', async () => {
   await queue(); const job = (await rows('jobs'))[0]!; const conversation = f.store.scopeId(thread);
   await database.db.query("UPDATE jobs SET state='failed',attempt=1");
-  for (let i = 0; i < DEFAULTS.maxQueue; i++) {
+  for (let i = 0; i < MODEL_QUEUE_LIMIT; i++) {
     const saved = await f.store.save(event(`queue-${i}`, { kind: 'command', command: 'task' }), f.policy.revision, false);
     await f.store.accept(saved.id, 'task', f.policy.revision);
   }
   const retry = () => f.store.control(f.policy.owner, conversation, 'retry', job.id) as Promise<{ ok?: boolean; status: string }>;
   const full = await retry();
   assert.equal(full.ok, false); assert.match(full.status, /대기열이 가득/);
-  assert.equal((await rows('jobs')).find(j => j.id === job.id)!.state, 'failed'); assert.equal(await queued(), DEFAULTS.maxQueue);
+  assert.equal((await rows('jobs')).find(j => j.id === job.id)!.state, 'failed'); assert.equal(await queued(), MODEL_QUEUE_LIMIT);
   await database.db.query("UPDATE jobs SET state='cancelled' WHERE id=(SELECT id FROM jobs WHERE state='queued' ORDER BY created_at LIMIT 1)");
   assert.notEqual((await retry()).ok, false);
-  assert.equal((await rows('jobs')).find(j => j.id === job.id)!.state, 'queued'); assert.equal(await queued(), DEFAULTS.maxQueue);
+  assert.equal((await rows('jobs')).find(j => j.id === job.id)!.state, 'queued'); assert.equal(await queued(), MODEL_QUEUE_LIMIT);
 });
 
 // PGlite는 연결이 하나라 행 잠금 대기(교착)를 재현할 수 없다. 트랜잭션마다 잠금을 잡는 문장의 순서를 기록해

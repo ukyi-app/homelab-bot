@@ -5,7 +5,7 @@ import pg from 'pg';
 import { DEFAULTS } from '../src/contracts.js';
 import { Postgres, migrate } from '../src/database.js';
 import type { Database } from '../src/database.js';
-import { Store } from '../src/store.js';
+import { MODEL_QUEUE_LIMIT, Store } from '../src/store.js';
 import type { Scope } from '../src/contracts.js';
 import { event, fixture, thread } from './helpers.js';
 
@@ -83,7 +83,7 @@ test('4316750325 실제 PostgreSQL: 서로 다른 대화의 동시 /retry도 que
       failed.push(await f.store.accept(saved.id, 'task', f.policy.revision));
     }
     await db.query("UPDATE jobs SET state='failed',attempt=1");
-    for (let i = 0; i < DEFAULTS.maxQueue - 1; i++) {
+    for (let i = 0; i < MODEL_QUEUE_LIMIT - 1; i++) {
       const saved = await f.store.save(event(`pg-queue-${i}`, { kind: 'command', command: 'task' }), f.policy.revision, false);
       await f.store.accept(saved.id, 'task', f.policy.revision);
     }
@@ -97,6 +97,6 @@ test('4316750325 실제 PostgreSQL: 서로 다른 대화의 동시 /retry도 que
     const results = await Promise.all([first, second]);
     assert.deepEqual(results.map(r => r.ok !== false), [true, false]);
     const queued = (await db.query<{ count: string }>("SELECT count(*) FROM jobs WHERE state='queued'")).rows[0]!;
-    assert.equal(Number(queued.count), DEFAULTS.maxQueue);
+    assert.equal(Number(queued.count), MODEL_QUEUE_LIMIT);
   } finally { await close(); }
 });

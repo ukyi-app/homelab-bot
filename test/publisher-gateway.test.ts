@@ -42,14 +42,16 @@ function start(overrides: Partial<GatewayOptions> = {}) {
 }
 const ready = async () => until(() => gw.connections.some(c => c.received.some(p => p.op === 2)));
 
-test('EVENT-03 Gateway: HELLO 뒤 IDENTIFY(intents 33281, DM 끔)·heartbeat·READY, 이벤트는 받은 순서대로 처리기에', async () => {
+test('EVENT-03 Gateway: HELLO 뒤 IDENTIFY(intents 35329 = 33281 + 입력 중 2048, DM 끔)·heartbeat·READY, 이벤트는 받은 순서대로 처리기에', async () => {
   const record = start();
   await ready();
   const connection = gw.latest;
   assert.equal(connection.query.get('v'), '10'); assert.equal(connection.query.get('encoding'), 'json');
   const identify = connection.received.find(p => p.op === 2)!.d as { token: string; intents: number };
-  assert.equal(identify.token, 'fixture-token'); assert.equal(identify.intents, GATEWAY_INTENTS); assert.equal(GATEWAY_INTENTS, 1 | 512 | 32768);
-  assert.equal(GATEWAY_INTENTS & 4096, 0);
+  assert.equal(identify.token, 'fixture-token'); assert.equal(identify.intents, GATEWAY_INTENTS); assert.equal(GATEWAY_INTENTS, 1 | 512 | 2048 | 32768);
+  assert.equal(GATEWAY_INTENTS, 35329);
+  // DM(4096·8192·16384)과 리액션(1024)은 켜지 않는다.
+  assert.equal(GATEWAY_INTENTS & (1024 | 4096 | 8192 | 16384), 0);
   await until(() => record.readies.length === 1);
   assert.deepEqual(record.readies, [{ applicationId: 'fixture-app', userId: 'fixture-bot' }]);
   assert.deepEqual(record.health, [true]); assert.equal(record.identifies, 1);

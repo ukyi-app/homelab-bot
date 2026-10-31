@@ -91,7 +91,8 @@ for (const status of ['limited', 'auth_expired'] as const) test(`R7-AUDIT ${stat
   finished.resolve({ status, stopped: true }); release.resolve(); await running;
   const job = (await rows('jobs'))[0]!;
   assert.equal(job.state, 'waiting_user'); assert.equal(job.wait_reason, status === 'limited' ? 'model_limit' : 'auth_expired');
-  assert.equal((await rows('outbox')).length, 0); assert.equal((await rows('controls')).find(c => c.key === 'scheduler')!.value, true);
+  // impl-sched S4: waiting_user 안내(waiting:<job>:<attempt>)는 제외하고 센다.
+  assert.equal((await rows('outbox')).filter(o => !/^(waiting|unknown):/.test(o.idempotency_key)).length, 0); assert.equal((await rows('controls')).find(c => c.key === 'scheduler')!.value, true);
 });
 test('4315477925 완료와 교차한 진행 중 monitor의 Denied도 종결 전에 반영', async t => {
   t.mock.timers.enable({ apis: ['setInterval'] }); await queue();
@@ -117,7 +118,7 @@ for (const stopped of [true, false]) test(`R7-AUDIT 일반 monitor DB 오류는 
   const running = f.runtime.tick(); await started.promise; t.mock.timers.tick(1000); await running;
   const job = (await rows('jobs'))[0]!;
   assert.equal(job.state, stopped ? 'failed' : 'unknown'); assert.equal(job.wait_reason, 'stop_confirmation');
-  assert.equal((await rows('outbox')).length, stopped ? 1 : 0);
+  assert.equal((await rows('outbox')).filter(o => !/^(waiting|unknown):/.test(o.idempotency_key)).length, stopped ? 1 : 0);
 });
 test('R7-AUDIT 조회 중 서비스 철회도 일반 실패가 아닌 취소로 전파', async () => {
   await f.ingress.receive(event('read', { kind: 'command', command: 'read', target: service.id, text: template.id }));
@@ -126,7 +127,7 @@ test('R7-AUDIT 조회 중 서비스 철회도 일반 실패가 아닌 취소로 
     queries++; f.policy.services = [];
     return new TextEncoder().encode(JSON.stringify({ observedAt: f.now(), rows: [{ status: 'healthy' }] }));
   } }, f.now);
-  await new Runtime(f.store, f.gate, f.worker, f.signer, reader).tick();
+  await new Runtime(f.store, f.gate, f.worker, f.signer, reader).tickRead();
   await assertRevoked(true); assert.equal(queries, 1); assert.equal(f.requests.length, 0);
 });
 
@@ -137,7 +138,7 @@ for (const status of ['failed', 'limited', 'auth_expired'] as const) test(`R7-AU
   await f.runtime.tick(); const job = (await rows('jobs'))[0]!;
   assert.equal(job.state, status === 'failed' ? 'failed' : 'waiting_user');
   assert.equal(job.wait_reason, status === 'failed' ? 'model_failed' : status === 'limited' ? 'model_limit' : 'auth_expired');
-  assert.equal((await rows('outbox')).length, status === 'failed' ? 1 : 0);
+  assert.equal((await rows('outbox')).filter(o => !/^(waiting|unknown):/.test(o.idempotency_key)).length, status === 'failed' ? 1 : 0);
 });
 for (const status of ['limited', 'auth_expired'] as const) for (const phase of ['authorization', 'state']) {
   test(`R7-AUDIT ${status} 확인 직후 ${phase} DB 오류도 재시도 가능한 실패를 만들지 않음`, async () => {

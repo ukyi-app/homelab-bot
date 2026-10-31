@@ -4,8 +4,9 @@ import type { IdentifySlot } from './health.js';
 import { errorInfo } from './log.js';
 
 // Discord Gateway v10 세션(JSON, 압축 없음). Node 24 내장 WebSocket을 쓴다(새 의존성 없음).
-// GUILDS(1) | GUILD_MESSAGES(512) | MESSAGE_CONTENT(32768). DM을 끄므로 DIRECT_MESSAGES는 뺀다(T16a 확정).
-export const GATEWAY_INTENTS = 33281;
+// GUILDS(1) | GUILD_MESSAGES(512) | GUILD_MESSAGE_TYPING(2048) | MESSAGE_CONTENT(32768). DM을 끄므로 DIRECT_MESSAGES는 뺀다(T16a 확정).
+// TYPING은 입력 중 디바운스 힌트용(개선안 v2 2-3)이다. 비특권 intent라 포털 설정 없이 IDENTIFY 비트만 바꾼다.
+export const GATEWAY_INTENTS = 35329;
 // 이 코드로 닫히면 다시 연결해도 같은 결과다(토큰·샤드·버전·intent 오류). 사람이 고칠 때까지 멈춘다.
 const FATAL_CLOSE = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
 // 세션이 무효라 RESUME할 수 없는 close 코드.

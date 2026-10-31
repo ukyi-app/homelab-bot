@@ -6,6 +6,7 @@ import type { Agent } from 'undici';
 import { AlertIngress } from '../src/alerts.js';
 import { DEFAULTS, Denied, RateLimited, WorkerRejected } from '../src/contracts.js';
 import type { Scope } from '../src/contracts.js';
+import { MODEL_QUEUE_LIMIT } from '../src/store.js';
 import { DiscordIngress, DiscordPublisher } from '../src/discord.js';
 import { discordHttpApi } from '../src/discord-protocol.js';
 import { Health } from '../src/health.js';
@@ -118,7 +119,7 @@ for (const scope of [thread, { kind: 'dm', channel: 'fixture-dm', guild: null, p
     await assert.rejects(f.ingress.recover(scope, f.policy.owner), Denied);
     const fresh = { ...scope, channel: 'fixture-fresh' };
     await f.ingress.receive(event('fresh', { actor: f.policy.owner, scope: fresh }));
-    f.advance(800); await f.runtime.tick(); await f.runtime.tick();
+    f.advance(DEFAULTS.debounceMs + 50); await f.runtime.tick(); await f.runtime.tick();
     assert.equal(f.requests.length, 1);
     assert.ok(!JSON.stringify(f.requests).includes('이전 owner 기록'));
   });
@@ -129,7 +130,7 @@ test('4314746177 직접 저장·오염된 context·실행 claim·control outbox�
   await assert.rejects(f.store.save(event('b', { actor: 'fixture-next-owner' }), f.policy.revision, true), Denied);
   await database.db.query('UPDATE events SET actor_id=$1', ['fixture-next-owner']);
   assert.deepEqual(await f.store.context(f.store.scopeId(thread), saved.id), []);
-  f.advance(800); assert.equal(await f.store.claim(), undefined);
+  f.advance(DEFAULTS.debounceMs + 50); assert.equal(await f.store.claim(), undefined);
   f.policy.owner = 'fixture-next-owner'; await enqueue('control-without-conversation');
   await f.publisher.deliver(); assert.equal((await rows('outbox'))[0]!.state, 'blocked'); assert.equal(f.rest.messages.length, 0);
 });
@@ -261,7 +262,7 @@ test('4314746229 일반 chat 교체에도 urgent 우선순위·즉시 실행 가
   const claimed = (await f.store.claim())!; assert.equal(claimed.id, jobs.find(j => j.priority === 0)!.id); assert.equal(Number(jobs.find(j => j.priority === 0)!.available_at), f.now());
 });
 for (const operation of ['execute', 'cancel'] as const) test(`4314746240 ${operation} 발급 미래 1000ms 허용·1001ms 거부, 만료·TTL·nonce 엄격 유지`, async () => {
-  await f.ingress.receive(event('100')); f.advance(800); const job = (await f.store.claim())!;
+  await f.ingress.receive(event('100')); f.advance(DEFAULTS.debounceMs + 50); const job = (await f.store.claim())!;
   const body = { job: job.id, lease: job.lease_token };
   const verifier = (offset: number) => new WorkerVerifier(f.keys.publicKey, async () => true, () => f.now() + offset);
   const token = f.signer.issue(job, operation, body);
@@ -278,7 +279,7 @@ for (const operation of ['execute', 'cancel'] as const) test(`4314746240 ${opera
 });
 
 for (const boundary of ['cancel', 'stop', 'gap', 'owner']) test(`R6-AUDIT context 읽은 뒤 ${boundary} 변경은 모델 호출 전 재확인`, async () => {
-  await f.ingress.receive(event('100')); f.advance(800);
+  await f.ingress.receive(event('100')); f.advance(DEFAULTS.debounceMs + 50);
   const context = f.store.context.bind(f.store);
   f.store.context = async (...args) => {
     const result = await context(...args);
@@ -292,7 +293,7 @@ for (const boundary of ['cancel', 'stop', 'gap', 'owner']) test(`R6-AUDIT contex
   assert.equal((await rows('jobs'))[0]!.state, boundary === 'gap' ? 'queued' : boundary === 'stop' ? 'superseded' : 'cancelled');
 });
 test('R6-AUDIT 직접 emergency-stop 두 번째 쓰기 실패는 scheduler도 rollback', async () => {
-  await f.ingress.receive(event('100')); f.advance(800); await f.store.claim();
+  await f.ingress.receive(event('100')); f.advance(DEFAULTS.debounceMs + 50); await f.store.claim();
   await failTransaction(sql => sql.includes("UPDATE jobs SET state='cancel_requested' WHERE state IN ('running','verifying')"),
     () => f.store.control(f.policy.owner, f.store.scopeId(thread), 'emergency-stop'));
   assert.equal((await rows('controls')).find(c => c.key === 'scheduler')!.value, false);
@@ -307,7 +308,7 @@ test('R6-AUDIT thread 생성 중 owner 교체는 후속 대화·job 없이 unkno
   await f.publisher.reconcile(); assert.equal((await rows('outbox'))[0]!.state, 'blocked'); assert.equal(f.rest.threads.length, 1);
 });
 test('R6-AUDIT HttpWorker transport 구성 실패는 미시작, 정리 실패는 확인된 결과 보존', async () => {
-  await f.ingress.receive(event('100')); f.advance(800); const job = (await f.store.claim())!;
+  await f.ingress.receive(event('100')); f.advance(DEFAULTS.debounceMs + 50); const job = (await f.store.claim())!;
   const request = workerRequest(job, []); let calls = 0;
   const send: typeof fetch = async () => { calls++; return Response.json({ status: 'failed', stopped: true }); };
   const broken = new HttpWorker('http://fixture-worker', send, () => { throw new Error('setup_failed'); });
@@ -338,7 +339,7 @@ test('R6-AUDIT migration 007은 기존 sending을 보수적으로 이관하고 �
 for (const failure of ['queue_full', 'inbox_deadline']) test(`4314746194 ${failure}도 재활성화 부분 커밋 없음`, async () => {
   await f.ingress.receive(event('100')); await f.store.control(f.policy.owner, f.store.scopeId(thread), 'stop');
   if (failure === 'queue_full') {
-    for (let i = 0; i < DEFAULTS.maxQueue - 1; i++) {
+    for (let i = 0; i < MODEL_QUEUE_LIMIT - 1; i++) {
       const saved = await f.store.save(event(`queued-${i}`, { kind: 'command', command: 'task' }), f.policy.revision, false);
       await f.store.accept(saved.id, 'task', f.policy.revision);
     }
@@ -356,7 +357,7 @@ for (const failure of ['queue_full', 'inbox_deadline']) test(`4314746194 ${failu
   assert.equal(f.rest.acks.length, 1);
 });
 test('R6-AUDIT 결과 저장 직전 stop은 완료 결과·게시를 함께 억제', async () => {
-  await f.ingress.receive(event('100')); f.advance(800);
+  await f.ingress.receive(event('100')); f.advance(DEFAULTS.debounceMs + 50);
   const finish = f.store.finish.bind(f.store);
   f.store.finish = async (...args) => { await f.store.control(f.policy.owner, f.store.scopeId(thread), 'stop'); return finish(...args); };
   await f.runtime.tick(); assert.equal(f.requests.length, 1);
