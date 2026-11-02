@@ -235,3 +235,58 @@ test('EVENT-03 stop()은 타이머를 정리하고 1000으로 닫은 뒤 다시 
   assert.equal(gw.connections.length, 1); assert.deepEqual(record.health, [true, false]);
   session = undefined;
 });
+
+// 패킷이 버려지는 망(nft DROP) 흉내: close()를 불러도 'close'·'error'를 내지 않는 소켓. 시험이 직접 이벤트를 넣는다.
+class SilentSocket {
+  readonly sent: { op: number; d?: unknown }[] = [];
+  readonly closes: (number | undefined)[] = [];
+  private listeners = new Map<string, ((event: { data?: unknown; code?: number }) => void)[]>();
+  constructor(readonly url: string, private readonly reply: (socket: SilentSocket, payload: { op: number; d?: unknown }) => void) {}
+  send(data: string): void { const payload = JSON.parse(data) as { op: number; d?: unknown }; this.sent.push(payload); this.reply(this, payload); }
+  close(code?: number): void { this.closes.push(code); }
+  addEventListener(type: string, listener: (event: { data?: unknown; code?: number }) => void): void {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+  emit(type: string, event: { data?: unknown; code?: number } = {}): void { for (const listener of this.listeners.get(type) ?? []) listener(event); }
+  message(payload: unknown): void { this.emit('message', { data: JSON.stringify(payload) }); }
+}
+
+test('S16 EVENT-03 heartbeat ACK 누락이면 close 응답을 기다리지 않고 즉시 끊김 처리·재시도·새 소켓, 버린 소켓의 늦은 이벤트는 무시', async () => {
+  const timeline: string[] = [];
+  const sockets: SilentSocket[] = [];
+  // 첫 소켓은 ACK를 주지 않는다(좀비). 둘째 소켓은 ACK를 주고 RESUME에 RESUMED로 답한다.
+  const reply = (socket: SilentSocket, payload: { op: number; d?: unknown }) => queueMicrotask(() => {
+    if (payload.op === 2) socket.message({ op: 0, s: 1, t: 'READY', d: { session_id: 'session-1', resume_gateway_url: 'ws://127.0.0.1/resume',
+      user: { id: 'fixture-bot' }, application: { id: 'fixture-app' } } });
+    if (payload.op === 1 && socket !== sockets[0]) socket.message({ op: 11 });
+    if (payload.op === 6) socket.message({ op: 0, s: 2, t: 'RESUMED', d: {} });
+  });
+  const record = start({
+    connect: url => { const socket = new SilentSocket(url, reply); sockets.push(socket); timeline.push(`connect:${sockets.length}`);
+      queueMicrotask(() => socket.message({ op: 10, d: { heartbeat_interval: 40 } })); return socket; },
+    health: { gateway: connected => { record.health.push(connected); timeline.push(`health:${connected}`); } },
+    log: (event, detail) => { record.logs.push(event); timeline.push(event === 'gateway_closed' ? `${event}:${String(detail?.code)}` : event); },
+  });
+  await until(() => record.readies.length === 1);
+  const first = sockets[0]!;
+  await until(() => sockets.length === 2);
+  // 첫 소켓의 close()는 아무 이벤트도 내지 않았는데도 끊김 처리·재시도가 이미 끝났다.
+  assert.deepEqual(first.closes, [4900]);
+  const dropAt = timeline.indexOf('gateway_drop');
+  assert.deepEqual(timeline.slice(dropAt, dropAt + 5), ['gateway_drop', 'health:false', 'gateway_closed:4900', 'gateway_retry', 'connect:2']);
+  const second = sockets[1]!;
+  await until(() => record.health.length === 3);
+  assert.deepEqual(record.health, [true, false, true]);
+  assert.ok(second.url.includes('/resume')); assert.ok(second.sent.some(p => p.op === 6)); assert.equal(record.identifies, 1);
+  // 버린 소켓의 늦은 이벤트(망이 풀린 뒤 1006 close 등)가 새 연결 상태를 바꾸지 않는다.
+  const before = { logs: record.logs.length, health: [...record.health], events: record.events.length };
+  first.message({ op: 0, s: 9, t: 'MESSAGE_CREATE', d: { id: 'late' } });
+  first.message({ op: 7, d: null });
+  first.emit('error');
+  first.emit('close', { code: 1006 });
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.deepEqual(record.health, before.health); assert.equal(record.events.length, before.events);
+  assert.equal(sockets.length, 2); assert.deepEqual(second.closes, []);
+  assert.deepEqual(record.logs.slice(before.logs), []);
+  assert.deepEqual(session!.state, { connected: true, halted: false, resumable: true });
+});

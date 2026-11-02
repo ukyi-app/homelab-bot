@@ -450,6 +450,11 @@ IDENTIFY 간격(단일 shard)을 같은 잠금 아래에서 함께 예약하고 
 다음 예약은 직전 예약 + 5초 + 창 0.4초 + 망 지연 여유 0.1초 = 5.5초 뒤라, 실제 전송 간격은 늘 5.1초 이상이다.
 예약은 audit에 남아 재시작에도 이어진다. 연결 전에는 `next()`로 소진·대기 시간을 보고(소진되면 연결하지 않음), RESUME은 예약하지 않는다.
 다중 shard가 되면 `max_concurrency` 버킷마다 간격을 따로 둔다. 재연결 간격에는 이 backoff를 쓴다.
+Gateway 끊김 판단: 봇이 스스로 끊는 경우(heartbeat ACK 누락, HELLO 시간 초과, op 7·op 9, 전송 실패, 잘못된 HELLO·READY, IDENTIFY 예약 실패)는
+소켓의 close 응답을 **기다리지 않고** 그 자리에서 끊김으로 본다. 연결 gauge를 0으로 내리고 타이머를 정리한 뒤 close 코드 4900으로
+재시도를 예약하고, 그다음 소켓 close를 시도한다(로그 순서 `gateway_drop → gateway_closed(4900) → gateway_retry`). 버린 소켓의 늦은
+close·message·error는 무시한다. 패킷이 버려지는 망에서는 close 응답이 TCP 재전송 한도까지 오지 않아, 기다리면 그동안 gauge가 1로 남아
+단절 경보가 울리지 않았다(S16: 13분 DROP 동안 1). 정상 종료 `stop()`만 close 1000 응답을 기한까지 기다린다.
 
 작업자 제어 인증은 **Ed25519**다. 게시 서버에만 개인 키, 작업자에는 공개 키만 둔다.
 capability는 audience·operation·job·lease·body digest·발급/만료 시각에 묶이고 유효기간은 **30초**다.

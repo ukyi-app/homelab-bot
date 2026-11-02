@@ -141,14 +141,18 @@ export class GatewaySession {
       this.handle(socket, payload, identify);
     });
     socket.addEventListener('close', event => { this.onClose(socket, event.code ?? 1006); });
-    socket.addEventListener('error', () => { this.log('gateway_socket_error'); });
+    socket.addEventListener('error', () => { if (this.socket === socket) this.log('gateway_socket_error'); });
   }
   private send(socket: GatewaySocket, payload: unknown) {
     try { socket.send(JSON.stringify(payload)); } catch { this.drop(socket, 'send_failed'); }
   }
+  // close 이벤트를 기다리지 않고 그 소켓을 바로 버린다. 패킷이 버려지는 망에서는 close 핸드셰이크 응답이 없어
+  // 'close'가 TCP 재전송 한도(수 분~십수 분)까지 안 오고, 그동안 연결 gauge가 1로 남아 단절 경보가 울리지 않는다(S16).
+  // 늦게 오는 close·message는 onClose·message의 `this.socket !== socket` 가드가 거른다. stop()은 이 경로를 쓰지 않는다(1000 대기).
   private drop(socket: GatewaySocket, reason: string) {
     this.log('gateway_drop', { reason });
-    try { socket.close(RECONNECT_CODE, reason); } catch { this.onClose(socket, 1006); }
+    this.onClose(socket, RECONNECT_CODE);
+    try { socket.close(RECONNECT_CODE, reason); } catch { /* 이미 버린 소켓이다 */ }
   }
   private heartbeat(socket: GatewaySocket, interval: number, first: boolean) {
     const delay = first ? Math.floor(interval * (this.options.random ?? Math.random)()) : interval;
