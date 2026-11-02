@@ -28,7 +28,21 @@ const backup = (name: string, phase: string, startedAt: number, stoppedAt?: numb
   metadata: { name, namespace: 'database', creationTimestamp: iso(startedAt) }, spec: { cluster: { name: 'pg' } },
   status: { phase, startedAt: iso(startedAt), ...(stoppedAt === undefined ? {} : { stoppedAt: iso(stoppedAt) }), ...extra } });
 const cronjob = (name: string, status: Record<string, unknown>, suspend = false) =>
-  ({ metadata: { name, namespace: 'app-a' }, spec: { schedule: '0 3 * * *', suspend }, status });
+  ({ metadata: { name, namespace: 'app-a', uid: `uid-${name}` }, spec: { schedule: '0 3 * * *', suspend }, status });
+const JOBS_PATH = '/apis/batch/v1/namespaces/app-a/jobs';
+// CronJob 컨트롤러가 만드는 Job 모양: 이름 <CronJob>-<예약 시각(분)>, 예약 시각 annotation, CronJob ownerReference.
+const job = (cron: string, scheduledAt: number, status: Record<string, unknown>,
+  options: { annotation?: boolean; owner?: string; ownerUid?: string; name?: string } = {}) => {
+  const name = options.name ?? `${cron}-${Math.floor(scheduledAt / 60_000)}`;
+  return { metadata: { name, namespace: 'app-a', uid: `uid-job-${name}`,
+    ...(options.annotation === false ? {} : { annotations: { 'batch.kubernetes.io/cronjob-scheduled-timestamp': iso(scheduledAt) } }),
+    ownerReferences: [{ apiVersion: 'batch/v1', kind: 'CronJob', name: options.owner ?? cron, uid: options.ownerUid ?? `uid-${options.owner ?? cron}`, controller: true }] },
+  status };
+};
+const complete = (start: number, end: number) => ({ startTime: iso(start), completionTime: iso(end), conditions: [{ type: 'Complete', status: 'True' }] });
+const failedRun = (start: number) => ({ startTime: iso(start), conditions: [{ type: 'Failed', status: 'True' }] });
+const runningRun = (start: number) => ({ startTime: iso(start), active: 1 });
+const ref = (value: ReturnType<typeof job>) => ({ kind: 'Job', name: value.metadata.name, namespace: 'app-a', uid: value.metadata.uid });
 
 type Reply = unknown | Error;
 function mock(replies: Record<string, Reply>) {
@@ -105,21 +119,28 @@ test('[T20 B5] 백업 읽기 실패·권한 없음·모양이 틀린 응답은 �
 });
 
 test('[T20 B5] 예약 작업: 빈 목록·정상·실패·중지·실행 기록 없음·멈춘 실행·읽기 실패', async () => {
-  const read = (reply: Reply) => scheduledJobSource(mock({ [CRONJOBS_PATH]: reply }), now).read();
+  const read = (reply: Reply, jobs: unknown[] = []) => scheduledJobSource(mock({ [CRONJOBS_PATH]: reply, [JOBS_PATH]: { items: jobs } }), now).read();
   assert.deepEqual(await read({ items: [] }), { observedAt: NOW, status: 'ok', summary: '등록된 CronJob 없음' });
+  const backupDone = job('a-valkey-backup', NOW - 2 * HOUR, complete(NOW - 2 * HOUR + 1000, NOW - 2 * HOUR + 30_000));
+  const reportRun = job('a-report', NOW - 60_000, runningRun(NOW - 59_000));
   const fine = await read({ items: [
     cronjob('a-valkey-backup', { lastScheduleTime: iso(NOW - 2 * HOUR), lastSuccessfulTime: iso(NOW - 2 * HOUR + 30_000) }),
-    cronjob('a-report', { lastScheduleTime: iso(NOW - 60_000), lastSuccessfulTime: iso(NOW - DAY), active: [{ name: 'a-report-1' }] }),
-  ] });
-  assert.deepEqual([fine.status, fine.summary], ['ok', 'CronJob 2개 마지막 실행 성공']);
+    cronjob('a-report', { lastScheduleTime: iso(NOW - 60_000), lastSuccessfulTime: iso(NOW - DAY), active: [ref(reportRun)] }),
+  ] }, [backupDone, reportRun]);
+  // 마지막 회차가 아직 실행 중인 CronJob은 성공으로 세지 않고 실행 중으로 따로 적는다.
+  assert.deepEqual([fine.status, fine.summary], ['ok', 'CronJob 2개 중 마지막 실행 성공 1개, 실행 중 1개']);
+  const done = await read({ items: [cronjob('a-valkey-backup', { lastScheduleTime: iso(NOW - 2 * HOUR) })] }, [backupDone]);
+  assert.deepEqual([done.status, done.summary], ['ok', 'CronJob 1개 마지막 실행 성공']);
+  const stuckRun = job('stuck', NOW - DAY - HOUR, runningRun(NOW - DAY - HOUR + 1000));
   const bad = await read({ items: [
     cronjob('failed', { lastScheduleTime: iso(NOW - HOUR), lastSuccessfulTime: iso(NOW - DAY) }),
     cronjob('never-succeeded', { lastScheduleTime: iso(NOW - HOUR) }),
     cronjob('paused', { lastScheduleTime: iso(NOW - HOUR), lastSuccessfulTime: iso(NOW - HOUR + 1000) }, true),
     cronjob('never-ran', {}),
-    cronjob('stuck', { lastScheduleTime: iso(NOW - DAY - HOUR), active: [{ name: 'stuck-1' }] }),
+    cronjob('stuck', { lastScheduleTime: iso(NOW - DAY - HOUR), active: [ref(stuckRun)] }),
     cronjob('ok', { lastScheduleTime: iso(NOW - HOUR), lastSuccessfulTime: iso(NOW - HOUR + 1000) }),
-  ] });
+  ] }, [job('failed', NOW - HOUR, failedRun(NOW - HOUR + 1000)), job('never-succeeded', NOW - HOUR, failedRun(NOW - HOUR + 1000)),
+    stuckRun, job('ok', NOW - HOUR, complete(NOW - HOUR + 1000, NOW - HOUR + 2000))]);
   assert.equal(bad.status, 'problem');
   assert.equal(bad.summary, 'CronJob 6개 중 확인 필요 5개: app-a/failed(마지막 실행 실패), app-a/never-succeeded(마지막 실행 실패), '
     + 'app-a/paused(일시 중지), app-a/never-ran(실행 기록 없음), app-a/stuck(24시간 넘게 실행 중)');
@@ -127,6 +148,66 @@ test('[T20 B5] 예약 작업: 빈 목록·정상·실패·중지·실행 기록 
   assert.match(many.summary, /CronJob 7개 중 확인 필요 7개: .*job-4\(실행 기록 없음\) 외 2개$/);
   await assert.rejects(read(new Error('read_http_403')), /read_http_403/);
   await assert.rejects(read({ items: [{ metadata: { name: 'x' } }] }));
+});
+
+// PR #26 리뷰 지적 1: concurrencyPolicy Allow면 새 회차마다 lastScheduleTime이 갱신된다. 예약 시각이 아니라
+// active가 가리키는 개별 Job의 시작 시각으로 장기 실행을 본다.
+test('[T20 B5 fix] Allow 동시 실행: 새 회차가 예약돼도 오래 실행 중인 옛 Job을 장기 실행으로 잡음', async () => {
+  const oldAt = NOW - 30 * HOUR, newAt = NOW - HOUR;
+  const read = (jobs: unknown[], active: unknown[]) => scheduledJobSource(mock({
+    [CRONJOBS_PATH]: { items: [cronjob('allow', { lastScheduleTime: iso(newAt), lastSuccessfulTime: iso(NOW - 2 * HOUR), active })] },
+    [JOBS_PATH]: { items: jobs } }), now).read();
+  const oldJob = job('allow', oldAt, runningRun(oldAt + 1000)), newJob = job('allow', newAt, runningRun(newAt + 1000));
+  const stuck = await read([oldJob, newJob], [ref(oldJob), ref(newJob)]);
+  assert.deepEqual([stuck.status, stuck.summary], ['problem', 'CronJob 1개 중 확인 필요 1개: app-a/allow(24시간 넘게 실행 중)']);
+
+  // 시작 시각을 읽을 수 없으면 장기 실행 여부를 정상으로 두지 않는다.
+  const noStart = job('allow', oldAt, {});
+  const unknown = await read([noStart, newJob], [ref(noStart), ref(newJob)]);
+  assert.deepEqual([unknown.status, unknown.summary], ['problem', 'CronJob 1개 중 확인 필요 1개: app-a/allow(실행 중 Job 시작 시각 미확인)']);
+  const missing = await read([newJob], [ref(oldJob), ref(newJob)]);
+  assert.deepEqual([missing.status, missing.summary], ['problem', 'CronJob 1개 중 확인 필요 1개: app-a/allow(실행 중 Job 시작 시각 미확인)']);
+  // uid가 다른 같은 이름 Job(지워졌다 다시 만든 Job)은 active 항목과 연결하지 않는다.
+  const recreated = { ...oldJob, metadata: { ...oldJob.metadata, uid: 'uid-other' } };
+  assert.equal((await read([recreated, newJob], [ref(oldJob), ref(newJob)])).status, 'problem');
+
+  const fresh = await read([newJob], [ref(newJob)]);
+  assert.deepEqual([fresh.status, fresh.summary], ['ok', 'CronJob 1개 중 마지막 실행 성공 0개, 실행 중 1개']);
+  await assert.rejects(scheduledJobSource(mock({ [CRONJOBS_PATH]: { items: [cronjob('allow', { lastScheduleTime: iso(newAt) })] },
+    [JOBS_PATH]: new Error('read_http_403') }), now).read(), /read_http_403/);
+});
+
+// PR #26 리뷰 지적 2: lastSuccessfulTime >= lastScheduleTime은 마지막 회차의 성공이 아니다
+// (10:00 회차가 11:10 성공, 11:00 회차가 11:05 실패). 마지막 예약 회차의 Job 조건을 본다.
+test('[T20 B5 fix] 마지막 회차: 이전 회차의 늦은 성공이 마지막 회차의 실패·미확인을 덮지 않음', async () => {
+  const t10 = NOW - 13 * HOUR, t11 = t10 + HOUR;
+  const status = { lastScheduleTime: iso(t11), lastSuccessfulTime: iso(t10 + 70 * 60_000) };
+  const read = (jobs: unknown[]) => scheduledJobSource(mock({ [CRONJOBS_PATH]: { items: [cronjob('report', status)] },
+    [JOBS_PATH]: { items: jobs } }), now).read();
+  const job10 = job('report', t10, complete(t10 + 1000, t10 + 70 * 60_000));
+  const failed = await read([job10, job('report', t11, failedRun(t11 + 1000))]);
+  assert.deepEqual([failed.status, failed.summary], ['problem', 'CronJob 1개 중 확인 필요 1개: app-a/report(마지막 실행 실패)']);
+
+  // 마지막 회차 Job이 이력 정리로 없으면 성공을 확정하지 않는다.
+  const gone = await read([job10]);
+  assert.deepEqual([gone.status, gone.summary], ['problem', 'CronJob 1개 중 확인 필요 1개: app-a/report(마지막 회차 Job 없음 · 결과 미확인)']);
+  // 같은 예약 시각이어도 다른 CronJob이나 이전 CronJob(uid 다름)의 Job은 연결하지 않는다.
+  const foreign = await read([job10, job('other', t11, complete(t11, t11 + 1000)),
+    job('report', t11, complete(t11, t11 + 1000), { name: 'report-old', ownerUid: 'uid-old' })]);
+  assert.match(foreign.summary, /report\(마지막 회차 Job 없음 · 결과 미확인\)/);
+  // 끝나지도, 실행 중이지도 않은 Job(조건 없음, 시작 시각 없음)은 결과 미확인이다.
+  const pending = await read([job10, job('report', t11, {})]);
+  assert.match(pending.summary, /report\(마지막 회차 결과 미확인\)/);
+
+  // 마지막 회차가 Complete=True일 때만 성공. annotation이 없으면 컨트롤러 이름 규칙으로 연결한다.
+  const ok = await read([job10, job('report', t11, complete(t11 + 1000, t11 + 60_000))]);
+  assert.deepEqual([ok.status, ok.summary], ['ok', 'CronJob 1개 마지막 실행 성공']);
+  const byName = await read([job10, job('report', t11, complete(t11 + 1000, t11 + 60_000), { annotation: false })]);
+  assert.deepEqual([byName.status, byName.summary], ['ok', 'CronJob 1개 마지막 실행 성공']);
+  // annotation이 다른 회차를 가리키면 이름이 맞아도 연결하지 않는다.
+  const wrong = job('report', t11, complete(t11 + 1000, t11 + 60_000), { annotation: false });
+  Object.assign(wrong.metadata, { annotations: { 'batch.kubernetes.io/cronjob-scheduled-timestamp': iso(t10) } });
+  assert.equal((await read([wrong])).status, 'problem');
 });
 
 // 진입점이 넘길 객체(kubernetesTransport 반환값)로 실제 HTTP 경로·SA 토큰·권한 없음 응답을 본다.
@@ -163,6 +244,12 @@ test('[T20 B5] briefingSources: 읽기 transport의 연결로 고정 경로를 G
   assert.deepEqual(values.map(v => v.status), ['ok', 'ok']);
   assert.deepEqual(seen.map(s => s.url).sort(), [BACKUPS_PATH, CLUSTER_PATH, CRONJOBS_PATH].sort());
   assert.ok(seen.every(s => s.method === 'GET' && s.auth === 'Bearer fixture-sa-token'));
+  // CronJob이 있으면 그 namespace의 Job 목록만 고정 모양 경로로 더 읽는다.
+  seen = [];
+  serve({ [CRONJOBS_PATH]: { items: [cronjob('a-report', { lastScheduleTime: iso(NOW - HOUR) })] },
+    [JOBS_PATH]: { items: [job('a-report', NOW - HOUR, complete(NOW - HOUR + 1000, NOW - HOUR + 2000))] } });
+  assert.equal((await sources[1]!.read()).summary, 'CronJob 1개 마지막 실행 성공');
+  assert.deepEqual(seen.map(s => [s.method, s.url]), [['GET', CRONJOBS_PATH], ['GET', JOBS_PATH]]);
   serve({ [CLUSTER_PATH]: cluster(), [BACKUPS_PATH]: 403, [CRONJOBS_PATH]: 403 });
   for (const source of sources) await assert.rejects(source.read(), /read_http_403/);
   await kubernetes.close();
@@ -201,7 +288,8 @@ test('[T20 B5] 브리핑 문구: 미확인·확인 필요가 정상으로 바뀌
 
   // 3회차: 백업이 26시간을 넘음, CronJob 실패. 확인 필요이고 정상 문구 없음.
   serve({ [CLUSTER_PATH]: cluster(), [BACKUPS_PATH]: { items: [backup('b1', 'completed', slot - 10 * HOUR - 3000, slot - 10 * HOUR)] },
-    [CRONJOBS_PATH]: { items: [cronjob('a-valkey-backup', { lastScheduleTime: iso(slot + 2 * DAY - HOUR) })] } });
+    [CRONJOBS_PATH]: { items: [cronjob('a-valkey-backup', { lastScheduleTime: iso(slot + 2 * DAY - HOUR) })] },
+    [JOBS_PATH]: { items: [job('a-valkey-backup', slot + 2 * DAY - HOUR, failedRun(slot + 2 * DAY - HOUR + 1000))] } });
   at(slot + 2 * DAY); assert.equal(await scheduler.tick(), 'enqueued');
   const third = (await contents())[2]!;
   assert.match(third, /PostgreSQL 백업\(pg\): 확인 필요 · 마지막 성공 백업 58시간 전\(26시간 기준 초과\)/);
