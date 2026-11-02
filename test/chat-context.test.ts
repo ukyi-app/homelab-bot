@@ -49,7 +49,7 @@ test('가설 2번 장면: 직전 봇 답이 owner 메시지 사이에 들어간�
   assert.deepEqual(request.map(i => i.from), ['owner', 'bot', 'owner']);
   assert.match(request[1]!.text, /^가설:\n- IO 경합\n- 스왑 사용$/);
   assert.equal(request[2]!.text, '가설 2번 더 설명해줘');
-  // owner 항목은 저장된 payload 그대로에 from만 더한다.
+  // owner 항목은 저장된 payload에서 text·kind(명령이면 command·target)만 고르고 from을 더한다(S16).
   assert.equal((request[0] as Record<string, unknown>).kind, 'message');
 });
 

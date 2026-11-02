@@ -88,15 +88,17 @@ for (const seconds of [1, 15, 60, 120]) test(`4314491278 템플릿 ${seconds}초
   await f.ingress.receive(event('read', { kind: 'command', command: 'read', target: service.id, text: template.id }));
   await new Runtime(f.store, f.gate, f.worker, f.signer, reader).tickRead();
   assert.equal((await rows('jobs'))[0]!.state, 'succeeded'); assert.equal(f.requests.length, 0); assert.equal(requests.length, 1);
-  const window = { from: f.now() - Math.min(60, seconds) * 1000, to: f.now() };
+  // recent 창은 템플릿 상한 전체다(S16, 이전에는 min(60초, 상한)).
+  const window = { from: f.now() - seconds * 1000, to: f.now() };
   assert.deepEqual((await rows('results'))[0]!.result.window, window);
   assert.equal(requests[0]!.from, window.from); assert.equal(requests[0]!.to, window.to);
 });
-test('4314491278 recent도 서비스/템플릿 인가 유지, 명시적인 초과 시간창은 여전히 거부', async () => {
+test('4314491278 recent도 서비스 인가 유지, 없는 템플릿은 조회 없이 미등록, 명시적인 초과 시간창은 여전히 거부', async () => {
   let calls = 0;
   const reader = new ReadAdapter([service], [{ ...template, maxWindowSeconds: 5 }], f.gate, { query: async () => { calls++; throw new Error('unexpected'); } }, f.now);
   await assert.rejects(reader.read(f.policy.owner, thread, { service: service.id, template: template.id, from: f.now() - 6000, to: f.now() }), Denied);
-  await assert.rejects(reader.recent(f.policy.owner, thread, { service: service.id, template: 'unknown' }), Denied);
+  // 없는 템플릿은 권한 경계가 아니라 입력 오류다(S16): 철회로 기록하지 않고 미등록 답.
+  assert.equal((await reader.recent(f.policy.owner, thread, { service: service.id, template: 'unknown' })).status, 'unregistered');
   f.policy.services = []; await assert.rejects(reader.recent(f.policy.owner, thread, { service: service.id, template: template.id }), Denied);
   assert.equal((await reader.recent(f.policy.owner, thread, { service: 'unregistered', template: template.id })).status, 'unregistered');
   assert.equal(calls, 0);

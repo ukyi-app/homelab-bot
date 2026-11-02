@@ -237,7 +237,10 @@ test('READ-02 임의 셸·Secret·ConfigMap·pods/log·쿼리·데이터소스·
   for (const extra of [{ shell: 'kubectl get secrets' }, { query: '{}' }, { datasource: 'other' }, { namespace: 'other' }]) {
     await assert.rejects(f.reader.read('fixture-owner', thread, { ...input, ...extra }));
   }
-  for (const template of ['secrets', 'configmaps', 'pods/log', 'exec', '{}', 'sum(up)']) await assert.rejects(f.reader.read('fixture-owner', thread, { ...input, template }), Denied);
+  // 등록되지 않은 템플릿 이름은 조회 없이 미등록 답이다(S16: 권한 철회로 기록되던 무응답 대신).
+  for (const template of ['secrets', 'configmaps', 'pods/log', 'exec', '{}', 'sum(up)']) {
+    assert.equal((await f.reader.read('fixture-owner', thread, { ...input, template })).status, 'unregistered');
+  }
   await assert.rejects(f.reader.read('fixture-owner', thread, { ...input, from: f.now() - 301000 }), Denied);
   assert.equal(f.queries.length, 0);
   f.policy.services = []; await assert.rejects(f.reader.read('fixture-owner', thread, input), Denied);

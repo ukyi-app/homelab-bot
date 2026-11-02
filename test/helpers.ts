@@ -76,6 +76,18 @@ export class MockDiscord implements DiscordRest {
   }
   async history() { return this.pages.shift() ?? []; }
 }
+// 제어 결과는 사람이 읽는 문장으로 게시된다(S16). 상태 값을 보는 시험은 Store.control의 구조화 반환값을
+// 수신 ID(cursor 인자)별로 모아 본다. 트랜잭션이 되돌려져도 남으므로, 게시된 outbox 행과 함께 확인한다.
+export function captureControls() {
+  const results = new Map<string, unknown>();
+  const original = Store.prototype.control;
+  Store.prototype.control = async function (this: Store, ...args: Parameters<Store['control']>) {
+    const result = await original.apply(this, args);
+    if (args[4] !== undefined) results.set(args[4], result);
+    return result;
+  };
+  return { results, restore: () => { Store.prototype.control = original; } };
+}
 export const service: Service = { id: 'fixture-service', repository: 'fixture/service', namespace: 'app-fixture',
   deployment: 'fixture', internalDomain: null, externalDomain: null, documentation: [] };
 export const template: QueryTemplate = { id: 'fixture-status', service: service.id, datasource: 'fixture-metrics',

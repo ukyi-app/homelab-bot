@@ -49,7 +49,8 @@ export class ReadAdapter {
   async recent(actor: string, scope: Scope, request: { service: string; template: string }): Promise<ReadResult> {
     const template = this.templates.get(request.template);
     const to = this.now();
-    const seconds = template?.service === request.service ? Math.min(60, template.maxWindowSeconds) : 60;
+    // 템플릿 상한 전체를 본다. 60초로 자르면 logs는 거의 늘 0줄이었다(S16). 행 수·바이트 상한과 관측 신선도(5분)는 그대로다.
+    const seconds = template?.service === request.service ? template.maxWindowSeconds : 60;
     return this.read(actor, scope, { ...request, from: to - seconds * 1000, to });
   }
   async read(actor: string, scope: Scope, request: unknown): Promise<ReadResult> {
@@ -60,9 +61,14 @@ export class ReadAdapter {
     const service = this.services.get(r.service);
     if (!service) return { ...base, status: 'unregistered', unknowns: ['등록되지 않은 서비스'] };
     if (!p.services.includes(r.service)) throw new Denied();
+    // 없는 템플릿·다른 서비스의 템플릿은 권한 경계가 아니라 입력 오류다. 조회 없이 미등록 답을 돌려준다.
+    // Denied로 던지면 runtime이 권한 철회(authorization_revoked)로 기록하고 사용자에게 아무 답도 가지 않았다(S16).
+    // 서비스 권한(위의 정책 services)과 시간창 우회는 그대로 거부다.
     const t = this.templates.get(r.template);
-    if (!t || t.service !== service.id || t.namespace !== service.namespace || r.from >= r.to
-      || r.to > this.now() || r.to - r.from > t.maxWindowSeconds * 1000) throw new Denied();
+    if (!t || t.service !== service.id || t.namespace !== service.namespace) {
+      return { ...base, status: 'unregistered', unknowns: ['등록되지 않은 조회 템플릿'] };
+    }
+    if (r.from >= r.to || r.to > this.now() || r.to - r.from > t.maxWindowSeconds * 1000) throw new Denied();
     base.source = t.id;
     try {
       let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -95,8 +101,15 @@ export class ReadAdapter {
   }
 }
 // Public threads only get deterministic metadata/status, never raw logs or model declassification.
+// 시각은 ISO-8601 UTC 초 단위다(epoch ms 숫자는 사람이 읽지 못했다, S16).
+// 미등록 답은 시간창 검사 전에 돌아오므로 Date 범위 밖 값이 올 수 있다. 그때는 숫자 그대로 둔다(toISOString이 던진다).
+export function isoSeconds(ms: number): string {
+  const date = new Date(ms);
+  return Number.isNaN(date.getTime()) ? String(ms) : date.toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
 export function readSummary(result: ReadResult): string {
-  return [`대상: ${bounded(result.service, 120)}`, `출처: ${bounded(result.source ?? '없음', 120)}`, `시간창: ${result.window.from}~${result.window.to}`,
-    `관측 시각: ${result.observedAt ?? '미확인'}`, `사실: ${summaryItems(result.facts, 600)}`,
+  return [`대상: ${bounded(result.service, 120)}`, `출처: ${bounded(result.source ?? '없음', 120)}`,
+    `시간창: ${isoSeconds(result.window.from)}~${isoSeconds(result.window.to)}`,
+    `관측 시각: ${result.observedAt === null ? '미확인' : isoSeconds(result.observedAt)}`, `사실: ${summaryItems(result.facts, 600)}`,
     '가설: 없음', `미확인: ${summaryItems(result.unknowns, 350)}`, `권장 확인: ${summaryItems(result.checks, 350)}`].join('\n');
 }

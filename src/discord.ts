@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { DEFAULTS, Denied, DiscordRejected, DiscordUnauthorized, HistoryGap, PolicyUnavailable, RateLimited, ScopeSchema } from './contracts.js';
 import type { EventInput, Scope } from './contracts.js';
+import { controlText } from './control-format.js';
 import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
 import type { PolicyGate } from './policy.js';
@@ -95,7 +96,7 @@ export class DiscordIngress {
               && event.actor === current.owner });
         if (event.command !== 'revoke') await store.enqueue({ key: `control:${saved.id}`, actor: event.actor,
           scope: event.scope, revision: current.revision, payload: { kind: 'message', channel: event.scope.channel,
-            content: JSON.stringify(result), classification: 'safe_summary' } });
+            content: controlText(event.command!, result), classification: 'safe_summary' } });
       } else if (event.scope.kind === 'channel') {
         await store.enqueue({ key: `thread:${saved.id}`, conversation: conversationId,
           actor: event.actor, scope: event.scope, revision: current.revision,

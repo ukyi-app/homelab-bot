@@ -383,6 +383,7 @@ Discord 401은 별도 오류로 pending을 유지한다. 토큰 갱신 후 새 R
 
 부모 채널은 비활성이며 매번 멘션/명령이 필요하다. 활성 스레드만 멘션 없는 후속 메시지를 수집한다.
 스레드는 공개, 보관 시간 **1440분**이다. 모든 메시지/상호작용 응답의 `allowed_mentions.parse=[]`를 강제한다.
+제어 명령 결과(`/list`·`/stop`·`/resume`·`/cancel`·`/retry`·`/emergency-stop`·`/resume-model`·`/model-status`·리뷰 제어)는 `controlText`(`src/control-format.ts`)가 짧은 한국어 문장으로 바꿔 게시한다. 예: `/list` → "작업 N건" + 줄마다 `` `<작업 ID>` 상태(대기 사유) ``(최근 20건, 넘으면 머리줄에 "최근 20건만 표시"), 거절은 "실패: <안내>", `/model-status`는 모델 호출·비상 중지·실행 중 작업·한도/인증 대기 목록과 안내. 작업 ID는 `/cancel`·`/retry` target에 그대로 넣어야 해서 줄이지 않는다. 모르는 결과 모양은 JSON 그대로 둔다. 이전에는 결과를 `JSON.stringify`해 `{"ref":...,"data":[...]}`로 보였다(S16). 이제 제어 결과도 일반 문장이라 marker는 끝 줄 `[ref:…]`이고, JSON 본문의 marker 필드 방식(`markedContent`)은 JSON으로 읽히는 다른 본문을 위해 남겨 둔다.
 outbox UUID별 멱등 키에서 24자 nonce와 게시 marker를 만든다. 응답 유실은 unknown으로 두고 게시자의 marker와
 스레드 이름을 제한 조회한다. 못 찾았다고 재게시하지 않는다.
 대조 중 429는 즉시 루프를 중단하고 전역 다음 대조 시각을 DB에 기록한다. 재기동해도
@@ -410,10 +411,11 @@ after 페이지를 오름차순 처리한 뒤 최댓값으로 전진하는 방�
 읽기 템플릿은 service·datasource·namespace·고정 query·시간창·바이트·행 상한을 함께 가진다.
 상한은 상태 **5분**, 메트릭 **6시간**, 로그 **1시간**, 응답 **64KiB/200행**, 질의 문자열 **2000자**,
 요청 **5초**다. 템플릿은 더 작게 정할 수 있다. 시간창 상한은 유한한 1초 이상이다.
-Runtime의 /read는 ReadAdapter.recent를 통해 한 번 읽은 현재 시각을 기준으로 min(60초, 템플릿 상한)을 요청한다.
-명시적인 read 시간창을 자동 축소하지 않으며 상한 초과·미허용 템플릿·서비스는 기존대로 거부한다. 보존 기간 30일/14일과 별개다.
+Runtime의 /read는 ReadAdapter.recent를 통해 한 번 읽은 현재 시각을 기준으로 템플릿 상한(`maxWindowSeconds`) 전체를 요청한다(S16 수정, 이전 min(60초, 상한)은 logs를 거의 늘 0줄로 만들었다). 행 수·바이트 상한은 그대로다.
+명시적인 read 시간창을 자동 축소하지 않으며 상한 초과와 정책 `services` 밖 서비스는 거부(Denied)한다. 보존 기간 30일/14일과 별개다.
+등록되지 않은 서비스와, 없는 템플릿·다른 서비스의 템플릿은 조회 없이 `unregistered` 결과다(미확인: "등록되지 않은 서비스"/"등록되지 않은 조회 템플릿"). job은 succeeded이고 스레드에 같은 모양의 답이 간다. 템플릿 이름은 권한 경계가 아니라 입력 오류라서다. 이전에는 없는 템플릿이 Denied라 runtime이 `cancelled`(`authorization_revoked`)로 기록하고 아무 답도 없었다(S16). 정책 `services` 검사가 템플릿 검사보다 먼저라 권한 밖 서비스의 템플릿 존재 여부는 드러나지 않는다.
 현재 사실은 5분 안의 관측이며 빈 응답·오래된 값·조회 실패는 미확인이다.
-공개 응답은 대상·출처·시간창·시각·사실/가설/미확인·권장 확인을 포함한다. 로그 원문은 게시하지 않는다.
+공개 응답은 대상·출처·시간창·시각·사실/가설/미확인·권장 확인을 포함한다. 시간창과 관측 시각은 ISO-8601 UTC 초 단위(`2026-11-02T01:54:55Z`)다(`readSummary`, 이전 epoch ms 숫자). 로그 원문은 게시하지 않는다(줄 수만).
 서비스별 read 결과와 경보는 outbox의 service_ids에 범위를 남기고 게시·대조 직전 현재 policy.services로 검사한다.
 경보는 지원 라벨을 거른 뒤 고유 서비스 집합을 저장하며, thread 병합으로 내용을 교체할 때 범위도 교체한다.
 게시·대조 직전에 DB의 service_ids를 다시 읽어 claim 뒤 병합도 재인가한다.
@@ -1010,11 +1012,13 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 ### 봇 답 문맥 (`untrusted`)
 
-- `Store.context()` → `chatContext()`(`src/chat-context.ts`). owner 항목은 이벤트 payload에 `from:'owner'`, 봇 항목은 `{from:'bot', text, partial?}`.
+- `Store.context()` → `chatContext()`(`src/chat-context.ts`). owner 항목은 이벤트 payload에서 `text`·`kind`(명령이면 `command`·`target`)만 고른 `{from:'owner', ...}`, 봇 항목은 `{from:'bot', text, partial?}`.
+- **수집 경로 표시는 넘기지 않는다(S16 수정).** 이전에는 payload 전체(`mention`·`activate`·`urgent`·`revision`)를 넣어, 모델이 구독 스레드의 멘션 없는 후속에 "mention=false라 봇에게 한 말이 아닐 수 있다, 멘션하라"고 답했다. 이 값들은 수신 라우팅에서 이미 쓰였고 모델 판단에 필요 없다. 게시 서버 쪽 변경이라 작업자 배포와 무관하게 바로 적용된다.
 - 봇 항목은 같은 대화·owner의 **chat 결과 중 Discord 게시가 확정된(sent) 본문**만이다. 현재 입력보다 먼저 게시된 것만 넣는다(owner 메시지 ID와 게시 메시지 ID, 둘 다 snowflake로 비교. 불확실하면 뺀다). 일부 페이지만 sent면 `partial`. read·task·실패 안내·제어·스레드·경보는 넣지 않는다.
 - 전체 20개(작업자 스키마 상한)·배열 JSON 32KiB(라벨 포함). 현재 owner 메시지는 항상 마지막, 다음은 직전 봇 답, 나머지는 최신부터 채우고 처음 넘치는 곳에서 멈춘다. 넘치는 봇 답은 앞 페이지만 `partial`로 넣는다.
 - **받아들인 예외:** 현재 메시지 하나가 32KiB를 넘으면(입력 8000자 상한 안에서 제어 문자 등 JSON 이스케이프가 큰 극단 입력, 최대 약 48KB) 그것만 넣는다. 작업자 본문 상한 64KiB 안이고, 이전 코드는 이때 빈 문맥을 보냈다.
 - **작업자 프롬프트:** `chatPrompt`(`src/chat-lane.ts`, 실행기 전환이 `src/codex-chat.ts`에서 옮김)가 이 배열을 "owner(`from:'owner'`) 메시지와 봇이 이미 게시한 답(`from:'bot'`, `partial`이면 일부)"으로 설명한다. 작업자는 사람 배포라 sandbox 이미지를 바꾸기 전까지 옛 작업자는 같은 배열을 "owner 메시지 기록"이라 부른다(항목의 `from`이 스스로 설명해 받아들인 전환기). 되돌리려면 `Store.context()`만 owner 전용으로 바꾸면 된다(DB 변경 없음).
+- **신뢰 문맥(S16 수정):** `chatPrompt`가 지시문 다음, 대화 기록 앞에 `botFacts()`(`src/bot-facts.ts`)를 넣는다. 내용은 코드 고정값뿐이다: 구독 스레드에서 멘션 없이 보낸 owner 메시지도 봇에게 한 말이고 기록의 owner 메시지는 모두 받아들인 요청이라는 설명, 이 봇 자신의 slash 명령(`COMMAND_DEFINITIONS`의 이름·옵션·한 줄 설명), 서비스 카탈로그 공개 값(`SERVICES`의 id·namespace·deployment와 그 서비스의 `/read` 템플릿 ID). 대화 기록에서 만들지 않으므로 신뢰/비신뢰 경계는 그대로다. S16에서 모델이 `/revoke`를 "플랫폼 관리 콘솔 명령"으로, namespace를 `homelab-bot`으로 짐작했다(실제 `app-homelab-bot`). 작업자 HTTP v1 계약(`instructions` 리터럴·`untrusted` 배열)은 바꾸지 않아 옛 작업자도 새 요청을 받는다. 대신 신뢰 문맥은 **작업자 이미지를 다시 배포해야** 모델에 닿는다(작업자는 사람 배포).
 
 ### 지표 (`/metrics`, DB gauge)
 
