@@ -47,7 +47,7 @@
 8. 작업자 파드에서 `codex sandbox -- true`(모델 호출 없음)와 DNS 없이 `HTTPS_PROXY` 경유 모델 쪽 도메인 도달(U29).
    - T16b 결과: **부분.** 모델 도메인 도달은 해소: DNS 없는 작업자가 `HTTPS_PROXY`만으로 `api.anthropic.com` CONNECT 200, 다른 호스트 거부 0(homelab `approvals.md` 2026-10-31 07:20 행, S12). `codex sandbox -- true`는 not_run: D-14 변경으로 실행기가 Claude 구독(`claude-subscription`)이라 운영 경로가 아니다. Codex 프로필로 돌아갈 때(T18) 다시 본다.
 9. 작업자 파드에서 프록시 경유 `codeload.github.com` → 연결, `github.com`·`api.github.com`·gist → 프록시 거부(D-15).
-   - T16b 결과: **해소.** 시험 작업자에서 프록시 경유 `codeload.github.com` 301(연결), `github.com`·`api.github.com`·gist CONNECT 403(homelab `approvals.md` 2026-10-30 11:3x 행 (c)).
+   - T16b 결과: **해소.** 시험 작업자에서 프록시 경유 `codeload.github.com` 301(연결), `github.com`·`api.github.com`·gist CONNECT 403(homelab `approvals.md` 2026-10-30 11:3x 행 (c)). 2026-11-02 운영 작업자(봇 이미지 `097c93e`)에서 다시 잼: 프록시 CONNECT `codeload.github.com`·`api.anthropic.com` 200, `github.com`·`api.github.com`·`gist.github.com`·`claude.ai`·`example.com` 403.
 10. 작업자 파드를 다시 만든 뒤에도 영속 쓰기 공간의 파일이 남는지(D-14 조건 4).
    - T16b 결과: **해소(Claude 프로필 기준).** 2026-11-02 lead 실측: 작업자 PVC `codex-home`(`/codex-home`)의 `.homelab-worker`(2026-10-30 생성)가 11-02 파드 재생성(EVENT-04 03:45Z 삭제, homelab #1011 05:14Z 교체) 뒤에도 남아 있고 `nonces/`는 08:50Z에 갱신됐다(파일 내용은 읽지 않음). PVC는 local-path, Retain이다. Claude 프로필은 자격을 읽기 전용 Secret 마운트로 받아 되쓰기가 없다. Codex 프로필의 "`auth.json`이 시드로 덮이지 않음"은 그 프로필로 돌아갈 때(T18) 다시 본다.
 11. 공개 webhook 경로(T08a): GET → 403, 다른 경로 POST → 403(또는 404), 서명이 틀린 POST → 401, 시험 webhook ping → Recent Deliveries 200.
@@ -57,7 +57,7 @@
 13. homelab에 ruleset A~D가 active인지(`gh api` GET, T10).
    - T16b 결과: **해소.** homelab ruleset A `main-checks`·B `main-review`·C `deploy-branches`·D `release-tags-lock`·`release-tags-create` 모두 active, `main-interim` disabled(homelab `approvals.md` 2026-10-30 10:5x 행).
 14. 작업자 파드의 init 방화벽(U13): 프록시 ClusterIP:3128 밖으로 가는 새 연결(노드 IP의 6443·10250·22, DNS 53) → 실패, 봇 → 작업자 Service 요청의 응답 → 통과. 안 되면 작업자만 호스트 전용 UID + nft로 물러난다(D-15).
-   - T16b 결과: **해소.** 시험 작업자에서 노드 6443·10250·22, DNS 53 막힘, 봇 자리 시험 파드 → `worker.sandbox:8080` 200, 라벨 없는 파드 → 작업자 실패(homelab `approvals.md` 2026-10-30 11:3x 행 (d)). 호스트 전용 UID + nft로 물러날 필요가 없었다. 작업자 이미지를 봇 이미지로 바꾼 뒤(homelab #1000) 다시 잰 기록은 없다.
+   - T16b 결과: **해소.** 시험 작업자에서 노드 6443·10250·22, DNS 53 막힘, 봇 자리 시험 파드 → `worker.sandbox:8080` 200, 라벨 없는 파드 → 작업자 실패(homelab `approvals.md` 2026-10-30 11:3x 행 (d)). 호스트 전용 UID + nft로 물러날 필요가 없었다. 2026-11-02 운영 작업자(봇 이미지 `097c93e`)에서 다시 잼: 프록시를 거치지 않는 직접 연결(밖 IP 443, 노드 6443, kube-dns 53)이 모두 ECONNREFUSED.
 
 ## FOUNDATION T16a 실행 결과 (2026-10-20)
 
