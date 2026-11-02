@@ -1,14 +1,14 @@
 # PROJECT_STATUS: 홈랩 AI Discord 봇
 
-- 기준일: 2026-10-19. T16a 작업 트리 기준이며 커밋·PR·배포는 하지 않았다.
-- 한 줄 상태: **T16a FOUNDATION 로컬 구현·검증 완료, 실연동 대기(`LOCAL_VERIFIED_INTEGRATION_PENDING`). PR #5 병합(2026-10-20), DM 끔·브리핑 08:50 확정(사용자 2026-10-20).**
+- 기준일: 2026-11-02. 운영 배포 봇 main `097c93e`(게시 서버·작업자). 아래 "주요 위험"·"다음 행동"은 T16a 당시 기록이고, 실연동 결과는 [VERIFICATION](VERIFICATION.md) "T16b 실연동 결과"가 기준이다.
+- 한 줄 상태: **T16b FOUNDATION 실연동·첫 배포 완료, 시범 P-1(허용 채널 읽기 조회만) 승인 대기.** T16a 로컬 구현·검증은 PR #5(2026-10-20)로 끝났다.
 
 ## 현재 단계
 
 | 항목 | 상태 |
 |---|---|
 | 목표 | V1 (`00` §3 필수 기능 7개) |
-| 현재 STAGE | FOUNDATION (`MODE=build`, homelab 티켓 T16a) |
+| 현재 STAGE | FOUNDATION (`MODE=build`, homelab 티켓 T16b 실연동 완료, 시범 P-1 승인 대기) |
 | DISCOVERY 산출물 | 초안 작성: [DISCOVERY.md](DISCOVERY.md), [ARCHITECTURE.md](ARCHITECTURE.md), [DECISIONS.md](DECISIONS.md), [VERIFICATION.md](VERIFICATION.md), [V1_PLAN.md](V1_PLAN.md), 이 파일, [config/homelab-bot.example.yaml](config/homelab-bot.example.yaml). 이 저장소 병합 전(PR과 사람 승인 필요) |
 | 운영 산출물 | HANDOFF·evidence·내부판은 private 운영 저장소 몫이다(D-13). 그 저장소는 아직 비어 있다. 첫 커밋 전에 할 Codex Connector 설치 범위 축소(D-16)는 끝났다(사람 2026-10-18 17:45. 남긴 저장소 목록은 사용자 보고이고 API로는 확인하지 못함). 첫 커밋은 사람 승인 뒤다 |
 | 결정 | D-14, D-15(남은 부분), D-16(하위 결정 포함), D-17, D-24: 확정(사용자 2026-10-18, T15). D-14는 에이전트 추천(API 키)이 아니라 봇 전용 ChatGPT 구독 계정을 골랐다. D-14에 T17 차단 조건을 더했다(확정(사용자 2026-10-18, PR #3 리뷰)) |
@@ -16,7 +16,7 @@
 | 범위 조정 | 안 3(시범 운영 + 로컬 선행), 확정(사용자 2026-10-18, T15). T16을 T16a·T16b로 나눈다(V1_PLAN §4) |
 | 코드 | `src/`, PostgreSQL 마이그레이션, 로컬·mock 시험. Gateway·모델 실연동과 배포 진입점은 T16b |
 | CI | 없음. 템플릿 기반 `build.yaml`과 금지 패턴 검사는 플랫폼 E5·E9 뒤 |
-| 배포 | 이번 작업에서 배포하지 않음. 플랫폼 현황은 조사하지 않았으며 T13 뒤 T16b에서 확인 |
+| 배포 | T16b에서 첫 배포. 봇 main 병합 → 빌드 → 배포 PR 자동 병합 → Argo CD(시나리오 1). 작업자 이미지는 사람 PR로 digest 고정. 2026-11-02 게시 서버·작업자 모두 `097c93e` |
 
 ## STAGE 진행표
 
@@ -24,7 +24,7 @@
 |---|---|---|---|
 | DISCOVERY | T15 | 초안, 결정 확정, 저장소 반영 대기 | 이 저장소 PR 병합과 운영 저장소 push(사람 승인) |
 | FOUNDATION 로컬·mock | T16a | 완료(PR #5 병합 2026-10-20, DM·브리핑 확정) | 없음 |
-| FOUNDATION 실연동·첫 배포 | T16b | 대기 | T13(플랫폼), T16a, Discord 서버·봇 계정, 작업자 영속 쓰기 공간(설계 C.8 변경), 봇 전용 구독 계정·첫 시드(D-14) |
+| FOUNDATION 실연동·첫 배포 | T16b | 실연동·첫 배포 완료(2026-11-02). 배정 시험 fail 없음, EVENT-01 not_run·EVENT-02 outbox 경로 not_run은 사유와 해소 티켓 있음([VERIFICATION](VERIFICATION.md) "T16b 실연동 결과") | 시범 P-1 사람 승인 |
 | PR_REVIEW | T17 | 로컬·mock 구현(2026-10-29, 브랜치 `feat/t17-pr-review-local`, 로컬 커밋만, 병합 전). r2·r3(독립 Codex 리뷰 r1의 P1 2·P2 7, 재리뷰 r2의 P2 3)와 PR #7 리뷰 r1(P2 3) 수정·회귀 검증 뒤 배정 시험 12개가 로컬·mock 범위에서 pass(358/358). 이벤트 순서는 `updated_at` 초 단위 기준, 마이그레이션 재적용은 r1 시점 스키마의 PGlite에서만 확인. 모델 품질 평가·실연동·파드 격리 사례 blocked([VERIFICATION](VERIFICATION.md) "PR_REVIEW T17"). 리뷰 모델 대기 해제는 공유 제어 계약에 리뷰 전용 명령 추가로 해소(실제 명령 등록은 T16b) | 완료 T16b. 작업별 세션 저장 공간 결정(ARCHITECTURE §5.1). 리뷰 App(사람). D-14 차단 조건(OpenAI 허용 확인이나 API 키 등 공식 지원 인증 전환. 공개 저장소 PR 내용으로 구독 모델을 부르는 일만 막음). 결정 대기([DECISIONS](DECISIONS.md) "T17") |
 | CODEX_BRIDGE | T18 | 로컬·mock 진행(2026-10-29, 브랜치 `feat/t18-codex-bridge-local`, PR #9). 봇 소유 작업 경로, 질문·완료 중계, 작업자 Codex 설정 생성, 어댑터 능력표, 도구 호출 예산·출력 상한 집행. rev-t18 r1 지적 6건·재리뷰 r2 지적 5건·r3 지적 2건·r4 지적 2건과 자체 점검, PR #9 Codex Connector 리뷰 1라운드 3건 반영, 347/347([ARCHITECTURE](ARCHITECTURE.md) §12, [VERIFICATION](VERIFICATION.md) "CODEX_BRIDGE T18"). AC-B5 완료 아님 | 완료 T16b(실제 `codex exec`·작업자 파드). 사용자 결정 대기: R08 연결 방식, 인증 파일 분리, 레인 분리, 작업별 세션 저장 공간([DECISIONS](DECISIONS.md) "T18 결정 대기"). SEC-02 `auth.json` 읽기·세션 디렉터리 격리 blocked(로컬 시험 가능 부분만 pass). 소멸 확인 완전성(cgroup) blocked. T16a 소유 변경 요청(Discord 명령 연결 등, ARCHITECTURE §12). D-14 차단 조건 |
 | MEMORY_BRIEFING | T20 | 로컬·mock 구현·검증(2026-10-29, 브랜치 `feat/t20-memory-briefing-local`, 병합 전). Codex 리뷰 rev-t20(P1 1·P2 4), 재리뷰 rev-t20b(잔여 P1 1: 재기동 원장 재적용), rev-t20c(P1 1: 미확인 기동의 대기 사본 발송, P2 1: 재적용 재시도 상태), 같은 경로 자체 점검 3건, rev-t20d(P2 2: 저장 제외·큐 등록 경합, 저장 제외 기억의 충돌 표시), PR #8 리뷰 rev-pr8(P2 2: 조회 개수 제한 뒤 권한 적용, 다른 결정자 결정의 미확인 문서) 수정·회귀 검증 뒤 재판정: MEM-01·DATA-02·AUTH-02(기억·예약)·BRIEF-01 로컬 경로 pass(VERIFICATION T20 표의 경계로 한정), BRIEF-01 실채널 blocked | 완료: T16b(실제 브리핑 채널 전송 BRIEF-01 `authorized_external`), 삭제 원장 저장소·자격·보존 결정 대기([DECISIONS](DECISIONS.md) T20), Codex 작업 상태·질문 대기 칸 연결 T18 |

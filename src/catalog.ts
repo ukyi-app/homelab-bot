@@ -18,7 +18,7 @@ export const TEMPLATES: readonly QueryTemplate[] = Object.freeze([
   { id: 'homelab-bot-available', service: 'homelab-bot', datasource: 'victoriametrics', namespace: 'app-homelab-bot', kind: 'metrics',
     query: 'kube_deployment_status_replicas_available{namespace="app-homelab-bot",deployment="homelab-bot"}',
     maxWindowSeconds: 3600, maxRows: 10, maxBytes: 8192 },
-  // [미확인] 로그 필드 이름은 vector 설정(namespace·pod·container 스트림 필드) 기준이다. 실제 로그로 S16에서 확인한다.
+  // 로그 스트림 필드는 {container, namespace, pod, stream}이라 namespace 스트림 선택자로 이 앱 로그만 고른다(실측 2026-11-02).
   { id: 'homelab-bot-logs', service: 'homelab-bot', datasource: 'victorialogs', namespace: 'app-homelab-bot', kind: 'logs',
     query: '{namespace="app-homelab-bot"}', maxWindowSeconds: 3600, maxRows: 100, maxBytes: 65536 },
 ]);

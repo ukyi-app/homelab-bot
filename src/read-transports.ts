@@ -64,7 +64,8 @@ export function grafanaTransport(options: { base: string; token: string; datasou
     const query = kind === 'metrics'
       ? { refId: 'A', datasource: { uid: request.datasource }, expr: request.query, instant: true, range: false,
         format: 'time_series', maxDataPoints: request.limit }
-      // [미확인] VictoriaLogs 플러그인 v0.33.1의 질의 필드. 실연동(S16)에서 실제 응답으로 맞춘다.
+      // VictoriaLogs 플러그인 v0.33.1(pkg/plugin/query.go): queryType instant는 /select/logsql/query로 가고
+      // start=from, end=to, limit=maxLines다. 그래서 창 전체의 원문 줄을 최대 maxLines개 받는다(실측 2026-11-02).
       : { refId: 'A', datasource: { uid: request.datasource }, expr: request.query, queryType: 'instant', maxLines: request.limit };
     const raw = DataResponse.parse(await call(send, `${base}/api/ds/query`, { method: 'POST', signal: request.signal,
       headers: { authorization: bearer(options.token), 'content-type': 'application/json', accept: 'application/json' },
@@ -114,7 +115,9 @@ const Workload = z.object({ metadata: z.object({ name: z.string(), namespace: z.
 const workload = /^(deployment|statefulset)\/([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$/;
 const Application = z.object({ metadata: z.object({ name: z.string(), namespace: z.string() }),
   status: z.object({ health: z.object({ status: z.string() }).optional(), sync: z.object({ status: z.string() }).optional() }).optional() });
-// Argo CD Application CR이 사는 namespace(D9). 템플릿 namespace(서비스 ns)와 상관없이 고정이다. SA 권한도 이 ns의 get뿐이다.
+// Argo CD Application CR이 사는 namespace(D9). 템플릿 namespace(서비스 ns)와 상관없이 고정이다.
+// SA 권한은 클러스터 범위 읽기(ClusterRole homelab-readonly)라 다른 ns도 읽힌다. Application이 argocd에만 있어
+// 실제 차이는 없고, 경계는 이 코드가 이 ns만 읽는다는 데 있다(실측 2026-11-02).
 export const ARGOCD_NAMESPACE = 'argocd';
 export const SERVICE_ACCOUNT = Object.freeze({
   token: '/var/run/secrets/kubernetes.io/serviceaccount/token',
