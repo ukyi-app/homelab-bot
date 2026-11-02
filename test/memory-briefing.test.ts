@@ -1,20 +1,22 @@
-import { after, before, beforeEach, test } from 'node:test';
+import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cp, mkdir, mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises';
-import type { FileHandle } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { DEFAULTS, Denied, DiscordRejected, PolicyUnavailable } from '../src/contracts.js';
 import type { Scope } from '../src/contracts.js';
 import type { Database } from '../src/database.js';
-import { FileDeletionLedger, MemoryNotReady, MemoryRejected, MemoryService } from '../src/memory.js';
+import { MemoryNotReady, MemoryRejected, MemoryService } from '../src/memory.js';
 import type { DeletionEntry, DeletionLedger, DocumentSource, MemoryInput } from '../src/memory.js';
 import { BRIEFING, BriefingScheduler, latestSlot, nextSlot } from '../src/briefing.js';
 import type { BriefingConfig, Observation, ObservationSource } from '../src/briefing.js';
 import { Store } from '../src/store.js';
 import { localDatabase, fixture, event, thread } from './helpers.js';
+import { closeLedgers, faultyIo, initLedger, ledgerAt, openLedger } from './ledger-fixture.js';
 
 let database: Awaited<ReturnType<typeof localDatabase>>;
 let f: Awaited<ReturnType<typeof fixture>>;
 let dir: string;
+// 시험 하나의 원장 디렉터리는 모두 같은 세대를 쓴다(DB 세대 묶음은 하나다).
+let generation: string;
 let ledger: FlakyLedger;
 let memory: MemoryService;
 const notifications: Scope = { guild: 'fixture-guild', channel: 'fixture-notifications', parent: null, kind: 'channel' };
@@ -29,6 +31,7 @@ class FlakyLedger implements DeletionLedger {
   readFails = false;
   onAppend: (() => Promise<void>) | undefined;
   constructor(readonly inner: DeletionLedger) {}
+  async open() { await this.inner.open?.(); }
   async append(entry: DeletionEntry) {
     await this.onAppend?.();
     if (this.appendFails === 'before') throw new Error('ledger_down');
@@ -53,14 +56,17 @@ function faulty(db: Database, match: (sql: string) => boolean) {
 before(async () => { database = await localDatabase(); await mkdir('.local', { recursive: true }); });
 beforeEach(async () => {
   await database.pg.exec(`TRUNCATE events,conversations,jobs,results,outbox,schedules,denied_actors,controls,audit,incidents,
-    memories,memory_terms,memory_exclusions,memory_deletions,briefing_runs,briefing_copies,briefing_observations RESTART IDENTITY CASCADE`);
+    memories,memory_terms,memory_exclusions,memory_deletions,briefing_runs,briefing_copies,briefing_observations,
+    deletion_ledger_generation RESTART IDENTITY CASCADE`);
   f = await fixture(database.db);
-  dir = await mkdtemp('.local/memory-');
-  ledger = new FlakyLedger(new FileDeletionLedger(`${dir}/deletions.jsonl`));
+  ({ dir, generation } = await initLedger('memory'));
+  ledger = new FlakyLedger(ledgerAt(dir, database.db));
   memory = new MemoryService(database.db, f.gate, ledger, documents, f.now);
   await memory.open();
 });
-after(async () => { await database.pg.close(); await rm(dir, { recursive: true, force: true }); });
+// 원장 디렉터리는 시험마다 새로 만든다. 닫은 뒤 지운다.
+afterEach(async () => { await closeLedgers(); await rm(dir, { recursive: true, force: true }); });
+after(async () => { await database.pg.close(); });
 async function rows(table: string, db = database.db) { return (await db.query<Record<string, any>>(`SELECT * FROM ${table}`)).rows; }
 // 정책 원본 확인 시각도 함께 옮긴다(5분 초과면 닫힌다).
 function at(ts: number) { f.advance(ts - f.now()); f.policy.confirmedAt = f.now(); }
@@ -312,17 +318,19 @@ test('DATA-02 재적용은 ID와 created_at이 둘 다 맞을 때만, 원장을 
   await assert.rejects(closed.open(), /ledger_down/);
   await assert.rejects(closed.search('fixture-owner', thread, '되감긴'), MemoryNotReady);
 });
+// T20 원장 계약 v1에서 바꿈: 예전 마지막 단언("부모 경로가 없으면 빈 원장")은 이제 열기 실패(missing)다.
 test('DATA-02 원장 파일: 끊긴 마지막 줄은 무시하고 다음 append 전에 잘라내며, 중간 손상은 닫힘', async () => {
-  const file = `${dir}/torn.jsonl`;
-  await writeFile(file, `${JSON.stringify({ memoryId: 'a', createdAt: 1, deletedAt: 2 })}\n{"memoryId":"b","crea`);
-  assert.deepEqual((await new FileDeletionLedger(file).entries()).map(e => e.memoryId), ['a']);
-  await new FileDeletionLedger(file).append({ memoryId: 'c', createdAt: 3, deletedAt: 4 });
-  assert.deepEqual((await new FileDeletionLedger(file).entries()).map(e => e.memoryId), ['a', 'c']);
-  assert.equal(await new FileDeletionLedger(file).has('c', 3), true);
-  await writeFile(file, `{"memoryId":\n${JSON.stringify({ memoryId: 'a', createdAt: 1, deletedAt: 2 })}\n`);
-  await assert.rejects(new FileDeletionLedger(file).entries(), { message: 'deletion_ledger_corrupt' });
-  const missing = new FileDeletionLedger(`${dir}/none/deletions.jsonl`);
-  assert.deepEqual(await missing.entries(), []);
+  const torn = await initLedger('torn', { generation });
+  await writeFile(torn.file, `${JSON.stringify({ memoryId: 'a', createdAt: 1, deletedAt: 2 })}\n{"memoryId":"b","crea`);
+  const opened = async () => openLedger(torn.dir, database.db);
+  assert.deepEqual((await (await opened()).entries()).map(e => e.memoryId), ['a']);
+  await (await opened()).append({ memoryId: 'c', createdAt: 3, deletedAt: 4 });
+  assert.deepEqual((await (await opened()).entries()).map(e => e.memoryId), ['a', 'c']);
+  assert.equal(await (await opened()).has('c', 3), true);
+  await writeFile(torn.file, `{"memoryId":\n${JSON.stringify({ memoryId: 'a', createdAt: 1, deletedAt: 2 })}\n`);
+  await assert.rejects((await opened()).entries(), { message: 'deletion_ledger_corrupt' });
+  await assert.rejects(openLedger(`${dir}/none`, database.db), { message: 'deletion_ledger_missing' });
+  await rm(torn.dir, { recursive: true, force: true });
 });
 test('DATA-02 삭제는 파생 브리핑에 반영: 대기 중은 막고, 이미 보낸 것은 지우지 않았다고 안내', async () => {
   const due = { access: ['fixture-notifications'], classification: 'safe_summary' as const, recheckAt: f.now() + 1 };
@@ -544,11 +552,12 @@ test('DATA-02 게시자가 잡았지만 아직 보내지 않은 브리핑은 삭
 test('DATA-02 끊긴 조각이 있는 원장에 동시 append해도 확정된 항목을 잃지 않음', async () => {
   // 경합은 확률적이다. 직렬화가 없으면 5개 동시 append에서 한 회차당 약 7%가 항목을 잃어 100회면 거의 확실히 드러난다.
   for (let round = 0; round < 100; round++) {
-    const file = `${dir}/race-${round}.jsonl`;
-    await writeFile(file, `${JSON.stringify({ memoryId: 'old', createdAt: 1, deletedAt: 1 })}\n{"memoryId":"to`);
-    const shared = new FileDeletionLedger(file);
+    const race = await initLedger('race', { generation });
+    await writeFile(race.file, `${JSON.stringify({ memoryId: 'old', createdAt: 1, deletedAt: 1 })}\n{"memoryId":"to`);
+    const shared = await openLedger(race.dir, database.db);
     await Promise.all(['a', 'b', 'c', 'd', 'e'].map((id, i) => shared.append({ memoryId: id, createdAt: i + 1, deletedAt: i + 1 })));
     assert.deepEqual((await shared.entries()).map(e => e.memoryId).sort(), ['a', 'b', 'c', 'd', 'e', 'old']);
+    await shared.close(); await rm(race.dir, { recursive: true, force: true });
   }
 });
 test('DATA-02 발송을 시작한 브리핑이 429로 대기열에 돌아와도 삭제 뒤에는 다시 보내지 않음', async () => {
@@ -588,24 +597,18 @@ test('BRIEF-01 작성 중에 알림 채널 설정이 바뀌면 막지 않고 새
 
 // --- Codex 리뷰 rev-t20 회귀 시험 ---
 test('DATA-02 [rev-t20 P1] 원장 디렉터리 fsync를 확인하지 못하면 삭제 완료라 하지 않고, 확인 뒤 정리', async () => {
-  const ledgerDir = await mkdtemp('.local/ledger-dir-');
-  let failDir = true;
-  let dirFailures = 0;
-  const io = { readFile: (path: string, encoding: 'utf8') => readFile(path, encoding),
-    open: async (path: Parameters<typeof open>[0], flags?: Parameters<typeof open>[1]) => {
-      const handle = await open(path, flags);
-      if (path !== ledgerDir || !failDir) return handle;
-      return { sync: async () => { dirFailures++; throw new Error('EIO'); }, close: () => handle.close() } as unknown as FileHandle;
-    } } as unknown as ConstructorParameters<typeof FileDeletionLedger>[1];
+  const { dir: ledgerDir } = await initLedger('ledger-dir', { generation });
+  const faults = { dirSync: 'EIO' as string | undefined };
+  const counts = { dirSync: 0, fileSync: 0 };
   try {
-    const fragile = new FileDeletionLedger(`${ledgerDir}/deletions.jsonl`, io);
+    const fragile = ledgerAt(ledgerDir, database.db, { io: faultyIo(faults, counts) });
     const service = new MemoryService(database.db, f.gate, fragile, documents, f.now); await service.open();
     const stored = await service.remember('fixture-owner', thread, config('디렉터리 fsync 실패 중 삭제'));
     const result = await service.delete('fixture-owner', thread, stored.id);
-    assert.ok(dirFailures > 0);
+    assert.ok(counts.dirSync > 0);
     assert.deepEqual([result.status, result.reason], ['pending', 'ledger_unconfirmed']);
     assert.equal((await rows('memories'))[0]!.statement, '디렉터리 fsync 실패 중 삭제');
-    failDir = false;
+    faults.dirSync = undefined;
     assert.equal(await service.resume(), 1);
     assert.equal((await rows('memories'))[0]!.status, 'deleted');
   } finally { await rm(ledgerDir, { recursive: true, force: true }); }
@@ -679,73 +682,56 @@ test('MEM-01 [rev-t20 P2-4] 만료된 기억은 같은 주제 새 기억의 충�
 });
 // --- Codex 재리뷰 rev-t20b 회귀 시험 ---
 test('DATA-02 [rev-t20b P1] 디렉터리 fsync 장애가 이어지는 중 재기동해도 원장 재적용·삭제 재요청을 완료로 올리지 않음', async () => {
-  const ledgerDir = await mkdtemp('.local/ledger-restart-');
-  let failDir = true;
-  let dirFailures = 0;
-  const io = { readFile: (path: string, encoding: 'utf8') => readFile(path, encoding),
-    open: async (path: Parameters<typeof open>[0], flags?: Parameters<typeof open>[1]) => {
-      const handle = await open(path, flags);
-      if (path !== ledgerDir || !failDir) return handle;
-      return { sync: async () => { dirFailures++; throw new Error('EIO'); }, close: () => handle.close() } as unknown as FileHandle;
-    } } as unknown as ConstructorParameters<typeof FileDeletionLedger>[1];
-  const path = `${ledgerDir}/deletions.jsonl`;
+  const { dir: ledgerDir } = await initLedger('ledger-restart', { generation });
+  const faults = { dirSync: 'EIO' as string | undefined };
+  const counts = { dirSync: 0, fileSync: 0 };
+  const io = faultyIo(faults, counts);
   const stored = async () => (await rows('memories'))[0]!;
   try {
-    const first = new MemoryService(database.db, f.gate, new FileDeletionLedger(path, io), documents, f.now); await first.open();
+    const first = new MemoryService(database.db, f.gate, ledgerAt(ledgerDir, database.db, { io }), documents, f.now); await first.open();
     const memoryRow = await first.remember('fixture-owner', thread, config('장애 중 재기동해도 남아야 할 기억'));
     assert.deepEqual((await first.delete('fixture-owner', thread, memoryRow.id)).status, 'pending');
-    const failuresBeforeRestart = dirFailures;
+    const failuresBeforeRestart = counts.dirSync;
     // 장애를 풀지 않은 채 같은 DB·원장 파일로 새 프로세스를 띄운다.
-    const restarted = new MemoryService(database.db, f.gate, new FileDeletionLedger(path, io), documents, f.now);
+    const restarted = new MemoryService(database.db, f.gate, ledgerAt(ledgerDir, database.db, { io }), documents, f.now);
     const opened = await restarted.open();
     assert.equal(opened.applied, 0);
-    assert.ok(dirFailures > failuresBeforeRestart);
+    assert.ok(counts.dirSync > failuresBeforeRestart);
     assert.deepEqual([(await stored()).status, (await stored()).statement], ['active', '장애 중 재기동해도 남아야 할 기억']);
     assert.deepEqual((await rows('memory_deletions')).map(d => [d.ledger_state, d.applied_at]), [['pending', null]]);
     assert.deepEqual(await restarted.search('fixture-owner', thread, '재기동'), []);
     const again = await restarted.delete('fixture-owner', thread, memoryRow.id);
     assert.deepEqual([again.status, again.reason], ['pending', 'ledger_unconfirmed']);
     assert.equal((await stored()).statement, '장애 중 재기동해도 남아야 할 기억');
-    failDir = false;
+    faults.dirSync = undefined;
     assert.equal(await restarted.resume(), 1);
     assert.deepEqual([(await stored()).status, (await stored()).statement], ['deleted', '']);
     assert.equal((await restarted.delete('fixture-owner', thread, memoryRow.id)).status, 'deleted');
   } finally { await rm(ledgerDir, { recursive: true, force: true }); }
 });
 test('DATA-02 [rev-t20b P1] 복원으로 삭제 요청 행이 없어도 확인되지 않은 원장 항목은 숨기기만 하고, 확인 뒤 재적용', async () => {
-  const ledgerDir = await mkdtemp('.local/ledger-restore-');
-  let failDir = true;
-  const io = { readFile: (path: string, encoding: 'utf8') => readFile(path, encoding),
-    open: async (path: Parameters<typeof open>[0], flags?: Parameters<typeof open>[1]) => {
-      const handle = await open(path, flags);
-      if (path !== ledgerDir || !failDir) return handle;
-      return { sync: async () => { throw new Error('EIO'); }, close: () => handle.close() } as unknown as FileHandle;
-    } } as unknown as ConstructorParameters<typeof FileDeletionLedger>[1];
-  const path = `${ledgerDir}/deletions.jsonl`;
+  const { dir: ledgerDir, file: path } = await initLedger('ledger-restore', { generation });
+  const faults = { dirSync: 'EIO' as string | undefined };
   try {
     const kept = await memory.remember('fixture-owner', thread, config('복원 뒤 확인 전 기억'));
     const createdAt = Number((await rows('memories'))[0]!.created_at);
     await writeFile(path, `${JSON.stringify({ memoryId: kept.id, createdAt, deletedAt: createdAt })}\n`);
-    const restored = new MemoryService(database.db, f.gate, new FileDeletionLedger(path, io), documents, f.now);
+    const restored = new MemoryService(database.db, f.gate, ledgerAt(ledgerDir, database.db, { io: faultyIo(faults) }), documents, f.now);
     assert.deepEqual(await restored.open(), { entries: 1, applied: 0 });
     assert.equal((await rows('memories'))[0]!.status, 'active');
     assert.deepEqual(await restored.search('fixture-owner', thread, '확인 전'), []);
-    failDir = false;
+    faults.dirSync = undefined;
     await restored.resume();
     assert.equal((await rows('memories'))[0]!.status, 'deleted');
   } finally { await rm(ledgerDir, { recursive: true, force: true }); }
 });
 // --- Codex 재리뷰 rev-t20c 회귀 시험과 같은 경로의 자체 점검 시험 ---
 async function dirFaultLedger(prefix: string) {
-  const ledgerDir = await mkdtemp(`.local/${prefix}-`);
+  const { dir: ledgerDir } = await initLedger(prefix, { generation });
   const state = { fail: false };
-  const io = { readFile: (path: string, encoding: 'utf8') => readFile(path, encoding),
-    open: async (path: Parameters<typeof open>[0], flags?: Parameters<typeof open>[1]) => {
-      const handle = await open(path, flags);
-      if (path !== ledgerDir || !state.fail) return handle;
-      return { sync: async () => { throw new Error('EIO'); }, close: () => handle.close() } as unknown as FileHandle;
-    } } as unknown as ConstructorParameters<typeof FileDeletionLedger>[1];
-  return { dir: ledgerDir, state, make: () => new FileDeletionLedger(`${ledgerDir}/deletions.jsonl`, io) };
+  const io = faultyIo({ get dirSync() { return state.fail ? 'EIO' : undefined; } });
+  const make = () => ledgerAt(ledgerDir, database.db, { io });
+  return { dir: ledgerDir, state, make, opened: async () => { const l = make(); await l.open(); return l; } };
 }
 test('DATA-02 [rev-t20c P1] 삭제 전 백업 복원·최신 회차 대기 브리핑·디렉터리 장애에서 정상 기동해도 지운 기억을 보내지 않음', async () => {
   const fault = await dirFaultLedger('ledger-restore-briefing');
@@ -787,7 +773,7 @@ test('DATA-02 [rev-t20c P2] 요청 행 없는 복원에서 재적용 정리가 �
   try {
     const kept = await memory.remember('fixture-owner', thread, config('재시도로 지워야 할 기억'));
     const createdAt = Number((await rows('memories'))[0]!.created_at);
-    await fault.make().append({ memoryId: kept.id, createdAt, deletedAt: createdAt });
+    await (await fault.opened()).append({ memoryId: kept.id, createdAt, deletedAt: createdAt });
     fault.state.fail = true;
     const broken = faulty(database.db, sql => sql.includes("UPDATE memories SET status='deleted'"));
     const restored = new MemoryService(broken, f.gate, fault.make(), documents, f.now);
@@ -830,7 +816,7 @@ test('MEM-01 [자체 G3] 원장에서 본 삭제(정리 전) 기억은 같은 �
   try {
     const old = await memory.remember('fixture-owner', thread, config('삭제된 옛 포트 80', { topic: 'svc:port' }));
     const createdAt = Number((await rows('memories'))[0]!.created_at);
-    await fault.make().append({ memoryId: old.id, createdAt, deletedAt: createdAt });
+    await (await fault.opened()).append({ memoryId: old.id, createdAt, deletedAt: createdAt });
     fault.state.fail = true;
     const restored = new MemoryService(database.db, f.gate, fault.make(), documents, f.now);
     await restored.open();

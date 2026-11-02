@@ -59,19 +59,19 @@ test('T16b 실제 PostgreSQL: 마이그레이션 Job 두 개가 겹쳐도 adviso
   const d = await database();
   try {
     const results = await Promise.all([runMigrations(d.pool()), runMigrations(d.pool()), runMigrations(d.pool())]);
-    assert.deepEqual(results.map(r => r.length).sort(), [0, 0, 11]);
-    assert.equal((await appliedMigrations(new Postgres(d.pool()))).size, 11);
+    assert.deepEqual(results.map(r => r.length).sort((a, b) => a - b), [0, 0, MIGRATIONS.length]);
+    assert.equal((await appliedMigrations(new Postgres(d.pool()))).size, MIGRATIONS.length);
   } finally { await d.close(); }
 });
 
-test('T16b 실제 PostgreSQL: 010까지 적용된 기존 DB는 011만 적용', { skip }, async () => {
+test('T16b 실제 PostgreSQL: 010까지 적용된 기존 DB는 011부터만 적용', { skip }, async () => {
   const d = await database();
   try {
     const pool = d.pool();
     for (const file of MIGRATIONS.slice(0, 10)) await pool.query(await readFile(`migrations/${file}`, 'utf8'));
     const db = new Postgres(d.pool(2));
     await pendingAlert(db);
-    assert.deepEqual(await runMigrations(pool), [11]);
+    assert.deepEqual(await runMigrations(pool), [11, 12]);
     assert.equal((await db.query<{ state: string }>('SELECT state FROM outbox')).rows[0]!.state, 'pending');
   } finally { await d.close(); }
 });
