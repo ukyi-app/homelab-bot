@@ -1,7 +1,7 @@
 import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { DEFAULTS, Denied, DiscordRejected, PolicyUnavailable } from '../src/contracts.js';
+import { DEFAULTS, Denied, DiscordRejected, PolicyUnavailable, RateLimited } from '../src/contracts.js';
 import type { Scope } from '../src/contracts.js';
 import type { Database } from '../src/database.js';
 import { MemoryNotReady, MemoryRejected, MemoryService } from '../src/memory.js';
@@ -901,4 +901,141 @@ test('MEM-01 [rev-pr8 P2-2] 다른 결정자의 결정은 확인된 문서가 �
   assert.equal((await memory.remember('fixture-owner', thread, decision([said, { type: 'document', uri: 'repo://draft/release.md', revision: 'r1' }]))).status, 'candidate');
   assert.equal((await memory.remember('fixture-owner', thread, decision([said, doc('release.md')]))).status, 'active');
   assert.equal((await memory.remember('fixture-owner', thread, decision([doc('release.md')]))).status, 'active');
+});
+
+// --- T20 예약 해제(T16b 이월 P2) 회귀 시험 ---
+// time·timezone을 각각 비우거나 잘못 넣은 설정. ensure가 이 값을 받으면 예약을 끈다.
+const BAD: BriefingConfig[] = [{ time: null, timezone: 'Asia/Seoul' }, { time: '25:00', timezone: 'Asia/Seoul' },
+  { time: '08:50', timezone: null }, { time: '08:50', timezone: 'Mars/Base' }];
+const disable = (bad: BriefingConfig = BAD[0]!) => scheduler([], { config: bad }).ensure();
+async function runs() {
+  return (await rows('briefing_runs')).sort((a, b) => a.slot_date.localeCompare(b.slot_date)).map(r => [r.slot_date, r.state, r.reason]);
+}
+async function drain() { for (let i = 0; i < 4; i++) await f.publisher.deliver(); }
+test('BRIEF-01 [T20 예약 해제] 큐에 든 브리핑은 시각·시간대를 비우거나 잘못 바꾸면 보내지 않음', async () => {
+  for (const [day, bad] of BAD.entries()) {
+    const s = scheduler(); assert.equal(await s.ensure(), 'enabled');
+    at(SLOT + day * DAY); assert.equal(await s.tick(), 'enqueued');
+    assert.equal(await disable(bad), 'unconfigured');
+    assert.equal(await s.tick(), 'idle');
+    await drain();
+    assert.equal(f.rest.messages.length, 0, JSON.stringify(bad));
+  }
+  assert.deepEqual((await briefings()).map(b => b.state), ['blocked', 'blocked', 'blocked', 'blocked']);
+  assert.deepEqual(await runs(), ['2027-01-16', '2027-01-17', '2027-01-18', '2027-01-19'].map(d => [d, 'blocked', 'schedule_disabled']));
+});
+test('BRIEF-01 [T20 예약 해제] 게시자가 잡았지만 발송을 시작하지 않은 브리핑은 예약을 끄면 보내지 않음', async () => {
+  const s = scheduler(); await s.ensure();
+  at(SLOT); await s.tick();
+  const claimed = (await f.store.claimDelivery())!;
+  assert.equal(claimed.state, 'sending');
+  assert.equal(await disable(BAD[1]), 'unconfigured');
+  assert.equal(await f.store.dispatchDelivery(claimed), false);
+  f.advance(31_000); f.policy.confirmedAt = f.now(); await f.store.expire();
+  await drain();
+  assert.equal(f.rest.messages.length, 0);
+  assert.deepEqual((await briefings()).map(b => b.state), ['blocked']);
+});
+test('BRIEF-01 [T20 예약 해제] 이미 보냈거나 발송을 시작한 브리핑은 예약을 꺼도 상태를 바꾸지 않음', async () => {
+  const s = scheduler(); await s.ensure();
+  at(SLOT); await s.tick(); await f.publisher.deliver();
+  assert.equal(await disable(BAD[0]), 'unconfigured');
+  assert.deepEqual((await briefings()).map(b => b.state), ['sent']);
+  assert.equal(await s.ensure(), 'enabled');
+  at(SLOT + DAY); assert.equal(await s.tick(), 'enqueued');
+  const claimed = (await f.store.claimDelivery())!;
+  assert.equal(await f.store.dispatchDelivery(claimed), true);
+  assert.equal(await disable(BAD[2]), 'unconfigured');
+  const started = (await briefings())[1] as unknown as { state: string; dispatch_started: boolean };
+  assert.deepEqual([started.state, started.dispatch_started], ['sending', true]);
+  await f.store.deliveryState(claimed, 'unknown');
+  assert.equal(await disable(BAD[3]), 'unconfigured');
+  assert.deepEqual((await briefings()).map(b => b.state), ['sent', 'unknown']);
+  // 발송을 시작한 회차는 "취소"로 바꾸지 않는다.
+  assert.deepEqual(await runs(), [['2027-01-16', 'enqueued', null], ['2027-01-17', 'enqueued', null]]);
+  assert.equal(f.rest.messages.length, 1);
+});
+test('BRIEF-01 [T20 예약 해제] 429로 대기열에 돌아온 브리핑은 예약을 끈 뒤에도, 다시 켠 뒤에도 보내지 않음', async () => {
+  const s = scheduler(); await s.ensure();
+  at(SLOT); await s.tick();
+  f.rest.rateLimit = new RateLimited(1000);
+  await f.publisher.deliver();
+  assert.deepEqual((await briefings()).map(b => b.state), ['pending']);
+  assert.equal(await disable(BAD[0]), 'unconfigured');
+  assert.deepEqual((await briefings()).map(b => b.state), ['blocked']);
+  // 발송 요청 중에 예약을 끄고 그 요청이 429로 돌아오면, 재시도 때 게시자가 예약 상태를 보고 막는다.
+  const send = f.rest.sendMessage.bind(f.rest);
+  const disableThen429 = async () => { await disable(BAD[3]); throw new RateLimited(1000); };
+  assert.equal(await s.ensure(), 'enabled');
+  at(SLOT + DAY); assert.equal(await s.tick(), 'enqueued');
+  f.rest.sendMessage = disableThen429;
+  await f.publisher.deliver();
+  f.rest.sendMessage = send;
+  assert.equal((await briefings())[1]!.state, 'pending');
+  at(SLOT + DAY + 5000); await drain();
+  assert.equal((await briefings())[1]!.state, 'blocked');
+  // 같은 상황에서 재시도 전에 예약을 다시 켜도 옛 회차는 나가지 않는다.
+  assert.equal(await s.ensure(), 'enabled');
+  at(SLOT + 2 * DAY); assert.equal(await s.tick(), 'enqueued');
+  f.rest.sendMessage = disableThen429;
+  await f.publisher.deliver();
+  f.rest.sendMessage = send;
+  assert.equal(await s.ensure(), 'enabled');
+  at(SLOT + 2 * DAY + 5000); await drain();
+  assert.equal(f.rest.messages.length, 0);
+  assert.deepEqual((await briefings()).map(b => b.state), ['blocked', 'blocked', 'blocked']);
+});
+test('BRIEF-01 [T20 예약 해제] 다시 켜도 끈 회차는 보내지 않고 다음 회차부터 한 번 보냄', async () => {
+  const s = scheduler(); await s.ensure();
+  at(SLOT); assert.equal(await s.tick(), 'enqueued');
+  assert.equal(await disable(BAD[1]), 'unconfigured');
+  at(SLOT + 60_000); assert.equal(await s.ensure(), 'enabled');
+  assert.equal(await s.tick(), 'idle');
+  await drain();
+  assert.equal(f.rest.messages.length, 0);
+  at(SLOT + DAY); assert.equal(await s.tick(), 'enqueued');
+  await drain();
+  assert.equal(f.rest.messages.length, 1);
+  assert.match(f.rest.messages[0]!.body.content, /^\[일일 브리핑\] 2027-01-17/);
+  assert.deepEqual((await briefings()).map(b => b.state), ['blocked', 'sent']);
+});
+test('BRIEF-01 [T20 예약 해제] 작성 중에 예약을 끄면 큐에 넣지 않음', async () => {
+  let toggled = false;
+  const toggling = source('toggling', 'backup', async () => {
+    if (!toggled) { toggled = true; assert.equal(await disable(BAD[2]), 'unconfigured'); }
+    return { observedAt: f.now(), status: 'ok', summary: '백업 정상' };
+  });
+  const s = scheduler([toggling]); await s.ensure();
+  at(SLOT); assert.notEqual(await s.tick(), 'enqueued');
+  assert.equal(await s.tick(), 'idle');
+  await drain();
+  assert.equal(f.rest.messages.length, 0);
+  assert.equal((await briefings()).length, 0);
+  assert.deepEqual(await runs(), [['2027-01-16', 'blocked', 'schedule_disabled']]);
+});
+test('BRIEF-01 [T20 예약 해제] 작성 중에 예약을 껐다 바로 켜도 그 회차는 큐에 넣지 않음', async () => {
+  let toggled = false;
+  const toggling = source('toggling', 'backup', async () => {
+    if (!toggled) { toggled = true; await disable(BAD[3]); assert.equal(await scheduler().ensure(), 'enabled'); }
+    return { observedAt: f.now(), status: 'ok', summary: '백업 정상' };
+  });
+  const s = scheduler([toggling]); await s.ensure();
+  at(SLOT); assert.notEqual(await s.tick(), 'enqueued');
+  assert.equal(await s.tick(), 'idle');
+  await drain();
+  assert.equal(f.rest.messages.length, 0);
+  assert.equal((await briefings()).length, 0);
+});
+test('BRIEF-01 [T20 예약 해제] 정리 없이 예약 행만 꺼져도 작성 중 회차는 큐 확정 때 다시 보고 막음', async () => {
+  // 수동 SQL이나 이 수정 전 버전처럼 enabled만 끄는 경로가 있어도 큐 확정은 같은 transaction에서 예약 상태를 다시 본다.
+  let toggled = false;
+  const toggling = source('toggling', 'backup', async () => {
+    if (!toggled) { toggled = true; await database.db.query('UPDATE schedules SET enabled=false'); }
+    return { observedAt: f.now(), status: 'ok', summary: '백업 정상' };
+  });
+  const s = scheduler([toggling]); await s.ensure();
+  at(SLOT); assert.equal(await s.tick(), 'blocked');
+  await drain();
+  assert.equal((await briefings()).length, 0);
+  assert.deepEqual(await runs(), [['2027-01-16', 'blocked', 'schedule_disabled']]);
 });

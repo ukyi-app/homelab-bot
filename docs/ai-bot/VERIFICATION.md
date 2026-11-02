@@ -274,6 +274,16 @@ PGlite는 transaction을 직렬화한다. 실제 PostgreSQL 다중 연결 경합
 
 **재판정(PR #8 Codex Connector 리뷰 1라운드 rev-pr8 반영, 2026-10-29):** rev-pr8은 P2 2건을 지적했고 둘 다 재현했다. (1) `search()`·`recheckDue()`가 `LIMIT 20`·`LIMIT 50` 뒤에 서비스·guild 권한과 원장 숨김을 적용해, 철회된 서비스의 기억이 앞자리를 채우면 접근 가능한 기억이 검색에서 빠지고 브리핑 기억 칸이 "없음"으로 나갔다(누출이 아니라 누락). 같은 종류의 빈틈인 guild 변경·원장에서 본 삭제(정리 전) 기억도 함께 재현했다. (2) 다른 결정자의 결정은 문서 출처의 존재만 확인해, owner 대화에 revision 없는 문서나 확인기가 unverified로 답한 문서를 더하면 active가 됐다. 이에 따라 MEM-01은 수정 전까지 **fail**이었다. 회귀 시험 4개를 먼저 넣어 `df10ede`에서 4개 실패를 확인했고, 수정 `b7a5164`에서 모두 통과했다. 권한·숨김 조건은 LIMIT 전 SQL로 옮기고 뒤의 `visible()` 필터는 그대로 두었다. 서비스·guild·숨김 조건과 문서 확인 조건을 하나씩 무력화하면 해당 시험만 다시 실패한다. 실제 PostgreSQL 18.6에서 333/333 pass(3회)다. 위 표의 MEM-01·AUTH-02 pass는 이 수정 뒤의 판정이며 각 행 오른쪽 경계로 한정한다. `recheckDue()`의 `total`은 여전히 50건에서 멈춘다(브리핑의 "외 N건"은 최대 45건, 기존 설계).
 
+### T20 예약 해제 P2 수정 (2026-11-02, 로컬·PG)
+
+T16b에서 이월한 P2다. 브리핑 시각·시간대를 비우거나 잘못 바꿔 `ensure()`가 예약을 꺼도 `schedules.enabled`만 바뀌어, 이미 큐에 든 사본·작성 중 회차·429로 대기열에 돌아온 행이 그대로 나갔다. 로컬·mock과 로컬 PostgreSQL 범위이고 실연동 pass가 아니다.
+
+- 고친 것: 끄기 transaction에서 예약 끄기·발송 전 사본 차단(`briefing_copies` 포함)·작성 중 lease 무효화·회차 `blocked`를 함께 한다. 큐 확정은 같은 transaction에서 예약 행을 다시 본다(`FOR SHARE`). 게시자는 브리핑 사본 발송 직전 예약이 켜져 있는지 본다. 다시 켤 때도 남은 발송 전 사본을 막는다. migration은 추가하지 않았다. 결정은 [DECISIONS](DECISIONS.md) T20 "일일 브리핑".
+- 회귀 시험: `test/memory-briefing.test.ts`(PGlite) 8개, `test/memory-briefing-pg.test.ts`(실제 PostgreSQL 다중 연결) 3개, 이름에 `[T20 예약 해제]`가 붙는다. time·timezone 각각 비움·오류, pending과 발송 전 sending, 작성 중 끄기(바로 다시 켜기 포함), 정리 없이 enabled만 꺼진 경우, 이미 보냄·발송 시작·unknown은 그대로, 429 재대기(끈 채 재시도·다시 켠 뒤 재시도), 다시 켠 뒤 옛 회차 미발송을 본다.
+- 수정 전 코드에서 처음 쓴 10개 중 9개가 지적한 증상(전송 1건, `pending` 그대로, 작성 중 회차 `enqueued`)으로 실패했다. 통과한 1개는 발송을 시작한 행을 건드리지 않는 경계 시험이다. 수정 뒤 모두 통과했다. 큐 확정의 예약 재확인, 게시자 확인, 다시 켤 때 차단, 끄기의 회차 정리를 하나씩 빼면 각각 1~2개 시험이 실패했다(나머지 경로는 회차 행 잠금이 함께 막는다).
+- `npm run check` 통과. `npm test`(기본)는 **796 tests / 774 pass / 0 fail / 22 skipped**(건너뜀은 실제 PostgreSQL 시험). 로컬 `postgres:18-alpine`(`--pull=never --network none`, 데이터 tmpfs, 소켓 디렉터리 바인드)을 `HOMELAB_TEST_PG_SOCKET`으로 주면 **796/796 pass**를 3회 연속 확인했다. Node 24.22.2, TypeScript 7.0.2, PGlite 0.5.10.
+- 남은 것: 실제 Discord·실제 시계·운영 DB에서 끄기·다시 켜기 확인은 T20 3단계 BRIEF-01 실연동이다. 설정 env 연결과 기동 순서는 T20 2단계다.
+
 ## CODEX_BRIDGE T18 실행 결과 (2026-10-29, 로컬·mock)
 
 - 기준: 브랜치 `feat/t18-codex-bridge-local`(origin/main `bf6a8e9` 위, PR #9). 구현은 [ARCHITECTURE.md](ARCHITECTURE.md) §12, 결정 대기는 [DECISIONS.md](DECISIONS.md) "T18 결정 대기 (사용자)".
@@ -582,7 +592,7 @@ S16에서 찾은 결함을 봇 저장소에서 고치고 병합·배포했다(�
 7. EVENT-01 Discord 경로 관측 수단(중복 흡수 감사 기록), T21 재확인 때. GitHub 경로는 T17.
 8. EVENT-02 outbox 경로 실연동, T21.
 
-이월(S18): T17·T18·T20의 P2(`review.ts`·`review-input.ts`, `codex-process.ts`, `briefing.ts`)는 그 경로가 T16b에서 꺼져 있어 각 티켓의 실연동 전 할 일로 옮겼다. T16a 변경 요청의 `accept()` 잠금 순서는 #11 `3fb389a`에서 이미 고쳤다.
+이월(S18): T17·T18·T20의 P2(`review.ts`·`review-input.ts`, `codex-process.ts`, `briefing.ts`)는 그 경로가 T16b에서 꺼져 있어 각 티켓의 실연동 전 할 일로 옮겼다. T16a 변경 요청의 `accept()` 잠금 순서는 #11 `3fb389a`에서 이미 고쳤다. T20의 `briefing.ts` P2(예약 해제 뒤 남은 outbox)는 2026-11-02 로컬·실제 PostgreSQL 다중 연결 범위에서 고쳤다([위 T20 절](#t20-예약-해제-p2-수정-2026-11-02-로컬pg)). 운영 연결·실채널 확인은 T20 3단계(BRIEF-01 실연동)다.
 
 플랫폼·사람:
 

@@ -89,21 +89,58 @@ export class BriefingScheduler {
   async ensure(): Promise<'enabled' | 'unconfigured'> {
     const { time, timezone } = this.config;
     if (!validTime(time) || !validZone(timezone)) {
-      await this.db.query('UPDATE schedules SET enabled=false WHERE id=$1', [BRIEFING.scheduleId]);
-      await this.store.audit('briefing_unconfigured', BRIEFING.scheduleId, { time, timezone });
+      // 끄기와 남은 사본 차단을 한 transaction에서 한다. 이 UPDATE의 예약 행 잠금이 compose의 FOR SHARE와,
+      // stop의 회차 행 잠금이 compose의 회차 UPDATE와 부딪혀 작성 중 회차의 큐 확정과 줄 선다.
+      await this.store.atomic(async store => {
+        await store.db.query('UPDATE schedules SET enabled=false WHERE id=$1', [BRIEFING.scheduleId]);
+        const stopped = await this.stop(store.db);
+        await store.audit('briefing_unconfigured', BRIEFING.scheduleId, { time, timezone, ...stopped });
+      });
       return 'unconfigured';
     }
     const policy = await this.gate.current();
     const scope = target(policy);
     await this.gate.authorize(policy.owner, scope);
-    // 설정이 같으면 next_run을 유지해야 중단 동안 지난 회차를 누락으로 알아챌 수 있다.
-    await this.db.query(`INSERT INTO schedules(id,owner_id,scope,timezone,next_run,payload,enabled) VALUES ($1,$2,$3,$4,$5,$6,true)
-      ON CONFLICT (id) DO UPDATE SET owner_id=$2,scope=$3,timezone=$4,payload=$6,enabled=true,
-        next_run=CASE WHEN schedules.enabled AND schedules.timezone=$4 AND schedules.payload->>'time'=$7
-          THEN schedules.next_run ELSE $5 END`,
-    [BRIEFING.scheduleId, policy.owner, JSON.stringify(scope), timezone, nextSlot(this.store.now(), time, timezone),
-      JSON.stringify({ kind: 'daily_briefing', time }), time]);
+    await this.store.atomic(async store => {
+      const previous = (await store.db.query<{ enabled: boolean }>('SELECT enabled FROM schedules WHERE id=$1 FOR UPDATE',
+        [BRIEFING.scheduleId])).rows[0];
+      // 꺼져 있던 예약을 다시 켤 때도 남은 사본을 막는다. 발송 중에 끈 뒤 429로 대기열에 돌아온 옛 회차가 여기에 남을 수 있다.
+      if (previous && !previous.enabled) {
+        const stopped = await this.stop(store.db);
+        if (stopped.blocked) await store.audit('briefing_reenabled', BRIEFING.scheduleId, stopped);
+      }
+      // 설정이 같으면 next_run을 유지해야 중단 동안 지난 회차를 누락으로 알아챌 수 있다.
+      // 꺼져 있었으면 다음 회차부터 다시 센다. 끈 동안의 회차는 보내지도 누락으로 세지도 않는다.
+      await store.db.query(`INSERT INTO schedules(id,owner_id,scope,timezone,next_run,payload,enabled) VALUES ($1,$2,$3,$4,$5,$6,true)
+        ON CONFLICT (id) DO UPDATE SET owner_id=$2,scope=$3,timezone=$4,payload=$6,enabled=true,
+          next_run=CASE WHEN schedules.enabled AND schedules.timezone=$4 AND schedules.payload->>'time'=$7
+            THEN schedules.next_run ELSE $5 END`,
+      [BRIEFING.scheduleId, policy.owner, JSON.stringify(scope), timezone, nextSlot(store.now(), time, timezone),
+        JSON.stringify({ kind: 'daily_briefing', time }), time]);
+    });
     return 'enabled';
+  }
+  // 예약 행을 잠근 transaction 안에서 부른다. 그 예약의 발송 전 사본(pending, 또는 발송을 시작하지 않은 sending)을 막는다.
+  // 막는 대상은 최신 outbox_key만이 아니라 briefing_copies에 남은 그 예약의 모든 사본이다(다시 작성한 회차의 옛 revision 포함).
+  // 발송을 시작한 행(sent·unknown·dispatch_started)은 보냈을 수 있으니 그대로 두고, 그 회차도 "취소"로 바꾸지 않는다.
+  private async stop(tx: Database): Promise<{ blocked: number; started: number }> {
+    const id = BRIEFING.scheduleId;
+    const runs = (await tx.query<{ slot_date: string; state: string; outbox_key: string | null }>(`SELECT slot_date,state,outbox_key
+      FROM briefing_runs WHERE schedule_id=$1 AND state IN ('composing','enqueued') ORDER BY slot_date FOR UPDATE`, [id])).rows;
+    const copies = (await tx.query<{ message_key: string }>('SELECT message_key FROM briefing_copies WHERE schedule_id=$1', [id])).rows;
+    const keys = [...new Set([...runs.flatMap(run => run.outbox_key ? [run.outbox_key] : []), ...copies.map(copy => copy.message_key)])];
+    // 게시자의 dispatch 표시가 state='sending'을 요구하므로 발송 시작 전 sending을 blocked로 바꾸면 보내지 않는다.
+    const blocked = new Set(keys.length ? (await tx.query<{ message_key: string }>(`UPDATE outbox SET state='blocked'
+      WHERE message_key=ANY($1::text[]) AND (state='pending' OR (state='sending' AND dispatch_started=false))
+      RETURNING message_key`, [keys])).rows.map(row => row.message_key) : []);
+    const started = new Set(keys.length ? (await tx.query<{ message_key: string }>(`SELECT DISTINCT message_key FROM outbox
+      WHERE message_key=ANY($1::text[]) AND (state IN ('sent','unknown') OR dispatch_started)`, [keys])).rows.map(row => row.message_key) : []);
+    // 작성 중 회차는 lease를 지워 작성 중인 쪽의 큐 확정(lease_token 일치 조건)이 실패하게 한다.
+    const closed = runs.filter(run => run.state === 'composing'
+      || (run.outbox_key !== null && blocked.has(run.outbox_key) && !started.has(run.outbox_key))).map(run => run.slot_date);
+    if (closed.length) await tx.query(`UPDATE briefing_runs SET state='blocked',reason='schedule_disabled',lease_token=NULL,lease_until=NULL,
+      updated_at=$3 WHERE schedule_id=$1 AND slot_date=ANY($2::text[])`, [id, closed, this.store.now()]);
+    return { blocked: blocked.size, started: started.size };
   }
   async tick(): Promise<BriefingOutcome> {
     const claim = await this.claim();
@@ -179,6 +216,15 @@ export class BriefingScheduler {
         '■ 다시 확인할 기억', ...memory.lines,
       ].join('\n');
       return await this.db.transaction(async tx => {
+        // 예약 끄기(ensure)와 줄 세운다. 끄기가 먼저 끝났으면 이 회차의 lease가 이미 지워졌거나 여기서 막는다.
+        // 큐 확정이 먼저 끝났으면 끄기가 이 잠금을 기다렸다가 방금 넣은 사본을 막는다.
+        const active = (await tx.query<{ enabled: boolean }>('SELECT enabled FROM schedules WHERE id=$1 FOR SHARE', [schedule.id])).rows[0];
+        if (!active?.enabled) {
+          const closed = (await tx.query(`UPDATE briefing_runs SET state='blocked',reason='schedule_disabled',lease_token=NULL,lease_until=NULL,
+            updated_at=$4 WHERE schedule_id=$1 AND slot_date=$2 AND lease_token=$3 AND state='composing' RETURNING slot_date`,
+          [schedule.id, claim.date, claim.token, this.store.now()])).rows.length;
+          return closed ? 'blocked' : 'idle';
+        }
         // 큐에 넣기 직전에 최신 권한을 다시 본다. 게시 직전 검사는 게시자가 한 번 더 한다.
         // 작성 중에 대상 설정만 바뀌었으면 막지 않고 새 대상으로 다시 작성한다. 실제 철회는 authorize가 막는다.
         const latest = await this.gate.current();
