@@ -63,8 +63,9 @@ function clock(ts: number, timeZone: string): string {
   const p = parts(ts, timeZone);
   return `${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')} ${String(p.hour).padStart(2, '0')}:${String(p.minute).padStart(2, '0')}`;
 }
-const validTime = (time: unknown): time is string => typeof time === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(time);
-function validZone(zone: unknown): zone is string {
+// config.ts의 BRIEFING_TIME·BRIEFING_TIMEZONE 검사도 이 둘을 쓴다(기동 검사와 ensure()의 판단이 갈리지 않게).
+export const validTime = (time: unknown): time is string => typeof time === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(time);
+export function validZone(zone: unknown): zone is string {
   if (typeof zone !== 'string' || !zone) return false;
   try { new Intl.DateTimeFormat('en-US', { timeZone: zone }); return true; } catch { return false; }
 }
