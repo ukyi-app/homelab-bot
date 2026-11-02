@@ -5,16 +5,18 @@ import { DiscordIngress, DiscordPublisher } from '../src/discord.js';
 import { DiscordProtocol, discordHttpApi } from '../src/discord-protocol.js';
 import { Runtime } from '../src/runtime.js';
 import { MODEL_QUEUE_LIMIT, Store } from '../src/store.js';
-import { event, fixture, localDatabase, thread } from './helpers.js';
+import { controlText } from '../src/control-format.js';
+import { captureControls, event, fixture, localDatabase, thread } from './helpers.js';
 
 let database: Awaited<ReturnType<typeof localDatabase>>;
 let f: Awaited<ReturnType<typeof fixture>>;
-before(async () => { database = await localDatabase(); });
+let controls: ReturnType<typeof captureControls>;
+before(async () => { database = await localDatabase(); controls = captureControls(); });
 beforeEach(async () => {
   await database.pg.exec('TRUNCATE events,conversations,jobs,results,outbox,schedules,denied_actors,controls,audit,incidents RESTART IDENTITY CASCADE');
   f = await fixture(database.db);
 });
-after(async () => { await database.pg.close(); });
+after(async () => { controls.restore(); await database.pg.close(); });
 async function rows(table: string) { return (await database.db.query<Record<string, any>>(`SELECT * FROM ${table}`)).rows; }
 async function enqueue(key = 'fixture-delivery') {
   await f.store.enqueue({ key, actor: f.policy.owner, scope: thread, revision: f.policy.revision,
@@ -29,7 +31,10 @@ async function paused(reason: 'limited' | 'auth_expired' = 'limited') {
 async function control(command: string, target?: string, id = `${command}-${target ?? 'none'}`) {
   await f.ingress.receive(event(id, { kind: 'command', command, target }));
   const input = (await rows('events')).find(e => e.delivery_id === id)!;
-  return JSON.parse((await rows('outbox')).find(o => o.idempotency_key === `control:${input.id}`)!.payload.content);
+  const content = (await rows('outbox')).find(o => o.idempotency_key === `control:${input.id}`)!.payload.content;
+  const result = controls.results.get(id) as Record<string, any>;
+  assert.equal(content, controlText(command, result));
+  return result;
 }
 async function flag(key = 'scheduler') { return (await rows('controls')).find(c => c.key === key)!.value; }
 async function failOnce(match: (sql: string) => boolean, run: () => Promise<unknown>) {

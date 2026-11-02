@@ -29,11 +29,20 @@ export async function chatContext(db: Database, conversation: string, event: str
     if (snowflake(row.delivery_id)) {
       while (next < answers.length && answers[next]!.position < BigInt(row.delivery_id)) timeline.push({ from: 'bot', answer: answers[next++]! });
     }
-    // 발화자 라벨은 저장된 payload가 덮지 못하게 마지막에도 쓴다(키 순서는 from이 앞).
-    timeline.push({ from: 'owner', item: Object.assign({ from: 'owner' as const }, row.payload, { from: 'owner' as const }), current: row.id === event });
+    timeline.push({ from: 'owner', item: ownerItem(row.payload), current: row.id === event });
   }
   while (next < answers.length) timeline.push({ from: 'bot', answer: answers[next++]! });
   return select(timeline, limits);
+}
+
+// owner 항목은 모델에 필요한 필드만 고른다. 저장된 수집 경로 표시(mention·activate·urgent)와 정책 revision을 넘기면
+// 모델이 구독 스레드의 멘션 없는 후속을 "봇에게 한 말이 아닐 수 있다"로 읽었다(S16). 기록에 든 owner 메시지는 모두
+// 봇이 받아들인 요청이고, 그 설명은 작업자 프롬프트의 신뢰 문맥(bot-facts.ts)에 있다.
+function ownerItem(payload: Record<string, unknown>): ContextItem {
+  const item: ContextItem = { from: 'owner', text: typeof payload.text === 'string' ? payload.text : '', kind: payload.kind };
+  if (typeof payload.command === 'string') item.command = payload.command;
+  if (typeof payload.target === 'string') item.target = payload.target;
+  return item;
 }
 
 // 같은 대화·같은 owner의 chat 결과 중 게시가 확정된(sent) 페이지만. 실패 안내·제어 ACK·스레드·경보는 message_key가

@@ -16,7 +16,8 @@ import { GitHubError, GitHubIngress, githubWebhook, RestrictedGitHub, restrictGi
 import type { GitHubReader, GitHubTransport, GitHubWrite, ReviewPolicy, ReviewResult } from '../src/review.js';
 import { archiveContract } from '../src/worker.js';
 import { HttpReviewWorker, reviewWorkerServer } from '../src/review-http.js';
-import { event, fixture, localDatabase, thread } from './helpers.js';
+import { controlText } from '../src/control-format.js';
+import { captureControls, event, fixture, localDatabase, thread } from './helpers.js';
 
 const SECRET = 'fixture-webhook-secret';
 const BASE = 'a'.repeat(40), HEAD = 'b'.repeat(40), HEAD2 = 'c'.repeat(40), BASE2 = 'd'.repeat(40);
@@ -113,14 +114,15 @@ class FakeGitHub implements GitHubReader {
 let database: Awaited<ReturnType<typeof localDatabase>>;
 let f: Awaited<ReturnType<typeof fixture>>;
 let r: Awaited<ReturnType<typeof setup>>;
-before(async () => { database = await localDatabase(); });
+let controls: ReturnType<typeof captureControls>;
+before(async () => { database = await localDatabase(); controls = captureControls(); });
 beforeEach(async () => {
   await database.pg.exec(`TRUNCATE events,conversations,jobs,results,outbox,schedules,denied_actors,controls,audit,incidents,
     github_deliveries,pr_reviews,review_deliveries RESTART IDENTITY CASCADE`);
   f = await fixture(database.db);
   r = await setup();
 });
-after(async () => { await database.pg.close(); });
+after(async () => { controls.restore(); await database.pg.close(); });
 async function setup() {
   const gh = new FakeGitHub();
   const archives = new Map<string, Buffer>();
@@ -1197,7 +1199,10 @@ async function command(name: string, target?: string, scope: Scope = notificatio
   const id = `${name}-${randomUUID()}`;
   await f.ingress.receive(event(id, { scope, actor, kind: 'command', command: name, target, mention: false }));
   const input = (await rows('events')).find(e => e.delivery_id === id)!;
-  return JSON.parse((await rows('outbox')).find(o => o.idempotency_key === `control:${input.id}`)!.payload.content);
+  const content = (await rows('outbox')).find(o => o.idempotency_key === `control:${input.id}`)!.payload.content;
+  const result = controls.results.get(id) as Record<string, any>;
+  assert.equal(content, controlText(name, result));
+  return result;
 }
 const schedulerPaused = async () => (await rows('controls')).find(c => c.key === 'scheduler')!.value;
 for (const reason of ['limited', 'auth_expired'] as const) {

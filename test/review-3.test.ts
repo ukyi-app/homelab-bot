@@ -206,18 +206,15 @@ test('4313740796 큰 read도 미확인·권장 확인을 보존한 완결 요약
   const summary = readSummary({ ...raw, checks: ['승인된 조회 경로와 관측 시각 확인'] });
   assert.match(summary, /권장 확인: 승인된 조회 경로와 관측 시각 확인/);
 });
-test('4313740796 큰 list는 모든 작업을 유효한 JSON 페이지로 전달', async () => {
+test('4313740796 큰 list는 한 메시지에 전체 건수와 최근 20건(S16 사람 읽는 형식)', async () => {
   for (let i = 0; i < 45; i++) await f.ingress.receive(event(`history-${i}`));
   const ids = new Set((await rows('jobs')).map(job => job.id));
   await f.ingress.receive(event('list', { kind: 'command', command: 'list', text: '' }));
   while (await f.publisher.deliver()) { /* Drain every independently idempotent page. */ }
-  assert.ok(f.rest.messages.length > 1);
-  const delivered = f.rest.messages.flatMap(message => {
-    assert.ok(message.body.content.length <= 2000);
-    // marker는 JSON 필드다(4316750293). 메시지 전체를 그대로 파싱한다.
-    return (JSON.parse(message.body.content) as { data: { id: string }[] }).data;
-  });
-  assert.equal(delivered.length, ids.size); assert.deepEqual(new Set(delivered.map(job => job.id)), ids);
-  assert.equal(new Set(f.rest.messages.map(message => message.body.nonce)).size, f.rest.messages.length);
+  assert.equal(f.rest.messages.length, 1);
+  const [head, ...lines] = f.rest.messages[0]!.body.content.split('\n').slice(0, -1);
+  assert.ok(f.rest.messages[0]!.body.content.length <= 2000);
+  assert.equal(head, `작업 ${ids.size}건(최근 20건만 표시)`); assert.equal(lines.length, 20);
+  for (const line of lines) assert.ok(ids.has(/^- `([^`]+)` /.exec(line)![1]!), line);
   const text = '안내😀'.repeat(1000); assert.equal(messagePages(text).join(''), text);
 });
