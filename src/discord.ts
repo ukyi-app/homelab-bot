@@ -305,6 +305,14 @@ export class DiscordPublisher {
       if (row.conversation_id && conversation?.gap) throw new HistoryGap();
     }
   }
+  // 예약 브리핑 사본은 그 예약이 지금 켜져 있을 때만 보낸다. 예약 끄기가 막지 못한 행(발송 중에 끈 뒤 429로 돌아온 행)을 여기서 막는다.
+  // 이 확인 뒤에 끄기가 끝나도 발송 전 sending은 끄기가 blocked로 바꾸고 dispatch 표시가 실패한다.
+  // reconcile(unknown 확인)에는 걸지 않는다. 보냈을 수 있는 행을 blocked로 바꾸면 안 된다.
+  private async scheduled(row: Delivery): Promise<void> {
+    const copy = (await this.store.db.query<{ enabled: boolean | null }>(`SELECT s.enabled FROM briefing_copies c
+      LEFT JOIN schedules s ON s.id=c.schedule_id WHERE c.message_key=$1`, [row.message_key])).rows[0];
+    if (copy && !copy.enabled) throw new Denied();
+  }
   async deliver(): Promise<boolean> {
     const row = await this.store.claimDelivery();
     if (!row) return false;
@@ -312,6 +320,7 @@ export class DiscordPublisher {
     let remoteId: string | null = null;
     try {
       await this.authorized(row);
+      await this.scheduled(row);
       const pause = await this.store.discordPauseUntil(row.payload.channel);
       if (pause > this.store.now()) { await this.store.pauseDelivery(row, 'discord_global_pause'); return true; }
       const marker = deliveryMarker(row);
