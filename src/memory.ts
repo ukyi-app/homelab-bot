@@ -1,10 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { open, readFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
 import { z } from 'zod';
 import { Denied } from './contracts.js';
 import type { Clock, Scope } from './contracts.js';
 import type { Database } from './database.js';
+import type { DeletionEntry, DeletionLedger } from './deletion-ledger.js';
 import type { Policy, PolicyGate } from './policy.js';
 
 export class MemoryRejected extends Error { constructor(reason: string) { super(reason); } }
@@ -65,81 +64,9 @@ export interface MemoryView {
 }
 export interface DeletionResult { status: 'deleted' | 'pending'; reason?: 'ledger_unconfirmed' | 'db_purge_pending'; publishedCopies: number; message: string }
 
-export interface DeletionEntry { memoryId: string; createdAt: number; deletedAt: number }
-// 복원 대상 밖의 append-only 삭제 원장. append가 resolve되면 내구성 있게 기록된 것이다.
-// entries()는 지금 보이는 항목일 뿐이다. 그 항목으로 삭제를 완료로 올리기 전에는 durable()로 내구성을 확인한다.
-export interface DeletionLedger {
-  append(entry: DeletionEntry): Promise<void>;
-  has(memoryId: string, createdAt: number): Promise<boolean>;
-  entries(): Promise<DeletionEntry[]>;
-  durable(): Promise<boolean>;
-}
-const EntrySchema = z.strictObject({ memoryId: z.string().min(1), createdAt: Time, deletedAt: Time });
-export interface LedgerIo { open: typeof open; readFile: (path: string, encoding: 'utf8') => Promise<string> }
-// 로컬 대역이다. 실제 원장 위치(R2 등)는 결정 대기(DECISIONS T20).
-export class FileDeletionLedger implements DeletionLedger {
-  private tail: Promise<unknown> = Promise.resolve();
-  private dirSynced = false;
-  private syncFailed = false;
-  // 파일 I/O는 장애 주입 시험을 위해서만 바꿀 수 있다.
-  constructor(private readonly path: string, private readonly io: LedgerIo = { open, readFile }) {}
-  // 프로세스 안의 append를 줄 세운다. 겹치면 한쪽의 조각 잘라내기가 다른 쪽의 확정된 줄을 지운다.
-  // 쓰는 프로세스는 하나라고 가정한다.
-  append(entry: DeletionEntry): Promise<void> {
-    const run = this.tail.then(() => this.write(entry));
-    this.tail = run.catch(() => {});
-    return run;
-  }
-  private async write(entry: DeletionEntry): Promise<void> {
-    const line = `${JSON.stringify(EntrySchema.parse(entry))}\n`;
-    const handle = await this.io.open(this.path, 'a+');
-    try {
-      // 끊긴 이전 append의 조각 뒤에 붙이면 원장이 손상된다. 확인되지 않은 조각이므로 잘라낸다.
-      const raw = await this.io.readFile(this.path, 'utf8');
-      if (raw.length && !raw.endsWith('\n')) await handle.truncate(Buffer.byteLength(raw.slice(0, raw.lastIndexOf('\n') + 1)));
-      await handle.appendFile(line);
-      try { await handle.sync(); } catch (error) { this.syncFailed = true; throw error; }
-    } finally { await handle.close(); }
-    // 파일을 만든 직후뿐 아니라 이 프로세스에서 확인하기 전까지는 디렉터리 항목도 fsync해야 전원 차단 뒤 파일이 남는다.
-    await this.syncDirectory();
-  }
-  async has(memoryId: string, createdAt: number): Promise<boolean> {
-    if (!await this.durable()) throw new Error('deletion_ledger_unsynced');
-    return (await this.entries()).some(e => e.memoryId === memoryId && e.createdAt === createdAt);
-  }
-  // 파일과 디렉터리 항목이 둘 다 fsync로 확인될 때만 true다. 새 파일의 디렉터리 항목이 없으면 전원 차단 뒤 파일째 사라진다.
-  // fsync가 한 번 실패하면 커널이 실패한 페이지를 clean으로 돌려 캐시만 보일 수 있어, 이 프로세스에서는 다시 믿지 않는다.
-  async durable(): Promise<boolean> {
-    if (this.syncFailed) return false;
-    await this.tail;
-    try {
-      const handle = await this.io.open(this.path, 'r').catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return undefined; throw error; });
-      if (!handle) return true;
-      try { await handle.sync(); } catch { this.syncFailed = true; return false; } finally { await handle.close(); }
-      await this.syncDirectory();
-      return true;
-    } catch { return false; }
-  }
-  private async syncDirectory(): Promise<void> {
-    if (this.dirSynced) return;
-    const dir = await this.io.open(dirname(this.path), 'r');
-    try { await dir.sync(); } finally { await dir.close(); }
-    this.dirSynced = true;
-  }
-  async entries(): Promise<DeletionEntry[]> {
-    let raw: string;
-    try { raw = await this.io.readFile(this.path, 'utf8'); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
-      throw error;
-    }
-    const lines = raw.split('\n');
-    // 마지막 줄이 줄바꿈 없이 끝나면 확인되지 않은 append가 끊긴 것이다. 그 줄만 무시한다.
-    const complete = lines.slice(0, -1);
-    return complete.filter(line => line.length).map(line => {
-      try { return EntrySchema.parse(JSON.parse(line)); } catch { throw new Error('deletion_ledger_corrupt'); }
-    });
-  }
-}
+// 원장 계약과 파일 구현은 deletion-ledger.ts에 있다(T20 원장 계약 v1).
+export { FileDeletionLedger, LedgerError } from './deletion-ledger.js';
+export type { DeletionEntry, DeletionLedger, LedgerStatus } from './deletion-ledger.js';
 
 const parent = (scope: Scope) => scope.kind === 'thread' ? scope.parent ?? '' : scope.channel;
 const erasedKey = (id: string, createdAt: number) => `${id}@${createdAt}`;
@@ -164,7 +91,8 @@ export class MemoryService {
   async open(): Promise<{ entries: number; applied: number }> {
     this.ready = false;
     let entries: DeletionEntry[];
-    try { entries = await this.ledger.entries(); } catch (error) {
+    // 원장 잠금·검증(open)은 읽기보다 먼저다. 열지 못하면 읽지 못한 것과 같게 닫힌 채로 둔다.
+    try { await this.ledger.open?.(); entries = await this.ledger.entries(); } catch (error) {
       // 어떤 기억이 지워졌는지 모르므로 기억이 든 대기 브리핑을 모두 막는다. 게시자가 먼저 돌아도 새지 않게 한다.
       await this.db.transaction(tx => this.reviseBriefings(tx, null, 'suppress'));
       throw error;
