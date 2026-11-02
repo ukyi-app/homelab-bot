@@ -64,7 +64,8 @@ export function grafanaTransport(options: { base: string; token: string; datasou
     const query = kind === 'metrics'
       ? { refId: 'A', datasource: { uid: request.datasource }, expr: request.query, instant: true, range: false,
         format: 'time_series', maxDataPoints: request.limit }
-      // [미확인] VictoriaLogs 플러그인 v0.33.1의 질의 필드. 실연동(S16)에서 실제 응답으로 맞춘다.
+      // VictoriaLogs 플러그인 v0.33.1(pkg/plugin/query.go): queryType instant는 /select/logsql/query로 가고
+      // start=from, end=to, limit=maxLines다. 그래서 창 전체의 원문 줄을 최대 maxLines개 받는다(실측 2026-11-02).
       : { refId: 'A', datasource: { uid: request.datasource }, expr: request.query, queryType: 'instant', maxLines: request.limit };
     const raw = DataResponse.parse(await call(send, `${base}/api/ds/query`, { method: 'POST', signal: request.signal,
       headers: { authorization: bearer(options.token), 'content-type': 'application/json', accept: 'application/json' },
