@@ -313,3 +313,19 @@ test('[T20 B5] 일부 종류만 연결하면 나머지 종류를 연결 없음·
   assert.match(content, /■ 확인 필요\n- 백업·인증서: 연결된 조회 없음 · 미확인\n■ 관측 결과\n- jobs: 정상 · 정상 요약/);
   assert.match(content, /- Codex 작업 상태·승인\/질문 대기: 연결 전\(T18\) · 미확인/);
 });
+
+test('[T20 B5 fix2] 시계가 작성 시작과 원본 읽기 사이에 지나가도 방금 읽은 관측을 읽기 불가로 버리지 않음', async () => {
+  const f = await fixture(database.db);
+  await database.pg.exec('TRUNCATE outbox,schedules,briefing_runs,briefing_copies,briefing_observations RESTART IDENTITY CASCADE');
+  const memory = { recheckDue: async () => ({ items: [], total: 0 }), live: async () => true } as unknown as MemoryService;
+  // 실제 Date.now처럼 원본이 읽는 사이에 1ms가 지난다. 원본은 읽은 시각을 관측 시각으로 낸다.
+  const scheduler = new BriefingScheduler(f.store, f.gate, memory, [{ id: 'jobs', label: 'jobs', kind: 'scheduled_job',
+    read: async () => { f.advance(1); return { observedAt: f.now(), status: 'ok', summary: '정상 요약' }; } }],
+  { time: '08:50', timezone: 'Asia/Seoul' });
+  await scheduler.ensure();
+  f.advance(Date.UTC(2027, 0, 15, 23, 50) - f.now()); f.policy.confirmedAt = f.now();
+  assert.equal(await scheduler.tick(), 'enqueued');
+  const content = (await database.db.query<{ payload: { content: string } }>("SELECT payload FROM outbox WHERE message_key LIKE 'briefing:%'")).rows[0]!.payload.content;
+  assert.match(content, /- jobs: 정상 · 정상 요약/);
+  assert.doesNotMatch(content, /jobs: 읽기 불가/);
+});

@@ -302,7 +302,9 @@ export class BriefingScheduler {
     const fine: string[] = [];
     // 원본을 함께 읽어 작성 시간이 원본 수에 비례해 lease를 넘지 않게 한다.
     const read = await Promise.all(this.sources.map(source => deadline(Promise.resolve().then(() => source.read()), BRIEFING.sourceTimeoutMs)
-      .then(value => valid(value, now) ? value : undefined, () => undefined)));
+      // 미래 시각 검사는 읽은 뒤의 현재 시각과 한다. 작성 시작 시각(now)과 비교하면 원본이 읽는 동안 시계가 지나간 것만으로
+      // 방금 읽은 관측이 '미래'가 돼 읽기 불가로 버려진다(PR #26 리뷰).
+      .then(value => valid(value, this.store.now()) ? value : undefined, () => undefined)));
     for (const [index, source] of this.sources.entries()) {
       const observation = read[index];
       await this.db.query(`INSERT INTO briefing_observations VALUES ($1,$2,$3,$4) ON CONFLICT (source_id) DO UPDATE SET
