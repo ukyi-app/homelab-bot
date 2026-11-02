@@ -46,7 +46,7 @@ for (const type of [2, 3]) for (const elapsed of [2499, 2500, 2600]) test(`43160
   const received = f.now(); let callbacks = 0; let expires = 0;
   const protocol = new DiscordProtocol({ request: async (method, path, _body, options) => {
     if (method === 'GET') { f.advance(1200); return { id: thread.channel, type: 11, parent_id: thread.parent, guild_id: thread.guild }; }
-    if (path.endsWith('/callback')) { callbacks++; expires = options!.expiresAt; return; }
+    if (path.endsWith('/callback')) { callbacks++; expires = options!.expiresAt!; return; }
     throw new Error('unexpected');
   } }, 'fixture-bot', f.now);
   const save = f.store.save.bind(f.store);

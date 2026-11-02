@@ -347,7 +347,15 @@ ACK 전에 inbox와 처리 경로를 저장한다. 처리 경로 transaction 안
 확인한다. true면 종료하고 false면 저장된 actor/scope/입력으로 다시 라우팅한다. 제어 명령도 이 잠금과
 같은 transaction 안에서 한 번 실행한다. save 직후 프로세스 종료·route rollback 뒤 재전달/복구도 적용한다.
 기존 job 재수락은 큐 상한보다 먼저 검사하므로 큐가 가득 차도 같은 job을 반환한다.
-Discord REST의 1초 전송 제한은 상호작용 첫 응답 3초에 맞춰 유지하며 작업 수락 여부와 분리한다.
+Discord REST 전송 제한은 세 가지다(S16 실측 뒤 사용자 결정 2026-11-02, 이전 1초 일괄 제한을 나눔). 작업 수락 여부와는 분리한다.
+상호작용 첫 응답(callback)은 그 상호작용 기한(아래 REVIEW-8, 진입 + 2500ms)의 남은 시간 전체를 쓴다.
+Gateway dispatch 안의 REST(이벤트 채널 조회, 일반 메시지 👀 리액션과 그 대체 게시)는 **1초**다. dispatch는 이벤트를
+하나씩 처리하므로 오래 기다리면 뒤에 밀린 상호작용이 3초 기한을 놓친다. 그 밖의 REST(게시·대조, history 복구의
+채널·history 조회, 명령 등록, gateway URL, 입력 중 표시)는 **5초**다. 게시 lease·복구 lease(각 30초)나 별도 루프 안에서
+돌아 몇 초 기다려도 계약이 깨지지 않는다. 복구 중 느린 응답으로 30초를 넘기면 기존대로 budget(gap 유지)이다.
+`ack_uncertain` 감사 detail은 `{ processing: 'durable', reason }`이다. reason은 `timeout`(전송 제한 초과)·`expired`(기한이
+지나 callback 생략)·`rate_limited`·`paused`(채널·전역 429 중지 중)·`rejected:<상태>`(400/403/404)·`unauthorized`·`denied`·
+`policy_unavailable`·`http_error`(그 밖의 비정상 응답)·`error` 중 하나다. 오류 원문·토큰은 남기지 않는다.
 상호작용 ACK 만료·유실 때는 처리 스레드/DM에 요청이 저장됐으며 재전송 전에 `/list`를 확인하라는
 멱등 안내를 보낸다. 새 스레드는 생성 대조 뒤 안내한다. 같은 명령 문자열의 별도 요청을 자동 합치지 않는다.
 정상적인 반복 작업을 잃지 않으려는 선택이며, 안내 전에 사용자가 새 ID로 재전송할 중복 위험은 남는다.
@@ -551,7 +559,7 @@ PolicyGate, DB rollback, HTTP/health, format에서 점검했다. ReadAdapter는 
 
 상호작용 마감은 `DiscordProtocol.gateway` 진입 시각 + 2500ms다. 메타데이터 조회가 끝난 뒤 새 타이머를
 시작하지 않는다. slash/버튼 모두 같은 절대 시각을 사용하고 callback HTTP 예산은
-min(1000ms, expiresAt-now)다. 저장 전 deferred ACK는 하지 않는다. 이미 수락했지만 마감이 지난 요청은
+expiresAt-now 전체다(2026-11-02 전에는 min(1000ms, expiresAt-now)). 저장 전 deferred ACK는 하지 않는다. 이미 수락했지만 마감이 지난 요청은
 callback을 생략하고 기존 ackUncertain/처리 대화 안내 경로를 쓴다. 네트워크 지연 때문에 실제 최초 응답의
 성공을 보장하는 것은 아니며, 토큰을 늦게 사용하지 않는 경계다.
 

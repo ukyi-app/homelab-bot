@@ -128,7 +128,7 @@ export class DiscordIngress {
       } catch (error) {
         if (error instanceof RateLimited) await this.store.recordRateLimit(error, event.scope.channel);
         await this.store.atomic(async store => {
-          await store.audit('ack_uncertain', id, { processing: 'durable' });
+          await store.audit('ack_uncertain', id, { processing: 'durable', reason: ackFailureReason(error) });
           if (event.kind !== 'message') {
             await store.db.query(`UPDATE events SET payload=payload || '{"ackUncertain":true}'::jsonb WHERE id=$1`, [id]);
             await store.ackNotice(id);
@@ -249,6 +249,22 @@ export class DiscordIngress {
   }
 }
 
+// ack_uncertain의 원인 분류. 다음 실측에서 시간 초과·기한 만료·429·거부를 가르려는 것이다.
+// 오류 메시지 원문은 남기지 않는다(callback 경로에 상호작용 토큰이 들어가므로). 아는 값만 고정 문자열로 바꾼다.
+export function ackFailureReason(error: unknown): string {
+  if (error instanceof RateLimited) return 'rate_limited';
+  if (error instanceof DiscordRejected) return `rejected:${error.status}`;
+  if (error instanceof DiscordUnauthorized) return 'unauthorized';
+  if (error instanceof Denied) return 'denied';
+  if (error instanceof PolicyUnavailable) return 'policy_unavailable';
+  // AbortSignal.timeout이 끊은 fetch는 name이 TimeoutError인 DOMException으로 실패한다.
+  if ((error as { name?: unknown } | null)?.name === 'TimeoutError') return 'timeout';
+  const message = error instanceof Error ? error.message : undefined;
+  if (message === 'interaction_expired') return 'expired';
+  if (message === 'discord_global_pause') return 'paused';
+  if (message === 'discord_request_failed') return 'http_error';
+  return 'error';
+}
 export function deliveryMarker(row: Delivery): string {
   return createHash('sha256').update(row.idempotency_key).digest('hex').slice(0, 24);
 }
