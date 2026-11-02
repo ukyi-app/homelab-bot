@@ -123,26 +123,37 @@ export const SERVICE_ACCOUNT = Object.freeze({
   token: '/var/run/secrets/kubernetes.io/serviceaccount/token',
   ca: '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
 });
-// Kubernetes API(D8·D9: in-cluster SA bot-reader). 객체 하나만 GET한다.
-// datasource kubernetes: 템플릿 namespace의 Deployment·StatefulSet. argocd: namespace argocd의 Argo CD Application CR,
-// 이름은 applications(카탈로그 고정값)에 있을 때만. 그 밖 datasource는 요청 없이 거부한다.
+// Kubernetes API GET(D8·D9: in-cluster SA bot-reader). 읽기 transport와 브리핑 관측(src/briefing-observations.ts)이 같은
+// 연결 풀을 쓴다. path는 호출하는 쪽이 고정 모양으로만 만든다(사용자 입력을 넣지 않는다).
 // 토큰은 kubelet이 갈아 끼우므로 요청마다 다시 읽는다. CA는 처음 쓸 때 읽어 연결 풀을 만든다.
-export function kubernetesTransport(options: { base: string; tokenFile: string; caFile: string | null;
-  applications: readonly string[]; send?: typeof fetch; readText?: (path: string) => Promise<string> }): ReadTransport & { close(): Promise<void> } {
+export interface KubernetesClient { get(path: string, signal: AbortSignal): Promise<unknown>; close(): Promise<void> }
+export function kubernetesClient(options: { base: string; tokenFile: string; caFile: string | null; send?: typeof fetch;
+  readText?: (path: string) => Promise<string> }): KubernetesClient {
   const send = options.send ?? fetch;
   const readText = options.readText ?? (path => readFile(path, 'utf8'));
   const base = options.base.replace(/\/$/, '');
-  const applications = new Set(options.applications.filter(app => name.test(app)));
   let dispatcher: Promise<Agent | undefined> | undefined;
   const agent = () => dispatcher ??= options.caFile === null ? Promise.resolve(undefined)
     : readText(options.caFile).then(ca => new Agent({ connect: { ca } })).catch(error => { dispatcher = undefined; throw error; });
-  // path는 아래 두 함수가 모양을 검사한 값으로만 만든다.
-  const get = async (path: string, signal: AbortSignal): Promise<unknown> => {
-    const token = (await readText(options.tokenFile)).trim();
-    if (!token || /\s/.test(token)) throw new Error('service_account_token');
-    return call(send, `${base}${path}`, { method: 'GET', signal, dispatcher: await agent(),
-      headers: { authorization: bearer(token), accept: 'application/json' } });
+  return {
+    async get(path, signal) {
+      const token = (await readText(options.tokenFile)).trim();
+      if (!token || /\s/.test(token)) throw new Error('service_account_token');
+      return call(send, `${base}${path}`, { method: 'GET', signal, dispatcher: await agent(),
+        headers: { authorization: bearer(token), accept: 'application/json' } });
+    },
+    async close() { const current = await dispatcher?.catch(() => undefined); await current?.close().catch(() => {}); },
   };
+}
+// 읽기 transport. 객체 하나만 GET한다.
+// datasource kubernetes: 템플릿 namespace의 Deployment·StatefulSet. argocd: namespace argocd의 Argo CD Application CR,
+// 이름은 applications(카탈로그 고정값)에 있을 때만. 그 밖 datasource는 요청 없이 거부한다.
+export function kubernetesTransport(options: { base: string; tokenFile: string; caFile: string | null;
+  applications: readonly string[]; send?: typeof fetch; readText?: (path: string) => Promise<string> }): ReadTransport & KubernetesClient {
+  const client = kubernetesClient(options);
+  const applications = new Set(options.applications.filter(app => name.test(app)));
+  // path는 아래 두 함수가 모양을 검사한 값으로만 만든다.
+  const get = client.get;
   const workloadStatus = async (request: Request): Promise<Uint8Array> => {
     const match = workload.exec(request.query);
     if (!match || !name.test(request.namespace)) throw new Error('unsupported_query');
@@ -175,7 +186,8 @@ export function kubernetesTransport(options: { base: string; tokenFile: string; 
       if (request.datasource === 'argocd') return applicationStatus(request);
       throw new Error('unsupported_query');
     },
-    async close() { const current = await dispatcher?.catch(() => undefined); await current?.close().catch(() => {}); },
+    get: client.get,
+    close: client.close,
   };
 }
 

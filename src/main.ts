@@ -5,6 +5,7 @@ import pg from 'pg';
 import { AlertIngress } from './alerts.js';
 import { BriefingScheduler } from './briefing.js';
 import type { ObservationSource } from './briefing.js';
+import { briefingSources } from './briefing-observations.js';
 import { ARGOCD_APPLICATIONS, GRAFANA_DATASOURCES, SERVICES, TEMPLATES } from './catalog.js';
 import { FOUNDATION_COMMANDS, registerCommands } from './commands.js';
 import { ConfigError, databasePoolConfig, loadPublisherConfig } from './config.js';
@@ -139,8 +140,9 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       acceptGeneration: config.memory.acceptGeneration ?? undefined,
       lock: advisoryLedgerLock(lockClient(databasePoolConfig(config.databaseUrl, { application_name: 'homelab-bot-ledger' }))) });
     const memory = new MemoryService(deps.db, gate, ledger, deps.documents ?? NO_DOCUMENTS, now);
-    // 관측 원본은 아직 비어 있다(브리핑에 "연결된 조회 없음 · 미확인"). B5가 실제 원본으로 바꾼다.
-    const observations: ObservationSource[] = deps.observations ?? [];
+    // 관측 원본: 백업(CNPG)·예약 작업(CronJob). 인증서·복원 검증은 봇 권한으로 읽을 원본이 없어 브리핑에 미확인으로 남는다.
+    // kubernetes는 읽기 transport와 같은 연결(SA 토큰·CA)이고 닫기는 종료의 kubernetes.close()가 맡는다.
+    const observations: ObservationSource[] = deps.observations ?? briefingSources({ kubernetes }, now);
     const briefing = new BriefingScheduler(store, gate, memory, observations,
       { time: config.briefing?.time ?? null, timezone: config.briefing?.timezone ?? null });
     return { ledger, memory, briefing };
