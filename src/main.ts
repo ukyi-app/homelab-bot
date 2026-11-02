@@ -165,7 +165,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       catch (error) { log('recovery_barrier_failed', errorInfo(error)); await pause(Math.min(30_000, 1000 * 2 ** Math.min(attempt, 5))); }
     }
   };
-  // REST는 요청마다 1초 제한이라 등록이 한 번 실패할 수 있다. 다음 READY(며칠 뒤일 수도)까지 미루지 않고 몇 번 더 시도한다.
+  // REST 요청 하나가 시간 초과(5초)·일시 오류로 실패할 수 있다. 다음 READY(며칠 뒤일 수도)까지 미루지 않고 몇 번 더 시도한다.
   let registering: string | undefined;
   const register = async (applicationId: string) => {
     if (registering === applicationId) return;

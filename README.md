@@ -94,8 +94,9 @@ ACK 전에 이벤트와 처리 경로(job 또는 outbox, 제어 결과)를 영�
 1500ms 마감을 적용하고 최종 갱신 뒤에도 검사한다. 마감 내 commit한 뒤 응답만 잃은 경우의
 수락 여부는 단정하지 않으며 같은 이벤트 ID로 중복 작업을 만들지 않는다.
 상호작용 callback의 절대 마감은 Gateway 어댑터 진입 시각 + 2500ms다. 채널 조회·저장 시간을
-모두 포함하고 HTTP 전송도 min(1000ms, 남은 시간)만 사용한다. 만료 뒤 callback을 시도하지 않는다.
-ACK 응답 유실은 `ack_uncertain` 감사 기록을 남기고 이미 수락한 작업을 계속한다.
+모두 포함하고 callback HTTP 전송 제한은 남은 시간 전체다(1초 상한 없음). 만료 뒤 callback을 시도하지 않는다.
+기한 없는 Discord REST는 요청당 5초, Gateway dispatch 안의 채널 조회·👀 리액션은 1초다.
+ACK 응답 유실은 `ack_uncertain` 감사 기록(`reason`으로 원인 분류)을 남기고 이미 수락한 작업을 계속한다.
 상호작용 응답의 만료·유실은 처리 스레드/DM에 상태 확인 안내를 한 번 보낸다. 새 스레드는 생성 확인 뒤 안내한다.
 thread/DM의 모든 입력·복구·실행·게시에서 기존 대화 owner 일치를 확인한다. 모델 맥락은 같은 owner의
 해당 job event_order 이하 수락 이벤트만 포함한다. buffer의 event_order는 실제 수락 때 재배치한다. 후속 요청은 자기 job에서 처리한다.
