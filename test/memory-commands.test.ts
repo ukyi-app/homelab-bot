@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, rm } from 'node:fs/promises';
@@ -9,7 +10,7 @@ import { ALL_COMMANDS, DiscordIngress, MEMORY_ACK_NOTICE } from '../src/discord.
 import { DOCUMENT_REPOSITORIES, githubDocuments } from '../src/document-source.js';
 import { MemoryService } from '../src/memory.js';
 import type { DeletionEntry, DeletionLedger, DocumentSource } from '../src/memory.js';
-import { DELETE_SCOPE, MemoryCommands, SEARCH_HEADER, UNAVAILABLE } from '../src/memory-commands.js';
+import { DELETE_SCOPE, MemoryCommands, REPLY_LIMIT, SEARCH_HEADER, UNAVAILABLE, savedText } from '../src/memory-commands.js';
 import { MockDiscord, event, fixture, localDatabase, thread } from './helpers.js';
 import { closeLedgers, initLedger, ledgerAt } from './ledger-fixture.js';
 
@@ -302,4 +303,22 @@ test('DOC-SRC 문서 출처 확인기: 허용 저장소의 커밋 고정 링크�
     assert.equal(await docs.check('fixture-owner', uri, null), 'inaccessible', uri);
   }
   assert.equal(calls.length, before);
+});
+
+test('MEM-CMD 응답 길이: 충돌이 많아도 저장·정정 응답은 Discord 한도 안이고 남은 충돌은 개수로 적음(PR #28 리뷰)', () => {
+  const ids = Array.from({ length: 50 }, () => randomUUID());
+  const saved = savedText('저장했습니다', { id: randomUUID(), status: 'candidate', conflictsWith: ids });
+  assert.ok(saved.length <= REPLY_LIMIT, `저장 응답 ${saved.length}자`);
+  assert.match(saved, /충돌 50건: .* 외 \d+건\(memory-search로 확인\)\. memory-correct로 정리하세요\./);
+  const shown = (saved.match(/`[0-9a-f-]{36}`/g) ?? []).length - 1;
+  assert.ok(shown > 0 && shown < 50);
+  assert.ok(saved.includes(`외 ${50 - shown}건`));
+  // 정정은 뒤에 바꾼 기억 줄이 붙는다. 그 몫을 빼고 자른다.
+  const tail = `바꾼 기억 ${ids.slice(0, 5).map(id => `\`${id}\``).join(', ')}은 superseded로 검색에서 빠집니다.`;
+  const corrected = `${savedText('정정했습니다. 새 기억', { id: randomUUID(), status: 'candidate', conflictsWith: ids }, REPLY_LIMIT - tail.length - 1)}\n${tail}`;
+  assert.ok(corrected.length <= REPLY_LIMIT, `정정 응답 ${corrected.length}자`);
+  // 충돌이 적으면 전부 적는다.
+  const few = savedText('저장했습니다', { id: randomUUID(), status: 'candidate', conflictsWith: ids.slice(0, 3) });
+  assert.match(few, /충돌 3건: `[^`]+`, `[^`]+`, `[^`]+`\. memory-correct로 정리하세요\./);
+  assert.doesNotMatch(few, /외 \d+건/);
 });

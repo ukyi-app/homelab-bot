@@ -167,11 +167,28 @@ export function searchText(views: MemoryView[]): string {
   }
   return lines.join('\n');
 }
-const savedText = (verb: string, result: { id: string; status: 'active' | 'candidate'; conflictsWith: string[] }) => [
-  `${verb}: \`${result.id}\` · 상태 ${STATUS[result.status]}`,
-  ...(result.status === 'candidate' ? ['근거가 이 종류에 맞지 않거나(설정·장애는 확인된 문서·작업) 충돌이 있어 확정하지 않았습니다.'] : []),
-  ...(result.conflictsWith.length ? [`충돌 ${result.conflictsWith.length}건: ${result.conflictsWith.map(id => `\`${id}\``).join(', ')}. memory-correct로 정리하세요.`] : []),
-].join('\n');
+// 충돌 ID 수에는 상한이 없다(같은 주제의 진술이 쌓이면 늘어난다). 저장·정정은 응답 전에 이미 끝났으므로 응답이 Discord 한도를
+// 넘어 거부되면 사용자는 결과를 못 본다. 검색처럼 전체 길이를 자르고 남은 충돌은 개수로 적는다(PR #28 리뷰).
+export function savedText(verb: string, result: { id: string; status: 'active' | 'candidate'; conflictsWith: string[] },
+  limit = REPLY_LIMIT): string {
+  const lines = [`${verb}: \`${result.id}\` · 상태 ${STATUS[result.status]}`,
+    ...(result.status === 'candidate' ? ['근거가 이 종류에 맞지 않거나(설정·장애는 확인된 문서·작업) 충돌이 있어 확정하지 않았습니다.'] : [])];
+  const total = result.conflictsWith.length;
+  if (!total) return lines.join('\n');
+  const ids: string[] = [];
+  for (const [index, id] of result.conflictsWith.entries()) {
+    const left = total - index - 1;
+    const line = (shown: string[], more: number) =>
+      `충돌 ${total}건: ${shown.join(', ')}${more ? ` 외 ${more}건(memory-search로 확인)` : ''}. memory-correct로 정리하세요.`;
+    if ([...lines, line([...ids, `\`${id}\``], left)].join('\n').length > limit) {
+      lines.push(line(ids, total - ids.length));
+      return lines.join('\n');
+    }
+    ids.push(`\`${id}\``);
+  }
+  lines.push(`충돌 ${total}건: ${ids.join(', ')}. memory-correct로 정리하세요.`);
+  return lines.join('\n');
+}
 // 삭제 범위 문구. 서비스 메시지(memory.ts)를 그대로 싣고, Discord 사본 범위를 늘 덧붙인다.
 export const DELETE_SCOPE = '이미 Discord에 게시된 사본(브리핑·이 명령들의 응답)은 지우지 않습니다.';
 export const DELETE_PENDING_SCOPE = '완료돼도 백업에는 최대 14일 남을 수 있습니다. 같은 명령으로 다시 확인할 수 있습니다.';
@@ -224,7 +241,8 @@ export class MemoryCommands implements MemoryCommandHandler {
       const reason = one(fields, 'reason');
       if (!reason) throw new CommandInputError('memory_cmd_reason', REJECTED.memory_correction_reason_required!);
       const result = await this.memory.correct(actor, scope, ids, input, reason);
-      return `${savedText('정정했습니다. 새 기억', result)}\n바꾼 기억 ${ids.map(old => `\`${old}\``).join(', ')}은 superseded로 검색에서 빠집니다.`;
+      const replaced = `바꾼 기억 ${ids.map(old => `\`${old}\``).join(', ')}은 superseded로 검색에서 빠집니다.`;
+      return `${savedText('정정했습니다. 새 기억', result, REPLY_LIMIT - replaced.length - 1)}\n${replaced}`;
     }
     if (command === 'memory-exclude') {
       const raw = (target ?? '').trim();
