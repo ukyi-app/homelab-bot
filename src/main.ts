@@ -7,7 +7,7 @@ import { BriefingScheduler } from './briefing.js';
 import type { ObservationSource } from './briefing.js';
 import { briefingSources } from './briefing-observations.js';
 import { ARGOCD_APPLICATIONS, GRAFANA_DATASOURCES, SERVICES, TEMPLATES } from './catalog.js';
-import { FOUNDATION_COMMANDS, registerCommands } from './commands.js';
+import { FOUNDATION_COMMANDS, MEMORY_COMMANDS, commandDefinitions, registerCommands } from './commands.js';
 import { ConfigError, databasePoolConfig, loadPublisherConfig } from './config.js';
 import type { PublisherConfig } from './config.js';
 import { z } from 'zod';
@@ -19,6 +19,7 @@ import type { Database } from './database.js';
 import { FileDeletionLedger, LedgerError } from './deletion-ledger.js';
 import type { DeletionLedger, LedgerStatus } from './deletion-ledger.js';
 import { DiscordIngress, DiscordPublisher } from './discord.js';
+import { githubDocuments } from './document-source.js';
 import { DiscordProtocol, discordHttpApi } from './discord-protocol.js';
 import type { DiscordApi } from './discord-protocol.js';
 import { GatewaySession, discordGatewayUrl } from './gateway.js';
@@ -29,6 +30,7 @@ import { typingHints } from './typing.js';
 import { advisoryLedgerLock, lockClient } from './ledger-lock.js';
 import { MemoryService } from './memory.js';
 import type { DocumentSource } from './memory.js';
+import { MemoryCommands } from './memory-commands.js';
 import { PORTS, receivers } from './http.js';
 import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
@@ -45,7 +47,7 @@ import { HttpWorker } from './worker-http.js';
 
 // 게시 서버 진입점(T16b S3). 이미지 기본 CMD는 node dist/src/main.js다. 마이그레이션은 src/migrate-main.ts(차트 migration.command).
 // T17(리뷰 큐·게시)·T18(TaskLane)은 연결하지 않는다. /github은 리뷰 비활성으로만 받는다(D6).
-// T20 기억·브리핑은 MEMORY_LEDGER_DIR이 있을 때만 만들고 기동 장벽·주기 루프까지 잇는다. 기억 명령은 아직 없다(B4).
+// T20 기억·브리핑은 MEMORY_LEDGER_DIR이 있을 때만 만들고 기동 장벽·주기 루프까지 잇는다. 기억 명령(memory-*)도 그때만 등록·수신한다.
 
 // 리뷰 정책이 정책 JSON에 있어도 T16b에서는 리뷰 경로를 열지 않는다. 기본 정책을 못 읽으면 503(PolicyUnavailable)이다.
 class ReviewOff extends ReviewPolicySource {
@@ -53,8 +55,6 @@ class ReviewOff extends ReviewPolicySource {
   override async current(): Promise<ReviewContext> { await this.base.current(); throw new ReviewDisabled(); }
 }
 const MessageChannel = z.object({ channel_id: z.string().min(1) });
-// 문서 출처 확인기는 아직 없다(B4가 실제 권한·revision 확인기로 바꾼다). 그 전에는 문서 출처를 근거로 받지 않는다.
-const NO_DOCUMENTS: DocumentSource = { check: async () => 'inaccessible' };
 export type ManagedLedger = DeletionLedger & { status(): LedgerStatus; close(): Promise<void> };
 const T20_PERIODS = { briefingTickMs: 30_000, memoryResumeMs: 60_000, ledgerReopenMs: 60_000 };
 const closedReader: GitHubReader = {
@@ -139,7 +139,8 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     const ledger = deps.ledger ?? new FileDeletionLedger({ dir: config.memory.ledgerDir, db: deps.db, now,
       acceptGeneration: config.memory.acceptGeneration ?? undefined,
       lock: advisoryLedgerLock(lockClient(databasePoolConfig(config.databaseUrl, { application_name: 'homelab-bot-ledger' }))) });
-    const memory = new MemoryService(deps.db, gate, ledger, deps.documents ?? NO_DOCUMENTS, now);
+    // 문서 출처는 공개 저장소 두 곳의 커밋 고정 링크만 raw 파일 존재로 확인한다(document-source.ts, 기존 인터넷 443 egress).
+    const memory = new MemoryService(deps.db, gate, ledger, deps.documents ?? githubDocuments({ send }), now);
     // 관측 원본: 백업(CNPG)·예약 작업(CronJob). 인증서·복원 검증은 봇 권한으로 읽을 원본이 없어 브리핑에 미확인으로 남는다.
     // kubernetes는 읽기 transport와 같은 연결(SA 토큰·CA)이고 닫기는 종료의 kubernetes.close()가 맡는다.
     const observations: ObservationSource[] = deps.observations ?? briefingSources({ kubernetes }, now);
@@ -276,7 +277,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       for (const delay of deps.registerDelaysMs ?? [0, 5000, 30_000, 120_000, 300_000]) {
         if (delay) await pause(delay);
         if (stop.signal.aborted) return;
-        try { log('commands_registered', await registerCommands(api, applicationId, config.policy.guild)); return; }
+        try { log('commands_registered', await registerCommands(api, applicationId, config.policy.guild, commandDefinitions(!!t20))); return; }
         catch (error) {
           log('commands_register_failed', errorInfo(error));
           if (error instanceof RateLimited) await pause(error.retryAfterMs);
@@ -310,7 +311,10 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     onReady: async ready => {
       if (!discord) {
         protocol = new DiscordProtocol(api, ready.userId, now);
-        discord = { ingress: new DiscordIngress(store, gate, protocol, true, new Set(FOUNDATION_COMMANDS)),
+        // 기억 명령은 원장이 켜졌을 때만 받는다. 장벽 전·기억이 닫힌 동안은 MemoryNotReady로, 종료 중이면 바로 "쓸 수 없음"으로 답한다.
+        const memoryCommands = t20 && new MemoryCommands(t20.memory, () => t20.ledger.status().state, () => stop.signal.aborted, now);
+        discord = { ingress: new DiscordIngress(store, gate, protocol, true,
+          new Set<string>([...FOUNDATION_COMMANDS, ...(memoryCommands ? MEMORY_COMMANDS : [])]), log, memoryCommands || undefined),
           publisher: new DiscordPublisher(store, gate, protocol) };
         const publisher = discord.publisher;
         const publish = () => {
