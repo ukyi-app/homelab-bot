@@ -71,6 +71,7 @@ function validZone(zone: unknown): zone is string {
 class StaleBriefing extends Error { constructor() { super('briefing_stale_memory'); } }
 const target = (policy: Policy): Scope => ({ guild: policy.guild, channel: policy.notificationChannel, parent: null, kind: 'channel' });
 const KIND: Record<MemoryView['kind'], string> = { configuration: '설정', decision: '결정', incident: '장애', preference: '선호' };
+const OBSERVED: Record<ObservationSource['kind'], string> = { backup: '백업', certificate: '인증서', scheduled_job: '예약 작업' };
 // bigint 열에 들어가므로 정수 ms만 받는다. 형식이 틀린 관측은 읽기 불가로 다룬다.
 function valid(value: Observation, now: number): boolean {
   return Number.isSafeInteger(value?.observedAt) && value.observedAt <= now && ['ok', 'problem'].includes(value.status)
@@ -319,6 +320,9 @@ export class BriefingScheduler {
       else if (observation.status === 'problem') attention.push(`- ${source.label}: 확인 필요 · ${summary} · ${seen}${restore}`);
       else fine.push(`- ${source.label}: 정상 · ${summary} · ${seen}${restore}`);
     }
+    // 일부 종류만 연결했으면 나머지 종류를 적는다. 빼면 "확인 필요 없음"이 연결하지 않은 종류까지 정상인 것처럼 읽힌다.
+    const unconnected = Object.entries(OBSERVED).filter(([kind]) => !this.sources.some(source => source.kind === kind)).map(([, label]) => label);
+    if (unconnected.length) attention.push(`- ${unconnected.join('·')}: 연결된 조회 없음 · 미확인`);
     return [...(attention.length ? ['■ 확인 필요', ...attention] : ['■ 확인 필요', '- 없음(아래 관측 기준)']),
       ...(fine.length ? ['■ 관측 결과', ...fine] : [])];
   }
