@@ -9,6 +9,9 @@ const NOW = 1_800_000_000_000;
 const OPEN = ['queued', 'running', 'verifying', 'cancel_requested', 'waiting_user', 'unknown'];
 const TYPES = ['chat', 'task', 'read', 'review'];
 const OUTBOX = ['pending', 'sending', 'unknown', 'blocked'];
+const LEDGER = ['closed', 'ready', 'degraded', 'failed', 'fenced', 'disabled'];
+const T20_SCALARS = ['homelab_bot_memory_deletions_pending', 'homelab_bot_memory_deletion_pending_oldest_seconds', 'homelab_bot_briefing_enabled'];
+const ledgerKey = (state: string) => `homelab_bot_deletion_ledger_state{state="${state}"}`;
 let database: Awaited<ReturnType<typeof localDatabase>>;
 let health: Health;
 before(async () => { database = await localDatabase(); });
@@ -55,8 +58,11 @@ test('OPS-M1 빈 DB: 모든 상태×종류·gap·outbox·제어 계열이 0으�
   for (const state of OUTBOX) assert.equal(m.get(`homelab_bot_outbox{state="${state}"}`), 0);
   for (const name of ['homelab_bot_conversation_gaps', 'homelab_bot_scheduler_paused', 'homelab_bot_emergency_stop', 'homelab_bot_gateway_halted'])
     assert.equal(m.get(name), 0, name);
-  // 기존 3개 + jobs 24 + outbox 4 + gap·paused·emergency·halted 4.
-  assert.equal(m.size, 3 + TYPES.length * OPEN.length + OUTBOX.length + 4);
+  // T20: 원장을 켜지 않은 기본은 disabled만 1, 삭제 대기·브리핑은 0.
+  for (const state of LEDGER) assert.equal(m.get(ledgerKey(state)), state === 'disabled' ? 1 : 0, state);
+  for (const name of T20_SCALARS) assert.equal(m.get(name), 0, name);
+  // 기존 3개 + jobs 24 + outbox 4 + gap·paused·emergency·halted 4 + T20 원장 상태 6·스칼라 3.
+  assert.equal(m.size, 3 + TYPES.length * OPEN.length + OUTBOX.length + 4 + LEDGER.length + T20_SCALARS.length);
 });
 
 test('OPS-M2 작업 상태·종류별 개수, 종결 상태는 내보내지 않음', async () => {
@@ -73,7 +79,7 @@ test('OPS-M2 작업 상태·종류별 개수, 종결 상태는 내보내지 않�
   assert.equal(m.get(jobKey('review', 'unknown')), 1);
   assert.equal(m.get(jobKey('review', 'verifying')), 1);
   assert.equal(m.get(jobKey('task', 'queued')), 0);
-  assert.equal([...m.keys()].some(key => /succeeded|failed|cancelled"|superseded/.test(key)), false);
+  assert.equal([...m.keys()].some(key => key.startsWith('homelab_bot_jobs') && /succeeded|failed|cancelled"|superseded/.test(key)), false);
 });
 
 test('OPS-M3 gap인 대화 수', async () => {
@@ -126,9 +132,32 @@ test('OPS-M8 라벨은 화이트리스트뿐: 모르는 종류·ID·본문·채�
     if (!labels) continue;
     for (const pair of labels.split(',')) {
       const [name, value] = pair.split('=') as [string, string];
-      const allowed = name === 'type' ? TYPES : name === 'state' ? [...OPEN, ...OUTBOX] : [];
+      const allowed = name === 'type' ? TYPES : name === 'state' ? [...OPEN, ...OUTBOX, ...LEDGER] : [];
       assert.ok(allowed.includes(JSON.parse(value)), `허용 밖 라벨: ${pair}`);
     }
   }
   assert.equal(parse(text).get(jobKey('chat', 'queued')), 1);
+});
+
+async function deletion(id: string, requestedAt: number, appliedAt: number | null) {
+  await database.db.query(`INSERT INTO memory_deletions(memory_id,memory_created_at,requested_by,requested_at,applied_at)
+    VALUES ($1,1,'fixture-owner',$2,$3)`, [id, requestedAt, appliedAt]);
+}
+test('OPS-M9 [T20] 원장 상태는 지금 값만 1(one-hot), 브리핑 0/1, 삭제 대기 수와 가장 오래된 대기 초', async () => {
+  let state: { ledger: (typeof LEDGER)[number]; briefingEnabled: boolean } = { ledger: 'closed', briefingEnabled: false };
+  health.watchMemory(() => state as never);
+  for (const ledger of LEDGER) {
+    state = { ledger, briefingEnabled: ledger === 'ready' };
+    const m = parse(await health.metrics());
+    assert.deepEqual(LEDGER.map(s => m.get(ledgerKey(s))), LEDGER.map(s => s === ledger ? 1 : 0), ledger);
+    assert.equal(m.get('homelab_bot_briefing_enabled'), ledger === 'ready' ? 1 : 0);
+  }
+  // 정리 끝난 삭제(applied_at 있음)는 세지 않는다. 가장 오래된 것은 요청 시각 기준.
+  await deletion('fixture-memory-a', NOW - 90_000, null);
+  await deletion('fixture-memory-b', NOW - 5000, null);
+  await deletion('fixture-memory-c', NOW - 999_000, NOW - 1000);
+  const m = parse(await health.metrics());
+  assert.equal(m.get('homelab_bot_memory_deletions_pending'), 2);
+  assert.equal(m.get('homelab_bot_memory_deletion_pending_oldest_seconds'), 90);
+  assert.doesNotMatch(await health.metrics(), /fixture-memory/);
 });

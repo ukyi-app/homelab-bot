@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
 import pg from 'pg';
-import { ADDRESS_KEYS, ConfigError, SECRET_KEYS, databasePoolConfig, loadPublisherConfig } from '../src/config.js';
+import { ADDRESS_KEYS, ConfigError, MEMORY_KEYS, SECRET_KEYS, databasePoolConfig, loadPublisherConfig } from '../src/config.js';
 
 // 값은 모두 시험용 가짜다. 실제 토큰·ID·주소를 쓰지 않는다.
 const ed25519 = () => generateKeyPairSync('ed25519').privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
@@ -101,4 +101,53 @@ test('T16b DB 연결: 차트의 sslmode=require를 libpq 의미(암호화, 인�
   assert.equal(databasePoolConfig('postgresql://h/db').connectionString, 'postgresql://h/db?uselibpqcompat=true');
   assert.equal(databasePoolConfig(`${url}&uselibpqcompat=false`).connectionString, `${url}&uselibpqcompat=false`);
   assert.equal(config.statement_timeout, 10_000);
+});
+
+const LEDGER = '/var/lib/homelab-bot/ledger';
+const GEN = '3f1c9a2e-7b4d-4e8a-9c21-5d6e7f8a9b0c';
+test('T20 설정: 원장·브리핑 env가 없으면 둘 다 꺼짐(T20 전과 같음), 있으면 읽음', () => {
+  assert.deepEqual([...MEMORY_KEYS], ['MEMORY_LEDGER_DIR', 'MEMORY_LEDGER_ACCEPT_GENERATION', 'BRIEFING_TIME', 'BRIEFING_TIMEZONE']);
+  const off = loadPublisherConfig(publisherEnv(), 1_800_000_000_000);
+  assert.equal(off.memory, null); assert.equal(off.briefing, null);
+  const ledgerOnly = loadPublisherConfig(publisherEnv({ MEMORY_LEDGER_DIR: LEDGER }), 1_800_000_000_000);
+  assert.deepEqual(ledgerOnly.memory, { ledgerDir: LEDGER, acceptGeneration: null }); assert.equal(ledgerOnly.briefing, null);
+  const all = loadPublisherConfig(publisherEnv({ MEMORY_LEDGER_DIR: LEDGER, MEMORY_LEDGER_ACCEPT_GENERATION: GEN,
+    BRIEFING_TIME: '08:50', BRIEFING_TIMEZONE: 'Asia/Seoul' }), 1_800_000_000_000);
+  assert.deepEqual(all.memory, { ledgerDir: LEDGER, acceptGeneration: GEN });
+  assert.deepEqual(all.briefing, { time: '08:50', timezone: 'Asia/Seoul' });
+});
+
+test('T20 설정: 형식이 틀리면 기동 실패, 오류에는 키 이름과 사유만(값·경로 없음)', () => {
+  const bad: [string, string][] = [
+    ['MEMORY_LEDGER_DIR', 'var/lib/homelab-bot/ledger'], ['MEMORY_LEDGER_DIR', '/var/lib/homelab-bot'], ['MEMORY_LEDGER_DIR', '/var/lib/homelab-bot/'],
+    ['MEMORY_LEDGER_DIR', '/var/lib/homelab-bot/ledger/'], ['MEMORY_LEDGER_DIR', '/var/lib/homelab-bot/../secret-place'],
+    ['MEMORY_LEDGER_DIR', '/var/lib/homelab-bot-other/ledger'], ['MEMORY_LEDGER_DIR', '/tmp/secret-place'], ['MEMORY_LEDGER_DIR', ''],
+    ['MEMORY_LEDGER_DIR', '/var/lib/homelab-bot//ledger'],
+  ];
+  for (const [key, value] of bad) {
+    const found = problems(publisherEnv({ [key]: value }));
+    assert.deepEqual(found, [`${key}(invalid)`], `${key}=${value}`);
+    assert.ok(!found.join().includes('secret-place'));
+  }
+  const withLedger = (extra: Record<string, string | undefined>) => problems(publisherEnv({ MEMORY_LEDGER_DIR: LEDGER, ...extra }));
+  for (const value of ['3F1C9A2E-7B4D-4E8A-9C21-5D6E7F8A9B0C', '3f1c9a2e-7b4d-1e8a-9c21-5d6e7f8a9b0c', 'not-a-uuid', '']) {
+    assert.deepEqual(withLedger({ MEMORY_LEDGER_ACCEPT_GENERATION: value }), ['MEMORY_LEDGER_ACCEPT_GENERATION(invalid)'], value);
+  }
+  for (const value of ['8:50', '24:00', '08:60', '0850', '08:50:00', ' 08:50', '']) {
+    assert.deepEqual(withLedger({ BRIEFING_TIME: value, BRIEFING_TIMEZONE: 'Asia/Seoul' }), ['BRIEFING_TIME(invalid)'], value);
+  }
+  for (const value of ['Asia/Nowhere', 'KST+9', '']) {
+    assert.deepEqual(withLedger({ BRIEFING_TIME: '08:50', BRIEFING_TIMEZONE: value }), ['BRIEFING_TIMEZONE(invalid)'], value);
+  }
+});
+
+test('T20 설정: 브리핑 둘 중 하나만 있거나, 원장 없이 원장 의존 키가 있으면 기동 실패(조용히 끄지 않음)', () => {
+  assert.deepEqual(problems(publisherEnv({ MEMORY_LEDGER_DIR: LEDGER, BRIEFING_TIME: '08:50' })), ['BRIEFING_TIMEZONE(missing)']);
+  assert.deepEqual(problems(publisherEnv({ MEMORY_LEDGER_DIR: LEDGER, BRIEFING_TIMEZONE: 'Asia/Seoul' })), ['BRIEFING_TIME(missing)']);
+  assert.deepEqual(problems(publisherEnv({ BRIEFING_TIME: '08:50', BRIEFING_TIMEZONE: 'Asia/Seoul' })),
+    ['BRIEFING_TIME(requires MEMORY_LEDGER_DIR)', 'BRIEFING_TIMEZONE(requires MEMORY_LEDGER_DIR)']);
+  assert.deepEqual(problems(publisherEnv({ MEMORY_LEDGER_ACCEPT_GENERATION: GEN })), ['MEMORY_LEDGER_ACCEPT_GENERATION(requires MEMORY_LEDGER_DIR)']);
+  // 다른 키 오류와 함께 모두 모아 알린다.
+  assert.deepEqual(problems(publisherEnv({ WORKER_URL: undefined, MEMORY_LEDGER_DIR: '/tmp/x', BRIEFING_TIME: '25:00' })),
+    ['WORKER_URL(missing)', 'MEMORY_LEDGER_DIR(invalid)', 'BRIEFING_TIME(invalid)', 'BRIEFING_TIMEZONE(missing)']);
 });

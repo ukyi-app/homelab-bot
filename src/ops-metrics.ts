@@ -6,6 +6,12 @@ import type { Database } from './database.js';
 const OPEN_STATES = ['queued', 'running', 'verifying', 'cancel_requested', 'waiting_user', 'unknown'] as const;
 const JOB_TYPES = ['chat', 'task', 'read', 'review'] as const;
 const OUTBOX_STATES = ['pending', 'sending', 'unknown', 'blocked'] as const;
+// T20 삭제 원장 상태(LedgerState + 원장을 켜지 않은 disabled). 지금 값만 1인 one-hot이다.
+export const LEDGER_STATES = ['closed', 'ready', 'degraded', 'failed', 'fenced', 'disabled'] as const;
+export type LedgerMetricState = (typeof LEDGER_STATES)[number];
+// 프로세스 안의 T20 상태. 원장 상태와 이 프로세스의 브리핑 예약 반영 결과는 DB에 없다.
+export interface MemoryMetrics { ledger: LedgerMetricState; briefingEnabled: boolean }
+export const MEMORY_DISABLED: MemoryMetrics = Object.freeze({ ledger: 'disabled', briefingEnabled: false });
 
 // 한 번의 왕복으로 상수 개수의 집계만 한다. jobs는 jobs_queue(state,...) 인덱스의 state 조건으로 좁힌다.
 // outbox·conversations에는 state·gap 인덱스가 없어 표 전체를 읽는다(지금 규모에선 작다. 커지면 부분 인덱스를 더한다).
@@ -13,15 +19,19 @@ const QUERY = `
   SELECT 'job' AS kind, type AS a, state AS b, count(*)::text AS n FROM jobs WHERE state = ANY($1::text[]) GROUP BY type, state
   UNION ALL SELECT 'outbox', state, '', count(*)::text FROM outbox WHERE state = ANY($2::text[]) GROUP BY state
   UNION ALL SELECT 'gap', '', '', count(*)::text FROM conversations WHERE gap = true
-  UNION ALL SELECT 'control', key, value::text, '0' FROM controls WHERE key IN ('scheduler', 'scheduler_emergency')`;
+  UNION ALL SELECT 'control', key, value::text, '0' FROM controls WHERE key IN ('scheduler', 'scheduler_emergency')
+  UNION ALL SELECT 'deletion', '', COALESCE(min(requested_at)::text, ''), count(*)::text FROM memory_deletions WHERE applied_at IS NULL`;
 
-export async function opsMetrics(db: Database): Promise<string> {
+// 삭제 대기는 DB의 정리 안 끝난 삭제 요청(memory_deletions.applied_at IS NULL)이다. 원장 기록 전(ledger_unconfirmed)과
+// 원장 기록 뒤 DB 정리 전(db_purge_pending)을 함께 센다. 복원으로 요청 행이 사라진 원장 재적용 대기는 여기 없다(원장 상태로 본다).
+export async function opsMetrics(db: Database, now: number, memory: MemoryMetrics = MEMORY_DISABLED): Promise<string> {
   const rows = (await db.query<{ kind: string; a: string; b: string; n: string }>(QUERY, [OPEN_STATES, OUTBOX_STATES])).rows;
   const jobs = new Map<string, number>();
   const outbox = new Map<string, number>();
-  let gaps = 0, paused = 0, emergency = 0;
+  let gaps = 0, paused = 0, emergency = 0, deletions = 0, oldest = 0;
   for (const row of rows) {
     if (row.kind === 'job') jobs.set(`${row.a}/${row.b}`, Number(row.n));
+    else if (row.kind === 'deletion') { deletions = Number(row.n); oldest = row.b ? Math.max(0, (now - Number(row.b)) / 1000) : 0; }
     else if (row.kind === 'outbox') outbox.set(row.a, Number(row.n));
     else if (row.kind === 'gap') gaps = Number(row.n);
     else if (row.a === 'scheduler') paused = row.b === 'true' ? 1 : 0;
@@ -34,6 +44,10 @@ export async function opsMetrics(db: Database): Promise<string> {
     ...OUTBOX_STATES.map(state => `homelab_bot_outbox{state="${state}"} ${outbox.get(state) ?? 0}`),
     `homelab_bot_scheduler_paused ${paused}`,
     `homelab_bot_emergency_stop ${emergency}`,
+    ...LEDGER_STATES.map(state => `homelab_bot_deletion_ledger_state{state="${state}"} ${memory.ledger === state ? 1 : 0}`),
+    `homelab_bot_memory_deletions_pending ${deletions}`,
+    `homelab_bot_memory_deletion_pending_oldest_seconds ${oldest}`,
+    `homelab_bot_briefing_enabled ${memory.briefingEnabled ? 1 : 0}`,
   ];
   return `${lines.join('\n')}\n`;
 }

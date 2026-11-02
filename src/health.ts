@@ -1,5 +1,6 @@
 import { DEFAULTS } from './contracts.js';
-import { opsMetrics } from './ops-metrics.js';
+import { MEMORY_DISABLED, opsMetrics } from './ops-metrics.js';
+import type { MemoryMetrics } from './ops-metrics.js';
 import type { Store } from './store.js';
 
 export class Health {
@@ -9,6 +10,7 @@ export class Health {
   private lastPing: number | null = null;
   private pinging = false;
   private gatewayState: () => { halted: boolean } = () => ({ halted: false });
+  private memoryState: () => MemoryMetrics = () => MEMORY_DISABLED;
   public receivers = { app: false, alerts: false };
   constructor(private readonly store: Store, private readonly ping: () => Promise<void>) {}
   gateway(connected: boolean): void {
@@ -19,6 +21,8 @@ export class Health {
   // fatal close(토큰·intent 오류 등)로 Gateway가 다시 연결하지 않는 상태. connected=0만으로는 일시 단절과 구분되지 않는다.
   // Discord REST 401(discord-protocol의 halted)은 별개 상태라 여기 들어오지 않는다.
   watchGateway(state: () => { halted: boolean }): void { this.gatewayState = state; }
+  // T20 원장·브리핑 상태. readiness에는 묶지 않는다(원장 장애로 경보·webhook 수신까지 끊기지 않게, DECISIONS T20).
+  watchMemory(state: () => MemoryMetrics): void { this.memoryState = state; }
   async ready(): Promise<boolean> {
     if (!this.receivers.app || !this.receivers.alerts) return false;
     try {
@@ -46,7 +50,7 @@ export class Health {
       + `homelab_bot_outbox_unknown ${unknown.count}\n`
       + `homelab_bot_outbox_oldest_seconds ${row.oldest === null ? 0 : Math.max(0, (this.store.now() - Number(row.oldest)) / 1000)}\n`
       + `homelab_bot_gateway_halted ${Number(this.gatewayState().halted)}\n`
-      + await opsMetrics(this.store.db);
+      + await opsMetrics(this.store.db, this.store.now(), this.memoryState());
   }
 }
 // Discord는 IDENTIFY를 24시간 1000회(봇 상한 900), rate_limit_key마다 5초에 1회 받는다. 단일 shard라 키는 하나다.
