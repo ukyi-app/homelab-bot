@@ -7,7 +7,8 @@ import type { Database } from '../src/database.js';
 import { MemoryService } from '../src/memory.js';
 import type { DeletionEntry, DeletionLedger, DocumentSource } from '../src/memory.js';
 import { BriefingScheduler } from '../src/briefing.js';
-import type { BriefingConfig } from '../src/briefing.js';
+import type { BriefingConfig, ObservationSource } from '../src/briefing.js';
+import { DiscordPublisher } from '../src/discord.js';
 import { Store } from '../src/store.js';
 import type { Scope } from '../src/contracts.js';
 import { fixture } from './helpers.js';
@@ -110,5 +111,69 @@ test('DATA-02 [rev-t20d P2 PG] 저장 제외가 먼저 시작돼 끝나기 전�
     hold.release();
     await Promise.all([excluding, ticking]);
     assert.equal(await sentStatements(env, scheduler), 0);
+  } finally { await env.close(); }
+});
+
+// --- T20 예약 해제(T16b 이월 P2): 예약 끄기와 큐 확정·게시의 실제 다중 연결 경합 ---
+const unconfigured: BriefingConfig = { time: null, timezone: 'Asia/Seoul' };
+async function delivered(env: Awaited<ReturnType<typeof setup>>) {
+  for (let i = 0; i < 3; i++) await env.f.publisher.deliver();
+  return env.f.rest.messages.length;
+}
+test('BRIEF-01 [T20 예약 해제 PG] 큐 확정 transaction이 열린 동안 예약을 끄면 그 회차를 보내지 않음', { skip }, async () => {
+  const env = await setup();
+  try {
+    const hold = pausing(env.db, sql => sql.includes("SET state='enqueued'"));
+    const scheduler = new BriefingScheduler(new Store(hold.db, env.f.now), env.f.gate, env.memory, [], seoul);
+    await scheduler.ensure(); env.move(SLOT);
+    const ticking = scheduler.tick();
+    await hold.paused;
+    const disabling = new BriefingScheduler(env.f.store, env.f.gate, env.memory, [], unconfigured).ensure();
+    // 직렬화가 있으면 예약 끄기는 큐 확정이 끝나기를 기다렸다가 그 사본을 막는다.
+    await sleep(200);
+    hold.release();
+    await Promise.all([ticking, disabling]);
+    assert.equal(await delivered(env), 0);
+  } finally { await env.close(); }
+});
+test('BRIEF-01 [T20 예약 해제 PG] 예약 끄기가 끝나기 전에 작성을 마친 회차가 큐에 넣으려 해도 보내지 않음', { skip }, async () => {
+  const env = await setup();
+  try {
+    let arrive!: () => void;
+    let proceed!: () => void;
+    const arrived = new Promise<void>(resolve => { arrive = resolve; });
+    const gate = new Promise<void>(resolve => { proceed = resolve; });
+    const waiting: ObservationSource = { id: 'waiting', label: 'waiting', kind: 'backup', read: async () => {
+      arrive(); await gate; return { observedAt: env.f.now(), status: 'ok', summary: '백업 정상' };
+    } };
+    const scheduler = new BriefingScheduler(env.f.store, env.f.gate, env.memory, [waiting], seoul);
+    await scheduler.ensure(); env.move(SLOT);
+    const ticking = scheduler.tick();
+    await arrived;
+    const hold = pausing(env.db, sql => sql.includes('SET enabled=false'));
+    const disabling = new BriefingScheduler(new Store(hold.db, env.f.now), env.f.gate, env.memory, [], unconfigured).ensure();
+    await hold.paused;
+    proceed();
+    // 직렬화가 있으면 큐 확정은 예약 끄기가 끝나기를 기다렸다가 꺼진 예약을 보고 멈춘다.
+    await sleep(200);
+    hold.release();
+    await Promise.all([ticking, disabling]);
+    assert.equal(await delivered(env), 0);
+  } finally { await env.close(); }
+});
+test('BRIEF-01 [T20 예약 해제 PG] 게시자가 잡아 권한을 확인하는 동안 예약을 끄면 발송하지 않음', { skip }, async () => {
+  const env = await setup();
+  try {
+    const scheduler = new BriefingScheduler(env.f.store, env.f.gate, env.memory, [], seoul);
+    await scheduler.ensure(); env.move(SLOT);
+    assert.equal(await scheduler.tick(), 'enqueued');
+    const hold = pausing(env.db, sql => sql.includes('SELECT service_ids FROM outbox'));
+    const publisher = new DiscordPublisher(new Store(hold.db, env.f.now), env.f.gate, env.f.rest);
+    const delivering = publisher.deliver();
+    await hold.paused;
+    assert.equal(await new BriefingScheduler(env.f.store, env.f.gate, env.memory, [], unconfigured).ensure(), 'unconfigured');
+    hold.release();
+    await delivering;
+    assert.equal(await delivered(env), 0);
   } finally { await env.close(); }
 });
