@@ -58,7 +58,7 @@ discord:
   activation: explicit_mention_or_command     # 00 §8 원래 값. D-17 확정: 멘션이나 / 명령으로 공개 스레드 시작, 스레드 안은 멘션 없이
   thread_type: public                         # D-17 확정. 메시지 없이 만들 때 type을 항상 명시
   auto_archive_minutes: 1440                  # D-17 확정. 허용 값 60 | 1440 | 4320 | 10080
-  briefing_time: "08:50"                     # 확정(사용자 2026-10-20, T16a). 위 timezone 기준, 매일
+  briefing_time: "08:50"                     # 확정(사용자 2026-10-20, T16a). 매일. 실제 설정은 env BRIEFING_TIME=08:50 + BRIEFING_TIMEZONE=Asia/Seoul(둘 다 있거나 둘 다 없음, MEMORY_LEDGER_DIR 필요). 운영 첫 값에는 넣지 않음(실채널 발송은 사용자 별도 승인 뒤)
   message_content_intent: enabled             # D-17 확정: 켬. 00 §8 원래 초안 값은 unverified. 실연동 확인은 T16b
   gateway_intents: null                       # 제안: 33281(GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT). DM 끔(T16a)이라 DIRECT_MESSAGES 뺌. MESSAGE_CONTENT를 끄는 fallback은 513(GUILDS|GUILD_MESSAGES)
   bot_permissions: null                       # 제안 309237763136. D-17 확정: ADMINISTRATOR·MANAGE_THREADS·MENTION_EVERYONE 없음, 허용 채널 overwrite로
@@ -161,10 +161,12 @@ retention:
   evidence_days: null
   memory: scoped_and_deletable
   backup_days: 14                             # 설계 기본값, 확정. 삭제한 기억도 이 기간 백업에 남을 수 있음
-  deletion_ledger: null                       # 제안: 복원 대상 밖(예: R2 append-only 객체). 기억 ID·created_at·삭제 시각만. 기동 때마다 재적용
-                                              # ID와 created_at이 둘 다 맞을 때만 삭제. memory_id는 재사용되지 않는 값(UUID 등) 제안. T20(R17), ARCHITECTURE §7
-                                              # 순서: 원장 기록 확인 → DB 삭제 → 완료 응답. 원장 쓰기가 실패하면 지우지 않음(실패 알림 또는 재시도 outbox) [가정]
-                                              # DB 삭제가 실패하면 성공할 때까지 재시도하고 그동안 조회에서 숨김(원장 또는 DB 숨김 표식 대조) [가정]
+  deletion_ledger: "/var/lib/homelab-bot/ledger"  # 확정(사용자 2026-11-02): NUC 두 번째 SSD의 파일 원장(R2 아님). env MEMORY_LEDGER_DIR, 원장 계약 v1(DECISIONS T20)
+                                              # env가 없으면 기억·원장·브리핑을 만들지 않음. 있으면 /var/lib/homelab-bot/ 아래 절대 경로여야 하고 아니면 기동 실패
+                                              # 새 원장 세대(SSD 교체·재초기화)를 받아들일 때만 MEMORY_LEDGER_ACCEPT_GENERATION=<표식의 generation>
+                                              # 기억 ID·created_at·삭제 시각만. 기동 때마다 재적용. ID와 created_at이 둘 다 맞을 때만 삭제. T20(R17), ARCHITECTURE §7
+                                              # 순서: 원장 기록 확인 → DB 정리 → 완료 응답. 원장 기록을 확인하지 못하면 지우지 않고 숨긴 채 재시도
+                                              # 기동 순서: 원장 열기·재적용 → 브리핑 예약 반영 → 첫 tick → 게시자(DECISIONS T20 "기동 순서")
 
 # 비밀값과 실제 값의 위치. 값은 여기 쓰지 않는다(키 이름만).
 secret_keys:
