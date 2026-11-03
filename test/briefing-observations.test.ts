@@ -6,9 +6,11 @@ import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import { BriefingScheduler } from '../src/briefing.js';
 import type { Observation } from '../src/briefing.js';
-import { BACKUP_STALE_MS, backupSource, briefingSources, scheduledJobSource } from '../src/briefing-observations.js';
+import { BACKUP_STALE_MS, CERT_QUERIES, RESTORE_ANNOTATIONS, backupSource, briefingSources, certificateSource, restoreCheck,
+  scheduledJobSource } from '../src/briefing-observations.js';
 import type { MemoryService } from '../src/memory.js';
-import { kubernetesTransport } from '../src/read-transports.js';
+import type { ReadTransport } from '../src/read.js';
+import { encodeObservation, grafanaTransport, kubernetesTransport } from '../src/read-transports.js';
 import { fixture, localDatabase } from './helpers.js';
 
 // 브리핑 관측 어댑터(T20 B5). 가짜 Kubernetes API 응답만 쓴다. 실제 클러스터에는 연결하지 않는다.
@@ -58,12 +60,13 @@ function mock(replies: Record<string, Reply>) {
 const healthyBackups = () => ({ items: [backup('pg-daily-1', 'completed', NOW - 19 * HOUR - 3000, NOW - 19 * HOUR)] });
 const readBackup = (replies: Record<string, Reply>) => backupSource(mock(replies), now, { namespace: 'database', cluster: 'pg' }).read();
 
-test('[T20 B5] 백업 정상: 고정 경로 둘만 읽고 관측 시각은 읽은 시각, 복원 검증은 채우지 않음', async () => {
+test('[T20 B5] 백업 정상: 고정 경로 둘만 읽고 관측 시각은 읽은 시각, 복원 기록이 없으면 복원 검증은 미확인', async () => {
   const k8s = mock({ [CLUSTER_PATH]: cluster(), [BACKUPS_PATH]: healthyBackups() });
   const source = backupSource(k8s, now, { namespace: 'database', cluster: 'pg' });
   assert.equal(source.kind, 'backup');
   const value = await source.read();
-  assert.deepEqual(value, { observedAt: NOW, status: 'ok', summary: '마지막 성공 백업 19시간 전 · WAL 아카이브 정상', restoreVerifiedAt: null });
+  assert.deepEqual(value, { observedAt: NOW, status: 'ok', summary: '마지막 성공 백업 19시간 전 · WAL 아카이브 정상', restoreVerifiedAt: null,
+    restoreCheck: { status: 'unknown', passAt: null, failedAt: null, staleDays: null, issue: null } });
   assert.deepEqual(k8s.seen.sort(), [BACKUPS_PATH, CLUSTER_PATH].sort());
 });
 
@@ -273,7 +276,7 @@ test('[T20 B5] 브리핑 문구: 미확인·확인 필요가 정상으로 바뀌
     [BACKUPS_PATH]: { items: [backup('b1', 'completed', slot - 10 * HOUR - 3000, slot - 10 * HOUR)] } });
   at(slot); assert.equal(await scheduler.tick(), 'enqueued');
   const first = (await contents())[0]!;
-  assert.match(first, /PostgreSQL 백업\(pg\): 정상 · 마지막 성공 백업 10시간 전 · WAL 아카이브 정상 · 관측 01-16 08:50 · 복원 검증 미확인\(백업 성공과 별개\)/);
+  assert.match(first, /PostgreSQL 백업\(pg\): 정상 · 마지막 성공 백업 10시간 전 · WAL 아카이브 정상 · 관측 01-16 08:50 · 복원 검증 기록 없음\(미확인\) · CLI 기록 기준, 백업 성공과 별개/);
   assert.match(first, /예약 작업\(CronJob\): 정상 · 등록된 CronJob 없음/);
   assert.match(first, /- 인증서: 연결된 조회 없음 · 미확인/);
   assert.doesNotMatch(first, /- 없음\(아래 관측 기준\)/);
@@ -328,4 +331,271 @@ test('[T20 B5 fix2] 시계가 작성 시작과 원본 읽기 사이에 지나가
   const content = (await database.db.query<{ payload: { content: string } }>("SELECT payload FROM outbox WHERE message_key LIKE 'briefing:%'")).rows[0]!.payload.content;
   assert.match(content, /- jobs: 정상 · 정상 요약/);
   assert.doesNotMatch(content, /jobs: 읽기 불가/);
+});
+
+// T24 인증서 원본. 가짜 Grafana transport가 집계 질의마다 값(없으면 빈 결과)을 돌려준다.
+type Metric = number | number[] | undefined | Error;
+type CertValues = Partial<Record<keyof typeof CERT_QUERIES, Metric>>;
+function grafanaFake(values: CertValues) {
+  const seen: Parameters<ReadTransport['query']>[0][] = [];
+  const transport: ReadTransport = { async query(request) {
+    seen.push(request);
+    const key = (Object.keys(CERT_QUERIES) as (keyof typeof CERT_QUERIES)[]).find(k => CERT_QUERIES[k] === request.query);
+    assert.ok(key, `모르는 질의 ${request.query}`);
+    const value = values[key];
+    if (value instanceof Error) throw value;
+    const rows = value === undefined ? [] : (Array.isArray(value) ? value : [value]).map(v => ({ value: v }));
+    return encodeObservation(request.to, rows, request);
+  } };
+  return { seen, transport };
+}
+const seconds = (ts: number) => ts / 1000;
+const healthyCerts = (extra: CertValues = {}): CertValues =>
+  ({ count: 2, earliest: seconds(NOW + 79 * DAY + HOUR), ready: 2, age: 30, ...extra });
+const readCert = (values: CertValues, zone?: string) =>
+  certificateSource({ transport: grafanaFake(values).transport, datasource: 'victoriametrics' }, now, zone).read();
+
+test('[T24] 인증서 정상: 집계 질의 4개만 메트릭 datasource로 보내고 관측 시각은 읽은 시각', async () => {
+  const fake = grafanaFake(healthyCerts());
+  const source = certificateSource({ transport: fake.transport, datasource: 'victoriametrics' }, now, 'Asia/Seoul');
+  assert.deepEqual([source.id, source.label, source.kind], ['certificate:cert-manager', '인증서(cert-manager)', 'certificate']);
+  assert.deepEqual(await source.read(), { observedAt: NOW, status: 'ok', summary: '2개 모두 Ready · 가장 이른 만료 2027-04-05(79일)' });
+  assert.deepEqual(fake.seen.map(r => r.query).sort(), Object.values(CERT_QUERIES).sort());
+  // 계약 1의 질의 문자열 그대로. 가장 이른 만료는 발급 전 인증서(만료 값 0)를 뺀다.
+  assert.deepEqual({ ...CERT_QUERIES }, {
+    count: 'count(certmanager_certificate_expiration_timestamp_seconds)',
+    earliest: 'min(certmanager_certificate_expiration_timestamp_seconds > 0)',
+    ready: 'count(certmanager_certificate_ready_status{condition="True"} == 1)',
+    age: 'max(time() - timestamp(certmanager_certificate_expiration_timestamp_seconds))' });
+  assert.ok(fake.seen.every(r => r.datasource === 'victoriametrics' && r.to === NOW && r.signal instanceof AbortSignal && r.limit === 2));
+  // 경계: 만료까지 정확히 7일, 신선도 정확히 600초는 정상이다.
+  assert.equal((await readCert(healthyCerts({ earliest: seconds(NOW + 7 * DAY), age: 600 }))).status, 'ok');
+});
+
+test('[T24] 인증서 확인 필요: 만료 임박·만료됨·Ready 부족·오래됨·0개', async () => {
+  const cases: [CertValues, string][] = [
+    [healthyCerts({ earliest: seconds(NOW + 6 * DAY + HOUR) }), '만료 임박(7일 미만) · 가장 이른 만료 2027-01-22(6일)'],
+    [healthyCerts({ earliest: seconds(NOW - HOUR) }), '만료된 인증서 있음 · 가장 이른 만료 2027-01-15(만료됨)'],
+    [healthyCerts({ ready: 1 }), 'Ready 아님 1개(전체 2개) · 가장 이른 만료 2027-04-05(79일)'],
+    // Ready 0개는 빈 결과로 온다(== 1 필터). 0개로 본다.
+    [healthyCerts({ ready: undefined }), 'Ready 아님 2개(전체 2개) · 가장 이른 만료 2027-04-05(79일)'],
+    [healthyCerts({ ready: 3 }), 'Ready 수 불일치(Ready 3, 전체 2) · 가장 이른 만료 2027-04-05(79일)'],
+    [healthyCerts({ age: 601 }), '지표 오래됨 10분(10분 기준 초과) · 가장 이른 만료 2027-04-05(79일)'],
+    [healthyCerts({ ready: 1, age: 3600, earliest: seconds(NOW + DAY) }),
+      '만료 임박(7일 미만), Ready 아님 1개(전체 2개), 지표 오래됨 60분(10분 기준 초과) · 가장 이른 만료 2027-01-16(1일)'],
+    // 수집 대상이 사라져 시계열이 없을 때도 0개다. 정상으로 두지 않는다.
+    [{}, '인증서 지표 0개(cert-manager 수집·인증서 확인 필요)'],
+    [{ count: 0 }, '인증서 지표 0개(cert-manager 수집·인증서 확인 필요)'],
+    // 발급 전 인증서 1개(만료 값 0, Ready 아님) + 정상 1개. min은 0을 빼므로 정상 인증서의 만료가 잡히고 Ready 수 불일치로 확인 필요.
+    [healthyCerts({ count: 2, ready: 1 }), 'Ready 아님 1개(전체 2개) · 가장 이른 만료 2027-04-05(79일)'],
+    // 모두 발급 전이면 min(> 0) 결과가 빈다. throw하지 않고 만료 시각 없음으로 확인 필요.
+    [healthyCerts({ count: 1, ready: undefined, earliest: undefined }), '만료 시각 없음, Ready 아님 1개(전체 1개)'],
+    [healthyCerts({ earliest: undefined }), '만료 시각 없음'],
+  ];
+  for (const [values, summary] of cases) assert.deepEqual(await readCert(values), { observedAt: NOW, status: 'problem', summary });
+});
+
+test('[T24] 인증서 질의 실패·응답 모양 오류는 관측을 내지 않음(throw)', async () => {
+  await assert.rejects(readCert(healthyCerts({ ready: new Error('grafana_query_failed') })), /grafana_query_failed/);
+  await assert.rejects(readCert(healthyCerts({ earliest: new Error('read_http_403') })), /read_http_403/);
+  // 집계가 아닌 결과(시계열 둘)·개수는 있는데 만료·신선도가 없음·정수가 아닌 개수.
+  await assert.rejects(readCert(healthyCerts({ count: [1, 1] })));
+  await assert.rejects(readCert(healthyCerts({ age: undefined })), /unexpected_metric/);
+  await assert.rejects(readCert(healthyCerts({ count: 1.5 })), /unexpected_metric/);
+  await assert.rejects(readCert(healthyCerts({ ready: -1 })), /unexpected_metric/);
+  // transport가 관측 JSON이 아닌 것을 돌려주면 모양 오류다.
+  const broken: ReadTransport = { query: async () => new TextEncoder().encode('{"rows":"x"}') };
+  await assert.rejects(certificateSource({ transport: broken, datasource: 'victoriametrics' }, now).read());
+});
+
+test('[T24] 인증서: /read의 Grafana transport로 POST /api/ds/query, 같은 토큰·datasource uid, HTTP 오류는 throw', async () => {
+  const values: Record<string, number | undefined> = { [CERT_QUERIES.count]: 1, [CERT_QUERIES.earliest]: seconds(NOW + 30 * DAY),
+    [CERT_QUERIES.ready]: 1, [CERT_QUERIES.age]: 12 };
+  const bodies: { from: string; to: string; queries: { datasource: { uid: string }; expr: string; instant: boolean }[] }[] = [];
+  let status = 200;
+  handler = (req, res) => {
+    let raw = '';
+    req.on('data', chunk => { raw += chunk; });
+    req.on('end', () => {
+      const body = JSON.parse(raw) as (typeof bodies)[number];
+      bodies.push(body);
+      if (status !== 200) return json(res, { message: 'fixture' }, status);
+      const value = values[body.queries[0]!.expr];
+      json(res, { results: { A: { status: 200, frames: value === undefined ? [] : [{
+        schema: { fields: [{ name: 'Time', type: 'time' }, { name: 'Value', type: 'number' }] }, data: { values: [[NOW], [value]] } }] } } });
+    });
+  };
+  const grafana = grafanaTransport({ base, token: 'fixture-grafana-token', datasources: { victoriametrics: 'metrics', victorialogs: 'logs' } });
+  const source = certificateSource({ transport: grafana, datasource: 'victoriametrics' }, now);
+  assert.deepEqual(await source.read(), { observedAt: NOW, status: 'ok', summary: '1개 모두 Ready · 가장 이른 만료 2027-02-14(30일)' });
+  assert.equal(seen.length, 4);
+  assert.ok(seen.every(s => s.method === 'POST' && s.url === '/api/ds/query' && s.auth === 'Bearer fixture-grafana-token'));
+  assert.deepEqual(bodies.map(b => b.queries[0]!.expr).sort(), Object.values(CERT_QUERIES).sort());
+  assert.ok(bodies.every(b => b.queries[0]!.datasource.uid === 'victoriametrics' && b.queries[0]!.instant === true && b.to === String(NOW)));
+  // 시계열 없음(빈 frames)은 0개다.
+  values[CERT_QUERIES.count] = undefined;
+  assert.equal((await source.read()).summary, '인증서 지표 0개(cert-manager 수집·인증서 확인 필요)');
+  status = 500;
+  await assert.rejects(source.read(), /read_http_500/);
+  // 메트릭 datasource가 아닌 이름은 요청 없이 실패한다.
+  seen = [];
+  await assert.rejects(certificateSource({ transport: grafana, datasource: 'victorialogs-missing' }, now).read(), /unsupported_query/);
+  assert.equal(seen.length, 0);
+});
+
+test('[T24] briefingSources: Grafana 설정이 없으면 인증서 원본을 만들지 않고, 있으면 백업 다음에 둠', () => {
+  const kubernetes = mock({});
+  assert.deepEqual(briefingSources({ kubernetes }, now).map(s => s.kind), ['backup', 'scheduled_job']);
+  assert.deepEqual(briefingSources({ kubernetes, certificates: undefined }, now).map(s => s.kind), ['backup', 'scheduled_job']);
+  const certificates = { transport: grafanaFake({}).transport, datasource: 'victoriametrics' };
+  assert.deepEqual(briefingSources({ kubernetes, certificates }, now, 'Asia/Seoul').map(s => s.id),
+    ['backup:database/pg', 'certificate:cert-manager', 'scheduled_job:cronjobs']);
+});
+
+// T24 복원 검증 기록(Cluster pg annotation). 값 스키마 v1, 키 순서 고정·공백 없음(계약 2).
+const UID = 'uid-cluster-pg';
+const record = (result: 'pass' | 'fail', at: number, extra: Record<string, unknown> = {}) => JSON.stringify({ v: 1, run: `rc-${at}`,
+  result, at: iso(at), target: iso(at - HOUR), server: 'pg-restore-check', dbs: 3, cluster: UID,
+  ...(result === 'fail' ? { reason: 'missing_db' } : {}), ...extra });
+const annotated = (annotations: Record<string, unknown> | unknown, uid: string | undefined = UID, conditions?: { type: string; status: string }[]) => {
+  const value = cluster(conditions);
+  return { ...value, metadata: { ...value.metadata, ...(uid === undefined ? {} : { uid }), annotations } };
+};
+const records = (pass?: string, last?: string) => ({
+  ...(pass === undefined ? {} : { [RESTORE_ANNOTATIONS.pass]: pass }), ...(last === undefined ? {} : { [RESTORE_ANNOTATIONS.last]: last }) });
+
+test('[T24] 복원 검증 기록: 없음·통과·100일 초과·통과보다 새 실패', () => {
+  const check = (annotations: unknown, uid: string | undefined = UID) => restoreCheck(annotations, uid, NOW);
+  const none = { status: 'unknown', passAt: null, failedAt: null, staleDays: null, issue: null };
+  assert.deepEqual(check(undefined), none);
+  assert.deepEqual(check({ other: 'x' }), none);
+  const passAt = NOW - 3 * DAY;
+  assert.deepEqual(check(records(record('pass', passAt), record('pass', passAt))),
+    { status: 'verified', passAt, failedAt: null, staleDays: null, issue: null });
+  // 정확히 100일은 아직 오래되지 않았다. 넘으면 확인 필요.
+  assert.equal(check(records(record('pass', NOW - 100 * DAY))).status, 'verified');
+  assert.deepEqual(check(records(record('pass', NOW - 101 * DAY - HOUR))),
+    { status: 'problem', passAt: NOW - 101 * DAY - HOUR, failedAt: null, staleDays: 101, issue: null });
+  // 실패는 pass를 건드리지 않는다. last 실패가 pass보다 새것이면 확인 필요, 옛것이면 통과 그대로.
+  assert.deepEqual(check(records(record('pass', passAt), record('fail', NOW - DAY))),
+    { status: 'problem', passAt, failedAt: NOW - DAY, staleDays: null, issue: null });
+  assert.equal(check(records(record('pass', passAt), record('fail', passAt - DAY))).status, 'verified');
+  assert.deepEqual(check(records(undefined, record('fail', NOW - DAY, { reason: 'no_db', dbs: 0 }))),
+    { status: 'problem', passAt: null, failedAt: NOW - DAY, staleDays: null, issue: null });
+  assert.deepEqual(check(records(record('pass', NOW - 120 * DAY), record('fail', NOW - DAY, { reason: 'aborted' }))),
+    { status: 'problem', passAt: NOW - 120 * DAY, failedAt: NOW - DAY, staleDays: 120, issue: null });
+});
+
+test('[T24] 복원 검증 기록 오류(JSON·스키마·uid 불일치·미래 시각)는 그 기록만 미확인', () => {
+  const issue = (annotations: unknown, uid: string | undefined = UID) => {
+    const value = restoreCheck(annotations, uid, NOW);
+    return [value.status, value.passAt, value.issue];
+  };
+  const pass = record('pass', NOW - DAY);
+  for (const bad of ['{not json', '"pass"', 'null', record('pass', NOW - DAY, { v: 2 }), record('pass', NOW - DAY, { extra: 1 }),
+    record('pass', NOW - DAY, { dbs: 0 }), record('pass', NOW - DAY, { reason: 'x' }), record('pass', NOW - DAY, { dbs: 1.5 }),
+    record('pass', NOW - DAY, { at: '2027-01-14T23:50:00+09:00' }), record('pass', NOW - DAY, { at: '2027-01-14T25:50:00Z' }),
+    record('pass', NOW - DAY, { run: '' }), JSON.stringify({ v: 1, result: 'pass' }),
+    // pass 키에 실패 기록이 있으면 계약 위반이다.
+    record('fail', NOW - DAY), 'x'.repeat(2000)]) {
+    assert.deepEqual(issue(records(bad)), ['unknown', null, 'format'], bad.slice(0, 80));
+  }
+  assert.deepEqual(issue(records(undefined, record('fail', NOW - DAY, { reason: undefined }))), ['unknown', null, 'format']);
+  assert.deepEqual(issue(records(undefined, record('fail', NOW - DAY, { reason: 'Bad Reason' }))), ['unknown', null, 'format']);
+  assert.deepEqual(issue({ [RESTORE_ANNOTATIONS.pass]: 42 }), ['unknown', null, 'format']);
+  assert.deepEqual(issue('annotations-not-object'), ['unknown', null, 'format']);
+  // 지웠다 다시 만든 Cluster(uid 다름)나 uid를 모르는 Cluster의 기록은 믿지 않는다.
+  assert.deepEqual(issue(records(pass), 'uid-other'), ['unknown', null, 'cluster']);
+  const unknownUid = restoreCheck(records(pass), undefined, NOW);
+  assert.deepEqual([unknownUid.status, unknownUid.passAt, unknownUid.issue], ['unknown', null, 'cluster']);
+  assert.deepEqual(issue(records(record('pass', NOW + 60_000))), ['unknown', null, 'future']);
+  // 통과가 유효하고 last만 틀리면 통과는 그대로 두고 사유를 남긴다. 틀린 last를 실패로 치지 않는다.
+  assert.deepEqual(issue(records(pass, '{bad')), ['verified', NOW - DAY, 'format']);
+  // pass가 틀려도 유효한 새 실패는 확인 필요로 남는다.
+  assert.deepEqual(issue(records('{bad', record('fail', NOW - HOUR))), ['problem', null, 'format']);
+});
+
+test('[T24] 백업 원본: 복원 기록을 Cluster 응답에서 읽고, 기록 오류·실패여도 백업 판정은 그대로', async () => {
+  const read = (annotations: unknown, uid?: string, conditions?: { type: string; status: string }[]) =>
+    readBackup({ [CLUSTER_PATH]: annotated(annotations, uid, conditions), [BACKUPS_PATH]: healthyBackups() });
+  const passAt = NOW - 2 * DAY;
+  const ok = await read(records(record('pass', passAt), record('pass', passAt)));
+  assert.deepEqual([ok.status, ok.summary, ok.restoreVerifiedAt, ok.restoreCheck?.status],
+    ['ok', '마지막 성공 백업 19시간 전 · WAL 아카이브 정상', passAt, 'verified']);
+  for (const annotations of [records('{bad'), records(record('pass', NOW + DAY)), 'not-an-object', [1, 2], null,
+    records(record('pass', passAt), record('fail', NOW - HOUR)), records(record('pass', NOW - 200 * DAY))]) {
+    const value = await read(annotations);
+    assert.deepEqual([value.status, value.summary], ['ok', '마지막 성공 백업 19시간 전 · WAL 아카이브 정상'], JSON.stringify(annotations));
+  }
+  assert.equal((await read(records(record('pass', passAt)), 'uid-other')).restoreVerifiedAt, null);
+  // 백업이 확인 필요면 복원 기록이 통과여도 확인 필요 그대로다.
+  const failing = await read(records(record('pass', passAt)), UID, [{ type: 'ContinuousArchiving', status: 'False' }]);
+  assert.deepEqual([failing.status, failing.restoreVerifiedAt], ['problem', passAt]);
+  assert.match(failing.summary, /WAL 아카이브 실패/);
+});
+
+test('[T24] 브리핑 사본: 인증서·복원 검증 문구(CLI 기록 기준)와 기록 오류에도 백업 정상 유지', async () => {
+  const f = await fixture(database.db);
+  await database.pg.exec('TRUNCATE outbox,schedules,briefing_runs,briefing_copies,briefing_observations RESTART IDENTITY CASCADE');
+  const memory = { recheckDue: async () => ({ items: [], total: 0 }), live: async () => true } as unknown as MemoryService;
+  let annotations: unknown = {};
+  let certs: CertValues = {};
+  const kubernetes = { get: async (path: string) => {
+    if (path === CLUSTER_PATH) return annotated(annotations);
+    if (path === BACKUPS_PATH) return { items: [backup('b1', 'completed', f.now() - 10 * HOUR - 3000, f.now() - 10 * HOUR)] };
+    if (path === CRONJOBS_PATH) return { items: [] };
+    throw new Error('read_http_404');
+  } };
+  const transport: ReadTransport = { query: request => grafanaFake(certs).transport.query(request) };
+  const sources = briefingSources({ kubernetes, certificates: { transport, datasource: 'victoriametrics' } }, f.now, 'Asia/Seoul');
+  const scheduler = new BriefingScheduler(f.store, f.gate, memory, sources, { time: '08:50', timezone: 'Asia/Seoul' });
+  await scheduler.ensure();
+  const slot = Date.UTC(2027, 0, 15, 23, 50);
+  const tick = async (day: number) => {
+    f.advance(slot + day * DAY - f.now()); f.policy.confirmedAt = f.now();
+    assert.equal(await scheduler.tick(), 'enqueued');
+    return (await database.db.query<{ payload: { content: string } }>(
+      "SELECT payload FROM outbox WHERE message_key LIKE 'briefing:%' ORDER BY created_at DESC,page_index LIMIT 1")).rows[0]!.payload.content;
+  };
+  const tail = ' · CLI 기록 기준, 백업 성공과 별개';
+  const backupOk = 'PostgreSQL 백업(pg): 정상 · 마지막 성공 백업 10시간 전 · WAL 아카이브 정상 · 관측 01-16 08:50';
+
+  // 1회차: 통과 기록, 인증서 정상. 확인 필요 없음.
+  annotations = records(record('pass', slot - 2 * DAY), record('pass', slot - 2 * DAY));
+  certs = healthyCerts();
+  const first = await tick(0);
+  assert.match(first, /■ 확인 필요\n- 없음\(아래 관측 기준\)\n■ 관측 결과\n/);
+  assert.ok(first.includes(`- ${backupOk} · 복원 검증 통과 01-14 08:50${tail}`), first);
+  assert.ok(first.includes('- 인증서(cert-manager): 정상 · 2개 모두 Ready · 가장 이른 만료 2027-04-05(79일) · 관측 01-16 08:50'), first);
+  assert.doesNotMatch(first, /인증서: 연결된 조회 없음/);
+
+  // 2회차: 통과보다 새 실패, 인증서 만료 임박. 백업 판정은 정상으로 보이되 확인 필요 쪽에 적는다.
+  annotations = records(record('pass', slot - 2 * DAY), record('fail', slot + DAY - 3 * HOUR));
+  certs = healthyCerts({ earliest: seconds(slot + DAY + 6 * DAY + HOUR) });
+  const second = await tick(1);
+  assert.ok(second.includes('- PostgreSQL 백업(pg): 백업 정상 · 마지막 성공 백업 10시간 전 · WAL 아카이브 정상 · 관측 01-17 08:50'
+    + ` · 확인 필요: 최근 복원 검증 실패 01-17 05:50(마지막 통과 01-14 08:50)${tail}`), second);
+  assert.ok(second.includes('- 인증서(cert-manager): 확인 필요 · 만료 임박(7일 미만) · 가장 이른 만료 2027-01-23(6일) · 관측 01-17 08:50'), second);
+  assert.doesNotMatch(second, /■ 관측 결과\n- PostgreSQL/);
+
+  // 3회차: 통과가 100일을 넘음, 인증서 질의 실패(읽기 불가·미확인).
+  annotations = records(record('pass', slot + 2 * DAY - 101 * DAY));
+  certs = healthyCerts({ count: new Error('grafana_query_failed') });
+  const third = await tick(2);
+  assert.match(third, new RegExp(`백업 정상 · .* · 확인 필요: 복원 검증 오래됨 101일\\(마지막 통과 \\d\\d-\\d\\d 08:50\\)${tail}`));
+  assert.match(third, /- 인증서\(cert-manager\): 읽기 불가 · 마지막 정상 수집 01-17 08:50 · 미확인/);
+
+  // 4회차: 기록 JSON 오류. 복원 검증만 미확인이고 백업은 정상(관측 결과)에 남는다.
+  annotations = records('{broken');
+  certs = healthyCerts();
+  const fourth = await tick(3);
+  assert.match(fourth, new RegExp(`■ 관측 결과\\n- PostgreSQL 백업\\(pg\\): 정상 · .* · 복원 검증 기록 확인 불가\\(JSON·스키마 오류\\) · 미확인${tail}`));
+
+  // 5회차: 기록 없음, uid 불일치(다른 Cluster의 기록), 미래 시각.
+  annotations = {};
+  assert.ok((await tick(4)).includes(` · 복원 검증 기록 없음(미확인)${tail}`));
+  annotations = records(record('pass', slot).replace(UID, 'uid-other'));
+  assert.ok((await tick(5)).includes(` · 복원 검증 기록 확인 불가(클러스터 uid 불일치) · 미확인${tail}`));
+  annotations = records(record('pass', slot + 30 * DAY));
+  assert.ok((await tick(6)).includes(` · 복원 검증 기록 확인 불가(미래 시각) · 미확인${tail}`));
 });

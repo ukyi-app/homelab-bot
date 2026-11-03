@@ -14,7 +14,18 @@ export const BRIEFING = Object.freeze({
 });
 // 시각·시간대는 실제 설정에서만 온다. 비어 있으면 자동 발송하지 않는다.
 export interface BriefingConfig { time: string | null; timezone: string | null }
-export interface Observation { observedAt: number; status: 'ok' | 'problem'; summary: string; restoreVerifiedAt?: number | null }
+export interface Observation {
+  observedAt: number; status: 'ok' | 'problem'; summary: string; restoreVerifiedAt?: number | null;
+  // 백업 원본만 낸다. 백업 status와 따로 판정해 복원 기록 문제·오류가 백업 정상·확인 필요를 바꾸지 않는다.
+  restoreCheck?: RestoreCheck;
+}
+// `homelab db restore-check`가 Cluster annotation에 남긴 기록(CLI 기록)의 판정. 시각은 정수 ms다.
+// passAt: 유효한 마지막 통과(= restoreVerifiedAt). failedAt: 통과보다 새로운 유효한 실패.
+// staleDays: 통과가 100일을 넘었을 때의 경과 일수. issue: 무효로 버린 기록이 있으면 그 사유.
+export interface RestoreCheck {
+  status: 'verified' | 'problem' | 'unknown'; passAt: number | null; failedAt: number | null;
+  staleDays: number | null; issue: 'format' | 'cluster' | 'future' | null;
+}
 export interface ObservationSource {
   id: string; label: string; kind: 'backup' | 'certificate' | 'scheduled_job'; read(): Promise<Observation>;
 }
@@ -77,6 +88,29 @@ const OBSERVED: Record<ObservationSource['kind'], string> = { backup: '백업', 
 function valid(value: Observation, now: number): boolean {
   return Number.isSafeInteger(value?.observedAt) && value.observedAt <= now && ['ok', 'problem'].includes(value.status)
     && typeof value.summary === 'string' && (value.restoreVerifiedAt == null || Number.isSafeInteger(value.restoreVerifiedAt));
+}
+const RESTORE_ISSUE: Record<NonNullable<RestoreCheck['issue']>, string> = { format: 'JSON·스키마 오류', cluster: '클러스터 uid 불일치', future: '미래 시각' };
+const intOrNull = (value: unknown) => value === null || Number.isSafeInteger(value);
+function validRestore(check: RestoreCheck | undefined): check is RestoreCheck {
+  return check != null && ['verified', 'problem', 'unknown'].includes(check.status) && intOrNull(check.passAt) && intOrNull(check.failedAt)
+    && intOrNull(check.staleDays) && (check.issue === null || Object.hasOwn(RESTORE_ISSUE, check.issue));
+}
+// 백업 줄 끝에 붙는 복원 검증 문구. restoreCheck가 없거나 모양이 틀리면 예전 문구(restoreVerifiedAt만)로 적는다.
+function restoreText(observation: Observation, zone: string): { text: string; problem: boolean } {
+  const check = observation.restoreCheck;
+  if (!validRestore(check)) {
+    return { text: `복원 검증 ${observation.restoreVerifiedAt ? clock(observation.restoreVerifiedAt, zone) : '미확인'}(백업 성공과 별개)`, problem: false };
+  }
+  const parts: string[] = [];
+  const pass = check.passAt !== null ? `마지막 통과 ${clock(check.passAt, zone)}` : '통과 기록 없음';
+  if (check.failedAt !== null) parts.push(`최근 복원 검증 실패 ${clock(check.failedAt, zone)}${check.staleDays !== null ? '' : `(${pass})`}`);
+  if (check.staleDays !== null) parts.push(`복원 검증 오래됨 ${check.staleDays}일(${pass})`);
+  if (!parts.length && check.passAt !== null) parts.push(`복원 검증 통과 ${clock(check.passAt, zone)}`);
+  const issue = check.issue ? `복원 검증 기록 확인 불가(${RESTORE_ISSUE[check.issue]})` : undefined;
+  if (!parts.length) parts.push(issue ? `${issue} · 미확인` : '복원 검증 기록 없음(미확인)');
+  else if (issue) parts.push(issue);
+  const problem = check.status === 'problem';
+  return { text: `${problem ? '확인 필요: ' : ''}${parts.join(' · ')} · CLI 기록 기준, 백업 성공과 별개`, problem };
 }
 function deadline<T>(work: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -315,12 +349,14 @@ export class BriefingScheduler {
         attention.push(`- ${source.label}: 읽기 불가 · 마지막 정상 수집 ${last?.last_ok_at ? clock(Number(last.last_ok_at), zone) : '없음'} · 미확인`);
         continue;
       }
-      const restore = source.kind === 'backup'
-        ? ` · 복원 검증 ${observation.restoreVerifiedAt ? clock(observation.restoreVerifiedAt, zone) : '미확인'}(백업 성공과 별개)` : '';
+      const check = source.kind === 'backup' ? restoreText(observation, zone) : undefined;
+      const restore = check ? ` · ${check.text}` : '';
       const seen = `관측 ${clock(observation.observedAt, zone)}`;
       const summary = bounded(observation.summary.replace(/\s+/g, ' ').trim(), 200);
       if (now - observation.observedAt > BRIEFING.freshMs) attention.push(`- ${source.label}: 오래된 관측(${seen}) · 현재 상태 미확인${restore}`);
       else if (observation.status === 'problem') attention.push(`- ${source.label}: 확인 필요 · ${summary} · ${seen}${restore}`);
+      // 백업은 정상이고 복원 검증만 확인 필요면 확인 필요 쪽에 적되 백업 판정(정상)은 그대로 보인다.
+      else if (check?.problem) attention.push(`- ${source.label}: 백업 정상 · ${summary} · ${seen}${restore}`);
       else fine.push(`- ${source.label}: 정상 · ${summary} · ${seen}${restore}`);
     }
     // 일부 종류만 연결했으면 나머지 종류를 적는다. 빼면 "확인 필요 없음"이 연결하지 않은 종류까지 정상인 것처럼 읽힌다.

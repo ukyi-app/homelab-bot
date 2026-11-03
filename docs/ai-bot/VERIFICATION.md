@@ -659,3 +659,14 @@ S16에서 찾은 결함을 봇 저장소에서 고치고 병합·배포했다(�
 4. CLI `homelab db restore` 재개 단계는 Deployment Ready만 본다. 원장이 있는 앱은 restore.md 2.1 블록을 따로 돌려야 `--finish`할 수 있다(이번에도 따로 돌림).
 5. 브리핑 인증서·복원 검증 칸 원본(플랫폼 변경, homelab T24), Codex 작업 상태·질문 대기 칸(T18).
 6. 기억을 모델 맥락에 넣는 경로(SEC-01)는 V1 코드에 없다(`memories`는 `src/memory.ts`만 읽고, 쓰는 곳은 기억 명령과 모델을 부르지 않는 브리핑). T21이 경로 부재를 다시 확인하고, 경로를 여는 변경이 비신뢰 자료 표시와 SEC-01 시험을 함께 맡는다.
+
+## T24 브리핑 관측 원본: 인증서·복원 검증 (2026-11-03, 로컬·mock)
+
+homelab T24 할 일 3이다. 원본은 사용자 결정(2026-11-03)으로 정했다. 인증서는 cert-manager 지표(homelab 수집 job `cert-manager`)를 `/read`와 같은 Grafana transport로 읽는다. 복원 검증은 `homelab db restore-check`가 `database/pg` Cluster에 남기는 annotation 두 개(`homelab.ukyi.app/restore-check-last`·`-pass`, 한 줄 JSON 스키마 v1)를 백업 원본이 이미 받는 Cluster 응답에서 읽는다. 봇 RBAC·NetworkPolicy·자격은 그대로다. 실연동 전이다.
+
+| 시험 ID | 등급 / 판정 | 확인한 경계 | 남은 검증 / 해소 |
+|---|---|---|---|
+| BRIEF-01 (인증서 칸) | mock / pass | 집계 질의 4개만 보냄(개수, `min(… > 0)` 가장 이른 만료, Ready 개수, 신선도). 정상 = 1개 이상·모두 Ready·만료 7일 이상·신선도 600초 이하. 만료 임박·만료됨·Ready 부족·발급 전 인증서(만료 값 0)·오래됨·0개는 확인 필요, 질의 실패·응답 모양 오류는 미확인. Grafana 설정이 없으면 원본을 만들지 않음 | 실제 Grafana 응답·VictoriaMetrics `timestamp()`·`> 0` 필터는 실연동(T24 할 일 4) |
+| BRIEF-01 (복원 검증 칸) | mock / pass | 기록 없음 → 미확인, 통과 → 그 시각, 통과 100일 초과·통과보다 새 실패 → 확인 필요, JSON·스키마 오류·Cluster uid 불일치·미래 시각 → 그 기록만 미확인. 기록 오류·실패가 백업 정상 판정을 바꾸지 않음. 표시에 "CLI 기록 기준, 백업 성공과 별개" | 실제 annotation은 homelab CLI 변경 뒤 `restore-check` 실행으로 확인(T24 할 일 4) |
+
+시험: `test/briefing-observations.test.ts`(T24 시험 9개, 브리핑 사본 형식 고정 포함). Node 24.22.0에서 `npm run check` 통과, `npm test` 860개 중 831 pass / 0 fail / 29 skip(PG 소켓 없는 PG 시험). 기본 셸 Node 26에서는 런타임 major 고정 시험 1개가 환경 때문에 실패한다(이번 변경과 무관).

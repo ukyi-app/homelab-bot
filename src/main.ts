@@ -141,9 +141,13 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       lock: advisoryLedgerLock(lockClient(databasePoolConfig(config.databaseUrl, { application_name: 'homelab-bot-ledger' }))) });
     // 문서 출처는 공개 저장소 두 곳의 커밋 고정 링크만 raw 파일 존재로 확인한다(document-source.ts, 기존 인터넷 443 egress).
     const memory = new MemoryService(deps.db, gate, ledger, deps.documents ?? githubDocuments({ send }), now);
-    // 관측 원본: 백업(CNPG)·예약 작업(CronJob). 인증서·복원 검증은 봇 권한으로 읽을 원본이 없어 브리핑에 미확인으로 남는다.
+    // 관측 원본: 백업(CNPG, 복원 검증 기록 포함)·인증서(cert-manager 지표)·예약 작업(CronJob).
     // kubernetes는 읽기 transport와 같은 연결(SA 토큰·CA)이고 닫기는 종료의 kubernetes.close()가 맡는다.
-    const observations: ObservationSource[] = deps.observations ?? briefingSources({ kubernetes }, now);
+    // 인증서는 /read와 같은 Grafana transport·자격·메트릭 datasource를 쓴다. 설정이 비면 인증서 원본을 만들지 않는다.
+    const metrics = Object.entries(GRAFANA_DATASOURCES).find(([, kind]) => kind === 'metrics')?.[0];
+    const certificates = config.grafana.url && config.grafana.token && metrics ? { transport: grafana, datasource: metrics } : undefined;
+    const observations: ObservationSource[] = deps.observations
+      ?? briefingSources({ kubernetes, certificates }, now, config.briefing?.timezone);
     const briefing = new BriefingScheduler(store, gate, memory, observations,
       { time: config.briefing?.time ?? null, timezone: config.briefing?.timezone ?? null });
     return { ledger, memory, briefing };
