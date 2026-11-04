@@ -1563,6 +1563,227 @@ test('4407851854 EVENT-02 오래된 게시 행이 전송 중 lease를 잃어도 
   assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['blocked', 'unknown_deadline']]);
   assert.equal(r.gh.writes.length, 0);
 });
+test('T17 이월 1 대기 중 자동 세대에 온 댓글은 중복이어도 trigger를 승격해 live draft에서 실행하고 게시한다', async () => {
+  await opened();
+  const draft = pull({ draft: true, updated_at: '2026-11-04T00:01:00Z' });
+  r.gh.pulls.set(7, draft);
+  assert.equal((await hook('issue_comment', commentEvent())).outcome, 'duplicate_generation');
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.trigger]), [['queued', 'comment']]);
+  await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.trigger]), [['succeeded', 'comment']]);
+  assert.equal(r.inputs.length, 1);
+  await r.publisher.deliver();
+  assert.equal(r.gh.writes.length, 1);
+});
+test('T17 이월 1 승격한 세대는 뒤이은 converted_to_draft에 지워지지 않고, 뒤따르는 자동 이벤트가 trigger를 낮추지 못한다', async () => {
+  await opened();
+  assert.equal((await hook('issue_comment', commentEvent())).outcome, 'duplicate_generation');
+  const draft = pull({ draft: true, updated_at: '2026-11-04T00:02:00Z' });
+  await hook('pull_request', prEvent('converted_to_draft', draft));
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.trigger]), [['queued', 'comment']]);
+  assert.equal((await hook('pull_request', prEvent('reopened', pull({ updated_at: '2026-11-04T00:03:00Z' })))).outcome, 'duplicate_generation');
+  assert.deepEqual((await reviewJobs()).map(j => j.trigger), ['comment']);
+});
+test('T17 이월 1 게시 대기 중 PR이 draft가 돼도 댓글로 승격한 세대는 저장 결과를 게시한다', async () => {
+  await opened(); await r.runtime.tick();
+  r.gh.pulls.set(7, pull({ draft: true, updated_at: '2026-11-04T00:04:00Z' }));
+  assert.equal((await hook('issue_comment', commentEvent())).outcome, 'duplicate_generation');
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => d.state), ['sent']);
+  assert.equal(r.inputs.length, 1);
+});
+test('T17 이월 1 실행 시작 뒤 PR 조회 중 들어온 댓글도 draft 판단에 반영한다', async () => {
+  await opened();
+  const pullRequest = r.gh.pullRequest.bind(r.gh);
+  const draft = pull({ draft: true, updated_at: '2026-11-04T00:05:00Z' });
+  let once = true;
+  r.gh.pullRequest = async (repository: string, number: number) => {
+    r.gh.pulls.set(7, draft);
+    if (once) { once = false; assert.equal((await hook('issue_comment', commentEvent())).outcome, 'duplicate_generation'); }
+    return pullRequest(repository, number);
+  };
+  await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.trigger]), [['succeeded', 'comment']]);
+  assert.equal(r.inputs.length, 1);
+});
+test('T17 이월 1 실행 중 draft로 밀려난 세대에 댓글이 오면 결과를 버리지 않고 게시한다', async () => {
+  await opened();
+  const draft = pull({ draft: true, updated_at: '2026-11-04T00:06:00Z' });
+  r.reply((async () => {
+    r.gh.pulls.set(7, draft);
+    await hook('pull_request', prEvent('converted_to_draft', draft));
+    assert.equal((await reviewJobs())[0]!.superseded_reason, 'draft');
+    assert.equal((await hook('issue_comment', commentEvent())).outcome, 'duplicate_generation');
+    return { status: 'succeeded', output: OUTPUT };
+  }) as never);
+  await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.trigger, j.superseded_reason, j.review_outcome]), [['succeeded', 'comment', null, 'completed']]);
+  await r.publisher.deliver();
+  assert.equal(r.gh.writes.length, 1);
+  assert.equal(r.inputs.length, 1);
+});
+test('T17 이월 1 되돌아온 head의 실행 중 세대를 댓글로 현재로 되돌리면 밀어낸 새 세대의 대기 작업을 정리한다', async () => {
+  await opened();
+  const moved = pull({ head: { sha: HEAD2, ref: 'feature', repo: repository }, updated_at: '2026-11-04T00:07:00Z' });
+  const back = pull({ updated_at: '2026-11-04T00:08:00Z' });
+  r.reply((async () => {
+    await hook('pull_request', prEvent('synchronize', moved));
+    r.gh.pulls.set(7, back);
+    assert.equal((await hook('issue_comment', commentEvent())).outcome, 'duplicate_generation');
+    return { status: 'succeeded', output: OUTPUT };
+  }) as never);
+  await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.head_sha, j.state]), [[HEAD, 'succeeded'], [HEAD2, 'superseded']]);
+  await r.publisher.deliver();
+  assert.equal(r.gh.writes[0]!.body.commit_id, HEAD);
+});
+test('T17 이월 1 기록보다 오래된 PR 조회로 온 댓글은 승격만 하고 밀려난 세대를 되돌리지 않는다', async () => {
+  await opened();
+  const moved = pull({ head: { sha: HEAD2, ref: 'feature', repo: repository }, updated_at: '2026-11-04T00:09:00Z' });
+  r.reply((async () => {
+    await hook('pull_request', prEvent('synchronize', moved));
+    assert.equal((await hook('issue_comment', commentEvent())).outcome, 'duplicate_generation');
+    return { status: 'succeeded', output: OUTPUT };
+  }) as never);
+  await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.head_sha, j.state, j.trigger, j.review_outcome]),
+    [[HEAD, 'succeeded', 'comment', 'superseded'], [HEAD2, 'queued', 'synchronize', null]]);
+  assert.equal((await deliveries()).length, 0);
+});
+const LOOKUP_CHANGES: { name: string; change: () => void; state: [string, string]; before?: () => void }[] = [
+  { name: '저장소 철회', change: () => { r.policy().repositories = []; }, state: ['blocked', 'authorization_revoked'] },
+  { name: '설치 변경', change: () => { r.policy().repositories = [{ ...REPO, installationId: 999 }]; }, state: ['blocked', 'authorization_revoked'] },
+  { name: '정책 revision 변경', change: () => { r.policy().input = { ...POLICY.input, maxFiles: 5 }; }, state: ['superseded', 'policy_changed'] },
+  { name: '내부 표식 추가(출력 분류)', change: () => { r.policy().internalMarkers = ['0으로 나누기']; }, state: ['blocked', 'output_classification'] },
+  { name: '게시 상한 해제', change: () => { r.policy().publish = null; }, state: ['blocked', 'publish_limits_unset'] },
+  { name: '본문 길이 상한 축소', change: () => { r.policy().publish = { ...POLICY.publish!, maxBodyChars: 100 }; }, state: ['blocked', 'publish_limit_exceeded'] },
+];
+for (const c of LOOKUP_CHANGES) {
+  for (const during of ['pullRequest', 'mergeBase'] as const) {
+    test(`T17 이월 2 게시 전 ${during} 조회 중 ${c.name}이면 POST 하지 않는다`, async () => {
+      await opened(); await r.runtime.tick();
+      const reader = r.gh as unknown as Record<string, unknown>;
+      const original = (reader[during] as (...args: unknown[]) => Promise<unknown>).bind(r.gh);
+      reader[during] = async (...args: unknown[]) => { c.change(); return original(...args); };
+      await r.publisher.deliver();
+      assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [c.state]);
+      assert.equal(r.gh.writes.length, 0);
+    });
+  }
+}
+test('T17 이월 2 게시 전 조회 중 낮아진 지적 수·인라인 수는 POST 본문에 적용한다', async () => {
+  const second = { ...FINDING, severity: 'P2', title: '두 번째 지적', line: 1 };
+  r.reply({ status: 'succeeded', output: { ...OUTPUT, findings: [FINDING, second] } });
+  await opened(); await r.runtime.tick();
+  const pullRequest = r.gh.pullRequest.bind(r.gh);
+  r.gh.pullRequest = async (repository: string, number: number) => {
+    r.policy().publish = { maxFindings: 1, maxInlineComments: 0, maxBodyChars: 20_000 };
+    return pullRequest(repository, number);
+  };
+  await r.publisher.deliver();
+  assert.ok(!r.gh.writes[0]!.body.body.includes('두 번째 지적'));
+  assert.deepEqual(r.gh.writes[0]!.body.comments, []);
+  assert.ok(!(await deliveries())[0]!.body.includes('두 번째 지적'));
+});
+test('T17 이월 2 게시 전 조회 중 리뷰가 꺼지면 POST 없이 재시도 횟수를 쓰지 않고 기다렸다가 다시 켜지면 게시한다', async () => {
+  await opened(); await r.runtime.tick();
+  const pullRequest = r.gh.pullRequest.bind(r.gh);
+  r.gh.pullRequest = async (repository: string, number: number) => { r.policy().comparison = null; return pullRequest(repository, number); };
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.attempt, d.reason]), [['pending', 0, 'policy_unavailable']]);
+  assert.equal(r.gh.writes.length, 0);
+  r.gh.pullRequest = pullRequest;
+  r.policy().comparison = 'merge_base';
+  f.advance(DEFAULTS.retryDelayMs);
+  await r.publisher.deliver();
+  assert.equal(r.gh.writes.length, 1);
+});
+test('T17 이월 2 게시 전 조회 중 허용 봇 철회·draft 허용 해제도 최신 정책으로 막는다', async () => {
+  await opened(pull(bot(RENOVATE))); await r.runtime.tick();
+  const pullRequest = r.gh.pullRequest.bind(r.gh);
+  r.gh.pullRequest = async (repository: string, number: number) => { r.policy().allowedBotAuthorIds = [WRITER_BOT]; return pullRequest(repository, number); };
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['blocked', 'author_denied']]);
+  r.gh.pullRequest = pullRequest;
+  r.policy().allowedBotAuthorIds = POLICY.allowedBotAuthorIds;
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,outbox CASCADE');
+  r.policy().reviewDrafts = true;
+  await opened(pull({ draft: true, updated_at: '2026-11-04T00:10:00Z' })); await r.runtime.tick();
+  r.gh.pullRequest = async (repository: string, number: number) => { r.policy().reviewDrafts = false; return pullRequest(repository, number); };
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['superseded', 'draft']]);
+  assert.equal(r.gh.writes.length, 0);
+});
+test('T17 이월 2 재시도의 기존 리뷰 대조 중 철회돼도 POST 하지 않고, 이미 올라간 리뷰는 PR 상태와 무관하게 sent다', async () => {
+  await opened(); await r.runtime.tick();
+  r.gh.fail = new GitHubError(500);
+  await r.publisher.deliver();
+  assert.equal((await deliveries())[0]!.state, 'unknown');
+  await database.db.query(`UPDATE review_deliveries SET state='pending',dispatch_started=false,available_at=0`);
+  const reviews = r.gh.reviews.bind(r.gh);
+  (r.gh as GitHubReader).reviews = async () => { r.policy().repositories = []; return reviews(); };
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['blocked', 'authorization_revoked']]);
+  assert.equal(r.gh.writes.length, 0);
+  // 앞 시도의 POST가 실제로는 올라가 있었다면 draft로 바뀌었어도 보류하지 않는다(재개 때 중복 게시 방지).
+  r.policy().repositories = [REPO];
+  r.gh.reviews = reviews;
+  const key = (await deliveries())[0]!.idempotency_key;
+  r.gh.remote.push({ id: 777, commit_id: HEAD, body: reviewMarker(key) });
+  r.gh.pulls.set(7, pull({ draft: true }));
+  await database.db.query(`UPDATE review_deliveries SET state='pending',dispatch_started=false,available_at=0`);
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.external_id]), [['sent', '777']]);
+  assert.equal(r.gh.writes.length, 0);
+});
+async function unknownRows(count: number) {
+  await opened(); await r.runtime.tick();
+  await database.db.query('DELETE FROM review_deliveries');
+  const job = (await reviewJobs())[0]!.id;
+  // 번호가 작을수록 오래된 행이다. PR 번호로 어느 행을 대조했는지 본다.
+  for (let i = 1; i <= count; i++) {
+    await database.db.query(`INSERT INTO review_deliveries(id,job_id,idempotency_key,repo_id,repo_full_name,pr_number,head_sha,comparison_revision,
+      policy_revision,body,comments,state,reason,attempt,dispatch_started,available_at,created_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'rp','','[]','unknown','response_lost',1,true,$9,$9)`,
+    [randomUUID(), job, `github-review:${i}`, REPO.id, REPO.fullName, i, HEAD, BASE, f.now() + i]);
+  }
+  const seen: number[] = [];
+  (r.gh as GitHubReader).reviews = async (_repository, number) => { seen.push(number); return []; };
+  return { seen, job };
+}
+test('T17 이월 3 unknown이 한 번의 상한보다 많아도 커서가 돌아 가장 오래된 행까지 차례를 받고 끝에서 처음으로 돌아간다', async () => {
+  const { seen } = await unknownRows(45);
+  await r.publisher.reconcile();
+  assert.deepEqual(seen, Array.from({ length: 20 }, (_, i) => i + 1));
+  await r.publisher.reconcile();
+  assert.deepEqual(seen.slice(20), Array.from({ length: 20 }, (_, i) => i + 21));
+  // 끝에 닿으면 남은 5개 뒤로 처음부터 채운다.
+  await r.publisher.reconcile();
+  assert.deepEqual(seen.slice(40), [41, 42, 43, 44, 45, ...Array.from({ length: 15 }, (_, i) => i + 1)]);
+  assert.deepEqual(new Set(seen).size, 45);
+});
+test('T17 이월 3 오래된 unknown의 marker를 찾아 sent로 끝내고, 재시작한 게시자도 커서를 이어받으며 빠진 행 때문에 차례가 밀리지 않는다', async () => {
+  const { seen } = await unknownRows(25);
+  const remote = { id: 888, commit_id: HEAD, body: reviewMarker('github-review:21') };
+  const reviews: GitHubReader['reviews'] = async (_repository, number) => { seen.push(number); return number === 21 ? [remote] : []; };
+  (r.gh as GitHubReader).reviews = reviews;
+  await r.publisher.reconcile();
+  assert.deepEqual(seen, Array.from({ length: 20 }, (_, i) => i + 1));
+  // 이미 본 행이 빠져도 다음 차례는 그대로다.
+  await database.db.query(`UPDATE review_deliveries SET state='blocked' WHERE pr_number IN (3,20)`);
+  const restarted = new ReviewPublisher(f.store, r.source, r.gh, new RestrictedGitHub(r.gh.transport), r.queue, 5);
+  await restarted.reconcile();
+  assert.deepEqual(seen.slice(20, 25), [21, 22, 23, 24, 25]);
+  assert.equal((await deliveries()).find(d => d.pr_number === 21)!.state, 'sent');
+  assert.equal((await deliveries()).find(d => d.pr_number === 21)!.external_id, '888');
+});
+test('T17 이월 3 대조 오류가 나도 다음 행으로 넘어가고 커서가 앞으로 간다', async () => {
+  const { seen } = await unknownRows(25);
+  (r.gh as GitHubReader).reviews = async (_repository, number) => { seen.push(number); throw new GitHubError(500); };
+  await r.publisher.reconcile(); await r.publisher.reconcile();
+  assert.deepEqual(seen.slice(20, 25), [21, 22, 23, 24, 25]);
+  assert.equal((await deliveries()).filter(d => d.state === 'unknown').length, 25);
+});
 test('4407851858 EVENT-02 게시 전 PR·비교 기준 조회가 lease(30초)보다 길어도 현재 lease를 갱신해 그 시도에서 게시', async () => {
   await opened(); await r.runtime.tick();
   const pullRequest = r.gh.pullRequest.bind(r.gh), mergeBase = r.gh.mergeBase.bind(r.gh);

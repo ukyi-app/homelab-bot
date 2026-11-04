@@ -114,7 +114,8 @@ export function readArchive(bytes: Uint8Array, maxBytes: number): Map<string, En
     const path = parts.slice(1).join('/');
     if (!path || type === '5') continue;
     const mode = Number.parseInt(cstr(header, 100, 8).trim() || '0', 8) || 0;
-    entries.set(path, type === '0' || type === '\0' || type === '7' ? { kind: 'file', data: Buffer.from(data), mode }
+    // 복사하지 않고 압축 해제본을 함께 가리킨다. 복사하면 해제본이 풀릴 때까지 압축본 하나가 두 벌이라 메모리 피크가 배로 뛴다.
+    entries.set(path, type === '0' || type === '\0' || type === '7' ? { kind: 'file', data, mode }
       : type === '2' ? { kind: 'symlink', data: Buffer.from(cstr(header, 157, 100)), mode } : { kind: 'other', data: Buffer.alloc(0), mode });
   }
   return entries;
@@ -136,69 +137,142 @@ const lines = (value: string) => {
   return all;
 };
 const MAX_EDIT_DISTANCE = 2000;
-// Myers diff. trace는 d마다 필요한 대각선 범위만 복사해 메모리를 O(D^2)로 묶는다.
-function editScript(a: string[], b: string[]): { op: ' ' | '-' | '+'; line: string }[] | null {
-  const n = a.length, m = b.length, limit = Math.min(n + m, MAX_EDIT_DISTANCE);
-  const v = new Map<number, number>([[1, 0]]);
-  const trace: Map<number, number>[] = [];
-  for (let d = 0; d <= limit; d++) {
-    trace.push(new Map(v));
-    for (let k = -d; k <= d; k += 2) {
-      let x = k === -d || (k !== d && (v.get(k - 1) ?? -1) < (v.get(k + 1) ?? -1)) ? v.get(k + 1)! : v.get(k - 1)! + 1;
-      let y = x - k;
-      while (x < n && y < m && a[x] === b[y]) { x++; y++; }
-      v.set(k, x);
-      if (x >= n && y >= m) return backtrack(trace, a, b);
+// 계산량(줄 대조·대각선 방문 수) 상한. 넘으면 diff_too_complex로 미검토 표시한다. 벽시계가 아니라 횟수라 같은 입력이면 결과가 같다.
+// diff 계산은 동기라 이벤트 루프를 막는다. 파일 상한이 곧 취소 요청을 못 받는 시간의 상한이다.
+const MAX_FILE_DIFF_WORK = 200_000_000;
+const MAX_TASK_DIFF_WORK = 2_000_000_000;
+interface DiffBudget { left: number }
+const KEEP = 0, REMOVE = 1, ADD = 2;
+// (d, 대각선 k)에 어느 쪽에서 왔는지 고른다. 앞으로 갈 때와 되짚을 때 같은 판단을 써야 경로가 맞는다.
+// 격자 밖 값을 저장하지 않아서 trace의 모든 값이 실제 위치다. 도달할 수 없는 대각선은 -1이다.
+function moveInto(trace: Int32Array, above: number, i: number, d: number, k: number, n: number, m: number): typeof ADD | typeof REMOVE | -1 {
+  const down = i < d ? trace[above + i]! : -1, right = i > 0 ? trace[above + i - 1]! : -1;
+  const downOk = down >= 0 && down - k <= m, rightOk = right >= 0 && right < n;
+  if (downOk && (!rightOk || right < down)) return ADD;
+  return rightOk ? REMOVE : -1;
+}
+// Myers diff. trace를 d행마다 d+1칸인 삼각형 Int32Array 하나에 담아, D 상한에서 메모리가 약 8MB로 고정된다.
+// 줄은 정수로 바꿔 비교해 긴 줄이 반복돼도 비교 한 번의 비용이 늘지 않는다.
+function editScript(a: string[], b: string[], budget: DiffBudget): Uint8Array | null {
+  const shared = Math.min(a.length, b.length);
+  let start = 0, tail = 0;
+  while (start < shared && a[start] === b[start]) start++;
+  while (tail < shared - start && a[a.length - 1 - tail] === b[b.length - 1 - tail]) tail++;
+  const n = a.length - start - tail, m = b.length - start - tail, limit = Math.min(n + m, MAX_EDIT_DISTANCE);
+  // 편집 거리는 줄 수 차이보다 작을 수 없다. 표를 잡기 전에 끝낸다.
+  if (Math.abs(n - m) > limit) return null;
+  const allowance = Math.min(MAX_FILE_DIFF_WORK, budget.left);
+  let work = n + m;
+  if (work > allowance) { budget.left -= work; return null; }
+  const ids = new Map<string, number>();
+  const intern = (source: string[], count: number) => {
+    const out = new Int32Array(count);
+    for (let i = 0; i < count; i++) {
+      const line = source[start + i]!;
+      let id = ids.get(line);
+      if (id === undefined) { id = ids.size; ids.set(line, id); }
+      out[i] = id;
     }
-    for (const key of v.keys()) if (key < -d - 1 || key > d + 1) v.delete(key);
+    return out;
+  };
+  const left = intern(a, n), right = intern(b, m);
+  ids.clear();
+  const trace = new Int32Array((limit + 1) * (limit + 2) / 2);
+  let row = 0;
+  for (let d = 0; d <= limit; d++) {
+    const above = row - d;
+    for (let i = 0, k = -d; i <= d; i++, k += 2) {
+      let x = 0;
+      if (d > 0) {
+        const move = moveInto(trace, above, i, d, k, n, m);
+        if (move < 0) { trace[row + i] = -1; work++; continue; }
+        x = move === ADD ? trace[above + i]! : trace[above + i - 1]! + 1;
+      }
+      let y = x - k;
+      const from = x;
+      while (x < n && y < m && left[x] === right[y]) { x++; y++; }
+      trace[row + i] = x;
+      work += x - from + 1;
+      if (x === n && y === m) {
+        budget.left -= work;
+        return backtrack(trace, row, d, n, m, start, tail);
+      }
+      if (work > allowance) { budget.left -= work; return null; }
+    }
+    row += d + 1;
   }
+  budget.left -= work;
   return null;
 }
-function backtrack(trace: Map<number, number>[], a: string[], b: string[]) {
-  const ops: { op: ' ' | '-' | '+'; line: string }[] = [];
-  let x = a.length, y = b.length;
-  for (let d = trace.length - 1; d >= 0; d--) {
-    const v = trace[d]!, k = x - y;
-    const prevK = k === -d || (k !== d && (v.get(k - 1) ?? -1) < (v.get(k + 1) ?? -1)) ? k + 1 : k - 1;
-    const prevX = v.get(prevK) ?? 0, prevY = prevX - prevK;
-    while (x > prevX && y > prevY) { ops.push({ op: ' ', line: a[x - 1]! }); x--; y--; }
-    if (d > 0) { if (x === prevX) ops.push({ op: '+', line: b[y - 1]! }); else ops.push({ op: '-', line: a[x - 1]! }); }
-    x = prevX; y = prevY;
+function backtrack(trace: Int32Array, lastRow: number, distance: number, n: number, m: number, start: number, tail: number): Uint8Array {
+  // 공통 앞뒤는 0(KEEP)으로 남는다. 가운데 작업 수는 (n + m + D) / 2다.
+  const middle = (n + m + distance) / 2;
+  const ops = new Uint8Array(start + middle + tail);
+  let position = start + middle, x = n, y = m, row = lastRow;
+  for (let d = distance; d > 0; d--) {
+    const above = row - d, k = x - y, i = (k + d) / 2;
+    const move = moveInto(trace, above, i, d, k, n, m);
+    const from = move === ADD ? trace[above + i]! : trace[above + i - 1]! + 1;
+    while (x > from) { ops[--position] = KEEP; x--; y--; }
+    ops[--position] = move;
+    if (move === ADD) y--; else x--;
+    row = above;
   }
-  return ops.reverse();
+  return ops;
 }
-export function unifiedDiff(path: string, before: string, after: string, context = 3): { patch: string; rightLines: number[] } | null {
-  const ops = editScript(lines(before), lines(after));
-  if (!ops) return null;
-  const out = [`--- a/${path}`, `+++ b/${path}`];
+const NO_NEWLINE_MARK = '\\ No newline at end of file';
+type BoundedDiff = { patch: string; rightLines: number[] } | 'too_complex' | 'too_large';
+// maxBytes를 넘는 것이 확실하면 계산하지 않고, 만드는 중에 넘으면 바로 멈춘다.
+function boundedDiff(path: string, before: string, after: string, context: number, budget: DiffBudget, maxBytes: number): BoundedDiff {
+  // 지운 줄과 더한 줄이 모두 patch에 들어가므로 patch는 두 내용의 크기 차이보다 작을 수 없다.
+  if (Math.abs(Buffer.byteLength(before) - Buffer.byteLength(after)) > maxBytes) return 'too_large';
+  const a = lines(before), b = lines(after);
+  const ops = editScript(a, b, budget);
+  if (!ops) return 'too_complex';
+  const out: string[] = [];
+  let bytes = 0;
+  const emit = (segment: string) => { out.push(segment); bytes += Buffer.byteLength(segment) + 1; return bytes <= maxBytes; };
+  if (!emit(`--- a/${path}`) || !emit(`+++ b/${path}`)) return 'too_large';
   const rightLines: number[] = [];
-  const changed = ops.map((o, i) => o.op !== ' ' ? i : -1).filter(i => i >= 0);
-  let index = 0;
-  while (index < changed.length) {
-    let end = index;
-    while (end + 1 < changed.length && changed[end + 1]! - changed[end]! <= context * 2) end++;
-    const from = Math.max(0, changed[index]! - context), to = Math.min(ops.length - 1, changed[end]! + context);
-    let left = 1, right = 1;
-    for (let i = 0; i < from; i++) { if (ops[i]!.op !== '+') left++; if (ops[i]!.op !== '-') right++; }
+  let scanned = 0, ai = 0, bi = 0, index = 0;
+  while (index < ops.length) {
+    let first = index;
+    while (first < ops.length && ops[first] === KEEP) first++;
+    if (first === ops.length) break;
+    let last = first;
+    for (let i = first + 1; i < ops.length && i - last <= context * 2; i++) if (ops[i] !== KEEP) last = i;
+    const from = Math.max(0, first - context), to = Math.min(ops.length - 1, last + context);
+    for (; scanned < from; scanned++) { if (ops[scanned] !== ADD) ai++; if (ops[scanned] !== REMOVE) bi++; }
+    const startLeft = ai + 1, startRight = bi + 1;
     const body: string[] = [];
     let leftCount = 0, rightCount = 0;
     for (let i = from; i <= to; i++) {
-      const o = ops[i]!;
-      if (o.line.endsWith(NO_EOL)) body.push(`${o.op}${o.line.slice(0, -1)}`, '\\ No newline at end of file');
-      else body.push(`${o.op}${o.line}`);
-      if (o.op !== '+') leftCount++;
-      if (o.op !== '-') { rightLines.push(right + rightCount); rightCount++; }
+      const op = ops[i]!;
+      const line = op === ADD ? b[bi]! : a[ai]!;
+      const prefix = op === KEEP ? ' ' : op === ADD ? '+' : '-';
+      if (line.endsWith(NO_EOL)) body.push(`${prefix}${line.slice(0, -1)}`, NO_NEWLINE_MARK);
+      else body.push(`${prefix}${line}`);
+      if (op !== ADD) { leftCount++; ai++; }
+      if (op !== REMOVE) { rightLines.push(startRight + rightCount); rightCount++; bi++; }
     }
-    out.push(`@@ -${leftCount ? left : left - 1},${leftCount} +${rightCount ? right : right - 1},${rightCount} @@`, ...body);
-    index = end + 1;
+    scanned = to + 1;
+    if (!emit(`@@ -${leftCount ? startLeft : startLeft - 1},${leftCount} +${rightCount ? startRight : startRight - 1},${rightCount} @@`)) return 'too_large';
+    for (const segment of body) if (!emit(segment)) return 'too_large';
+    index = last + 1;
   }
   return { patch: `${out.join('\n')}\n`, rightLines };
+}
+export function unifiedDiff(path: string, before: string, after: string, context = 3, workLimit = MAX_TASK_DIFF_WORK): { patch: string; rightLines: number[] } | null {
+  const diff = boundedDiff(path, before, after, context, { left: workLimit }, Number.POSITIVE_INFINITY);
+  return typeof diff === 'string' ? null : diff;
 }
 
 // 변경 목록은 API 열거가 기준이다. 압축본은 같은 SHA 쌍의 blob 내용에만 쓴다.
 // reservedBytes: 같은 모델 입력 예산(maxDiffBytes)에서 먼저 잡아 둔 기준 지침 크기.
-export function buildReviewFiles(changes: Change[], truncated: boolean, base: Map<string, Entry>, head: Map<string, Entry>,
-  limits: InputLimits, reservedBytes = 0): { files: ReviewFile[]; coverage: Coverage } {
+// 파일 사이마다 이벤트 루프를 넘겨, 긴 작업 중에도 취소 요청을 받아 모델을 부르기 전에 멈춘다.
+export async function buildReviewFiles(changes: Change[], truncated: boolean, base: Map<string, Entry>, head: Map<string, Entry>,
+  limits: InputLimits, reservedBytes = 0, signal?: AbortSignal, workLimit = MAX_TASK_DIFF_WORK): Promise<{ files: ReviewFile[]; coverage: Coverage }> {
+  const budget: DiffBudget = { left: workLimit };
   const files: ReviewFile[] = [];
   const coverage: Coverage = { checked_files: [], omitted_files_with_reasons: [], limits_hit: [] };
   const hit = (limit: Coverage['limits_hit'][number]) => { if (!coverage.limits_hit.includes(limit)) coverage.limits_hit.push(limit); };
@@ -207,6 +281,8 @@ export function buildReviewFiles(changes: Change[], truncated: boolean, base: Ma
   let bytes = reservedBytes;
   const listed = new Set<string>();
   for (const change of [...changes].sort((x, y) => x.path.localeCompare(y.path))) {
+    await new Promise(resolve => setImmediate(resolve));
+    signal?.throwIfAborted();
     listed.add(change.path);
     if (change.previousPath) listed.add(change.previousPath);
     if (change.baseType === 'commit' || change.headType === 'commit') { omit(change.path, 'submodule_pointer'); continue; }
@@ -221,8 +297,6 @@ export function buildReviewFiles(changes: Change[], truncated: boolean, base: Ma
     }
     const left = text(before), right = text(after);
     if (left === null || right === null) { omit(change.path, 'binary'); continue; }
-    const computed = unifiedDiff(change.path, left, right);
-    if (!computed) { omit(change.path, 'diff_too_complex'); continue; }
     // 내용 밖의 변경(모드·이름·새 파일·삭제)도 리뷰 입력에 git 형식 머리줄로 드러낸다.
     const baseMode = change.baseMode ?? (before ? gitMode(before) : null), headMode = change.headMode ?? (after ? gitMode(after) : null);
     const meta: string[] = [];
@@ -231,9 +305,12 @@ export function buildReviewFiles(changes: Change[], truncated: boolean, base: Ma
     else if (change.status === 'removed') meta.push(`deleted file mode ${baseMode}`);
     else if (baseMode && headMode && baseMode !== headMode) meta.push(`old mode ${baseMode}`, `new mode ${headMode}`);
     // 목록은 변경이라는데 내용·모드·이름 어느 것도 다르지 않으면 고정 SHA가 어긋난 것이다. 검토 완료로 세지 않는다.
-    if (!computed.patch.includes('\n@@ ') && !meta.length) { omit(change.path, 'archive_mismatch'); continue; }
-    const diff = { patch: meta.length ? `${meta.join('\n')}\n${computed.patch}` : computed.patch, rightLines: computed.rightLines };
-    if (bytes + Buffer.byteLength(diff.patch) > limits.maxDiffBytes) { omit(change.path, 'diff_limit'); hit('diff_limit'); continue; }
+    if (left === right && !meta.length) { omit(change.path, 'archive_mismatch'); continue; }
+    const header = meta.length ? `${meta.join('\n')}\n` : '';
+    const computed = boundedDiff(change.path, left, right, 3, budget, limits.maxDiffBytes - bytes - Buffer.byteLength(header));
+    if (computed === 'too_large') { omit(change.path, 'diff_limit'); hit('diff_limit'); continue; }
+    if (computed === 'too_complex') { omit(change.path, 'diff_too_complex'); continue; }
+    const diff = { patch: `${header}${computed.patch}`, rightLines: computed.rightLines };
     bytes += Buffer.byteLength(diff.patch);
     files.push({ path: change.path, status: change.status, ...diff });
     coverage.checked_files.push(change.path);
@@ -286,9 +363,9 @@ export class ReviewWorker {
       const entry = base.get('AGENTS.md');
       const raw = entry && entry.data.length <= task.limits.maxFileBytes ? text(entry) : null;
       const guidelines = raw && Buffer.byteLength(raw) <= task.limits.maxDiffBytes ? raw : null;
-      let built: ReturnType<typeof buildReviewFiles>;
+      let built: Awaited<ReturnType<typeof buildReviewFiles>>;
       // 모델을 부르기 전의 실패는 실행이 없었다는 것이 확실하므로 unknown이 아니라 failed다.
-      try { built = buildReviewFiles(task.changes, task.truncated, base, head, task.limits, guidelines ? Buffer.byteLength(guidelines) : 0); }
+      try { built = await buildReviewFiles(task.changes, task.truncated, base, head, task.limits, guidelines ? Buffer.byteLength(guidelines) : 0, signal); }
       catch { return { status: 'failed', stopped: true, reason: 'input_build_failed' }; }
       const { files, coverage } = built;
       if (entry && !guidelines && (entry.data.length > 0)) coverage.limits_hit.push('guidelines_limit');

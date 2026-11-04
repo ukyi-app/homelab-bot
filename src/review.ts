@@ -175,6 +175,9 @@ export class ReviewQueue {
     await tx.query(`INSERT INTO controls VALUES ('review_admission','false') ON CONFLICT DO NOTHING`);
     await tx.query(`SELECT * FROM controls WHERE key='review_admission' FOR UPDATE`);
     const key = generationKey(repo.id, pr.number, pr.head.sha, comparison, context.revision);
+    // 행을 먼저 잠그고 다음 문장에서 읽는다. finish가 같은 행을 잠그므로, 실행 중으로 읽고 밀려남을 풀었는데
+    // 그 사이 finish가 게시 행 없이 끝나 결과가 영영 게시되지 못하는 순서를 막는다.
+    await tx.query('SELECT job_id FROM pr_reviews WHERE generation_key=$1 FOR UPDATE', [key]);
     const existing = (await tx.query<{ job_id: string; state: string; attempt: number; superseded_at: string | null; delivered: boolean;
       held: boolean; blocked: boolean; result: ReviewResult | null; head_sha: string; comparison_revision: string; policy_revision: string }>(
       `SELECT p.job_id,j.state,j.attempt,p.superseded_at,p.result,p.head_sha,p.comparison_revision,p.policy_revision,
@@ -191,15 +194,23 @@ export class ReviewQueue {
     const revive = existing && !resume && existing.attempt <= DEFAULTS.maxRetries && (existing.state === 'superseded'
       || (existing.state === 'succeeded' && existing.superseded_at !== null && !existing.delivered)
       || (trigger === 'comment' && ['failed', 'cancelled'].includes(existing.state)));
-    if (existing && !revive && !resume) {
-      // 같은 세대라도 더 새 이벤트(재개·draft 해제 등)를 봤다는 사실은 남긴다. 늦게 온 옛 닫힘·draft가 이 시각과 비교된다.
-      await tx.query('UPDATE pr_reviews SET pr_updated_at=GREATEST(pr_updated_at,$2) WHERE job_id=$1', [existing.job_id, pr.updatedAt]);
-      return { outcome: 'duplicate_generation', key, job: existing.job_id };
-    }
     const latest = (await tx.query<ReviewRow>(`SELECT * FROM pr_reviews WHERE repo_id=$1 AND pr_number=$2
       ORDER BY pr_updated_at DESC,created_at DESC LIMIT 1`, [repo.id, pr.number])).rows[0];
+    const stale = !!latest && Number(latest.pr_updated_at) > pr.updatedAt;
+    if (existing && !revive && !resume) {
+      // 아직 끝나지 않은 작업이 닫힘·draft·새 세대로 밀려나 있으면 finish가 결과를 버린다. 명시 요청은 이 세대를 다시 현재로 되돌린다.
+      const rejoin = trigger === 'comment' && !stale && existing.superseded_at !== null
+        && ['queued', 'running', 'verifying', 'waiting_user'].includes(existing.state);
+      if (rejoin) await this.supersede(tx, repo.id, pr.number, 'new_generation', key);
+      // 같은 세대라도 더 새 이벤트(재개·draft 해제 등)를 봤다는 사실은 남긴다. 늦게 온 옛 닫힘·draft가 이 시각과 비교된다.
+      // 명시 요청은 draft 예외의 근거이므로 승격하고, 뒤따르는 자동 이벤트가 낮추지 못한다.
+      await tx.query(`UPDATE pr_reviews SET pr_updated_at=GREATEST(pr_updated_at,$2),trigger=CASE WHEN $3='comment' THEN 'comment' ELSE trigger END,
+        superseded_at=CASE WHEN $4::boolean THEN NULL ELSE superseded_at END,superseded_reason=CASE WHEN $4::boolean THEN NULL ELSE superseded_reason END,
+        review_outcome=CASE WHEN $4::boolean THEN NULL ELSE review_outcome END WHERE job_id=$1`, [existing.job_id, pr.updatedAt, trigger, rejoin]);
+      return { outcome: 'duplicate_generation', key, job: existing.job_id };
+    }
     // 늦게 도착한 옛 이벤트가 새 세대를 밀어내지 않게 한다. 실행 직전 live 조회가 한 번 더 막는다.
-    if (latest && Number(latest.pr_updated_at) > pr.updatedAt) return { outcome: 'stale_event', key };
+    if (stale) return { outcome: 'stale_event', key };
     if (existing && resume) {
       await this.supersede(tx, repo.id, pr.number, 'new_generation', key);
       const result = existing.result!;
@@ -494,7 +505,8 @@ export class ReviewRuntime {
         else await this.store.db.transaction(tx => this.queue.supersede(tx, repo.id, pr.number, stale));
         return true;
       }
-      const denied = pullRequestDecision(pr, repo, context.review, review.trigger === 'comment');
+      // trigger는 조회 중 댓글 명시 요청으로 승격될 수 있어 작업 시작 때 읽은 값을 쓰지 않는다.
+      const denied = pullRequestDecision(pr, repo, context.review, await this.explicit(job.id));
       if (denied) { await this.close(job, review, denied.outcome === 'denied' ? 'cancelled' : 'superseded', denied.reason); return true; }
       let compare: { files: Change[]; truncated: boolean };
       try { compare = CompareSchema.parse(await this.reader.compare(repo.fullName, review.comparison_revision, review.head_sha)); }
@@ -518,7 +530,7 @@ export class ReviewRuntime {
         await this.queue.admitLive(pr, freshRepo, fresh, 'live_check');
         return true;
       }
-      const revoked = pullRequestDecision(pr, freshRepo, fresh.review, review.trigger === 'comment');
+      const revoked = pullRequestDecision(pr, freshRepo, fresh.review, await this.explicit(job.id));
       if (revoked) { await this.close(job, review, revoked.outcome === 'denied' ? 'cancelled' : 'superseded', revoked.reason); return true; }
       // PR·목록 조회 동안 들어온 취소·비상 중지와 lease 만료를 dispatch 직전에 다시 본다.
       const live = (await this.store.db.query<{ state: string; lease_token: string; lease_until: string }>(
@@ -595,6 +607,9 @@ export class ReviewRuntime {
       if (!dispatched) await this.releaseUndispatched(job).catch(() => {});
     }
     return true;
+  }
+  private async explicit(job: string): Promise<boolean> {
+    return (await this.store.db.query<{ trigger: string }>('SELECT trigger FROM pr_reviews WHERE job_id=$1', [job])).rows[0]?.trigger === 'comment';
   }
   private async releaseUndispatched(job: Job): Promise<void> {
     await this.store.db.query(`UPDATE jobs SET state='queued',attempt=GREATEST(0,attempt-1),available_at=$3,lease_token=NULL,
@@ -705,8 +720,9 @@ interface DeliveryRow {
   id: string; job_id: string; idempotency_key: string; repo_id: string; repo_full_name: string; pr_number: number;
   head_sha: string; comparison_revision: string; policy_revision: string; body: string;
   comments: { path: string; line: number; side: 'RIGHT'; body: string }[]; inline: boolean; state: string; attempt: number;
-  lease_token: string; external_id: string | null;
+  lease_token: string; external_id: string | null; available_at: string | number;
 }
+const RECONCILE_BATCH = 20;
 export class ReviewPublisher {
   constructor(private readonly store: Store, private readonly policy: ReviewPolicySource, private readonly reader: GitHubReader,
     private readonly github: RestrictedGitHub, private readonly queue: ReviewQueue, private readonly pollMs = 1000) {}
@@ -732,26 +748,19 @@ export class ReviewPublisher {
         [row.id, row.lease_token, this.store.now() + DEFAULTS.leaseMs, this.store.now()]).catch(() => {});
     }, this.pollMs);
     try {
-      const context = await this.policy.current();
-      const repo = context.review.repositories.find(r => String(r.id) === String(row.repo_id) && r.fullName === row.repo_full_name);
-      if (!repo) { await this.state(row, 'blocked', 'authorization_revoked'); return true; }
-      if (context.revision !== row.policy_revision) { await this.state(row, 'superseded', 'policy_changed'); return true; }
-      if (!context.review.publish) { await this.state(row, 'blocked', 'publish_limits_unset'); return true; }
-      // 내부 표식 목록은 결과 저장 뒤에도 바뀔 수 있어 게시 직전 현재 정책으로 다시 분류한다(DATA-01).
-      const saved = (await this.store.db.query<{ result: ReviewResult | null; positions: { path: string; lines: number[] }[] | null }>(
-        'SELECT result,positions FROM pr_reviews WHERE job_id=$1', [row.job_id])).rows[0];
-      const stored = saved?.result;
-      if (!stored || classify(stored, context.review) !== 'public') { await this.state(row, 'blocked', 'output_classification'); return true; }
-      // 게시 상한(지적 수·인라인 수·본문 길이)은 게시 시점 정책으로 저장된 구조화 결과를 다시 렌더링해 적용한다.
-      const rendered = render(stored, saved.positions ?? [], context.review.publish, row.idempotency_key);
-      if (!rendered) { await this.state(row, 'blocked', 'publish_limit_exceeded'); return true; }
-      row.body = rendered.body;
-      row.comments = row.inline ? rendered.comments : [];
-      await this.store.db.query('UPDATE review_deliveries SET body=$3,comments=$4 WHERE id=$1 AND lease_token=$2',
-        [row.id, row.lease_token, row.body, json(row.comments)]);
+      // 원격 조회를 부르기 전에 막을 수 있는 것은 먼저 막는다. 조회 뒤에 같은 검사를 최신 정책으로 다시 한다.
+      const initial = await this.policy.current();
+      if (!await this.publishable(row, initial)) return true;
+      // 이전 시도의 게시 여부는 다른 판단보다 먼저 확인한다. 이미 올라간 리뷰를 보류·차단으로 기록하면 재개 때 중복 게시된다.
+      if (row.attempt > 1 && await this.existing(row)) return true;
       // 게시 직전 최신 PR을 다시 본다. 오래된 리뷰를 최신 검증처럼 올리지 않는다(REVIEW-02).
-      const pr = pullRequest(await this.reader.pullRequest(repo.fullName, row.pr_number));
-      const current = pr.open && pr.head.sha === row.head_sha ? await this.queue.comparison(repo.fullName, pr, context.review) : undefined;
+      const pr = pullRequest(await this.reader.pullRequest(row.repo_full_name, row.pr_number));
+      const current = pr.open && pr.head.sha === row.head_sha ? await this.queue.comparison(row.repo_full_name, pr, initial.review) : undefined;
+      // 원격 조회 동안 바뀐 저장소 허용·revision·공개 범위·게시 상한을 POST 직전에 최신 정책으로 다시 본다.
+      // 이 아래로는 원격 호출이 없어 판단과 POST 사이에 다시 벌어지는 틈은 DB 조회뿐이다.
+      const context = await this.policy.current();
+      const repo = await this.publishable(row, context);
+      if (!repo) return true;
       const stale = !pr.open ? (pr.merged ? 'merged_before_publish' : 'pr_closed')
         : pr.head.sha !== row.head_sha ? 'stale_head' : current !== row.comparison_revision ? 'base_moved' : undefined;
       if (stale) {
@@ -771,7 +780,6 @@ export class ReviewPublisher {
         [row.job_id, this.store.now()]);
         return true;
       }
-      if (row.attempt > 1 && await this.existing(row)) return true;
       const request = { method: 'POST', path: `/repos/${repo.fullName}/pulls/${row.pr_number}/reviews`,
         body: { commit_id: row.head_sha, event: 'COMMENT', body: row.body, comments: row.comments } };
       const expected = { repository: repo.fullName, pr: row.pr_number, head: row.head_sha };
@@ -801,6 +809,28 @@ export class ReviewPublisher {
     } finally { clearInterval(keepalive); }
     return true;
   }
+  // 이 정책으로 게시해도 되는지 본다. 되면 row.body·comments를 이 정책으로 다시 렌더링해 허용 저장소를 돌려주고,
+  // 안 되면 게시 행 상태를 바꾸고 undefined를 돌려준다.
+  private async publishable(row: DeliveryRow, context: ReviewContext): Promise<ReviewPolicy['repositories'][number] | undefined> {
+    const saved = (await this.store.db.query<{ result: ReviewResult | null; positions: { path: string; lines: number[] }[] | null; installation_id: string }>(
+      'SELECT result,positions,installation_id FROM pr_reviews WHERE job_id=$1', [row.job_id])).rows[0];
+    const repo = context.review.repositories.find(r => String(r.id) === String(row.repo_id) && r.fullName === row.repo_full_name
+      && String(r.installationId) === String(saved?.installation_id));
+    if (!repo) { await this.state(row, 'blocked', 'authorization_revoked'); return; }
+    if (context.revision !== row.policy_revision) { await this.state(row, 'superseded', 'policy_changed'); return; }
+    if (!context.review.publish) { await this.state(row, 'blocked', 'publish_limits_unset'); return; }
+    // 내부 표식 목록은 결과 저장 뒤에도 바뀔 수 있어 게시 직전 현재 정책으로 다시 분류한다(DATA-01).
+    const stored = saved?.result;
+    if (!stored || classify(stored, context.review) !== 'public') { await this.state(row, 'blocked', 'output_classification'); return; }
+    // 게시 상한(지적 수·인라인 수·본문 길이)은 게시 시점 정책으로 저장된 구조화 결과를 다시 렌더링해 적용한다.
+    const rendered = render(stored, saved.positions ?? [], context.review.publish, row.idempotency_key);
+    if (!rendered) { await this.state(row, 'blocked', 'publish_limit_exceeded'); return; }
+    row.body = rendered.body;
+    row.comments = row.inline ? rendered.comments : [];
+    await this.store.db.query('UPDATE review_deliveries SET body=$3,comments=$4 WHERE id=$1 AND lease_token=$2',
+      [row.id, row.lease_token, row.body, json(row.comments)]);
+    return repo;
+  }
   // T16a 게시 pause와 같은 규칙: 시도 수를 되돌리고 1초부터 60초까지 늘려 기다린다.
   private async pause(row: DeliveryRow, reason: string, retryAfterMs = 0): Promise<void> {
     await this.store.db.query(`UPDATE review_deliveries SET state='pending',attempt=GREATEST(0,attempt-1),dispatch_started=false,
@@ -814,8 +844,17 @@ export class ReviewPublisher {
     const retired = await this.store.db.query<{ id: string }>(`UPDATE review_deliveries SET state='blocked',reason='unknown_deadline'
       WHERE state='unknown' AND available_at<=$1 RETURNING id`, [this.store.now() - DEFAULTS.unknownDeliveryMs]);
     for (const row of retired.rows) await this.store.audit('review_delivery_unresolved_retired', row.id, { reason: 'unknown_deadline', resend: false });
-    for (const row of (await this.store.db.query<DeliveryRow>("SELECT * FROM review_deliveries WHERE state='unknown' ORDER BY available_at DESC LIMIT 20")).rows) {
-      try { await this.existing(row); } catch { /* 다음 대조에서 다시 본다 */ }
+    // 커서 다음 행부터 진입 시각 순으로 보고 끝에 닿으면 처음으로 돌아가, 행이 많아도 모든 행이 기한 안에 차례를 받는다.
+    // 재시작해도 이어지게 저장하고, 대조 전에 옮겨 한 행이 계속 프로세스를 죽여도 다음 행으로 넘어간다.
+    // 키가 위치(진입 시각, id)라 앞선 행이 sent·은퇴로 빠져도 차례가 밀리지 않는다.
+    const cursor = (await this.store.db.query<{ value: { at: number; id: string } }>(`SELECT value FROM controls WHERE key='review_reconcile_cursor'`)).rows[0]?.value;
+    const rows = (await this.store.db.query<DeliveryRow>(`SELECT * FROM review_deliveries WHERE state='unknown'
+      ORDER BY (available_at,id) > ($1::bigint,$2::text) DESC,available_at,id LIMIT $3`, [cursor?.at ?? -1, cursor?.id ?? '', RECONCILE_BATCH])).rows;
+    const last = rows.at(-1);
+    if (last) await this.store.db.query(`INSERT INTO controls VALUES ('review_reconcile_cursor',$1::jsonb) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`,
+      [json({ at: Number(last.available_at), id: last.id })]);
+    for (const row of rows) {
+      try { await this.existing(row); } catch { /* 다음 차례에 다시 본다 */ }
     }
   }
   private async existing(row: DeliveryRow): Promise<boolean> {
