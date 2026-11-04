@@ -26,7 +26,7 @@ export const ReviewPolicySchema = z.strictObject({
   allowedBotAuthorIds: z.array(z.number().int().positive()).max(20),
   commentCommand: z.string().trim().min(1).max(100).nullable(),
   reviewDrafts: z.boolean(), rereviewOnBaseMove: z.boolean().nullable(),
-  // 비교 기준(결정 대기, DECISIONS "T17"). null이면 리뷰 경로를 닫는다.
+  // 비교 기준(운영 값 merge_base, DECISIONS "T17 결정"). null이면 리뷰 경로를 닫는다.
   comparison: z.enum(['merge_base', 'base_head']).nullable(),
   reviewSince: z.number().int().nonnegative(), internalMarkers: z.array(z.string().min(4).max(200)).max(100),
   input: InputLimitsSchema,
@@ -41,7 +41,7 @@ export const MODEL_CALL_ASSOCIATIONS = Object.freeze(['OWNER', 'MEMBER', 'COLLAB
 export function reviewRevision(review: ReviewPolicy): string {
   return `rp-${createHash('sha256').update(JSON.stringify([REVIEW_INSTRUCTIONS, review.input, review.comparison])).digest('hex').slice(0, 16)}`;
 }
-// 리뷰 정책이 없거나 결정 대기 값(comparison null)이면 새 요청만 받지 않는다. 철회(Denied)가 아니라
+// 리뷰 정책이 없거나 비교 기준을 정하지 않은 값(comparison null)이면 새 요청만 받지 않는다. 철회(Denied)가 아니라
 // 일시 상태로 다뤄, 대기 작업과 미게시 결과를 지우지 않고 다시 켜질 때까지 기다린다.
 export class ReviewDisabled extends PolicyUnavailable {}
 export class ReviewPolicySource {
@@ -485,7 +485,7 @@ export class ReviewRuntime {
       if (signal.aborted) stop();
     });
   }
-  // 대화 claim과 같은 scheduler 잠금·전역 슬롯 조건을 쓴다. 리뷰도 대화와 같은 auth.json 직렬 1개다(D-14).
+  // 대화 claim과 같은 scheduler 잠금·전역 슬롯 조건을 쓴다. 리뷰도 대화와 같은 직렬 1개다(D-14).
   async claim(): Promise<(Job & Record<string, unknown>) | undefined> {
     return this.store.db.transaction(async tx => {
       await tx.query(`INSERT INTO controls VALUES ('scheduler','false') ON CONFLICT DO NOTHING`);
