@@ -15,6 +15,8 @@ export const SECRET_KEYS = Object.freeze(['DATABASE_URL', 'DISCORD_BOT_TOKEN', '
 export const ADDRESS_KEYS = Object.freeze(['WORKER_URL', 'GRAFANA_URL', 'KUBERNETES_API_URL'] as const);
 // T20 기억·브리핑(비밀 아님, 차트 env). 없으면 끈다. 있는데 틀리면 기동하지 않는다(조용히 끄지 않는다).
 export const MEMORY_KEYS = Object.freeze(['MEMORY_LEDGER_DIR', 'MEMORY_LEDGER_ACCEPT_GENERATION', 'BRIEFING_TIME', 'BRIEFING_TIMEZONE'] as const);
+// T17 리뷰 App(비밀). 없으면 리뷰 GitHub 전송을 만들지 않는다. 하나만 있으면 기동하지 않는다.
+export const REVIEW_APP_KEYS = Object.freeze(['GITHUB_REVIEW_APP_ID', 'GITHUB_REVIEW_APP_PRIVATE_KEY'] as const);
 // 원장 PVC 마운트(계약 v1 /var/lib/homelab-bot/ledger)가 들어갈 수 있는 곳. 그 밖 경로는 컨테이너 쓰기 층이라 재시작에 사라진다.
 export const LEDGER_ROOT = '/var/lib/homelab-bot/';
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -29,6 +31,8 @@ export interface PublisherConfig {
   memory?: { ledgerDir: string; acceptGeneration: string | null } | null;
   // null이면 브리핑 예약을 끈다(ensure()가 남은 사본을 막음). memory 없이 켤 수 없다.
   briefing?: { time: string; timezone: string } | null;
+  // null이면 리뷰 App 입력이 없다. 있어도 정책과 조립(main.ts)이 켜기 전에는 GitHub을 부르지 않는다.
+  githubReviewApp?: { appId: string; privateKey: KeyObject } | null;
 }
 type Env = Readonly<Record<string, string | undefined>>;
 const token = (value: string) => value.length > 0 && !/\s/.test(value);
@@ -75,10 +79,30 @@ export function loadPublisherConfig(env: Env, loadedAt: number): PublisherConfig
   const grafanaUrl = read('GRAFANA_URL', value => url(value, ['http:', 'https:'], true));
   const kubernetesUrl = read('KUBERNETES_API_URL', value => url(value, ['https:'], true));
   const { memory, briefing } = memoryConfig(env, problems);
+  const githubReviewApp = reviewAppConfig(env, problems);
   if (problems.length || !policy || !workerKey) throw new ConfigError(problems.length ? problems : ['unknown']);
   return { databaseUrl, discordToken, policy, grafana: { url: grafanaUrl, token: grafanaToken },
     kubernetes: { url: kubernetesUrl }, workerUrl, healthchecksUrl,
-    workerKey, githubWebhookSecret, memory, briefing };
+    workerKey, githubWebhookSecret, memory, briefing, githubReviewApp };
+}
+// GitHub이 내려주는 키는 RSA 2048이다. 짧은 키나 다른 종류는 잘못 넣은 값으로 본다.
+function reviewAppConfig(env: Env, problems: string[]): NonNullable<PublisherConfig['githubReviewApp']> | null {
+  const rawId = env.GITHUB_REVIEW_APP_ID, rawKey = env.GITHUB_REVIEW_APP_PRIVATE_KEY;
+  if (rawId === undefined && rawKey === undefined) return null;
+  let appId: string | undefined;
+  let privateKey: KeyObject | undefined;
+  if (rawId === undefined) problems.push('GITHUB_REVIEW_APP_ID(missing)');
+  else if (/^[1-9]\d{0,15}$/.test(rawId.trim())) appId = rawId.trim();
+  else problems.push('GITHUB_REVIEW_APP_ID(invalid)');
+  if (rawKey === undefined) problems.push('GITHUB_REVIEW_APP_PRIVATE_KEY(missing)');
+  else {
+    try {
+      const key = createPrivateKey(rawKey.trim().replaceAll('\\n', '\n'));
+      if (key.asymmetricKeyType !== 'rsa' || (key.asymmetricKeyDetails?.modulusLength ?? 0) < 2048) throw new Error('not_rsa_2048');
+      privateKey = key;
+    } catch { problems.push('GITHUB_REVIEW_APP_PRIVATE_KEY(invalid)'); }
+  }
+  return appId && privateKey ? { appId, privateKey } : null;
 }
 // 선택 키는 "없음(undefined)"만 끔으로 본다. 빈 값은 잘못 넣은 것이라 오류다.
 function memoryConfig(env: Env, problems: string[]): Pick<PublisherConfig, 'memory' | 'briefing'> {
