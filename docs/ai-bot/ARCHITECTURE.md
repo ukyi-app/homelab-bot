@@ -926,6 +926,8 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 **실행 기록 정리 실패(리뷰 exec-r1 P2).** 프로세스 소멸을 확인한 실행은 어댑터 고유 잔여물(Codex `sessions/`·`archived_sessions/`)과 실행 디렉터리를 지우고, 실행 디렉터리가 정말 없어졌는지 확인한 뒤에 결과를 확정한다. 지우지 못하면(권한·파일시스템 오류) 그 실행의 답은 게시하지 않고 `failed`(`stopped: true`, 프로세스는 끝났으니 `unknown`이 아님)이며, 한도·인증·실패 결과는 그대로 둔다. 지우지 못한 실행은 잔여물로 추적한다. 잔여물이 남은 동안 새 실행은 띄우지 않고(`failed`) readiness는 503이다. readiness 확인과 새 실행 직전마다 다시 지워 보고, 모두 지워지면 자동으로 돌아온다. 소멸을 확인하지 못한 실행은 살아 있는 프로세스가 쓰는 중일 수 있어 지우지 않는다(그 실행은 `unknown`이고 `ExecutionSlot`과 `RunControl`이 막는다). 기동 로그와 같은 줄 형식으로 값 없는 사건 `{"event":"cleanup_failed"}`·`{"event":"cleanup_recovered"}`만 남긴다(경로·내용 없음). `ChatLane`을 공유 실행 제어 없이 따로 조립할 때만 옛 이름 `chat_cleanup_*`로 옮겨 낸다. 운영 진입점은 공유 실행 제어라 이 경우가 아니다.
 
+**정책 위반 종류 로그(2026-11-04).** 결과 `reason`과 DB는 `policy_violation` 한 단어뿐이라, 실행이 정책 위반으로 멈추면 같은 줄 형식으로 `{"component":"worker","level":"warn","event":"run_policy_violation","lane":"review","kind":"plugins_enabled"}`를 실행당 한 번 남긴다. `kind`는 봇 코드의 상수(`PolicyViolation`: `tools_enabled`·`mcp_enabled`·`skills_enabled`·`plugins_enabled`·`hooks_enabled`·`tool_activity`·`model_mismatch`·`model_fallback`·`credential_source_mismatch`·`version_mismatch`)뿐이고 도구·플러그인·모델 이름과 job ID는 싣지 않는다. 실행 중 관측(`observe`)과 사후 판정(`interpretClaudeStream`)을 모두 덮고, 프로세스 소멸을 확인하지 못해 결과가 `unknown`이어도 실행 중 관측분은 남는다. `tool_use` 블록은 정책 위반이 아니라 `tool_budget_exceeded` 경로라 이 사건을 내지 않는다.
+
 **readiness.** `GET /readyz`는 앞 실행의 기록이 모두 지워졌고 선택한 자격이 쓸 수 있는 모양으로 있으면 200이다. Claude: 토큰 파일 읽기·모양(없어지거나 틀리면 503, 돌아오면 200). Codex: 영속 공간의 일반 파일 `auth.json`. 모델을 부르지 않는다. readiness 200은 인증 서버가 토큰을 받는다는 뜻이 아니다.
 
 **준비된 프로필 사이 전환(설정 PR 하나 + 자격 하나).**

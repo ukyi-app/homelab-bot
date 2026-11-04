@@ -11,12 +11,13 @@ import { SYSTEM_INSTRUCTIONS, WorkerRejected } from '../src/contracts.js';
 import { StaticEnvCredential } from '../src/credentials.js';
 import { CLAUDE_FIXED_ENV, CLAUDE_FORBIDDEN_FLAGS, ClaudeChatAdapter, ClaudeReviewAdapter, REVIEW_SETTINGS, claudeArgs } from '../src/executor-claude.js';
 import { CodexChatAdapter } from '../src/executor-codex.js';
+import type { AdapterRun, ChatRun } from '../src/executor.js';
 import { PROFILES } from '../src/executor-profiles.js';
 import { REVIEW_INSTRUCTIONS, ReviewOutputSchema, ReviewWorker } from '../src/review-input.js';
 import type { ReviewerInput, ReviewerModel, ReviewerResult, ReviewTask } from '../src/review-input.js';
 import { REVIEW_OMITTED_NOTE, REVIEW_OUTPUT_JSON_SCHEMA, assertEgressBound, createReviewerModel, interpretReview, reviewPrompt } from '../src/review-lane.js';
 import { RUN_PREFIX, RunControl } from '../src/run-control.js';
-import type { RunControlOptions } from '../src/run-control.js';
+import type { RunControlOptions, RunEvent } from '../src/run-control.js';
 import { archiveContract } from '../src/worker.js';
 import type { WorkerRequest, WorkerVerifier } from '../src/worker.js';
 import { WorkerStartError } from '../src/worker-state.js';
@@ -227,6 +228,122 @@ test('T17 무도구 경계 (b) init이 정책과 다르면 그 실행은 정책 
   // CLI 내장 agents 목록은 도구가 없으면 쓸 길이 없어 막지 않는다(가짜 init에 들어 있다).
   await mode({ answer: OUTPUT });
   assert.equal((await review(fixture().reviewer)).status, 'succeeded');
+});
+
+// 사건에 실리면 안 되는 자료 값 자리에 넣는 표식. 사건은 deepEqual로 키까지 비교하고, 표식도 따로 찾는다.
+const MARKER = 'value-marker-must-not-log';
+const collector = () => {
+  const events: RunEvent[] = [];
+  return { events, onEvent: (event: RunEvent) => { events.push(event); } };
+};
+const violationEvent = (lane: string, kind: string) => ({ event: 'run_policy_violation', lane, kind });
+// 실행 중 관측을 지나친 경우를 흉내 낸다. 실제 어댑터는 같은 조건을 observe가 먼저 잡으므로, 사후 판정만 시험하려면 가려야 한다.
+class BlindAdapter extends ClaudeReviewAdapter {
+  override async start(run: ChatRun): Promise<AdapterRun> {
+    const plan = await super.start(run);
+    return { ...plan, observe: line => ({ ...plan.observe(line), violation: null }) };
+  }
+}
+
+test('T17 위반 사건: 리뷰 init plugins가 비어 있지 않으면 plugins_enabled가 값 없이 한 번 나오고 사유는 그대로다', async () => {
+  // 첫 실리뷰를 막은 모양(2026-11-04 실측)에 이름 자리만 표식으로 바꿨다. 위반이 둘 이어져도 사건은 첫 위반 하나다.
+  await mode({ kind: 'hang', init: { plugins: [{ name: MARKER, path: 'builtin', source: `${MARKER}@builtin` }] },
+    events: [{ type: 'system', subtype: 'hook_started', hook_id: 'h', hook_name: MARKER, hook_event: 'SessionStart' }] });
+  const { events, onEvent } = collector();
+  const f = fixture(new SpawnLauncher(fakeBin), { onEvent });
+  const job = randomUUID();
+  assert.deepEqual(await review(f.reviewer, live(), job), { status: 'failed', reason: 'policy_violation' });
+  assert.deepEqual(f.launcher.aborted, [job]);
+  assert.deepEqual(events, [violationEvent('review', 'plugins_enabled')]);
+  assert.ok(!JSON.stringify(events).includes(MARKER));
+  assert.ok(!JSON.stringify(events).includes(job));
+});
+
+test('T17 위반 사건: 리뷰 레인의 실행 중 위반마다 정확한 종류가 값 없이 한 번 나온다', async () => {
+  const cases: [Record<string, unknown>, string][] = [
+    [{ init: { skills: [MARKER] } }, 'skills_enabled'],
+    [{ init: { tools: ['StructuredOutput', MARKER] } }, 'tools_enabled'],
+    [{ init: { mcp_servers: [{ name: MARKER, status: 'connected' }] } }, 'mcp_enabled'],
+    [{ init: { model: MARKER } }, 'model_mismatch'],
+    [{ answeredBy: MARKER }, 'model_mismatch'],
+    [{ init: { apiKeySource: MARKER } }, 'credential_source_mismatch'],
+    [{ init: { claude_code_version: MARKER } }, 'version_mismatch'],
+    [{ events: [{ type: 'system', subtype: 'hook_response', hook_id: 'h', hook_name: MARKER, hook_event: 'Stop' }] }, 'hooks_enabled'],
+    [{ events: [{ type: 'tool_progress', tool_use_id: 'x', tool_name: MARKER, elapsed_time_seconds: 1 }] }, 'tool_activity'],
+    [{ events: [{ type: 'system', subtype: 'permission_denied', tool_name: MARKER }] }, 'tool_activity'],
+    [{ events: [{ type: 'system', subtype: 'model_refusal_fallback', original_model: MODEL, fallback_model: MARKER }] }, 'model_fallback'],
+  ];
+  for (const [item, kind] of cases) {
+    await mode({ answer: OUTPUT, ...item });
+    const { events, onEvent } = collector();
+    assert.deepEqual(await review(fixture(new SpawnLauncher(fakeBin), { onEvent }).reviewer), { status: 'failed', reason: 'policy_violation' }, JSON.stringify(item));
+    assert.deepEqual(events, [violationEvent('review', kind)], JSON.stringify(item));
+    assert.ok(!JSON.stringify(events).includes(MARKER), JSON.stringify(item));
+  }
+});
+
+test('T17 위반 사건: 대화 레인도 같은 경로로 lane chat 사건을 낸다', async () => {
+  const cases: [Record<string, unknown>, string][] = [
+    [{ init: { tools: ['StructuredOutput', MARKER] } }, 'tools_enabled'],
+    [{ answeredBy: MARKER }, 'model_mismatch'],
+    [{ events: [{ type: 'system', subtype: 'model_refusal_fallback', original_model: MODEL, fallback_model: MARKER }] }, 'model_fallback'],
+  ];
+  for (const [item, kind] of cases) {
+    await mode({ answer: { facts: ['x'], hypotheses: [], unknowns: [], checks: [] }, ...item });
+    const { events, onEvent } = collector();
+    assert.equal((await fixture(new SpawnLauncher(fakeBin), { onEvent }).chat.run(chatRequest(), live())).status, 'failed', JSON.stringify(item));
+    assert.deepEqual(events, [violationEvent('chat', kind)], JSON.stringify(item));
+    assert.ok(!JSON.stringify(events).includes(MARKER), JSON.stringify(item));
+  }
+});
+
+test('T17 위반 사건: 도구 호출(예산 초과)·정상 실행은 위반이 아니라 사건이 없다', async () => {
+  // 대화·리뷰 모두 tool_use 블록은 tool_budget_exceeded 경로다. 정책 위반으로 세지 않는다(판정을 넓히지 않았다).
+  await mode({ kind: 'hang', events: [{ type: 'assistant', uuid: 'u1', message: { model: MODEL,
+    content: [{ type: 'tool_use', id: 'toolu_bash', name: MARKER, input: {} }] } }] });
+  const toolUse = collector();
+  const tool = fixture(new SpawnLauncher(fakeBin), { onEvent: toolUse.onEvent });
+  assert.deepEqual(await review(tool.reviewer), { status: 'failed', reason: 'tool_budget_exceeded' });
+  assert.equal((await tool.chat.run(chatRequest(), live())).status, 'failed');
+  assert.equal(tool.launcher.aborted.length, 2);
+  assert.deepEqual(toolUse.events, []);
+  await mode({ answer: OUTPUT });
+  const clean = collector();
+  assert.equal((await review(fixture(new SpawnLauncher(fakeBin), { onEvent: clean.onEvent }).reviewer)).status, 'succeeded');
+  assert.deepEqual(clean.events, []);
+});
+
+test('T17 위반 사건: 프로세스 소멸을 확인하지 못해 결과가 unknown이어도 종류는 남는다', async () => {
+  await mode({ kind: 'hang', init: { plugins: [{ name: MARKER }] } });
+  const { events, onEvent } = collector();
+  const launcher = new SpawnLauncher(fakeBin);
+  launcher.left = 1;
+  assert.deepEqual(await review(fixture(launcher, { onEvent }).reviewer), { status: 'unknown' });
+  assert.deepEqual(events, [violationEvent('review', 'plugins_enabled')]);
+});
+
+test('T17 위반 사건: 실행 중 관측을 지나쳐 사후 판정에서 걸려도 정확한 종류가 한 번 나온다', async () => {
+  const cases: [Record<string, unknown>, string][] = [
+    [{ init: { tools: ['StructuredOutput', MARKER] } }, 'tools_enabled'],
+    [{ answeredBy: MARKER }, 'model_mismatch'],
+    // 사후 판정 순서는 init이 먼저다.
+    [{ init: { claude_code_version: MARKER }, answeredBy: MARKER }, 'version_mismatch'],
+  ];
+  for (const [item, kind] of cases) {
+    const { events, onEvent } = collector();
+    const launcher = new SpawnLauncher(fakeBin);
+    const control = new RunControl(new StaticEnvCredential(tokenFile, []), launcher, { tmp: base, proxy: PROXY, onEvent });
+    const blind = new BlindAdapter('subscription-token');
+    await mode({ answer: OUTPUT, ...item });
+    assert.deepEqual(await review(createReviewerModel({ reviewAdapter: blind }, control, { model: MODEL })), { status: 'failed', reason: 'policy_violation' }, JSON.stringify(item));
+    await mode({ answer: { facts: ['x'], hypotheses: [], unknowns: [], checks: [] }, ...item });
+    const chat = new ChatLane(blind, new StaticEnvCredential(tokenFile, []), launcher, { model: MODEL, control });
+    assert.equal((await chat.run(chatRequest(), live())).status, 'failed', JSON.stringify(item));
+    // 프로세스를 멈춘 게 아니라 끝까지 돈 뒤 판정했다.
+    assert.deepEqual(launcher.aborted, [], JSON.stringify(item));
+    assert.deepEqual(events, [violationEvent('review', kind), violationEvent('chat', kind)], JSON.stringify(item));
+    assert.ok(!JSON.stringify(events).includes(MARKER), JSON.stringify(item));
+  }
 });
 
 test('T17 무도구 경계 (c) 반사 검사는 구조화 출력의 모든 필드를 본다', async () => {

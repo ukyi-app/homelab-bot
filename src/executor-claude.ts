@@ -1,4 +1,4 @@
-import type { AdapterRun, ChatAdapter, ChatRun, EngineOutcome, ExecutorCapabilities, ExitStatus, Observation } from './executor.js';
+import type { AdapterRun, ChatAdapter, ChatRun, EngineOutcome, ExecutorCapabilities, ExitStatus, Observation, PolicyViolation } from './executor.js';
 
 // Claude Code CLI 대화 어댑터(D-14 변경, 사용자 2026-10-30: Claude Code CLI, 구독 장기 토큰, 첫 모델 Opus 5.5).
 // 이 파일은 argv·env 이름·출력 해석·CLI 오류 분류만 한다. 실행·정리는 공통부(run-control), 결과 검증은 레인(chat-lane·review-lane)이다.
@@ -99,7 +99,7 @@ export function compactClaudeEvent(line: string): Compact | null {
 export interface ClaudeExpectation { model: string; apiKeySource: string; version: string }
 // 실행마다 첫 init 이벤트로 확인하는 정책. 하나라도 다르면 그 실행은 정책 위반으로 멈추고 실패다.
 // 도구는 출력 전달용 StructuredOutput만, MCP 서버 0개, 요청한 모델 그대로(별칭·폴백 아님), 선택한 자격 방식, 고정 버전.
-export function initViolation(init: Compact, expect: ClaudeExpectation): string | null {
+export function initViolation(init: Compact, expect: ClaudeExpectation): PolicyViolation | null {
   if (!Array.isArray(init.tools) || init.tools.some(tool => tool !== STRUCTURED_OUTPUT_TOOL)) return 'tools_enabled';
   if (!Array.isArray(init.mcp_servers) || init.mcp_servers.length > 0) return 'mcp_enabled';
   if (init.model !== expect.model) return 'model_mismatch';
@@ -110,7 +110,7 @@ export function initViolation(init: Compact, expect: ClaudeExpectation): string 
 
 // init 뒤 이벤트의 모델 정책. 자동 모델 전환 이벤트는 그 자체로 위반이다(env로 껐는데 왔다). assistant 메시지는
 // 요청한 모델(날짜가 붙은 같은 ID 포함)이나 CLI 합성 오류 메시지여야 한다. 모델이 없거나 다르면 위반이다.
-export function modelViolation(event: Compact, expect: ClaudeExpectation): string | null {
+export function modelViolation(event: Compact, expect: ClaudeExpectation): PolicyViolation | null {
   if (event.type === 'system' && event.subtype === 'model_refusal_fallback') return 'model_fallback';
   if (event.type !== 'assistant') return null;
   const model = event.model;
@@ -147,8 +147,9 @@ export function interpretClaudeStream(lines: readonly string[], exit: ExitStatus
   }
   const inits = events.filter(e => e.type === 'system' && e.subtype === 'init');
   if (inits.length !== 1) return failed('invalid_stream');
-  if (initViolation(inits[0]!, expect)) return failed('policy_violation');
-  if (events.some(event => modelViolation(event, expect))) return failed('policy_violation');
+  // 실행 중 관측(observe)을 지나친 위반의 마지막 보루. 종류를 실어 보내 공통부가 로그로 남긴다. 판정 순서는 init → 모델이다.
+  const violation = initViolation(inits[0]!, expect) ?? events.map(event => modelViolation(event, expect)).find(kind => kind !== null);
+  if (violation) return { kind: 'failed', reason: 'policy_violation', violation };
   const results = events.filter(e => e.type === 'result');
   if (results.length > 1) return failed('invalid_stream');
   const apiErrors = events.filter(e => e.type === 'assistant' && e.error !== undefined);
@@ -188,7 +189,7 @@ export class ClaudeChatAdapter implements ChatAdapter {
       observe(line: string): Observation {
         const compact = compactClaudeEvent(line);
         if (!compact) return { line: '<malformed>', tool: null, violation: null };
-        let violation: string | null = null;
+        let violation: PolicyViolation | null = null;
         if (compact.type === 'system' && compact.subtype === 'init' && !initChecked) {
           initChecked = true;
           violation = initViolation(compact, expect);
@@ -210,7 +211,7 @@ export class ClaudeChatAdapter implements ChatAdapter {
 // 2.1.308 바이너리의 SDK 스키마를 정적으로 읽은 것이다 [가정: 실제 출력 대조는 S7]. init의 agents·slash_commands는 CLI 내장 목록이
 // 올 수 있고 도구가 없으면 쓸 길이 없어 보지 않는다. 판정은 원문 줄로 한다(줄인 줄에는 이 필드들이 없다).
 const TOOL_ACTIVITY_TYPES = new Set(['tool_progress', 'tool_use_summary']);
-export function noToolBoundaryViolation(line: string): string | null {
+export function noToolBoundaryViolation(line: string): PolicyViolation | null {
   let raw: unknown;
   try { raw = JSON.parse(line); } catch { return null; }
   const event = record(raw);

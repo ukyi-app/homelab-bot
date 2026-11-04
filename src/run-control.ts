@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assertWorkerRoot } from './codex-config.js';
 import type { RunCredential, WorkerCredential } from './credentials.js';
-import type { AdapterRun, ChatAdapter, EngineOutcome, ExecutorCapabilities, ExitStatus, RunDirs } from './executor.js';
+import type { AdapterRun, ChatAdapter, EngineOutcome, ExecutorCapabilities, ExitStatus, PolicyViolation, RunDirs } from './executor.js';
 import { LaunchFailed, TASK_MARKER } from './process-launcher.js';
 import type { LaunchResult, ProcessLauncher } from './process-launcher.js';
 
@@ -104,11 +104,14 @@ export interface RunSpec {
   prompt: string;
   limits: RunLimits;
 }
+// 정책 위반으로 멈춘 실행의 종류. 결과 reason은 policy_violation 한 단어라 원인을 가르는 곳은 이 사건뿐이다.
+export interface RunViolationEvent { event: 'run_policy_violation'; lane: RunLane; kind: PolicyViolation }
+export type RunEvent = { event: 'cleanup_failed' | 'cleanup_recovered' } | RunViolationEvent;
 export interface RunControlOptions {
   // 실행마다 임시 디렉터리를 만드는 곳. 파드에서는 emptyDir(/tmp)이다.
   tmp?: string; homes?: string[]; proxy?: { https: string; noProxy: string };
-  // 값 없는 운영 사건(실행 기록 정리 실패·복구). 경로·내용은 싣지 않는다.
-  onEvent?: (event: { event: 'cleanup_failed' | 'cleanup_recovered' }) => void;
+  // 값 없는 운영 사건(실행 기록 정리 실패·복구, 정책 위반 종류). 경로·내용·job ID는 싣지 않는다.
+  onEvent?: (event: RunEvent) => void;
 }
 interface Active { job: string; controller: AbortController; done: Promise<void> }
 // 한 실행이 남긴 것. 프로세스 소멸을 확인한 뒤에만 지운다.
@@ -277,12 +280,14 @@ export class RunControl {
     const forward = () => inner.abort();
     signal.addEventListener('abort', forward, { once: true });
     const stop = (reason: NonNullable<RunReport['exceeded']>) => { exceeded ??= reason; inner.abort(); };
+    const violated = (kind: PolicyViolation) => this.options.onEvent?.({ event: 'run_policy_violation', lane: spec.lane, kind });
     const onLine = (line: string) => {
       if (exceeded) return;
       if (lines.length >= limits.events) { stop('output_limit_exceeded'); return; }
       const seen = plan.observe(line);
       lines.push(seen.line);
-      if (seen.violation) { stop('policy_violation'); return; }
+      // 소멸 확인 전에 남긴다. 프로세스가 안 죽어 결과가 unknown이 되어도 종류는 보인다. 위 exceeded 검사로 실행당 한 번이다.
+      if (seen.violation) { stop('policy_violation'); violated(seen.violation); return; }
       if (seen.tool && !tools.has(seen.tool)) {
         tools.add(seen.tool);
         if (tools.size > budget) stop('tool_budget_exceeded');
@@ -304,6 +309,8 @@ export class RunControl {
     // 남은 프로세스가 있거나 모르면 결과 파일을 읽지 않는다. 살아 있는 프로세스가 바꿔치기할 수 있다.
     if (survivors !== 0 || !result.exit || exceeded || signal.aborted) return report;
     const outcome = await plan.finish(lines, result.exit as ExitStatus).catch((): EngineOutcome => ({ kind: 'failed', reason: 'finish_failed' }));
+    // 실행 중에 이미 멈췄다면(exceeded) 위에서 돌아가 여기 오지 않으니 두 번 나가지 않는다.
+    if (outcome.kind === 'failed' && outcome.violation) violated(outcome.violation);
     // 실행 뒤 자격을 다시 읽지 못하면(회전 파일 갱신본 포함) 반사 검사를 할 수 없어 답을 내보내지 않는다(리뷰 exec-r1 P1).
     let after: string[];
     try { after = await this.credential.secrets(); } catch { return { ...report, credentialRecheckFailed: true }; }
