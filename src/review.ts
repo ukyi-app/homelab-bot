@@ -5,6 +5,7 @@ import { DEFAULTS, Denied, PolicyUnavailable, WorkerRejected } from './contracts
 import type { Job, Scope } from './contracts.js';
 import type { Database } from './database.js';
 import type { Policy, PolicyGate } from './policy.js';
+import { DRAIN_MS } from './runtime.js';
 import type { Store } from './store.js';
 import type { CancelRequest, WorkerSigner } from './worker.js';
 import { archiveContract } from './worker.js';
@@ -456,10 +457,31 @@ export interface ReviewWorkerClient {
   review(task: ReviewTask, capability: string, signal: AbortSignal): Promise<ReviewWorkerResult>;
   cancel(request: CancelRequest, capability: string): Promise<{ stopped: boolean }>;
 }
+// 종료 규칙은 대화 runtime과 같다(ARCHITECTURE "정상 종료"). 신호 뒤에는 claim하지 않고, dispatch 전이면 대기열로 되돌리고,
+// 실행 중이면 drainMs를 기다린 뒤 cancel한다. 멈춤이 확인된 리뷰는 자동 재실행하지 않고 failed다.
+export interface ReviewRuntimeOptions { shutdown?: AbortSignal; drainMs?: number }
+class ReviewShutdown extends Error {}
 export class ReviewRuntime {
+  private readonly shutdown?: AbortSignal;
+  private readonly drainMs: number;
   constructor(private readonly store: Store, private readonly policy: ReviewPolicySource, private readonly queue: ReviewQueue,
     private readonly reader: GitHubReader, private readonly worker: ReviewWorkerClient, private readonly signer: WorkerSigner,
-    private readonly pollMs = 1000) {}
+    private readonly pollMs = 1000, options: ReviewRuntimeOptions = {}) {
+    this.shutdown = options.shutdown;
+    this.drainMs = options.drainMs ?? DRAIN_MS;
+  }
+  // dispatch 전 GitHub 조회를 종료 기한까지 기다리지 않는다. 끝까지 기다리면 프로세스가 먼저 끝나
+  // 모델을 부르지 않은 작업이 lease 만료로 unknown이 되고 전역 슬롯을 잡는다.
+  private untilShutdown<T>(work: Promise<T>): Promise<T> {
+    const signal = this.shutdown;
+    if (!signal) return work;
+    return new Promise<T>((resolve, reject) => {
+      const stop = () => reject(new ReviewShutdown());
+      signal.addEventListener('abort', stop, { once: true });
+      work.then(resolve, reject).finally(() => signal.removeEventListener('abort', stop));
+      if (signal.aborted) stop();
+    });
+  }
   // T16a의 claim과 같은 scheduler 잠금·전역 슬롯 조건을 쓴다. 리뷰도 대화와 같은 auth.json 직렬 1개다(D-14).
   async claim(): Promise<(Job & Record<string, unknown>) | undefined> {
     return this.store.db.transaction(async tx => {
@@ -479,6 +501,7 @@ export class ReviewRuntime {
     });
   }
   async tick(): Promise<boolean> {
+    if (this.shutdown?.aborted) return false;
     await this.store.expire();
     const job = await this.claim();
     if (!job) return false;
@@ -494,8 +517,8 @@ export class ReviewRuntime {
       if (!repo) { await this.close(job, review, 'cancelled', 'authorization_revoked'); return true; }
       if (context.revision !== review.policy_revision) { await this.close(job, review, 'superseded', 'policy_changed'); return true; }
       // 실행 직전 live PR로 head·base·닫힘·작성자를 다시 본다. webhook 내용만 믿지 않는다.
-      const pr = pullRequest(await this.reader.pullRequest(repo.fullName, review.pr_number));
-      const liveComparison = pr.open && pr.head.sha === review.head_sha ? await this.queue.comparison(repo.fullName, pr, context.review) : undefined;
+      const pr = pullRequest(await this.untilShutdown(this.reader.pullRequest(repo.fullName, review.pr_number)));
+      const liveComparison = pr.open && pr.head.sha === review.head_sha ? await this.untilShutdown(this.queue.comparison(repo.fullName, pr, context.review)) : undefined;
       const stale = !pr.open ? (pr.merged ? 'merged_before_review' : 'pr_closed')
         : pr.head.sha !== review.head_sha ? 'stale_head' : liveComparison !== review.comparison_revision ? 'base_moved' : undefined;
       if (stale) {
@@ -509,8 +532,9 @@ export class ReviewRuntime {
       const denied = pullRequestDecision(pr, repo, context.review, await this.explicit(job.id));
       if (denied) { await this.close(job, review, denied.outcome === 'denied' ? 'cancelled' : 'superseded', denied.reason); return true; }
       let compare: { files: Change[]; truncated: boolean };
-      try { compare = CompareSchema.parse(await this.reader.compare(repo.fullName, review.comparison_revision, review.head_sha)); }
+      try { compare = CompareSchema.parse(await this.untilShutdown(this.reader.compare(repo.fullName, review.comparison_revision, review.head_sha))); }
       catch (error) {
+        if (error instanceof ReviewShutdown) throw error;
         if (error instanceof GitHubError && (error.status === 429 || error.status >= 500)) { await this.backoff(job, review, error); return true; }
         // 열거 실패를 압축본 비교로 대신하지 않는다(REVIEW-03).
         await this.close(job, review, 'failed', 'enumeration_failed'); return true;
@@ -538,9 +562,20 @@ export class ReviewRuntime {
       if (!live || live.lease_token !== job.lease_token || Number(live.lease_until) <= this.store.now()) return true;
       if (live.state === 'cancel_requested') { await this.close(job, review, 'cancelled', 'cancel_before_dispatch'); return true; }
       if (live.state !== 'running' || !await this.store.heartbeat(asJob(job))) return true;
+      // 여기부터 아래 리스너 등록까지 await가 없어 신호를 놓치지 않는다. 신호 뒤 dispatch하지 않는다.
+      if (this.shutdown?.aborted) throw new ReviewShutdown();
       const abort = new AbortController();
       let timeout: ReturnType<typeof setTimeout> | undefined;
       let checking: Promise<void> | undefined;
+      const cancelBody = { job: job.id, lease: job.lease_token };
+      // cancel은 한 번만 보낸다. 작업자는 첫 확인 뒤 job을 놓아 두 번째 cancel은 stopped:false다.
+      let stopping: Promise<{ stopped: boolean }> | undefined;
+      const stopRequest = () => stopping ??= this.worker.cancel(cancelBody, this.signer.issue(asJob(job), 'cancel', cancelBody)).catch(() => ({ stopped: false }));
+      let drained = false;
+      let drain: ReturnType<typeof setTimeout> | undefined;
+      // 드레인 기한이 되면 DB 후처리를 기다리지 않고 그 자리에서 cancel을 보낸다(대화 runtime과 같은 이유).
+      const onShutdown = () => { drain = setTimeout(() => { drained = true; void stopRequest(); abort.abort(); }, this.drainMs); };
+      this.shutdown?.addEventListener('abort', onShutdown, { once: true });
       const interrupted = new Promise<ReviewWorkerResult>(resolve => {
         abort.signal.addEventListener('abort', () => resolve({ status: 'unknown', stopped: false }), { once: true });
       });
@@ -560,16 +595,19 @@ export class ReviewRuntime {
           new Promise<ReviewWorkerResult>(resolve => {
             timeout = setTimeout(() => { abort.abort(); resolve({ status: 'unknown', stopped: false }); }, task.timeoutMs);
           })]);
-      } finally { clearInterval(monitor); clearTimeout(timeout); await checking; }
+      } finally {
+        clearInterval(monitor); clearTimeout(timeout); clearTimeout(drain);
+        this.shutdown?.removeEventListener('abort', onShutdown);
+        await checking;
+      }
       const current = (await this.store.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0]?.state;
       if (current === 'cancel_requested' || abort.signal.aborted) {
-        const body = { job: job.id, lease: job.lease_token };
-        const confirmation = result.stopped ? { stopped: true }
-          : await this.worker.cancel(body, this.signer.issue(asJob(job), 'cancel', body)).catch(() => ({ stopped: false }));
+        const confirmation = result.stopped ? { stopped: true } : await stopRequest();
         // 멈춤을 확인하지 못하면 unknown으로 두어 전역 슬롯을 잡는다. 자동 재실행하지 않는다.
         const state = !confirmation.stopped ? 'unknown' : current === 'cancel_requested' ? 'cancelled' : 'failed';
-        if (state === 'unknown') await this.store.transition(asJob(job), 'unknown', 'stop_confirmation');
+        if (state === 'unknown') await this.store.transition(asJob(job), 'unknown', drained ? 'publisher_shutdown' : 'stop_confirmation');
         else await this.close(job, review, state, 'stop_confirmation');
+        if (drained) await this.store.audit('publisher_shutdown', job.id, { type: 'review', attempt: job.attempt, outcome: state });
         return true;
       }
       if (!result.stopped) { await this.store.transition(asJob(job), 'unknown', 'worker_disconnected'); return true; }
@@ -588,7 +626,11 @@ export class ReviewRuntime {
       if (result.status !== 'succeeded') { await this.close(job, review, 'failed', result.reason ?? 'model_failed'); return true; }
       await this.finish(job, review, context, task, result);
     } catch (error) {
-      if (error instanceof WorkerRejected) await this.close(job, review, 'failed', 'worker_rejected');
+      if (error instanceof ReviewShutdown) {
+        await this.store.defer(asJob(job), 'publisher_shutdown');
+        await this.store.audit('publisher_shutdown', job.id, { type: 'review', outcome: 'deferred' });
+      }
+      else if (error instanceof WorkerRejected) await this.close(job, review, 'failed', 'worker_rejected');
       else if (!dispatched && error instanceof PolicyUnavailable) {
         await this.store.defer(asJob(job), error instanceof ReviewDisabled ? 'review_disabled' : 'policy_unavailable');
         // 리뷰가 꺼진 동안은 1분 간격으로만 다시 본다.
@@ -725,8 +767,11 @@ interface DeliveryRow {
 const RECONCILE_BATCH = 20;
 export class ReviewPublisher {
   constructor(private readonly store: Store, private readonly policy: ReviewPolicySource, private readonly reader: GitHubReader,
-    private readonly github: RestrictedGitHub, private readonly queue: ReviewQueue, private readonly pollMs = 1000) {}
+    private readonly github: RestrictedGitHub, private readonly queue: ReviewQueue, private readonly pollMs = 1000,
+    private readonly shutdown?: AbortSignal) {}
   async deliver(): Promise<boolean> {
+    // 종료 신호 뒤에는 새 게시를 잡지 않는다. 이미 잡은 게시는 끝까지 간다. 프로세스가 먼저 끝나면 다음 기동이 lease로 회수한다.
+    if (this.shutdown?.aborted) return false;
     // 게시 중 죽은 프로세스의 lease를 회수한다. 전송을 시작했으면 결과를 모르므로 unknown(재게시 없이 대조).
     // unknown의 available_at은 진입 시각이다(T16a outbox와 같은 관례). 대조 기한을 생성 시각이 아니라 여기서부터 센다.
     await this.store.db.query(`UPDATE review_deliveries SET state=CASE WHEN dispatch_started THEN 'unknown' ELSE 'pending' END,
@@ -840,6 +885,7 @@ export class ReviewPublisher {
   }
   // 응답 유실 뒤에는 PR의 리뷰 목록에서 marker와 검토 SHA로 찾는다. 못 찾아도 자동 재게시하지 않는다.
   async reconcile(): Promise<void> {
+    if (this.shutdown?.aborted) return;
     // 기한은 unknown 진입 시각(available_at)부터다. 정책 비활성·조회 장애·draft 보류로 오래 기다린 행도 대조 기회를 온전히 받는다.
     const retired = await this.store.db.query<{ id: string }>(`UPDATE review_deliveries SET state='blocked',reason='unknown_deadline'
       WHERE state='unknown' AND available_at<=$1 RETURNING id`, [this.store.now() - DEFAULTS.unknownDeliveryMs]);
@@ -854,6 +900,7 @@ export class ReviewPublisher {
     if (last) await this.store.db.query(`INSERT INTO controls VALUES ('review_reconcile_cursor',$1::jsonb) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`,
       [json({ at: Number(last.available_at), id: last.id })]);
     for (const row of rows) {
+      if (this.shutdown?.aborted) return;
       try { await this.existing(row); } catch { /* 다음 차례에 다시 본다 */ }
     }
   }
@@ -891,14 +938,16 @@ export class ReviewPublisher {
 // EVENT-03: 봇 중단 중 놓친 PR을 허용 저장소의 열린 PR로 대조한다. 설치 전 PR과 실행 한도 밖은 넣지 않는다.
 export class ReviewReconciler {
   constructor(private readonly store: Store, private readonly policy: ReviewPolicySource, private readonly queue: ReviewQueue,
-    private readonly reader: GitHubReader) {}
+    private readonly reader: GitHubReader, private readonly shutdown?: AbortSignal) {}
   async run(): Promise<{ admitted: number; limited: boolean }> {
     const context = await this.policy.current();
     let admitted = 0;
     for (const repo of context.review.repositories) {
       for (let page = 1; page <= context.review.reconcile.maxPages; page++) {
+        if (this.shutdown?.aborted) return { admitted, limited: false };
         const prs = (await this.reader.openPullRequests(repo.fullName, page)).map(pullRequest);
         for (const pr of prs) {
+          if (this.shutdown?.aborted) return { admitted, limited: false };
           if (pr.updatedAt < context.review.reviewSince) continue;
           if (admitted >= context.review.reconcile.maxReviewsPerRun) {
             await this.store.audit('review_reconcile_limit', repo.fullName, { admitted });

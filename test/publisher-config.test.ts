@@ -35,6 +35,24 @@ const problems = (env: Record<string, string | undefined>) => {
   return [];
 };
 
+const rsa = () => generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+test('T17 REVIEW_ENABLED: 없으면 꺼짐, true·false만 받음, 켜졌는데 App 자격이 없으면 기동 오류', () => {
+  const app = { GITHUB_REVIEW_APP_ID: '12345', GITHUB_REVIEW_APP_PRIVATE_KEY: rsa() };
+  assert.equal(loadPublisherConfig(publisherEnv(), 1).reviewEnabled, false);
+  assert.equal(loadPublisherConfig(publisherEnv({ REVIEW_ENABLED: 'false' }), 1).reviewEnabled, false);
+  assert.equal(loadPublisherConfig(publisherEnv({ REVIEW_ENABLED: 'true', ...app }), 1).reviewEnabled, true);
+  // 자격만 있고 스위치가 없으면 열지 않는다.
+  assert.equal(loadPublisherConfig(publisherEnv(app), 1).reviewEnabled, false);
+  for (const value of ['', 'TRUE', '1', 'yes', ' true']) assert.deepEqual(problems(publisherEnv({ REVIEW_ENABLED: value })), ['REVIEW_ENABLED(invalid)'], value);
+  assert.deepEqual(problems(publisherEnv({ REVIEW_ENABLED: 'true' })), ['REVIEW_ENABLED(requires GITHUB_REVIEW_APP_ID, GITHUB_REVIEW_APP_PRIVATE_KEY)']);
+  // 스위치가 꺼져 있어도 자격 하나만 있으면 기동 오류다. 켜졌을 때 사유가 겹치지 않는다.
+  for (const flag of [{}, { REVIEW_ENABLED: 'false' }, { REVIEW_ENABLED: 'true' }]) {
+    assert.deepEqual(problems(publisherEnv({ ...flag, GITHUB_REVIEW_APP_ID: '12345' })), ['GITHUB_REVIEW_APP_PRIVATE_KEY(missing)']);
+    assert.deepEqual(problems(publisherEnv({ ...flag, GITHUB_REVIEW_APP_PRIVATE_KEY: app.GITHUB_REVIEW_APP_PRIVATE_KEY })), ['GITHUB_REVIEW_APP_ID(missing)']);
+  }
+  assert.deepEqual(problems(publisherEnv({ REVIEW_ENABLED: 'true', GITHUB_REVIEW_APP_ID: 'not-a-number', GITHUB_REVIEW_APP_PRIVATE_KEY: app.GITHUB_REVIEW_APP_PRIVATE_KEY })), ['GITHUB_REVIEW_APP_ID(invalid)']);
+});
+
 test('T16b 설정: 키가 모두 맞으면 읽고, 정책 confirmedAt은 기동 시각', () => {
   const config = loadPublisherConfig(publisherEnv(), 1_800_000_000_000);
   assert.equal(config.policy.confirmedAt, 1_800_000_000_000); assert.equal(config.policy.owner, 'fixture-owner-id');
