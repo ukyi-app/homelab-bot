@@ -29,7 +29,7 @@ export class RecoveryScheduler {
     for (const row of rows) this.pending.set(row.id, { scope: row.scope, owner: row.owner_id, attempt: 0, at: now });
     return rows.length;
   }
-  // live 메시지 하나가 일시 장애로 처리되지 못했을 때 그 채널의 활성 대화에만 같은 장벽을 세운다(PR #12 리뷰 4420530263).
+  // live 메시지 하나가 일시 장애로 처리되지 못했을 때 그 채널의 활성 대화에만 같은 장벽을 세운다.
   // 그 이벤트는 Gateway sequence가 이미 지나 RESUME으로도 다시 오지 않는다. 장벽 뒤 메시지는 버퍼에 들어가 checkpoint를
   // 올리지 못하므로, history 대조가 실패한 메시지부터 순서대로 다시 읽는다. 진행 중인 복구는 토큰을 지워 새 세대로 바꾼다.
   async guard(channel: string): Promise<number> {

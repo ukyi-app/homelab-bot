@@ -107,7 +107,7 @@ export function interpretRun(report: RunReport, expectedThread: string | null, s
   if (threadId && !THREAD_ID.test(threadId)) return { kind: 'failed', reason: 'invalid_thread', threadId: null, turns };
   const failures = events.flatMap(e => e.type === 'turn.failed' ? [e.error?.message ?? ''] : e.type === 'error' ? [e.message ?? ''] : []);
   const lastTurn = events.filter(e => e.type.startsWith('turn.')).at(-1);
-  // 재연결 같은 일시 error 이벤트 뒤 턴이 끝나고 종료 코드 0이면 결과를 버리지 않는다 [미확인: 일시 오류도 error로 내는지, T16b].
+  // 재연결 같은 일시 error 이벤트 뒤 턴이 끝나고 종료 코드 0이면 결과를 버리지 않는다 [미확인: 일시 오류도 error로 내는지].
   // 세션(thread.started)이 생기기 전 오류도 판정한다. 인증·한도는 세션 전에 날 수 있고, 버리면 대기 대신 실패가 된다(D-14 조건 2).
   if (events.some(e => e.type === 'turn.failed') || (failures.length && (report.exit.code !== 0 || lastTurn?.type !== 'turn.completed'))) {
     const reason = waitReason(failures.join('\n'));
@@ -176,9 +176,9 @@ export function echoesSecret(text: string, secrets: readonly string[]): boolean 
   return false;
 }
 
-// 판정에 쓰는 필드만 남기고 명령 출력·메시지 본문(agent_message 등)은 버린다(rev r1 S3).
+// 판정에 쓰는 필드만 남기고 명령 출력·메시지 본문(agent_message 등)은 버린다.
 // 남긴 필드는 자르지 않는다. 자른 뒤 판정하면 긴 오류 뒤쪽의 인증·한도 표식, 500번째 뒤의 작업 공간 밖 경로,
-// 4096자 뒤의 상위 이동이 사라진다(rev r2 N1·N2). 남긴 크기는 launcher의 줄·전체 바이트 상한이 묶는다.
+// 4096자 뒤의 상위 이동이 사라진다. 남긴 크기는 launcher의 줄·전체 바이트 상한이 묶는다.
 export const TOOL_ITEMS = new Set(['command_execution', 'mcp_tool_call', 'web_search', 'file_change']);
 export function compactEvent(line: string): { line: string; tool: string | null } {
   let raw: unknown;

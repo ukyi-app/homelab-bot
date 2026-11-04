@@ -19,14 +19,14 @@ export interface DiscordRest {
   history(channel: string, after: string | null, limit: 100): Promise<EventInput[]>;
 }
 const noMentions = { allowed_mentions: { parse: [] as never[] } };
-// Discord 메시지 플래그 SUPPRESS_EMBEDS. 기억 명령 응답의 문서 링크(`doc=`)에 미리보기 카드가 붙었다(T20 실연동).
+// Discord 메시지 플래그 SUPPRESS_EMBEDS. 기억 명령 응답의 문서 링크(`doc=`)에 미리보기 카드가 붙는다(실연동).
 // 기억 응답은 ID·상태를 보는 용도라 끈다. 다른 명령 응답은 그대로 둔다.
 export const SUPPRESS_EMBEDS = 4 as const;
 const controls = new Set(['stop', 'resume', 'list', 'cancel', 'retry', 'emergency-stop', 'resume-model', 'model-status', 'revoke',
   'review-status', 'review-resume', 'review-cancel']);
 // 수신이 아는 명령 전체. 배포 진입점은 단계에 맞춰 더 좁은 목록(FOUNDATION_COMMANDS)을 넘긴다.
 export type RecoveryOutcome = 'done' | 'budget' | 'skipped';
-// T20 기억 명령. 대화 작업·제어와 달리 받은 자리에서 기억 서비스로 처리하고 상호작용 응답으로만 답한다.
+// 기억 명령. 대화 작업·제어와 달리 받은 자리에서 기억 서비스로 처리하고 상호작용 응답으로만 답한다.
 const memoryCommands = new Set<string>(['memory-save', 'memory-search', 'memory-correct', 'memory-exclude', 'memory-delete']);
 export const ALL_COMMANDS: ReadonlySet<string> = new Set(['chat', 'urgent', 'task', 'read', ...controls, ...memoryCommands]);
 // 기억 명령 응답을 전하지 못했을 때 그 채널에 남기는 안내. 결과(기억 내용)는 싣지 않는다.
@@ -45,7 +45,7 @@ export class DiscordIngress {
   async receive(input: EventInput, recovered = false, recovery?: { token: string; epoch: number }): Promise<string | undefined> {
     const event = EventSchema.parse(input);
     if (event.bot || event.webhook) return;
-    // 이 단계에서 열지 않은 명령·버튼은 저장·권한 확인 전에 닫는다(T16b: task·review-*는 FOUNDATION 밖).
+    // 이 단계에서 열지 않은 명령·버튼은 저장·권한 확인 전에 닫는다(task·review-*는 FOUNDATION 밖).
     if (event.kind !== 'message' && !this.commands.has(event.command ?? '')) throw new Denied();
     const p = await this.gate.authorize(event.actor, event.scope);
     if (!this.messageContent && event.kind === 'message') return;
@@ -103,7 +103,7 @@ export class DiscordIngress {
         const result = event.command === 'revoke'
           ? await gate.revoke(event.actor, event.scope, event.target!)
           : await store.control(event.actor, conversationId, event.command!, event.target, event.id,
-            // T17 리뷰 작업 제어의 별도 권한: 현재 정책의 owner가 알림 채널(부모 없는 채널)에서 보낸 명령만.
+            // 리뷰 작업 제어의 별도 권한: 현재 정책의 owner가 알림 채널(부모 없는 채널)에서 보낸 명령만.
             { review: event.scope.kind === 'channel' && event.scope.parent === null && event.scope.channel === current.notificationChannel
               && event.actor === current.owner });
         if (event.command !== 'revoke') await store.enqueue({ key: `control:${saved.id}`, actor: event.actor,
@@ -125,7 +125,7 @@ export class DiscordIngress {
     if (routed && !recovered) await this.acknowledge(event, saved.id);
     return saved.id;
   }
-  // 기억 명령(T20 B4). 구독·gap·작업 큐를 거치지 않고 받은 자리에서 한 번 처리한 뒤 상호작용 응답으로 답한다.
+  // 기억 명령. 구독·gap·작업 큐를 거치지 않고 받은 자리에서 한 번 처리한 뒤 상호작용 응답으로 답한다.
   // 중복 전달(같은 상호작용 ID)은 events의 accepted를 먼저 잡은 쪽만 처리한다. 잡은 뒤 처리 중에 죽으면 다시 하지 않는다
   // (응답 토큰이 3초라 되살릴 수 없다. 사용자가 새 명령으로 다시 보낸다).
   private async memoryCommand(event: z.infer<typeof EventSchema>, revision: string, recovered: boolean): Promise<string | undefined> {

@@ -28,7 +28,7 @@ export interface WorkerCredential {
   // 실행 준비 때. 읽지 못하면 throw다(실행하지 않는다).
   forRun(): Promise<RunCredential>;
   // 실행 뒤 다시 읽은 비밀(회전 파일이면 갱신본). 반사 검사에 실행 전 값과 함께 쓴다.
-  // 읽지 못하거나 비어 있으면 throw다. 빈 목록으로 반사 검사를 건너뛰지 않는다(리뷰 exec-r1 P1).
+  // 읽지 못하거나 비어 있으면 throw다. 빈 목록으로 반사 검사를 건너뛰지 않는다.
   secrets(): Promise<string[]>;
 }
 

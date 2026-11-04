@@ -143,7 +143,7 @@ export class ExecutionSlot {
   }
 }
 
-// Used by the mock HTTP worker and, after T16b verification, a process adapter.
+// Used by the mock HTTP worker and the process adapter.
 // A mutex is also enforced here, independently of the publisher's SQL scheduler.
 export class SerialWorker implements WorkerClient {
   constructor(private readonly verifier: WorkerVerifier,

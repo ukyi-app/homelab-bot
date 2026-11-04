@@ -95,7 +95,7 @@ function validRestore(check: RestoreCheck | undefined): check is RestoreCheck {
   return check != null && ['verified', 'problem', 'unknown'].includes(check.status) && intOrNull(check.passAt) && intOrNull(check.failedAt)
     && intOrNull(check.staleDays) && (check.issue === null || Object.hasOwn(RESTORE_ISSUE, check.issue));
 }
-// 백업 줄 끝에 붙는 복원 검증 문구. restoreCheck가 없거나 모양이 틀리면 예전 문구(restoreVerifiedAt만)로 적는다.
+// 백업 줄 끝에 붙는 복원 검증 문구. restoreCheck가 없거나 모양이 틀리면 restoreVerifiedAt만 담은 문구로 적는다.
 function restoreText(observation: Observation, zone: string): { text: string; problem: boolean } {
   const check = observation.restoreCheck;
   if (!validRestore(check)) {
@@ -337,7 +337,7 @@ export class BriefingScheduler {
     // 원본을 함께 읽어 작성 시간이 원본 수에 비례해 lease를 넘지 않게 한다.
     const read = await Promise.all(this.sources.map(source => deadline(Promise.resolve().then(() => source.read()), BRIEFING.sourceTimeoutMs)
       // 미래 시각 검사는 읽은 뒤의 현재 시각과 한다. 작성 시작 시각(now)과 비교하면 원본이 읽는 동안 시계가 지나간 것만으로
-      // 방금 읽은 관측이 '미래'가 돼 읽기 불가로 버려진다(PR #26 리뷰).
+      // 방금 읽은 관측이 '미래'가 돼 읽기 불가로 버려진다.
       .then(value => valid(value, this.store.now()) ? value : undefined, () => undefined)));
     for (const [index, source] of this.sources.entries()) {
       const observation = read[index];

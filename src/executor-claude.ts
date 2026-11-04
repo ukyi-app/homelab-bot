@@ -1,6 +1,6 @@
 import type { AdapterRun, ChatAdapter, ChatRun, EngineOutcome, ExecutorCapabilities, ExitStatus, Observation, PolicyViolation } from './executor.js';
 
-// Claude Code CLI 대화 어댑터(D-14 변경, 사용자 2026-10-30: Claude Code CLI, 구독 장기 토큰, 첫 모델 Opus 5.5).
+// Claude Code CLI 대화 어댑터(D-14, 사용자 결정: Claude Code CLI, 구독 장기 토큰, 첫 모델 Opus 5.5).
 // 이 파일은 argv·env 이름·출력 해석·CLI 오류 분류만 한다. 실행·정리는 공통부(run-control), 결과 검증은 레인(chat-lane·review-lane)이다.
 // 플래그 근거 [실측: 고정 바이너리 2.1.308 `claude --help`, 모델 호출 없음]. 이벤트 모양 근거는 같은 바이너리에 든
 // SDK 메시지 스키마(정적 읽기)와 공식 headless 문서다 [가정: 실제 출력 대조는 첫 승인 대화 S12].
@@ -15,7 +15,7 @@ import type { AdapterRun, ChatAdapter, ChatRun, EngineOutcome, ExecutorCapabilit
 // - `--bare`는 쓰지 않는다: bare는 CLAUDE_CODE_OAUTH_TOKEN을 읽지 않는다 [확인: --help "OAuth and keychain are never read"].
 // - `--fallback-model`을 쓰지 않는다. 한도·인증 때 다른 모델·계정·실행기로 넘어가지 않는다(D-14 조건 2).
 // - Opus 5.5의 내용 기반 자동 모델 전환(refusal fallback)은 `--fallback-model`과 별개로 기본 켜져 있다. env로 끄고,
-//   그래도 전환 이벤트나 다른 모델의 응답이 보이면 정책 위반으로 즉시 멈춘다. 모델 고정은 사용자 결정이다(리뷰 exec-r1 P1).
+//   그래도 전환 이벤트나 다른 모델의 응답이 보이면 정책 위반으로 즉시 멈춘다. 모델 고정은 사용자 결정이다.
 export const CLAUDE_CLI_VERSION = '2.1.308';
 export const CLAUDE_CHAT_CAPABILITIES: ExecutorCapabilities = Object.freeze({
   executor: 'claude', cliVersion: CLAUDE_CLI_VERSION, lanes: Object.freeze({ chat: true, task: false, review: true }),
@@ -206,7 +206,7 @@ export class ClaudeChatAdapter implements ChatAdapter {
   }
 }
 
-// 리뷰 레인 무도구 경계(사용자 2026-11-04, DECISIONS "T18 결정"의 T17 진입 조건). argv·env·출력 해석은 대화와 같고, 대화보다 더 본다:
+// 리뷰 레인 무도구 경계(사용자 결정, DECISIONS "T18 결정"의 T17 진입 조건). argv·env·출력 해석은 대화와 같고, 대화보다 더 본다:
 // init의 skills·plugins가 비어 있어야 하고, hook 실행과 도구가 돌 때만 나오는 이벤트가 보이면 멈춘다. 이벤트 이름과 init 필드는
 // 2.1.308 바이너리의 SDK 스키마를 정적으로 읽은 것이다 [가정: 실제 출력 대조는 S7]. init의 agents·slash_commands는 CLI 내장 목록이
 // 올 수 있고 도구가 없으면 쓸 길이 없어 보지 않는다. 판정은 원문 줄로 한다(줄인 줄에는 이 필드들이 없다).
@@ -226,9 +226,9 @@ export function noToolBoundaryViolation(line: string): PolicyViolation | null {
   return null;
 }
 // `--safe-mode`도 CLI 내장 플러그인은 켠 채 둔다(2.1.308 --help: "built-in tools and plugins … work normally").
-// 첫 실리뷰(2026-11-04)가 init plugins의 이 두 이름 때문에 plugins_enabled로 막혔다 [실측: 작업자 파드, 가짜 토큰 init].
+// init plugins에 이 두 이름이 있으면 plugins_enabled로 막힌다 [실측: 작업자 파드, 가짜 토큰 init].
 // 그래서 이 둘만 끄는 고정 인라인 JSON을 `--settings`로 넘긴다(같은 실측에서 init plugins가 []). 파일·다른 출처를 읽는
-// `--settings`는 여전히 금지다(CLAUDE_FORBIDDEN_FLAGS, 시험이 값까지 확인). 새 CLI가 다른 내장 플러그인을 더하면 위 init
+// `--settings`는 금지다(CLAUDE_FORBIDDEN_FLAGS, 시험이 값까지 확인). 새 CLI가 다른 내장 플러그인을 더하면 위 init
 // 검사가 그대로 막는다(fail-closed).
 export const REVIEW_DISABLED_BUILTIN_PLUGINS: readonly string[] = Object.freeze(['cc-plugin-agents-md@builtin', 'cc-plugin-plugin-authoring@builtin']);
 export const REVIEW_SETTINGS = JSON.stringify({ enabledPlugins: Object.fromEntries(REVIEW_DISABLED_BUILTIN_PLUGINS.map(name => [name, false])) });

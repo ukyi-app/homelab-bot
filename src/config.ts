@@ -13,9 +13,9 @@ import { validTime, validZone } from './briefing.js';
 export const SECRET_KEYS = Object.freeze(['DATABASE_URL', 'DISCORD_BOT_TOKEN', 'RUNTIME_POLICIES', 'GRAFANA_READER_TOKEN',
   'HEALTHCHECKS_PING_URL', 'WORKER_CONTROL_PRIVATE_KEY', 'GITHUB_REVIEW_WEBHOOK_SECRET'] as const);
 export const ADDRESS_KEYS = Object.freeze(['WORKER_URL', 'GRAFANA_URL', 'KUBERNETES_API_URL'] as const);
-// T20 기억·브리핑(비밀 아님, 차트 env). 없으면 끈다. 있는데 틀리면 기동하지 않는다(조용히 끄지 않는다).
+// 기억·브리핑(비밀 아님, 차트 env). 없으면 끈다. 있는데 틀리면 기동하지 않는다(조용히 끄지 않는다).
 export const MEMORY_KEYS = Object.freeze(['MEMORY_LEDGER_DIR', 'MEMORY_LEDGER_ACCEPT_GENERATION', 'BRIEFING_TIME', 'BRIEFING_TIMEZONE'] as const);
-// T17 리뷰 App(비밀). 없으면 리뷰 GitHub 전송을 만들지 않는다. 하나만 있으면 기동하지 않는다.
+// 리뷰 App(비밀). 없으면 리뷰 GitHub 전송을 만들지 않는다. 하나만 있으면 기동하지 않는다.
 export const REVIEW_APP_KEYS = Object.freeze(['GITHUB_REVIEW_APP_ID', 'GITHUB_REVIEW_APP_PRIVATE_KEY'] as const);
 // 원장 PVC 마운트(계약 v1 /var/lib/homelab-bot/ledger)가 들어갈 수 있는 곳. 그 밖 경로는 컨테이너 쓰기 층이라 재시작에 사라진다.
 export const LEDGER_ROOT = '/var/lib/homelab-bot/';
@@ -27,13 +27,13 @@ export interface PublisherConfig {
   databaseUrl: string; discordToken: string; policy: Policy;
   grafana: { url: string; token: string }; kubernetes: { url: string };
   workerUrl: string; healthchecksUrl: string; workerKey: KeyObject; githubWebhookSecret: string;
-  // null(또는 없음)이면 기억·원장·브리핑을 만들지 않는다(T20 전과 같은 동작).
+  // null(또는 없음)이면 기억·원장·브리핑을 만들지 않는다.
   memory?: { ledgerDir: string; acceptGeneration: string | null } | null;
   // null이면 브리핑 예약을 끈다(ensure()가 남은 사본을 막음). memory 없이 켤 수 없다.
   briefing?: { time: string; timezone: string } | null;
   // null이면 리뷰 App 입력이 없다. 있어도 정책과 조립(main.ts)이 켜기 전에는 GitHub을 부르지 않는다.
   githubReviewApp?: { appId: string; privateKey: KeyObject } | null;
-  // T17 리뷰 명시 스위치. 켜져도 정책·작업자 조건이 맞아야 열린다(main.ts reviewPrecondition).
+  // 리뷰 명시 스위치. 켜져도 정책·작업자 조건이 맞아야 열린다(main.ts reviewPrecondition).
   reviewEnabled?: boolean;
 }
 type Env = Readonly<Record<string, string | undefined>>;
@@ -75,7 +75,7 @@ export function loadPublisherConfig(env: Env, loadedAt: number): PublisherConfig
       workerKey = key;
     } catch { problems.push('WORKER_CONTROL_PRIVATE_KEY(invalid)'); }
   }
-  // GitHub webhook 비밀(D6). 시험 webhook과 T17 리뷰 App이 같은 값을 쓴다. homelab secret set 하한과 같은 16자 이상.
+  // GitHub webhook 비밀(D6). 시험 webhook과 리뷰 App이 같은 값을 쓴다. homelab secret set 하한과 같은 16자 이상.
   const githubWebhookSecret = read('GITHUB_REVIEW_WEBHOOK_SECRET', value => value.length >= 16);
   const workerUrl = read('WORKER_URL', value => url(value, ['http:'], true));
   const grafanaUrl = read('GRAFANA_URL', value => url(value, ['http:', 'https:'], true));

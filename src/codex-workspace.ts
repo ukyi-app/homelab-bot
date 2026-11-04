@@ -30,7 +30,7 @@ export function under(dir: FileHandle, name: string): string {
 export const openDirAt = (dir: FileHandle, name: string) => open(under(dir, name), DIR);
 export const openDir = (path: string) => open(path, DIR);
 
-// 실제로 읽은 바이트로 상한을 센다. 크기를 본 뒤 파일이 커져도 maxBytes+1바이트에서 멈춘다(rev r3 N7).
+// 실제로 읽은 바이트로 상한을 센다. 크기를 본 뒤 파일이 커져도 maxBytes+1바이트에서 멈춘다.
 async function readLimited(handle: FileHandle, maxBytes: number): Promise<Buffer | null> {
   const chunks: Buffer[] = [];
   let total = 0;
@@ -77,7 +77,7 @@ export const fileWorkspace: CodexWorkspace = {
     const git = (...args: string[]) => run('git', ['-c', 'user.name=homelab-bot', '-c', 'user.email=homelab-bot@invalid',
       '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...args], { cwd: dir, env });
     // 이미 있는 .git은 누가 썼는지 모른다(압축본에 섞였거나 이전 실행). 그 config로 git을 돌리지 않는다.
-    // 작업 공간 원본을 푸는 단계(T16b·T19)는 .git 없이 풀고 git init은 여기서만 한다.
+    // 작업 공간 원본을 푸는 단계는 .git 없이 풀고 git init은 여기서만 한다.
     const existing = typeof target === 'string' ? join(target, '.git') : under(target, '.git');
     if (await lstat(existing).then(() => true, () => false)) throw new Error('workspace_git_exists');
     await git('init', '-q');
@@ -114,13 +114,13 @@ export const fileWorkspace: CodexWorkspace = {
           // 하드링크는 다른 inode(작업 공간 밖 파일)를 가리킬 수 있어 내용을 읽지 않는다. 링크 수가 바뀌면 변경으로 잡힌다.
           if (stat.nlink !== 1) { result[path] = 'special:hardlink'; continue; }
           const hash = createHash('sha256');
-          // 읽은 바이트로 센다. 크기를 본 뒤 커지는 파일도 전체 상한에서 멈춘다(rev r3 N7과 같은 원인).
+          // 읽은 바이트로 센다. 크기를 본 뒤 커지는 파일도 전체 상한에서 멈춘다.
           for await (const chunk of file.readableWebStream()) {
             if ((bytes += (chunk as Uint8Array).byteLength) > LIMITS.bytes) throw new Error('workspace_too_large');
             hash.update(chunk as Uint8Array);
           }
           // git이 일반 파일 모드에 반영하는 소유자 실행 비트만 기록한다(100755/100644). 그룹·기타 실행 비트는
-          // git이 보지 않으므로 세지 않는다. 내용이 같은 chmod u+x도 실제 변경이다(rev r1 R4, r2 N5).
+          // git이 보지 않으므로 세지 않는다. 내용이 같은 chmod u+x도 실제 변경이다.
           result[path] = `${hash.digest('hex')}:${stat.mode & 0o100 ? '755' : '644'}`;
         } finally { await file.close().catch(() => {}); }
       }

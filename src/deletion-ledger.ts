@@ -20,7 +20,7 @@ export interface DeletionLedger {
   durable(): Promise<boolean>;
 }
 
-// 원장 계약 v1(T20). 디렉터리와 두 파일은 사람이 host/install.sh로 만든다. 봇은 어떤 파일도 만들지 않는다.
+// 원장 계약 v1. 디렉터리와 두 파일은 사람이 host/install.sh로 만든다. 봇은 어떤 파일도 만들지 않는다.
 export const LEDGER_FILE = 'deletions.jsonl';
 export const MARKER_FILE = 'ledger.json';
 export const MARKER_FORMAT = 'homelab-bot-deletion-ledger';

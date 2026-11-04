@@ -1,14 +1,14 @@
 import { z } from 'zod';
 import type { DiscordApi } from './discord-protocol.js';
 
-// FOUNDATION에서 여는 slash 명령(T16b PLAN S3). task·브리핑 명령은 등록하지 않고
-// DiscordIngress에도 넘기지 않아 수신에서 닫는다(T18 경로는 연결하지 않음).
+// FOUNDATION에서 여는 slash 명령. task·브리핑 명령은 등록하지 않고
+// DiscordIngress에도 넘기지 않아 수신에서 닫는다(작업 경로는 연결하지 않음).
 export const FOUNDATION_COMMANDS = Object.freeze(['chat', 'urgent', 'read', 'stop', 'resume', 'list', 'cancel', 'retry',
   'emergency-stop', 'resume-model', 'model-status', 'revoke'] as const);
-// T20 기억 명령. 삭제 원장이 켜졌을 때(MEMORY_LEDGER_DIR)만 등록·수신한다. 옵션은 문자열(text·target)뿐이라
+// 기억 명령. 삭제 원장이 켜졌을 때(MEMORY_LEDGER_DIR)만 등록·수신한다. 옵션은 문자열(text·target)뿐이라
 // 하위 명령 대신 하이픈 이름을 쓰고, 종류별 값은 text 안의 `키=값`으로 받는다(서식은 memory-commands.ts).
 export const MEMORY_COMMANDS = Object.freeze(['memory-save', 'memory-search', 'memory-correct', 'memory-exclude', 'memory-delete'] as const);
-// T17 리뷰 제어. 리뷰가 열렸을 때만 등록·수신한다. owner·알림 채널 검사는 DiscordIngress·Store가 그대로 한다.
+// 리뷰 제어. 리뷰가 열렸을 때만 등록·수신한다. owner·알림 채널 검사는 DiscordIngress·Store가 그대로 한다.
 export const REVIEW_COMMANDS = Object.freeze(['review-status', 'review-resume', 'review-cancel'] as const);
 // DiscordProtocol은 옵션 값을 문자열로만 받는다(type 3 STRING). 이름은 수신 계약(text·target)과 같다.
 const option = (name: 'text' | 'target', description: string, maxLength: number) =>
@@ -17,7 +17,7 @@ const text = (description: string, maxLength = 6000) => option('text', descripti
 const target = (description: string, maxLength = 100) => option('target', description, maxLength);
 type CommandName = typeof FOUNDATION_COMMANDS[number] | typeof MEMORY_COMMANDS[number] | typeof REVIEW_COMMANDS[number];
 const command = (name: CommandName, description: string, options: ReturnType<typeof option>[] = []) =>
-  // type 1(CHAT_INPUT), 서버 안에서만(contexts 0 GUILD, integration_types 0 GUILD_INSTALL). DM은 끔(T16a).
+  // type 1(CHAT_INPUT), 서버 안에서만(contexts 0 GUILD, integration_types 0 GUILD_INSTALL). DM은 끔(D-17).
   ({ name, type: 1, description, options, contexts: [0], integration_types: [0] });
 export const COMMAND_DEFINITIONS = Object.freeze([
   command('chat', '홈랩 조력자에게 묻기(스레드를 엽니다)', [text('질문이나 요청')]),
@@ -52,7 +52,7 @@ export const REVIEW_COMMAND_DEFINITIONS = Object.freeze([
   command('review-resume', '한도·인증 대기 리뷰 작업 재개(owner, 알림 채널)', [target('리뷰 작업 ID')]),
   command('review-cancel', '리뷰 작업 취소(owner, 알림 채널)', [target('리뷰 작업 ID')]),
 ]);
-// 등록할 명령 목록. 원장·리뷰가 꺼져 있으면 지금 운영 목록(FOUNDATION)과 같다.
+// 등록할 명령 목록. 원장·리뷰가 꺼져 있으면 FOUNDATION 목록과 같다.
 export const commandDefinitions = (memory: boolean, review = false) => !memory && !review ? COMMAND_DEFINITIONS
   : Object.freeze([...COMMAND_DEFINITIONS, ...(memory ? MEMORY_COMMAND_DEFINITIONS : []), ...(review ? REVIEW_COMMAND_DEFINITIONS : [])]);
 

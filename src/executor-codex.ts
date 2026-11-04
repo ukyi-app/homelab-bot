@@ -10,7 +10,7 @@ import { compactEvent, parseStream, waitReason } from './codex-events.js';
 import { openDir, readAt, writeAt } from './codex-workspace.js';
 import type { AdapterRun, ChatAdapter, ChatRun, EngineOutcome, ExecutorCapabilities, ExitStatus } from './executor.js';
 
-// Codex 대화 어댑터(T16b D4의 기존 경로를 실행기 인터페이스 뒤로 옮긴 것, 동작은 그대로).
+// Codex 대화 어댑터(D4 경로를 실행기 인터페이스 뒤에 둔다).
 // - CODEX_HOME은 작업자 영속 공간(file-mutable 자격의 home)을 그대로 쓴다. auth.json 갱신본이 그 자리에 남는다(D-14 조건 4).
 // - 세션 기록을 남기지 않는다: `--ephemeral` [확인: 0.163.0 `codex exec --help` "Run without persisting session files
 //   to disk"]. 플래그가 실제로 지키는지는 모델 호출 전이라 [미확인]이어서, 실행 뒤 세션 디렉터리도 지운다.
@@ -98,7 +98,7 @@ export class CodexChatAdapter implements ChatAdapter {
         if (!confirmed) return;
         // `--ephemeral`이 남긴 것이 있으면 지운다. 이 CODEX_HOME의 세션은 대화 레인 것뿐이다(작업 레인 미연결).
         // 세션 위치 `sessions/`·`archived_sessions/`는 [가정: Codex 기본 배치]다. 지우지 못하면 오류를 올려 보내
-        // 공통부가 실패로 다루고 다시 지운다(리뷰 exec-r1 P2: 예전에는 오류를 숨겼다).
+        // 공통부가 실패로 다루고 다시 지운다(오류를 숨기면 succeeded로 나간다).
         for (const name of ['sessions', 'archived_sessions']) await rm(join(home, name), { recursive: true, force: true });
       },
     };

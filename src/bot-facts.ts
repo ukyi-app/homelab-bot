@@ -2,7 +2,7 @@ import { SERVICES, TEMPLATES } from './catalog.js';
 import { COMMAND_DEFINITIONS } from './commands.js';
 
 // 작업자 프롬프트의 신뢰 문맥. 코드에 고정된 공개 값(봇 slash 명령, 서비스 카탈로그)만 쓴다. 대화 기록(untrusted)에서
-// 만들지 않는다. S16에서 모델이 /revoke를 "플랫폼 관리 콘솔 명령"으로, namespace를 서비스 ID로 짐작해 틀렸다.
+// 만들지 않는다. 이 문맥이 없으면 모델이 /revoke를 "플랫폼 관리 콘솔 명령"으로, namespace를 서비스 ID로 짐작해 틀린다(S16).
 // 작업자 이미지에 들어가므로 바뀐 내용은 작업자를 다시 배포해야 모델에 닿는다.
 const usage = (definition: typeof COMMAND_DEFINITIONS[number]) => {
   const options = definition.options.map(option => `${option.name}:<${option.description}>`);

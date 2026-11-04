@@ -46,7 +46,7 @@ export class HttpReviewWorker implements ReviewWorkerClient {
   }
   async review(task: ReviewTask, capability: string, signal: AbortSignal): Promise<ReviewWorkerResult> {
     const body = JSON.stringify(ReviewTaskSchema.parse(task));
-    // 긴 리뷰가 undici 기본 300초 응답 대기에 끊기지 않게 작업 예산에 맞춘다(T16a R1-06과 같은 함정).
+    // 긴 리뷰가 undici 기본 300초 응답 대기에 끊기지 않게 작업 예산에 맞춘다(R1-06과 같은 함정).
     const dispatcher = new Agent({ headersTimeout: task.timeoutMs + 30_000, bodyTimeout: task.timeoutMs + 30_000 });
     try {
       const options = { method: 'POST', redirect: 'error' as const, signal, dispatcher,

@@ -11,7 +11,7 @@ import { CODEX_CHAT_CAPABILITIES, CodexChatAdapter } from './executor-codex.js';
 import type { ChatAdapter, ExecutorCapabilities, ExecutorId } from './executor.js';
 import { WorkerStartError } from './worker-state.js';
 
-// 승인된 실행기 프로필(D-14 변경, 사용자 2026-10-30: "추후 쉽게 claude, codex, opencode 등 변경하기 용이하게").
+// 승인된 실행기 프로필(D-14, 사용자 결정: "추후 쉽게 claude, codex, opencode 등 변경하기 용이하게").
 // 기동 env 세 개가 프로필 하나를 고른다: WORKER_EXECUTOR(실행기), WORKER_CREDENTIAL_KEY(자격 키 이름 = 인증 방식),
 // WORKER_MODEL(모델). 표에 없는 실행기·자격 조합이나 모양이 틀린 모델은 기동 실패다. 다른 프로필로 몰래 돌아가지 않는다.
 // 이미 이 표에 있는 프로필 사이의 전환은 sandbox 설정 PR 하나(env 세 값·Secret 키·egress) + 자격 하나다.
@@ -35,7 +35,7 @@ export const PROFILES: readonly ExecutorProfile[] = Object.freeze([
   Object.freeze({ id: 'claude-subscription', executor: 'claude', credentialKey: 'CLAUDE_CODE_OAUTH_TOKEN',
     auth: 'subscription-token', credential: 'env-static', bin: '/usr/local/bin/claude',
     model: /^claude-[a-z0-9]+(?:-[a-z0-9]+){1,8}$/, capabilities: CLAUDE_CHAT_CAPABILITIES, requiredEnv: Object.freeze([]) }),
-  // 기존 Codex 대화 경로(D4). 모델은 CLI 기본값(`cli-default`, -m 없음)이다.
+  // Codex 대화 경로(D4). 모델은 CLI 기본값(`cli-default`, -m 없음)이다.
   Object.freeze({ id: 'codex-subscription', executor: 'codex', credentialKey: 'CODEX_AUTH_JSON',
     auth: 'subscription-auth-json', credential: 'file-mutable', bin: '/usr/local/bin/codex',
     model: /^cli-default$/, capabilities: CODEX_CHAT_CAPABILITIES, requiredEnv: Object.freeze(['CODEX_HOME']) }),
@@ -64,7 +64,7 @@ export function createExecutor(profile: ExecutorProfile, paths: { credentialFile
         reviewAdapter: new ClaudeReviewAdapter('subscription-token') };
     case 'codex': {
       // 홈을 여기서 한 번 검증·해석해 어댑터와 자격이 같은 실제 경로를 쓴다. 정상 별칭(심링크) 경로를 자격에 그대로
-      // 넘기면 O_NOFOLLOW 읽기가 실패해 반사 검사가 비밀을 모른 채 실행됐다(리뷰 exec-r1 P1).
+      // 넘기면 O_NOFOLLOW 읽기가 실패해 반사 검사가 비밀을 모른 채 실행된다.
       let home: string;
       try { home = assertWorkerRoot(paths.codexHome ?? '', homes); } catch { throw new WorkerStartError('codex_home_unavailable'); }
       return { adapter: new CodexChatAdapter(home, homes), credential: new FileMutableCredential(home, paths.credentialFile, homes),

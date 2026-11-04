@@ -10,7 +10,7 @@ import type { WorkerClient, WorkerResult, WorkerSigner } from './worker.js';
 import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
 
-// T18: 봇 소유 Codex 작업 경로. dispatch 뒤의 오류는 스스로 상태로 기록하고 던지지 않는다.
+// 봇 소유 Codex 작업 경로. dispatch 뒤의 오류는 스스로 상태로 기록하고 던지지 않는다.
 export interface TaskLane { run(job: Job): Promise<void>; sweep?(): Promise<unknown> }
 // shutdown: 게시 서버 종료 신호(SIGTERM). drainMs: 신호 뒤 실행 중 작업의 자연 완료를 기다리는 시간.
 // 기본 10초 + cancel 응답 상한 5초가 main.ts의 전체 종료 기한(20초)과 kubelet 유예(30초) 안에 들어간다.
@@ -198,7 +198,7 @@ export class Runtime {
     } catch { return false; }
   }
   // 이전 실행이 unknown으로 남긴 chat·review에 새 cancel capability로 멈춤을 묻는다(네트워크는 DB 트랜잭션 밖).
-  // 작업자는 잡고 있는 job이면 멈춘 뒤, 잡고 있지 않으면(재시작·OOM 뒤) 표식 프로세스 소멸을 확인했을 때 stopped:true를 준다(#42).
+  // 작업자는 잡고 있는 job이면 멈춘 뒤, 잡고 있지 않으면(재시작·OOM 뒤) 표식 프로세스 소멸을 확인했을 때 stopped:true를 준다.
   // 확인 뒤 쓰기는 afterStop으로 재시도한다. 작업자는 첫 확인 뒤 job을 놓아 다음 조사의 cancel은 stopped:false다.
   async probeUnknown(): Promise<number> {
     if (this.shutdown?.aborted) return 0;

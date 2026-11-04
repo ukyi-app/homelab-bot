@@ -3,7 +3,7 @@ import { Agent } from 'undici';
 import { z } from 'zod';
 import type { ReadTransport } from './read.js';
 
-// T16b 읽기 transport 둘(Grafana, Kubernetes API). 원본 응답을 ReadAdapter가 받는 관측 JSON({observedAt, rows})으로 투영한다.
+// 읽기 transport 둘(Grafana, Kubernetes API). 원본 응답을 ReadAdapter가 받는 관측 JSON({observedAt, rows})으로 투영한다.
 // 각 transport는 ReadAdapter의 AbortSignal을 fetch에 넘겨 5초 시간 초과 때 실제 요청을 끊는다.
 // 경로는 고정 모양만 만든다. 템플릿이 코드에 있어도 여기서 다시 막아 Secret·ConfigMap·pods/log·exec 경로가 생기지 않는다.
 type Request = Parameters<ReadTransport['query']>[0];
@@ -65,7 +65,7 @@ export function grafanaTransport(options: { base: string; token: string; datasou
       ? { refId: 'A', datasource: { uid: request.datasource }, expr: request.query, instant: true, range: false,
         format: 'time_series', maxDataPoints: request.limit }
       // VictoriaLogs 플러그인 v0.33.1(pkg/plugin/query.go): queryType instant는 /select/logsql/query로 가고
-      // start=from, end=to, limit=maxLines다. 그래서 창 전체의 원문 줄을 최대 maxLines개 받는다(실측 2026-11-02).
+      // start=from, end=to, limit=maxLines다. 그래서 창 전체의 원문 줄을 최대 maxLines개 받는다(실측).
       : { refId: 'A', datasource: { uid: request.datasource }, expr: request.query, queryType: 'instant', maxLines: request.limit };
     const raw = DataResponse.parse(await call(send, `${base}/api/ds/query`, { method: 'POST', signal: request.signal,
       headers: { authorization: bearer(options.token), 'content-type': 'application/json', accept: 'application/json' },
@@ -117,7 +117,7 @@ const Application = z.object({ metadata: z.object({ name: z.string(), namespace:
   status: z.object({ health: z.object({ status: z.string() }).optional(), sync: z.object({ status: z.string() }).optional() }).optional() });
 // Argo CD Application CR이 사는 namespace(D9). 템플릿 namespace(서비스 ns)와 상관없이 고정이다.
 // SA 권한은 클러스터 범위 읽기(ClusterRole homelab-readonly)라 다른 ns도 읽힌다. Application이 argocd에만 있어
-// 실제 차이는 없고, 경계는 이 코드가 이 ns만 읽는다는 데 있다(실측 2026-11-02).
+// 실제 차이는 없고, 경계는 이 코드가 이 ns만 읽는다는 데 있다(실측).
 export const ARGOCD_NAMESPACE = 'argocd';
 export const SERVICE_ACCOUNT = Object.freeze({
   token: '/var/run/secrets/kubernetes.io/serviceaccount/token',

@@ -11,7 +11,7 @@ import { RUN_PREFIX, RunControl, runDeadline } from './run-control.js';
 import type { RunControlOptions, RunLimits, RunReport, RunViolationEvent } from './run-control.js';
 import type { CancelRequest, WorkerRequest, WorkerResult } from './worker.js';
 
-// 대화 레인(T16b D4, 실행기 프로필 구조 사용자 2026-10-30). 공통 실행 제어는 run-control에 있고, 여기는 대화 프롬프트·
+// 대화 레인(D4, 실행기 프로필 구조는 사용자 결정). 공통 실행 제어는 run-control에 있고, 여기는 대화 프롬프트·
 // 출력 스키마·결과 분류·반사 검사만 한다. 직렬은 SerialWorker가 함께 진다.
 // 작업 레인(lane 'task')은 어떤 실행기도 연결하지 않는다(능력표 lanes.task=false). 받으면 띄우지 않고 failed다.
 
@@ -80,7 +80,7 @@ export class ChatLane {
   constructor(private readonly adapter: ChatAdapter, credential: WorkerCredential, launcher: ProcessLauncher,
     private readonly options: ChatLaneOptions) {
     this.control = options.control ?? new RunControl(credential, launcher, { ...options,
-      // 옛 이름으로 옮기는 것은 정리 사건뿐이다. 위반 사건까지 옮기면 chat_cleanup_recovered로 둔갑한다.
+      // chat_cleanup_* 이름으로 옮기는 것은 정리 사건뿐이다. 위반 사건까지 옮기면 chat_cleanup_recovered로 둔갑한다.
       onEvent: event => options.onEvent?.(event.event === 'run_policy_violation' ? event
         : { event: event.event === 'cleanup_failed' ? 'chat_cleanup_failed' : 'chat_cleanup_recovered' }) });
   }

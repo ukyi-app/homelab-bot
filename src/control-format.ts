@@ -1,5 +1,5 @@
 // 제어 명령 결과(Store.control·reviewControl의 반환값)를 스레드에 게시할 짧은 한국어 문장으로 바꾼다.
-// 이전에는 JSON.stringify 그대로라 /list가 {"ref":...,"data":[...]}로 보였다(S16). 작업 ID는 /cancel·/retry의
+// JSON.stringify 그대로면 /list가 {"ref":...,"data":[...]}로 보인다(S16). 작업 ID는 /cancel·/retry의
 // target에 그대로 넣어야 하므로 줄이지 않는다.
 const LIST_LIMIT = 20;
 type Row = Record<string, unknown>;

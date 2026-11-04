@@ -49,9 +49,9 @@ import { Store } from './store.js';
 import { WorkerSigner } from './worker.js';
 import { HttpWorker } from './worker-http.js';
 
-// 게시 서버 진입점(T16b S3). 이미지 기본 CMD는 node dist/src/main.js다. 마이그레이션은 src/migrate-main.ts(차트 migration.command).
-// T18(TaskLane)은 연결하지 않는다. T17 리뷰는 네 조건이 모두 맞을 때만 열고, 아니면 /github을 리뷰 비활성으로만 받는다(D6).
-// T20 기억·브리핑은 MEMORY_LEDGER_DIR이 있을 때만 만들고 기동 장벽·주기 루프까지 잇는다. 기억 명령(memory-*)도 그때만 등록·수신한다.
+// 게시 서버 진입점. 이미지 기본 CMD는 node dist/src/main.js다. 마이그레이션은 src/migrate-main.ts(차트 migration.command).
+// 작업 레인(TaskLane)은 연결하지 않는다. 리뷰는 네 조건이 모두 맞을 때만 열고, 아니면 /github을 리뷰 비활성으로만 받는다(D6).
+// 기억·브리핑은 MEMORY_LEDGER_DIR이 있을 때만 만들고 기동 장벽·주기 루프까지 잇는다. 기억 명령(memory-*)도 그때만 등록·수신한다.
 
 // 닫혀 있으면 정책 JSON에 리뷰 절이 있어도 리뷰 경로를 열지 않는다. 기본 정책을 못 읽으면 503(PolicyUnavailable)이다.
 class GatedReviewPolicy extends ReviewPolicySource {
@@ -115,7 +115,7 @@ export interface PublisherDeps {
   registerDelaysMs?: readonly number[];
   recoveryBackoff?: (attempt: number) => number;
   identifySpacingMs?: number;
-  // T20. config.memory가 있을 때만 쓴다. 시험이 원장(임시 디렉터리·잠금)·관측 원본·주기를 바꿀 때만 준다.
+  // config.memory가 있을 때만 쓴다. 시험이 원장(임시 디렉터리·잠금)·관측 원본·주기를 바꿀 때만 준다.
   ledger?: ManagedLedger;
   documents?: DocumentSource;
   observations?: ObservationSource[];
@@ -123,7 +123,7 @@ export interface PublisherDeps {
   memoryResumeMs?: number;
   ledgerReopenMs?: number;
   t20Backoff?: (attempt: number) => number;
-  // T17 주기. 시험만 바꾼다.
+  // 리뷰 주기. 시험만 바꾼다.
   reviewWorkerProbeMs?: number;
   reviewDeliveryReconcileMs?: number;
   reviewPullRequestReconcileMs?: number;
@@ -187,7 +187,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   const github = new GitHubIngress(config.githubWebhookSecret, store, reviewPolicy, review?.queue ?? new ReviewQueue(store, closedReader),
     review?.reader ?? closedReader);
   const servers = receivers(health, new AlertIngress(store, gate), { github: githubWebhook(github) });
-  // T20 객체는 만들기만 한다(I/O 없음). 원장 잠금 연결·파일은 첫 READY의 기동 장벽에서 연다.
+  // 기억·브리핑 객체는 만들기만 한다(I/O 없음). 원장 잠금 연결·파일은 첫 READY의 기동 장벽에서 연다.
   // 잠금은 풀과 다른 전용 연결이다. 풀은 연결을 돌려쓰거나 닫아 세션 잠금이 유지되지 않는다(ledger-lock.ts).
   const t20 = config.memory ? (() => {
     const ledger = deps.ledger ?? new FileDeletionLedger({ dir: config.memory.ledgerDir, db: deps.db, now,
@@ -232,7 +232,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   const loops: Promise<void>[] = [];
   // alive: 이 루프의 한 바퀴가 성공했다는 것이 DB에 닿았다는 증거인지. 하트비트 조건(조율 루프가 최근 60초 안에 돎)은
   // 그런 루프로만 잰다. runtime(store.expire)·publisher(claimDelivery)는 늘 DB를 거친다. 복구 루프는 대기 항목이 없으면
-  // DB 없이 끝나므로 생존 근거가 아니다(DB 장애 중에도 정상 ping이 나가지 않게, PR #12 재리뷰 4420612644).
+  // DB 없이 끝나므로 생존 근거가 아니다(DB 장애 중에도 정상 ping이 나가지 않게).
   const loop = (name: string, step: () => Promise<boolean>, alive = true) => loops.push((async () => {
     while (!stop.signal.aborted) {
       try {
@@ -263,7 +263,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       catch (error) { log('recovery_barrier_failed', errorInfo(error)); await pause(Math.min(30_000, 1000 * 2 ** Math.min(attempt, 5))); }
     }
   };
-  // T20 기동 장벽(DECISIONS T20 기동 순서): 원장 열기·재적용(memory.open) → 예약 반영(ensure) → 첫 tick → 게시자.
+  // 기동 장벽(DECISIONS T20 기동 순서): 원장 열기·재적용(memory.open) → 예약 반영(ensure) → 첫 tick → 게시자.
   // 첫 tick이 지난 회차·12시간 넘은 대기 브리핑을 막기 전에 게시자가 그것을 보내지 않게 한다.
   let memoryOpen = false;
   // 'closed': 원장을 열지 못했지만 open()이 기억이 든 대기 브리핑을 막은 뒤 원장 오류를 다시 던졌다. 기억만 닫고 진행한다.
@@ -423,7 +423,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
             return publisher.deliver();
           });
         };
-        // T20이 켜져 있으면 게시자(reconcile·deliver 모두)는 기동 장벽 뒤에 연다. 대화 수신·복구 장벽·runtime claim은 기다리지 않는다
+        // 기억·브리핑이 켜져 있으면 게시자(reconcile·deliver 모두)는 기동 장벽 뒤에 연다. 대화 수신·복구 장벽·runtime claim은 기다리지 않는다
         // (그동안 나온 답은 outbox에 쌓였다가 게시자가 열리면 나간다). 장벽은 이벤트 순서 밖에서 돌아 Gateway 이벤트를 막지 않는다.
         if (!t20) publish();
         else loops.push(t20Barrier().then(passed => {
@@ -436,7 +436,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       }
       await barrier();
       // 작업 claim은 첫 장벽이 선 뒤에 시작한다. 재시작 때 남은 queued 작업이 중단 중 메시지를 history로 복구하기 전에
-      // 이전 입력으로 모델을 부르지 않게 한다(PR #12 재리뷰 4420612638). 이후 READY의 장벽은 claim의 gap 조건이 막는다.
+      // 이전 입력으로 모델을 부르지 않게 한다. 이후 READY의 장벽은 claim의 gap 조건이 막는다.
       // read는 모델 응답을 기다리지 않게 따로 돈다. 늘 DB를 거치므로 생존 근거다.
       if (!runtimeStarted && !stop.signal.aborted) {
         runtimeStarted = true;

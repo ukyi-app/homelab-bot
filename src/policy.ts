@@ -10,7 +10,7 @@ const PolicySchema = z.strictObject({
   conversationChannel: z.string().min(1), notificationChannel: z.string().min(1),
   dmEnabled: z.boolean().nullable(), services: z.array(z.string()),
   revocationRestores: z.array(z.string().uuid()).optional(),
-  // PR 리뷰 정책(T17). 형식 검사는 review.ts가 하고, 없으면 리뷰 경로만 닫힌다.
+  // PR 리뷰 정책. 형식 검사는 review.ts가 하고, 없으면 리뷰 경로만 닫힌다.
   review: z.unknown().optional(),
 });
 export type Policy = z.infer<typeof PolicySchema>;
@@ -23,7 +23,7 @@ function frozen<T>(value: T): T {
   }
   return value;
 }
-// D1(사용자 2026-10-30): 정책은 기동 때 env에서 한 번 읽는다. 값 변경은 `homelab secret set`의 파드 재시작으로 반영되고,
+// D1(사용자 결정): 정책은 기동 때 env에서 한 번 읽는다. 값 변경은 `homelab secret set`의 파드 재시작으로 반영되고,
 // 즉시 차단은 /revoke(DB 거부 목록)다. confirmedAt은 이 읽은 시각이고, 거부 해제(revocationRestores)가
 // "철회 뒤 확인한 정책"인지 가리는 기준이다. 오류 메시지에는 알려진 필드 경로만 넣고 값·모르는 키 이름은 넣지 않는다(비밀일 수 있다).
 export function loadRuntimePolicy(raw: string, loadedAt: number): Policy {

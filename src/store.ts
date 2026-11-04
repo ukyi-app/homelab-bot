@@ -348,7 +348,7 @@ export class Store {
       await tx.query('DELETE FROM controls WHERE key=$1', [`unknown_probe:${row.id}`]);
       await tx.query('INSERT INTO audit(kind,subject,detail,created_at) VALUES ($1,$2,$3,$4)',
         ['unknown_stop_confirmed', row.id, json({ attempt: row.attempt }), this.now()]);
-      // Job['type']에는 review가 없다(리뷰 작업은 T17이 같은 표에 더했다).
+      // Job['type']에는 review가 없다(리뷰 작업도 같은 표에 둔다).
       if ((row.type as string) === 'review') {
         // 리뷰 job의 target은 GitHub PR이라 게시할 Discord 채널이 없고 알림 채널은 정책에만 있다. 이 자리에서는 안내하지 않는다.
         // 밀려난 세대의 기록은 그대로 둔다.
@@ -383,7 +383,7 @@ export class Store {
   }
   async claimDelivery(): Promise<Delivery | undefined> {
     return this.db.transaction(async tx => {
-      // 실행기는 WHERE 조건 순서를 보장하지 않아 key 비교 전에 다른 키의 boolean(scheduler 등)을 bigint로 바꾸다 22023이 났다.
+      // 실행기는 WHERE 조건 순서를 보장하지 않아 key 비교 전에 다른 키의 boolean(scheduler 등)을 bigint로 바꾸다 22023이 난다.
       // CASE 안에서만 형 변환하면 숫자가 아닌 값은 평가되지 않는다.
       const row = (await tx.query<Delivery>(`SELECT o.* FROM outbox o WHERE o.state='pending' AND o.available_at<=$1
         AND NOT EXISTS (SELECT 1 FROM controls WHERE key='discord_global_after'
@@ -481,13 +481,13 @@ export class Store {
       AND NOT EXISTS (SELECT 1 FROM jobs WHERE state='waiting_user')`);
     return (await this.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler'")).rows[0]!.value;
   }
-  // options.review는 호출자가 "정책 owner가 알림 채널에서 보낸 명령"임을 확인했을 때만 true다(T17 리뷰 작업 제어).
+  // options.review는 호출자가 "정책 owner가 알림 채널에서 보낸 명령"임을 확인했을 때만 true다(리뷰 작업 제어).
   async control(actor: string, conversation: string, action: string, target?: string, cursor?: string,
     options: { review?: boolean } = {}): Promise<unknown> {
     if (action.startsWith('review-')) return this.atomic(store => store.reviewControlLocked(actor, action, target, options.review === true));
     return this.atomic(store => store.controlLocked(actor, conversation, action, target, cursor));
   }
-  // T17: 리뷰 작업은 대화가 없어 기존 대화 명령으로 재개·포기할 수 없다. 별도 명령과 별도 권한 검사로만 다룬다.
+  // 리뷰 작업은 대화가 없어 기존 대화 명령으로 재개·포기할 수 없다. 별도 명령과 별도 권한 검사로만 다룬다.
   private async reviewControlLocked(actor: string, action: string, target: string | undefined, allowed: boolean): Promise<unknown> {
     if (!allowed) return { ok: false, status: '리뷰 작업 제어는 owner가 알림 채널에서만 할 수 있습니다.' };
     if (action === 'review-status') {
