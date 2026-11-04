@@ -451,7 +451,6 @@ test('GitHubTransport 금지 요청: 토큰 발급도 전송도 하기 전에 �
     ['점 세그먼트 소유자', write({ path: '/repos/../fixture-repo/pulls/5/reviews' })],
     ['다른 호스트 모양', write({ path: `//evil.example/repos/${REPO.fullName}/pulls/5/reviews` })],
     ['쿼리 붙임', write({ path: `/repos/${REPO.fullName}/pulls/5/reviews?x=1` })],
-    ['허용 밖 저장소', write({ path: '/repos/fixture-org/not-allowed/pulls/5/reviews' })],
     ['본문 없음', { method: 'POST', path: `/repos/${REPO.fullName}/pulls/5/reviews` }],
   ];
   for (const [name, request] of bad) {
@@ -459,6 +458,10 @@ test('GitHubTransport 금지 요청: 토큰 발급도 전송도 하기 전에 �
     await assert.rejects(fake.io().transport(request as GitHubWrite), Denied, name);
     assert.deepEqual(fake.sent, [], name);
   }
+  // 정책 밖 저장소는 모양 검사를 지나 정책 조회에서 막힌다. 보내지 않고 403(재시도 없음)으로 올린다(아래 [PR #38 리뷰 P2]).
+  const outside = new Fake(() => json({ id: 1 }));
+  await rejectsWith(outside.io().transport(write({ path: '/repos/fixture-org/not-allowed/pulls/5/reviews' }) as GitHubWrite), 403);
+  assert.deepEqual(outside.sent, []);
   // RestrictedGitHub을 거치면 검토 SHA가 다른 요청도 막힌다.
   const fake = new Fake(() => json({ id: 1 }));
   await assert.rejects(new RestrictedGitHub(fake.io().transport).createReview(write(), { repository: REPO.fullName, pr: 5, head: BASE }), Denied);
@@ -504,6 +507,25 @@ test('GitHubTransport 실패 분류: 게시 전 실패는 다시 보낼 수 있�
   // 422·429·403 한도는 게시되지 않은 것이라 그대로 올린다.
   await rejectsWith(new Fake(() => json({}, 422)).io().transport(write()), 422);
   await rejectsWith(new Fake(() => json({}, 429)).io().transport(write()), 429);
+});
+
+test('GitHubTransport [PR #38 리뷰 P2]: 게시 직전 정책 조회 실패는 보내기 전 실패로 올린다(unknown으로 잃지 않음)', async () => {
+  // deliver는 transport 직전에 dispatched로 표시하고 그 뒤의 일반 예외를 unknown(재게시 없음)으로 본다.
+  // 정책 일시 불가·리뷰 꺼짐은 나중에 다시 보낼 수 있게 429, 정책에서 빠진 저장소는 보내지 않고 403(재시도 없음).
+  const cases: [string, () => never, number, number][] = [
+    ['정책 확인 불가', () => { throw new PolicyUnavailable(); }, 429, 60_000],
+    ['리뷰 꺼짐', () => { throw new ReviewDisabled(); }, 429, 60_000],
+    ['정책에서 빠진 저장소', () => { throw new Denied(); }, 403, 0],
+  ];
+  for (const [name, fail, status, retry] of cases) {
+    const fake = new Fake(() => json({ id: 1 }));
+    await assert.rejects(fake.io(async () => fail()).transport(write()), (error: unknown) => {
+      assert.ok(error instanceof GitHubError, name);
+      assert.deepEqual([error.status, error.retryAfterMs], [status, retry], name);
+      return true;
+    });
+    assert.deepEqual(fake.sent, [], name);
+  }
 });
 
 test('비밀 노출 없음: 키·JWT·토큰이 오류 문구·inspect에 나오지 않는다', async () => {

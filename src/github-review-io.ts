@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { Denied } from './contracts.js';
+import { Denied, PolicyUnavailable } from './contracts.js';
 import { GitHubApi, GitHubAppAuth, GitHubTokenError, assertAllowed } from './github-app.js';
 import type { BoundRepository, GitHubAppCredentials } from './github-app.js';
 import { GitHubError, restrictGitHubWrite } from './review.js';
@@ -131,7 +131,17 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
     const target = /^\/repos\/([^/]+\/[^/]+)\/pulls\/(\d+)\/reviews$/.exec(String(path));
     if (!target) throw new Denied();
     const write = restrictGitHubWrite(request, { repository: target[1]!, pr: Number(target[2]), head: request.body?.commit_id });
-    const repo = await repositories(target[1]!);
+    // deliver는 transport를 부르기 직전에 dispatched로 표시하고, 그 뒤의 예외를 응답 유실(unknown)로 본다.
+    // 정책 조회는 아무것도 보내기 전이라 그렇게 잃으면 안 된다(PR #38 리뷰). 일시 불가는 나중에 다시(429),
+    // 정책에서 빠진 저장소는 보내지 않고 막는다(403, 재시도 없음).
+    let repo: BoundRepository;
+    try {
+      repo = await repositories(target[1]!);
+    } catch (error) {
+      if (error instanceof PolicyUnavailable) throw new GitHubError(429, NOT_SENT_RETRY_MS);
+      if (error instanceof Denied) throw new GitHubError(403, 0);
+      throw error;
+    }
     try {
       return parse(ReviewCreated, await auth.withToken(repo, 'write', token => api.call('POST', write.path, token, write.body)));
     } catch (error) {
