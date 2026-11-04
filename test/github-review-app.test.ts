@@ -302,6 +302,21 @@ test('diffTrees: 이름 변경은 같은 blob만 짝짓고 gitlink·링크 종�
   assert.equal(result.truncated, false);
 });
 
+test('diffTrees [PR #38 리뷰 P2]: 같은 내용의 파일 40,000개 이동도 선형 시간에 짝짓는다(이벤트 루프를 막지 않음)', () => {
+  const count = 40_000;
+  const before = Array.from({ length: count }, (_, i) => blob(`old/${String(i).padStart(5, '0')}`, 'e'));
+  const after = Array.from({ length: count }, (_, i) => blob(`new/${String(i).padStart(5, '0')}`, 'e'));
+  const started = performance.now();
+  const result = diffTrees(tree(before), tree(after));
+  const elapsed = performance.now() - started;
+  // 수정 전 배열 복사·shift()는 이 크기에서 수십 초였다. 여유를 크게 두되 O(n²)는 걸러낸다.
+  assert.ok(elapsed < 3000, `diffTrees ${Math.round(elapsed)}ms`);
+  const renamed = result.files.filter(f => f.status === 'renamed');
+  assert.equal(renamed.length, Math.min(count, MAX_CHANGES));
+  assert.deepEqual([renamed[0]!.path, renamed[0]!.previousPath], ['new/00000', 'old/00000']);
+  assert.equal(result.truncated, count > MAX_CHANGES);
+});
+
 test('compare: 같은 tree면 tree를 받지 않고 빈 목록', async () => {
   const fake = new Fake(sent => json({ sha: sent.path.endsWith(BASE) ? BASE : HEAD, tree: { sha: BASE_TREE } }));
   assert.deepEqual(await fake.io().reader.compare(REPO.fullName, BASE, HEAD), { files: [], truncated: false });

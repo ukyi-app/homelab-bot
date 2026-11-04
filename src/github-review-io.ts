@@ -51,11 +51,21 @@ export function diffTrees(base: Pick<Tree, 'tree' | 'truncated'>, head: Pick<Tre
   }
   // 잘린 tree에 없는 경로는 정말 없는지 모른다. 반대쪽에만 보인다고 추가·삭제로 지어내지 않는다.
   const removed = head.truncated ? [] : [...remaining.values()].sort(byPath);
-  const sources = new Map<string, TreeEntry[]>();
-  for (const entry of removed) if (entry.type === 'blob') sources.set(renameKey(entry), [...sources.get(renameKey(entry)) ?? [], entry]);
+  // 같은 내용의 파일(빈 파일 등)이 수만 개여도 선형이어야 한다. 배열 복사·shift()는 O(n²)이라 이벤트 루프를 막는다(PR #38 리뷰).
+  const sources = new Map<string, { entries: TreeEntry[]; next: number }>();
+  for (const entry of removed) {
+    if (entry.type !== 'blob') continue;
+    const key = renameKey(entry);
+    const bucket = sources.get(key);
+    if (bucket) bucket.entries.push(entry); else sources.set(key, { entries: [entry], next: 0 });
+  }
+  const take = (key: string): TreeEntry | undefined => {
+    const bucket = sources.get(key);
+    return bucket && bucket.next < bucket.entries.length ? bucket.entries[bucket.next++] : undefined;
+  };
   const moved = new Set<string>();
   for (const after of base.truncated ? [] : added.sort(byPath)) {
-    const before = after.type === 'blob' ? sources.get(renameKey(after))?.shift() : undefined;
+    const before = after.type === 'blob' ? take(renameKey(after)) : undefined;
     if (before) moved.add(before.path);
     changes.push(describe(before ? 'renamed' : 'added', before, after, after.path));
   }
