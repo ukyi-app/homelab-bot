@@ -829,3 +829,75 @@ homelab T24 할 일 3이다. 원본은 사용자 결정(2026-11-03)으로 정했
 | BRIEF-01 (복원 검증 칸) | live / pass | owner가 11-03 14:32~14:35Z `homelab db restore-check --apply` → 통과. `database/pg`에 `restore-check-last`·`-pass` 기록(Database 1개, Cluster uid = 현재 `pg`), 임시 객체 0, Argo CD `cnpg-cluster` Synced 유지. 봇 판정 함수에 실제 annotation 값: 지금 → 통과, 101일 뒤 → 확인 필요(오래됨), 다른 uid → 미확인. 11-03 23:50Z 회차 백업 줄 끝 "복원 검증 통과 11-03 23:34 · CLI 기록 기준, 백업 성공과 별개" | 실패 기록·`--abort`·uid 불일치 표시는 CLI·봇 시험(mock)만. 100일 오래됨은 다음 분기 실행 전후로 다시 본다 |
 
 회차는 1건(`enqueued`), outbox `sent` attempt 1, Discord 메시지 ID 받음. 이 결과로 homelab T24를 완료로 바꿨다(2026-11-04, homelab spec §8.1). 표본은 칸마다 1건이다.
+
+## T18 작업 레인 격리 파드 실측 (2026-11-04, live)
+
+등급 `live`는 운영 NUC에서 한 실측이다. 환경은 k3s v1.36.5+k3s1, containerd 2.3.4-k3s1.36, Ubuntu 26.04.1, 커널 7.0, `kernel.apparmor_restrict_unprivileged_userns=1`이다. 시각은 UTC다. 시험 자원(임시 네임스페이스·파드, 호스트 프로필, 시험 이미지)은 Git 밖에서 만들었고, 클러스터 자원은 시험마다 지웠다(homelab approvals 2026-11-04 줄). 무엇을 재는지는 [DECISIONS](DECISIONS.md) "T18 결정 (Claude 실행기 기준)" (2)이고, 결과에 따른 정리는 같은 문서 "(2) 파드 실측 결과와 대가 수용"이다.
+
+### 1. 기본 보안 설정에서는 bwrap이 돌지 않는다 (13:15~13:30Z, 토큰 없음)
+
+Ubuntu 시험 이미지에 bubblewrap 0.11.1을 넣고 uid 10001·capability 없음·`no_new_privs`로 내려 `bwrap --unshare-user --unshare-pid --proc /proc` 계열을 돌렸다.
+
+| 변형 | hostUsers / procMount | seccomp / AppArmor | 결과 |
+|---|---|---|---|
+| v0 지금 worker | 기본 / 기본 | RuntimeDefault / containerd 기본 | namespace 생성 실패 |
+| v1 목표 | false / Unmasked | RuntimeDefault / containerd 기본 | namespace 생성 실패 |
+| v2 진단 | false / Unmasked | Unconfined / containerd 기본 | `Failed to make / slave: Permission denied` |
+| v3 진단 | false / Unmasked | RuntimeDefault / Unconfined | namespace 생성 실패 |
+| v4 진단 | false / Unmasked | Unconfined / Unconfined | 성공. 새 `/proc` 안 가짜 env 0건(bwrap 밖 1건) |
+| v5 진단 | false / Unmasked | RuntimeDefault + spec `SYS_ADMIN` / Unconfined | `pivot_root: Operation not permitted` |
+
+- 막는 층은 둘이다. containerd 기본 seccomp는 `CAP_SYS_ADMIN` 없이 namespace 생성을 막고, `pivot_root`는 SYS_ADMIN이 있어도 허용 목록에 없다. containerd 기본 AppArmor는 `deny mount`다(containerd v2.3.4 `contrib/seccomp/seccomp_default.go`·`contrib/apparmor/template.go`).
+- 사용자 namespace와 `procMount: Unmasked` 자체는 이 노드에서 정상 적용됐다.
+- 호스트 Ubuntu 프로필 `bwrap`(`/etc/apparmor.d/bwrap-userns-restrict`)이 컨테이너 안 `/usr/bin/bwrap`에도 경로로 붙어 userns·mount를 허용한다. 그 자식은 `unpriv_bwrap`(capability 거부)이다.
+
+### 2. 전용 Localhost 프로필 (13:55~14:13Z, 토큰 없음)
+
+containerd v2.3.4의 기본값(빈 capability 집합)을 Go로 뽑아 출발점으로 썼다.
+
+- **seccomp:** 기본 + `clone`·`unshare`·`mount`·`umount2`·`pivot_root`·`sethostname`. `clone3`는 기본(ENOSYS) 유지.
+- **AppArmor:** `deny mount`를 빼고 bwrap 0.12.0이 하는 mount만 연다. bind·rbind·전파 변경(rslave·rprivate)은 정확한 옵션 집합으로, remount는 `remount` 규칙으로, 새 mount는 tmpfs·proc·devpts fstype으로만 연다. `/proc/sys/user/max_user_namespaces` 쓰기는 deny를 나눠 그 파일만 연다(bwrap `--disable-userns`). 겹친 라벨용 signal·ptrace peer 규칙을 둔다.
+- **설치:** 사람이 sudo로 seccomp JSON을 kubelet seccomp 디렉터리(`/var/lib/kubelet/seccomp/homelab/`)에 두고 AppArmor는 커널에만 적재했다. 파드는 `seccompProfile: Localhost`·`appArmorProfile: Localhost`로 고른다.
+
+**실제 worker 모양에서의 결과.** 운영 worker 이미지에 Debian trixie `bubblewrap 0.12.0`·`socat 1.8.0.3`만 더한 시험 이미지를 썼다. init 방화벽(root + NET_ADMIN, RuntimeDefault 유지), PVC(local-path), Secret 볼륨(가짜 값, 0440·fsGroup 10001), 읽기 전용 루트, uid 10001, capability 0, `no_new_privs`를 그대로 두고 `hostUsers: false`를 더했다. worker 컨테이너에만 `procMount: Unmasked`와 Localhost 두 프로필을 걸었다.
+
+| 확인 | 결과 |
+|---|---|
+| init 방화벽(`hostUsers: false`) | iptables·ip6tables 규칙 적용, 직접 연결 거부 |
+| Secret·PVC(idmap 마운트) | uid 10001이 Secret을 읽고 PVC에 씀 |
+| `claude --version` | `2.1.308 (Claude Code)` |
+| Claude 주 경로 근사(`--unshare-user/pid/net`, `--disable-userns`) | 성공, 가짜 env 0건, 중첩 userns 거부 |
+| Claude 다른 경로 근사(ipc·uts·cgroup·`--hostname`) | 성공, 가짜 env 0건 |
+| bwrap `--unshare-net` 너머 socat 유닉스 소켓 중계 | 중계 성공, 샌드박스 안 직접 loopback은 실패 |
+| 샌드박스 안 자격 디렉터리 | `--ro-bind / /`만으로는 **읽힘**. 가리면 안 보임 |
+| 컨테이너 안 kill(자식, bwrap, 샌드박스 안 프로세스) | 성공, 남은 프로세스 0 |
+| 막아야 할 mount(overlay, mqueue) | 전용 AppArmor가 거부 |
+| bwrap 밖 `unshare -Ur` | uid_map 쓰기 실패(Ubuntu `unprivileged_userns`). 쓸 수 있는 namespace는 `/usr/bin/bwrap`으로만 만들어진다 |
+
+**함정.**
+
+- **겹친 라벨:** 이 호스트의 userns 파드는 runc의 프로필 전환이 unconfined와의 stack으로 바뀌어 라벨이 `<프로필>//&unconfined`가 된다. peer 규칙은 겹친 라벨 문자열 전체와 맞춰 보므로, `peer=<프로필>`이나 `peer=*<프로필>*`(`*`는 `/`를 넘지 못함)로는 같은 컨테이너 안 kill·ptrace도 거부됐다. `peer=**<프로필>**`로 풀었다. RuntimeDefault + `hostUsers: false` 조합도 컨테이너 안 kill이 막힐 가능성이 크다(미측정).
+- **부분집합 일치:** AppArmor `mount options in (...)`은 부분집합 일치라, fstype을 정하지 않은 규칙에 쓰면 아무 fs의 rw mount(mqueue)도 받았다. bind·전파는 `options=(...)`로 정확히 쓴다.
+
+### 3. 진짜 토큰 + Claude CLI 2.1.308 (14:49~14:55Z, 사용자 승인)
+
+sandbox ns에 임시 파드 하나를 띄웠다. 프록시 NetworkPolicy가 `app=worker`만 받아 그 라벨을 달았고, readiness를 늘 실패하게 해 worker Service 엔드포인트에서 `ready=false`로 빠진 것을 확인했다. 운영 Secret `worker-credential-claude-subscription`, 위 2절의 파드 모양, `claude-opus-5-5`를 썼다. 모델에게는 `sh check.sh` 하나만 허용했고(`--allowedTools "Bash(sh check.sh)"`), 검사 출력은 개수와 단어뿐이다. 로그에 토큰이 없는 것(전체·끝 8자·`sk-ant` 모두 없음)을 확인한 뒤 열람했다.
+
+| 실행 | 설정 | Bash env 토큰 | `/proc/*/environ` 토큰 | 자격 파일 | 미끼(Bash) | 중첩 userns | 직접 네트워크 |
+|---|---|---|---|---|---|---|---|
+| R1 대조군 | scrub·샌드박스 끔 | 0 | **1** | **읽힘** | 읽힘 | 허용 | 막힘 |
+| R2 | scrub=1 + 샌드박스 | 실행 실패: `apply-seccomp: write /proc/self/setgroups (nested userns is capability-restricted; caller must provide CAP_SYS_ADMIN)` ||||||
+| R2b | R2 + `network.allowAllUnixSockets: true` | 0 | **0** | 가려짐 | 가려짐 | 거부 | 막힘 |
+| R3 | scrub + 샌드박스, Read 도구로 미끼 | `READ_DENIED` ||||||
+
+R2·R2b·R3의 `--settings`는 `sandbox.enabled`, `failIfUnavailable: true`, `allowUnsandboxedCommands: false`, `filesystem.denyRead`(자격 디렉터리·미끼), `permissions.deny`의 `Read(//run/worker-credential/**)`·`Read(//tmp/decoy/**)`다.
+
+- **R1:** 2.1.308은 scrub이 없어도 Bash env에 토큰 변수를 넣지 않았다. 그러나 같은 uid의 `/proc/<claude pid>/environ`으로 1건 보였고 자격 파일도 읽혔다. 대조군이 노출을 잡으므로 R2b의 0건은 검사 실패가 아니라 차단이다.
+- **R2:** Claude는 유닉스 소켓 차단용 seccomp 도우미(`apply-seccomp`, CLI 내장)를 샌드박스 안에서 돌린다. 이 도우미가 만드는 중첩 userns가 Ubuntu `unpriv_bwrap`(capability 거부)에 막혔다.
+- **R2b:** `allowAllUnixSockets: true`면 도우미 대신 `bwrap --disable-userns`로 중첩 userns를 막는다. 샌드박스 라벨은 `bwrap//&<프로필>//&unpriv_bwrap`이었다.
+- **R3:** `Read(...)` deny가 Read 도구를 막았다. 진짜 자격 경로는 Read로 시험하지 않았다.
+
+### T18 남은 것
+
+- 운영 반영: 호스트 프로필 설치·재부팅 유지(homelab `host/`), 봇 이미지에 bubblewrap·socat, 작업 레인 실행 설정(scrub, 샌드박스, `denyRead`, Read deny, `--allowedTools`), 작업 레인 파드(`hostUsers: false`, Localhost 프로필). 순서는 호스트 프로필이 먼저다. 노드에 없는 프로필을 참조하면 파드가 뜨지 않는다.
+- 이 절의 R2b 조합을 운영 작업 레인에서 다시 확인한다(SEC-02 작업 레인 사례).

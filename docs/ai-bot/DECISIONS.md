@@ -560,6 +560,23 @@ Workflows 권한이 없으므로 **봇은 `.github/workflows` 변경 PR을 만�
 | (4) 작업별 세션 저장 공간 | **α′.** 작업마다 따로 `CLAUDE_CONFIG_DIR`을 두고, 같은 작업의 턴 사이에는 유지하며, 작업이 끝나면 지운다. 같은 작업의 턴은 직렬로 돈다. 자격 되쓰기 문제는 env-static이라 없다. 다른 작업 디렉터리 읽기는 샌드박스 `filesystem.denyRead`와 파일 도구 가두기로 막는다. 리뷰 레인은 대화처럼 실행마다 빈 임시 공간을 쓰고 세션을 남기지 않는다 |
 | T17 진입 조건(인증 격리·SEC-02) | **무도구 경계로 갈음.** 리뷰 레인은 도구 0개·MCP·hooks·skills 없음으로 돌아 셸이 없다. 그래서 토큰을 읽을 비신뢰 프로세스가 없다. 리뷰에는 V1_PLAN T17 행의 "인증 파일 격리를 정하고 그 SEC-02 사례가 통과한 뒤" 조건 대신 다음 무도구 경계 시험을 둔다. 가짜 CLI·가짜 자격으로 모델 호출 전에 보인다. (a) 실행 중 도구 호출이 보이면 즉시 중단 (b) MCP·hooks·skills 0개 (c) 출력 반사 검사 (d) 작업자 egress 제한 (e) 실행별 임시 공간 삭제와 실패 시 차단. T18 작업 레인에는 원래 조건(위 (2))이 그대로 걸린다 |
 
+### (2) 파드 실측 결과와 대가 수용 (사용자 2026-11-04)
+
+위 (2)의 "파드 실측 먼저"를 2026-11-04 운영 NUC에서 쟀다. 근거는 [VERIFICATION](VERIFICATION.md) "T18 작업 레인 격리 파드 실측"이다.
+
+- **결과.** 기본 보안 설정(RuntimeDefault seccomp + containerd 기본 AppArmor)에서는 bwrap이 돌지 않는다. 전용 Localhost seccomp·AppArmor 프로필로는 약한 모드(`enableWeakerNestedSandbox`) 없이 돈다. 진짜 토큰 시험에서 샌드박스 Bash의 env·`/proc/*/environ` 토큰 0건, 자격 파일 가려짐, 중첩 userns 거부가 나왔다. 대조군에서는 `/proc`로 1건이 보였다. 그래서 (2)의 "실측이 실패하거나 약한 모드만 되면 (d)" 조건에 걸리지 않는다. 작업 레인은 (d)로 바꾸지 않고 아래 조합으로 연다(운영 반영 뒤).
+- **고른 과정.** 기본 설정이 실패한 뒤 세 길을 비교했다: (가) 파드 seccomp·AppArmor를 둘 다 Unconfined로 연다, (나) 전용 Localhost 프로필, (다) (d)로 전환. 독립 리뷰(Codex)는 (다)를 추천했다. 단일 노드의 호스트 공격면과 (나)의 검증·유지 비용이 이유였다. 사용자는 리뷰를 본 뒤 (나)를 골랐고(2026-11-04), 실측이 통과한 뒤 아래 대가를 받아들였다(2026-11-04). (가)는 쓰지 않는다.
+- **작업 레인 조합.**
+  - 파드: `hostUsers: false`. worker 컨테이너만 `procMount: Unmasked`, `seccompProfile`·`appArmorProfile`은 `Localhost`. init 방화벽은 RuntimeDefault다. uid 10001·capability 없음·`no_new_privs`·읽기 전용 루트는 지금 그대로다.
+  - 호스트: containerd 기본에서 만든 전용 seccomp(+ `clone`·`unshare`·`mount`·`umount2`·`pivot_root`·`sethostname`)·AppArmor(bwrap 0.12.0이 하는 mount만, 겹친 라벨 peer 규칙, `max_user_namespaces` 쓰기 예외)를 사람이 설치한다(homelab `host/`).
+  - 이미지: `bubblewrap`(`/usr/bin/bwrap`)·`socat`을 Debian 패키지로 넣고 버전을 고정한다.
+  - 실행: `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`, `--settings`로 `sandbox.enabled`·`failIfUnavailable: true`·`allowUnsandboxedCommands: false`·`network.allowAllUnixSockets: true`·`filesystem.denyRead`(자격 디렉터리, 다른 작업의 세션), `permissions.deny`의 `Read(//<자격 디렉터리>/**)`, `--allowedTools` 명시.
+- **받아들인 대가(사용자 2026-11-04).**
+  - **유닉스 소켓 차단 없음.** Claude의 소켓 차단 도우미(`apply-seccomp`)가 Ubuntu의 `unpriv_bwrap` 제한과 충돌해 `allowAllUnixSockets: true`로 끈다. 샌드박스 안 명령이 파일 경로로 보이는 유닉스 소켓에 연결할 수 있다. 지금 파드에는 Claude 자신의 중계 소켓 말고 소켓 서비스가 없다. 이미지나 파드에 소켓을 여는 것을 더하면 다시 본다.
+  - **Ubuntu 프로필 의존.** bwrap이 namespace를 만들 수 있는 것은 호스트 Ubuntu의 `bwrap` 프로필이 `/usr/bin/bwrap`에 경로로 붙어서다. bwrap 경로를 바꾸거나 호스트에서 그 프로필이 빠지면 다시 잰다.
+  - **호스트 프로필 유지.** 전용 프로필은 containerd 기본의 복사본이라 upstream 수정이 저절로 들어오지 않는다. k3s·containerd·Ubuntu·bubblewrap·Claude CLI를 올릴 때마다 다시 생성하고 실측한다.
+- **남은 일.** 운영 반영(호스트 → 이미지 → 작업 레인 설정 → 작업 레인 파드)과, 운영 작업 레인에서 같은 조합으로 SEC-02 작업 레인 사례를 다시 확인하는 것.
+
 ## T20 기억·삭제 원장·브리핑 (로컬·mock, 2026-10-29)
 
 **상태:** 삭제 원장 위치는 정함(아래, 사용자 2026-11-02). 나머지는 T20 구현 선택이고 사용자 결정이 아니다. 코드는 `src/memory.ts`, `src/deletion-ledger.ts`, `src/ledger-lock.ts`, `src/briefing.ts`, `migrations/010_memory_briefing.sql`·`012_deletion_ledger_generation.sql`, 시험은 `test/memory-briefing.test.ts`, `test/deletion-ledger.test.ts`, `test/deletion-ledger-pg.test.ts`다. 실제 SSD·Discord는 쓰지 않았다.
