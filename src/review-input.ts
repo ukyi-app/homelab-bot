@@ -4,7 +4,7 @@ import { DEFAULTS, Denied, WorkerRejected } from './contracts.js';
 import { archiveContract, CancelRequestSchema, ExecutionSlot, REPOSITORY_NAME } from './worker.js';
 import type { CancelRequest, WorkerVerifier } from './worker.js';
 
-// 리뷰 작업자 쪽: base·head 압축본 두 개로 diff를 만들고 리뷰 모델(지금은 fake)을 부른다.
+// 리뷰 작업자 쪽: base·head 압축본 두 개로 diff를 만들고 리뷰 모델을 부른다.
 // 작업자에는 GitHub 자격이 없고(D-15), 변경 목록은 게시 서버가 API로 열거해 넘긴다(ARCHITECTURE §6).
 export const InputLimitsSchema = z.strictObject({
   maxFiles: z.number().int().positive().max(1000), maxFileBytes: z.number().int().positive().max(2_000_000),

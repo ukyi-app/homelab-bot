@@ -23,8 +23,7 @@ async function queued() { await f.ingress.receive(event('chat')); f.advance(DEFA
 const logs: { event: string; detail?: Record<string, unknown> }[] = [];
 function runtime(shutdown?: AbortController, drainMs = 50) {
   logs.length = 0;
-  // log는 수정 전 RuntimeOptions에 없다. 리터럴 초과 속성 검사를 피해 수정 전 코드에서도 컴파일되게 한다.
-  const options: RuntimeOptions = { shutdown: shutdown?.signal, drainMs, ...{ log: (e: string, d?: Record<string, unknown>) => { logs.push({ event: e, detail: d }); } } };
+  const options: RuntimeOptions = { shutdown: shutdown?.signal, drainMs, log: (e: string, d?: Record<string, unknown>) => { logs.push({ event: e, detail: d }); } };
   return new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, undefined, options);
 }
 function holding() {

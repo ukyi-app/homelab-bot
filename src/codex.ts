@@ -20,7 +20,7 @@ import type { Store } from './store.js';
 export const CODEX_CAPABILITIES = Object.freeze({
   version: '0.163.0', adapter: 'exec',
   start_task: true,
-  // R08 연결 방식은 사용자 결정 대기다. false로 정한 것이 아니다(DECISIONS "R08").
+  // R08 연결 방식은 읽기 전용 알림으로 정했다(DECISIONS "T18 결정" (1)). 연결이 구현되지 않아 attach는 이 값으로 거부한다.
   attach_task: 'undecided',
   read_status: true, read_events: true, read_final_result: true,
   answer_question: 'clarification_only',

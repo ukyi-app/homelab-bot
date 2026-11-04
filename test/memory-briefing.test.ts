@@ -68,7 +68,7 @@ beforeEach(async () => {
 afterEach(async () => { await closeLedgers(); await rm(dir, { recursive: true, force: true }); });
 after(async () => { await database.pg.close(); });
 async function rows(table: string, db = database.db) { return (await db.query<Record<string, any>>(`SELECT * FROM ${table}`)).rows; }
-// 정책 원본 확인 시각도 함께 옮긴다(5분 초과면 닫힌다).
+// 정책 원본 확인 시각도 함께 옮긴다. 시계를 되돌리면 확인 시각이 미래가 돼 정책이 닫힌다(src/policy.ts).
 function at(ts: number) { f.advance(ts - f.now()); f.policy.confirmedAt = f.now(); }
 const doc = (name: string) => ({ type: 'document' as const, uri: `repo://allowed/${name}`, revision: 'fixture-rev' });
 const config = (statement: string, extra: Partial<MemoryInput> = {}): MemoryInput => ({ kind: 'configuration', statement,
