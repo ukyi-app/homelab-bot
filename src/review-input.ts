@@ -57,9 +57,14 @@ export const ReviewTaskSchema = z.strictObject({
 });
 export type ReviewTask = z.infer<typeof ReviewTaskSchema>;
 export interface ReviewFile { path: string; status: Change['status']; patch: string; rightLines: number[] }
+// 모델에 알리는 제외 파일 수의 상한. 목록 전체(최대 5000)를 넣으면 입력 예산을 잡아먹는다. 넘으면 omittedTotal로 수만 알린다.
+export const MODEL_OMITTED_MAX = 200;
 export interface ReviewerInput {
   instructions: string; guidelines: string | null;
-  untrusted: { pullRequest: { title: string; body: string }; files: ReviewFile[] };
+  // omitted: 이 PR이 바꿨지만 내용을 싣지 않은 파일(경로는 PR이 정한 비신뢰 자료). 없으면 모델이 참조된 파일을
+  // "PR에 없다"고 오판한다(2026-11-04 실리뷰 오탐). limitsHit: 변경 목록·본문·지침이 잘린 이유.
+  untrusted: { pullRequest: { title: string; body: string }; files: ReviewFile[];
+    omitted: { path: string; reason: typeof OMIT_REASONS[number] }[]; omittedTotal: number; limitsHit: string[] };
 }
 // unknown: 모델 프로세스가 멈췄는지 확인하지 못했다. 실패로 뭉개면 슬롯이 풀려 살아 있는 프로세스 옆에서 다음 작업이 돈다.
 export type ReviewerResult =
@@ -383,7 +388,9 @@ export class ReviewWorker {
       const body = task.pullRequest.body.slice(0, task.limits.maxBodyChars);
       if (body.length < task.pullRequest.body.length) coverage.limits_hit.push('body_truncated');
       const result = await this.model({ instructions: REVIEW_INSTRUCTIONS, guidelines: guidelines || null,
-        untrusted: { pullRequest: { title: task.pullRequest.title, body }, files } }, signal,
+        untrusted: { pullRequest: { title: task.pullRequest.title, body }, files,
+          omitted: coverage.omitted_files_with_reasons.slice(0, MODEL_OMITTED_MAX).map(({ path, reason }) => ({ path, reason })),
+          omittedTotal: coverage.omitted_files_with_reasons.length, limitsHit: [...coverage.limits_hit] } }, signal,
       { job: task.job, timeoutMs: Math.max(1, task.timeoutMs - (Date.now() - started)) });
       if (result.status === 'unknown') { stopped = false; return { status: 'unknown', stopped: false }; }
       if (result.status !== 'succeeded') return { status: result.status, stopped: true, ...(result.reason ? { reason: result.reason } : {}) };

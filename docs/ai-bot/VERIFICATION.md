@@ -246,7 +246,7 @@ slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG �
 - (2026-11-04 해소) `RUNTIME_POLICIES` review 절: 기록했다(값의 출처는 DECISIONS "T17 결정"과 같은 날 사용자 승인. 실제 ID·내부 표식은 Infisical에만). `reviewSince`는 켜는 시각이다.
 - 실제 모델 품질 평가(REVIEW-01): 5건(아래 "실제 모델 품질")이다. 표본 확대가 남았다.
 - 반례·복구 시험(실연동): A 묶음(댓글 명령, 닫기·다시 열기, draft, 실행 중 head 이동, base 바꾸기, 공개 범위 차단, partial)은 2026-11-04에 했다(아래 "반례·복구 시험 A 묶음"). B 묶음(Renovate PR, 허용 밖 작성자·fork, Bot 댓글 무시의 실례, webhook 재전송, 한도·인증 대기와 제어 명령, 게시 응답 유실 대조)이 남았고 사람 준비(Renovate 설치 확대, 다른 계정, 재전송)가 필요하다.
-- 제외 파일이 모델 입력에 없다: `ReviewerInput.untrusted`에는 검토한 파일만 들어가고 `coverage.omitted_files_with_reasons`는 모델에 가지 않는다. 그래서 바이너리를 참조하는 코드에 "파일이 PR에 없다"는 오탐이 났다(A7). 제외 파일 이름과 이유를 비신뢰 자료로 함께 넘기고 지침에 "제외 파일은 PR에 있으나 보지 못한 것"이라고 적는 수정이 후속이다.
+- (2026-11-04 고침) 제외 파일이 모델 입력에 없었다: `ReviewerInput.untrusted`에 검토한 파일만 들어가 바이너리를 참조하는 코드에 "파일이 PR에 없다"는 오탐이 났다(A7). 이제 작업자가 `omitted`(경로·이유, 최대 `MODEL_OMITTED_MAX` 200개), `omittedTotal`, `limitsHit`를 비신뢰 자료로 넘기고, 프롬프트 고정 문장(`REVIEW_OMITTED_NOTE`)이 "PR에 있지만 내용을 싣지 않은 파일이니 없다고 판단하거나 추측해 지적하지 않는다"고 알린다. 게시 서버와 같아야 하는 `REVIEW_INSTRUCTIONS`와 세대 revision은 그대로다. 실리뷰 재확인은 작업자 이미지를 바꾼 뒤 한다.
 - 다시 연 PR의 세대 기록: 닫을 때 `superseded(pr_closed)`가 된 세대는 같은 세대로 다시 열려도(`duplicate_generation`) 기록이 그대로다. 이미 게시된 리뷰는 유효하고 재게시·재실행에는 영향이 없다(기록 표시만 어긋남).
 - (2026-11-04 확인) 실제 Claude CLI init의 `skills`·`plugins` 빈 배열: `skills`는 비어 있었고, `plugins`에 내장 플러그인 2개가 있어 첫 실리뷰가 `policy_violation`으로 막혔다. 리뷰 레인 `--settings`로 끄도록 고쳤다(아래 "첫 실리뷰 시도").
 - `homelab-smoke`의 Codex 자동 리뷰 끄기(DECISIONS "T17 결정"의 사람 작업): 사람이 껐다(2026-11-04, homelab `approvals.md` 15:08 행). 첫 시험 PR #11에 Codex 자동 리뷰가 달리지 않아 꺼진 것을 확인했다(2026-11-04 18:13).

@@ -9,7 +9,7 @@ import { readFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { DEFAULTS, Denied, WorkerRejected } from '../src/contracts.js';
 import type { Scope } from '../src/contracts.js';
-import { ArchiveError, readArchive, REVIEW_INSTRUCTIONS, ReviewWorker, unifiedDiff } from '../src/review-input.js';
+import { ArchiveError, MODEL_OMITTED_MAX, readArchive, REVIEW_INSTRUCTIONS, ReviewWorker, unifiedDiff } from '../src/review-input.js';
 import type { ArchiveFetcher, ReviewerInput, ReviewerModel, ReviewTask } from '../src/review-input.js';
 import { GitHubError, GitHubIngress, githubWebhook, RestrictedGitHub, restrictGitHubWrite, ReviewPolicySource,
   ReviewPublisher, ReviewQueue, ReviewReconciler, ReviewRuntime, reviewMarker } from '../src/review.js';
@@ -535,6 +535,33 @@ test('REVIEW-03 파일 수·diff 상한·바이너리·큰 잠금 파일·submod
   assert.ok(result.coverage.limits_hit.includes('file_limit'));
   assert.match(r.gh.writes[0]!.body.body, /부분 검토/);
   assert.match(r.gh.writes[0]!.body.body, /미검토 `vendor\/lib`: submodule_pointer/);
+  // 모델도 제외 파일과 이유를 받는다. 없으면 참조된 파일을 "PR에 없다"고 오판한다(2026-11-04 실리뷰 오탐).
+  const sent = r.inputs.at(-1)!.untrusted;
+  assert.deepEqual(sent.omitted, result.coverage.omitted_files_with_reasons);
+  assert.equal(sent.omittedTotal, result.coverage.omitted_files_with_reasons.length);
+  assert.ok(sent.limitsHit.includes('file_limit'));
+  assert.ok(!sent.files.some(f => sent.omitted.some(o => o.path === f.path)));
+});
+test('REVIEW-03 모델에 넘기는 제외 목록은 상한까지만 싣고 전체 수는 따로 준다', async () => {
+  const base: Record<string, ArchiveFile> = { 'AGENTS.md': '기준\n' };
+  const head: Record<string, ArchiveFile> = { 'AGENTS.md': '기준\n' };
+  const changes: { path: string }[] = [];
+  for (let i = 0; i < 250; i++) {
+    const path = `zz/f${String(i).padStart(3, '0')}.ts`;
+    base[path] = `${i}\n`; head[path] = `${i}!\n`; changes.push({ path });
+  }
+  r.archives.set(BASE, tarGz(base)); r.archives.set(HEAD, tarGz(head));
+  r.gh.compareResult = { truncated: false, files: changes.map(c => ({ ...c, previousPath: null, status: 'modified', baseType: 'blob', headType: 'blob' })) };
+  // 기본 답은 이 PR에 없는 src/app.ts를 지적해 결과 검증에서 걸린다. 지적 없는 답을 쓴다.
+  r.reply({ status: 'succeeded', output: { findings: [], open_questions: [], public_summary: '일부만 검토했습니다.' } });
+  await fullReview();
+  const result = (await reviewJobs())[0]!.result as ReviewResult;
+  const sent = r.inputs.at(-1)!.untrusted;
+  // 정책 maxFiles 20이라 230개가 file_limit로 빠진다. 모델에는 앞 200개만 가고 수는 230이다.
+  assert.equal(result.coverage.omitted_files_with_reasons.length, 230);
+  assert.equal(sent.omittedTotal, 230);
+  assert.equal(sent.omitted.length, MODEL_OMITTED_MAX);
+  assert.deepEqual(sent.omitted, result.coverage.omitted_files_with_reasons.slice(0, MODEL_OMITTED_MAX));
 });
 test('REVIEW-03 submodule 포인터만 바뀐 PR은 완전 검토로 표시하지 않는다', async () => {
   r.archives.set(HEAD, r.archives.get(BASE)!);
