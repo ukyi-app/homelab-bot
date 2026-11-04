@@ -236,9 +236,25 @@ slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG �
 | fixture Renovate 의존성 갱신 / 시험용 SHA | 정상 버전 갱신, 본문에 릴리스 노트 지시 | 0 | 0 | 0 | 0 | `package-lock.json` large_lockfile(partial) | fake 1회, 시간 not_run |
 | fixture noisy / 시험용 SHA | 정상, fake가 근거 없는 지적 1건 | 0 | 1 | 0 | 0 | 없음(completed) | fake 1회, 시간 not_run |
 
+### T17 완료 판정 (2026-11-04, 사용자 확인)
+
+homelab T17 티켓의 완료 조건 7개를 아래 기록과 대조했다.
+
+| 완료 조건 | 근거 |
+|---|---|
+| 배정 시험(REVIEW-01~05, SEC-01·02, DATA-01, EVENT-02, PR 경로 AUTH-01·EVENT-01·EVENT-03) 결과, fail 없음 | 2026-10-29 표(로컬·mock pass)와 아래 "T17 실가동 구현"의 실연동 행. fail 0 |
+| 보안 경계 시험(AUTH-01, SEC-01·02, DATA-01, REVIEW-04) 최소 mock·local_integration pass | 2026-10-29 표. 실연동: `MEMBER`·허용 봇 통과, `CONTRIBUTOR`·fork 차단, 공개 범위 차단(`restricted`), COMMENT만 게시 |
+| D-16 작성자 사례 | 실연동: `MEMBER` 통과, `CONTRIBUTOR` 차단(17:33), 허용 봇 ID 통과(Renovate #16), fork 차단(#15). 로컬: `NONE`·`FIRST_TIME_CONTRIBUTOR`·허용 밖 봇 ID 차단, Bot 댓글 무시 |
+| 의존성 갱신 PR 리뷰 1건 이상 | Renovate `homelab-smoke` #16 |
+| `04` §6 품질 표 | 아래 "실제 모델 품질" 8건 |
+| Codex 자동 리뷰 끔, Connector 범위에 `homelab-bot-ops` 없음 | Connector는 선택 저장소 4개(`homelab`, `homelab-app-template`, `files`, `homelab-bot`)에만 설치(GitHub 설정 화면 확인, 2026-11-04). `homelab-smoke`에도 없어 시험 PR에 Codex 리뷰가 오지 않았다 |
+| HANDOFF | private 운영 저장소 `handoffs/pr-review.md` |
+
+운영에서 만들지 않은 사례(허용 밖 사람 작성자·댓글, 실행 중 비상 중지, Bot 댓글 실례, 한도·인증 대기·게시 응답 유실 대조)는 로컬 증거로 두고 T21이 다시 본다(사용자 결정). 시범 P-2는 `homelab-smoke`만 계속하고 대상을 늘릴 때마다 사람이 승인한다.
+
 ### T17 남은 것
 
-- (r2에서 해소) 리뷰 작업의 `waiting_user` 해제: `Store.control`에 리뷰 전용 명령(`review-status`·`review-resume`·`review-cancel`)과 별도 권한 검사(현재 정책 owner가 알림 채널에서 보낸 명령)를 추가했다. 명령 등록은 리뷰가 열려 있을 때만 한다(2026-11-04 해소, #41). 실연동 확인은 아직이다.
+- (r2에서 해소) 리뷰 작업의 `waiting_user` 해제: `Store.control`에 리뷰 전용 명령(`review-status`·`review-resume`·`review-cancel`)과 별도 권한 검사(현재 정책 owner가 알림 채널에서 보낸 명령)를 추가했다. 명령 등록은 리뷰가 열려 있을 때만 한다(2026-11-04 해소, #41). `review-status`는 실연동에서 확인했다(B 묶음). `review-resume`·`review-cancel`의 실연동은 한도·인증 대기가 있어야 해서 not_run이다.
 - (2026-11-04 해소, #38·#41) 실제 GitHub 리뷰 App 경로: 설치 토큰 발급과 REST 어댑터(#38), 게시 서버 조립과 `pull_request`·`issue_comment` 수신 연결(#41). 실제 GitHub 이벤트 수신은 ping·installation 배달까지만 봤다(아래 "T17 실가동 구현").
 - (2026-11-04 해소, #40·#42·#43·#44) 실제 작업자 프로세스: 리뷰 레인(#40), 작업자 서버 통합(#42), codeload 다운로더(#43·#44). 구현은 끝났다. 실제 codeload 받기는 아래 "배포 경계 확인"에서 확인했고, 실제 모델 호출은 0회다.
 - HANDOFF는 private 운영 저장소 몫이다(D-13). 이번 반환 보고가 그 원문이다.
