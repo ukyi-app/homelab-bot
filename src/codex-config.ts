@@ -58,7 +58,7 @@ export function codexConfig(paths: CodexPaths, sandbox: SandboxMode = 'workspace
   return {
     sandbox_mode: sandbox, approval_policy: 'never',
     sandbox_workspace_write: { network_access: false },
-    // 기본값은 KEY·SECRET·TOKEN 이름 변수까지 모델이 띄우는 명령에 넘긴다 [확인: config-advanced, 2026-10-18].
+    // 기본값은 KEY·SECRET·TOKEN 이름 변수까지 모델이 띄우는 명령에 넘긴다 [확인: config-advanced].
     // inherit=none이면 exclude는 쓰이지 않지만, 누가 inherit을 바꿔도 이름 필터가 남게 둔다.
     shell_environment_policy: { inherit: 'none', ignore_default_excludes: false,
       exclude: ['*KEY*', '*SECRET*', '*TOKEN*', '*PASSWORD*', '*CREDENTIAL*', '*AUTH*', 'CODEX_*', 'OPENAI_*', 'GITHUB_*', 'DISCORD_*', 'KUBECONFIG', 'SSH_AUTH_SOCK'],

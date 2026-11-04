@@ -63,7 +63,7 @@ export async function appliedMigrations(db: Database): Promise<Set<number>> {
   return new Set((await db.query<{ version: number }>('SELECT version FROM schema_migrations')).rows.map(r => Number(r.version)));
 }
 // 차트의 마이그레이션 Job은 매 sync마다 돈다(D-22). 적용된 버전은 건너뛴다. 006처럼 데이터를 바꾸는 파일이
-// 다시 돌면 그 순간 대기 중인 전달을 막는다(T16b 위험 5). 반환값은 이번에 적용한 버전이다.
+// 다시 돌면 그 순간 대기 중인 전달을 막는다(위험 5). 반환값은 이번에 적용한 버전이다.
 export async function migrate(db: Database): Promise<number[]> {
   const applied = await appliedMigrations(db);
   const ran: number[] = [];

@@ -128,7 +128,7 @@ export async function startWorker(config: WorkerConfig,
   server.listen(options.port ?? PORTS.worker, options.host);
   await once(server, 'listening');
   return { server, profile: config.profile.id, cliVersion, credential: state, ...(reviewClosed ? { reviewClosed } : {}), async close() {
-    // 먼저 새 실행을 닫는다(동기). 이미 받은 요청이 본문 수신·서명 확인 중이어도 이 뒤에는 모델 CLI를 띄우지 않는다(r1 P2).
+    // 먼저 새 실행을 닫는다(동기). 이미 받은 요청이 본문 수신·서명 확인 중이어도 이 뒤에는 모델 CLI를 띄우지 않는다.
     // 그다음 새 연결을 받지 않고, 실행 중인 모델 CLI와 압축본 받기를 멈춘 뒤 그 요청의 응답(failed)을 보내고 닫는다.
     // 연결을 먼저 끊으면 게시 서버는 결과를 몰라 unknown으로 둔다.
     const stopping = Promise.all([control.shutdown(), review?.shutdown()]);

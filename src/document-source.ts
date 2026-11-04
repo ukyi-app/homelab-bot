@@ -1,6 +1,6 @@
 import type { DocumentSource, SourceCheck } from './memory.js';
 
-// 기억의 문서 출처 확인기(T20 B4). 공개 저장소 두 곳의 커밋 고정 링크만 확인한다.
+// 기억의 문서 출처 확인기. 공개 저장소 두 곳의 커밋 고정 링크만 확인한다.
 // 게시 서버는 공유 차트 정책으로 인터넷 443(IPv4)만 나간다. 새 egress·토큰 없이 닿는 곳은 공개 저장소의 raw 파일뿐이다.
 // 공개 문서라 actor별 권한 차이는 없다. 봇의 기억 명령은 owner만 쓰고 owner 확인은 수신·서비스가 한다.
 export const DOCUMENT_REPOSITORIES: readonly string[] = Object.freeze(['ukyi-app/homelab', 'ukyi-app/homelab-bot']);

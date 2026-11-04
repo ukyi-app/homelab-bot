@@ -36,7 +36,7 @@ export async function chatContext(db: Database, conversation: string, event: str
 }
 
 // owner 항목은 모델에 필요한 필드만 고른다. 저장된 수집 경로 표시(mention·activate·urgent)와 정책 revision을 넘기면
-// 모델이 구독 스레드의 멘션 없는 후속을 "봇에게 한 말이 아닐 수 있다"로 읽었다(S16). 기록에 든 owner 메시지는 모두
+// 모델이 구독 스레드의 멘션 없는 후속을 "봇에게 한 말이 아닐 수 있다"로 읽는다(S16). 기록에 든 owner 메시지는 모두
 // 봇이 받아들인 요청이고, 그 설명은 작업자 프롬프트의 신뢰 문맥(bot-facts.ts)에 있다.
 function ownerItem(payload: Record<string, unknown>): ContextItem {
   const item: ContextItem = { from: 'owner', text: typeof payload.text === 'string' ? payload.text : '', kind: payload.kind };

@@ -16,7 +16,7 @@ import { LaunchFailed } from './process-launcher.js';
 import type { LaunchResult, LaunchSpec, ProcessLauncher } from './process-launcher.js';
 import type { Store } from './store.js';
 
-// `01` §6 추상 계약의 V1 값. 경로 (A) `codex exec --json`. 실제 CLI 대조는 T16b다.
+// `01` §6 추상 계약의 V1 값. 경로 (A) `codex exec --json`.
 export const CODEX_CAPABILITIES = Object.freeze({
   version: '0.163.0', adapter: 'exec',
   start_task: true,
@@ -27,7 +27,7 @@ export const CODEX_CAPABILITIES = Object.freeze({
   // exec에는 승인 정책 플래그가 없다 [실측: 0.163.0 `codex exec --help`]. --approve-for-me도 쓰지 않는다.
   tool_approval_relay: false,
   request_cancel: true,
-  // 프로세스 그룹과 작업 표식으로만 확인한다. 환경을 지우고 빠져나간 자식은 cgroup 없이 못 찾는다(T16b).
+  // 프로세스 그룹과 작업 표식으로만 확인한다. 환경을 지우고 빠져나간 자식은 cgroup 없이 못 찾는다.
   confirm_stop: 'process_group_and_marker',
   resume_task: 'same_job_thread_only',
 } as const);
@@ -44,7 +44,7 @@ export class CapabilityUnavailable extends Error {
   constructor(public readonly capability: string, public readonly state: 'false' | 'undecided') { super(`capability_${state}:${capability}`); }
 }
 
-// 프로세스 실행 계약은 실행기 공통(process-launcher)이다. T18 작업 레인은 같은 계약을 이 이름으로 쓴다.
+// 프로세스 실행 계약은 실행기 공통(process-launcher)이다. 작업 레인은 같은 계약을 이 이름으로 쓴다.
 export { LaunchFailed };
 export type { LaunchResult, LaunchSpec };
 export type CodexLauncher = ProcessLauncher;
@@ -54,7 +54,7 @@ export const nodeFiles = {
   mkdir: async (path: string) => { await mkdir(path, { recursive: true, mode: 0o700 }); },
   resolve: (path: string) => realpath(path),
   // 경로로 읽는 일반 도구다. 연 파일의 실제 경로가 요청 경로와 같을 때만 읽는다. 상위 디렉터리가 심링크면
-  // O_NOFOLLOW가 막지 못하므로 연 뒤 /proc/self/fd로 확인한다(rev r3 N6). 하드링크·FIFO·상한 초과는 null.
+  // O_NOFOLLOW가 막지 못하므로 연 뒤 /proc/self/fd로 확인한다. 하드링크·FIFO·상한 초과는 null.
   read: async (path: string, maxBytes = Number.MAX_SAFE_INTEGER): Promise<string | null> => {
     let handle;
     try { handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); } catch { return null; }
@@ -72,7 +72,7 @@ export interface CodexLimits { lineBytes: number; outputBytes: number; events: n
 export const CODEX_LIMITS: Readonly<CodexLimits> = Object.freeze({ lineBytes: 1024 * 1024, outputBytes: 16 * 1024 * 1024, events: 20_000 });
 // 작업 공간 밖 run/·CODEX_HOME 파일의 읽기 상한. 최종 메시지는 스키마상 수만 자라 1MiB면 넉넉하다 [가정].
 const READ_LIMITS = Object.freeze({ output: 1024 * 1024, auth: 1024 * 1024, baseline: 64 * 1024 * 1024 });
-// 결과 행에 남기는 경로 수. 판정은 전체 목록으로 끝낸 뒤 보관할 때만 줄인다(rev r2 N2).
+// 결과 행에 남기는 경로 수. 판정은 전체 목록으로 끝낸 뒤 보관할 때만 줄인다.
 const EVIDENCE_PATHS = 1000;
 interface PinnedLink { entry: string | null; parent: number; handle: FileHandle; dev: number; ino: number }
 interface Pinned { chain: PinnedLink[]; home: FileHandle; run: FileHandle; workspace: FileHandle }
@@ -86,7 +86,7 @@ export interface CodexTaskAdapter {
 // 작업자 쪽 어댑터. 개인 Codex 홈을 찾지 않고 작업자 전용 루트 아래 경로만 만든다(D-14).
 export class ExecCodexAdapter implements CodexTaskAdapter {
   private readonly root: string;
-  // 작업별 실행 세대. confirmStop이 올리면 그 전에 시작해 아직 준비 중인 실행은 프로세스를 띄우지 못한다(rev r1 R1).
+  // 작업별 실행 세대. confirmStop이 올리면 그 전에 시작해 아직 준비 중인 실행은 프로세스를 띄우지 못한다.
   private readonly generations = new Map<string, number>();
   constructor(root: string, private readonly launcher: CodexLauncher,
     private readonly options: { files?: CodexFiles; workspace?: CodexWorkspace; homes?: string[];
@@ -119,7 +119,7 @@ export class ExecCodexAdapter implements CodexTaskAdapter {
         await files.mkdir(dir);
         if (await files.resolve(dir) !== dir) throw new Denied();
       }
-      // 실행 전에 루트부터 이름 하나씩 O_NOFOLLOW로 열어 디렉터리를 고정한다. 이후 쓰기·읽기는 이 핸들 아래에서만 한다(rev r3 N6).
+      // 실행 전에 루트부터 이름 하나씩 O_NOFOLLOW로 열어 디렉터리를 고정한다. 이후 쓰기·읽기는 이 핸들 아래에서만 한다.
       pinned = await this.pin(paths);
       keep(pinned);
       // 설정은 매 실행 다시 쓴다. 이전 턴 출력이 남아 이번 결과로 읽히지 않게 지운다.
@@ -178,10 +178,10 @@ export class ExecCodexAdapter implements CodexTaskAdapter {
     const survivors = await this.launcher.survivors(request.job).catch(() => null);
     const report = { lines, exit: result.exit, survivors, aborted: signal.aborted, launchFailed, exceeded, workspace: paths.workspace };
     // 남은 프로세스가 있거나 모르면 아무 파일도 읽지 않고 unknown으로 닫는다. 판정에 필요 없고, 살아 있는 프로세스가
-    // 읽는 도중 파일을 키우거나 바꿔치기할 수 있다(rev r3 N7).
+    // 읽는 도중 파일을 키우거나 바꿔치기할 수 있다.
     if (survivors !== 0) return { ...interpretRun({ ...report, output: null, changes: null }, request.resume), tools: tools.size };
     // 확인 시점에 경로의 디렉터리가 바뀌어 있으면(심링크·다른 디렉터리로 교체) 결과·증거 본문을 하나도 읽지 않고
-    // 실패로 닫는다(rev r4 N8). 루트부터 이름 하나씩 다시 열어 고정한 inode와 비교한다. realpath 비교가 아니다.
+    // 실패로 닫는다. 루트부터 이름 하나씩 다시 열어 고정한 inode와 비교한다. realpath 비교가 아니다.
     // 원래 디렉터리를 제자리로 되돌린 교체(같은 inode)는 이 확인으로 알 수 없다(ARCHITECTURE §12 한계).
     const tampered = { kind: 'failed' as const, reason: 'workspace_tampered', threadId: request.resume, turns: 0, tools: tools.size };
     if (!await this.intact(pinned)) return tampered;
@@ -239,8 +239,8 @@ export const TASK_INSTRUCTIONS = '홈랩 봇이 소유한 Codex 작업이다. �
 export const RESUME_AFTER_WAIT = '이전 턴이 모델 사용 한도나 인증 만료로 중단됐다. 같은 요청을 이어서 진행한다. '
   + '작업 공간의 현재 상태를 먼저 확인하고 이미 한 변경을 되풀이하지 않는다. 끝나면 출력 스키마대로 반환한다.';
 export interface CodexBridgeOptions { monitorMs: number; questionTtlMs: number; answerChars: number; stopWaitMs: number }
-// 질문 기한 1시간: T16a claim()이 waiting_user를 모델 슬롯 점유로 보므로 답을 기다리는 동안 대화도 멈춘다.
-// clarification을 점유에서 빼는 변경(T16a 소유) 전까지 막힘 시간을 이 값으로 묶는다.
+// 질문 기한 1시간: claim()이 waiting_user를 모델 슬롯 점유로 보므로 답을 기다리는 동안 대화도 멈춘다.
+// 그 막힘 시간을 이 값으로 묶는다.
 export const CODEX_DEFAULTS: Readonly<CodexBridgeOptions> = Object.freeze({ monitorMs: 1000, questionTtlMs: 3_600_000,
   answerChars: 2000, stopWaitMs: 15_000 });
 // tool_calls가 null이면 사용량을 모른다(현재 009 이전 스키마에서 올라온 세션).
@@ -251,7 +251,7 @@ interface Question {
 }
 type Stop = 'cancel' | 'revoked' | 'lease' | 'timeout' | 'monitor';
 
-// 게시 서버 쪽 조율. 질문·완료는 Discord outbox(T16a 계약)로만 내보낸다.
+// 게시 서버 쪽 조율. 질문·완료는 Discord outbox로만 내보낸다.
 export class CodexBridge {
   private readonly options: CodexBridgeOptions;
   constructor(private readonly store: Store, private readonly gate: PolicyGate,
@@ -268,13 +268,13 @@ export class CodexBridge {
     if (current.state === 'cancel_requested') { await this.store.transition(job, 'cancelled', 'cancel_before_dispatch'); return; }
     if (current.state !== 'running') return;
     const session = (await db.query<Session>('SELECT * FROM codex_sessions WHERE job_id=$1', [job.id])).rows[0];
-    // 이어 가기는 세션이 대기 상태로 남은 경우뿐이다. 실패로 정리된 세션은 /retry에서 새 스레드로 시작한다(rev r2 N3).
+    // 이어 가기는 세션이 대기 상태로 남은 경우뿐이다. 실패로 정리된 세션은 /retry에서 새 스레드로 시작한다.
     const resumable = session?.state === 'waiting_answer' || session?.state === 'waiting_model';
     const answered = resumable && session?.thread_id ? (await db.query<Question>(`SELECT * FROM codex_questions
       WHERE job_id=$1 AND thread_id=$2 AND turn=$3 AND state='answered'`, [job.id, session.thread_id, session.turn])).rows[0] : undefined;
     let request: { prompt: string; resume: string | null };
     if (answered) request = { prompt: answered.answer!, resume: answered.thread_id };
-    // 한도·인증 대기에서 /resume-model로 돌아왔으면 저장된 스레드를 잇는다. 한도 전에 한 변경을 처음부터 다시 하지 않는다(rev r1 R3).
+    // 한도·인증 대기에서 /resume-model로 돌아왔으면 저장된 스레드를 잇는다. 한도 전에 한 변경을 처음부터 다시 하지 않는다.
     // 재개가 실패하면 failed로 끝나고 새 스레드로 조용히 바꾸지 않는다. 처음부터 다시 하는 것은 owner의 /retry뿐이다.
     else if (resumable && session?.state === 'waiting_model' && session.thread_id) request = { prompt: RESUME_AFTER_WAIT, resume: session.thread_id };
     else {
@@ -389,7 +389,7 @@ export class CodexBridge {
         'SELECT state,wait_reason,attempt FROM jobs WHERE id=$1', [job.id])).rows[0];
       if (now?.state !== 'waiting_user' || now.wait_reason !== outcome.reason) return;
       if (answered) await this.store.db.query("UPDATE codex_questions SET state='answered' WHERE id=$1 AND state='resumed'", [answered]);
-      // clarification 재개도 claim마다 attempt를 올린다. T16a /resume-model의 시도 한도에 닿았으면 재개를 안내하지 않는다.
+      // clarification 재개도 claim마다 attempt를 올린다. /resume-model의 시도 한도에 닿았으면 재개를 안내하지 않는다.
       const resumable = Number(now.attempt) < DEFAULTS.maxRetries + 1;
       await this.store.enqueue({ key: `codex-wait:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id,
         actor: job.owner_id, scope: job.target, revision, payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary',
@@ -482,7 +482,7 @@ export class CodexBridge {
       scope: job.target, revision: job.revision.policy, payload: { kind: 'message', channel: job.target.channel,
         classification: 'safe_summary', content: `질문 ${q.id}의 답 기한이 지나 작업을 멈췄습니다(cancelled). 답 없이 진행하지 않습니다. 필요하면 새 작업으로 다시 요청하세요.` } });
   }
-  // T16a 제어 경로와 같은 순서(대화 행 → 스케줄러 행 → 작업 행)로 잠근다. 부르는 쪽이 대화 행을 먼저 잠근다.
+  // 제어 경로와 같은 순서(대화 행 → 스케줄러 행 → 작업 행)로 잠근다. 부르는 쪽이 대화 행을 먼저 잠근다.
   // 만료 알림 outbox 삽입의 외래 키 검사도 대화 행을 잡으므로(KEY SHARE), 스케줄러를 먼저 잡으면 같은 대화의
   // /cancel·/model-status와 교착한다. 순서가 다르면 비상 중지를 기다린 뒤 옛 스냅샷으로 스케줄러를 풀어 버릴 수도 있다.
   private async lockScheduler(store: Store): Promise<void> {
@@ -491,7 +491,7 @@ export class CodexBridge {
     await store.db.query(`INSERT INTO controls(key,value) SELECT 'scheduler_emergency',value FROM controls WHERE key='scheduler'
       ON CONFLICT DO NOTHING`);
   }
-  // T16a /cancel과 같은 해제 조건이다. 질문 대기 중 비상 중지가 풀렸다면 대기가 끝난 지금 스케줄러도 푼다.
+  // /cancel과 같은 해제 조건이다. 질문 대기 중 비상 중지가 풀렸다면 대기가 끝난 지금 스케줄러도 푼다.
   private async releaseScheduler(store: Store): Promise<void> {
     await store.db.query(`UPDATE controls SET value='false' WHERE key='scheduler'
       AND NOT EXISTS (SELECT 1 FROM controls WHERE key='scheduler_emergency' AND value='true')

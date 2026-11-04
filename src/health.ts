@@ -21,7 +21,7 @@ export class Health {
   // fatal close(토큰·intent 오류 등)로 Gateway가 다시 연결하지 않는 상태. connected=0만으로는 일시 단절과 구분되지 않는다.
   // Discord REST 401(discord-protocol의 halted)은 별개 상태라 여기 들어오지 않는다.
   watchGateway(state: () => { halted: boolean }): void { this.gatewayState = state; }
-  // T20 원장·브리핑 상태. readiness에는 묶지 않는다(원장 장애로 경보·webhook 수신까지 끊기지 않게, DECISIONS T20).
+  // 원장·브리핑 상태. readiness에는 묶지 않는다(원장 장애로 경보·webhook 수신까지 끊기지 않게, DECISIONS T20).
   watchMemory(state: () => MemoryMetrics): void { this.memoryState = state; }
   async ready(): Promise<boolean> {
     if (!this.receivers.app || !this.receivers.alerts) return false;

@@ -51,7 +51,7 @@ export function diffTrees(base: Pick<Tree, 'tree' | 'truncated'>, head: Pick<Tre
   }
   // 잘린 tree에 없는 경로는 정말 없는지 모른다. 반대쪽에만 보인다고 추가·삭제로 지어내지 않는다.
   const removed = head.truncated ? [] : [...remaining.values()].sort(byPath);
-  // 같은 내용의 파일(빈 파일 등)이 수만 개여도 선형이어야 한다. 배열 복사·shift()는 O(n²)이라 이벤트 루프를 막는다(PR #38 리뷰).
+  // 같은 내용의 파일(빈 파일 등)이 수만 개여도 선형이어야 한다. 배열 복사·shift()는 O(n²)이라 이벤트 루프를 막는다.
   const sources = new Map<string, { entries: TreeEntry[]; next: number }>();
   for (const entry of removed) {
     if (entry.type !== 'blob') continue;
@@ -132,7 +132,7 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
     if (!target) throw new Denied();
     const write = restrictGitHubWrite(request, { repository: target[1]!, pr: Number(target[2]), head: request.body?.commit_id });
     // deliver는 transport를 부르기 직전에 dispatched로 표시하고, 그 뒤의 예외를 응답 유실(unknown)로 본다.
-    // 정책 조회는 아무것도 보내기 전이라 그렇게 잃으면 안 된다(PR #38 리뷰). 일시 불가는 나중에 다시(429),
+    // 정책 조회는 아무것도 보내기 전이라 그렇게 잃으면 안 된다. 일시 불가는 나중에 다시(429),
     // 정책에서 빠진 저장소는 보내지 않고 막는다(403, 재시도 없음).
     let repo: BoundRepository;
     try {

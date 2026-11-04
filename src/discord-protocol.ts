@@ -4,8 +4,8 @@ import type { Clock, EventInput } from './contracts.js';
 import { gatewayMessage, hasMarker } from './discord.js';
 import type { AckOutcome, DiscordIngress, DiscordRest, GatewayFrame } from './discord.js';
 
-// 기한 없는 REST(게시·대조·history 복구·명령 등록·gateway URL·typing)의 전송 제한. S16에서 1초 일괄 제한이 재시작 직후
-// 복구 GET을 시간 초과로 실패시켰다. 이 호출들은 게시 lease·복구 lease(각 30초)나 별도 루프 안에서 돌아 몇 초를 기다려도
+// 기한 없는 REST(게시·대조·history 복구·명령 등록·gateway URL·typing)의 전송 제한. 1초 일괄 제한은 재시작 직후
+// 복구 GET을 시간 초과로 실패시킨다(S16). 이 호출들은 게시 lease·복구 lease(각 30초)나 별도 루프 안에서 돌아 몇 초를 기다려도
 // 계약이 깨지지 않는다. 늘리면 한 요청이 막혔을 때 그 루프의 한 바퀴만 길어진다.
 export const DISCORD_REST_TIMEOUT_MS = 5000;
 // Gateway dispatch 안에서 부르는 REST(이벤트의 채널 조회, 일반 메시지 👀 리액션과 그 대체 게시)의 제한.

@@ -4,7 +4,7 @@ import { readdir, readFile } from 'node:fs/promises';
 
 // 작업자의 공통 실행 제어: 모델 CLI를 작업마다 새 프로세스 그룹으로 띄우고, 그룹과 작업 표식으로 남은 프로세스를
 // 찾아 끝내고 센다. 실행기(Claude·Codex)와 무관하다. 실행기 어댑터는 argv·env·stdin만 넘기고 직접 spawn하지 않는다.
-// 한계: 환경을 지우고 새 세션으로 빠져나간 자식은 찾지 못한다. cgroup의 cgroup.procs 확인은 T16b 실측 뒤다.
+// 한계: 환경을 지우고 새 세션으로 빠져나간 자식은 찾지 못한다. cgroup의 cgroup.procs 확인은 하지 않는다.
 
 // 작업이 띄운 프로세스를 찾는 표식(env 이름). 새 세션으로 빠져나간 자식도 환경을 지우지 않았다면 찾는다.
 export const TASK_MARKER = 'HOMELAB_WORKER_TASK';
@@ -14,7 +14,7 @@ export class LaunchFailed extends Error { constructor() { super('launch_failed')
 
 export interface LaunchSpec {
   job: string; args: string[]; cwd: string; env: Record<string, string>; stdin: string;
-  // stdout 바이트 상한. 넘으면 launcher가 작업 그룹을 끝내고 overflow로 알린다(rev r1 S3).
+  // stdout 바이트 상한. 넘으면 launcher가 작업 그룹을 끝내고 overflow로 알린다.
   limits: { lineBytes: number; outputBytes: number };
 }
 export interface LaunchResult { exit: { code: number | null; signal: string | null } | null; overflow?: boolean }
@@ -33,7 +33,7 @@ export class ProcessGroupLauncher implements ProcessLauncher {
   constructor(private readonly command: readonly [string, ...string[]],
     private readonly options: { graceMs?: number; proc?: string } = {}) {}
   async run(spec: LaunchSpec, signal: AbortSignal, onLine: (line: string) => void): Promise<LaunchResult> {
-    // 이미 중단된 실행은 띄우지 않는다. 기록을 남겨 소멸 확인이 "이 실행으로 생긴 프로세스 없음"을 안다(rev r1 R1).
+    // 이미 중단된 실행은 띄우지 않는다. 기록을 남겨 소멸 확인이 "이 실행으로 생긴 프로세스 없음"을 안다.
     if (signal.aborted) { this.groups.set(spec.job, { pgid: 0, since: Number.POSITIVE_INFINITY }); throw new LaunchFailed(); }
     // env는 호출자가 만든 허용 목록 그대로다. 작업자 프로세스 환경을 섞지 않는다.
     const child = spawn(this.command[0], [...this.command.slice(1), ...spec.args],
@@ -49,7 +49,7 @@ export class ProcessGroupLauncher implements ProcessLauncher {
     this.groups.set(spec.job, record);
     const abort = () => { void this.terminate(spec.job); };
     signal.addEventListener('abort', abort, { once: true });
-    // 줄을 모아 두지 않는다. 한 줄·전체 바이트 상한을 넘으면 더 읽지 않고 그룹을 끝낸다(rev r1 S3).
+    // 줄을 모아 두지 않는다. 한 줄·전체 바이트 상한을 넘으면 더 읽지 않고 그룹을 끝낸다.
     let overflow = false;
     let total = 0;
     let pending: Buffer[] = [];

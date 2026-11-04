@@ -5,12 +5,12 @@ import type { Clock } from './contracts.js';
 import type { ReadTransport } from './read.js';
 import type { KubernetesClient } from './read-transports.js';
 
-// 일일 브리핑의 실제 관측 원본(T20 2단계 B5, T24). 봇 SA(ClusterRole homelab-readonly)와 /read의 Grafana 자격으로 읽히는 것만 연결한다.
+// 일일 브리핑의 실제 관측 원본. 봇 SA(ClusterRole homelab-readonly)와 /read의 Grafana 자격으로 읽히는 것만 연결한다.
 // - 백업: CNPG Cluster 조건과 Backup CR(postgresql.cnpg.io clusters·backups get/list).
 // - 예약 작업: CronJob 목록과 그 Job(batch cronjobs list, jobs list).
-// - 인증서: cert-manager 지표(수집 job cert-manager)를 /read와 같은 Grafana transport로 집계 질의한다(T24 계약 1·3).
+// - 인증서: cert-manager 지표(수집 job cert-manager)를 /read와 같은 Grafana transport로 집계 질의한다.
 //   클러스터 안 Certificate CR만 본다. 공개 TLS(Cloudflare 종단)·ts.net 인증서는 cert-manager 밖이라 범위 밖이다.
-// - 복원 검증: `homelab db restore-check`가 Cluster pg에 남기는 annotation 두 개(T24 계약 2)를 백업 원본이 이미 읽는
+// - 복원 검증: `homelab db restore-check`가 Cluster pg에 남기는 annotation 두 개를 백업 원본이 이미 읽는
 //   Cluster 응답에서 읽는다. 기록은 CLI가 쓴 것이라 "CLI 기록 기준"으로 적고, 기록 오류는 복원 검증만 미확인으로 둔다.
 // 관측 시각은 요청 직전 시각이다. Kubernetes API는 현재 상태를 돌려주므로 "오래된 값"은 원본 안의 시각(백업 완료,
 // Job 시작)으로 판단한다. 읽기 실패·권한 없음(403)·모양이 틀린 응답은 throw해 브리핑이 읽기 불가·미확인으로 적게 한다.
@@ -38,7 +38,7 @@ export const CERT_QUERIES = Object.freeze({
   ready: 'count(certmanager_certificate_ready_status{condition="True"} == 1)',
   age: 'max(time() - timestamp(certmanager_certificate_expiration_timestamp_seconds))',
 });
-// restore-check 기록(T24 계약 2). last: 마지막으로 끝난 시도, pass: 마지막 통과(실패는 이 키를 건드리지 않음).
+// restore-check 기록. last: 마지막으로 끝난 시도, pass: 마지막 통과(실패는 이 키를 건드리지 않음).
 export const RESTORE_ANNOTATIONS = Object.freeze({
   last: 'homelab.ukyi.app/restore-check-last', pass: 'homelab.ukyi.app/restore-check-pass' });
 export const RESTORE_STALE_MS = 100 * DAY;

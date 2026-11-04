@@ -7,8 +7,8 @@ import { RUN_PREFIX } from './run-control.js';
 import type { RunControl, RunLimits, RunReport } from './run-control.js';
 import { WorkerStartError } from './worker-state.js';
 
-// 리뷰 레인(T17). 공통 실행 제어는 run-control이고, 여기는 리뷰 프롬프트·출력 스키마·결과 분류·반사 검사만 한다.
-// 인증 격리·SEC-02 조건은 무도구 경계로 갈음한다(사용자 2026-11-04, DECISIONS "T18 결정"): 도구 0개라 토큰을 읽을 비신뢰 프로세스가 없다.
+// 리뷰 레인. 공통 실행 제어는 run-control이고, 여기는 리뷰 프롬프트·출력 스키마·결과 분류·반사 검사만 한다.
+// 인증 격리·SEC-02 조건은 무도구 경계로 갈음한다(사용자 결정, DECISIONS "T18 결정"): 도구 0개라 토큰을 읽을 비신뢰 프로세스가 없다.
 // 이 경계는 같은 UID 프로세스가 토큰을 못 읽는다는 증명이 아니다. 도구가 켜지는 레인에 그대로 옮기지 않는다.
 
 // `--json-schema`에 넘길 모양. 검증과 같은 스키마에서 만들어 어긋나지 않게 한다. CLI가 상한을 넘긴 답을 되돌리고, 그래도 넘으면 실패다.
@@ -18,7 +18,7 @@ export const REVIEW_OUTPUT_JSON_SCHEMA: object = Object.freeze(schema);
 export const REVIEW_LIMITS: RunLimits = Object.freeze({ lineBytes: 2 * 1024 * 1024, outputBytes: 16 * 1024 * 1024, events: 20_000 });
 
 // PR 내용은 stdin으로만 넘긴다. JSON 안에 두어 자료가 프롬프트 구조를 끊지 못한다. rightLines는 게시 위치 검사용이라 모델에 주지 않는다.
-// 제외 파일 안내는 작업자 쪽 고정 문장이다. REVIEW_INSTRUCTIONS(게시 서버와 같은 값을 요구하는 계약, 세대 revision의 재료)는 건드리지 않는다.
+// 제외 파일 안내는 작업자 쪽 고정 문장이다. REVIEW_INSTRUCTIONS(게시 서버와 같은 값을 요구하는 계약, 세대 revision의 재료)에 넣지 않는다.
 export const REVIEW_OMITTED_NOTE = 'untrusted.omitted는 이 PR이 바꿨지만 크기·형식·한도 때문에 내용을 싣지 않은 파일이다(reason이 이유, '
   + 'omittedTotal이 전체 수). 이 파일들이 PR에 없다고 판단하거나 보지 않은 내용을 추측해 지적하지 않는다. '
   + 'untrusted.limitsHit가 비어 있지 않으면 변경 목록·본문·지침 일부가 잘렸다.';

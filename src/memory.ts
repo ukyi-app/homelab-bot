@@ -64,7 +64,7 @@ export interface MemoryView {
 }
 export interface DeletionResult { status: 'deleted' | 'pending'; reason?: 'ledger_unconfirmed' | 'db_purge_pending'; publishedCopies: number; message: string }
 
-// 원장 계약과 파일 구현은 deletion-ledger.ts에 있다(T20 원장 계약 v1).
+// 원장 계약과 파일 구현은 deletion-ledger.ts에 있다(원장 계약 v1).
 export { FileDeletionLedger, LedgerError } from './deletion-ledger.js';
 export type { DeletionEntry, DeletionLedger, LedgerStatus } from './deletion-ledger.js';
 

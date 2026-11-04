@@ -62,7 +62,7 @@ export const MODEL_OMITTED_MAX = 200;
 export interface ReviewerInput {
   instructions: string; guidelines: string | null;
   // omitted: 이 PR이 바꿨지만 내용을 싣지 않은 파일(경로는 PR이 정한 비신뢰 자료). 없으면 모델이 참조된 파일을
-  // "PR에 없다"고 오판한다(2026-11-04 실리뷰 오탐). limitsHit: 변경 목록·본문·지침이 잘린 이유.
+  // "PR에 없다"고 오판한다(실리뷰 실측). limitsHit: 변경 목록·본문·지침이 잘린 이유.
   untrusted: { pullRequest: { title: string; body: string }; files: ReviewFile[];
     omitted: { path: string; reason: typeof OMIT_REASONS[number] }[]; omittedTotal: number; limitsHit: string[] };
 }

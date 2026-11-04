@@ -8,7 +8,7 @@ import type { AdapterRun, ChatAdapter, EngineOutcome, ExecutorCapabilities, Exit
 import { LaunchFailed, TASK_MARKER } from './process-launcher.js';
 import type { LaunchResult, ProcessLauncher } from './process-launcher.js';
 
-// 대화·리뷰 레인이 함께 쓰는 공통 실행 제어(T16b D4에서 대화 레인 안에 있던 것을 T17에서 분리). 실행기·레인과 무관한 것을 모두 여기서 한다:
+// 대화·리뷰 레인이 함께 쓰는 공통 실행 제어. 실행기·레인과 무관한 것을 모두 여기서 한다:
 // 기한·취소·종료, 프로세스 그룹 정리와 소멸 확인, 실행마다 빈 임시 공간, 자식 env 허용 목록(작업자 env 비상속), 자격 유출 검사,
 // 도구 예산·정책 위반 즉시 중단. 프롬프트·출력 스키마·결과 분류·반사 검사는 레인 몫이고, 어댑터(executor-*)는 argv·env 이름·
 // 설정 파일·출력 해석·CLI 오류 분류만 한다. 한 작업자의 모든 레인이 인스턴스 하나를 공유해야 잔여물·생존 불명 차단이 레인을 넘어 걸린다.
@@ -47,7 +47,7 @@ export async function assertLaunchSafe(adapter: ChatAdapter, plan: AdapterRun, e
   if (credential.value !== undefined) {
     if (!adapter.credentialEnv || plan.env[adapter.credentialEnv] !== credential.value) throw new Error('credential_env_missing');
   }
-  // 반사 검사에 쓸 비밀이 없으면 띄우지 않는다. 자격을 못 읽은 채 검사 없이 실행하지 않는다(리뷰 exec-r1 P1).
+  // 반사 검사에 쓸 비밀이 없으면 띄우지 않는다. 자격을 못 읽은 채 검사 없이 실행하지 않는다.
   if (!credential.secrets.length) throw new Error('credential_secrets_missing');
   const secrets = credential.secrets.filter(secret => secret.length >= 16);
   const leaks = (text: string) => secrets.some(secret => text.includes(secret));
@@ -127,7 +127,7 @@ export class RunControl {
   private active: Active | undefined;
   // 종료가 시작되면 true. 그 뒤에 들어온 실행은 띄우지 않는다.
   private closed = false;
-  // 실행 뒤 기록을 지우지 못한 실행들. 남아 있는 동안 새 실행을 띄우지 않고 readiness도 닫는다(리뷰 exec-r1 P2).
+  // 실행 뒤 기록을 지우지 못한 실행들. 남아 있는 동안 새 실행을 띄우지 않고 readiness도 닫는다.
   private readonly residues: Residue[] = [];
   // 소멸을 확인하지 못한 실행. stop이 0개를 확인하기 전에는 어느 레인도 새 실행을 띄우지 않는다.
   private readonly unconfirmed = new Set<string>();
@@ -311,7 +311,7 @@ export class RunControl {
     const outcome = await plan.finish(lines, result.exit as ExitStatus).catch((): EngineOutcome => ({ kind: 'failed', reason: 'finish_failed' }));
     // 실행 중에 이미 멈췄다면(exceeded) 위에서 돌아가 여기 오지 않으니 두 번 나가지 않는다.
     if (outcome.kind === 'failed' && outcome.violation) violated(outcome.violation);
-    // 실행 뒤 자격을 다시 읽지 못하면(회전 파일 갱신본 포함) 반사 검사를 할 수 없어 답을 내보내지 않는다(리뷰 exec-r1 P1).
+    // 실행 뒤 자격을 다시 읽지 못하면(회전 파일 갱신본 포함) 반사 검사를 할 수 없어 답을 내보내지 않는다.
     let after: string[];
     try { after = await this.credential.secrets(); } catch { return { ...report, credentialRecheckFailed: true }; }
     return { ...report, outcome, secrets: [...credential.secrets, ...after] };

@@ -13,9 +13,9 @@ import { CoverageSchema, FindingSchema, InputLimitsSchema, REVIEW_INSTRUCTIONS, 
   reviewOutcome } from './review-input.js';
 import type { Change, Coverage, ReviewOutput, ReviewTask, ReviewWorkerResult } from './review-input.js';
 
-// PR_REVIEW(T17) 게시 서버 쪽. 모델 호출 전 작성자 확인(D-16), 세대 단위 작업, COMMENT만 게시하는 제한 게시.
+// PR_REVIEW 게시 서버 쪽. 모델 호출 전 작성자 확인(D-16), 세대 단위 작업, COMMENT만 게시하는 제한 게시.
 const Sha = z.string().regex(/^[a-f0-9]{40}$/);
-// owner/repo. 세그먼트가 정확히 `.`·`..`이면 거부한다(경로 조립에서 위로 올라가지 않게, PR #42 리뷰).
+// owner/repo. 세그먼트가 정확히 `.`·`..`이면 거부한다(경로 조립에서 위로 올라가지 않게).
 // 작업자 쪽 REPOSITORY_NAME(src/worker.ts)과 같은 규칙이다. 게시 서버가 작업자 모듈을 불러오지 않게 따로 둔다.
 const REPO_NAME = /^(?!\.\.?\/)[A-Za-z0-9_.-]+\/(?!\.\.?$)[A-Za-z0-9_.-]+$/;
 const RepoName = z.string().regex(REPO_NAME);
@@ -485,7 +485,7 @@ export class ReviewRuntime {
       if (signal.aborted) stop();
     });
   }
-  // T16a의 claim과 같은 scheduler 잠금·전역 슬롯 조건을 쓴다. 리뷰도 대화와 같은 auth.json 직렬 1개다(D-14).
+  // 대화 claim과 같은 scheduler 잠금·전역 슬롯 조건을 쓴다. 리뷰도 대화와 같은 auth.json 직렬 1개다(D-14).
   async claim(): Promise<(Job & Record<string, unknown>) | undefined> {
     return this.store.db.transaction(async tx => {
       await tx.query(`INSERT INTO controls VALUES ('scheduler','false') ON CONFLICT DO NOTHING`);
@@ -582,7 +582,7 @@ export class ReviewRuntime {
       const interrupted = new Promise<ReviewWorkerResult>(resolve => {
         abort.signal.addEventListener('abort', () => resolve({ status: 'unknown', stopped: false }), { once: true });
       });
-      // 비상 중지·취소 요청·lease 상실을 실행 중에도 본다(T16a 대화 레인과 같은 규칙).
+      // 비상 중지·취소 요청·lease 상실을 실행 중에도 본다(대화 레인과 같은 규칙).
       const monitor = setInterval(() => {
         if (checking) return;
         checking = (async () => {
@@ -776,7 +776,7 @@ export class ReviewPublisher {
     // 종료 신호 뒤에는 새 게시를 잡지 않는다. 이미 잡은 게시는 끝까지 간다. 프로세스가 먼저 끝나면 다음 기동이 lease로 회수한다.
     if (this.shutdown?.aborted) return false;
     // 게시 중 죽은 프로세스의 lease를 회수한다. 전송을 시작했으면 결과를 모르므로 unknown(재게시 없이 대조).
-    // unknown의 available_at은 진입 시각이다(T16a outbox와 같은 관례). 대조 기한을 생성 시각이 아니라 여기서부터 센다.
+    // unknown의 available_at은 진입 시각이다(outbox와 같은 관례). 대조 기한을 생성 시각이 아니라 여기서부터 센다.
     await this.store.db.query(`UPDATE review_deliveries SET state=CASE WHEN dispatch_started THEN 'unknown' ELSE 'pending' END,
       reason=CASE WHEN dispatch_started THEN 'lease_expired' ELSE reason END,
       available_at=CASE WHEN dispatch_started THEN $1 ELSE available_at END WHERE state='sending' AND lease_until<=$1`, [this.store.now()]);
@@ -879,7 +879,7 @@ export class ReviewPublisher {
       [row.id, row.lease_token, row.body, json(row.comments)]);
     return repo;
   }
-  // T16a 게시 pause와 같은 규칙: 시도 수를 되돌리고 1초부터 60초까지 늘려 기다린다.
+  // outbox 게시 pause와 같은 규칙: 시도 수를 되돌리고 1초부터 60초까지 늘려 기다린다.
   private async pause(row: DeliveryRow, reason: string, retryAfterMs = 0): Promise<void> {
     await this.store.db.query(`UPDATE review_deliveries SET state='pending',attempt=GREATEST(0,attempt-1),dispatch_started=false,
       pause_count=LEAST(pause_count+1,7),available_at=$3+GREATEST($4::bigint,LEAST(60000,$5::bigint*power(2,LEAST(pause_count,6))::bigint)),

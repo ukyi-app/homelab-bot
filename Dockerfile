@@ -1,9 +1,9 @@
-# 봇 이미지 계약(homelab 공유 차트와 app-build, 템플릿 homelab-app-template의 Dockerfile을 Node로 옮김):
+# 봇 이미지 계약(homelab 공유 차트와 app-build 기준, 템플릿 homelab-app-template Dockerfile의 Node판):
 # - amd64 단일 빌드. app-build가 --platform linux/amd64로 부른다. 모델 CLI(claude·codex)는 npm의 linux-x64 패키지가 들어간다.
-# - 작업자 실행기는 프로필로 고른다(WORKER_EXECUTOR, D-14 변경 사용자 2026-10-30). 이미지에는 지원하는 실행기 CLI를 모두
+# - 작업자 실행기는 프로필로 고른다(WORKER_EXECUTOR, D-14). 이미지에는 지원하는 실행기 CLI를 모두
 #   고정 버전으로 넣어, 준비된 프로필 사이 전환에 이미지 재빌드가 필요 없게 한다. 런타임에 CLI를 받거나 갱신하지 않는다.
 # - test 단계가 있어야 한다. app-build가 --target test로 시험(npm ci → npm run check → npm test)을 돌린다.
-# - 이미지 하나를 게시 서버와 작업자가 함께 쓴다(D2, 사용자 2026-10-30). 기본 CMD는 게시 서버이고,
+# - 이미지 하나를 게시 서버와 작업자가 함께 쓴다(D2, 사용자 결정). 기본 CMD는 게시 서버이고,
 #   sandbox 작업자는 command를 ["node", "dist/src/worker-main.js"]로 바꾼다. ENTRYPOINT는 비워 두어 command가 그대로 돈다.
 # - 비root uid 65532(공유 차트 runAsUser). sandbox 작업자는 uid 10001로 돈다. 그래서 파일은 root 소유·누구나 읽기로 둔다.
 # - 루트 파일시스템은 읽기 전용이다. 쓰기는 /tmp(emptyDir)와 작업자의 영속 공간(PVC)만 된다.

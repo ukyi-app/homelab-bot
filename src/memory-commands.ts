@@ -5,7 +5,7 @@ import { documentRevision } from './document-source.js';
 import { MemoryNotReady, MemoryRejected } from './memory.js';
 import type { MemoryInput, MemoryService, MemoryView, SourceRef } from './memory.js';
 
-// T20 기억 명령(B4). 수신(discord.ts)이 owner·채널 확인과 중복 처리를 마친 명령만 여기로 온다.
+// 기억 명령. 수신(discord.ts)이 owner·채널 확인과 중복 처리를 마친 명령만 여기로 온다.
 // 응답은 상호작용 응답(본인만 보는 ephemeral)으로만 나간다. 기억 내용은 outbox·events·감사·로그에 남기지 않는다.
 // 검색 결과는 사람에게 보여 줄 뿐 모델 입력에 넣지 않는다(SEC-01, 모델 맥락 주입은 이 범위 밖).
 
@@ -168,7 +168,7 @@ export function searchText(views: MemoryView[]): string {
   return lines.join('\n');
 }
 // 충돌 ID 수에는 상한이 없다(같은 주제의 진술이 쌓이면 늘어난다). 저장·정정은 응답 전에 이미 끝났으므로 응답이 Discord 한도를
-// 넘어 거부되면 사용자는 결과를 못 본다. 검색처럼 전체 길이를 자르고 남은 충돌은 개수로 적는다(PR #28 리뷰).
+// 넘어 거부되면 사용자는 결과를 못 본다. 검색처럼 전체 길이를 자르고 남은 충돌은 개수로 적는다.
 export function savedText(verb: string, result: { id: string; status: 'active' | 'candidate'; conflictsWith: string[] },
   limit = REPLY_LIMIT): string {
   const lines = [`${verb}: \`${result.id}\` · 상태 ${STATUS[result.status]}`,

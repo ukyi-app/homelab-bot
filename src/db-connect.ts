@@ -4,7 +4,7 @@
 const TRANSIENT = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH', 'EAI_AGAIN']);
 
 // node-pg는 연결 시간 초과·연결 중 끊김을 코드 없이 이 문구로 낸다(pg 8.23 client.js, pg-pool index.js).
-// 운영에서 새 파드가 연결은 열었는데 인증 전에 멈춰 5초 연결 시간 초과로 끝난 적이 있다(서버 로그 57014).
+// 새 파드가 연결은 열었는데 인증 전에 멈춰 5초 연결 시간 초과로 끝날 수 있다(운영 서버 로그 57014).
 // SQLSTATE 코드가 붙은 오류(인증 28P01 등)는 문구와 상관없이 다시 하지 않는다.
 const TRANSIENT_MESSAGES = [/^Connection terminated due to connection timeout$/, /^timeout expired$/, /^Connection terminated unexpectedly$/];
 

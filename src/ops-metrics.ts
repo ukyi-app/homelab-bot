@@ -6,10 +6,10 @@ import type { Database } from './database.js';
 const OPEN_STATES = ['queued', 'running', 'verifying', 'cancel_requested', 'waiting_user', 'unknown'] as const;
 const JOB_TYPES = ['chat', 'task', 'read', 'review'] as const;
 const OUTBOX_STATES = ['pending', 'sending', 'unknown', 'blocked'] as const;
-// T20 삭제 원장 상태(LedgerState + 원장을 켜지 않은 disabled). 지금 값만 1인 one-hot이다.
+// 삭제 원장 상태(LedgerState + 원장을 켜지 않은 disabled). 지금 값만 1인 one-hot이다.
 export const LEDGER_STATES = ['closed', 'ready', 'degraded', 'failed', 'fenced', 'disabled'] as const;
 export type LedgerMetricState = (typeof LEDGER_STATES)[number];
-// 프로세스 안의 T20 상태. 원장 상태와 이 프로세스의 브리핑 예약 반영 결과는 DB에 없다.
+// 프로세스 안의 기억·브리핑 상태. 원장 상태와 이 프로세스의 브리핑 예약 반영 결과는 DB에 없다.
 export interface MemoryMetrics { ledger: LedgerMetricState; briefingEnabled: boolean }
 export const MEMORY_DISABLED: MemoryMetrics = Object.freeze({ ledger: 'disabled', briefingEnabled: false });
 
