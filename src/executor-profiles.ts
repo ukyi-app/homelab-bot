@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { assertWorkerRoot } from './codex-config.js';
 import { FileMutableCredential, StaticEnvCredential } from './credentials.js';
 import type { CredentialKind, WorkerCredential } from './credentials.js';
-import { CLAUDE_CHAT_CAPABILITIES, ClaudeChatAdapter } from './executor-claude.js';
+import { CLAUDE_CHAT_CAPABILITIES, ClaudeChatAdapter, ClaudeReviewAdapter } from './executor-claude.js';
 import { CODEX_CHAT_CAPABILITIES, CodexChatAdapter } from './executor-codex.js';
 import type { ChatAdapter, ExecutorCapabilities, ExecutorId } from './executor.js';
 import { WorkerStartError } from './worker-state.js';
@@ -53,19 +53,22 @@ export function selectProfile(executor: string, credentialKey: string, model: st
   return profile;
 }
 
-export interface Executor { adapter: ChatAdapter; credential: WorkerCredential }
+// reviewAdapter: 리뷰 레인 어댑터. 무도구 경계를 시험하지 않은 실행기는 null이다(능력표 lanes.review와 같은 뜻).
+export interface Executor { adapter: ChatAdapter; credential: WorkerCredential; reviewAdapter: ChatAdapter | null }
 // 프로필 → 어댑터·자격 방식. 어댑터가 쓰는 경로(CODEX_HOME)가 사람 홈·개인 CLI 홈이면 여기서 거부된다.
 export function createExecutor(profile: ExecutorProfile, paths: { credentialFile: string; codexHome?: string },
   homes: readonly string[]): Executor {
   switch (profile.executor) {
     case 'claude':
-      return { adapter: new ClaudeChatAdapter('subscription-token'), credential: new StaticEnvCredential(paths.credentialFile, homes) };
+      return { adapter: new ClaudeChatAdapter('subscription-token'), credential: new StaticEnvCredential(paths.credentialFile, homes),
+        reviewAdapter: new ClaudeReviewAdapter('subscription-token') };
     case 'codex': {
       // 홈을 여기서 한 번 검증·해석해 어댑터와 자격이 같은 실제 경로를 쓴다. 정상 별칭(심링크) 경로를 자격에 그대로
       // 넘기면 O_NOFOLLOW 읽기가 실패해 반사 검사가 비밀을 모른 채 실행됐다(리뷰 exec-r1 P1).
       let home: string;
       try { home = assertWorkerRoot(paths.codexHome ?? '', homes); } catch { throw new WorkerStartError('codex_home_unavailable'); }
-      return { adapter: new CodexChatAdapter(home, homes), credential: new FileMutableCredential(home, paths.credentialFile, homes) };
+      return { adapter: new CodexChatAdapter(home, homes), credential: new FileMutableCredential(home, paths.credentialFile, homes),
+        reviewAdapter: null };
     }
   }
 }

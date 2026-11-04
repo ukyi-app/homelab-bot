@@ -2,8 +2,8 @@ import type { CredentialKind, RunCredential } from './credentials.js';
 
 // 작업자 안 모델 실행기의 내부 계약(T16b, D-14 변경 사용자 2026-10-30).
 // 게시 서버와의 HTTP v1(worker.ts)은 실행기 이름·플래그·자격을 담지 않는다. 그 아래에서
-//   공통 실행 제어(chat-lane, process-launcher): 직렬·기한·취소·프로세스 그룹 정리·빈 작업 공간·env 허용 목록·
-//     자격 유출 검사·구조화 결과 검증·반사 검사·결과 분류(succeeded/limited/auth_expired/failed/unknown)
+//   공통 실행 제어(run-control, process-launcher): 기한·취소·프로세스 그룹 정리·빈 작업 공간·env 허용 목록·자격 유출 검사
+//   레인(chat-lane, review-lane): 프롬프트·출력 스키마·구조화 결과 검증·반사 검사·결과 분류(succeeded/limited/auth_expired/failed/unknown)
 //   실행기 어댑터(executor-claude, executor-codex): argv·env·설정 파일·출력 해석·CLI 오류 분류만
 // 로 나눈다. 어떤 실행기를 쓸지는 기동 때 프로필(executor-profiles)이 고르고, 실행 중에는 바꾸지 않는다.
 
@@ -14,8 +14,8 @@ export interface ExecutorCapabilities {
   readonly executor: ExecutorId;
   // 이미지에 고정한 CLI 버전. 기동 때 `--version`과 대조한다.
   readonly cliVersion: string;
-  // 레인별 지원. 작업 레인은 아직 어떤 실행기도 연결하지 않았다(T18 결정 대기).
-  readonly lanes: { readonly chat: boolean; readonly task: boolean };
+  // 레인별 지원. 작업 레인은 아직 어떤 실행기도 연결하지 않았다(T18). 리뷰 레인은 무도구 경계를 시험한 Claude 구독 프로필만이다(T17).
+  readonly lanes: { readonly chat: boolean; readonly task: boolean; readonly review: boolean };
   // 구조화 출력: CLI가 스키마를 받아 결과에 담는다. 봇이 공통 스키마로 다시 검증한다.
   readonly structuredOutput: 'native-schema';
   // 대화 레인에서 모델이 쓸 수 있는 도구. none: CLI 도구를 끄고 실행 중 도구 호출이 보이면 멈춘다.

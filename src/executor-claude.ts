@@ -1,7 +1,7 @@
 import type { AdapterRun, ChatAdapter, ChatRun, EngineOutcome, ExecutorCapabilities, ExitStatus, Observation } from './executor.js';
 
 // Claude Code CLI 대화 어댑터(D-14 변경, 사용자 2026-10-30: Claude Code CLI, 구독 장기 토큰, 첫 모델 Opus 5.5).
-// 이 파일은 argv·env 이름·출력 해석·CLI 오류 분류만 한다. 실행·정리·검증은 공통부(chat-lane)다.
+// 이 파일은 argv·env 이름·출력 해석·CLI 오류 분류만 한다. 실행·정리는 공통부(run-control), 결과 검증은 레인(chat-lane·review-lane)이다.
 // 플래그 근거 [실측: 고정 바이너리 2.1.308 `claude --help`, 모델 호출 없음]. 이벤트 모양 근거는 같은 바이너리에 든
 // SDK 메시지 스키마(정적 읽기)와 공식 headless 문서다 [가정: 실제 출력 대조는 첫 승인 대화 S12].
 // - `-p` + stdin 프롬프트. 프롬프트는 argv에 두지 않는다(프로세스 목록에 남지 않고, `--`로 시작해도 플래그가 아니다).
@@ -18,7 +18,7 @@ import type { AdapterRun, ChatAdapter, ChatRun, EngineOutcome, ExecutorCapabilit
 //   그래도 전환 이벤트나 다른 모델의 응답이 보이면 정책 위반으로 즉시 멈춘다. 모델 고정은 사용자 결정이다(리뷰 exec-r1 P1).
 export const CLAUDE_CLI_VERSION = '2.1.308';
 export const CLAUDE_CHAT_CAPABILITIES: ExecutorCapabilities = Object.freeze({
-  executor: 'claude', cliVersion: CLAUDE_CLI_VERSION, lanes: Object.freeze({ chat: true, task: false }),
+  executor: 'claude', cliVersion: CLAUDE_CLI_VERSION, lanes: Object.freeze({ chat: true, task: false, review: true }),
   structuredOutput: 'native-schema', tools: 'none', sessionPersistence: 'off', modelPinned: true,
   credential: 'env-static', evidence: 'fake-cli',
 } as const);
@@ -202,5 +202,37 @@ export class ClaudeChatAdapter implements ChatAdapter {
       // 실행 잔여물(HOME·CLAUDE_CONFIG_DIR·TMPDIR)은 모두 실행 디렉터리 안이라 공통부가 통째로 지운다.
       cleanup: async () => {},
     };
+  }
+}
+
+// 리뷰 레인 무도구 경계(사용자 2026-11-04, DECISIONS "T18 결정"의 T17 진입 조건). argv·env·출력 해석은 대화와 같고, 대화보다 더 본다:
+// init의 skills·plugins가 비어 있어야 하고, hook 실행과 도구가 돌 때만 나오는 이벤트가 보이면 멈춘다. 이벤트 이름과 init 필드는
+// 2.1.308 바이너리의 SDK 스키마를 정적으로 읽은 것이다 [가정: 실제 출력 대조는 S7]. init의 agents·slash_commands는 CLI 내장 목록이
+// 올 수 있고 도구가 없으면 쓸 길이 없어 보지 않는다. 판정은 원문 줄로 한다(줄인 줄에는 이 필드들이 없다).
+const TOOL_ACTIVITY_TYPES = new Set(['tool_progress', 'tool_use_summary']);
+export function noToolBoundaryViolation(line: string): string | null {
+  let raw: unknown;
+  try { raw = JSON.parse(line); } catch { return null; }
+  const event = record(raw);
+  if (!event) return null;
+  if (typeof event.type === 'string' && TOOL_ACTIVITY_TYPES.has(event.type)) return 'tool_activity';
+  if (event.type !== 'system' || typeof event.subtype !== 'string') return null;
+  if (event.subtype.startsWith('hook_')) return 'hooks_enabled';
+  if (event.subtype.startsWith('task_') || event.subtype === 'permission_denied') return 'tool_activity';
+  if (event.subtype !== 'init') return null;
+  if (!Array.isArray(event.skills) || event.skills.length > 0) return 'skills_enabled';
+  if (!Array.isArray(event.plugins) || event.plugins.length > 0) return 'plugins_enabled';
+  return null;
+}
+export class ClaudeReviewAdapter extends ClaudeChatAdapter {
+  override async start(run: ChatRun): Promise<AdapterRun> {
+    const plan = await super.start(run);
+    return { ...plan,
+      // 없으면 hook 이벤트가 흐름에 나오지 않아 위 검사가 볼 수 없다 [확인: 2.1.308 --help].
+      args: [...plan.args, '--include-hook-events'],
+      observe(line: string): Observation {
+        const seen = plan.observe(line);
+        return seen.violation ? seen : { ...seen, violation: noToolBoundaryViolation(line) };
+      } };
   }
 }

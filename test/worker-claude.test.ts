@@ -154,9 +154,9 @@ test('CLD-01 프로필: claude + CLAUDE_CODE_OAUTH_TOKEN + 전체 모델 ID만 �
   assert.equal(profile.id, 'claude-subscription');
   assert.equal(profile.bin, '/usr/local/bin/claude');
   assert.deepEqual(profile.capabilities, CLAUDE_CHAT_CAPABILITIES);
-  // 능력표: 대화 레인만, 도구 없음, 세션 기록 없음, 모델 고정, 정적 자격, 가짜 CLI 근거.
+  // 능력표: 대화·리뷰 레인(작업 레인 없음), 도구 없음, 세션 기록 없음, 모델 고정, 정적 자격, 가짜 CLI 근거.
   assert.deepEqual({ ...profile.capabilities, lanes: { ...profile.capabilities.lanes } }, { executor: 'claude', cliVersion: '2.1.308',
-    lanes: { chat: true, task: false }, structuredOutput: 'native-schema', tools: 'none', sessionPersistence: 'off', modelPinned: true,
+    lanes: { chat: true, task: false, review: true }, structuredOutput: 'native-schema', tools: 'none', sessionPersistence: 'off', modelPinned: true,
     credential: 'env-static', evidence: 'fake-cli' });
   const config = workerConfig(env());
   assert.equal(config.profile.id, 'claude-subscription');
