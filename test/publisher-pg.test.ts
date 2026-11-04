@@ -141,8 +141,8 @@ test('P2-5 실제 진입 프로세스: 8081 listen 실패면 열었던 8080을 �
   } finally { blocker.close(); await d.close(); }
 });
 
-// 운영 장애(2026-10-30): controls에 숫자가 아닌 값(scheduler·alert_admission=false)이 있고 대기 글이 있으면
-// 실행기가 value::bigint를 key 비교보다 먼저 평가해 claimDelivery가 22023으로 실패했다. ANALYZE 뒤라야 그 순서가 나온다.
+// controls에 숫자가 아닌 값(scheduler·alert_admission=false)이 있고 대기 글이 있으면
+// 실행기가 value::bigint를 key 비교보다 먼저 평가해 claimDelivery가 22023으로 실패한다. ANALYZE 뒤라야 그 순서가 나온다.
 test('t16b-hotfix 실제 PostgreSQL: controls에 boolean 값이 있어도 대기 글을 꺼내고, 숫자 pause는 그대로 지킴', { skip }, async () => {
   const d = await database();
   try {

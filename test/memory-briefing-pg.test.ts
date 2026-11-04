@@ -114,7 +114,7 @@ test('DATA-02 [rev-t20d P2 PG] 저장 제외가 먼저 시작돼 끝나기 전�
   } finally { await env.close(); }
 });
 
-// --- T20 예약 해제(T16b 이월 P2): 예약 끄기와 큐 확정·게시의 실제 다중 연결 경합 ---
+// --- 예약 해제: 예약 끄기와 큐 확정·게시의 실제 다중 연결 경합 ---
 const unconfigured: BriefingConfig = { time: null, timezone: 'Asia/Seoul' };
 async function delivered(env: Awaited<ReturnType<typeof setup>>) {
   for (let i = 0; i < 3; i++) await env.f.publisher.deliver();

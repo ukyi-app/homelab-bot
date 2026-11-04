@@ -9,7 +9,7 @@ import { localDatabase, fixture, thread } from './helpers.js';
 import { FIXED_MARKER, closeLedgers, faultyIo, freeLock, initLedger, ledgerAt, markerBytes, openLedger } from './ledger-fixture.js';
 import type { Faults } from './ledger-fixture.js';
 
-// T20 원장 계약 v1(파일·표식·권한·동일성·디스크 오류). 잠금 배타와 세대 묶음은 deletion-ledger-pg.test.ts가 실제 PostgreSQL로 본다.
+// 원장 계약 v1(파일·표식·권한·동일성·디스크 오류). 잠금 배타와 세대 묶음은 deletion-ledger-pg.test.ts가 실제 PostgreSQL로 본다.
 let database: Awaited<ReturnType<typeof localDatabase>>;
 let ledger: Awaited<ReturnType<typeof initLedger>>;
 const dirs: string[] = [];

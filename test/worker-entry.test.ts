@@ -24,7 +24,7 @@ import { WORKER_ENV, startWorker, workerConfig } from '../src/worker-main.js';
 import { FileNonceStore, NONCE_RETENTION_MS, WorkerStartError, seedAuth } from '../src/worker-state.js';
 import { SpawnLauncher } from './spawn-launcher.js';
 
-// 작업자 진입점(T16b S4)과 Codex 프로필(codex-subscription, file-mutable 자격). Claude 프로필은 worker-claude.test.ts다.
+// 작업자 진입점과 Codex 프로필(codex-subscription, file-mutable 자격). Claude 프로필은 worker-claude.test.ts다.
 // 모델 호출 없음: codex 자리에 같은 인자·stdin·env로 도는 가짜 실행 파일을 둔다.
 // 시드 값은 시험용 가짜다. 개인 ~/.codex*는 쓰지 않고 저장소 .local/ 아래 임시 CODEX_HOME만 쓴다.
 const FAKE_TOKEN = 'fixture-refresh-token-abcdefghijklmnopqrstuvwxyz0123';
@@ -485,7 +485,7 @@ test('WRK-15 종료 신호 때 실행 중인 대화는 codex를 멈추고 failed
   assert.deepEqual(launcher.aborted, [j.id]);
 });
 
-// ---- 리뷰 wrk-r1 회귀 시험(수정 전 실패를 먼저 확인했다) ----
+// ---- 시드 설치·종료 중 요청·nonce 기록 회귀 시험 ----
 test('WRK-16 [r1 P1] 시드 설치는 "없을 때만" 원자적: 확인 뒤 생긴 갱신본·심링크를 덮지 않고, 동시 기동 둘 중 하나만 설치', async () => {
   const target = join(codexHome, 'auth.json');
   const seedFile = join(seedDir, 'CODEX_AUTH_JSON');
@@ -610,7 +610,7 @@ test('WRK-19 [r1 P2] nonce 파일을 만든 뒤 시각 기록·닫기 I/O가 실
   }
 });
 
-// ---- 리뷰 exec-r1 회귀 시험(수정 전 실패를 먼저 확인했다) ----
+// ---- CODEX_HOME 별칭과 세션 정리 실패 회귀 시험 ----
 test('WRK-20 [r1 P1] CODEX_HOME이 작업자 디렉터리의 정상 별칭(심링크)이어도 시드·readiness·반사 차단이 같은 실제 경로로 동작', async () => {
   const alias = join(base, 'codex-home-alias');
   await symlink(codexHome, alias);
@@ -624,7 +624,7 @@ test('WRK-20 [r1 P1] CODEX_HOME이 작업자 디렉터리의 정상 별칭(심�
     assert.equal(worker.credential, 'seeded');
     assert.equal(await readFile(join(codexHome, 'auth.json'), 'utf8'), SEED);
     assert.equal((await fetch(`http://127.0.0.1:${(worker.server.address() as AddressInfo).port}/readyz`)).status, 200);
-    // 리뷰어 재현: 답에 자격(갱신 토큰)이 섞이면 게시하지 않는다.
+    // 답에 자격(갱신 토큰)이 섞이면 게시하지 않는다.
     await mode({ kind: 'answer', answer: { ...ANSWER, facts: [`토큰 ${FAKE_TOKEN}`] } });
     assert.deepEqual(await call(), { status: 'failed', stopped: true });
     await mode({ kind: 'answer', answer: ANSWER });

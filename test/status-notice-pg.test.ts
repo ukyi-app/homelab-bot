@@ -8,7 +8,7 @@ import type { Database } from '../src/database.js';
 import { Store } from '../src/store.js';
 import { event, fixture, thread } from './helpers.js';
 
-// impl-sched S4 실제 PostgreSQL: 상태 안내 삽입(outbox 외래 키 → 대화 행 KEY SHARE)이 제어 경로
+// S4 실제 PostgreSQL: 상태 안내 삽입(outbox 외래 키 → 대화 행 KEY SHARE)이 제어 경로
 // (대화 행 FOR UPDATE → scheduler 행 → job 행)와 반대 순서로 잠그지 않는지 본다. 뒤집히면 교착(40P01)이나 잠금 시간 초과(55P03)다.
 const socket = process.env.HOMELAB_TEST_PG_SOCKET;
 const skip = socket ? false : 'HOMELAB_TEST_PG_SOCKET 없음(로컬 PostgreSQL 필요)';
@@ -101,9 +101,9 @@ test('S4 실제 PostgreSQL: /cancel이 대화 행을 쥔 사이 runtime의 unkno
   } finally { await close(); }
 });
 
-// fix-a F1: 만료 처리 E가 대화 행을 선잠금한 뒤·UPDATE 전에 다른 job J의 lease가 끝나고, 같은 대화의 /cancel C가 대화 행을 잡는다.
-// 수정 전에는 E의 UPDATE가 선잠금하지 않은 J를 잡고 안내 INSERT에서 C를 기다리며, C는 J를 기다려 순환한다.
-// 수정 뒤에는 E가 선잠금 때 정한 후보에 한해서만 바꾸므로 J는 다음 바퀴가 처리한다.
+// 만료 처리 E가 대화 행을 선잠금한 뒤·UPDATE 전에 다른 job J의 lease가 끝나고, 같은 대화의 /cancel C가 대화 행을 잡는다.
+// E의 UPDATE가 선잠금하지 않은 J를 잡으면 안내 INSERT에서 C를 기다리고, C는 J를 기다려 순환한다.
+// E는 선잠금 때 정한 후보에 한해서만 바꾸므로 J는 다음 바퀴가 처리한다.
 function expiryHook(db: Database, model: boolean, onLocked: () => Promise<void>): Database {
   let armed = true;
   const wrap = (inner: Database, seen: string[]): Database => ({

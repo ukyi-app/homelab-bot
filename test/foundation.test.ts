@@ -46,7 +46,7 @@ test('AUTH-01 Gateway의 검증된 채널 메타데이터로 parent를 결정', 
   const normalized = await gatewayMessage(frame, 'fixture-bot', async () => ({ type: 11, parent_id: thread.parent!, guild_id: thread.guild! }));
   assert.deepEqual(normalized.scope, thread);
 });
-// 운영 장애(2026-10-30): 일반 채널(type 0)의 parent_id는 카테고리라 parent로 넣으면 authorize가 조용히 거부했다.
+// 일반 채널(type 0)의 parent_id는 카테고리라 parent로 넣으면 authorize가 조용히 거부한다.
 test('t16b-hotfix 카테고리 안 일반 채널은 parent null, 스레드는 부모 채널을 parent로', async () => {
   const frame = { id: 'fixture-message', channel_id: 'fixture-chat', guild_id: thread.guild!, author: { id: 'fixture-owner' } };
   const channel = await gatewayMessage(frame, 'fixture-bot', async () => ({ type: 0, parent_id: 'fixture-category', guild_id: thread.guild! }));
@@ -75,8 +75,8 @@ test('AUTH-02 큐 실행·게시 직전 정책 revision 재확인', async () => 
   await f.publisher.deliver(); assert.equal(f.rest.messages.length, 0);
   assert.equal((await rows('outbox'))[0]!.state, 'blocked');
 });
-// D1(사용자 2026-10-30) 뒤 정책 원천은 기동 때 읽은 env 값이고 나이로 닫지 않는다(test/publisher-policy.test.ts).
-// 원천이 주는 값이 틀리거나 읽히지 않으면 닫히는 규칙은 그대로다.
+// D1(사용자 결정): 정책 원천은 기동 때 읽은 env 값이고 나이로 닫지 않는다(test/publisher-policy.test.ts).
+// 원천이 주는 값이 틀리거나 읽히지 않으면 닫힌다.
 test('AUTH-02 정책 원천의 값이 바뀌면 현재 값으로, 형식 오류·읽기 실패·미래 시각은 실패 시 닫힘', async () => {
   let value: unknown = { ...f.policy };
   const gate = new PolicyGate(async () => { if (value instanceof Error) throw value; return value; }, database.db, f.now);
@@ -237,7 +237,7 @@ test('READ-02 임의 셸·Secret·ConfigMap·pods/log·쿼리·데이터소스·
   for (const extra of [{ shell: 'kubectl get secrets' }, { query: '{}' }, { datasource: 'other' }, { namespace: 'other' }]) {
     await assert.rejects(f.reader.read('fixture-owner', thread, { ...input, ...extra }));
   }
-  // 등록되지 않은 템플릿 이름은 조회 없이 미등록 답이다(S16: 권한 철회로 기록되던 무응답 대신).
+  // 등록되지 않은 템플릿 이름은 조회 없이 미등록 답이다. 권한 철회로 기록해 무응답으로 끝내지 않는다(S16).
   for (const template of ['secrets', 'configmaps', 'pods/log', 'exec', '{}', 'sum(up)']) {
     assert.equal((await f.reader.read('fixture-owner', thread, { ...input, template })).status, 'unregistered');
   }
@@ -418,7 +418,7 @@ test('작업자 HTTP 계약은 로컬 서버에서 서명 검증하고 잘못된
     assert.equal(f.requests.length, 1);
   } finally { server.close(); await once(server, 'close'); }
 });
-// 4316750309: 같은 payload·서명 바이트로 디코드되는 다른 base64url 표기. Node 디코더는 패딩, 허용 밖 문자,
+// 같은 payload·서명 바이트로 디코드되는 다른 base64url 표기. Node 디코더는 패딩, 허용 밖 문자,
 // 표준 base64 문자, 서명 끝 글자의 남는 4비트를 그냥 넘긴다.
 function capabilityVariants(token: string) {
   const [payload, signature] = token.split('.') as [string, string];

@@ -4,7 +4,7 @@ import { Denied } from '../src/contracts.js';
 import { PolicyGate, loadRuntimePolicy } from '../src/policy.js';
 import { localDatabase, fixture, thread } from './helpers.js';
 
-// D1(사용자 2026-10-30): 정책은 env RUNTIME_POLICIES를 기동 때 한 번 읽는다. 값 변경은 파드 재시작으로,
+// D1(사용자 결정): 정책은 env RUNTIME_POLICIES를 기동 때 한 번 읽는다. 값 변경은 파드 재시작으로,
 // 즉시 차단은 /revoke(DB 거부 목록)로 한다. 읽은 뒤 시간이 지났다는 이유로 닫지 않는다.
 let database: Awaited<ReturnType<typeof localDatabase>>;
 let f: Awaited<ReturnType<typeof fixture>>;

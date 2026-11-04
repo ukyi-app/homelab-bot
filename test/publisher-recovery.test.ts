@@ -95,7 +95,7 @@ test('P1-2 skipped는 구독이 살아 있고 gap이면 다시 시도, 구독이
   assert.equal(scheduler.size, 0); assert.deepEqual(calls, ['a', 'b', 'a']);
 });
 
-// ---- 리뷰 2라운드(rev-pub-r2): 실제 DiscordIngress.recover()와 함께 ----
+// ---- 실제 DiscordIngress.recover()와 함께 ----
 type HistoryFn = (channel: string, after: string | null) => Promise<EventInput[]>;
 const setHistory = (f: Awaited<ReturnType<typeof fixture>>, history: HistoryFn) => { (f.rest as unknown as { history: HistoryFn }).history = history; };
 const historyMessage = (id: string): EventInput => ({ id, actor: 'fixture-owner', scope: thread, text: `fixture-${id}`, kind: 'message' });
@@ -246,7 +246,7 @@ test('R2-2 버퍼 처리 중 30초를 넘겨도 budget', async () => {
   assert.equal((await threadRow()).gap, true);
 });
 
-// ---- 리뷰 3라운드(rev-pub-r3): gap을 푸는 마지막 transaction의 check() 뒤 DB 왕복 경계 ----
+// ---- gap을 푸는 마지막 transaction의 check() 뒤 DB 왕복 경계 ----
 // 지정한 질의의 응답이 돌아온 직후 시계를 당긴다. 마지막 check()는 이미 통과한 뒤다.
 function advancingDatabase(f: Awaited<ReturnType<typeof fixture>>, match: (sql: string) => boolean, ms: () => number) {
   let fired = false;

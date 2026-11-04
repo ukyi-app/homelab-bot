@@ -328,7 +328,7 @@ test('P1-2 영속 Discord pause 동안은 history를 부르지 않고, pause가 
   assert.equal(gw.connections.length, 1);
 });
 
-// PR #12 리뷰 4420530263(P1): 활성 스레드 메시지가 일시 장애로 실패하면 그 이벤트는 RESUME으로도 다시 오지 않는다.
+// 활성 스레드 메시지가 일시 장애로 실패하면 그 이벤트는 RESUME으로도 다시 오지 않는다.
 // 다음 메시지가 checkpoint를 올리면 history 복구도 그 메시지를 건너뛴다.
 for (const failure of ['channel_rest', 'database'] as const) {
   test(`PR12 활성 스레드 메시지가 일시 장애(${failure === 'channel_rest' ? '채널 REST 조회' : 'DB 쓰기'})로 실패해도 다음 메시지가 checkpoint를 넘기지 못하고, 복구가 실패한 메시지를 결국 수락`, async () => {
@@ -407,7 +407,7 @@ test('PR12 확정 거부(허용되지 않은 사용자)는 장벽을 세우지 �
   assert.equal(histories(), before);
 });
 
-// PR #12 재리뷰 4420612638(P1): 재시작 때 queued 작업이 첫 READY의 복구 장벽보다 먼저 claim되면,
+// 재시작 때 queued 작업이 첫 READY의 복구 장벽보다 먼저 claim되면,
 // 중단 중 메시지를 history로 복구하기 전에 이전 입력으로 모델을 부른다.
 async function queuedChat(channel: string, id: string) {
   const store = new Store(database.db);
@@ -441,7 +441,7 @@ test('PR12-2 재시작 뒤 첫 READY 복구가 중단 중 메시지를 먼저 �
   assert.ok(auxCalls.filter(call => call.startsWith('POST /v1/execute')).length <= 1, JSON.stringify(auxCalls));
 });
 
-// PR #12 재리뷰 4420612644(P2): 복구 대기 항목이 없는 RecoveryScheduler.runDue()는 DB 없이 false를 돌려준다.
+// 복구 대기 항목이 없는 RecoveryScheduler.runDue()는 DB 없이 false를 돌려준다.
 // 그 루프가 하트비트 생존을 기록하면 DB 장애 중에도 healthchecks에 정상 ping이 나간다.
 test('PR12-3 DB가 끊기면 DB에 닿지 못한 루프는 하트비트 생존으로 치지 않아 60초 뒤 ping이 멈춤', async () => {
   let offset = 0;

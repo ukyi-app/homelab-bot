@@ -36,7 +36,7 @@ test('T17 이월 4 스키마 상한 입력(압축본 200MB 두 개, 2MB 파일 9
   const dir = await mkdtemp(join(tmpdir(), 'review-diff-peak-'));
   try {
     child(['fixture', dir], 1024, 120_000);
-    // 1Gi cgroup의 기본 힙 한도는 560MiB다(2026-11-04 systemd-run MemoryMax=1G로 측정). 그보다 좁게 잡아 힙에 기대지 않는지 본다.
+    // 1Gi cgroup의 기본 힙 한도는 560MiB다(systemd-run MemoryMax=1G로 측정). 그보다 좁게 잡아 힙에 기대지 않는지 본다.
     const result = child(['worker', dir], 256, 300_000);
     assert.ok(result.maxRssMiB < WORKER_LIMIT_MIB * 0.9, `maxRSS ${result.maxRssMiB}MiB`);
     assert.equal(result.checked, 0);

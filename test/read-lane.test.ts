@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { DEFAULTS } from '../src/contracts.js';
 import { localDatabase, fixture, event, thread, service, template } from './helpers.js';
 
-// impl-sched S1: /read는 모델 슬롯과 다른 레인에서 claim·실행한다. 모델 실행·unknown·waiting_user·비상 중지에 막히지 않지만
+// S1: /read는 모델 슬롯과 다른 레인에서 claim·실행한다. 모델 실행·unknown·waiting_user·비상 중지에 막히지 않지만
 // 대화 단위 장벽(구독 중지·gap·권한 철회)은 그대로 지킨다. read 동시 실행은 1개, 모델 동시 실행도 1개다.
 let database: Awaited<ReturnType<typeof localDatabase>>;
 let f: Awaited<ReturnType<typeof fixture>>;
@@ -130,7 +130,7 @@ test('S1 대기열 몫: 모델 계열이 상한(100-10)에 닿아도 read는 100
   await assert.rejects(read('read-over'), /queue_full/);
 });
 
-// Codex r(f733420) P2: /retry도 대상 작업의 실제 종류로 상한을 센다. 모델이 정체해도 실패한 조회는 다시 돌 수 있어야 한다.
+// /retry도 대상 작업의 실제 종류로 상한을 센다. 모델이 정체해도 실패한 조회는 다시 돌 수 있어야 한다.
 test('S1 대기열 몫: 모델 계열이 상한에 닿아도 실패한 read의 /retry는 들어오고, chat 재시도는 막힘', async () => {
   await read('read-1');
   await chat('chat-1');

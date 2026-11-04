@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { Denied } from '../src/contracts.js';
 import { ReviewPolicySchema, restrictGitHubWrite } from '../src/review.js';
 
-// PR #42 리뷰 후속: 게시 서버의 정책 저장소 이름과 리뷰 쓰기 경로도 점 세그먼트를 거부한다(작업자 쪽 REPOSITORY_NAME과 같은 규칙).
+// 게시 서버의 정책 저장소 이름과 리뷰 쓰기 경로도 점 세그먼트를 거부한다(작업자 쪽 REPOSITORY_NAME과 같은 규칙).
 const SHA = 'a'.repeat(40);
 const policy = (fullName: string) => ({
   repositories: [{ id: 1, fullName, installationId: 2, visibility: 'public' }], allowedBotAuthorIds: [], commentCommand: null,

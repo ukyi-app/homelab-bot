@@ -19,7 +19,7 @@ import { HttpWorker } from '../src/worker-http.js';
 import { startWorker, workerConfig } from '../src/worker-main.js';
 import { SpawnLauncher } from './spawn-launcher.js';
 
-// 작업자 서버 통합(t17-wsrv): 한 서버의 네 경로, 공통 자리·실행 제어, unknown 해제, sweep, 종료 drain, 프록시 없음.
+// 작업자 서버 통합: 한 서버의 네 경로, 공통 자리·실행 제어, unknown 해제, sweep, 종료 drain, 프록시 없음.
 // 모델 호출·네트워크 없음. claude·codex 자리에 가짜 실행 파일을 두고 압축본은 주입한 함수로 준다.
 const TOKEN = 'sk-ant-oat01-fixture-token-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789';
 const MODEL = 'claude-opus-5-5';
@@ -591,7 +591,7 @@ test('T17 onEvent: 공유 실행 제어의 정리 사건이 리뷰 실행에서�
 
 test('T17 위반 사건: 작업자 로그에 run_policy_violation 한 줄이 값 없이 남고 HTTP 응답 사유는 그대로다', async () => {
   const marker = 'value-marker-must-not-log';
-  // 첫 실리뷰와 같은 위반: 리뷰 어댑터만 보는 plugins. 대화 어댑터는 이 필드를 보지 않는다.
+  // 리뷰 어댑터만 보는 plugins 위반. 대화 어댑터는 이 필드를 보지 않는다.
   const plugins = await wrap(join(base, 'fake'), 'claude-plugins', FAKE_CLAUDE.replace('plugins: []', `plugins: [{ name: '${marker}', path: 'builtin' }]`));
   const first = await boot({ config: claude({ WORKER_EXECUTOR_BIN: plugins }), launcher: new SpawnLauncher(plugins) });
   const a = job();

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { DEFAULTS } from '../src/contracts.js';
 import { localDatabase, fixture, event } from './helpers.js';
 
-// impl-sched S4: 상태 알림. chat이 waiting_user·unknown이 될 때 같은 트랜잭션에서 그 대화에 안내를 넣는다.
+// S4: 상태 알림. chat이 waiting_user·unknown이 될 때 같은 트랜잭션에서 그 대화에 안내를 넣는다.
 // 멱등 키는 (job, attempt)라 같은 시도가 다시 같은 상태에 들어가도 하나다. 멘션은 넣지 않는다(owner 멘션은 나중 결정).
 let database: Awaited<ReturnType<typeof localDatabase>>;
 let f: Awaited<ReturnType<typeof fixture>>;

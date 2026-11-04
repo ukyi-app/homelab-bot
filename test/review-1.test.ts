@@ -222,7 +222,7 @@ test('R1-08/EVENT-02 실제 Protocol.findDelivery는 다른 작성자의 marker�
   } }, 'fixture-bot', f.now);
   const publisher = new DiscordPublisher(f.store, f.gate, protocol);
   await publisher.deliver(); await publisher.reconcile(); assert.equal((await rows('outbox'))[0]!.state, 'unknown');
-  // 검색 miss 뒤에는 backoff(1초) 전까지 다시 찾지 않는다(4316750315).
+  // 검색 miss 뒤에는 backoff(1초) 전까지 다시 찾지 않는다.
   includeBot = true; f.advance(DEFAULTS.retryDelayMs); await publisher.reconcile(); await publisher.deliver();
   assert.equal((await rows('outbox'))[0]!.external_id, 'actual'); assert.equal(sends, 1);
 });

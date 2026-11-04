@@ -535,7 +535,7 @@ test('REVIEW-03 파일 수·diff 상한·바이너리·큰 잠금 파일·submod
   assert.ok(result.coverage.limits_hit.includes('file_limit'));
   assert.match(r.gh.writes[0]!.body.body, /부분 검토/);
   assert.match(r.gh.writes[0]!.body.body, /미검토 `vendor\/lib`: submodule_pointer/);
-  // 모델도 제외 파일과 이유를 받는다. 없으면 참조된 파일을 "PR에 없다"고 오판한다(2026-11-04 실리뷰 오탐).
+  // 모델도 제외 파일과 이유를 받는다. 없으면 참조된 파일을 "PR에 없다"고 오판한다.
   const sent = r.inputs.at(-1)!.untrusted;
   assert.deepEqual(sent.omitted, result.coverage.omitted_files_with_reasons);
   assert.equal(sent.omittedTotal, result.coverage.omitted_files_with_reasons.length);
@@ -1191,7 +1191,7 @@ test('REVIEW-02 리뷰 정책이 꺼지거나 비교 기준이 미정이 되어�
   assert.deepEqual((await deliveries()).map(d => d.state), ['sent']);
 });
 
-// ---- r2: 독립 Codex 리뷰(review-t17-r1) 지적별 회귀 ----
+// ---- 권한 철회·대기 재개·draft·늦은 이벤트·리뷰 입력 회귀 시험 ----
 test('r2 P1-01 AUTH-01 GitHub 조회 중 저장소·허용 봇 철회·정책 변경·리뷰 비활성은 capability 발급 전에 반영해 모델을 부르지 않는다', async () => {
   const compare = r.gh.compare.bind(r.gh);
   const during = (change: () => void) => { r.gh.compare = async (name, base, head) => { change(); return compare(name, base, head); }; };
@@ -1252,7 +1252,7 @@ for (const reason of ['limited', 'auth_expired'] as const) {
       assert.equal((await command('review-cancel', job!.id, scope)).ok, false);
     }
     await assert.rejects(command('review-resume', job!.id, notificationChannel, 'intruder'), Denied);
-    // 기존 대화 명령의 뜻은 그대로: 리뷰 job ID로는 풀리지 않는다.
+    // 대화 명령은 리뷰 job ID로 풀리지 않는다.
     assert.equal((await command('resume-model', job!.id)).ok, false);
     assert.equal((await command('cancel', job!.id)).ok, false);
     assert.deepEqual((await reviewJobs()).map(j => j.state), ['waiting_user']);
@@ -1414,8 +1414,8 @@ test('r2 P2-07 REVIEW-03 기준 AGENTS.md도 파일·총 입력 예산을 적용
   assert.deepEqual(changed.coverage.omitted_files_with_reasons, [{ path: 'AGENTS.md', reason: 'file_too_large' }]);
 });
 
-// ---- r3: 재리뷰(review-t17-r2) 지적별 회귀 ----
-// r1 반환 시점(0daf892)의 마이그레이션 008 원문. 이미 그 스키마로 만든 DB를 흉내 낸다.
+// ---- 스키마 재적용·draft 세대·게시 직전 조회·unknown 대조 회귀 시험 ----
+// 커밋 0daf892의 마이그레이션 008 원문. 이미 그 스키마로 만든 DB를 흉내 낸다.
 const R1_MIGRATION_008 = `BEGIN;
 -- PR 리뷰 작업은 jobs(type='review', conversation_id NULL)에 둔다. 대화 작업과 모델 슬롯 1개를 같은 표로 나눈다.
 CREATE TABLE IF NOT EXISTS github_deliveries (

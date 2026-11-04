@@ -8,7 +8,7 @@ import { Store } from '../src/store.js';
 import type { Scope } from '../src/contracts.js';
 import { event, fixture, service, template, thread } from './helpers.js';
 
-// impl-sched S1 실제 PostgreSQL 다중 연결 시험. 게시 서버 둘(구·신 RollingUpdate)이 동시에 read·모델 claim을 해도
+// S1 실제 PostgreSQL 다중 연결 시험. 게시 서버 둘(구·신 RollingUpdate)이 동시에 read·모델 claim을 해도
 // 같은 job을 두 번 잡지 않고, read 동시 1개·모델 동시 1개를 지키며, 제어 명령과 교착하지 않는다.
 // HOMELAB_TEST_PG_SOCKET이 없으면 건너뛴다(test/review-9-pg.test.ts와 같은 방식).
 const socket = process.env.HOMELAB_TEST_PG_SOCKET;

@@ -14,7 +14,7 @@ import { DELETE_SCOPE, MemoryCommands, REPLY_LIMIT, SEARCH_HEADER, UNAVAILABLE, 
 import { MockDiscord, event, fixture, localDatabase, thread } from './helpers.js';
 import { closeLedgers, initLedger, ledgerAt } from './ledger-fixture.js';
 
-// T20 기억 명령(B4). 수신(DiscordIngress) → 명령 처리기 → MemoryService(PGlite + 실제 원장 파일)까지 잇는다.
+// 기억 명령(B4). 수신(DiscordIngress) → 명령 처리기 → MemoryService(PGlite + 실제 원장 파일)까지 잇는다.
 let database: Awaited<ReturnType<typeof localDatabase>>;
 let f: Awaited<ReturnType<typeof fixture>>;
 let dir: string;

@@ -63,7 +63,7 @@ test('T16a 변경 요청 6 실제 PostgreSQL: /model-status가 대화 행을 잡
     const held = pausing(db, sql => /FROM conversations WHERE id=\$1 FOR UPDATE/.test(sql));
     const status = new Store(held.db, f.now).control(f.policy.owner, conversation, 'model-status');
     await held.paused;
-    // B: 수정 전 accept()는 스케줄러를 먼저 쥐고 jobs 외래 키 검사로 대화 행을 기다려 A와 교착했다(55P03).
+    // B: accept()가 스케줄러를 먼저 쥐면 jobs 외래 키 검사로 대화 행을 기다려 A와 교착한다(55P03).
     const accepting = new Store(db, f.now).accept(saved.id, 'chat', f.policy.revision);
     await sleep(300);
     held.release();
@@ -87,7 +87,7 @@ test('4316750325 실제 PostgreSQL: 서로 다른 대화의 동시 /retry도 que
       const saved = await f.store.save(event(`pg-queue-${i}`, { kind: 'command', command: 'task' }), f.policy.revision, false);
       await f.store.accept(saved.id, 'task', f.policy.revision);
     }
-    // A: 첫 재시도가 상태를 바꾼 직후 커밋 전에 멈춘다. 수정 뒤에는 스케줄러 행을 쥐고 있어 B가 기다린다.
+    // A: 첫 재시도가 상태를 바꾼 직후 커밋 전에 멈춘다. 스케줄러 행을 쥐고 있어 B가 기다린다.
     const held = pausing(db, sql => sql.startsWith("UPDATE jobs SET state='queued',available_at=$4,wait_reason=NULL"));
     const first = new Store(held.db, f.now).control(f.policy.owner, f.store.scopeId(thread), 'retry', failed[0]) as Promise<{ ok?: boolean }>;
     await held.paused;

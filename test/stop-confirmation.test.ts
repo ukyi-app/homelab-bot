@@ -6,7 +6,7 @@ import type { RuntimeOptions } from '../src/runtime.js';
 import type { WorkerResult } from '../src/worker.js';
 import { localDatabase, fixture, event } from './helpers.js';
 
-// fix-a F2·F3. 작업자의 cancel은 자기가 잡고 있는 job일 때만 stopped:true를 주고, 첫 확인 뒤 job을 놓는다.
+// F2·F3. 작업자의 cancel은 자기가 잡고 있는 job일 때만 stopped:true를 주고, 첫 확인 뒤 job을 놓는다.
 // F2: 드레인 기한이 되면 DB 검사(monitor·재인가·상태 조회)를 기다리지 않고 그 자리에서 cancel을 보낸다.
 // F3: 확인된 멈춤 뒤의 상태 쓰기가 일시 DB 오류로 실패해도 cancel을 다시 묻지 않고(두 번째는 false다) unknown으로 적지 않는다.
 let database: Awaited<ReturnType<typeof localDatabase>>;
@@ -120,7 +120,7 @@ test('F3 확인 뒤 상태 쓰기가 끝내 실패해도 unknown으로 적지 �
   assert.ok((await rows('audit')).some(a => a.kind === 'stop_confirmed_write_failed' && a.subject === job.id));
 });
 
-// rev-a2 후속. 실행 대기가 stopped:false(불확실 응답·예외)로 끝나면 DB 후처리를 기다리지 않고 그 자리에서 공유 cancel을 보낸다.
+// 실행 대기가 stopped:false(불확실 응답·예외)로 끝나면 DB 후처리를 기다리지 않고 그 자리에서 공유 cancel을 보낸다.
 // cancel은 한 실행에 한 번이다. false·오류도 결과로 다시 쓰고, catch도 같은 판정(드레인이면 shutdownOutcome)을 거친다.
 function cancelSequence(answers: (boolean | 'error')[]) {
   const at: number[] = [];

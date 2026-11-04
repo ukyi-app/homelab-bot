@@ -88,7 +88,7 @@ for (const seconds of [1, 15, 60, 120]) test(`4314491278 템플릿 ${seconds}초
   await f.ingress.receive(event('read', { kind: 'command', command: 'read', target: service.id, text: template.id }));
   await new Runtime(f.store, f.gate, f.worker, f.signer, reader).tickRead();
   assert.equal((await rows('jobs'))[0]!.state, 'succeeded'); assert.equal(f.requests.length, 0); assert.equal(requests.length, 1);
-  // recent 창은 템플릿 상한 전체다(S16, 이전에는 min(60초, 상한)).
+  // recent 창은 템플릿 상한 전체다(S16).
   const window = { from: f.now() - seconds * 1000, to: f.now() };
   assert.deepEqual((await rows('results'))[0]!.result.window, window);
   assert.equal(requests[0]!.from, window.from); assert.equal(requests[0]!.to, window.to);

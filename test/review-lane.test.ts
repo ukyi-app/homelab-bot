@@ -23,7 +23,7 @@ import type { WorkerRequest, WorkerVerifier } from '../src/worker.js';
 import { WorkerStartError } from '../src/worker-state.js';
 import { SpawnLauncher } from './spawn-launcher.js';
 
-// 리뷰 레인과 무도구 경계(사용자 2026-11-04: T17 인증 격리·SEC-02 조건을 이 시험으로 갈음). 모델 호출·로그인 없음.
+// 리뷰 레인과 무도구 경계(사용자 결정: T17 인증 격리·SEC-02 조건을 이 시험으로 갈음). 모델 호출·로그인 없음.
 // claude 자리에 같은 인자·stdin·env로 도는 가짜 실행 파일을 둔다. 이벤트 모양은 고정 바이너리의 SDK 스키마로 합성했다(실제 출력 녹음이 아니다).
 // 토큰은 합성 값이고, 개인 ~/.claude*는 쓰지 않고 저장소 .local/ 아래 임시 디렉터리만 쓴다.
 const TOKEN = 'sk-ant-oat01-fixture-token-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789';
@@ -169,7 +169,7 @@ test('T17 무도구 경계 (a) tool_use 블록 없이 도구 실행 이벤트만
     assert.deepEqual(await review(f.reviewer), { status: 'failed', reason: 'policy_violation' }, JSON.stringify(event));
     assert.equal(f.launcher.aborted.length, 1);
   }
-  // 대화 어댑터의 판정은 넓히지 않았다. 같은 이벤트로 멈추지 않는다.
+  // 대화 어댑터는 같은 이벤트로 멈추지 않는다.
   await mode({ answer: { facts: ['x'], hypotheses: [], unknowns: [], checks: [] }, events: [events[0]] });
   assert.equal((await fixture().chat.run(chatRequest(), live())).status, 'succeeded');
 });
@@ -211,7 +211,7 @@ test('T17 무도구 경계 (b) init이 정책과 다르면 그 실행은 정책 
   const cases: Record<string, unknown>[] = [
     { init: { mcp_servers: [{ name: 'x', status: 'connected' }] } }, { init: { tools: ['StructuredOutput', 'Bash'] } },
     { init: { skills: ['deploy'] } }, { init: { skills: null } }, { init: { plugins: [{ name: 'p', path: '/p' }] } }, { init: { plugins: null } },
-    // 2.1.308이 --safe-mode에서도 싣던 내장 플러그인 모양(2026-11-04 실측). 설정이 먹지 않으면 여기서 막혀야 한다.
+    // 2.1.308이 --safe-mode에서도 싣는 내장 플러그인 모양(실측). 설정이 먹지 않으면 여기서 막혀야 한다.
     { init: { plugins: [{ name: 'cc-plugin-agents-md', path: 'builtin', source: 'cc-plugin-agents-md@builtin' }] } },
     { events: [{ type: 'system', subtype: 'hook_started', hook_id: 'h', hook_name: 'SessionStart', hook_event: 'SessionStart' }] },
     { events: [{ type: 'system', subtype: 'hook_response', hook_id: 'h', hook_name: 'Stop', hook_event: 'Stop' }] },
@@ -246,7 +246,7 @@ class BlindAdapter extends ClaudeReviewAdapter {
 }
 
 test('T17 위반 사건: 리뷰 init plugins가 비어 있지 않으면 plugins_enabled가 값 없이 한 번 나오고 사유는 그대로다', async () => {
-  // 첫 실리뷰를 막은 모양(2026-11-04 실측)에 이름 자리만 표식으로 바꿨다. 위반이 둘 이어져도 사건은 첫 위반 하나다.
+  // 리뷰를 막는 내장 플러그인 모양(실측)에 이름 자리만 표식으로 둔다. 위반이 둘 이어져도 사건은 첫 위반 하나다.
   await mode({ kind: 'hang', init: { plugins: [{ name: MARKER, path: 'builtin', source: `${MARKER}@builtin` }] },
     events: [{ type: 'system', subtype: 'hook_started', hook_id: 'h', hook_name: MARKER, hook_event: 'SessionStart' }] });
   const { events, onEvent } = collector();
@@ -298,7 +298,7 @@ test('T17 위반 사건: 대화 레인도 같은 경로로 lane chat 사건을 �
 });
 
 test('T17 위반 사건: 도구 호출(예산 초과)·정상 실행은 위반이 아니라 사건이 없다', async () => {
-  // 대화·리뷰 모두 tool_use 블록은 tool_budget_exceeded 경로다. 정책 위반으로 세지 않는다(판정을 넓히지 않았다).
+  // 대화·리뷰 모두 tool_use 블록은 tool_budget_exceeded 경로다. 정책 위반으로 세지 않는다.
   await mode({ kind: 'hang', events: [{ type: 'assistant', uuid: 'u1', message: { model: MODEL,
     content: [{ type: 'tool_use', id: 'toolu_bash', name: MARKER, input: {} }] } }] });
   const toolUse = collector();
@@ -425,8 +425,8 @@ test('T17 무도구 경계 (e) 성공·실패·중단 모두 임시 공간을 �
     ['정책 위반', { answer: OUTPUT, session: true, init: { skills: ['x'] } }, reviewer => review(reviewer), 'failed'],
     ['한도', { session: true, kind: 'error', error: 'rate_limit', status: 429 }, reviewer => review(reviewer), 'limited'],
     // 가짜 CLI가 세션 파일과 기록을 남긴 뒤에 멈춘다. 고정 100ms 중단은 부하 큰 CI 빌드에서 기록 도중에 죽여
-    // 빈 JSON을 읽었다(2026-11-04 봇 main 빌드). 기한도 같은 이유로 시작이 늦어도 기록이 남을 만큼 준다.
-    // 실제 기한은 runDeadline(timeoutMs) = max(timeoutMs/2, timeoutMs - 5000)이라 4000이면 2초다(100이면 50ms였다).
+    // 빈 JSON을 읽는다. 기한도 같은 이유로 시작이 늦어도 기록이 남을 만큼 준다.
+    // 실제 기한은 runDeadline(timeoutMs) = max(timeoutMs/2, timeoutMs - 5000)이라 4000이면 2초다(100이면 50ms다).
     ['취소', { session: true, kind: 'hang' }, reviewer => {
       const abort = new AbortController();
       void recorded().then(() => abort.abort());

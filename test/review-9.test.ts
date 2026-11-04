@@ -12,7 +12,7 @@ import { MODEL_QUEUE_LIMIT, Store } from '../src/store.js';
 import type { Delivery } from '../src/store.js';
 import { event, fixture, localDatabase, service, template, thread } from './helpers.js';
 
-// PR #5 마지막 재리뷰(head 1a639db)에서 T16b로 이월한 P2와 T16a 변경 요청 6번(ARCHITECTURE §12)의 회귀 시험이다.
+// 끝 줄 marker·검색 backoff·응답 섹션·read 시간 초과·/retry 상한과 accept 잠금 순서(ARCHITECTURE §12 변경 요청 6번)의 회귀 시험이다.
 let database: Awaited<ReturnType<typeof localDatabase>>;
 let f: Awaited<ReturnType<typeof fixture>>;
 before(async () => { database = await localDatabase(); });
@@ -113,7 +113,7 @@ test('4316750315 검색 오류도 backoff, 간격은 상한에서 멈추고 unkn
   assert.equal(f.rest.messages.length, 0);
 });
 
-// 개선안 v2 C1: 섹션 예산으로 항목을 버리던 방식을 바꿔 모든 항목을 완결 그대로 싣고 빈 섹션은 생략한다.
+// 개선안 v2 C1: 섹션 예산으로 항목을 버리지 않고 모든 항목을 완결 그대로 실으며 빈 섹션은 생략한다.
 test('4316750301 모델 응답 섹션은 완결 항목을 모두 싣고 빈 섹션은 생략', async () => {
   const unknowns = Array.from({ length: 8 }, (_, i) => `미확인 항목 ${i} ${'가'.repeat(80)}`);
   f.setRun(async () => ({ status: 'succeeded', stopped: true, answer: { facts: [], hypotheses: [], unknowns, checks: ['짧은 확인'] } }));
@@ -173,7 +173,7 @@ test('4316750325 /retry도 scheduler 잠금 아래 queued 상한을 지키고 �
 });
 
 // PGlite는 연결이 하나라 행 잠금 대기(교착)를 재현할 수 없다. 트랜잭션마다 잠금을 잡는 문장의 순서를 기록해
-// T16a 제어 경로(대화 행 FOR UPDATE → 스케줄러 행)와 같은지 본다. jobs·outbox 삽입은 conversation_id 외래 키 검사로
+// 제어 경로(대화 행 FOR UPDATE → 스케줄러 행)와 같은지 본다. jobs·outbox 삽입은 conversation_id 외래 키 검사로
 // 대화 행 KEY SHARE를 잡고 이것은 제어 경로가 먼저 잡은 FOR UPDATE와 충돌하므로 대화 행에 닿는 문장으로 센다.
 // 실제 다중 연결 재현은 test/review-9-pg.test.ts다(HOMELAB_TEST_PG_SOCKET).
 function lockLog(db: Database) {

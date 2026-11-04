@@ -10,7 +10,7 @@ import { advisoryLedgerLock, lockClient } from '../src/ledger-lock.js';
 import { initLedger } from './ledger-fixture.js';
 import { Trace, boot, ledgerState, pendingAlert, publisherConfig, waitFor } from './t20-harness.js';
 
-// T20 기동 장벽의 원장 잠금 경합을 실제 PostgreSQL로 본다. 진입점이 직접 만드는 원장(전용 연결 advisory lock)을 그대로 쓴다.
+// 기동 장벽의 원장 잠금 경합을 실제 PostgreSQL로 본다. 진입점이 직접 만드는 원장(전용 연결 advisory lock)을 그대로 쓴다.
 // HOMELAB_TEST_PG_SOCKET(유닉스 소켓 디렉터리)이 없으면 건너뛴다. 실행 방법은 VERIFICATION T20 절에 있다.
 const socket = process.env.HOMELAB_TEST_PG_SOCKET;
 const skip = socket ? false : 'HOMELAB_TEST_PG_SOCKET 없음(로컬 PostgreSQL 필요)';
