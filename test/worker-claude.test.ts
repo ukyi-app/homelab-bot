@@ -22,7 +22,7 @@ import { WORKER_ENV, startWorker, workerConfig } from '../src/worker-main.js';
 import { WorkerStartError } from '../src/worker-state.js';
 import { SpawnLauncher } from './spawn-launcher.js';
 
-// Claude 프로필(claude-subscription: Claude Code CLI 2.1.308, 구독 장기 토큰, env-static 자격, D-14 변경 사용자 2026-10-30).
+// Claude 프로필(claude-subscription: Claude Code CLI 2.1.308, 구독 장기 토큰, env-static 자격, D-14).
 // 모델 호출·로그인 없음: claude 자리에 같은 인자·stdin·env로 도는 가짜 실행 파일을 둔다. 가짜가 내는 stream-json 모양은
 // 고정 바이너리에 든 SDK 메시지 스키마와 공식 headless 문서로 합성했다(실제 출력 녹음이 아니다, S12에서 대조).
 // 토큰은 합성 값이다. 개인 ~/.claude*는 쓰지 않고 저장소 .local/ 아래 임시 디렉터리만 쓴다.
@@ -556,7 +556,7 @@ test('CLD-14 진입점 프로세스: 토큰이 틀리거나 사람 홈 경로면
   }
 });
 
-// ---- 리뷰 exec-r1 회귀 시험(수정 전 실패를 먼저 확인했다) ----
+// ---- 모델 전환 차단과 실행 디렉터리 삭제 실패 회귀 시험 ----
 test('CLD-15 [r1 P1] Opus 5.5 자동 모델 전환: 끄는 env를 넘기고, 전환 이벤트·다른 모델의 답은 즉시 중단·실패', { timeout: 20_000 }, async () => {
   // 자동 전환을 끄는 공식 변수 [확인: 공식 env 문서, 2.1.308 바이너리의 전환 조건].
   const launcher = new SpawnLauncher(fakeBin);
@@ -575,7 +575,7 @@ test('CLD-15 [r1 P1] Opus 5.5 자동 모델 전환: 끄는 env를 넘기고, 전
     [[init, assistant(MODEL), success], 'output'],
     // 날짜가 붙은 같은 모델 ID는 같은 모델이다.
     [[init, assistant(`${MODEL}-20261001`), success], 'output'],
-    // 리뷰어 재현: init은 고정 모델, 전환 이벤트 뒤 다른 모델이 답하고 결과는 성공.
+    // init은 고정 모델, 전환 이벤트 뒤 다른 모델이 답하고 결과는 성공.
     [[init, fallback, assistant('claude-opus-4-8'), success], 'failed', 'policy_violation'],
     [[init, fallback, success], 'failed', 'policy_violation'],
     // 전환 이벤트 없이 다른 모델이 답해도 실패다.

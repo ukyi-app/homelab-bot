@@ -11,7 +11,7 @@ import { FakeGateway } from './fake-gateway.js';
 import { localDatabase } from './helpers.js';
 import { CHAT, GUILD, NOTIFY, OWNER, Rest, Trace, waitFor } from './t20-harness.js';
 
-// T17 게시 서버 조립 시험. 네트워크를 쓰지 않는다. GitHub·작업자는 send 주입 가짜, Discord는 loopback 가짜 Gateway다. 값은 모두 가짜다.
+// 게시 서버 조립 시험. 네트워크를 쓰지 않는다. GitHub·작업자는 send 주입 가짜, Discord는 loopback 가짜 Gateway다. 값은 모두 가짜다.
 const SECRET = 'fixture-webhook-secret-value';
 const REPO = { id: 101, full_name: 'fixture-org/fixture-repo' };
 const BASE = 'a'.repeat(40), HEAD = 'b'.repeat(40), MERGE_BASE = '9'.repeat(40), BASE_TREE = 'c'.repeat(40), HEAD_TREE = 'd'.repeat(40);

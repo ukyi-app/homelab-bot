@@ -11,7 +11,7 @@ import { localDatabase } from './helpers.js';
 import { ProbeLedger, Trace, boot, breakable, briefingTime, ledgerState, metric, outboxState, pendingAlert, publisherConfig,
   stageBriefing, waitFor } from './t20-harness.js';
 
-// T20 기동 장벽·루프·종료·지표(B3). 진입점(startPublisher)을 PGlite·가짜 Gateway·메모리 REST로 띄운다.
+// 기동 장벽·루프·종료·지표(B3). 진입점(startPublisher)을 PGlite·가짜 Gateway·메모리 REST로 띄운다.
 // 원장은 실제 파일(.local 임시 디렉터리)이고 잠금만 PGlite용 가짜(freeLock)다. 실제 잠금 경합은 t20-startup-pg가 본다.
 let database: Awaited<ReturnType<typeof localDatabase>>;
 let dirs: string[] = [];

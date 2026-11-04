@@ -309,7 +309,7 @@ test('diffTrees [PR #38 리뷰 P2]: 같은 내용의 파일 40,000개 이동도 
   const started = performance.now();
   const result = diffTrees(tree(before), tree(after));
   const elapsed = performance.now() - started;
-  // 수정 전 배열 복사·shift()는 이 크기에서 수십 초였다. 여유를 크게 두되 O(n²)는 걸러낸다.
+  // 배열 복사·shift()로 구현하면 이 크기에서 수십 초가 걸린다. 여유를 크게 두되 O(n²)는 걸러낸다.
   assert.ok(elapsed < 3000, `diffTrees ${Math.round(elapsed)}ms`);
   const renamed = result.files.filter(f => f.status === 'renamed');
   assert.equal(renamed.length, Math.min(count, MAX_CHANGES));
@@ -458,7 +458,7 @@ test('GitHubTransport 금지 요청: 토큰 발급도 전송도 하기 전에 �
     await assert.rejects(fake.io().transport(request as GitHubWrite), Denied, name);
     assert.deepEqual(fake.sent, [], name);
   }
-  // 정책 밖 저장소는 모양 검사를 지나 정책 조회에서 막힌다. 보내지 않고 403(재시도 없음)으로 올린다(아래 [PR #38 리뷰 P2]).
+  // 정책 밖 저장소는 모양 검사를 지나 정책 조회에서 막힌다. 보내지 않고 403(재시도 없음)으로 올린다.
   const outside = new Fake(() => json({ id: 1 }));
   await rejectsWith(outside.io().transport(write({ path: '/repos/fixture-org/not-allowed/pulls/5/reviews' }) as GitHubWrite), 403);
   assert.deepEqual(outside.sent, []);
@@ -576,7 +576,7 @@ test('policyRepositories: 현재 정책의 저장소만 바인딩하고 비활�
   assert.deepEqual(fake.sent, []);
 });
 
-// 설정: 게시 서버 기동 입력. 기존 필수 키는 모두 가짜 값이다.
+// 설정: 게시 서버 기동 입력. 필수 키는 모두 가짜 값이다.
 const rsaPem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
 const baseEnv = () => ({
   DATABASE_URL: 'postgresql://homelab-bot:fixture-db-password@pg-rw.database.svc:5432/homelab-bot?sslmode=require',

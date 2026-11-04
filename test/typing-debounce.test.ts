@@ -136,7 +136,7 @@ test('TYP-08 DB·정책 오류는 삼키고 로그만 남김(예외를 밖으로
   assert.equal(logs[0]!.detail?.reason, 'fixture_db_down');
 });
 
-// 진입점 배선: TYPING_START는 기존 필터 앞에서 처리하고, 실패해도 history gap 장벽(guard)을 세우지 않는다.
+// 진입점 배선: TYPING_START는 이벤트 종류 필터 앞에서 처리하고, 실패해도 history gap 장벽(guard)을 세우지 않는다.
 let gw: FakeGateway;
 let publisher: Publisher | undefined;
 afterEach(async () => { await publisher?.stop(); publisher = undefined; await gw?.close(); });
@@ -180,7 +180,7 @@ test('TYP-10 진입점: typing 처리 DB 오류는 삼키고 guard를 부르지 
 });
 
 // typing 처리(typingStart 안)의 첫 DB 접근 하나를 붙잡는다. PGlite는 연결이 하나라 트랜잭션 안에서 붙잡으면 다른 질의까지
-// 막히므로, 트랜잭션을 시작하기 전(운영의 연결 대기에 해당)에 붙잡는다. 수정 전 코드는 트랜잭션 없이 바로 질의한다.
+// 막히므로, 트랜잭션을 시작하기 전(운영의 연결 대기에 해당)에 붙잡는다. 트랜잭션 없이 바로 질의하는 경로도 같은 자리에서 붙잡는다.
 function stallTyping(inner: Database) {
   let armed = false;
   let reached!: () => void, release!: () => void, done!: () => void;
@@ -220,7 +220,7 @@ test('TYP-11 진입점: typing DB가 느려도 뒤 MESSAGE_CREATE·상호작용�
     gw.dispatch(gw.latest, 4, 'INTERACTION_CREATE', { id: '9001', token: 'fixture-token-9001', type: 2, channel_id: THREAD, guild_id: GUILD,
       member: { user: { id: OWNER } }, data: { name: 'chat', options: [{ name: 'text', value: 'fixture-command' }] } });
     // 힌트가 붙잡혀 있는 동안 둘 다 처리된다(Gateway 직렬 처리를 막지 않는다).
-    // 상호작용 응답 기한(3초)보다 짧게 본다. 수정 전에는 풀어 줄 때까지 영영 막힌다.
+    // 상호작용 응답 기한(3초)보다 짧게 본다. 힌트가 Gateway 직렬 처리를 막으면 풀어 줄 때까지 영영 막힌다.
     assert.ok(await waitFor(async () => (await jobs()).length >= 1, 2000), 'MESSAGE_CREATE가 typing 뒤에서 막힘');
     assert.ok(await waitFor(() => rest.calls.some(c => c.path.startsWith('/interactions/9001/')), 2000), '상호작용 응답이 typing 뒤에서 막힘');
   } finally { slow.release(); }

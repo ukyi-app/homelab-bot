@@ -5,7 +5,7 @@ import { DEFAULTS } from '../src/contracts.js';
 import type { CancelRequest } from '../src/worker.js';
 import { localDatabase, fixture, event } from './helpers.js';
 
-// impl-sched S3·S4: chat unknown은 경과 시간이 아니라 작업자의 종료 확인(cancel stopped:true)으로만 failed가 된다.
+// S3·S4: chat unknown은 경과 시간이 아니라 작업자의 종료 확인(cancel stopped:true)으로만 failed가 된다.
 // 조사는 작업별 backoff(30초부터 두 배, 상한 10분)로 되풀이하고 새 모델 실행을 자동으로 시작하지 않는다. task는 건드리지 않는다.
 // 확인 완료 안내는 같은 트랜잭션에서 멱등 키로 한 번만 넣는다.
 let database: Awaited<ReturnType<typeof localDatabase>>;
@@ -50,7 +50,7 @@ test('S3 작업자가 멈춤을 확인하면 unknown chat은 failed + 안내 1�
   assert.notEqual(((await f.store.control(f.policy.owner, job.conversation_id, 'retry', job.id)) as { ok?: boolean }).ok, false);
 });
 
-// Codex r(50531b7) P2: 실제 작업자는 첫 확인 뒤 job을 놓아 두 번째 cancel에 stopped:false다. 확인 직후 쓰기가 일시 실패해도
+// 실제 작업자는 첫 확인 뒤 job을 놓아 두 번째 cancel에 stopped:false다. 확인 직후 쓰기가 일시 실패해도
 // 확인 결과를 유지한 채 쓰기만 다시 해야 한다. 아니면 풀 수 없는 unknown이 모델 슬롯을 계속 막는다.
 test('S3 확인 뒤 resolveUnknown 일시 DB 오류: cancel 다시 안 묻고 쓰기만 재시도해 failed', async () => {
   const job = await unknownJob();

@@ -278,7 +278,7 @@ test('4314215638 중간 페이지 enqueue 실패는 논리 메시지 전체 roll
   try { await assert.rejects(enqueue('atomic', '내용'.repeat(2000)), /page_write_failed/); } finally { database.db.transaction = transaction; }
   assert.equal((await rows('outbox')).length, 0);
 });
-// impl-sched S1: read 레인 분리 뒤에는 모델 실행이 끝나기 전에 두 read가 모두 끝난다.
+// read 레인이 따로라 모델 실행이 끝나기 전에 두 read가 모두 끝난다.
 test('4314215667 모델 실행 중 연속 read도 둘 다 관측(read 레인 분리)', async () => {
   await queue(); let ready!: () => void; let release!: () => void;
   const started = new Promise<void>(resolve => { ready = resolve; });

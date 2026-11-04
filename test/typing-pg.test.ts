@@ -6,7 +6,7 @@ import { Postgres, migrate } from '../src/database.js';
 import { typingStart } from '../src/typing.js';
 import { event, fixture } from './helpers.js';
 
-// fix-b G1 실제 PostgreSQL: 입력 중 힌트가 job 행 잠금을 오래 기다리지 않고 짧은 기한 안에 버려지는지 본다.
+// 실제 PostgreSQL: 입력 중 힌트가 job 행 잠금을 오래 기다리지 않고 짧은 기한 안에 버려지는지 본다.
 const socket = process.env.HOMELAB_TEST_PG_SOCKET;
 const skip = socket ? false : 'HOMELAB_TEST_PG_SOCKET 없음(로컬 PostgreSQL 필요)';
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));

@@ -6,8 +6,8 @@ import { DISCORD_DISPATCH_REST_TIMEOUT_MS, DISCORD_REST_TIMEOUT_MS, DiscordProto
 import type { DiscordApi, DiscordRequestOptions } from '../src/discord-protocol.js';
 import { event, fixture, localDatabase, thread } from './helpers.js';
 
-// S16: 1초 일괄 제한을 나눈다. 상호작용 callback은 그 상호작용 기한까지, 나머지 REST는 5초,
-// Gateway dispatch 안의 REST(채널 조회·👀 리액션)는 뒤 이벤트를 막지 않게 짧은 제한을 유지한다.
+// S16: REST 제한은 경로마다 다르다. 상호작용 callback은 그 상호작용 기한까지, 나머지 REST는 5초,
+// Gateway dispatch 안의 REST(채널 조회·👀 리액션)는 뒤 이벤트를 막지 않게 짧은 제한을 둔다.
 
 // signal을 지키는 가짜 fetch: delayMs 뒤 204, 그 전에 signal이 끊기면 그 사유로 실패한다.
 function slowSend(delayMs: number): typeof fetch {

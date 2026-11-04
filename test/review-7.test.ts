@@ -91,7 +91,7 @@ for (const status of ['limited', 'auth_expired'] as const) test(`R7-AUDIT ${stat
   finished.resolve({ status, stopped: true }); release.resolve(); await running;
   const job = (await rows('jobs'))[0]!;
   assert.equal(job.state, 'waiting_user'); assert.equal(job.wait_reason, status === 'limited' ? 'model_limit' : 'auth_expired');
-  // impl-sched S4: waiting_user 안내(waiting:<job>:<attempt>)는 제외하고 센다.
+  // waiting_user 안내(waiting:<job>:<attempt>)는 제외하고 센다.
   assert.equal((await rows('outbox')).filter(o => !/^(waiting|unknown):/.test(o.idempotency_key)).length, 0); assert.equal((await rows('controls')).find(c => c.key === 'scheduler')!.value, true);
 });
 test('4315477925 완료와 교차한 진행 중 monitor의 Denied도 종결 전에 반영', async t => {

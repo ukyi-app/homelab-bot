@@ -98,7 +98,7 @@ export async function fixture(db: Database) {
   const now = () => time;
   const policy: Policy = { revision: 'fixture-v1', confirmedAt: time, owner: 'fixture-owner', guild: 'fixture-guild',
     conversationChannel: 'fixture-chat', notificationChannel: 'fixture-notifications', dmEnabled: null, services: [service.id] };
-  // D1 뒤로 정책은 기동 때 한 번 읽어 나이로 닫히지 않는다. 원천을 읽지 못하는 경우(방어 경로)는 이 스위치로 만든다.
+  // D1: 정책은 기동 때 한 번 읽어 나이로 닫히지 않는다. 원천을 읽지 못하는 경우(방어 경로)는 이 스위치로 만든다.
   let policyUnavailable = false;
   const gate = new PolicyGate(async () => {
     if (policyUnavailable) throw new Error('policy_source_unavailable');

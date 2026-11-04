@@ -5,7 +5,7 @@ import { closeLedgers, initLedger, ledgerAt } from './ledger-fixture.js';
 import { localDatabase } from './helpers.js';
 import { CHAT, GUILD, OWNER, ProbeLedger, Rest, Trace, boot, publisherConfig, waitFor } from './t20-harness.js';
 
-// T20 기억 명령(B4)을 진입점(startPublisher)에서 본다. 가짜 Gateway로 실제 상호작용 payload를 보내고,
+// 기억 명령(B4)을 진입점(startPublisher)에서 본다. 가짜 Gateway로 실제 상호작용 payload를 보내고,
 // 등록 PUT과 상호작용 콜백을 메모리 REST에서 확인한다. 실제 Discord에는 닿지 않는다.
 let database: Awaited<ReturnType<typeof localDatabase>>;
 const dirs: string[] = [];
@@ -86,7 +86,7 @@ test('T20 명령 [원장 켜짐] 기억 명령 다섯 개를 등록하고, 상�
   const saved = await send(booted, 'memory-save', { target: 'decision', text: '봇 DB 백업은 R2 한 곳 @everyone | applies=봇 DB' });
   await waitFor(() => !!reply(booted.rest, saved));
   const save = reply(booted.rest, saved)!.body;
-  // 본인만 보는 응답(64) + 링크 미리보기 끔(4). 기억 응답의 문서 링크에 미리보기가 붙지 않게(T20 실연동 후속).
+  // 본인만 보는 응답(64) + 링크 미리보기 끔(4). 기억 응답의 문서 링크에 미리보기가 붙지 않게 한다.
   assert.equal(save.type, 4); assert.equal(save.data.flags, 64 | 4);
   assert.deepEqual(save.data.allowed_mentions, { parse: [] });
   assert.match(save.data.content, /^저장했습니다: `[0-9a-f-]{36}` · 상태 active\(확정\)$/);

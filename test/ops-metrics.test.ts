@@ -58,10 +58,10 @@ test('OPS-M1 빈 DB: 모든 상태×종류·gap·outbox·제어 계열이 0으�
   for (const state of OUTBOX) assert.equal(m.get(`homelab_bot_outbox{state="${state}"}`), 0);
   for (const name of ['homelab_bot_conversation_gaps', 'homelab_bot_scheduler_paused', 'homelab_bot_emergency_stop', 'homelab_bot_gateway_halted'])
     assert.equal(m.get(name), 0, name);
-  // T20: 원장을 켜지 않은 기본은 disabled만 1, 삭제 대기·브리핑은 0.
+  // 원장을 켜지 않은 기본은 disabled만 1, 삭제 대기·브리핑은 0.
   for (const state of LEDGER) assert.equal(m.get(ledgerKey(state)), state === 'disabled' ? 1 : 0, state);
   for (const name of T20_SCALARS) assert.equal(m.get(name), 0, name);
-  // 기존 3개 + jobs 24 + outbox 4 + gap·paused·emergency·halted 4 + T20 원장 상태 6·스칼라 3.
+  // 기본 3개 + jobs 24 + outbox 4 + gap·paused·emergency·halted 4 + 원장 상태 6·스칼라 3.
   assert.equal(m.size, 3 + TYPES.length * OPEN.length + OUTBOX.length + 4 + LEDGER.length + T20_SCALARS.length);
 });
 
@@ -109,7 +109,7 @@ test('OPS-M6 기존 3개 지표 이름·의미 유지(연결, unknown 수, pendi
   const m = parse(await health.metrics());
   assert.equal(m.get('homelab_bot_gateway_connected'), 1);
   assert.equal(m.get('homelab_bot_outbox_unknown'), 1);
-  // sending·blocked는 기존 정의대로 보지 않는다.
+  // sending·blocked는 보지 않는다.
   assert.equal(m.get('homelab_bot_outbox_oldest_seconds'), 5);
   health.gateway(false);
   assert.equal(parse(await health.metrics()).get('homelab_bot_gateway_connected'), 0);

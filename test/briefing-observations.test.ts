@@ -13,7 +13,7 @@ import type { ReadTransport } from '../src/read.js';
 import { encodeObservation, grafanaTransport, kubernetesTransport } from '../src/read-transports.js';
 import { fixture, localDatabase } from './helpers.js';
 
-// 브리핑 관측 어댑터(T20 B5). 가짜 Kubernetes API 응답만 쓴다. 실제 클러스터에는 연결하지 않는다.
+// 브리핑 관측 어댑터(B5). 가짜 Kubernetes API 응답만 쓴다. 실제 클러스터에는 연결하지 않는다.
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 const NOW = Date.UTC(2027, 0, 15, 23, 50);
@@ -153,7 +153,7 @@ test('[T20 B5] 예약 작업: 빈 목록·정상·실패·중지·실행 기록 
   await assert.rejects(read({ items: [{ metadata: { name: 'x' } }] }));
 });
 
-// PR #26 리뷰 지적 1: concurrencyPolicy Allow면 새 회차마다 lastScheduleTime이 갱신된다. 예약 시각이 아니라
+// concurrencyPolicy Allow면 새 회차마다 lastScheduleTime이 갱신된다. 예약 시각이 아니라
 // active가 가리키는 개별 Job의 시작 시각으로 장기 실행을 본다.
 test('[T20 B5 fix] Allow 동시 실행: 새 회차가 예약돼도 오래 실행 중인 옛 Job을 장기 실행으로 잡음', async () => {
   const oldAt = NOW - 30 * HOUR, newAt = NOW - HOUR;
@@ -180,7 +180,7 @@ test('[T20 B5 fix] Allow 동시 실행: 새 회차가 예약돼도 오래 실행
     [JOBS_PATH]: new Error('read_http_403') }), now).read(), /read_http_403/);
 });
 
-// PR #26 리뷰 지적 2: lastSuccessfulTime >= lastScheduleTime은 마지막 회차의 성공이 아니다
+// lastSuccessfulTime >= lastScheduleTime은 마지막 회차의 성공이 아니다
 // (10:00 회차가 11:10 성공, 11:00 회차가 11:05 실패). 마지막 예약 회차의 Job 조건을 본다.
 test('[T20 B5 fix] 마지막 회차: 이전 회차의 늦은 성공이 마지막 회차의 실패·미확인을 덮지 않음', async () => {
   const t10 = NOW - 13 * HOUR, t11 = t10 + HOUR;

@@ -12,7 +12,7 @@ import type { WorkerResult } from '../src/worker.js';
 import { FakeGateway } from './fake-gateway.js';
 import { localDatabase, fixture, event } from './helpers.js';
 
-// impl-sched S2: 게시 서버 정상 종료(SIGTERM). 종료 신호를 받으면 dispatch 전 작업은 되돌리고, 실행 중 작업은 드레인 창 안의
+// S2: 게시 서버 정상 종료(SIGTERM). 종료 신호를 받으면 dispatch 전 작업은 되돌리고, 실행 중 작업은 드레인 창 안의
 // 자연 완료를 기다린 뒤 작업자가 아직 잡고 있을 때 취소·확인한다. 확인된 chat은 다시 대기열로, task는 확정 실패, 확인 실패는 unknown.
 let database: Awaited<ReturnType<typeof localDatabase>>;
 let f: Awaited<ReturnType<typeof fixture>>;

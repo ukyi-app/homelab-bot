@@ -19,7 +19,7 @@ import { Store } from '../src/store.js';
 import type { Database } from '../src/database.js';
 import { localDatabase, fixture, event, thread } from './helpers.js';
 
-// JSONL fixture는 공식 문서의 `codex exec --json` 이벤트 형태로 합성했다. 실제 CLI 녹음은 모델 호출이라 T16b다(D-14).
+// JSONL fixture는 공식 문서의 `codex exec --json` 이벤트 형태로 합성했다. 실제 CLI 녹음은 모델 호출이라 쓰지 않는다(D-14).
 const THREAD = '0199a213-81c0-7800-8aa1-bbab2a035a53';
 const jsonl = (...events: unknown[]) => events.map(e => JSON.stringify(e));
 const begin = (id = THREAD) => [{ type: 'thread.started', thread_id: id }, { type: 'turn.started' }];
@@ -561,7 +561,7 @@ test('TASK-03 시간 초과는 정리 확인 뒤 failed 안내, 실패 결과는
   const job = await task();
   await database.db.query(`UPDATE jobs SET budget='{"timeoutMs":30,"toolCalls":8}' WHERE id=$1`, [job.id]);
   // 시간 초과 타이머는 가짜 시계로 실행이 시작된 뒤에 넘긴다. 실제 30ms 타이머는 부하에서 준비(디렉터리·설정 쓰기)가
-  // 끝나기 전에 울려 프로세스를 띄우지 않았다(launcher.started 0, 부하 14에서 12회 중 7회).
+  // 끝나기 전에 울려 프로세스를 띄우지 않는다(launcher.started 0, 부하 14에서 12회 중 7회).
   t.mock.timers.enable({ apis: ['setTimeout'] });
   let settled = false;
   const ticking = instant.tick().finally(() => { settled = true; });
@@ -682,7 +682,7 @@ class WatchedLauncher extends ProcessGroupLauncher {
 }
 // 실제 프로세스 시험의 작업 ID는 실행마다 새로 만든다(randomUUID). launcher는 같은 UID의 모든 프로세스에서 작업 표식
 // (HOMELAB_WORKER_TASK=<job>)을 찾아 끝내고 센다. 고정 ID면 같은 기계에서 동시에 도는 다른 시험 실행(다른 worktree·에이전트)의
-// 같은 시험 프로세스를 자기 것으로 보고 죽이거나 남은 프로세스로 셌다(두 벌 동시 실행에서 S2가 8회 중 3회 exit_nonzero).
+// 같은 시험 프로세스를 자기 것으로 보고 죽이거나 남은 프로세스로 센다(두 벌 동시 실행에서 S2가 8회 중 3회 exit_nonzero).
 // graceMs는 정리 신호 뒤 프로세스가 사라지기를 기다리는 상한이다. 사라지면 바로 끝나므로 넉넉히 둔다(부하에서 정리가 늦어도
 // 남은 프로세스로 오판하지 않게). 확인 불가가 계속되는 non-dumpable 시험만 짧게 준다.
 async function local(mode: string, job: string,
@@ -712,7 +712,7 @@ test('SEC-02 실제 프로세스: 작업자 환경 미상속, 정상 종료 뒤 
     assert.equal(run.result.kind, 'completed', mode);
     assert.equal(alive(run.pid), false, mode);
   }
-  // 어댑터가 thread.started를 받은 뒤 중단한다(실행 중 중단). 고정 300ms면 부하에서 준비(git init)가 끝나기 전에 와서 띄우지 않았다.
+  // 어댑터가 thread.started를 받은 뒤 중단한다(실행 중 중단). 고정 300ms면 부하에서 준비(git init)가 끝나기 전에 와서 띄우지 않는다.
   const hung = await local('hang', randomUUID(), { abortOn: line => line.includes('"thread.started"') });
   assert.deepEqual(hung.result, { kind: 'failed', reason: 'aborted', threadId: 'local-thread-1', turns: 0, tools: 0 });
 });
@@ -894,7 +894,7 @@ test('TASK-03 질문 재개로 시도 한도에 닿은 뒤 한도 대기가 오�
   assert.equal((await f.store.control('fixture-owner', f.store.scopeId(thread), 'resume-model', job.id) as { ok: boolean }).ok, false);
 });
 
-// ---- rev-t18 r1 회귀 시험: 수정 전 실패를 먼저 확인했다(VERIFICATION "r1 반영"). ----
+// ---- 세션 전 오류 판정·준비 중 중단·도구 예산·출력 상한·재개·실행 권한 회귀 시험 ----
 test('S1·R2 스레드가 생기기 전 인증·한도 오류도 대기로 판정', () => {
   for (const [message, reason] of [['401 unauthorized', 'auth_expired'], ['usage_limit_reached', 'model_limit']] as const) {
     assert.deepEqual(interpretRun(report(jsonl({ type: 'error', message }), null, { exit: { code: 1, signal: null } }), null),
@@ -1017,7 +1017,7 @@ test('R4 실행 권한만 바뀐 파일도 실제 변경으로 기록', async ()
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-// ---- rev-t18 r2 회귀 시험: 수정 전 실패를 먼저 확인했다(VERIFICATION "r2 반영"). ----
+// ---- 긴 오류 축약·변경 보고 경로·재개 예산·옛 009 재적용·실행 비트 회귀 시험 ----
 const longError = (message: string) => [
   { type: 'error', message: `${'x'.repeat(2001)} ${message}` },
   { type: 'turn.failed', error: { message: `${'context '.repeat(300)}${message}` } },
@@ -1173,7 +1173,7 @@ test('자체 점검: 한 줄 상한 안의 수만 개 변경 경로도 판정이
   assert.ok(result.kind === 'completed' && result.reported.length === 45_000 && result.unconfirmed.length === 22_500);
 });
 
-// ---- rev-t18 r3 회귀 시험: 수정 전 실패를 먼저 확인했다(VERIFICATION "r3 반영"). ----
+// ---- 실행 중 디렉터리 교체·링크·파일 크기 경계 회귀 시험 ----
 async function outsideDir() {
   const dir = resolve(await mkdtemp('.local/outside-'));
   await writeFile(join(dir, 'last-message.json'), out('completed', 'outside-output-marker'));
@@ -1262,7 +1262,7 @@ test('자체 점검: 실행 전 설정 쓰기는 기존 하드링크를 따라 �
   } finally { await rm(outside, { recursive: true, force: true }); }
 });
 
-// ---- rev-t18 r4 회귀 시험 ----
+// ---- 실행 뒤 읽기 차단·결과 확정 전 재인가·__proto__ 회귀 시험 ----
 test('N8 실행 중 교체가 남아 있으면 실행 뒤 파일 본문을 한 번도 읽지 않고 실패(원래 run의 출력 포함)', async () => {
   const outside = await outsideDir();
   const probe = await open(join(outside, 'secret.txt'), 'r');
@@ -1394,7 +1394,7 @@ test('PR9 4407855007 작업 공간 루트의 __proto__ 파일도 생성·수정�
   }
 });
 // PGlite는 연결이 하나라 두 트랜잭션의 행 잠금 대기(교착)를 재현할 수 없다. 그래서 트랜잭션마다 잠금을 잡는 문장의 순서를 기록해
-// T16a 제어 경로(대화 행 FOR UPDATE → 스케줄러 행)와 같은 순서인지 본다. outbox·질문 행 삽입은 conversation_id 외래 키 검사로
+// 제어 경로(대화 행 FOR UPDATE → 스케줄러 행)와 같은 순서인지 본다. outbox·질문 행 삽입은 conversation_id 외래 키 검사로
 // 대화 행 KEY SHARE를 잡고, 이것은 제어 경로가 먼저 잡은 대화 행 FOR UPDATE와 충돌하므로 대화 행에 닿는 문장으로 센다.
 function lockLog(db: Database) {
   const transactions: string[][] = [];
@@ -1421,7 +1421,7 @@ test('PR9 4407855013 질문 만료 정리는 T16a 제어 경로와 같은 순서
   const log = lockLog(database.db);
   const store = new Store(log.db, f.now);
   const watched = new CodexBridge(store, f.gate, adapter, { monitorMs: 5 });
-  // 기준: T16a /model-status·/cancel은 대화 행을 먼저 잠그고 스케줄러를 기다린다.
+  // 기준: /model-status·/cancel은 대화 행을 먼저 잠그고 스케줄러를 기다린다.
   const first = await asked();
   await store.control('fixture-owner', store.scopeId(thread), 'model-status');
   assert.deepEqual(log.transactions.at(-1), ['conversation', 'scheduler']);

@@ -13,7 +13,7 @@ import { PolicyGate, loadRuntimePolicy } from '../src/policy.js';
 import { Store } from '../src/store.js';
 import { FakeGateway } from './fake-gateway.js';
 
-// T20 기동 장벽 시험 도구. 실제 Discord에는 닿지 않는다(loopback 가짜 Gateway + 메모리 REST 대역).
+// 기동 장벽 시험 도구. 실제 Discord에는 닿지 않는다(loopback 가짜 Gateway + 메모리 REST 대역).
 export const GUILD = 'fixture-guild', CHAT = 'fixture-chat', NOTIFY = 'fixture-notifications', OWNER = 'fixture-owner';
 export const notify: Scope = { guild: GUILD, channel: NOTIFY, parent: null, kind: 'channel' };
 

@@ -156,7 +156,7 @@ test('MEM-01 충돌 기억은 둘 다 확정하지 않고, 사유 있는 정정�
   await assert.rejects(memory.correct('fixture-owner', thread, [a.id], config('대체된 기억 재정정'), '다시'), Denied);
 });
 test('MEM-01 [T20 실연동 후속] 한쪽만 정정하면 남은 상대와 다시 충돌해 candidate, 새 ID와 충돌 ID를 함께 정정하면 active', async () => {
-  // 11-03 실연동: 충돌한 candidate만 정정했더니 새 기억이 같은 주제의 active와 다시 충돌했다. 응답 안내(함께 정정)가 맞는지 본다.
+  // 충돌한 candidate만 정정하면 새 기억이 같은 주제의 active와 다시 충돌한다. 응답 안내(함께 정정)가 맞는지 본다.
   const a = await memory.remember('fixture-owner', thread, config('원장 위치는 SSD', { topic: 'ledger:place' }));
   const b = await memory.remember('fixture-owner', thread, config('원장 위치는 R2', { topic: 'ledger:place' }));
   assert.equal(a.status, 'active'); assert.deepEqual(b.conflictsWith, [a.id]);
@@ -329,7 +329,7 @@ test('DATA-02 재적용은 ID와 created_at이 둘 다 맞을 때만, 원장을 
   await assert.rejects(closed.open(), /ledger_down/);
   await assert.rejects(closed.search('fixture-owner', thread, '되감긴'), MemoryNotReady);
 });
-// T20 원장 계약 v1에서 바꿈: 예전 마지막 단언("부모 경로가 없으면 빈 원장")은 이제 열기 실패(missing)다.
+// 부모 경로가 없으면 빈 원장이 아니라 열기 실패(missing)다.
 test('DATA-02 원장 파일: 끊긴 마지막 줄은 무시하고 다음 append 전에 잘라내며, 중간 손상은 닫힘', async () => {
   const torn = await initLedger('torn', { generation });
   await writeFile(torn.file, `${JSON.stringify({ memoryId: 'a', createdAt: 1, deletedAt: 2 })}\n{"memoryId":"b","crea`);
@@ -434,7 +434,7 @@ test('BRIEF-01 며칠 중단 뒤에는 밀린 회차를 몰아 보내지 않고 
   assert.equal(all[0]!.idempotency_key, 'briefing:daily-briefing:2027-01-19');
   assert.match(all[0]!.payload.content, /지연 발송: 예정 08:50, 작성 01-19 09:20/);
   assert.match(all[0]!.payload.content, /누락: 01-16, 01-17, 01-18 브리핑은 보내지 않았습니다/);
-  // 보낸 회차는 누락이 아니다. 보내지 않은 채 12시간이 지나면 누락으로 바뀐다(rev-t20 P2-2 시험).
+  // 보낸 회차는 누락이 아니다. 보내지 않은 채 12시간이 지나면 누락으로 바뀐다.
   await f.publisher.deliver();
   at(SLOT + 4 * DAY + BRIEFING.skipAfterMs + 1);
   assert.equal(await s.tick(), 'idle');
@@ -606,7 +606,7 @@ test('BRIEF-01 작성 중에 알림 채널 설정이 바뀌면 막지 않고 새
   assert.equal(f.rest.messages[0]!.channel, 'fixture-briefing-next');
 });
 
-// --- Codex 리뷰 rev-t20 회귀 시험 ---
+// --- 원장 fsync·큐 사본 정리·지난 회차 차단·저장 제외·만료 충돌 회귀 시험 ---
 test('DATA-02 [rev-t20 P1] 원장 디렉터리 fsync를 확인하지 못하면 삭제 완료라 하지 않고, 확인 뒤 정리', async () => {
   const { dir: ledgerDir } = await initLedger('ledger-dir', { generation });
   const faults = { dirSync: 'EIO' as string | undefined };
@@ -691,7 +691,7 @@ test('MEM-01 [rev-t20 P2-4] 만료된 기억은 같은 주제 새 기억의 충�
   const replacement = await memory.remember('fixture-owner', thread, config('단독 주제 새 근거', { topic: 'expired:solo' }));
   assert.deepEqual([replacement.status, replacement.conflictsWith], ['active', []]);
 });
-// --- Codex 재리뷰 rev-t20b 회귀 시험 ---
+// --- fsync 장애 중 재기동과 요청 행 없는 복원 회귀 시험 ---
 test('DATA-02 [rev-t20b P1] 디렉터리 fsync 장애가 이어지는 중 재기동해도 원장 재적용·삭제 재요청을 완료로 올리지 않음', async () => {
   const { dir: ledgerDir } = await initLedger('ledger-restart', { generation });
   const faults = { dirSync: 'EIO' as string | undefined };
@@ -736,7 +736,7 @@ test('DATA-02 [rev-t20b P1] 복원으로 삭제 요청 행이 없어도 확인�
     assert.equal((await rows('memories'))[0]!.status, 'deleted');
   } finally { await rm(ledgerDir, { recursive: true, force: true }); }
 });
-// --- Codex 재리뷰 rev-t20c 회귀 시험과 같은 경로의 자체 점검 시험 ---
+// --- 복원·디렉터리 장애 기동과 원장 실패 때 브리핑 사본 회귀 시험 ---
 async function dirFaultLedger(prefix: string) {
   const { dir: ledgerDir } = await initLedger(prefix, { generation });
   const state = { fail: false };
@@ -835,7 +835,7 @@ test('MEM-01 [자체 G3] 원장에서 본 삭제(정리 전) 기억은 같은 �
     assert.deepEqual([fresh.status, fresh.conflictsWith], ['active', []]);
   } finally { await rm(fault.dir, { recursive: true, force: true }); }
 });
-// --- Codex 재리뷰 rev-t20d 회귀 시험(PGlite로 재현되는 것). 경합 반례는 test/memory-briefing-pg.test.ts ---
+// --- 저장 제외 뒤 충돌 표시 회귀 시험(PGlite로 재현되는 것). 경합 반례는 test/memory-briefing-pg.test.ts ---
 test('MEM-01 [rev-t20d P2] 충돌이 생긴 뒤 한쪽을 저장 제외하면 그 충돌 표시만 사라지고 다른 유효한 충돌은 남음', async () => {
   const cfg = (statement: string, topic: string, source: string) => config(statement, { topic, sources: [doc(source)] });
   const a = await memory.remember('fixture-owner', thread, cfg('포트 80', 'svc:port', 'old.md'));
@@ -852,7 +852,7 @@ test('MEM-01 [rev-t20d P2] 충돌이 생긴 뒤 한쪽을 저장 제외하면 �
   assert.ok((await flags('81')).includes('conflict'));
   assert.ok((await flags('82')).includes('conflict'));
 });
-// --- PR #8 Codex Connector 리뷰 1라운드(rev-pr8) 회귀 시험 ---
+// --- 접근 불가 기억이 앞을 채우는 검색과 다른 결정자의 결정 확인 회귀 시험 ---
 test('AUTH-02 [rev-pr8 P2-1] 서비스 권한을 철회한 기억이 앞을 채워도 검색·재확인 브리핑은 접근 가능한 기억을 돌려줌', async () => {
   const due = (extra: Partial<MemoryInput>) => ({ access: ['fixture-notifications'], classification: 'safe_summary' as const, ...extra });
   f.policy.services = ['fixture-service', 'retired-service'];
@@ -914,7 +914,7 @@ test('MEM-01 [rev-pr8 P2-2] 다른 결정자의 결정은 확인된 문서가 �
   assert.equal((await memory.remember('fixture-owner', thread, decision([doc('release.md')]))).status, 'active');
 });
 
-// --- T20 예약 해제(T16b 이월 P2) 회귀 시험 ---
+// --- 예약 해제 회귀 시험 ---
 // time·timezone을 각각 비우거나 잘못 넣은 설정. ensure가 이 값을 받으면 예약을 끈다.
 const BAD: BriefingConfig[] = [{ time: null, timezone: 'Asia/Seoul' }, { time: '25:00', timezone: 'Asia/Seoul' },
   { time: '08:50', timezone: null }, { time: '08:50', timezone: 'Mars/Base' }];
@@ -1038,7 +1038,7 @@ test('BRIEF-01 [T20 예약 해제] 작성 중에 예약을 껐다 바로 켜도 
   assert.equal((await briefings()).length, 0);
 });
 test('BRIEF-01 [T20 예약 해제] 정리 없이 예약 행만 꺼져도 작성 중 회차는 큐 확정 때 다시 보고 막음', async () => {
-  // 수동 SQL이나 이 수정 전 버전처럼 enabled만 끄는 경로가 있어도 큐 확정은 같은 transaction에서 예약 상태를 다시 본다.
+  // 수동 SQL처럼 enabled만 끄는 경로가 있어도 큐 확정은 같은 transaction에서 예약 상태를 다시 본다.
   let toggled = false;
   const toggling = source('toggling', 'backup', async () => {
     if (!toggled) { toggled = true; await database.db.query('UPDATE schedules SET enabled=false'); }
