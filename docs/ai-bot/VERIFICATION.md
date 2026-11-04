@@ -244,8 +244,10 @@ slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG �
 - HANDOFF는 private 운영 저장소 몫이다(D-13). 이번 반환 보고가 그 원문이다.
 - (2026-11-04 해소) 리뷰 켜기: 사용자 승인으로 켰다(homelab #1058 `REVIEW_ENABLED`, 아래 "첫 실리뷰 시도").
 - (2026-11-04 해소) `RUNTIME_POLICIES` review 절: 기록했다(값의 출처는 DECISIONS "T17 결정"과 같은 날 사용자 승인. 실제 ID·내부 표식은 Infisical에만). `reviewSince`는 켜는 시각이다.
-- 실제 모델 품질 평가(REVIEW-01): 1건(아래 "실제 모델 품질")만 했다. 표본 확대가 남았다.
-- 반례·복구 시험(실연동): 하지 않았다. Renovate PR, 댓글 명령, Bot 댓글 무시, fork·허용 밖 작성자, webhook 재전송, head·base 이동, draft, 한도·인증 대기와 제어 명령, 게시 응답 유실 대조가 대상이다. 일부는 사람 준비(Renovate 설치 확대, 다른 계정, 재전송)가 필요하다.
+- 실제 모델 품질 평가(REVIEW-01): 5건(아래 "실제 모델 품질")이다. 표본 확대가 남았다.
+- 반례·복구 시험(실연동): A 묶음(댓글 명령, 닫기·다시 열기, draft, 실행 중 head 이동, base 바꾸기, 공개 범위 차단, partial)은 2026-11-04에 했다(아래 "반례·복구 시험 A 묶음"). B 묶음(Renovate PR, 허용 밖 작성자·fork, Bot 댓글 무시의 실례, webhook 재전송, 한도·인증 대기와 제어 명령, 게시 응답 유실 대조)이 남았고 사람 준비(Renovate 설치 확대, 다른 계정, 재전송)가 필요하다.
+- 제외 파일이 모델 입력에 없다: `ReviewerInput.untrusted`에는 검토한 파일만 들어가고 `coverage.omitted_files_with_reasons`는 모델에 가지 않는다. 그래서 바이너리를 참조하는 코드에 "파일이 PR에 없다"는 오탐이 났다(A7). 제외 파일 이름과 이유를 비신뢰 자료로 함께 넘기고 지침에 "제외 파일은 PR에 있으나 보지 못한 것"이라고 적는 수정이 후속이다.
+- 다시 연 PR의 세대 기록: 닫을 때 `superseded(pr_closed)`가 된 세대는 같은 세대로 다시 열려도(`duplicate_generation`) 기록이 그대로다. 이미 게시된 리뷰는 유효하고 재게시·재실행에는 영향이 없다(기록 표시만 어긋남).
 - (2026-11-04 확인) 실제 Claude CLI init의 `skills`·`plugins` 빈 배열: `skills`는 비어 있었고, `plugins`에 내장 플러그인 2개가 있어 첫 실리뷰가 `policy_violation`으로 막혔다. 리뷰 레인 `--settings`로 끄도록 고쳤다(아래 "첫 실리뷰 시도").
 - `homelab-smoke`의 Codex 자동 리뷰 끄기(DECISIONS "T17 결정"의 사람 작업): 사람이 껐다(2026-11-04, homelab `approvals.md` 15:08 행). 첫 시험 PR #11에 Codex 자동 리뷰가 달리지 않아 꺼진 것을 확인했다(2026-11-04 18:13).
 - PR 본문이 활성화 전 확인으로 넘긴 것:
@@ -320,6 +322,26 @@ slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG �
 | 평가 PR / head SHA | 알려진 정답·근거 | 유효 지적 | 오탐 | 알려진 문제 누락 | 중복/스타일 잡음 | 미검토 범위 표시 | 시간/호출량 |
 |---|---|---|---|---|---|---|---|
 | `homelab-smoke` #11 / `77b9d48` | 결함 2개: `fail()`이 `err.message`를 503 본문·로그에 넣음(기존 "이름만" 불변식 위반, 기존 시험은 사각), `/echo`가 `q`를 이스케이프 없이 `text/html`로 반사(XSS) | 2(둘 다 P1, 위치 `src/server.ts` 22·61) | 0 | 0 | 0. 확인 질문 2개는 시험 사각과 운영 노출 여부로 근거가 있다 | 없음(검토 완료, 파일 2개, 제외 0) | 모델 실행 1회, 세대 생성부터 게시 행까지 약 23초 |
+| `homelab-smoke` #12 / `78d551b` | 결함 2개: 거절된 요청도 `lastSeen`을 갱신(자주 오는 클라이언트 영구 차단), `lastSeen` 무한 증가 | 3(결함 2개 P2, 시험 공백 P3) | 0 | 0 | 0 | 없음(파일 2개) | 1회 |
+| `homelab-smoke` #12 / `4531dfc`(base main) | 정답 미지정(앞 결함을 고친 커밋) | 3(`sweep` 전체 순회 P2, 시험 공백 P3, `prev` 기본값 0의 첫 요청 경계 P3) | 0 | - | 0 | 없음(파일 2개) | 1회(앞 head `6863161` 실행 1회는 밀려 미게시) |
+| `homelab-smoke` #12 / `4531dfc`(base 옛 main) | base 차이로 `src/slow.test.ts` 삭제가 들어옴 | 3(무관한 삭제 P2, 위 둘 P3) | 0 | - | 0 | 없음(파일 3개) | 1회 |
+| `homelab-smoke` #13 / `85ba189` | 가짜 `sk-` 키 하드코딩 | 게시 차단(`restricted`)이라 지적 수 미관측 | - | - | - | - | 1회 |
+| `homelab-smoke` #14 / `7e3c3ca` | 결함 없음, 바이너리 1개 | 0 | 1(P2 "`assets/probe.bin`이 변경 목록에 없음": 제외 파일을 모델이 모름) | 0 | 0 | 부분 검토(확인 1, 제외 1 `binary`) | 1회 |
+
+**반례·복구 시험 A 묶음** (2026-11-04 19:22~19:33, 사용자 승인, `homelab-smoke`, 모델 호출 6회) [실측]. 판정은 배달 기록(`github_deliveries`)·세대·게시 행 상태와 GitHub 리뷰 수로 했다(본문 내용은 위 품질 표).
+
+| 사례 | 조작 | 관측 | 판정 |
+|---|---|---|---|
+| A1 댓글 명령 | 이미 게시된 #11에 `/homelab-review` | `issue_comment/created` → `duplicate_generation`, 세대 trigger만 `comment`로 승격, GitHub 리뷰 수 그대로 | pass |
+| A2 닫기·다시 열기 | #11 닫기 → 다시 열기 | `closed` → `superseded:pr_closed`, `reopened` → `duplicate_generation`, 새 리뷰 없음 | pass(세대 기록 표시는 위 "남은 것") |
+| A3 draft | #12를 draft로 열기 → 댓글 → ready | `opened` → `ignored:draft_waiting`(모델 호출 없음). 댓글 → `queued` → draft인 채 게시. `ready_for_review` → `duplicate_generation` | pass |
+| A4 실행 중 head 이동 | #12에 커밋 B push, 세대가 `running`일 때 커밋 C push | B 세대 `succeeded` 뒤 `superseded:new_head`, 게시 행 없음. C 세대만 게시 | pass |
+| A5 base 바꾸기 | 옛 main(`577eb59`)에서 만든 브랜치로 #12 base 변경 | `edited` → `queued`(trigger `retarget`, 비교 기준 `577eb59`) → 게시(확인 3파일). 앞 세대 `superseded:base_moved` | pass |
+| A6 공개 범위 | 가짜 `sk-` 키를 박은 #13 | 결과 `restricted`, 게시 행 없음, GitHub 리뷰 0, Discord `review-restricted` 안내 `sent` | pass |
+| A7 partial | 바이너리 1개를 더한 #14 | 결과 `partial`, 본문 "부분 검토. 확인 파일 1개, 제외 1개", 미검토 `assets/probe.bin: binary` | pass(동작). 오탐 1은 위 "남은 것" |
+
+- 정리: #11·#13·#14는 닫았다(`superseded:pr_closed`, 모델 호출 없음). #12는 B 묶음용으로 열어 두었다.
+- 같은 시간대에 GitHub 쓰기 API가 502·500을 자주 냈다. push·PR 생성은 실패 응답 뒤에도 실제로 처리된 경우가 있어, 매번 상태를 확인한 뒤 다시 시도했다. 봇 쪽 수신·게시는 영향이 없었다.
 
 **판정 변화.** 위 2026-10-29 표는 옛 기록이라 그대로 둔다. 이번에 pass로 바뀐 칸은 없다. `blocked` 칸의 사유가 다음처럼 바뀌었다.
 
