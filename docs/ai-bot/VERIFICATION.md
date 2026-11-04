@@ -247,7 +247,7 @@ slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG �
 - 실제 모델 품질 평가(REVIEW-01): 6건(아래 "실제 모델 품질", 재시험 1건 포함)이다. 표본 확대가 남았다.
 - 반례·복구 시험(실연동): A 묶음(댓글 명령, 닫기·다시 열기, draft, 실행 중 head 이동, base 바꾸기, 공개 범위 차단, partial)은 2026-11-04에 했다(아래 "반례·복구 시험 A 묶음"). B 묶음(Renovate PR, 허용 밖 작성자·fork, Bot 댓글 무시의 실례, webhook 재전송, 한도·인증 대기와 제어 명령, 게시 응답 유실 대조)이 남았고 사람 준비(Renovate 설치 확대, 다른 계정, 재전송)가 필요하다.
 - (2026-11-04 고침) 제외 파일이 모델 입력에 없었다: `ReviewerInput.untrusted`에 검토한 파일만 들어가 바이너리를 참조하는 코드에 "파일이 PR에 없다"는 오탐이 났다(A7). 이제 작업자가 `omitted`(경로·이유, 최대 `MODEL_OMITTED_MAX` 200개), `omittedTotal`, `limitsHit`를 비신뢰 자료로 넘기고, 프롬프트 고정 문장(`REVIEW_OMITTED_NOTE`)이 "PR에 있지만 내용을 싣지 않은 파일이니 없다고 판단하거나 추측해 지적하지 않는다"고 알린다. 게시 서버와 같아야 하는 `REVIEW_INSTRUCTIONS`와 세대 revision은 그대로다. 봇 #50, 작업자 이미지 homelab #1067 뒤 같은 #14를 새 head로 다시 리뷰해 오탐이 사라진 것을 확인했다(아래 품질 표 `01c3fbf` 행).
-- 다시 연 PR의 세대 기록: 닫을 때 `superseded(pr_closed)`가 된 세대는 같은 세대로 다시 열려도(`duplicate_generation`) 기록이 그대로다. 이미 게시된 리뷰는 유효하고 재게시·재실행에는 영향이 없다(기록 표시만 어긋남).
+- 다시 연 PR의 세대 기록: 닫을 때 `superseded(pr_closed)`가 된 세대는 같은 세대로 다시 열려도(`duplicate_generation`) 기록이 그대로다. 이미 게시된 리뷰는 유효하고 재게시·재실행에는 영향이 없다(기록 표시만 어긋남). 소비자를 모두 대조한 결과 그대로 둔다(2026-11-04 정적 분석): 게시 여부는 `review_deliveries.state`, 재실행 여부는 `jobs.state`와 admission 조건(`concluded`는 게시 행을 본다)으로 정하고, `review-status`·브리핑·지표·Discord 요약은 이 세 열(`review_outcome`·`superseded_at`·`superseded_reason`)을 읽지 않는다. 같은 일은 자동 리뷰가 게시된 뒤의 draft → ready에서도 생기고(`superseded(draft)`), 그 뒤 base가 움직여도 사유는 처음 값(`pr_closed`·`draft`)으로 남는다. 그래서 세대 행의 outcome만으로 현재 유효성이나 게시 여부를 판단하지 않는다.
 - (2026-11-04 확인) 실제 Claude CLI init의 `skills`·`plugins` 빈 배열: `skills`는 비어 있었고, `plugins`에 내장 플러그인 2개가 있어 첫 실리뷰가 `policy_violation`으로 막혔다. 리뷰 레인 `--settings`로 끄도록 고쳤다(아래 "첫 실리뷰 시도").
 - `homelab-smoke`의 Codex 자동 리뷰 끄기(DECISIONS "T17 결정"의 사람 작업): 사람이 껐다(2026-11-04, homelab `approvals.md` 15:08 행). 첫 시험 PR #11에 Codex 자동 리뷰가 달리지 않아 꺼진 것을 확인했다(2026-11-04 18:13).
 - PR 본문이 활성화 전 확인으로 넘긴 것:
@@ -315,7 +315,7 @@ slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG �
 | 18:12~18:13 | #46 작업자 이미지(homelab #1060, 18:11) 뒤 #11에 빈 커밋 push → `pull_request/synchronize` `queued` → 리뷰 job `succeeded`(세대 생성 18:12:47.7, 게시 행 18:13:10.8) → GitHub `COMMENTED` 리뷰 1건, 인라인 2(리뷰 App, `commit_id` = 검토 head) → Discord 알림 채널 요약 `sent`(18:13:14). 앞 세대는 `new_head`로 밀림 | 정상 경로 첫 통과. 요약 원문(맥 Codex로 읽기만)은 저장소·PR 번호·head 12자·"검토 완료"·지적 수·고정 문구뿐이고 모델 문장은 없다(D-17). Codex 자동 리뷰는 오지 않았다(`homelab-smoke`에서 끔 확인). 확인 중 봇 추가 전송 0 |
 
 - 17:47 실행은 init에서 멈췄다. 그 전에 CLI가 모델 요청을 이미 보냈는지는 확인할 수 없다(가짜 토큰 시험에서는 init 뒤에 `api_retry`가 왔다).
-- 위반 종류(`plugins_enabled` 등)는 DB·로그에 남지 않고 `policy_violation` 하나로만 남는다. 이번 원인은 같은 인자의 재현으로 찾았다.
+- (2026-11-04 고침) 위반 종류(`plugins_enabled` 등)는 DB·로그에 남지 않고 `policy_violation` 하나로만 남았다. 이번 원인은 같은 인자의 재현으로 찾았다. 이제 작업자 로그 `run_policy_violation`에 종류가 남는다(DB와 결과 `reason`은 그대로 `policy_violation`).
 
 **실제 모델 품질(`04` §6, 실연동 1건).** 정답은 PR을 열기 전에 모델 입력과 분리해 적었다(PR 본문·코드에 결함 설명 없음). 표본 1건이라 상한·품질 판정에는 부족하다. 사례 확대는 반례·복구 시험과 함께 한다.
 

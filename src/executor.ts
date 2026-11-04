@@ -41,14 +41,18 @@ export interface ChatRun {
   schema: object;
 }
 // 실행 중 stdout 한 줄을 본 결과. line은 판정에 쓰는 필드만 남긴 줄이다(모델 본문·도구 출력은 버린다).
-// tool은 작업용 도구 호출 ID(출력 전달용 내부 도구는 빼고), violation은 정책 위반 사유(있으면 공통부가 바로 멈춘다).
-export interface Observation { line: string; tool: string | null; violation: string | null }
+// tool은 작업용 도구 호출 ID(출력 전달용 내부 도구는 빼고), violation은 정책 위반 종류(있으면 공통부가 바로 멈춘다).
+// 종류는 작업자 로그에 그대로 나간다. 도구·플러그인 이름 같은 자료 값이 섞이지 않도록 string이 아니라 상수 합집합으로 묶는다.
+export type PolicyViolation = 'tools_enabled' | 'mcp_enabled' | 'skills_enabled' | 'plugins_enabled' | 'hooks_enabled' | 'tool_activity'
+  | 'model_mismatch' | 'model_fallback' | 'credential_source_mismatch' | 'version_mismatch';
+export interface Observation { line: string; tool: string | null; violation: PolicyViolation | null }
 // 어댑터가 내는 실행기 중립 결과. 소멸 확인·중단·상한·스키마·반사 판정은 공통부가 한다.
+// violation은 로그 전용이다. 레인은 reason만 결과로 넘기므로 HTTP 계약에는 나가지 않는다.
 export type EngineOutcome =
   | { kind: 'output'; value: unknown }
   | { kind: 'limited' }
   | { kind: 'auth_expired' }
-  | { kind: 'failed'; reason: string };
+  | { kind: 'failed'; reason: string; violation?: PolicyViolation };
 export interface ExitStatus { code: number | null; signal: string | null }
 
 export interface AdapterRun {

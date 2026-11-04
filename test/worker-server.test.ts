@@ -589,6 +589,34 @@ test('T17 onEvent: 공유 실행 제어의 정리 사건이 리뷰 실행에서�
   }
 });
 
+test('T17 위반 사건: 작업자 로그에 run_policy_violation 한 줄이 값 없이 남고 HTTP 응답 사유는 그대로다', async () => {
+  const marker = 'value-marker-must-not-log';
+  // 첫 실리뷰와 같은 위반: 리뷰 어댑터만 보는 plugins. 대화 어댑터는 이 필드를 보지 않는다.
+  const plugins = await wrap(join(base, 'fake'), 'claude-plugins', FAKE_CLAUDE.replace('plugins: []', `plugins: [{ name: '${marker}', path: 'builtin' }]`));
+  const first = await boot({ config: claude({ WORKER_EXECUTOR_BIN: plugins }), launcher: new SpawnLauncher(plugins) });
+  const a = job();
+  try {
+    assert.deepEqual(await runReview(first, a), { status: 'failed', stopped: true, reason: 'policy_violation' });
+    assert.deepEqual(first.logs.filter(l => l.event === 'run_policy_violation'),
+      [{ level: 'warn', event: 'run_policy_violation', lane: 'review', kind: 'plugins_enabled' }]);
+    assert.deepEqual(await runChat(first, job()), { status: 'succeeded', stopped: true, answer: CHAT });
+    assert.equal(first.logs.filter(l => l.event === 'run_policy_violation').length, 1);
+    const written = JSON.stringify(first.logs);
+    assert.ok(!written.includes(marker) && !written.includes(a.id));
+  } finally { await first.worker.close(); }
+  // 대화·리뷰가 함께 보는 위반: 운영 조립(공유 실행 제어)에서 대화 실행도 같은 로그를 낸다.
+  const tools = await wrap(join(base, 'fake'), 'claude-tools', FAKE_CLAUDE.replace("tools: ['StructuredOutput']", `tools: ['StructuredOutput', '${marker}']`));
+  const second = await boot({ config: claude({ WORKER_EXECUTOR_BIN: tools }), launcher: new SpawnLauncher(tools) });
+  const b = job();
+  try {
+    assert.deepEqual(await runChat(second, b), { status: 'failed', stopped: true });
+    assert.deepEqual(second.logs.filter(l => l.event === 'run_policy_violation'),
+      [{ level: 'warn', event: 'run_policy_violation', lane: 'chat', kind: 'tools_enabled' }]);
+    const written = JSON.stringify(second.logs);
+    assert.ok(!written.includes(marker) && !written.includes(b.id));
+  } finally { await second.worker.close(); }
+});
+
 test('T17 종료 drain: 모델 실행 중 리뷰는 CLI를 멈추고 failed로 답한 뒤 닫힘', async () => {
   await mode({ hang: 'review' });
   const w = await boot();

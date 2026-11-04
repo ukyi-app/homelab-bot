@@ -599,6 +599,38 @@ test('CLD-15 [r1 P1] Opus 5.5 자동 모델 전환: 끄는 env를 넘기고, 전
   }
 });
 
+test('CLD-15b 위반 사건: 공유 실행 제어 없는 대화 레인도 옛 정리 이름으로 바꾸지 않고 그대로 낸다', async () => {
+  await mode({ kind: 'hang', init: { tools: ['StructuredOutput', 'Bash'] } });
+  const events: unknown[] = [];
+  const lane = claudeLane(new SpawnLauncher(fakeBin), { onEvent: event => { events.push(event); } });
+  assert.deepEqual(await lane.run(chatRequest(job()), new AbortController().signal), { status: 'failed', stopped: true });
+  assert.deepEqual(events, [{ event: 'run_policy_violation', lane: 'chat', kind: 'tools_enabled' }]);
+});
+
+test('CLD-15c 사후 판정: interpretClaudeStream은 reason을 그대로 두고 종류를 함께 낸다', () => {
+  const expect = { model: MODEL, apiKeySource: 'none', version: '2.1.308' };
+  const ok = { code: 0, signal: null };
+  const init = { type: 'system', subtype: 'init', tools: ['StructuredOutput'], mcp_servers: [], model: MODEL, apiKeySource: 'none',
+    claude_code_version: '2.1.308' };
+  const fallback = { type: 'system', subtype: 'model_refusal_fallback', original_model: MODEL, fallback_model: 'claude-opus-4-8' };
+  const answered = { type: 'assistant', message: { model: 'claude-opus-4-8', content: [] } };
+  const cases: [unknown[], string][] = [
+    [[{ ...init, tools: ['Bash'] }], 'tools_enabled'],
+    [[{ ...init, mcp_servers: ['x'] }], 'mcp_enabled'],
+    [[{ ...init, model: 'claude-sonnet-5-5' }], 'model_mismatch'],
+    [[{ ...init, apiKeySource: 'ANTHROPIC_API_KEY' }], 'credential_source_mismatch'],
+    [[{ ...init, claude_code_version: '2.1.314' }], 'version_mismatch'],
+    [[init, fallback, answered], 'model_fallback'],
+    [[init, answered, fallback], 'model_mismatch'],
+    // init 위반이 모델 위반보다 먼저다(판정 순서).
+    [[{ ...init, tools: ['Bash'] }, answered], 'tools_enabled'],
+  ];
+  for (const [events, violation] of cases) {
+    assert.deepEqual(interpretClaudeStream(events.map(event => JSON.stringify(event)), ok, expect),
+      { kind: 'failed', reason: 'policy_violation', violation }, JSON.stringify(events));
+  }
+});
+
 test('CLD-16 [r1 P2] 실행 디렉터리 삭제 실패: 성공으로 내지 않고, 남은 동안 readiness 503·새 실행 안 띄움, 지워지면 재개', async t => {
   if (process.getuid?.() === 0) { t.skip('root는 쓰기 금지 디렉터리도 지운다'); return; }
   await mode({ kind: 'answer', answer: ANSWER, lock: true });

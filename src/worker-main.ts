@@ -99,8 +99,10 @@ export async function startWorker(config: WorkerConfig,
   const launcher = options.launcher ?? new ProcessGroupLauncher([config.executorBin]);
   // 모든 레인이 이 실행 제어 하나를 쓴다. 잔여물·생존 불명 차단, readiness, 종료가 레인을 넘어 걸린다.
   const control = new RunControl(credential, launcher, { homes, ...(config.proxy ? { proxy: config.proxy } : {}),
-    // 실행 기록 정리 실패는 readiness를 닫는다. 운영자가 원인을 보도록 값 없는 사건 이름만 남긴다.
-    onEvent: event => options.log?.({ level: event.event === 'cleanup_failed' ? 'error' : 'info', ...event }) });
+    // 실행 기록 정리 실패는 readiness를 닫는다. 운영자가 원인을 보도록 값 없는 사건만 남긴다.
+    // 정책 위반은 그 실행만 막고 작업자는 계속 돌아 review_lane_closed와 같은 warn이다.
+    onEvent: event => options.log?.({ level: event.event === 'cleanup_failed' ? 'error'
+      : event.event === 'run_policy_violation' ? 'warn' : 'info', ...event }) });
   // 컨테이너만 재시작하면 emptyDir(/tmp)는 남는다. 이전 프로세스가 못 지운 실행 공간을 받기 전에 치운다.
   // 못 지우면 기동은 하되 새 실행과 readiness가 막힌다(원인이 풀리면 돌아온다).
   if (!await control.sweep()) options.log?.({ level: 'error', event: 'worker_sweep_failed' });

@@ -8,7 +8,7 @@ import type { ChatAdapter } from './executor.js';
 import { bounded } from './format.js';
 import type { ProcessLauncher } from './process-launcher.js';
 import { RUN_PREFIX, RunControl, runDeadline } from './run-control.js';
-import type { RunControlOptions, RunLimits, RunReport } from './run-control.js';
+import type { RunControlOptions, RunLimits, RunReport, RunViolationEvent } from './run-control.js';
 import type { CancelRequest, WorkerRequest, WorkerResult } from './worker.js';
 
 // 대화 레인(T16b D4, 실행기 프로필 구조 사용자 2026-10-30). 공통 실행 제어는 run-control에 있고, 여기는 대화 프롬프트·
@@ -69,8 +69,8 @@ export function interpretChat(report: ChatReport): WorkerResult {
 export interface ChatLaneOptions extends Omit<RunControlOptions, 'onEvent'> {
   model: string;
   limits?: RunLimits;
-  // 값 없는 운영 사건(실행 기록 정리 실패·복구). 경로·내용은 싣지 않는다.
-  onEvent?: (event: { event: 'chat_cleanup_failed' | 'chat_cleanup_recovered' }) => void;
+  // 값 없는 운영 사건(실행 기록 정리 실패·복구, 정책 위반 종류). 경로·내용은 싣지 않는다.
+  onEvent?: (event: { event: 'chat_cleanup_failed' | 'chat_cleanup_recovered' } | RunViolationEvent) => void;
   // 다른 레인과 함께 쓸 실행 제어. 주면 자격·launcher·tmp·homes·proxy·onEvent는 그 인스턴스 것을 쓴다.
   control?: RunControl;
 }
@@ -80,7 +80,9 @@ export class ChatLane {
   constructor(private readonly adapter: ChatAdapter, credential: WorkerCredential, launcher: ProcessLauncher,
     private readonly options: ChatLaneOptions) {
     this.control = options.control ?? new RunControl(credential, launcher, { ...options,
-      onEvent: ({ event }) => options.onEvent?.({ event: event === 'cleanup_failed' ? 'chat_cleanup_failed' : 'chat_cleanup_recovered' }) });
+      // 옛 이름으로 옮기는 것은 정리 사건뿐이다. 위반 사건까지 옮기면 chat_cleanup_recovered로 둔갑한다.
+      onEvent: event => options.onEvent?.(event.event === 'run_policy_violation' ? event
+        : { event: event.event === 'cleanup_failed' ? 'chat_cleanup_failed' : 'chat_cleanup_recovered' }) });
   }
   ready(): Promise<boolean> { return this.control.ready(); }
   accepting(): boolean { return this.control.accepting(); }
