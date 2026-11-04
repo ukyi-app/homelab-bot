@@ -17,7 +17,7 @@ import type { AdapterRun, ChatAdapter, ChatRun, EngineOutcome, ExecutorCapabilit
 // - 빈 임시 작업 공간 + `--skip-git-repo-check`. 정책은 플래그가 아니라 config.toml(read-only 샌드박스, 셸 env 비상속).
 // - 모델은 CLI 기본값이다(프로필 모델 `cli-default`, -m을 넘기지 않는다). 모델 고정은 검증한 모델 ID가 생기면 더한다.
 export const CODEX_CHAT_CAPABILITIES: ExecutorCapabilities = Object.freeze({
-  executor: 'codex', cliVersion: CODEX_CAPABILITIES.version, lanes: Object.freeze({ chat: true, task: false }),
+  executor: 'codex', cliVersion: CODEX_CAPABILITIES.version, lanes: Object.freeze({ chat: true, task: false, review: false }),
   structuredOutput: 'native-schema', tools: 'read-only-sandbox', sessionPersistence: 'off', modelPinned: false,
   credential: 'file-mutable', evidence: 'fake-cli',
 } as const);
@@ -35,7 +35,7 @@ export interface CodexChatReport {
 }
 const failed = (reason: string): EngineOutcome => ({ kind: 'failed', reason });
 // Codex JSONL 해석. 순서는 작업 레인(interpretRun)과 같다: 흐름 무결성 → 실패 신호 → 종료 코드 → 턴 완료 → 최종 출력.
-// 소멸 확인·상한·중단·스키마·반사는 공통부(chat-lane)가 한다.
+// 소멸 확인·상한·중단은 공통부(run-control)가, 스키마·반사는 레인(chat-lane)이 한다.
 export function interpretCodexChat(report: CodexChatReport): EngineOutcome {
   const { events, malformed } = parseStream(report.lines);
   if (malformed > 0) return failed('invalid_stream');
