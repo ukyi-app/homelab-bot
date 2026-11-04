@@ -7,7 +7,7 @@ import { gzipSync } from 'node:zlib';
 import { ChatLane } from '../src/chat-lane.js';
 import { SYSTEM_INSTRUCTIONS, WorkerRejected } from '../src/contracts.js';
 import { StaticEnvCredential } from '../src/credentials.js';
-import { CLAUDE_FIXED_ENV, CLAUDE_FORBIDDEN_FLAGS, ClaudeChatAdapter, ClaudeReviewAdapter, claudeArgs } from '../src/executor-claude.js';
+import { CLAUDE_FIXED_ENV, CLAUDE_FORBIDDEN_FLAGS, ClaudeChatAdapter, ClaudeReviewAdapter, REVIEW_SETTINGS, claudeArgs } from '../src/executor-claude.js';
 import { CodexChatAdapter } from '../src/executor-codex.js';
 import { PROFILES } from '../src/executor-profiles.js';
 import { REVIEW_INSTRUCTIONS, ReviewOutputSchema, ReviewWorker } from '../src/review-input.js';
@@ -176,9 +176,13 @@ test('T17 무도구 경계 (b) argv는 도구·MCP·hooks·skills를 끄고 빈 
   const f = fixture();
   await review(f.reviewer);
   const s = await seen();
-  assert.deepEqual(s.args, [...claudeArgs(MODEL, REVIEW_OUTPUT_JSON_SCHEMA), '--include-hook-events']);
-  for (const flag of CLAUDE_FORBIDDEN_FLAGS) assert.ok(!s.args.includes(flag), flag);
+  assert.deepEqual(s.args, [...claudeArgs(MODEL, REVIEW_OUTPUT_JSON_SCHEMA), '--include-hook-events', '--settings', REVIEW_SETTINGS]);
   const value = (flag: string) => s.args[s.args.indexOf(flag) + 1];
+  // 금지 플래그 중 `--settings`만 예외이고, 내장 플러그인 두 개를 끄는 고정 인라인 JSON 하나여야 한다(파일 경로·다른 키 없음).
+  for (const flag of CLAUDE_FORBIDDEN_FLAGS.filter(flag => flag !== '--settings')) assert.ok(!s.args.includes(flag), flag);
+  assert.equal(s.args.filter(arg => arg === '--settings').length, 1);
+  assert.deepEqual(JSON.parse(value('--settings') ?? ''),
+    { enabledPlugins: { 'cc-plugin-agents-md@builtin': false, 'cc-plugin-plugin-authoring@builtin': false } });
   assert.equal(value('--tools'), '');
   assert.equal(value('--mcp-config'), '{"mcpServers":{}}');
   assert.equal(value('--model'), MODEL);
@@ -199,6 +203,8 @@ test('T17 무도구 경계 (b) init이 정책과 다르면 그 실행은 정책 
   const cases: Record<string, unknown>[] = [
     { init: { mcp_servers: [{ name: 'x', status: 'connected' }] } }, { init: { tools: ['StructuredOutput', 'Bash'] } },
     { init: { skills: ['deploy'] } }, { init: { skills: null } }, { init: { plugins: [{ name: 'p', path: '/p' }] } }, { init: { plugins: null } },
+    // 2.1.308이 --safe-mode에서도 싣던 내장 플러그인 모양(2026-11-04 실측). 설정이 먹지 않으면 여기서 막혀야 한다.
+    { init: { plugins: [{ name: 'cc-plugin-agents-md', path: 'builtin', source: 'cc-plugin-agents-md@builtin' }] } },
     { events: [{ type: 'system', subtype: 'hook_started', hook_id: 'h', hook_name: 'SessionStart', hook_event: 'SessionStart' }] },
     { events: [{ type: 'system', subtype: 'hook_response', hook_id: 'h', hook_name: 'Stop', hook_event: 'Stop' }] },
     { init: { model: 'claude-sonnet-5-5' } }, { answeredBy: 'claude-sonnet-5-5' }, { init: { apiKeySource: 'ANTHROPIC_API_KEY' } },

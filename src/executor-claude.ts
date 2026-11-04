@@ -224,12 +224,19 @@ export function noToolBoundaryViolation(line: string): string | null {
   if (!Array.isArray(event.plugins) || event.plugins.length > 0) return 'plugins_enabled';
   return null;
 }
+// `--safe-mode`도 CLI 내장 플러그인은 켠 채 둔다(2.1.308 --help: "built-in tools and plugins … work normally").
+// 첫 실리뷰(2026-11-04)가 init plugins의 이 두 이름 때문에 plugins_enabled로 막혔다 [실측: 작업자 파드, 가짜 토큰 init].
+// 그래서 이 둘만 끄는 고정 인라인 JSON을 `--settings`로 넘긴다(같은 실측에서 init plugins가 []). 파일·다른 출처를 읽는
+// `--settings`는 여전히 금지다(CLAUDE_FORBIDDEN_FLAGS, 시험이 값까지 확인). 새 CLI가 다른 내장 플러그인을 더하면 위 init
+// 검사가 그대로 막는다(fail-closed).
+export const REVIEW_DISABLED_BUILTIN_PLUGINS: readonly string[] = Object.freeze(['cc-plugin-agents-md@builtin', 'cc-plugin-plugin-authoring@builtin']);
+export const REVIEW_SETTINGS = JSON.stringify({ enabledPlugins: Object.fromEntries(REVIEW_DISABLED_BUILTIN_PLUGINS.map(name => [name, false])) });
 export class ClaudeReviewAdapter extends ClaudeChatAdapter {
   override async start(run: ChatRun): Promise<AdapterRun> {
     const plan = await super.start(run);
     return { ...plan,
       // 없으면 hook 이벤트가 흐름에 나오지 않아 위 검사가 볼 수 없다 [확인: 2.1.308 --help].
-      args: [...plan.args, '--include-hook-events'],
+      args: [...plan.args, '--include-hook-events', '--settings', REVIEW_SETTINGS],
       observe(line: string): Observation {
         const seen = plan.observe(line);
         return seen.violation ? seen : { ...seen, violation: noToolBoundaryViolation(line) };
