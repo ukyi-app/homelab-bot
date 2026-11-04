@@ -7,10 +7,10 @@ import type { AddressInfo } from 'node:net';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
-import { SYSTEM_INSTRUCTIONS, WorkerRejected } from '../src/contracts.js';
+import { Denied, SYSTEM_INSTRUCTIONS, WorkerRejected } from '../src/contracts.js';
 import type { Job } from '../src/contracts.js';
 import { HttpReviewWorker, reviewWorkerServer } from '../src/review-http.js';
-import { REVIEW_INSTRUCTIONS, ReviewWorker } from '../src/review-input.js';
+import { REVIEW_INSTRUCTIONS, ReviewTaskSchema, ReviewWorker } from '../src/review-input.js';
 import type { ArchiveFetcher, ReviewTask } from '../src/review-input.js';
 import { RUN_PREFIX } from '../src/run-control.js';
 import { ExecutionSlot, SerialWorker, WorkerSigner, WorkerVerifier, archiveContract } from '../src/worker.js';
@@ -412,6 +412,137 @@ test('T17 ExecutionSlot: 겹친 cancel은 정리를 한 번만 하고, 실행 �
   assert.ok(running);
   assert.deepEqual(await slot.cancel({ job: 'b', lease: 'l' }), { stopped: true });
   assert.deepEqual(sweeps, ['sweep']);
+});
+
+for (const lane of ['리뷰', '대화'] as const) test(`T17 PR #42 리뷰(${lane}): 실행 중 취소 뒤 unknown으로 끝나고 소멸이 확인되면 실행 공간을 지우고 자리를 푼다`, async () => {
+  await mode({ hang: lane === '리뷰' ? 'review' : 'chat' });
+  const launcher = new SpawnLauncher(fakeBin);
+  // 실행 끝에서는 프로세스가 보여 unknown이 되고, 취소의 소멸 확인 때는 사라졌다.
+  const seen = [1];
+  launcher.survivors = async () => seen.shift() ?? 0;
+  const w = await boot({ launcher });
+  try {
+    const a = job();
+    const running: Promise<unknown> = lane === '리뷰' ? runReview(w, a) : runChat(w, a);
+    await until(() => launcher.specs.length === 1);
+    assert.deepEqual(await (lane === '리뷰' ? cancelViaReview : cancelViaChat)(w, a), { stopped: true });
+    assert.deepEqual(await running, { status: 'unknown', stopped: false });
+    assert.deepEqual(await spaces(), []);
+    assert.equal((await fetch(`${w.url}/readyz`)).status, 200);
+    await mode();
+    assert.equal((await runChat(w, job())).status, 'succeeded');
+  } finally { await w.worker.close(); }
+});
+
+test('T17 PR #42 리뷰: 취소 시작 때 잠금 전이어도 리뷰가 unknown이면 소멸 확인 뒤 sweep하고, sweep이 끝나야 자리를 놓음', async () => {
+  const calls: string[] = [];
+  let finishSweep!: (cleaned: boolean) => void;
+  const slot = new ExecutionSlot({ stop: async () => { calls.push('stop'); return true; },
+    sweep: () => new Promise<boolean>(resolve => { calls.push('sweep'); finishSweep = resolve; }) });
+  let entered!: () => void;
+  const reached = new Promise<void>(resolve => { entered = resolve; });
+  const worker = new ReviewWorker({ check: async () => {} } as unknown as WorkerVerifier, archives, (_input, signal) => new Promise(resolve => {
+    entered();
+    signal.addEventListener('abort', () => resolve({ status: 'unknown' }), { once: true });
+  }), 5000, slot);
+  const j = job();
+  const review = worker.review(reviewTask(j), 'c', live());
+  await reached;
+  const cancelling = worker.cancel(cancelBody(j), 'c');
+  assert.deepEqual(await review, { status: 'unknown', stopped: false });
+  await until(() => calls.includes('sweep'));
+  assert.deepEqual(calls, ['stop', 'sweep']);
+  assert.equal(slot.acquire('next', 'l', async () => true), undefined);
+  finishSweep(true);
+  assert.deepEqual(await cancelling, { stopped: true });
+  assert.ok(slot.acquire('next', 'l', async () => true));
+});
+
+test('T17 PR #42 리뷰: 취소를 기다리는 사이 자리를 놓은 실행의 늦은 잠금은 다음 실행 공간을 sweep하지 않음', async () => {
+  let sweeps = 0;
+  const slot = new ExecutionSlot({ stop: async () => true, sweep: async () => { sweeps++; return true; } });
+  let answer!: (stopped: boolean) => void;
+  const first = slot.acquire('a', 'l', () => new Promise<boolean>(resolve => { answer = resolve; }))!;
+  const cancelling = slot.cancel({ job: 'a', lease: 'l' });
+  slot.release(first);
+  assert.ok(slot.acquire('b', 'l', async () => true));
+  slot.lock(first);
+  answer(true);
+  assert.deepEqual(await cancelling, { stopped: true });
+  assert.equal(sweeps, 0);
+  assert.equal(slot.acquire('c', 'l', async () => true), undefined);
+});
+
+// confirmGone을 호출 순서대로 하나씩 답하게 해 겹친 취소의 순서를 고정한다.
+const gatedSlot = () => {
+  const answers: ((stopped: boolean) => void)[] = [];
+  return { answers, slot: new ExecutionSlot({ stop: () => new Promise<boolean>(resolve => { answers.push(resolve); }), sweep: async () => true }) };
+};
+const settle = () => new Promise(resolve => setImmediate(resolve));
+const noStop = async () => true;
+const cancelled = { job: 'a', lease: 'l' };
+
+test('T17 PR #42 리뷰: 확정한 차단 표식은 같은 job·lease 재취소의 일시 실패로 지워지지 않음', async () => {
+  const { answers, slot } = gatedSlot();
+  const first = slot.cancel(cancelled);
+  answers[0]!(true);
+  assert.deepEqual(await first, { stopped: true });
+  const again = slot.cancel(cancelled);
+  answers[1]!(false);
+  // 이번 조회는 실패했으니 답은 그대로 false다. 앞서 확정한 차단만 남는다.
+  assert.deepEqual(await again, { stopped: false });
+  assert.equal(slot.acquire('a', 'l', noStop), undefined);
+  // 다른 lease는 다른 시도라 막지 않는다.
+  assert.ok(slot.acquire('a', 'other', noStop));
+});
+
+for (const [order, late] of [['성공 뒤 실패', [true, false]], ['실패 뒤 성공', [false, true]]] as const) test(`T17 PR #42 리뷰: 겹친 취소가 돌아온 순서(${order})와 무관하게 차단이 남음`, async () => {
+  const { answers, slot } = gatedSlot();
+  const results = [slot.cancel(cancelled), slot.cancel(cancelled)];
+  assert.equal(answers.length, 2);
+  answers[0]!(late[0]);
+  await settle();
+  assert.equal(slot.acquire('a', 'l', noStop), undefined);
+  answers[1]!(late[1]);
+  assert.deepEqual(await Promise.all(results), [{ stopped: late[0] }, { stopped: late[1] }]);
+  assert.equal(slot.acquire('a', 'l', noStop), undefined);
+});
+
+test('T17 PR #42 리뷰: 겹친 취소가 모두 실패하면 먼저 실패한 호출은 뒤 호출의 임시 차단을 풀지 않고, 마지막 실패 뒤에만 다시 받음', async () => {
+  const { answers, slot } = gatedSlot();
+  const results = [slot.cancel(cancelled), slot.cancel(cancelled)];
+  answers[0]!(false);
+  await settle();
+  assert.equal(slot.acquire('a', 'l', noStop), undefined);
+  answers[1]!(false);
+  assert.deepEqual(await Promise.all(results), [{ stopped: false }, { stopped: false }]);
+  assert.ok(slot.acquire('a', 'l', noStop));
+});
+
+const BAD_REPOSITORIES = ['../x', './x', 'x/..', 'x/.', '../..', '/x', 'x/', 'a//b', 'a/b/c', '..', 'a/b\n'];
+const GOOD_REPOSITORIES = ['ukyi-app/homelab-smoke', 'ukyi-app/.github', 'a.b/c..d', 'a/..b', 'a/b.'];
+
+test('T17 PR #42 리뷰: archiveContract·ReviewTaskSchema는 owner/repo 꼴만 받고 점 세그먼트·빈 세그먼트를 거부', () => {
+  const task = reviewTask(job());
+  for (const repository of BAD_REPOSITORIES) {
+    assert.throws(() => archiveContract(repository, BASE_SHA, HEAD_SHA), Denied, JSON.stringify(repository));
+    assert.equal(ReviewTaskSchema.safeParse({ ...task, repository }).success, false, JSON.stringify(repository));
+  }
+  // .github처럼 점으로 시작하는 실제 저장소 이름은 계속 받는다.
+  for (const repository of GOOD_REPOSITORIES) {
+    assert.ok(archiveContract(repository, BASE_SHA, HEAD_SHA), repository);
+    assert.equal(ReviewTaskSchema.safeParse({ ...task, repository }).success, true, repository);
+  }
+});
+
+test('T17 PR #42 리뷰: 저장소가 ../x인 리뷰 요청은 압축본을 받기 전에 거부', async () => {
+  let fetched = 0;
+  const worker = new ReviewWorker({ check: async () => {} } as unknown as WorkerVerifier,
+    async url => { fetched++; return archives(url, { credentials: 'omit', redirect: 'error', maxBytes: 1, signal: live() }); },
+    async () => ({ status: 'succeeded', output: OUTPUT }), 50);
+  await assert.rejects(worker.review({ ...reviewTask(job()), repository: '../x',
+    archives: { base: `https://codeload.github.com/../x/tar.gz/${BASE_SHA}`, head: `https://codeload.github.com/../x/tar.gz/${HEAD_SHA}` } }, 'c', live()), WorkerRejected);
+  assert.equal(fetched, 0);
 });
 
 test('T17 sweep: 기동 때 이전 프로세스의 실행 공간을 지우고 다른 파일은 두며, 못 지우면 readiness와 새 실행을 막음', async t => {

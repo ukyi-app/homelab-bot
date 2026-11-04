@@ -1,7 +1,7 @@
 import { gunzipSync } from 'node:zlib';
 import { z } from 'zod';
 import { DEFAULTS, Denied, WorkerRejected } from './contracts.js';
-import { archiveContract, CancelRequestSchema, ExecutionSlot } from './worker.js';
+import { archiveContract, CancelRequestSchema, ExecutionSlot, REPOSITORY_NAME } from './worker.js';
 import type { CancelRequest, WorkerVerifier } from './worker.js';
 
 // 리뷰 작업자 쪽: base·head 압축본 두 개로 diff를 만들고 리뷰 모델(지금은 fake)을 부른다.
@@ -48,7 +48,7 @@ export const ReviewOutputSchema = z.strictObject({
 export type ReviewOutput = z.infer<typeof ReviewOutputSchema>;
 export const ReviewTaskSchema = z.strictObject({
   version: z.literal(1), job: z.string().uuid(), lease: z.string().uuid(), lane: z.literal('review'),
-  repository: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/), base: Sha, head: Sha,
+  repository: z.string().regex(REPOSITORY_NAME), base: Sha, head: Sha,
   archives: z.strictObject({ base: z.string().url(), head: z.string().url() }),
   changes: z.array(ChangeSchema).max(5000), truncated: z.boolean(),
   pullRequest: z.strictObject({ title: z.string().max(1000), body: z.string().max(65_536) }),
