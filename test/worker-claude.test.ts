@@ -118,9 +118,11 @@ beforeEach(async () => {
   await chmod(fakeBin, 0o755);
   await writeFile(join(fakeDir, 'version.txt'), '2.1.308 (Claude Code)\n');
   await mode({ kind: 'answer', answer: ANSWER });
+  // 기동 sweep이 공용 /tmp에서 병렬로 도는 다른 시험 파일의 실행 공간을 지우지 않게 한다.
+  process.env.TMPDIR = base;
 });
 // .local은 다른 시험 파일도 함께 쓴다. 이 시험이 만든 디렉터리만 지운다.
-afterEach(async () => { await rm(base, { recursive: true, force: true }).catch(() => {}); });
+afterEach(async () => { delete process.env.TMPDIR; await rm(base, { recursive: true, force: true }).catch(() => {}); });
 const mode = (value: unknown) => writeFile(join(fakeDir, 'mode.json'), JSON.stringify(value));
 interface Seen { args: string[]; cwd: string; entries: string[]; env: Record<string, string>; input: string; files: Record<string, string>; root: string }
 const seen = async () => JSON.parse(await readFile(join(fakeDir, 'seen.json'), 'utf8')) as Seen;
@@ -130,7 +132,7 @@ const chatRequest = (j: Job, overrides: Partial<WorkerRequest> = {}): WorkerRequ
   timeoutMs: 60_000, toolCalls: 8, ...overrides });
 const env = (overrides: Record<string, string | undefined> = {}) => ({ WORKER_EXECUTOR: 'claude', WORKER_MODEL: MODEL,
   WORKER_CREDENTIAL_DIR: tokenDir, WORKER_CREDENTIAL_KEY: 'CLAUDE_CODE_OAUTH_TOKEN', WORKER_NONCE_DIR: nonceDir,
-  WORKER_CONTROL_PUBLIC_KEY: publicPem, WORKER_EXECUTOR_BIN: fakeBin, ...overrides });
+  WORKER_CONTROL_PUBLIC_KEY: publicPem, WORKER_EXECUTOR_BIN: fakeBin, TMPDIR: base, ...overrides });
 const tokenFile = () => join(tokenDir, 'CLAUDE_CODE_OAUTH_TOKEN');
 const credential = (homes: string[] = []) => new StaticEnvCredential(tokenFile(), homes);
 const claudeLane = (launcher: SpawnLauncher, options: Partial<ChatLaneOptions> = {}, cred: WorkerCredential = credential(),

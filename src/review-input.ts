@@ -1,7 +1,7 @@
 import { gunzipSync } from 'node:zlib';
 import { z } from 'zod';
 import { DEFAULTS, Denied, WorkerRejected } from './contracts.js';
-import { archiveContract, CancelRequestSchema } from './worker.js';
+import { archiveContract, CancelRequestSchema, ExecutionSlot } from './worker.js';
 import type { CancelRequest, WorkerVerifier } from './worker.js';
 
 // 리뷰 작업자 쪽: base·head 압축본 두 개로 diff를 만들고 리뷰 모델(지금은 fake)을 부른다.
@@ -332,12 +332,13 @@ export const reviewOutcome = (coverage: Coverage): 'completed' | 'partial' =>
   coverage.omitted_files_with_reasons.length || coverage.limits_hit.length ? 'partial' : 'completed';
 
 // 작업자 쪽 실행기. 서명된 capability가 이 요청 본문에 묶여 있을 때만 압축본을 받고 모델을 부른다.
+interface ReviewRun { abort: AbortController; done: Promise<boolean> }
 export class ReviewWorker {
-  private active: { job: string; lease: string; abort: AbortController; done: Promise<boolean> } | undefined;
-  // 중단 신호를 받은 호출이 cancel보다 먼저 정상 반환할 수 있다. 그 종료도 멈춤 증거로 답한다.
-  private stopped: { job: string; lease: string } | undefined;
+  private running: ReviewRun | undefined;
+  private closed = false;
+  // 슬롯을 대화와 함께 쓰면 실행 잠금·unknown 잠금이 두 레인에 함께 걸린다.
   constructor(private readonly verifier: WorkerVerifier, private readonly fetchArchive: ArchiveFetcher,
-    private readonly model: ReviewerModel, private readonly stopWaitMs = 5000) {}
+    private readonly model: ReviewerModel, private readonly stopWaitMs = 5000, private readonly slot = new ExecutionSlot()) {}
   async review(input: ReviewTask, capability: string, signal: AbortSignal): Promise<ReviewWorkerResult> {
     let task: ReviewTask;
     try {
@@ -347,13 +348,16 @@ export class ReviewWorker {
       // 게시 서버가 보낸 URL을 그대로 믿지 않는다. 고정 SHA의 codeload 주소만 받는다.
       if (task.archives.base !== contract.base || task.archives.head !== contract.head) throw new Denied();
     } catch { throw new WorkerRejected(); }
-    if (this.active) throw new WorkerRejected('worker_busy');
+    // 서명 확인이 끝나기를 기다리는 사이 종료가 시작될 수 있다. 압축본 받기는 실행 제어가 막아 주지 않는다.
+    if (this.closed) throw new WorkerRejected('worker_closing');
     const started = Date.now();
     const abort = new AbortController();
-    if (signal.aborted) abort.abort(); else signal.addEventListener('abort', () => abort.abort(), { once: true });
     let settle!: (stopped: boolean) => void;
-    const active = { job: task.job, lease: task.lease, abort, done: new Promise<boolean>(resolve => { settle = resolve; }) };
-    this.active = active;
+    const run: ReviewRun = { abort, done: new Promise<boolean>(resolve => { settle = resolve; }) };
+    const held = this.slot.acquire(task.job, task.lease, () => this.stop(task.job, run), true);
+    if (!held) throw new WorkerRejected('worker_busy');
+    this.running = run;
+    if (signal.aborted) abort.abort(); else signal.addEventListener('abort', () => abort.abort(), { once: true });
     signal = abort.signal;
     let stopped = true;
     try {
@@ -390,22 +394,36 @@ export class ReviewWorker {
       stopped = false;
       return { status: 'unknown', stopped: false };
     } finally {
+      if (this.running === run) this.running = undefined;
+      if (stopped) this.slot.release(held); else this.slot.lock(held);
       settle(stopped);
-      if (stopped && this.active === active) { this.active = undefined; this.stopped = { job: task.job, lease: task.lease }; }
     }
   }
-  // 모델 호출이 중단 신호를 받고 정상 반환했을 때만 멈췄다고 답한다. 예외·무응답은 멈춤의 증거가 아니다.
   async cancel(input: CancelRequest, capability: string): Promise<{ stopped: boolean }> {
     const request = CancelRequestSchema.parse(input);
     await this.verifier.check(capability, 'cancel', request);
-    const active = this.active;
-    if (active?.job !== request.job || active.lease !== request.lease) {
-      return { stopped: this.stopped?.job === request.job && this.stopped.lease === request.lease };
-    }
-    active.abort.abort();
+    return this.slot.cancel(request);
+  }
+  // 새 리뷰를 닫고(동기, 첫 await 전) 진행 중인 리뷰를 멈춘다. 압축본을 받는 중이면 실행 제어의 종료로는 멈추지 않는다.
+  async shutdown(): Promise<void> {
+    this.closed = true;
+    const run = this.running;
+    if (!run) return;
+    run.abort.abort();
+    await this.settled(run);
+  }
+  // 호출이 중단 신호를 받고 정상 반환했으면 멈춘 것이다. unknown으로 끝났으면 실제 소멸을 확인했을 때만 멈췄다고 답한다.
+  // 예외·무응답은 멈춤의 증거가 아니다.
+  private async stop(job: string, run: ReviewRun): Promise<boolean> {
+    run.abort.abort();
+    const done = await this.settled(run);
+    if (done === 'pending') return false;
+    return done || this.slot.confirmGone(job);
+  }
+  private async settled(run: ReviewRun): Promise<boolean | 'pending'> {
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const stopped = await Promise.race([active.done, new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), this.stopWaitMs); })]);
+    const done = await Promise.race([run.done, new Promise<'pending'>(resolve => { timer = setTimeout(() => resolve('pending'), this.stopWaitMs); })]);
     clearTimeout(timer);
-    return { stopped };
+    return done;
   }
 }

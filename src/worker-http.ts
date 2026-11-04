@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { z } from 'zod';
 import { Agent } from 'undici';
 import { AnswerSchema, WorkerRejected } from './contracts.js';
@@ -64,12 +65,17 @@ export class HttpWorker implements WorkerClient {
 }
 // ready를 넘기면 GET /readyz를 연다(kubelet readiness, 인증 없음. 응답에 상태 본문을 싣지 않는다).
 // accepting이 false를 돌려주면(종료 중) 새 실행 요청을 실행 전에 거부한다(403, started:false). 취소는 계속 받는다.
-export function workerServer(worker: WorkerClient, ready?: () => Promise<boolean>, accepting?: () => boolean) {
+// routes는 같은 포트에 얹는 다른 레인의 경로다(리뷰). 없는 경로는 404라, 레인을 닫으면 경로 자체가 없다.
+export type WorkerRoute = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+export function workerServer(worker: WorkerClient, ready?: () => Promise<boolean>, accepting?: () => boolean,
+  routes?: ReadonlyMap<string, WorkerRoute>) {
   const server = createServer(async (req, res) => {
     if (ready && req.method === 'GET' && req.url === '/readyz') {
       const ok = await ready().catch(() => false);
       res.writeHead(ok ? 200 : 503).end(); return;
     }
+    const route = routes?.get(req.url ?? '');
+    if (route) { await route(req, res); return; }
     if (req.method !== 'POST' || !['/v1/execute', '/v1/cancel'].includes(req.url ?? '')) { res.writeHead(404).end(); return; }
     const auth = req.headers.authorization;
     if (!auth?.startsWith('Capability ')) {
