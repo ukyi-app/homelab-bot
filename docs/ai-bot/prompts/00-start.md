@@ -248,8 +248,8 @@ github:
   model_call_author_associations: [OWNER, MEMBER, COLLABORATOR]  # D-29, 확정(사용자 2026-10-18). 모델 호출 전 확인. 설계 C.8. CONTRIBUTOR는 넣지 않는다. App PR은 NONE·CONTRIBUTOR로 찍혀(T15 실측) allowed_bot_author_ids로 통과시킨다(D-16 하위 결정)
   prohibit_approve_request_changes_merge: true
   change_existing_merge_policy: false
-  change_writer_identity: dedicated_github_app  # D-24, 확정(사용자 2026-10-18, T15): 봇 전용 쓰기 GitHub App(Contents·Pull requests write, Metadata read, webhook 끔, 작업마다 저장소 하나로 좁힌 1시간 토큰). App 이름은 T19에서 정한다(미정)
-  change_writer_repositories: []             # D-24: 선택 저장소에만 설치. 설치 저장소는 T19에서 정한다(미정)
+  change_writer_identity: dedicated_github_app  # D-24, 확정(사용자 2026-10-18, T15): 봇 전용 쓰기 GitHub App(Contents·Pull requests write, Metadata read, webhook 끔, 작업마다 저장소 하나로 좁힌 1시간 토큰). App 이름 `ukyi-writer`, 토큰은 커밋·ref용과 PR용 두 종류(확정(사용자 2026-11-05, T19))
+  change_writer_repositories: []             # D-24: 선택 저장소에만 설치. 설치는 homelab-smoke 먼저, homelab은 별도 승인(확정(사용자 2026-11-05, T19)). 런타임 허용은 기능을 열 때 채운다
   change_writer_branch_prefix: "bot/"
   change_writer_allow_paths: []              # D-24: Workflows 권한이 없어 .github/workflows는 넣을 수 없다(범위 축소)
   workflow_dispatch_enabled: false
