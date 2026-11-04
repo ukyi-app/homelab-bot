@@ -5,6 +5,7 @@ import type { Server } from 'node:http';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { once } from 'node:events';
 import { pathToFileURL } from 'node:url';
+import { createArchiveFetcher } from './archive-fetcher.js';
 import { ChatLane } from './chat-lane.js';
 import { createExecutor, executorVersion, selectProfile } from './executor-profiles.js';
 import type { ExecutorProfile } from './executor-profiles.js';
@@ -70,7 +71,7 @@ export function workerConfig(env: Record<string, string | undefined>): WorkerCon
     publicKey, executorBin, ...(codexHome ? { codexHome } : {}), ...(proxy ? { proxy } : {}) };
 }
 
-// 압축본 다운로더 자리. 실제 구현이 들어오기 전 기본값은 받지 못한다(리뷰는 archive_fetch_failed로 끝나고 모델을 부르지 않는다).
+// 압축본 다운로더 기본값(시험·조립용). 운영 진입점 main()은 createArchiveFetcher를 넘긴다. 이 값이면 리뷰는 archive_fetch_failed로 끝나고 모델을 부르지 않는다.
 export const closedArchiveFetcher: ArchiveFetcher = async () => { throw new Error('archive_fetcher_unavailable'); };
 // 취소 응답 안에 끝내야 한다(게시 서버 조사 cancel 5초). 넘겨도 멈춘 뒤의 cancel이 stopped:true를 답한다.
 const REVIEW_STOP_WAIT_MS = 4000;
@@ -145,7 +146,9 @@ export async function main(env: Record<string, string | undefined> = process.env
   let config: WorkerConfig;
   try {
     config = workerConfig(env);
-    worker = await startWorker(config, { log });
+    // 운영 작업자만 실제 다운로더를 쓴다. startWorker 기본값(closedArchiveFetcher)은 시험·조립용으로 남긴다.
+    // 프록시는 이 env의 HTTPS_PROXY만 쓰고, 없으면 받는 호출이 archive_proxy_unavailable로 실패한다(대화는 영향 없음).
+    worker = await startWorker(config, { log, fetchArchive: createArchiveFetcher({ env }) });
   } catch (error) {
     // 예상한 사유는 코드만, 그 밖은 오류 종류 이름만 남긴다. 메시지에는 입력 조각이 실릴 수 있다.
     const reason = error instanceof WorkerStartError ? error.code

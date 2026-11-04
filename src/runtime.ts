@@ -197,8 +197,8 @@ export class Runtime {
       return (await this.worker.cancel(body, this.signer.issue(job, 'cancel', body))).stopped;
     } catch { return false; }
   }
-  // 이전 실행이 unknown으로 남긴 chat에 새 cancel capability로 멈춤을 묻는다(네트워크는 DB 트랜잭션 밖).
-  // 지금 작업자는 그 job을 아직 잡고 있을 때만 stopped:true를 준다. 이미 끝냈거나 재시작한 작업자의 job은 풀리지 않는다.
+  // 이전 실행이 unknown으로 남긴 chat·review에 새 cancel capability로 멈춤을 묻는다(네트워크는 DB 트랜잭션 밖).
+  // 작업자는 잡고 있는 job이면 멈춘 뒤, 잡고 있지 않으면(재시작·OOM 뒤) 표식 프로세스 소멸을 확인했을 때 stopped:true를 준다(#42).
   // 확인 뒤 쓰기는 afterStop으로 재시도한다. 작업자는 첫 확인 뒤 job을 놓아 다음 조사의 cancel은 stopped:false다.
   async probeUnknown(): Promise<number> {
     if (this.shutdown?.aborted) return 0;

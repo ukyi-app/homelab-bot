@@ -62,7 +62,7 @@ export function assertEgressBound(proxy: RunControl['proxy']): void {
 }
 
 export interface ReviewerOptions { model: string; limits?: RunLimits }
-// 실행 제어는 대화 레인과 같은 인스턴스를 받는다(잔여물·생존 불명 차단이 두 레인에 함께 걸린다). 아직 어디에도 연결하지 않았다.
+// 실행 제어는 대화 레인과 같은 인스턴스를 받는다(잔여물·생존 불명 차단이 두 레인에 함께 걸린다). 작업자 진입점(startWorker)이 대화와 같은 RunControl로 조립한다.
 export function createReviewerModel(executor: Pick<Executor, 'reviewAdapter'>, control: RunControl, options: ReviewerOptions): ReviewerModel {
   const adapter = executor.reviewAdapter;
   if (!adapter?.capabilities.lanes.review) throw new WorkerStartError('review_unsupported');
