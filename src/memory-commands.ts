@@ -179,14 +179,14 @@ export function savedText(verb: string, result: { id: string; status: 'active' |
   for (const [index, id] of result.conflictsWith.entries()) {
     const left = total - index - 1;
     const line = (shown: string[], more: number) =>
-      `충돌 ${total}건: ${shown.join(', ')}${more ? ` 외 ${more}건(memory-search로 확인)` : ''}. memory-correct로 정리하세요.`;
+      `충돌 ${total}건: ${shown.join(', ')}${more ? ` 외 ${more}건(memory-search로 확인)` : ''}. memory-correct의 target에 이 ID와 충돌 ID를 쉼표로 함께(최대 5개) 넣어 정정하면 그 충돌이 풀립니다.`;
     if ([...lines, line([...ids, `\`${id}\``], left)].join('\n').length > limit) {
       lines.push(line(ids, total - ids.length));
       return lines.join('\n');
     }
     ids.push(`\`${id}\``);
   }
-  lines.push(`충돌 ${total}건: ${ids.join(', ')}. memory-correct로 정리하세요.`);
+  lines.push(`충돌 ${total}건: ${ids.join(', ')}. memory-correct의 target에 이 ID와 충돌 ID를 쉼표로 함께(최대 5개) 넣어 정정하면 그 충돌이 풀립니다.`);
   return lines.join('\n');
 }
 // 삭제 범위 문구. 서비스 메시지(memory.ts)를 그대로 싣고, Discord 사본 범위를 늘 덧붙인다.

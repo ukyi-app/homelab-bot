@@ -309,7 +309,7 @@ test('MEM-CMD 응답 길이: 충돌이 많아도 저장·정정 응답은 Discor
   const ids = Array.from({ length: 50 }, () => randomUUID());
   const saved = savedText('저장했습니다', { id: randomUUID(), status: 'candidate', conflictsWith: ids });
   assert.ok(saved.length <= REPLY_LIMIT, `저장 응답 ${saved.length}자`);
-  assert.match(saved, /충돌 50건: .* 외 \d+건\(memory-search로 확인\)\. memory-correct로 정리하세요\./);
+  assert.match(saved, /충돌 50건: .* 외 \d+건\(memory-search로 확인\)\. memory-correct의 target에 이 ID와 충돌 ID를 쉼표로 함께\(최대 5개\) 넣어 정정하면 그 충돌이 풀립니다\./);
   const shown = (saved.match(/`[0-9a-f-]{36}`/g) ?? []).length - 1;
   assert.ok(shown > 0 && shown < 50);
   assert.ok(saved.includes(`외 ${50 - shown}건`));
@@ -319,6 +319,6 @@ test('MEM-CMD 응답 길이: 충돌이 많아도 저장·정정 응답은 Discor
   assert.ok(corrected.length <= REPLY_LIMIT, `정정 응답 ${corrected.length}자`);
   // 충돌이 적으면 전부 적는다.
   const few = savedText('저장했습니다', { id: randomUUID(), status: 'candidate', conflictsWith: ids.slice(0, 3) });
-  assert.match(few, /충돌 3건: `[^`]+`, `[^`]+`, `[^`]+`\. memory-correct로 정리하세요\./);
+  assert.match(few, /충돌 3건: `[^`]+`, `[^`]+`, `[^`]+`\. memory-correct의 target에 이 ID와 충돌 ID를 쉼표로 함께\(최대 5개\) 넣어 정정하면 그 충돌이 풀립니다\./);
   assert.doesNotMatch(few, /외 \d+건/);
 });

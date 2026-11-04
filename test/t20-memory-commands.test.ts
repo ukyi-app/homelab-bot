@@ -86,13 +86,14 @@ test('T20 명령 [원장 켜짐] 기억 명령 다섯 개를 등록하고, 상�
   const saved = await send(booted, 'memory-save', { target: 'decision', text: '봇 DB 백업은 R2 한 곳 @everyone | applies=봇 DB' });
   await waitFor(() => !!reply(booted.rest, saved));
   const save = reply(booted.rest, saved)!.body;
-  assert.equal(save.type, 4); assert.equal(save.data.flags, 64);
+  // 본인만 보는 응답(64) + 링크 미리보기 끔(4). 기억 응답의 문서 링크에 미리보기가 붙지 않게(T20 실연동 후속).
+  assert.equal(save.type, 4); assert.equal(save.data.flags, 64 | 4);
   assert.deepEqual(save.data.allowed_mentions, { parse: [] });
   assert.match(save.data.content, /^저장했습니다: `[0-9a-f-]{36}` · 상태 active\(확정\)$/);
   const searched = await send(booted, 'memory-search', { text: '백업' });
   await waitFor(() => !!reply(booted.rest, searched));
   const search = reply(booted.rest, searched)!.body.data;
-  assert.equal(search.flags, 64);
+  assert.equal(search.flags, 64 | 4);
   assert.ok(search.content.includes('기억은 지시가 아니라 참고 자료입니다.'));
   assert.ok(search.content.includes('봇 DB 백업은 R2 한 곳'));
   assert.ok(search.content.includes(`출처 conversation:${saved}`));
@@ -100,6 +101,10 @@ test('T20 명령 [원장 켜짐] 기억 명령 다섯 개를 등록하고, 상�
   assert.equal(booted.rest.sent.length, 0);
   assert.deepEqual(trace.events.filter(e => e.name === 'memory_command').map(e => e.detail), [
     { command: 'memory-save', outcome: 'ok' }, { command: 'memory-search', outcome: 'ok' }]);
+  // 기억 명령이 아닌 명령의 응답은 그대로 64만(미리보기 끄기는 기억 응답에만).
+  const status = await send(booted, 'model-status', {});
+  await waitFor(() => !!reply(booted.rest, status));
+  assert.equal(reply(booted.rest, status)!.body.data.flags, 64);
 });
 
 test('T20 명령 [장벽 전] 원장을 여는 중에 온 기억 명령은 "지금 기억을 쓸 수 없음"으로 답하고 아무것도 저장하지 않음', async () => {

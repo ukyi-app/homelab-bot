@@ -155,6 +155,17 @@ test('MEM-01 충돌 기억은 둘 다 확정하지 않고, 사유 있는 정정�
   assert.equal((await rows('memory_terms')).filter(t => t.memory_id === a.id || t.memory_id === b.id).length, 0);
   await assert.rejects(memory.correct('fixture-owner', thread, [a.id], config('대체된 기억 재정정'), '다시'), Denied);
 });
+test('MEM-01 [T20 실연동 후속] 한쪽만 정정하면 남은 상대와 다시 충돌해 candidate, 새 ID와 충돌 ID를 함께 정정하면 active', async () => {
+  // 11-03 실연동: 충돌한 candidate만 정정했더니 새 기억이 같은 주제의 active와 다시 충돌했다. 응답 안내(함께 정정)가 맞는지 본다.
+  const a = await memory.remember('fixture-owner', thread, config('원장 위치는 SSD', { topic: 'ledger:place' }));
+  const b = await memory.remember('fixture-owner', thread, config('원장 위치는 R2', { topic: 'ledger:place' }));
+  assert.equal(a.status, 'active'); assert.deepEqual(b.conflictsWith, [a.id]);
+  const c = await memory.correct('fixture-owner', thread, [b.id], config('원장 위치는 NUC SSD', { topic: 'ledger:place' }), '결정 확인');
+  assert.equal(c.status, 'candidate'); assert.deepEqual(c.conflictsWith, [a.id]);
+  const d = await memory.correct('fixture-owner', thread, [c.id, a.id], config('원장 위치는 NUC SSD', { topic: 'ledger:place' }), '하나로 정리');
+  assert.equal(d.status, 'active'); assert.deepEqual(d.conflictsWith, []);
+  assert.deepEqual((await memory.search('fixture-owner', thread, '원장')).map(m => [m.statement, m.flags]), [['원장 위치는 NUC SSD', []]]);
+});
 test('MEM-01 일시 지시는 유효기간이 필요하고 지나면 검색되지 않으며, 오래된 설정은 재확인 표시', async () => {
   await f.ingress.receive(event('m-pref', { text: '오늘은 짧게 답해' })); f.advance(DEFAULTS.debounceMs + 50);
   const preference = { kind: 'preference' as const, statement: '답변을 짧게', targetUser: 'fixture-owner', endCondition: '오늘 끝',
