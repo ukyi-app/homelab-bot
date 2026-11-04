@@ -246,7 +246,7 @@ slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG �
 - `RUNTIME_POLICIES` review 절: 아직 기록하지 않았다. 값의 출처는 DECISIONS "T17 결정"이다. 절이 없거나 `comparison`이 `null`이면 스위치를 켜도 리뷰는 닫힌다. `reviewSince`는 활성화 시각의 epoch ms를 넣는다(0이면 열린 PR 전체가 들어온다, PR #41 본문).
 - 실제 모델 품질 평가(REVIEW-01): 하지 않았다.
 - 반례·복구 시험(실연동): 하지 않았다.
-- 실제 Claude CLI init의 `skills`·`plugins` 빈 배열 확인: 첫 호출 전에는 할 수 없다. 지금 전제는 2.1.308 정적 읽기다. 틀리면 모든 리뷰가 안전 쪽(`policy_violation`)으로 막힌다(PR #40 본문).
+- (2026-11-04 확인) 실제 Claude CLI init의 `skills`·`plugins` 빈 배열: `skills`는 비어 있었고, `plugins`에 내장 플러그인 2개가 있어 첫 실리뷰가 `policy_violation`으로 막혔다. 리뷰 레인 `--settings`로 끄도록 고쳤다(아래 "첫 실리뷰 시도").
 - `homelab-smoke`의 Codex 자동 리뷰 끄기(DECISIONS "T17 결정"의 사람 작업): 사람이 껐다(2026-11-04, homelab `approvals.md` 15:08 행). API로는 확인할 수 없어 첫 시험 PR에서 자동 리뷰가 달리지 않는지 본다.
 - PR 본문이 활성화 전 확인으로 넘긴 것:
   - (2026-11-04 해소, 아래 "배포 경계 확인") 실제 codeload·Envoy 경유(CONNECT·SNI)와 `content-encoding`. 응답에 `content-encoding`이 없어(identity) 받기가 된다(#43의 전제).
@@ -303,6 +303,16 @@ slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG �
 
 - 리뷰를 켜도 옛 작업이 갑자기 돌지 않는다(리뷰 job·세대·게시 행 0건).
 - 프록시 CONNECT 403이 codeload에 나면(허용 목록 회귀) 다운로더는 `archive_network`로 분류할 것이다. 코드 경로 추론이고 재현하지 않았다. codeload 밖 주소는 다운로더의 URL 검사가 프록시에 보내기 전에 막는다.
+
+**첫 실리뷰 시도** (2026-11-04 17:22~17:55, 사용자 승인으로 리뷰 켬) [실측]. 정책 review 절을 넣고(17:22) homelab #1058로 `REVIEW_ENABLED`를 켰다(17:31, 로그 `review_gate` `waiting_worker` → `open`). 시험 PR은 `homelab-smoke` #11이다. 결함 2개를 심었고 정답은 모델 입력과 분리해 두었다.
+
+| 시각 | 관측 | 원인과 조치 |
+|---|---|---|
+| 17:33 | `pull_request/opened` 배달 → `denied`/`author_denied`. 모델 호출 없음 | owner의 조직 멤버십이 비공개라 리뷰 App이 받는 `author_association`이 `MEMBER`가 아니라 `CONTRIBUTOR`였다(owner 토큰 조회는 `MEMBER`, 익명 조회는 `CONTRIBUTOR`). 사용자 승인으로 멤버십을 공개했다(17:40, 익명 조회도 `MEMBER`). D-16·설계 C.8의 허용 목록(OWNER·MEMBER·COLLABORATOR)은 사람 작성자가 공개 멤버이거나 저장소 협업자라는 전제가 필요하다. 댓글 트리거(`comment.author_association`)도 같다 |
+| 17:47 | 15분 PR 재조정이 #11을 받음(`review_reconciled admitted:1`, 놓친 PR 복구 경로 동작) → 리뷰 job `failed`/`policy_violation`, 세대 `failed`. 게시 0건 | CLI 2.1.308은 `--safe-mode`에서도 내장 플러그인 `cc-plugin-agents-md@builtin`·`cc-plugin-plugin-authoring@builtin`을 init `plugins`에 싣는다. 무도구 경계가 `plugins_enabled`로 멈췄다(아래 "남은 것"의 init 확인 위험이 실제로 났다). 같은 인자를 작업자 파드에서 가짜 토큰으로 띄워 init만 확인했다: `tools`는 `StructuredOutput`뿐, `skills`·`mcp_servers`는 빈 배열, hook 이벤트는 없었다. `--settings`로 두 플러그인을 끄면 `plugins`가 `[]`가 된다. 이것을 리뷰 레인 인자로 고쳤다(`REVIEW_SETTINGS`, ARCHITECTURE §12 금지 플래그 줄) |
+
+- 17:47 실행은 init에서 멈췄다. 그 전에 CLI가 모델 요청을 이미 보냈는지는 확인할 수 없다(가짜 토큰 시험에서는 init 뒤에 `api_retry`가 왔다).
+- 위반 종류(`plugins_enabled` 등)는 DB·로그에 남지 않고 `policy_violation` 하나로만 남는다. 이번 원인은 같은 인자의 재현으로 찾았다.
 
 **판정 변화.** 위 2026-10-29 표는 옛 기록이라 그대로 둔다. 이번에 pass로 바뀐 칸은 없다. `blocked` 칸의 사유가 다음처럼 바뀌었다.
 
