@@ -34,6 +34,17 @@ RUN npm run build \
 
 FROM docker.io/library/node:24.22.0-trixie-slim@sha256:a6155384446670e9719bdc4fd0ebe4d4b29fb32a8d6aa523da3547a6cfbcf22c
 WORKDIR /app
+# 작업 레인의 Claude 샌드박스(CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1)는 bubblewrap과 socat을 PATH에서 찾는다(DECISIONS T18 "(2) 파드
+# 실측 결과와 대가 수용"). bwrap은 Debian 패키지 경로 /usr/bin/bwrap이어야 한다. 호스트 Ubuntu의 AppArmor bwrap 프로필이 이 경로에
+# 붙어 user namespace·mount를 허용하고, 다른 경로면 호스트의 userns 제한에 걸려 샌드박스가 뜨지 않는다.
+# 버전은 정확히 고정한다. Debian이 새 수정판을 내면 옛 버전이 미러에서 빠져 이 단계가 실패한다. 그때 버전을 올리고 T18 실측
+# (VERIFICATION "T18 작업 레인 격리 파드 실측")을 다시 확인한다.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends bubblewrap=0.12.0-1~deb13u1 socat=1.8.0.3-1+deb13u1 \
+  && rm -rf /var/lib/apt/lists/* \
+  && test "$(command -v bwrap)" = /usr/bin/bwrap \
+  && test "$(bwrap --version)" = "bubblewrap 0.12.0" \
+  && socat -V | grep -q 'socat version 1.8.0.3 '
 COPY --from=runtime --chown=root:root /app/node_modules ./node_modules
 COPY --from=runtime --chown=root:root /app/dist/src ./dist/src
 COPY --from=runtime --chown=root:root /app/package.json ./
