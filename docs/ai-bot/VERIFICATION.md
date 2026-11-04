@@ -242,12 +242,12 @@ slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG �
 - (2026-11-04 해소, #38·#41) 실제 GitHub 리뷰 App 경로: 설치 토큰 발급과 REST 어댑터(#38), 게시 서버 조립과 `pull_request`·`issue_comment` 수신 연결(#41). 실제 GitHub 이벤트 수신은 ping·installation 배달까지만 봤다(아래 "T17 실가동 구현").
 - (2026-11-04 해소, #40·#42·#43·#44) 실제 작업자 프로세스: 리뷰 레인(#40), 작업자 서버 통합(#42), codeload 다운로더(#43·#44). 구현은 끝났다. 실제 codeload 받기는 아래 "배포 경계 확인"에서 확인했고, 실제 모델 호출은 0회다.
 - HANDOFF는 private 운영 저장소 몫이다(D-13). 이번 반환 보고가 그 원문이다.
-- 리뷰 켜기: 사용자 승인 대기다. 지금은 `REVIEW_ENABLED`가 없어 꺼져 있다.
-- `RUNTIME_POLICIES` review 절: 아직 기록하지 않았다. 값의 출처는 DECISIONS "T17 결정"이다. 절이 없거나 `comparison`이 `null`이면 스위치를 켜도 리뷰는 닫힌다. `reviewSince`는 활성화 시각의 epoch ms를 넣는다(0이면 열린 PR 전체가 들어온다, PR #41 본문).
-- 실제 모델 품질 평가(REVIEW-01): 하지 않았다.
-- 반례·복구 시험(실연동): 하지 않았다.
+- (2026-11-04 해소) 리뷰 켜기: 사용자 승인으로 켰다(homelab #1058 `REVIEW_ENABLED`, 아래 "첫 실리뷰 시도").
+- (2026-11-04 해소) `RUNTIME_POLICIES` review 절: 기록했다(값의 출처는 DECISIONS "T17 결정"과 같은 날 사용자 승인. 실제 ID·내부 표식은 Infisical에만). `reviewSince`는 켜는 시각이다.
+- 실제 모델 품질 평가(REVIEW-01): 1건(아래 "실제 모델 품질")만 했다. 표본 확대가 남았다.
+- 반례·복구 시험(실연동): 하지 않았다. Renovate PR, 댓글 명령, Bot 댓글 무시, fork·허용 밖 작성자, webhook 재전송, head·base 이동, draft, 한도·인증 대기와 제어 명령, 게시 응답 유실 대조가 대상이다. 일부는 사람 준비(Renovate 설치 확대, 다른 계정, 재전송)가 필요하다.
 - (2026-11-04 확인) 실제 Claude CLI init의 `skills`·`plugins` 빈 배열: `skills`는 비어 있었고, `plugins`에 내장 플러그인 2개가 있어 첫 실리뷰가 `policy_violation`으로 막혔다. 리뷰 레인 `--settings`로 끄도록 고쳤다(아래 "첫 실리뷰 시도").
-- `homelab-smoke`의 Codex 자동 리뷰 끄기(DECISIONS "T17 결정"의 사람 작업): 사람이 껐다(2026-11-04, homelab `approvals.md` 15:08 행). API로는 확인할 수 없어 첫 시험 PR에서 자동 리뷰가 달리지 않는지 본다.
+- `homelab-smoke`의 Codex 자동 리뷰 끄기(DECISIONS "T17 결정"의 사람 작업): 사람이 껐다(2026-11-04, homelab `approvals.md` 15:08 행). 첫 시험 PR #11에 Codex 자동 리뷰가 달리지 않아 꺼진 것을 확인했다(2026-11-04 18:13).
 - PR 본문이 활성화 전 확인으로 넘긴 것:
   - (2026-11-04 해소, 아래 "배포 경계 확인") 실제 codeload·Envoy 경유(CONNECT·SNI)와 `content-encoding`. 응답에 `content-encoding`이 없어(identity) 받기가 된다(#43의 전제).
   - 압축본 하나당 deadline 300초라 둘이면 최대 약 10분이다. 리뷰 job 시간 상한은 30분(`DEFAULTS.taskTimeoutMs`)이고, 압축본에 쓴 시간만큼 모델 몫이 준다(`src/review-input.ts`). 실측은 8,144바이트 270ms라 지금은 문제가 아니다. 큰 저장소를 넣기 전에 `deadlineMs`를 다시 본다(#43).
@@ -309,10 +309,17 @@ slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG �
 | 시각 | 관측 | 원인과 조치 |
 |---|---|---|
 | 17:33 | `pull_request/opened` 배달 → `denied`/`author_denied`. 모델 호출 없음 | owner의 조직 멤버십이 비공개라 리뷰 App이 받는 `author_association`이 `MEMBER`가 아니라 `CONTRIBUTOR`였다(owner 토큰 조회는 `MEMBER`, 익명 조회는 `CONTRIBUTOR`). 사용자 승인으로 멤버십을 공개했다(17:40, 익명 조회도 `MEMBER`). D-16·설계 C.8의 허용 목록(OWNER·MEMBER·COLLABORATOR)은 사람 작성자가 공개 멤버이거나 저장소 협업자라는 전제가 필요하다. 댓글 트리거(`comment.author_association`)도 같다 |
-| 17:47 | 15분 PR 재조정이 #11을 받음(`review_reconciled admitted:1`, 놓친 PR 복구 경로 동작) → 리뷰 job `failed`/`policy_violation`, 세대 `failed`. 게시 0건 | CLI 2.1.308은 `--safe-mode`에서도 내장 플러그인 `cc-plugin-agents-md@builtin`·`cc-plugin-plugin-authoring@builtin`을 init `plugins`에 싣는다. 무도구 경계가 `plugins_enabled`로 멈췄다(아래 "남은 것"의 init 확인 위험이 실제로 났다). 같은 인자를 작업자 파드에서 가짜 토큰으로 띄워 init만 확인했다: `tools`는 `StructuredOutput`뿐, `skills`·`mcp_servers`는 빈 배열, hook 이벤트는 없었다. `--settings`로 두 플러그인을 끄면 `plugins`가 `[]`가 된다. 이것을 리뷰 레인 인자로 고쳤다(`REVIEW_SETTINGS`, ARCHITECTURE §12 금지 플래그 줄) |
+| 17:47 | 15분 PR 재조정이 #11을 받음(`review_reconciled admitted:1`, 놓친 PR 복구 경로 동작) → 리뷰 job `failed`/`policy_violation`, 세대 `failed`. 게시 0건 | CLI 2.1.308은 `--safe-mode`에서도 내장 플러그인 `cc-plugin-agents-md@builtin`·`cc-plugin-plugin-authoring@builtin`을 init `plugins`에 싣는다. 무도구 경계가 `plugins_enabled`로 멈췄다(위 "T17 남은 것"의 init 확인 위험이 실제로 났다). 같은 인자를 작업자 파드에서 가짜 토큰으로 띄워 init만 확인했다: `tools`는 `StructuredOutput`뿐, `skills`·`mcp_servers`는 빈 배열, hook 이벤트는 없었다. `--settings`로 두 플러그인을 끄면 `plugins`가 `[]`가 된다. 이것을 리뷰 레인 인자로 고쳤다(`REVIEW_SETTINGS`, ARCHITECTURE §12 금지 플래그 줄) |
+| 18:12~18:13 | #46 작업자 이미지(homelab #1060, 18:11) 뒤 #11에 빈 커밋 push → `pull_request/synchronize` `queued` → 리뷰 job `succeeded`(세대 생성 18:12:47.7, 게시 행 18:13:10.8) → GitHub `COMMENTED` 리뷰 1건, 인라인 2(리뷰 App, `commit_id` = 검토 head) → Discord 알림 채널 요약 `sent`(18:13:14). 앞 세대는 `new_head`로 밀림 | 정상 경로 첫 통과. 요약 원문(맥 Codex로 읽기만)은 저장소·PR 번호·head 12자·"검토 완료"·지적 수·고정 문구뿐이고 모델 문장은 없다(D-17). Codex 자동 리뷰는 오지 않았다(`homelab-smoke`에서 끔 확인). 확인 중 봇 추가 전송 0 |
 
 - 17:47 실행은 init에서 멈췄다. 그 전에 CLI가 모델 요청을 이미 보냈는지는 확인할 수 없다(가짜 토큰 시험에서는 init 뒤에 `api_retry`가 왔다).
 - 위반 종류(`plugins_enabled` 등)는 DB·로그에 남지 않고 `policy_violation` 하나로만 남는다. 이번 원인은 같은 인자의 재현으로 찾았다.
+
+**실제 모델 품질(`04` §6, 실연동 1건).** 정답은 PR을 열기 전에 모델 입력과 분리해 적었다(PR 본문·코드에 결함 설명 없음). 표본 1건이라 상한·품질 판정에는 부족하다. 사례 확대는 반례·복구 시험과 함께 한다.
+
+| 평가 PR / head SHA | 알려진 정답·근거 | 유효 지적 | 오탐 | 알려진 문제 누락 | 중복/스타일 잡음 | 미검토 범위 표시 | 시간/호출량 |
+|---|---|---|---|---|---|---|---|
+| `homelab-smoke` #11 / `77b9d48` | 결함 2개: `fail()`이 `err.message`를 503 본문·로그에 넣음(기존 "이름만" 불변식 위반, 기존 시험은 사각), `/echo`가 `q`를 이스케이프 없이 `text/html`로 반사(XSS) | 2(둘 다 P1, 위치 `src/server.ts` 22·61) | 0 | 0 | 0. 확인 질문 2개는 시험 사각과 운영 노출 여부로 근거가 있다 | 없음(검토 완료, 파일 2개, 제외 0) | 모델 실행 1회, 세대 생성부터 게시 행까지 약 23초 |
 
 **판정 변화.** 위 2026-10-29 표는 옛 기록이라 그대로 둔다. 이번에 pass로 바뀐 칸은 없다. `blocked` 칸의 사유가 다음처럼 바뀌었다.
 
