@@ -470,7 +470,7 @@ Workflows 권한이 없으므로 **봇은 `.github/workflows` 변경 PR을 만�
 
 ---
 
-## T18 결정 대기 (사용자)
+## T18 결정 대기 (사용자) → 확정(사용자 2026-11-04, 아래 "T18 결정 (Claude 실행기 기준)")
 
 - 작성: T18 CODEX_BRIDGE 로컬·mock 작업(2026-10-29, 에이전트). **아래 넷은 사용자가 정한다. 에이전트는 정하지 않았고, 구현은 결정과 무관한 부분만 했다.** 구현과 시험은 [ARCHITECTURE.md](ARCHITECTURE.md) §12, 결과는 [VERIFICATION.md](VERIFICATION.md) "CODEX_BRIDGE T18"이다.
 - 근거 꼬리표의 확인일은 따로 적지 않으면 2026-10-18 T15 조사다. 이번 작업은 네트워크를 쓰지 않아 새로 확인한 공식 문서가 없다.
@@ -533,6 +533,32 @@ Workflows 권한이 없으므로 **봇은 `.github/workflows` 변경 PR을 만�
 - **에이전트 추천: α, 대화·리뷰 레인은 γ 검토, UID·마운트 분리는 T16b 실측 뒤.** 세션 보존 기간과 R17 삭제 때 세션 기록 처리는 T20과 함께 정한다.
 
 ---
+
+## T18 결정 (Claude 실행기 기준, 사용자 2026-11-04)
+
+위 "T18 결정 대기" 네 건은 Codex `auth.json`을 전제로 쓰였다. 실행기가 Claude Code CLI(구독 장기 토큰 `CLAUDE_CODE_OAUTH_TOKEN`, env-static)로 바뀐 뒤 사실을 다시 확인했다. 확인한 출처는 공식 문서와 고정 바이너리 2.1.308의 `--help`·문자열이다. 그 뒤 사용자가 추천안 넷을 그대로 골랐다. 같은 날 T17 진입 조건 하나도 정했다. 조사 원문은 비공개 작업 문서(2026-11-04 T18 Claude 사실 조사)에 있다.
+
+**다시 확인한 사실.**
+
+- Bash 도구가 띄우는 명령은 부모 env를 그대로 물려받는다. 그래서 작업 레인에서 셸을 켜면 토큰이 셸 명령에 보인다. `echo`·`cat` 같은 읽기 명령은 `dontAsk`로도 막지 못한다 [확인: https://code.claude.com/docs/en/sandboxing 기본값 표, https://code.claude.com/docs/en/permissions 읽기 전용 명령].
+- 공식 대책은 `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`이다. 2.1.83에서 env 제거가, 2.1.98에서 Linux PID namespace 격리가 들어왔다. 2.1.308 바이너리의 제거 목록에 `CLAUDE_CODE_OAUTH_TOKEN`이 있다 [확인: https://code.claude.com/docs/en/env-vars "What the subprocess environment scrub removes"] [실측: 바이너리 문자열].
+  - 이 모드는 bubblewrap 샌드박스를 강제하고 새 `/proc` 마운트를 요구한다. 그래서 비특권 파드(user namespace 없음, `procMount` 기본, 이미지에 bwrap 없음)에서는 실패할 가능성이 크다 [해석: 파드 실측 전].
+  - 권한 모드도 `default`로 바뀐다. 그래서 `--allowedTools`를 명시해야 한다.
+- 같은 UID의 다른 프로세스는 `/proc/<pid>/environ`으로 env를 읽을 수 있다. `hidepid`도 같은 UID는 막지 못한다 [실측: 가짜 값].
+- 클러스터 프록시가 구독 토큰을 대신 붙이는 방식은 쓸 수 없다. Claude Code Legal의 "may not collect, store, or intermediate Claude.ai credentials or session tokens"에 정면으로 걸리기 때문이다 [확인: https://code.claude.com/docs/en/legal-and-compliance]. 작업자 밖에 키를 두는 방식은 Console API 키 + LLM gateway만 공식이다.
+- 작업 재개 방법: 처음에 `--session-id <uuid>`를 주고, 다음 턴에 `-p --resume <uuid>`로 잇는다. 세션은 `$CLAUDE_CONFIG_DIR/projects/` 아래에 남는다. `--no-session-persistence`를 쓰면 재개할 수 없다. 같은 세션을 동시에 재개하면 안 된다.
+- Codex의 "`auth.json` 하나당 직렬 흐름 하나" 같은 조건은 Claude 문서에 없다. 한도는 계정 전체가 함께 쓴다.
+- R08의 사람 쪽 이벤트는 공식으로 있다. Claude Code hooks의 `Stop`(`last_assistant_message`)·`Notification`과 Codex `notify`(`agent-turn-complete`)다. 다만 payload에 마지막 답 전문과 `cwd`가 실린다.
+
+**결정.**
+
+| 항목 | 결정 |
+|---|---|
+| (1) R08 연결 방식 | **A 읽기 전용 알림.** 사람 쪽 Claude Code `Stop` 훅(처리기는 `command`, `async: true`)과 Codex `notify`가 최소 필드만 연결 토큰으로 서명해 봇에 보낸다. 최소 필드는 외부 작업 ID, 턴 완료, 길이를 제한한 요약이다. 답 전문을 그대로 보내는 raw `http` 처리기는 쓰지 않는다. 연결 기록의 능력은 `read_status`·`read_events`만 true다. 수신 경로는 플랫폼 작업으로 따로 정한다 |
+| (2) 작업 레인 자격 분리 | **파드 실측 먼저.** 작업자 파드에서 `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` + bubblewrap 샌드박스가 실제로 도는지 잰다. 이를 위해 `hostUsers: false`, `procMount: Unmasked`, 이미지의 bwrap·socat이 필요하고 플랫폼 PR로 바꾼다. Read 도구와 다른 작업 디렉터리 읽기도 함께 막는다. 실측이 실패하거나 약한 모드만 되면, 작업 레인은 "Console API 키 + 클러스터 LLM gateway"(d)로 바꾸기 전까지 열지 않는다. 다른 UID(c)는 Claude에 자리가 없다. 반사 검사(e)는 보완책으로 유지한다 |
+| (3) 대화·작업 레인 분리 | **열 때 파드 둘.** 작업 레인을 열기 전까지는 지금처럼 파드 하나·직렬 1로 둔다. 작업 레인을 열 때 파드를 둘로 나누고, 레인마다 setup-token을 따로 만들어 철회를 분리한다. 직렬 1 조건(D-14 조건 3)을 레인별로 바꾸는 것은 이 결정에 포함된다. 한도는 계정을 함께 쓰므로 합산 사용량을 본다 |
+| (4) 작업별 세션 저장 공간 | **α′.** 작업마다 따로 `CLAUDE_CONFIG_DIR`을 두고, 같은 작업의 턴 사이에는 유지하며, 작업이 끝나면 지운다. 같은 작업의 턴은 직렬로 돈다. 자격 되쓰기 문제는 env-static이라 없다. 다른 작업 디렉터리 읽기는 샌드박스 `filesystem.denyRead`와 파일 도구 가두기로 막는다. 리뷰 레인은 대화처럼 실행마다 빈 임시 공간을 쓰고 세션을 남기지 않는다 |
+| T17 진입 조건(인증 격리·SEC-02) | **무도구 경계로 갈음.** 리뷰 레인은 도구 0개·MCP·hooks·skills 없음으로 돌아 셸이 없다. 그래서 토큰을 읽을 비신뢰 프로세스가 없다. 리뷰에는 V1_PLAN T17 행의 "인증 파일 격리를 정하고 그 SEC-02 사례가 통과한 뒤" 조건 대신 다음 무도구 경계 시험을 둔다. 가짜 CLI·가짜 자격으로 모델 호출 전에 보인다. (a) 실행 중 도구 호출이 보이면 즉시 중단 (b) MCP·hooks·skills 0개 (c) 출력 반사 검사 (d) 작업자 egress 제한 (e) 실행별 임시 공간 삭제와 실패 시 차단. T18 작업 레인에는 원래 조건(위 (2))이 그대로 걸린다 |
 
 ## T20 기억·삭제 원장·브리핑 (로컬·mock, 2026-10-29)
 
