@@ -4,7 +4,7 @@
 
 - 단계: `TARGET=V1`, `STAGE=DISCOVERY`, `MODE=plan` (homelab 티켓 T15). 작성일 2026-10-18. 초안.
 - **상태: D-14, D-15(남은 부분), D-16, D-17, D-24는 확정(사용자 2026-10-18, T15)이다.** 사용자가 2026-10-18 16:29 T15 질문에 답해 정했다. D-14는 에이전트 추천(B)이 아니라 A를 골랐다. D-15의 코드 읽기 축소는 에이전트 설명을 듣고 골랐다. 나머지는 에이전트 추천을 받아들였다. 결정 기록의 기준은 homelab spec §5.1이고, 이 문서는 선택지·근거·함께 지킬 조건을 남긴다.
-- 확정된 결정 안에 남은 미정 세부는 새 결정 ID 없이 담당 티켓에서 정한다(spec §5.3): D-17의 DM 허용 여부와 브리핑 시각은 T16a(확정(사용자 2026-10-20): DM 끔, 브리핑 매일 08:50 Asia/Seoul), D-24의 토큰 분리·ruleset E 여부·App 이름·설치 저장소·허용 파일 경로는 T19.
+- 확정된 결정 안에 남은 미정 세부는 새 결정 ID 없이 담당 티켓에서 정한다(spec §5.3): D-17의 DM 허용 여부와 브리핑 시각은 T16a(확정(사용자 2026-10-20): DM 끔, 브리핑 매일 08:50 Asia/Seoul), D-24의 토큰 분리·ruleset E 여부·App 이름·설치 저장소·허용 파일 경로는 T19(확정(사용자 2026-11-05): 아래 D-24 "T19 세부 결정").
 - 같은 응답에서 함께 정한 것: R08 연결 방식은 T18에서 다시 판단하고 그때까지 보류한다(아래 "R08"). V1 범위 조정은 안 3이다([V1_PLAN.md](V1_PLAN.md) §4). 둘 다 T15 질문에 에이전트 추천으로 제시한 안이고 사용자가 골랐다.
 - 같은 날 뒤이어 정한 것(사용자 2026-10-18): Codex Connector 설치 범위 축소는 `homelab-bot-ops`에 운영 산출물을 처음 올리기 전에 사람이 한다(아래 D-16 "Codex Connector 설치 범위"). 축소는 완료됐다(사람 2026-10-18 17:45, homelab `approvals.md`). 또 D-29의 비앱 저장소 처리를 `aiops`·`mac-uptime-guard` 제거, `aiops-autodeploy-canary` private 보관으로 바꿨다(사용자 2026-10-18 17:46, 실행 T22).
 - PR #3 리뷰 중 정한 것(사용자 2026-10-18): D-14에 T17 차단 조건을 더했다(아래 D-14 "차단 조건").
@@ -21,7 +21,7 @@
 | D-15 | 실행 호스트, 라벨·포트, 코드 읽기 호스트 | NUC 클러스터 안. 라벨 `homelab-bot`, 앱·작업자 포트 8080, 경보 수신 포트 8081. 작업자 코드 읽기는 `codeload.github.com` 압축본만 | U13·U29와 프록시 경유 압축본 받기 실측(T08b·T16b) |
 | D-16 | PR 리뷰 방식 | 기본안. 봇 리뷰 저장소의 Codex 자동 리뷰는 저장소별 설정에서 끔. Connector 설치는 선택 저장소로 줄이고 운영 저장소는 뺌(축소 완료, 사람 2026-10-18 17:45). 하위 결정: 허용 봇 작성자 목록 | 남긴 저장소 목록의 API 확인(사용자 보고만 있음). 리뷰 대상 저장소 목록과 리뷰 App 이름, 리뷰 App 권한 확인(Issues read 포함, 설계 세부)(T17) |
 | D-17 | Discord 서버, 채널, 허용 사용자 | 봇 전용 개인 서버 신설, 허용 사용자 owner 1명, 채널 2개, `MESSAGE_CONTENT` 켬. DM 끔, 브리핑 매일 08:50 Asia/Seoul(확정(사용자 2026-10-20, T16a)) | 없음 |
-| D-24 | 봇 변경 PR 작성 신원 | 봇 전용 쓰기 GitHub App(Contents·Pull requests write, Metadata read) | 토큰 분리, ruleset E 여부, App 이름, 설치 저장소, 허용 파일 경로(T19) |
+| D-24 | 봇 변경 PR 작성 신원 | 봇 전용 쓰기 GitHub App(Contents·Pull requests write, Metadata read). 세부(사용자 2026-11-05): 이름 `ukyi-writer`, 토큰 두 종류, 설치 저장소마다 ruleset E(`bot/**/*` 생성·갱신·삭제), smoke 먼저 설치, 저장소별 좁은 허용 경로 | App 생성·설치와 키 등록(사람), 실제 writer 신원의 AC-P8 시험(T19) |
 
 ---
 
@@ -442,13 +442,17 @@ issue_comment (PR 댓글로 리뷰 요청):
 
 Workflows 권한이 없으므로 **봇은 `.github/workflows` 변경 PR을 만들 수 없다** [확인: https://docs.github.com/en/rest/repos/contents]. git push 경로로도 거부되는지는 E5 시험이다 [미확인]. D-15로 작업자는 GitHub에 쓰지 않고, 커밋·브랜치·PR은 게시 서버가 이 App으로 만든다.
 
-### T19에서 정할 것 (에이전트 추천 유지)
+### T19 세부 결정 (사용자 2026-11-05)
 
-| 항목 | 추천 | 근거 |
+사용자가 독립 리뷰(Codex)와 에이전트 의견을 나란히 본 뒤 정했다. 이름은 추천(`ukyi-homelab-bot-writer`)이 아니라 사용자가 고른 값이다. 나머지 넷은 두 리뷰의 추천과 같고, ruleset E의 삭제 제한은 에이전트 의견을 받았다.
+
+| 항목 | 결정 | 근거·함정 |
 |---|---|---|
-| 토큰 분리 | 분리한다: 커밋·ref용 Contents write 토큰과 PR 생성·본문 갱신용 Contents read + Pull requests write 토큰 | PR을 다루는 경로에서 병합 API 권한이 빠진다. 병합 차단의 주 장치는 여전히 ruleset과 게시 서버다 [가정] |
-| ruleset E | 둔다(`infra/github`, App ID는 숫자 리터럴, D-28) | 다른 신원이 봇 브랜치를 덮는 것을 막는다. homelab에 같은 모양의 옛 ruleset 선례가 있다 [실측] |
-| App 이름·설치 저장소 | 이름 예 `homelab-bot-writer`. 설치 저장소는 `github.change_writer_repositories` | 이름은 예시다 [가정] |
+| App 이름 | `ukyi-writer`(org 소유 private App) | 이름은 GitHub 전체에서 유일해야 하고 등록 때 확인한다. ruleset bypass에는 App ID, 토큰 발급에는 설치 ID, 작성자 허용에는 봇 사용자의 숫자 `user.id`를 쓴다. 이름 문자열은 허용 근거가 아니다 |
+| 토큰 분리 | 같은 App에서 두 종류: 커밋·ref는 `contents: write`, PR 생성·제목·본문은 `contents: read` + `pull_requests: write`. 둘 다 작업마다 `repository_ids` 하나와 `permissions`를 명시하고, 반환된 저장소·권한·만료를 대조한다 | PR을 다루는 코드에서 병합 API 권한(Contents write)이 빠진다. 커밋용 토큰에는 여전히 병합 권한이 있고 같은 App 키가 두 토큰을 모두 만들 수 있어, 키 유출에는 효과가 없다. 병합 차단의 주 장치는 ruleset과 게시 서버 허용 API다 |
+| ruleset E | 설치 저장소마다 둔다(`infra/github`, App ID는 숫자 리터럴, D-28). 대상 `refs/heads/bot/**/*`, 생성·갱신·삭제 제한, bypass는 `ukyi-writer` App(`Integration`) 하나 `always` | 다른 신원이 봇 브랜치를 만들거나 덮거나 지우는 것을 막는다. 패턴 함정: `refs/heads/deploy/**`는 `deploy/x`에만 걸리고 `deploy/x/y`에는 걸리지 않았다(2026-11-05 `GET /rules/branches` 실측). E는 writer를 `bot/` 안에 가두지 않는다. 그것은 게시 서버의 ref 제한과 main·deploy·태그 ruleset이 한다. E의 bypass를 다른 ruleset에 복사하지 않는다 |
+| 설치 저장소 | `ukyi-app/homelab-smoke` 하나로 시작한다. `ukyi-app/homelab`은 실제 `ukyi-writer` 신원의 AC-P8 시험 직전에 별도 승인으로 더한다. `homelab-bot`·`files`·템플릿·운영 저장소는 지금 열지 않는다 | 키가 새도 설치되지 않은 저장소에는 토큰을 만들 수 없어, 키 유출에 남는 유일한 상한이다. 설치는 기능 개방이 아니다. `github.change_writer_repositories`는 설치 목록과 따로 좁힌다 |
+| 허용 파일 경로 | 저장소별 좁은 목록. smoke는 `src/**`·`tests/**`·`docs/**`·`README.md`, homelab은 `docs/runbooks-public/**`. 정책이 없는 저장소와 빈 목록은 모두 거부. 어디서든 `.github/**`, 모든 위치의 `AGENTS.md`·`CLAUDE.md`·`CODEOWNERS`, `.gitmodules`, 보안 검사 설정(`.gitleaks*`, `.pre-commit-config.yaml`), 자격 파일은 거부 | Free + public이라 GitHub 파일 경로 제한(push ruleset)을 쓸 수 없다. 그래서 이 목록은 게시 서버가 지킨다. 고정 base tree와 결과 tree 전체를 비교해 추가·수정·삭제·rename 양쪽과 mode를 보고, `..`·절대 경로·symlink·gitlink는 거부한다. **첫 blob을 GitHub에 올리기 전에** 검사를 끝낸다. 올린 객체는 되돌릴 수 없는 공개다. 키가 새면 이 경계는 우회된다 |
 
 게시 서버 허용 API(결정의 "허용 목록"을 채울 초안, CHANGE-02 시험 대상) [가정]: git data(`POST /git/blobs`, `/git/trees`, `/git/commits`), `bot/` 접두의 `POST /git/refs`·`PATCH /git/refs/heads/bot/…`(`force: false`), `POST /pulls`(head `bot/…`), `PATCH /pulls/{n}`(제목·본문). 그 밖은 거부. 특히 merge, `/merges`, `/dispatches`, update-branch, GraphQL `mergePullRequest`·`enablePullRequestAutoMerge`, 리뷰 API. 허용 파일 경로(`github.change_writer_allow_paths`)도 T19에서 정한다.
 

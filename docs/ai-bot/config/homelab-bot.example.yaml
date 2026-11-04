@@ -8,7 +8,7 @@
 # - null은 미결정이거나, 확정됐지만 설계에 값 이름이 없는 키다(주석에 확정 내용. 예: auto_merge_scope).
 #   빈 목록은 "모두 거부"다. 필수 값이 비면 시작을 거부하는 것이 기본이다.
 # - D-14~D-17, D-24는 확정(사용자 2026-10-18, T15)이다(DECISIONS.md). 확정 값은 값으로 적었다.
-#   결정 안에 남은 세부(D-24 세부는 T19, R08 연결 방식은 T18)는 null로 둔다. D-17의 DM·브리핑 시각은 T16a에서 정했다(2026-10-20).
+#   결정 안에 남은 세부는 null로 둔다(D-24 세부는 2026-11-05, R08 연결 방식은 2026-11-04에 정했다). D-17의 DM·브리핑 시각은 T16a에서 정했다(2026-10-20).
 #   "제안"이라고 적은 값은 에이전트 제안이고 담당 티켓에서 정한다.
 # - 허용 목록과 runtime policy의 실제 값, 비밀값은 Infisical /apps/homelab-bot/ 에 사람이 둔다(D-13).
 #   이 저장소(public)에는 키 이름만 둔다. Discord ID, 숫자 사용자 ID, 토큰을 여기에 쓰지 않는다.
@@ -84,10 +84,10 @@ github:
   prohibit_approve_request_changes_merge: true
   change_existing_merge_policy: false
   change_writer_identity: dedicated_github_app  # D-24 확정: Contents·Pull requests write, Metadata read. Workflows·Actions·Administration·Issues 없음
-  change_writer_repositories: []              # D-24 남은 세부, T19
+  change_writer_repositories: []              # D-24 확정(2026-11-05): 설치는 homelab-smoke 먼저, homelab은 별도 승인. 런타임 허용은 기능을 열 때 채운다
   change_writer_branch_prefix: "bot/"
-  change_writer_allow_paths: []               # T19에서 정한다. .github/workflows 는 넣을 수 없다(권한 없음)
-  change_writer_split_tokens: null            # D-24 남은 세부, T19. 제안: 커밋·ref용과 PR용 토큰 분리
+  change_writer_allow_paths: []               # D-24 확정(2026-11-05): 저장소별 좁은 목록(DECISIONS D-24). 저장소별 스키마는 T19. 빈 목록은 모두 거부
+  change_writer_split_tokens: true            # D-24 확정(2026-11-05): 커밋·ref용(contents write)과 PR용(contents read + pull_requests write)
   workflow_dispatch_enabled: false
 
 codex:

@@ -12,7 +12,7 @@
 | DISCOVERY 산출물 | 초안 작성: [DISCOVERY.md](DISCOVERY.md), [ARCHITECTURE.md](ARCHITECTURE.md), [DECISIONS.md](DECISIONS.md), [VERIFICATION.md](VERIFICATION.md), [V1_PLAN.md](V1_PLAN.md), 이 파일, [config/homelab-bot.example.yaml](config/homelab-bot.example.yaml). 이 저장소 병합 전(PR과 사람 승인 필요) |
 | 운영 산출물 | HANDOFF·evidence·내부판은 private 운영 저장소 몫이다(D-13). 그 저장소는 아직 비어 있다. 첫 커밋 전에 할 Codex Connector 설치 범위 축소(D-16)는 끝났다(사람 2026-10-18 17:45. 남긴 저장소 목록은 사용자 보고이고 API로는 확인하지 못함). 첫 커밋은 사람 승인 뒤다 |
 | 결정 | D-14, D-15(남은 부분), D-16(하위 결정 포함), D-17, D-24: 확정(사용자 2026-10-18, T15). D-14는 에이전트 추천(API 키)이 아니라 봇 전용 ChatGPT 구독 계정을 골랐다. D-14에 T17 차단 조건을 더했다(확정(사용자 2026-10-18, PR #3 리뷰)). 그 차단은 Claude 구독 프로필에서 해제(사용자 2026-11-04, DECISIONS D-14 "재조사와 해제") |
-| 남은 미정 세부 | D-24의 토큰 분리·ruleset E·App 이름·설치 저장소·허용 파일 경로(T19), R08 연결 방식(T18, 보류) |
+| 남은 미정 세부 | 없음. D-24 세부는 확정(사용자 2026-11-05, DECISIONS D-24 "T19 세부 결정"), R08 연결 방식은 확정(사용자 2026-11-04, DECISIONS "T18 결정 (Claude 실행기 기준)") |
 | 범위 조정 | 안 3(시범 운영 + 로컬 선행), 확정(사용자 2026-10-18, T15). T16을 T16a·T16b로 나눈다(V1_PLAN §4) |
 | 코드 | `src/`, PostgreSQL 마이그레이션, 로컬·mock 시험. Gateway·모델 실연동과 배포 진입점은 T16b |
 | CI | 없음. 템플릿 기반 `build.yaml`과 금지 패턴 검사는 플랫폼 E5·E9 뒤 |
