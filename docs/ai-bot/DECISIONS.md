@@ -571,6 +571,7 @@ Workflows 권한이 없으므로 **봇은 `.github/workflows` 변경 PR을 만�
   - 호스트: containerd 기본에서 만든 전용 seccomp(+ `clone`·`unshare`·`mount`·`umount2`·`pivot_root`·`sethostname`)·AppArmor(bwrap 0.12.0이 하는 mount만, 겹친 라벨 peer 규칙, `max_user_namespaces` 쓰기 예외)를 사람이 설치한다(homelab `host/`).
   - 이미지: `bubblewrap`(`/usr/bin/bwrap`)·`socat`을 Debian 패키지로 넣고 버전을 고정한다.
   - 실행: `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`, `--settings`로 `sandbox.enabled`·`failIfUnavailable: true`·`allowUnsandboxedCommands: false`·`network.allowAllUnixSockets: true`·`filesystem.denyRead`(자격 디렉터리, 다른 작업의 세션), `permissions.deny`의 `Read(//<자격 디렉터리>/**)`, `--allowedTools` 명시.
+  - 설정 출처: 저장소 스냅샷의 설정·hook·MCP를 읽지 않는다. hook·로컬 MCP는 샌드박스 밖에서 같은 uid로 돌아 scrub·`denyRead`·`--allowedTools`가 막지 못하고 자격 파일을 읽을 수 있다. 작업마다 빈 전용 `CLAUDE_CONFIG_DIR`, `--setting-sources user`, `--safe-mode`, `--strict-mcp-config`(빈 MCP 설정), `--disable-slash-commands`를 강제한다(대화·리뷰 레인과 같은 방식). 악성 `.claude/settings.json` hook·`.mcp.json`·CLAUDE.md를 넣은 스냅샷으로 hook이 돌지 않고 결과에 자격이 없음을 회귀 시험하고, 이 플래그들 아래에서도 `--settings`의 샌드박스 설정이 걸리는지 확인한다.
 - **받아들인 대가(사용자 2026-11-04).**
   - **유닉스 소켓 차단 없음.** Claude의 소켓 차단 도우미(`apply-seccomp`)가 Ubuntu의 `unpriv_bwrap` 제한과 충돌해 `allowAllUnixSockets: true`로 끈다. 샌드박스 안 명령이 파일 경로로 보이는 유닉스 소켓에 연결할 수 있다. 지금 파드에는 Claude 자신의 중계 소켓 말고 소켓 서비스가 없다. 이미지나 파드에 소켓을 여는 것을 더하면 다시 본다.
   - **Ubuntu 프로필 의존.** bwrap이 namespace를 만들 수 있는 것은 호스트 Ubuntu의 `bwrap` 프로필이 `/usr/bin/bwrap`에 경로로 붙어서다. bwrap 경로를 바꾸거나 호스트에서 그 프로필이 빠지면 다시 잰다.
