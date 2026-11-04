@@ -613,7 +613,7 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 16. **같은 세대 결과 재사용(r3):** 같은 세대(head·비교 기준·정책 revision이 같음)에 공개 가능한 결과가 이미 있는데 닫힘·draft·게시 직전 상태 변화로 게시만 못 했으면, 재개·ready_for_review·재조정·댓글에서 모델을 다시 부르지 않고 게시 행을 다시 대기시킨다(`resumed`, 재조정 예산에 세지 않음). 본문은 게시 직전 현재 정책으로 다시 렌더링된다. 이미 게시·대기·차단된 세대는 다시 잇지 않는다.
 17. **마이그레이션 008의 열 추가(r3):** 008은 아직 배포 전이지만, 앞선 008로 만든 표에도 같은 열이 생기도록 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`를 둔다(`positions`·`inline`·`defer_count`·`pause_count`).
 
-### 결정 대기 (사용자 결정 필요)
+### 결정 대기 (사용자 결정 필요) → 확정(사용자 2026-11-04, 아래 "T17 결정")
 
 | 항목 | 후보 | 근거 | 추천 | 지금 구현 |
 |---|---|---|---|---|
@@ -622,6 +622,23 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 | 댓글 리뷰 명령 문법(`review.commentCommand`, D-16 규칙 스케치 "문법은 T17") | 슬래시형 고정 문자열 / `@<리뷰 App>` 멘션형 | 멘션형은 아직 없는 App 이름에 묶이고 수동 `@codex review`와 헷갈린다 | 슬래시형 하나(예 `/homelab-review`) | 값이 `null`이면 댓글 트리거 끔. 앞뒤 공백만 무시하고 정확히 일치할 때만 |
 | 게시 상한 값(`review.publish`: 지적 수, 인라인 수, 본문 길이) | `01` §5대로 대표 평가 뒤 | 평가셋은 D-14 차단 조건 뒤다(Claude 구독 프로필에서 해제, 사용자 2026-11-04) | 평가 전 임시값 지적 10·인라인 5·본문 20,000자 [가정] | 값이 `null`이면 자동 게시 거부(`publish_limits_unset`) |
 | 입력 상한 값(`review.input`) | 운영 값 | 압축본 크기와 직렬 1 대기 시간 | 파일 200개, 파일 1MB, diff 1MB, 압축본 100MB, 본문 8,000자 [가정] | 정책 필수 값. 없으면 리뷰가 비활성이다 |
+
+### T17 결정 (사용자 2026-11-04)
+
+위 표의 추천안을 그대로 고르고, 시범 P-2의 시험 저장소를 함께 정했다("진행해").
+
+| 항목 | 결정 |
+|---|---|
+| `comparison_revision` 기준 | `comparison: merge_base`. GitHub "Files changed"와 같은 diff다. 게시 서버가 compare API의 merge base를 고정한다 |
+| `review.rereviewOnBaseMove` | `false`: 다시 리뷰하지 않는다. 결과만 `superseded`로 두고, 재리뷰는 댓글 명령으로 한다. 코드의 예외는 그대로 유지한다(`src/review.ts` `admit`). 예외는 두 가지다. 아직 게시하지 못했고 끝나지도 않은 세대는 한 번 더 리뷰하고, base 재지정(`retarget`)과 댓글은 늘 새 세대다. merge base 기준이라 base만 움직였다고 세대가 바뀌는 일은 드물다 |
+| `review.commentCommand` | `"/homelab-review"` 하나다. 앞뒤 공백만 무시하고 정확히 일치할 때만 받는다 |
+| `review.publish` | 평가 전 임시값으로 `maxFindings` 10, `maxInlineComments` 5, `maxBodyChars` 20,000이다. 대표 평가 뒤 다시 정한다 |
+| `review.input` | `maxFiles` 200, `maxFileBytes` 1,000,000, `maxDiffBytes` 1,000,000, `maxArchiveBytes` 100,000,000, `maxBodyChars` 8,000. MB는 10진(1MB = 1,000,000바이트)이다 |
+| 시험 저장소(시범 P-2, REVIEW `authorized_external`) | `ukyi-app/homelab-smoke`. T13 시험 앱이라 새 저장소를 만들지 않는다 |
+
+- 값은 런타임 정책(`RUNTIME_POLICIES`, Infisical)의 review 절에 넣는다. 넣는 때는 리뷰 활성화 단계다. 이 문서에는 값의 출처만 둔다.
+- 리뷰 App(사람 작업, 2026-11-04 14:05): 사용자가 org `ukyi-app`의 GitHub App `ukyi-review`(App ID 5606407)를 만들었다. 권한은 Pull requests write와 Contents·Metadata·Checks·Issues read이고, 이벤트는 `pull_request`·`issue_comment`다(`gh api apps/ukyi-review`로 확인). 위 "리뷰 App 권한과 구독 이벤트"와 같다. 다음은 사람 작업으로 이어진다: 설치(`homelab-smoke` 하나), 개인 키, Infisical `GITHUB_REVIEW_APP_ID`·`GITHUB_REVIEW_APP_PRIVATE_KEY`, `homelab-smoke`의 Codex 자동 리뷰 끄기.
+- 그대로 남은 T17 진입 조건이 있다. 작업별 세션 저장 공간과 인증 파일 분리(T18 결정 (2)·(4))이고, V1_PLAN T17 행 기준이다.
 
 ### 공유 파일(T16a 소유) 변경이 필요해 하지 않은 것
 
