@@ -1,8 +1,10 @@
 import { afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { gzipSync } from 'node:zlib';
 import { ChatLane } from '../src/chat-lane.js';
 import { SYSTEM_INSTRUCTIONS, WorkerRejected } from '../src/contracts.js';
@@ -43,7 +45,9 @@ process.stdin.on('end', () => {
   const walk = dir => { for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
     const p = path.join(dir, e.name); if (e.isDirectory()) walk(p); else files[path.relative(root, p)] = fs.readFileSync(p, 'utf8'); } };
   walk(root);
-  fs.writeFileSync(path.join(__dirname, 'seen.json'), JSON.stringify({ args, cwd: process.cwd(), entries: fs.readdirSync('.'), env: process.env, input, files, root }));
+  // 시작 때 모습을 먼저 잡고, 파일은 세션·잠금 파일을 남긴 뒤에 원자적으로 쓴다(아래). 시험이 이 파일을 보고 중단하므로
+  // 반쯤 쓴 파일이 보이거나 세션 파일보다 먼저 보이면 안 된다.
+  const record = JSON.stringify({ args, cwd: process.cwd(), entries: fs.readdirSync('.'), env: process.env, input, files, root });
   // --no-session-persistence를 무시하고 세션·설정·임시 파일을 남기는 경우를 흉내 낸다.
   if (mode.session) {
     const dir = path.join(process.env.CLAUDE_CONFIG_DIR, 'projects', 'workspace');
@@ -56,6 +60,8 @@ process.stdin.on('end', () => {
     const dir = path.join(process.env.CLAUDE_CONFIG_DIR, 'projects', 'locked');
     fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, 'session.jsonl'), '{}\\n'); fs.chmodSync(dir, 0o500);
   }
+  const seenFile = path.join(__dirname, 'seen.json');
+  fs.writeFileSync(seenFile + '.' + process.pid, record); fs.renameSync(seenFile + '.' + process.pid, seenFile);
   // 토큰 갱신·삭제를 실행 중에 흉내 낸다.
   if (mode.rewrite) fs.writeFileSync(mode.rewrite.file, mode.rewrite.value);
   if (mode.removeFile) fs.rmSync(mode.removeFile);
@@ -300,14 +306,21 @@ test('T17 무도구 경계 (e) 성공·실패·중단 모두 임시 공간을 �
     ['성공', { answer: OUTPUT, session: true }, reviewer => review(reviewer), 'succeeded'],
     ['정책 위반', { answer: OUTPUT, session: true, init: { skills: ['x'] } }, reviewer => review(reviewer), 'failed'],
     ['한도', { session: true, kind: 'error', error: 'rate_limit', status: 429 }, reviewer => review(reviewer), 'limited'],
+    // 가짜 CLI가 세션 파일과 기록을 남긴 뒤에 멈춘다. 고정 100ms 중단은 부하 큰 CI 빌드에서 기록 도중에 죽여
+    // 빈 JSON을 읽었다(2026-11-04 봇 main 빌드). 기한도 같은 이유로 시작이 늦어도 기록이 남을 만큼 준다.
+    // 실제 기한은 runDeadline(timeoutMs) = max(timeoutMs/2, timeoutMs - 5000)이라 4000이면 2초다(100이면 50ms였다).
     ['취소', { session: true, kind: 'hang' }, reviewer => {
       const abort = new AbortController();
-      setTimeout(() => abort.abort(), 100);
+      void recorded().then(() => abort.abort());
       return review(reviewer, abort.signal);
     }, 'failed'],
-    ['기한', { session: true, kind: 'hang' }, reviewer => review(reviewer, live(), randomUUID(), 100), 'failed'],
+    ['기한', { session: true, kind: 'hang' }, reviewer => review(reviewer, live(), randomUUID(), 4_000), 'failed'],
   ];
+  const seenFile = join(fakeDir, 'seen.json');
+  const recorded = async () => { for (let i = 0; i < 2_000 && !existsSync(seenFile); i++) await sleep(5); };
   for (const [name, config, run, status] of runs) {
+    // 앞 실행의 기록이 이번 실행의 증거로 읽히지 않게 지운다.
+    await rm(seenFile, { force: true });
     await mode(config);
     assert.equal((await run(fixture().reviewer)).status, status, name);
     // 세션·설정·임시 파일을 실제로 남긴 실행이었다.
