@@ -657,7 +657,7 @@ S16에서 찾은 결함을 봇 저장소에서 고치고 병합·배포했다(�
 2. 기억 검색 응답의 URL에 Discord 링크 미리보기가 붙는다(owner에게만 보이는 응답이라 누출은 아님, 미리보기 끄기 후보).
 3. 정정한 기억이 같은 주제의 active 결정과 충돌하면 candidate로 남는다(설계 한계). `memory-correct`는 ID 여러 개를 받으므로 충돌 상대도 함께 정정하면 확정될 것으로 보이나 실연동으로 확인하지 않았다. 응답에 이 안내를 넣는 것이 후보다.
 4. CLI `homelab db restore` 재개 단계는 Deployment Ready만 본다. 원장이 있는 앱은 restore.md 2.1 블록을 따로 돌려야 `--finish`할 수 있다(이번에도 따로 돌림).
-5. 브리핑 인증서·복원 검증 칸 원본(플랫폼 변경, homelab T24), Codex 작업 상태·질문 대기 칸(T18).
+5. 브리핑 인증서·복원 검증 칸 원본(플랫폼 변경, homelab T24): 해소(2026-11-04, 아래 "T24 실연동 결과"). Codex 작업 상태·질문 대기 칸(T18)은 남음.
 6. 기억을 모델 맥락에 넣는 경로(SEC-01)는 V1 코드에 없다(`memories`는 `src/memory.ts`만 읽고, 쓰는 곳은 기억 명령과 모델을 부르지 않는 브리핑). T21이 경로 부재를 다시 확인하고, 경로를 여는 변경이 비신뢰 자료 표시와 SEC-01 시험을 함께 맡는다.
 
 ## T24 브리핑 관측 원본: 인증서·복원 검증 (2026-11-03, 로컬·mock)
@@ -670,3 +670,14 @@ homelab T24 할 일 3이다. 원본은 사용자 결정(2026-11-03)으로 정했
 | BRIEF-01 (복원 검증 칸) | mock / pass | 기록 없음 → 미확인, 통과 → 그 시각, 통과 100일 초과·통과보다 새 실패 → 확인 필요, JSON·스키마 오류·Cluster uid 불일치·미래 시각 → 그 기록만 미확인. 기록 오류·실패가 백업 정상 판정을 바꾸지 않음. 표시에 "CLI 기록 기준, 백업 성공과 별개" | 실제 annotation은 homelab CLI 변경 뒤 `restore-check` 실행으로 확인(T24 할 일 4) |
 
 시험: `test/briefing-observations.test.ts`(T24 시험 9개, 브리핑 사본 형식 고정 포함). Node 24.22.0에서 `npm run check` 통과, `npm test` 860개 중 831 pass / 0 fail / 29 skip(PG 소켓 없는 PG 시험). 기본 셸 Node 26에서는 런타임 major 고정 시험 1개가 환경 때문에 실패한다(이번 변경과 무관).
+
+## T24 실연동 결과 (2026-11-03~04, live)
+
+등급 `live`는 운영 클러스터·실제 Discord로 한 실연동이다. 위 T24 mock 판정과 섞지 않는다. 시각은 UTC다. 게시 서버는 봇 `12a09c3`(#32)이고, homelab #1035(`40f1798`: cert-manager 수집 job·만료 경보, `restore-check` 결과 기록, Argo CD 비교 제외)를 적용한 상태다. 채널 문구는 owner 맥의 Codex computer use가 Discord 앱에서 읽기만 해서 옮겼다(보낸 것 없음). DB 확인은 `BEGIN READ ONLY`로 상태 열만 봤다.
+
+| 시험 ID | 등급 / 판정 | 확인한 경계 | 남은 검증 / 해소 |
+|---|---|---|---|
+| BRIEF-01 (인증서 칸) | live / pass | 11-03 23:50Z 회차: 봇 Grafana 계정의 집계 질의 4개가 23:50:07Z 모두 성공(Grafana 로그 `status=ok`). 같은 시각 VictoriaMetrics 값: 개수 2, 가장 이른 만료 2027-01-21, Ready 2, 신선도 28초. 채널 문구 "정상 · 2개 모두 Ready · 가장 이른 만료 2027-01-21(78일) · 관측 11-04 08:50" | 만료 임박·Ready 아님·오래됨·질의 실패 표시는 mock만(운영 인증서 2개가 정상). homelab 경보 3개는 규칙 시험만, 발화 not_run |
+| BRIEF-01 (복원 검증 칸) | live / pass | owner가 11-03 14:32~14:35Z `homelab db restore-check --apply` → 통과. `database/pg`에 `restore-check-last`·`-pass` 기록(Database 1개, Cluster uid = 현재 `pg`), 임시 객체 0, Argo CD `cnpg-cluster` Synced 유지. 봇 판정 함수에 실제 annotation 값: 지금 → 통과, 101일 뒤 → 확인 필요(오래됨), 다른 uid → 미확인. 11-03 23:50Z 회차 백업 줄 끝 "복원 검증 통과 11-03 23:34 · CLI 기록 기준, 백업 성공과 별개" | 실패 기록·`--abort`·uid 불일치 표시는 CLI·봇 시험(mock)만. 100일 오래됨은 다음 분기 실행 전후로 다시 본다 |
+
+회차는 1건(`enqueued`), outbox `sent` attempt 1, Discord 메시지 ID 받음. 이 결과로 homelab T24를 완료로 바꿨다(2026-11-04, homelab spec §8.1). 표본은 칸마다 1건이다.
