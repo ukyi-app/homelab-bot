@@ -15,7 +15,10 @@ import type { Change, Coverage, ReviewOutput, ReviewTask, ReviewWorkerResult } f
 
 // PR_REVIEW(T17) 게시 서버 쪽. 모델 호출 전 작성자 확인(D-16), 세대 단위 작업, COMMENT만 게시하는 제한 게시.
 const Sha = z.string().regex(/^[a-f0-9]{40}$/);
-const RepoName = z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/);
+// owner/repo. 세그먼트가 정확히 `.`·`..`이면 거부한다(경로 조립에서 위로 올라가지 않게, PR #42 리뷰).
+// 작업자 쪽 REPOSITORY_NAME(src/worker.ts)과 같은 규칙이다. 게시 서버가 작업자 모듈을 불러오지 않게 따로 둔다.
+const REPO_NAME = /^(?!\.\.?\/)[A-Za-z0-9_.-]+\/(?!\.\.?$)[A-Za-z0-9_.-]+$/;
+const RepoName = z.string().regex(REPO_NAME);
 export const ReviewPolicySchema = z.strictObject({
   repositories: z.array(z.strictObject({ id: z.number().int().positive(), fullName: RepoName,
     installationId: z.number().int().positive(), visibility: z.enum(['public', 'private']) })).max(50),
@@ -118,7 +121,7 @@ export interface GitHubReader {
 const CompareSchema = z.strictObject({ files: ReviewTaskSchema.shape.changes, truncated: z.boolean() });
 const RemoteReview = z.object({ id: z.number().int(), commit_id: z.string().nullable(), body: z.string().nullable() });
 const ReviewWriteSchema = z.strictObject({
-  method: z.literal('POST'), path: z.string().regex(/^\/repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pulls\/[1-9]\d*\/reviews$/),
+  method: z.literal('POST'), path: z.string().regex(/^\/repos\/(?!\.\.?\/)[A-Za-z0-9_.-]+\/(?!\.\.?\/)[A-Za-z0-9_.-]+\/pulls\/[1-9]\d*\/reviews$/),
   body: z.strictObject({ commit_id: Sha, event: z.literal('COMMENT'), body: z.string().min(1).max(65_536),
     comments: z.array(z.strictObject({ path: z.string().min(1), line: z.number().int().positive(), side: z.literal('RIGHT'),
       body: z.string().min(1).max(65_536) })).max(50) }),

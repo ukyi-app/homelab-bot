@@ -86,9 +86,11 @@ beforeEach(async () => {
   await chmod(fakeBin, 0o755);
   await writeFile(join(fakeDir, 'version.txt'), 'codex-cli 0.163.0\n');
   await mode({ kind: 'answer', answer: ANSWER });
+  // 기동 sweep이 공용 /tmp에서 병렬로 도는 다른 시험 파일의 실행 공간을 지우지 않게 한다.
+  process.env.TMPDIR = base;
 });
 // .local은 다른 시험 파일도 함께 쓴다. 이 시험이 만든 디렉터리만 지운다.
-afterEach(async () => { await rm(base, { recursive: true, force: true }).catch(() => {}); });
+afterEach(async () => { delete process.env.TMPDIR; await rm(base, { recursive: true, force: true }).catch(() => {}); });
 const mode = (value: unknown) => writeFile(join(fakeDir, 'mode.json'), JSON.stringify(value));
 const seen = async () => JSON.parse(await readFile(join(fakeDir, 'seen.json'), 'utf8')) as {
   args: string[]; cwd: string; entries: string[]; env: Record<string, string>; input: string; config: string; schema: string };
@@ -98,7 +100,7 @@ const chatRequest = (j: Job, overrides: Partial<WorkerRequest> = {}): WorkerRequ
   timeoutMs: 60_000, toolCalls: 8, ...overrides });
 const env = (overrides: Record<string, string | undefined> = {}) => ({ WORKER_EXECUTOR: 'codex', WORKER_MODEL: 'cli-default',
   WORKER_CREDENTIAL_DIR: seedDir, WORKER_CREDENTIAL_KEY: 'CODEX_AUTH_JSON', CODEX_HOME: codexHome, WORKER_NONCE_DIR: nonceDir,
-  WORKER_CONTROL_PUBLIC_KEY: publicPem, WORKER_EXECUTOR_BIN: fakeBin, ...overrides });
+  WORKER_CONTROL_PUBLIC_KEY: publicPem, WORKER_EXECUTOR_BIN: fakeBin, TMPDIR: base, ...overrides });
 // Codex 프로필의 대화 레인(진입점과 같은 조립): Codex 어댑터 + file-mutable 자격 + 공통 ChatLane.
 const codexLane = (launcher: ProcessLauncher, options: Omit<ChatLaneOptions, 'model'> = {}) =>
   new ChatLane(new CodexChatAdapter(codexHome), new FileMutableCredential(codexHome, join(seedDir, 'CODEX_AUTH_JSON'), []),

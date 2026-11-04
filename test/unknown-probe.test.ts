@@ -114,6 +114,85 @@ test('S3 task unknown은 조사하지 않음', async () => {
   assert.equal(calls.length, 0); assert.equal((await rows('jobs'))[0]!.state, 'unknown');
 });
 
+// 이전 실행이 남긴 unknown review(게시 서버 쪽 ReviewQueue가 넣는 모양 그대로).
+async function unknownReview(lease: string | null = randomUUID()) {
+  const event = randomUUID(), id = randomUUID();
+  await database.db.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,conversation_id,received_at,payload,accepted)
+    VALUES ($1,'github',$2,$3,'github:1','{"kind":"github","repo":1,"pr":7}',NULL,$4,'{"command":"review"}',true)`, [event, `d-${id}`, `k-${id}`, f.now()]);
+  await database.db.query(`INSERT INTO jobs(id,event_id,conversation_id,type,owner_id,target,revision,budget,priority,available_at,created_at,state,wait_reason,attempt,lease_token,lease_until)
+    VALUES ($1,$2,NULL,'review','github-review','{"kind":"github","repo":1,"pr":7}','{"policy":"rp-x"}','{"timeoutMs":1000,"toolCalls":0}',40,$3,$3,'unknown','worker_disconnected',1,$4,$3)`,
+  [id, event, f.now(), lease]);
+  await database.db.query(`INSERT INTO pr_reviews(job_id,generation_key,installation_id,repo_id,repo_full_name,pr_number,head_sha,comparison_revision,
+    base_ref,policy_revision,trigger,pr_updated_at,created_at) VALUES ($1,$2,1,1,'o/r',7,'h','c','main','rp-x','opened',$3,$3)`, [id, `g-${id}`, f.now()]);
+  return (await rows('jobs')).find(j => j.id === id)!;
+}
+const review = async (id: string) => (await database.db.query<Record<string, any>>('SELECT * FROM pr_reviews WHERE job_id=$1', [id])).rows[0]!;
+
+test('T17 리뷰 unknown: 작업자가 멈춤을 확인하면 failed로 풀려 전역 슬롯이 비고, 새 실행은 자동으로 시작하지 않음', async () => {
+  const job = await unknownReview();
+  await queued('next');
+  // 풀리기 전에는 대화도 집히지 않는다.
+  assert.equal(await f.store.claim(), undefined);
+  const calls = cancels(() => true);
+  assert.equal(await f.runtime.probeUnknown(), 1);
+  assert.deepEqual(calls, [{ job: job.id, lease: job.lease_token }]);
+  const row = (await rows('jobs')).find(j => j.id === job.id)!;
+  assert.equal(row.state, 'failed'); assert.equal(row.wait_reason, 'stop_confirmed_after_unknown'); assert.ok(row.finished_at);
+  assert.equal((await review(job.id)).review_outcome, 'failed');
+  assert.ok((await rows('audit')).some(a => a.kind === 'unknown_stop_confirmed' && a.subject === job.id));
+  // 리뷰 job에는 Discord 대상이 없어 안내를 넣지 않는다. /retry 문구가 나가면 안 된다.
+  assert.equal((await notices('unknown-resolved:')).length, 0);
+  assert.equal(f.requests.length, 0);
+  assert.equal((await f.store.claim())?.type, 'chat');
+  f.advance(3_600_000); await f.runtime.probeUnknown();
+  assert.equal(calls.length, 1);
+});
+
+test('T17 리뷰 unknown: 확인하지 못하면 경과 시간과 무관하게 슬롯을 잡고, chat과 같은 backoff로 다시 묻는다', async () => {
+  const job = await unknownReview();
+  const calls = cancels(() => false);
+  await f.runtime.probeUnknown();
+  f.advance(29_999); await f.runtime.probeUnknown();
+  assert.equal(calls.length, 1);
+  f.advance(1); await f.runtime.probeUnknown();
+  assert.equal(calls.length, 2);
+  f.worker.cancel = async () => { throw new Error('worker_unreachable'); };
+  f.advance(86_400_000); await f.runtime.probeUnknown();
+  assert.equal((await rows('jobs'))[0]!.state, 'unknown');
+  assert.equal((await review(job.id)).review_outcome, null);
+  await queued('next');
+  assert.equal(await f.store.claim(), undefined);
+});
+
+test('T17 리뷰 unknown: 확인하는 사이 lease가 바뀌면 바꾸지 않고, 밀려난 세대 기록은 보존하며, lease 없는 행은 묻지 않음', async () => {
+  const changed = await unknownReview();
+  cancels(async () => { await database.db.query('UPDATE jobs SET lease_token=$2 WHERE id=$1', [changed.id, randomUUID()]); return true; });
+  await f.runtime.probeUnknown();
+  assert.equal((await rows('jobs'))[0]!.state, 'unknown');
+  await database.db.query('TRUNCATE jobs,pr_reviews,events,controls CASCADE');
+  const old = await unknownReview();
+  await database.db.query(`UPDATE pr_reviews SET review_outcome='superseded',superseded_at=1,superseded_reason='new_head' WHERE job_id=$1`, [old.id]);
+  cancels(() => true);
+  await f.runtime.probeUnknown();
+  assert.equal((await rows('jobs'))[0]!.state, 'failed');
+  assert.equal((await review(old.id)).review_outcome, 'superseded');
+  await database.db.query('TRUNCATE jobs,pr_reviews,events,controls CASCADE');
+  await unknownReview(null);
+  const calls = cancels(() => true);
+  await f.runtime.probeUnknown();
+  assert.equal(calls.length, 0);
+});
+
+test('T17 /review-cancel은 unknown을 풀지 않고 이유를 알린다(확인 없이 슬롯을 풀지 않음)', async () => {
+  const job = await unknownReview();
+  const result = await f.store.control(f.policy.owner, '', 'review-cancel', job.id, undefined, { review: true }) as { ok: boolean; status: string };
+  assert.equal(result.ok, false);
+  assert.match(result.status, /종료를 확인하지 못한/);
+  assert.equal((await rows('jobs'))[0]!.state, 'unknown');
+  const none = await f.store.control(f.policy.owner, '', 'review-cancel', randomUUID(), undefined, { review: true }) as { ok: boolean; status: string };
+  assert.match(none.status, /취소할 리뷰 작업이 없거나/);
+});
+
 test('S3 lease가 새로 바뀐 unknown은 backoff를 처음부터', async () => {
   const job = await unknownJob();
   const calls = cancels(() => false);

@@ -8,9 +8,11 @@ import type { ReviewTask, ReviewWorker, ReviewWorkerResult } from './review-inpu
 import type { ReviewWorkerClient } from './review.js';
 import { CancelRequestSchema } from './worker.js';
 import type { CancelRequest } from './worker.js';
+import type { WorkerRoute } from './worker-http.js';
 
 // 리뷰 레인의 작업자 HTTP(작업자 포트 8080의 별도 경로). 대화 레인 worker-http.ts와 같은 규칙:
 // capability 없으면 시작 전 거부, 깨진 응답은 멈춤의 증거가 아님.
+// 인증 없는 POST /v1/review의 401은 게시 서버가 작업자의 리뷰 준비를 판단하는 신호다. 본문을 읽기 전에 답한다.
 const ResultSchema = z.discriminatedUnion('status', [
   z.strictObject({ status: z.literal('succeeded'), stopped: z.literal(true), coverage: CoverageSchema,
     positions: z.array(z.strictObject({ path: z.string(), lines: z.array(z.number().int().positive()) })), output: z.unknown() }),
@@ -71,25 +73,39 @@ export class HttpReviewWorker implements ReviewWorkerClient {
     return z.strictObject({ stopped: z.boolean() }).parse(await response.json());
   }
 }
-export function reviewWorkerServer(worker: ReviewWorker) {
-  const server = createServer(async (req, res) => {
-    if (req.method !== 'POST' || !['/v1/review', '/v1/review/cancel'].includes(req.url ?? '')) { res.writeHead(404).end(); return; }
-    const reject = (status: number) => res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify({ status: 'rejected', started: false }));
+// accepting이 false면(종료 중) 새 리뷰를 시작 전에 거부한다. 취소는 계속 받는다(worker-http.ts와 같은 규칙).
+export function reviewRoutes(worker: Pick<ReviewWorker, 'review' | 'cancel'>, accepting?: () => boolean): ReadonlyMap<string, WorkerRoute> {
+  const route: WorkerRoute = async (req, res) => {
+    if (req.method !== 'POST') { res.writeHead(404).end(); return; }
+    // 종료 중의 응답은 연결을 이어 두지 않는다. keep-alive면 서버 종료가 그 연결을 기다린다.
+    const send = (status: number, payload: unknown) => {
+      if (accepting && !accepting()) res.shouldKeepAlive = false;
+      res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(payload));
+    };
+    const reject = (status: number) => send(status, { status: 'rejected', started: false });
     const auth = req.headers.authorization;
     if (!auth?.startsWith('Capability ')) { reject(401); return; }
     let input: unknown;
     try { input = await raw(req); } catch { reject(400); return; }
     try {
       if (req.url === '/v1/review/cancel') {
-        const result = await worker.cancel(CancelRequestSchema.parse(input), auth.slice(11));
-        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(result)); return;
+        send(200, await worker.cancel(CancelRequestSchema.parse(input), auth.slice(11))); return;
       }
-      const result = await worker.review(ReviewTaskSchema.parse(input), auth.slice(11), new AbortController().signal);
-      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(result));
+      const task = ReviewTaskSchema.parse(input);
+      if (accepting && !accepting()) throw new WorkerRejected('worker_closing');
+      send(200, await worker.review(task, auth.slice(11), new AbortController().signal));
     } catch (error) {
       if (error instanceof WorkerRejected || error instanceof Denied || error instanceof z.ZodError) reject(403);
-      else res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ status: 'unknown', stopped: false }));
+      else send(500, { status: 'unknown', stopped: false });
     }
+  };
+  return new Map([['/v1/review', route], ['/v1/review/cancel', route]]);
+}
+export function reviewWorkerServer(worker: Pick<ReviewWorker, 'review' | 'cancel'>) {
+  const routes = reviewRoutes(worker);
+  const server = createServer(async (req, res) => {
+    const route = routes.get(req.url ?? '');
+    if (route) await route(req, res); else res.writeHead(404).end();
   });
   server.requestTimeout = 5000;
   return server;

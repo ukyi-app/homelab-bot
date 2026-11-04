@@ -309,14 +309,16 @@ export class Store {
         payload: { kind: 'message', channel: scope.channel, content, classification: 'safe_summary' } }, tx);
     });
   }
-  // chat unknown 조사 예약. 다음 조사 시각은 마이그레이션 없이 controls 행(unknown_probe:<job>)에 둔다.
+  // chat·review unknown 조사 예약. 다음 조사 시각은 마이그레이션 없이 controls 행(unknown_probe:<job>)에 둔다.
   // 같은 행을 잠그고 시각이 된 것만 다음 시각으로 미뤄 돌려주므로 게시 서버 둘이 같은 job을 동시에 조사하지 않는다.
   // lease가 바뀌었으면(다시 실행된 뒤 다시 unknown) backoff를 처음부터 센다. 경과 시간만으로 상태를 바꾸지 않는다.
+  // /review-cancel로 풀지 않는 이유: 제어 명령은 DB 트랜잭션 안이라 작업자에게 물을 수 없고, 확인 없이 풀면 살아 있는 프로세스 옆에서 다음 작업이 돈다.
+  // task는 작업 레인 소멸 확인의 한계로 넣지 않는다. review는 도구 없는 단일 프로세스 그룹이고 작업자가 표식으로 소멸을 확인한다.
   async reserveUnknownProbes(limit = 3): Promise<Job[]> {
     return this.db.transaction(async tx => {
       await tx.query(`DELETE FROM controls WHERE key LIKE 'unknown_probe:%' AND NOT EXISTS
-        (SELECT 1 FROM jobs WHERE id=substr(controls.key,15) AND type='chat' AND state='unknown')`);
-      const jobs = (await tx.query<Job>(`SELECT * FROM jobs WHERE type='chat' AND state='unknown' AND lease_token IS NOT NULL
+        (SELECT 1 FROM jobs WHERE id=substr(controls.key,15) AND type IN ('chat','review') AND state='unknown')`);
+      const jobs = (await tx.query<Job>(`SELECT * FROM jobs WHERE type IN ('chat','review') AND state='unknown' AND lease_token IS NOT NULL
         ORDER BY id LIMIT 50`)).rows;
       const due: Job[] = [];
       for (const job of jobs) {
@@ -335,17 +337,24 @@ export class Store {
       return due;
     });
   }
-  // 작업자가 멈춤을 확인한 unknown chat을 확정 실패로 끝낸다. 관측한 lease일 때만 바꾸고(CAS), 상태·감사·안내를 함께 쓴다.
-  // 새 실행은 시작하지 않는다. owner가 /retry로 다시 실행한다.
+  // 작업자가 멈춤을 확인한 unknown을 확정 실패로 끝낸다. 관측한 lease일 때만 바꾸고(CAS), 상태·감사·안내를 함께 쓴다.
+  // 새 실행은 시작하지 않는다. chat은 owner가 /retry로, review는 리뷰 명령 댓글이나 새 세대로 다시 실행한다.
   async resolveUnknown(job: Job): Promise<boolean> {
     return this.db.transaction(async tx => {
       await this.lockConversation(job, tx);
       const row = (await tx.query<Job>(`UPDATE jobs SET state='failed',wait_reason='stop_confirmed_after_unknown',finished_at=$3
-        WHERE id=$1 AND type='chat' AND state='unknown' AND lease_token=$2 RETURNING *`, [job.id, job.lease_token, this.now()])).rows[0];
+        WHERE id=$1 AND type IN ('chat','review') AND state='unknown' AND lease_token=$2 RETURNING *`, [job.id, job.lease_token, this.now()])).rows[0];
       if (!row) return false;
       await tx.query('DELETE FROM controls WHERE key=$1', [`unknown_probe:${row.id}`]);
       await tx.query('INSERT INTO audit(kind,subject,detail,created_at) VALUES ($1,$2,$3,$4)',
         ['unknown_stop_confirmed', row.id, json({ attempt: row.attempt }), this.now()]);
+      // Job['type']에는 review가 없다(리뷰 작업은 T17이 같은 표에 더했다).
+      if ((row.type as string) === 'review') {
+        // 리뷰 job의 target은 GitHub PR이라 게시할 Discord 채널이 없고 알림 채널은 정책에만 있다. 이 자리에서는 안내하지 않는다.
+        // 밀려난 세대의 기록은 그대로 둔다.
+        await tx.query(`UPDATE pr_reviews SET review_outcome='failed' WHERE job_id=$1 AND superseded_at IS NULL`, [row.id]);
+        return true;
+      }
       await this.enqueue({ key: `unknown-resolved:${row.id}:${row.attempt}`, job: row.id, conversation: row.conversation_id,
         actor: row.owner_id, scope: row.target, revision: row.revision.policy,
         payload: { kind: 'message', channel: row.target.channel, classification: 'safe_summary',
@@ -504,7 +513,11 @@ export class Store {
     const changed = await this.db.query(`UPDATE jobs SET state=CASE WHEN state IN ('queued','waiting_user') THEN 'cancelled' ELSE 'cancel_requested' END,
       finished_at=CASE WHEN state IN ('queued','waiting_user') THEN $2 ELSE finished_at END
       WHERE id=$1 AND type='review' AND state IN ('queued','running','verifying','waiting_user') RETURNING id`, [target, this.now()]);
-    if (!changed.rows.length) return { ok: false, status: '취소할 리뷰 작업이 없거나 취소 가능한 상태가 아닙니다.' };
+    if (!changed.rows.length) {
+      const unconfirmed = (await this.db.query(`SELECT id FROM jobs WHERE id=$1 AND type='review' AND state='unknown'`, [target])).rows.length > 0;
+      return { ok: false, status: unconfirmed ? '종료를 확인하지 못한 리뷰 작업은 취소로 풀지 않습니다. 봇이 작업자에게 종료 확인을 계속 시도하고, 확인되면 실패로 끝납니다.'
+        : '취소할 리뷰 작업이 없거나 취소 가능한 상태가 아닙니다.' };
+    }
     const paused = await this.releaseScheduler();
     await this.audit('review_cancelled', target!, { actor, paused });
     return { ok: true, paused, status: '리뷰 작업 취소 요청. 실행 중 작업의 종료 확인 전에는 cancelled로 표시하지 않습니다.' };
