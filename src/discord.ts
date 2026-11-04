@@ -12,13 +12,16 @@ import type { Delivery, Store } from './store.js';
 // 일반 메시지 수신 표시가 리액션 대신 텍스트로 대체됐을 때의 거부 상태(권한 점검 신호).
 export interface AckOutcome { fallback: 403 | 404 }
 export interface DiscordRest {
-  acknowledge(event: EventInput, content: string, options: { allowed_mentions: { parse: never[] } }): Promise<AckOutcome | void>;
+  acknowledge(event: EventInput, content: string, options: { allowed_mentions: { parse: never[] }; flags?: typeof SUPPRESS_EMBEDS }): Promise<AckOutcome | void>;
   createThread(channel: string, body: { name: string; type: 11; auto_archive_duration: 1440 }): Promise<{ id: string }>;
   sendMessage(channel: string, body: { content: string; nonce: string; enforce_nonce: true; allowed_mentions: { parse: never[] } }): Promise<{ id: string }>;
   findDelivery(channel: string, marker: string, kind: 'message' | 'thread'): Promise<{ id: string } | undefined>;
   history(channel: string, after: string | null, limit: 100): Promise<EventInput[]>;
 }
 const noMentions = { allowed_mentions: { parse: [] as never[] } };
+// Discord 메시지 플래그 SUPPRESS_EMBEDS. 기억 명령 응답의 문서 링크(`doc=`)에 미리보기 카드가 붙었다(T20 실연동).
+// 기억 응답은 ID·상태를 보는 용도라 끈다. 다른 명령 응답은 그대로 둔다.
+export const SUPPRESS_EMBEDS = 4 as const;
 const controls = new Set(['stop', 'resume', 'list', 'cancel', 'retry', 'emergency-stop', 'resume-model', 'model-status', 'revoke',
   'review-status', 'review-resume', 'review-cancel']);
 // 수신이 아는 명령 전체. 배포 진입점은 단계에 맞춰 더 좁은 목록(FOUNDATION_COMMANDS)을 넘긴다.
@@ -171,7 +174,8 @@ export class DiscordIngress {
         if (pause > this.store.now()) throw new Error('discord_global_pause');
         // 일반 메시지는 👀 리액션이고 이 문구는 권한 거부 때의 대체 텍스트로만 쓰인다.
         outcome = await this.rest.acknowledge(event, content
-          ?? (this.messageContent ? '수신·처리 기록 저장됨. 처리·대기 상태는 별도로 안내합니다.' : '명령/버튼 모드: 수신·처리 기록 저장됨.'), noMentions);
+          ?? (this.messageContent ? '수신·처리 기록 저장됨. 처리·대기 상태는 별도로 안내합니다.' : '명령/버튼 모드: 수신·처리 기록 저장됨.'),
+        memory ? { ...noMentions, flags: SUPPRESS_EMBEDS } : noMentions);
       } catch (error) {
         if (error instanceof RateLimited) await this.store.recordRateLimit(error, event.scope.channel);
         await this.store.atomic(async store => {

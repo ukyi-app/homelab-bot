@@ -69,7 +69,8 @@ export class DiscordProtocol implements DiscordRest {
       const interaction = this.interactions.get(event.id);
       if (!interaction || this.now() >= interaction.expires) throw new Error('interaction_expired');
       await this.api.request('POST', `/interactions/${part(event.id)}/${part(interaction.token)}/callback`,
-        { type: 4, data: { content, flags: 64, ...options } }, { expiresAt: interaction.expires });
+        // 상호작용 응답은 늘 본인만 보는 메시지(EPHEMERAL 64)다. 호출자가 준 플래그(미리보기 끄기)는 더하기만 한다.
+        { type: 4, data: { content, ...options, flags: 64 | (options.flags ?? 0) } }, { expiresAt: interaction.expires });
       return;
     }
     // 일반 메시지는 원문에 👀만 단다. 텍스트 ACK는 대화를 덮는다. 같은 봇·메시지·emoji의 PUT은 다시 해도 하나다.
