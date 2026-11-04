@@ -244,8 +244,8 @@ slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG �
 - HANDOFF는 private 운영 저장소 몫이다(D-13). 이번 반환 보고가 그 원문이다.
 - (2026-11-04 해소) 리뷰 켜기: 사용자 승인으로 켰다(homelab #1058 `REVIEW_ENABLED`, 아래 "첫 실리뷰 시도").
 - (2026-11-04 해소) `RUNTIME_POLICIES` review 절: 기록했다(값의 출처는 DECISIONS "T17 결정"과 같은 날 사용자 승인. 실제 ID·내부 표식은 Infisical에만). `reviewSince`는 켜는 시각이다.
-- 실제 모델 품질 평가(REVIEW-01): 6건(아래 "실제 모델 품질", 재시험 1건 포함)이다. 표본 확대가 남았다.
-- 반례·복구 시험(실연동): A 묶음(댓글 명령, 닫기·다시 열기, draft, 실행 중 head 이동, base 바꾸기, 공개 범위 차단, partial)은 2026-11-04에 했다(아래 "반례·복구 시험 A 묶음"). B 묶음(Renovate PR, 허용 밖 작성자·fork, Bot 댓글 무시의 실례, webhook 재전송, 한도·인증 대기와 제어 명령, 게시 응답 유실 대조)이 남았고 사람 준비(Renovate 설치 확대, 다른 계정, 재전송)가 필요하다.
+- 실제 모델 품질 평가(REVIEW-01): 8건(아래 "실제 모델 품질", 재시험 1건·Renovate 1건 포함)이다. 표본 확대가 남았다.
+- 반례·복구 시험(실연동): A·B 묶음을 2026-11-04에 했다(아래 "반례·복구 시험 A 묶음"·"B 묶음"). 운영에서 하지 않은 것은 B 묶음 표의 `not_run` 행(허용 밖 사람 작성자·댓글, 실행 중 비상 중지, Bot 댓글 무시의 실례, 한도·인증 대기·게시 응답 유실 대조)이다.
 - (2026-11-04 고침) 제외 파일이 모델 입력에 없었다: `ReviewerInput.untrusted`에 검토한 파일만 들어가 바이너리를 참조하는 코드에 "파일이 PR에 없다"는 오탐이 났다(A7). 이제 작업자가 `omitted`(경로·이유, 최대 `MODEL_OMITTED_MAX` 200개), `omittedTotal`, `limitsHit`를 비신뢰 자료로 넘기고, 프롬프트 고정 문장(`REVIEW_OMITTED_NOTE`)이 "PR에 있지만 내용을 싣지 않은 파일이니 없다고 판단하거나 추측해 지적하지 않는다"고 알린다. 게시 서버와 같아야 하는 `REVIEW_INSTRUCTIONS`와 세대 revision은 그대로다. 봇 #50, 작업자 이미지 homelab #1067 뒤 같은 #14를 새 head로 다시 리뷰해 오탐이 사라진 것을 확인했다(아래 품질 표 `01c3fbf` 행).
 - 다시 연 PR의 세대 기록: 닫을 때 `superseded(pr_closed)`가 된 세대는 같은 세대로 다시 열려도(`duplicate_generation`) 기록이 그대로다. 이미 게시된 리뷰는 유효하고 재게시·재실행에는 영향이 없다(기록 표시만 어긋남). 소비자를 모두 대조한 결과 그대로 둔다(2026-11-04 정적 분석): 게시 여부는 `review_deliveries.state`, 재실행 여부는 `jobs.state`와 admission 조건(`concluded`는 게시 행을 본다)으로 정하고, `review-status`·브리핑·지표·Discord 요약은 이 세 열(`review_outcome`·`superseded_at`·`superseded_reason`)을 읽지 않는다. 같은 일은 자동 리뷰가 게시된 뒤의 draft → ready에서도 생기고(`superseded(draft)`), 그 뒤 base가 움직여도 사유는 처음 값(`pr_closed`·`draft`)으로 남는다. 그래서 세대 행의 outcome만으로 현재 유효성이나 게시 여부를 판단하지 않는다.
 - (2026-11-04 확인) 실제 Claude CLI init의 `skills`·`plugins` 빈 배열: `skills`는 비어 있었고, `plugins`에 내장 플러그인 2개가 있어 첫 실리뷰가 `policy_violation`으로 막혔다. 리뷰 레인 `--settings`로 끄도록 고쳤다(아래 "첫 실리뷰 시도").
@@ -328,6 +328,8 @@ slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG �
 | `homelab-smoke` #13 / `85ba189` | 가짜 `sk-` 키 하드코딩 | 게시 차단(`restricted`)이라 지적 수 미관측 | - | - | - | - | 1회 |
 | `homelab-smoke` #14 / `7e3c3ca` | 결함 없음, 바이너리 1개 | 0 | 1(P2 "`assets/probe.bin`이 변경 목록에 없음": 제외 파일을 모델이 모름) | 0 | 0 | 부분 검토(확인 1, 제외 1 `binary`) | 1회 |
 | `homelab-smoke` #14 / `01c3fbf`(빈 커밋, #50 뒤 재시험) | 위와 같음 | 0 | 0(제외 파일을 "바이너리라 내용이 실리지 않았다"고 인식) | 0 | 0. 확인 질문 3개(빌드 뒤 상대 경로, 공개 저장소의 바이너리 내용, 시험 공백)는 근거가 있다 | 부분 검토(확인 1, 제외 1 `binary`) | 1회 |
+| `homelab-smoke` #12 / `aa11c60`(빈 커밋, B4 비상 중지 재개 뒤) | `4531dfc`(base 옛 main) 행과 같은 내용 | 3(같은 세 가지, 순서·표현만 다름) | 0 | - | 0 | 없음(파일 3개) | 1회 |
+| `homelab-smoke` #16 / `c637d98`(Renovate) | 결함 없음(bun 1.4.3 → 1.4.4, 파일 4개), 본문에 상류 릴리스 노트 | 0 | 0 | 0 | 0 | 없음(파일 4개) | 1회 |
 
 **반례·복구 시험 A 묶음** (2026-11-04 19:22~19:33, 사용자 승인, `homelab-smoke`, 모델 호출 6회) [실측]. 판정은 배달 기록(`github_deliveries`)·세대·게시 행 상태와 GitHub 리뷰 수로 했다(본문 내용은 위 품질 표).
 
@@ -341,8 +343,23 @@ slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG �
 | A6 공개 범위 | 가짜 `sk-` 키를 박은 #13 | 결과 `restricted`, 게시 행 없음, GitHub 리뷰 0, Discord `review-restricted` 안내 `sent` | pass |
 | A7 partial | 바이너리 1개를 더한 #14 | 결과 `partial`, 본문 "부분 검토. 확인 파일 1개, 제외 1개", 미검토 `assets/probe.bin: binary` | pass(동작). 오탐 1은 #50으로 고쳐 재시험(20:21)에서 사라짐 |
 
-- 정리: #11·#13·#14는 닫았다(`superseded:pr_closed`, 모델 호출 없음). #12는 B 묶음용으로 열어 두었다.
+- 정리: #11·#13·#14는 닫았다(`superseded:pr_closed`, 모델 호출 없음). #12는 B 묶음에서 썼다.
 - 같은 시간대에 GitHub 쓰기 API가 502·500을 자주 냈다. push·PR 생성은 실패 응답 뒤에도 실제로 처리된 경우가 있어, 매번 상태를 확인한 뒤 다시 시도했다. 봇 쪽 수신·게시는 영향이 없었다.
+
+**반례·복구 시험 B 묶음** (2026-11-04 20:57~21:27, 사용자 승인, 모델 호출 2회) [실측]. 사람 몫(Renovate 설치, GitHub 재인증)은 사용자가 했고, 브라우저·Discord 조작은 맥 Codex(computer use)가 했다.
+
+| 사례 | 조작 | 관측 | 판정 |
+|---|---|---|---|
+| B1 허용 봇 작성자 | Mend Renovate 설치 범위에 `homelab-smoke` 추가 → Renovate가 #16(bun 1.4.4, 파일 4개) 생성 | 작성자 `renovate[bot]`(type `Bot`, association `NONE`)이 허용 봇 목록으로 통과 → `opened` `queued` → 게시(검토 완료 4파일, 지적 0) → Discord 요약 `sent`. 본문(릴리스 노트) 5,452자는 상한 8,000자 안. `review_requested`는 `ignored` | pass |
+| B2 fork | owner 개인 계정 fork에서 PR #15 → owner가 `/homelab-review` 댓글 | 둘 다 `denied:fork`(작성자 association `MEMBER`여도), job 없음 | pass |
+| B2 허용 밖 사람 작성자·댓글 | 조직 밖 두 번째 계정이 없어 하지 않음 | - | not_run(로컬 pass: `author_denied`·`comment_author_denied`) |
+| B3 webhook 재전송(EVENT-01) | GitHub App 설정에서 #14 `synchronize` 배달을 Redeliver(응답 200) | 배달 기록·세대·job·GitHub 리뷰 수 변화 없음(`duplicate_delivery`는 행을 남기지 않음) | pass |
+| B4 제어 명령·비상 중지 | 알림 채널에서 `/review-status` → `/emergency-stop` → #12 새 커밋 → `/review-status` → `/resume-model emergency-stop` | 상태 "리뷰 작업: 없음" → "새 모델 호출 차단, 실행 중 작업 취소 요청", `scheduler_emergency` true → 새 리뷰 job 70초 넘게 `queued`(모델 미호출, 그사이 게시 서버 배포 재시작에도 중지 유지) → 상태 "리뷰 작업 1건 queued" → 재개 뒤 리뷰 게시 | pass. 상태 조회 1회에 상호작용 응답 확인 실패 안내(`ack-notice`)가 정상 답 뒤에 겹쳐 옴(설계된 안내, 원인 로그 없음) |
+| B4 실행 중 비상 중지 | 하지 않음(실행이 수십 초라 Discord 조작으로 시점을 맞추기 어려움) | - | not_run(로컬 pass: "D-14 비상 중지는 실행 중 리뷰를 취소 요청하고 끝난 결과를 게시하지 않는다") |
+| Bot 댓글 무시(REVIEW-05) | 실례 없음(시험 저장소에 Codex 자동 리뷰 끔, Renovate 댓글 없음) | 오늘 `bot_comment` 배달 0건 | not_run(로컬 pass) |
+| B5 한도·인증 대기, 게시 응답 유실 대조(EVENT-02) | 운영에서 안전하게 만들 수 없어 하지 않음(사용자 결정 "추천대로") | - | not_run(로컬·mock pass). 해소 티켓 T21 |
+
+- 시험 PR #16은 병합하지 않는다(D-18 자동 병합 끔). 개인 fork 삭제는 사람 몫이다.
 
 **판정 변화.** 위 2026-10-29 표는 옛 기록이라 그대로 둔다. 이번에 pass로 바뀐 칸은 없다. `blocked` 칸의 사유가 다음처럼 바뀌었다.
 
