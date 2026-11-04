@@ -1042,3 +1042,97 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 한 번의 만료 처리(`expire()`)는 기준 시각 하나로 **후보 job ID를 먼저 정하고**, 그 대화 행을 id 순으로 `FOR KEY SHARE` 잠근 뒤 `id=ANY(후보)`에 한해 만료 조건을 다시 확인해 바꾼다. 선잠금 뒤 새로 만료된 job은 다음 바퀴가 처리한다(선잠금과 UPDATE의 시각이 달라 잠그지 않은 대화의 job이 끼어들던 문제, 독립 리뷰 지적).
 
 상태 안내를 outbox에 넣으면 외래 키로 대화 행 KEY SHARE를 잡는다. job·scheduler 행을 쥔 뒤 대화 행을 기다리면 제어 경로(대화 행 FOR UPDATE → scheduler → job)와 교착한다(실제 PostgreSQL에서 3건 모두 lock timeout으로 재현). 그래서 상태를 바꾸기 전에 대화 행을 `FOR KEY SHARE`로 먼저 잡는다: `transition(unknown)`, `waitForUser`(scheduler보다 먼저), `expire`(대상 대화를 id 순서로), `resolveUnknown`, 기존 `fail()`. `fail()`은 원래 job → outbox 순서였는데 종료 경로가 이 경로를 더 자주 타게 돼 함께 고쳤다.
+
+## 14. 운영 세부(README에서 옮김)
+
+README에 있던 운영 세부 중 §1~13과 다른 `docs/ai-bot/` 문서에 없던 내용을 문장 그대로 옮겼다. 옮기면서 사실을 고치지 않았다. 앞 절이나 지금 코드와 다르면 앞 절과 코드가 기준이다.
+
+### 시험 환경
+
+시험은 외부 Discord·GitHub·플랫폼·모델에 연결하지 않는다. PostgreSQL 엔진인 PGlite와 임시 디스크 DB, loopback HTTP 서버, 주입한 Gateway/REST·관측·모델 모의를 쓴다.
+시험 데이터는 합성 값이다. 임시 파일은 무시되는 `.local/` 안에서 만들고 지운다.
+패키지 설치 외 네트워크는 필요하지 않다.
+
+### 게시 서버 실행
+
+```sh
+npm run build
+node dist/src/migrate-main.js   # DATABASE_URL만 필요. 적용된 버전은 건너뛴다
+node dist/src/main.js           # 게시 서버. 8080(/readyz·/metrics·/github), 8081(/alerts)
+```
+
+- 비밀 env(Infisical `/apps/homelab-bot/`): `DATABASE_URL`(차트가 넣음), `DISCORD_BOT_TOKEN`, `RUNTIME_POLICIES`, `GRAFANA_READER_TOKEN`, `HEALTHCHECKS_PING_URL`, `WORKER_CONTROL_PRIVATE_KEY`(Ed25519 PKCS8 PEM), `GITHUB_REVIEW_WEBHOOK_SECRET`(16자 이상).
+- 주소 env(차트 values, 기본값 없음): `WORKER_URL`(http, 경로 `/`), `GRAFANA_URL`, `KUBERNETES_API_URL`(https). 차트가 넣는 `PORT`가 있으면 8080이어야 한다.
+- 로컬에서 실제 Discord·플랫폼에 붙이지 않는다. 진입점 시험은 `test/publisher-*.test.ts`(가짜 Gateway·REST·HTTP)다.
+
+### 작업자 실행
+
+```sh
+npm run build
+# Claude 프로필(claude-subscription)
+WORKER_EXECUTOR=claude WORKER_MODEL=claude-opus-5-5 \
+WORKER_CREDENTIAL_DIR=/run/worker-credential WORKER_CREDENTIAL_KEY=CLAUDE_CODE_OAUTH_TOKEN \
+WORKER_NONCE_DIR=/worker-state/.homelab-worker/nonces \
+WORKER_CONTROL_PUBLIC_KEY="$(cat worker-control.pub.pem)" \
+node dist/src/worker-main.js
+
+# Codex 프로필(codex-subscription): 실행기·자격 키·모델과 CODEX_HOME만 다르다
+WORKER_EXECUTOR=codex WORKER_MODEL=cli-default WORKER_CREDENTIAL_KEY=CODEX_AUTH_JSON CODEX_HOME=/codex-home ...
+```
+
+로컬에서 돌려 볼 때도 빈 임시 디렉터리와 봇 전용 자격만 쓴다.
+
+### 이미지 빌드
+
+이미지는 `docker build --target test .`(시험 단계)와 `docker build .`(최종)로 만든다. CI는 homelab `app-build`가 같은 두 빌드를 돈다.
+
+### 버전 고정
+
+직접 의존성과 개발 도구는 `package.json`, 전이 의존성은 `package-lock.json`에 정확히 고정했다.
+설치 시 npm registry의 stable version을 확인했다.
+
+- Node **24.22.0**: 최신 major보다 낮게 고정. DISCOVERY에서 정한 Node 24 대안과 현재 로컬 검증 환경을 유지한다. Bun의 재연결 위험을 FOUNDATION 로직과 분리하려는 선택이다. 런타임 major 변경은 T16b 연동 검증 뒤 한다.
+- npm **11.19.1**: 현재 Node 24 환경의 설치 도구를 고정했다. 최신 npm 12로 바꾸는 것은 런타임 major와 함께 검증한다.
+- TypeScript **7.0.2**, pg **8.23.1**, zod **4.6.7**, PGlite **0.5.10**, @types/node **24.19.2**, @types/pg **8.23.1**, @openai/codex **0.163.0**, @anthropic-ai/claude-code **2.1.308**(npm `stable` 태그, 2026-10-30 조회), undici **7.30.1**. Node 타입은 최신 24.x로 런타임 범위에 맞춘다. undici는 최신 7.x로 Node 24 내장 fetch와 호환한다. 8.x Agent는 내장 fetch와 `invalid onRequestStart method` 오류가 발생해 제외했다.
+
+### 연결 지점
+
+| 모듈 | 책임 |
+|---|---|
+| `src/database.ts`, `src/store.ts`, `migrations/001_foundation.sql` | PostgreSQL 트랜잭션, inbox·jobs·outbox·대화·예약 기반, lease·fencing·재시작 |
+| `src/policy.ts` | env `RUNTIME_POLICIES`를 기동 때 한 번 읽기(D1), owner·scope 검사, 영속 즉시 거부 목록 |
+| `src/discord.ts`, `src/discord-protocol.ts` | Gateway payload 정규화, 명령·버튼, 1440분 공개 스레드, ACK·REST·대조 |
+| `src/read.ts` | 등록 서비스와 승인 템플릿, namespace·시간·행·바이트 제한, 현재 근거와 미확인 구분 |
+| `src/worker.ts`, `src/worker-http.ts`, `src/runtime.ts` | 서명 capability, 포트 8080 HTTP 계약, 두 레인 합산 직렬 1, 취소·한도·unknown |
+| `src/alerts.ts`, `src/health.ts`, `src/http.ts` | Alertmanager 사건 요약, 8080/8081 수신기, readiness·Gateway 지표·조건부 하트비트 |
+| `src/main.ts`, `src/config.ts`, `src/log.ts` | 게시 서버 진입점(T16b): env 설정, pg Pool, 수신기·루프·Gateway 조립, SIGTERM 정리 |
+| `src/migrate-main.ts` | 마이그레이션 진입점(차트 `migration.command`), advisory lock |
+| `src/gateway.ts`, `src/commands.ts` | Gateway 세션(IDENTIFY·heartbeat·RESUME·재연결·예산), FOUNDATION slash 명령 등록 |
+| `src/read-transports.ts`, `src/catalog.ts` | Grafana·Kubernetes API(Argo CD Application CR 포함) 읽기 transport와 응답 투영, 서비스·질의 템플릿 |
+
+외부 SDK와 인증은 주입 경계다. `DiscordProtocol.gateway()`에 인증된 Gateway frame을 전달하고, REST는 `discordHttpApi(token, fetch)`를 주입한다. 직접 호출하지 않는 한 네트워크를 열지 않는다. `receivers()`·`workerServer()`도 반환만 하며 호출자가 명시적으로 listen해야 한다.
+
+### 마이그레이션 실행
+
+`Postgres`에는 전용 DB/역할의 `pg.Pool`을 주입한다. `migrate()`는 `schema_migrations`에 기록된 버전을 건너뛴다(T16b).
+운영 마이그레이션은 Sync hook Job이 `node dist/src/migrate-main.js`로 매 sync마다 실행한다.
+후속 티켓도 기존 파일을 변경하지 않고 expand/contract 후속 파일을 추가한다.
+
+### 사용 계약 보충
+
+`/read text:<template-id> target:<service-id>`는 최근 min(60초, 템플릿 상한)의 승인 템플릿을 실행한다.
+
+`/stop`, `/resume`, `/list`, `/cancel target:<job-id>`, `/retry target:<job-id>`, `/emergency-stop`, `/model-status`, `/resume-model target:<job-id|emergency-stop>`, `/revoke target:<actor-id>`는 모델을 거치지 않는다.
+버튼의 custom ID는 `list`, `stop`, `resume`, `cancel:<job-id>`만 허용한다.
+
+`queued/running/waiting_user/verifying/succeeded/failed/cancel_requested/cancelled/unknown/superseded`를 구분한다.
+
+Grafana/K8s/Argo CD의 실제 응답을 `ReadTransport`의 제한된 observation 형식으로 투영하는 연결은 T16b에서 실측하며, Secret·ConfigMap·환경변수 원문을 observation에 넣지 않는다.
+로그 원문은 내부 result에만 남고 공개 스레드에는 결정적인 상태 요약만 보낸다.
+
+비전역 429는 채널 전체를 최소 1초 또는 retry_after 중 긴 시간 동안 영속 중지한다.
+
+### 작업자 nonce 저장소 요구
+
+작업자 검증기는 `consume(nonce)`에 **원자적·영속적인 일회 사용 기록**을 요구한다.
+시험의 메모리 Set은 재시작 보안을 증명하지 않는다.
