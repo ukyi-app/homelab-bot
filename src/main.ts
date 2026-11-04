@@ -7,7 +7,7 @@ import { BriefingScheduler } from './briefing.js';
 import type { ObservationSource } from './briefing.js';
 import { briefingSources } from './briefing-observations.js';
 import { ARGOCD_APPLICATIONS, GRAFANA_DATASOURCES, SERVICES, TEMPLATES } from './catalog.js';
-import { FOUNDATION_COMMANDS, MEMORY_COMMANDS, commandDefinitions, registerCommands } from './commands.js';
+import { FOUNDATION_COMMANDS, MEMORY_COMMANDS, REVIEW_COMMANDS, commandDefinitions, registerCommands } from './commands.js';
 import { ConfigError, databasePoolConfig, loadPublisherConfig } from './config.js';
 import type { PublisherConfig } from './config.js';
 import { z } from 'zod';
@@ -37,8 +37,12 @@ import type { Log } from './log.js';
 import { PolicyGate } from './policy.js';
 import { ReadAdapter } from './read.js';
 import { SERVICE_ACCOUNT, grafanaTransport, kubernetesTransport, routedTransport } from './read-transports.js';
-import { GitHubIngress, ReviewDisabled, ReviewPolicySource, ReviewQueue, githubWebhook } from './review.js';
-import type { GitHubReader, ReviewContext } from './review.js';
+import { githubReviewIO, policyRepositories } from './github-review-io.js';
+import type { GitHubAppCredentials } from './github-app.js';
+import { GitHubIngress, RestrictedGitHub, ReviewDisabled, ReviewPolicySchema, ReviewPolicySource, ReviewPublisher, ReviewQueue,
+  ReviewReconciler, ReviewRuntime, githubWebhook } from './review.js';
+import type { GitHubReader, ReviewContext, ReviewPolicy } from './review.js';
+import { HttpReviewWorker } from './review-http.js';
 import { RecoveryScheduler } from './recovery.js';
 import { Runtime } from './runtime.js';
 import { Store } from './store.js';
@@ -46,17 +50,44 @@ import { WorkerSigner } from './worker.js';
 import { HttpWorker } from './worker-http.js';
 
 // 게시 서버 진입점(T16b S3). 이미지 기본 CMD는 node dist/src/main.js다. 마이그레이션은 src/migrate-main.ts(차트 migration.command).
-// T17(리뷰 큐·게시)·T18(TaskLane)은 연결하지 않는다. /github은 리뷰 비활성으로만 받는다(D6).
+// T18(TaskLane)은 연결하지 않는다. T17 리뷰는 네 조건이 모두 맞을 때만 열고, 아니면 /github을 리뷰 비활성으로만 받는다(D6).
 // T20 기억·브리핑은 MEMORY_LEDGER_DIR이 있을 때만 만들고 기동 장벽·주기 루프까지 잇는다. 기억 명령(memory-*)도 그때만 등록·수신한다.
 
-// 리뷰 정책이 정책 JSON에 있어도 T16b에서는 리뷰 경로를 열지 않는다. 기본 정책을 못 읽으면 503(PolicyUnavailable)이다.
-class ReviewOff extends ReviewPolicySource {
-  constructor(private readonly base: PolicyGate) { super(base); }
-  override async current(): Promise<ReviewContext> { await this.base.current(); throw new ReviewDisabled(); }
+// 닫혀 있으면 정책 JSON에 리뷰 절이 있어도 리뷰 경로를 열지 않는다. 기본 정책을 못 읽으면 503(PolicyUnavailable)이다.
+class GatedReviewPolicy extends ReviewPolicySource {
+  constructor(private readonly base: PolicyGate, private readonly opened: () => boolean) { super(base); }
+  override async current(): Promise<ReviewContext> {
+    if (this.opened()) return super.current();
+    await this.base.current();
+    throw new ReviewDisabled();
+  }
+}
+// 기동 때 정해지는 세 조건: (a) 스위치 (b) App 자격 (c) 유효한 review 절(comparison null 아님). 정책 변경은 재시작으로만 반영된다.
+// publish:null은 닫는 조건이 아니다. 모델은 부르고 게시만 막힌다(publish_limits_unset). 준비 단계는 스위치로 닫는다.
+export type ReviewPrecondition = { open: true; app: GitHubAppCredentials; review: ReviewPolicy }
+  | { open: false; reason: 'switch_off' | 'app_missing' | 'policy_invalid' };
+export function reviewPrecondition(config: Pick<PublisherConfig, 'reviewEnabled' | 'githubReviewApp' | 'policy'>): ReviewPrecondition {
+  if (!config.reviewEnabled) return { open: false, reason: 'switch_off' };
+  if (!config.githubReviewApp) return { open: false, reason: 'app_missing' };
+  const review = ReviewPolicySchema.safeParse(config.policy.review);
+  if (!review.success || review.data.comparison === null) return { open: false, reason: 'policy_invalid' };
+  return { open: true, app: config.githubReviewApp, review: review.data };
+}
+// (d) 작업자에 리뷰 경로가 있는가. capability 없는 POST라 실행·nonce 소모가 없다. 경로가 있으면 401, 옛 이미지는 404다.
+// 옛 이미지에 리뷰를 보내면 404가 응답 불명으로 처리돼 전역 슬롯을 잡는 unknown이 되므로 먼저 확인한다.
+export async function reviewWorkerRouted(workerUrl: string, send: typeof fetch, signal: AbortSignal): Promise<boolean> {
+  try {
+    const response = await send(new URL('/v1/review', workerUrl).href, { method: 'POST', redirect: 'error',
+      signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]) });
+    await response.body?.cancel().catch(() => {});
+    return response.status === 401;
+  } catch { return false; }
 }
 const MessageChannel = z.object({ channel_id: z.string().min(1) });
 export type ManagedLedger = DeletionLedger & { status(): LedgerStatus; close(): Promise<void> };
 const T20_PERIODS = { briefingTickMs: 30_000, memoryResumeMs: 60_000, ledgerReopenMs: 60_000 };
+// 재조정 주기. PR 재조정은 열린 PR마다 compare를 한 번 부르므로 길게 두고(webhook이 주 경로), 게시 대조는 응답 유실 행만 본다.
+const REVIEW_PERIODS = { workerProbeMs: 30_000, deliveryReconcileMs: 60_000, pullRequestReconcileMs: 900_000 };
 const closedReader: GitHubReader = {
   pullRequest: async () => { throw new Error('review_disabled'); },
   openPullRequests: async () => { throw new Error('review_disabled'); },
@@ -92,6 +123,10 @@ export interface PublisherDeps {
   memoryResumeMs?: number;
   ledgerReopenMs?: number;
   t20Backoff?: (attempt: number) => number;
+  // T17 주기. 시험만 바꾼다.
+  reviewWorkerProbeMs?: number;
+  reviewDeliveryReconcileMs?: number;
+  reviewPullRequestReconcileMs?: number;
 }
 export interface Publisher {
   health: Health; gateway: GatewaySession; ports: { app: number; alerts: number };
@@ -129,9 +164,28 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   const reader = new ReadAdapter([...SERVICES], [...TEMPLATES], gate, routedTransport({ kubernetes, argocd: kubernetes,
     victoriametrics: grafana, victorialogs: grafana }), now);
   // stop 신호가 곧 runtime의 종료 신호다. 새 claim을 멈추고 실행 중 작업의 드레인·취소 확인을 바로 시작한다.
-  const runtime = new Runtime(store, gate, new HttpWorker(config.workerUrl, send), new WorkerSigner(config.workerKey, now), reader,
+  const signer = new WorkerSigner(config.workerKey, now);
+  const runtime = new Runtime(store, gate, new HttpWorker(config.workerUrl, send), signer, reader,
     undefined, { shutdown: stop.signal, drainMs: deps.drainMs });
-  const github = new GitHubIngress(config.githubWebhookSecret, store, new ReviewOff(gate), new ReviewQueue(store, closedReader), closedReader);
+  // 객체는 만들기만 한다(I/O 없음). 조건 (d)를 확인하기 전에는 reviewOpened가 false라 webhook·명령이 닫힌 그대로다.
+  const precondition = reviewPrecondition(config);
+  let reviewOpened = false;
+  const reviewPolicy = new GatedReviewPolicy(gate, () => reviewOpened);
+  const review = precondition.open ? (() => {
+    const io = githubReviewIO({ app: precondition.app, repositories: policyRepositories(reviewPolicy), send, now });
+    const queue = new ReviewQueue(store, io.reader);
+    return { queue, reader: io.reader,
+      runtime: new ReviewRuntime(store, reviewPolicy, queue, io.reader, new HttpReviewWorker(config.workerUrl, send), signer, undefined,
+        { shutdown: stop.signal, drainMs: deps.drainMs }),
+      publisher: new ReviewPublisher(store, reviewPolicy, io.reader, new RestrictedGitHub(io.transport), queue, undefined, stop.signal),
+      reconciler: new ReviewReconciler(store, reviewPolicy, queue, io.reader, stop.signal) };
+  })() : undefined;
+  // 둘 다 정책상 유효하지만 위험한 값이다. publish null은 모델만 쓰고 게시가 막히고, reviewSince 0은 열린 PR 전체가 재조정 대상이다.
+  log('review_gate', precondition.open
+    ? { state: 'waiting_worker', publishLimitsSet: precondition.review.publish !== null, reviewSinceSet: precondition.review.reviewSince > 0 }
+    : { state: 'closed', reason: precondition.reason });
+  const github = new GitHubIngress(config.githubWebhookSecret, store, reviewPolicy, review?.queue ?? new ReviewQueue(store, closedReader),
+    review?.reader ?? closedReader);
   const servers = receivers(health, new AlertIngress(store, gate), { github: githubWebhook(github) });
   // T20 객체는 만들기만 한다(I/O 없음). 원장 잠금 연결·파일은 첫 READY의 기동 장벽에서 연다.
   // 잠금은 풀과 다른 전용 연결이다. 풀은 연결을 돌려쓰거나 닫아 세션 잠금이 유지되지 않는다(ledger-lock.ts).
@@ -170,6 +224,8 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   let discord: { ingress: DiscordIngress; publisher: DiscordPublisher } | undefined;
   let protocol: DiscordProtocol | undefined;
   let runtimeStarted = false;
+  // 수신 허용 목록. 리뷰가 열리면 같은 Set에 더한다(DiscordIngress는 이 참조를 본다).
+  const acceptedCommands = new Set<string>([...FOUNDATION_COMMANDS, ...(t20 ? MEMORY_COMMANDS : [])]);
   const background = new Set<Promise<void>>();
   const track = (task: Promise<void>) => { background.add(task); void task.finally(() => background.delete(task)); };
   const typingHint = typingHints(store, gate, log, track, { shutdown: stop.signal });
@@ -272,8 +328,33 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       await openMemory().catch(error => { log('memory_open_failed', errorInfo(error)); });
     });
   };
+  // 리뷰 루프는 조건 (d)와 첫 READY 장벽을 모두 지난 뒤 시작한다. 장벽 전에 슬롯을 잡으면 복구할 대화 메시지보다 리뷰가 먼저 돈다.
+  // 게시 대조·게시, PR 재조정, claim은 함께 출발한다. 실행·게시 직전 live 재확인이 있어 셋의 선후가 안전성을 좌우하지 않는다.
+  // 리뷰 runtime은 DB를 거치지만 대화 runtime 루프가 이미 생존 근거라 하트비트에 더하지 않는다.
+  let reviewWorkerReady = false;
+  let reviewLoopsStarted = false;
+  const startReviewLoops = () => {
+    if (!review || !reviewOpened || !runtimeStarted || reviewLoopsStarted || stop.signal.aborted) return;
+    reviewLoopsStarted = true;
+    let reconciled = -Infinity;
+    loop('review_publisher', async () => {
+      if (Date.now() - reconciled >= (deps.reviewDeliveryReconcileMs ?? REVIEW_PERIODS.deliveryReconcileMs)) {
+        reconciled = Date.now();
+        await review.publisher.reconcile();
+      }
+      return review.publisher.deliver();
+    }, false);
+    every('review_reconcile', deps.reviewPullRequestReconcileMs ?? REVIEW_PERIODS.pullRequestReconcileMs, async () => {
+      const result = await review.reconciler.run();
+      if (result.admitted || result.limited) log('review_reconciled', result);
+    });
+    // 열린 뒤 작업자가 옛 이미지·재시작으로 돌아가면 새 claim만 멈춘다. webhook은 계속 받아 재시작 중 댓글 명령을 잃지 않는다.
+    loop('review_runtime', () => reviewWorkerReady ? review.runtime.tick() : Promise.resolve(false), false);
+  };
   // REST 요청 하나가 시간 초과(5초)·일시 오류로 실패할 수 있다. 다음 READY(며칠 뒤일 수도)까지 미루지 않고 몇 번 더 시도한다.
   let registering: string | undefined;
+  let registerAgain = false;
+  let knownApplication: string | undefined;
   const register = async (applicationId: string) => {
     if (registering === applicationId) return;
     registering = applicationId;
@@ -281,13 +362,28 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       for (const delay of deps.registerDelaysMs ?? [0, 5000, 30_000, 120_000, 300_000]) {
         if (delay) await pause(delay);
         if (stop.signal.aborted) return;
-        try { log('commands_registered', await registerCommands(api, applicationId, config.policy.guild, commandDefinitions(!!t20))); return; }
+        try { log('commands_registered', await registerCommands(api, applicationId, config.policy.guild, commandDefinitions(!!t20, reviewOpened))); return; }
         catch (error) {
           log('commands_register_failed', errorInfo(error));
           if (error instanceof RateLimited) await pause(error.retryAfterMs);
         }
       }
-    } finally { registering = undefined; }
+    } finally {
+      registering = undefined;
+      // 진행 중이던 등록은 열리기 전 목록을 보냈을 수 있다.
+      if (registerAgain) { registerAgain = false; track(register(applicationId)); }
+    }
+  };
+  // 한 번 열리면 이 프로세스에서는 닫지 않는다. 작업자 재시작마다 Discord 명령을 지웠다 다시 쓰면 대기 작업을 제어할 수 없다.
+  const openReview = () => {
+    reviewOpened = true;
+    for (const name of REVIEW_COMMANDS) acceptedCommands.add(name);
+    log('review_gate', { state: 'open' });
+    if (knownApplication) {
+      if (registering) registerAgain = true;
+      else track(register(knownApplication));
+    }
+    startReviewLoops();
   };
   const gateway = new GatewaySession({
     token: config.discordToken,
@@ -317,8 +413,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
         protocol = new DiscordProtocol(api, ready.userId, now);
         // 기억 명령은 원장이 켜졌을 때만 받는다. 장벽 전·기억이 닫힌 동안은 MemoryNotReady로, 종료 중이면 바로 "쓸 수 없음"으로 답한다.
         const memoryCommands = t20 && new MemoryCommands(t20.memory, () => t20.ledger.status().state, () => stop.signal.aborted, now);
-        discord = { ingress: new DiscordIngress(store, gate, protocol, true,
-          new Set<string>([...FOUNDATION_COMMANDS, ...(memoryCommands ? MEMORY_COMMANDS : [])]), log, memoryCommands || undefined),
+        discord = { ingress: new DiscordIngress(store, gate, protocol, true, acceptedCommands, log, memoryCommands || undefined),
           publisher: new DiscordPublisher(store, gate, protocol) };
         const publisher = discord.publisher;
         const publish = () => {
@@ -347,21 +442,29 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
         runtimeStarted = true;
         loop('runtime', () => runtime.tick());
         loop('read', () => runtime.tickRead());
+        startReviewLoops();
       }
       // 명령 등록과 history 대조 자체는 이벤트 처리 순서 밖에서 돈다(대조가 30초까지 걸려도 상호작용 ACK가 밀리지 않게).
+      knownApplication = ready.applicationId;
       track(register(ready.applicationId));
     },
   });
   health.watchGateway(() => gateway.state);
   const heartbeat = setInterval(() => { health.heartbeat().catch(error => log('heartbeat_failed', errorInfo(error))); },
     deps.heartbeatEveryMs ?? 10_000);
+  // Discord를 기다리지 않는다. Discord 장애 중에도 webhook의 댓글 명령은 받아 대기열에 둘 수 있어야 한다(claim만 장벽 뒤).
+  if (review) every('review_worker_probe', deps.reviewWorkerProbeMs ?? REVIEW_PERIODS.workerProbeMs, async () => {
+    reviewWorkerReady = await reviewWorkerRouted(config.workerUrl, send, stop.signal);
+    if (reviewWorkerReady && !reviewOpened && !stop.signal.aborted) openReview();
+  });
   gateway.start();
   log('publisher_started', { ports, policyRevision: config.policy.revision, services: SERVICES.length });
 
   let stopped: Promise<void> | undefined;
   return { health, gateway, ports, stop: () => stopped ??= (async () => {
     // 전체 종료 기한 하나(기본 20초, kubelet 유예 30초 안). 단계별 대기를 차례로 더하지 않고 남은 시간을 나눈다.
-    // 최악: Gateway 정리(≤4초)·수신 서버(≤5초)는 runtime의 드레인(10초)+cancel(5초)과 동시에 돌아 기한 안에 끝난다.
+    // 최악: Gateway 정리(≤4초)·수신 서버(≤5초)는 runtime의 드레인(10초)+cancel(대화 5초·리뷰 10초)과 동시에 돌아 기한 안에 끝난다.
+    // 전역 슬롯이 하나라 대화와 리뷰가 함께 드레인하지 않는다.
     const deadline = Date.now() + (deps.stopTimeoutMs ?? 20_000);
     const left = () => Math.max(0, deadline - Date.now());
     stop.abort();

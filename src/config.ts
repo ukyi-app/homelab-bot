@@ -33,6 +33,8 @@ export interface PublisherConfig {
   briefing?: { time: string; timezone: string } | null;
   // null이면 리뷰 App 입력이 없다. 있어도 정책과 조립(main.ts)이 켜기 전에는 GitHub을 부르지 않는다.
   githubReviewApp?: { appId: string; privateKey: KeyObject } | null;
+  // T17 리뷰 명시 스위치. 켜져도 정책·작업자 조건이 맞아야 열린다(main.ts reviewPrecondition).
+  reviewEnabled?: boolean;
 }
 type Env = Readonly<Record<string, string | undefined>>;
 const token = (value: string) => value.length > 0 && !/\s/.test(value);
@@ -80,10 +82,22 @@ export function loadPublisherConfig(env: Env, loadedAt: number): PublisherConfig
   const kubernetesUrl = read('KUBERNETES_API_URL', value => url(value, ['https:'], true));
   const { memory, briefing } = memoryConfig(env, problems);
   const githubReviewApp = reviewAppConfig(env, problems);
+  const reviewEnabled = reviewSwitch(env, problems);
   if (problems.length || !policy || !workerKey) throw new ConfigError(problems.length ? problems : ['unknown']);
   return { databaseUrl, discordToken, policy, grafana: { url: grafanaUrl, token: grafanaToken },
     kubernetes: { url: kubernetesUrl }, workerUrl, healthchecksUrl,
-    workerKey, githubWebhookSecret, memory, briefing, githubReviewApp };
+    workerKey, githubWebhookSecret, memory, briefing, githubReviewApp, reviewEnabled };
+}
+// 없으면 꺼짐. 오타가 조용히 꺼짐이나 켜짐이 되지 않게 true·false만 받는다.
+function reviewSwitch(env: Env, problems: string[]): boolean {
+  const raw = env.REVIEW_ENABLED;
+  if (raw === undefined) return false;
+  if (raw !== 'true' && raw !== 'false') { problems.push('REVIEW_ENABLED(invalid)'); return false; }
+  // 자격이 하나만 있거나 틀린 경우는 reviewAppConfig가 이미 오류로 냈다. 둘 다 없는 켜짐만 여기서 막는다.
+  if (raw === 'true' && env.GITHUB_REVIEW_APP_ID === undefined && env.GITHUB_REVIEW_APP_PRIVATE_KEY === undefined) {
+    problems.push(`REVIEW_ENABLED(requires ${REVIEW_APP_KEYS.join(', ')})`);
+  }
+  return raw === 'true';
 }
 // GitHub이 내려주는 키는 RSA 2048이다. 짧은 키나 다른 종류는 잘못 넣은 값으로 본다.
 function reviewAppConfig(env: Env, problems: string[]): NonNullable<PublisherConfig['githubReviewApp']> | null {
