@@ -238,9 +238,84 @@ slash 명령 등록, 실제 한도 창/인증 복구·worker 종료 증거, PG �
 
 ### T17 남은 것
 
-- (r2에서 해소) 리뷰 작업의 `waiting_user` 해제: `Store.control`에 리뷰 전용 명령(`review-status`·`review-resume`·`review-cancel`)과 별도 권한 검사(현재 정책 owner가 알림 채널에서 보낸 명령)를 추가했다. 실제 Discord 슬래시 명령 등록과 실연동 확인은 T16b다.
-- 실제 GitHub 리뷰 App 경로(설치 토큰 발급, REST 어댑터, `pull_request`·`issue_comment` 수신 연결)와 실제 작업자 프로세스(codeload 받기, 모델 실행)는 아직 없다. 리뷰 레인 작업자 HTTP(`src/review-http.ts`)는 loopback 시험까지다. 게시 서버 HTTP의 webhook 경로 연결은 `src/http.ts`(T16a 소유) 변경이라 하지 않았다.
+- (r2에서 해소) 리뷰 작업의 `waiting_user` 해제: `Store.control`에 리뷰 전용 명령(`review-status`·`review-resume`·`review-cancel`)과 별도 권한 검사(현재 정책 owner가 알림 채널에서 보낸 명령)를 추가했다. 명령 등록은 리뷰가 열려 있을 때만 한다(2026-11-04 해소, #41). 실연동 확인은 아직이다.
+- (2026-11-04 해소, #38·#41) 실제 GitHub 리뷰 App 경로: 설치 토큰 발급과 REST 어댑터(#38), 게시 서버 조립과 `pull_request`·`issue_comment` 수신 연결(#41). 실제 GitHub 이벤트 수신은 ping·installation 배달까지만 봤다(아래 "T17 실가동 구현").
+- (2026-11-04 해소, #40·#42·#43·#44) 실제 작업자 프로세스: 리뷰 레인(#40), 작업자 서버 통합(#42), codeload 다운로더(#43·#44). 구현은 끝났다. 실제 codeload 받기는 아래 "배포 경계 확인"에서 확인했고, 실제 모델 호출은 0회다.
 - HANDOFF는 private 운영 저장소 몫이다(D-13). 이번 반환 보고가 그 원문이다.
+- 리뷰 켜기: 사용자 승인 대기다. 지금은 `REVIEW_ENABLED`가 없어 꺼져 있다.
+- `RUNTIME_POLICIES` review 절: 아직 기록하지 않았다. 값의 출처는 DECISIONS "T17 결정"이다. 절이 없거나 `comparison`이 `null`이면 스위치를 켜도 리뷰는 닫힌다. `reviewSince`는 활성화 시각의 epoch ms를 넣는다(0이면 열린 PR 전체가 들어온다, PR #41 본문).
+- 실제 모델 품질 평가(REVIEW-01): 하지 않았다.
+- 반례·복구 시험(실연동): 하지 않았다.
+- 실제 Claude CLI init의 `skills`·`plugins` 빈 배열 확인: 첫 호출 전에는 할 수 없다. 지금 전제는 2.1.308 정적 읽기다. 틀리면 모든 리뷰가 안전 쪽(`policy_violation`)으로 막힌다(PR #40 본문).
+- `homelab-smoke`의 Codex 자동 리뷰 끄기(DECISIONS "T17 결정"의 사람 작업): 사람이 껐다(2026-11-04, homelab `approvals.md` 15:08 행). API로는 확인할 수 없어 첫 시험 PR에서 자동 리뷰가 달리지 않는지 본다.
+- PR 본문이 활성화 전 확인으로 넘긴 것:
+  - (2026-11-04 해소, 아래 "배포 경계 확인") 실제 codeload·Envoy 경유(CONNECT·SNI)와 `content-encoding`. 응답에 `content-encoding`이 없어(identity) 받기가 된다(#43의 전제).
+  - 압축본 하나당 deadline 300초라 둘이면 최대 약 10분이다. 리뷰 job 시간 상한은 30분(`DEFAULTS.taskTimeoutMs`)이고, 압축본에 쓴 시간만큼 모델 몫이 준다(`src/review-input.ts`). 실측은 8,144바이트 270ms라 지금은 문제가 아니다. 큰 저장소를 넣기 전에 `deadlineMs`를 다시 본다(#43).
+  - 압축본 실패의 `kind`(transient·permanent)는 재시도에 쓰이지 않는다. 어느 쪽이든 job은 `failed` + 사유로 끝난다(`src/review-input.ts`). codeload 403은 `archive_http_rejected`(permanent)다. 속도 제한이 실제로 403인지는 [미확인]이다(#43).
+  - 리뷰 메모리 피크: diff 구간 846MiB만 쟀다. 모델 호출 중 합산과 압축본당 일시 약 2배는 재지 않았다(#39·#43). 게시 서버 256Mi에서 큰 tree도 재지 않았다(#38).
+  - 파드에서 잡지 않은 job의 cancel이 실제로 `stopped:true`인지(#42). 실제 GitHub 응답 모양(권한 필드 등)과 정책 저장소 이름 표기(#38). `admit`·`finish` 잠금 순서의 실제 PG 동시 시험(#39, 소켓 없어 skip).
+
+### T17 실가동 구현 (2026-11-04, 로컬·mock·배포)
+
+구현과 시험은 로컬·mock이고, 코드는 운영에 배포됐지만 리뷰 스위치는 꺼져 있다. **실제 모델 호출 0회, 리뷰 게시 0건**이라 실연동 판정이 아니다.
+
+병합 순서대로 적는다. 시험 수치는 Node 24.22.0의 `npm test`이고, 29 skip은 PG 소켓이 필요한 시험이다. 모든 PR의 CI `build / test`가 통과했다(`gh pr view`의 `statusCheckRollup`).
+
+| PR | 병합 커밋 | 한 일 | 시험 | Codex 리뷰 |
+|---|---|---|---|---|
+| #39 | `08cdaa2` | 이월 결함 4건: 같은 세대 댓글의 `trigger` 승격, 게시 직전 최신 정책 재검사, unknown 대조 커서 순환, diff 메모리 상한 | 868 pass / 0 fail / 29 skip. 새 시험 37건 중 32건은 수정 전 실패. 스키마 상한 입력의 최고 RSS 약 1032MiB → 846MiB | 지적 없음 |
+| #38 | `d226b22` | 리뷰 App 인증(`src/github-app.ts`), GitHub 조회·COMMENT 게시 전송(`src/github-review-io.ts`). 연결 전 | PR 본문(병합 전 실행) 856 pass / 0 fail / 29 skip, 새 시험 24개. main 합친 트리 923 / 0 fail(호출자 기록) | P2 2건 수정 뒤 재리뷰 지적 없음: 이름 변경 O(n²)(`55a5a16`), 게시 직전 정책 조회 실패 분류(`b8c91fa`) |
+| #40 | `e70cfed` | 공통 실행 제어 분리(`src/run-control.ts`), Claude 리뷰 레인(`src/review-lane.ts`), 무도구 경계 시험. 연결 전 | 3회 매번 918 pass / 0 fail / 29 skip. `test/review-lane.test.ts` 24건(무도구 경계 14건) | 지적 없음 |
+| #41 | `961083d` | 게시 서버 `REVIEW_ENABLED` 스위치(기본 꺼짐), 조립, 운영 루프, 제어 명령 | 2회 매번 939 pass / 0 fail / 29 skip. 새 시험 21건 | 지적 없음 |
+| #43 | `02e18ec` | 압축본 다운로더 `ArchiveFetcher`(`src/archive-fetcher.ts`). 연결 전 | 966 pass / 0 fail / 29 skip. `test/archive-fetcher.test.ts` 27개 | 지적 없음 |
+| #42 | `df50e1b` | 작업자 서버 통합, 공통 실행 자리 `ExecutionSlot`, 리뷰 `unknown` 해제 | PR 본문(#43 전 기준) 2회 매번 965 pass / 0 fail / 29 skip, 새 시험 26개. main 합친 트리 1004 / 0 fail(호출자 기록) | P2 2건(취소 경합) 수정(`663345f`)과 저장소 경로 검사 강화 뒤 재리뷰 지적 없음 |
+| #44 | `bd0bc8f` | 작업자 진입점에 압축본 다운로더 연결, 낡은 주석 정리 | 1004 pass / 0 fail / 29 skip. 시험 파일 변경 없음 | 지적 없음 |
+
+- #38의 923은 전체 시험 수로 보인다 [해석]. #40의 918 pass에서 그 PR의 새 시험 24건을 빼면 894 pass이고, 29 skip을 더하면 923이다. 다른 행의 수치는 pass 수다.
+- #40 작업자 첫 실행에서 `SEC-02 실제 프로세스`(`test/codex-bridge.test.ts`)가 한 번 실패했다. 단독 실행과 이후 6회 전체 실행에서는 재현되지 않아 부하 민감 시험으로 기록했다(PR #40 본문).
+- #39 동작 변경: 게시 행의 `installation_id`가 현재 정책과 다르면 `authorization_revoked`로 막는다. App을 다시 설치하면 대기 중인 게시 행은 차단된다(PR #39 본문).
+- #42 동작 확장: 작업자가 잡고 있지 않은 job의 cancel도 표식 프로세스 소멸을 확인하면 `stopped:true`다. 대화에도 적용되고 작업자 하나가 전제다(ARCHITECTURE §13).
+
+**운영 배포 상태** (2026-11-04 16:3x 관측. 작업자 이미지 digest는 16:49에 다시 확인).
+
+- homelab #1053: 리뷰 App 자격 두 키(`GITHUB_REVIEW_APP_ID`·`GITHUB_REVIEW_APP_PRIVATE_KEY`)를 봇 values에 연결했다. `REVIEW_ENABLED`는 없다(꺼짐).
+- homelab #1055: sandbox 작업자 이미지를 봇 `bd0bc8f` 빌드로 바꿨다. SLSA provenance로 소스·빌드를 대조했다.
+- 관측(2026-11-04 16:3x): 작업자 로그 `worker_started`에 `review:"open"`, 게시 서버 로그 `review_gate closed switch_off`. 대화 레인은 새 작업자에서 정상이다(job `succeeded`). `review:"open"`은 작업자 리뷰 경로가 열렸다는 뜻이고(`src/worker-main.ts`), 리뷰는 게시 서버 스위치에서 닫혀 있다(`src/main.ts`).
+- 리뷰 App `ukyi-review`는 시험 저장소 `ukyi-app/homelab-smoke` 하나에만 설치했다. webhook 서명 검사를 통과했고, ping·installation 배달이 `review_disabled`로 기록됐다.
+
+**아직 확인하지 않은 것.**
+
+- 실제 모델 호출 0회, 실연동 리뷰 0건. 실제 PR 이벤트 처리·GitHub 조회·게시를 확인한 기록은 없다.
+- 그 밖에 남은 것은 위 "T17 남은 것"에 있다.
+
+**배포 경계 확인** (2026-11-04 16:49~16:55, 모델 미호출, 읽기만) [실측]. 운영 작업자 파드(이미지 = 봇 `bd0bc8f`) 안에서 `kubectl exec`로 node를 띄워 `/app/dist`의 `createArchiveFetcher`·`readArchive`를 직접 불렀다. 대상은 공개 시험 저장소 `homelab-smoke`의 실제 커밋이다. 값은 남기지 않고 상태·크기·분류만 적는다.
+
+| 확인 | 결과 |
+|---|---|
+| 같은 프록시 설정의 원시 요청 | 200, `content-type: application/x-gzip`, `content-encoding` 없음(identity), `content-length` 없음(chunked) |
+| `createArchiveFetcher` 실제 SHA | 성공, 8,144바이트, gzip 머리 맞음, 270ms. `readArchive`로 항목 15개, `AGENTS.md` 있음 |
+| 없는 SHA(0 40개) | `archive_not_found`(permanent), codeload 404 |
+| 상한 1,000바이트 | `archive_limit`(too_large). `content-length`가 없어 미리 막지 못하고 본문을 읽다가 끊는다 |
+| 금지 호스트 `api.github.com`·`github.com` CONNECT | 프록시 403, undici "Proxy response (403) !== 200 when HTTP Tunneling" |
+| SNI 위장(codeload로 CONNECT, SNI는 `api.github.com`) | TLS 전에 연결이 끊긴다. 프록시의 SNI 검사가 동작한다 |
+| 리뷰 App 메타데이터(`gh api apps/ukyi-review`) | 권한 pull_requests write, checks·contents·issues·metadata read. 이벤트 `pull_request`·`issue_comment`. D-16과 같다 |
+| 게시 서버 DB(`BEGIN READ ONLY`, 개수만) | review job 0, 열린 job(queued·running·waiting_user·verifying·cancel_requested·unknown) 0, `pr_reviews` 0, `review_deliveries` 0. `github_deliveries` 4건 모두 `ignored`/`review_disabled`(ping 2, installation 1, 2026-11-02 webhook 이전 때의 meta 1). migration 1~12 적용 |
+
+- 리뷰를 켜도 옛 작업이 갑자기 돌지 않는다(리뷰 job·세대·게시 행 0건).
+- 프록시 CONNECT 403이 codeload에 나면(허용 목록 회귀) 다운로더는 `archive_network`로 분류할 것이다. 코드 경로 추론이고 재현하지 않았다. codeload 밖 주소는 다운로더의 URL 검사가 프록시에 보내기 전에 막는다.
+
+**판정 변화.** 위 2026-10-29 표는 옛 기록이라 그대로 둔다. 이번에 pass로 바뀐 칸은 없다. `blocked` 칸의 사유가 다음처럼 바뀌었다.
+
+| 시험 ID | 이전 판정 | 지금 |
+|---|---|---|
+| AUTH-01 (PR 경로) | 실제 리뷰 App 설치·webhook 전달·`author_association` 실측 blocked(사람 작업) | 리뷰 App 설치와 webhook 서명 검사는 끝났다. `pull_request`·`issue_comment` 전달과 `author_association` 실측은 not_run(리뷰 꺼짐) |
+| EVENT-01·EVENT-02·EVENT-03·REVIEW-03·REVIEW-05 | 실제 GitHub 재전송·게시·조회·압축본·자기 이벤트 blocked(T16b, 리뷰 App) | T16b·리뷰 App·코드(#38·#41·#43)가 갖춰져 막는 것이 사용자 승인으로 바뀌었다. 실제 확인은 not_run |
+| REVIEW-01 | 모델 평가 blocked: D-14 차단 조건, 인증 파일 격리·SEC-02 선행 | D-14는 Claude 구독 프로필에서 해제됐고(사용자 2026-11-04), 선행 조건은 리뷰 레인에 한해 무도구 경계로 갈음했다(DECISIONS "T18 결정"). 남은 것은 사용자 승인과 S7. 평가는 not_run |
+| REVIEW-02 | 실제 이벤트 순서·compare/merge base 응답 blocked(T16b). base 이동 재리뷰는 결정 대기 | 값은 확정(`comparison: merge_base`, `rereviewOnBaseMove: false`, DECISIONS "T17 결정"). 실제 응답 확인은 not_run |
+| REVIEW-04 | 실제 리뷰 App 권한·`authorized_external` blocked(리뷰 App, 시험 PR 게시 승인) | 리뷰 App과 게시 전송(#38)은 갖췄다. 시험 PR 게시 승인 대기로 여전히 blocked |
+| SEC-01 | 실제 모델 인젝션 저항성은 증거에 넣지 않음(D-14 차단 조건) | 차단 조건은 해제됐다. 실제 모델 호출 0회라 증거는 여전히 없다 |
+| SEC-02 | 파드 격리 사례 blocked. 통과 전에는 T17이 모델을 부르지 않음 | 리뷰 레인은 무도구 경계 시험으로 갈음했고(DECISIONS "T18 결정"), 그 시험 14건은 가짜 CLI·가짜 자격으로 통과했다(#40). 실제 파드 확인은 없다. T18 작업 레인에는 원래 조건이 그대로 걸린다 |
+| DATA-01 | 세션 파일 사례 blocked(작업별 세션 저장 공간 결정 대기) | 결정 확정(DECISIONS "T18 결정" (4)). 리뷰 레인은 실행마다 빈 임시 공간을 쓰고 세션을 남기지 않는다(#40). 실제 실행 확인은 not_run. 작업 레인은 T18 |
 
 ## MEMORY_BRIEFING T20 실행 결과 (2026-10-29)
 

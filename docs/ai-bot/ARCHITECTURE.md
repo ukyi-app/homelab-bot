@@ -833,19 +833,20 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - 같은 UID의 모델 셸은 `read-only`에서도 공유 CODEX_HOME의 `auth.json`을 읽을 수 있다. D4가 받아들인 위험이다(T16b에는 비신뢰 코드 실행이 없고 대화 입력은 owner 한 명). 작업 레인을 열기 전에 T18 결정 (2)·(4)가 필요하다.
 - codex는 CODEX_HOME 아래에 보조 실행 파일(PATH alias)을 만든다 [실측: 임시 디렉터리 CODEX_HOME에서 `--version`이 "Refusing to create helper binaries under temporary dir" 경고]. 영속 공간 크기(1Gi)에 들어가는지와 `--ephemeral` 실행 뒤 CODEX_HOME에 남는 파일 이름은 S12 첫 대화 뒤 이름만 확인한다.
 - 이미지는 `node`가 PID 1이다. SIGTERM은 직접 받아 정리한다. 고아 손자 프로세스(zombie)는 거두지 않는다(tini 없음, 빌드에서 apt를 쓰지 않음). 정상 종료한 codex는 자기 자식을 거두므로 쌓이는 경우는 강제 종료 때뿐이다 [가정].
-- `SerialWorker.cancel`(T16a)은 이미 끝나 바쁘지 않은 작업의 취소에 `stopped: false`를 답한다. 게시 서버의 시간 초과와 작업자 완료가 겹치면 `unknown`이 될 수 있어 위 기한 여유를 뒀다.
+- 이미 끝나 잡고 있지 않은 대화 작업의 취소는 표식 프로세스를 정리하고 남은 프로세스 0개를 확인해야 `stopped: true`다(#42 `ExecutionSlot.cancel`, §13 "불확실한 결과와 chat unknown"). 확인하지 못하면 `stopped: false`다. 게시 서버의 시간 초과와 작업자 완료가 겹치면 `unknown`이 될 수 있어 위 기한 여유를 뒀다.
 
 ### T16b 실행기 프로필 (2026-10-30, D-14 변경)
 
 - 결정: D-14 변경(사용자 2026-10-30, [DECISIONS.md](DECISIONS.md) D-14 "변경"). Claude Code CLI, 구독 장기 토큰, 첫 모델 Opus 5.5, 실행기를 설정으로 바꾸는 구조. 설계는 T16b 조사(실행기 어댑터·Claude 인증·Claude 전환 영향, 비공개 작업 문서)의 추천안 "공통 실행 제어 + 작은 실행기 어댑터 + 프로필 선택 + 이미지 하나"를 따랐다.
-- 범위: 대화 레인만. 작업 레인(T18)·리뷰(T17)는 어떤 실행기에도 연결하지 않았다(능력표 `lanes.task=false`). 게시 서버와의 HTTP v1(요청·응답·서명·nonce)은 바꾸지 않았다. 실행기 이름·플래그·자격은 그 계약에 들어가지 않는다.
+- 범위: 처음에는 대화 레인만이었다. 리뷰(T17)는 2026-11-04에 `claude-subscription`에 연결했다(`lanes.review=true`, #40·#42·#44, 아래). `codex-subscription`의 리뷰는 닫혀 있다(`lanes.review=false`). 작업 레인(T18)은 어떤 실행기에도 연결하지 않았다(능력표 `lanes.task=false`). 게시 서버와의 HTTP v1(요청·응답·서명·nonce)은 바꾸지 않았다. 실행기 이름·플래그·자격은 그 계약에 들어가지 않는다.
+- 리뷰 레인 연결(T17, 2026-11-04): 작업자 서버 하나(8080)가 `/v1/execute`·`/v1/cancel`·`/v1/review`·`/v1/review/cancel`을 받고 서명 확인과 영속 nonce를 함께 쓴다. 리뷰 경로는 리뷰 레인이 열렸을 때만 있다. 인증 없는 요청에는 401이고(게시 서버의 준비 확인 신호), 닫히면 404다. 대화와 리뷰는 실행 제어 `RunControl` 하나와 실행 자리 `ExecutionSlot` 하나를 함께 쓴다. 그래서 실행 잠금·`unknown` 잠금·잔여물 차단·readiness·종료 drain이 두 레인에 함께 걸린다. 기동 때 `sweep()`으로 이전 프로세스가 남긴 실행 공간을 지운다. 리뷰 실행은 도구 0개, MCP·hooks·skills 없음, 실행마다 빈 임시 공간, 세션 안 남김이다(`src/review-lane.ts`). 실제 모델 호출은 아직 없다([VERIFICATION](VERIFICATION.md) "T17 실가동 구현").
 - 모델 호출·로그인 없음. Claude CLI는 고정 바이너리의 `--version`·`--help`만 실행했다. 시험의 CLI 자리는 같은 인자·stdin·env로 도는 가짜 실행 파일이다.
 
 ```text
 게시 서버 ── 서명된 HTTP v1(변경 없음) ──▶ 작업자
-  SerialWorker: 서명·nonce·직렬 1
-  ChatLane(chat-lane.ts): 공통 실행 제어
-    ├ 실행마다 빈 /tmp/homelab-chat-*/{home,config,workspace,run,tmp}, 끝나고 소멸 확인 뒤 통째 삭제
+  SerialWorker(대화)·ReviewWorker(리뷰): 서명·nonce, 실행 자리 ExecutionSlot(worker.ts) 하나로 직렬 1
+  RunControl(run-control.ts, #40에서 ChatLane에서 분리): 공통 실행 제어
+    ├ 실행마다 빈 /tmp/homelab-{chat,review}-*/{home,config,workspace,run,tmp}, 끝나고 소멸 확인 뒤 통째 삭제
     ├ 자식 env = 공통 기본(PATH·HOME·LANG·TMPDIR·작업 표식·프록시) + 어댑터가 선언한 이름만
     ├ 실행 전: 자격 유출 검사 / 실행 중: 도구 예산·정책 위반 즉시 중단 / 기한·취소·종료
     ├ ProcessGroupLauncher(process-launcher.ts): 그룹 정리·소멸 확인
@@ -860,7 +861,10 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 |---|---|
 | `src/executor.ts` | 내부 계약: `ChatAdapter`·`AdapterRun`·`ExecutorCapabilities`·`EngineOutcome` |
 | `src/executor-profiles.ts` | 프로필 표 `PROFILES`, 선택 `selectProfile`, 조립 `createExecutor`, `--version` 확인 `executorVersion` |
-| `src/chat-lane.ts` | 공통 실행 제어 `ChatLane`, 판정 `interpretChat`, 실행 전 검사 `assertLaunchSafe`, 출력 스키마 `CHAT_OUTPUT_JSON_SCHEMA` |
+| `src/run-control.ts` | 공통 실행 제어 `RunControl`, 실행 전 검사 `assertLaunchSafe`(#40에서 `chat-lane.ts`에서 옮김) |
+| `src/chat-lane.ts` | 대화 레인 `ChatLane`, 판정 `interpretChat`, 출력 스키마 `CHAT_OUTPUT_JSON_SCHEMA` |
+| `src/review-lane.ts` | 리뷰 레인 `createReviewerModel`, egress 조건 `assertEgressBound`(#40) |
+| `src/archive-fetcher.ts` | 작업자 압축본 다운로더 `createArchiveFetcher`(#43, 진입점 연결 #44) |
 | `src/executor-claude.ts` | Claude 어댑터: `claudeArgs`, `CLAUDE_FIXED_ENV`, `initViolation`, `classifyClaudeError`, `interpretClaudeStream` |
 | `src/executor-codex.ts` | Codex 어댑터(옛 `codex-chat.ts`의 실행기 부분): `chatArgs`, `interpretCodexChat` |
 | `src/credentials.ts` | 자격 방식 `StaticEnvCredential`·`FileMutableCredential` |
@@ -880,7 +884,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 | | `claude-subscription` | `codex-subscription` |
 |---|---|---|
-| 레인 | 대화만 | 대화만 |
+| 레인 | 대화·리뷰(#40) | 대화만 |
 | 구조화 출력 | `--json-schema` → 마지막 `result.structured_output` | `--output-schema` → `-o` 파일 |
 | 도구 | none: `--tools ""`, MCP 없음, 실행 중 도구 호출이 보이면 즉시 중단(예산 0) | read-only 샌드박스 + 요청 도구 예산(D4) |
 | 세션 기록 | `--no-session-persistence` + 실행 디렉터리(HOME·CLAUDE_CONFIG_DIR·TMPDIR) 통째 삭제 | `--ephemeral` + CODEX_HOME `sessions/`·`archived_sessions/` 삭제 |
@@ -918,9 +922,9 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 | `WORKER_CONTROL_PUBLIC_KEY` | 예 | Ed25519 공개 키 PEM(위 절 그대로) |
 | `CODEX_HOME` | Codex만 | 영속 공간의 Codex 홈(auth.json 갱신본). `WORKER_NONCE_DIR`과 같으면 거부 |
 | `WORKER_EXECUTOR_BIN` | 아니오 | 실행 파일 경로를 바꾼다(시험용). 기본은 프로필의 이미지 경로 |
-| `HTTPS_PROXY`, `NO_PROXY` | 아니오 | 모델 CLI 프로세스 env에만 넘긴다 |
+| `HTTPS_PROXY`, `NO_PROXY` | 아니오 | 모델 CLI 프로세스 env에 넘긴다. 없거나 잘못되면(`NO_PROXY`가 루프백 밖인 경우 포함) 리뷰 레인만 닫고 사유를 로그에 남긴다(`review_lane_closed`, #42). 압축본 다운로더는 이 env의 `HTTPS_PROXY`만 쓰고 `NO_PROXY`는 무시한다(#43·#44) |
 
-**실행 기록 정리 실패(리뷰 exec-r1 P2).** 프로세스 소멸을 확인한 실행은 어댑터 고유 잔여물(Codex `sessions/`·`archived_sessions/`)과 실행 디렉터리를 지우고, 실행 디렉터리가 정말 없어졌는지 확인한 뒤에 결과를 확정한다. 지우지 못하면(권한·파일시스템 오류) 그 실행의 답은 게시하지 않고 `failed`(`stopped: true`, 프로세스는 끝났으니 `unknown`이 아님)이며, 한도·인증·실패 결과는 그대로 둔다. 지우지 못한 실행은 잔여물로 추적한다. 잔여물이 남은 동안 새 실행은 띄우지 않고(`failed`) readiness는 503이다. readiness 확인과 새 실행 직전마다 다시 지워 보고, 모두 지워지면 자동으로 돌아온다. 소멸을 확인하지 못한 실행은 살아 있는 프로세스가 쓰는 중일 수 있어 지우지 않는다(그 실행은 `unknown`이고 SerialWorker가 막는다). 기동 로그와 같은 줄 형식으로 값 없는 사건 `{"event":"chat_cleanup_failed"}`·`{"event":"chat_cleanup_recovered"}`만 남긴다(경로·내용 없음).
+**실행 기록 정리 실패(리뷰 exec-r1 P2).** 프로세스 소멸을 확인한 실행은 어댑터 고유 잔여물(Codex `sessions/`·`archived_sessions/`)과 실행 디렉터리를 지우고, 실행 디렉터리가 정말 없어졌는지 확인한 뒤에 결과를 확정한다. 지우지 못하면(권한·파일시스템 오류) 그 실행의 답은 게시하지 않고 `failed`(`stopped: true`, 프로세스는 끝났으니 `unknown`이 아님)이며, 한도·인증·실패 결과는 그대로 둔다. 지우지 못한 실행은 잔여물로 추적한다. 잔여물이 남은 동안 새 실행은 띄우지 않고(`failed`) readiness는 503이다. readiness 확인과 새 실행 직전마다 다시 지워 보고, 모두 지워지면 자동으로 돌아온다. 소멸을 확인하지 못한 실행은 살아 있는 프로세스가 쓰는 중일 수 있어 지우지 않는다(그 실행은 `unknown`이고 `ExecutionSlot`과 `RunControl`이 막는다). 기동 로그와 같은 줄 형식으로 값 없는 사건 `{"event":"cleanup_failed"}`·`{"event":"cleanup_recovered"}`만 남긴다(경로·내용 없음). `ChatLane`을 공유 실행 제어 없이 따로 조립할 때만 옛 이름 `chat_cleanup_*`로 옮겨 낸다. 운영 진입점은 공유 실행 제어라 이 경우가 아니다.
 
 **readiness.** `GET /readyz`는 앞 실행의 기록이 모두 지워졌고 선택한 자격이 쓸 수 있는 모양으로 있으면 200이다. Claude: 토큰 파일 읽기·모양(없어지거나 틀리면 503, 돌아오면 200). Codex: 영속 공간의 일반 파일 `auth.json`. 모델을 부르지 않는다. readiness 200은 인증 서버가 토큰을 받는다는 뜻이 아니다.
 
@@ -973,11 +977,16 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 - 실행 대기가 `stopped:false`로 끝나면(불확실 응답 `worker_disconnected`, 실행 중 예외 `runtime_uncertain`, monitor abort, 시간 초과, 드레인) 인가 재검사·상태 조회 같은 DB 후처리 **전에** 그 자리에서 cancel을 보낸다. 한 실행에 cancel은 한 번이고(정상 판정·예외 처리가 같은 결과를 쓴다, 실패·오류 포함) 최종 상태는 공통 판정이다: 권한 철회면 확인 시 `cancelled`, 드레인이면 확인된 chat은 되돌리기, owner `/cancel`이면 `cancelled`, 그 밖은 확인 시 `fail(stop_confirmation)`(실패 안내 → `/retry`). 확인 실패는 모두 `unknown`. 작업자에 보내기 전 오류와 작업자가 받지 않은 요청(`WorkerRejected`)은 cancel하지 않는다.
 - **확인된 멈춤은 거짓 `unknown`이 되지 않는다.** 확인 결과를 상태 쓰기 전에 보존하고, 뒤의 기록(fail·되돌리기·취소)이 일시 오류로 실패하면 cancel을 다시 묻지 않고 lease CAS 아래 최대 3번(200ms·400ms 간격) 다시 쓴다. 끝내 못 쓰면 로그·감사 `stop_confirmed_write_failed`를 남긴다. 그 뒤 lease가 끝나면 `expire()`가 `unknown`으로 두므로, 이 감사가 실제로 멈췄다는 근거다.
-- chat `unknown`은 모델 `tick()`의 claim 직전에 주기적으로 조사한다(`Runtime.probeUnknown()`). chat unknown이 있으면 모델 claim이 어차피 막혀 있어 모델 실행을 늦추지 않는다.
+- chat·review `unknown`은 모델 `tick()`의 claim 직전에 주기적으로 조사한다(`Runtime.probeUnknown()`, review는 #42에서 넓힘). 이런 unknown이 있으면 모델 claim이 어차피 막혀 있어 모델 실행을 늦추지 않는다.
   - 예약은 `controls` 행 `unknown_probe:<job>`(`{lease,count,next}`)이고 마이그레이션은 없다. 행을 잠그고 시각이 된 것만 미뤄 돌려주므로 게시 서버 둘이 같은 job을 동시에 조사하지 않는다. backoff 즉시 → 30초 → 1분 → … → 상한 10분, 한 바퀴 3건.
-  - 저장된 job ID·lease로 새 cancel capability를 만들어 DB 트랜잭션 밖에서 보낸다. 확인되면 짧은 트랜잭션의 CAS(`type='chat' AND state='unknown' AND lease_token=<관측값>`)로 `failed`(`stop_confirmed_after_unknown`) + 감사 `unknown_stop_confirmed` + 안내. 이 쓰기가 일시 DB 오류로 실패하면 확인 결과를 유지한 채 쓰기만 재시도한다(정상 종료의 `afterStop`과 같음). 작업자는 첫 확인 뒤 job을 놓아 다음 조사의 cancel은 `stopped:false`라, 확인을 버리면 풀 수 없는 unknown이 모델 슬롯을 막는다(Codex 리뷰 지적).
-  - 경과 시간만으로 풀지 않는다. 새 모델 실행을 자동으로 시작하지 않는다. task·review는 조사하지 않는다(작업 레인 소멸 확인 한계, §12).
-- **한계:** 작업자 `SerialWorker.cancel`은 그 job·lease를 **아직 잡고 있을 때만** `stopped:true`다. 이미 끝냈거나(응답 유실 포함) 재시작한 작업자의 job은 조사로도 풀리지 않는다. 작업자가 "잡고 있지 않은 job의 cancel"을 "실행 중 아님"으로 답하게 바뀌면(작업자 Recreate·replicas 1, capability 30초 만료라 안전한 조건) 게시 서버 수정 없이 이 조사가 그대로 푼다. 실행기 전환 뒤에도 이 의미는 같다(`ChatLane.stop()`이 옛 `codex-chat.ts`와 같은 본문). 작업자 쪽 변경은 남은 후속이다.
+  - 저장된 job ID·lease로 새 cancel capability를 만들어 DB 트랜잭션 밖에서 보낸다. 확인되면 짧은 트랜잭션의 CAS(`type IN ('chat','review') AND state='unknown' AND lease_token=<관측값>`)로 `failed`(`stop_confirmed_after_unknown`) + 감사 `unknown_stop_confirmed`. chat은 Discord 안내를 더한다. review는 Discord 안내 없이 밀려나지 않은 세대의 `pr_reviews.review_outcome`을 `failed`로 둔다(리뷰 job에는 게시할 Discord 채널이 없다). 이 쓰기가 일시 DB 오류로 실패하면 확인 결과를 유지한 채 쓰기만 재시도한다(정상 종료의 `afterStop`과 같음). 작업자는 첫 확인 뒤 job을 놓아, 다음 조사의 cancel은 소멸을 다시 확인하지 못하면 `stopped:false`다. 그래서 확인을 버리면 풀리지 않는 unknown이 모델 슬롯을 막을 수 있다(Codex 리뷰 지적).
+  - 경과 시간만으로 풀지 않는다. 새 모델 실행을 자동으로 시작하지 않는다. task는 조사하지 않는다(작업 레인 소멸 확인 한계, §12). review는 도구 없는 단일 프로세스 그룹이고 작업자가 표식으로 소멸을 확인하므로 조사한다(#42). `/review-cancel`은 review `unknown`을 풀지 않고 이유만 답한다. 제어 명령은 DB 트랜잭션 안이라 작업자에게 물을 수 없고, 확인 없이 풀면 살아 있는 프로세스 옆에서 다음 작업이 돈다.
+- **작업자 답(#42, `ExecutionSlot.cancel`, `src/worker.ts`):** 대화·리뷰가 같은 실행 자리를 쓴다.
+  - 그 job·lease를 잡고 있으면 멈추고 소멸을 확인해 답한다.
+  - 리뷰 레인은 마지막으로 끝낸 job·lease의 cancel에도 `stopped:true`다.
+  - 잡고 있지 않은 job(응답 유실, 작업자 재시작·OOM 뒤)은 표식 프로세스를 정리하고 남은 프로세스 0개를 확인하면 `stopped:true`다. 그렇게 답한 job·lease의 늦은 실행 요청은 시작하지 않는다.
+  - 다른 job이 자리를 잡고 있으면 `stopped:false`다.
+- **한계:** 이 답은 작업자가 하나일 때만 믿을 수 있다(작업자 Recreate·`replicas: 1`, capability 30초 만료). 다른 파드의 실행은 볼 수 없다. 파드에서 실제로 `stopped:true`가 나오는지는 [미확인]이다. NUC에서 실제 launcher로 돌렸을 때는 같은 UID의 다른 프로세스 env를 읽지 못해 안전 쪽(`stopped:false`)으로 닫혔다(PR #42 본문). 그때는 unknown이 풀리지 않고 슬롯을 계속 막는다.
 
 ### 상태 안내 (멘션 없음)
 
