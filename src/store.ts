@@ -28,6 +28,9 @@ export const MODEL_QUEUE_LIMIT = DEFAULTS.maxQueue - READ_QUEUE_RESERVE;
 // unknown chat 조사 간격: 처음 조사 뒤 30초, 이후 두 배씩, 상한 10분.
 export const UNKNOWN_PROBE_FIRST_MS = 30_000;
 export const UNKNOWN_PROBE_MAX_MS = 600_000;
+// 작업 레인을 닫는 unknown job(별칭 j). 세션 행이 없어도 센다. 턴 시작 전에 lease가 끝난 Claude 작업이다. Codex 세션의 task는 뺀다.
+const TASK_LANE_UNKNOWN = `(j.execution_lane='task' AND j.state='unknown'
+  AND NOT EXISTS (SELECT 1 FROM codex_sessions cs WHERE cs.job_id=j.id AND cs.executor='codex'))`;
 // 작업 레인의 새 접수가 닫혀 있다. 호출자(수신 경로)가 사유를 안내한다.
 export class LaneClosed extends Error {
   constructor(public readonly reason: ExecutionLaneClosedReason) { super(`lane_closed:${reason}`); }
@@ -174,10 +177,10 @@ export class Store {
   }
   // 작업 레인의 닫힘 사유를 사실에서 다시 계산해 execution_lanes에 적고 돌려준다. 사실이 모두 DB에 있어 재시작 뒤에도 같은 값이 나온다.
   // 사유가 사라지면 새 접수가 다시 열린다. 부르는 쪽이 레인 행을 먼저 잠근다.
-  // Claude 세션만 센다. Codex 작업의 unknown은 jobs 상태만으로 슬롯을 막고 레인 접수에는 관여하지 않는다.
+  // Codex 작업의 unknown은 jobs 상태만으로 슬롯을 막고 레인 접수에는 관여하지 않는다. 작업 레인을 돌리는 경로만 부른다.
   async syncTaskLane(tx = this.db): Promise<ExecutionLaneClosedReason | null> {
     const facts = (await tx.query<{ unknown: boolean; cleanup: boolean; retained: string }>(`SELECT
-      EXISTS (SELECT 1 FROM codex_sessions s JOIN jobs j ON j.id=s.job_id WHERE s.executor='claude' AND (j.state='unknown' OR s.state='unknown')) AS unknown,
+      (EXISTS (SELECT 1 FROM codex_sessions s WHERE s.executor='claude' AND s.state='unknown') OR EXISTS (SELECT 1 FROM jobs j WHERE ${TASK_LANE_UNKNOWN})) AS unknown,
       EXISTS (SELECT 1 FROM codex_sessions WHERE executor='claude' AND cleanup_state='pending') AS cleanup,
       (SELECT count(*) FROM codex_sessions WHERE executor='claude' AND session_retained) AS retained`)).rows[0]!;
     const reason: ExecutionLaneClosedReason | null = facts.unknown ? 'unknown' : facts.cleanup ? 'cleanup_pending'
@@ -612,16 +615,28 @@ export class Store {
       const waiting = (await this.db.query(`SELECT id,wait_reason FROM jobs WHERE owner_id=$1 AND conversation_id=$2
         AND state='waiting_user' ORDER BY created_at LIMIT 5`, [actor, conversation])).rows;
       const executionPending = (await this.db.query("SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown') AND type<>'read' LIMIT 1")).rows.length > 0;
-      return { paused, emergency, waiting, executionPending, status: '한도·인증 원인을 사람이 해소한 뒤 /resume-model target:<job-id>, 포기는 /cancel target:<job-id>. 비상/이전 중지는 /resume-model target:emergency-stop으로 확인하세요.' };
+      const taskLaneClosed = (await this.db.query<{ closed_reason: ExecutionLaneClosedReason | null }>(`SELECT closed_reason FROM execution_lanes WHERE lane='task'`)).rows[0]?.closed_reason ?? null;
+      const laneNote = taskLaneClosed === 'unknown' ? '작업 레인은 unknown으로 닫혀 있습니다. 작업자 프로세스 0개를 확인한 뒤 /task-release target:<job-id>로 해제하세요. '
+        : taskLaneClosed ? `작업 레인의 새 접수가 닫혀 있습니다(${taskLaneClosed}). ` : '';
+      return { paused, emergency, waiting, executionPending, taskLaneClosed, status: `${laneNote}한도·인증 원인을 사람이 해소한 뒤 /resume-model target:<job-id>, 포기는 /cancel target:<job-id>. 비상/이전 중지는 /resume-model target:emergency-stop으로 확인하세요.` };
     }
     if (action === 'resume-model') {
       if (target === 'emergency-stop') {
-        if ((await this.db.query("SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown') AND type<>'read' LIMIT 1")).rows.length)
+        const closed = (await this.db.query<{ closed_reason: ExecutionLaneClosedReason | null }>(`SELECT closed_reason FROM execution_lanes WHERE lane='task' FOR UPDATE`)).rows[0]?.closed_reason ?? null;
+        // 작업 레인의 unknown은 그 레인이 닫혀 있다고 기록된 때만 해제를 막지 않는다. 닫힘 없이 풀면 새 작업을 받는다.
+        // 작업 루프를 켜지 않은 배치는 이 행이 닫히지 않아, 슬롯을 함께 쓰는 task unknown이 지금처럼 해제를 막는다.
+        if ((await this.db.query(`SELECT j.id FROM jobs j WHERE j.type<>'read' AND (j.state IN ('running','verifying','cancel_requested')
+          OR (j.state='unknown' AND NOT ($1::boolean AND ${TASK_LANE_UNKNOWN}))) LIMIT 1`, [closed === 'unknown'])).rows.length)
           return { ok: false, status: '실행 중이거나 종료를 확인하지 못한 작업이 있습니다. 중지 확인 전에는 재개할 수 없습니다.' };
         await this.db.query("UPDATE controls SET value='false' WHERE key='scheduler_emergency'");
         const paused = await this.releaseScheduler();
-        await this.audit('model_emergency_released', actor, { conversation, paused });
-        return { ok: true, paused, status: paused ? '비상 중지를 해제했습니다. 남은 waiting_user는 해당 대화에서 재개하거나 취소하세요.' : '비상 중지를 해제했습니다.' };
+        const unknownJobs = closed === 'unknown' ? (await this.db.query<{ id: string }>(`SELECT j.id FROM jobs j WHERE ${TASK_LANE_UNKNOWN} ORDER BY j.created_at,j.id LIMIT 5`)).rows.map(row => row.id) : [];
+        await this.audit('model_emergency_released', actor, { conversation, paused, taskLaneClosed: closed, taskUnknownJobs: unknownJobs });
+        const laneNote = closed === 'unknown'
+          ? ` 대화·리뷰는 다시 동작하지만 작업 레인은 unknown으로 닫힌 채입니다(작업 ${unknownJobs.join(', ')}). 작업자 프로세스 0개를 확인한 뒤 /task-release target:<job-id>로 해제하세요.`
+          : closed ? ` 작업 레인의 새 접수는 닫힌 채입니다(${closed}).` : '';
+        return { ok: true, paused, taskLane: { closed, unknownJobs },
+          status: `${paused ? '비상 중지를 해제했습니다. 남은 waiting_user는 해당 대화에서 재개하거나 취소하세요.' : '비상 중지를 해제했습니다.'}${laneNote}` };
       }
       const emergency = (await this.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler_emergency'")).rows[0]!.value;
       if (emergency) return { ok: false, status: '비상 또는 이전 중지가 유지되고 있습니다. /model-status로 확인하세요.' };

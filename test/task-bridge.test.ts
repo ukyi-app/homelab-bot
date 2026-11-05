@@ -10,7 +10,7 @@ import { Runtime } from '../src/runtime.js';
 import { LaneClosed, Store } from '../src/store.js';
 import { TASK_RETENTION, taskQuestionId } from '../src/task-contracts.js';
 import { event, fixture, localDatabase, thread } from './helpers.js';
-import { FakeTaskWorker, PLAN, allRows, answer, control, conversationId, hang, jobs, lane, laneRow, rejectStart, reply, task, until } from './task-lane-fixture.js';
+import { ABSENT, FakeTaskWorker, OTHER_STORAGE, PLAN, allRows, answer, control, conversationId, hang, jobs, lane, laneRow, rejectStart, reply, retainedThenStorageReplaced, task, until } from './task-lane-fixture.js';
 import type { Fixture } from './task-lane-fixture.js';
 
 // 중립 브리지와 작업 레인 스케줄링. 질문 사례는 test/codex-bridge.test.ts의 TASK-02·AUTH-02와 같은 의미를 Claude 턴으로 본다.
@@ -639,6 +639,289 @@ test('재개 전 확인: 세션 유실·저장소 변경은 새 세션으로 바
   assert.equal((await jobs(db()))[0]!.wait_reason, 'task_session_missing');
   assert.equal(local.worker.executes.length, 1);
   assert.equal((await rows('codex_questions'))[0]!.state, 'cancelled');
+});
+// ---- 저장소 identity ----
+const nextRetry = () => { f.advance(30_000); f.policy.confirmedAt = f.now(); };
+test('정리 전 PVC 교체: 다른 저장소의 absent를 몇 번 받아도 identity·보존 기록·cleanup_pending을 유지하고, 원래 저장소가 답해야 푼다', async () => {
+  const { old } = await retainedThenStorageReplaced(setup, f, db());
+  assert.equal((await session()).worker_storage, old.storage);
+  assert.equal((await session()).cleanup_state, 'pending');
+  for (let attempt = 0; attempt < 3; attempt++) {
+    nextRetry();
+    await setup.bridge.sweep();
+    const row = await session();
+    assert.equal(row.worker_storage, old.storage, `재시도 ${attempt}`);
+    assert.equal(row.worker_instance, old.instance, `재시도 ${attempt}`);
+    assert.equal(row.session_retained, true, `재시도 ${attempt}`);
+    assert.equal(row.cleanup_state, 'pending', `재시도 ${attempt}`);
+    assert.equal((await laneRow(db())).closed_reason, 'cleanup_pending', `재시도 ${attempt}`);
+  }
+  assert.equal(setup.worker.finalizes.length, 0);
+  await assert.rejects(newTask('task-2'), LaneClosed);
+  setup.worker.identity = { instance: crypto.randomUUID(), storage: old.storage };
+  nextRetry();
+  await setup.bridge.sweep();
+  assert.equal((await session()).cleanup_state, 'cleaned');
+  assert.equal((await session()).session_retained, false);
+  assert.equal((await session()).worker_instance, setup.worker.identity.instance, '같은 저장소면 파드 교체는 따라간다');
+  assert.equal((await laneRow(db())).closed_reason, null);
+});
+test('재개 전 저장소 변경으로 실패한 세션도 옛 identity를 유지해 정리를 보류한다', async () => {
+  const first = await asked();
+  await answer(setup.bridge, first.question, 'main', 'answer-1');
+  const old = setup.worker.identity;
+  setup.worker.identity = { ...old, storage: OTHER_STORAGE };
+  setup.worker.statusOverride = undefined;
+  await setup.runtime.tickTask();
+  assert.equal((await jobs(db()))[0]!.wait_reason, 'task_session_missing');
+  setup.worker.statusOverride = ABSENT;
+  for (let attempt = 0; attempt < 2; attempt++) { nextRetry(); await setup.bridge.sweep(); }
+  assert.equal((await session()).worker_storage, old.storage);
+  assert.equal((await session()).session_retained, true);
+  assert.equal((await laneRow(db())).closed_reason, 'cleanup_pending');
+});
+test('저장소를 모르는 세션은 absent 응답으로 identity를 묶지 않고, 세션이 있다고 답한 저장소에만 묶는다', async () => {
+  await newTask();
+  setup.worker.finalizeCleans = false;
+  await setup.runtime.tickTask();
+  await db().query(`UPDATE codex_sessions SET worker_instance=NULL,worker_storage=NULL,cleanup_state='pending',session_retained=true`);
+  setup.worker.statusOverride = ABSENT;
+  nextRetry();
+  await setup.bridge.sweep();
+  assert.equal((await session()).worker_storage, null, 'absent는 본 적 없다는 뜻이라 묶지 않는다');
+  assert.equal((await session()).cleanup_state, 'pending');
+  setup.worker.statusOverride = { state: 'waiting', sessionExists: true, stopped: true };
+  nextRetry();
+  await setup.bridge.sweep();
+  assert.equal((await session()).worker_storage, setup.worker.identity.storage);
+  assert.equal((await session()).cleanup_state, 'pending');
+  // 이제 다른 저장소의 absent는 증명이 아니다.
+  const held = setup.worker.identity.storage;
+  setup.worker.identity = { ...setup.worker.identity, storage: OTHER_STORAGE };
+  setup.worker.statusOverride = ABSENT;
+  nextRetry();
+  await setup.bridge.sweep();
+  assert.equal((await session()).worker_storage, held);
+  assert.equal((await session()).session_retained, true);
+});
+test('재개 턴 취소에 다른 저장소가 답하면 소멸 증명이 아니다: unknown으로 두고 identity·보존 기록을 덮어쓰지 않는다', async () => {
+  const first = await asked();
+  await answer(setup.bridge, first.question, 'main', 'answer-1');
+  setup.worker.scripts.push(hang);
+  const running = setup.runtime.tickTask();
+  await until(() => setup.worker.executes.length === 2);
+  const old = setup.worker.identity;
+  setup.worker.identity = { instance: crypto.randomUUID(), storage: OTHER_STORAGE };
+  await control(f, 'cancel', first.job.id);
+  await running;
+  const row = await session();
+  assert.equal(row.state, 'unknown');
+  assert.equal(row.worker_storage, old.storage);
+  assert.equal(row.worker_instance, old.instance);
+  assert.equal(row.session_retained, true);
+  assert.equal((await jobs(db()))[0]!.state, 'unknown');
+  assert.equal((await laneRow(db())).closed_reason, 'unknown');
+});
+test('unknown 해제: 다른 저장소의 취소 응답으로는 풀지 않는다', async () => {
+  setup.worker.scripts.push(reply.unknown());
+  const job = await newTask();
+  await setup.runtime.tickTask();
+  const old = setup.worker.identity;
+  setup.worker.identity = { instance: crypto.randomUUID(), storage: OTHER_STORAGE };
+  assert.equal((await setup.bridge.release('fixture-owner', thread, job.id)).ok, false);
+  assert.equal((await jobs(db()))[0]!.state, 'unknown');
+  assert.equal((await session()).worker_storage, old.storage);
+  assert.equal((await laneRow(db())).closed_reason, 'unknown');
+});
+test('정리 중 경합: finalize가 다른 저장소에서 답하면 지운 것으로 치지 않고, 그 사이 새 세대가 시작했으면 그 세션을 건드리지 않는다', async () => {
+  setup.worker.statusFails = true;
+  await newTask();
+  await setup.runtime.tickTask();
+  setup.worker.statusFails = false;
+  const old = setup.worker.identity;
+  setup.worker.onControl = endpoint => { if (endpoint === '/v1/task/finalize') setup.worker.identity = { instance: crypto.randomUUID(), storage: OTHER_STORAGE }; };
+  nextRetry();
+  await setup.bridge.sweep();
+  assert.equal((await session()).cleanup_state, 'pending');
+  assert.equal((await session()).worker_storage, old.storage);
+  // 작업자에 묻는 사이 세대가 바뀌면 묻기 전에 읽은 세션의 결론을 새 세대에 쓰지 않는다.
+  setup.worker.identity = old;
+  const before = await session();
+  const fresh = crypto.randomUUID();
+  setup.worker.onControl = async endpoint => {
+    if (endpoint !== '/v1/task/status') return;
+    await db().query(`UPDATE codex_sessions SET generation=generation+1,claude_session_id=$1,thread_id=$1,cleanup_state='none',session_retained=true,state='running'`, [fresh]);
+  };
+  nextRetry();
+  await setup.bridge.sweep();
+  const after = await session();
+  assert.equal(after.generation, before.generation + 1);
+  assert.equal(after.cleanup_state, 'none');
+  assert.equal(after.session_retained, true);
+});
+test('새 세대 시작은 그 사이 보존으로 바뀐 앞 세대의 identity를 지우지 못한다', async () => {
+  setup.worker.scripts.push(rejectStart);
+  const job = await newTask();
+  await setup.runtime.tickTask();
+  await control(f, 'retry', job.id);
+  const worker = new FakeTaskWorker();
+  const racing = new ClaudeTaskBridge(f.store, f.gate, worker, { plan: async () => {
+    await db().query(`UPDATE codex_sessions SET worker_storage=$1,worker_instance=$1,session_retained=true`, [OTHER_STORAGE]);
+    return PLAN;
+  } }, { monitorMs: 5, stopWaitMs: 50 });
+  const claimed = (await f.store.claim('task'))!;
+  await racing.run(claimed);
+  assert.equal(worker.executes.length, 0, '작업자를 부르지 않는다');
+  assert.equal((await session()).worker_storage, OTHER_STORAGE);
+  assert.equal((await session()).session_retained, true);
+});
+
+// ---- 비상 중지 해제와 레인별 unknown ----
+const emergencyReleased = async () => control(f, 'resume-model', 'emergency-stop') as Promise<{ ok?: boolean; status?: string; paused?: boolean; taskLane?: { closed: string | null; unknownJobs: string[] } }>;
+const unknownTask = async (id = 'task') => {
+  setup.worker.scripts.push(reply.unknown());
+  const job = await newTask(id);
+  await setup.runtime.tickTask();
+  assert.equal((await jobs(db())).find(row => row.id === job.id)!.state, 'unknown');
+  return job;
+};
+const unknownChat = async (id = 'chat-u') => {
+  await chat(id);
+  const job = (await f.store.claim('interactive'))!;
+  assert.equal(job.type, 'chat');
+  f.advance(DEFAULTS.leaseMs + 1); f.policy.confirmedAt = f.now();
+  await f.store.expire();
+  assert.equal((await jobs(db())).find(row => row.id === job.id)!.state, 'unknown');
+  return job;
+};
+test('작업 레인 unknown이 있어도 비상 중지를 풀 수 있다: 대화 claim 가능·작업 claim 불가·레인은 닫힌 채, 응답·감사·Discord에 드러난다', async () => {
+  const job = await unknownTask();
+  await control(f, 'emergency-stop');
+  await chat('chat-1');
+  assert.equal(await f.store.claim('interactive'), undefined);
+  const released = await emergencyReleased();
+  assert.equal(released.ok, true);
+  assert.equal(released.paused, false);
+  assert.deepEqual(released.taskLane, { closed: 'unknown', unknownJobs: [job.id] });
+  assert.match(released.status!, /작업 레인은 unknown으로 닫힌 채/);
+  assert.ok(released.status!.includes(job.id));
+  const audit = (await rows('audit')).find(row => row.kind === 'model_emergency_released')!;
+  const detail = typeof audit.detail === 'string' ? JSON.parse(audit.detail) : audit.detail;
+  assert.equal(detail.taskLaneClosed, 'unknown');
+  assert.deepEqual(detail.taskUnknownJobs, [job.id]);
+  assert.equal((await f.store.claim('interactive'))?.type, 'chat');
+  assert.equal(await f.store.claim('task'), undefined);
+  assert.equal((await laneRow(db())).closed_reason, 'unknown');
+  await assert.rejects(newTask('task-2'), (error: unknown) => error instanceof LaneClosed && error.reason === 'unknown');
+  assert.equal(setup.worker.executes.length, 1, '다시 실행하지 않는다');
+  // /model-status에서도 보인다. /task-release 뒤에는 레인이 다시 열린다.
+  const status = await control(f, 'model-status') as { status?: string; taskLaneClosed?: string | null };
+  assert.equal(status.taskLaneClosed, 'unknown');
+  assert.match(status.status!, /작업 레인은 unknown으로 닫혀/);
+  assert.equal((await setup.bridge.release('fixture-owner', thread, job.id)).ok, true);
+  assert.equal((await laneRow(db())).closed_reason, null);
+});
+test('해제 안내는 Discord 제어 응답으로 게시된다', async () => {
+  const job = await unknownTask();
+  await f.ingress.receive(event('stop-1', { kind: 'command', command: 'emergency-stop' }));
+  await f.ingress.receive(event('release-1', { kind: 'command', command: 'resume-model', target: 'emergency-stop' }));
+  const posted = (await outbox()).map(row => JSON.stringify(row.payload)).find(text => text.includes('작업 레인은 unknown으로 닫힌 채'));
+  assert.ok(posted, '제어 응답에 레인 상태가 있다');
+  assert.ok(posted.includes(job.id));
+});
+test('대화 레인 unknown은 지금처럼 비상 중지 해제를 거부한다', async () => {
+  await unknownChat();
+  await control(f, 'emergency-stop');
+  const refused = await emergencyReleased();
+  assert.equal(refused.ok, false);
+  assert.match(refused.status!, /종료를 확인하지 못한 작업/);
+  assert.equal(await f.store.claim('interactive'), undefined);
+  assert.equal((await rows('audit')).filter(row => row.kind === 'model_emergency_released').length, 0);
+});
+test('두 레인 모두 unknown이면 거부하고, 대화 쪽이 풀리면 해제되며 작업 레인은 닫힌 채다', async () => {
+  const taskJob = await unknownTask();
+  const chatJob = await unknownChat();
+  await control(f, 'emergency-stop');
+  assert.equal((await emergencyReleased()).ok, false);
+  assert.equal(await f.store.resolveUnknown(chatJob), true);
+  const released = await emergencyReleased();
+  assert.equal(released.ok, true);
+  assert.deepEqual(released.taskLane?.unknownJobs, [taskJob.id]);
+  await chat('chat-2');
+  assert.equal((await f.store.claim('interactive'))?.type, 'chat');
+  assert.equal(await f.store.claim('task'), undefined);
+  assert.equal((await laneRow(db())).closed_reason, 'unknown');
+});
+test('실행 중인 작업은 unknown이 아니므로 지금처럼 해제를 막는다', async () => {
+  setup.worker.scripts.push(hang);
+  const job = await newTask();
+  const running = setup.runtime.tickTask();
+  await until(() => setup.worker.executes.length === 1);
+  await db().query(`UPDATE controls SET value='true' WHERE key IN ('scheduler','scheduler_emergency')`);
+  assert.equal((await emergencyReleased()).ok, false);
+  await control(f, 'cancel', job.id);
+  await running;
+});
+test('세션 전에 lease가 끝난 작업 unknown도 레인을 닫고, 닫힘이 기록된 뒤에야 해제된다', async () => {
+  const job = await newTask();
+  assert.equal((await f.store.claim('task'))?.id, job.id);
+  f.advance(DEFAULTS.leaseMs + 1); f.policy.confirmedAt = f.now();
+  await f.store.expire();
+  assert.equal((await jobs(db()))[0]!.state, 'unknown');
+  await control(f, 'emergency-stop');
+  // 레인 행이 아직 닫힘을 모르면 새 작업을 받을 수 있어 풀지 않는다.
+  assert.equal((await emergencyReleased()).ok, false);
+  await setup.bridge.sweep();
+  assert.equal((await laneRow(db())).closed_reason, 'unknown');
+  assert.equal((await emergencyReleased()).ok, true);
+  await chat('chat-1');
+  assert.equal((await f.store.claim('interactive'))?.type, 'chat');
+  assert.equal(await f.store.claim('task'), undefined);
+  assert.equal((await setup.bridge.release('fixture-owner', thread, job.id)).ok, true);
+  assert.equal((await laneRow(db())).closed_reason, null);
+});
+test('task off: 작업 레인이 닫혀 있지 않은 배치의 task unknown은 지금처럼 해제를 거부하고 레인 행을 바꾸지 않는다', async () => {
+  const single = new Runtime(f.store, f.gate, f.worker, f.signer, f.reader);
+  await newTask();
+  const claimed = (await f.store.claim())!;
+  assert.equal(claimed.type, 'task');
+  f.advance(DEFAULTS.leaseMs + 1); f.policy.confirmedAt = f.now();
+  await f.store.expire();
+  await control(f, 'emergency-stop');
+  assert.equal((await emergencyReleased()).ok, false);
+  assert.equal((await laneRow(db())).closed_reason, null);
+  assert.equal(await single.tickTask(), false);
+});
+test('재시작 뒤에도 유지: 비상 중지 해제는 재시작을 넘어 가능하고, 해제 뒤 재시작해도 대화는 돌고 작업 레인은 닫혀 있다', async () => {
+  const dir = resolve(await mkdtemp('.local/task-lane-release-'));
+  try {
+    const boot = async () => {
+      const disk = await localDatabase(dir);
+      const g = await fixture(disk.db);
+      return { disk, g, ...lane(g) };
+    };
+    const first = await boot();
+    first.worker.scripts.push(reply.unknown());
+    await first.g.ingress.receive(event('disk-1', { kind: 'command', command: 'task' }));
+    await first.runtime.tickTask();
+    const job = (await jobs(first.disk.db))[0]!;
+    await control(first.g, 'emergency-stop');
+    await first.disk.pg.close();
+    const second = await boot();
+    assert.equal((await laneRow(second.disk.db)).closed_reason, 'unknown');
+    assert.equal((await control(second.g, 'resume-model', 'emergency-stop')).ok, true);
+    await second.disk.pg.close();
+    const third = await boot();
+    try {
+      assert.equal((await laneRow(third.disk.db)).closed_reason, 'unknown');
+      assert.equal((await jobs(third.disk.db))[0]!.id, job.id);
+      await assert.rejects(third.g.ingress.receive(event('disk-2', { kind: 'command', command: 'task' })), LaneClosed);
+      await third.g.ingress.receive(event('disk-chat', { kind: 'command', command: 'urgent', text: '대화' }));
+      assert.equal(await third.runtime.tick(), true);
+      assert.equal(await third.runtime.tickTask(), false);
+      assert.equal(third.worker.executes.length, 0);
+    } finally { await third.disk.pg.close(); }
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 test('재개 대조: 저장소·기준·프로젝트·정책 revision이 바뀌면 띄우지 않고 실패', async () => {
   const variants: [string, (plan: typeof PLAN) => typeof PLAN, string][] = [

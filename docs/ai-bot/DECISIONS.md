@@ -601,6 +601,10 @@ Workflows 권한이 없으므로 **봇은 `.github/workflows` 변경 PR을 만�
   - **좀비 누적.** 작업자(Node)가 PID 1이면 고아 좀비를 회수하지 않는다(로컬 실측). 좀비는 코드가 돌지 않아 소멸 확인에서 세지 않지만 파드 재시작까지 PID를 차지한다. 악성 작업이 fork를 되풀이하면 PID 상한까지 채워 다음 턴이 뜨지 못할 수 있다. 격리 경계가 아니라 가용성 위험이고 파드 재시작으로 풀린다.
   - **운영 조합 미확인.** `kill(-1)`과 `NSpid` 판독은 로컬 PID namespace에서 시험했다. 운영 파드의 AppArmor peer 규칙 아래에서 같은지는 작업 레인 파드 배포 뒤 무모델 시험으로 확인한다. 신호가 막히면 프로세스가 검사에 남아 unknown으로 닫히는 쪽으로 틀린다.
 
+### 작업 레인 unknown과 비상 중지 (사용자 2026-11-05)
+
+작업 레인의 unknown·정리 실패는 작업 레인만 닫는다. 작업 파드 하나의 불확실성 때문에 대화까지 멈춘 채로 두지 않기 위해서다. 비상 중지 해제(`/resume-model target:emergency-stop`)는 interactive 레인의 unknown만 막고, task 레인의 unknown은 `execution_lanes.closed_reason`으로 닫힘이 기록돼 있으면 막지 않는다. 풀린 뒤에도 그 레인은 닫혀 있어 소멸을 확인(`/task-release`)하기 전에는 새 작업을 받지 않고, 응답·감사·Discord 안내에 이 사실을 드러낸다. 실행 중·중지 요청 중인 job과 interactive unknown의 거부, 작업 루프를 켜지 않은 배치의 task unknown 거부는 그대로다. 세부는 [ARCHITECTURE](ARCHITECTURE.md) "T18 게시 서버 스케줄링과 질문"이다.
+
 ## T20 기억·삭제 원장·브리핑 (로컬·mock, 2026-10-29)
 
 **상태:** 삭제 원장 위치는 정함(아래, 사용자 2026-11-02). 나머지는 T20 구현 선택이고 사용자 결정이 아니다. 코드는 `src/memory.ts`, `src/deletion-ledger.ts`, `src/ledger-lock.ts`, `src/briefing.ts`, `migrations/010_memory_briefing.sql`·`012_deletion_ledger_generation.sql`, 시험은 `test/memory-briefing.test.ts`, `test/deletion-ledger.test.ts`, `test/deletion-ledger-pg.test.ts`다. 실제 SSD·Discord는 쓰지 않았다.

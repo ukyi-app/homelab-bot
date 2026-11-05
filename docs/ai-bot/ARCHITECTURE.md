@@ -579,7 +579,7 @@ queued로 돌리거나 `/cancel target:<job-id>`로 포기한다. 현재 대화 
 
 `controls.scheduler_emergency`는 비상 중지를 별도로 보존한다. 기존 scheduler=true에 이 값이 없으면
 원인이 불명인 이전 중지로 취급해 true로 초기화한다. `/resume-model target:emergency-stop`은 owner의
-명시 확인으로 그 중지만 해제하며 running/verifying/cancel_requested/unknown이 있으면 거부한다.
+명시 확인으로 그 중지만 해제하며 running/verifying/cancel_requested/unknown이 있으면 거부한다(닫힘이 기록된 작업 레인의 unknown은 예외, "T18 게시 서버 스케줄링과 질문" 참고).
 waiting_user는 각 대화에서 별도 처리해야 한다. verifying도 cancel/emergency-stop의 중지 요청 대상이다.
 자격 파일 읽기/복구, 자동 계정 전환, unknown worker의 종료를 추정하는 기능은 추가하지 않았다.
 실제 slash 명령 등록과 종료 확인 연결은 T16b/T18이다. 새 스키마 migration은 필요하지 않다.
@@ -1069,13 +1069,15 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 | 계정 한도 대기(`model_limit`) | 어느 레인에서 나도 양쪽을 막는다(`scheduler` 켜짐). 토큰이 달라도 한도는 합쳐진다고 본다 | 같음 |
 | 인증 대기(`auth_expired`) | `scheduler`를 켜 대화·리뷰가 멈추고 표시·지표는 지금 그대로다. 작업 레인은 막지 않는다 | `waitForUser(..., { laneOnly: true })`로 `scheduler`를 켜지 않고 작업 레인만 막는다 |
 | 비상 중지·인가·전체 큐 상한 | 공유 | 공유 |
-| unknown | 대화·리뷰 슬롯만 막는다 | 작업 레인만 막고 새 접수를 닫는다 |
+| unknown | 대화·리뷰 슬롯을 막고 비상 중지 해제도 거부한다 | 작업 레인만 막고 새 접수를 닫는다. 비상 중지 해제는 막지 않는다 |
 
 작업 레인 claim은 `scheduler` 값을 보지 않고 `scheduler_emergency`와 `model_limit` 대기만 본다. 대화 레인의 인증 대기가 켠 `scheduler`에 막히지 않게 하려는 것이다. `releaseScheduler`는 비상 중지가 없고, 질문 대기와 작업 레인의 인증 대기를 뺀 대기가 없을 때 정지를 푼다.
 
+**비상 중지 해제와 unknown(사용자 2026-11-05).** `/resume-model target:emergency-stop`은 실행 중·중지 요청 중인 job(레인 무관)과 interactive 레인의 unknown이 있으면 거부한다. 작업 레인의 unknown은 `execution_lanes.closed_reason='unknown'`이 기록돼 있을 때만 해제를 막지 않는다. 풀린 뒤 대화·리뷰는 돌고, 작업 레인은 `claim('task')`와 `accept('task')`가 계속 닫혀 있어 `/task-release`로 소멸을 확인하기 전에는 새 작업을 받지 않는다. 해제 응답의 `taskLane`, 감사 `model_emergency_released`의 `taskLaneClosed`·`taskUnknownJobs`, Discord 제어 응답 문장, `/model-status`의 `taskLaneClosed`와 안내 문장에 드러난다. 닫힘 기록을 조건으로 둔 이유는 두 가지다. 작업 루프를 켜지 않은 배치는 이 행이 닫히지 않아 슬롯을 함께 쓰는 task unknown이 지금처럼 해제를 막고, lease 만료 직후 sweep 전이면 잠시 거부됐다가 다음 sweep 뒤 풀린다. 닫히지 않은 채 풀어 새 작업을 받는 틈이 없다.
+
 **잠금 순서.** 대화 행 → `scheduler` 행 → `execution_lanes` 행 → job·세션·질문 행. `Store.lockTaskControl`이 앞의 셋을 이 순서로 잡고, 턴 시작(`begin`)·결과 확정(`settle`)·정리·해제가 이것으로 시작한다. claim과 접수는 대화 행이 없는 구간부터 같은 순서를 따른다. 스케줄러 행은 레인과 무관하게 하나라 짧은 claim 트랜잭션끼리는 줄을 서지만, 실행 자체는 어떤 행도 쥐지 않아 긴 작업이 대화를 기다리게 하지 않는다.
 
-**접수 닫힘.** `Store.syncTaskLane`이 Claude 세션 사실에서 사유를 다시 계산해 `execution_lanes`에 적는다. `unknown`(job이나 세션이 unknown) → `cleanup_pending`(정리 확인 실패) → `retention_full`(보존 세션 8개) 순이고, 사실이 사라지면 다시 열린다. 사실이 DB에 있어 재시작 뒤에도 같은 값이다. `accept('task')`는 `LaneClosed`를 던진다. `unknown`·`cleanup_pending`이면 claim도 아무것도 집지 않는다. `retention_full`이면 이미 보존 중인 세션의 재개만 집는다. 막으면 그 세션이 끝나지 못해 칸이 영영 비지 않는다. 세션은 첫 요청 전부터 보존으로 세어 응답을 잃어도 칸을 놓치지 않는다. Codex 작업은 세지 않으며 jobs 상태로만 슬롯을 막는다.
+**접수 닫힘.** `Store.syncTaskLane`이 DB 사실에서 사유를 다시 계산해 `execution_lanes`에 적는다. `unknown`(Claude 세션이 unknown이거나, Codex 세션이 아닌 작업 레인 job이 unknown. 턴 시작 전에 lease가 끝나 세션이 없는 job도 센다) → `cleanup_pending`(정리 확인 실패) → `retention_full`(보존 세션 8개) 순이고, 사실이 사라지면 다시 열린다. 사실이 DB에 있어 재시작 뒤에도 같은 값이다. `accept('task')`는 `LaneClosed`를 던진다. `unknown`·`cleanup_pending`이면 claim도 아무것도 집지 않는다. `retention_full`이면 이미 보존 중인 세션의 재개만 집는다. 막으면 그 세션이 끝나지 못해 칸이 영영 비지 않는다. 세션은 첫 요청 전부터 보존으로 세어 응답을 잃어도 칸을 놓치지 않는다. Codex 작업은 세지 않으며 jobs 상태로만 슬롯을 막는다.
 
 **턴 흐름(`ClaudeTaskBridge.run`).**
 
@@ -1095,7 +1097,12 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 **수명.** `sweep`이 매 바퀴 하는 일: 기한 지난 질문 닫기, unknown 알림, `/cancel`·철회로 끝난 job의 세션·질문 닫기, 24시간 넘은 모델 대기에 `owner_confirm_requested_at` 표시와 알림 한 번(자동 재개·폐기 없음), 정리 재시도. 정리는 최종 상태를 DB에 남긴 뒤에만 `/v1/task/finalize`로 보내고 먼저 `/v1/task/status`로 identity를 얻는다. 다른 storage의 `absent`·`finalized`는 소멸 증명으로 쓰지 않는다. 실패하면 `cleanup_pending`이고 `finalizeRetryMs`(기본 30초) 뒤 다시 시도한다. 대기 세션의 `cleanupPending`은 세션을 지우지 않고 작업자가 `waiting`이라고 답하면 막힘만 푼다. unknown 해제(`release`)는 작업자의 소멸 확인 뒤에만 `cancelled`로 바꾸고 정리까지 시도하며 다시 실행하지 않는다.
 
-**한계.** 저장소(PVC)가 바뀌면 옛 세션의 정리를 증명할 길이 없어 `cleanup_pending`이 남고 작업 레인이 닫힌 채로 있다. 자동으로 풀지 않는다.
+**저장소 identity.** `codex_sessions.worker_storage`는 한 번 알면 그 세대가 끝날 때까지 바뀌지 않는다. status·cancel·finalize·턴 응답의 어떤 경로도 다른 storage로 덮어쓰지 않고, 같은 storage면 `worker_instance`만 파드 교체를 따라간다. 덮어쓰면 다음 재시도에서 새 저장소가 원래 저장소로 보여 그 `absent`만으로 `cleaned`가 되기 때문이다. 다른 storage가 답한 취소·해제 응답은 소멸 증명이 아니라 확인 실패로 보고, 다른 storage의 finalize 응답은 지운 것으로 치지 않는다. storage를 아직 모르는 세션(첫 턴 응답을 잃음)은 세션을 봤다고 답한 작업자에만 묶는다. `absent`·`unknown` 상태나 `sessionRetained:false`인 취소 응답으로는 묶지 않는다. 턴 시작의 재개 CAS는 storage를 조건에 넣고, 새 세대 시작은 앞 세대가 보존·정리 대기면 덮어쓰지 않는다. 정리 결론은 물어본 세대와 세션에만 쓴다.
+
+**한계.**
+
+- 저장소(PVC)가 바뀌면 옛 세션의 정리를 증명할 길이 없어 `cleanup_pending`이 남고 작업 레인이 닫힌 채로 있다. 자동으로 풀지 않는다.
+- storage를 한 번도 알지 못한 세션은 작업자가 세션을 받았다는 근거가 없다. 그래서 `absent`여도 작업자의 `/v1/task/finalize` 답을 따른다. 첫 턴 응답을 잃은 바로 그 사이에 PVC까지 바뀐 경우는 구분하지 못한다. 시작 전에 identity를 알 수단이 계약에 없고, 막으면 작업자 단절 뒤 레인이 풀 길 없이 닫힌다.
 
 ## 13. 개선안 v2 적용 (2026-10-30)
 

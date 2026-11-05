@@ -34,6 +34,8 @@ export class FakeTaskWorker implements TaskWorkerPort {
   finalizeCleans = true;
   statusFails = false;
   statusOverride: Partial<TaskStatusResponse> | undefined;
+  // 제어 호출이 작업자에 닿은 시점에 끼어든다. DB 트랜잭션 밖 네트워크 구간의 경합을 만든다.
+  onControl: ((endpoint: TaskEndpoint) => void | Promise<void>) | undefined;
   private readonly sessions = new Map<string, 'waiting' | 'finalized'>();
   private readonly turns = new Map<string, number>();
   async call<E extends TaskEndpoint>(endpoint: E, body: TaskEndpointRequest<E>, signal?: AbortSignal): Promise<TaskEndpointResponse<E>> {
@@ -50,6 +52,7 @@ export class FakeTaskWorker implements TaskWorkerPort {
       this.turns.set(request.sessionId, request.turn);
       return answer;
     }
+    await this.onControl?.(endpoint);
     const control = body as { job: string; lease: string; generation: number; sessionId: string };
     const shape = { version: 1 as const, job: control.job, lease: control.lease, generation: control.generation, sessionId: control.sessionId, worker: this.identity };
     if (endpoint === '/v1/task/cancel') {
@@ -70,6 +73,20 @@ export class FakeTaskWorker implements TaskWorkerPort {
   }
 }
 export const rejectStart: Script = () => { throw new TaskWorkerRejected(); };
+export const OTHER_STORAGE = '00000000-0000-4000-8000-00000000f00d';
+// 이 저장소가 이 세대를 본 적이 없다는 응답. 다른 저장소가 답하면 옛 세션의 소멸 증명이 아니다.
+export const ABSENT: Partial<TaskStatusResponse> = { state: 'absent', turn: null, sessionExists: false, stopped: true };
+// 보존 세션 하나를 정리 대기(cleanup_pending)로 둔 뒤 작업자 PVC를 교체한다. 정리 전 교체를 재현한다.
+export async function retainedThenStorageReplaced(local: ReturnType<typeof lane>, f: Fixture, db: Database) {
+  local.worker.statusFails = true;
+  const job = await task(f, db);
+  await local.runtime.tickTask();
+  const old = local.worker.identity;
+  local.worker.statusFails = false;
+  local.worker.identity = { instance: randomUUID(), storage: OTHER_STORAGE };
+  local.worker.statusOverride = ABSENT;
+  return { job, old };
+}
 export const hang: Script = (_request, _worker, signal) => new Promise((_resolve, reject) => {
   signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
 });

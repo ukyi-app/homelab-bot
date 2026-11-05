@@ -8,7 +8,7 @@ import type { Database } from '../src/database.js';
 import { Store } from '../src/store.js';
 import { TASK_RETENTION, taskQuestionId } from '../src/task-contracts.js';
 import { event, fixture, thread } from './helpers.js';
-import { FakeTaskWorker, PLAN, allRows, answer, conversationId, hang, jobs, lane, laneRow, reply, task, until } from './task-lane-fixture.js';
+import { FakeTaskWorker, OTHER_STORAGE, PLAN, allRows, answer, conversationId, hang, jobs, lane, laneRow, reply, retainedThenStorageReplaced, task, until } from './task-lane-fixture.js';
 import type { Fixture } from './task-lane-fixture.js';
 
 // 실제 PostgreSQL 다중 연결 경합. PGlite는 transaction을 직렬화해 행 잠금 대기를 만들 수 없다.
@@ -236,6 +236,70 @@ test('실제 PostgreSQL: 비상 중지와 실행 중 작업·대화가 겹쳐도
     await chat(f, 'chat-3');
     assert.equal(await instance(db, f).claim('interactive'), undefined);
     assert.equal(await instance(db, f).claim('task'), undefined);
+  } finally { await close(); }
+});
+test('실제 PostgreSQL: 정리 전 PVC 교체 뒤 여러 인스턴스가 겹쳐 재시도해도 옛 identity와 보존 기록을 잃지 않는다', { skip }, async () => {
+  const { db, f, close } = await setup();
+  try {
+    const local = lane(f, { finalizeRetryMs: 0 });
+    const { old } = await retainedThenStorageReplaced(local, f, db);
+    const other = new ClaudeTaskBridge(instance(db, f), f.gate, local.worker, { plan: async () => PLAN }, { monitorMs: 5, stopWaitMs: 50, finalizeRetryMs: 0 });
+    for (let round = 0; round < 3; round++) settled(await Promise.allSettled([local.bridge.sweep(), other.sweep()]));
+    const row = (await allRows(db, 'codex_sessions'))[0]!;
+    assert.equal(row.worker_storage, old.storage);
+    assert.notEqual(row.worker_storage, OTHER_STORAGE);
+    assert.equal(row.session_retained, true);
+    assert.equal(row.cleanup_state, 'pending');
+    assert.equal((await laneRow(db)).closed_reason, 'cleanup_pending');
+    assert.equal(local.worker.finalizes.length, 0);
+  } finally { await close(); }
+});
+test('실제 PostgreSQL: 작업 레인 unknown이 있을 때 해제·claim·접수가 겹쳐도 대화만 다시 돌고 작업 레인은 닫힌 채다', { skip }, async () => {
+  for (let round = 0; round < 4; round++) {
+    const { db, f, close } = await setup();
+    try {
+      const local = lane(f);
+      local.worker.scripts.push(reply.unknown());
+      const job = await task(f, db);
+      await local.runtime.tickTask();
+      await f.store.control('fixture-owner', conversationId(f), 'emergency-stop');
+      await chat(f, 'chat-1');
+      const release = () => instance(db, f).control('fixture-owner', conversationId(f), 'resume-model', 'emergency-stop');
+      const results = await Promise.allSettled([release(), instance(db, f).claim('interactive'), instance(db, f).claim('task'), release(),
+        instance(db, f).claim('task'), f.store.control('fixture-owner', conversationId(f), 'model-status'), local.bridge.sweep(),
+        f.ingress.receive(event(`closed-${round}`, { kind: 'command', command: 'task', scope: thread }))]);
+      assert.equal(results[7]!.status, 'rejected', '닫힌 레인의 새 작업');
+      const values = settled(results.slice(0, 7));
+      // 먼저 풀린 뒤 대화가 집혔으면 나중 해제는 실행 중인 대화 때문에 거부된다.
+      assert.ok((values[0] as { ok: boolean }).ok || (values[3] as { ok: boolean }).ok);
+      assert.equal(values[2], undefined); assert.equal(values[4], undefined);
+      const claimed = values[1] as { type: string } | undefined ?? await instance(db, f).claim('interactive');
+      assert.equal(claimed?.type, 'chat');
+      assert.equal((await laneRow(db)).closed_reason, 'unknown');
+      assert.equal(await instance(db, f).claim('task'), undefined);
+      assert.equal(local.worker.executes.length, 1);
+      assert.equal((await jobs(db)).find(row => row.id === job.id)!.state, 'unknown');
+      assert.equal((await db.query("SELECT 1 FROM jobs WHERE type='task'")).rows.length, 1);
+    } finally { await close(); }
+  }
+});
+test('실제 PostgreSQL: 실행 중인 대화가 있으면 작업 레인 unknown만 남을 때까지 해제되지 않고 대화 unknown이면 거부한다', { skip }, async () => {
+  const { db, f, close } = await setup();
+  try {
+    const local = lane(f);
+    local.worker.scripts.push(reply.unknown());
+    await task(f, db);
+    await local.runtime.tickTask();
+    await chat(f, 'chat-1');
+    const chatJob = (await instance(db, f).claim('interactive'))!;
+    await f.store.control('fixture-owner', conversationId(f), 'emergency-stop');
+    const attempts = settled(await Promise.allSettled([1, 2, 3].map(() => instance(db, f).control('fixture-owner', conversationId(f), 'resume-model', 'emergency-stop')))) as { ok: boolean }[];
+    assert.ok(attempts.every(result => !result.ok));
+    f.advance(120_000); f.policy.confirmedAt = f.now();
+    await instance(db, f).expire();
+    assert.equal((await jobs(db)).find(row => row.id === chatJob.id)!.state, 'unknown');
+    assert.equal((await instance(db, f).control('fixture-owner', conversationId(f), 'resume-model', 'emergency-stop') as { ok: boolean }).ok, false);
+    assert.equal(await instance(db, f).claim('interactive'), undefined);
   } finally { await close(); }
 });
 test('실제 PostgreSQL: 접수와 레인 닫힘이 겹쳐도 닫힌 뒤 접수되지 않는다', { skip }, async () => {
