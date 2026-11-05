@@ -2,12 +2,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { DEFAULTS, Denied, DiscordRejected, DiscordUnauthorized, HistoryGap, PolicyUnavailable, RateLimited, ScopeSchema } from './contracts.js';
 import type { EventInput, Scope } from './contracts.js';
-import { controlText } from './control-format.js';
+import { controlText, taskLaneClosedText } from './control-format.js';
 import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
 import type { MemoryCommand, MemoryCommandHandler } from './memory-commands.js';
 import type { PolicyGate } from './policy.js';
+import { LaneClosed } from './store.js';
 import type { Delivery, Store } from './store.js';
+import type { TaskCommandHandler } from './task-commands.js';
 
 // 일반 메시지 수신 표시가 리액션 대신 텍스트로 대체됐을 때의 거부 상태(권한 점검 신호).
 export interface AckOutcome { fallback: 403 | 404 }
@@ -23,7 +25,10 @@ const noMentions = { allowed_mentions: { parse: [] as never[] } };
 // 기억 응답은 ID·상태를 보는 용도라 끈다. 다른 명령 응답은 그대로 둔다.
 export const SUPPRESS_EMBEDS = 4 as const;
 const controls = new Set(['stop', 'resume', 'list', 'cancel', 'retry', 'emergency-stop', 'resume-model', 'model-status', 'revoke',
-  'review-status', 'review-resume', 'review-cancel']);
+  'review-status', 'review-resume', 'review-cancel', 'answer', 'task-status', 'task-cancel', 'task-release']);
+// 작업 레인 제어. 처리기가 없으면(스위치 꺼짐) 닫는다. 조회·해제는 작업자나 다른 연결을 쓸 수 있어 수신 트랜잭션 밖에서 처리한다.
+const taskControls = new Set<string>(['answer', 'task-status', 'task-cancel', 'task-release']);
+const taskDirect = new Set<string>(['task-status', 'task-release']);
 // 수신이 아는 명령 전체. 배포 진입점은 단계에 맞춰 더 좁은 목록(FOUNDATION_COMMANDS)을 넘긴다.
 export type RecoveryOutcome = 'done' | 'budget' | 'skipped';
 // 기억 명령. 대화 작업·제어와 달리 받은 자리에서 기억 서비스로 처리하고 상호작용 응답으로만 답한다.
@@ -41,12 +46,13 @@ export class DiscordIngress {
   constructor(private readonly store: Store, private readonly gate: PolicyGate,
     private readonly rest: DiscordRest, public readonly messageContent = true,
     private readonly commands: ReadonlySet<string> = ALL_COMMANDS, private readonly log: Log = jsonLog,
-    private readonly memory?: MemoryCommandHandler) {}
+    private readonly memory?: MemoryCommandHandler, private readonly tasks?: TaskCommandHandler) {}
   async receive(input: EventInput, recovered = false, recovery?: { token: string; epoch: number }): Promise<string | undefined> {
     const event = EventSchema.parse(input);
     if (event.bot || event.webhook) return;
     // 이 단계에서 열지 않은 명령·버튼은 저장·권한 확인 전에 닫는다(task·review-*는 FOUNDATION 밖).
     if (event.kind !== 'message' && !this.commands.has(event.command ?? '')) throw new Denied();
+    if (event.kind !== 'message' && taskControls.has(event.command ?? '') && !this.tasks) throw new Denied();
     const p = await this.gate.authorize(event.actor, event.scope);
     if (!this.messageContent && event.kind === 'message') return;
     const conversation = await this.store.conversation(event.scope);
@@ -62,9 +68,13 @@ export class DiscordIngress {
     // Unsupported commands cannot acquire model or control authority.
     if (event.kind !== 'message' && !['chat', 'urgent', 'task', 'read', ...controls, ...memoryCommands].includes(event.command ?? '')) throw new Denied();
     if (isMemory) return this.memoryCommand(event, p.revision, recovered);
-    if (['cancel', 'retry', 'resume-model', 'revoke', 'read', 'review-resume', 'review-cancel'].includes(event.command ?? '') && !event.target) throw new Denied();
+    if (['cancel', 'retry', 'resume-model', 'revoke', 'read', 'review-resume', 'review-cancel', ...taskControls].includes(event.command ?? '') && !event.target) throw new Denied();
     if (event.command === 'read' && !event.text.trim()) throw new Denied();
+    if (event.command === 'task' && this.tasks && (!event.target || !event.text.trim())) throw new Denied();
+    if (event.kind === 'command' && taskDirect.has(event.command ?? '')) return this.taskDirectCommand(event, p.revision, recovered);
     const started = this.store.now();
+    // 작업 접수를 막은 안내. 받은 자리면 상호작용 응답으로, 복구 중이면 대화에 게시한다.
+    let refused: string | undefined;
     const saved = await this.store.save(event, p.revision, !!explicit && (!isControl || event.command === 'resume'));
     if (!recovered && this.store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
     // Route durably before ACK: a lost response or process exit cannot orphan an acknowledged request.
@@ -96,16 +106,33 @@ export class DiscordIngress {
         await store.db.query('UPDATE events SET buffered=true WHERE id=$1', [saved.id]);
         return true;
       }
+      // 스레드를 만들기 전에 본다. 프로젝트가 없거나 레인이 닫혔으면 빈 스레드를 남기지 않고, 구독도 켜지 않는다.
+      const refuse = async (text: string) => {
+        await store.db.query(`UPDATE events SET accepted=true,buffered=false,payload=payload || '{"ignored":"task_refused"}'::jsonb WHERE id=$1`, [saved.id]);
+        refused = text;
+        if (recovered) await store.enqueue({ key: `task-refused:${saved.id}`, actor: event.actor, scope: event.scope, revision: current.revision,
+          payload: { kind: 'message', channel: event.scope.channel, content: text, classification: 'safe_summary' } });
+        return true;
+      };
+      if (event.kind === 'command' && event.command === 'task' && this.tasks) {
+        const refusal = await this.tasks.admit(store, event.target);
+        if (refusal) return refuse(refusal);
+      }
       if (inbox.buffered) await store.db.query("UPDATE events SET event_order=nextval('events_event_order_seq') WHERE id=$1", [saved.id]);
       if (event.scope.kind === 'channel') await store.db.query('UPDATE conversations SET active=false WHERE id=$1', [conversationId]);
       if (inbox.payload.activate && event.command !== 'resume') await store.activate(subscription, event.id);
       if (durableControl) {
         const result = event.command === 'revoke'
           ? await gate.revoke(event.actor, event.scope, event.target!)
-          : await store.control(event.actor, conversationId, event.command!, event.target, event.id,
-            // 리뷰 작업 제어의 별도 권한: 현재 정책의 owner가 알림 채널(부모 없는 채널)에서 보낸 명령만.
-            { review: event.scope.kind === 'channel' && event.scope.parent === null && event.scope.channel === current.notificationChannel
-              && event.actor === current.owner });
+          // 대화 행을 위에서 잠갔고 답 처리도 이 트랜잭션 안이다. 같은 대화의 /revoke와 직렬화되고, 중복 전달은 inbox.accepted가 막는다.
+          : event.command === 'answer'
+            ? await this.tasks!.answerIn(store, { question: event.target!, actor: event.actor, scope: event.scope, text: event.text, event: event.id })
+            : event.command === 'task-cancel'
+              ? await this.tasks!.cancelIn(store, event.actor, conversationId, event.target!, event.id)
+              : await store.control(event.actor, conversationId, event.command!, event.target, event.id,
+                // 리뷰 작업 제어의 별도 권한: 현재 정책의 owner가 알림 채널(부모 없는 채널)에서 보낸 명령만.
+                { review: event.scope.kind === 'channel' && event.scope.parent === null && event.scope.channel === current.notificationChannel
+                  && event.actor === current.owner });
         if (event.command !== 'revoke') await store.enqueue({ key: `control:${saved.id}`, actor: event.actor,
           scope: event.scope, revision: current.revision, payload: { kind: 'message', channel: event.scope.channel,
             content: controlText(event.command!, result), classification: 'safe_summary' } });
@@ -114,7 +141,12 @@ export class DiscordIngress {
           actor: event.actor, scope: event.scope, revision: current.revision,
           payload: { kind: 'thread', channel: event.scope.channel, content: saved.id, classification: 'safe_summary' } });
       } else {
-        await store.accept(saved.id, event.command === 'task' ? 'task' : event.command === 'read' ? 'read' : 'chat', current.revision, event.urgent || event.command === 'urgent');
+        // admit 뒤에 레인이 닫힌 경합. SQL 오류가 아니라 트랜잭션은 그대로 쓸 수 있다.
+        try { await store.accept(saved.id, event.command === 'task' ? 'task' : event.command === 'read' ? 'read' : 'chat', current.revision, event.urgent || event.command === 'urgent'); }
+        catch (error) {
+          if (!(error instanceof LaneClosed) || !this.tasks) throw error;
+          return refuse(taskLaneClosedText(error.reason));
+        }
         if ((!recovered || inbox.buffered) && event.kind === 'message') await store.checkpoint(conversationId, event.id, inbox.buffered);
       }
       if (!recovered && store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
@@ -122,8 +154,39 @@ export class DiscordIngress {
       await store.db.query('UPDATE events SET buffered=false WHERE id=$1', [saved.id]);
       return true;
     }, recovered ? undefined : { expiresAt: started + DEFAULTS.inboxTimeoutMs, now: this.store.now });
-    if (routed && !recovered) await this.acknowledge(event, saved.id);
+    if (routed && !recovered) await this.acknowledge(event, saved.id, refused);
     return saved.id;
+  }
+  // 작업 상태·해제. 수신 트랜잭션을 쥔 채 다른 연결을 쓰거나 작업자를 기다리지 않는다. 처리 방식은 기억 명령과 같다(같은 상호작용은 한 번만 처리한다).
+  private async taskDirectCommand(event: z.infer<typeof EventSchema>, revision: string, recovered: boolean): Promise<string | undefined> {
+    if (recovered || !this.tasks) throw new Denied();
+    const started = this.store.now();
+    const saved = await this.store.save(event, revision, false);
+    if (!await this.claimOnce(event, saved.id, started)) return saved.id;
+    let content: string;
+    try {
+      content = event.command === 'task-status' ? await this.tasks.status(event.actor, event.scope, event.target!)
+        : this.tasks.release({ id: saved.id, actor: event.actor, scope: event.scope, job: event.target!, revision });
+    } catch (error) {
+      if (!(error instanceof Denied)) this.log('task_command_failed', { command: event.command!, ...errorInfo(error) });
+      // 타인 작업과 다른 대화의 작업은 존재 여부도 구별해 알리지 않는다.
+      content = error instanceof Denied ? '이 대화에서 볼 수 있는 작업이 아닙니다.' : '처리하지 못했습니다(일시 오류). 다시 시도하세요.';
+    }
+    await this.acknowledge(event, saved.id, content);
+    return saved.id;
+  }
+  // 같은 상호작용 ID는 events의 accepted를 먼저 잡은 쪽만 처리한다.
+  private claimOnce(event: z.infer<typeof EventSchema>, id: string, started: number): Promise<boolean> {
+    return this.store.atomic(async store => {
+      const inbox = (await store.db.query<{ accepted: boolean; actor_id: string; scope: Scope; payload: { command?: string; target?: string } }>(
+        'SELECT accepted,actor_id,scope,payload FROM events WHERE id=$1 FOR UPDATE', [id])).rows[0]!;
+      if (inbox.accepted) return false;
+      if (inbox.actor_id !== event.actor || store.scopeId(inbox.scope) !== store.scopeId(event.scope) || inbox.scope.parent !== event.scope.parent
+        || inbox.payload.command !== event.command || inbox.payload.target !== event.target) throw new Denied();
+      await this.gate.withDatabase(store.db).authorize(event.actor, event.scope);
+      await store.db.query('UPDATE events SET accepted=true WHERE id=$1', [id]);
+      return true;
+    }, { expiresAt: started + DEFAULTS.inboxTimeoutMs, now: this.store.now });
   }
   // 기억 명령. 구독·gap·작업 큐를 거치지 않고 받은 자리에서 한 번 처리한 뒤 상호작용 응답으로 답한다.
   // 중복 전달(같은 상호작용 ID)은 events의 accepted를 먼저 잡은 쪽만 처리한다. 잡은 뒤 처리 중에 죽으면 다시 하지 않는다
@@ -136,17 +199,7 @@ export class DiscordIngress {
     // target(종류·기억 ID·출처 키)만 남긴다. 대화 출처 확인(memory.ts)은 이 행의 actor·accepted·scope를 본다.
     const saved = await this.store.save({ ...event, text: '' }, revision, false);
     if (this.store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
-    const claimed = await this.store.atomic(async store => {
-      const inbox = (await store.db.query<{ accepted: boolean; actor_id: string; scope: Scope; payload: { command?: string; target?: string } }>(
-        'SELECT accepted,actor_id,scope,payload FROM events WHERE id=$1 FOR UPDATE', [saved.id])).rows[0]!;
-      if (inbox.accepted) return false;
-      if (inbox.actor_id !== event.actor || store.scopeId(inbox.scope) !== store.scopeId(event.scope) || inbox.scope.parent !== event.scope.parent
-        || inbox.payload.command !== event.command || inbox.payload.target !== event.target) throw new Denied();
-      await this.gate.withDatabase(store.db).authorize(event.actor, event.scope);
-      await store.db.query('UPDATE events SET accepted=true WHERE id=$1', [saved.id]);
-      return true;
-    }, { expiresAt: started + DEFAULTS.inboxTimeoutMs, now: this.store.now });
-    if (!claimed) return saved.id;
+    if (!await this.claimOnce(event, saved.id, started)) return saved.id;
     let reply;
     try {
       reply = await this.memory.handle({ id: event.id, actor: event.actor, scope: event.scope,
@@ -469,8 +522,18 @@ export class DiscordPublisher {
           await store.db.query('UPDATE events SET accepted=true WHERE id=$1', [row.payload.content]);
           await store.enqueue({ key, actor: row.owner_id, scope, conversation: id, revision: row.policy_revision, services: current.service_ids,
             payload: { kind: 'message', channel: externalId, content: event.payload.text, classification: 'safe_summary' } });
-        } else await store.accept(row.payload.content, event.payload.command === 'task' ? 'task' : event.payload.command === 'read' ? 'read' : 'chat', row.policy_revision,
-          event.payload.urgent || event.payload.command === 'urgent');
+        } else {
+          // 스레드를 만드는 사이 작업 레인이 닫혔다. 이미 만든 스레드에 이유를 남긴다. 던지면 이 전달이 unknown으로 남아 되풀이된다.
+          try {
+            await store.accept(row.payload.content, event.payload.command === 'task' ? 'task' : event.payload.command === 'read' ? 'read' : 'chat', row.policy_revision,
+              event.payload.urgent || event.payload.command === 'urgent');
+          } catch (error) {
+            if (!(error instanceof LaneClosed)) throw error;
+            await store.db.query(`UPDATE events SET accepted=true,payload=payload || '{"ignored":"task_refused"}'::jsonb WHERE id=$1`, [row.payload.content]);
+            await store.enqueue({ key: `task-refused:${row.id}`, actor: row.owner_id, scope, conversation: id, revision: row.policy_revision, services: current.service_ids,
+              payload: { kind: 'message', channel: externalId, content: taskLaneClosedText(error.reason), classification: 'safe_summary' } });
+          }
+        }
         await store.ackNotice(row.payload.content);
       }
       await store.deliveryState(row, 'sent', externalId);

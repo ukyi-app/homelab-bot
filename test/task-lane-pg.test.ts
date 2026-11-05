@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { ClaudeTaskBridge } from '../src/claude-task-bridge.js';
+import { taskLaneClosedText } from '../src/control-format.js';
 import { Postgres, migrate } from '../src/database.js';
+import { ALL_COMMANDS, DiscordIngress } from '../src/discord.js';
+import { TaskCommands } from '../src/task-commands.js';
 import type { Database } from '../src/database.js';
 import { Store } from '../src/store.js';
 import { TASK_RETENTION, taskQuestionId } from '../src/task-contracts.js';
@@ -53,6 +56,62 @@ async function setup() {
     await admin.end();
   } };
 }
+test('실제 PostgreSQL: 수신 트랜잭션이 LaneClosed를 받아도 안내까지 커밋되고, /answer 중복과 /task-cancel 경합은 교착 없이 하나로 끝난다', { skip }, async () => {
+  const { db, f, close } = await setup();
+  try {
+    (f.policy as { task?: unknown }).task = { projects: [{ id: 'fixture', revision: 'r1', repository: 'fixture-org/fixture-repo', branch: 'main', allowedPaths: ['src'], forbiddenPaths: [], verifyCommands: [] }] };
+    const local = lane(f);
+    const handler = new TaskCommands(f.store, f.gate, local.bridge, () => ({ routed: true, open: true, reasons: [] }), () => {}, () => {});
+    const ingress = new DiscordIngress(f.store, f.gate, f.rest, true, ALL_COMMANDS, () => {}, undefined, handler);
+    const task = (id: string) => event(id, { kind: 'command', command: 'task', target: 'fixture', text: '고쳐줘' });
+    const question = async () => {
+      local.worker.scripts.push(reply.question());
+      await local.runtime.tickTask();
+      return (await db.query<{ id: string; job_id: string }>(`SELECT id,job_id FROM codex_questions WHERE state='open'`)).rows[0]!;
+    };
+    await ingress.receive(task('first'));
+    const first = await question();
+    const answerEvent = event('answer-1', { kind: 'command', command: 'answer', target: first.id, text: '메인 기준으로' });
+    // 같은 상호작용이 두 연결로 겹쳐 온다.
+    await Promise.all([ingress.receive(answerEvent), ingress.receive({ ...answerEvent })]);
+    const stored = (await db.query<{ state: string; answer_event: string }>('SELECT state,answer_event FROM codex_questions WHERE id=$1', [first.id])).rows[0]!;
+    assert.deepEqual([stored.state, stored.answer_event], ['answered', 'answer-1']);
+    assert.equal((await db.query('SELECT id FROM outbox WHERE idempotency_key LIKE $1', ['control:%'])).rows.length, 1);
+    local.worker.scripts.push(reply.completed());
+    await local.runtime.tickTask();
+    await local.runtime.tickTask();
+    // 답과 취소가 겹쳐도 멈추지 않고 어느 한쪽 결과로 끝난다.
+    await ingress.receive(task('second'));
+    const second = await question();
+    const results = await Promise.allSettled([
+      ingress.receive(event('answer-2', { kind: 'command', command: 'answer', target: second.id, text: '이쪽으로' })),
+      ingress.receive(event('cancel-2', { kind: 'command', command: 'task-cancel', target: second.job_id })),
+    ]);
+    assert.deepEqual(results.map(result => result.status), ['fulfilled', 'fulfilled']);
+    const job = (await db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [second.job_id])).rows[0]!;
+    const asked = (await db.query<{ state: string }>('SELECT state FROM codex_questions WHERE id=$1', [second.id])).rows[0]!;
+    // 어느 순서든 취소가 이긴다. 답이 먼저면 질문이 잠시 answered로 남고 다음 sweep이 닫는다. 재개되는 일은 없다.
+    assert.equal(job.state, 'cancelled');
+    assert.ok(['answered', 'cancelled'].includes(asked.state), asked.state);
+    const executed = local.worker.executes.length;
+    await local.runtime.tickTask();
+    assert.equal(local.worker.executes.length, executed);
+    assert.equal((await db.query<{ state: string }>('SELECT state FROM codex_questions WHERE id=$1', [second.id])).rows[0]!.state, 'cancelled');
+    // 트랜잭션 안의 LaneClosed는 SQL 오류가 아니라 앞선 쓰기와 안내가 함께 커밋된다.
+    const closing = { admit: async (store: Store) => { await store.db.query(`UPDATE execution_lanes SET closed_reason='retention_full',closed_at=1 WHERE lane='task'`); return null; } };
+    const acks: string[] = [];
+    const acknowledge = f.rest.acknowledge.bind(f.rest);
+    f.rest.acknowledge = async (e, content, options) => { acks.push(content); return acknowledge(e, content, options); };
+    const racing = new DiscordIngress(f.store, f.gate, f.rest, true, ALL_COMMANDS, () => {}, undefined, closing as never);
+    await racing.receive(task('raced'));
+    assert.equal(acks.at(-1), taskLaneClosedText('retention_full'));
+    const raced = (await db.query<{ accepted: boolean; ignored: string }>(`SELECT accepted,payload->>'ignored' AS ignored FROM events WHERE delivery_id='raced'`)).rows[0]!;
+    assert.deepEqual([raced.accepted, raced.ignored], [true, 'task_refused']);
+    assert.equal((await laneRow(db)).closed_reason, 'retention_full');
+    assert.equal((await db.query(`SELECT j.id FROM jobs j JOIN events e ON e.id=j.event_id WHERE e.delivery_id='raced'`)).rows.length, 0);
+  } finally { await close(); }
+});
+
 // 게시 서버 인스턴스 하나에 해당하는 Store. 같은 풀이어도 트랜잭션마다 연결이 다르다.
 const instance = (db: Database, f: Fixture) => new Store(db, f.now);
 const chat = async (f: Fixture, id: string) => f.ingress.receive(event(id, { kind: 'command', command: 'urgent', text: '대화' }));

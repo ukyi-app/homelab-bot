@@ -19,6 +19,14 @@ function jobList(label: string, jobs: Row[], reasonOnly = false): string[] {
     ...shown.map(job => jobLine(job, reasonOnly))];
 }
 
+// 작업 레인 새 접수가 닫힌 이유와 다음 행동. execution_lanes.closed_reason 세 값이다.
+export function taskLaneClosedText(reason: string): string {
+  if (reason === 'unknown') return '작업 레인이 닫혀 있습니다(unknown). 종료를 확인하지 못한 작업이 있습니다. 작업자 프로세스 0개를 확인한 뒤 /task-release target:<job-id>로 해제하세요. 대화·리뷰는 계속 동작합니다.';
+  if (reason === 'cleanup_pending') return '작업 레인이 닫혀 있습니다(cleanup_pending). 끝난 작업의 세션 공간을 지웠는지 확인하지 못했습니다. 봇이 계속 다시 시도하고, 지워지면 저절로 열립니다.';
+  if (reason === 'retention_full') return '작업 레인이 닫혀 있습니다(retention_full). 보존 세션 8개가 찼습니다. 대기 중인 작업을 /answer·/resume-model로 끝내거나 /task-cancel로 멈추면 다시 열립니다.';
+  return `작업 레인이 닫혀 있습니다(${reason}).`;
+}
+
 export function controlText(command: string, result: unknown): string {
   if (Array.isArray(result) && result.every(isObject)) return jobList('작업', result).join('\n');
   if (!isObject(result)) return JSON.stringify(result);

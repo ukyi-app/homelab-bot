@@ -17,6 +17,8 @@ export const ADDRESS_KEYS = Object.freeze(['WORKER_URL', 'GRAFANA_URL', 'KUBERNE
 export const MEMORY_KEYS = Object.freeze(['MEMORY_LEDGER_DIR', 'MEMORY_LEDGER_ACCEPT_GENERATION', 'BRIEFING_TIME', 'BRIEFING_TIMEZONE'] as const);
 // 리뷰 App(비밀). 없으면 리뷰 GitHub 전송을 만들지 않는다. 하나만 있으면 기동하지 않는다.
 export const REVIEW_APP_KEYS = Object.freeze(['GITHUB_REVIEW_APP_ID', 'GITHUB_REVIEW_APP_PRIVATE_KEY'] as const);
+// 작업 레인(비밀 아님, 차트 env). 스위치가 true가 아니면 주소를 읽지도 않는다. 켰는데 주소가 없거나 틀리면 기동하지 않는다.
+export const TASK_KEYS = Object.freeze(['TASK_LANE_ENABLED', 'TASK_WORKER_URL'] as const);
 // 원장 PVC 마운트(계약 v1 /var/lib/homelab-bot/ledger)가 들어갈 수 있는 곳. 그 밖 경로는 컨테이너 쓰기 층이라 재시작에 사라진다.
 export const LEDGER_ROOT = '/var/lib/homelab-bot/';
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -35,6 +37,8 @@ export interface PublisherConfig {
   githubReviewApp?: { appId: string; privateKey: KeyObject } | null;
   // 리뷰 명시 스위치. 켜져도 정책·작업자 조건이 맞아야 열린다(main.ts reviewPrecondition).
   reviewEnabled?: boolean;
+  // null(또는 없음)이면 작업 레인을 조립하지 않는다. 있어도 정책과 작업자 조건이 맞아야 열린다(main.ts taskPrecondition).
+  taskLane?: { workerUrl: string } | null;
 }
 type Env = Readonly<Record<string, string | undefined>>;
 const token = (value: string) => value.length > 0 && !/\s/.test(value);
@@ -83,10 +87,20 @@ export function loadPublisherConfig(env: Env, loadedAt: number): PublisherConfig
   const { memory, briefing } = memoryConfig(env, problems);
   const githubReviewApp = reviewAppConfig(env, problems);
   const reviewEnabled = reviewSwitch(env, problems);
+  const taskLane = taskLaneConfig(env, problems);
   if (problems.length || !policy || !workerKey) throw new ConfigError(problems.length ? problems : ['unknown']);
   return { databaseUrl, discordToken, policy, grafana: { url: grafanaUrl, token: grafanaToken },
     kubernetes: { url: kubernetesUrl }, workerUrl, healthchecksUrl,
-    workerKey, githubWebhookSecret, memory, briefing, githubReviewApp, reviewEnabled };
+    workerKey, githubWebhookSecret, memory, briefing, githubReviewApp, reviewEnabled, taskLane };
+}
+function taskLaneConfig(env: Env, problems: string[]): PublisherConfig['taskLane'] {
+  const raw = env.TASK_LANE_ENABLED;
+  if (raw === undefined || raw === 'false') return null;
+  if (raw !== 'true') { problems.push('TASK_LANE_ENABLED(invalid)'); return null; }
+  const workerUrl = env.TASK_WORKER_URL?.trim();
+  if (!workerUrl) { problems.push('TASK_WORKER_URL(missing)'); return null; }
+  if (!url(workerUrl, ['http:'], true)) { problems.push('TASK_WORKER_URL(invalid)'); return null; }
+  return { workerUrl };
 }
 // 없으면 꺼짐. 오타가 조용히 꺼짐이나 켜짐이 되지 않게 true·false만 받는다.
 function reviewSwitch(env: Env, problems: string[]): boolean {

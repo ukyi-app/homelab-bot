@@ -52,6 +52,35 @@ async function conversation(gap: boolean) {
   await database.db.query(`INSERT INTO conversations(id,owner_id,scope,channel_id,created_at,gap) VALUES ($1,'fixture-owner','{}',$1,0,$2)`, [id, gap]);
 }
 
+test('B5 작업 레인 지표: 켠 배치에서만 나오고, 레인별 대기·실행·unknown·닫힘 사유·정리 실패·보존 수를 낸다', async () => {
+  const off = await health.metrics();
+  assert.doesNotMatch(off, /homelab_bot_(lane_jobs|task_)/);
+  health.watchTaskLane(() => ({ workerRouted: true, intakeOpen: false }));
+  const lane = (name: string, state: string) => `homelab_bot_lane_jobs{lane="${name}",state="${state}"}`;
+  const closed = (reason: string) => `homelab_bot_task_lane_closed{reason="${reason}"}`;
+  let m = parse(await health.metrics());
+  for (const name of ['interactive', 'task']) for (const state of OPEN) assert.equal(m.get(lane(name, state)), 0);
+  for (const reason of ['unknown', 'cleanup_pending', 'retention_full']) assert.equal(m.get(closed(reason)), 0);
+  assert.equal(m.get('homelab_bot_task_cleanup_pending'), 0);
+  assert.equal(m.get('homelab_bot_task_sessions_retained'), 0);
+  assert.deepEqual([m.get('homelab_bot_task_worker_routed'), m.get('homelab_bot_task_worker_intake_open')], [1, 0]);
+  await job('task', 'queued'); await job('task', 'unknown'); await job('chat', 'running'); await job('review', 'queued'); await job('read', 'queued');
+  await database.db.query(`INSERT INTO codex_sessions(job_id,thread_id,turn,tool_calls,host,repository,capabilities,state,created_at,updated_at,executor,claude_session_id,generation,worker_lease,
+    base_sha,policy_revision,project_id,project_revision,turn_timeout_ms,run_budget_ms,session_retained,cleanup_state)
+    SELECT id,gen_random_uuid()::text,1,0,'worker-task','fixture/repo','{}','failed',0,0,'claude',gen_random_uuid()::text,1,gen_random_uuid()::text,repeat('a',40),'r','p','r',1,1,true,'pending' FROM jobs WHERE type='task' AND state='queued'`);
+  // 이 파일의 beforeEach가 표 전체를 비운다.
+  await database.db.query(`INSERT INTO execution_lanes(lane,closed_reason,closed_at) VALUES ('task','unknown',0)`);
+  m = parse(await health.metrics());
+  assert.equal(m.get(lane('task', 'queued')), 1);
+  assert.equal(m.get(lane('task', 'unknown')), 1);
+  assert.equal(m.get(lane('interactive', 'running')), 1);
+  // 대화와 리뷰가 interactive를 함께 쓰고 read는 어느 레인도 아니다.
+  assert.equal(m.get(lane('interactive', 'queued')), 1);
+  assert.deepEqual(['unknown', 'cleanup_pending', 'retention_full'].map(reason => m.get(closed(reason))), [1, 0, 0]);
+  assert.equal(m.get('homelab_bot_task_cleanup_pending'), 1);
+  assert.equal(m.get('homelab_bot_task_sessions_retained'), 1);
+});
+
 test('OPS-M1 빈 DB: 모든 상태×종류·gap·outbox·제어 계열이 0으로 나옴(계열 안정)', async () => {
   const m = parse(await health.metrics());
   for (const type of TYPES) for (const state of OPEN) assert.equal(m.get(jobKey(type, state)), 0, jobKey(type, state));

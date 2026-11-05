@@ -1,6 +1,6 @@
 import { DEFAULTS } from './contracts.js';
 import { MEMORY_DISABLED, opsMetrics } from './ops-metrics.js';
-import type { MemoryMetrics } from './ops-metrics.js';
+import type { MemoryMetrics, TaskLaneMetrics } from './ops-metrics.js';
 import type { Store } from './store.js';
 
 export class Health {
@@ -11,6 +11,7 @@ export class Health {
   private pinging = false;
   private gatewayState: () => { halted: boolean } = () => ({ halted: false });
   private memoryState: () => MemoryMetrics = () => MEMORY_DISABLED;
+  private taskState: (() => TaskLaneMetrics) | undefined;
   public receivers = { app: false, alerts: false };
   constructor(private readonly store: Store, private readonly ping: () => Promise<void>) {}
   gateway(connected: boolean): void {
@@ -23,6 +24,8 @@ export class Health {
   watchGateway(state: () => { halted: boolean }): void { this.gatewayState = state; }
   // 원장·브리핑 상태. readiness에는 묶지 않는다(원장 장애로 경보·webhook 수신까지 끊기지 않게, DECISIONS T20).
   watchMemory(state: () => MemoryMetrics): void { this.memoryState = state; }
+  // 작업 레인을 조립했을 때만 부른다. 부르지 않으면 지표에 레인 계열이 없다.
+  watchTaskLane(state: () => TaskLaneMetrics): void { this.taskState = state; }
   async ready(): Promise<boolean> {
     if (!this.receivers.app || !this.receivers.alerts) return false;
     try {
@@ -50,7 +53,7 @@ export class Health {
       + `homelab_bot_outbox_unknown ${unknown.count}\n`
       + `homelab_bot_outbox_oldest_seconds ${row.oldest === null ? 0 : Math.max(0, (this.store.now() - Number(row.oldest)) / 1000)}\n`
       + `homelab_bot_gateway_halted ${Number(this.gatewayState().halted)}\n`
-      + await opsMetrics(this.store.db, this.store.now(), this.memoryState());
+      + await opsMetrics(this.store.db, this.store.now(), this.memoryState(), this.taskState?.());
   }
 }
 // Discord는 IDENTIFY를 24시간 1000회(봇 상한 900), rate_limit_key마다 5초에 1회 받는다. 단일 shard라 키는 하나다.

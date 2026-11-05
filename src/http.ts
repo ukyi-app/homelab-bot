@@ -5,12 +5,12 @@ import type { Health } from './health.js';
 import { z } from 'zod';
 
 export const PORTS = Object.freeze({ publisher: 8080, alerts: 8081, worker: 8080 });
-export async function body(request: IncomingMessage): Promise<unknown> {
+export async function body(request: IncomingMessage, limit = 65_536): Promise<unknown> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > 65_536) throw new Error('body_limit');
+    if (size > limit) throw new Error('body_limit');
     chunks.push(Buffer.from(chunk));
   }
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));

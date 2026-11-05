@@ -88,7 +88,7 @@
 `01` §6 추상 계약 기준. 경로 (A) `codex exec`를 쓸 때다. 최종 값은 T18이 실측으로 정한다.
 
 > T18 로컬·mock 값(2026-10-29)은 §12다. 실제 CLI 실측은 아직 없다(T16b, D-14 차단 조건).
-> T16b(2026-10-30): 대화 레인의 실행기는 프로필로 고른다(§12 "T16b 실행기 프로필", Claude가 첫 운영 프로필). 이 표는 T18 Codex 작업 어댑터의 기준이고, 작업 레인은 아직 어떤 실행기에도 연결하지 않았다.
+> T16b(2026-10-30): 대화 레인의 실행기는 프로필로 고른다(§12 "T16b 실행기 프로필", Claude가 첫 운영 프로필). 이 표는 T18 Codex 작업 어댑터의 기준이다. 작업 레인은 Claude 전용 작업자로 조립했고 스위치가 기본 꺼짐이다(§12 "T18 작업 레인 조립").
 
 | 계약 | V1 값 | 근거 |
 |---|---|---|
@@ -838,7 +838,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 ### T16b 실행기 프로필 (2026-10-30, D-14 변경)
 
 - 결정: D-14 변경(사용자 2026-10-30, [DECISIONS.md](DECISIONS.md) D-14 "변경"). Claude Code CLI, 구독 장기 토큰, 첫 모델 Opus 5.5, 실행기를 설정으로 바꾸는 구조. 설계는 T16b 조사(실행기 어댑터·Claude 인증·Claude 전환 영향, 비공개 작업 문서)의 추천안 "공통 실행 제어 + 작은 실행기 어댑터 + 프로필 선택 + 이미지 하나"를 따랐다.
-- 범위: 처음에는 대화 레인만이었다. 리뷰(T17)는 2026-11-04에 `claude-subscription`에 연결했다(`lanes.review=true`, #40·#42·#44, 아래). `codex-subscription`의 리뷰는 닫혀 있다(`lanes.review=false`). 작업 레인(T18)은 어떤 실행기에도 연결하지 않았다(능력표 `lanes.task=false`). 게시 서버와의 HTTP v1(요청·응답·서명·nonce)은 바꾸지 않았다. 실행기 이름·플래그·자격은 그 계약에 들어가지 않는다.
+- 범위: 처음에는 대화 레인만이었다. 리뷰(T17)는 2026-11-04에 `claude-subscription`에 연결했다(`lanes.review=true`, #40·#42·#44, 아래). `codex-subscription`의 리뷰는 닫혀 있다(`lanes.review=false`). 작업 레인(T18)은 이 프로필 작업자가 아니라 `WORKER_LANES=task` 전용 작업자가 맡는다(이 표의 `lanes.task=false`, 프로필의 `taskCapabilities`). 게시 서버와의 HTTP v1(요청·응답·서명·nonce)은 바꾸지 않았다. 실행기 이름·플래그·자격은 그 계약에 들어가지 않는다.
 - 리뷰 레인 연결(T17, 2026-11-04): 작업자 서버 하나(8080)가 `/v1/execute`·`/v1/cancel`·`/v1/review`·`/v1/review/cancel`을 받고 서명 확인과 영속 nonce를 함께 쓴다. 리뷰 경로는 리뷰 레인이 열렸을 때만 있다. 인증 없는 요청에는 401이고(게시 서버의 준비 확인 신호), 닫히면 404다. 대화와 리뷰는 실행 제어 `RunControl` 하나와 실행 자리 `ExecutionSlot` 하나를 함께 쓴다. 그래서 실행 잠금·`unknown` 잠금·잔여물 차단·readiness·종료 drain이 두 레인에 함께 걸린다. 기동 때 `sweep()`으로 이전 프로세스가 남긴 실행 공간을 지운다. 리뷰 실행은 도구 0개, MCP·hooks·skills 없음, 실행마다 빈 임시 공간, 세션 안 남김이다(`src/review-lane.ts`). 실제 모델 호출은 아직 없다([VERIFICATION](VERIFICATION.md) "T17 실가동 구현").
 - 모델 호출·로그인 없음. Claude CLI는 고정 바이너리의 `--version`·`--help`만 실행했다. 시험의 CLI 자리는 같은 인자·stdin·env로 도는 가짜 실행 파일이다.
 
@@ -950,7 +950,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 ### T18 작업 레인 계약 (Claude, 2026-11-05)
 
-**아직 연결하지 않았다(task off).** 계약 타입·파서·서명 검증과 DB 확장, 아래 "T18 작업 레인 실행·정리"의 작업자 쪽 부품만 있다. 라우트·조립·스케줄러·Discord 명령이 없고 어떤 프로필도 `lanes.task=true`를 내지 않아 게시 서버와 작업자 동작은 그대로다. 기존 `/v1/execute`·`/v1/cancel`·`/v1/review*`와 `REVIEW_INSTRUCTIONS`는 바꾸지 않는다. 위 "T16a 소유 변경 요청" 3의 task 요청 필드는 기존 `WorkerRequest`가 아니라 이 새 계약이 담는다. 이 절의 재개·수명 규칙은 Claude 작업 경로의 계약이고, 위 Codex 절의 어댑터 값을 바꾸지 않는다.
+**이 절은 끝점 계약이다.** 라우트·조립·명령은 아래 "T18 작업 레인 조립"에 있고 스위치가 기본 꺼짐이다. 기존 `/v1/execute`·`/v1/cancel`·`/v1/review*`와 `REVIEW_INSTRUCTIONS`는 바꾸지 않는다. 위 "T16a 소유 변경 요청" 3의 task 요청 필드는 기존 `WorkerRequest`가 아니라 이 새 계약이 담는다. 이 절의 재개·수명 규칙은 Claude 작업 경로의 계약이고, 위 Codex 절의 어댑터 값을 바꾸지 않는다.
 
 **계약.** `src/task-contracts.ts`가 끝점 표 `TASK_ENDPOINTS`로 끝점·operation·요청·응답을 묶는다. 모두 strict이고 `version:1`이다.
 
@@ -1004,7 +1004,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 ### T18 작업 레인 실행·정리 (Claude, 2026-11-05)
 
-**부품만 있고 조립되지 않았다.** `worker-main`·라우트·프로필이 이 코드를 쓰지 않아 운영 동작은 그대로다. 대화·리뷰의 argv·판정·정리·임시 공간도 그대로다.
+`WORKER_LANES=task` 작업자만 이 코드를 쓴다(아래 "T18 작업 레인 조립"). 대화·리뷰의 argv·판정·정리·임시 공간은 그대로다.
 
 **구성.**
 
@@ -1055,7 +1055,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 ### T18 게시 서버 스케줄링과 질문 (2026-11-05)
 
-**아직 켜지 않았다.** 함수와 옵션만 있다. `RuntimeOptions.taskLoop`와 `ReviewRuntimeOptions.lanes`가 기본 false면 `Runtime.tick`이 지금처럼 모델 job 전부를 슬롯 하나로 처리하고 `tickTask`는 아무것도 하지 않으며 레인 행을 잡지 않는다. 아래는 두 옵션을 켠 배치의 동작이다.
+`main.ts`가 작업 레인을 조립할 때만 두 옵션을 함께 켠다(아래 "T18 작업 레인 조립"). `RuntimeOptions.taskLoop`와 `ReviewRuntimeOptions.lanes`가 기본 false면 `Runtime.tick`이 지금처럼 모델 job 전부를 슬롯 하나로 처리하고 `tickTask`는 아무것도 하지 않으며 레인 행을 잡지 않는다. 아래는 두 옵션을 켠 배치의 동작이다.
 
 **구성.** `src/task-bridge.ts`의 `TaskBridge`가 실행기와 무관한 부분(재인가, 질문 중복·만료, outbox, lease 감시, 상태, 해제 권한)을 갖고, `CodexBridge`와 `ClaudeTaskBridge`(`src/claude-task-bridge.ts`)가 이를 상속한다. 작업자 호출은 `TaskWorkerPort.call(endpoint, body, signal)` 하나로, `TASK_ENDPOINTS`의 요청·응답 타입을 그대로 쓴다. 저장소·기준 커밋·프로젝트 정책은 `TaskPlanSource.plan`이 정한다. 시작하지 않았다는 증거(거부 응답, 연결 전 실패)는 `TaskWorkerRejected`로 던지고, 그 밖의 예외는 시작 여부를 모르는 것으로 본다.
 
@@ -1107,6 +1107,71 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 - 저장소(PVC)가 바뀌면 옛 세션의 정리를 증명할 길이 없어 `cleanup_pending`이 남고 작업 레인이 닫힌 채로 있다. 자동으로 풀지 않는다.
 - storage를 한 번도 알지 못한 세션은 작업자가 세션을 받았다는 근거가 없다. 그래서 `absent`여도 작업자의 `/v1/task/finalize` 답을 따른다. 첫 턴 응답을 잃은 바로 그 사이에 PVC까지 바뀐 경우는 구분하지 못한다. 시작 전에 identity를 알 수단이 계약에 없고, 막으면 작업자 단절 뒤 레인이 풀 길 없이 닫힌다.
+
+### T18 작업 레인 조립 (2026-11-05)
+
+**기본은 꺼짐이다.** `TASK_LANE_ENABLED`가 없거나 `false`면 작업 레인 객체를 만들지 않는다. 명령 등록·수신, 루프, 작업 HTTP 클라이언트, 지표 계열이 모두 없고 `taskLoop`·`lanes`도 꺼져 지금과 같다. 작업자 이미지는 사람 PR로만 바뀌고 `WORKER_LANES`가 없으면 대화·리뷰 작업자 그대로다. R08(외부 세션 알림)은 이 조립에 없다. `attach_task`는 작업 레인 능력표에서 `false`이고, 조립 자리는 아래 "R08"이다.
+
+**구성.**
+
+| 파일 | 맡는 것 |
+|---|---|
+| `src/task-worker.ts` | `TaskWorkerService`(서명·nonce·lease·fence·직렬 슬롯·세대·identity, 네 끝점의 동작), `TaskIntake`(수락 상태), `TaskReceipts`(실행 영수증), `TaskNonces` |
+| `src/task-http.ts` | 작업자 라우트와 서버(`taskWorkerServer`), 게시 서버 포트(`HttpTaskWorker`), 무서명 상태 응답 `GET /v1/task/intake` |
+| `src/task-policy.ts` | 정책 `task` 절 검사, `PolicyTaskPlans`(`TaskPlanSource`), 기준 SHA |
+| `src/task-commands.ts` | Discord 작업 명령과 브리지 사이(`TaskCommands`) |
+
+**작업자(`WORKER_LANES=task`) 기동 순서.** 설정 → `taskImageProblems()` → CLI `--version` → `PodPidSpace.record({ dedicatedTaskPod: true })`(HTTP 열기 전) → `ProcessGroupLauncher([bin], { cleanup: space })`와 전용 `RunControl` → 상태 볼륨(저장소 ID, 영수증, `TaskSessions`) → 수신. 대화·리뷰 끝점은 경로 자체가 없다. 시험은 `cleanup`을 가짜로 주입한다. 개발 기계에서는 `record`가 기준 밖 프로세스를 보고 거부해 `kill(-1)` 수단이 생기지 않는다.
+
+**가용성. 무엇이 무엇을 닫는가.** 작업 파드가 Ready가 아니면 Argo CD root가 sandbox wave에서 멈춰 뒤 단계 플랫폼 적용까지 막힌다. 그래서 재시작으로 풀리지 않는 문제에 재시작을 걸지 않고, 런타임 장애가 Ready를 내리지 않는다.
+
+| 구분 | 사유 | 프로세스 | `/readyz` | `/v1/task` | 제어 끝점 | 풀림 |
+|---|---|---|---|---|---|---|
+| 설정 오류 | env 누락·형식, 개인 경로, 프로필 | 종료 코드 1 | 없음 | 없음 | 없음 | 차트 PR |
+| 기동 검사 | `bwrap_missing`·`socat_missing`·`git_missing`·`managed_settings_present`·`executor_version_*`·`pid_*`·`run_control_unavailable` | 유지 | 503 | 503 | 정리 수단이 있으면 동작, 없으면 `stopped:false`·`unknown` | 이미지 교체 |
+| 런타임 | `nonce_write_failed`·`receipt_write_failed`·`volume_unwritable`·`volume_low`(여유 32MiB 미만)·`credential_unavailable` | 유지 | 200 | 503 | 동작 | 30초 주기 확인이 저절로 연다 |
+| 볼륨 미확립 | `state_unavailable`(저장소 ID를 아직 읽지 못함) | 유지 | 200 | 503 | 503 | 같음 |
+
+사유는 값 없는 상수이고 로그(`task_intake_closed`·`task_intake_recovered`), `GET /v1/task/intake`, 게시 서버 `/metrics`로 보인다.
+
+**nonce 기록 실패와 제어.** 실행은 영속 기록이 되어야만 받는다. 취소·상태·정리는 기록을 못 쓰면 메모리로 받는다. 볼륨이 찼을 때 정리까지 막으면 공간을 비울 길이 없어 레인이 스스로 풀리지 못한다. 대가는 볼륨 장애와 컨테이너 재시작이 겹칠 때 수명 30초 안의 제어 capability를 다시 쓸 수 있다는 것이다. 제어는 본문 digest에 묶여 같은 일을 또 할 뿐이다.
+
+**라우트 순서.** capability 없음 401(본문을 읽기 전) → 본문 상한·스키마 400 → (`/v1/task`만) 종료 중 403·수락 닫힘 503 → 서명·nonce 403(`/v1/task`의 기록 실패는 503) → identity 불일치 409 → (`/v1/task`만) 슬롯·fence 409. 거부 본문은 모두 `TaskRejectionSchema`다. 게시 서버는 400·401·403·409와 연결 전 실패만 미시작으로 본다. **503은 미시작의 증거로 세지 않는다**(B1 계약). 응답 불명과 같게 취소로 확인하고, 작업자가 멈춤을 답하면 `task_worker_lost` 실패, 아니면 `unknown`이다. 그래서 게시 서버는 먼저 `/v1/task/intake`를 보고 닫혀 있으면 새 접수와 claim을 멈춘다.
+
+**fence.** nonce는 재생 방지이고 실행 멱등은 `.homelab-worker/receipts/<job>.json`이 맡는다. 실행 전에 기록하고, 못 쓰면 실행하지 않는다. 재시작 뒤에도 거부하는 것: 지난 세대, 같은 세대의 첫 턴 재전송, 지난 턴, 취소·정리된 세대의 늦은 요청. 취소는 세대를 막지만 옛 lease의 취소는 지금 턴을 건드리지 않는다. 기록은 1시간이 지나고 세션 공간도 없으면 지운다. 그때 발급된 capability는 모두 만료다.
+
+**정리 호출.** `kill(-1)`은 파드 전체를 향한다. 다른 job의 턴이 도는 동안에는 부르지 않고 직렬 1을 근거로 답한다(소멸 미확인 job이 있으면 실행을 받지 않으므로 다른 턴이 돌면 그 job의 프로세스는 없다). 정리가 도는 동안에는 실행을 받지 않는다. 턴 준비 중의 git이 함께 죽기 때문이다.
+
+**게시 서버 조립.** 정적 조건(스위치·주소·유효한 `task` 절)이 맞으면 `ClaudeTaskBridge`와 별도 루프 `runtime.tickTask()`를 만들고 `taskLoop`·`lanes`를 함께 켠다. 절이 없거나 틀리면 작업 레인만 닫고 대화·리뷰는 그대로 뜬다. 30초마다 `/v1/task/intake`를 물어 **작업 모드 작업자가 답한 뒤에** 명령을 연다. 옛 이미지·대화 작업자는 404라, 거기 실행을 보내 응답 불명으로 레인을 닫는 일을 막는다. 한 번 열면 닫지 않는다. 수락이 닫혀 있으면 claim만 멈추고 `sweep`(정리 재시도·질문 만료)은 계속한다.
+
+**명령.** owner·허용 채널·스레드 소유 검사는 기존 수신 경로 그대로다.
+
+| 명령 | 옵션 | 처리 |
+|---|---|---|
+| `/task` | `project`, `text` | 정책에 프로젝트가 없거나 레인·작업자 수락이 닫혔으면 안내만 하고 스레드·작업을 만들지 않는다. 그 뒤 닫히면 `accept`의 `LaneClosed`를 받아 같은 안내를 낸다. 스레드를 만든 뒤면 그 스레드에 남긴다 |
+| `/answer` | `question`, `text`(2,000자) | 수신 `store.atomic` 안, `ownedConversation` 잠금 뒤 `answerIn`. 이벤트 처리와 답 쓰기를 한 번에 확정한다 |
+| `/task-status` | `target` | 트랜잭션 밖. 이 대화의 작업만 |
+| `/task-cancel` | `target` | `/cancel`과 같은 경로이고 작업 레인 작업만 |
+| `/task-release` | `target` | 먼저 답하고 작업자 소멸 확인 결과를 대화에 게시한다. Gateway 이벤트 순서를 막으면 뒤 상호작용이 3초 기한을 놓친다 |
+
+**기준 SHA.** 프로젝트 정책의 `branch`면 작업 시작 때 `GET https://api.github.com/repos/<repo>/commits/<branch>`(sha 미디어 타입)를 **자격 없이** 읽는다. `base`면 그 고정 SHA를 쓰고 GitHub에 묻지 않는다. 이유: 작업자가 같은 저장소를 자격 없이 codeload로 받으므로 익명으로 안 보이는 저장소는 어차피 시작할 수 없고, 리뷰 App 토큰을 작업 레인에 끌어오면 리뷰 조건에 묶인다. 게시 서버의 기존 인터넷 443 egress 안이다. 익명 한도(IP당 시간 60회)에 걸리거나 닿지 않으면 그 작업만 실패하고 `/retry`한다. 브리지가 재개 때 세션의 SHA와 대조하므로 대기 세션은 세션의 값을 돌려준다. `/retry`는 새 세대가 그때의 머리에서 시작한다.
+
+**정책 키.** `task.projects[]`: `id`, `revision`, `repository`, `branch` 또는 `base`, `allowedPaths`, `forbiddenPaths`, `verifyCommands`, `limits`(선택, `TaskRunLimitsSchema` 상한 안). 값은 Infisical에만 둔다. `task` 키는 이 코드 이전의 게시 서버가 거부하므로(strict) 코드 배포 뒤에 넣는다.
+
+**설정 키.** 게시 서버: `TASK_LANE_ENABLED`(`true`·`false`만), `TASK_WORKER_URL`(켰을 때 필수, http, 경로 `/`). 작업자: `WORKER_LANES`(미설정·`chat,review`·`task`), `TASK_STATE_ROOT`, `WORKER_NONCE_DIR`(`<TASK_STATE_ROOT>/.homelab-worker` 아래. 밖이면 샌드박스가 가리지 않아 기동 오류).
+
+**지표(작업 레인을 조립했을 때만).** `homelab_bot_lane_jobs{lane,state}`, `homelab_bot_task_lane_closed{reason}`, `homelab_bot_task_cleanup_pending`, `homelab_bot_task_sessions_retained`, `homelab_bot_task_worker_routed`, `homelab_bot_task_worker_intake_open`.
+
+**켜는 순서.**
+
+1. **봇 병합(지금).** 게시 서버 자동 배포. 스위치 꺼짐이라 변화 없음.
+2. **H2.** 이 코드가 든 digest로 `task.image`를 고정하고 `task.enabled:true`. `WORKER_LANES=task`·`TASK_STATE_ROOT=/worker-state`는 차트가 넣는다. 사람 토큰 등록 → ES 준비 → 파드 순서다.
+3. **무모델 확인.** `/readyz` 200, `GET /v1/task/intake`의 `open:true`, 사유 없음. 모델을 부르지 않는다.
+4. **H4.** `RUNTIME_POLICIES`에 `task` 절을 넣고 `TASK_LANE_ENABLED=true`, `TASK_WORKER_URL=http://worker-task.sandbox:8080`. 첫 시험 프로젝트는 승인된 범위로 묶고(`base` 고정 권장), live 시험은 그 승인 뒤다.
+
+되돌리기는 `TASK_LANE_ENABLED`를 끈 게시 서버 배포가 먼저다. 실행 중 턴은 드레인·취소 확인을 거치고, 못 하면 `unknown`이다. 켠 채 작업자를 옛 이미지로 내리지 않는다.
+
+**R08(B5b).** 수신 경로가 정해지면 `main.ts`의 `receivers` 라우트, `commands.ts`의 별도 명령 목록, `DiscordIngress` 처리기 인자, `CLAUDE_TASK_LANE_CAPABILITIES`와 별개의 연결 능력표에 더한다. 작업 레인 스위치와 묶지 않는다.
 
 ## 13. 개선안 v2 적용 (2026-10-30)
 

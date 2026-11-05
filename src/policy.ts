@@ -12,6 +12,8 @@ const PolicySchema = z.strictObject({
   revocationRestores: z.array(z.string().uuid()).optional(),
   // PR 리뷰 정책. 형식 검사는 review.ts가 하고, 없으면 리뷰 경로만 닫힌다.
   review: z.unknown().optional(),
+  // 작업 레인 프로젝트 정책. 형식 검사는 task-policy.ts가 하고, 없으면 작업 레인만 닫힌다.
+  task: z.unknown().optional(),
 });
 export type Policy = z.infer<typeof PolicySchema>;
 // 사람이 Infisical에 두는 값(env RUNTIME_POLICIES)의 모양. confirmedAt은 봇이 읽은 시각으로 채우므로 받지 않는다.
