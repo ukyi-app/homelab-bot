@@ -483,7 +483,7 @@ T16b에서 이월한 P2다. 브리핑 시각·시간대를 비우거나 잘못 �
 
 이 결과를 실연동 성공·AC-B5 완료로 쓰지 않는다.
 
-- **r1 반영(rev-t18 리뷰 `/home/ukyi/t13/bot/review-t18-r1.md`):** 지적별 회귀 시험(`test/codex-bridge.test.ts`)과 수정 커밋 `7b23166`.
+- **r1 반영(rev-t18 리뷰, 비공개 작업 문서):** 지적별 회귀 시험(`test/codex-bridge.test.ts`)과 수정 커밋 `7b23166`.
   - S1·R2 [P1] 세션 전 한도·인증 오류: :868(판정), :876(waiting_user·스케줄러 정지·다음 작업 차단).
   - R1 [P1] 중단·해제 뒤 늦은 실행: :886(시간 초과 → unknown → release → 준비 완료 뒤 spawn 0회), :903(confirmStop의 세대 무효화, 중단된 신호로 실제 launcher spawn 0회).
   - S2 [P2] 도구 호출 예산: :921(예산 1, 호출 2 → failed), :930(질문 뒤 재개 합산), :942(실제 프로세스에서 초과 시작을 보고 끝내 셋째 호출의 효과 없음).
@@ -492,7 +492,7 @@ T16b에서 이월한 P2다. 브리핑 시각·시간대를 비우거나 잘못 �
   - R4 [P2] 실행 비트: :970(0644 → 0755는 변경, git이 보지 않는 비트는 변경 아님).
   - 수정 전 실행: 새 10건 실패·기존 40건 통과(커밋 `2286f2f`). 수정 뒤 50/50, 전체 326/326을 3회 연속 통과.
   - 수정이 바꾼 기존 시험: 시간 초과 사례(:553)는 준비(git init) 중 시간 초과가 이제 실행을 막아(R1) 준비가 즉시 끝나는 작업 공간으로 바꿨다. 결과 객체에 `tools` 필드가 더해져 기대값 2개를 갱신했다. fake codex는 파이프 출력을 비운 뒤 끝나게 고쳤다(바로 exit하면 3MiB 출력이 잘림).
-- **r2 반영(재리뷰 `/home/ukyi/t13/bot/review-t18-r2.md`):** 회귀 시험(`test/codex-bridge.test.ts`)과 수정 커밋 `33b8a27`.
+- **r2 반영(재리뷰 r2, 비공개 작업 문서):** 회귀 시험(`test/codex-bridge.test.ts`)과 수정 커밋 `33b8a27`.
   - N1 [P1] 긴 오류 메시지 뒤쪽 인증·한도 표식: :991(최상위 `error`·`turn.failed` 모두 2000자 뒤 표식 → 대기), :999(실제 브리지 waiting_user·스케줄러 정지·다음 작업 차단). r1 S1·R2를 완전히 닫는다.
   - N2 [P2] 경로 500개·4096자 절단 뒤 판정: :1009(501번째 공간 밖 경로, 4096자 뒤 상위 이동 → failed, 실제 브리지 포함).
   - N3 [P2] 재개 예산 소진 뒤 /retry: :1022(한도 대기 경로), :1039(clarification 경로). 세션 failed·질문 cancelled 정리 뒤 /retry가 새 스레드로 dispatch.
@@ -502,14 +502,14 @@ T16b에서 이월한 P2다. 브리핑 시각·시간대를 비우거나 잘못 �
   - 자체 점검(같은 종류): 맨 처음 009판에는 `repository` 열과 `waiting_model` 상태 제약도 없었다(N4 시험이 함께 확인). 실행 출력 파일을 크기 확인 없이 통째로 읽던 것(:1109, `output_too_large`). 변경 경로 중복 제거·대조가 경로 수의 제곱 비용이던 것(:1119, 수정 전 4만 5천 개에 1541ms, 수정 뒤 66ms). 축약에서 항목 id·종류·상태·스레드 ID를 자르던 것도 함께 없앴다.
   - 수정 전 실행: 새 8건 실패·기존 50건 통과(커밋 `1e6c990`, 원문 `.local/r2-red.txt`는 커밋하지 않음). 제곱 비용 시험은 그 뒤 더해 수정 전 실패(1541ms)를 따로 확인했다. 수정 뒤 59/59, 전체 335/335를 3회 연속 통과.
   - 시험 쪽 변경: D-14 시험의 파일 접근 기록용 spy에 새 `size` 메서드를 더했다.
-- **r3 반영(재리뷰 `/home/ukyi/t13/bot/review-t18-r3.md`):** 회귀 시험(`test/codex-bridge.test.ts`)과 수정 커밋 `404fe6a`.
+- **r3 반영(재리뷰 r3, 비공개 작업 문서):** 회귀 시험(`test/codex-bridge.test.ts`)과 수정 커밋 `404fe6a`.
   - N6 [P1] 실행 뒤 상위 디렉터리 심링크로 바깥 읽기: :1140(리뷰어의 정적 교체 재현. 실행 구간에 `run`·`workspace`·둘 다·작업 디렉터리를 바깥 디렉터리 심링크로 교체 → `failed`(`workspace_tampered`), 바깥 요약 표식 없음), :1159(실제 브리지에서 결과 행·게시 없음), :1171(루트 심링크 스냅샷 거부, 상위 심링크를 거친 `nodeFiles.read` 거부).
   - N7 [P2] fstat 뒤 커지는 파일: :1190(fstat이 1바이트를 본 직후 2MiB로 키우는 순서를 고정 → 상한 1024에서 null).
   - 자체 점검(같은 종류: 경로 해석·심링크·TOCTOU): 하드링크 파일 읽기·해시(:1180), 설정 쓰기가 기존 하드링크를 따라 바깥 파일을 덮어쓰던 것(:1206, `O_EXCL` 새 inode), 스냅샷 순회의 lstat→readdir 사이 교체(핸들 기준 순회로 함께 고침), git 준비가 경로 기반이던 것(고정 핸들에서 돌림), 남은 프로세스가 있을 때도 결과·인증 파일을 읽던 것(N7 제안대로 읽지 않음).
   - 막은 범위와 남는 한계: ARCHITECTURE §12 "실행 뒤 파일 읽기 경계". 사슬 확인을 realpath 비교로 쓰지 않았고, 확인 뒤 교체는 고정 핸들이 지킨다. 같은 UID의 내용 위조, codex 자신의 경로 사용, 다른 살아 있는 프로세스의 경합은 남는다.
   - 수정 전 실행: 새 5건 실패·기존 59건 통과(커밋 `b43e376`). 처음에는 시험의 작업 ID에 16진수 아닌 글자를 넣어 다른 이유로 실패했고, 고친 뒤 의도한 실패(바깥 결과로 `completed`)를 확인했다. 설정 쓰기 하드링크 시험은 그 뒤 더해 수정 전 실패를 따로 확인했다. 수정 뒤 65/65, 전체 341/341을 3회 연속 통과.
   - 시험 쪽 변경: `CodexFiles`가 실행 전 경로 연산(mkdir·resolve)만 남아 D-14 시험의 spy를 그에 맞췄다.
-- **r4 반영(재리뷰 `/home/ukyi/t13/bot/review-t18-r4.md`, P3 2건):** 재리뷰는 N6·N7과 r3 자체 수정 5건을 해결로 판정했다.
+- **r4 반영(재리뷰 r4, 비공개 작업 문서, P3 2건):** 재리뷰는 N6·N7과 r3 자체 수정 5건을 해결로 판정했다.
   - N8 [P3] 사슬 확인 전에 출력 파일을 읽던 순서: 확인 실패 반환을 모든 본문 읽기 앞으로 옮겼다(수정 커밋 `9a15db9`). 회귀 시험 `test/codex-bridge.test.ts:1221`은 실행 뒤 `FileHandle.read`·`readFile`·`readableWebStream` 호출을 모두 기록해, `workspace`만 바깥 심링크로 바꾸고 결과는 원래 `run`에 쓴 경우 읽기 0회를 확인한다. 수정 전에는 출력 파일을 2회(데이터·EOF) 읽어 실패했다(커밋 `3abf48d`).
   - N9 [P3] 사후 확인의 범위: 원래 inode로 되돌린 교체는 탐지하지 못한다는 한계, `dev`·`ino` 비교가 마운트를 보지 않는다는 점, 실행 전 디렉터리 만들기 경합이 실패로 닫히는 조건(잘못된 경로가 고정 단계까지 남아 있을 때)을 ARCHITECTURE §12에 적었다. 한계 기록 시험 `test/codex-bridge.test.ts:1253`은 바뀐 설정을 읽게 한 뒤 원래 디렉터리를 되돌리면 `completed`가 됨을 고정한다. 하드링크 변경 검출 범위 문구도 좁혔다.
   - 수정 뒤 67/67, 전체 343/343을 3회 연속 통과.
@@ -901,3 +901,78 @@ R2·R2b·R3의 `--settings`는 `sandbox.enabled`, `failIfUnavailable: true`, `al
 
 - 운영 반영: 호스트 프로필 설치·재부팅 유지(homelab `host/`), 봇 이미지에 bubblewrap·socat, 작업 레인 실행 설정(scrub, 샌드박스, `denyRead`, Read deny, `--allowedTools`), 작업 레인 파드(`hostUsers: false`, Localhost 프로필). 순서는 호스트 프로필이 먼저다. 노드에 없는 프로필을 참조하면 파드가 뜨지 않는다.
 - 이 절의 R2b 조합을 운영 작업 레인에서 다시 확인한다(SEC-02 작업 레인 사례).
+
+## T18 할 일 6·작업 레인 실행 부품 (2026-11-05, 로컬 + 무모델 파드)
+
+결정은 [DECISIONS](DECISIONS.md) "T18 할 일 6 정리 방식", 구조는 [ARCHITECTURE](ARCHITECTURE.md) "T18 작업 레인 실행·정리"다. **모델을 부르지 않았다.** 토큰은 합성 값이고 CLI는 네트워크 없는 namespace에서만 띄웠다. 작업 레인은 여전히 꺼져 있다.
+
+### 1. 정리 방식을 고른 파드 실측 (무모델, 토큰 없음)
+
+조건: `hostUsers: false`, `procMount: Unmasked`, uid 10001, capability 없음, Localhost seccomp·AppArmor, 스크립트가 PID 1.
+
+| 항목 | 결과 |
+|---|---|
+| 파드 안 cgroup 위임 | 불가. `/sys/fs/cgroup` 읽기 전용, 소유 65534 |
+| 바깥 bwrap PID namespace로 작업을 감싸기 | 불가. 그 안에서 Claude 샌드박스 bwrap이 namespace를 못 만든다 |
+| 샌드박스 안 `unshare -U`·중첩 bwrap | 둘 다 거부 |
+| 샌드박스 안 회피 자식 5종(`setsid`, double fork, `env -i`, TERM 무시, `nohup`), 샌드박스를 띄운 부모만 KILL | 전부 끝남(die-with-parent) |
+| 샌드박스 밖 `setsid`·`env -i` 도우미 | 부모 KILL로는 남음. 기준 밖 전부 KILL하면 끝남 |
+
+### 2. 정리 방식 시험
+
+`test/task-process-containment.test.ts`, 29건. 실제 프로세스 사례는 bwrap 0.11.1로 만든 별도 PID namespace에서 돌렸다(커널 7.0). 정리 코드와 따로 `/proc/<pid>/stat`을 세어 대조한다.
+
+| 사례 | 정리 전 | 정리 뒤 | 판정 |
+|---|---|---|---|
+| background, stdout을 쥔 자식 | 살아 있음 | 0 | 0 확인 |
+| `setsid`, double fork, `nohup` | 살아 있음 | 0 | 0 확인 |
+| `setsid` + `env -i`(옛 방식이 못 찾는 자식) | 살아 있음 | 0 | 0 확인 |
+| non-dumpable(`prctl`) + `env -i` | 살아 있음 | 0 | 0 확인 |
+| TERM 무시 | 살아 있음 | 0 | 유예 뒤 KILL, 0 확인 |
+| fork 반복, TERM을 받으면 새 세션 자식을 띄움 | 살아 있음 | 0 | 0 확인 |
+| 번호를 옮겨 다니는 fork 연쇄(쉬는 것, 쉬지 않는 것) | **검사에는 0개로 보임**, 파일로 살아 있음 확인 | 파일 증가 멈춤 | 0 확인 |
+| 리더 스레드만 끝낸 프로세스(Z로 보임) | 살아 있음 | 0 | 0 확인 |
+| 끝나지 않는 CLI + 중단 | 살아 있음 | 0 | 0 확인 |
+| 정리 중 같은 launcher로 spawn | | | 거부 |
+| 작업자가 PID 1 | 살아 있음 | 0, 고아 좀비 1개 남음 | 0 확인(좀비는 세지 않음) |
+| 음성 대조: 옛 방식에 `setsid` + `env -i` | | **`survivors` 0인데 자식이 살아 있음** | 옛 방식의 한계 재현 |
+
+가짜 `/proc`으로 본 것: 다른 PID namespace만 남은 경우, `status` 권한 오류·I/O 오류, 목록 읽기 실패, `kill` 권한 오류, KILL로도 안 끝남, 사라지는 항목이 멈추지 않음은 모두 0이 아니다. 기준 밖 프로세스가 있으면 기록을 거부하고 신호를 보내지 않는다.
+
+**시험에서 찾은 결함.** 처음에는 검사가 깨끗하면 신호를 생략했다. 쉬지 않는 fork 연쇄는 목록에 잡혀도 읽을 때 없어 깨끗하게 보였고, 살아 있는데 0이 됐다. 지금은 TERM·KILL을 언제나 보낸다.
+
+### 3. 고정 CLI 2.1.308 (무모델)
+
+`test/task-settings-boundary.test.ts`. 가짜 토큰, 네트워크 없는 namespace, 샌드박스 의존성 확인용 빈 `socat` 대역. 도구 호출이 없어 대역은 실행되지 않는다.
+
+| 시험 | 결과 |
+|---|---|
+| 악성 스냅샷(`.claude/settings.json`·`settings.local.json`의 hook 8종·`apiKeyHelper`·sandbox 해제, `.mcp.json`, skill, 명령, `CLAUDE.md`, `AGENTS.md`), 시작 | marker 0 |
+| 같은 스냅샷, 같은 UUID로 `--resume` | marker 0, init `session_id` 같음 |
+| 대조군: 같은 스냅샷에서 `--setting-sources user`·`--safe-mode`만 뺌 | **hook marker 생김** |
+| init 값(시작·재개) | `tools` Bash·Edit·Read·StructuredOutput·Write, `mcp_servers`·`skills`·`plugins`·`slash_commands` 빈 목록, `permissionMode` default, `apiKeySource` none |
+| 어댑터 판정 | 실제 출력에서 위반 0, 끝은 `api_error`(네트워크 없음) |
+| 토큰 잔존 | stdout·stderr·세션 공간 파일 전부 0건 |
+| bwrap이 PATH에 없음 | 기동 거부, 흐름 없음(scrub이 요구) |
+| socat만 없음 | init 없이 result 오류 `Sandbox required but unavailable`(`failIfUnavailable`) |
+
+정적 확인: `blockReadsOutsideWorkingDirectories`는 2.1.308 바이너리에 설정으로 있다. 켜면 파일 도구가 작업 디렉터리 밖 읽기를 거부하고 샌드박스 명령이 홈 디렉터리를 잃는다는 문구가 있다. 파싱은 통과했지만 실제로 막는지는 도구 호출이 필요해 **[미확인]**이며 경계로 세지 않는다. `/etc/claude-code`가 관리 설정 위치임을 바이너리에서 확인했고, 이미지 빌드가 없음을 확인한다.
+
+### 4. 시험 결과
+
+- `npm run check` 통과. Node 24.22.0(저장소 고정).
+- `npm test`: **1152 tests / 1122 pass / 0 fail / 30 skipped**. 건너뜀 30건은 모두 `HOMELAB_TEST_PG_SOCKET` 없음(PostgreSQL)이다.
+- 네트워크 없는 임시 `postgres:18`(18.6)을 소켓으로 주면 **1152/1152 pass**. 시험 뒤 컨테이너를 지웠다.
+- 이미지: 런타임 기반 이미지에서 `bubblewrap=0.12.0-1~deb13u1`, `socat=1.8.0.3-1+deb13u1`, `git=1:2.47.3-0+deb13u1` 설치와 `/usr/bin/git`, `git version 2.47.3`을 확인했다. 전체 이미지 빌드와 그 이미지에서의 시험은 돌리지 않았다.
+- Dockerfile `test` 단계에는 bwrap이 없어 실제 프로세스·고정 CLI 시험이 사유와 함께 skip된다. 통과로 세지 않는다.
+
+### 5. 아직 확인하지 못한 것
+
+| 항목 | 왜 못 봤나 | 어디서 본다 |
+|---|---|---|
+| 운영 파드에서 `kill(-1)`·`NSpid` 판독·`record` 통과 | 로컬 namespace에서만 돌렸다. AppArmor peer 규칙 아래는 다를 수 있다 | 작업 레인 파드 배포 뒤 무모델 시험 |
+| 샌드박스 안 제어 경로·다른 작업 경로의 `denyRead`·`denyWrite`, Edit·Write deny, symlink·fd 별칭 | 도구 호출이 필요하다 | 운영 SEC-02 |
+| `config` 가림과 Bash 도구의 공존 | CLI가 셸 스냅샷을 `CLAUDE_CONFIG_DIR` 아래에 둘 수 있다. 가리면 Bash가 깨질 수 있다 | 운영 SEC-02 첫 턴 |
+| 메시징 소켓 가림의 효과와 부작용 | 도구 호출이 필요하다 | 운영 SEC-02 |
+| 실제 모델 응답의 재개 흐름(`--resume` 뒤 도구·`structured_output`) | 모델을 부르지 않았다. assistant·result 모양은 합성 fixture다 | live TASK-02 |
+| 실제 디스크 부족 | ENOSPC를 쓰기 호출에 주입했다 | 운영 |

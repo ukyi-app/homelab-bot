@@ -40,7 +40,7 @@ export function baseEnvironment(dirs: RunDirs, job: string, proxy?: { https: str
 // 실행 전 마지막 검사. 자격 값은 어댑터가 정한 env 변수 하나에만 있어야 한다: argv·다른 env 값·실행 디렉터리
 // 파일(어댑터가 쓴 설정)에 있으면 띄우지 않는다. env 이름은 공통 기본 + 어댑터 선언 목록 밖이면 거부한다.
 export async function assertLaunchSafe(adapter: ChatAdapter, plan: AdapterRun, env: Record<string, string>,
-  credential: RunCredential, root: string): Promise<void> {
+  credential: RunCredential, root: string | null): Promise<void> {
   for (const name of Object.keys(plan.env)) {
     if (BASE_ENV_NAMES.includes(name) || !adapter.envNames.includes(name)) throw new Error('env_not_allowed');
   }
@@ -69,7 +69,7 @@ export async function assertLaunchSafe(adapter: ChatAdapter, plan: AdapterRun, e
       if (content.length > SCAN_LIMIT.bytes || leaks(content.toString('utf8'))) throw new Error('credential_in_file');
     }
   };
-  if (secrets.length) await walk(root);
+  if (secrets.length && root !== null) await walk(root);
 }
 
 // 레인이 결과로 분류할 재료. 판정 순서가 계약이다: 소멸 확인 → 집행한 상한·정책 위반·중단 → 실행기 결과 → 레인 스키마 → 반사 검사.
@@ -87,14 +87,19 @@ export interface RunReport {
   // 실행은 끝났지만 임시 공간을 지우지 못했다. 답을 내보내지 않는다.
   cleanupFailed?: boolean;
   credentialRecheckFailed?: boolean;
+  // 이번 실행에서 시작한 도구 호출 수. 예산은 작업 단위로 게시 서버가 합산한다.
+  toolCalls?: number;
+  // 실행 중 멈춘 정책 위반의 종류. 로그 외에 작업 레인이 세션 불일치를 가르는 데 쓴다.
+  violation?: PolicyViolation;
 }
-export interface RunSpec {
+// 실행 공간을 어디서 얻는지. 대화·리뷰는 실행마다 새 임시 공간을 만들고 지운다. 작업 레인은 턴 사이 유지하는 세션 공간을 넘기고,
+// 그 공간의 수명은 task-workspace가 맡는다. 작업 어댑터는 파일을 쓰지 않아(설정은 인라인) 파일 유출 검사를 하지 않는다.
+type RunSpace = { prefix: string; session?: undefined } | { prefix?: undefined; session: { dirs: RunDirs } };
+export type RunSpec = RunSpace & {
   adapter: ChatAdapter;
   lane: RunLane;
   job: string;
   model: string;
-  // 실행 공간 이름 앞부분(RUN_PREFIX).
-  prefix: string;
   timeoutMs: number;
   // 도구를 끈 실행기(tools 'none')는 값과 무관하게 예산 0이다.
   toolCalls: number;
@@ -103,7 +108,7 @@ export interface RunSpec {
   // stdin으로만 넘긴다. argv·파일에 두지 않는다.
   prompt: string;
   limits: RunLimits;
-}
+};
 // 정책 위반으로 멈춘 실행의 종류. 결과 reason은 policy_violation 한 단어라 원인을 가르는 곳은 이 사건뿐이다.
 export interface RunViolationEvent { event: 'run_policy_violation'; lane: RunLane; kind: PolicyViolation }
 export type RunEvent = { event: 'cleanup_failed' | 'cleanup_recovered' } | RunViolationEvent;
@@ -254,17 +259,20 @@ export class RunControl {
     let env: Record<string, string>;
     let credential: RunCredential;
     let plan: AdapterRun;
-    let base: string;
+    let dirs: RunDirs;
     try {
-      base = state.base = await mkdtemp(join(this.tmp, spec.prefix));
-      const dirs: RunDirs = { root: base, home: join(base, 'home'), config: join(base, 'config'),
-        workspace: join(base, 'workspace'), run: join(base, 'run'), tmp: join(base, 'tmp') };
-      for (const dir of [dirs.home, dirs.config, dirs.workspace, dirs.run, dirs.tmp]) await mkdir(dir, { mode: 0o700 });
+      if (spec.session) dirs = spec.session.dirs;
+      else {
+        const base = state.base = await mkdtemp(join(this.tmp, spec.prefix));
+        dirs = { root: base, home: join(base, 'home'), config: join(base, 'config'),
+          workspace: join(base, 'workspace'), run: join(base, 'run'), tmp: join(base, 'tmp') };
+        for (const dir of [dirs.home, dirs.config, dirs.workspace, dirs.run, dirs.tmp]) await mkdir(dir, { mode: 0o700 });
+      }
       credential = await this.credential.forRun();
       plan = state.plan = await adapter.start({ job: spec.job, model: spec.model, dirs, credential, schema: spec.schema });
       // 작업자 프로세스 env를 읽거나 병합하지 않는다. 작업자 env에는 다른 자격·공개 키·플랫폼 값이 있을 수 있다.
       env = { ...plan.env, ...baseEnvironment(dirs, spec.job, this.options.proxy) };
-      await assertLaunchSafe(adapter, plan, env, credential, base);
+      await assertLaunchSafe(adapter, plan, env, credential, spec.session ? null : dirs.root);
     } catch {
       // 프로세스를 띄우기 전 실패다. 남은 프로세스가 없으니 unknown이 아니다.
       state.survivors = 0;
@@ -276,6 +284,7 @@ export class RunControl {
     const lines: string[] = [];
     const tools = new Set<string>();
     let exceeded: RunReport['exceeded'];
+    let violation: PolicyViolation | undefined;
     const inner = new AbortController();
     const forward = () => inner.abort();
     signal.addEventListener('abort', forward, { once: true });
@@ -287,7 +296,7 @@ export class RunControl {
       const seen = plan.observe(line);
       lines.push(seen.line);
       // 소멸 확인 전에 남긴다. 프로세스가 안 죽어 결과가 unknown이 되어도 종류는 보인다. 위 exceeded 검사로 실행당 한 번이다.
-      if (seen.violation) { stop('policy_violation'); violated(seen.violation); return; }
+      if (seen.violation) { stop('policy_violation'); violation = seen.violation; violated(seen.violation); return; }
       for (const tool of seen.tools) tools.add(tool);
       if (tools.size > budget) stop('tool_budget_exceeded');
     };
@@ -296,14 +305,15 @@ export class RunControl {
     try {
       // 준비하는 동안 중단·종료가 시작됐으면 띄우지 않는다. 이 확인과 launcher의 spawn 사이에는 await가 없다.
       if (signal.aborted || this.closed) { state.survivors = 0; return refused('aborted'); }
-      result = await this.launcher.run({ job: spec.job, args: [...plan.args], cwd: join(base, 'workspace'), env,
+      result = await this.launcher.run({ job: spec.job, args: [...plan.args], cwd: dirs.workspace, env,
         stdin: spec.prompt, limits: { lineBytes: limits.lineBytes, outputBytes: limits.outputBytes } }, inner.signal, onLine);
       if (result.overflow) exceeded ??= 'output_limit_exceeded';
     } catch (error) { launchFailed = error instanceof LaunchFailed; }
     finally { signal.removeEventListener('abort', forward); }
     await this.launcher.terminate(spec.job).catch(() => {});
     const survivors = state.survivors = await this.launcher.survivors(spec.job).catch(() => null);
-    const report: RunReport = { exit: result.exit, survivors, aborted: signal.aborted, launchFailed, exceeded };
+    const report: RunReport = { exit: result.exit, survivors, aborted: signal.aborted, launchFailed, exceeded,
+      toolCalls: tools.size, ...(violation ? { violation } : {}) };
     // 남은 프로세스가 있거나 모르면 결과 파일을 읽지 않는다. 살아 있는 프로세스가 바꿔치기할 수 있다.
     if (survivors !== 0 || !result.exit || exceeded || signal.aborted) return report;
     const outcome = await plan.finish(lines, result.exit as ExitStatus).catch((): EngineOutcome => ({ kind: 'failed', reason: 'finish_failed' }));

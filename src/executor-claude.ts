@@ -55,7 +55,7 @@ export function claudeArgs(model: string, schema: object): string[] {
 }
 
 // 판정에 쓰는 필드만 남긴 이벤트. 모델 본문(text·thinking), 도구 입력, 결과 텍스트(result)는 버린다.
-interface Compact {
+export interface Compact {
   type?: unknown; subtype?: unknown;
   tools?: unknown; mcp_servers?: unknown; model?: unknown; apiKeySource?: unknown; claude_code_version?: unknown;
   error?: unknown; api_error_status?: unknown; api_error?: unknown; tool_uses?: { id: unknown; name: unknown }[];
@@ -134,21 +134,30 @@ export function classifyClaudeError(kind: unknown, status: unknown): EngineOutco
   return null;
 }
 
+// 흐름 해석에서 레인마다 다른 부분. 대화·리뷰는 무도구 정책이고, 작업 레인은 자기 정책을 넘긴다(executor-claude-task).
+export interface ClaudeStreamPolicy {
+  compact(line: string): Compact | null;
+  init(init: Compact, expect: ClaudeExpectation): PolicyViolation | null;
+  event(event: Compact, expect: ClaudeExpectation): PolicyViolation | null;
+}
+const NO_TOOL_STREAM: ClaudeStreamPolicy = { compact: compactClaudeEvent, init: initViolation, event: modelViolation };
+
 const failed = (reason: string): EngineOutcome => ({ kind: 'failed', reason });
 // stream-json 해석. 순서: 흐름 무결성(init 하나, result 최대 하나) → init 정책 → 오류 결과(한도·인증 대기 또는 실패)
 // → 종료 코드 → structured_output. `subtype: success`만으로 성공을 확정하지 않는다(is_error=false와 구조화 출력이 있어야 한다).
-export function interpretClaudeStream(lines: readonly string[], exit: ExitStatus, expect: ClaudeExpectation): EngineOutcome {
+export function interpretClaudeStream(lines: readonly string[], exit: ExitStatus, expect: ClaudeExpectation,
+  policy: ClaudeStreamPolicy = NO_TOOL_STREAM): EngineOutcome {
   const events: Compact[] = [];
   for (const line of lines) {
     if (!line.trim()) continue;
-    const parsed = compactClaudeEvent(line);
+    const parsed = policy.compact(line);
     if (!parsed) return failed('invalid_stream');
     events.push(parsed);
   }
   const inits = events.filter(e => e.type === 'system' && e.subtype === 'init');
   if (inits.length !== 1) return failed('invalid_stream');
   // 실행 중 관측(observe)을 지나친 위반의 마지막 보루. 종류를 실어 보내 공통부가 로그로 남긴다. 판정 순서는 init → 모델이다.
-  const violation = initViolation(inits[0]!, expect) ?? events.map(event => modelViolation(event, expect)).find(kind => kind !== null);
+  const violation = policy.init(inits[0]!, expect) ?? events.map(event => policy.event(event, expect)).find(kind => kind !== null);
   if (violation) return { kind: 'failed', reason: 'policy_violation', violation };
   const results = events.filter(e => e.type === 'result');
   if (results.length > 1) return failed('invalid_stream');

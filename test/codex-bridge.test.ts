@@ -723,7 +723,9 @@ test('SEC-02 작업 시작 뒤 생긴 같은 UID 프로세스의 환경을 못 �
   assert.equal(run.result.kind === 'unknown' && run.result.reason, 'stop_unverifiable');
   process.kill(run.pid, 'SIGKILL');
 });
-test('SEC-02 한계 기록: 환경을 지우고 새 세션으로 빠져나간 자식은 그룹·표식으로 못 찾는다(cgroup 필요, T16b)', async () => {
+// 옛 Codex 경로(ProcessGroupLauncher 기본값)의 한계만 기록한다. 비신뢰 코드가 도는 작업 레인은 이 방식을 쓰지 않고,
+// 같은 자식이 끝나는 회귀는 test/task-process-containment.test.ts의 envclear 사례다.
+test('SEC-02 한계 기록(옛 Codex 경로): 환경을 지우고 새 세션으로 빠져나간 자식은 그룹·표식으로 못 찾는다', async () => {
   const run = await local('escape-clean', randomUUID());
   // 이 결과가 바뀌면 confirm_stop 표시와 ARCHITECTURE §12의 한계 문장을 함께 고친다.
   assert.equal(run.result.kind, 'completed');
