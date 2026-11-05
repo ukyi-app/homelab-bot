@@ -58,12 +58,21 @@ export function claudeArgs(model: string, schema: object): string[] {
 export interface Compact {
   type?: unknown; subtype?: unknown;
   tools?: unknown; mcp_servers?: unknown; model?: unknown; apiKeySource?: unknown; claude_code_version?: unknown;
-  error?: unknown; api_error_status?: unknown; api_error?: unknown; tool_uses?: { id: unknown; name: unknown }[];
+  error?: unknown; api_error_status?: unknown; api_error?: unknown; api_error_code?: unknown; api_error_origin?: unknown;
+  stop_reason?: unknown; tool_uses?: { id: unknown; name: unknown }[];
   is_error?: unknown; structured_output?: unknown; num_turns?: unknown;
   original_model?: unknown; fallback_model?: unknown;
 }
 const record = (value: unknown): Record<string, unknown> | null =>
   typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
+// 진단에 남겨도 되는 문자열 모양. CLI enum과 서버 error_code가 쓰는 식별자 형식이다 [확인: 2.1.308 바이너리의 api_error_code 설명].
+// 모양이 어긋나면 값을 버리고 unknown으로 둔다. 오류 문구가 이 필드로 들어와도 줄과 로그에 남지 않는다.
+const IDENTIFIER = /^[a-z][a-z0-9_]{0,63}$/;
+export const safeIdentifier = (value: unknown): string | null => value === undefined || value === null ? null
+  : typeof value === 'string' && IDENTIFIER.test(value) ? value : 'unknown';
+const keptIdentifier = (value: unknown) => value === undefined ? undefined : safeIdentifier(value);
+const errorKinds = (event: Record<string, unknown>) => ({ api_error: keptIdentifier(event.api_error),
+  api_error_code: keptIdentifier(event.api_error_code), api_error_origin: keptIdentifier(event.api_error_origin) });
 export function compactClaudeEvent(line: string): Compact | null {
   let raw: unknown;
   try { raw = JSON.parse(line); } catch { return null; }
@@ -86,12 +95,13 @@ export function compactClaudeEvent(line: string): Compact | null {
       }) : [];
     // 응답한 모델(API 응답의 message.model). 줄인 줄에는 model로 남는다.
     const model = record(event.message)?.model ?? event.model;
-    Object.assign(compact, { model, error: event.error, api_error_status: event.api_error_status, tool_uses: uses });
+    Object.assign(compact, { model, error: event.error, api_error_status: event.api_error_status, ...errorKinds(event),
+      stop_reason: keptIdentifier(record(event.message)?.stop_reason ?? event.stop_reason), tool_uses: uses });
   } else if (event.type === 'system' && event.subtype === 'model_refusal_fallback') {
     Object.assign(compact, { original_model: event.original_model, fallback_model: event.fallback_model });
   } else if (event.type === 'result') {
-    Object.assign(compact, { is_error: event.is_error, api_error_status: event.api_error_status, api_error: event.api_error,
-      structured_output: event.structured_output, num_turns: event.num_turns });
+    Object.assign(compact, { is_error: event.is_error, api_error_status: event.api_error_status, ...errorKinds(event),
+      stop_reason: keptIdentifier(event.stop_reason), structured_output: event.structured_output, num_turns: event.num_turns });
   }
   return compact;
 }
@@ -134,6 +144,24 @@ export function classifyClaudeError(kind: unknown, status: unknown): EngineOutco
   return null;
 }
 
+// 오류 판정과 진단이 함께 보는 이벤트. 값은 result에 있으면 그것을, 없으면 마지막 assistant의 것을 쓴다.
+// error는 종류가 정해진 오류에만 온다. 세부 필드는 그것 없이 올 수 있어 따로 기억한다 [확인: 2.1.308 바이너리의 SDK 스키마].
+export interface ClaudeErrorSeen { assistantError?: Compact; assistantDetail?: Compact; assistantStop?: Compact; result?: Compact }
+export function noteClaudeError(seen: ClaudeErrorSeen, event: Compact): void {
+  if (event.type === 'result') seen.result = event;
+  if (event.type !== 'assistant') return;
+  if (event.error !== undefined) seen.assistantError = event;
+  if ([event.api_error, event.api_error_status, event.api_error_code, event.api_error_origin].some(value => value !== undefined && value !== null)) seen.assistantDetail = event;
+  if (event.stop_reason !== undefined && event.stop_reason !== null) seen.assistantStop = event;
+}
+export const seenStopReason = (seen: ClaudeErrorSeen) => seen.result?.stop_reason ?? seen.assistantStop?.stop_reason;
+export const seenApiError = (seen: ClaudeErrorSeen) => seen.result?.api_error ?? seen.assistantDetail?.api_error;
+// 거절은 일시 오류와 달리 같은 요청을 되풀이해도 소용없어 api_error와 가른다. stop_reason은 Messages API의 거절이고,
+// api_error의 두 값은 조직 DLP와 안전 모니터 차단이다 [확인: 2.1.308 바이너리의 SDK 스키마]. 인증·한도의 HTTP 상태 추정보다 앞선다.
+export const MODEL_REFUSAL = 'model_refusal';
+const REFUSAL_API_ERRORS = new Set<unknown>(['dlp_request_denied', 'safety_monitor_blocked']);
+const refused = (seen: ClaudeErrorSeen) => seenStopReason(seen) === 'refusal' || REFUSAL_API_ERRORS.has(seenApiError(seen));
+
 // 흐름 해석에서 레인마다 다른 부분. 대화·리뷰는 무도구 정책이고, 작업 레인은 자기 정책을 넘긴다(executor-claude-task).
 export interface ClaudeStreamPolicy {
   compact(line: string): Compact | null;
@@ -161,16 +189,18 @@ export function interpretClaudeStream(lines: readonly string[], exit: ExitStatus
   if (violation) return { kind: 'failed', reason: 'policy_violation', violation };
   const results = events.filter(e => e.type === 'result');
   if (results.length > 1) return failed('invalid_stream');
-  const apiErrors = events.filter(e => e.type === 'assistant' && e.error !== undefined);
-  const lastError = apiErrors.at(-1);
+  const seen: ClaudeErrorSeen = {};
+  for (const event of events) noteClaudeError(seen, event);
+  const lastError = seen.assistantError;
   const result = results[0];
   if (!result) return classifyClaudeError(lastError?.error, lastError?.api_error_status) ?? failed('no_result');
   if (result.is_error !== false || result.subtype !== 'success') {
+    if (refused(seen)) return failed(MODEL_REFUSAL);
     return classifyClaudeError(lastError?.error, result.api_error_status ?? lastError?.api_error_status)
       ?? failed(result.subtype === 'success' ? 'api_error' : 'execution_error');
   }
   if (exit.code !== 0) return failed('exit_nonzero');
-  if (result.structured_output === undefined || result.structured_output === null) return failed('no_structured_output');
+  if (result.structured_output === undefined || result.structured_output === null) return failed(refused(seen) ? MODEL_REFUSAL : 'no_structured_output');
   return { kind: 'output', value: result.structured_output };
 }
 

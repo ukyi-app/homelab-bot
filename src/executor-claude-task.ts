@@ -1,9 +1,9 @@
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { TASK_OUTPUT_JSON_SCHEMA, TaskOutputSchema, echoesSecret } from './codex-events.js';
-import { CLAUDE_AUTH, CLAUDE_CLI_VERSION, CLAUDE_FIXED_ENV, ClaudeChatAdapter, REVIEW_DISABLED_BUILTIN_PLUGINS, STRUCTURED_OUTPUT_TOOL,
-  compactClaudeEvent, interpretClaudeStream, modelViolation } from './executor-claude.js';
-import type { ClaudeAuth, ClaudeExpectation, ClaudeStreamPolicy, Compact } from './executor-claude.js';
+import { CLAUDE_AUTH, CLAUDE_CLI_VERSION, CLAUDE_FIXED_ENV, ClaudeChatAdapter, MODEL_REFUSAL, REVIEW_DISABLED_BUILTIN_PLUGINS, STRUCTURED_OUTPUT_TOOL,
+  compactClaudeEvent, interpretClaudeStream, modelViolation, noteClaudeError, safeIdentifier, seenApiError, seenStopReason } from './executor-claude.js';
+import type { ClaudeAuth, ClaudeErrorSeen, ClaudeExpectation, ClaudeStreamPolicy, Compact } from './executor-claude.js';
 import type { AdapterRun, ChatAdapter, ChatRun, EngineOutcome, ExecutorCapabilities, ExitStatus, Observation, PolicyViolation } from './executor.js';
 import { bounded } from './format.js';
 import type { ArchiveFetcher } from './review-input.js';
@@ -143,8 +143,33 @@ function usageOf(value: unknown): TaskModelUsage | null {
     cacheWriteTokens: whole(usage.cache_creation_input_tokens) ? usage.cache_creation_input_tokens as number : null };
 }
 
+// 오류로 끝난 턴의 원인을 가를 재료. 턴마다 새로 만들어 어댑터와 실행이 채운다.
+export interface TaskTurnTrace { errors: ClaudeErrorSeen; initConfirmed: boolean; version: unknown; report: RunReport | null }
+const newTrace = (): TaskTurnTrace => ({ errors: {}, initConfirmed: false, version: undefined, report: null });
+const SEMVER = /^\d{1,5}\.\d{1,5}\.\d{1,5}$/;
+const SIGNAL = /^SIG[A-Z0-9]{1,12}$/;
+const shaped = (value: unknown, pattern: RegExp) => value === undefined || value === null ? null : typeof value === 'string' && pattern.test(value) ? value : 'unknown';
+const httpStatus = (value: unknown) => value === undefined || value === null ? null : Number.isInteger(value) && (value as number) >= 100 && (value as number) <= 599 ? value : 'unknown';
+// first_party만 뜻이 있다. 없다고 외부 제공자로 확정되지는 않는다 [확인: 2.1.308 바이너리의 SDK 스키마].
+const errorOrigin = (value: unknown) => value === undefined || value === null ? null : value === 'first_party' ? value : 'unknown';
+// 구조화 필드만 형식을 검사해 남긴다. error_details·errors[]·message.content·result 원문·stderr·요청·응답 본문은 애초에 읽지 않는다.
+export function taskErrorDetail(trace: TaskTurnTrace): Record<string, unknown> {
+  const { assistantError, assistantDetail, result } = trace.errors;
+  const exit = trace.report?.exit;
+  const outcome = trace.report?.outcome;
+  return { cli_version: shaped(trace.version, SEMVER), init_confirmed: trace.initConfirmed,
+    engine_reason: outcome ? safeIdentifier(outcome.kind === 'failed' ? outcome.reason : outcome.kind) : null,
+    result_subtype: safeIdentifier(result?.subtype),
+    is_error: result?.is_error === undefined || result.is_error === null ? null : typeof result.is_error === 'boolean' ? result.is_error : 'unknown',
+    exit_code: Number.isSafeInteger(exit?.code) ? exit!.code : null, exit_signal: shaped(exit?.signal, SIGNAL), tools: trace.report?.toolCalls ?? null,
+    assistant_error: safeIdentifier(assistantError?.error), api_error: safeIdentifier(seenApiError(trace.errors)),
+    api_error_status: httpStatus(result?.api_error_status ?? assistantDetail?.api_error_status), stop_reason: safeIdentifier(seenStopReason(trace.errors)),
+    api_error_code: safeIdentifier(result?.api_error_code ?? assistantDetail?.api_error_code),
+    api_error_origin: errorOrigin(result?.api_error_origin ?? assistantDetail?.api_error_origin) };
+}
+
 export interface ClaudeTaskTurn { operation: ClaudeTaskOperation; sessionId: string; sandbox: TaskSandboxPaths }
-// 턴마다 새로 만든다. 이번 턴의 세션 ID·경로를 쥐고, 흐름에서 본 사용량을 runTaskTurn에 넘긴다.
+// 턴마다 새로 만든다. 이번 턴의 세션 ID·경로를 쥐고, 흐름에서 본 사용량과 오류 필드를 runTaskTurn에 넘긴다.
 export class ClaudeTaskAdapter implements ChatAdapter {
   readonly capabilities = CLAUDE_TASK_CAPABILITIES;
   readonly envNames: readonly string[];
@@ -153,7 +178,7 @@ export class ClaudeTaskAdapter implements ChatAdapter {
   usage: TaskModelUsage | null = null;
   private readonly apiKeySource: string;
   private readonly versioning: ClaudeChatAdapter;
-  constructor(auth: ClaudeAuth, private readonly turn: ClaudeTaskTurn) {
+  constructor(auth: ClaudeAuth, private readonly turn: ClaudeTaskTurn, private readonly trace: TaskTurnTrace = newTrace()) {
     this.credentialEnv = CLAUDE_AUTH[auth].env;
     this.apiKeySource = CLAUDE_AUTH[auth].apiKeySource;
     this.versioning = new ClaudeChatAdapter(auth);
@@ -170,6 +195,7 @@ export class ClaudeTaskAdapter implements ChatAdapter {
     let initChecked = false;
     let unnamed = 0;
     const seen = (usage: TaskModelUsage | null) => { this.usage = usage; };
+    const trace = this.trace;
     return {
       args: taskArgs({ model: run.model, schema: run.schema, operation, sessionId, settings: taskSettings(sandbox) }),
       env: { CLAUDE_CONFIG_DIR: run.dirs.config, ...CLAUDE_TASK_ENV, [this.credentialEnv]: run.credential.value },
@@ -180,8 +206,11 @@ export class ClaudeTaskAdapter implements ChatAdapter {
         if (compact.type === 'system' && compact.subtype === 'init' && !initChecked) {
           initChecked = true;
           violation = policy.init(compact, expect);
+          trace.version = compact.claude_code_version;
+          trace.initConfirmed = violation === null;
         }
         violation ??= policy.event(compact, expect);
+        noteClaudeError(trace.errors, compact);
         if (compact.type === 'result') seen(usageOf(compact.usage));
         const tools = (compact.tool_uses ?? []).filter(use => use.name !== STRUCTURED_OUTPUT_TOOL)
           .map(use => typeof use.id === 'string' && use.id ? use.id : `unnamed-${++unnamed}`);
@@ -265,6 +294,8 @@ export async function judgeTaskRun(input: { request: TaskRequest; base: Base; re
   }
   if (outcome.kind === 'failed') {
     if (outcome.violation === 'session_mismatch') return failedResponse(base, 'session_mismatch', true);
+    // 계약의 사유 표에 거절이 따로 없어 응답에는 가장 가까운 model_cannot_complete로 싣는다. 거절인지는 task_turn_error_detail의 engine_reason이 말한다.
+    if (outcome.reason === MODEL_REFUSAL) return failedResponse(base, 'model_cannot_complete', true);
     return failedResponse(base, KNOWN_REASONS.has(outcome.reason) ? outcome.reason as TaskFailureReason : 'execution_error', true);
   }
   const parsed = TaskOutputSchema.safeParse(outcome.value);
@@ -294,19 +325,24 @@ export async function runTaskTurn(deps: TaskTurnDeps, request: TaskRequest, sign
   const started = Date.now();
   const turn = { job: request.job, generation: request.generation, turn: request.turn };
   deps.log?.({ level: 'info', event: 'task_turn_started', ...turn, operation: request.operation });
+  const trace = newTrace();
   try {
-    const response = await executeTaskTurn(deps, request, signal);
+    const response = await executeTaskTurn(deps, request, signal, trace);
+    if (response.status !== 'completed' && response.status !== 'needs_input') {
+      deps.log?.({ level: 'warn', event: 'task_turn_error_detail', ...turn, status: response.status, reason: response.status === 'failed' ? response.reason : null, ...taskErrorDetail(trace) });
+    }
     deps.log?.({ level: response.status === 'failed' || response.status === 'unknown' ? 'warn' : 'info', event: 'task_turn_finished', ...turn, status: response.status,
       reason: response.status === 'failed' ? response.reason : null, tools: response.usage.toolCalls, ms: Date.now() - started,
       stopped: response.stopped, cleaned: !response.sessionRetained });
     return response;
   } catch (error) {
     // 라우트가 이 예외를 unknown 응답으로 바꾼다. 로그의 상태도 그 응답과 같게 적는다.
+    deps.log?.({ level: 'warn', event: 'task_turn_error_detail', ...turn, status: 'unknown', reason: 'turn_threw', ...taskErrorDetail(trace) });
     deps.log?.({ level: 'error', event: 'task_turn_finished', ...turn, status: 'unknown', reason: 'turn_threw', tools: null, ms: Date.now() - started, stopped: false, cleaned: false });
     throw error;
   }
 }
-async function executeTaskTurn(deps: TaskTurnDeps, request: TaskRequest, signal: AbortSignal): Promise<TaskResponse> {
+async function executeTaskTurn(deps: TaskTurnDeps, request: TaskRequest, signal: AbortSignal, trace: TaskTurnTrace): Promise<TaskResponse> {
   const base: Base = { version: 1, job: request.job, lease: request.lease, generation: request.generation, sessionId: request.sessionId,
     turn: request.turn, worker: deps.worker, usage: { toolCalls: null, model: null } };
   // 보존 여부는 사유로 짐작하지 않는다. session_missing이어도 공간이 남아 보존 상한을 쓰고 있으면 게시 서버가 finalize해야 한다.
@@ -323,10 +359,11 @@ async function executeTaskTurn(deps: TaskTurnDeps, request: TaskRequest, signal:
   catch { return failedResponse(base, 'prepare_failed', await retained()); }
   const adapter = new ClaudeTaskAdapter(deps.auth, { operation: request.operation, sessionId: request.sessionId,
     sandbox: { credentialDir: deps.credentialDir, controlDir: deps.sessions.controlDir, config: session.dirs.config, run: session.dirs.run, others,
-      ...(deps.socketDir ? { socketDir: deps.socketDir } : {}) } });
+      ...(deps.socketDir ? { socketDir: deps.socketDir } : {}) } }, trace);
   const report = await deps.control.run({ adapter, lane: 'task', job: request.job, model: deps.model, session: { dirs: session.dirs },
     timeoutMs: request.timeoutMs, toolCalls: request.toolCalls, schema: TASK_OUTPUT_JSON_SCHEMA, prompt: taskPrompt(request),
     limits: { lineBytes: request.limits.lineBytes, outputBytes: request.limits.outputBytes, events: request.limits.events } }, signal);
+  trace.report = report;
   base.usage = { toolCalls: report.toolCalls ?? null, model: adapter.usage };
   const launched = report.survivors === 0 && !report.refused && !report.launchFailed;
   if (launched) await deps.sessions.recordTurn(session, request.turn).catch(() => {});

@@ -457,7 +457,9 @@ test('TASK-03 취소 요청은 작업 그룹 소멸 확인 뒤에만 cancelled',
   await running;
   assert.equal((await jobs())[0]!.state, 'cancelled');
   assert.deepEqual(launcher.terminated, [job.id]);
-  assert.equal((await rows('results')).length, 0); assert.equal((await outbox()).length, 0);
+  // 결과는 게시하지 않고 취소 안내만 간다.
+  assert.equal((await rows('results')).length, 0);
+  assert.deepEqual((await outbox()).map(row => row.idempotency_key), [`task-cancelled:${job.id}`]);
 });
 test('TASK-03 취소·정상 종료 뒤 남은 프로세스는 unknown, 새 실행 차단·알림, 0개 확인 뒤에만 owner 해제', async () => {
   launcher.left = 1;
