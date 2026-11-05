@@ -1020,3 +1020,50 @@ R2·R2b·R3의 `--settings`는 `sandbox.enabled`, `failIfUnavailable: true`, `al
 - 빈 stub은 모델 턴 내내 있다. 저장소에 `package.json`이 없어도 `npm`이 빈 파일을 볼 수 있다.
 - stub 초기화는 `.git/commondir`, `.git/config.worktree`, `.git/info/exclude`도 건드린다. 증거는 `.git`을 읽지 않아 영향이 없다. 파드의 `/tmp/inline-comments-buffer.jsonl`도 만든다.
 - 로컬에서 `config` 가림과 Bash 도구는 함께 돌았다. 위 "아직 확인하지 못한 것"의 공존 항목을 운영에서 볼 때 참고한다.
+
+## T18 운영 live 시험 5건과 후속 수정 (2026-11-05)
+
+**결과 표.** 값(요청 원문·모델 출력·파일 내용)은 적지 않는다. 출처는 운영 `worker-task` 로그(`task_turn_*`, `task_sandbox_traces_ignored`), 게시 서버 로그(`task_job_finished`), 시험 직후 `/worker-state/tasks` 목록과 파드 프로세스 수(lead가 읽기만), DB `jobs.wait_reason`(사용자 실행 읽기 전용 조회)이다. 1차는 작업별 로그가 생기기 전(봇 #71 전)이라 도구·흔적 수가 없다. Discord 쪽은 사람 기기의 Codex가 #작업공간에서 보고 옮겼다.
+
+| 시험 | 작업 ID 앞 8자 | 상태 | 사유 코드 | 도구 수 | 흔적 수 | 정리 확인 |
+|---|---|---|---|---|---|---|
+| TASK-01 1차 | `26e39cd8` | `failed` | `task_change_outside_policy` | 기록 없음 | 기록 없음(로컬 재현 17) | finalize로 지워짐 |
+| TASK-01 재시도 | `c36d1d92` | `succeeded`, 변경 README.md 1개 | 없음 | 3 | 16(smoke에 `package.json`이 있어 하나 적다) | `stopped: true`, `tasks` 비어 있음 |
+| TASK-02 질문·`/answer`·같은 세션 resume | `165ec7a2` | 1턴 `needs_input` → 2턴 `resume` `completed` → `succeeded`, 변경 README.md 1개 | 없음 | 0 / 2 | 2턴 16 | 두 턴 모두 `stopped: true` |
+| TASK-03 취소 | `9c8b705f` | 작업자 `failed(aborted)` 77초 → `cancelled` | `stop_confirmation` | 2 | 기록 없음(중단) | `stopped: true`, `tasks` 비어 있음, 파드 프로세스 수 기준 그대로. Discord 취소 완료 안내 누락(이 수정 대상) |
+| SEC-02 | `38778ff1` | `failed` 3.6초 | `task_api_error` | 0 | 기록 없음 | `stopped: true`, `tasks` 비어 있음 |
+
+다섯 건 모두 토큰 의심 문자열 반사·unknown은 없었다.
+
+**SEC-02 판정은 `not_run`이다.** 도구가 한 번도 돌지 않아(`tools 0`, 3618ms) 경계가 지켜졌다고도 뚫렸다고도 읽지 않는다. `api_error`의 원인(정책 거절, 일시 오류, 전송 실패 등)은 당시 구조화 필드를 남기지 않아 **[미확인]**으로 남는다. 작업 실행 실패 기록은 지우지 않는다.
+
+**오류 진단.** `compactClaudeEvent`가 `stop_reason`, assistant의 `api_error`, `api_error_code`, `api_error_origin`을 버리고 있었고 `task_turn_finished`는 최종 사유만 남겼다. 규칙은 [ARCHITECTURE](ARCHITECTURE.md) "T18 작업 레인 실행·정리"의 "오류 진단"·"거절 분류"다. `test/task-diagnostics.test.ts`가 실제 `RunControl`과 가짜 실행 파일로 본다.
+
+| 흐름 | 응답 | `engine_reason` | 이벤트에서 본 값 |
+|---|---|---|---|
+| 400 | `failed(api_error)` | `api_error` | `invalid_request`, 400, `api_error_code`, `first_party` |
+| 401 | `auth_expired` | `auth_expired` | `authentication_failed`, 401 |
+| 429 | `limited` | `limited` | `rate_limit`, 429 |
+| 500 | `failed(api_error)` | `api_error` | `server_error`, 500 |
+| 529 | `failed(api_error)` | `api_error` | `overloaded`, 529 |
+| 연결 종료, result 있음 | `failed(api_error)` | `api_error` | `api_error: no_response`, 상태 `null` |
+| 연결 종료, result 없음, SIGKILL | `failed(no_result)` | `no_result` | `exit_signal: SIGKILL`, 종료 코드 `null` |
+| `stop_reason: refusal`(오류 result, assistant만, HTTP 200) | `failed(model_cannot_complete)` | `model_refusal` | `stop_reason: refusal` |
+| DLP·안전 모니터 | `failed(model_cannot_complete)` | `model_refusal` | `dlp_request_denied`(403), `safety_monitor_blocked` |
+| 모르는 enum | `failed(execution_error)` 또는 `api_error` | 그대로 | 식별자 모양이면 그대로, 아니면 `unknown` |
+
+오류 문구·`message.content`·`result`·`error_details`·`errors[]`·요청·응답 본문·stderr와 모든 구조화 필드에 가짜 비밀을 넣어도 로그 전체에 남지 않는다. 완료·질문 턴은 이벤트를 남기지 않고, 정책 위반·실행 전 실패·예외 턴은 남긴다. 고정 CLI를 가짜 토큰·네트워크 없이 띄우는 기존 시험(`test/task-settings-boundary.test.ts`)은 그대로 `api_error`다.
+
+**취소 안내 누락.** 원인: 작업 레인의 취소 확정(`ClaudeTaskBridge.settle` → `Store.transition`)은 job 상태만 바꿨다. 완료(`Store.finish`)·실패(`Store.fail`)와 달리 outbox에 넣는 코드가 없었다. `/task-cancel`이 실행 중 작업에 주는 답은 "취소 요청"뿐이라 스레드에 끝 안내가 오지 않았다. 대기열·`waiting_user`의 즉시 취소와 dispatch 직전 취소도 같았다. 규칙은 [ARCHITECTURE](ARCHITECTURE.md) "T18 게시 서버 스케줄링과 질문"의 "취소 안내"다.
+
+`test/task-cancel-notice.test.ts`가 본다: 실행 중 취소 → 소멸 확인 → `cancelled` → 안내 1건. 같은 확정 반복(이미 끝난 job, sweep 반복, 상태를 되돌려 같은 키 재삽입) → 1건. 소멸 미확인 → `cancelled` 안내 0건, unknown 안내 1건. 취소 뒤 lease 만료로 상태를 못 바꾸면 0건. 대기열·질문 대기·한도 대기·dispatch 직전·`defer` → 각 1건. 완료·실패·권한 철회·질문 만료·대화 취소 → 0건. 실제 PostgreSQL에서 취소·제어·접수가 겹쳐도 8회 모두 교착 없이 1건. 안내 쓰기를 끄면 이 파일의 4건이 실패한다. `test/codex-bridge.test.ts`의 "취소 뒤 outbox 0건" 단언은 안내 1건으로 바꿨다. Codex 세션의 작업도 같은 저장소 경로를 쓰기 때문이다.
+
+**검사.** `npm run check` 통과. `npm test` 1390 tests / 1327 pass / 0 fail / 63 skipped(PG 소켓 없음). 네트워크 없는 임시 `postgres:18-alpine`(18.6, 기본 사용자 postgres)을 소켓으로 주면 **1390/1390 pass**. 시험 뒤 컨테이너를 지웠다. Node 24.22.0.
+
+**아직 확인하지 못한 것.**
+
+| 항목 | 왜 못 봤나 | 어디서 본다 |
+|---|---|---|
+| 실제 API 오류에서 이 필드들이 나오는 모양 | fixture는 고정 CLI 2.1.308의 SDK 스키마를 읽어 만들었고 실제 오류 흐름과 대조하지 않았다. `api_error_code`·`api_error_origin`은 내부 필드라 유지 보장이 없다 | 다음 live 원인 진단 |
+| 위 표의 [미확인] 칸 | 작업 계약 자료에 값이 없다 | 운영 작업자 로그 |
+| 거절의 별도 응답 사유 | `model_refusal`을 응답까지 싣으려면 `TASK_FAILURE_REASONS`(B1 계약)를 바꿔야 하고 게시 서버·작업자 배포 순서가 얽힌다. 지금은 응답이 `model_cannot_complete`, 게시 서버 사유가 `task_model_cannot_complete`다 | lead 결정 |

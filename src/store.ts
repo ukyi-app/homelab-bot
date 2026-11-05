@@ -279,13 +279,17 @@ export class Store {
     });
   }
   async defer(job: Job, reason = 'policy_unavailable'): Promise<void> {
-    await this.db.query(`UPDATE jobs SET
-      state=CASE WHEN state='cancel_requested' THEN 'cancelled' ELSE 'queued' END,
-      wait_reason=CASE WHEN state='cancel_requested' THEN 'cancel_before_dispatch' ELSE $5 END,
-      finished_at=CASE WHEN state='cancel_requested' THEN $4 ELSE NULL END,attempt=GREATEST(0,attempt-1),
-      available_at=$3,lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2
-      AND lease_until>$4 AND state IN ('running','cancel_requested')`,
-    [job.id, job.lease_token, this.now() + DEFAULTS.retryDelayMs, this.now(), reason]);
+    await this.db.transaction(async tx => {
+      await this.lockConversation(job, tx);
+      const state = (await tx.query<{ state: State }>(`UPDATE jobs SET
+        state=CASE WHEN state='cancel_requested' THEN 'cancelled' ELSE 'queued' END,
+        wait_reason=CASE WHEN state='cancel_requested' THEN 'cancel_before_dispatch' ELSE $5 END,
+        finished_at=CASE WHEN state='cancel_requested' THEN $4 ELSE NULL END,attempt=GREATEST(0,attempt-1),
+        available_at=$3,lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2
+        AND lease_until>$4 AND state IN ('running','cancel_requested') RETURNING state`,
+      [job.id, job.lease_token, this.now() + DEFAULTS.retryDelayMs, this.now(), reason])).rows[0]?.state;
+      if (state === 'cancelled') await this.cancelledNotice(job, 'cancel_before_dispatch', tx);
+    });
   }
   // 게시 서버 종료 중 멈춤이 확인된 chat을 대기열로 되돌린다. defer와 달리 시도 횟수는 쓴 것으로 둔다(실제로 실행했다).
   // 그 사이 owner가 /cancel했으면 cancelled로 끝낸다. lease CAS가 실패하면 아무것도 바꾸지 않는다(expire가 처리).
@@ -307,11 +311,20 @@ export class Store {
         payload: { kind: 'message', channel: job.target.channel, content: '작업 실패가 확인됐습니다. /list로 상태를 확인하고 /retry로 재시도할 수 있습니다.', classification: 'safe_summary' } });
     });
   }
+  // 호출자가 대화 행을 먼저 잡은 트랜잭션 안에서 부른다. cancelled가 되면 안내를 함께 넣는다.
   private async complete(job: Job, state: State, reason: string | null = null, tx = this.db): Promise<State | undefined> {
-    return (await tx.query<{ state: State }>(`UPDATE jobs SET
+    const next = (await tx.query<{ state: State }>(`UPDATE jobs SET
       state=CASE WHEN state='cancel_requested' THEN 'cancelled' ELSE $3 END,wait_reason=$4,finished_at=$5
       WHERE id=$1 AND lease_token=$2 AND lease_until>$5 AND state IN ('running','verifying','cancel_requested') RETURNING state`,
     [job.id, job.lease_token, state, reason, this.now()])).rows[0]?.state;
+    if (next === 'cancelled') await this.cancelledNotice(job, reason, tx);
+    return next;
+  }
+  // 작업이 cancelled로 확정되면 그 스레드에 한 번 알린다. cancelled는 끝 상태라(재시도는 failed만 받는다) job마다 키 하나다.
+  // 권한 철회로 멈춘 대화에는 안내하지 않는다(게시도 막힌다). 대화·조회의 취소는 지금처럼 알리지 않는다.
+  private async cancelledNotice(job: Job, reason: string | null, tx: Database): Promise<void> {
+    if (job.type !== 'task' || reason === 'authorization_revoked') return;
+    await this.notice(job, `task-cancelled:${job.id}`, `작업 ${job.id} 취소를 완료했습니다(cancelled). 실행 중인 프로세스가 없음을 확인했고 다시 실행하지 않습니다. 필요하면 새 작업으로 요청하세요.`, tx);
   }
   // laneOnly: 그 레인만 막는 대기다. scheduler를 켜지 않고 waiting_user 행이 laneBusy로 자기 레인만 막는다(작업 레인 토큰의 인증 만료).
   async waitForUser(job: Job, reason: string, options: { laneOnly?: boolean } = {}): Promise<void> {
@@ -328,7 +341,10 @@ export class Store {
   }
   async transition(job: Job, state: State, reason: string | null = null): Promise<boolean> {
     // Only an uncertain worker may override cancellation with unknown.
-    if (state !== 'unknown') return (await this.complete(job, state, reason)) !== undefined;
+    if (state !== 'unknown') return this.db.transaction(async tx => {
+      await this.lockConversation(job, tx);
+      return (await this.complete(job, state, reason, tx)) !== undefined;
+    });
     return this.db.transaction(async tx => {
       await this.lockConversation(job, tx);
       const row = (await tx.query<Job>(`UPDATE jobs SET state=$3,wait_reason=$4,finished_at=$5
@@ -653,10 +669,12 @@ export class Store {
       return { ok: true, paused, status: '원인 해소 확인을 기록하고 작업을 재개했습니다.' };
     }
     if (action === 'cancel') {
-      const changed = await this.db.query(`UPDATE jobs SET state=CASE WHEN state IN ('queued','waiting_user') THEN 'cancelled' ELSE 'cancel_requested' END,
+      const changed = await this.db.query<Job>(`UPDATE jobs SET state=CASE WHEN state IN ('queued','waiting_user') THEN 'cancelled' ELSE 'cancel_requested' END,
         finished_at=CASE WHEN state IN ('queued','waiting_user') THEN $4 ELSE finished_at END
-        WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND state IN ('queued','running','verifying','waiting_user') RETURNING id`, [target, actor, conversation, this.now()]);
-      if (!changed.rows.length) return { ok: false, status: '취소할 작업이 현재 대화에 없거나 취소 가능한 상태가 아닙니다.' };
+        WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND state IN ('queued','running','verifying','waiting_user') RETURNING *`, [target, actor, conversation, this.now()]);
+      const job = changed.rows[0];
+      if (!job) return { ok: false, status: '취소할 작업이 현재 대화에 없거나 취소 가능한 상태가 아닙니다.' };
+      if (job.state === 'cancelled') await this.cancelledNotice(job, null, this.db);
       await this.releaseScheduler();
       return { status: '취소 요청. 실행 중 작업의 종료 확인 전에는 cancelled로 표시하지 않습니다.' };
     }
