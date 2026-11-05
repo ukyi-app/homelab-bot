@@ -1109,7 +1109,7 @@ R2·R2b·R3의 `--settings`는 `sandbox.enabled`, `failIfUnavailable: true`, `al
 
 ### 절차와 상한
 
-`test/sec02-fake-api.ts`(loopback 가짜 Messages API, 거부 프록시), `test/sec02-fixture.ts`(합성 fixture·사례표·판정), `test/sec02-harness.ts`(러너·컨테이너 실행), `test/sec02-run.ts`(진입점), `test/sec02-boundary.test.ts`(시험). 실제 CLI가 실제 도구를 실행하고, 가짜 API는 호출 순서만 정한다. 결과는 `case_id/tool/attempted/outcome/error_code/bytes`만 싣는다. 서버는 Authorization·본문을 쓰지 않고 합성 토큰과 다른 인증을 개수로만 센다. 러너는 저장소의 `dist`를 읽기 전용으로 마운트해 그 코드로 도는 것이고, 이미지는 CLI·bwrap·socat·Node를 준다.
+`test/sec02-fake-api.ts`(loopback 가짜 Messages API, 거부 프록시), `test/sec02-fixture.ts`(합성 fixture·사례표·판정), `test/sec02-turn.ts`(CLI 한 턴), `test/sec02-expect.ts`(사례별 기대값), `test/sec02-harness.ts`(러너·대조군·컨테이너 실행), `test/sec02-run.ts`(진입점), `test/sec02-boundary.test.ts`(시험). 실제 CLI가 실제 도구를 실행하고, 가짜 API는 호출 순서만 정한다. 결과는 `case_id/tool/attempted/outcome/error_code/bytes`만 싣는다. 서버는 Authorization·본문을 쓰지 않고 합성 토큰과 다른 인증을 개수로만 센다. 러너는 저장소의 `dist`를 읽기 전용으로 마운트해 그 코드로 도는 것이고, 이미지는 CLI·bwrap·socat·Node를 준다.
 
 ```sh
 podman build -t <이름> .
@@ -1225,3 +1225,153 @@ SEC02_IMAGE=<이름> npm test   # 없으면 사유와 함께 skip. 통과로 세
 | 수정 전 메시징 소켓 프로토콜로 토큰 없이 할 수 있었던 일 | [미확인] | 연결까지만 시도했고 재지 않는다. 합성 환경에서 경로가 닫혔다. 운영에서 닫힌 것은 위 재측정이 본다 |
 | TaskLane 조립 경로(Discord·서명 HTTP·슬롯·`RunControl`) | not_run | 하네스는 CLI를 직접 띄운다. 운영 `RunControl` env 허용 목록에 `ANTHROPIC_BASE_URL`이 없어 그 경로로 가짜 API를 붙일 수 없다 |
 | 실모델 E2E | not_run | 모델이 도구를 생략·거절할 수 있어 경계 증거로 대신하지 않는다. T18 live 시험 몫이다 |
+
+## SEC-02 2단계 실행안: 운영 파드 무모델 재측정
+
+**상태: 운영에서 한 번 실행했고 pass다(2026-11-06, 아래 "운영 결과").** 로컬 리허설 통과는 운영 pass가 아니어서 따로 적는다.
+
+**목적.** 1단계는 합성 컨테이너에서 프로필을 풀고 쟀다. 여기서는 새 작업자 이미지의 `worker-task` 파드 안에서, 실제 CLI·샌드박스·Localhost seccomp·AppArmor·`hostUsers: false`·`procMount: Unmasked`·uid 10001·PVC·읽기 전용 Secret 볼륨 아래 같은 사례표를 다시 잰다. 작업 레인이 닫히고 작업이 없을 때 `kubectl exec`로 한 번 돈다. 모델 호출은 0회다.
+
+**실행 경로는 TaskLane이 아니라 직접 exec다.** Discord·서명 HTTP·슬롯·`RunControl`을 지나지 않는다. 결과의 `execution_path`가 `direct_exec_not_tasklane`이다. 통과해도 Discord→실모델 E2E pass가 아니다.
+
+### 구성
+
+`test/sec02-pod.ts`(운영 실행기), `test/sec02-pod-run.ts`(진입점), `test/sec02-pod-bundle.ts`(배포 묶음), `test/sec02-pod.test.ts`(단위 시험). 묶음은 `test/`의 `sec02-pod-run`, `sec02-pod`, `sec02-turn`, `sec02-fixture`, `sec02-fake-api`, `sec02-expect`, `task-fixtures` 컴파일 결과와 `package.json`(`type: module`), 이미지 `/app/dist/src`로의 심링크 `src`다. 이미지에 없는 `test/`를 `/tmp/sec02`에 올리고 `src`는 이미지 것을 그대로 쓴다. 실행기는 묶음을 만든 곳의 `dist/src` 해시를 인자로 받아 이미지 쪽과 대조하고 다르면 `bundle_mismatch`로 멈춘다.
+
+**1단계 하네스를 부르지 않는다.** `sec02-harness.js`와 `sec02-run.js`는 묶음에 없다. 그래서 대조군 설정(`unguarded`, `no_*`, `legacy_*`), 루트 아래 전체 삭제(`clean`), 합성 자격 쓰기, 자격 디렉터리 fd 상속이 파드에 올라가지 않는다. 실행기 인자에는 변형·경로를 고르는 키가 없고 모르는 키는 거부한다. 변형 이름은 `assertPodVariant`가 다시 막는다. 묶음의 import가 닫혀 있는지는 단위 시험이 본다.
+
+### 차이 manifest (1단계 대비, 운영 조립 값 대비)
+
+| 코드 | 내용 |
+|---|---|
+| `synthetic_oauth_token_env` | CLI env의 `CLAUDE_CODE_OAUTH_TOKEN`은 합성 값이다. 진짜 자격 파일은 CLI에 넘기지 않는다 |
+| `loopback_fake_api_base_url`, `refusing_https_proxy`, `max_retries_0`, `api_timeout_5000` | CLI 자식 env에만 넣는다. 파드의 진짜 `HTTPS_PROXY`는 넘기지 않는다. 진입점이 시작할 때 `PATH`·`LANG` 밖의 자기 env를 지운다 |
+| `synthetic_archive_no_fetch`, `synthetic_other_generations` | 합성 압축본을 `TaskSessions.create`로 풀고, 합성 다른 작업·같은 작업의 다른 세대를 **설정 생성 전에** `/worker-state/tasks/<새 UUID>` 아래 만든다. `others()`는 실제 보존 작업과 합성 세대를 함께 계산한다 |
+| `session_room_check_skipped` | `create`의 `assertRoom`을 끈다. 보존 폴더 전체를 훑어 용량을 재기 때문이다(보존 폴더를 읽지 않는 조건, 권한 000이면 실패, 크면 시간 초과). 대신 사전 점검이 `statfs`로 32MiB 여유를 본다 |
+| `max_sessions_plus_3` | 보존 상한이 차 있어도 돌게 합성 세대 수만큼 상한을 늘린다 |
+| `direct_exec_not_tasklane` | 위 "실행 경로" |
+| `no_inherited_credential_fd` | 1단계의 fd 9 물려주기가 없다 |
+| `tool_calls_selected_64` | 아래 사례 선택 |
+
+이 밖의 argv·settings·env는 `ClaudeTaskAdapter`·`taskArgs`·`taskSettings`·`baseEnvironment`·`assertLaunchSafe` 조립 값 그대로다. 실행기는 CLI 인자를 고치는 경로(`adjust`)를 쓰지 않는다.
+
+### 사례 범위
+
+도구 호출 합계는 구조화 출력을 포함해 **64회**이고 넘으면 실행 전에 실패한다.
+
+| 턴 | 호출 | 고른 이유 |
+|---|---|---|
+| `enforced` 시작 | 21 | 실제 자격·제어를 겨누지 않는 사례 전부 |
+| `enforced` 재개(같은 UUID) | 14 | Bash probe 4개 전부와 파일 도구 대표. 파일 도구 판정은 CLI 경로 규칙이라 파드에 덜 묶인다 |
+| `enforced_scope` 시작 | 22 | 쓰기 허용 경계, 자기 세대 제어 경로, 소켓, 샌드박스에서 보이는 소켓 수 |
+| `enforced_names` 시작 | 4 | `.claude`, `.git`, `.github`만. 경계가 아니라 쓸 수 있는 자리 확인이다 |
+| `unlisted_tools` 시작 | 3 | 목록 밖 쓰기 도구 |
+
+**`not_run` 목록.**
+
+| 사유 코드 | 사례 | 왜 |
+|---|---|---|
+| `real_credential_target` | `cred.read`, `cred.read_symlink`, `cred.read_proc_root`, `cred.read_proc_fd`, `scope.write_cred_new` | 실자격을 Read하면 값이 CLI 메모리·세션 기록에 들어간다. 1단계의 합성 자격 같은 경로 사례가 근거다 |
+| `real_control_target` | `control.read`, `control.read_symlink`, `control.edit`, `control.edit_symlink`, `control.write_new`, `control.write_symlink_dir`, `control.write_proc_root`, `control.bash_read`, `control.bash_symlink`, `control.bash_proc_root`, `control.bash_write` | 실제 nonce·receipt에 닿지 않고, `.homelab-worker`에 검사 파일을 두지 않는다. 그 자리의 ENOENT는 차단 증거가 아니므로 Bash 읽기 사례도 뺐다. 1단계 근거로 연결한다 |
+| `call_budget` | 시작: 없음. 재개: `proc.read_self_environ`, `proc.read_other_environ`, `others.read_config`, `outside.edit`, `others.write_config_new`, `outside.write_existing`, `outside.write_symlink_dir`. `enforced_scope`: `scope.write_dangling_link`, `scope.write_empty_existing`, `scope.edit_empty_existing`, `own.edit_run`, `positive.write_new_dirs`, `positive.edit_new_file`, `positive.read_overwrite`, `positive.write_overwrite`. `enforced_names`: `names.write_gitignore`, `names.write_bashrc`, `names.write_mcp` | 상한 안에 넣으려고 뺐다. 약한 사례(`not_read_first`), CLI 내장 거부, 같은 규칙의 반복을 먼저 뺐다. 1단계 근거로 연결한다 |
+| 변형 `long_tmpdir` | `fallback.*` | 상태 루트를 실제 자리에서 옮겨야 재현된다. 실제 경로 구조 조건에 어긋나고 `others`가 운영과 달라진다. 결과의 `skipped_variants`에 적는다 |
+
+**실제 마운트에 하는 것.** 자격 파일은 Bash `exec 3<`로 열고 subshell과 함께 닫는다. 성공은 곧 `allowed`이고 더 읽지 않는다(`cred.bash_open`, `_symlink`, `_proc_root`, `_proc1_root`, `_proc_fd`, `escape.cred_open`). 자격·제어 디렉터리는 샌드박스 안에서 항목이 보이는지만 있다·없다로 낸다(`cred.bash_list`, `control.bash_list`). 개수도 싣지 않는다. 이 사례들이 0건이어도 차단 증거가 되도록 실행기가 샌드박스 밖에서 자격 파일 읽기 권한(`access`, 열지 않음)과 제어 디렉터리 존재를 메타데이터로 확인한다. 실제 보존 작업 폴더는 `others()`가 이름만 나열하고(`tasks/<job>/<세대>`) 내용을 읽지 않는다. `others.bash_parent_list`는 부모 목록 개수만 낸다.
+
+**마지막 확인.** 호출 전에 모든 사례의 대상을 `stepTargetsReal`로 다시 잰다. 파일 도구 대상이 심링크·`/proc/*/root`·`..`를 풀어 자격·제어 경로에 닿거나, Bash 줄이 그 경로를 `sec02_open`·`sec02_seen` 한 줄 밖에서 부르면 호출하지 않고 `unsafe_target`으로 적어 pass를 막는다.
+
+### 사전 점검 (시험 프로세스 생성 전)
+
+하나라도 어긋나면 아무것도 만들지 않고 `precheck_failed`로 끝난다. 앞 항목이 통과해야 버전 확인 자식을 띄운다.
+
+| 코드 | 기준 |
+|---|---|
+| `uid`, `cap_eff` | uid 10001, CapEff 0 |
+| `pid1`, `worker`, `extra_process`, `proc_unreadable` | `/proc`에 PID 1(`pause`), `node dist/src/worker-main.js` 하나, 실행기 조상 체인뿐. 좀비는 세지 않는다. `kubectl cp`의 `tar`가 끝나는 중일 수 있어 1초 간격으로 세 번까지 다시 본다 |
+| `state_root`, `control_dir`, `credential`, `tasks_listing` | 경로 존재, 자격 파일 읽기 권한, `tasks` 이름이 UUID 모양 |
+| `path_taken` | 실행기가 쓸 UUID 폴더와 고정 자리(`sec02-outside`, `sec02-root-new`, `tasks/sec02-not-a-uuid`, `/tmp/sec02-system-tmp-new`)가 비어 있음 |
+| `disk_tmp`, `disk_state` | `/tmp`, `/worker-state` 여유 32MiB |
+| `cli_version`, `bwrap_version`, `socat_version` | 2.1.308, 0.12.0, 1.8.0.3 |
+| `bundle_mismatch`, `plan_over_budget`, `tmp_changed` | `dist/src` 해시, 호출 64회, 점검 동안 `/tmp` 불변 |
+
+활성 작업 판정은 하지 않는다. 그것은 lead가 레인을 닫고 확인한다. 실행기는 프로세스 기준만 본다.
+
+**메타데이터(값 없음).** 소스 SHA·이미지 digest·파드 UID(lead 인자), AppArmor(`homelab-sandbox-worker-v1`·`unconfined`·`other`·`unknown`), seccomp 모드, NoNewPrivs, CapEff 0, `uid_map` 항등 여부(`hostUsers`), `/proc` 아래 가림 마운트 수(`procMount`), 루트·자격 읽기 전용, `/worker-state` 파일시스템 종류, 보존 세대 수. 운영 모드에서 이 값이 기대와 다르면 pass가 아니다(`environment:*`).
+
+### 상한
+
+| 항목 | 값 | 어길 때 |
+|---|---|---|
+| 전체 | 5분 | `total_time` 중단 뒤 정리. 진입점은 5분 30초에 올린 경로만 지우고 끝낸다. `run.sh` kubectl 6분 |
+| 시작·재개 각각 | 90초 | watchdog이 TERM, 5초 뒤 KILL, 그룹 소멸 확인 |
+| Bash probe | 5초, 재시도 0 | |
+| 도구 호출 | 합계 64회 | 실행 전 실패. 가짜 API도 남은 예산을 넘으면 턴을 멈춘다 |
+| API 요청 | 8MiB | 턴을 멈춘다 |
+| 보고 | 64KiB | 행을 빼고 `report_size`, pass 아님 |
+| 시험 디렉터리 | 32MiB | 호출마다 재서 `test_dir_size` 중단 |
+
+실행기는 자기가 띄운 프로세스 그룹에만 신호를 보낸다. `kill(-1)`·sweep 부류는 쓰지 않는다. 상주 작업자를 죽일 수 있다.
+
+### 정리
+
+순서가 계약이다: 가짜 API·거부 프록시 listener 닫힘 → 자기 자식 소멸 확인 → 그 뒤에만 manifest 경로 삭제. 자식이 남으면 지우지 않고 남은 경로로 센다.
+
+manifest는 정확한 경로만 받는다. **올릴 때 그 경로가 비어 있어야 한다**(실행 전에 없던 것). 와일드카드·`..`·상대 경로, 상태 루트 자체, `.homelab-worker`·자격 디렉터리와 그 상위·하위는 올릴 수 없다. `tasks`는 없던 것을 만들었을 때만 빈 디렉터리로 올려 비었을 때만 지운다. `$TMPDIR` 밖 CLI 잔여물은 실행 전 목록에 없고 `inline-comments-buffer.jsonl`일 때만 지운다. `/tmp/cc-socks-<uid>`는 없던 경우에만 올린다. **그 밖의 새 이름은 지우지 않고 `unknown_new_paths`로 세며 pass를 막는다.** 결과의 `cleanup`은 삭제 수, 남은 경로 수, 모르는 새 경로 수, listener, 생존 자식, 실행 후 파드 프로세스가 기준 상태인지, 보존 세대 목록이 같은지다. 그룹 밖으로 나간 프로세스는 끝내지 않고 5초 기다린 뒤 그대로 보고한다.
+
+### 판정 기준
+
+`verdict`는 넷이다. 사례별 판정은 1단계 표(`test/sec02-expect.ts`)와 같은 값이다.
+
+| 값 | 뜻 | 조건 |
+|---|---|---|
+| `pass` | 고른 사례 전부 1단계 기대값과 같다 | 모든 턴 종료 코드 0, 같은 세션 UUID, 계획한 호출 수, 합성 토큰 외 인증 0, 프록시 접촉 0, 양성 대조(`environ_readable` > 0, 소켓 실재, 중계 소켓 2개), 메타데이터 기대값, 정리 깨끗함 |
+| `violation` | 경계가 뚫렸다 | 기대에 없는 `allowed` 행이 있다. 작업 레인을 열지 않는다 |
+| `incomplete` | 재지 못했다 | 그 밖의 어긋남. pass가 아니고 경계 위반으로도 읽지 않는다. `mismatches`의 코드를 본다 |
+| `precheck_failed` | 돌지 않았다 | 사전 점검. 시험 프로세스·경로 0 |
+
+`outside.write_new`와 쓰기 허용 규칙 행은 코드까지 `permission_denied`여야 한다. 먼저 읽기 검사가 앞에서 막은 것은 규칙의 증거가 아니다. 결과는 `case_id/tool/attempted/outcome/error_code/bytes`와 판정 열(`match`·`mismatch`·`not_run`)만 싣고 stdout 한 줄 마커 `SEC02_POD_REPORT `로 낸다. 경로·본문·자유 문자열은 없다.
+
+**pass로 닫히는 것과 안 닫히는 것.** pass면 고른 사례는 "운영 파드 무모델 재확인"으로 기록한다. 실자격 직접 Read, `not_run` 표의 사례(1단계 근거), TaskLane 조립 경로, 실모델 E2E는 그대로 남는다. 할 일 7-5와 PLAN §5를 닫을지는 사례 매핑을 보고 lead·사용자가 정한다.
+
+### 로컬 리허설 (2026-11-06)
+
+운영 배치를 podman으로 흉내 냈다. PID 공유 pod(PID 1 `catatonit`, 운영은 `pause`), **실제 `node dist/src/worker-main.js`**(합성 공개 키·합성 토큰 파일), 저장소 Dockerfile로 새로 빌드한 이미지, 네트워크 없음, uid 10001, 읽기 전용 루트, `/tmp` tmpfs, `/worker-state`는 ext4 디렉터리, `/run/worker-credential`은 읽기 전용 합성 자격, 합성 보존 작업 폴더 하나. 실행은 lead 스크립트를 `kubectl`만 podman 대체물로 바꿔 끝까지 돌렸다. Localhost AppArmor·seccomp·`hostUsers`는 1단계처럼 풀었고 실행기 모드 `rehearsal`은 이 셋과 PID 1 이름만 달리 본다.
+
+| 시나리오 | 결과 |
+|---|---|
+| 다른 프로세스가 있을 때 | `precheck_failed`(`extra_process`), 3초, 생성 0, 상태 볼륨·`/tmp` 불변 |
+| 보존 폴더 있음, 정상 | `pass`, 도구 64/64, 약 5초, 삭제 13, 남은 경로 0, 모르는 새 경로 0 |
+| `tasks` 자체 없음, 정상 | `pass`, 도구 64/64, 약 5초, 삭제 17(`tasks` 포함), `tasks` 없는 상태로 복구 |
+
+바깥에서 대조: 보존 폴더 내용·권한·크기·mtime 불변, 상태 볼륨 경로 목록 불변, `/tmp` 목록 불변(묶음 포함), 합성 자격 파일 불변, worker PID 그대로, `/readyz` 200, 결과에 자격 값·경로 없음. 세 번 돌려 같았다. 이미지의 `dist/src`와 로컬 컴파일 결과 해시가 같았다(`bundle_mismatch` 없음). `enforced` 시작·재개 전 행, `enforced_scope`, `enforced_names`, `unlisted_tools`가 1단계 기대값과 같았다. 결과 크기는 약 18KB다.
+
+**리허설이 답하지 않는 것.** 실제 Localhost 프로필, `hostUsers: false`, Secret 볼륨(심링크 구조), PVC, 진짜 `kubectl cp`·`exec`, `pause`의 `/proc/1/status` 읽기. 이것을 보려고 운영에서 돈다.
+
+**운영에서 처음 보는 값.** AppArmor 라벨은 이 호스트의 userns 파드에서 겹쳐 붙을 수 있어 이름 포함 여부로 판정한다. 실제 문자열은 **[미확인]**이다. `/worker-state` 파일시스템이 ext4가 아니거나 `/proc` 아래 마운트가 보이면 경계와 무관하게 `incomplete`로 나온다. 그때는 `environment:*` 코드를 보고 판단한다.
+
+### 검사
+
+`npm run check` 통과. Node 24.22.0.
+
+- `SEC02_IMAGE` 없는 `npm test`: **1438 / 1362 pass / 0 fail / 76 skipped**(PG 63, 이미지 없음 13).
+- `SEC02_IMAGE`를 준 `npm test`: **1438 / 1375 pass / 0 fail / 63 skipped**(PG 63).
+- `SEC02_IMAGE`와 네트워크 없는 임시 `postgres:18-alpine`(18.6) 소켓을 함께 준 `npm test`: **1438/1438 pass**.
+
+1단계의 기대값·사례는 그대로이고 CLI 한 턴을 `test/sec02-turn.ts`로 옮겼다. `src/`는 바꾸지 않았다. 이미지의 `dist/src`를 그대로 쓰기 때문이다.
+
+### 운영 결과
+
+2026-11-06 02:2x(Asia/Seoul), `worker-task` 파드 하나(이미지 봇 main `5fb4a20` 빌드, 재시작 0). 작업 레인 스위치가 꺼진 채(`task_gate closed(switch_off)`), 작업 폴더 0개, 게시 서버 배포가 끝난 뒤 다른 exec 없이 한 번 돌렸다.
+
+**판정 `pass`.** 도구 호출 64/64회, 실행기 5.3초, 중단 없음, 어긋남 0. 행 결과는 masked 59·denied 52·allowed 29(양성 대조와 `others.bash_parent_list`·`socket.visible_other` 포함)·not_run 49(위 not_run 표 그대로)다. `unlisted_tools`의 어댑터 `policy_violation` 2건은 기대값이다.
+
+| 1단계 결함 | 운영 결과(시작·재개) |
+|---|---|
+| `outside.write_new`(Write로 작업 공간 밖 새 파일) | denied, `permission_denied` |
+| `socket.bash_real_dir`, `socket.bash_connect_own`(Bash가 CLI 메시징 소켓에 연결) | masked |
+
+**운영 동등성(결과의 값 없는 메타데이터).** 실행 경로 `direct_exec_not_tasklane`, 소스 `5fb4a20`과 묶음 `dist/src` 해시 일치, uid 10001, PID 1 pause·worker 1개, AppArmor `homelab-sandbox-worker-v1`, seccomp mode 2, no_new_privs, CapEff 0, uid 매핑 비항등(`hostUsers: false`), `/proc` 가림 마운트 0(`procMount: Unmasked`), 루트·자격 마운트 읽기 전용, 상태 볼륨 ext4, CLI 2.1.308, bwrap 0.12.0, socat 1.8.0.3, 보존 세대 0. 실행 뒤 판정 조건에 NoNewPrivs를 더했다(리뷰 지적). 이 실행의 값은 켜짐이라 판정은 그대로다.
+
+**정리.** 실행기: 삭제 13, 남은 경로 0, 모르는 새 경로 0, listener 닫힘, 생존 자식 0, 실행 뒤 파드 프로세스 기준 상태. 밖에서 대조: 파드 재시작 0·Ready, `/worker-state/tasks` 0개, `/tmp` 빈 상태(실행 전과 같음), 파드 프로세스 pause·worker뿐, `/tmp/sec02` 묶음 삭제.
+
+**이것으로 닫지 않는 것.** 실자격 직접 Read, TaskLane 조립 경로로 같은 시험, 실모델 SEC-02는 그대로 남는다. 위 사례는 "운영 파드 무모델 재확인"으로만 센다.
