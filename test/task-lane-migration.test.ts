@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { PGlite } from '@electric-sql/pglite';
 import pg from 'pg';
-import { MIGRATIONS, Postgres, migrate } from '../src/database.js';
+import { MIGRATIONS, Postgres, migrate, migrationVersion } from '../src/database.js';
 import type { Database } from '../src/database.js';
 import { runMigrations } from '../src/migrate-main.js';
 import { Store } from '../src/store.js';

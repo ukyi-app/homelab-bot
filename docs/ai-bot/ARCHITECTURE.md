@@ -10,7 +10,7 @@
 
 1. **작은 제어 서비스 하나 + PostgreSQL + 격리 작업자 하나.** 게시 서버(ns `app-homelab-bot`, replicas 1)가 수신·조율·읽기 조회·게시를 맡고, 상태와 큐는 공유 PostgreSQL의 봇 전용 DB에 둔다. 모델 호출은 ns `sandbox`의 작업자만 한다.
 2. **모델 자격은 작업자에만, 게시 자격은 게시 서버에만.** 모델 자격은 봇 전용 구독 계정의 `auth.json` 하나이고 작업자 전용 영속 CODEX_HOME에 있다(D-14). 비신뢰 자료(로그, PR, 댓글)를 읽는 모델은 Discord 토큰·GitHub App 키와 다른 파드에서 돈다.
-3. **Codex는 `codex exec --json` 경로.** 질문은 턴 종료 + `exec resume`으로만, 도구 승인 중계는 `capability=false`. `codex app-server`는 어댑터 뒤 실험 후보로만 둔다. 사람이 연결한 기존 Codex 작업(R08)의 연결 방식은 T18에서 다시 판단한다.
+3. **Codex는 `codex exec --json` 경로.** 질문은 턴 종료 + `exec resume`으로만, 도구 승인 중계는 `capability=false`. `codex app-server`는 어댑터 뒤 실험 후보로만 둔다. 사람이 연결한 기존 작업(R08)은 읽기 전용 알림으로 정했고 아직 켜지 않았다(§15).
 4. **Discord는 Gateway로만 받는다.** 새 공개 수신 경로가 없다. 공개 경로는 GitHub webhook 한 경로뿐이다(설계 C.8).
 5. **복구의 기본은 "외부 상태를 다시 읽고 대조"다.** Discord는 `after=` 대조, GitHub은 열린 PR 대조(webhook 수동 재전송은 3일 한정), 결과를 모르는 작업은 `unknown`으로 두고 다시 실행하지 않는다.
 6. **작업자의 모델 호출은 한 번에 하나다.** `auth.json` 사본 하나를 대화 레인과 작업 레인이 함께 쓰기 때문이다(D-14 조건 3). 긴 작업 중 대화 응답성, 인증 파일 노출, 작업 사이 세션 파일 격리는 열린 항목이다(§5.1, §10).
@@ -94,7 +94,7 @@
 |---|---|---|
 | `capabilities()` | true. 고정 버전 + `--help` 대조 | [실측: `codex --version`, `codex exec --help`] |
 | `start_task` | true. 작업 레인에서 `codex exec --json`, 작업 공간은 고정 SHA의 `codeload.github.com` 압축본 + `git init` 한 번 커밋(D-15) | [확인: https://learn.chatgpt.com/docs/non-interactive-mode] |
-| `attach_task` | **보류(T18).** R08(사용자가 명시적으로 연결한 기존 Codex 작업)은 요구 그대로이고 연결 방식은 T18에서 다시 판단한다. 봇 소유 세션의 재개는 `resume_task`(R10 경로)다. herdr 경유는 쓰지 않는다 | 사용자 결정(2026-10-18, T15). herdr는 상태를 화면으로 추정하고 소켓에 인증이 없다 [확인: https://raw.githubusercontent.com/herdrdev/herdr/v0.9.5/docs/next/website/src/content/docs/integrations.mdx , 실측: 소켓 0600]. Codex 공식 훅 이벤트 목록 [미확인] |
+| `attach_task` | **결정 완료·구현 비활성.** R08은 읽기 전용 알림으로 정했다(§15). 핵심은 구현했지만 수신 경로가 미정이고 `/attach`·리스너가 연결되지 않아 어댑터 값은 아직 `undecided`이고 부르면 거부한다. 봇 소유 세션의 재개는 `resume_task`(R10 경로)다. herdr 경유는 쓰지 않는다 | 사용자 결정(2026-11-04, DECISIONS "T18 결정" (1)). herdr는 상태를 화면으로 추정하고 소켓에 인증이 없다 [확인: https://raw.githubusercontent.com/herdrdev/herdr/v0.9.5/docs/next/website/src/content/docs/integrations.mdx , 실측: 소켓 0600] |
 | `read_status`, `read_events` | true. JSONL 이벤트 + 프로세스 생존 | [확인: https://learn.chatgpt.com/docs/non-interactive-mode] |
 | `read_final_result` | true. `-o` 파일 + `--output-schema` + 작업 공간 diff. "완료"라는 문자열은 판정 근거가 아니다 | `01` §6 완료 기준 |
 | `answer_question` | **clarification만.** 모델이 턴을 끝내며 묻고, 봇이 `exec resume <id> "<답>"`으로 잇는다. 질문 ID는 봇이 `job_id + thread_id + 턴 순번`으로 만든다 | [실측: exec에 승인 플래그 없음] |
@@ -274,7 +274,7 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 - 하트비트를 Gateway 연결에 묶는 대안의 채택 여부와 N(§8 "대안") [T16a].
 - runtime policy의 현재 revision 확인 방법과 최대 나이(§6 "허용 목록 반영") [T16a]. → T16b D1로 정함: 기동 때 env 읽기, 나이 검사 없음(§11).
 - 삭제 원장의 보존 기간(§7) [T20]. 저장소는 정함(SSD 파일, DECISIONS T20), 쓰기 순서와 부분 실패 처리는 T20에서 구현.
-- R08 연결 방식 [T18].
+- R08 수신 경로 [H3]. 연결 방식은 정했다(§15).
 
 ## 11. T16a 확정 계약과 로컬 구현 (2026-10-19)
 
@@ -623,7 +623,7 @@ POST 거부·GET 대조 거부·확정 ID 보존·인가 철회·local confirm �
 |---|---|---|---|
 | `capabilities()` | `CODEX_CAPABILITIES` 고정 표, 버전 0.163.0. 작업마다 `codex_sessions`에 기록 | TASK-01 | 설치 CLI `--help` 대조(T16b) |
 | `start_task` | true. `codex exec --json --output-schema … -o … -`, 지시는 stdin | TASK-01 | 실제 실행(T16b) |
-| `attach_task` | **미정**(`undecided`). 부르면 `CapabilityUnavailable(undecided)`. `false`로 정한 것이 아니다 | TASK-01 | R08 연결 방식 사용자 결정 |
+| `attach_task` | **결정 완료·구현 비활성.** 연결 방식은 읽기 전용 알림으로 정했다(§15). 어댑터 값은 아직 `undecided`이고 부르면 `CapabilityUnavailable(undecided)`다. `false`로 정한 것이 아니다 | TASK-01 | 수신 경로 결정(H3), `/attach`·리스너 조립(B5) |
 | `read_status`, `read_events` | true. `status()`는 owner·같은 대화만. 이벤트는 판정에만 쓰고 원문 로그를 Discord로 흘리지 않는다 | TASK-01 | 없음 |
 | `read_final_result` | true. 완료 = 종료 코드 0 + 마지막 turn 이벤트가 `turn.completed` + `-o` 파일이 출력 스키마 `completed` + 작업 그룹 소멸 확인 + 작업 공간 실제 diff를 얻음. 게시하는 변경 목록은 실제 diff 기준이고, Codex 보고와 다른 파일은 증거(`unconfirmedReports`)와 안내 문구로 남긴다. 작업 공간 밖을 바꿨다는 보고는 실패다. "완료" 문자열·로그는 근거가 아니다 | TASK-03 | 실제 저장소 압축본 작업 공간(T16b·T19), `file_change` 경로 형식 [미확인] |
 | `answer_question` | clarification만. 질문은 모델이 `status=needs_input`으로 턴을 끝낼 때만 생긴다 | TASK-02 | 없음 |
@@ -1000,7 +1000,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 **실행기 관측.** `Observation.tools`는 그 줄에서 시작한 도구 호출 ID 목록이다. 한 assistant 메시지의 `tool_use`를 모두 세고, ID가 없는 호출은 서로 합치지 않는다. 대화·리뷰는 도구 예산이 0이라 호출 하나로 멈춘다. 능력표 값 `tools:'sandboxed-task'`·`sessionPersistence:'per-job'`과 위반 종류 `tool_not_allowed`·`session_mismatch`는 아래 작업 어댑터만 낸다. 어떤 프로필에도 들어가지 않았다.
 
-**R08은 이 계약 밖이다.** 수신 경로가 미정이고 계약·테이블은 다음 작업이 따로 둔다.
+**R08은 이 계약 밖이다.** 계약·테이블은 §15에 따로 둔다.
 
 ### T18 작업 레인 실행·정리 (Claude, 2026-11-05)
 
@@ -1296,3 +1296,81 @@ Grafana/K8s/Argo CD의 실제 응답을 `ReadTransport`의 제한된 observation
 
 작업자 검증기는 `consume(nonce)`에 **원자적·영속적인 일회 사용 기록**을 요구한다.
 시험의 메모리 Set은 재시작 보안을 증명하지 않는다.
+
+## 15. R08 읽기 전용 알림 (2026-11-05)
+
+사용자가 자기 기기에서 직접 돌리는 Claude Code·Codex 세션을 봇에 명시적으로 연결해, 턴이 끝나면 Discord로 알린다(DECISIONS "T18 결정" (1)). 사람 세션의 자기 보고이고 봇이 결과·프로세스 소멸을 검증한 것이 아니다.
+
+- **아직 켜지 않았다.** `src/main.ts`가 이 모듈을 읽지 않고, `/attach`도 수신 포트도 없다. 수신 경로(tailnet 전용 또는 공개+Access)는 미정이고 조립은 B5, 노출은 H3이 한다. 어댑터의 `attach_task`는 그때까지 `undecided`다.
+- **능력.** `EXTERNAL_TASK_CAPABILITIES`는 `read_status`·`read_events`만 true다. 이벤트로 모델 호출·작업 시작·답·취소·재개가 생기지 않는다. `jobs`·`codex_sessions`·`events`에 행을 만들지 않는다.
+
+**저장(`migrations/016_external_task_links.sql`).** 015는 B3가 쓴다. 번호는 운영 적용 순서를 단조롭게 두려는 것이다.
+
+| 표 | 내용 |
+|---|---|
+| `external_task_connections` | owner, 대화·scope, 등록한 외부 세션 ID, 실행기(`claude`·`codex`), Ed25519 public key, `key_id`, 만료(30일), 폐기 시각·사유, 요약 동의, 마지막 수신 시각. 개인 seed 열은 없다 |
+| `external_task_events` | `connection_id`+`event_id` PK, 본문 SHA-256, 수락한 `accepted_key_id`, 발생·수신 시각, `outbox_key`, `post_state`(`pending`·`posted`·`blocked`). 요약 원문은 없다 |
+| `external_task_link_fence` | 복원 감지 값 한 행 |
+
+`post_state`의 원천은 `outbox.state`다. 게시자는 R08을 모르므로 트리거 `outbox_external_task_post_state`가 같은 트랜잭션에서 따라간다. `unknown`은 보냈는지 모르므로 미게시로 센다. 중복 방지 ID는 게시가 끝난 뒤 7일 보관하고 `ExternalTaskLinks.purge()`가 지운다(주기 호출은 B5). 지운 뒤의 재생은 `occurred_at` 24시간 창에서 거절된다.
+
+**수명(`src/external-task-links.ts`).**
+
+- `attach`는 서버에서 키쌍을 만들고 seed를 `OneTimeSeed`로 돌려준다. `reveal()`은 한 번만 되고, 문자열·JSON·`inspect`는 `[redacted]`다. 그래서 outbox·감사·오류 수집에 실수로 실려도 값이 남지 않는다. 전달은 호출자가 ephemeral로 한다.
+- `rotate`는 같은 행의 키를 덮어써 이전 키를 즉시 무효로 하고, 이전 키로 들어온 미게시 행을 막는다.
+- `revoke`·`detach`는 `pending`과 발송 시작 전 `sending`을 `blocked`로 바꾼다. 게시자의 dispatch 표시가 `state='sending'`을 요구하므로 이 트랜잭션 뒤에는 나갈 수 없다. 이미 발송을 시작한 행은 보냈을 수 있어 그대로 둔다. 전달 실패 때는 `revoke(...,'delivery_failed')`로 닫는다.
+- **발송 중 폐기·재발급.** 그대로 둔 행의 발송이 429·401로 실패하면 게시자가 `pending`으로 되돌린다. 트리거 `outbox_external_task_claim`이 `pending`→`sending` 전이마다 연결 폐기, 수락한 키와 현재 키의 일치, WAL timeline을 다시 보고 어긋나면 `blocked`로 바꾼다. 게시자는 R08을 모르고 재시도 경로가 여럿이라 모든 발송이 지나는 이 전이에 둔다. 폐기·재발급·동의 변경이 연결 행을 잠근 동안에는 기다리지 않고(교착 방지) lease 30초만큼 미룬다.
+- **동의 철회.** `setSummaryConsent`와 수락이 같은 연결 행 잠금으로 직렬화된다. 철회가 끝난 뒤 새로 저장되는 요약은 없고, 철회 전에 큐에 든 행과 이미 받은 이벤트의 재전송은 그대로다.
+
+**복원.** 복원하면 폐기한 키가 DB 행과 함께 되살아난다. `enforceRestoreFence`는 attach·재발급·수신마다 지금 값(`timeline:<WAL timeline>;epoch:<restoreEpoch>`)을 저장 값과 비교하고, 다르면 활성 연결을 모두 `restore_fence`로 닫고 미게시 행을 막고 감사를 남긴다. 복원된 DB에는 어느 키가 폐기됐는지 알 근거가 없으므로 전부 닫고 사람이 다시 연결한다.
+
+- 물리 복원·PITR은 timeline이 올라가 자동으로 잡힌다.
+- **pg_dump 복원은 timeline이 그대로라 자동으로 못 잡는다.** 복원 절차에서 `restoreEpoch` 설정값을 올려야 한다.
+- **장애 조치(promote)도 timeline을 올려 모든 연결이 닫힌다.** 안전한 쪽의 오탐이다.
+- 값을 읽지 못하면 수신이 503으로 닫힌다.
+- **조립(B5).** 게시 루프를 시작하기 전에 `enforceRestoreFence()`를 한 번 부른다. 게시 트리거는 timeline만 볼 수 있어 pg_dump 복원의 `restoreEpoch` 변경은 이 호출이 있어야 미게시 행보다 먼저 잡힌다.
+
+**수신(`src/external-task-receiver.ts`).** `ExternalTaskReceiver`는 판정, `externalTaskServer`는 전용 HTTP 서버이고 listen은 조립하는 쪽이 한다. 이 서버에는 다른 경로가 없다(`/metrics`·`/readyz` 없음).
+
+| 항목 | 값 |
+|---|---|
+| 경로 | `POST /external-task-events` 완전 일치. `req.url` 원문을 비교해 query·후행 slash·하위 경로·인코딩 변형·absolute-form을 거절한다 |
+| 본문·헤더 | 실제 누적 4 KiB(413), `Content-Encoding` 전부 415, 헤더 8 KiB(431), 헤더·본문 각 5초(408), `application/json`만 |
+| 동시·소켓 | 동시 8(503), 소켓 32. 소켓 상한은 헤더를 천천히 보내는 연결이 동시 수에 잡히기 전 단계라 따로 뒀다 |
+| 전체 속도 | token bucket 초당 10·burst 20(429). 프로세스별이다 |
+| 연결별 속도 | 서명 검증 뒤 분당 30·burst 5·시간당 300(429). 프로세스별이다. 남의 connection_id로 quota를 깎을 수 없다 |
+| 역압 | 미게시 연결별 100(429)·전체 1,000(503). advisory 잠금으로 세기와 삽입을 묶어 동시에 들어와도 넘지 않는다. 이미 받은 이벤트의 재전송은 대상이 아니다 |
+| 시각 | `sent_at` ±5분(422 `clock_skew`), `occurred_at` 미래 5분·과거 24시간(422) |
+| DB | R08 동시 DB 작업 2개, 대기 6개(초과는 곧바로 503 `overloaded`), DB 단계마다 2초(복원 울타리·연결 조회·권한·수락), 처리 전체 5초(503 `unavailable`). GitHub·Discord 처리를 굶기지 않기 위해서다. 기한이 지난 대기는 줄에서 빠지고, 실행 중 작업은 다음 단계로 가지 않는다. 슬롯은 작업이 실제로 끝나야 돌아오므로 응답이 닫혀도 DB에 남는 작업은 2개를 넘지 않는다. 연결을 빌리는 대기(`pool.connect`)만 이 기한 밖이고 풀의 `connectionTimeoutMillis`로 끊긴다 |
+
+요청 헤더는 `x-r08-connection-id`, `x-r08-key-id`, `x-r08-sent-at`(ms), `x-r08-signature`(Ed25519 base64url)다. 서명 입력은 아래 값을 개행으로 이은 UTF-8이고, JSON을 다시 직렬화하지 않는다.
+
+```text
+R08-v1
+<환경 식별자>
+POST
+/external-task-events
+<connection_id>
+<key_id>
+<sent_at>
+<SHA-256(raw body) hex>
+```
+
+본문 필드는 `version`(1), `connection_id`(헤더와 같아야 함), `event_id`, `external_task_id`, `type`(`turn_complete`), `occurred_at`(ms), `summary`뿐이고 나머지는 거절한다. 판정 순서는 HTTP 상한 → 헤더 형식 → `sent_at` → 복원 울타리 → 서명 → 연결별 속도 → 본문 → 외부 ID·요약 동의 → 현재 owner 권한 → 수락 트랜잭션이다. 수락 트랜잭션은 연결 행을 잠근 뒤 폐기·`key_id`·만료를 잠금 시각으로, 새 요약의 동의를 잠근 행으로 다시 본다.
+
+- **응답.** 수락과 중복은 같은 202다. 미등록·위조·폐기·만료·옛 키는 모두 같은 401이라 구별해 주지 않는다. 같은 ID 다른 내용은 409, 다른 외부 ID·동의 없는 요약·권한 거부는 403이다.
+- **목적지.** 연결 레코드로만 정한다. 클라이언트의 owner·채널 필드는 거절한다.
+- **요약.** 동의 없는 연결은 고정 문구 `턴 완료`만 받는다. 동의한 연결도 500 코드 포인트·2,000바이트·제어 문자 없음이고 경로·토큰 의심 표현은 거절한다. 같은 표가 helper에 있고 시험이 일치를 확인한다. 이 표는 완전한 비밀 탐지가 아니다.
+- **게시.** "사람 세션이 턴을 끝냈다고 알림", 발생·수신 시각(KST), 지연을 적는다. `allowed_mentions.parse=[]`는 게시자가 건다. 게시자의 본문에 `flags` 칸이 없어 링크 미리보기는 내용 쪽에서 막는다. 사용자 값을 모두 코드 스팬에 넣는다.
+- **게시 직전 권한.** 게시자가 `PolicyGate`와 대화 활성 여부를 다시 본다. 연결 폐기·재발급은 위 `blocked` 처리와 claim 트리거로 막는다. 만료는 게시를 막지 않는다. 만료 전에 정상으로 받은 이벤트이기 때문이다. 다시 연결해 옛 행이 `expired`로 닫혀도 같다.
+- **권한 조립(B5).** `authorize`는 기한이 걸린 트랜잭션 `db`를 받는다. `(owner, scope, db) => gate.withDatabase(db).authorize(owner, scope)`로 넘긴다.
+- **관측.** `metrics()`가 사유별 수·지연·동시 처리·DB 슬롯 사용·DB 대기·미게시 수를 고정 라벨로 낸다. 전용 포트에 두지 않으므로 8080 `/metrics`에 조립한다. 본문·인증 헤더·연결 ID는 없다.
+
+**사람 쪽 helper(`tools/r08-helper/`).** 설치 안내는 그 디렉터리의 README다. 봇 이미지 런타임 단계는 `src`만 복사하므로 helper가 이미지에 들어가지 않고, Node 내장 모듈만 써서 기기에 복사해 쓴다. 시험 단계는 저장소 전체를 복사하므로 시험이 함께 돈다.
+
+- `claude-stop.mjs`(Stop, `async: true`)·`codex-notify.mjs`는 등록한 세션만 큐에 넣고 끝난다. 네트워크와 키를 만지지 않는다.
+- `sender.mjs`가 큐를 서명해 보낸다. 키는 `keychain:`·`libsecret:` 참조로만 받는다. 재시도는 본문을 유지하고 새 `sent_at`으로 다시 서명한다.
+- 큐는 기기당 100건 또는 1 MiB, 발생 후 24시간이다. 초과·만료·서버 거절은 사유 코드로 남고 `sender.mjs status`가 보여 준다.
+- 전달 보장이 아니다. 훅이 큐에 넣기 전에 죽거나 기기·봇이 24시간 넘게 꺼져 있으면 알림이 없다.
+
+**시험의 한계.** Claude·Codex 입력은 공식 문서의 필드로 만든 합성 입력이다. 실제 CLI 버전별 필드, 절전 복귀, Keychain 동작, NUC 자원 안의 부하는 시험하지 않았다.
