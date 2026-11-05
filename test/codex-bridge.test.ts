@@ -802,7 +802,9 @@ test('TASK-02 질문 대기 중 비상 중지를 풀었으면 답한 뒤 스케�
   const conversation = f.store.scopeId(thread);
   await f.store.control('fixture-owner', conversation, 'emergency-stop');
   const released = await f.store.control('fixture-owner', conversation, 'resume-model', 'emergency-stop') as { paused: boolean };
-  assert.equal(released.paused, true);
+  // 질문 대기는 scheduler를 잡지 않는다. 단일 슬롯 배치에서는 waiting_user 행이 답 전까지 새 실행을 막는다.
+  assert.equal(released.paused, false);
+  assert.equal(await f.store.claim(), undefined);
   assert.equal((await owner(question, 'main', 'answer-1')).ok, true);
   launcher.scripts.push(finished(out('completed', '끝'), [], null));
   assert.equal(await runtime.tick(), true);

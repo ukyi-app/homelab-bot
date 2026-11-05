@@ -15,7 +15,9 @@ export interface TaskLane { run(job: Job): Promise<void>; sweep?(): Promise<unkn
 // shutdown: 게시 서버 종료 신호(SIGTERM). drainMs: 신호 뒤 실행 중 작업의 자연 완료를 기다리는 시간.
 // 기본 10초 + cancel 응답 상한 5초가 main.ts의 전체 종료 기한(20초)과 kubelet 유예(30초) 안에 들어간다.
 // cancel은 드레인 기한에 바로 나가므로 DB 지연은 cancel이 아니라 그 뒤의 상태 확정만 늦춘다.
-export interface RuntimeOptions { shutdown?: AbortSignal; drainMs?: number; log?: Log }
+// taskLoop: 작업 레인을 tickTask 루프로 따로 돌린다. tick은 대화만 집어 긴 작업이 대화를 기다리게 하지 않는다.
+// 끄면(기본) tick 하나가 모든 모델 job을 슬롯 하나로 처리한다.
+export interface RuntimeOptions { shutdown?: AbortSignal; drainMs?: number; log?: Log; taskLoop?: boolean }
 export const DRAIN_MS = 10_000;
 // 멈춤이 확인된 뒤의 상태 쓰기 시도 횟수. 간격은 200ms, 400ms로 짧게 둔다(종료 기한 안에 들어가야 한다).
 export const STOPPED_WRITE_ATTEMPTS = 3;
@@ -25,12 +27,14 @@ export class Runtime {
   private readonly shutdown?: AbortSignal;
   private readonly drainMs: number;
   private readonly log: Log;
+  private readonly taskLoop: boolean;
   constructor(private readonly store: Store, private readonly gate: PolicyGate,
     private readonly worker: WorkerClient, private readonly signer: WorkerSigner,
     reader: ReadAdapter, private readonly tasks?: TaskLane, options: RuntimeOptions = {}) {
     this.shutdown = options.shutdown;
     this.drainMs = options.drainMs ?? DRAIN_MS;
     this.log = options.log ?? jsonLog;
+    this.taskLoop = options.taskLoop ?? false;
     this.reads = new ReadRuntime(store, gate, reader, options.shutdown);
   }
   // read 레인 한 바퀴. 모델 tick과 다른 루프에서 부른다.
@@ -39,11 +43,22 @@ export class Runtime {
     if (this.shutdown?.aborted) return false;
     await this.store.expire();
     // 기한 지난 질문 대기를 먼저 풀어야 슬롯을 잡은 waiting_user가 다음 작업을 막지 않는다.
-    await this.tasks?.sweep?.();
+    // 작업 루프를 켰으면 tickTask가 맡는다. 정리에 작업자 호출이 있어 대화 루프를 늦추면 안 된다.
+    if (!this.taskLoop) await this.tasks?.sweep?.();
     // chat unknown이 있으면 모델 claim은 어차피 막혀 있으므로 여기서 조사해도 모델 실행을 늦추지 않는다.
     await this.probeUnknown();
-    const job = await this.store.claim();
-    if (!job) return false;
+    const job = await this.store.claim(this.taskLoop ? 'interactive' : undefined);
+    return job ? this.execute(job) : false;
+  }
+  // 작업 레인 한 바퀴. tick과 다른 루프에서 부른다. 작업 루프를 켜지 않았으면 아무것도 하지 않는다.
+  async tickTask(): Promise<boolean> {
+    if (!this.taskLoop || !this.tasks || this.shutdown?.aborted) return false;
+    await this.store.expire();
+    await this.tasks.sweep?.();
+    const job = await this.store.claim('task');
+    return job ? this.execute(job) : false;
+  }
+  private async execute(job: Job): Promise<boolean> {
     let dispatched = false;
     let stopped = false;
     let waiting = false;

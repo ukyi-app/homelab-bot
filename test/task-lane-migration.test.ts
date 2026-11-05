@@ -49,7 +49,7 @@ test('T18 B1 013: 빈 DB에 013까지 적용되고 다시 돌려도 빈 목록',
   const engine = new PGlite();
   try {
     const db = migrationDatabase(engine);
-    assert.deepEqual((await migrate(db)).at(-1), 13);
+    assert.ok((await migrate(db)).includes(13));
     assert.deepEqual(await migrate(db), []);
     const lanes = (await db.query<{ lane: string; closed_reason: string | null }>('SELECT lane,closed_reason FROM execution_lanes ORDER BY lane')).rows;
     assert.deepEqual(lanes, EXECUTION_LANES.map(name => ({ lane: name, closed_reason: null })));
@@ -59,7 +59,7 @@ async function upgraded(db: Database, exec: (sql: string) => Promise<unknown>, a
   for (const file of UPTO_012) await exec(await readFile(`migrations/${file}`, 'utf8'));
   const jobs = { chat: await legacyJob(db, 'chat'), review: await legacyJob(db, 'review'), task: await legacyJob(db, 'task'), read: await legacyJob(db, 'read') };
   await legacySession(db, jobs.task);
-  assert.deepEqual(await apply(), [13]);
+  assert.deepEqual((await apply()).filter(version => version === 13), [13]);
   // 옛 세션은 Codex다. Claude가 재개할 값은 비어 있고, 쓴 도구 수·상태는 그대로다.
   const old = await session(db, jobs.task);
   assert.equal(old.executor, 'codex');

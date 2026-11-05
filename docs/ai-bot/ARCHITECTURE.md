@@ -996,7 +996,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 | `jobs` | `execution_lane`(생성 열) | task는 `task`, read는 NULL, 나머지는 `interactive` |
 | `execution_lanes` | 행 `interactive`·`task`, `closed_reason`(`unknown`·`cleanup_pending`·`retention_full`), `closed_at` | 레인별 잠금 행과 새 접수 막힘. 작업 레인 개방 여부는 이 행이 아니라 설정 gate가 정한다 |
 
-`Store.claim`은 아직 이 열을 보지 않는다. 슬롯 분리는 스케줄러를 연결할 때 함께 바꾼다.
+슬롯을 어떻게 쓰는지는 아래 "T18 게시 서버 스케줄링과 질문"이 다룬다.
 
 **실행기 관측.** `Observation.tools`는 그 줄에서 시작한 도구 호출 ID 목록이다. 한 assistant 메시지의 `tool_use`를 모두 세고, ID가 없는 호출은 서로 합치지 않는다. 대화·리뷰는 도구 예산이 0이라 호출 하나로 멈춘다. 능력표 값 `tools:'sandboxed-task'`·`sessionPersistence:'per-job'`과 위반 종류 `tool_not_allowed`·`session_mismatch`는 아래 작업 어댑터만 낸다. 어떤 프로필에도 들어가지 않았다.
 
@@ -1052,6 +1052,50 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - 작업 파드에 exec probe·사이드카·`kubectl exec`가 있으면 정리에 함께 죽거나 기동이 실패한다.
 - `runTaskTurn`은 서명·lease·fence·직렬 슬롯을 하지 않는다. 라우트가 앞에서 막는다. 턴 준비 중의 git도 정리에 죽을 수 있어 취소와 실행을 직렬로 묶는다.
 - 이미지 검사(`taskImageProblems`)가 문제를 내면 작업 레인을 닫는다.
+
+### T18 게시 서버 스케줄링과 질문 (2026-11-05)
+
+**아직 켜지 않았다.** 함수와 옵션만 있다. `RuntimeOptions.taskLoop`와 `ReviewRuntimeOptions.lanes`가 기본 false면 `Runtime.tick`이 지금처럼 모델 job 전부를 슬롯 하나로 처리하고 `tickTask`는 아무것도 하지 않으며 레인 행을 잡지 않는다. 아래는 두 옵션을 켠 배치의 동작이다.
+
+**구성.** `src/task-bridge.ts`의 `TaskBridge`가 실행기와 무관한 부분(재인가, 질문 중복·만료, outbox, lease 감시, 상태, 해제 권한)을 갖고, `CodexBridge`와 `ClaudeTaskBridge`(`src/claude-task-bridge.ts`)가 이를 상속한다. 작업자 호출은 `TaskWorkerPort.call(endpoint, body, signal)` 하나로, `TASK_ENDPOINTS`의 요청·응답 타입을 그대로 쓴다. 저장소·기준 커밋·프로젝트 정책은 `TaskPlanSource.plan`이 정한다. 시작하지 않았다는 증거(거부 응답, 연결 전 실패)는 `TaskWorkerRejected`로 던지고, 그 밖의 예외는 시작 여부를 모르는 것으로 본다.
+
+**슬롯.**
+
+| 대상 | interactive(대화·리뷰) | task |
+|---|---|---|
+| 직렬 1 | `Store.claim('interactive')`, `ReviewRuntime.claim` | `Store.claim('task')` |
+| 레인 안에서 막는 것 | 실행 중·unknown·waiting_user(질문 대기 제외) | 같음 |
+| 질문 대기 | 해당 없음 | 슬롯을 놓는다. job이 queued로 돌아오기 전에는 그 job을 집을 수 없고, 턴 시작의 세션 CAS가 같은 세션의 겹친 재개를 막는다 |
+| 계정 한도 대기(`model_limit`) | 어느 레인에서 나도 양쪽을 막는다(`scheduler` 켜짐). 토큰이 달라도 한도는 합쳐진다고 본다 | 같음 |
+| 인증 대기(`auth_expired`) | `scheduler`를 켜 대화·리뷰가 멈추고 표시·지표는 지금 그대로다. 작업 레인은 막지 않는다 | `waitForUser(..., { laneOnly: true })`로 `scheduler`를 켜지 않고 작업 레인만 막는다 |
+| 비상 중지·인가·전체 큐 상한 | 공유 | 공유 |
+| unknown | 대화·리뷰 슬롯만 막는다 | 작업 레인만 막고 새 접수를 닫는다 |
+
+작업 레인 claim은 `scheduler` 값을 보지 않고 `scheduler_emergency`와 `model_limit` 대기만 본다. 대화 레인의 인증 대기가 켠 `scheduler`에 막히지 않게 하려는 것이다. `releaseScheduler`는 비상 중지가 없고, 질문 대기와 작업 레인의 인증 대기를 뺀 대기가 없을 때 정지를 푼다.
+
+**잠금 순서.** 대화 행 → `scheduler` 행 → `execution_lanes` 행 → job·세션·질문 행. `Store.lockTaskControl`이 앞의 셋을 이 순서로 잡고, 턴 시작(`begin`)·결과 확정(`settle`)·정리·해제가 이것으로 시작한다. claim과 접수는 대화 행이 없는 구간부터 같은 순서를 따른다. 스케줄러 행은 레인과 무관하게 하나라 짧은 claim 트랜잭션끼리는 줄을 서지만, 실행 자체는 어떤 행도 쥐지 않아 긴 작업이 대화를 기다리게 하지 않는다.
+
+**접수 닫힘.** `Store.syncTaskLane`이 Claude 세션 사실에서 사유를 다시 계산해 `execution_lanes`에 적는다. `unknown`(job이나 세션이 unknown) → `cleanup_pending`(정리 확인 실패) → `retention_full`(보존 세션 8개) 순이고, 사실이 사라지면 다시 열린다. 사실이 DB에 있어 재시작 뒤에도 같은 값이다. `accept('task')`는 `LaneClosed`를 던진다. `unknown`·`cleanup_pending`이면 claim도 아무것도 집지 않는다. `retention_full`이면 이미 보존 중인 세션의 재개만 집는다. 막으면 그 세션이 끝나지 못해 칸이 영영 비지 않는다. 세션은 첫 요청 전부터 보존으로 세어 응답을 잃어도 칸을 놓치지 않는다. Codex 작업은 세지 않으며 jobs 상태로만 슬롯을 막는다.
+
+**턴 흐름(`ClaudeTaskBridge.run`).**
+
+- 한 번의 `run`이 `/v1/task` 한 번, 곧 한 턴이다. 첫 턴은 새 세션 UUID와 세대를 쓰고, `/retry`는 앞 세대를 지운 뒤 세대를 올린다. 지우기 전이면 대기열로 되돌린다.
+- 재개 전에 세션의 저장소·기준·프로젝트·정책 revision을 대조하고 `/v1/task/status`로 세션 공간과 이전 턴 소멸을 확인한다. 어긋나거나 세션이 없으면 실패이고 새 세션으로 조용히 바꾸지 않는다. 파드만 바뀌었으면(같은 storage) 새 instance로 잇는다. 상태 확인이 끊기면 대기열로 되돌린다.
+- 도구 호출 수와 누적 실행 시간은 세션에 누적해 재개로 새로 채워지지 않는다. 사용량을 모르면 잇지 않는다.
+- 턴 시작은 lease 확인과 세션 상태 CAS를 한 트랜잭션으로 한다. 띄우지 않고 job을 되돌리거나 실패시키는 경로도 읽어 둔 세션 상태가 그대로일 때만 그렇게 해, 겹친 실행이 돌고 있는 턴의 job을 건드리지 못한다. 응답은 계약 스키마로 다시 읽고 job·lease·세대·세션·턴·작업자가 요청과 다르면 받지 않은 것과 같다.
+- 결과 확정은 한 트랜잭션이고 다른 lease가 넘겨받았으면 어떤 행도 바꾸지 않는다. 소멸을 확인하지 못하거나 lease를 잃으면 `unknown`이다. 멈춘 턴의 확인에는 `/v1/task/cancel`을 한 번만 보낸다.
+- 정상 종료 신호: dispatch 전이면 대기열로 되돌리고, 실행 중이면 `drainMs` 뒤 취소해 확인되면 `failed`(`task_shutdown`), 아니면 `unknown`이다. 작업은 자동으로 다시 실행하지 않는다.
+
+**질문.**
+
+- `questionId = taskQuestionId(job, sessionId, turn)`, `codex_questions.thread_id`에는 세션 UUID를 넣는다. 응답 스키마를 통과한 `needs_input`(`stopped:true`)으로만 만든다. 기한 1시간, 답 2,000자다.
+- `TaskBridge.answerIn(store, input)`은 호출자가 연 트랜잭션 안에서 답을 처리한다. 수신 경로가 이벤트 처리와 답 쓰기를 한 번에 확정하는 경계다. 인가도 그 연결로 해 같은 대화의 `/revoke`와 대화 행으로 직렬화된다. `answer`는 이것을 자기 트랜잭션으로 감싼다.
+- 권한 재확인 지점: 답 수락, 재개 dispatch 직전, 실행 중 감시, 결과 확정 전.
+- 한도·인증으로 끊긴 턴이 나르던 답은 `answered`로 되돌려 `/resume-model` 뒤 같은 답으로 잇는다. 대기 사유는 세션의 `wait_reason`(migration 015)에 남는다. `/resume-model`이 `jobs.wait_reason`을 비우기 때문이다.
+
+**수명.** `sweep`이 매 바퀴 하는 일: 기한 지난 질문 닫기, unknown 알림, `/cancel`·철회로 끝난 job의 세션·질문 닫기, 24시간 넘은 모델 대기에 `owner_confirm_requested_at` 표시와 알림 한 번(자동 재개·폐기 없음), 정리 재시도. 정리는 최종 상태를 DB에 남긴 뒤에만 `/v1/task/finalize`로 보내고 먼저 `/v1/task/status`로 identity를 얻는다. 다른 storage의 `absent`·`finalized`는 소멸 증명으로 쓰지 않는다. 실패하면 `cleanup_pending`이고 `finalizeRetryMs`(기본 30초) 뒤 다시 시도한다. 대기 세션의 `cleanupPending`은 세션을 지우지 않고 작업자가 `waiting`이라고 답하면 막힘만 푼다. unknown 해제(`release`)는 작업자의 소멸 확인 뒤에만 `cancelled`로 바꾸고 정리까지 시도하며 다시 실행하지 않는다.
+
+**한계.** 저장소(PVC)가 바뀌면 옛 세션의 정리를 증명할 길이 없어 `cleanup_pending`이 남고 작업 레인이 닫힌 채로 있다. 자동으로 풀지 않는다.
 
 ## 13. 개선안 v2 적용 (2026-10-30)
 

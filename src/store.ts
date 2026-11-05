@@ -5,6 +5,8 @@ import type { Clock, EventInput, Job, Scope, State } from './contracts.js';
 import { remaining } from './database.js';
 import type { Database, TransactionDeadline } from './database.js';
 import { messagePages } from './format.js';
+import { TASK_RETENTION } from './task-contracts.js';
+import type { ExecutionLane, ExecutionLaneClosedReason } from './task-contracts.js';
 
 export interface Conversation {
   id: string; owner_id: string; scope: Scope; channel_id: string;
@@ -26,6 +28,10 @@ export const MODEL_QUEUE_LIMIT = DEFAULTS.maxQueue - READ_QUEUE_RESERVE;
 // unknown chat 조사 간격: 처음 조사 뒤 30초, 이후 두 배씩, 상한 10분.
 export const UNKNOWN_PROBE_FIRST_MS = 30_000;
 export const UNKNOWN_PROBE_MAX_MS = 600_000;
+// 작업 레인의 새 접수가 닫혀 있다. 호출자(수신 경로)가 사유를 안내한다.
+export class LaneClosed extends Error {
+  constructor(public readonly reason: ExecutionLaneClosedReason) { super(`lane_closed:${reason}`); }
+}
 export class Store {
   constructor(public readonly db: Database, public readonly now: Clock = Date.now) {}
   async atomic<T>(fn: (store: Store) => Promise<T>, deadline?: TransactionDeadline): Promise<T> {
@@ -96,6 +102,11 @@ export class Store {
       await tx.query(`SELECT * FROM controls WHERE key='scheduler' FOR UPDATE`);
       const existing = (await tx.query<{ id: string }>('SELECT id FROM jobs WHERE event_id=$1', [id])).rows[0];
       if (existing) return existing.id;
+      if (type === 'task') {
+        // 기록된 값만 읽는다. 사실이 바뀌는 경로와 작업 루프의 정리가 이 행을 맞춘다. 사이에 끼어든 접수도 claim이 다시 계산해 막는다.
+        const closed = (await tx.query<{ closed_reason: ExecutionLaneClosedReason | null }>(`SELECT closed_reason FROM execution_lanes WHERE lane='task' FOR UPDATE`)).rows[0]?.closed_reason;
+        if (closed) throw new LaneClosed(closed);
+      }
       if (await this.queueFull(type, tx)) throw new Error('queue_full');
       const jobId = randomUUID();
       const inserted = await tx.query<{ id: string }>(`INSERT INTO jobs(id,event_id,conversation_id,type,owner_id,target,revision,budget,
@@ -111,24 +122,75 @@ export class Store {
       return jobId;
     });
   }
-  async claim(): Promise<Job | undefined> {
+  // lane을 주면 그 레인의 직렬 1을 execution_lanes 행 잠금 아래에서 판정한다. 잠금 순서는 scheduler 행 → 레인 행 → job이다.
+  // lane이 없으면 작업 루프가 꺼진 배치의 단일 슬롯이다. 대화·리뷰·작업이 슬롯 하나를 나누고 질문 대기도 슬롯을 잡는다.
+  async claim(lane?: ExecutionLane): Promise<Job | undefined> {
     return this.db.transaction(async tx => {
       await tx.query(`INSERT INTO controls VALUES ('scheduler','false') ON CONFLICT DO NOTHING`);
       const control = (await tx.query<{ value: boolean }>(`SELECT value FROM controls WHERE key='scheduler' FOR UPDATE`)).rows[0]!;
-      if (control.value) return;
-      // Unknown hosts may still be executing; they hold the global model slot.
-      // read는 모델을 부르지 않아 슬롯을 잡지도, 슬롯에 막히지도 않는다(claimRead가 따로 고른다).
-      if ((await tx.query(`SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown','waiting_user')
-        AND type<>'read' LIMIT 1`)).rows.length) return;
+      if (lane === 'task' ? await this.taskLaneStopped(tx) : control.value) return;
+      let startsClosed = false;
+      if (lane) {
+        await tx.query('SELECT lane FROM execution_lanes WHERE lane=$1 FOR UPDATE', [lane]);
+        if (lane === 'task') {
+          const closed = await this.syncTaskLane(tx);
+          if (closed && closed !== 'retention_full') return;
+          startsClosed = closed === 'retention_full';
+        }
+        if (await this.laneBusy(lane, tx)) return;
+      } else {
+        // Unknown hosts may still be executing; they hold the global model slot.
+        // read는 모델을 부르지 않아 슬롯을 잡지도, 슬롯에 막히지도 않는다(claimRead가 따로 고른다).
+        if ((await tx.query(`SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown','waiting_user')
+          AND type<>'read' LIMIT 1`)).rows.length) return;
+      }
+      // 보존 칸이 찼어도 이미 보존 중인 세션을 잇는 일은 칸을 늘리지 않는다. 막으면 그 세션이 끝나지 못해 칸이 영영 비지 않는다.
+      const retained = startsClosed ? `AND EXISTS (SELECT 1 FROM codex_sessions s WHERE s.job_id=j.id AND s.executor='claude'
+        AND s.session_retained AND s.state IN ('waiting_answer','waiting_model'))` : '';
       const row = (await tx.query<Job>(`SELECT j.* FROM jobs j JOIN events e ON e.id=j.event_id
         JOIN conversations c ON c.id=j.conversation_id WHERE j.state='queued' AND j.type<>'read' AND e.accepted=true
         AND c.active=true AND c.gap=false AND c.owner_id=j.owner_id AND e.actor_id=j.owner_id AND j.available_at<=$1
-        ORDER BY j.priority,j.created_at,e.event_order FOR UPDATE OF j SKIP LOCKED LIMIT 1`, [this.now()])).rows[0];
+        ${lane ? 'AND j.execution_lane=$2' : ''} ${retained}
+        ORDER BY j.priority,j.created_at,e.event_order FOR UPDATE OF j SKIP LOCKED LIMIT 1`, lane ? [this.now(), lane] : [this.now()])).rows[0];
       if (!row) return;
       return (await tx.query<Job>(`UPDATE jobs SET state='running',attempt=attempt+1,
         lease_token=$2,lease_until=$3,started_at=$4 WHERE id=$1 RETURNING *`,
       [row.id, randomUUID(), this.now() + DEFAULTS.leaseMs, this.now()])).rows[0];
     });
+  }
+  // 레인의 실행 슬롯을 잡고 있는 job이 있는지. 질문 대기는 프로세스가 없어 슬롯을 놓는다. 같은 job의 동시 턴은 그 job이 queued로
+  // 돌아오기 전에 claim될 수 없고 세션 CAS(claude-task-bridge)가 한 번 더 막는다.
+  async laneBusy(lane: ExecutionLane, tx = this.db): Promise<boolean> {
+    return (await tx.query(`SELECT id FROM jobs WHERE execution_lane=$1 AND (state IN ('running','verifying','cancel_requested','unknown')
+      OR (state='waiting_user' AND wait_reason IS DISTINCT FROM 'clarification')) LIMIT 1`, [lane])).rows.length > 0;
+  }
+  // 작업 레인은 scheduler 값을 그대로 보지 않는다. 대화 레인의 인증 대기도 그 값을 켜지만 작업 레인은 토큰이 달라 막힐 이유가 없다.
+  // 공유하는 장벽은 비상 중지와 계정 한도 대기뿐이다.
+  private async taskLaneStopped(tx: Database): Promise<boolean> {
+    await tx.query(`INSERT INTO controls(key,value) SELECT 'scheduler_emergency',value FROM controls WHERE key='scheduler'
+      ON CONFLICT DO NOTHING`);
+    const emergency = (await tx.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler_emergency'")).rows[0]!.value;
+    return emergency || (await tx.query(`SELECT id FROM jobs WHERE state='waiting_user' AND wait_reason='model_limit' AND type<>'read' LIMIT 1`)).rows.length > 0;
+  }
+  // 작업 레인의 닫힘 사유를 사실에서 다시 계산해 execution_lanes에 적고 돌려준다. 사실이 모두 DB에 있어 재시작 뒤에도 같은 값이 나온다.
+  // 사유가 사라지면 새 접수가 다시 열린다. 부르는 쪽이 레인 행을 먼저 잠근다.
+  // Claude 세션만 센다. Codex 작업의 unknown은 jobs 상태만으로 슬롯을 막고 레인 접수에는 관여하지 않는다.
+  async syncTaskLane(tx = this.db): Promise<ExecutionLaneClosedReason | null> {
+    const facts = (await tx.query<{ unknown: boolean; cleanup: boolean; retained: string }>(`SELECT
+      EXISTS (SELECT 1 FROM codex_sessions s JOIN jobs j ON j.id=s.job_id WHERE s.executor='claude' AND (j.state='unknown' OR s.state='unknown')) AS unknown,
+      EXISTS (SELECT 1 FROM codex_sessions WHERE executor='claude' AND cleanup_state='pending') AS cleanup,
+      (SELECT count(*) FROM codex_sessions WHERE executor='claude' AND session_retained) AS retained`)).rows[0]!;
+    const reason: ExecutionLaneClosedReason | null = facts.unknown ? 'unknown' : facts.cleanup ? 'cleanup_pending'
+      : Number(facts.retained) >= TASK_RETENTION.maxRetainedSessions ? 'retention_full' : null;
+    await tx.query(`UPDATE execution_lanes SET closed_reason=$1::text,closed_at=CASE WHEN $1::text IS NULL THEN NULL ELSE $2::bigint END
+      WHERE lane='task' AND closed_reason IS DISTINCT FROM $1::text`, [reason, this.now()]);
+    return reason;
+  }
+  // 세션·질문을 쓰는 경로의 공통 잠금. 제어 경로와 같은 대화 행 → scheduler 행 → 레인 행 순서다.
+  async lockTaskControl(conversation: string): Promise<void> {
+    await this.db.query('SELECT id FROM conversations WHERE id=$1 FOR UPDATE', [conversation]);
+    await this.lockScheduler();
+    await this.db.query(`SELECT lane FROM execution_lanes WHERE lane='task' FOR UPDATE`);
   }
   // read 레인. 모델 슬롯·scheduler 행(대기·비상 중지)·unknown에 막히지 않는다. /emergency-stop은 모델 호출 중지다.
   // 대화 장벽(구독 중지·gap·owner 불일치)은 모델과 같다. 동시 실행은 게시 서버 전체에서 1개이며 read_lane 행으로 직렬화한다.
@@ -248,12 +310,13 @@ export class Store {
       WHERE id=$1 AND lease_token=$2 AND lease_until>$5 AND state IN ('running','verifying','cancel_requested') RETURNING state`,
     [job.id, job.lease_token, state, reason, this.now()])).rows[0]?.state;
   }
-  async waitForUser(job: Job, reason: string): Promise<void> {
+  // laneOnly: 그 레인만 막는 대기다. scheduler를 켜지 않고 waiting_user 행이 laneBusy로 자기 레인만 막는다(작업 레인 토큰의 인증 만료).
+  async waitForUser(job: Job, reason: string, options: { laneOnly?: boolean } = {}): Promise<void> {
     await this.db.transaction(async tx => {
       await this.lockConversation(job, tx);
       await this.lockScheduler(tx);
       if (await this.complete(job, 'waiting_user', reason, tx) !== 'waiting_user') return;
-      await tx.query(`UPDATE controls SET value='true' WHERE key='scheduler'`);
+      if (!options.laneOnly) await tx.query(`UPDATE controls SET value='true' WHERE key='scheduler'`);
       // task는 작업 레인(codex.ts)이 따로 알린다. 여기서는 chat만.
       if (job.type === 'chat') await this.notice(job, `waiting:${job.id}:${job.attempt}`,
         `${reason === 'auth_expired' ? '모델 인증이 만료돼' : '모델 사용 한도에 걸려'} 작업이 멈췄습니다. `
@@ -469,16 +532,18 @@ export class Store {
     const row = (await this.db.query<Conversation>('SELECT * FROM conversations WHERE id=$1', [conversation])).rows[0];
     return !!row?.active;
   }
-  private async lockScheduler(tx = this.db): Promise<void> {
+  async lockScheduler(tx = this.db): Promise<void> {
     await tx.query(`INSERT INTO controls VALUES ('scheduler','false') ON CONFLICT DO NOTHING`);
     await tx.query(`SELECT * FROM controls WHERE key='scheduler' FOR UPDATE`);
     await tx.query(`INSERT INTO controls(key,value) SELECT 'scheduler_emergency',value FROM controls WHERE key='scheduler'
       ON CONFLICT DO NOTHING`);
   }
-  private async releaseScheduler(): Promise<boolean> {
+  // 비상 중지와 전역 대기가 없으면 정지를 푼다. 질문 대기와 작업 레인의 인증 대기는 scheduler를 켜지 않는 대기라 해제를 막지 않는다.
+  async releaseScheduler(): Promise<boolean> {
     await this.db.query(`UPDATE controls SET value='false' WHERE key='scheduler'
       AND NOT EXISTS (SELECT 1 FROM controls WHERE key='scheduler_emergency' AND value='true')
-      AND NOT EXISTS (SELECT 1 FROM jobs WHERE state='waiting_user')`);
+      AND NOT EXISTS (SELECT 1 FROM jobs WHERE state='waiting_user' AND wait_reason IS DISTINCT FROM 'clarification'
+        AND NOT (type='task' AND wait_reason='auth_expired'))`);
     return (await this.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler'")).rows[0]!.value;
   }
   // options.review는 호출자가 "정책 owner가 알림 채널에서 보낸 명령"임을 확인했을 때만 true다(리뷰 작업 제어).

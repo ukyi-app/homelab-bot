@@ -1,0 +1,108 @@
+import { randomUUID } from 'node:crypto';
+import { ClaudeTaskBridge } from '../src/claude-task-bridge.js';
+import type { ClaudeTaskBridgeOptions, TaskPlan } from '../src/claude-task-bridge.js';
+import type { Database } from '../src/database.js';
+import { Runtime } from '../src/runtime.js';
+import { TaskWorkerRejected } from '../src/task-bridge.js';
+import type { TaskEndpointRequest, TaskEndpointResponse, TaskWorkerPort } from '../src/task-bridge.js';
+import { TASK_ENDPOINTS } from '../src/task-contracts.js';
+import type { TaskEndpoint, TaskRequest, TaskResponse, TaskStatusResponse, TaskWorkerIdentity } from '../src/task-contracts.js';
+import { event, fixture, thread } from './helpers.js';
+
+export type Fixture = Awaited<ReturnType<typeof fixture>>;
+const usage = (toolCalls: number | null = 1) => ({ toolCalls, model: null });
+const base = (request: TaskRequest, worker: TaskWorkerIdentity, toolCalls: number | null = 1) => ({ version: 1 as const, job: request.job, lease: request.lease,
+  generation: request.generation, sessionId: request.sessionId, turn: request.turn, worker, usage: usage(toolCalls) });
+export const reply = {
+  completed: (summary = '끝냈습니다.') => (r: TaskRequest, w: TaskWorkerIdentity): TaskResponse => ({ ...base(r, w), status: 'completed', stopped: true, sessionRetained: true, cleanupPending: false,
+    summary, changes: { total: 0, items: [] }, patch: { text: '', bytes: 0, digest: 'a'.repeat(64), truncated: false }, verification: [] }),
+  question: (question = '어느 브랜치 기준으로 고칠까요?') => (r: TaskRequest, w: TaskWorkerIdentity): TaskResponse => ({ ...base(r, w), status: 'needs_input', stopped: true, sessionRetained: true, cleanupPending: false, question }),
+  limited: (status: 'limited' | 'auth_expired' = 'limited', cleanupPending = false) => (r: TaskRequest, w: TaskWorkerIdentity): TaskResponse => ({ ...base(r, w), status, stopped: true, sessionRetained: true, cleanupPending }),
+  failed: (reason: 'session_missing' | 'api_error' | 'cleanup_pending' = 'api_error', cleanupPending = false) => (r: TaskRequest, w: TaskWorkerIdentity): TaskResponse => ({ ...base(r, w), status: 'failed', stopped: true, sessionRetained: true, cleanupPending, reason }),
+  unknown: () => (r: TaskRequest, w: TaskWorkerIdentity): TaskResponse => ({ ...base(r, w), status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: false }),
+};
+export type Script = (request: TaskRequest, worker: TaskWorkerIdentity, signal?: AbortSignal) => unknown;
+// 계약 스키마로 요청을 검사하는 가짜 작업자. 세션 상태는 게시 서버가 받은 응답에 맞춰 스스로 기억한다.
+export class FakeTaskWorker implements TaskWorkerPort {
+  identity: TaskWorkerIdentity = { instance: randomUUID(), storage: randomUUID() };
+  scripts: Script[] = [];
+  executes: TaskRequest[] = [];
+  cancels: TaskEndpointRequest<'/v1/task/cancel'>[] = [];
+  finalizes: TaskEndpointRequest<'/v1/task/finalize'>[] = [];
+  statuses: TaskEndpointRequest<'/v1/task/status'>[] = [];
+  stopped = true;
+  finalizeCleans = true;
+  statusFails = false;
+  statusOverride: Partial<TaskStatusResponse> | undefined;
+  private readonly sessions = new Map<string, 'waiting' | 'finalized'>();
+  private readonly turns = new Map<string, number>();
+  async call<E extends TaskEndpoint>(endpoint: E, body: TaskEndpointRequest<E>, signal?: AbortSignal): Promise<TaskEndpointResponse<E>> {
+    TASK_ENDPOINTS[endpoint].request.parse(body);
+    return await this.handle(endpoint, body, signal) as TaskEndpointResponse<E>;
+  }
+  private async handle(endpoint: TaskEndpoint, body: unknown, signal?: AbortSignal): Promise<unknown> {
+    if (endpoint === '/v1/task') {
+      const request = body as TaskRequest;
+      this.executes.push(request);
+      const script = this.scripts.shift() ?? reply.completed();
+      const answer = await script(request, this.identity, signal);
+      this.sessions.set(request.sessionId, 'waiting');
+      this.turns.set(request.sessionId, request.turn);
+      return answer;
+    }
+    const control = body as { job: string; lease: string; generation: number; sessionId: string };
+    const shape = { version: 1 as const, job: control.job, lease: control.lease, generation: control.generation, sessionId: control.sessionId, worker: this.identity };
+    if (endpoint === '/v1/task/cancel') {
+      this.cancels.push(body as TaskEndpointRequest<'/v1/task/cancel'>);
+      if (this.stopped) this.sessions.set(control.sessionId, 'waiting');
+      return { ...shape, stopped: this.stopped, cleaned: false, cleanupPending: false, sessionRetained: true };
+    }
+    if (endpoint === '/v1/task/status') {
+      this.statuses.push(body as TaskEndpointRequest<'/v1/task/status'>);
+      if (this.statusFails) throw new Error('worker_down');
+      const known = this.sessions.get(control.sessionId);
+      const state = known ?? 'running';
+      return { ...shape, state, turn: this.turns.get(control.sessionId) ?? null, sessionExists: state === 'waiting' || state === 'running', stopped: state !== 'running', ...this.statusOverride };
+    }
+    this.finalizes.push(body as TaskEndpointRequest<'/v1/task/finalize'>);
+    if (this.finalizeCleans) this.sessions.set(control.sessionId, 'finalized');
+    return { ...shape, stopped: true, cleaned: this.finalizeCleans, cleanupPending: !this.finalizeCleans, sessionRetained: !this.finalizeCleans };
+  }
+}
+export const rejectStart: Script = () => { throw new TaskWorkerRejected(); };
+export const hang: Script = (_request, _worker, signal) => new Promise((_resolve, reject) => {
+  signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+});
+export const PLAN: TaskPlan = { repository: 'fixture-owner/fixture-repo', base: 'b'.repeat(40),
+  project: { id: 'fixture', revision: 'r1', allowedPaths: ['src'], forbiddenPaths: [], verifyCommands: [] },
+  limits: { archiveBytes: 1000, files: 10, fileBytes: 100, patchBytes: 100, lineBytes: 100, outputBytes: 100, events: 10 } };
+
+export function lane(f: Fixture, options: Partial<ClaudeTaskBridgeOptions> = {}, plan: TaskPlan = PLAN) {
+  const worker = new FakeTaskWorker();
+  const bridge = new ClaudeTaskBridge(f.store, f.gate, worker, { plan: async () => plan }, { monitorMs: 5, stopWaitMs: 50, ...options });
+  const runtime = new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, bridge, { taskLoop: true });
+  return { worker, bridge, runtime };
+}
+export async function allRows(db: Database, table: string) { return (await db.query<Record<string, any>>(`SELECT * FROM ${table}`)).rows; }
+export async function jobs(db: Database) {
+  return (await db.query<Record<string, any>>('SELECT j.* FROM jobs j JOIN events e ON e.id=j.event_id ORDER BY e.event_order')).rows;
+}
+export async function laneRow(db: Database) {
+  return (await db.query<{ closed_reason: string | null; closed_at: string | null }>("SELECT closed_reason,closed_at FROM execution_lanes WHERE lane='task'")).rows[0]!;
+}
+export async function task(f: Fixture, db: Database, id = 'task', text = '실패하는 시험을 고쳐줘') {
+  await f.ingress.receive(event(id, { kind: 'command', command: 'task', text }));
+  return (await jobs(db)).at(-1)!;
+}
+export const answer = (bridge: ClaudeTaskBridge, question: string, text: string, eventId: string, scope = thread, actor = 'fixture-owner') =>
+  bridge.answer({ question, actor, scope, text, event: eventId });
+export const conversationId = (f: Fixture) => f.store.scopeId(thread);
+export const control = (f: Fixture, action: string, target?: string) => f.store.control('fixture-owner', conversationId(f), action, target) as Promise<{ ok?: boolean; status?: string; paused?: boolean }>;
+// 상태를 기다린다. 끝내 안 오면 시험이 멈추지 않고 실패한다.
+export const until = async (condition: () => boolean | Promise<boolean>) => {
+  const deadline = Date.now() + 10_000;
+  while (!await condition()) {
+    if (Date.now() > deadline) throw new Error('until_timeout');
+    await new Promise(resolve => setImmediate(resolve));
+  }
+};

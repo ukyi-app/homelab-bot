@@ -4,6 +4,7 @@ import { mkdir, open, readlink, realpath } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { DEFAULTS, Denied, PolicyUnavailable } from './contracts.js';
 import type { Job, Scope } from './contracts.js';
+import { TaskBridge } from './task-bridge.js';
 import { assertWorkerRoot, codexConfig, configToml, execArgs, launchEnvironment, taskPaths } from './codex-config.js';
 import type { CodexPaths } from './codex-config.js';
 import { TASK_OUTPUT_JSON_SCHEMA, authSecrets, compactEvent, interpretRun } from './codex-events.js';
@@ -239,24 +240,26 @@ export const TASK_INSTRUCTIONS = '홈랩 봇이 소유한 Codex 작업이다. �
 export const RESUME_AFTER_WAIT = '이전 턴이 모델 사용 한도나 인증 만료로 중단됐다. 같은 요청을 이어서 진행한다. '
   + '작업 공간의 현재 상태를 먼저 확인하고 이미 한 변경을 되풀이하지 않는다. 끝나면 출력 스키마대로 반환한다.';
 export interface CodexBridgeOptions { monitorMs: number; questionTtlMs: number; answerChars: number; stopWaitMs: number }
-// 질문 기한 1시간: claim()이 waiting_user를 모델 슬롯 점유로 보므로 답을 기다리는 동안 대화도 멈춘다.
+// 질문 기한 1시간: 단일 슬롯 배치에서는 claim()이 waiting_user를 모델 슬롯 점유로 보므로 답을 기다리는 동안 대화도 멈춘다.
 // 그 막힘 시간을 이 값으로 묶는다.
 export const CODEX_DEFAULTS: Readonly<CodexBridgeOptions> = Object.freeze({ monitorMs: 1000, questionTtlMs: 3_600_000,
   answerChars: 2000, stopWaitMs: 15_000 });
 // tool_calls가 null이면 사용량을 모른다(현재 009 이전 스키마에서 올라온 세션).
 interface Session { job_id: string; thread_id: string | null; turn: number; tool_calls: number | null; state: string }
-interface Question {
-  id: string; job_id: string; conversation_id: string; thread_id: string; turn: number; responder_id: string;
-  state: string; expires_at: number; answer: string | null; answer_event: string | null;
-}
+interface Question { id: string; thread_id: string; answer: string | null }
 type Stop = 'cancel' | 'revoked' | 'lease' | 'timeout' | 'monitor';
+const CODEX_TEXT = Object.freeze({
+  prefix: 'codex', question: 'Codex 작업 질문', accepted: '답을 받았습니다. 같은 Codex 세션을 이어서 실행합니다.',
+  blocked: (job: string) => `작업 ${job}의 Codex 프로세스 종료를 확인하지 못했습니다(unknown). 다시 실행하지 않고 새 모델 실행을 막았습니다. 작업자 프로세스 0개를 확인한 뒤 /codex-release target:${job} 로 해제하세요.`,
+});
 
-// 게시 서버 쪽 조율. 질문·완료는 Discord outbox로만 내보낸다.
-export class CodexBridge {
+// 게시 서버 쪽 조율. 질문·완료는 Discord outbox로만 내보낸다. 실행기 중립 부분은 TaskBridge에 있다.
+export class CodexBridge extends TaskBridge {
   private readonly options: CodexBridgeOptions;
-  constructor(private readonly store: Store, private readonly gate: PolicyGate,
-    private readonly adapter: CodexTaskAdapter, options: Partial<CodexBridgeOptions> = {}) {
-    this.options = { ...CODEX_DEFAULTS, ...options };
+  constructor(store: Store, gate: PolicyGate, private readonly adapter: CodexTaskAdapter, options: Partial<CodexBridgeOptions> = {}) {
+    const merged = { ...CODEX_DEFAULTS, ...options };
+    super(store, gate, CODEX_TEXT, merged);
+    this.options = merged;
   }
   async run(job: Job): Promise<void> {
     if (job.type !== 'task') throw new Denied();
@@ -333,21 +336,6 @@ export class CodexBridge {
       await this.store.transition(job, 'unknown', 'record_failed').catch(() => {});
     }
   }
-  // 띄우지 않고 실패로 끝낼 때 세션·질문도 함께 닫는다. 남겨 두면 /retry가 같은 세션 재개로 읽혀 같은 이유로 다시 실패한다.
-  private async abandon(job: Job, reason: string): Promise<void> {
-    await this.store.atomic(async store => {
-      await store.db.query("UPDATE codex_sessions SET state='failed',updated_at=$2 WHERE job_id=$1", [job.id, store.now()]);
-      await store.db.query("UPDATE codex_questions SET state='cancelled' WHERE job_id=$1 AND state IN ('open','answered')", [job.id]);
-      await store.fail(job, reason);
-    });
-  }
-  private async check(job: Job): Promise<Stop | undefined> {
-    const row = (await this.store.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0];
-    if (row?.state === 'cancel_requested') return 'cancel';
-    try { await this.gate.authorize(job.owner_id, job.target); }
-    catch (error) { if (error instanceof Denied) return 'revoked'; if (!(error instanceof PolicyUnavailable)) throw error; }
-    return await this.store.heartbeat(job) ? undefined : 'lease';
-  }
   private async settle(job: Job, revision: string, before: Session | undefined, outcome: RunOutcome, stop: Stop | undefined,
     answered?: string): Promise<void> {
     const stopped = outcome.kind !== 'unknown';
@@ -400,7 +388,7 @@ export class CodexBridge {
     }
     if (outcome.kind === 'question') {
       await sessionState('waiting_answer');
-      await this.ask(job, revision, outcome.threadId, turn, outcome.question);
+      await this.ask(job, revision, `${job.id}:${outcome.threadId}:${turn}`, outcome.threadId, turn, outcome.question);
       return;
     }
     await sessionState('completed');
@@ -413,137 +401,16 @@ export class CodexBridge {
         reportedChanges: keepPaths(outcome.reported), reportedCount: outcome.reported.length,
         unconfirmedReports: keepPaths(outcome.unconfirmed), unconfirmedCount: outcome.unconfirmed.length }, content, job.target);
   }
-  private async ask(job: Job, revision: string, threadId: string, turn: number, question: string): Promise<void> {
-    const id = `${job.id}:${threadId}:${turn}`;
-    const expires = this.store.now() + this.options.questionTtlMs;
-    await this.store.atomic(async store => {
-      const conversation = (await store.db.query<{ active: boolean }>('SELECT active FROM conversations WHERE id=$1 FOR UPDATE', [job.conversation_id])).rows[0];
-      const state = (await store.db.query<{ state: string }>(`UPDATE jobs SET
-        state=CASE WHEN state='cancel_requested' THEN 'cancelled' WHEN $5::boolean THEN 'waiting_user' ELSE 'superseded' END,
-        wait_reason=CASE WHEN state='cancel_requested' THEN 'stop_confirmation' WHEN $5::boolean THEN 'clarification' ELSE 'subscription_stopped' END,
-        finished_at=CASE WHEN state='cancel_requested' OR NOT $5::boolean THEN $4::bigint ELSE NULL END
-        WHERE id=$1 AND lease_token=$2 AND lease_until>$3 AND state IN ('running','verifying','cancel_requested') RETURNING state`,
-      [job.id, job.lease_token, store.now(), store.now(), !!conversation?.active])).rows[0]?.state;
-      if (state !== 'waiting_user') return;
-      await store.db.query(`INSERT INTO codex_questions(id,job_id,conversation_id,thread_id,turn,kind,responder_id,prompt,state,created_at,expires_at)
-        VALUES ($1,$2,$3,$4,$5,'clarification',$6,$7,'open',$8,$9)`,
-      [id, job.id, job.conversation_id, threadId, turn, job.owner_id, question, store.now(), expires]);
-      await store.enqueue({ key: `codex-question:${id}`, job: job.id, conversation: job.conversation_id, actor: job.owner_id,
-        scope: job.target, revision, payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary',
-          content: [`Codex 작업 질문 (질문 ID: ${id})`, bounded(question, 500),
-            `기한: ${new Date(expires).toISOString()}. 이 스레드에서 /answer question:${id} 로 답하세요. 답으로 도구 실행을 승인하거나 권한을 바꿀 수 없습니다.`].join('\n') } });
-    });
-  }
-  private async blocked(job: Job, revision: string): Promise<void> {
-    await this.store.enqueue({ key: `codex-blocked:${job.id}`, job: job.id, conversation: job.conversation_id, actor: job.owner_id,
-      scope: job.target, revision, payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary',
-        content: `작업 ${job.id}의 Codex 프로세스 종료를 확인하지 못했습니다(unknown). 다시 실행하지 않고 새 모델 실행을 막았습니다. 작업자 프로세스 0개를 확인한 뒤 /codex-release target:${job.id} 로 해제하세요.` } });
-  }
-  async answer(input: { question: string; actor: string; scope: Scope; text: string; event: string }): Promise<{ ok: boolean; status: string; duplicate?: boolean }> {
-    // 질문 답도 실행 직전과 같이 최신 정책으로 다시 인가한다(AUTH-02).
-    await this.gate.authorize(input.actor, input.scope);
-    if (!input.text.trim() || input.text.length > this.options.answerChars) return { ok: false, status: '답이 비었거나 너무 깁니다.' };
-    return this.store.atomic(async store => {
-      // 다른 대화의 질문은 아래에서 Denied라 기한이 지나 닫으며 알림을 넣는 대화는 이 대화뿐이다.
-      await store.db.query('SELECT id FROM conversations WHERE id=$1 FOR UPDATE', [store.scopeId(input.scope)]);
-      await this.lockScheduler(store);
-      const q = (await store.db.query<Question & { job_state: string; wait_reason: string | null; owner_id: string }>(`SELECT q.*,
-        j.state AS job_state,j.wait_reason,j.owner_id FROM codex_questions q JOIN jobs j ON j.id=q.job_id WHERE q.id=$1 FOR UPDATE`, [input.question])).rows[0];
-      if (!q) return { ok: false, status: '질문을 찾을 수 없습니다.' };
-      if (q.conversation_id !== store.scopeId(input.scope) || q.responder_id !== input.actor || q.owner_id !== input.actor) throw new Denied();
-      if (q.answer_event === input.event) return { ok: true, duplicate: true, status: '이미 받은 답입니다.' };
-      if (q.state !== 'open') return { ok: false, status: '이미 답했거나 닫힌 질문입니다. 지금 열린 질문의 ID를 확인하세요.' };
-      if (store.now() >= Number(q.expires_at)) {
-        await this.close(store, q, 'expired');
-        return { ok: false, status: '기한이 지난 질문입니다. 작업을 멈췄습니다.' };
-      }
-      if (q.job_state !== 'waiting_user' || q.wait_reason !== 'clarification') {
-        await store.db.query("UPDATE codex_questions SET state='cancelled' WHERE id=$1", [q.id]);
-        return { ok: false, status: '작업이 이 질문의 답을 기다리는 상태가 아닙니다.' };
-      }
-      await store.db.query(`UPDATE codex_questions SET state='answered',answer=$2,answered_by=$3,answer_event=$4,answered_at=$5
-        WHERE id=$1`, [q.id, input.text, input.actor, input.event, store.now()]);
-      await store.db.query(`UPDATE jobs SET state='queued',wait_reason=NULL,available_at=$2,lease_token=NULL,lease_until=NULL,
-        started_at=NULL,finished_at=NULL WHERE id=$1 AND state='waiting_user' AND wait_reason='clarification'`, [q.job_id, store.now()]);
-      await this.releaseScheduler(store);
-      await store.audit('codex_answer_accepted', q.id, { actor: input.actor });
-      return { ok: true, status: '답을 받았습니다. 같은 Codex 세션을 이어서 실행합니다.' };
-    });
-  }
-  private async close(store: Store, q: Question, state: 'expired'): Promise<void> {
-    await store.db.query('UPDATE codex_questions SET state=$2 WHERE id=$1', [q.id, state]);
-    // 무응답을 승인으로 보지 않는다. 프로세스는 턴 종료 때 소멸 확인을 마쳤으므로 cancelled다.
-    const job = (await store.db.query<Job>(`UPDATE jobs SET state='cancelled',wait_reason='question_expired',finished_at=$2
-      WHERE id=$1 AND state='waiting_user' AND wait_reason='clarification' RETURNING *`, [q.job_id, store.now()])).rows[0];
-    if (!job) return;
-    await store.db.query("UPDATE codex_sessions SET state='cancelled',updated_at=$2 WHERE job_id=$1", [q.job_id, store.now()]);
-    await this.releaseScheduler(store);
-    await store.enqueue({ key: `codex-expired:${q.id}`, job: job.id, conversation: job.conversation_id, actor: job.owner_id,
-      scope: job.target, revision: job.revision.policy, payload: { kind: 'message', channel: job.target.channel,
-        classification: 'safe_summary', content: `질문 ${q.id}의 답 기한이 지나 작업을 멈췄습니다(cancelled). 답 없이 진행하지 않습니다. 필요하면 새 작업으로 다시 요청하세요.` } });
-  }
-  // 제어 경로와 같은 순서(대화 행 → 스케줄러 행 → 작업 행)로 잠근다. 부르는 쪽이 대화 행을 먼저 잠근다.
-  // 만료 알림 outbox 삽입의 외래 키 검사도 대화 행을 잡으므로(KEY SHARE), 스케줄러를 먼저 잡으면 같은 대화의
-  // /cancel·/model-status와 교착한다. 순서가 다르면 비상 중지를 기다린 뒤 옛 스냅샷으로 스케줄러를 풀어 버릴 수도 있다.
-  private async lockScheduler(store: Store): Promise<void> {
-    await store.db.query(`INSERT INTO controls VALUES ('scheduler','false') ON CONFLICT DO NOTHING`);
-    await store.db.query(`SELECT * FROM controls WHERE key='scheduler' FOR UPDATE`);
-    await store.db.query(`INSERT INTO controls(key,value) SELECT 'scheduler_emergency',value FROM controls WHERE key='scheduler'
-      ON CONFLICT DO NOTHING`);
-  }
-  // /cancel과 같은 해제 조건이다. 질문 대기 중 비상 중지가 풀렸다면 대기가 끝난 지금 스케줄러도 푼다.
-  private async releaseScheduler(store: Store): Promise<void> {
-    await store.db.query(`UPDATE controls SET value='false' WHERE key='scheduler'
-      AND NOT EXISTS (SELECT 1 FROM controls WHERE key='scheduler_emergency' AND value='true')
-      AND NOT EXISTS (SELECT 1 FROM jobs WHERE state='waiting_user')`);
-  }
-  // Runtime.tick이 claim 전에 부른다. lease 만료·기록 실패 등 settle 밖에서 생긴 unknown도 알림 없이 두지 않는다.
+  // Runtime.tick이 claim 전에 부른다.
   async sweep(): Promise<number> {
-    const expired = await this.expireQuestions();
-    const silent = (await this.store.db.query<Job>(`SELECT * FROM jobs j WHERE j.type='task' AND j.state='unknown'
-      AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.idempotency_key='codex-blocked:' || j.id)`)).rows;
-    for (const job of silent) await this.blocked(job, job.revision.policy);
-    return expired + silent.length;
-  }
-  async expireQuestions(): Promise<number> {
-    // 매 tick 잠그지 않도록 먼저 잠금 없이 본다. 실제 정리는 잠근 트랜잭션에서 다시 고른다.
-    if (!(await this.store.db.query("SELECT 1 FROM codex_questions WHERE state='open' AND expires_at<=$1 LIMIT 1", [this.store.now()])).rows.length) return 0;
-    return this.store.atomic(async store => {
-      // 대화 행을 스케줄러보다 먼저, 여러 개면 id 순으로 잠근다. 잠근 뒤에 만료된 다른 대화의 질문은 다음 정리로 미룬다.
-      const conversations = (await store.db.query<{ id: string }>(`SELECT id FROM conversations WHERE id IN
-        (SELECT conversation_id FROM codex_questions WHERE state='open' AND expires_at<=$1) ORDER BY id FOR UPDATE`, [store.now()])).rows.map(row => row.id);
-      await this.lockScheduler(store);
-      const rows = (await store.db.query<Question>(`SELECT * FROM codex_questions WHERE state='open' AND expires_at<=$1
-        AND conversation_id=ANY($2::text[]) FOR UPDATE`, [store.now(), conversations])).rows;
-      for (const q of rows) await this.close(store, q, 'expired');
-      return rows.length;
-    });
-  }
-  private async owned(actor: string, scope: Scope, jobId: string): Promise<Job> {
-    await this.gate.authorize(actor, scope);
-    const job = (await this.store.db.query<Job>('SELECT * FROM jobs WHERE id=$1', [jobId])).rows[0];
-    // 타인 작업과 다른 대화의 작업은 존재 여부도 구별해 알리지 않는다.
-    if (!job || job.type !== 'task' || job.owner_id !== actor || job.conversation_id !== this.store.scopeId(scope)) throw new Denied();
-    return job;
-  }
-  async status(actor: string, scope: Scope, jobId: string): Promise<{ state: string; waitReason: string | null; session: boolean; question: { id: string; expiresAt: number } | null }> {
-    const job = await this.owned(actor, scope, jobId);
-    const session = (await this.store.db.query<Session>('SELECT * FROM codex_sessions WHERE job_id=$1', [jobId])).rows[0];
-    const q = job.state === 'waiting_user' ? (await this.store.db.query<Question>("SELECT * FROM codex_questions WHERE job_id=$1 AND state='open'", [jobId])).rows[0] : undefined;
-    return { state: job.state, waitReason: (job as Job & { wait_reason: string | null }).wait_reason, session: !!session?.thread_id,
-      question: q ? { id: q.id, expiresAt: Number(q.expires_at) } : null };
+    return await this.expireQuestions() + await this.unknownNotices();
   }
   async attach(actor: string, scope: Scope, _external: string): Promise<never> {
     await this.gate.authorize(actor, scope);
     throw new CapabilityUnavailable('attach_task', 'undecided');
   }
   async release(actor: string, scope: Scope, jobId: string): Promise<{ ok: boolean; status: string }> {
-    const policy = await this.gate.authorize(actor, scope);
-    const job = (await this.store.db.query<Job>('SELECT * FROM jobs WHERE id=$1', [jobId])).rows[0];
-    // owner가 바뀌어 남은 막힘은 옛 owner가 풀 수 없다. 그 작업만 현재 정책 owner가 프로세스 0개 확인 뒤 풀 수 있다.
-    const own = job?.owner_id === actor && job.conversation_id === this.store.scopeId(scope);
-    const successor = !!job && job.owner_id !== policy.owner && actor === policy.owner;
-    if (!job || job.type !== 'task' || (!own && !successor)) throw new Denied();
+    const job = await this.releasable(actor, scope, jobId);
     if (job.state !== 'unknown') return { ok: false, status: '종료를 확인하지 못한(unknown) 작업이 아닙니다.' };
     const confirmed = await this.adapter.confirmStop(jobId).catch(() => ({ stopped: false }));
     if (!confirmed.stopped) return { ok: false, status: '작업자 프로세스가 남아 있거나 확인할 수 없습니다. 작업자 파드를 다시 만든 뒤 확인하세요.' };

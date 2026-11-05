@@ -9,7 +9,7 @@ import { once } from 'node:events';
 import pg from 'pg';
 import { databasePoolConfig } from '../src/config.js';
 import type { PublisherConfig } from '../src/config.js';
-import { MIGRATIONS, Postgres, appliedMigrations } from '../src/database.js';
+import { MIGRATIONS, Postgres, appliedMigrations, migrationVersion } from '../src/database.js';
 import { startPublisher } from '../src/main.js';
 import { runMigrations } from '../src/migrate-main.js';
 import { loadRuntimePolicy } from '../src/policy.js';
@@ -46,7 +46,7 @@ test('T16b 위험 5 실제 PostgreSQL: 마이그레이션 진입점 재실행은
   const d = await database();
   try {
     const pool = d.pool();
-    assert.deepEqual(await runMigrations(pool), MIGRATIONS.map((_, i) => i + 1));
+    assert.deepEqual(await runMigrations(pool), MIGRATIONS.map(migrationVersion));
     const db = new Postgres(d.pool(2));
     await pendingAlert(db);
     assert.deepEqual(await runMigrations(pool), []);
@@ -71,7 +71,7 @@ test('T16b 실제 PostgreSQL: 010까지 적용된 기존 DB는 011부터만 적�
     for (const file of MIGRATIONS.slice(0, 10)) await pool.query(await readFile(`migrations/${file}`, 'utf8'));
     const db = new Postgres(d.pool(2));
     await pendingAlert(db);
-    assert.deepEqual(await runMigrations(pool), [11, 12, 13]);
+    assert.deepEqual(await runMigrations(pool), [11, 12, 13, 15]);
     assert.equal((await db.query<{ state: string }>('SELECT state FROM outbox')).rows[0]!.state, 'pending');
   } finally { await d.close(); }
 });
