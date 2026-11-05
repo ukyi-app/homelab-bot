@@ -79,17 +79,22 @@ export class HttpTaskWorker implements TaskWorkerPort {
 }
 
 const REJECTED = JSON.stringify({ status: 'rejected', started: false });
-export function taskRoutes(service: TaskWorkerService, capabilities: object): ReadonlyMap<string, WorkerRoute> {
+// 로그에는 끝점·상태·사유 상수만 남긴다. 요청 본문과 capability는 넘기지 않는다.
+export function taskRoutes(service: TaskWorkerService, capabilities: object, log?: (fields: Record<string, unknown>) => void): ReadonlyMap<string, WorkerRoute> {
   const route = (endpoint: TaskEndpoint): WorkerRoute => async (req, res) => {
     const send = (status: number, payload: string) => { if (!res.headersSent) res.writeHead(status, { 'content-type': 'application/json' }).end(payload); };
+    const refuse = (status: number, reason: string) => {
+      log?.({ level: 'warn', event: 'task_route_rejected', endpoint, status, reason });
+      send(status, REJECTED);
+    };
     try {
       if (req.method !== 'POST') { res.writeHead(404).end(); return; }
       const auth = req.headers.authorization;
-      if (!auth?.startsWith('Capability ')) { send(401, REJECTED); return; }
+      if (!auth?.startsWith('Capability ')) { refuse(401, 'capability_missing'); return; }
       let input: unknown;
-      try { input = await body(req, TASK_LIMITS.bodyBytes); } catch { send(400, REJECTED); return; }
+      try { input = await body(req, TASK_LIMITS.bodyBytes); } catch { refuse(400, 'body_invalid'); return; }
       const parsed = TASK_ENDPOINTS[endpoint].request.safeParse(input);
-      if (!parsed.success) { send(400, REJECTED); return; }
+      if (!parsed.success) { refuse(400, 'request_invalid'); return; }
       const token = auth.slice(11);
       const result = endpoint === '/v1/task' ? await service.execute(parsed.data as never, token)
         : endpoint === '/v1/task/cancel' ? await service.cancel(parsed.data as never, token)
@@ -97,9 +102,10 @@ export function taskRoutes(service: TaskWorkerService, capabilities: object): Re
             : await service.finalize(parsed.data as never, token);
       send(200, JSON.stringify(result));
     } catch (error) {
-      if (error instanceof TaskRouteError) send(error.status, REJECTED);
+      if (error instanceof TaskRouteError) { refuse(error.status, error.message); return; }
+      log?.({ level: 'error', event: 'task_route_failed', endpoint, error: error instanceof Error ? error.name : typeof error });
       // 시작 여부를 모른다. 프로세스가 멈췄다는 증거가 아니다.
-      else send(500, JSON.stringify({ status: 'unknown', stopped: false }));
+      send(500, JSON.stringify({ status: 'unknown', stopped: false }));
     }
   };
   const intake: WorkerRoute = async (req, res) => {
@@ -111,8 +117,8 @@ export function taskRoutes(service: TaskWorkerService, capabilities: object): Re
 
 // 작업 모드 작업자의 서버. 대화·리뷰 끝점이 없어 경로 자체가 404다.
 // 처리기 안의 어떤 오류도 프로세스를 끝내지 않게 여기서 받는다. /readyz는 HTTP 서버 생존과 기동 검사만 본다(task-worker.ts 가용성 규칙).
-export function taskWorkerServer(service: TaskWorkerService, capabilities: object) {
-  const routes = taskRoutes(service, capabilities);
+export function taskWorkerServer(service: TaskWorkerService, capabilities: object, log?: (fields: Record<string, unknown>) => void) {
+  const routes = taskRoutes(service, capabilities, log);
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const handle = async () => {
       if (req.method === 'GET' && req.url === '/readyz') { res.writeHead(service.intake.startupClean ? 200 : 503).end(); return; }

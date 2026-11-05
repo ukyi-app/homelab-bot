@@ -11,7 +11,7 @@ import type { RunCredential, WorkerCredential } from '../src/credentials.js';
 import { RunControl } from '../src/run-control.js';
 import type { RunReport } from '../src/run-control.js';
 import { TaskResponseSchema } from '../src/task-contracts.js';
-import type { TaskResponse } from '../src/task-contracts.js';
+import type { TaskRequest, TaskResponse } from '../src/task-contracts.js';
 import { TaskSessions } from '../src/task-workspace.js';
 import type { TaskSession } from '../src/task-workspace.js';
 import { SpawnLauncher } from './spawn-launcher.js';
@@ -174,6 +174,58 @@ async function harness(steps: Step[], overrides: { credential?: WorkerCredential
   return { deps, seen, launcher, events };
 }
 const parsed = (response: TaskResponse) => TaskResponseSchema.parse(response);
+
+const REQUEST_MARK = '사용자요청표식-비공개';
+const SUMMARY_MARK = '모델요약표식-비공개';
+const CONTENT_MARK = '파일내용표식-비공개';
+const logged = (logs: Record<string, unknown>[], event: string) => logs.filter(item => item.event === event);
+const assertLogsClean = (logs: Record<string, unknown>[]) => {
+  const text = JSON.stringify(logs);
+  for (const mark of [REQUEST_MARK, SUMMARY_MARK, CONTENT_MARK, TOKEN, 'private-dir', 'secret-name']) assert.equal(text.includes(mark), false, mark);
+};
+const started = (request: TaskRequest) => ({ job: request.job, generation: request.generation, turn: request.turn });
+
+test('샌드박스 흔적: 실제 턴에서 CLI가 남긴 빈 stub은 빠지고 완료된다. 로그에 내용이 없다', async () => {
+  const { deps } = await harness([{ lines: [INIT, assistantS([toolUse('t1', 'Bash')]), resultS({ status: 'completed', summary: SUMMARY_MARK, question: '' })],
+    files: { 'README.md': `${CONTENT_MARK}\n`, '.env': '', 'package.json': '', '.mcp.json': '' } }]);
+  const logs: Record<string, unknown>[] = [];
+  const request = startRequest({ untrusted: { request: REQUEST_MARK } });
+  const response = parsed(await runTaskTurn({ ...deps, log: item => logs.push(item) }, request, new AbortController().signal));
+  assert.ok(response.status === 'completed');
+  assert.deepEqual(response.changes.items.map(item => [item.path, item.change]), [['README.md', 'modified']]);
+  assert.deepEqual(logged(logs, 'task_turn_started').map(item => ({ ...item })), [{ level: 'info', event: 'task_turn_started', ...started(request), operation: 'start' }]);
+  const [finished] = logged(logs, 'task_turn_finished');
+  assert.equal(typeof finished!.ms, 'number');
+  assert.deepEqual({ ...finished, ms: 0 }, { level: 'info', event: 'task_turn_finished', ...started(request), status: 'completed', reason: null, tools: 1, ms: 0, stopped: true, cleaned: false });
+  assert.deepEqual(logged(logs, 'task_sandbox_traces_ignored'), [{ level: 'info', event: 'task_sandbox_traces_ignored', ...started(request), count: 3 }]);
+  assert.equal(logged(logs, 'task_change_outside_policy').length, 0);
+  assertLogsClean(logs);
+});
+
+test('로그: 정책 밖 변경은 경로 이름 없이 개수·종류만 남기고 실패로 끝난다', async () => {
+  const { deps } = await harness([{ lines: [INIT, resultS({ status: 'completed', summary: SUMMARY_MARK, question: '' })],
+    files: { 'private-dir/secret-name.txt': `${CONTENT_MARK}\n`, 'secret-name.md': `${CONTENT_MARK}\n` } }]);
+  const logs: Record<string, unknown>[] = [];
+  const request = startRequest({ untrusted: { request: REQUEST_MARK } });
+  const response = parsed(await runTaskTurn({ ...deps, log: item => logs.push(item) }, request, new AbortController().signal));
+  assert.equal(response.status === 'failed' && response.reason, 'change_outside_policy');
+  assert.deepEqual(logged(logs, 'task_change_outside_policy'), [{ level: 'warn', event: 'task_change_outside_policy', ...started(request), reason: 'change_outside_policy',
+    total: 2, added: 2, modified: 0, deleted: 0, topLevel: 1, nested: 1 }]);
+  const [finished] = logged(logs, 'task_turn_finished');
+  assert.deepEqual({ ...finished, ms: 0 }, { level: 'warn', event: 'task_turn_finished', ...started(request), status: 'failed', reason: 'change_outside_policy', tools: 0, ms: 0, stopped: true, cleaned: false });
+  assertLogsClean(logs);
+});
+
+test('로그: 턴이 던지면 끝 기록을 unknown으로 남기고 예외를 그대로 넘긴다', async () => {
+  const { deps } = await harness([]);
+  const logs: Record<string, unknown>[] = [];
+  const boom = { ...deps, sessions: { create: async () => { throw new Error(REQUEST_MARK); }, exists: async () => { throw new Error(REQUEST_MARK); } } as unknown as TaskSessions, log: (item: Record<string, unknown>) => { logs.push(item); } };
+  const request = startRequest();
+  await assert.rejects(runTaskTurn(boom, request, new AbortController().signal), { message: REQUEST_MARK });
+  const [finished] = logged(logs, 'task_turn_finished');
+  assert.deepEqual({ ...finished, ms: 0 }, { level: 'error', event: 'task_turn_finished', ...started(request), status: 'unknown', reason: 'turn_threw', tools: null, ms: 0, stopped: false, cleaned: false });
+  assertLogsClean(logs);
+});
 
 test('한 턴 흐름: 질문 → 답으로 재개 → 완료, 같은 공간·같은 세션 UUID, diff는 실제 파일에서', async () => {
   const { deps, seen } = await harness([

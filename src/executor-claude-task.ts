@@ -233,7 +233,10 @@ export interface TaskTurnDeps {
   credentialDir: string;
   // 시험 주입. 기본은 CLI의 고정 위치.
   socketDir?: string;
+  log?: TaskLog;
 }
+// 값 없는 필드만 받는다. 사용자 요청·모델 출력·파일 내용·경로 이름·토큰을 넘기지 않는다.
+export type TaskLog = (fields: Record<string, unknown>) => void;
 const KNOWN_REASONS = new Set<string>(TASK_FAILURE_REASONS);
 const REFUSALS: Readonly<Record<NonNullable<RunReport['refused']>, TaskFailureReason>> = {
   lane_closed: 'lane_closed', busy: 'busy', survivors_unconfirmed: 'lane_closed', cleanup_pending: 'cleanup_pending', prepare_failed: 'prepare_failed', aborted: 'aborted',
@@ -244,8 +247,8 @@ const failedResponse = (base: Base, reason: TaskFailureReason, sessionRetained: 
 
 // 판정 순서가 계약이다: 정리 확인 → 실행 중 집행(상한·위반·중단) → stream 무결성 → 종료·오류 → structured_output → 실제 diff·반사 검사.
 // 소멸을 확인하지 못하면 어떤 결과도 읽지 않는다. 살아 있는 프로세스가 파일을 바꿔치기할 수 있다.
-export async function judgeTaskRun(input: { request: TaskRequest; base: Base; report: RunReport; cancelled: boolean; session: TaskSession; sessions: TaskSessions }): Promise<TaskResponse> {
-  const { request, base, report, cancelled, session, sessions } = input;
+export async function judgeTaskRun(input: { request: TaskRequest; base: Base; report: RunReport; cancelled: boolean; session: TaskSession; sessions: TaskSessions; log?: TaskLog }): Promise<TaskResponse> {
+  const { request, base, report, cancelled, session, sessions, log } = input;
   if (report.survivors !== 0) return { ...base, status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: false };
   if (report.refused) return failedResponse(base, REFUSALS[report.refused], true, report.refused === 'cleanup_pending');
   if (report.launchFailed) return failedResponse(base, 'launch_failed', true);
@@ -274,7 +277,11 @@ export async function judgeTaskRun(input: { request: TaskRequest; base: Base; re
   if (parsed.data.status === 'needs_input') {
     return { ...base, status: 'needs_input', stopped: true, sessionRetained: true, cleanupPending: false, question: bounded(parsed.data.question, TASK_LIMITS.questionChars) };
   }
-  const evidence = await sessions.collect(session, request.project, { patchBytes: request.limits.patchBytes }, secrets);
+  const evidence = await sessions.collect(session, request.project, { patchBytes: request.limits.patchBytes }, secrets, seen => {
+    const turn = { job: request.job, generation: request.generation, turn: request.turn };
+    if (seen.traces) log?.({ level: 'info', event: 'task_sandbox_traces_ignored', ...turn, count: seen.traces });
+    if (seen.outside) log?.({ level: 'warn', event: 'task_change_outside_policy', ...turn, reason: seen.reason, ...seen.outside });
+  });
   if (!evidence.ok) return failedResponse(base, evidence.reason, true);
   return { ...base, status: 'completed', stopped: true, sessionRetained: true, cleanupPending: false,
     summary: bounded(parsed.data.summary, TASK_LIMITS.summaryChars), ...evidence.evidence,
@@ -284,6 +291,22 @@ export async function judgeTaskRun(input: { request: TaskRequest; base: Base; re
 
 // 작업자 쪽 한 턴. 호출자(작업 라우트)가 서명·lease·직렬 슬롯을 책임진다.
 export async function runTaskTurn(deps: TaskTurnDeps, request: TaskRequest, signal: AbortSignal): Promise<TaskResponse> {
+  const started = Date.now();
+  const turn = { job: request.job, generation: request.generation, turn: request.turn };
+  deps.log?.({ level: 'info', event: 'task_turn_started', ...turn, operation: request.operation });
+  try {
+    const response = await executeTaskTurn(deps, request, signal);
+    deps.log?.({ level: response.status === 'failed' || response.status === 'unknown' ? 'warn' : 'info', event: 'task_turn_finished', ...turn, status: response.status,
+      reason: response.status === 'failed' ? response.reason : null, tools: response.usage.toolCalls, ms: Date.now() - started,
+      stopped: response.stopped, cleaned: !response.sessionRetained });
+    return response;
+  } catch (error) {
+    // 라우트가 이 예외를 unknown 응답으로 바꾼다. 로그의 상태도 그 응답과 같게 적는다.
+    deps.log?.({ level: 'error', event: 'task_turn_finished', ...turn, status: 'unknown', reason: 'turn_threw', tools: null, ms: Date.now() - started, stopped: false, cleaned: false });
+    throw error;
+  }
+}
+async function executeTaskTurn(deps: TaskTurnDeps, request: TaskRequest, signal: AbortSignal): Promise<TaskResponse> {
   const base: Base = { version: 1, job: request.job, lease: request.lease, generation: request.generation, sessionId: request.sessionId,
     turn: request.turn, worker: deps.worker, usage: { toolCalls: null, model: null } };
   // 보존 여부는 사유로 짐작하지 않는다. session_missing이어도 공간이 남아 보존 상한을 쓰고 있으면 게시 서버가 finalize해야 한다.
@@ -307,7 +330,7 @@ export async function runTaskTurn(deps: TaskTurnDeps, request: TaskRequest, sign
   base.usage = { toolCalls: report.toolCalls ?? null, model: adapter.usage };
   const launched = report.survivors === 0 && !report.refused && !report.launchFailed;
   if (launched) await deps.sessions.recordTurn(session, request.turn).catch(() => {});
-  const judged = await judgeTaskRun({ request, base, report, cancelled: signal.aborted, session, sessions: deps.sessions });
+  const judged = await judgeTaskRun({ request, base, report, cancelled: signal.aborted, session, sessions: deps.sessions, ...(deps.log ? { log: deps.log } : {}) });
   // 판정은 공간이 남아 있다고 가정하고 값을 채운다. 소멸을 확인한 응답은 실제 경로로 덮는다. needs_input은 보존이 계약이라 공간이 없으면 아래에서 실패가 된다.
   const response = judged.status === 'unknown' ? judged : { ...judged, sessionRetained: await retained() } as TaskResponse;
   // 계약에 맞지 않는 응답은 내보내지 않는다. 소멸을 확인한 경우에만 실패로 바꿀 수 있고, 아니면 unknown 그대로다.

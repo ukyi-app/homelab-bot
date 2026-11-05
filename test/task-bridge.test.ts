@@ -41,6 +41,59 @@ async function asked(question?: string) {
 }
 const chat = async (id: string) => { await f.ingress.receive(event(id, { kind: 'command', command: 'urgent', text: '대화' })); };
 
+test('게시 서버 로그: 완료·실패·unknown의 끝을 job·상태·사유 상수로 남기고 내용을 담지 않는다', async () => {
+  const REQUEST = '사용자요청표식-비공개';
+  const SUMMARY = '모델요약표식-비공개';
+  const events: [string, Record<string, unknown> | undefined][] = [];
+  const local = lane(f, { log: (event, detail) => { events.push([event, detail]); } });
+  const finished = () => events.filter(([event]) => event === 'task_job_finished').map(([, detail]) => detail);
+
+  local.worker.scripts.push(reply.completed(SUMMARY));
+  const done = await newTask('log-done', REQUEST);
+  await local.runtime.tickTask();
+  assert.deepEqual(finished(), [{ job: done.id, state: 'succeeded', reason: null }]);
+
+  events.length = 0;
+  local.worker.scripts.push(reply.failed('api_error'));
+  const failed = await newTask('log-failed', REQUEST);
+  await local.runtime.tickTask();
+  assert.deepEqual(finished(), [{ job: failed.id, state: 'failed', reason: 'task_api_error' }]);
+
+  events.length = 0;
+  local.worker.scripts.push(reply.unknown());
+  local.worker.stopped = false;
+  const unknown = await newTask('log-unknown', REQUEST);
+  await local.runtime.tickTask();
+  assert.deepEqual(finished(), [{ job: unknown.id, state: 'unknown', reason: 'task_unknown' }]);
+  const text = JSON.stringify(events);
+  assert.equal(text.includes(REQUEST), false);
+  assert.equal(text.includes(SUMMARY), false);
+});
+
+test('게시 서버 로그: 대기로 들어가는 턴은 끝 기록을 남기지 않고, 재개 전 포기는 사유를 남긴다', async () => {
+  const events: [string, Record<string, unknown> | undefined][] = [];
+  const local = lane(f, { log: (event, detail) => { events.push([event, detail]); } });
+  local.worker.scripts.push(reply.question());
+  const job = await newTask();
+  await local.runtime.tickTask();
+  assert.equal(events.length, 0);
+  const question = taskQuestionId(job.id, (await session()).claude_session_id as string, 1);
+  await answer(local.bridge, question, '답', 'answer-log');
+  local.worker.statusOverride = ABSENT;
+  await local.runtime.tickTask();
+  assert.deepEqual(events.filter(([event]) => event === 'task_job_finished'), [['task_job_finished', { job: job.id, state: 'failed', reason: 'task_session_missing' }]]);
+});
+
+test('게시 서버 로그: dispatch 전 오류는 사유 코드만 남기고 Runtime 분류로 넘긴다', async () => {
+  const events: [string, Record<string, unknown> | undefined][] = [];
+  const bridge = new ClaudeTaskBridge(f.store, f.gate, setup.worker, { plan: async () => { throw new Error('plan_unavailable'); } }, { monitorMs: 5, stopWaitMs: 50, log: (event, detail) => { events.push([event, detail]); } });
+  const runtime = new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, bridge, { taskLoop: true });
+  const job = await newTask('log-prepare', '요청본문표식');
+  await runtime.tickTask();
+  assert.deepEqual(events.filter(([event]) => event === 'task_job_prepare_error'), [['task_job_prepare_error', { job: job.id, error: 'Error', reason: 'plan_unavailable' }]]);
+  assert.equal(JSON.stringify(events).includes('요청본문표식'), false);
+});
+
 test('TASK-02 질문 중계 → owner 답 → 같은 세션 resume → 완료 → 영속 뒤 세션 정리', async () => {
   const { job, sid, question } = await asked('어느 브랜치 기준으로 고칠까요?');
   const current = (await jobs(db()))[0]!;

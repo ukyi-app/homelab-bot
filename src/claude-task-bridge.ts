@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { Denied, PolicyUnavailable, DEFAULTS } from './contracts.js';
 import type { Job, Scope } from './contracts.js';
 import { bounded } from './format.js';
+import { errorInfo, jsonLog } from './log.js';
+import type { Log } from './log.js';
 import type { Policy, PolicyGate } from './policy.js';
 import { DRAIN_MS } from './runtime.js';
 import type { TaskLane } from './runtime.js';
@@ -41,9 +43,11 @@ export interface ClaudeTaskBridgeOptions {
   // 정리 실패(cleanup_pending) 재시도 간격. 매 tick 작업자를 부르지 않게 한다.
   finalizeRetryMs: number;
   drainMs: number; shutdown?: AbortSignal;
+  // job·상태·사유 상수만 남긴다. 사용자 요청·모델 출력·파일 내용·토큰은 넘기지 않는다.
+  log: Log;
 }
 export const CLAUDE_TASK_DEFAULTS: Readonly<ClaudeTaskBridgeOptions> = Object.freeze({ monitorMs: 1000, questionTtlMs: TASK_RETENTION.questionTtlMs,
-  answerChars: 2000, stopWaitMs: 15_000, finalizeRetryMs: 30_000, drainMs: DRAIN_MS });
+  answerChars: 2000, stopWaitMs: 15_000, finalizeRetryMs: 30_000, drainMs: DRAIN_MS, log: jsonLog });
 
 interface SessionRow {
   job_id: string; thread_id: string | null; executor: 'codex' | 'claude'; claude_session_id: string | null; generation: number | null;
@@ -59,6 +63,8 @@ type Stop = 'cancel' | 'revoked' | 'lease' | 'timeout' | 'shutdown' | 'monitor';
 // 턴의 결말. rejected는 시작하지 않았다는 증거, lost는 응답을 못 받아 시작 여부를 모르는 경우다.
 type Turn = { kind: 'response'; response: TaskResponse } | { kind: 'rejected' } | { kind: 'lost' };
 type CancelFacts = Pick<TaskCancelResponse, 'stopped' | 'cleanupPending' | 'sessionRetained' | 'worker'>;
+// settle이 트랜잭션 안에서 정한 끝. 커밋된 뒤에 로그로 남긴다.
+interface JobEnd { state?: string; reason?: string | null }
 interface Facts { stopped: boolean; retained: boolean | null; cleanupPending: boolean; worker: TaskWorkerIdentity | null; tools: number | null }
 const TEXT = Object.freeze({
   executor: 'claude' as const, prefix: 'task', question: '작업 질문', accepted: '답을 받았습니다. 같은 세션을 이어서 실행합니다.',
@@ -121,28 +127,40 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       if (this.options.shutdown?.aborted) { await this.unchanged(job, session, store => store.defer(job, 'publisher_shutdown')); return; }
       const begun = await this.begin(job, request, session);
       if (begun !== 'started') return;
+    } catch (error) {
+      // dispatch 전 오류의 끝은 Runtime이 정한다. 여기서는 그 원인만 남긴다.
+      this.options.log('task_job_prepare_error', { job: job.id, ...errorInfo(error) });
+      throw error;
     } finally { clearInterval(keepalive); }
     await this.dispatch(job, request, revision);
   }
+  private finished(job: string, state: string, reason: string | null): void {
+    this.options.log('task_job_finished', { job, state, reason });
+  }
   // 이 실행이 아직 job을 쥐고 있고 읽어 둔 세션 상태가 그대로일 때만 job을 정리한다. 그 사이 lease가 끝났거나 다른 실행이 턴을 시작했으면 어떤 행도 건드리지 않는다.
-  private async unchanged(job: Job, session: SessionRow | undefined, act: (store: Store) => Promise<unknown>): Promise<void> {
-    await this.store.atomic(async store => {
+  // act가 돌았으면 true다.
+  private async unchanged(job: Job, session: SessionRow | undefined, act: (store: Store) => Promise<unknown>): Promise<boolean> {
+    return this.store.atomic(async store => {
       await store.db.query('SELECT id FROM conversations WHERE id=$1 FOR UPDATE', [job.conversation_id]);
       const held = (await store.db.query<{ state: string; lease_token: string; lease_until: string }>(
         'SELECT state,lease_token,lease_until FROM jobs WHERE id=$1 FOR UPDATE', [job.id])).rows[0];
-      if (!held || held.lease_token !== job.lease_token || Number(held.lease_until) <= store.now() || !HELD.has(held.state)) return;
+      if (!held || held.lease_token !== job.lease_token || Number(held.lease_until) <= store.now() || !HELD.has(held.state)) return false;
       const now = (await store.db.query<{ state: string; turn: number }>('SELECT state,turn FROM codex_sessions WHERE job_id=$1 FOR UPDATE', [job.id])).rows[0];
-      if (session ? now?.state !== session.state || now.turn !== session.turn : !!now) return;
+      if (session ? now?.state !== session.state || now.turn !== session.turn : !!now) return false;
       await act(store);
+      return true;
     });
   }
-  private giveUp(job: Job, session: SessionRow | undefined, reason: string): Promise<void> {
-    return this.unchanged(job, session, store => this.abandon(job, reason, store));
+  private async giveUp(job: Job, session: SessionRow | undefined, reason: string): Promise<void> {
+    if (await this.unchanged(job, session, store => this.abandon(job, reason, store))) this.finished(job.id, 'failed', reason);
   }
   // 이번 턴의 요청을 만든다. 띄우지 않기로 했으면 job을 정리하고 undefined.
   private async prepare(job: Job, policy: Policy, session: SessionRow | undefined): Promise<TaskRequest | undefined> {
     // 다른 실행기의 세션은 잇지도 덮지도 않는다. 행은 그 실행기의 경로가 닫게 둔다.
-    if (session && session.executor !== 'claude') { await this.unchanged(job, session, store => store.fail(job, 'task_session_mismatch')); return; }
+    if (session && session.executor !== 'claude') {
+      if (await this.unchanged(job, session, store => store.fail(job, 'task_session_mismatch'))) this.finished(job.id, 'failed', 'task_session_mismatch');
+      return;
+    }
     const event = (await this.store.db.query<{ payload: { text: string } }>('SELECT payload FROM events WHERE id=$1', [job.event_id])).rows[0]!;
     const plan = await this.plans.plan(job, policy, event.payload.text);
     const waiting = session?.state === 'waiting_answer' || session?.state === 'waiting_model';
@@ -277,11 +295,14 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     try { await this.gate.authorize(job.owner_id, job.target); }
     catch (error) { if (error instanceof Denied) stop = 'revoked'; else if (!(error instanceof PolicyUnavailable)) stop ??= 'monitor'; }
     let terminal = false;
-    try { terminal = await this.settle(job, request, revision, turn, facts, stop, this.store.now() - started); }
+    const ended: JobEnd = {};
+    try { terminal = await this.settle(job, request, revision, turn, facts, stop, this.store.now() - started, ended); }
     catch {
       // 기록 실패는 결과를 모르는 것과 같다. lease가 끝나면 expire()가 unknown으로 둔다.
       await this.store.transition(job, 'unknown', 'record_failed').catch(() => {});
+      Object.assign(ended, { state: 'unknown', reason: 'record_failed' });
     }
+    if (ended.state) this.finished(job.id, ended.state, ended.reason ?? null);
     if (terminal) await this.finalizeJob(job.id).catch(() => {});
   }
   // 응답을 계약으로 다시 읽는다. 다른 job·lease·세대·세션·턴의 응답이나 깨진 응답은 시작 여부를 모르는 것과 같다.
@@ -336,7 +357,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     } catch { return null; } finally { clearTimeout(wait); }
   }
   // 턴 결과를 한 트랜잭션으로 확정한다. 돌려주는 값은 세션을 지울 차례인지다.
-  private async settle(job: Job, request: TaskRequest, revision: string, turn: Turn, facts: Facts, stop: Stop | undefined, usedMs: number): Promise<boolean> {
+  private async settle(job: Job, request: TaskRequest, revision: string, turn: Turn, facts: Facts, stop: Stop | undefined, usedMs: number, ended: JobEnd): Promise<boolean> {
     return this.store.atomic(async store => {
       await store.lockTaskControl(job.conversation_id);
       const row = (await store.db.query<{ state: string; lease_token: string; lease_until: string }>(
@@ -354,12 +375,13 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
           facts.retained, facts.cleanupPending, wait?.reason ?? null, wait ? store.now() : null, request.lease, request.generation, request.sessionId]);
       };
       const end = async (state: string) => { await session(state); await store.syncTaskLane(); };
-      const fail = async (reason: string) => { await end('failed'); await store.fail(job, reason); return true; };
+      const fail = async (reason: string) => { await end('failed'); await store.fail(job, reason); Object.assign(ended, { state: 'failed', reason }); return true; };
       const leaseLost = stop === 'lease' || Number(row.lease_until) <= store.now();
       if (stop === 'revoked') {
         await session(facts.stopped ? 'cancelled' : 'unknown');
         await store.transition(job, facts.stopped ? 'cancelled' : 'unknown', 'authorization_revoked');
         await store.syncTaskLane();
+        Object.assign(ended, { state: facts.stopped ? 'cancelled' : 'unknown', reason: 'authorization_revoked' });
         return facts.stopped;
       }
       if (stop === 'cancel' || row.state === 'cancel_requested') {
@@ -367,14 +389,16 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
         await store.transition(job, facts.stopped ? 'cancelled' : 'unknown', 'stop_confirmation');
         if (!facts.stopped) await this.blocked(job, revision, store);
         await store.syncTaskLane();
+        Object.assign(ended, { state: facts.stopped ? 'cancelled' : 'unknown', reason: 'stop_confirmation' });
         return facts.stopped;
       }
       // lease를 잃었으면 다른 기록이 이 작업을 넘겨받았을 수 있어 종료 확인과 무관하게 unknown이다.
       if (!facts.stopped || leaseLost) {
+        const reason = leaseLost ? 'task_lease' : stop === 'shutdown' ? 'publisher_shutdown' : turn.kind === 'response' ? 'task_unknown' : 'task_worker_lost';
         await session('unknown');
-        await store.transition(job, 'unknown', leaseLost ? 'task_lease' : stop === 'shutdown' ? 'publisher_shutdown'
-          : turn.kind === 'response' ? 'task_unknown' : 'task_worker_lost');
+        await store.transition(job, 'unknown', reason);
         await this.blocked(job, revision, store);
+        Object.assign(ended, { state: 'unknown', reason });
         await store.syncTaskLane();
         return false;
       }
@@ -416,6 +440,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
         `검증: 통과 ${verified.passed} · 실패 ${verified.failed} · 미실행 ${verified.not_run}`].join('\n'), job.target);
       const after = (await store.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0]!;
       await end(after.state === 'succeeded' ? 'completed' : 'cancelled');
+      Object.assign(ended, { state: after.state, reason: null });
       return true;
     });
   }

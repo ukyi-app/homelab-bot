@@ -240,6 +240,9 @@ export interface TaskEvidence {
 }
 type Project = TaskRequest['project'];
 export type EvidenceResult = { ok: true; evidence: TaskEvidence } | { ok: false; reason: TaskFailureReason };
+// 로그에 남길 변경 계산 요약. 경로 이름은 모델이 고를 수 있어 담지 않는다.
+export interface OutsideChanges { total: number; added: number; modified: number; deleted: number; topLevel: number; nested: number }
+export interface ChangesSeen { traces: number; outside: OutsideChanges | null; reason: TaskFailureReason | null }
 export interface TaskSessionsOptions {
   // 이 작업자가 쓰는 저장소의 식별자(worker identity의 storage). 재개 대조에 쓴다.
   storage: string;
@@ -422,7 +425,8 @@ export class TaskSessions {
   }
 
   // 소멸을 확인한 뒤에만 부른다. 해시 대조는 실제 파일에서 한다. 모델이 무엇을 했다고 말했는지는 보지 않는다.
-  async collect(session: TaskSession, project: Project, limits: { patchBytes: number; changeItems?: number }, secrets: readonly string[]): Promise<EvidenceResult> {
+  async collect(session: TaskSession, project: Project, limits: { patchBytes: number; changeItems?: number }, secrets: readonly string[],
+    onChanges?: (seen: ChangesSeen) => void): Promise<EvidenceResult> {
     const { dirs } = session;
     let before: Snapshot;
     let after: Snapshot | null;
@@ -434,8 +438,11 @@ export class TaskSessions {
       try { after = await fileWorkspace.snapshot(handle); } finally { await handle.close().catch(() => {}); }
     } catch { return { ok: false, reason: 'diff_unavailable' }; }
     if (!after) return { ok: false, reason: 'diff_unavailable' };
+    const traces = sandboxTraces(before, after);
+    for (const path of traces) delete after[path];
     const changed = changedPaths(before, after);
     const classified = classifyChanges(changed, before, after, project);
+    onChanges?.({ traces: traces.length, outside: outsideChanges(changed, before, after, project), reason: classified.ok ? null : classified.reason });
     if (!classified.ok) return classified;
     const scanner = new SecretScanner(secrets);
     for (const path of changed) scanner.push(Buffer.from(path, 'utf8'));
@@ -459,6 +466,40 @@ export class TaskSessions {
 
 const matchesPrefix = (path: string, prefix: string) => path === prefix || path.startsWith(`${prefix}/`);
 const sha256 = (data: string) => createHash('sha256').update(data).digest('hex');
+
+// 고정 CLI 2.1.308이 모델의 의도와 무관하게 작업 디렉터리 최상위에 남기는 빈 항목의 이름이다. 이 버전의 코드에서 뽑아 실측으로 맞췄다.
+// CLI를 올리면 바이너리와 실측으로 다시 뽑는다(VERIFICATION "T18 live 시험 1"). 버전이 바뀌면 이 목록은 근거를 잃는다.
+export const SANDBOX_TRACE_NAMES: ReadonlySet<string> = new Set([
+  // scrub stub. CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1이면 CLI가 시작할 때 만들고 끝나도 지우지 않는다. 도구를 한 번도 안 불러도 생긴다.
+  'package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', '.npmrc', '.yarnrc', '.yarnrc.yml', 'bunfig.toml', '.gitmodules',
+  '.env', '.env.local', '.env.development', '.env.development.local', '.env.test', '.env.test.local', '.env.production', '.env.production.local',
+  // bwrap 마운트 지점. 없는 deny 경로마다 생긴다. CLI가 정상 종료하면 지우고, 강제 종료되면 남는다. 디렉터리 이름도 빈 파일로 남는다.
+  '.gitconfig', '.bashrc', '.bash_profile', '.zshrc', '.zprofile', '.profile', '.ripgreprc', '.mcp.json', '.vscode', '.idea', '.github', 'scripts',
+  // 바이너리의 나머지 보호 목록. 실측에서 생기지 않았지만 같은 경계의 이름이다.
+  '.zshenv', '.zlogin', '.zlogout', '.bash_login', '.bash_aliases', '.bash_logout', '.envrc', '.claude.json', '.pnp.cjs', '.pnp.loader.mjs', '.pnpmfile.cjs',
+  '.bunfig.toml', '.bazelrc', '.bazelversion', '.bazeliskrc', '.pre-commit-config.yaml', 'lefthook.yml', '.lefthook.yml', 'lefthook.yaml', '.lefthook.yaml',
+  'gradle-wrapper.properties', 'maven-wrapper.properties', '.devcontainer.json', 'pyrightconfig.json',
+  '.claude', '.husky', '.cargo', '.devcontainer', '.yarn', '.mvn',
+]);
+const EMPTY_FILE = `${sha256('')}:644`;
+// 실행 전에 없던 최상위 빈 일반 파일 가운데 위 이름만 증거에서 뺀다. 내용·실행 비트·심링크·특수 파일·hardlink는 스냅샷 값이 달라 걸리지 않고 정책 판정을 받는다.
+// 뺀 파일은 바이트가 없어 patch로 나갈 것을 잃지 않는다. 이름도 상수라 모델이 값을 실을 수 없다.
+// 빈 디렉터리(.claude/agents, node_modules/.bin 등)는 snapshot이 디렉터리를 기록하지 않아 처음부터 증거에 없다.
+export function sandboxTraces(before: Snapshot, after: Snapshot): string[] {
+  return Object.keys(after).filter(path => SANDBOX_TRACE_NAMES.has(path) && before[path] === undefined && after[path] === EMPTY_FILE);
+}
+
+const outsidePolicy = (path: string, project: Project) =>
+  project.forbiddenPaths.some(prefix => matchesPrefix(path, prefix)) || !project.allowedPaths.some(prefix => matchesPrefix(path, prefix));
+function outsideChanges(changed: readonly string[], before: Snapshot, after: Snapshot, project: Project): OutsideChanges | null {
+  const outside = changed.filter(path => outsidePolicy(path, project));
+  if (!outside.length) return null;
+  const count = (test: (path: string) => boolean) => outside.filter(test).length;
+  const topLevel = count(path => !path.includes('/'));
+  return { total: outside.length, added: count(path => before[path] === undefined), deleted: count(path => after[path] === undefined),
+    modified: count(path => before[path] !== undefined && after[path] !== undefined), topLevel, nested: outside.length - topLevel };
+}
+
 function classifyChanges(changed: readonly string[], before: Snapshot, after: Snapshot, project: Project): { ok: true; items: TaskChange[] } | { ok: false; reason: TaskFailureReason } {
   const links = new Map<string, string>();
   for (const [path, value] of Object.entries(after)) if (value.startsWith('link:')) links.set(path, value.slice(5));
@@ -466,9 +507,7 @@ function classifyChanges(changed: readonly string[], before: Snapshot, after: Sn
   for (const path of changed) {
     const value = after[path];
     if (path.split('/').some(part => GIT_NAME.test(part))) return { ok: false, reason: 'change_path_invalid' };
-    if (project.forbiddenPaths.some(prefix => matchesPrefix(path, prefix)) || !project.allowedPaths.some(prefix => matchesPrefix(path, prefix))) {
-      return { ok: false, reason: 'change_outside_policy' };
-    }
+    if (outsidePolicy(path, project)) return { ok: false, reason: 'change_outside_policy' };
     let item: TaskChange;
     if (value === undefined) item = { change: 'deleted', path };
     else if (value === 'special:hardlink') return { ok: false, reason: 'change_outside_workspace' };

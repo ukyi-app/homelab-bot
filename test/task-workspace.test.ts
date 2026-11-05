@@ -6,10 +6,11 @@ import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, st
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
+import { CLAUDE_CLI_VERSION } from '../src/executor-claude.js';
 import { ArchiveError } from '../src/review-input.js';
 import { TaskChangeSchema, TaskResponseSchema } from '../src/task-contracts.js';
-import { TaskSessions, TaskWorkspaceError, parseTaskArchive, symlinkEscapes } from '../src/task-workspace.js';
-import type { TaskSession } from '../src/task-workspace.js';
+import { SANDBOX_TRACE_NAMES, TaskSessions, TaskWorkspaceError, parseTaskArchive, symlinkEscapes } from '../src/task-workspace.js';
+import type { ChangesSeen, TaskSession } from '../src/task-workspace.js';
 import { LIMITS, ROOT, SHA, WORKER, archive, paxRecord, resumeRequest, startRequest, tarBytes, tarGz } from './task-fixtures.js';
 import type { TarItem } from './task-fixtures.js';
 
@@ -378,6 +379,132 @@ test('세대 존재: 없음을 확인하지 못하면 남은 것으로 본다', 
   await chmod(parent, 0o000);
   try { assert.equal(await sessions.exists(request.job, request.generation), true); }
   finally { await chmod(parent, 0o700); }
+});
+
+// 고정 CLI 2.1.308 실측(VERIFICATION "T18 live 시험 1"): scrub stub과 강제 종료 때 남는 bwrap 마운트 지점.
+const SCRUB_STUBS = ['package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', '.npmrc', '.yarnrc', '.yarnrc.yml', 'bunfig.toml', '.gitmodules',
+  '.env', '.env.local', '.env.development', '.env.development.local', '.env.test', '.env.test.local', '.env.production', '.env.production.local'];
+const MOUNT_POINTS = ['.gitconfig', '.bashrc', '.bash_profile', '.zshrc', '.zprofile', '.profile', '.ripgreprc', '.mcp.json', '.vscode', '.idea', '.github', 'scripts'];
+async function collectSeen(sessions: TaskSessions, session: TaskSession, project = PROJECT) {
+  const seen: ChangesSeen[] = [];
+  const result = await sessions.collect(session, project, { patchBytes: LIMITS.patchBytes }, [SECRET], item => seen.push(item));
+  return { result, seen: seen[0] };
+}
+
+test('샌드박스 흔적: 최상위 빈 stub·마운트 지점·빈 디렉터리는 빠지고 README 변경만 남는다', async () => {
+  const { sessions } = await fresh();
+  const { session } = await created(sessions);
+  const { workspace } = session.dirs;
+  for (const name of SCRUB_STUBS) await writeFile(join(workspace, name), '');
+  // 강제 종료 때 남는 모양: bwrap이 만든 mode 444 빈 파일.
+  for (const name of MOUNT_POINTS) await writeFile(join(workspace, name), '', { mode: 0o444 });
+  for (const dir of ['.claude/agents', '.claude/commands', '.claude/.cc-writes', 'node_modules/.bin']) await mkdir(join(workspace, dir), { recursive: true });
+  await writeFile(join(workspace, 'README.md'), 'hello\nworld\n');
+  const { result, seen } = await collectSeen(sessions, session);
+  assert.ok(result.ok);
+  assert.deepEqual(result.evidence.changes.items.map(item => [item.path, item.change]), [['README.md', 'modified']]);
+  assert.equal(result.evidence.changes.total, 1);
+  assert.equal(result.evidence.patch.text.includes('.env'), false);
+  assert.deepEqual(seen, { traces: SCRUB_STUBS.length + MOUNT_POINTS.length, outside: null, reason: null });
+});
+
+test('샌드박스 흔적: 목록은 고정 CLI의 stub·마운트 지점과 바이너리 보호 목록을 모두 담는다', () => {
+  const PROTECTED = ['.gitconfig', '.gitmodules', '.bashrc', '.bash_profile', '.zshrc', '.zprofile', '.profile', '.zshenv', '.zlogin', '.zlogout', '.bash_login', '.bash_aliases',
+    '.bash_logout', '.envrc', '.ripgreprc', '.mcp.json', '.claude.json', '.npmrc', '.yarnrc', '.yarnrc.yml', '.pnp.cjs', '.pnp.loader.mjs', '.pnpmfile.cjs', 'bunfig.toml', '.bunfig.toml',
+    '.bazelrc', '.bazelversion', '.bazeliskrc', '.pre-commit-config.yaml', 'lefthook.yml', '.lefthook.yml', 'lefthook.yaml', '.lefthook.yaml', 'gradle-wrapper.properties',
+    'maven-wrapper.properties', '.devcontainer.json', 'pyrightconfig.json', '.vscode', '.idea', '.claude', '.husky', '.cargo', '.devcontainer', '.yarn', '.mvn'];
+  for (const name of [...SCRUB_STUBS, ...MOUNT_POINTS, ...PROTECTED]) assert.ok(SANDBOX_TRACE_NAMES.has(name), name);
+  // .git은 snapshot이 따로 건너뛰고, 흔적으로 빼면 중첩 .git 판정과 섞인다.
+  assert.equal(SANDBOX_TRACE_NAMES.has('.git'), false);
+  for (const name of SANDBOX_TRACE_NAMES) assert.equal(name.includes('/'), false, name);
+  assert.equal(CLAUDE_CLI_VERSION, '2.1.308', 'CLI를 올리면 SANDBOX_TRACE_NAMES를 그 바이너리와 실측으로 다시 뽑는다');
+});
+
+test('샌드박스 흔적: 같은 이름이어도 내용이 있거나 실행 비트가 있으면 정책 판정을 받는다', async () => {
+  const cases: [string, (workspace: string) => Promise<unknown>][] = [
+    ['내용', workspace => writeFile(join(workspace, '.gitconfig'), '[core]\n')],
+    ['줄바꿈 한 개', workspace => writeFile(join(workspace, '.env'), '\n')],
+    ['실행 비트', workspace => writeFile(join(workspace, 'package.json'), '', { mode: 0o755 })],
+    ['디렉터리 이름 아래 파일', workspace => mkdir(join(workspace, '.claude')).then(() => writeFile(join(workspace, '.claude/settings.json'), ''))],
+  ];
+  for (const [label, make] of cases) {
+    const { sessions } = await fresh();
+    const { session } = await created(sessions);
+    await make(session.dirs.workspace);
+    const { result, seen } = await collectSeen(sessions, session);
+    assert.deepEqual(result, { ok: false, reason: 'change_outside_policy' }, label);
+    assert.equal(seen!.traces, 0, label);
+    assert.equal(seen!.outside!.total, 1, label);
+  }
+});
+
+test('샌드박스 흔적: 하위 경로의 같은 이름은 빼지 않고 정책 판정을 받는다', async () => {
+  const outside = await fresh();
+  const first = await created(outside.sessions);
+  await mkdir(join(first.session.dirs.workspace, 'other'));
+  await writeFile(join(first.session.dirs.workspace, 'other/.gitconfig'), '');
+  const judged = await collectSeen(outside.sessions, first.session);
+  assert.deepEqual(judged.result, { ok: false, reason: 'change_outside_policy' });
+  assert.deepEqual(judged.seen, { traces: 0, reason: 'change_outside_policy', outside: { total: 1, added: 1, modified: 0, deleted: 0, topLevel: 0, nested: 1 } });
+  const allowed = await fresh();
+  const second = await created(allowed.sessions);
+  await writeFile(join(second.session.dirs.workspace, 'src/.gitconfig'), '');
+  const kept = await collectSeen(allowed.sessions, second.session);
+  assert.ok(kept.result.ok);
+  assert.deepEqual(kept.result.evidence.changes.items.map(item => [item.path, item.change]), [['src/.gitconfig', 'added']]);
+});
+
+test('샌드박스 흔적: 실행 전에 있던 경로는 흔적이 아니다', async () => {
+  const withEmpty = archive([...GOOD, { name: '.env', data: '' }, { name: 'package.json', data: '{}\n' }, { name: '.npmrc', data: 'x=1\n' }]);
+  const untouched = await fresh();
+  const first = await created(untouched.sessions, withEmpty);
+  const same = await collectSeen(untouched.sessions, first.session);
+  assert.ok(same.result.ok);
+  assert.equal(same.result.evidence.changes.total, 0);
+  assert.equal(same.seen!.traces, 0, '있던 빈 파일을 흔적으로 세지 않는다');
+  const truncated = await fresh();
+  const second = await created(truncated.sessions, withEmpty);
+  await writeFile(join(second.session.dirs.workspace, 'package.json'), '');
+  const changed = await collectSeen(truncated.sessions, second.session);
+  assert.deepEqual(changed.result, { ok: false, reason: 'change_outside_policy' }, '있던 파일을 비우면 수정이다');
+  assert.deepEqual(changed.seen, { traces: 0, reason: 'change_outside_policy', outside: { total: 1, added: 0, modified: 1, deleted: 0, topLevel: 1, nested: 0 } });
+  const removed = await fresh();
+  const third = await created(removed.sessions, withEmpty);
+  await unlink(join(third.session.dirs.workspace, '.env'));
+  const gone = await collectSeen(removed.sessions, third.session);
+  assert.deepEqual(gone.result, { ok: false, reason: 'change_outside_policy' }, '있던 빈 파일을 지우면 삭제다');
+  assert.equal(gone.seen!.outside!.deleted, 1);
+});
+
+test('샌드박스 흔적: 심링크·FIFO·hardlink로 생긴 같은 이름은 정책 판정을 받는다', async () => {
+  const cases: [string, (workspace: string) => Promise<unknown>][] = [
+    ['심링크', workspace => symlink('README.md', join(workspace, '.gitconfig'))],
+    ['매달린 심링크', workspace => symlink('nowhere', join(workspace, '.mcp.json'))],
+    ['FIFO', async workspace => { execFileSync('mkfifo', [join(workspace, '.env')]); }],
+    ['hardlink', async workspace => { await writeFile(join(workspace, 'src/empty'), ''); await link(join(workspace, 'src/empty'), join(workspace, '.npmrc')); }],
+  ];
+  for (const [label, make] of cases) {
+    const { sessions } = await fresh();
+    const { session } = await created(sessions);
+    await make(session.dirs.workspace);
+    const { result, seen } = await collectSeen(sessions, session);
+    assert.deepEqual(result, { ok: false, reason: 'change_outside_policy' }, label);
+    assert.equal(seen!.traces, 0, label);
+  }
+});
+
+test('변경 요약: 정책 밖 변경을 종류·깊이별로 세고 경로 이름을 담지 않는다', async () => {
+  const { sessions } = await fresh();
+  const { session } = await created(sessions);
+  const { workspace } = session.dirs;
+  await unlink(join(workspace, '.gitignore'));
+  await writeFile(join(workspace, 'ignored.txt'), 'changed\n');
+  await mkdir(join(workspace, 'private-name'));
+  await writeFile(join(workspace, 'private-name/secret-plan.txt'), 'x\n');
+  const { result, seen } = await collectSeen(sessions, session);
+  assert.deepEqual(result, { ok: false, reason: 'change_outside_policy' });
+  assert.deepEqual(seen, { traces: 0, reason: 'change_outside_policy', outside: { total: 3, added: 1, modified: 1, deleted: 1, topLevel: 2, nested: 1 } });
+  assert.equal(JSON.stringify(seen).includes('private-name'), false);
 });
 
 test('증거: 큰 patch는 잘라 표시하고 전체 digest를 남기며 깨진 UTF-8을 계약 안에 둔다', async () => {

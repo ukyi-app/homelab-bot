@@ -104,7 +104,7 @@ export const PLAN: TaskPlan = { repository: 'fixture-owner/fixture-repo', base: 
 
 export function lane(f: Fixture, options: Partial<ClaudeTaskBridgeOptions> = {}, plan: TaskPlan = PLAN) {
   const worker = new FakeTaskWorker();
-  const bridge = new ClaudeTaskBridge(f.store, f.gate, worker, { plan: async () => plan }, { monitorMs: 5, stopWaitMs: 50, ...options });
+  const bridge = new ClaudeTaskBridge(f.store, f.gate, worker, { plan: async () => plan }, { monitorMs: 5, stopWaitMs: 50, log: () => {}, ...options });
   const runtime = new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, bridge, { taskLoop: true });
   return { worker, bridge, runtime };
 }
