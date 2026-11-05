@@ -18,11 +18,13 @@ export interface ExecutorCapabilities {
   readonly lanes: { readonly chat: boolean; readonly task: boolean; readonly review: boolean };
   // 구조화 출력: CLI가 스키마를 받아 결과에 담는다. 봇이 공통 스키마로 다시 검증한다.
   readonly structuredOutput: 'native-schema';
-  // 대화 레인에서 모델이 쓸 수 있는 도구. none: CLI 도구를 끄고 실행 중 도구 호출이 보이면 멈춘다.
+  // 그 프로필의 레인에서 모델이 쓸 수 있는 도구. none: CLI 도구를 끄고 실행 중 도구 호출이 보이면 멈춘다.
   // read-only-sandbox: Codex read-only 샌드박스 + 요청의 도구 예산(D4, 기존 승인 범위).
-  readonly tools: 'none' | 'read-only-sandbox';
-  // 대화 실행은 세션 기록을 남기지 않는다(CLI 플래그 + 실행 뒤 정리). 재개는 지원하지 않는다.
-  readonly sessionPersistence: 'off';
+  // sandboxed-task: 작업 레인 전용. 강제 샌드박스 안의 고정 도구 집합 + 작업 단위 도구 예산. 아직 이 값을 내는 프로필은 없다.
+  readonly tools: 'none' | 'read-only-sandbox' | 'sandboxed-task';
+  // off: 실행이 세션 기록을 남기지 않고(CLI 플래그 + 실행 뒤 정리) 재개하지 않는다.
+  // per-job: 작업 레인 전용. 작업마다 따로 둔 세션을 턴 사이에 유지하고 작업이 끝나면 지운다(α′). 아직 이 값을 내는 프로필은 없다.
+  readonly sessionPersistence: 'off' | 'per-job';
   // 모델을 CLI 인자로 정확히 고정하는지. false면 CLI 기본 모델이다.
   readonly modelPinned: boolean;
   readonly credential: CredentialKind;
@@ -41,11 +43,14 @@ export interface ChatRun {
   schema: object;
 }
 // 실행 중 stdout 한 줄을 본 결과. line은 판정에 쓰는 필드만 남긴 줄이다(모델 본문·도구 출력은 버린다).
-// tool은 작업용 도구 호출 ID(출력 전달용 내부 도구는 빼고), violation은 정책 위반 종류(있으면 공통부가 바로 멈춘다).
+// tools는 이 줄에서 시작한 작업용 도구 호출 ID 전부다(출력 전달용 내부 도구는 뺀다). 한 assistant 메시지에 여러 호출이 올 수 있고
+// 하나라도 빠지면 작업 도구 예산을 넘겨도 멈추지 못한다. 같은 호출을 다시 알리는 줄이 있어 공통부가 ID로 중복을 뺀다.
+// violation은 정책 위반 종류(있으면 공통부가 바로 멈춘다).
 // 종류는 작업자 로그에 그대로 나간다. 도구·플러그인 이름 같은 자료 값이 섞이지 않도록 string이 아니라 상수 합집합으로 묶는다.
 export type PolicyViolation = 'tools_enabled' | 'mcp_enabled' | 'skills_enabled' | 'plugins_enabled' | 'hooks_enabled' | 'tool_activity'
+  | 'tool_not_allowed' | 'session_mismatch'
   | 'model_mismatch' | 'model_fallback' | 'credential_source_mismatch' | 'version_mismatch';
-export interface Observation { line: string; tool: string | null; violation: PolicyViolation | null }
+export interface Observation { line: string; tools: readonly string[]; violation: PolicyViolation | null }
 // 어댑터가 내는 실행기 중립 결과. 소멸 확인·중단·상한·스키마·반사 판정은 공통부가 한다.
 // violation은 로그 전용이다. 레인은 reason만 결과로 넘기므로 HTTP 계약에는 나가지 않는다.
 export type EngineOutcome =

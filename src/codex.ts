@@ -73,7 +73,7 @@ export const CODEX_LIMITS: Readonly<CodexLimits> = Object.freeze({ lineBytes: 10
 // 작업 공간 밖 run/·CODEX_HOME 파일의 읽기 상한. 최종 메시지는 스키마상 수만 자라 1MiB면 넉넉하다 [가정].
 const READ_LIMITS = Object.freeze({ output: 1024 * 1024, auth: 1024 * 1024, baseline: 64 * 1024 * 1024 });
 // 결과 행에 남기는 경로 수. 판정은 전체 목록으로 끝낸 뒤 보관할 때만 줄인다.
-const EVIDENCE_PATHS = 1000;
+export const EVIDENCE_PATHS = 1000;
 interface PinnedLink { entry: string | null; parent: number; handle: FileHandle; dev: number; ino: number }
 interface Pinned { chain: PinnedLink[]; home: FileHandle; run: FileHandle; workspace: FileHandle }
 const text = (result: ReadResult) => result.status === 'ok' ? result.text : '';

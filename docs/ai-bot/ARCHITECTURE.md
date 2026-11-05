@@ -926,7 +926,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 **실행 기록 정리 실패(리뷰 exec-r1 P2).** 프로세스 소멸을 확인한 실행은 어댑터 고유 잔여물(Codex `sessions/`·`archived_sessions/`)과 실행 디렉터리를 지우고, 실행 디렉터리가 정말 없어졌는지 확인한 뒤에 결과를 확정한다. 지우지 못하면(권한·파일시스템 오류) 그 실행의 답은 게시하지 않고 `failed`(`stopped: true`, 프로세스는 끝났으니 `unknown`이 아님)이며, 한도·인증·실패 결과는 그대로 둔다. 지우지 못한 실행은 잔여물로 추적한다. 잔여물이 남은 동안 새 실행은 띄우지 않고(`failed`) readiness는 503이다. readiness 확인과 새 실행 직전마다 다시 지워 보고, 모두 지워지면 자동으로 돌아온다. 소멸을 확인하지 못한 실행은 살아 있는 프로세스가 쓰는 중일 수 있어 지우지 않는다(그 실행은 `unknown`이고 `ExecutionSlot`과 `RunControl`이 막는다). 기동 로그와 같은 줄 형식으로 값 없는 사건 `{"event":"cleanup_failed"}`·`{"event":"cleanup_recovered"}`만 남긴다(경로·내용 없음). `ChatLane`을 공유 실행 제어 없이 따로 조립할 때만 옛 이름 `chat_cleanup_*`로 옮겨 낸다. 운영 진입점은 공유 실행 제어라 이 경우가 아니다.
 
-**정책 위반 종류 로그(2026-11-04).** 결과 `reason`과 DB는 `policy_violation` 한 단어뿐이라, 실행이 정책 위반으로 멈추면 같은 줄 형식으로 `{"component":"worker","level":"warn","event":"run_policy_violation","lane":"review","kind":"plugins_enabled"}`를 실행당 한 번 남긴다. `kind`는 봇 코드의 상수(`PolicyViolation`: `tools_enabled`·`mcp_enabled`·`skills_enabled`·`plugins_enabled`·`hooks_enabled`·`tool_activity`·`model_mismatch`·`model_fallback`·`credential_source_mismatch`·`version_mismatch`)뿐이고 도구·플러그인·모델 이름과 job ID는 싣지 않는다. 실행 중 관측(`observe`)과 사후 판정(`interpretClaudeStream`)을 모두 덮고, 프로세스 소멸을 확인하지 못해 결과가 `unknown`이어도 실행 중 관측분은 남는다. `tool_use` 블록은 정책 위반이 아니라 `tool_budget_exceeded` 경로라 이 사건을 내지 않는다.
+**정책 위반 종류 로그(2026-11-04).** 결과 `reason`과 DB는 `policy_violation` 한 단어뿐이라, 실행이 정책 위반으로 멈추면 같은 줄 형식으로 `{"component":"worker","level":"warn","event":"run_policy_violation","lane":"review","kind":"plugins_enabled"}`를 실행당 한 번 남긴다. `kind`는 봇 코드의 상수(`PolicyViolation`: `tools_enabled`·`mcp_enabled`·`skills_enabled`·`plugins_enabled`·`hooks_enabled`·`tool_activity`·`tool_not_allowed`·`session_mismatch`·`model_mismatch`·`model_fallback`·`credential_source_mismatch`·`version_mismatch`)뿐이고 도구·플러그인·모델 이름과 job ID는 싣지 않는다. 실행 중 관측(`observe`)과 사후 판정(`interpretClaudeStream`)을 모두 덮고, 프로세스 소멸을 확인하지 못해 결과가 `unknown`이어도 실행 중 관측분은 남는다. `tool_use` 블록은 정책 위반이 아니라 `tool_budget_exceeded` 경로라 이 사건을 내지 않는다.
 
 **readiness.** `GET /readyz`는 앞 실행의 기록이 모두 지워졌고 선택한 자격이 쓸 수 있는 모양으로 있으면 200이다. Claude: 토큰 파일 읽기·모양(없어지거나 틀리면 503, 돌아오면 200). Codex: 영속 공간의 일반 파일 `auth.json`. 모델을 부르지 않는다. readiness 200은 인증 서버가 토큰을 받는다는 뜻이 아니다.
 
@@ -947,6 +947,60 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - `--safe-mode`·`--strict-mcp-config`·`--disable-slash-commands`와 OAuth 토큰·구조화 출력의 조합이 실제로 함께 도는지. CLI가 실행 디렉터리 밖(`/tmp` 직접 등)에 쓰는 파일이 있는지.
 - 메모리·`/tmp`(256Mi) 사용량, 첫 응답 시간(대화 기한 60초 안인지).
 - Claude 토큰도 같은 UID에서 `/proc/<pid>/environ`으로 읽힌다. 대화 레인에는 비신뢰 코드가 없어 받아들인 위험이고, 작업 레인을 열기 전에 T18 결정 (2)·(4)가 필요하다.
+
+### T18 작업 레인 계약 (Claude, 2026-11-05)
+
+**아직 연결하지 않았다(task off).** 계약 타입·파서·서명 검증과 DB 확장만 있다. 라우트·실행기·스케줄러·Discord 명령이 없고 어떤 프로필도 `lanes.task=true`를 내지 않아 게시 서버와 작업자 동작은 그대로다. 기존 `/v1/execute`·`/v1/cancel`·`/v1/review*`와 `REVIEW_INSTRUCTIONS`는 바꾸지 않는다. 위 "T16a 소유 변경 요청" 3의 task 요청 필드는 기존 `WorkerRequest`가 아니라 이 새 계약이 담는다. 이 절의 재개·수명 규칙은 Claude 작업 경로의 계약이고, 위 Codex 절의 어댑터 값을 바꾸지 않는다.
+
+**계약.** `src/task-contracts.ts`가 끝점 표 `TASK_ENDPOINTS`로 끝점·operation·요청·응답을 묶는다. 모두 strict이고 `version:1`이다.
+
+| 끝점 | capability operation | 요청 | 응답 |
+|---|---|---|---|
+| `POST /v1/task` | `task_execute` | `TaskRequestSchema`. `operation:'start'`(turn 1, `untrusted.request`) 또는 `'resume'`(turn 2 이상, `expectedWorker`·`resumeReason` 필수, clarification이면 `questionId`·`untrusted.answer` 필수) | `TaskResponseSchema`: `completed`·`needs_input`·`limited`·`auth_expired`·`failed`·`unknown` |
+| `POST /v1/task/cancel` | `task_cancel` | job·lease·generation·sessionId + `expectedWorker`(첫 턴 응답을 잃었으면 null) | `stopped`·`cleaned`·`cleanupPending`·`sessionRetained`·worker identity. `cleaned`는 이 턴의 실행 잔여물을 치웠다는 뜻이다 |
+| `POST /v1/task/status` | `task_status` | cancel과 같은 식별자 | `state`(`running`·`waiting`·`cleanup_pending`·`finalized`·`absent`·`unknown`)·`turn`·`sessionExists`·`stopped`·worker identity. 내용·파일·토큰은 없다 |
+| `POST /v1/task/finalize` | `task_finalize` | 같은 식별자, `expectedWorker` 필수, `disposition:'terminal'`, 결과 영속 `receipt` | cancel과 같은 필드. `cleaned`는 세대 전체를 지웠다는 뜻이라 `sessionRetained`와 함께 true일 수 없다 |
+
+거부는 `400·401·403·409` + `{status:'rejected',started:false}`(`TaskRejectionSchema`)다. 이것과 연결 전 실패만 미시작의 증거다.
+
+`stopped`는 프로세스 소멸 확인만 말한다. `completed`·`needs_input`은 `cleanupPending:true`로 나가지 못해 그 경우는 `failed`(`cleanup_pending`)다. `unknown`은 `stopped:false`·`sessionRetained:true`만 있고 결과·diff 필드가 없다. 응답의 변경 목록·patch·검증 결과는 소멸 확인 뒤 작업자가 계산한 값이고, `failed.reason`은 상수 목록(`TASK_FAILURE_REASONS`)이다. 정리를 어떤 방식으로 확인했는지(작업 레인 프로세스 정리 backend)는 계약에 담지 않는다.
+
+**서명.** 형식은 대화·리뷰와 같다(`src/worker.ts`의 `sealCapability`·`openCapability`·`capabilityLive`, Ed25519, 수명 30초, skew 1초, nonce 보존 62초). `TaskWorkerSigner`·`TaskWorkerVerifier`가 audience `homelab-task-worker`와 위 operation, `version`·`job`·`lease`·`generation`, 본문 digest를 검증한다. 대화·리뷰의 `homelab-worker` capability와는 같은 키로 서명돼도 양쪽 검증이 서로의 토큰을 거부하고, operation·본문 타입도 달라 컴파일에서 막힌다. digest는 `JSON.stringify` 기준이라 발급·검증 양쪽이 같은 schema로 파싱한 값을 넘겨야 한다.
+
+**값.**
+
+| 항목 | 값 | 근거 |
+|---|---|---|
+| 질문 대기 기한 | 1시간 | 확정(사용자 2026-11-05), `CODEX_DEFAULTS.questionTtlMs` |
+| 모델 한도·인증 대기 | 24시간이 지나면 owner 확인 요구. 자동 재개·자동 폐기 없음 | 확정 |
+| 작업 세션 PVC | 2Gi | 확정 |
+| 같은 레인에 보존하는 작업 세션 | 최대 8개 | 확정 |
+| unknown | 기한이 지나도 강제 삭제하지 않고 새 접수를 닫음 | 확정 |
+| 첫 live 시험 저장소 | `homelab-smoke`. 이 변경에서 실행·개방하지 않음 | 확정 |
+| 턴 기한, 남은 도구 호출, 입력 길이 | 1,800,000ms, 1~8회, 각 8,000자 | `DEFAULTS` 재사용 |
+| 본문 | 2MiB | `MAX_TASK_BYTES` 재사용 |
+| 줄·전체 출력·이벤트, 변경 목록 항목 | 1MiB·16MiB·2만 개, 1000개 | `CODEX_LIMITS`·`EVIDENCE_PATHS` 재사용 |
+| 압축본·파일 수·파일 크기 | 200MB·1000개·2MB | 리뷰 레인 상한과 같은 값 |
+| 요약·질문 | 1500자·500자 | `interpretRun`이 자르는 값과 같음 |
+| job 누적 실행 시간 | 5,400,000ms(최대 턴 3회) | 제안. 실측 뒤 조정 |
+| 턴 수 | 16 | 제안. 실측 뒤 조정 |
+| patch | 1MiB, 넘치면 `truncated`와 전체 digest | 제안. 응답 본문 상한 안에 들어가게 정함 |
+
+**DB(`migrations/013_task_lane.sql`, expand).** 009를 고치지 않는다. 새 열은 기본값이 있거나 비워 둘 수 있어 이 열을 모르는 코드가 그대로 돈다.
+
+| 대상 | 추가 | 의미 |
+|---|---|---|
+| `codex_sessions` | `executor`(기본 `codex`), `claude_session_id`, `generation`, `worker_lease`, `worker_instance`, `worker_storage`, `base_sha`, `policy_revision`, `project_id`, `project_revision` | 옛 세션은 codex로 남고 Claude가 잇지 않는다. Claude 행은 재개 대조 값이 모두 있어야 한다(CHECK) |
+| `codex_sessions` | `turn_timeout_ms`, `run_budget_ms`, `run_used_ms` | 턴 기한과 누적 예산을 나눠 재개로 시간이 새로 채워지지 않게 한다 |
+| `codex_sessions` | `stopped`, `session_retained`, `cleanup_state`(`none`·`pending`·`cleaned`), `waiting_since`, `owner_confirm_requested_at` | 정리 상태와 모델 대기 시작·owner 확인 요청 시각 |
+| `jobs` | `execution_lane`(생성 열) | task는 `task`, read는 NULL, 나머지는 `interactive` |
+| `execution_lanes` | 행 `interactive`·`task`, `closed_reason`(`unknown`·`cleanup_pending`·`retention_full`), `closed_at` | 레인별 잠금 행과 새 접수 막힘. 작업 레인 개방 여부는 이 행이 아니라 설정 gate가 정한다 |
+
+`Store.claim`은 아직 이 열을 보지 않는다. 슬롯 분리는 스케줄러를 연결할 때 함께 바꾼다.
+
+**실행기 관측.** `Observation.tools`는 그 줄에서 시작한 도구 호출 ID 목록이다. 한 assistant 메시지의 `tool_use`를 모두 세고, ID가 없는 호출은 서로 합치지 않는다. 대화·리뷰는 도구 예산이 0이라 호출 하나로 멈춘다. 능력표 값 `tools:'sandboxed-task'`·`sessionPersistence:'per-job'`과 위반 종류 `tool_not_allowed`·`session_mismatch`는 타입만 있고 내는 코드가 아직 없다.
+
+**R08은 이 계약 밖이다.** 수신 경로가 미정이고 계약·테이블은 다음 작업이 따로 둔다.
 
 ## 13. 개선안 v2 적용 (2026-10-30)
 

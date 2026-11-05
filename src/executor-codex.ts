@@ -86,7 +86,7 @@ export class CodexChatAdapter implements ChatAdapter {
     return {
       args: chatArgs(run.dirs.run),
       env: { CODEX_HOME: home },
-      observe: line => { const compact = compactEvent(line); return { line: compact.line, tool: compact.tool, violation: null }; },
+      observe: line => { const compact = compactEvent(line); return { line: compact.line, tools: compact.tool ? [compact.tool] : [], violation: null }; },
       async finish(lines, exit) {
         const output = await readAt(dir, 'last-message.json', OUTPUT_LIMIT);
         return interpretCodexChat({ lines, exit, output: output.status === 'ok' ? output.text : null,

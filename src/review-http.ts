@@ -20,7 +20,7 @@ const ResultSchema = z.discriminatedUnion('status', [
   z.strictObject({ status: z.literal('unknown'), stopped: z.literal(false) }),
 ]);
 const Denial = z.strictObject({ status: z.literal('rejected'), started: z.literal(false) });
-const MAX_TASK_BYTES = 2_097_152;
+export const MAX_TASK_BYTES = 2_097_152;
 // 연결 자체가 안 된 실패는 요청이 작업자에 닿지 않았다는 증거다(worker-http.ts와 같은 분류).
 const CONNECTION_FAILURES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
 function beforeConnection(error: unknown): boolean {
