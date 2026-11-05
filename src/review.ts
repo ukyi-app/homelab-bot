@@ -462,16 +462,19 @@ export interface ReviewWorkerClient {
 }
 // 종료 규칙은 대화 runtime과 같다(ARCHITECTURE "정상 종료"). 신호 뒤에는 claim하지 않고, dispatch 전이면 대기열로 되돌리고,
 // 실행 중이면 drainMs를 기다린 뒤 cancel한다. 멈춤이 확인된 리뷰는 자동 재실행하지 않고 failed다.
-export interface ReviewRuntimeOptions { shutdown?: AbortSignal; drainMs?: number }
+// lanes: 작업 루프를 켠 배치. 리뷰는 대화와 interactive 레인을 나눠 쓰고 작업 레인의 실행·대기에 막히지 않는다.
+export interface ReviewRuntimeOptions { shutdown?: AbortSignal; drainMs?: number; lanes?: boolean }
 class ReviewShutdown extends Error {}
 export class ReviewRuntime {
   private readonly shutdown?: AbortSignal;
   private readonly drainMs: number;
+  private readonly lanes: boolean;
   constructor(private readonly store: Store, private readonly policy: ReviewPolicySource, private readonly queue: ReviewQueue,
     private readonly reader: GitHubReader, private readonly worker: ReviewWorkerClient, private readonly signer: WorkerSigner,
     private readonly pollMs = 1000, options: ReviewRuntimeOptions = {}) {
     this.shutdown = options.shutdown;
     this.drainMs = options.drainMs ?? DRAIN_MS;
+    this.lanes = options.lanes ?? false;
   }
   // dispatch 전 GitHub 조회를 종료 기한까지 기다리지 않는다. 끝까지 기다리면 프로세스가 먼저 끝나
   // 모델을 부르지 않은 작업이 lease 만료로 unknown이 되고 전역 슬롯을 잡는다.
@@ -491,11 +494,14 @@ export class ReviewRuntime {
       await tx.query(`INSERT INTO controls VALUES ('scheduler','false') ON CONFLICT DO NOTHING`);
       const control = (await tx.query<{ value: boolean }>(`SELECT value FROM controls WHERE key='scheduler' FOR UPDATE`)).rows[0]!;
       if (control.value) return;
-      if ((await tx.query(`SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown','waiting_user') LIMIT 1`)).rows.length) return;
+      if (this.lanes) {
+        await tx.query(`SELECT lane FROM execution_lanes WHERE lane='interactive' FOR UPDATE`);
+        if (await this.store.laneBusy('interactive', tx)) return;
+      } else if ((await tx.query(`SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown','waiting_user') LIMIT 1`)).rows.length) return;
       // 대화가 리뷰보다 먼저다(F05). Store.claim이 지금 집을 수 있는 대화·작업이 있으면 양보한다.
       if ((await tx.query(`SELECT j.id FROM jobs j JOIN events e ON e.id=j.event_id JOIN conversations c ON c.id=j.conversation_id
         WHERE j.state='queued' AND e.accepted=true AND c.active=true AND c.gap=false AND c.owner_id=j.owner_id
-        AND e.actor_id=j.owner_id AND j.available_at<=$1 LIMIT 1`, [this.store.now()])).rows.length) return;
+        AND e.actor_id=j.owner_id AND j.available_at<=$1 ${this.lanes ? "AND j.execution_lane='interactive'" : ''} LIMIT 1`, [this.store.now()])).rows.length) return;
       const row = (await tx.query<{ id: string }>(`SELECT id FROM jobs WHERE type='review' AND state='queued' AND available_at<=$1
         ORDER BY priority,created_at FOR UPDATE SKIP LOCKED LIMIT 1`, [this.store.now()])).rows[0];
       if (!row) return;
