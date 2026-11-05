@@ -218,7 +218,7 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 | 출처 | 대조 방법 | 한계 |
 |---|---|---|
 | Discord | RESUME 성공이면 재생. 새 IDENTIFY면 구독 스레드마다 마지막 처리 메시지 이후를 `GET /channels/{id}/messages?after=`로 읽는다. 한 번에 최대 100건이라 저장한 체크포인트부터 페이지를 이어 읽어 빈틈이 없을 때까지 반복하고, 정해진 복구 한도(100건×10쪽/30초, T16a §11)를 넘으면 그 스레드를 `gap` 상태로 기록하고 작업을 진행하지 않는다 [가정] | 새 IDENTIFY 때 놓친 이벤트 재생 여부는 문서에 없다. 보관된 스레드는 연결 때 동기화되지 않으므로 구독 목록 원본은 봇 DB다 |
-| GitHub | 허용 저장소의 열린 PR을 주기적으로 읽어 처리 기록과 대조. 대조 키는 `01` §5의 세대 구분과 같은 `(head_sha, comparison_revision, policy_revision)`이다. head가 같아도 기록된 base·`comparison_revision`이 현재와 다르면(base 브랜치가 앞서감, base 재지정) 새 세대로 보고 이전 결과를 `superseded`로 둔다(REVIEW-02). webhook 트리거에도 `pull_request` `edited` 중 base가 바뀐 경우(재지정)를 넣는다(DECISIONS D-16 규칙 스케치). 새 설치 직후 과거 PR을 무제한 리뷰하지 않는다 | 실패한 webhook은 자동 재전송되지 않고 수동 재전송은 3일 안만 된다. base 브랜치가 앞서가기만 하면 리뷰 App이 받는 PR 이벤트가 없어 폴링이 잡는다 [가정]. `comparison_revision`을 무엇으로 둘지(base 브랜치 머리 또는 merge base), base만 움직였을 때 다시 리뷰할지 결과만 `superseded`로 표시할지는 모델 호출 직렬 1(D-14)을 보고 T17에서 정한다 |
+| GitHub | 허용 저장소의 열린 PR을 주기적으로 읽어 처리 기록과 대조. 대조 키는 `01` §5의 세대 구분과 같은 `(head_sha, comparison_revision, policy_revision)`이다. head가 같아도 `comparison_revision`이 현재와 다르면 새 세대로 보고 이전 결과를 `superseded`로 둔다(REVIEW-02). 비교 기준은 정책 `comparison`이다. 운영 값 `merge_base`에서는 base 머리만 앞서가고 merge base가 같으면 같은 세대다. webhook 트리거에도 `pull_request` `edited` 중 base가 바뀐 경우(재지정)를 넣는다(DECISIONS D-16 규칙 스케치). 새 설치 직후 과거 PR을 무제한 리뷰하지 않는다 | 실패한 webhook은 자동 재전송되지 않고 수동 재전송은 3일 안만 된다. base 브랜치가 앞서가기만 하면 리뷰 App이 받는 PR 이벤트가 없어 폴링이 잡는다 [가정]. base만 움직였을 때 다시 리뷰할지는 `review.rereviewOnBaseMove`가 정한다. 운영 값은 `false`이고 재리뷰는 댓글 명령으로 한다(DECISIONS "T17 결정") |
 | Alertmanager | 그룹화·반복 전송에 기댄다. 수신 실패는 Alertmanager 지표에 남는다 | 봇이 놓친 경보는 Telegram 경로가 따로 받는다 |
 | 작업자 | 작업자 파드가 사라지면 `running` 작업을 `unknown`으로. CODEX_HOME은 영속 공간이라 세션 파일이 남을 수 있고, 재개 여부는 사람이 고른다 | 작업 공간(코드)은 영속이 아니다 [가정]. 영속 공간은 설계 C.8 변경이고 C.8 격리 행·E4b에 들어갔다(크기·백업은 T08b) |
 
@@ -305,7 +305,7 @@ live 메시지 하나가 일시 장애(DB·REST·429 등)로 처리되지 못하
 같은 장벽(`RecoveryScheduler.guard()`, 진행 중 복구 토큰도 지움)을 세워 history 대조로 메운다. 장벽이 설 때까지 다음 이벤트는 기다려
 뒤 메시지가 checkpoint를 먼저 올리지 못한다. 확정 거부(`Denied`·형식 오류·채널 403/404)는 장벽 없이 버린다. 상호작용은 토큰이 3초라
 되살리지 않는다(사용자가 다시 보낸다). 작업 claim(`Runtime` 루프)은 첫 READY 장벽이 선 뒤에 시작한다. 재시작 때 남은 queued 작업이
-중단 중 메시지를 history로 복구하기 전에 이전 입력으로 모델을 부르지 않고, 복구된 최신 메시지가 그 작업을 먼저 supersede할 수 있다. slash 명령은 READY마다 guild 단위로 FOUNDATION 12개에 맞추고(`task`·`review-*` 없음, 같으면 쓰지 않음)
+중단 중 메시지를 history로 복구하기 전에 이전 입력으로 모델을 부르지 않고, 복구된 최신 메시지가 그 작업을 먼저 supersede할 수 있다. slash 명령은 READY마다 guild 단위로 FOUNDATION 12개에 맞춘다. 원장이 설정되면 `memory-*` 5개, 리뷰 경로가 열리면 `review-*` 3개를 더한다(`task` 없음, 같으면 쓰지 않음).
 전역 명령은 비운다. 수신도 같은 목록만 받는다. 재연결·RESUME 실측은 실연동(S16)이다.
 
 작업자 모델 호출은 **대화·작업 레인 합쳐 1개**다. DB의 scheduler 행 잠금과 작업자의 별도 mutex가
@@ -424,7 +424,7 @@ fingerprint 계산에 서비스 ID도 포함해 같은 fingerprint 문자열의 
 006 이전 경보는 건수만 남아 서비스 범위를 재구성할 수 없으므로 미전달·범위 없는 행은 blocked와 감사로 닫는다.
 이미 sent인 전달과 범위를 가진 행은 바꾸지 않으며 과거 경보의 범위를 현재 허용 목록으로 추정하지 않는다.
 read 요약 예산은 대상/출처 각 120자, 사실 600자, 미확인/권장 확인 각 350자다. 항목 수가 넘으면 생략 건수를
-표시한다. 대화(chat) 답은 이 섹션 예산을 쓰지 않고 모든 항목을 싣는다(§13 답 형식). 긴 작업 목록은 유효한 JSON 배열로 1800자 이하 페이지를 만들어 별도 멱등 키로 게시한다.
+표시한다. 대화(chat) 답은 이 섹션 예산을 쓰지 않고 모든 항목을 싣는다(§13 답 형식). 작업 목록은 최근 20건을 텍스트로 표시한다. 긴 본문은 1800자 이하 페이지로 나눠(JSON 배열 본문은 페이지마다 유효한 배열로) 별도 멱등 키로 게시한다.
 논리 메시지 key와 0부터 시작하는 page_index를 저장하고 선행 페이지가 모두 sent인 경우에만 다음 페이지를 claim한다.
 첫 페이지의 429/unknown/blocked 때문에 뒤 페이지가 추월하지 않으며 공유 rate limit이 없는 다른 메시지는 계속 처리한다.
 페이지 생성 전체도 한 transaction이다. migration 005는 기존 :page:N 키를 순서로 옮기고 경보 전달 참조를 복원한다.
@@ -1345,7 +1345,7 @@ WORKER_EXECUTOR=codex WORKER_MODEL=cli-default WORKER_CREDENTIAL_KEY=CODEX_AUTH_
 
 ### 사용 계약 보충
 
-`/read text:<template-id> target:<service-id>`는 최근 min(60초, 템플릿 상한)의 승인 템플릿을 실행한다.
+`/read text:<template-id> target:<service-id>`는 승인 템플릿을 현재부터 그 템플릿의 `maxWindowSeconds`만큼 이전까지 실행한다.
 
 `/stop`, `/resume`, `/list`, `/cancel target:<job-id>`, `/retry target:<job-id>`, `/emergency-stop`, `/model-status`, `/resume-model target:<job-id|emergency-stop>`, `/revoke target:<actor-id>`는 모델을 거치지 않는다.
 버튼의 custom ID는 `list`, `stop`, `resume`, `cancel:<job-id>`만 허용한다.

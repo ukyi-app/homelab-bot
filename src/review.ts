@@ -22,7 +22,7 @@ const RepoName = z.string().regex(REPO_NAME);
 export const ReviewPolicySchema = z.strictObject({
   repositories: z.array(z.strictObject({ id: z.number().int().positive(), fullName: RepoName,
     installationId: z.number().int().positive(), visibility: z.enum(['public', 'private']) })).max(50),
-  // 실제 ID는 Infisical runtime policy(review.allowed_bot_author_ids)에만 둔다.
+  // 실제 ID는 Infisical runtime policy(review.allowedBotAuthorIds)에만 둔다.
   allowedBotAuthorIds: z.array(z.number().int().positive()).max(20),
   commentCommand: z.string().trim().min(1).max(100).nullable(),
   reviewDrafts: z.boolean(), rereviewOnBaseMove: z.boolean().nullable(),

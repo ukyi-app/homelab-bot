@@ -15,7 +15,7 @@
 | 남은 미정 세부 | 없음. D-24 세부는 확정(사용자 2026-11-05, DECISIONS D-24 "T19 세부 결정"), R08 연결 방식은 확정(사용자 2026-11-04, DECISIONS "T18 결정 (Claude 실행기 기준)") |
 | 범위 조정 | 안 3(시범 운영 + 로컬 선행), 확정(사용자 2026-10-18, T15). T16을 T16a·T16b로 나눈다(V1_PLAN §4) |
 | 코드 | `src/`, PostgreSQL 마이그레이션, 로컬·mock 시험. Gateway·모델 실연동과 배포 진입점은 T16b |
-| CI | 없음. 템플릿 기반 `build.yaml`과 금지 패턴 검사는 플랫폼 E5·E9 뒤 |
+| CI | `build.yaml`이 공통 `app-build`를 부른다. PR은 공개 금지 패턴 검사, Dockerfile test 단계, 빌드 확인을 돌고 main push는 이미지 push와 배포 PR까지 간다 |
 | 배포 | T16b에서 첫 배포. 봇 main 병합 → 빌드 → 배포 PR 자동 병합 → Argo CD(시나리오 1). 작업자 이미지는 사람 PR로 digest 고정. 2026-11-04 게시 서버·작업자 모두 `bd0bc8f`(작업자는 homelab #1055) |
 
 ## STAGE 진행표
