@@ -7,6 +7,7 @@ import { assertWorkerRoot } from './codex-config.js';
 import { FileMutableCredential, StaticEnvCredential } from './credentials.js';
 import type { CredentialKind, WorkerCredential } from './credentials.js';
 import { CLAUDE_CHAT_CAPABILITIES, ClaudeChatAdapter, ClaudeReviewAdapter } from './executor-claude.js';
+import { CLAUDE_TASK_CAPABILITIES } from './executor-claude-task.js';
 import { CODEX_CHAT_CAPABILITIES, CodexChatAdapter } from './executor-codex.js';
 import type { ChatAdapter, ExecutorCapabilities, ExecutorId } from './executor.js';
 import { WorkerStartError } from './worker-state.js';
@@ -28,17 +29,19 @@ export interface ExecutorProfile {
   // 받는 모델 ID 모양. Claude는 별칭(opus 등) 없이 전체 ID만 받는다(실행마다 init 이벤트의 모델과 대조한다).
   readonly model: RegExp;
   readonly capabilities: ExecutorCapabilities;
+  // WORKER_LANES=task로 띄울 때의 능력표. capabilities(대화·리뷰 작업자)와 격리 조건이 달라 따로 둔다. null이면 그 프로필은 작업 레인을 띄우지 않는다.
+  readonly taskCapabilities: ExecutorCapabilities | null;
   // 이 프로필에만 필요한 env.
   readonly requiredEnv: readonly string[];
 }
 export const PROFILES: readonly ExecutorProfile[] = Object.freeze([
   Object.freeze({ id: 'claude-subscription', executor: 'claude', credentialKey: 'CLAUDE_CODE_OAUTH_TOKEN',
     auth: 'subscription-token', credential: 'env-static', bin: '/usr/local/bin/claude',
-    model: /^claude-[a-z0-9]+(?:-[a-z0-9]+){1,8}$/, capabilities: CLAUDE_CHAT_CAPABILITIES, requiredEnv: Object.freeze([]) }),
+    model: /^claude-[a-z0-9]+(?:-[a-z0-9]+){1,8}$/, capabilities: CLAUDE_CHAT_CAPABILITIES, taskCapabilities: CLAUDE_TASK_CAPABILITIES, requiredEnv: Object.freeze([]) }),
   // Codex 대화 경로(D4). 모델은 CLI 기본값(`cli-default`, -m 없음)이다.
   Object.freeze({ id: 'codex-subscription', executor: 'codex', credentialKey: 'CODEX_AUTH_JSON',
     auth: 'subscription-auth-json', credential: 'file-mutable', bin: '/usr/local/bin/codex',
-    model: /^cli-default$/, capabilities: CODEX_CHAT_CAPABILITIES, requiredEnv: Object.freeze(['CODEX_HOME']) }),
+    model: /^cli-default$/, capabilities: CODEX_CHAT_CAPABILITIES, taskCapabilities: null, requiredEnv: Object.freeze(['CODEX_HOME']) }),
 ] as const satisfies readonly ExecutorProfile[]);
 const EXECUTORS: readonly string[] = ['claude', 'codex'];
 const KEY = /^[A-Z][A-Z0-9_]{0,63}$/;

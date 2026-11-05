@@ -60,7 +60,7 @@ export class DiscordProtocol implements DiscordRest {
     const input: EventInput = { ...normalized, kind: interaction.type === 2 ? 'command' : 'button',
       command: interaction.type === 2 ? interaction.data.name : custom![0],
       urgent: interaction.type === 2 && interaction.data.name === 'urgent',
-      text: options.get('text') ?? '', target: options.get('target') ?? custom?.[1] };
+      text: options.get('text') ?? '', target: options.get('target') ?? options.get('project') ?? options.get('question') ?? custom?.[1] };
     this.interactions.set(input.id, { token: interaction.token, expires: receivedAt + 2500 });
     try { await ingress.receive(input); } finally { this.interactions.delete(input.id); }
   }

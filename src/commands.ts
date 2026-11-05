@@ -1,8 +1,8 @@
 import { z } from 'zod';
 import type { DiscordApi } from './discord-protocol.js';
 
-// FOUNDATION에서 여는 slash 명령. task·브리핑 명령은 등록하지 않고
-// DiscordIngress에도 넘기지 않아 수신에서 닫는다(작업 경로는 연결하지 않음).
+// FOUNDATION에서 여는 slash 명령. task·브리핑 명령은 여기 없어 스위치를 켜지 않으면
+// 등록하지 않고 DiscordIngress에도 넘기지 않아 수신에서 닫는다.
 export const FOUNDATION_COMMANDS = Object.freeze(['chat', 'urgent', 'read', 'stop', 'resume', 'list', 'cancel', 'retry',
   'emergency-stop', 'resume-model', 'model-status', 'revoke'] as const);
 // 기억 명령. 삭제 원장이 켜졌을 때(MEMORY_LEDGER_DIR)만 등록·수신한다. 옵션은 문자열(text·target)뿐이라
@@ -10,12 +10,14 @@ export const FOUNDATION_COMMANDS = Object.freeze(['chat', 'urgent', 'read', 'sto
 export const MEMORY_COMMANDS = Object.freeze(['memory-save', 'memory-search', 'memory-correct', 'memory-exclude', 'memory-delete'] as const);
 // 리뷰 제어. 리뷰가 열렸을 때만 등록·수신한다. owner·알림 채널 검사는 DiscordIngress·Store가 그대로 한다.
 export const REVIEW_COMMANDS = Object.freeze(['review-status', 'review-resume', 'review-cancel'] as const);
-// DiscordProtocol은 옵션 값을 문자열로만 받는다(type 3 STRING). 이름은 수신 계약(text·target)과 같다.
-const option = (name: 'text' | 'target', description: string, maxLength: number) =>
+// 작업 레인. TASK_LANE_ENABLED와 정책·작업자 조건이 맞을 때만 등록·수신한다. owner·채널·스레드 소유 검사는 DiscordIngress가 그대로 한다.
+export const TASK_COMMANDS = Object.freeze(['task', 'answer', 'task-status', 'task-cancel', 'task-release'] as const);
+// DiscordProtocol은 옵션 값을 문자열로만 받는다(type 3 STRING). project·question은 수신에서 target으로 읽는다.
+const option = (name: 'text' | 'target' | 'project' | 'question', description: string, maxLength: number) =>
   ({ type: 3, name, description, required: true, max_length: maxLength });
 const text = (description: string, maxLength = 6000) => option('text', description, maxLength);
 const target = (description: string, maxLength = 100) => option('target', description, maxLength);
-type CommandName = typeof FOUNDATION_COMMANDS[number] | typeof MEMORY_COMMANDS[number] | typeof REVIEW_COMMANDS[number];
+type CommandName = typeof FOUNDATION_COMMANDS[number] | typeof MEMORY_COMMANDS[number] | typeof REVIEW_COMMANDS[number] | typeof TASK_COMMANDS[number];
 const command = (name: CommandName, description: string, options: ReturnType<typeof option>[] = []) =>
   // type 1(CHAT_INPUT), 서버 안에서만(contexts 0 GUILD, integration_types 0 GUILD_INSTALL). DM은 끔(D-17).
   ({ name, type: 1, description, options, contexts: [0], integration_types: [0] });
@@ -52,9 +54,18 @@ export const REVIEW_COMMAND_DEFINITIONS = Object.freeze([
   command('review-resume', '한도·인증 대기 리뷰 작업 재개(owner, 알림 채널)', [target('리뷰 작업 ID')]),
   command('review-cancel', '리뷰 작업 취소(owner, 알림 채널)', [target('리뷰 작업 ID')]),
 ]);
-// 등록할 명령 목록. 원장·리뷰가 꺼져 있으면 FOUNDATION 목록과 같다.
-export const commandDefinitions = (memory: boolean, review = false) => !memory && !review ? COMMAND_DEFINITIONS
-  : Object.freeze([...COMMAND_DEFINITIONS, ...(memory ? MEMORY_COMMAND_DEFINITIONS : []), ...(review ? REVIEW_COMMAND_DEFINITIONS : [])]);
+// /task의 요청 글은 작업 계약의 untrusted 상한 안이다. /answer 2,000자는 Discord 메시지 한도이자 CLAUDE_TASK_DEFAULTS.answerChars다.
+export const TASK_COMMAND_DEFINITIONS = Object.freeze([
+  command('task', '저장소 작업 시작(스레드를 엽니다, 정책에 있는 프로젝트만)', [option('project', '프로젝트 ID', 100), text('작업 요청')]),
+  command('answer', '작업 질문에 답하기(질문이 게시된 스레드에서)', [option('question', '질문 ID', 100), text('답', 2000)]),
+  command('task-status', '작업 상태(이 대화의 작업)', [target('작업 ID')]),
+  command('task-cancel', '작업 취소 요청(이 대화의 작업)', [target('작업 ID')]),
+  command('task-release', '종료 미확인(unknown) 작업 해제(owner, 프로세스 소멸 확인 뒤)', [target('작업 ID')]),
+]);
+// 등록할 명령 목록. 원장·리뷰·작업 레인이 꺼져 있으면 FOUNDATION 목록과 같다.
+export const commandDefinitions = (memory: boolean, review = false, task = false) => !memory && !review && !task ? COMMAND_DEFINITIONS
+  : Object.freeze([...COMMAND_DEFINITIONS, ...(memory ? MEMORY_COMMAND_DEFINITIONS : []), ...(review ? REVIEW_COMMAND_DEFINITIONS : []),
+    ...(task ? TASK_COMMAND_DEFINITIONS : [])]);
 
 const Remote = z.array(z.object({ name: z.string(), type: z.number().optional(), description: z.string(),
   options: z.array(z.object({ type: z.number(), name: z.string(), description: z.string(), required: z.boolean().optional(),

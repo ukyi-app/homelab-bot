@@ -14,16 +14,16 @@ export interface ExecutorCapabilities {
   readonly executor: ExecutorId;
   // 이미지에 고정한 CLI 버전. 기동 때 `--version`과 대조한다.
   readonly cliVersion: string;
-  // 레인별 지원. 작업 레인은 어떤 실행기도 연결하지 않는다. 리뷰 레인은 무도구 경계를 시험한 Claude 구독 프로필만이다.
+  // 레인별 지원. 작업 레인은 Claude 구독 프로필의 전용 작업자만이다(CLAUDE_TASK_CAPABILITIES, WORKER_LANES=task). 리뷰 레인은 무도구 경계를 시험한 Claude 구독 프로필만이다.
   readonly lanes: { readonly chat: boolean; readonly task: boolean; readonly review: boolean };
   // 구조화 출력: CLI가 스키마를 받아 결과에 담는다. 봇이 공통 스키마로 다시 검증한다.
   readonly structuredOutput: 'native-schema';
   // 그 프로필의 레인에서 모델이 쓸 수 있는 도구. none: CLI 도구를 끄고 실행 중 도구 호출이 보이면 멈춘다.
   // read-only-sandbox: Codex read-only 샌드박스 + 요청의 도구 예산(D4, 기존 승인 범위).
-  // sandboxed-task: 작업 레인 전용. 강제 샌드박스 안의 고정 도구 집합 + 작업 단위 도구 예산. 아직 이 값을 내는 프로필은 없다.
+  // sandboxed-task: 작업 레인 전용. 강제 샌드박스 안의 고정 도구 집합 + 작업 단위 도구 예산.
   readonly tools: 'none' | 'read-only-sandbox' | 'sandboxed-task';
   // off: 실행이 세션 기록을 남기지 않고(CLI 플래그 + 실행 뒤 정리) 재개하지 않는다.
-  // per-job: 작업 레인 전용. 작업마다 따로 둔 세션을 턴 사이에 유지하고 작업이 끝나면 지운다(α′). 아직 이 값을 내는 프로필은 없다.
+  // per-job: 작업 레인 전용. 작업마다 따로 둔 세션을 턴 사이에 유지하고 작업이 끝나면 지운다(α′).
   readonly sessionPersistence: 'off' | 'per-job';
   // 모델을 CLI 인자로 정확히 고정하는지. false면 CLI 기본 모델이다.
   readonly modelPinned: boolean;

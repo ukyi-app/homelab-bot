@@ -7,6 +7,7 @@ import { reviewPrecondition, reviewWorkerRouted, startPublisher } from '../src/m
 import type { Publisher, PublisherDeps } from '../src/main.js';
 import { loadRuntimePolicy } from '../src/policy.js';
 import { ReviewPublisher, ReviewReconciler, ReviewRuntime } from '../src/review.js';
+import { Store } from '../src/store.js';
 import { FakeGateway } from './fake-gateway.js';
 import { localDatabase } from './helpers.js';
 import { CHAT, GUILD, NOTIFY, OWNER, Rest, Trace, waitFor } from './t20-harness.js';
@@ -282,6 +283,31 @@ test('T17 늦은 열림: 작업자가 나중에 준비되면 명령을 다시 �
   const jobs = await reviewJobs();
   assert.deepEqual(jobs.map(j => j.trigger), ['reconcile']);
   assert.equal((await database.db.query<{ pr_number: number }>('SELECT pr_number FROM pr_reviews')).rows[0]!.pr_number, 7);
+});
+
+test('B5 레인: 작업 레인을 켜면 리뷰가 대화 슬롯만 보고, 켜지 않으면 실행 중 작업 job이 리뷰를 막음', async () => {
+  const store = new Store(database.db);
+  const scope = { kind: 'thread', guild: GUILD, channel: 'fixture-thread', parent: CHAT } as const;
+  const saved = await store.save({ id: 'b5-task', actor: OWNER, scope, text: '작업', kind: 'command', command: 'task', target: 'fixture' }, 'fixture-v1', true);
+  await store.accept(saved.id, 'task', 'fixture-v1');
+  await database.db.query("UPDATE conversations SET active=true");
+  assert.equal((await store.claim('task'))?.type, 'task');
+  const heartbeat = setInterval(() => { void database.db.query(`UPDATE jobs SET lease_until=$1 WHERE type='task'`, [Date.now() + 60_000]); }, 200);
+  try {
+    const off = await boot(config());
+    await waitFor(() => rest.names().includes('review-status'));
+    assert.equal(await webhook(off, opened()), 202);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.deepEqual(world.tasks, [], '단일 슬롯이면 작업 job이 리뷰를 막는다');
+    await off.stop(); publisher = undefined;
+    // 켠 배치: 정책에 task 절이 있다. 작업자 확인 전이라 작업 명령은 닫혀 있어도 슬롯은 나뉜다.
+    const task = { projects: [{ id: 'fixture', revision: 'r1', repository: 'fixture-org/fixture-repo', branch: 'main', allowedPaths: ['src'], forbiddenPaths: [], verifyCommands: [] }] };
+    const policy = loadRuntimePolicy(JSON.stringify({ revision: 'fixture-v1', owner: OWNER, guild: GUILD, conversationChannel: CHAT, notificationChannel: NOTIFY, dmEnabled: false,
+      services: ['homelab-bot'], review: REVIEW, task }), Date.now());
+    await boot(config({ policy, taskLane: { workerUrl: 'http://worker-task.fixture/' } }));
+    await waitFor(() => world.posted.length === 1);
+    assert.equal(world.tasks.length, 1);
+  } finally { clearInterval(heartbeat); }
 });
 
 test('T17 첫 READY 전: webhook은 대기열에 넣지만 claim은 장벽 뒤로 미룸', async () => {

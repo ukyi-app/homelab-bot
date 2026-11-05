@@ -7,16 +7,23 @@ import { once } from 'node:events';
 import { pathToFileURL } from 'node:url';
 import { createArchiveFetcher } from './archive-fetcher.js';
 import { ChatLane } from './chat-lane.js';
+import { StaticEnvCredential } from './credentials.js';
+import { ClaudeChatAdapter } from './executor-claude.js';
+import { runTaskTurn, taskImageProblems } from './executor-claude-task.js';
 import { createExecutor, executorVersion, selectProfile } from './executor-profiles.js';
 import type { ExecutorProfile } from './executor-profiles.js';
 import { PORTS } from './http.js';
 import { ProcessGroupLauncher } from './process-launcher.js';
-import type { ProcessLauncher } from './process-launcher.js';
+import type { ProcessCleanup, ProcessLauncher } from './process-launcher.js';
 import { reviewRoutes } from './review-http.js';
 import { ReviewWorker } from './review-input.js';
 import type { ArchiveFetcher } from './review-input.js';
 import { createReviewerModel } from './review-lane.js';
 import { RunControl } from './run-control.js';
+import { ContainmentUnavailable, PodPidSpace } from './task-containment.js';
+import { taskWorkerServer } from './task-http.js';
+import { TaskWorkerService } from './task-worker.js';
+import type { TaskWorkerOptions } from './task-worker.js';
 import { ExecutionSlot, SerialWorker, WorkerVerifier } from './worker.js';
 import { workerServer } from './worker-http.js';
 import { FileNonceStore, WorkerStartError, assertNotPersonal, humanHomes } from './worker-state.js';
@@ -25,6 +32,10 @@ import { FileNonceStore, WorkerStartError, assertNotPersonal, humanHomes } from 
 // 기동 순서: env 확인 → 실행기 프로필 선택(실행기·자격 키·모델) → 개인 경로 거부 → 실행기 `--version` 확인 →
 // 자격 준비(정적 토큰은 읽기 확인, Codex auth.json은 없을 때만 시드) → nonce 저장소 → 잔여물 정리 → 8080 수신.
 // 어느 단계든 실패하면 값 없이 사유 코드만 남기고 종료 코드 1로 끝난다. 리뷰 레인만 못 여는 경우는 예외다: 리뷰만 닫고 대화는 뜬다.
+//
+// WORKER_LANES=task면 작업 레인 전용으로 뜬다(startTaskWorker). 대화·리뷰 끝점이 없고, 설정 오류 말고는 종료하지 않는다.
+// 기동 순서: env 확인 → 이미지 검사 → 실행기 `--version` → PodPidSpace.record(HTTP 열기 전) → 전용 RunControl → 상태 볼륨 → 8080 수신.
+// 재시작을 되풀이해도 풀리지 않는 문제에 재시작을 걸면 파드가 Ready가 되지 못해 Argo CD root가 sandbox wave에서 멈춘다(task-worker.ts 가용성 규칙).
 
 // 자격은 Secret 볼륨 파일 `<WORKER_CREDENTIAL_DIR>/<WORKER_CREDENTIAL_KEY>`다. 키 이름은 Infisical 키 그대로이고 인증 방식을
 // 뜻한다(CLAUDE_CODE_OAUTH_TOKEN: Claude 구독 장기 토큰, CODEX_AUTH_JSON: Codex 구독 auth.json 시드).
@@ -36,6 +47,23 @@ export interface WorkerConfig {
   // file-mutable 자격(Codex)의 영속 홈. 그 프로필에서만 있다.
   codexHome?: string;
   proxy?: { https: string; noProxy: string };
+  // 있으면 작업 레인 전용 작업자다. 없으면 지금처럼 대화·리뷰다.
+  task?: { stateRoot: string };
+}
+
+// 미설정과 chat,review는 대화·리뷰 작업자다. 그 밖의 값은 오타일 수 있어 기동하지 않는다.
+function taskLaneConfig(env: Record<string, string | undefined>, profile: ExecutorProfile, nonceDir: string): WorkerConfig['task'] {
+  const lanes = env.WORKER_LANES?.trim();
+  if (!lanes || lanes === 'chat,review') return undefined;
+  if (lanes !== 'task') throw new WorkerStartError('config_invalid:WORKER_LANES');
+  if (!profile.taskCapabilities) throw new WorkerStartError('profile_unsupported');
+  const raw = env.TASK_STATE_ROOT?.trim();
+  if (!raw) throw new WorkerStartError('config_missing:TASK_STATE_ROOT');
+  if (!isAbsolute(raw)) throw new WorkerStartError('config_invalid:TASK_STATE_ROOT');
+  const stateRoot = resolve(raw);
+  // 샌드박스 설정이 가리는 제어 경로 밖에 nonce가 있으면 비신뢰 명령이 지워 재사용할 수 있다.
+  if (!nonceDir.startsWith(`${join(stateRoot, '.homelab-worker')}/`) && nonceDir !== join(stateRoot, '.homelab-worker')) throw new WorkerStartError('config_invalid:WORKER_NONCE_DIR');
+  return { stateRoot };
 }
 
 export function workerConfig(env: Record<string, string | undefined>): WorkerConfig {
@@ -67,8 +95,9 @@ export function workerConfig(env: Record<string, string | undefined>): WorkerCon
   // 플랫폼이 넣는 egress 프록시(sandbox values). 모델 CLI 프로세스에만 넘기고 모델 셸에는 넘기지 않는다.
   const https = env.HTTPS_PROXY?.trim();
   const proxy = https ? { https, noProxy: env.NO_PROXY?.trim() || '127.0.0.1,localhost' } : undefined;
+  const task = taskLaneConfig(env, profile, nonceDir);
   return { profile, model: value('WORKER_MODEL'), credentialFile: join(credentialDir, value('WORKER_CREDENTIAL_KEY')), nonceDir,
-    publicKey, executorBin, ...(codexHome ? { codexHome } : {}), ...(proxy ? { proxy } : {}) };
+    publicKey, executorBin, ...(codexHome ? { codexHome } : {}), ...(proxy ? { proxy } : {}), ...(task ? { task } : {}) };
 }
 
 // 압축본 다운로더 기본값(시험·조립용). 운영 진입점 main()은 createArchiveFetcher를 넘긴다. 이 값이면 리뷰는 archive_fetch_failed로 끝나고 모델을 부르지 않는다.
@@ -77,14 +106,82 @@ export const closedArchiveFetcher: ArchiveFetcher = async () => { throw new Erro
 const REVIEW_STOP_WAIT_MS = 4000;
 
 export interface RunningWorker {
-  server: Server; profile: string; cliVersion: string; credential: 'seeded' | 'kept' | 'present';
+  server: Server; profile: string; cliVersion: string; credential: 'seeded' | 'kept' | 'present' | 'unavailable';
   // 리뷰 레인을 닫은 사유 코드. 열렸으면 없다.
   reviewClosed?: string;
+  // 작업 레인 전용 작업자에만 있다. 지금 새 작업을 받지 못하는 사유들.
+  taskIntake?: () => readonly string[];
   close(): Promise<void>;
 }
-export async function startWorker(config: WorkerConfig,
-  options: { port?: number; host?: string; launcher?: ProcessLauncher; homes?: string[]; fetchArchive?: ArchiveFetcher;
-    log?: (fields: Record<string, unknown>) => void } = {}): Promise<RunningWorker> {
+export interface StartWorkerOptions {
+  port?: number; host?: string; launcher?: ProcessLauncher; homes?: string[]; fetchArchive?: ArchiveFetcher;
+  log?: (fields: Record<string, unknown>) => void;
+  // 시험 주입. 운영은 PodPidSpace.record의 결과를 쓴다. 개발 기계에서 kill(-1)이 나가지 않게 시험은 가짜를 넘긴다.
+  cleanup?: ProcessCleanup;
+  fsRoot?: string;
+  taskProbe?: Pick<TaskWorkerOptions, 'probeMs' | 'nonceIo' | 'probeVolume' | 'freeBytes'>;
+}
+
+// 작업 레인 전용 작업자. 이 launcher와 RunControl은 이 파드에만 쓴다(정리가 파드 PID 공간 전체를 향한다).
+async function startTaskWorker(config: WorkerConfig, stateRoot: string, options: StartWorkerOptions): Promise<RunningWorker> {
+  const homes = options.homes ?? humanHomes();
+  assertNotPersonal('WORKER_CREDENTIAL_DIR', dirname(config.credentialFile), homes);
+  assertNotPersonal('WORKER_NONCE_DIR', config.nonceDir, homes);
+  assertNotPersonal('TASK_STATE_ROOT', stateRoot, homes);
+  const startup = await taskImageProblems(options.fsRoot);
+  let cliVersion = 'unknown';
+  try {
+    cliVersion = await executorVersion(new ClaudeChatAdapter('subscription-token'), config.executorBin);
+    if (cliVersion !== config.profile.taskCapabilities!.cliVersion) startup.push('executor_version_mismatch');
+  } catch { startup.push('executor_version_unavailable'); }
+  // --version 자식이 끝난 뒤, HTTP를 열기 전이다. 기준 상태를 확인하지 못하면 정리 수단이 없어 실행을 받지 않고 소멸도 답하지 않는다.
+  let cleanup = options.cleanup;
+  if (!cleanup) {
+    try { cleanup = await PodPidSpace.record({ dedicatedTaskPod: true }); }
+    catch (error) { startup.push(`pid_${error instanceof ContainmentUnavailable ? error.code : 'record_failed'}`); }
+  }
+  const credential = new StaticEnvCredential(config.credentialFile, homes);
+  const launcher = cleanup && (options.launcher ?? new ProcessGroupLauncher([config.executorBin], { cleanup }));
+  let control: RunControl | undefined;
+  if (launcher) {
+    try {
+      control = new RunControl(credential, launcher, { homes, ...(config.proxy ? { proxy: config.proxy } : {}),
+        onEvent: event => options.log?.({ level: event.event === 'cleanup_failed' ? 'error' : event.event === 'run_policy_violation' ? 'warn' : 'info', ...event }) });
+    } catch { startup.push('run_control_unavailable'); }
+  }
+  const credentialDir = dirname(config.credentialFile);
+  const fetchArchive = options.fetchArchive ?? closedArchiveFetcher;
+  const service = new TaskWorkerService({ root: stateRoot, nonceDir: config.nonceDir, publicKey: config.publicKey, homes, startup,
+    runTurn: ({ worker, sessions }, request, signal) => {
+      if (!control) throw new Error('task_control_unavailable');
+      return runTaskTurn({ control, sessions, fetchArchive, worker, model: config.model, auth: 'subscription-token', credentialDir }, request, signal);
+    },
+    stop: async job => control ? control.stop(job) : false,
+    survivors: async job => launcher ? launcher.survivors(job) : null,
+    accepting: () => control?.accepting() ?? true,
+    credentialReady: () => credential.ready(),
+    log: options.log,
+    ...options.taskProbe });
+  const server = taskWorkerServer(service, config.profile.taskCapabilities!);
+  // 볼륨·자격 문제는 여기서 끝내지 않고 수락만 닫는다. 값 없는 사유가 로그와 /v1/task/intake에 남는다.
+  await service.start();
+  server.listen(options.port ?? PORTS.worker, options.host);
+  await once(server, 'listening');
+  for (const reason of service.intake.reasons) options.log?.({ level: 'error', event: 'task_lane_closed', reason });
+  return { server, profile: config.profile.id, cliVersion, credential: await credential.ready() ? 'present' : 'unavailable', reviewClosed: 'task_lane_only',
+    taskIntake: () => service.intake.reasons, async close() {
+      const stopping = Promise.all([control?.shutdown(), service.shutdown()]);
+      const closed = new Promise<void>(resolve => server.close(() => resolve()));
+      server.closeIdleConnections();
+      await stopping;
+      await Promise.race([closed, new Promise(resolve => { setTimeout(resolve, 3000).unref(); })]);
+      server.closeAllConnections();
+      await closed;
+    } };
+}
+
+export async function startWorker(config: WorkerConfig, options: StartWorkerOptions = {}): Promise<RunningWorker> {
+  if (config.task) return startTaskWorker(config, config.task.stateRoot, options);
   const homes = options.homes ?? humanHomes();
   assertNotPersonal('WORKER_CREDENTIAL_DIR', dirname(config.credentialFile), homes);
   assertNotPersonal('WORKER_NONCE_DIR', config.nonceDir, homes);
@@ -162,7 +259,7 @@ export async function main(env: Record<string, string | undefined> = process.env
   // 값 없는 식별자만 남긴다: 프로필·실행기 버전·모델 ID·자격 상태(seeded/kept/present).
   log({ level: 'info', event: 'worker_started', port: (worker.server.address() as { port?: number } | null)?.port,
     profile: worker.profile, cli: worker.cliVersion, model: config.model, credential: worker.credential,
-    review: worker.reviewClosed ?? 'open' });
+    review: worker.reviewClosed ?? 'open', ...(worker.taskIntake ? { taskIntake: worker.taskIntake() } : {}) });
   let stopping = false;
   const stop = (signal: string) => {
     if (stopping) return;

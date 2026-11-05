@@ -13,7 +13,7 @@ const ResultSchema = z.discriminatedUnion('status', [
   z.strictObject({ status: z.literal('unknown'), stopped: z.literal(false) }),
 ]);
 const connectionFailures = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
-function beforeConnection(error: unknown): boolean {
+export function beforeConnection(error: unknown): boolean {
   if (error instanceof AggregateError) return error.errors.length > 0 && error.errors.every(beforeConnection);
   return typeof error === 'object' && error !== null && 'code' in error
     && typeof error.code === 'string' && connectionFailures.has(error.code);

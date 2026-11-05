@@ -18,6 +18,24 @@ import type { TaskCancelResponse, TaskRequest, TaskResponse, TaskStatusResponse,
 export interface TaskPlan { repository: string; base: string; project: TaskRequest['project']; limits: TaskRequest['limits'] }
 export interface TaskPlanSource { plan(job: Job, policy: Policy, request: string): Promise<TaskPlan> }
 
+// 작업 레인 능력. 값이 불명확하면 지원한다고 적지 않는다. 사람이 연 세션 연결(R08)은 별도 경로이고 이 표에 넣지 않는다.
+export const CLAUDE_TASK_LANE_CAPABILITIES = Object.freeze({
+  adapter: 'claude-print',
+  start_task: true,
+  // 모델이 턴을 끝내며 묻는 clarification뿐이다. 답으로 도구를 승인하거나 권한을 바꿀 수 없다.
+  answer_question: 'clarification_only',
+  request_cancel: true,
+  read_status: true,
+  read_final_result: true,
+  // 작업 전용 파드의 PID 공간 전체를 기준 상태로 되돌린 것을 확인한다(task-containment).
+  confirm_stop: 'pod_pid_space',
+  resume_task: 'same_job_session_only',
+  tool_approval_relay: false,
+  attach_task: false,
+  // 턴 중간 진행 이벤트를 게시 서버로 보내지 않는다. 계약에 끝점이 없다.
+  read_events: false,
+} as const);
+
 export interface ClaudeTaskBridgeOptions {
   monitorMs: number; questionTtlMs: number; answerChars: number; stopWaitMs: number;
   // 정리 실패(cleanup_pending) 재시도 간격. 매 tick 작업자를 부르지 않게 한다.

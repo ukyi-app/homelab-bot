@@ -144,6 +144,8 @@ export async function seedAuth(codexHome: string, seedFile: string, options: See
 // - 한 프로세스 안의 consume은 차례로 처리한다. 지우기와 만들기가 겹치지 않는다. 디렉터리는 이 작업자만 쓴다(replicas 1).
 const NONCE = /^[0-9a-f]{64}$/;
 export const NONCE_RETENTION_MS = 2 * (30_000 + DEFAULTS.capabilitySkewMs);
+// reused: 이미 쓴 값이다. failed: 기록하지 못했다. 둘 다 이번 사용은 거부지만 failed는 저장소 장애라 작업 레인이 수락을 닫는 근거다.
+export type NonceOutcome = 'fresh' | 'reused' | 'failed';
 export class FileNonceStore {
   private queue: Promise<unknown> = Promise.resolve();
   private ready: Promise<void> | undefined;
@@ -166,19 +168,26 @@ export class FileNonceStore {
     return this.ready;
   }
   consume(nonce: string): Promise<boolean> {
+    return this.enqueue(nonce).then(outcome => outcome === 'fresh');
+  }
+  // consume과 같은 기록을 하고 거부 사유를 가려 준다. 던지지 않는다.
+  record(nonce: string): Promise<NonceOutcome> {
+    return this.enqueue(nonce).catch((): NonceOutcome => 'failed');
+  }
+  private enqueue(nonce: string): Promise<NonceOutcome> {
     const next = this.queue.then(() => this.consumeNow(nonce));
     this.queue = next.catch(() => {});
     return next;
   }
-  private async consumeNow(nonce: string): Promise<boolean> {
-    if (!NONCE.test(nonce)) return false;
+  private async consumeNow(nonce: string): Promise<NonceOutcome> {
+    if (!NONCE.test(nonce)) return 'reused';
     await this.open();
     const now = this.now();
     await this.prune(now);
     let handle: FileHandle;
     try { handle = await this.io.open(join(this.dir, nonce), NOFOLLOW_NEW, 0o600); }
     // EEXIST는 재사용이고, 그 밖의 오류도 기록을 남겼는지 모르니 거부한다(fail-closed).
-    catch { return false; }
+    catch (error) { return (error as { code?: string }).code === 'EEXIST' ? 'reused' : 'failed'; }
     // 기록 과정의 I/O 오류는 이번 사용을 거부한다(fail-closed). 남은 표식은 지우지 않는다: 같은 nonce의 재사용은
     // 계속 거부되고, 다음 prune이 실제 mtime으로 정리한다.
     // 보장 범위: 프로세스·파드 재시작 뒤에도 남는다(페이지 캐시). fsync는 하지 않는다. 페이지 캐시를 잃는 사고(노드 정전)는
@@ -186,7 +195,7 @@ export class FileNonceStore {
     let recorded = false;
     try { await handle.utimes(now / 1000, now / 1000); recorded = true; } catch { /* 거부 */ }
     try { await handle.close(); } catch { recorded = false; }
-    return recorded;
+    return recorded ? 'fresh' : 'failed';
   }
   private async prune(now: number): Promise<void> {
     let names: string[];

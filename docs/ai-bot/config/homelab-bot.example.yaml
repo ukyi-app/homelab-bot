@@ -114,6 +114,10 @@ codex:
   shell_environment_inherit: none            # T16a 작업자 계약. 실제 CLI 격리는 T16b·T18
   authorized_task_ids: []
   unattended_operational_approval: false
+  task_lane:                                  # T18 작업 레인 env 이름. 차트 values로 넣는다. 조립과 켜는 순서는 ARCHITECTURE "T18 작업 레인 조립"
+    publisher_env: [TASK_LANE_ENABLED, TASK_WORKER_URL]  # 없거나 false면 꺼짐. 켜면 RUNTIME_POLICIES의 task 절이 있어야 열린다
+    worker_env: [WORKER_LANES, TASK_STATE_ROOT]          # WORKER_LANES=task면 작업 전용. WORKER_NONCE_DIR은 <TASK_STATE_ROOT>/.homelab-worker 아래여야 한다
+    runtime_policy_keys: [id, revision, repository, branch, base, allowedPaths, forbiddenPaths, verifyCommands, limits]  # task.projects[]. branch와 base는 둘 중 하나. 값은 Infisical에만
 
 homelab:
   read_only: true
