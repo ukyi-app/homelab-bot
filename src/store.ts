@@ -302,13 +302,16 @@ export class Store {
       AND lease_until>$3 AND state IN ('running','cancel_requested') RETURNING state`,
     [job.id, job.lease_token, this.now()])).rows[0]?.state;
   }
-  async fail(job: Job, reason: string): Promise<void> {
-    await this.atomic(async store => {
+  // 도달한 상태를 돌려준다. lease가 끝났거나 이미 다른 상태라 바꾸지 못했으면 undefined다.
+  async fail(job: Job, reason: string): Promise<State | undefined> {
+    return this.atomic(async store => {
       await store.lockConversation(job);
-      if (await store.complete(job, 'failed', reason) !== 'failed') return;
+      const next = await store.complete(job, 'failed', reason);
+      if (next !== 'failed') return next;
       await store.enqueue({ key: `failure:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id,
         actor: job.owner_id, scope: job.target, revision: job.revision.policy,
         payload: { kind: 'message', channel: job.target.channel, content: '작업 실패가 확인됐습니다. /list로 상태를 확인하고 /retry로 재시도할 수 있습니다.', classification: 'safe_summary' } });
+      return next;
     });
   }
   // 호출자가 대화 행을 먼저 잡은 트랜잭션 안에서 부른다. cancelled가 되면 안내를 함께 넣는다.
