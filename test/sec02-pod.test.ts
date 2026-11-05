@@ -486,6 +486,8 @@ test('판정: 조건이 하나라도 빠지면 pass가 아니다', () => {
     ['소켓 양성 대조', body => { body.turns[0]!.counts = { ...body.turns[0]!.counts, 'socket.own_exists_outside': 0 }; }, 'enforced/start:positive_socket_exists'],
     ['AppArmor', body => { body.environment = { ...baseEnv, apparmor: 'unconfined' }; }, 'environment:apparmor'],
     ['hostUsers', body => { body.environment = { ...baseEnv, uid_map_identity: true }; }, 'environment:host_users'],
+    ['no_new_privs 꺼짐', body => { body.environment = { ...baseEnv, no_new_privs: false }; }, 'environment:no_new_privs'],
+    ['no_new_privs 못 읽음', body => { body.environment = { ...baseEnv, no_new_privs: null }; }, 'environment:no_new_privs'],
     ['procMount', body => { body.environment = { ...baseEnv, proc_masked_mounts: 5 }; }, 'environment:proc_mount'],
     ['소스 SHA 없음', body => { body.environment = { ...baseEnv, source_sha: null }; }, 'environment:source_sha'],
   ];
@@ -497,7 +499,7 @@ test('판정: 조건이 하나라도 빠지면 pass가 아니다', () => {
     assert.ok(judged.mismatches.includes(code), `${label}: ${judged.mismatches.join(',')}`);
   }
   const body = reportBody();
-  body.environment = { ...baseEnv, mode: 'rehearsal', apparmor: 'unconfined', seccomp_mode: 0, uid_map_identity: true, source_sha: null };
+  body.environment = { ...baseEnv, mode: 'rehearsal', apparmor: 'unconfined', seccomp_mode: 0, no_new_privs: false, uid_map_identity: true, source_sha: null };
   assert.equal(judgePodRun(body).verdict, 'pass', '리허설은 프로필 조건을 보지 않는다');
 });
 

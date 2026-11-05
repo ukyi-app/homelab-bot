@@ -390,6 +390,8 @@ export function judgePodRun(report: Omit<PodReport, 'verdict' | 'mismatches' | '
     if (env.mode === 'pod') {
       requireEnv(env.apparmor === 'homelab-sandbox-worker-v1', 'apparmor');
       requireEnv(env.seccomp_mode === 2, 'seccomp');
+      // 운영 파드는 allowPrivilegeEscalation: false다. 리허설 컨테이너는 이 값을 맞추지 않아 운영에서만 본다.
+      requireEnv(env.no_new_privs === true, 'no_new_privs');
       requireEnv(env.uid_map_identity === false, 'host_users');
       requireEnv(env.source_sha !== null, 'source_sha');
     }

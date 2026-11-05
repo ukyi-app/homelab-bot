@@ -1370,7 +1370,7 @@ manifest는 정확한 경로만 받는다. **올릴 때 그 경로가 비어 있
 | `outside.write_new`(Write로 작업 공간 밖 새 파일) | denied, `permission_denied` |
 | `socket.bash_real_dir`, `socket.bash_connect_own`(Bash가 CLI 메시징 소켓에 연결) | masked |
 
-**운영 동등성(결과의 값 없는 메타데이터).** 실행 경로 `direct_exec_not_tasklane`, 소스 `5fb4a20`과 묶음 `dist/src` 해시 일치, uid 10001, PID 1 pause·worker 1개, AppArmor `homelab-sandbox-worker-v1`, seccomp mode 2, no_new_privs, CapEff 0, uid 매핑 비항등(`hostUsers: false`), `/proc` 가림 마운트 0(`procMount: Unmasked`), 루트·자격 마운트 읽기 전용, 상태 볼륨 ext4, CLI 2.1.308, bwrap 0.12.0, socat 1.8.0.3, 보존 세대 0.
+**운영 동등성(결과의 값 없는 메타데이터).** 실행 경로 `direct_exec_not_tasklane`, 소스 `5fb4a20`과 묶음 `dist/src` 해시 일치, uid 10001, PID 1 pause·worker 1개, AppArmor `homelab-sandbox-worker-v1`, seccomp mode 2, no_new_privs, CapEff 0, uid 매핑 비항등(`hostUsers: false`), `/proc` 가림 마운트 0(`procMount: Unmasked`), 루트·자격 마운트 읽기 전용, 상태 볼륨 ext4, CLI 2.1.308, bwrap 0.12.0, socat 1.8.0.3, 보존 세대 0. 실행 뒤 판정 조건에 NoNewPrivs를 더했다(리뷰 지적). 이 실행의 값은 켜짐이라 판정은 그대로다.
 
 **정리.** 실행기: 삭제 13, 남은 경로 0, 모르는 새 경로 0, listener 닫힘, 생존 자식 0, 실행 뒤 파드 프로세스 기준 상태. 밖에서 대조: 파드 재시작 0·Ready, `/worker-state/tasks` 0개, `/tmp` 빈 상태(실행 전과 같음), 파드 프로세스 pause·worker뿐, `/tmp/sec02` 묶음 삭제.
 
