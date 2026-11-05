@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { CLAUDE_TASK_CAPABILITIES, ClaudeTaskAdapter, compactTaskEvent, judgeTaskRun, runTaskTurn, taskImageProblems, taskPrompt, taskStreamPolicy } from '../src/executor-claude-task.js';
 import { interpretClaudeStream } from '../src/executor-claude.js';
 import type { ClaudeExpectation } from '../src/executor-claude.js';
@@ -305,6 +305,98 @@ test('한 턴 흐름: 준비 실패는 띄우지 않는다(압축본·세션 없
   const late = parsed(await runTaskTurn(deps, startRequest(), aborted.signal));
   assert.equal(late.status === 'failed' && late.reason, 'aborted');
   assert.equal(launcher.specs.length, 0);
+});
+
+test('한 턴 흐름: 기준 파일을 고쳐 지운 줄의 자격은 patch로 나가지 않는다', async () => {
+  const { deps } = await harness([{ lines: [INIT, resultS(OUTPUT)], files: { 'src/a.ts': 'clean\n' } }]);
+  const leaking = archive([{ name: 'src', type: '5' }, { name: 'src/a.ts', data: `token=${TOKEN}\n` }]);
+  const response = parsed(await runTaskTurn({ ...deps, fetchArchive: async () => leaking }, startRequest(), new AbortController().signal));
+  assert.equal(response.status === 'failed' && response.reason, 'secret_echo');
+  assert.equal('patch' in response, false);
+});
+
+const signalNow = () => new AbortController().signal;
+test('보존 여부: 대화 기록 없이 재개하면 명시 실패하되 남은 공간은 보존으로 보고하고 finalize가 지운다', async () => {
+  const { deps, launcher } = await harness([]);
+  const start = startRequest();
+  await deps.sessions.create(start, deps.fetchArchive, signalNow());
+  const response = parsed(await runTaskTurn(deps, resumeRequest(start), signalNow()));
+  assert.equal(response.status === 'failed' && response.reason, 'session_missing');
+  assert.equal(response.sessionRetained, true);
+  assert.equal(await deps.sessions.retained(), 1);
+  assert.equal(launcher.specs.length, 0);
+  assert.deepEqual(await deps.sessions.finalize(start.job, start.generation, async () => true), { stopped: true, cleaned: true });
+  assert.equal(await deps.sessions.retained(), 0);
+  const gone = parsed(await runTaskTurn(deps, resumeRequest(start), signalNow()));
+  assert.equal(gone.status === 'failed' && gone.reason, 'session_missing');
+  assert.equal(gone.sessionRetained, false);
+});
+
+test('보존 여부: 세션 기록이 깨져도 공간이 있으면 보존이다', async () => {
+  const { deps } = await harness([]);
+  const start = startRequest();
+  const session = await deps.sessions.create(start, deps.fetchArchive, signalNow());
+  await writeFile(join(session.dirs.run, 'session.json'), 'not json');
+  const response = parsed(await runTaskTurn(deps, resumeRequest(start), signalNow()));
+  assert.equal(response.status === 'failed' && response.reason, 'session_missing');
+  assert.equal(response.sessionRetained, true);
+  assert.equal(await deps.sessions.retained(), 1);
+});
+
+test('보존 여부: 같은 세대 첫 턴을 다시 받거나 이미 중단돼도 있는 세션을 보존으로 보고한다', async () => {
+  const { deps, launcher } = await harness([]);
+  const start = startRequest();
+  await deps.sessions.create(start, deps.fetchArchive, signalNow());
+  const twice = parsed(await runTaskTurn(deps, start, signalNow()));
+  assert.equal(twice.status === 'failed' && twice.reason, 'session_mismatch');
+  assert.equal(twice.sessionRetained, true);
+  const aborted = new AbortController();
+  aborted.abort();
+  const late = parsed(await runTaskTurn(deps, resumeRequest(start), aborted.signal));
+  assert.equal(late.status === 'failed' && late.reason, 'aborted');
+  assert.equal(late.sessionRetained, true);
+  const none = parsed(await runTaskTurn(deps, startRequest(), aborted.signal));
+  assert.equal(none.status === 'failed' && none.reason, 'aborted');
+  assert.equal(none.sessionRetained, false);
+  assert.equal(launcher.specs.length, 0);
+});
+
+test('보존 여부: 첫 턴 준비 실패 뒤 공간을 지우지 못하면 보존으로 보고한다', async t => {
+  if (process.getuid?.() === 0) { t.skip('root는 디렉터리 권한을 무시해 삭제 실패를 만들 수 없다'); return; }
+  const { deps } = await harness([]);
+  const start = startRequest();
+  const parent = dirname(deps.sessions.paths(start.job, start.generation).root);
+  deps.sessions['writeRecord'] = async () => {
+    await chmod(parent, 0o500);
+    throw new Error('write');
+  };
+  try {
+    const response = parsed(await runTaskTurn(deps, start, signalNow()));
+    assert.equal(response.status === 'failed' && response.reason, 'workspace_failed');
+    assert.equal(response.sessionRetained, true);
+    assert.equal(await deps.sessions.retained(), 1);
+  } finally { await chmod(parent, 0o700); }
+  assert.deepEqual(await deps.sessions.finalize(start.job, start.generation, async () => true), { stopped: true, cleaned: true });
+  assert.equal(await deps.sessions.retained(), 0);
+});
+
+test('보존 여부: 실행 중 공간이 사라지면 판정의 가정이 아니라 실제 부재를 보고한다', async () => {
+  const cases: [Step, string][] = [
+    [{ lines: [INIT, resultS({ status: 'needs_input', summary: '확인', question: '어느 쪽?' })] }, 'finish_failed'],
+    [{ lines: [INIT, resultS(OUTPUT)], exit: 3 }, 'exit_nonzero'],
+  ];
+  for (const [step, reason] of cases) {
+    const { deps } = await harness([step]);
+    const start = startRequest();
+    const control = { run: async (...args: Parameters<typeof deps.control.run>) => {
+      const report = await deps.control.run(...args);
+      await rm(deps.sessions.paths(start.job, start.generation).root, { recursive: true, force: true });
+      return report;
+    } } as unknown as typeof deps.control;
+    const response = parsed(await runTaskTurn({ ...deps, control }, start, signalNow()));
+    assert.equal(response.status === 'failed' && response.reason, reason);
+    assert.equal(response.sessionRetained, false, reason);
+  }
 });
 
 test('판정 순서: 소멸 확인이 먼저다. 생존이 있으면 나머지는 보지 않는다', async () => {

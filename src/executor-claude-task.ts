@@ -286,19 +286,18 @@ export async function judgeTaskRun(input: { request: TaskRequest; base: Base; re
 export async function runTaskTurn(deps: TaskTurnDeps, request: TaskRequest, signal: AbortSignal): Promise<TaskResponse> {
   const base: Base = { version: 1, job: request.job, lease: request.lease, generation: request.generation, sessionId: request.sessionId,
     turn: request.turn, worker: deps.worker, usage: { toolCalls: null, model: null } };
-  if (signal.aborted) return failedResponse(base, 'aborted', false);
+  // 보존 여부는 사유로 짐작하지 않는다. session_missing이어도 공간이 남아 보존 상한을 쓰고 있으면 게시 서버가 finalize해야 한다.
+  const retained = () => deps.sessions.exists(request.job, request.generation);
+  if (signal.aborted) return failedResponse(base, 'aborted', await retained());
   let session: TaskSession;
   try {
     session = request.operation === 'start' ? await deps.sessions.create(request, deps.fetchArchive, signal) : await deps.sessions.open(request);
   } catch (error) {
-    const reason = error instanceof TaskWorkspaceError ? error.reason : 'workspace_failed';
-    // 재개 실패는 기존 세션을 건드리지 않는다. 첫 턴 실패는 만든 것을 지웠다.
-    const retained = request.operation === 'resume' && reason !== 'session_missing';
-    return failedResponse(base, reason, retained);
+    return failedResponse(base, error instanceof TaskWorkspaceError ? error.reason : 'workspace_failed', await retained());
   }
   let others: string[];
   try { others = await deps.sessions.others(request.job, request.generation); }
-  catch { return failedResponse(base, 'prepare_failed', true); }
+  catch { return failedResponse(base, 'prepare_failed', await retained()); }
   const adapter = new ClaudeTaskAdapter(deps.auth, { operation: request.operation, sessionId: request.sessionId,
     sandbox: { credentialDir: deps.credentialDir, controlDir: deps.sessions.controlDir, config: session.dirs.config, run: session.dirs.run, others,
       ...(deps.socketDir ? { socketDir: deps.socketDir } : {}) } });
@@ -308,8 +307,10 @@ export async function runTaskTurn(deps: TaskTurnDeps, request: TaskRequest, sign
   base.usage = { toolCalls: report.toolCalls ?? null, model: adapter.usage };
   const launched = report.survivors === 0 && !report.refused && !report.launchFailed;
   if (launched) await deps.sessions.recordTurn(session, request.turn).catch(() => {});
-  const response = await judgeTaskRun({ request, base, report, cancelled: signal.aborted, session, sessions: deps.sessions });
+  const judged = await judgeTaskRun({ request, base, report, cancelled: signal.aborted, session, sessions: deps.sessions });
+  // 판정은 공간이 남아 있다고 가정하고 값을 채운다. 소멸을 확인한 응답은 실제 경로로 덮는다. needs_input은 보존이 계약이라 공간이 없으면 아래에서 실패가 된다.
+  const response = judged.status === 'unknown' ? judged : { ...judged, sessionRetained: await retained() } as TaskResponse;
   // 계약에 맞지 않는 응답은 내보내지 않는다. 소멸을 확인한 경우에만 실패로 바꿀 수 있고, 아니면 unknown 그대로다.
   if (TaskResponseSchema.safeParse(response).success) return response;
-  return report.survivors === 0 ? failedResponse(base, 'finish_failed', true) : { ...base, status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: false };
+  return report.survivors === 0 ? failedResponse(base, 'finish_failed', await retained()) : { ...base, status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: false };
 }

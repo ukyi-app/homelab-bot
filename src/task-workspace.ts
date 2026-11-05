@@ -309,6 +309,13 @@ export class TaskSessions {
       .map(item => join(this.tasks, item.job, item.generation)).sort();
   }
   async retained(): Promise<number> { return (await this.generations()).length; }
+  // 이 세대 공간이 디스크에 남아 있는가. 오류 사유로 짐작하지 않고 실제 경로를 본다. 없음을 확인하지 못하면 남은 것으로 답한다.
+  async exists(job: string, generation: number): Promise<boolean> {
+    let dir: string;
+    // 이 모양의 경로는 create가 만들지 않는다.
+    try { dir = this.generationDir(job, generation); } catch { return false; }
+    return lstat(dir).then(() => true, (error: { code?: string }) => error.code !== 'ENOENT');
+  }
   private async usedBytes(dir: string, budget = { entries: 2_000_000 }): Promise<number> {
     let used = 0;
     const names = await readdir(dir).catch((error: { code?: string }) => { if (error.code === 'ENOENT') return [] as string[]; throw error; });
@@ -439,7 +446,10 @@ export class TaskSessions {
       await mkdir(join(patchRoot, 'b'), { mode: 0o700 });
       if (changed.length) await materialize(await readFile(join(dirs.run, 'baseline.tar.gz')), record.limits, changed, before, after, dirs.workspace, patchRoot, scanner);
       if (scanner.found()) return { ok: false, reason: 'secret_echo' };
-      const patch = changed.length ? await gitPatch(patchRoot, limits.patchBytes) : emptyPatch();
+      scanner.end();
+      const patch = changed.length ? await gitPatch(patchRoot, limits.patchBytes, scanner) : emptyPatch();
+      // 양쪽 파일에 나뉜 조각이 삭제 줄과 추가 줄로 나란히 놓이면 patch에서 처음 온전해진다.
+      if (scanner.found()) return { ok: false, reason: 'secret_echo' };
       const max = limits.changeItems ?? TASK_LIMITS.changeItems;
       return { ok: true, evidence: { changes: { total: classified.items.length, items: classified.items.slice(0, max) }, patch } };
     } catch { return { ok: false, reason: 'diff_unavailable' }; }
@@ -498,6 +508,7 @@ class SecretScanner {
 }
 
 // 바뀐 파일만 a/(기준)·b/(실행 뒤)에 복사한다. 실행 뒤 쪽은 snapshot이 일반 파일로 본 것만 읽고, 소멸을 확인했으므로 경로가 그 사이 바뀌지 않는다.
+// 삭제 줄·문맥 줄·심링크 대상은 양쪽에서 patch로 나가므로 복사하는 바이트를 양쪽 다 검사한다. 이진 파일은 patch에서 base85가 되어 원본에서 재야 잡힌다.
 async function materialize(archive: Buffer, limits: ArchiveLimits, changed: readonly string[], before: Snapshot, after: Snapshot,
   workspace: string, patchRoot: string, scanner: SecretScanner): Promise<void> {
   const wanted = new Set(changed);
@@ -506,6 +517,8 @@ async function materialize(archive: Buffer, limits: ArchiveLimits, changed: read
     if (!wanted.has(entry.path) || before[entry.path] === undefined || entry.kind === 'directory') continue;
     const target = join(patchRoot, 'a', entry.path);
     await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+    scanner.push(entry.kind === 'symlink' ? Buffer.from(entry.target, 'utf8') : entry.data);
+    scanner.end();
     if (entry.kind === 'symlink') await symlink(entry.target, target);
     else await writeFile(target, entry.data, { mode: entry.executable ? 0o755 : 0o644, flag: 'wx' });
   }
@@ -531,8 +544,8 @@ async function materialize(archive: Buffer, limits: ArchiveLimits, changed: read
 function emptyPatch(): TaskEvidence['patch'] { return { text: '', bytes: 0, digest: sha256(''), truncated: false }; }
 
 // 저장소 밖의 두 디렉터리를 비교한다. 설정을 하나도 읽지 않게 하고 외부 diff·textconv를 끈다. 비신뢰 .git/config와 .gitattributes 구동기는 닿지 않는다.
-// digest와 bytes는 전체 출력 기준이다. text는 상한 안에서 유효한 UTF-8까지만 담고, 줄었으면 truncated다.
-function gitPatch(patchRoot: string, patchBytes: number): Promise<TaskEvidence['patch']> {
+// digest와 bytes는 전체 출력 기준이다. text는 상한 안에서 유효한 UTF-8까지만 담고, 줄었으면 truncated다. 반사 검사도 잘리기 전 전체를 본다.
+function gitPatch(patchRoot: string, patchBytes: number, scanner: SecretScanner): Promise<TaskEvidence['patch']> {
   return new Promise((resolve, reject) => {
     const child = spawn('git', ['diff', '--no-index', '--no-prefix', '--binary', '--full-index', '--no-color', '--no-ext-diff', '--no-textconv', '--no-renames', '--', 'a', 'b'], {
       cwd: patchRoot, stdio: ['ignore', 'pipe', 'ignore'],
@@ -544,6 +557,7 @@ function gitPatch(patchRoot: string, patchBytes: number): Promise<TaskEvidence['
     let bytes = 0;
     child.stdout.on('data', (chunk: Buffer) => {
       hash.update(chunk);
+      scanner.push(chunk);
       bytes += chunk.length;
       if (keptBytes < patchBytes) {
         const part = chunk.subarray(0, patchBytes - keptBytes);

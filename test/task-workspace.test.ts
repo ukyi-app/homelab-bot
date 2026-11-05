@@ -320,6 +320,66 @@ test('증거: 변경 파일·이름·심링크 대상의 자격 반사를 잡는
   }
 });
 
+test('증거: 기준 쪽 내용·심링크 대상의 자격 반사도 잡는다(삭제 줄·문맥 줄·이진 포함)', async () => {
+  const cases: [string, TarItem, (workspace: string) => Promise<unknown>][] = [
+    ['삭제한 파일', { name: 'src/creds.txt', data: `token=${SECRET}\n` }, workspace => unlink(join(workspace, 'src/creds.txt'))],
+    ['고친 파일의 삭제 줄', { name: 'src/creds.txt', data: `token=${SECRET}\nkeep\n` }, workspace => writeFile(join(workspace, 'src/creds.txt'), 'keep\n')],
+    ['문맥 줄', { name: 'src/creds.txt', data: `token=${SECRET}\nkeep\n` }, workspace => writeFile(join(workspace, 'src/creds.txt'), `token=${SECRET}\nkeep\nmore\n`)],
+    ['삭제한 이진 파일', { name: 'src/creds.bin', data: Buffer.concat([Buffer.from([0, 1, 2, 0]), Buffer.from(SECRET), Buffer.from([0])]) }, workspace => unlink(join(workspace, 'src/creds.bin'))],
+    ['삭제한 심링크의 대상', { name: 'src/creds-link', type: '2', link: SECRET }, workspace => unlink(join(workspace, 'src/creds-link'))],
+    ['바꾼 심링크의 옛 대상', { name: 'src/creds-link', type: '2', link: SECRET }, async workspace => {
+      await unlink(join(workspace, 'src/creds-link'));
+      await symlink('run.sh', join(workspace, 'src/creds-link'));
+    }],
+    ['기준 파일 이름', { name: `src/${SECRET}`, data: 'x\n' }, workspace => unlink(join(workspace, `src/${SECRET}`))],
+  ];
+  for (const [name, item, change] of cases) {
+    const { sessions } = await fresh();
+    const { session } = await created(sessions, archive([...GOOD, item]));
+    await change(session.dirs.workspace);
+    assert.deepEqual(await collect(sessions, session), { ok: false, reason: 'secret_echo' }, name);
+  }
+});
+
+test('증거: 삭제 줄과 추가 줄이 patch에서 이어져 자격 모양이 되면 내보내지 않는다', async () => {
+  // 어느 쪽 파일에도 16자 창이 온전히 없고, 나란히 놓인 patch에서만 온전해진다.
+  const squashed = SECRET.replace(/[^A-Za-z0-9]/g, '');
+  const { sessions } = await fresh();
+  const { session } = await created(sessions, archive([...GOOD, { name: 'src/split.txt', data: `old ${squashed.slice(4, 12)}\n` }]));
+  await writeFile(join(session.dirs.workspace, 'src/split.txt'), `${squashed.slice(12, 24)} new\n`);
+  assert.deepEqual(await collect(sessions, session), { ok: false, reason: 'secret_echo' });
+});
+
+test('증거: 바꾸지 않은 기준 파일은 patch에 나가지 않으므로 그 안의 값으로 막지 않는다', async () => {
+  const { sessions } = await fresh();
+  const { session } = await created(sessions, archive([...GOOD, { name: 'src/untouched.txt', data: `token=${SECRET}\n` }]));
+  await writeFile(join(session.dirs.workspace, 'README.md'), 'changed\n');
+  const result = await collect(sessions, session);
+  assert.ok(result.ok);
+  assert.equal(result.evidence.patch.text.includes(SECRET), false);
+  assert.deepEqual(result.evidence.changes.items.map(item => item.path), ['README.md']);
+});
+
+test('세대 존재: 실제 경로로 답하고 finalize 뒤에는 없다', async () => {
+  const { sessions } = await fresh();
+  const { request } = await created(sessions);
+  assert.equal(await sessions.exists(request.job, request.generation), true);
+  assert.equal(await sessions.exists(request.job, request.generation + 1), false);
+  assert.equal(await sessions.exists('not-a-job', 1), false);
+  assert.deepEqual(await sessions.finalize(request.job, request.generation, async () => true), { stopped: true, cleaned: true });
+  assert.equal(await sessions.exists(request.job, request.generation), false);
+});
+
+test('세대 존재: 없음을 확인하지 못하면 남은 것으로 본다', async t => {
+  if (process.getuid?.() === 0) { t.skip('root는 디렉터리 권한을 무시해 경로 확인 실패를 만들 수 없다'); return; }
+  const { root, sessions } = await fresh();
+  const { request } = await created(sessions);
+  const parent = join(root, 'tasks', request.job);
+  await chmod(parent, 0o000);
+  try { assert.equal(await sessions.exists(request.job, request.generation), true); }
+  finally { await chmod(parent, 0o700); }
+});
+
 test('증거: 큰 patch는 잘라 표시하고 전체 digest를 남기며 깨진 UTF-8을 계약 안에 둔다', async () => {
   const { sessions } = await fresh();
   const { session } = await created(sessions);
