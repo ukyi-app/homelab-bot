@@ -8,7 +8,7 @@ import type { Database } from '../src/database.js';
 import { Store } from '../src/store.js';
 import { TASK_RETENTION, taskQuestionId } from '../src/task-contracts.js';
 import { event, fixture, thread } from './helpers.js';
-import { FakeTaskWorker, OTHER_STORAGE, PLAN, allRows, answer, conversationId, hang, jobs, lane, laneRow, reply, retainedThenStorageReplaced, task, until } from './task-lane-fixture.js';
+import { FakeTaskWorker, OTHER_STORAGE, PLAN, allRows, answer, answerOnAbort, codexBridge, codexSession, conversationId, expiredWhileWaiting, hang, jobs, lane, laneRow, reply, retainedThenStorageReplaced, task, until } from './task-lane-fixture.js';
 import type { Fixture } from './task-lane-fixture.js';
 
 // 실제 PostgreSQL 다중 연결 경합. PGlite는 transaction을 직렬화해 행 잠금 대기를 만들 수 없다.
@@ -300,6 +300,121 @@ test('실제 PostgreSQL: 실행 중인 대화가 있으면 작업 레인 unknown
     assert.equal((await jobs(db)).find(row => row.id === chatJob.id)!.state, 'unknown');
     assert.equal((await instance(db, f).control('fixture-owner', conversationId(f), 'resume-model', 'emergency-stop') as { ok: boolean }).ok, false);
     assert.equal(await instance(db, f).claim('interactive'), undefined);
+  } finally { await close(); }
+});
+test('실제 PostgreSQL: 해제와 늦은 응답이 어떤 순서로 겹쳐도 해제된 작업이 레인을 다시 닫지 않는다', { skip }, async () => {
+  for (let round = 0; round < 8; round++) {
+    const { db, f, close } = await setup();
+    try {
+      const local = await expiredWhileWaiting(f, db, round % 2 ? reply.unknown() : reply.completed('늦은 결과'));
+      const [first, second] = round % 4 < 2
+        ? [local.bridge.release('fixture-owner', thread, local.job.id), (async () => { local.deliver(); await local.running; })()]
+        : [(async () => { local.deliver(); await local.running; })(), local.bridge.release('fixture-owner', thread, local.job.id)];
+      const results = settled(await Promise.allSettled([first, second]));
+      const released = results.find(value => value) as { ok: boolean };
+      assert.equal(released.ok, true);
+      assert.equal((await jobs(db))[0]!.state, 'cancelled');
+      const row = (await allRows(db, 'codex_sessions'))[0]!;
+      assert.equal(row.state, 'cancelled');
+      assert.equal(row.session_retained, false);
+      assert.equal((await laneRow(db)).closed_reason, null);
+      assert.equal((await allRows(db, 'results')).length, 0);
+      await local.bridge.sweep();
+      assert.equal((await laneRow(db)).closed_reason, null);
+    } finally { await close(); }
+  }
+});
+test('실제 PostgreSQL: 해제 뒤 늦은 응답을 두 인스턴스의 sweep과 겹쳐도 세션은 정리된 채다', { skip }, async () => {
+  const { db, f, close } = await setup();
+  try {
+    const local = await expiredWhileWaiting(f, db, reply.unknown());
+    assert.equal((await local.bridge.release('fixture-owner', thread, local.job.id)).ok, true);
+    const other = new ClaudeTaskBridge(instance(db, f), f.gate, local.worker, { plan: async () => PLAN }, { monitorMs: 5, stopWaitMs: 50, finalizeRetryMs: 0 });
+    local.deliver();
+    settled(await Promise.allSettled([local.running, other.sweep(), local.bridge.sweep()]));
+    const row = (await allRows(db, 'codex_sessions'))[0]!;
+    assert.equal(row.state, 'cancelled'); assert.equal(row.cleanup_state, 'cleaned');
+    assert.equal((await laneRow(db)).closed_reason, null);
+  } finally { await close(); }
+});
+test('실제 PostgreSQL: 취소·제어·접수가 겹쳐도 unknown 실행 응답과 취소 확인을 합쳐 cancelled로 끝난다', { skip }, async () => {
+  for (let round = 0; round < 4; round++) {
+    const { db, f, close } = await setup();
+    try {
+      const local = lane(f);
+      local.worker.scripts.push(answerOnAbort(reply.unknown()));
+      const job = await task(f, db);
+      const running = local.runtime.tickTask();
+      await until(() => local.worker.executes.length === 1);
+      const results = await Promise.allSettled([running, f.store.control('fixture-owner', conversationId(f), 'cancel', job.id),
+        instance(db, f).control('fixture-owner', conversationId(f), 'model-status'), chat(f, `chat-${round}`)]);
+      settled(results);
+      const current = (await jobs(db)).find(row => row.id === job.id)!;
+      assert.equal(current.state, 'cancelled');
+      assert.equal((await allRows(db, 'codex_sessions'))[0]!.state, 'cancelled');
+      assert.equal((await laneRow(db)).closed_reason, null);
+      assert.equal(local.worker.cancels.length, 1);
+    } finally { await close(); }
+  }
+});
+test('실제 PostgreSQL: Claude·Codex 해제가 겹쳐도 Codex 세션은 소멸 확인 경로로만 풀린다', { skip }, async () => {
+  for (let round = 0; round < 4; round++) {
+    const { db, f, close } = await setup();
+    try {
+      const local = lane(f);
+      const { job } = await codexSession(f, db);
+      const codex = codexBridge(f);
+      const results = settled(await Promise.allSettled(round % 2
+        ? [local.bridge.release('fixture-owner', thread, job.id), codex.bridge.release('fixture-owner', thread, job.id)]
+        : [codex.bridge.release('fixture-owner', thread, job.id), local.bridge.release('fixture-owner', thread, job.id)])) as { ok: boolean }[];
+      assert.equal(results.filter(result => result.ok).length, 1);
+      assert.equal(local.worker.cancels.length, 0);
+      assert.deepEqual(codex.confirms, [job.id]);
+      assert.equal((await jobs(db)).find(row => row.id === job.id)!.state, 'cancelled');
+      const row = (await allRows(db, 'codex_sessions'))[0]!;
+      assert.equal(row.executor, 'codex'); assert.equal(row.state, 'unknown');
+      assert.ok(!(await allRows(db, 'audit')).some(a => a.kind === 'task_unknown_released'));
+    } finally { await close(); }
+  }
+});
+test('실제 PostgreSQL: 다른 인스턴스가 지운 뒤 도착한 정리 실패가 cleaned를 되돌리지 않는다', { skip }, async () => {
+  const { db, f, close } = await setup();
+  try {
+    const local = lane(f, { finalizeRetryMs: 0 });
+    const other = new ClaudeTaskBridge(instance(db, f), f.gate, local.worker, { plan: async () => PLAN }, { monitorMs: 5, stopWaitMs: 50, finalizeRetryMs: 0 });
+    local.worker.statusFails = true;
+    await task(f, db);
+    await local.runtime.tickTask();
+    local.worker.statusFails = false;
+    local.worker.onControl = async endpoint => {
+      if (endpoint !== '/v1/task/status') return;
+      local.worker.onControl = undefined;
+      await other.sweep();
+      local.worker.statusFails = true;
+    };
+    await local.bridge.sweep();
+    const row = (await allRows(db, 'codex_sessions'))[0]!;
+    assert.equal(row.cleanup_state, 'cleaned');
+    assert.equal((await laneRow(db)).closed_reason, null);
+  } finally { await close(); }
+});
+test('실제 PostgreSQL: owner 확인 요청 표시 직전 취소된 작업에는 표시도 알림도 남기지 않는다', { skip }, async () => {
+  const { db, f, close } = await setup();
+  try {
+    const local = lane(f);
+    local.worker.scripts.push(reply.limited('auth_expired'));
+    const job = await task(f, db);
+    await local.runtime.tickTask();
+    f.advance(TASK_RETENTION.modelWaitOwnerConfirmMs); f.policy.confirmedAt = f.now();
+    const held = pausing(db, sql => /s\.waiting_since FROM codex_sessions/.test(sql));
+    const paused = new ClaudeTaskBridge(new Store(held.db, f.now), f.gate, local.worker, { plan: async () => PLAN }, { monitorMs: 5, stopWaitMs: 50 });
+    const sweeping = paused.sweep();
+    await held.paused;
+    await f.store.control('fixture-owner', conversationId(f), 'cancel', job.id);
+    held.release();
+    await sweeping;
+    assert.equal((await allRows(db, 'codex_sessions'))[0]!.owner_confirm_requested_at, null);
+    assert.equal((await db.query("SELECT 1 FROM outbox WHERE idempotency_key LIKE 'task-owner-confirm:%'")).rows.length, 0);
   } finally { await close(); }
 });
 test('실제 PostgreSQL: 접수와 레인 닫힘이 겹쳐도 닫힌 뒤 접수되지 않는다', { skip }, async () => {

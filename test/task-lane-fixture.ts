@@ -6,7 +6,9 @@ import { Runtime } from '../src/runtime.js';
 import { TaskWorkerRejected } from '../src/task-bridge.js';
 import type { TaskEndpointRequest, TaskEndpointResponse, TaskWorkerPort } from '../src/task-bridge.js';
 import { TASK_ENDPOINTS } from '../src/task-contracts.js';
-import type { TaskEndpoint, TaskRequest, TaskResponse, TaskStatusResponse, TaskWorkerIdentity } from '../src/task-contracts.js';
+import type { TaskCancelResponse, TaskEndpoint, TaskFinalizeResponse, TaskRequest, TaskResponse, TaskStatusResponse, TaskWorkerIdentity } from '../src/task-contracts.js';
+import { DEFAULTS } from '../src/contracts.js';
+import { CodexBridge } from '../src/codex.js';
 import { event, fixture, thread } from './helpers.js';
 
 export type Fixture = Awaited<ReturnType<typeof fixture>>;
@@ -34,6 +36,8 @@ export class FakeTaskWorker implements TaskWorkerPort {
   finalizeCleans = true;
   statusFails = false;
   statusOverride: Partial<TaskStatusResponse> | undefined;
+  cancelOverride: Partial<TaskCancelResponse> | undefined;
+  finalizeOverride: Partial<TaskFinalizeResponse> | undefined;
   // 제어 호출이 작업자에 닿은 시점에 끼어든다. DB 트랜잭션 밖 네트워크 구간의 경합을 만든다.
   onControl: ((endpoint: TaskEndpoint) => void | Promise<void>) | undefined;
   private readonly sessions = new Map<string, 'waiting' | 'finalized'>();
@@ -58,7 +62,7 @@ export class FakeTaskWorker implements TaskWorkerPort {
     if (endpoint === '/v1/task/cancel') {
       this.cancels.push(body as TaskEndpointRequest<'/v1/task/cancel'>);
       if (this.stopped) this.sessions.set(control.sessionId, 'waiting');
-      return { ...shape, stopped: this.stopped, cleaned: false, cleanupPending: false, sessionRetained: true };
+      return { ...shape, stopped: this.stopped, cleaned: false, cleanupPending: false, sessionRetained: true, ...this.cancelOverride };
     }
     if (endpoint === '/v1/task/status') {
       this.statuses.push(body as TaskEndpointRequest<'/v1/task/status'>);
@@ -69,7 +73,7 @@ export class FakeTaskWorker implements TaskWorkerPort {
     }
     this.finalizes.push(body as TaskEndpointRequest<'/v1/task/finalize'>);
     if (this.finalizeCleans) this.sessions.set(control.sessionId, 'finalized');
-    return { ...shape, stopped: true, cleaned: this.finalizeCleans, cleanupPending: !this.finalizeCleans, sessionRetained: !this.finalizeCleans };
+    return { ...shape, stopped: true, cleaned: this.finalizeCleans, cleanupPending: !this.finalizeCleans, sessionRetained: !this.finalizeCleans, ...this.finalizeOverride };
   }
 }
 export const rejectStart: Script = () => { throw new TaskWorkerRejected(); };
@@ -89,6 +93,10 @@ export async function retainedThenStorageReplaced(local: ReturnType<typeof lane>
 }
 export const hang: Script = (_request, _worker, signal) => new Promise((_resolve, reject) => {
   signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+});
+// 중단 신호를 받으면 그제서야 script의 응답으로 끝나는 실행. 취소 요청과 실행 응답이 겹치는 경우를 만든다.
+export const answerOnAbort = (script: Script): Script => (request, worker, signal) => new Promise(resolve => {
+  signal?.addEventListener('abort', () => resolve(script(request, worker, signal)), { once: true });
 });
 export const PLAN: TaskPlan = { repository: 'fixture-owner/fixture-repo', base: 'b'.repeat(40),
   project: { id: 'fixture', revision: 'r1', allowedPaths: ['src'], forbiddenPaths: [], verifyCommands: [] },
@@ -110,6 +118,34 @@ export async function laneRow(db: Database) {
 export async function task(f: Fixture, db: Database, id = 'task', text = '실패하는 시험을 고쳐줘') {
   await f.ingress.receive(event(id, { kind: 'command', command: 'task', text }));
   return (await jobs(db)).at(-1)!;
+}
+// 작업자 응답을 붙잡아 둔 채 lease가 끝나 다른 루프의 expire가 job을 unknown으로 바꾼 상태. deliver를 부르면 원래 응답이 도착한다.
+export async function expiredWhileWaiting(f: Fixture, db: Database, script: Script) {
+  const local = lane(f, { monitorMs: 3_600_000 });
+  let deliver!: () => void;
+  const held = new Promise<void>(resolve => { deliver = resolve; });
+  local.worker.scripts.push(async (request, worker) => { await held; return script(request, worker); });
+  const job = await task(f, db);
+  const running = local.runtime.tickTask();
+  await until(() => local.worker.executes.length === 1);
+  f.advance(DEFAULTS.leaseMs + 1); f.policy.confirmedAt = f.now();
+  await f.store.expire();
+  return { ...local, job, running, deliver };
+}
+// 013 전이나 Codex 프로필 때 남은 unknown 작업. executor 기본값이 codex다.
+export async function codexSession(f: Fixture, db: Database, sessionState = 'unknown', jobState = 'unknown', id = 'codex-task') {
+  const job = await task(f, db, id);
+  const claimed = (await f.store.claim('task'))!;
+  await db.query(`INSERT INTO codex_sessions(job_id,thread_id,turn,tool_calls,host,capabilities,state,created_at,updated_at)
+    VALUES ($1,'codex-thread',1,0,'worker','{}',$2,$3,$3)`, [job.id, sessionState, f.now()]);
+  await db.query('UPDATE jobs SET state=$2 WHERE id=$1', [job.id, jobState]);
+  return { job, claimed };
+}
+export function codexBridge(f: Fixture, stopped = true) {
+  const confirms: string[] = [];
+  const adapter = { capabilities: () => ({}), execute: async () => { throw new Error('codex_execute_not_expected'); },
+    confirmStop: async (job: string) => { confirms.push(job); return { stopped }; } };
+  return { bridge: new CodexBridge(f.store, f.gate, adapter as never), confirms };
 }
 export const answer = (bridge: ClaudeTaskBridge, question: string, text: string, eventId: string, scope = thread, actor = 'fixture-owner') =>
   bridge.answer({ question, actor, scope, text, event: eventId });

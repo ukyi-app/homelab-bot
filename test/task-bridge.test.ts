@@ -10,7 +10,7 @@ import { Runtime } from '../src/runtime.js';
 import { LaneClosed, Store } from '../src/store.js';
 import { TASK_RETENTION, taskQuestionId } from '../src/task-contracts.js';
 import { event, fixture, localDatabase, thread } from './helpers.js';
-import { ABSENT, FakeTaskWorker, OTHER_STORAGE, PLAN, allRows, answer, control, conversationId, hang, jobs, lane, laneRow, rejectStart, reply, retainedThenStorageReplaced, task, until } from './task-lane-fixture.js';
+import { ABSENT, FakeTaskWorker, OTHER_STORAGE, PLAN, allRows, answer, answerOnAbort, codexBridge, codexSession, control, conversationId, expiredWhileWaiting, hang, jobs, lane, laneRow, rejectStart, reply, retainedThenStorageReplaced, task, until } from './task-lane-fixture.js';
 import type { Fixture } from './task-lane-fixture.js';
 
 // 중립 브리지와 작업 레인 스케줄링. 질문 사례는 test/codex-bridge.test.ts의 TASK-02·AUTH-02와 같은 의미를 Claude 턴으로 본다.
@@ -1070,6 +1070,356 @@ test('리뷰 claim: lanes를 켜면 작업 레인에 막히지 않고 interactiv
   await running;
   assert.equal(await review(true).claim(), undefined);
   assert.equal((await f.store.claim('task'))?.type, 'task');
+});
+test('최종 상태 뒤 늦은 응답: 해제까지 끝난 job에 원래 응답이 도착해도 세션·레인·알림을 되돌리지 않는다', async () => {
+  for (const [name, script] of [['unknown', reply.unknown()], ['completed', reply.completed('늦은 결과')], ['question', reply.question()], ['limited', reply.limited()]] as const) {
+    await database.pg.exec(RESET);
+    const local = await expiredWhileWaiting(f, db(), script);
+    assert.equal((await jobs(db()))[0]!.state, 'unknown', name);
+    const released = await local.bridge.release('fixture-owner', thread, local.job.id);
+    assert.equal(released.ok, true, name);
+    const before = await session();
+    assert.equal(before.state, 'cancelled', name); assert.equal(before.cleanup_state, 'cleaned', name);
+    local.deliver();
+    await local.running;
+    assert.equal((await jobs(db()))[0]!.state, 'cancelled', name);
+    const after = await session();
+    assert.equal(after.state, 'cancelled', name); assert.equal(after.cleanup_state, 'cleaned', name); assert.equal(after.session_retained, false, name);
+    assert.equal((await laneRow(db())).closed_reason, null, name);
+    assert.equal((await rows('results')).length, 0, name); assert.equal((await rows('codex_questions')).length, 0, name);
+    assert.ok(!(await outbox()).some(row => row.idempotency_key === `task-blocked:${local.job.id}`), name);
+    assert.ok((await rows('audit')).some(row => row.kind === 'task_stale_response'), name);
+    assert.ok(!(await rows('controls')).some(row => row.key === 'scheduler' && row.value === true), name);
+    await newTask(`next-${name}`);
+  }
+});
+test('최종 상태 뒤 늦은 응답: /retry로 같은 lease가 남은 queued job을 옛 응답이 건드리지 못한다', async () => {
+  for (const script of [reply.unknown(), reply.completed('옛 결과')]) {
+    await database.pg.exec(RESET);
+    const local = lane(f, { monitorMs: 3_600_000 });
+    let deliver!: () => void;
+    const held = new Promise<void>(resolve => { deliver = resolve; });
+    local.worker.scripts.push(async (request, worker) => { await held; return script(request, worker); });
+    const job = await newTask();
+    const running = local.runtime.tickTask();
+    await until(() => local.worker.executes.length === 1);
+    // 다른 경로가 실패로 끝내고 /retry한 상태. lease_token은 다음 claim 때까지 그대로다.
+    await db().query("UPDATE jobs SET state='failed',wait_reason='fixture',finished_at=$2 WHERE id=$1", [job.id, f.now()]);
+    assert.equal((await control(f, 'retry', job.id)).status, '확인된 실패 작업만 재시도합니다.');
+    const queued = (await jobs(db()))[0]!;
+    assert.equal(queued.state, 'queued'); assert.ok(queued.lease_token);
+    deliver();
+    await running;
+    assert.equal((await jobs(db()))[0]!.state, 'queued');
+    assert.equal((await rows('results')).length, 0);
+    assert.equal((await session()).state, 'running');
+    assert.equal((await laneRow(db())).closed_reason, null);
+  }
+});
+test('최종 상태 뒤 늦은 응답: lease가 끝났지만 아직 해제 전이면 지금처럼 unknown을 유지한다', async () => {
+  const local = await expiredWhileWaiting(f, db(), reply.completed('늦은 결과'));
+  local.deliver();
+  await local.running;
+  assert.equal((await jobs(db()))[0]!.state, 'unknown');
+  assert.equal((await session()).state, 'unknown');
+  assert.equal((await laneRow(db())).closed_reason, 'unknown');
+  assert.equal((await rows('results')).length, 0);
+  assert.equal((await local.bridge.release('fixture-owner', thread, local.job.id)).ok, true);
+  assert.equal((await laneRow(db())).closed_reason, null);
+});
+test('늦은 정리 실패: 다른 인스턴스가 지운 뒤 도착한 실패가 cleaned를 pending으로 되돌리지 않는다', async () => {
+  const local = lane(f, { finalizeRetryMs: 0 });
+  const other = new ClaudeTaskBridge(f.store, f.gate, local.worker, { plan: async () => PLAN }, { monitorMs: 5, stopWaitMs: 50, finalizeRetryMs: 0 });
+  local.worker.statusFails = true;
+  await newTask();
+  await local.runtime.tickTask();
+  assert.equal((await session()).cleanup_state, 'pending');
+  local.worker.statusFails = false;
+  local.worker.onControl = async endpoint => {
+    if (endpoint !== '/v1/task/status') return;
+    local.worker.onControl = undefined;
+    await other.sweep();
+    assert.equal((await session()).cleanup_state, 'cleaned');
+    local.worker.statusFails = true;
+  };
+  await local.bridge.sweep();
+  const row = await session();
+  assert.equal(row.cleanup_state, 'cleaned'); assert.equal(row.session_retained, false);
+  assert.equal((await laneRow(db())).closed_reason, null);
+});
+test('대기 세션의 늦은 정리 확인은 그 사이 재개된 턴의 막힘 표시를 건드리지 않는다', async () => {
+  const local = lane(f, { finalizeRetryMs: 0, monitorMs: 3_600_000 });
+  local.worker.scripts.push(reply.limited('auth_expired', true));
+  const job = await newTask();
+  await local.runtime.tickTask();
+  assert.equal((await session()).cleanup_state, 'pending');
+  local.worker.onControl = async endpoint => {
+    if (endpoint !== '/v1/task/status') return;
+    local.worker.onControl = undefined;
+    await db().query("UPDATE codex_sessions SET state='running',turn=turn+1 WHERE job_id=$1", [job.id]);
+  };
+  await local.bridge.sweep();
+  assert.equal((await session()).cleanup_state, 'pending');
+});
+test('늦은 재개 판단: 상태 확인 사이 lease가 끝나 unknown이 된 job의 세션·질문을 닫지 않는다', async () => {
+  const { question } = await asked();
+  await answer(setup.bridge, question, 'main', 'answer-1');
+  setup.worker.onControl = async endpoint => {
+    if (endpoint !== '/v1/task/status') return;
+    setup.worker.onControl = undefined;
+    f.advance(DEFAULTS.leaseMs + 1); f.policy.confirmedAt = f.now();
+    await f.store.expire();
+  };
+  setup.worker.statusOverride = ABSENT;
+  await setup.runtime.tickTask();
+  assert.equal((await jobs(db()))[0]!.state, 'unknown');
+  assert.equal((await session()).state, 'waiting_answer');
+  assert.equal((await rows('codex_questions'))[0]!.state, 'answered');
+  assert.equal(setup.worker.executes.length, 1);
+});
+test('취소·실행 결과 합치기: 실행 응답이 unknown이어도 같은 작업자·세대의 취소가 소멸을 확인하면 그 값을 쓴다', async () => {
+  const stopHow: Record<string, () => Promise<unknown>> = {
+    cancel: async () => { await control(f, 'cancel', (await jobs(db()))[0]!.id); },
+    revoked: async () => { f.policy.owner = 'replacement'; },
+  };
+  for (const [name, stop] of Object.entries(stopHow)) {
+    await database.pg.exec(RESET);
+    f.policy.owner = 'fixture-owner';
+    const local = lane(f);
+    local.worker.scripts.push(answerOnAbort(reply.unknown()));
+    const job = await newTask(`merge-${name}`);
+    const running = local.runtime.tickTask();
+    await until(() => local.worker.executes.length === 1);
+    await stop();
+    await running;
+    const current = (await jobs(db()))[0]!;
+    assert.equal(current.state, 'cancelled', name);
+    assert.equal(current.wait_reason, name === 'cancel' ? 'stop_confirmation' : 'authorization_revoked', name);
+    assert.equal((await session()).state, 'cancelled', name);
+    assert.equal(local.worker.cancels.length, 1, name);
+    assert.deepEqual((await session()).worker_storage, local.worker.identity.storage, name);
+    assert.equal((await laneRow(db())).closed_reason, null, name);
+    assert.ok(!(await outbox()).some(row => row.idempotency_key === `task-blocked:${job.id}`), name);
+  }
+  f.policy.owner = 'fixture-owner';
+});
+test('취소·실행 결과 합치기: 시간 초과·종료도 소멸 확인이면 failed이고, 취소 응답을 기다린 뒤 판정한다', async () => {
+  const slow = lane(f, { stopWaitMs: 5000 });
+  let answerCancel!: () => void;
+  const held = new Promise<void>(resolve => { answerCancel = resolve; });
+  let reached = false;
+  slow.worker.onControl = async endpoint => { if (endpoint === '/v1/task/cancel') { reached = true; await held; } };
+  slow.worker.scripts.push(answerOnAbort(reply.unknown()));
+  const first = await newTask('timeout');
+  await db().query(`UPDATE jobs SET budget=jsonb_set(budget,'{timeoutMs}','20') WHERE id=$1`, [first.id]);
+  const running = slow.runtime.tickTask();
+  await until(() => reached);
+  // 실행 응답은 이미 왔다. 취소 응답 전에는 어느 쪽으로도 확정하지 않는다.
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal((await jobs(db()))[0]!.state, 'running');
+  answerCancel();
+  await running;
+  assert.equal((await jobs(db()))[0]!.state, 'failed'); assert.equal((await jobs(db()))[0]!.wait_reason, 'task_timeout');
+  assert.equal((await session()).state, 'failed');
+  await database.pg.exec(RESET);
+  const stopSignal = new AbortController();
+  const worker = new FakeTaskWorker();
+  const bridge = new ClaudeTaskBridge(f.store, f.gate, worker, { plan: async () => PLAN }, { monitorMs: 5, stopWaitMs: 50, drainMs: 5, shutdown: stopSignal.signal });
+  const runtime = new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, bridge, { taskLoop: true, shutdown: stopSignal.signal });
+  worker.scripts.push(answerOnAbort(reply.unknown()));
+  await newTask('shutdown');
+  const stopping = runtime.tickTask();
+  await until(() => worker.executes.length === 1);
+  stopSignal.abort();
+  await stopping;
+  assert.equal((await jobs(db()))[0]!.state, 'failed'); assert.equal((await jobs(db()))[0]!.wait_reason, 'task_shutdown');
+});
+test('취소·실행 결과 합치기: 소멸을 못 보거나 다른 작업자·세대의 취소면 unknown을 유지하고, 중단이 없으면 취소를 보내지 않는다', async () => {
+  const other = { instance: '00000000-0000-4000-8000-00000000beef', storage: OTHER_STORAGE };
+  const cases: [string, (worker: FakeTaskWorker) => void][] = [
+    ['not_stopped', worker => { worker.stopped = false; }],
+    ['other_worker', worker => { worker.cancelOverride = { worker: other }; }],
+    ['other_instance', worker => { worker.cancelOverride = { worker: { ...worker.identity, instance: other.instance } }; }],
+    ['other_generation', worker => { worker.cancelOverride = { generation: 7 }; }],
+    ['other_session', worker => { worker.cancelOverride = { sessionId: other.instance }; }],
+    ['other_lease', worker => { worker.cancelOverride = { lease: other.instance }; }],
+    ['other_job', worker => { worker.cancelOverride = { job: other.instance }; }],
+    ['broken', worker => { worker.onControl = () => { throw new Error('cancel_down'); }; }],
+  ];
+  for (const [name, arrange] of cases) {
+    await database.pg.exec(RESET);
+    const local = lane(f);
+    arrange(local.worker);
+    local.worker.scripts.push(answerOnAbort(reply.unknown()));
+    const job = await newTask(`keep-${name}`);
+    const running = local.runtime.tickTask();
+    await until(() => local.worker.executes.length === 1);
+    await control(f, 'cancel', job.id);
+    await running;
+    assert.equal((await jobs(db()))[0]!.state, 'unknown', name);
+    assert.equal((await session()).state, 'unknown', name);
+    assert.equal((await laneRow(db())).closed_reason, 'unknown', name);
+  }
+  await database.pg.exec(RESET);
+  const quiet = lane(f);
+  quiet.worker.scripts.push(reply.unknown());
+  await newTask('no-stop');
+  await quiet.runtime.tickTask();
+  assert.equal((await jobs(db()))[0]!.state, 'unknown');
+  assert.equal(quiet.worker.cancels.length, 0);
+});
+test('취소·실행 결과 합치기: 응답을 잃은 경로도 다른 세대의 취소 응답을 소멸 증명으로 쓰지 않는다', async () => {
+  const local = lane(f);
+  local.worker.cancelOverride = { generation: 7 };
+  local.worker.scripts.push(hang);
+  const job = await newTask();
+  const running = local.runtime.tickTask();
+  await until(() => local.worker.executes.length === 1);
+  await control(f, 'cancel', job.id);
+  await running;
+  assert.equal((await jobs(db()))[0]!.state, 'unknown');
+});
+test('제어 응답 대조: 다른 세대·세션·lease의 status·finalize·해제 cancel은 근거로 쓰지 않는다', async () => {
+  const id = '00000000-0000-4000-8000-00000000beef';
+  // 재개 전 상태 확인. 어긋난 응답은 끊긴 것과 같아 대기열로 되돌리고 재개하지 않는다.
+  const { question } = await asked();
+  await answer(setup.bridge, question, 'main', 'a-1');
+  setup.worker.statusOverride = { generation: 7 };
+  await setup.runtime.tickTask();
+  assert.equal(setup.worker.executes.length, 1);
+  assert.equal((await jobs(db()))[0]!.wait_reason, 'task_worker_unavailable');
+  // 정리: 다른 세션의 finalized·finalize 응답으로 지운 것으로 치지 않는다.
+  for (const override of [{ sessionId: id, state: 'finalized' as const, sessionExists: false, stopped: true, turn: null }, { lease: id, state: 'absent' as const, sessionExists: false, stopped: true, turn: null }]) {
+    await database.pg.exec(RESET);
+    const second = lane(f, { finalizeRetryMs: 0 });
+    second.worker.statusOverride = override;
+    await newTask('echo');
+    await second.runtime.tickTask();
+    assert.equal((await session()).session_retained, true);
+    assert.equal((await session()).cleanup_state, 'pending');
+    assert.equal((await laneRow(db())).closed_reason, 'cleanup_pending');
+  }
+  await database.pg.exec(RESET);
+  const finalizing = lane(f, { finalizeRetryMs: 0 });
+  finalizing.worker.finalizeOverride = { generation: 7 };
+  await newTask('finalize-echo');
+  await finalizing.runtime.tickTask();
+  assert.equal((await session()).session_retained, true);
+  assert.equal((await session()).cleanup_state, 'pending');
+  // 해제: 다른 세대의 cancel 응답으로 풀지 않는다.
+  await database.pg.exec(RESET);
+  const blocked = lane(f);
+  blocked.worker.scripts.push(reply.unknown());
+  const unknownJob = await newTask('release-echo');
+  await blocked.runtime.tickTask();
+  blocked.worker.cancelOverride = { generation: 7 };
+  assert.equal((await blocked.bridge.release('fixture-owner', thread, unknownJob.id)).ok, false);
+  assert.equal((await jobs(db()))[0]!.state, 'unknown');
+});
+test('해제 CAS: 소멸 확인 사이 새 lease·세대로 넘어간 작업은 옛 확인으로 풀지 않는다', async () => {
+  const local = lane(f);
+  local.worker.scripts.push(reply.unknown());
+  const job = await newTask();
+  await local.runtime.tickTask();
+  const lease = '00000000-0000-4000-8000-00000000abcd';
+  const sid = '00000000-0000-4000-8000-00000000abce';
+  local.worker.onControl = async endpoint => {
+    if (endpoint !== '/v1/task/cancel') return;
+    local.worker.onControl = undefined;
+    await db().query('UPDATE jobs SET lease_token=$2 WHERE id=$1', [job.id, lease]);
+    await db().query("UPDATE codex_sessions SET state='running',generation=2,claude_session_id=$2,thread_id=$2,worker_lease=$3 WHERE job_id=$1", [job.id, sid, lease]);
+  };
+  const released = await local.bridge.release('fixture-owner', thread, job.id);
+  assert.equal(released.ok, false);
+  assert.equal((await jobs(db()))[0]!.state, 'unknown');
+  assert.equal((await session()).state, 'running');
+  assert.equal((await session()).claude_session_id, sid);
+});
+test('executor 구분: Claude 해제는 Codex 세션을 실행 전 작업으로 보지 않고 거부하고, Codex 해제 경로는 소멸 확인 뒤 푼다', async () => {
+  const { job } = await codexSession(f, db());
+  const denied = await setup.bridge.release('fixture-owner', thread, job.id);
+  assert.equal(denied.ok, false);
+  assert.equal(setup.worker.cancels.length, 0);
+  assert.equal((await jobs(db()))[0]!.state, 'unknown');
+  const row = await session();
+  assert.equal(row.state, 'unknown'); assert.equal(row.executor, 'codex');
+  assert.ok(!(await rows('audit')).some(a => a.kind === 'task_unknown_released'));
+  const refused = codexBridge(f, false);
+  assert.equal((await refused.bridge.release('fixture-owner', thread, job.id)).ok, false);
+  assert.equal(refused.confirms.length, 1);
+  assert.equal((await jobs(db()))[0]!.state, 'unknown');
+  const codex = codexBridge(f);
+  assert.equal((await codex.bridge.release('fixture-owner', thread, job.id)).ok, true);
+  assert.deepEqual(codex.confirms, [job.id]);
+  assert.equal((await jobs(db()))[0]!.state, 'cancelled');
+});
+test('executor 구분: 세션 상태가 unknown이 아니어도, 질문이 있어도 Codex 세션은 건드리지 않는다', async () => {
+  const { job } = await codexSession(f, db(), 'waiting_answer');
+  await db().query(`INSERT INTO codex_questions(id,job_id,conversation_id,thread_id,turn,kind,responder_id,prompt,state,created_at,expires_at)
+    VALUES ('codex-q',$1,$2,'codex-thread',1,'clarification','fixture-owner','질문','open',$3,$4)`, [job.id, conversationId(f), f.now(), f.now() + 60_000]);
+  assert.equal((await setup.bridge.release('fixture-owner', thread, job.id)).ok, false);
+  assert.equal((await session()).state, 'waiting_answer');
+  assert.equal((await rows('codex_questions'))[0]!.state, 'open');
+});
+test('executor 구분: Codex 해제 경로는 Claude 세션을 풀지 않는다', async () => {
+  const local = lane(f);
+  local.worker.scripts.push(reply.unknown());
+  const job = await newTask();
+  await local.runtime.tickTask();
+  const codex = codexBridge(f);
+  assert.equal((await codex.bridge.release('fixture-owner', thread, job.id)).ok, false);
+  assert.equal(codex.confirms.length, 0);
+  assert.equal((await jobs(db()))[0]!.state, 'unknown');
+  assert.equal((await session()).state, 'unknown');
+});
+test('executor 구분: 다른 실행기 세션의 재시도를 덮어쓰지 않고 실패로 끝낸다', async () => {
+  const { job } = await codexSession(f, db(), 'failed', 'failed');
+  await db().query('UPDATE jobs SET lease_token=NULL,lease_until=NULL WHERE id=$1', [job.id]);
+  await control(f, 'retry', job.id);
+  await setup.runtime.tickTask();
+  assert.equal(setup.worker.executes.length, 0);
+  assert.equal((await jobs(db()))[0]!.state, 'failed'); assert.equal((await jobs(db()))[0]!.wait_reason, 'task_session_mismatch');
+  const row = await session();
+  assert.equal(row.executor, 'codex'); assert.equal(row.thread_id, 'codex-thread'); assert.equal(row.claude_session_id, null);
+  // Codex 경로도 Claude 세션을 잇지 않는다. 보존 기록을 덮지 않는다.
+  await database.pg.exec(RESET);
+  const local = lane(f);
+  local.worker.statusFails = true;
+  const failed = await newTask('claude-retained');
+  local.worker.scripts.push(reply.failed());
+  await local.runtime.tickTask();
+  const before = await session();
+  assert.equal(before.session_retained, true);
+  const codex = codexBridge(f);
+  await control(f, 'retry', failed.id);
+  // 작업 루프를 끈 Codex 배치는 레인 닫힘을 보지 않고 슬롯 하나로 집는다.
+  const claimed = (await f.store.claim())!;
+  await codex.bridge.run(claimed);
+  assert.equal((await jobs(db()))[0]!.state, 'failed'); assert.equal((await jobs(db()))[0]!.wait_reason, 'task_session_mismatch');
+  const after = await session();
+  assert.equal(after.executor, 'claude'); assert.equal(after.claude_session_id, before.claude_session_id); assert.equal(after.session_retained, true);
+});
+test('executor 구분: unknown 안내는 자기 실행기 작업에만 넣고, 다른 실행기의 질문에는 답을 받지 않는다', async () => {
+  const { job } = await codexSession(f, db());
+  await setup.bridge.sweep();
+  assert.ok(!(await outbox()).some(row => row.idempotency_key === `task-blocked:${job.id}`));
+  assert.equal((await laneRow(db())).closed_reason, null);
+  const codex = codexBridge(f);
+  await codex.bridge.sweep();
+  assert.ok((await outbox()).some(row => row.idempotency_key === `codex-blocked:${job.id}`));
+  await database.pg.exec(RESET);
+  const waiting = await codexSession(f, db(), 'waiting_answer', 'waiting_user');
+  await db().query(`UPDATE jobs SET wait_reason='clarification' WHERE id=$1`, [waiting.job.id]);
+  await db().query(`INSERT INTO codex_questions(id,job_id,conversation_id,thread_id,turn,kind,responder_id,prompt,state,created_at,expires_at)
+    VALUES ('codex-q',$1,$2,'codex-thread',1,'clarification','fixture-owner','질문','open',$3,$4)`, [waiting.job.id, conversationId(f), f.now(), f.now() + 60_000]);
+  assert.equal((await answer(setup.bridge, 'codex-q', 'main', 'foreign-1')).ok, false);
+  assert.equal((await rows('codex_questions'))[0]!.state, 'open');
+  assert.equal((await jobs(db()))[0]!.state, 'waiting_user');
+  assert.equal((await codexBridge(f).bridge.answer({ question: 'codex-q', actor: 'fixture-owner', scope: thread, text: 'main', event: 'own-1' })).ok, true);
+  await database.pg.exec(RESET);
+  const { question } = await asked();
+  assert.equal((await codexBridge(f).bridge.answer({ question, actor: 'fixture-owner', scope: thread, text: 'main', event: 'foreign-2' })).ok, false);
+  assert.equal((await rows('codex_questions'))[0]!.state, 'open');
 });
 test('잠금 순서: 세션·질문을 쓰는 경로가 대화 행 → scheduler 행 → 레인 행 순서를 지킨다', async () => {
   const sequence: string[][] = [];

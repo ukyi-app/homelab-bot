@@ -21,8 +21,9 @@ export class TaskWorkerRejected extends Error {
 }
 
 export interface TaskBridgeOptions { questionTtlMs: number; answerChars: number }
-// 실행기마다 다른 안내 문구와 멱등 키·감사 접두사.
+// 실행기마다 다른 안내 문구와 멱등 키·감사 접두사. executor는 이 브리지가 맡는 세션의 codex_sessions.executor 값이다.
 export interface TaskBridgeText {
+  executor: 'codex' | 'claude';
   prefix: string;
   question: string;
   accepted: string;
@@ -31,6 +32,7 @@ export interface TaskBridgeText {
 export interface TaskAnswerInput { question: string; actor: string; scope: Scope; text: string; event: string }
 export interface TaskAnswerResult { ok: boolean; status: string; duplicate?: boolean }
 export interface TaskStatus { state: string; waitReason: string | null; session: boolean; question: { id: string; expiresAt: number } | null }
+export const FOREIGN_SESSION_STATUS = '다른 실행기의 세션을 가진 작업입니다. 그 실행기의 경로로만 답하거나 해제할 수 있습니다.';
 interface Question {
   id: string; job_id: string; conversation_id: string; thread_id: string; turn: number; responder_id: string;
   state: string; expires_at: number; answer: string | null; answer_event: string | null;
@@ -38,6 +40,10 @@ interface Question {
 export abstract class TaskBridge {
   protected constructor(protected readonly store: Store, protected readonly gate: PolicyGate,
     protected readonly text: TaskBridgeText, protected readonly questions: TaskBridgeOptions) {}
+  // 세션은 실행기마다 작업자가 달라 소멸 확인·재개를 대신할 수 없다. 세션이 아직 없으면 어느 실행기의 것도 아니다.
+  protected async foreignSession(jobId: string, db = this.store.db): Promise<boolean> {
+    return (await db.query('SELECT 1 FROM codex_sessions WHERE job_id=$1 AND executor<>$2', [jobId, this.text.executor])).rows.length > 0;
+  }
   // 실행 중 감시. 취소 요청·철회·lease 상실이면 멈출 이유를 돌려준다. 정책을 잠시 못 읽는 것만으로는 멈추지 않는다.
   protected async check(job: Job): Promise<'cancel' | 'revoked' | 'lease' | undefined> {
     const row = (await this.store.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0];
@@ -101,6 +107,7 @@ export abstract class TaskBridge {
     if (!q) return { ok: false, status: '질문을 찾을 수 없습니다.' };
     if (q.conversation_id !== store.scopeId(input.scope) || q.responder_id !== input.actor || q.owner_id !== input.actor) throw new Denied();
     if (q.answer_event === input.event) return { ok: true, duplicate: true, status: '이미 받은 답입니다.' };
+    if (await this.foreignSession(q.job_id, store.db)) return { ok: false, status: FOREIGN_SESSION_STATUS };
     if (q.state !== 'open') return { ok: false, status: '이미 답했거나 닫힌 질문입니다. 지금 열린 질문의 ID를 확인하세요.' };
     if (store.now() >= Number(q.expires_at)) {
       await this.close(store, q, 'expired');
@@ -130,10 +137,11 @@ export abstract class TaskBridge {
       scope: job.target, revision: job.revision.policy, payload: { kind: 'message', channel: job.target.channel,
         classification: 'safe_summary', content: `질문 ${q.id}의 답 기한이 지나 작업을 멈췄습니다(cancelled). 답 없이 진행하지 않습니다. 필요하면 새 작업으로 다시 요청하세요.` } });
   }
-  // lease 만료·기록 실패 등 settle 밖에서 생긴 unknown도 알림 없이 두지 않는다.
+  // lease 만료·기록 실패 등 settle 밖에서 생긴 unknown도 알림 없이 두지 않는다. 안내의 해제 방법이 실행기마다 달라 자기 세션의 작업만 알린다.
   protected async unknownNotices(): Promise<number> {
     const silent = (await this.store.db.query<Job>(`SELECT * FROM jobs j WHERE j.type='task' AND j.state='unknown'
-      AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.idempotency_key=$1 || j.id)`, [`${this.text.prefix}-blocked:`])).rows;
+      AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.idempotency_key=$1 || j.id)
+      AND NOT EXISTS (SELECT 1 FROM codex_sessions s WHERE s.job_id=j.id AND s.executor<>$2)`, [`${this.text.prefix}-blocked:`, this.text.executor])).rows;
     for (const job of silent) await this.blocked(job, job.revision.policy);
     return silent.length;
   }

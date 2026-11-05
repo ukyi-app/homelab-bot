@@ -1110,7 +1110,9 @@ test('N4 옛 009로 만든 DB에 현재 009를 다시 적용하면 열·상태 �
         VALUES ($1,'old-thread',1,'worker','{}','waiting_answer',0,0)`, [job.id]);
       await old.pg.exec(await readFile('migrations/009_codex_bridge.sql', 'utf8'));
       await old.pg.exec(await readFile('migrations/009_codex_bridge.sql', 'utf8'));
-      const columns = (await old.db.query<{ column_name: string }>(`SELECT column_name FROM information_schema.columns
+      // 표를 지웠으므로 뒤 번호가 더한 열도 다시 올린다. 실제 배포에서는 migrate가 끝까지 적용한다.
+      for (const later of ['013_task_lane.sql', '015_task_wait_reason.sql']) await old.pg.exec(await readFile(`migrations/${later}`, 'utf8'));
+      const columns =(await old.db.query<{ column_name: string }>(`SELECT column_name FROM information_schema.columns
         WHERE table_name='codex_sessions'`)).rows.map(row => row.column_name);
       assert.ok(columns.includes('tool_calls') && columns.includes('repository'), commit);
       await old.db.query("UPDATE codex_sessions SET state='waiting_model' WHERE job_id=$1", [job.id]);

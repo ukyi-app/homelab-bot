@@ -6,10 +6,10 @@ import type { Policy, PolicyGate } from './policy.js';
 import { DRAIN_MS } from './runtime.js';
 import type { TaskLane } from './runtime.js';
 import type { Store } from './store.js';
-import { TaskBridge, TaskWorkerRejected } from './task-bridge.js';
+import { FOREIGN_SESSION_STATUS, TaskBridge, TaskWorkerRejected } from './task-bridge.js';
 import type { TaskStatus, TaskWorkerPort } from './task-bridge.js';
 import { TASK_ENDPOINTS, TASK_INSTRUCTIONS_REVISION, TASK_LIMITS, TASK_RETENTION, taskQuestionId } from './task-contracts.js';
-import type { TaskCancelResponse, TaskRequest, TaskResponse, TaskWorkerIdentity } from './task-contracts.js';
+import type { TaskCancelResponse, TaskRequest, TaskResponse, TaskStatusResponse, TaskWorkerIdentity } from './task-contracts.js';
 
 // 작업 레인(Claude)의 게시 서버 쪽 턴 조율. 한 run이 /v1/task 한 번, 곧 한 턴이다. 작업자 호출은 TaskWorkerPort로만 한다.
 // 결과는 프로세스 소멸 확인을 전제로만 확정하고, 확인을 못 하면 unknown으로 두어 작업 레인의 새 접수를 닫는다.
@@ -43,7 +43,7 @@ type Turn = { kind: 'response'; response: TaskResponse } | { kind: 'rejected' } 
 type CancelFacts = Pick<TaskCancelResponse, 'stopped' | 'cleanupPending' | 'sessionRetained' | 'worker'>;
 interface Facts { stopped: boolean; retained: boolean | null; cleanupPending: boolean; worker: TaskWorkerIdentity | null; tools: number | null }
 const TEXT = Object.freeze({
-  prefix: 'task', question: '작업 질문', accepted: '답을 받았습니다. 같은 세션을 이어서 실행합니다.',
+  executor: 'claude' as const, prefix: 'task', question: '작업 질문', accepted: '답을 받았습니다. 같은 세션을 이어서 실행합니다.',
   blocked: (job: string) => `작업 ${job}의 프로세스 종료를 확인하지 못했습니다(unknown). 다시 실행하지 않고 작업 레인의 새 접수를 닫았습니다. 대화·리뷰는 계속 동작합니다. 작업자 프로세스 0개를 확인한 뒤 /task-release target:${job} 로 해제하세요.`,
 });
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -53,6 +53,17 @@ const sameWorker = (expected: TaskWorkerIdentity | null, actual: TaskWorkerIdent
 // 같은 저장소면 파드 교체만 따라간다. 인자는 text로 캐스팅할 SQL 자리표시자다.
 const bindWorker = (instance: string, storage: string) => `worker_instance=CASE WHEN worker_storage IS NULL OR worker_storage=${storage}::text
   THEN COALESCE(${instance}::text,worker_instance) ELSE worker_instance END,worker_storage=COALESCE(worker_storage,${storage}::text)`;
+interface ControlTarget { job: string; lease: string; generation: number; sessionId: string }
+// 제어 응답은 물어본 job·lease·세대·세션의 것일 때만 근거가 된다. 다른 세대의 stopped·finalized를 받으면 이 세대의 소멸 증명으로 둔갑한다.
+const echoed = <T extends ControlTarget>(asked: ControlTarget, response: T): T => {
+  if (response.job !== asked.job || response.lease !== asked.lease || response.generation !== asked.generation || response.sessionId !== asked.sessionId) throw new Error('task_control_mismatch');
+  return response;
+};
+// 실행이 끝났을 수 있는 job. release는 lease를 바꾸지 않고 /retry도 다음 claim까지 같은 lease를 남겨 lease만으로는 늦은 응답을 가려내지 못한다.
+const HELD = new Set(['running', 'verifying', 'cancel_requested']);
+const SETTLEABLE = new Set([...HELD, 'unknown']);
+const sameSession = (a: SessionRow | undefined, b: SessionRow | undefined) => a?.executor === b?.executor && a?.generation === b?.generation
+  && a?.claude_session_id === b?.claude_session_id && a?.worker_lease === b?.worker_lease;
 
 export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
   private readonly options: ClaudeTaskBridgeOptions;
@@ -95,10 +106,13 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     } finally { clearInterval(keepalive); }
     await this.dispatch(job, request, revision);
   }
-  // 읽어 둔 세션 상태가 그대로일 때만 job을 정리한다. 그 사이 다른 실행이 턴을 시작했으면 그 실행의 job을 건드리지 않는다.
+  // 이 실행이 아직 job을 쥐고 있고 읽어 둔 세션 상태가 그대로일 때만 job을 정리한다. 그 사이 lease가 끝났거나 다른 실행이 턴을 시작했으면 어떤 행도 건드리지 않는다.
   private async unchanged(job: Job, session: SessionRow | undefined, act: (store: Store) => Promise<unknown>): Promise<void> {
     await this.store.atomic(async store => {
       await store.db.query('SELECT id FROM conversations WHERE id=$1 FOR UPDATE', [job.conversation_id]);
+      const held = (await store.db.query<{ state: string; lease_token: string; lease_until: string }>(
+        'SELECT state,lease_token,lease_until FROM jobs WHERE id=$1 FOR UPDATE', [job.id])).rows[0];
+      if (!held || held.lease_token !== job.lease_token || Number(held.lease_until) <= store.now() || !HELD.has(held.state)) return;
       const now = (await store.db.query<{ state: string; turn: number }>('SELECT state,turn FROM codex_sessions WHERE job_id=$1 FOR UPDATE', [job.id])).rows[0];
       if (session ? now?.state !== session.state || now.turn !== session.turn : !!now) return;
       await act(store);
@@ -109,13 +123,14 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
   }
   // 이번 턴의 요청을 만든다. 띄우지 않기로 했으면 job을 정리하고 undefined.
   private async prepare(job: Job, policy: Policy, session: SessionRow | undefined): Promise<TaskRequest | undefined> {
+    // 다른 실행기의 세션은 잇지도 덮지도 않는다. 행은 그 실행기의 경로가 닫게 둔다.
+    if (session && session.executor !== 'claude') { await this.unchanged(job, session, store => store.fail(job, 'task_session_mismatch')); return; }
     const event = (await this.store.db.query<{ payload: { text: string } }>('SELECT payload FROM events WHERE id=$1', [job.event_id])).rows[0]!;
     const plan = await this.plans.plan(job, policy, event.payload.text);
     const waiting = session?.state === 'waiting_answer' || session?.state === 'waiting_model';
-    if (session && session.executor !== 'claude' && waiting) { await this.giveUp(job, session, 'task_session_mismatch'); return; }
     if (!waiting) {
       // 앞 세대가 아직 지워지지 않았으면 새 세대를 시작하지 않는다. 보존 칸을 넘기고 옛 공간의 흔적을 잃는다. sweep이 지우면 다시 집힌다.
-      if (session?.executor === 'claude' && (session.session_retained || session.cleanup_state === 'pending')) {
+      if (session && (session.session_retained || session.cleanup_state === 'pending')) {
         await this.unchanged(job, session, store => store.defer(job, 'task_finalize_pending'));
         return;
       }
@@ -131,7 +146,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     // 재개 전에 세션 공간과 이전 턴 소멸을 작업자에게 확인한다. 파드만 바뀌었으면(같은 저장소) 그 identity로 잇는다.
     let status;
     try {
-      status = TASK_ENDPOINTS['/v1/task/status'].response.parse(await this.worker.call('/v1/task/status', this.control(job.id, claude, null)));
+      status = await this.statusOf(job.id, claude);
     } catch (error) {
       if (error instanceof TaskWorkerRejected) { await this.giveUp(job, claude, 'task_session_mismatch'); return; }
       await this.unchanged(job, claude, store => store.defer(job, 'task_worker_unavailable'));
@@ -182,7 +197,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
           executor='claude',claude_session_id=$2,generation=$6,worker_lease=$7,base_sha=$8,policy_revision=$9,project_id=$10,project_revision=$11,
           turn_timeout_ms=$12,run_budget_ms=$13,run_used_ms=0,stopped=NULL,session_retained=true,cleanup_state='none',waiting_since=NULL,
           owner_confirm_requested_at=NULL,wait_reason=NULL,worker_instance=NULL,worker_storage=NULL
-          WHERE codex_sessions.state NOT IN ('running','waiting_answer','waiting_model','unknown')
+          WHERE codex_sessions.executor='claude' AND codex_sessions.state NOT IN ('running','waiting_answer','waiting_model','unknown')
           AND NOT codex_sessions.session_retained AND codex_sessions.cleanup_state<>'pending' RETURNING job_id`,
         [job.id, request.sessionId, request.repository, JSON.stringify({ version: 1, lane: 'task', tool_approval_relay: false }), now,
           request.generation, request.lease, request.base, request.policyRevision, request.project.id, request.project.revision,
@@ -264,7 +279,12 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
   private async factsOf(turn: Turn, request: TaskRequest, cancel?: () => Promise<CancelFacts | null>): Promise<Facts> {
     if (turn.kind === 'response') {
       const r = turn.response;
-      return { stopped: r.stopped, retained: r.sessionRetained, cleanupPending: r.cleanupPending, worker: r.worker, tools: r.usage.toolCalls };
+      const own: Facts = { stopped: r.stopped, retained: r.sessionRetained, cleanupPending: r.cleanupPending, worker: r.worker, tools: r.usage.toolCalls };
+      if (r.stopped) return own;
+      // 실행 응답은 소멸을 못 봤어도 이미 보낸 취소가 봤을 수 있다. 첫 턴의 취소는 작업자를 지정하지 못해 그 턴을 띄운 작업자의 답인지 여기서 맞춘다.
+      const facts = await cancel?.();
+      if (!facts?.stopped || !sameWorker(r.worker, facts.worker)) return own;
+      return { ...own, stopped: true, retained: facts.sessionRetained, cleanupPending: r.cleanupPending || facts.cleanupPending };
     }
     // 시작하지 않았으면 새 세션은 없고 재개 세션은 그대로 있다.
     if (turn.kind === 'rejected') return { stopped: true, retained: request.operation === 'resume' ? true : false, cleanupPending: false, worker: null, tools: 0 };
@@ -280,15 +300,19 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
   private control(job: string, session: SessionRow, expectedWorker: TaskWorkerIdentity | null) {
     return { version: 1 as const, job, lease: session.worker_lease!, generation: session.generation!, sessionId: session.claude_session_id!, expectedWorker };
   }
+  private async statusOf(job: string, session: SessionRow): Promise<TaskStatusResponse> {
+    const body = this.control(job, session, null);
+    return echoed(body, TASK_ENDPOINTS['/v1/task/status'].response.parse(await this.worker.call('/v1/task/status', body)));
+  }
+  private async cancelOf(body: ControlTarget & { version: 1; expectedWorker: TaskWorkerIdentity | null }): Promise<TaskCancelResponse> {
+    return echoed(body, TASK_ENDPOINTS['/v1/task/cancel'].response.parse(await this.worker.call('/v1/task/cancel', TASK_ENDPOINTS['/v1/task/cancel'].request.parse(body))));
+  }
   // 소멸 확인. 작업자가 답하지 않거나 그 턴을 띄운 작업자가 아니면 확인하지 못한 것이다.
-  private async cancelTurn(body: { version: 1; job: string; lease: string; generation: number; sessionId: string; expectedWorker: TaskWorkerIdentity | null }): Promise<CancelFacts | null> {
+  private async cancelTurn(body: ControlTarget & { version: 1; expectedWorker: TaskWorkerIdentity | null }): Promise<CancelFacts | null> {
     let wait: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([
-        this.worker.call('/v1/task/cancel', TASK_ENDPOINTS['/v1/task/cancel'].request.parse(body)).then(raw => {
-          const response = TASK_ENDPOINTS['/v1/task/cancel'].response.parse(raw);
-          return sameWorker(body.expectedWorker, response.worker) ? response : null;
-        }),
+        this.cancelOf(body).then(response => sameWorker(body.expectedWorker, response.worker) ? response : null),
         new Promise<null>(resolve => { wait = setTimeout(() => resolve(null), this.options.stopWaitMs); }),
       ]);
     } catch { return null; } finally { clearTimeout(wait); }
@@ -299,15 +323,15 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       await store.lockTaskControl(job.conversation_id);
       const row = (await store.db.query<{ state: string; lease_token: string; lease_until: string }>(
         'SELECT state,lease_token,lease_until FROM jobs WHERE id=$1 FOR UPDATE', [job.id])).rows[0]!;
-      // 다른 실행이 넘겨받았으면 이 응답은 어떤 행도 바꾸지 못한다. 세션 갱신도 lease로 막힌다.
-      if (row.lease_token !== job.lease_token) { await store.audit('task_stale_response', job.id, { generation: request.generation, turn: request.turn }); return false; }
+      // 다른 실행이 넘겨받았거나 이미 확정됐으면 이 응답은 어떤 행도 바꾸지 못한다. 해제까지 끝난 세션을 unknown으로 덮으면 레인이 다시 닫힌다.
+      if (row.lease_token !== job.lease_token || !SETTLEABLE.has(row.state)) { await store.audit('task_stale_response', job.id, { generation: request.generation, turn: request.turn }); return false; }
       const session = async (state: string, wait: { reason: 'model_limit' | 'auth_expired' } | null = null) => {
         await store.db.query(`UPDATE codex_sessions SET state=$2,updated_at=$3,run_used_ms=run_used_ms+$4,
           tool_calls=CASE WHEN $5::integer IS NULL OR tool_calls IS NULL THEN NULL ELSE tool_calls+$5::integer END,
           ${bindWorker('$6', '$7')},stopped=$8,
           session_retained=COALESCE($9,session_retained),cleanup_state=CASE WHEN $10::boolean THEN 'pending' ELSE cleanup_state END,
           wait_reason=$11,waiting_since=$12,owner_confirm_requested_at=NULL
-          WHERE job_id=$1 AND worker_lease=$13 AND generation=$14 AND claude_session_id=$15`,
+          WHERE job_id=$1 AND state='running' AND worker_lease=$13 AND generation=$14 AND claude_session_id=$15`,
         [job.id, state, store.now(), Math.max(0, usedMs), facts.tools, facts.worker?.instance ?? null, facts.worker?.storage ?? null, facts.stopped ? true : null,
           facts.retained, facts.cleanupPending, wait?.reason ?? null, wait ? store.now() : null, request.lease, request.generation, request.sessionId]);
       };
@@ -399,7 +423,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       await this.store.atomic(async store => {
         await store.lockTaskControl(row.conversation_id);
         await store.db.query(`UPDATE codex_sessions s SET state='cancelled',updated_at=$2,wait_reason=NULL,waiting_since=NULL FROM jobs j
-          WHERE s.job_id=$1 AND j.id=s.job_id AND s.state IN ('running','waiting_answer','waiting_model') AND j.state IN ('succeeded','failed','cancelled','superseded')`, [row.job_id, store.now()]);
+          WHERE s.job_id=$1 AND s.executor='claude' AND j.id=s.job_id AND s.state IN ('running','waiting_answer','waiting_model') AND j.state IN ('succeeded','failed','cancelled','superseded')`, [row.job_id, store.now()]);
         await store.db.query("UPDATE codex_questions SET state='cancelled' WHERE job_id=$1 AND state IN ('open','answered')", [row.job_id]);
       });
     }
@@ -413,8 +437,8 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     for (const job of rows) {
       await this.store.atomic(async store => {
         await store.lockTaskControl(job.conversation_id);
-        const marked = await store.db.query(`UPDATE codex_sessions SET owner_confirm_requested_at=$2,updated_at=$2 WHERE job_id=$1 AND state='waiting_model'
-          AND owner_confirm_requested_at IS NULL AND waiting_since<=$3 RETURNING job_id`, [job.id, store.now(), due]);
+        const marked = await store.db.query(`UPDATE codex_sessions SET owner_confirm_requested_at=$2,updated_at=$2 WHERE job_id=$1 AND executor='claude' AND state='waiting_model'
+          AND owner_confirm_requested_at IS NULL AND waiting_since<=$3 AND EXISTS (SELECT 1 FROM jobs j WHERE j.id=$1 AND j.state='waiting_user') RETURNING job_id`, [job.id, store.now(), due]);
         if (!marked.rows.length) return;
         await store.audit('task_owner_confirm_requested', job.id, { waitingSince: Number(job.waiting_since) });
         await store.enqueue({ key: `task-owner-confirm:${job.id}:${job.waiting_since}`, job: job.id, conversation: job.conversation_id, actor: job.owner_id, scope: job.target,
@@ -444,7 +468,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     let waitingClean = false;
     let identity: TaskWorkerIdentity | null = null;
     try {
-      const status = TASK_ENDPOINTS['/v1/task/status'].response.parse(await this.worker.call('/v1/task/status', this.control(jobId, session, null)));
+      const status = await this.statusOf(jobId, session);
       // 다른 저장소의 absent·finalized는 이 세션의 소멸 증명이 아니다. 답을 적지 않아 다음 재시도도 옛 저장소를 기준으로 본다.
       const sameStorage = !session.worker_storage || status.worker.storage === session.worker_storage;
       // 저장소를 모르면 세션을 봤다고 답한 곳에만 묶는다. absent를 묶으면 다음 재시도의 absent가 소멸 증명이 된다.
@@ -458,14 +482,14 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     await this.store.atomic(async store => {
       await store.db.query(`SELECT lane FROM execution_lanes WHERE lane='task' FOR UPDATE`);
       if (session.state === 'waiting_answer' || session.state === 'waiting_model') {
-        // 대기 세션의 정리 완료는 세션을 지우지 않고 막힘만 푼다.
-        await store.db.query(`UPDATE codex_sessions SET cleanup_state=$2,updated_at=$3 WHERE job_id=$1 AND cleanup_state='pending' AND generation=$4 AND claude_session_id=$5`,
-          [jobId, waitingClean ? 'none' : 'pending', store.now(), session.generation, session.claude_session_id]);
+        // 대기 세션의 정리 완료는 세션을 지우지 않고 막힘만 푼다. 묻는 사이 재개됐으면 이 답은 그 턴의 것이 아니다.
+        await store.db.query(`UPDATE codex_sessions SET cleanup_state=$2,updated_at=$3 WHERE job_id=$1 AND cleanup_state='pending' AND generation=$4 AND claude_session_id=$5 AND state=$6 AND turn=$7`,
+          [jobId, waitingClean ? 'none' : 'pending', store.now(), session.generation, session.claude_session_id, session.state, session.turn]);
       } else {
-        // 작업자에 묻는 사이 새 세대가 시작했으면 이 결론은 그 세션의 것이 아니다.
-        await store.db.query(`UPDATE codex_sessions SET cleanup_state=$2,session_retained=CASE WHEN $3::boolean THEN false ELSE session_retained END,
-          stopped=CASE WHEN $3::boolean THEN true ELSE stopped END,${bindWorker('$4', '$5')},updated_at=$6 WHERE job_id=$1 AND generation=$7 AND claude_session_id=$8`,
-        [jobId, cleaned ? 'cleaned' : 'pending', cleaned, identity?.instance ?? null, identity?.storage ?? null, store.now(), session.generation, session.claude_session_id]);
+        // 작업자에 묻는 사이 새 세대가 시작했으면 이 결론은 그 세션의 것이 아니다. 다른 인스턴스가 이미 지웠으면 늦은 실패로 되돌리지 않는다.
+        await store.db.query(`UPDATE codex_sessions SET cleanup_state=CASE WHEN $2::boolean OR cleanup_state='cleaned' THEN 'cleaned' ELSE 'pending' END,session_retained=CASE WHEN $2::boolean THEN false ELSE session_retained END,
+          stopped=CASE WHEN $2::boolean THEN true ELSE stopped END,${bindWorker('$3', '$4')},updated_at=$5 WHERE job_id=$1 AND generation=$6 AND claude_session_id=$7`,
+        [jobId, cleaned, identity?.instance ?? null, identity?.storage ?? null, store.now(), session.generation, session.claude_session_id]);
       }
       await store.syncTaskLane();
     });
@@ -476,7 +500,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     const digestRow = outcome === 'succeeded' ? (await this.store.db.query<{ digest: string | null }>(`SELECT evidence->>'resultDigest' AS digest FROM results WHERE job_id=$1`, [job])).rows[0] : undefined;
     const body = TASK_ENDPOINTS['/v1/task/finalize'].request.parse({ ...this.control(job, session, worker), disposition: 'terminal',
       receipt: { outcome, persistedAt: Number(session.updated_at), resultDigest: digestRow?.digest ?? null } });
-    const response = TASK_ENDPOINTS['/v1/task/finalize'].response.parse(await this.worker.call('/v1/task/finalize', body));
+    const response = echoed(body, TASK_ENDPOINTS['/v1/task/finalize'].response.parse(await this.worker.call('/v1/task/finalize', body)));
     return response.stopped && response.cleaned && response.worker.storage === worker.storage;
   }
   // 세션 상태까지 함께 보여 준다. 24시간 owner 확인은 표시일 뿐 상태를 바꾸지 않는다.
@@ -490,16 +514,22 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
   // unknown 해제는 작업자의 소멸 확인을 거친다. 세션 공간도 함께 지우고, 지우지 못하면 cleanup_pending으로 레인을 계속 닫는다.
   async release(actor: string, scope: Scope, jobId: string): Promise<{ ok: boolean; status: string }> {
     const job = await this.releasable(actor, scope, jobId);
-    const session = (await this.store.db.query<SessionRow>(`SELECT * FROM codex_sessions WHERE job_id=$1 AND executor='claude'`, [jobId])).rows[0];
+    const session = (await this.store.db.query<SessionRow>('SELECT * FROM codex_sessions WHERE job_id=$1', [jobId])).rows[0];
+    // Codex 세션은 작업자가 달라 여기서 소멸을 확인할 수 없다. CodexBridge.release가 그 작업자에게 묻는다.
+    if (session && session.executor !== 'claude') return { ok: false, status: FOREIGN_SESSION_STATUS };
     if (job.state !== 'unknown' && session?.state !== 'unknown') return { ok: false, status: '종료를 확인하지 못한(unknown) 작업이 아닙니다.' };
-    // 세션이 없으면 작업자에 보낸 적이 없다.
+    // 세션 행이 없으면 어느 작업자에도 보낸 적이 없다. 턴 시작이 dispatch 전에 행을 남긴다.
     const stopped = session ? await this.confirmStopped(jobId, session) : true;
     if (!stopped) return { ok: false, status: '작업자 프로세스가 남아 있거나 확인할 수 없습니다. 작업자 파드를 다시 만든 뒤 확인하세요.' };
     const changed = await this.store.atomic(async store => {
       await store.lockTaskControl(job.conversation_id);
+      const held = (await store.db.query<{ lease_token: string | null }>('SELECT lease_token FROM jobs WHERE id=$1 FOR UPDATE', [jobId])).rows[0];
+      const current = (await store.db.query<SessionRow>('SELECT * FROM codex_sessions WHERE job_id=$1 FOR UPDATE', [jobId])).rows[0];
+      // 확인한 것은 읽어 둔 lease·세대의 소멸뿐이다. 그 사이 넘어갔으면 이 확인으로 풀지 않는다.
+      if (held?.lease_token !== job.lease_token || !sameSession(session, current)) return false;
       const row = (await store.db.query(`UPDATE jobs SET state='cancelled',wait_reason='stop_confirmed_after_unknown',finished_at=$2
         WHERE id=$1 AND state='unknown' RETURNING id`, [jobId, store.now()])).rows[0];
-      const moved = await store.db.query(`UPDATE codex_sessions SET state='cancelled',stopped=true,updated_at=$2 WHERE job_id=$1 AND state IN ('unknown','running') RETURNING job_id`, [jobId, store.now()]);
+      const moved = await store.db.query(`UPDATE codex_sessions SET state='cancelled',stopped=true,updated_at=$2 WHERE job_id=$1 AND executor='claude' AND state IN ('unknown','running') RETURNING job_id`, [jobId, store.now()]);
       if (!row && !moved.rows.length) return false;
       await store.db.query("UPDATE codex_questions SET state='cancelled' WHERE job_id=$1 AND state IN ('open','answered')", [jobId]);
       await store.audit('task_unknown_released', jobId, { actor });
@@ -513,15 +543,14 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
   private async confirmStopped(job: string, session: SessionRow): Promise<boolean> {
     const expected = session.worker_instance && session.worker_storage ? { instance: session.worker_instance, storage: session.worker_storage } : null;
     try {
-      const body = TASK_ENDPOINTS['/v1/task/cancel'].request.parse(this.control(job, session, expected));
-      const response = TASK_ENDPOINTS['/v1/task/cancel'].response.parse(await this.worker.call('/v1/task/cancel', body));
+      const response = await this.cancelOf(this.control(job, session, expected));
       return response.stopped && (!session.worker_storage || response.worker.storage === session.worker_storage);
     } catch (error) {
       if (!(error instanceof TaskWorkerRejected) || !session.worker_storage) return false;
     }
     // 파드가 바뀌어 옛 identity의 취소가 거부됐다. 같은 저장소의 새 작업자가 소멸을 말해 주면 그 값을 쓴다.
     try {
-      const status = TASK_ENDPOINTS['/v1/task/status'].response.parse(await this.worker.call('/v1/task/status', this.control(job, session, null)));
+      const status = await this.statusOf(job, session);
       return status.stopped && status.worker.storage === session.worker_storage;
     } catch { return false; }
   }
