@@ -1,7 +1,7 @@
 # homelab 공통 빌드를 태그 ref로 부른다. SHA로 고정하지 않는다: 배포 키 OIDC identity가 이 파일의
 # 태그 ref(job_workflow_ref claim, app-build.yaml@refs/tags/app-build-v*)에만 묶여 있어 SHA로 부르면
 # 배포 키를 받지 못한다. 태그는 homelab 관리자만 만들고 누구도 옮기거나 지우지 못한다(ruleset D1·D2).
-# 새 태그는 Renovate PR로 따라간다. 시험은 Dockerfile의 test 단계에서 돈다.
+# 이 저장소에는 Renovate가 없어 새 태그는 사람이 올린다. 시험은 Dockerfile의 test 단계에서 돈다.
 # main push면 GHCR push와 homelab 배포 PR(미등록 앱이면 요약만)까지 간다.
 name: build
 on:
