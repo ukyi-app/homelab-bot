@@ -182,22 +182,24 @@ export class ClaudeChatAdapter implements ChatAdapter {
     if (run.credential.value === undefined) throw new Error('credential_missing');
     const expect: ClaudeExpectation = { model: run.model, apiKeySource: this.apiKeySource, version: this.capabilities.cliVersion };
     let initChecked = false;
+    // ID가 없는 호출은 서로 합치지 않는다. 같은 호출을 두 번 세어도 예산 쪽으로 틀리지만, 합치면 초과를 놓친다.
+    let unnamed = 0;
     return {
       args: claudeArgs(run.model, run.schema),
       // 자격은 이 실행의 자식 env 한 변수에만 둔다. 설정 파일·argv에는 넣지 않는다(공통부가 실행 전에 확인한다).
       env: { CLAUDE_CONFIG_DIR: run.dirs.config, ...CLAUDE_FIXED_ENV, [this.credentialEnv]: run.credential.value },
       observe(line: string): Observation {
         const compact = compactClaudeEvent(line);
-        if (!compact) return { line: '<malformed>', tool: null, violation: null };
+        if (!compact) return { line: '<malformed>', tools: [], violation: null };
         let violation: PolicyViolation | null = null;
         if (compact.type === 'system' && compact.subtype === 'init' && !initChecked) {
           initChecked = true;
           violation = initViolation(compact, expect);
         }
         violation ??= modelViolation(compact, expect);
-        const use = compact.tool_uses?.find(u => u.name !== STRUCTURED_OUTPUT_TOOL);
-        const tool = use ? (typeof use.id === 'string' && use.id ? use.id : `unnamed-${String(use.name)}`) : null;
-        return { line: JSON.stringify(compact), tool, violation };
+        const tools = (compact.tool_uses ?? []).filter(use => use.name !== STRUCTURED_OUTPUT_TOOL)
+          .map(use => typeof use.id === 'string' && use.id ? use.id : `unnamed-${++unnamed}`);
+        return { line: JSON.stringify(compact), tools, violation };
       },
       finish: async (lines, exit) => interpretClaudeStream(lines, exit, expect),
       // 실행 잔여물(HOME·CLAUDE_CONFIG_DIR·TMPDIR)은 모두 실행 디렉터리 안이라 공통부가 통째로 지운다.

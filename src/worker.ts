@@ -28,38 +28,48 @@ const CapabilitySchema = z.strictObject({
   job: z.string().uuid(), lease: z.string().uuid(), digest: z.string().length(64),
   issued: z.number().int(), expires: z.number().int(),
 });
+// 서명 형식은 대화·리뷰·작업 레인이 같다. 무엇을 허가하는지(audience·operation·식별자)는 레인마다 자기 schema가 정한다.
+export const CAPABILITY_TTL_MS = 30_000;
+export const capabilityDigest = (body: unknown) => createHash('sha256').update(JSON.stringify(body)).digest('hex');
+export function sealCapability(claims: object, privateKey: KeyObject): string {
+  const payload = Buffer.from(JSON.stringify(claims)).toString('base64url');
+  return `${payload}.${sign(null, Buffer.from(payload), privateKey).toString('base64url')}`;
+}
+// Node's base64url decoder skips padding, foreign characters and unused trailing bits, so one capability
+// has many spellings. Only the spelling that re-encodes to itself is accepted.
+const canonical = (part: string) => Buffer.from(part, 'base64url').toString('base64url') === part;
+// 서명만 확인해 내용과 nonce를 돌려준다. 내용은 아직 믿지 않는다. 호출자가 자기 schema로 검사한 뒤 nonce를 쓴다.
+// The nonce is the signed payload, not the token text: Ed25519 gives one signature per payload,
+// so a capability is spent once however its signature is spelled.
+export function openCapability(token: string, publicKey: KeyObject): { claims: unknown; nonce: string } {
+  const pieces = token.split('.');
+  if (pieces.length !== 2) throw new Denied();
+  const [payload, signature] = pieces as [string, string];
+  if (!canonical(payload) || !canonical(signature)) throw new Denied();
+  const signed = Buffer.from(payload);
+  if (!verify(null, signed, publicKey, Buffer.from(signature, 'base64url'))) throw new Denied();
+  return { claims: JSON.parse(Buffer.from(payload, 'base64url').toString()), nonce: createHash('sha256').update(signed).digest('hex') };
+}
+export const capabilityLive = (c: { issued: number; expires: number }, now: number) =>
+  c.issued <= now + DEFAULTS.capabilitySkewMs && c.expires > now && c.expires > c.issued && c.expires - c.issued <= CAPABILITY_TTL_MS;
 export class WorkerSigner {
   constructor(private readonly privateKey: KeyObject, private readonly now: Clock = Date.now) {}
   issue(job: Job, operation: 'execute' | 'cancel', body: unknown): string {
     const issued = this.now();
-    const payload = Buffer.from(JSON.stringify({ audience: 'homelab-worker', operation, job: job.id,
-      lease: job.lease_token, digest: digest(body), issued, expires: issued + 30_000 })).toString('base64url');
-    return `${payload}.${sign(null, Buffer.from(payload), this.privateKey).toString('base64url')}`;
+    return sealCapability({ audience: 'homelab-worker', operation, job: job.id,
+      lease: job.lease_token, digest: capabilityDigest(body), issued, expires: issued + CAPABILITY_TTL_MS }, this.privateKey);
   }
 }
-const digest = (body: unknown) => createHash('sha256').update(JSON.stringify(body)).digest('hex');
-// Node's base64url decoder skips padding, foreign characters and unused trailing bits, so one capability
-// has many spellings. Only the spelling that re-encodes to itself is accepted.
-const canonical = (part: string) => Buffer.from(part, 'base64url').toString('base64url') === part;
 export class WorkerVerifier {
   constructor(private readonly publicKey: KeyObject,
     private readonly consume: (nonce: string) => Promise<boolean>, private readonly now: Clock = Date.now) {}
   async check(token: string, operation: 'execute' | 'cancel', body: { job: string; lease: string }): Promise<void> {
     try {
-      const pieces = token.split('.');
-      if (pieces.length !== 2) throw new Denied();
-      const [payload, signature] = pieces as [string, string];
-      if (!canonical(payload) || !canonical(signature)) throw new Denied();
-      const signed = Buffer.from(payload);
-      if (!verify(null, signed, this.publicKey, Buffer.from(signature, 'base64url'))) throw new Denied();
-      const c = CapabilitySchema.parse(JSON.parse(Buffer.from(payload, 'base64url').toString()));
-      const now = this.now();
-      // The nonce is the signed payload, not the token text: Ed25519 gives one signature per payload,
-      // so a capability is spent once however its signature is spelled.
+      const { claims, nonce } = openCapability(token, this.publicKey);
+      const c = CapabilitySchema.parse(claims);
       if (c.operation !== operation || c.job !== body.job || c.lease !== body.lease
-        || c.digest !== digest(body) || c.issued > now + DEFAULTS.capabilitySkewMs || c.expires <= now
-        || c.expires <= c.issued || c.expires - c.issued > 30_000
-        || !await this.consume(createHash('sha256').update(signed).digest('hex'))) throw new Denied();
+        || c.digest !== capabilityDigest(body) || !capabilityLive(c, this.now())
+        || !await this.consume(nonce)) throw new Denied();
     } catch { throw new Denied(); }
   }
 }

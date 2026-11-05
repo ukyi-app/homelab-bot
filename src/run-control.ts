@@ -288,10 +288,8 @@ export class RunControl {
       lines.push(seen.line);
       // 소멸 확인 전에 남긴다. 프로세스가 안 죽어 결과가 unknown이 되어도 종류는 보인다. 위 exceeded 검사로 실행당 한 번이다.
       if (seen.violation) { stop('policy_violation'); violated(seen.violation); return; }
-      if (seen.tool && !tools.has(seen.tool)) {
-        tools.add(seen.tool);
-        if (tools.size > budget) stop('tool_budget_exceeded');
-      }
+      for (const tool of seen.tools) tools.add(tool);
+      if (tools.size > budget) stop('tool_budget_exceeded');
     };
     let result: LaunchResult = { exit: null };
     let launchFailed = false;
