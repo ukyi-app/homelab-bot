@@ -39,12 +39,17 @@ WORKDIR /app
 # 붙어 user namespace·mount를 허용하고, 다른 경로면 호스트의 userns 제한에 걸려 샌드박스가 뜨지 않는다.
 # 버전은 정확히 고정한다. Debian이 새 수정판을 내면 옛 버전이 미러에서 빠져 이 단계가 실패한다. 그때 버전을 올리고 T18 실측
 # (VERIFICATION "T18 작업 레인 격리 파드 실측")을 다시 확인한다.
+# git은 작업 레인이 고정 SHA 압축본을 푼 뒤 기준 커밋을 만드는 데 쓴다(D-15, task-workspace). slim 이미지에는 없다.
+# 관리 설정(/etc/claude-code)은 --safe-mode로도 일부 남아 hook을 샌드박스 밖에서 돌릴 수 있다. 이미지에 없음을 빌드에서 확인한다.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends bubblewrap=0.12.0-1~deb13u1 socat=1.8.0.3-1+deb13u1 \
+  && apt-get install -y --no-install-recommends bubblewrap=0.12.0-1~deb13u1 socat=1.8.0.3-1+deb13u1 git=1:2.47.3-0+deb13u1 \
   && rm -rf /var/lib/apt/lists/* \
   && test "$(command -v bwrap)" = /usr/bin/bwrap \
   && test "$(bwrap --version)" = "bubblewrap 0.12.0" \
-  && socat -V | grep -q 'socat version 1.8.0.3 '
+  && socat -V | grep -q 'socat version 1.8.0.3 ' \
+  && test "$(command -v git)" = /usr/bin/git \
+  && test "$(git --version)" = "git version 2.47.3" \
+  && test ! -e /etc/claude-code
 COPY --from=runtime --chown=root:root /app/node_modules ./node_modules
 COPY --from=runtime --chown=root:root /app/dist/src ./dist/src
 COPY --from=runtime --chown=root:root /app/package.json ./

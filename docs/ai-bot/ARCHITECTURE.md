@@ -741,7 +741,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 - 종료 사유(정상·실패·시간 초과·취소)와 무관하게 실행 뒤 작업 그룹을 끝내고 남은 수를 확인한다. 남으면 완료 출력이 있어도 `unknown`이다.
 - 확인 수단은 프로세스 그룹(pgid)과 작업 표식 환경 변수다. 표식은 codex 프로세스 환경과 `shell_environment_policy.set` 양쪽에 넣어, 새 세션으로 빠져나간 자식도 환경을 지우지 않았다면 찾는다.
-- **한계(시험으로 기록):** 환경을 지우고 새 세션으로 빠져나간 자식은 찾지 못한다. 그래서 `confirm_stop` 값은 `process_group_and_marker`다. 이 한계가 풀리기 전에는 작업 레인에서 비신뢰 코드를 돌리는 단계(T19)의 소멸 확인 근거로 충분하지 않다. cgroup 위임·PID namespace 실측은 T16b다.
+- **한계(시험으로 기록):** 환경을 지우고 새 세션으로 빠져나간 자식은 찾지 못한다. 그래서 `confirm_stop` 값은 `process_group_and_marker`다. 이 한계는 옛 Codex 경로의 것이다. Claude 작업 레인은 이 방식을 쓰지 않고 아래 "T18 작업 레인 실행·정리"의 파드 PID 공간 정리를 쓴다.
 - 기록한 프로세스 그룹은 리더 pid가 다른 시작 시각으로 살아 있으면 재사용된 번호로 보고 쓰지 않는다.
 - 확인 불가는 0개로 세지 않는다: 작업 시작 뒤 생긴 같은 UID 프로세스의 environ을 못 읽으면(non-dumpable 등) `unknown`이다. 작업 전부터 있던 프로세스는 셈에서 뺀다. 작업 기록이 없으면(재시작 뒤) 못 읽는 같은 UID 프로세스를 모두 의심한다. 작업자 파드에는 다른 프로세스가 없어 영향이 없지만, 개발 기계에서 `release`가 거부될 수 있다.
 - 막힘 기록: `jobs.state='unknown'`이 DB에 남고(재시작 뒤 유지) T16a `claim()`이 새 모델 실행을 막는다. Discord 알림을 보낸다. settle 밖에서 생긴 unknown(lease 만료, 기록 실패)도 `Runtime.tick`의 `sweep()`이 알림을 한 번 넣는다. 비AI 경로(Telegram) 알림은 아래 T16a 변경 요청 5번이다.
@@ -950,7 +950,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 ### T18 작업 레인 계약 (Claude, 2026-11-05)
 
-**아직 연결하지 않았다(task off).** 계약 타입·파서·서명 검증과 DB 확장만 있다. 라우트·실행기·스케줄러·Discord 명령이 없고 어떤 프로필도 `lanes.task=true`를 내지 않아 게시 서버와 작업자 동작은 그대로다. 기존 `/v1/execute`·`/v1/cancel`·`/v1/review*`와 `REVIEW_INSTRUCTIONS`는 바꾸지 않는다. 위 "T16a 소유 변경 요청" 3의 task 요청 필드는 기존 `WorkerRequest`가 아니라 이 새 계약이 담는다. 이 절의 재개·수명 규칙은 Claude 작업 경로의 계약이고, 위 Codex 절의 어댑터 값을 바꾸지 않는다.
+**아직 연결하지 않았다(task off).** 계약 타입·파서·서명 검증과 DB 확장, 아래 "T18 작업 레인 실행·정리"의 작업자 쪽 부품만 있다. 라우트·조립·스케줄러·Discord 명령이 없고 어떤 프로필도 `lanes.task=true`를 내지 않아 게시 서버와 작업자 동작은 그대로다. 기존 `/v1/execute`·`/v1/cancel`·`/v1/review*`와 `REVIEW_INSTRUCTIONS`는 바꾸지 않는다. 위 "T16a 소유 변경 요청" 3의 task 요청 필드는 기존 `WorkerRequest`가 아니라 이 새 계약이 담는다. 이 절의 재개·수명 규칙은 Claude 작업 경로의 계약이고, 위 Codex 절의 어댑터 값을 바꾸지 않는다.
 
 **계약.** `src/task-contracts.ts`가 끝점 표 `TASK_ENDPOINTS`로 끝점·operation·요청·응답을 묶는다. 모두 strict이고 `version:1`이다.
 
@@ -998,9 +998,60 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 `Store.claim`은 아직 이 열을 보지 않는다. 슬롯 분리는 스케줄러를 연결할 때 함께 바꾼다.
 
-**실행기 관측.** `Observation.tools`는 그 줄에서 시작한 도구 호출 ID 목록이다. 한 assistant 메시지의 `tool_use`를 모두 세고, ID가 없는 호출은 서로 합치지 않는다. 대화·리뷰는 도구 예산이 0이라 호출 하나로 멈춘다. 능력표 값 `tools:'sandboxed-task'`·`sessionPersistence:'per-job'`과 위반 종류 `tool_not_allowed`·`session_mismatch`는 타입만 있고 내는 코드가 아직 없다.
+**실행기 관측.** `Observation.tools`는 그 줄에서 시작한 도구 호출 ID 목록이다. 한 assistant 메시지의 `tool_use`를 모두 세고, ID가 없는 호출은 서로 합치지 않는다. 대화·리뷰는 도구 예산이 0이라 호출 하나로 멈춘다. 능력표 값 `tools:'sandboxed-task'`·`sessionPersistence:'per-job'`과 위반 종류 `tool_not_allowed`·`session_mismatch`는 아래 작업 어댑터만 낸다. 어떤 프로필에도 들어가지 않았다.
 
 **R08은 이 계약 밖이다.** 수신 경로가 미정이고 계약·테이블은 다음 작업이 따로 둔다.
+
+### T18 작업 레인 실행·정리 (Claude, 2026-11-05)
+
+**부품만 있고 조립되지 않았다.** `worker-main`·라우트·프로필이 이 코드를 쓰지 않아 운영 동작은 그대로다. 대화·리뷰의 argv·판정·정리·임시 공간도 그대로다.
+
+**구성.**
+
+| 파일 | 맡는 것 |
+|---|---|
+| `src/executor-claude-task.ts` | `ClaudeTaskAdapter`(argv·env·`--settings`·stream 판정), `taskPrompt`, `judgeTaskRun`(응답 union으로 분류), `runTaskTurn`(한 턴), `taskImageProblems`(이미지 검사) |
+| `src/task-workspace.ts` | `TaskSessions`(세션 경로·추출·기준 커밋·재개 대조·증거 계산·finalize), `parseTaskArchive`(압축본 검사) |
+| `src/task-containment.ts` | `PodPidSpace`(기준 상태 기록·파드 PID 공간 정리·소멸 확인) |
+| `src/process-launcher.ts` | `options.cleanup`이 있으면 정리·소멸 확인을 그쪽에 넘긴다. 없으면 지금 그대로다 |
+| `src/run-control.ts` | `RunSpec.session`이 있으면 임시 공간을 만들지도 지우지도 않고 그 공간을 쓴다 |
+
+**한 턴의 순서.** 세션 준비(첫 턴: 압축본 받기 → 검사 → 풀기 → 기준 커밋·해시 / 재개: 묶인 값 대조) → 다른 작업 경로 열거 → 설정 생성 → 실행 → 정리 → 판정. 판정은 **정리 확인 → 실행 중 집행(상한·위반·중단) → stream 무결성 → 종료·오류 → structured_output → 실제 diff·반사 검사** 순서다. 소멸을 확인하지 못하면 결과 파일을 읽지 않는다.
+
+**세션 공간.** `<TASK_STATE_ROOT>/tasks/<job>/<generation>/{home,config,workspace,run,tmp}`. `run`에는 묶인 값(`session.json`), 기준 해시(`baseline.json`), 기준 압축본(`baseline.tar.gz`)이 있고 모델의 셸·파일 도구에서 가린다. patch의 이전 쪽은 이 압축본에서 푼다. 실행 뒤의 `workspace/.git`은 비신뢰라 쓰지 않는다.
+
+- **추출.** 고정 SHA URL만 `createArchiveFetcher` 계약으로 받는다. 디스크에 쓰기 전에 끝까지 검사하고, 하나라도 어긋나면 아무것도 쓰지 않는다. 절대경로·`..`·중복·`.git`(대소문자·깊이 무관)·device·FIFO·hardlink·GNU 확장·바깥 symlink·symlink를 거치는 항목을 거부한다. symlink는 글자가 아니라 실제로 따라가 판정한다(`x/up -> ..`, `out -> x/up/..`를 잡는다).
+- **상한.** 보존 세션 8개, 볼륨 2Gi(로컬 PV는 요청 크기를 강제하지 않아 코드가 센다), 해제본 256MiB(대조 상한과 같음). 넘거나 디스크가 차면 `failed(storage_full)`이다. 응답 사유가 하나라 보존 수 초과와 디스크 부족을 구분하지 않는다(`TaskWorkspaceError.detail`에는 있다).
+- **증거.** 변경 목록은 기준 해시와 실제 파일의 대조다. 바깥을 가리키는 symlink·hardlink는 `change_outside_workspace`, FIFO 등과 중첩 `.git`은 `change_path_invalid`, 정책 밖은 `change_outside_policy`다. 자격 반사는 바뀐 경로의 이름과, 기준 쪽(삭제 줄이 나오는 곳)·실행 뒤 쪽 본문(이진 포함)·symlink 대상, 그리고 잘리기 전 patch 출력 전체에서 찾는다. 이진 파일은 patch에서 base85가 되어 원본에서 재야 잡히고, 양쪽에 나뉜 조각은 patch에서 처음 이어지므로 둘 다 본다. 걸리면 `secret_echo`로 증거를 내보내지 않는다. 그래서 현재 자격이 든 기준 파일을 고치거나 지우는 작업은 완료될 수 없다. 바꾸지 않은 기준 파일은 patch에 나가지 않아 검사하지 않는다. patch는 설정을 읽지 않는 `git diff --no-index`로 만들어 1MiB까지 담고 digest는 전체 출력 기준이다. `verification`의 `command`는 서명된 요청의 이름(`^[a-z][a-z0-9_-]{0,63}$`)이고 상태는 상수라 작업이 만든 바이트가 없다.
+- **보존 여부.** `sessionRetained`는 오류 사유로 짐작하지 않고 `TaskSessions.exists`(실제 세대 경로)로 답한다. `retained()`도 같은 디렉터리를 센다. 없음을 확인하지 못하면 남은 것으로 본다. 그래서 대화 기록 없는 재개와 깨진 `session.json`은 `failed(session_missing)`이어도 공간이 있으면 `sessionRetained:true`이고 finalize가 지운다. 공간이 없을 때만 `false`다. 첫 턴 실패 뒤 지우지 못했거나 같은 세대 첫 턴이 다시 온 경우도 `true`다. 예외는 `unknown`이다. 계약상 항상 `true`다.
+- **표시 못 하는 것.** 압축본에 내용이 없는 submodule·LFS는 `TaskSession.unsupported`로 알려 준다. `verification`은 아직 전부 `not_run`이다. 검증 명령을 돌리는 코드가 없다.
+
+**실행 설정.** argv·settings·env는 `test/task-settings-boundary.test.ts`가 값까지 확인한다. 경계로 세는 것과 세지 않는 것을 나눈다.
+
+| 항목 | 상태 |
+|---|---|
+| 악성 스냅샷의 hook·`.mcp.json`·skill·명령·설정 차단(`--setting-sources user --safe-mode --strict-mcp-config --disable-slash-commands`) | 고정 CLI 실측: 시작·재개 모두 marker 0. 대조군에서는 hook이 돈다 |
+| 샌드박스 못 세우면 실패 | 고정 CLI 실측: bwrap 없음은 기동 거부, socat 없음은 init 전 오류 |
+| scrub·자격 경로 `denyRead`·Read deny | 파드 실측(위 DECISIONS "(2)") |
+| 제어 경로·다른 작업 경로의 `denyRead`·`denyWrite`, Edit deny | **[미확인]** 도구 호출이 있어야 본다 |
+| `blockReadsOutsideWorkingDirectories` | 2.1.308 바이너리에 있고 파싱된다. 막는지는 **[미확인]**이라 경계로 세지 않는다 |
+| CLI 메시징 소켓 디렉터리 가림(`/tmp/cc-socks-<uid>`) | 제안. init의 `messaging_socket_path`에서 찾았다. 효과 **[미확인]** |
+
+**프로세스 정리.** DECISIONS "T18 할 일 6 정리 방식"을 구현한다. 작업 레인 파드에서만 켠다.
+
+1. 기동 때 `PodPidSpace.record({ dedicatedTaskPod: true })`가 작업자와 PID 1만 있음을 확인한다. 다른 프로세스가 보이면 `ContainmentUnavailable`이다.
+2. `terminate`: `kill(-1, TERM)` → 유예(기본 1.5초, 모두 끝나면 바로 넘어감) → `kill(-1, KILL)` 반복(기본 2초). 합이 취소 대기 4초 안이다.
+3. `survivors`: `/proc`의 `State`·`NSpid`로 같은 namespace 기준 밖과 다른 PID namespace를 함께 세고, 깨끗한 검사가 3번 연달아 나와야 0이다. 읽기 실패나 검사 중 사라지는 항목이 멈추지 않으면 `null`이다. 0이 아니면 위층에서 `unknown`이다.
+4. 정리가 도는 동안 launcher는 새 프로세스를 띄우지 않는다.
+
+좀비는 코드가 돌지 않아 세지 않는다. 단, 리더 스레드만 끝난 프로세스는 Z로 보여도 다른 스레드가 살아 있으면 센다.
+
+**조립할 때 지킬 것.**
+
+- `PodPidSpace.record`는 `--version` 확인이 끝난 뒤, HTTP를 열기 전에 부른다. `new ProcessGroupLauncher(['/usr/local/bin/claude'], { cleanup: space })`로 넘기고, 이 launcher는 작업 레인 `RunControl`에만 쓴다.
+- 작업 파드에 exec probe·사이드카·`kubectl exec`가 있으면 정리에 함께 죽거나 기동이 실패한다.
+- `runTaskTurn`은 서명·lease·fence·직렬 슬롯을 하지 않는다. 라우트가 앞에서 막는다. 턴 준비 중의 git도 정리에 죽을 수 있어 취소와 실행을 직렬로 묶는다.
+- 이미지 검사(`taskImageProblems`)가 문제를 내면 작업 레인을 닫는다.
 
 ## 13. 개선안 v2 적용 (2026-10-30)
 

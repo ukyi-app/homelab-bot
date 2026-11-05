@@ -582,6 +582,25 @@ Workflows 권한이 없으므로 **봇은 `.github/workflows` 변경 PR을 만�
   - **호스트 프로필 유지.** 전용 프로필은 containerd 기본의 복사본이라 upstream 수정이 저절로 들어오지 않는다. k3s·containerd·Ubuntu·bubblewrap·Claude CLI를 올릴 때마다 다시 생성하고 실측한다.
 - **남은 일.** 운영 반영(호스트 → 이미지 → 작업 레인 설정 → 작업 레인 파드)과, 운영 작업 레인에서 같은 조합으로 SEC-02 작업 레인 사례를 다시 확인하는 것.
 
+### T18 할 일 6 정리 방식 (사용자 2026-11-05)
+
+작업 레인에서 프로세스 소멸을 무엇으로 확인할지 정했다. 티켓의 cgroup 요구를 이 방식으로 바꾼 것은 사용자 결정이다. 근거는 [VERIFICATION](VERIFICATION.md) "T18 할 일 6·작업 레인 실행 부품"이다.
+
+- **실측 요약(무모델 시험 파드).**
+  - 파드 안 cgroup 위임은 불가능했다. `/sys/fs/cgroup`이 읽기 전용이고 소유자가 65534다.
+  - 작업을 바깥 bwrap PID namespace로 감싸면 그 안에서 Claude 샌드박스 bwrap이 namespace를 못 만들어 쓸 수 없다. 샌드박스 안에서 `unshare`·중첩 bwrap도 거부됐다.
+  - Claude 샌드박스 모양의 bwrap 안에 둔 회피 자식(`setsid`·double fork·`env -i`·TERM 무시·`nohup`)은 그 bwrap이 죽으면 die-with-parent로 모두 끝났다. 샌드박스 밖에 남은 `setsid` 도우미는 파드 PID 공간 전체를 훑어 끝냈다.
+- **채택.** 작업 전용 파드(`worker-task`, 직렬 1)에서 작업이 끝나면 작업자 자신과 init을 뺀 파드 PID 공간의 모든 프로세스를 TERM 유예 뒤 KILL하고, 기준 상태(같은 namespace 기준 밖 0, 다른 PID namespace 0)로 돌아온 것을 확인한 뒤에만 `stopped:true`다. 확인 실패·권한 오류·시간 초과는 `stopped:false`(unknown)이고 새 접수를 닫는다.
+- **구현 선택(사용자 결정 아님).**
+  - 신호는 번호별이 아니라 `kill(-1)`로 보낸다. 커널이 한 번에 처리해 fork와 경쟁하지 않고 PID 재사용 위험이 없다.
+  - 검사가 깨끗해 보여도 TERM·KILL을 한 번씩은 보낸다. `/proc` 검사는 원자적이지 않아 fork와 exit를 빠르게 되풀이하는 프로세스는 목록에 잡혀도 읽을 때 없어 깨끗하게 보인다. 로컬 시험에서 실제로 그렇게 보였다. 같은 이유로 검사 중 사라진 항목이 계속 나오면 0이 아니라 확인 불가다.
+  - 확인은 `/proc/<pid>/status`의 `State`·`NSpid`로 한다. `environ`·`ns/pid`와 달리 ptrace 검사가 없어 non-dumpable 프로세스도 읽힌다.
+- **켜는 조건.** `PodPidSpace.record({ dedicatedTaskPod: true })`로만 켠다. 기록 때 기준 밖 프로세스가 하나라도 보이면 거부한다. 개발 기계나 대화·리뷰 파드에서 잘못 켜도 `kill(-1)`이 나가지 않는다. 대화·리뷰 레인의 정리는 그대로 프로세스 그룹과 표식이다.
+- **남는 위험.**
+  - **전제가 깨지면 방식도 깨진다.** 파드가 작업 전용이고 직렬 1이어야 한다. 같은 PID 공간에 다른 일이 돌면 함께 죽는다(`kubectl exec` 세션, exec probe, 작업자의 다른 자식 포함). 그래서 차트는 exec probe를 쓰지 않아야 하고, 기동 때 기록 시점에 다른 프로세스가 있으면 기동이 실패한다.
+  - **좀비 누적.** 작업자(Node)가 PID 1이면 고아 좀비를 회수하지 않는다(로컬 실측). 좀비는 코드가 돌지 않아 소멸 확인에서 세지 않지만 파드 재시작까지 PID를 차지한다. 악성 작업이 fork를 되풀이하면 PID 상한까지 채워 다음 턴이 뜨지 못할 수 있다. 격리 경계가 아니라 가용성 위험이고 파드 재시작으로 풀린다.
+  - **운영 조합 미확인.** `kill(-1)`과 `NSpid` 판독은 로컬 PID namespace에서 시험했다. 운영 파드의 AppArmor peer 규칙 아래에서 같은지는 작업 레인 파드 배포 뒤 무모델 시험으로 확인한다. 신호가 막히면 프로세스가 검사에 남아 unknown으로 닫히는 쪽으로 틀린다.
+
 ## T20 기억·삭제 원장·브리핑 (로컬·mock, 2026-10-29)
 
 **상태:** 삭제 원장 위치는 정함(아래, 사용자 2026-11-02). 나머지는 T20 구현 선택이고 사용자 결정이 아니다. 코드는 `src/memory.ts`, `src/deletion-ledger.ts`, `src/ledger-lock.ts`, `src/briefing.ts`, `migrations/010_memory_briefing.sql`·`012_deletion_ledger_generation.sql`, 시험은 `test/memory-briefing.test.ts`, `test/deletion-ledger.test.ts`, `test/deletion-ledger-pg.test.ts`다. 실제 SSD·Discord는 쓰지 않았다.
