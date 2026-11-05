@@ -63,8 +63,11 @@ type Stop = 'cancel' | 'revoked' | 'lease' | 'timeout' | 'shutdown' | 'monitor';
 // 턴의 결말. rejected는 시작하지 않았다는 증거, lost는 응답을 못 받아 시작 여부를 모르는 경우다.
 type Turn = { kind: 'response'; response: TaskResponse } | { kind: 'rejected' } | { kind: 'lost' };
 type CancelFacts = Pick<TaskCancelResponse, 'stopped' | 'cleanupPending' | 'sessionRetained' | 'worker'>;
-// settle이 트랜잭션 안에서 정한 끝. 커밋된 뒤에 로그로 남긴다.
-interface JobEnd { state?: string; reason?: string | null }
+// job의 끝 기록. 값은 전이를 시도한 트랜잭션에서 읽은 jobs.state·wait_reason이다. 커밋된 뒤에 로그로 남긴다.
+// intended가 있으면 그 전이가 일어나지 않은 것이고, state·reason은 남아 있는 DB 값이다(DB를 읽지 못했으면 null).
+type JobEnd = { intended?: undefined; state: string; reason: string | null } | { intended: string; state: string | null; reason: string | null };
+// terminal은 세션 공간을 지울 차례인지다.
+interface Settled { terminal: boolean; end?: JobEnd }
 interface Facts { stopped: boolean; retained: boolean | null; cleanupPending: boolean; worker: TaskWorkerIdentity | null; tools: number | null }
 const TEXT = Object.freeze({
   executor: 'claude' as const, prefix: 'task', question: '작업 질문', accepted: '답을 받았습니다. 같은 세션을 이어서 실행합니다.',
@@ -134,31 +137,39 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     } finally { clearInterval(keepalive); }
     await this.dispatch(job, request, revision);
   }
-  private finished(job: string, state: string, reason: string | null): void {
-    this.options.log('task_job_finished', { job, state, reason });
+  // task_job_finished는 이 실행이 job을 그 상태로 커밋했다는 뜻이다. 전이가 막히면 다른 이벤트로 남겨 "끝났다"로 읽히지 않게 한다.
+  private report(job: string, end: JobEnd): void {
+    if (end.intended) this.options.log('task_settle_transition_skipped', { job, intended: end.intended, actual_state: end.state, actual_reason: end.reason });
+    else this.options.log('task_job_finished', { job, state: end.state, reason: end.reason });
+  }
+  private async endOf(store: Store, job: string, intended?: string): Promise<JobEnd> {
+    const { state, wait_reason: reason } = (await store.db.query<{ state: string; wait_reason: string | null }>('SELECT state,wait_reason FROM jobs WHERE id=$1', [job])).rows[0]!;
+    return intended ? { intended, state, reason } : { state, reason };
   }
   // 이 실행이 아직 job을 쥐고 있고 읽어 둔 세션 상태가 그대로일 때만 job을 정리한다. 그 사이 lease가 끝났거나 다른 실행이 턴을 시작했으면 어떤 행도 건드리지 않는다.
-  // act가 돌았으면 true다.
-  private async unchanged(job: Job, session: SessionRow | undefined, act: (store: Store) => Promise<unknown>): Promise<boolean> {
+  // act가 돌았으면 그 결과를, 아니면 undefined를 돌려준다.
+  private async unchanged<T>(job: Job, session: SessionRow | undefined, act: (store: Store) => Promise<T>): Promise<T | undefined> {
     return this.store.atomic(async store => {
       await store.db.query('SELECT id FROM conversations WHERE id=$1 FOR UPDATE', [job.conversation_id]);
       const held = (await store.db.query<{ state: string; lease_token: string; lease_until: string }>(
         'SELECT state,lease_token,lease_until FROM jobs WHERE id=$1 FOR UPDATE', [job.id])).rows[0];
-      if (!held || held.lease_token !== job.lease_token || Number(held.lease_until) <= store.now() || !HELD.has(held.state)) return false;
+      if (!held || held.lease_token !== job.lease_token || Number(held.lease_until) <= store.now() || !HELD.has(held.state)) return undefined;
       const now = (await store.db.query<{ state: string; turn: number }>('SELECT state,turn FROM codex_sessions WHERE job_id=$1 FOR UPDATE', [job.id])).rows[0];
-      if (session ? now?.state !== session.state || now.turn !== session.turn : !!now) return false;
-      await act(store);
-      return true;
+      if (session ? now?.state !== session.state || now.turn !== session.turn : !!now) return undefined;
+      return act(store);
     });
   }
-  private async giveUp(job: Job, session: SessionRow | undefined, reason: string): Promise<void> {
-    if (await this.unchanged(job, session, store => this.abandon(job, reason, store))) this.finished(job.id, 'failed', reason);
+  // act는 job을 끝냈으면 참을 돌려준다. 그 사이의 /cancel로 failed가 아니라 cancelled가 될 수 있고 lease가 끝나 막힐 수도 있어, 끝은 DB 값으로 적는다.
+  private async giveUp(job: Job, session: SessionRow | undefined, reason: string,
+    act: (store: Store) => Promise<unknown> = store => this.abandon(job, reason, store)): Promise<void> {
+    const end = await this.unchanged(job, session, async store => this.endOf(store, job.id, await act(store) ? undefined : 'failed'));
+    if (end) this.report(job.id, end);
   }
   // 이번 턴의 요청을 만든다. 띄우지 않기로 했으면 job을 정리하고 undefined.
   private async prepare(job: Job, policy: Policy, session: SessionRow | undefined): Promise<TaskRequest | undefined> {
     // 다른 실행기의 세션은 잇지도 덮지도 않는다. 행은 그 실행기의 경로가 닫게 둔다.
     if (session && session.executor !== 'claude') {
-      if (await this.unchanged(job, session, store => store.fail(job, 'task_session_mismatch'))) this.finished(job.id, 'failed', 'task_session_mismatch');
+      await this.giveUp(job, session, 'task_session_mismatch', store => store.fail(job, 'task_session_mismatch'));
       return;
     }
     const event = (await this.store.db.query<{ payload: { text: string } }>('SELECT payload FROM events WHERE id=$1', [job.event_id])).rows[0]!;
@@ -294,16 +305,18 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     // 마지막 감시 뒤의 철회를 결과 확정 전에 다시 본다. 철회면 완료·질문·대기보다 취소가 앞선다.
     try { await this.gate.authorize(job.owner_id, job.target); }
     catch (error) { if (error instanceof Denied) stop = 'revoked'; else if (!(error instanceof PolicyUnavailable)) stop ??= 'monitor'; }
-    let terminal = false;
-    const ended: JobEnd = {};
-    try { terminal = await this.settle(job, request, revision, turn, facts, stop, this.store.now() - started, ended); }
-    catch {
-      // 기록 실패는 결과를 모르는 것과 같다. lease가 끝나면 expire()가 unknown으로 둔다.
-      await this.store.transition(job, 'unknown', 'record_failed').catch(() => {});
-      Object.assign(ended, { state: 'unknown', reason: 'record_failed' });
-    }
-    if (ended.state) this.finished(job.id, ended.state, ended.reason ?? null);
-    if (terminal) await this.finalizeJob(job.id).catch(() => {});
+    let settled: Settled;
+    try { settled = await this.settle(job, request, revision, turn, facts, stop, this.store.now() - started); }
+    catch { settled = { terminal: false, end: await this.recordFailed(job) }; }
+    if (settled.end) this.report(job.id, settled.end);
+    if (settled.terminal) await this.finalizeJob(job.id).catch(() => {});
+  }
+  // 기록 실패는 결과를 모르는 것과 같다. 이 갱신이 막히거나 DB에 닿지 못해도 lease가 끝나면 expire()가 unknown으로 둔다.
+  // 세션은 running으로 남는다. 해제가 그 상태를 받고, 레인은 job의 unknown으로 닫힌다.
+  private async recordFailed(job: Job): Promise<JobEnd> {
+    try {
+      return await this.store.atomic(async store => this.endOf(store, job.id, await store.transition(job, 'unknown', 'record_failed') ? undefined : 'unknown'));
+    } catch { return { intended: 'unknown', state: null, reason: null }; }
   }
   // 응답을 계약으로 다시 읽는다. 다른 job·lease·세대·세션·턴의 응답이나 깨진 응답은 시작 여부를 모르는 것과 같다.
   private read(raw: unknown, request: TaskRequest): Turn {
@@ -356,14 +369,14 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       ]);
     } catch { return null; } finally { clearTimeout(wait); }
   }
-  // 턴 결과를 한 트랜잭션으로 확정한다. 돌려주는 값은 세션을 지울 차례인지다.
-  private async settle(job: Job, request: TaskRequest, revision: string, turn: Turn, facts: Facts, stop: Stop | undefined, usedMs: number, ended: JobEnd): Promise<boolean> {
-    return this.store.atomic(async store => {
+  // 턴 결과를 한 트랜잭션으로 확정한다. job 행을 잠가 두므로 전이 뒤에 읽은 값이 커밋될 값이다. 끝 기록은 커밋이 돌려준 값만 남아 되돌려진 끝이 로그로 새지 않는다.
+  private async settle(job: Job, request: TaskRequest, revision: string, turn: Turn, facts: Facts, stop: Stop | undefined, usedMs: number): Promise<Settled> {
+    return this.store.atomic(async (store): Promise<Settled> => {
       await store.lockTaskControl(job.conversation_id);
       const row = (await store.db.query<{ state: string; lease_token: string; lease_until: string }>(
         'SELECT state,lease_token,lease_until FROM jobs WHERE id=$1 FOR UPDATE', [job.id])).rows[0]!;
       // 다른 실행이 넘겨받았거나 이미 확정됐으면 이 응답은 어떤 행도 바꾸지 못한다. 해제까지 끝난 세션을 unknown으로 덮으면 레인이 다시 닫힌다.
-      if (row.lease_token !== job.lease_token || !SETTLEABLE.has(row.state)) { await store.audit('task_stale_response', job.id, { generation: request.generation, turn: request.turn }); return false; }
+      if (row.lease_token !== job.lease_token || !SETTLEABLE.has(row.state)) { await store.audit('task_stale_response', job.id, { generation: request.generation, turn: request.turn }); return { terminal: false }; }
       const session = async (state: string, wait: { reason: 'model_limit' | 'auth_expired' } | null = null) => {
         await store.db.query(`UPDATE codex_sessions SET state=$2,updated_at=$3,run_used_ms=run_used_ms+$4,
           tool_calls=CASE WHEN $5::integer IS NULL OR tool_calls IS NULL THEN NULL ELSE tool_calls+$5::integer END,
@@ -375,32 +388,33 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
           facts.retained, facts.cleanupPending, wait?.reason ?? null, wait ? store.now() : null, request.lease, request.generation, request.sessionId]);
       };
       const end = async (state: string) => { await session(state); await store.syncTaskLane(); };
-      const fail = async (reason: string) => { await end('failed'); await store.fail(job, reason); Object.assign(ended, { state: 'failed', reason }); return true; };
+      // job이 전이했다. 세션도 끝내고 DB 값을 끝으로 적는다.
+      const applied = async (state: string, terminal: boolean): Promise<Settled> => {
+        await end(state);
+        return { terminal, end: await this.endOf(store, job.id) };
+      };
+      // 전이가 막혔다. lease가 끝났거나 expire()가 먼저 unknown으로 둔 행이다. 소멸을 확인했어도 job이 끝나지 않았으므로 세션을 unknown으로 두고 공간을 지우지 않는다.
+      // 공간은 해제가 지운다. 안내도 넣지 않는다. job이 unknown이 되면 sweep의 unknownNotices가 넣는다.
+      const skipped = async (intended: string): Promise<Settled> => {
+        await end('unknown');
+        return { terminal: false, end: await this.endOf(store, job.id, intended) };
+      };
+      const fail = async (reason: string) => await store.fail(job, reason) ? applied('failed', true) : skipped('failed');
+      const stopWith = async (reason: string, notify: boolean): Promise<Settled> => {
+        const state = facts.stopped ? 'cancelled' : 'unknown';
+        if (!await store.transition(job, state, reason)) return skipped(state);
+        if (notify && !facts.stopped) await this.blocked(job, revision, store);
+        return applied(state, facts.stopped);
+      };
       const leaseLost = stop === 'lease' || Number(row.lease_until) <= store.now();
-      if (stop === 'revoked') {
-        await session(facts.stopped ? 'cancelled' : 'unknown');
-        await store.transition(job, facts.stopped ? 'cancelled' : 'unknown', 'authorization_revoked');
-        await store.syncTaskLane();
-        Object.assign(ended, { state: facts.stopped ? 'cancelled' : 'unknown', reason: 'authorization_revoked' });
-        return facts.stopped;
-      }
-      if (stop === 'cancel' || row.state === 'cancel_requested') {
-        await session(facts.stopped ? 'cancelled' : 'unknown');
-        await store.transition(job, facts.stopped ? 'cancelled' : 'unknown', 'stop_confirmation');
-        if (!facts.stopped) await this.blocked(job, revision, store);
-        await store.syncTaskLane();
-        Object.assign(ended, { state: facts.stopped ? 'cancelled' : 'unknown', reason: 'stop_confirmation' });
-        return facts.stopped;
-      }
+      if (stop === 'revoked') return stopWith('authorization_revoked', false);
+      if (stop === 'cancel' || row.state === 'cancel_requested') return stopWith('stop_confirmation', true);
       // lease를 잃었으면 다른 기록이 이 작업을 넘겨받았을 수 있어 종료 확인과 무관하게 unknown이다.
       if (!facts.stopped || leaseLost) {
         const reason = leaseLost ? 'task_lease' : stop === 'shutdown' ? 'publisher_shutdown' : turn.kind === 'response' ? 'task_unknown' : 'task_worker_lost';
-        await session('unknown');
-        await store.transition(job, 'unknown', reason);
+        if (!await store.transition(job, 'unknown', reason)) return skipped('unknown');
         await this.blocked(job, revision, store);
-        Object.assign(ended, { state: 'unknown', reason });
-        await store.syncTaskLane();
-        return false;
+        return applied('unknown', false);
       }
       if (turn.kind === 'rejected') return fail('task_worker_rejected');
       if (stop) return fail(`task_${stop}`);
@@ -412,7 +426,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
         // 계정 한도는 대화·리뷰도 같은 계정이라 양쪽을 막고, 인증 만료는 레인 토큰의 일이라 작업 레인만 막는다.
         await store.waitForUser(job, reason, { laneOnly: reason === 'auth_expired' });
         const now = (await store.db.query<{ state: string; attempt: number }>('SELECT state,attempt FROM jobs WHERE id=$1', [job.id])).rows[0]!;
-        if (now.state !== 'waiting_user') { await end('cancelled'); return true; }
+        if (now.state !== 'waiting_user') return skipped('waiting_user');
         await session('waiting_model', { reason });
         await store.syncTaskLane();
         // 그 턴이 나르던 답은 처리되지 않았다. /resume-model 뒤 같은 답으로 잇는다.
@@ -422,12 +436,16 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
           payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary',
             content: `작업 ${job.id}이 ${reason === 'model_limit' ? '모델 사용 한도로 멈췄습니다. 같은 계정을 쓰는 대화·리뷰도 함께 멈춥니다' : '작업 레인 인증 만료로 멈췄습니다. 대화·리뷰는 계속 동작합니다'}. 다른 계정·인증으로 바꾸지 않습니다. `
               + (resumable ? `원인을 해소한 뒤 /resume-model target:${job.id} 로 재개하거나 /cancel 하세요.` : '재시도 한도에 닿아 재개할 수 없습니다. /cancel 뒤 새 작업으로 요청하세요.') } });
-        return false;
+        return { terminal: false };
       }
       if (response.status === 'needs_input') {
-        const waiting = await this.ask(job, revision, taskQuestionId(job.id, request.sessionId, request.turn), request.sessionId, request.turn, response.question, store);
-        await end(waiting ? 'waiting_answer' : 'cancelled');
-        return !waiting;
+        if (await this.ask(job, revision, taskQuestionId(job.id, request.sessionId, request.turn), request.sessionId, request.turn, response.question, store)) {
+          await end('waiting_answer');
+          return { terminal: false };
+        }
+        // 대기에 못 들어갔다. 구독 중지로 끝났으면(superseded) 세션을 닫고, job이 그대로면 전이가 막힌 것이다.
+        const after = (await store.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0]!;
+        return SETTLEABLE.has(after.state) ? skipped('waiting_user') : applied('cancelled', true);
       }
       if (response.status !== 'completed') throw new Error('unexpected_status');
       const result = { summary: response.summary, changes: response.changes, patch: response.patch, verification: response.verification };
@@ -438,10 +456,10 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       [`작업 완료 (작업 ${job.id})`, bounded(response.summary || '요약 없음', TASK_LIMITS.summaryChars),
         `변경 파일(작업자 diff 기준): ${response.changes.total}개`,
         `검증: 통과 ${verified.passed} · 실패 ${verified.failed} · 미실행 ${verified.not_run}`].join('\n'), job.target);
+      // 구독이 멈춘 대화에서 finish는 막혀도 던지지 않는다.
       const after = (await store.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0]!;
-      await end(after.state === 'succeeded' ? 'completed' : 'cancelled');
-      Object.assign(ended, { state: after.state, reason: null });
-      return true;
+      if (SETTLEABLE.has(after.state)) return skipped('succeeded');
+      return applied(after.state === 'succeeded' ? 'completed' : 'cancelled', true);
     });
   }
   // Runtime.tickTask가 claim 전에 부른다. 작업자 호출 실패는 이 바퀴를 깨지 않고 다음 sweep이 다시 시도한다.

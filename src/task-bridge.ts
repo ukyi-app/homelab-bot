@@ -53,12 +53,14 @@ export abstract class TaskBridge {
     return await this.store.heartbeat(job) ? undefined : 'lease';
   }
   // 띄우지 않고 실패로 끝낼 때 세션·질문도 함께 닫는다. 남겨 두면 /retry가 같은 세션 재개로 읽혀 같은 이유로 다시 실패한다.
-  protected async abandon(job: Job, reason: string, within: Store = this.store): Promise<void> {
-    await within.atomic(async store => {
+  // job을 끝내지 못했으면(lease가 끝남 등) 세션·질문을 그대로 두고 false를 돌려준다. 그 job은 unknown으로 가고 해제가 세션을 받는다.
+  protected async abandon(job: Job, reason: string, within: Store = this.store): Promise<boolean> {
+    return within.atomic(async store => {
       await store.db.query('SELECT id FROM conversations WHERE id=$1 FOR UPDATE', [job.conversation_id]);
+      if (!await store.fail(job, reason)) return false;
       await store.db.query("UPDATE codex_sessions SET state='failed',updated_at=$2 WHERE job_id=$1", [job.id, store.now()]);
       await store.db.query("UPDATE codex_questions SET state='cancelled' WHERE job_id=$1 AND state IN ('open','answered')", [job.id]);
-      await store.fail(job, reason);
+      return true;
     });
   }
   // 질문을 만들고 job을 대기로 둔다. 구독이 멈췄거나 취소 요청이 먼저면 질문 없이 끝낸다. 대기에 들어갔으면 true.
