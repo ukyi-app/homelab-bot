@@ -7,7 +7,7 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, 
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { TASK_OUTPUT_JSON_SCHEMA } from '../src/codex-events.js';
-import { CLAUDE_TASK_ENV, CLAUDE_TASK_FORBIDDEN_FLAGS, CLAUDE_TASK_TOOLS, ClaudeTaskAdapter, compactTaskEvent, taskArgs, taskSettings, taskStreamPolicy } from '../src/executor-claude-task.js';
+import { CLAUDE_TASK_ENV, CLAUDE_TASK_FORBIDDEN_FLAGS, CLAUDE_TASK_TOOLS, ClaudeTaskAdapter, compactTaskEvent, messagingSocketDir, taskArgs, taskEventViolation, taskSettings, taskStreamPolicy, taskWriteRule } from '../src/executor-claude-task.js';
 import { CLAUDE_FORBIDDEN_FLAGS, claudeArgs, interpretClaudeStream } from '../src/executor-claude.js';
 import { BASE_ENV_NAMES, assertLaunchSafe, baseEnvironment } from '../src/run-control.js';
 import type { RunDirs } from '../src/executor.js';
@@ -21,24 +21,62 @@ const TOKEN = 'fake-token-for-boundary-test-0123456789abcdef';
 const scratch = await realpath(await mkdtemp(join(tmpdir(), 't18-boundary-')));
 after(async () => { await rm(scratch, { recursive: true, force: true }); });
 
+const WORKSPACE = '/worker-state/tasks/job-a/1/workspace';
 const SANDBOX = { credentialDir: '/run/worker-credential', controlDir: '/worker-state/.homelab-worker',
-  config: '/worker-state/tasks/job-a/1/config', run: '/worker-state/tasks/job-a/1/run',
-  others: ['/worker-state/tasks/job-a/2', '/worker-state/tasks/job-b/1'], socketDir: '/tmp/cc-socks-10001' };
+  config: '/worker-state/tasks/job-a/1/config', run: '/worker-state/tasks/job-a/1/run', tmp: '/worker-state/tasks/job-a/1/tmp',
+  others: ['/worker-state/tasks/job-a/2', '/worker-state/tasks/job-b/1'] };
 const flagValue = (args: readonly string[], flag: string) => args[args.indexOf(flag) + 1];
+const dirsOf = (root: string): RunDirs => ({ root, home: join(root, 'home'), config: join(root, 'config'), workspace: join(root, 'workspace'), run: join(root, 'run'), tmp: join(root, 'tmp') });
 
-test('argv 시작: PLAN §2.3 목표 모양 그대로다', () => {
+test('argv 시작: PLAN §2.3 모양이고 쓰기 도구 허용은 작업 공간뿐이다. 경로 없는 Edit·Write 허용이 없다', () => {
   const settings = taskSettings(SANDBOX);
-  assert.deepEqual(taskArgs({ model: MODEL, schema: TASK_OUTPUT_JSON_SCHEMA, operation: 'start', sessionId: SESSION, settings }), [
+  const args = taskArgs({ model: MODEL, schema: TASK_OUTPUT_JSON_SCHEMA, operation: 'start', sessionId: SESSION, settings, workspace: WORKSPACE });
+  assert.deepEqual(args, [
     '-p', '--output-format', 'stream-json', '--verbose', '--json-schema', JSON.stringify(TASK_OUTPUT_JSON_SCHEMA), '--model', MODEL,
-    '--session-id', SESSION, '--tools', 'Bash,Read,Edit,Write', '--allowedTools', 'Bash', 'Read', 'Edit', 'Write',
+    '--session-id', SESSION, '--tools', 'Bash,Read,Edit,Write', '--allowedTools', 'Bash', 'Read', `Edit(/${WORKSPACE}/**)`,
     '--permission-mode', 'default', '--setting-sources', 'user', '--safe-mode', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
     '--disable-slash-commands', '--include-hook-events', '--settings', settings]);
+  for (const bare of ['Edit', 'Write']) assert.equal(args.slice(args.indexOf('--allowedTools'), args.indexOf('--permission-mode')).includes(bare), false, bare);
+});
+
+test('argv: 작업 공간 경로의 글자가 규칙의 뜻을 바꾸면 만들지 않는다', () => {
+  for (const bad of ['relative/path', '/a/*', '/a/b)', '/a/../b', '/a b', '/a/[x]', '/a\n/b', '']) {
+    assert.throws(() => taskWriteRule(bad), { message: 'sandbox_path_invalid' }, bad);
+    assert.throws(() => taskArgs({ model: MODEL, schema: {}, operation: 'start', sessionId: SESSION, settings: '{}', workspace: bad }), { message: 'sandbox_path_invalid' }, bad);
+  }
+});
+
+test('어댑터: 쓰기 허용과 소켓 가림을 이번 실행의 작업 디렉터리·TMPDIR에서 계산한다', async () => {
+  const dirs = dirsOf('/worker-state/tasks/job-c/7');
+  const adapter = new ClaudeTaskAdapter('subscription-token', { operation: 'start', sessionId: SESSION, sandbox: { credentialDir: SANDBOX.credentialDir, controlDir: SANDBOX.controlDir, others: [] } });
+  const plan = await adapter.start({ job: 'j', model: MODEL, dirs, credential: { value: TOKEN, secrets: [TOKEN] }, schema: {} });
+  assert.ok(plan.args.includes(`Edit(/${dirs.workspace}/**)`));
+  const settings = JSON.parse(flagValue(plan.args, '--settings')!) as Record<string, any>;
+  assert.ok(settings.sandbox.filesystem.denyRead.includes(`${dirs.tmp}/cc-socks`));
+  for (const hidden of [dirs.config, dirs.run]) assert.ok(settings.sandbox.filesystem.denyWrite.includes(hidden), hidden);
+  assert.equal(baseEnvironment(dirs, 'j').TMPDIR, dirs.tmp, '소켓 자리는 이 TMPDIR로 정해진다');
+  for (const name of ['XDG_RUNTIME_DIR', 'CLAUDE_CODE_TMPDIR']) assert.equal(name in baseEnvironment(dirs, 'j') || name in plan.env, false, `${name}가 있으면 소켓 자리가 달라진다`);
+});
+
+test('운영 경로 길이: 메시징 소켓이 fallback으로 옮겨 가지 않고 샌드박스 중계 소켓도 길이 한도에 걸리지 않는다', () => {
+  // 고정 CLI의 한도 [실측: SEC-02 long_tmpdir]. TMPDIR 74바이트까지 Bash가 돌고, 소켓은 전체 경로 103바이트까지 TMPDIR 아래다. 세대는 계약상 안전 정수이지만 실제로는 작은 수다.
+  const tmp = (generation: number) => `/worker-state/tasks/${SESSION}/${generation}/tmp`;
+  assert.equal(tmp(1).length, 62);
+  assert.ok(tmp(999_999_999).length <= 74, 'Bash가 닫히는 길이');
+  assert.ok(`${messagingSocketDir(tmp(999_999_999))}/4194304.sock`.length <= 103, 'pid_max 자릿수까지 TMPDIR 아래');
+});
+
+test('판정: 목록 밖 쓰기 도구는 정책 위반이다', () => {
+  for (const name of ['NotebookEdit', 'MultiEdit']) {
+    const event = compactTaskEvent(JSON.stringify({ type: 'assistant', session_id: SESSION, message: { model: MODEL, content: [{ type: 'tool_use', id: 't', name, input: {} }] } }))!;
+    assert.equal(taskEventViolation(event, { model: MODEL, apiKeySource: 'none', version: '2.1.308' }, SESSION), 'tool_not_allowed', name);
+  }
 });
 
 test('argv 재개: --session-id 자리만 같은 UUID의 --resume이고 나머지 격리 인자는 같다', () => {
   const settings = taskSettings(SANDBOX);
-  const start = taskArgs({ model: MODEL, schema: {}, operation: 'start', sessionId: SESSION, settings });
-  const resume = taskArgs({ model: MODEL, schema: {}, operation: 'resume', sessionId: SESSION, settings });
+  const start = taskArgs({ model: MODEL, schema: {}, operation: 'start', sessionId: SESSION, settings, workspace: WORKSPACE });
+  const resume = taskArgs({ model: MODEL, schema: {}, operation: 'resume', sessionId: SESSION, settings, workspace: WORKSPACE });
   assert.equal(flagValue(resume, '--resume'), SESSION);
   assert.equal(resume.includes('--session-id'), false);
   const at = start.indexOf('--session-id');
@@ -48,13 +86,13 @@ test('argv 재개: --session-id 자리만 같은 UUID의 --resume이고 나머�
 });
 
 test('argv: 금지 플래그가 없고, 세션 ID 자리에 플래그를 끼울 수 없다', () => {
-  const args = taskArgs({ model: MODEL, schema: {}, operation: 'start', sessionId: SESSION, settings: taskSettings(SANDBOX) });
+  const args = taskArgs({ model: MODEL, schema: {}, operation: 'start', sessionId: SESSION, settings: taskSettings(SANDBOX), workspace: WORKSPACE });
   for (const flag of CLAUDE_TASK_FORBIDDEN_FLAGS) assert.equal(args.includes(flag), false, flag);
   for (const flag of ['--no-session-persistence', '--continue', '--fork-session', '--bare', '--fallback-model', '--dangerously-skip-permissions', '--add-dir']) {
     assert.ok(CLAUDE_TASK_FORBIDDEN_FLAGS.includes(flag), flag);
   }
   for (const bad of ['--dangerously-skip-permissions', 'not-a-uuid', '', `${SESSION}x`]) {
-    assert.throws(() => taskArgs({ model: MODEL, schema: {}, operation: 'resume', sessionId: bad, settings: '{}' }), { message: 'session_id_invalid' });
+    assert.throws(() => taskArgs({ model: MODEL, schema: {}, operation: 'resume', sessionId: bad, settings: '{}', workspace: WORKSPACE }), { message: 'session_id_invalid' });
   }
 });
 
@@ -71,7 +109,7 @@ test('대화·리뷰의 무도구 경계는 그대로다', () => {
 test('settings: 샌드박스 강제 값과 가릴 경로 전부', () => {
   const settings = JSON.parse(taskSettings(SANDBOX)) as Record<string, any>;
   const hidden = ['/run/worker-credential', '/worker-state/.homelab-worker', '/worker-state/tasks/job-a/1/config', '/worker-state/tasks/job-a/1/run',
-    '/tmp/cc-socks-10001', '/worker-state/tasks/job-a/2', '/worker-state/tasks/job-b/1'];
+    '/worker-state/tasks/job-a/1/tmp/cc-socks', '/worker-state/tasks/job-a/2', '/worker-state/tasks/job-b/1'];
   assert.deepEqual(settings.sandbox, { enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false, enableWeakerNestedSandbox: false, excludedCommands: [],
     network: { allowAllUnixSockets: true }, filesystem: { denyRead: hidden, denyWrite: hidden } });
   assert.deepEqual(settings.enabledPlugins, { 'cc-plugin-agents-md@builtin': false, 'cc-plugin-plugin-authoring@builtin': false });
@@ -86,11 +124,12 @@ test('settings: 샌드박스 강제 값과 가릴 경로 전부', () => {
 test('settings: 규칙의 뜻을 바꾸는 글자가 든 경로는 설정을 만들지 않는다', () => {
   for (const bad of ['relative/path', '/a/*', '/a/b)', '/a/../b', '/a b', '/a/[x]', '/a\n/b']) {
     assert.throws(() => taskSettings({ ...SANDBOX, others: [bad] }), { message: 'sandbox_path_invalid' }, bad);
+    assert.throws(() => taskSettings({ ...SANDBOX, tmp: bad }), { message: 'sandbox_path_invalid' }, bad);
   }
 });
 
-const dirsOf = (root: string): RunDirs => ({ root, home: join(root, 'home'), config: join(root, 'config'), workspace: join(root, 'workspace'), run: join(root, 'run'), tmp: join(root, 'tmp') });
-const adapterFor = (sessionId: string, operation: 'start' | 'resume' = 'start', paths = SANDBOX) => new ClaudeTaskAdapter('subscription-token', { operation, sessionId, sandbox: paths });
+const adapterFor = (sessionId: string, operation: 'start' | 'resume' = 'start', others: readonly string[] = SANDBOX.others) =>
+  new ClaudeTaskAdapter('subscription-token', { operation, sessionId, sandbox: { credentialDir: SANDBOX.credentialDir, controlDir: SANDBOX.controlDir, others } });
 test('env: 기본 목록 + CLAUDE_CONFIG_DIR + 고정 값 + scrub + 토큰 한 개다. 토큰은 그 변수에만 있다', async () => {
   const dirs = dirsOf(scratch);
   const adapter = adapterFor(SESSION);
@@ -159,7 +198,7 @@ async function shimPath(root: string): Promise<string> {
 }
 interface OfflineRun { status: number | null; events: Record<string, unknown>[]; lines: string[]; stdout: string; stderr: string; plan: Awaited<ReturnType<ClaudeTaskAdapter['start']>> }
 async function runOffline(dirs: RunDirs, sessionId: string, options: { operation?: 'start' | 'resume'; path: string; argsOverride?: (args: string[]) => string[] }): Promise<OfflineRun> {
-  const adapter = adapterFor(sessionId, options.operation ?? 'start', { ...SANDBOX, config: dirs.config, run: dirs.run, others: [] });
+  const adapter = adapterFor(sessionId, options.operation ?? 'start', []);
   const plan = await adapter.start({ job: 'j', model: MODEL, dirs, credential: { value: TOKEN, secrets: [TOKEN] }, schema: TASK_OUTPUT_JSON_SCHEMA });
   const args = options.argsOverride ? options.argsOverride([...plan.args]) : [...plan.args];
   // 재시도를 끄는 두 값만 시험에서 더한다. 나머지는 실제 조립 값 그대로다.

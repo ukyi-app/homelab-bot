@@ -62,7 +62,7 @@ async function run(step: Step, request: TaskRequest = startRequest()) {
   const sessions = new TaskSessions(state, { storage: WORKER.storage, homes: ['/nonexistent-home'] });
   const logs: Record<string, unknown>[] = [];
   const response: TaskResponse = TaskResponseSchema.parse(await runTaskTurn({ control, sessions, fetchArchive: async () => GOOD, worker: WORKER, model: MODEL,
-    auth: 'subscription-token', credentialDir: '/run/worker-credential', socketDir: '/tmp/cc-socks-fixture', log: item => { logs.push(item); } }, request, new AbortController().signal));
+    auth: 'subscription-token', credentialDir: '/run/worker-credential', log: item => { logs.push(item); } }, request, new AbortController().signal));
   return { response, logs, request };
 }
 const details = (logs: Record<string, unknown>[]) => logs.filter(item => item.event === 'task_turn_error_detail');

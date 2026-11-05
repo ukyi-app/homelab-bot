@@ -14,8 +14,8 @@ import { TaskWorkspaceError } from './task-workspace.js';
 import type { TaskSession, TaskSessions } from './task-workspace.js';
 
 // 작업 레인 Claude 어댑터(PLAN §2.3, DECISIONS "T18 결정"). 대화·리뷰의 무도구 경계와 별개다. 그쪽 argv·금지 목록·판정은 그대로 둔다.
-// 근거 표기: [실측]은 고정 바이너리 2.1.308을 가짜 토큰·네트워크 없이 띄운 결과(VERIFICATION "T18 할 일 6·작업 레인 실행 부품"),
-// [운영 실측]은 격리 파드 실측(VERIFICATION "T18 작업 레인 격리 파드 실측"), [미확인]은 도구 호출이 있어야 볼 수 있어 아직 경계로 세지 않는 것이다.
+// 근거 표기: [실측]은 고정 바이너리 2.1.308을 가짜 토큰·네트워크 없이 띄운 결과(VERIFICATION "T18 할 일 6·작업 레인 실행 부품", 도구 경계는 "SEC-02 1단계"),
+// [운영 실측]은 격리 파드 실측(VERIFICATION "T18 작업 레인 격리 파드 실측"), [미확인]은 아직 경계로 세지 않는 것이다.
 export const CLAUDE_TASK_TOOLS = Object.freeze(['Bash', 'Read', 'Edit', 'Write'] as const);
 export const CLAUDE_TASK_CAPABILITIES: ExecutorCapabilities = Object.freeze({
   executor: 'claude', cliVersion: CLAUDE_CLI_VERSION, lanes: Object.freeze({ chat: false, task: true, review: false }),
@@ -31,13 +31,24 @@ export const CLAUDE_TASK_FORBIDDEN_FLAGS: readonly string[] = Object.freeze(['--
   '--file', '--worktree', '-w', '--cloud', '--teleport', '--from-pr', '--betas', '--system-prompt', '--append-system-prompt']);
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+// 권한 규칙은 glob이다. 경로는 신뢰된 코드가 고정 루트와 UUID로 만들지만, 글자가 어긋나면 규칙이 다른 뜻이 되므로 설정을 만들지 않는다.
+const TRUSTED_PATH = /^\/[A-Za-z0-9._/-]+$/;
+const assertTrustedPaths = (paths: readonly string[]) => {
+  if (paths.some(path => !TRUSTED_PATH.test(path) || path.split('/').includes('..'))) throw new Error('sandbox_path_invalid');
+};
+// 파일 쓰기 도구의 유일한 허용. Edit 규칙이 Write에도 걸린다 [실측: VERIFICATION "SEC-02 1단계"].
+// 파일 도구는 OS 샌드박스 밖에서 돌므로 도구 이름만 허용하면 deny에 없는 모든 경로가 쓰기 대상이 된다. 규칙 밖 쓰기는 -p에 승인할 사람이 없어 거부된다.
+export function taskWriteRule(workspace: string): string {
+  assertTrustedPaths([workspace]);
+  return `Edit(/${workspace}/**)`;
+}
 export type ClaudeTaskOperation = 'start' | 'resume';
-export function taskArgs(input: { model: string; schema: object; operation: ClaudeTaskOperation; sessionId: string; settings: string }): string[] {
+export function taskArgs(input: { model: string; schema: object; operation: ClaudeTaskOperation; sessionId: string; settings: string; workspace: string }): string[] {
   if (!UUID.test(input.sessionId)) throw new Error('session_id_invalid');
   const args = ['-p', '--output-format', 'stream-json', '--verbose',
     '--json-schema', JSON.stringify(input.schema), '--model', input.model,
     input.operation === 'start' ? '--session-id' : '--resume', input.sessionId,
-    '--tools', CLAUDE_TASK_TOOLS.join(','), '--allowedTools', ...CLAUDE_TASK_TOOLS,
+    '--tools', CLAUDE_TASK_TOOLS.join(','), '--allowedTools', 'Bash', 'Read', taskWriteRule(input.workspace),
     '--permission-mode', 'default', '--setting-sources', 'user', '--safe-mode',
     '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--disable-slash-commands',
     // 없으면 hook 이벤트가 흐름에 나오지 않아 판정이 볼 수 없다 [확인: 2.1.308 --help].
@@ -54,17 +65,20 @@ export interface TaskSandboxPaths {
   controlDir: string;
   // 이 세션의 제어 경로. CLI 자신은 config를 쓰지만 모델의 셸·파일 도구가 읽거나 고치면 안 된다.
   config: string; run: string;
+  // 이 턴의 TMPDIR. 메시징 소켓 자리가 여기서 정해진다.
+  tmp: string;
   // 보존 중인 다른 작업 경로 전부(TaskSessions.others).
   others: readonly string[];
-  // CLI 메시징 소켓 디렉터리 [실측: init의 messaging_socket_path가 /tmp/cc-socks-<uid>/<pid>.sock]. allowAllUnixSockets 아래에서 샌드박스 명령이 연결할 수 있어 가린다.
-  socketDir?: string;
 }
-const defaultSocketDir = () => `/tmp/cc-socks-${process.getuid?.() ?? 0}`;
-// 권한 규칙은 glob이다. 경로는 신뢰된 코드가 고정 루트와 UUID로 만들지만, 글자가 어긋나면 규칙이 다른 뜻이 되므로 설정을 만들지 않는다.
-const TRUSTED_PATH = /^\/[A-Za-z0-9._/-]+$/;
+// CLI 메시징 소켓 자리는 <TMPDIR>/cc-socks/<pid>.sock이다 [확인: 2.1.308 코드, 실측: init의 messaging_socket_path]. allowAllUnixSockets 아래에서는 경로가 보이면 샌드박스 명령이 연결할 수 있어
+// 가린다. pid는 띄운 뒤에야 정해지므로 디렉터리째다. CLI는 XDG_RUNTIME_DIR·CLAUDE_CODE_TMPDIR를 TMPDIR보다 먼저 보지만 baseEnvironment가 두 변수를 넘기지 않는다.
+// 소켓 경로가 103바이트를 넘으면 CLI가 /tmp/cc-socks-<uid>로 옮기지만 그 자리는 가리지 않는다. 샌드박스 중계 소켓이 먼저 길이 한도에 걸려 Bash가 닫히고(TMPDIR 77바이트에서 이미 닫힘, 소켓 이동은 7자리 pid도 82바이트부터),
+// 파일 도구는 쓰기 허용과 blockReadsOutsideWorkingDirectories가 막는다 [실측: SEC-02 long_tmpdir]. 운영 TMPDIR는 세대 한 자리일 때 62바이트다.
+export const messagingSocketDir = (tmp: string): string => join(tmp, 'cc-socks');
 export function taskSettings(paths: TaskSandboxPaths): string {
-  const hidden = [paths.credentialDir, paths.controlDir, paths.config, paths.run, paths.socketDir ?? defaultSocketDir(), ...paths.others];
-  if (hidden.some(path => !TRUSTED_PATH.test(path) || path.split('/').includes('..'))) throw new Error('sandbox_path_invalid');
+  const hidden = [paths.credentialDir, paths.controlDir, paths.config, paths.run, messagingSocketDir(paths.tmp), ...paths.others];
+  // join이 tmp의 '..'을 접으므로 원본도 본다.
+  assertTrustedPaths([paths.tmp, ...hidden]);
   return JSON.stringify({
     enabledPlugins: Object.fromEntries(REVIEW_DISABLED_BUILTIN_PLUGINS.map(name => [name, false])),
     sandbox: {
@@ -79,8 +93,8 @@ export function taskSettings(paths: TaskSandboxPaths): string {
       filesystem: { denyRead: hidden, denyWrite: hidden },
     },
     permissions: {
-      // 경계로 세지 않는다. 2.1.308에 설정이 있고 파싱은 되지만 [실측], 파일 도구·샌드박스 명령에서 실제로 막는지는 도구 호출이 있어야 본다 [미확인].
-      // 바이너리 문구로는 켜면 샌드박스 명령이 홈 디렉터리를 잃는다. 경계는 아래 deny와 위 filesystem이다.
+      // 경계다. 작업 공간 밖 Read와, 작업 공간 심링크로 /proc/self/environ을 읽는 별칭은 이 설정만 막는다 [실측: SEC-02 no_block_outside에서 합성 토큰이 읽힘].
+      // deny는 아는 경로만, /proc/self/environ 이름 검사는 그 이름만 잡는다. Bash 판정은 이 설정 유무로 달라지지 않았다 [실측]. Bash의 경계는 위 filesystem과 샌드박스 자체다.
       blockReadsOutsideWorkingDirectories: true,
       deny: hidden.flatMap(path => [`Read(/${path}/**)`, `Edit(/${path}/**)`]),
     },
@@ -168,7 +182,8 @@ export function taskErrorDetail(trace: TaskTurnTrace): Record<string, unknown> {
     api_error_origin: errorOrigin(result?.api_error_origin ?? assistantDetail?.api_error_origin) };
 }
 
-export interface ClaudeTaskTurn { operation: ClaudeTaskOperation; sessionId: string; sandbox: TaskSandboxPaths }
+// 세대 경로는 받지 않는다. 쓰기 허용·소켓 가림이 실제 작업 디렉터리·TMPDIR와 어긋나지 않게 실행의 run.dirs에서 계산한다.
+export interface ClaudeTaskTurn { operation: ClaudeTaskOperation; sessionId: string; sandbox: Pick<TaskSandboxPaths, 'credentialDir' | 'controlDir' | 'others'> }
 // 턴마다 새로 만든다. 이번 턴의 세션 ID·경로를 쥐고, 흐름에서 본 사용량과 오류 필드를 runTaskTurn에 넘긴다.
 export class ClaudeTaskAdapter implements ChatAdapter {
   readonly capabilities = CLAUDE_TASK_CAPABILITIES;
@@ -196,8 +211,9 @@ export class ClaudeTaskAdapter implements ChatAdapter {
     let unnamed = 0;
     const seen = (usage: TaskModelUsage | null) => { this.usage = usage; };
     const trace = this.trace;
+    const settings = taskSettings({ ...sandbox, config: run.dirs.config, run: run.dirs.run, tmp: run.dirs.tmp });
     return {
-      args: taskArgs({ model: run.model, schema: run.schema, operation, sessionId, settings: taskSettings(sandbox) }),
+      args: taskArgs({ model: run.model, schema: run.schema, operation, sessionId, settings, workspace: run.dirs.workspace }),
       env: { CLAUDE_CONFIG_DIR: run.dirs.config, ...CLAUDE_TASK_ENV, [this.credentialEnv]: run.credential.value },
       observe(line: string): Observation {
         const compact = compactTaskEvent(line);
@@ -260,8 +276,6 @@ export interface TaskTurnDeps {
   model: string;
   auth: ClaudeAuth;
   credentialDir: string;
-  // 시험 주입. 기본은 CLI의 고정 위치.
-  socketDir?: string;
   log?: TaskLog;
 }
 // 값 없는 필드만 받는다. 사용자 요청·모델 출력·파일 내용·경로 이름·토큰을 넘기지 않는다.
@@ -358,8 +372,7 @@ async function executeTaskTurn(deps: TaskTurnDeps, request: TaskRequest, signal:
   try { others = await deps.sessions.others(request.job, request.generation); }
   catch { return failedResponse(base, 'prepare_failed', await retained()); }
   const adapter = new ClaudeTaskAdapter(deps.auth, { operation: request.operation, sessionId: request.sessionId,
-    sandbox: { credentialDir: deps.credentialDir, controlDir: deps.sessions.controlDir, config: session.dirs.config, run: session.dirs.run, others,
-      ...(deps.socketDir ? { socketDir: deps.socketDir } : {}) } }, trace);
+    sandbox: { credentialDir: deps.credentialDir, controlDir: deps.sessions.controlDir, others } }, trace);
   const report = await deps.control.run({ adapter, lane: 'task', job: request.job, model: deps.model, session: { dirs: session.dirs },
     timeoutMs: request.timeoutMs, toolCalls: request.toolCalls, schema: TASK_OUTPUT_JSON_SCHEMA, prompt: taskPrompt(request),
     limits: { lineBytes: request.limits.lineBytes, outputBytes: request.limits.outputBytes, events: request.limits.events } }, signal);

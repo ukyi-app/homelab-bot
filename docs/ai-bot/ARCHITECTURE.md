@@ -1039,10 +1039,13 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 |---|---|
 | 악성 스냅샷의 hook·`.mcp.json`·skill·명령·설정 차단(`--setting-sources user --safe-mode --strict-mcp-config --disable-slash-commands`) | 고정 CLI 실측: 시작·재개 모두 marker 0. 대조군에서는 hook이 돈다 |
 | 샌드박스 못 세우면 실패 | 고정 CLI 실측: bwrap 없음은 기동 거부, socat 없음은 init 전 오류 |
-| scrub·자격 경로 `denyRead`·Read deny | 파드 실측(위 DECISIONS "(2)") |
-| 제어 경로·다른 작업 경로의 `denyRead`·`denyWrite`, Edit deny | **[미확인]** 도구 호출이 있어야 본다 |
-| `blockReadsOutsideWorkingDirectories` | 2.1.308 바이너리에 있고 파싱된다. 막는지는 **[미확인]**이라 경계로 세지 않는다 |
-| CLI 메시징 소켓 디렉터리 가림(`/tmp/cc-socks-<uid>`) | 제안. init의 `messaging_socket_path`에서 찾았다. 효과 **[미확인]** |
+| scrub·자격 경로 `denyRead`·Read deny | 파드 실측(위 DECISIONS "(2)"), 합성 환경 재측정(VERIFICATION "SEC-02 1단계") |
+| 파일 쓰기 허용은 작업 공간뿐: `--allowedTools Bash Read Edit(//<workspace>/**)` | 합성 환경 실측. 경로 없는 `Edit`·`Write` 허용을 넘기지 않는다. 이 규칙이 Write에도 걸리고, 규칙 밖 쓰기는 `-p`에 승인할 사람이 없어 거부된다. `--tools`에 없는 `NotebookEdit`·`MultiEdit`은 CLI가 실행하지 않고 어댑터가 `policy_violation`으로 끝낸다 |
+| 제어 경로·자기 `config`·`run`·다른 작업 경로의 `denyRead`·`denyWrite`, Read·Edit deny | 합성 환경 실측. 파일 도구는 OS 샌드박스 밖이라 deny와 위 허용 규칙이 경계이고, Bash는 샌드박스가 막는다 |
+| `blockReadsOutsideWorkingDirectories` | 합성 환경 실측, **경계다**. 작업 공간 밖 Read와 심링크로 `/proc/self/environ`을 읽는 별칭을 이것만 막는다. Bash 판정은 이 설정 유무로 달라지지 않았다 |
+| CLI 메시징 소켓 디렉터리 가림(`<TMPDIR>/cc-socks`) | 합성 환경 실측. 샌드박스 Bash가 소켓에 연결하지 못한다. 쓰기 허용·가림 경로는 실행의 `run.dirs`에서 계산한다. 경로가 103바이트를 넘으면 CLI가 소켓을 `/tmp/cc-socks-<uid>`로 옮기지만 그 전에 Bash가 닫혀 가리지 않는다(TMPDIR 77바이트에서 Bash가 이미 닫힘, 소켓 이동은 7자리 pid도 82바이트부터, 운영은 세대 한 자리일 때 62바이트) |
+
+위 "합성 환경 실측"은 운영 파드 재측정 전이다. 운영에서 같은 사례를 다시 재는 일은 VERIFICATION "SEC-02 1단계"의 2단계에 남아 있다.
 
 **프로세스 정리.** DECISIONS "T18 할 일 6 정리 방식"을 구현한다. 작업 레인 파드에서만 켠다.
 
