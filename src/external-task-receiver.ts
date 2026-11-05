@@ -6,6 +6,7 @@ import type { Duplex } from 'node:stream';
 import { z } from 'zod';
 import { Denied, PolicyUnavailable } from './contracts.js';
 import type { Scope } from './contracts.js';
+import type { Database, TransactionDeadline } from './database.js';
 import { EXTERNAL_TASK_ID, connectionRow, outboxKey } from './external-task-links.js';
 import type { ExternalConnection, ExternalTaskLinks } from './external-task-links.js';
 import { errorInfo } from './log.js';
@@ -23,7 +24,8 @@ export const RECEIVER_LIMITS = Object.freeze({
   sentAtSkewMs: 300_000, occurredFutureMs: 300_000, occurredPastMs: 24 * 3_600_000,
   summaryCodePoints: 500, summaryBytes: 2000, externalIdBytes: 128,
   // DB를 함께 쓰는 GitHub·Discord 처리를 굶기지 않게 R08이 동시에 쓰는 DB 작업 수를 따로 묶는다.
-  dbSlots: 2, processingTimeoutMs: 5000, transactionMs: 2000,
+  // 기한이 지나 응답을 닫아도 슬롯을 쥔 작업은 DB가 돌려줄 때까지 남고 HTTP 동시 수에서는 빠진다. 대기까지 합쳐 동시 8과 같게 둔다.
+  dbSlots: 2, dbQueue: 6, processingTimeoutMs: 5000, transactionMs: 2000,
 });
 export type ReceiverLimits = { readonly [K in keyof typeof RECEIVER_LIMITS]: number };
 
@@ -106,19 +108,38 @@ class ConnectionLimit {
     return wait;
   }
 }
-class Slots {
-  private busy = 0;
-  private readonly waiting: (() => void)[] = [];
-  constructor(private readonly size: number) {}
-  async run<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.busy >= this.size) await new Promise<void>(resolve => this.waiting.push(resolve));
-    else this.busy++;
-    try { return await fn(); } finally {
-      const next = this.waiting.shift();
-      if (next) next(); else this.busy--;
+export class SlotsFull extends Error { constructor() { super('external_slots_full'); } }
+export class ProcessingExpired extends Error { constructor() { super('external_processing_expired'); } }
+// 기한이 지난 대기 작업은 줄에서 빠진다. 슬롯은 작업이 실제로 끝나야 돌아오므로 busy가 DB에 남은 작업 수의 진짜 상한이다.
+export class Slots {
+  private busyCount = 0;
+  private readonly waiting = new Set<() => void>();
+  constructor(private readonly size: number, private readonly queue: number) {}
+  get busy(): number { return this.busyCount; }
+  get queued(): number { return this.waiting.size; }
+  async run<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> {
+    signal.throwIfAborted();
+    if (this.busyCount < this.size) this.busyCount++;
+    else {
+      if (this.waiting.size >= this.queue) throw new SlotsFull();
+      await new Promise<void>((resolve, reject) => {
+        const expire = () => { this.waiting.delete(grant); reject(signal.reason as Error); };
+        const grant = () => { signal.removeEventListener('abort', expire); resolve(); };
+        this.waiting.add(grant);
+        signal.addEventListener('abort', expire, { once: true });
+      });
+    }
+    try {
+      // 슬롯을 넘겨받은 직후에 기한이 지났을 수 있다.
+      signal.throwIfAborted();
+      return await fn();
+    } finally {
+      const [next] = this.waiting;
+      if (next) { this.waiting.delete(next); next(); } else this.busyCount--;
     }
   }
 }
+export interface ProcessingBudget { signal: AbortSignal; expiresAt: number }
 const pad = (value: number) => String(value).padStart(2, '0');
 // 서버 TZ와 무관하게 KST로 적는다. Asia/Seoul은 DST가 없다.
 export function kstTime(ms: number): string {
@@ -147,7 +168,8 @@ export interface ExternalReceiverOptions {
   store: Store;
   links: Pick<ExternalTaskLinks, 'enforceRestoreFence'>;
   // PolicyGate.authorize와 같은 뜻이다. 거부면 Denied, 정책을 못 읽으면 PolicyUnavailable을 던진다.
-  authorize: (owner: string, scope: Scope) => Promise<{ revision: string }>;
+  // db는 처리 기한이 걸린 트랜잭션이다. gate.withDatabase(db)로 넘겨야 DB가 느릴 때 이 조회도 기한 안에서 끊긴다.
+  authorize: (owner: string, scope: Scope, db: Database) => Promise<{ revision: string }>;
   environment: string;
   log?: Log;
   limits?: Partial<ReceiverLimits>;
@@ -169,18 +191,26 @@ export class ExternalTaskReceiver {
     this.limits = Object.freeze({ ...RECEIVER_LIMITS, ...options.limits });
     this.store = options.store;
     this.global = new TokenBucket(this.limits.globalBurst, this.limits.globalPerSecond, this.store.now());
-    this.slots = new Slots(this.limits.dbSlots);
+    this.slots = new Slots(this.limits.dbSlots, this.limits.dbQueue);
+  }
+  // 수신의 DB 단계마다 쓰는 기한이다. 각 단계는 transactionMs 안에서, 전체는 처리 기한 안에서 끝난다.
+  private deadline(budget?: ProcessingBudget): TransactionDeadline {
+    const expiresAt = this.store.now() + this.limits.transactionMs;
+    return { expiresAt: budget ? Math.min(expiresAt, budget.expiresAt) : expiresAt, now: this.store.now };
   }
   count(outcome: ExternalOutcome): void { this.counts.set(outcome, (this.counts.get(outcome) ?? 0) + 1); }
   // 전용 포트에는 /metrics를 두지 않는다. 8080의 /metrics를 조립하는 쪽(B5)이 이 값을 덧붙인다.
   // 라벨은 고정 이름뿐이고 본문·인증 헤더·연결 ID는 넣지 않는다.
   async metrics(): Promise<string> {
-    const { total } = (await this.store.db.query<{ total: string }>("SELECT count(*)::text AS total FROM external_task_events WHERE post_state='pending'")).rows[0]!;
+    const { total } = await this.store.atomic(async store =>
+      (await store.db.query<{ total: string }>("SELECT count(*)::text AS total FROM external_task_events WHERE post_state='pending'")).rows[0]!, this.deadline());
     return `${[
       ...OUTCOMES.map(name => `homelab_bot_external_task_requests{outcome="${name}"} ${this.counts.get(name) ?? 0}`),
       `homelab_bot_external_task_latency_seconds_sum ${this.latencyMs / 1000}`,
       `homelab_bot_external_task_latency_seconds_count ${this.latencyCount}`,
       `homelab_bot_external_task_in_flight ${this.inFlight}`,
+      `homelab_bot_external_task_db_busy ${this.slots.busy}`,
+      `homelab_bot_external_task_db_waiting ${this.slots.queued}`,
       `homelab_bot_external_task_unposted ${Number(total)}`,
     ].join('\n')}\n`;
   }
@@ -201,7 +231,8 @@ export class ExternalTaskReceiver {
     return limit;
   }
   // HTTP와 무관한 판정. 서명 뒤에만 연결별 제한·본문 파싱을 해서, 남의 connection_id로 그 연결의 quota를 깎을 수 없다.
-  async receive(headers: Record<string, string | string[] | undefined>, raw: Buffer): Promise<Reply> {
+  // budget이 지나면 다음 DB 단계로 가지 않는다. 이미 503을 받은 요청이 DB를 더 쓰거나 뒤늦게 저장되지 않게 한다.
+  async receive(headers: Record<string, string | string[] | undefined>, raw: Buffer, budget?: ProcessingBudget): Promise<Reply> {
     const connectionId = headerText(headers['x-r08-connection-id']);
     const keyId = headerText(headers['x-r08-key-id']);
     const sentAt = headerText(headers['x-r08-sent-at']);
@@ -211,8 +242,11 @@ export class ExternalTaskReceiver {
     }
     const now = this.store.now();
     if (Math.abs(now - Number(sentAt)) > this.limits.sentAtSkewMs) return { status: 422, outcome: 'clock_skew' };
-    await this.options.links.enforceRestoreFence();
-    const found = (await this.store.db.query<ExternalConnection>('SELECT * FROM external_task_connections WHERE id=$1', [connectionId])).rows[0];
+    await this.options.links.enforceRestoreFence(this.deadline(budget));
+    budget?.signal.throwIfAborted();
+    const found = await this.store.atomic(async store =>
+      (await store.db.query<ExternalConnection>('SELECT * FROM external_task_connections WHERE id=$1', [connectionId])).rows[0], this.deadline(budget));
+    budget?.signal.throwIfAborted();
     const row = found ? connectionRow(found) : undefined;
     const bodySha256 = sha256Hex(raw);
     const input = signatureInput({ environment: this.options.environment, method: 'POST', path: EXTERNAL_TASK_PATH, connectionId, keyId, sentAt, bodySha256 });
@@ -235,14 +269,15 @@ export class ExternalTaskReceiver {
       if (suspectSummary(event.summary)) return { status: 422, outcome: 'summary_rejected' };
     }
     let revision: string;
-    try { revision = (await this.options.authorize(row.owner_id, row.scope)).revision; }
-    catch (error) {
+    try {
+      revision = (await this.store.atomic(store => this.options.authorize(row.owner_id, row.scope, store.db), this.deadline(budget))).revision;
+    } catch (error) {
       if (error instanceof Denied) return { status: 403, outcome: 'scope_denied' };
       if (error instanceof PolicyUnavailable) return this.limited('unavailable', 503, 30);
       throw error;
     }
-    const deadlineStart = this.store.now();
-    return this.store.atomic(store => this.accept(store, row, event, bodySha256, revision), { expiresAt: deadlineStart + this.limits.transactionMs, now: this.store.now });
+    budget?.signal.throwIfAborted();
+    return this.store.atomic(store => this.accept(store, row, event, bodySha256, revision), this.deadline(budget));
   }
   private parse(raw: Buffer): z.infer<typeof EventSchema> | undefined {
     try {
@@ -252,15 +287,17 @@ export class ExternalTaskReceiver {
       return parsed.success ? parsed.data : undefined;
     } catch { return undefined; }
   }
-  // 수락과 outbox 생성을 한 트랜잭션으로 한다. 연결 행을 잠가 폐기·재발급과 직렬화한다. 잠근 뒤 상태를 다시 본다.
+  // 수락과 outbox 생성을 한 트랜잭션으로 한다. 연결 행을 잠가 폐기·재발급·동의 변경과 직렬화한다. 잠근 뒤 상태와 시각을 다시 본다.
+  // FOR NO KEY UPDATE: 그쪽의 FOR UPDATE와는 부딪히고, 게시 행을 잡을 때의 KEY SHARE와는 부딪히지 않아 수신이 게시를 미루지 않는다.
   private async accept(store: Store, seen: ExternalConnection, event: z.infer<typeof EventSchema>, bodySha256: string, revision: string): Promise<Reply> {
+    const locked = (await store.db.query<ExternalConnection>('SELECT * FROM external_task_connections WHERE id=$1 FOR NO KEY UPDATE', [seen.id])).rows[0];
     const now = store.now();
-    const locked = (await store.db.query<ExternalConnection>('SELECT * FROM external_task_connections WHERE id=$1 FOR UPDATE', [seen.id])).rows[0];
     const row = locked ? connectionRow(locked) : undefined;
     if (!row || row.key_id !== seen.key_id || row.revoked_at !== null || row.expires_at <= now) return { status: 401, outcome: 'unauthorized' };
     const existing = (await store.db.query<{ body_sha256: string }>('SELECT body_sha256 FROM external_task_events WHERE connection_id=$1 AND event_id=$2',
       [row.id, event.event_id])).rows[0];
     if (existing) return existing.body_sha256 === bodySha256 ? { status: 202, outcome: 'duplicate' } : { status: 409, outcome: 'event_conflict' };
+    if (event.summary !== FIXED_SUMMARY && !row.summary_consent) return { status: 403, outcome: 'summary_consent_required' };
     const conversation = (await store.db.query<{ owner_id: string; active: boolean }>('SELECT owner_id,active FROM conversations WHERE id=$1 FOR KEY SHARE', [row.conversation_id])).rows[0];
     if (!conversation || conversation.owner_id !== row.owner_id || !conversation.active) return { status: 403, outcome: 'scope_denied' };
     // 전체 상한은 서로 다른 연결끼리 경합하므로 세기와 삽입을 하나로 묶는다. 연결 행 다음에 잡으므로 이 순서만 지키면 교착이 없다.
@@ -270,8 +307,8 @@ export class ExternalTaskReceiver {
     if (Number(counts.total) >= this.limits.unpostedTotal) return this.limited('backlog_total', 503, 30);
     if (Number(counts.mine) >= this.limits.unpostedPerConnection) return this.limited('backlog_connection', 429, 30);
     const key = outboxKey(row.id, event.event_id);
-    await store.db.query(`INSERT INTO external_task_events(connection_id,event_id,body_sha256,occurred_at,received_at,outbox_key)
-      VALUES ($1,$2,$3,$4,$5,$6)`, [row.id, event.event_id, bodySha256, event.occurred_at, now, key]);
+    await store.db.query(`INSERT INTO external_task_events(connection_id,event_id,body_sha256,accepted_key_id,occurred_at,received_at,outbox_key)
+      VALUES ($1,$2,$3,$4,$5,$6,$7)`, [row.id, event.event_id, bodySha256, row.key_id, event.occurred_at, now, key]);
     await store.enqueue({ key, conversation: row.conversation_id, actor: row.owner_id, scope: row.scope, revision,
       payload: { kind: 'message', channel: row.scope.channel, classification: 'safe_summary',
         content: formatNotice({ executor: row.executor, externalTaskId: row.external_task_id, summary: event.summary, occurredAt: event.occurred_at, receivedAt: now }) } });
@@ -321,14 +358,17 @@ export class ExternalTaskReceiver {
   }
   // 실패 원인이 무엇이든 본문이나 헤더 값을 응답·로그에 싣지 않는다.
   private async settled(req: IncomingMessage, body: Buffer): Promise<Reply> {
-    let timer: NodeJS.Timeout | undefined;
-    const timeout = new Promise<Reply>(resolve => {
-      timer = setTimeout(() => resolve(this.limited('unavailable', 503, 5)), this.limits.processingTimeoutMs);
-    });
+    const expired = this.limited('unavailable', 503, 5);
+    const controller = new AbortController();
+    const budget: ProcessingBudget = { signal: controller.signal, expiresAt: this.store.now() + this.limits.processingTimeoutMs };
+    const timeout = new Promise<Reply>(resolve => { controller.signal.addEventListener('abort', () => resolve(expired), { once: true }); });
+    const timer = setTimeout(() => controller.abort(new ProcessingExpired()), this.limits.processingTimeoutMs);
     try {
-      return await Promise.race([timeout, this.slots.run(() => this.receive(req.headers, body)).catch(error => {
+      return await Promise.race([timeout, this.slots.run(controller.signal, () => this.receive(req.headers, body, budget)).catch(error => {
+        if (error instanceof SlotsFull) return this.limited('overloaded', 503, 5);
+        if (error instanceof ProcessingExpired) return expired;
         this.options.log?.('external_task_error', errorInfo(error));
-        return this.limited('unavailable', 503, 5);
+        return expired;
       })]);
     } finally { clearTimeout(timer); }
   }
@@ -383,7 +423,8 @@ export function externalTaskServer(receiver: ExternalTaskReceiver): Server {
       : error.code === 'ERR_HTTP_REQUEST_TIMEOUT' ? { status: 408, outcome: 'header_timeout' }
         : { status: 400, outcome: 'malformed_http' };
     receiver.count(reply.outcome);
-    if (socket.writable) socket.end(`HTTP/1.1 ${reply.status} ${reply.outcome}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+    // http 서버 소켓은 half-open을 허용한다. end만 하면 상대가 FIN을 보내지 않는 동안 maxConnections 자리를 계속 차지한다.
+    if (socket.writable) socket.end(`HTTP/1.1 ${reply.status} ${reply.outcome}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`, () => socket.destroy());
     else socket.destroy();
   });
   return server;

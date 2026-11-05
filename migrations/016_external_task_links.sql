@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS external_task_events (
   event_id text NOT NULL CHECK (event_id ~ '^[A-Za-z0-9_-]{16,64}$'),
   -- raw body의 SHA-256. 요약 원문은 여기 두지 않는다(동의한 요약은 게시용 outbox 행에만 있다).
   body_sha256 text NOT NULL CHECK (body_sha256 ~ '^[0-9a-f]{64}$'),
+  -- 이 이벤트를 수락한 키. 재발급 뒤 재시도되는 옛 키의 이벤트를 게시 직전에 가려낸다.
+  accepted_key_id text NOT NULL CHECK (accepted_key_id ~ '^[A-Za-z0-9_-]{16}$'),
   occurred_at bigint NOT NULL,
   received_at bigint NOT NULL,
   outbox_key text NOT NULL UNIQUE,
@@ -62,5 +64,41 @@ CREATE TABLE IF NOT EXISTS external_task_link_fence (
   fenced_at bigint
 );
 INSERT INTO external_task_link_fence(singleton) VALUES (true) ON CONFLICT DO NOTHING;
+
+-- 게시 행을 잡는 순간의 재확인. 폐기·재발급은 발송을 시작한 행을 건드리지 못하는데, 그 발송이 429·401로 실패하면 행이 pending으로 돌아온다.
+-- 돌아오는 경로가 여럿이고 게시자는 R08을 모르므로, 발송 전에 반드시 지나는 pending→sending 전이에서 막는다.
+-- 그 뒤의 폐기는 발송 시작 전 sending을 blocked로 바꾸고 dispatch 표시가 실패한다.
+-- blocked나 pending을 돌려주면 claim의 RETURNING 행도 그 상태라 게시자의 dispatch 표시(state='sending' 요구)가 실패해 나가지 않는다.
+-- 만료는 막지 않는다. 만료 전에 정상으로 받은 이벤트이기 때문이다. restoreEpoch는 프로세스 설정이라 여기서 볼 수 없다.
+CREATE OR REPLACE FUNCTION external_task_outbox_claim() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+  accepted record;
+  link record;
+BEGIN
+  SELECT connection_id,accepted_key_id INTO accepted FROM external_task_events WHERE outbox_key = NEW.message_key;
+  IF NOT FOUND THEN
+    NEW.state := 'blocked';
+    RETURN NEW;
+  END IF;
+  -- 폐기·재발급·동의 변경은 연결 행을 FOR UPDATE로 잠근 뒤 outbox 행을 기다린다. 여기는 outbox 행을 쥔 채라 잠금을 기다리면 교착이다.
+  -- 그 트랜잭션의 결과를 아직 알 수 없으므로 보내지 않고 lease 길이만큼 미룬다. 수락은 FOR NO KEY UPDATE라 이 잠금과 부딪히지 않는다.
+  SELECT key_id,revoked_reason INTO link FROM external_task_connections WHERE id = accepted.connection_id FOR KEY SHARE SKIP LOCKED;
+  IF NOT FOUND THEN
+    NEW.state := OLD.state;
+    NEW.attempt := OLD.attempt;
+    NEW.available_at := NEW.lease_until;
+    RETURN NEW;
+  END IF;
+  IF link.revoked_reason <> 'expired' OR link.key_id <> accepted.accepted_key_id
+    OR (SELECT split_part(token,';',1) FROM external_task_link_fence)
+      IS DISTINCT FROM 'timeline:' || substr(pg_walfile_name(pg_current_wal_lsn()),1,8) THEN
+    NEW.state := 'blocked';
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS outbox_external_task_claim ON outbox;
+CREATE TRIGGER outbox_external_task_claim BEFORE UPDATE OF state ON outbox FOR EACH ROW
+  WHEN (OLD.state = 'pending' AND NEW.state = 'sending' AND NEW.message_key LIKE 'external-task:%')
+  EXECUTE FUNCTION external_task_outbox_claim();
 INSERT INTO schema_migrations VALUES (16) ON CONFLICT DO NOTHING;
 COMMIT;

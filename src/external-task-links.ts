@@ -3,7 +3,7 @@ import { inspect } from 'node:util';
 import { z } from 'zod';
 import { Denied } from './contracts.js';
 import type { Scope } from './contracts.js';
-import type { Database } from './database.js';
+import type { Database, TransactionDeadline } from './database.js';
 import type { Store } from './store.js';
 
 // R08 연결 레코드의 수명(DECISIONS "T18 결정" (1), ARCHITECTURE §15). 사람 세션의 자기 보고를 받는 통로일 뿐이라
@@ -148,6 +148,7 @@ export class ExternalTaskLinks {
   }
   async detach(connectionId: string, owner: string): Promise<{ blocked: number }> { return this.revoke(connectionId, owner, 'detach'); }
   // 동의를 거두면 그 뒤 고정 문구가 아닌 요약은 수신에서 거절된다. 이미 큐에 든 게시 행은 owner가 받기로 했던 것이라 그대로 둔다.
+  // 이 트랜잭션이 잡는 연결 행 잠금으로 수신의 수락과 직렬화한다. 철회가 끝난 뒤 새로 저장되는 요약은 없다.
   async setSummaryConsent(connectionId: string, owner: string, consent: boolean): Promise<void> {
     await this.store.atomic(async store => {
       const row = await this.owned(store, connectionId, owner);
@@ -157,7 +158,7 @@ export class ExternalTaskLinks {
     });
   }
   // 게시자의 dispatch 표시는 state='sending'을 요구한다. 발송 시작 전 sending까지 blocked로 바꾸면 이 트랜잭션 뒤에는 나갈 수 없다.
-  // 이미 발송을 시작한 행은 보냈을 수 있어 그대로 둔다.
+  // 이미 발송을 시작한 행은 보냈을 수 있어 그대로 둔다. 그 발송이 실패해 pending으로 돌아오면 migration 016의 claim 트리거가 막는다.
   private async blockUnposted(store: Store, connections: string[]): Promise<number> {
     return (await store.db.query(`UPDATE outbox SET state='blocked' WHERE idempotency_key IN
       (SELECT outbox_key FROM external_task_events WHERE connection_id=ANY($1::text[]) AND post_state='pending')
@@ -165,13 +166,17 @@ export class ExternalTaskLinks {
   }
   // 복원이 감지되면 활성 연결을 모두 닫는다. 복원으로 되살아난 폐기 키와 미게시 행을 구별할 근거가 복원된 DB에는 없기 때문이다.
   // 수신마다 부른다. 값을 읽지 못하면 throw해서 수신이 닫힌다(503).
-  async enforceRestoreFence(): Promise<{ fenced: number }> {
+  // 트랜잭션으로 읽는 이유: 풀의 단발 조회에는 호출자 기한이 걸리지 않아, 잠금에 걸리면 응답이 끝난 뒤에도 DB 작업이 남는다.
+  async enforceRestoreFence(deadline?: TransactionDeadline): Promise<{ fenced: number }> {
     const current = async (db: Database) => {
       const { timeline } = (await db.query<{ timeline: string }>(CURRENT_TIMELINE)).rows[0]!;
       return `timeline:${timeline};epoch:${this.restoreEpoch}`;
     };
-    const quick = (await this.store.db.query<{ token: string | null }>('SELECT token FROM external_task_link_fence')).rows[0];
-    if (quick?.token === await current(this.store.db)) return { fenced: 0 };
+    const unchanged = await this.store.atomic(async store => {
+      const quick = (await store.db.query<{ token: string | null }>('SELECT token FROM external_task_link_fence')).rows[0];
+      return quick?.token === await current(store.db);
+    }, deadline);
+    if (unchanged) return { fenced: 0 };
     return this.store.atomic(async store => {
       const stored = (await store.db.query<{ token: string | null }>('SELECT token FROM external_task_link_fence FOR UPDATE')).rows[0];
       const token = await current(store.db);
@@ -184,7 +189,7 @@ export class ExternalTaskLinks {
       // 첫 실행은 값을 처음 적는 것뿐이라 감사에 남기지 않는다.
       if (stored?.token) await store.audit('external_task_restore_fence', 'all', { fenced: ids.length, blocked });
       return { fenced: ids.length };
-    });
+    }, deadline);
   }
   // read_status: owner·같은 대화만 본다. "살아 있다"가 아니라 마지막으로 알림을 받은 시각만 말한다.
   async status(connectionId: string, owner: string, scope: Scope) {

@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
+import type { Clock } from '../src/contracts.js';
 import { Postgres } from '../src/database.js';
 import { ExternalTaskLinks } from '../src/external-task-links.js';
 import { externalTaskServer, EXTERNAL_TASK_PATH, ExternalTaskReceiver } from '../src/external-task-receiver.js';
@@ -16,14 +17,14 @@ const socket = process.env.HOMELAB_TEST_PG_SOCKET;
 const skip = socket ? false : 'HOMELAB_TEST_PG_SOCKET 없음(로컬 PostgreSQL 필요)';
 const HIGH: Partial<ReceiverLimits> = { globalBurst: 100_000, connectionBurst: 100_000, connectionPerHour: 100_000, concurrent: 64 };
 
-async function database(limits: Partial<ReceiverLimits> = {}) {
+async function database(limits: Partial<ReceiverLimits> = {}, now: Clock = Date.now) {
   const admin = new pg.Pool({ host: socket, user: 'postgres', database: 'postgres', max: 1 });
   const name = `t18r08_${randomUUID().replaceAll('-', '').slice(0, 12)}`;
   await admin.query(`CREATE DATABASE ${name}`);
   const pool = new pg.Pool({ host: socket, user: 'postgres', database: name, max: 8 });
   await runMigrations(pool);
   const db = new Postgres(pool);
-  const store = new Store(db);
+  const store = new Store(db, now);
   await seedConversation(db, store, store.now());
   const links = new ExternalTaskLinks(store);
   const receiver = new ExternalTaskReceiver({ store, links, authorize: async () => ({ revision: 'fixture-v1' }), environment: ENVIRONMENT, limits: { ...HIGH, ...limits } });
@@ -43,6 +44,22 @@ async function database(limits: Partial<ReceiverLimits> = {}) {
 }
 const post = (ctx: Awaited<ReturnType<typeof database>>, who: ReturnType<typeof sender>, body: string) =>
   ctx.receiver.receive(signedHeaders(who, body, ctx.store.now()), Buffer.from(body));
+const OWNER = 'fixture-owner';
+const until = async (check: () => Promise<boolean>, ms = 3000) => {
+  const deadline = Date.now() + ms;
+  while (!await check()) {
+    assert.ok(Date.now() < deadline, 'until_timeout');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+};
+const lockWaiters = (ctx: Awaited<ReturnType<typeof database>>) => ctx.count(`pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock'`);
+// 폐기·재발급·동의 변경이 연결 행을 잠그고 아직 커밋하지 않은 상태다.
+async function lockConnection(ctx: Awaited<ReturnType<typeof database>>, id: string) {
+  const client = await ctx.pool.connect();
+  await client.query('BEGIN');
+  await client.query('SELECT 1 FROM external_task_connections WHERE id=$1 FOR UPDATE', [id]);
+  return client;
+}
 
 test('R08 실제 PostgreSQL: 수락과 outbox 생성은 한 트랜잭션이다', { skip }, async () => {
   const ctx = await database();
@@ -97,6 +114,151 @@ test('R08 실제 PostgreSQL: 폐기와 수신이 겹쳐도 폐기 뒤에 게시 
       assert.equal(await ctx.count(`outbox WHERE idempotency_key LIKE $1 AND state='pending'`, [`external-task:${who.connectionId}:%`]), 0);
       assert.equal((await post(ctx, who, eventBody(who, ctx.store.now()))).outcome, 'unauthorized');
     }
+  } finally { await ctx.close(); }
+});
+
+test('R08 실제 PostgreSQL: 폐기 트랜잭션이 커밋 전이면 게시 행을 잡아도 발송하지 못하고 기다리지 않으며, 커밋 뒤 다시 잡으면 막힌다', { skip }, async () => {
+  const ctx = await database();
+  try {
+    const who = await ctx.attach('claim-locked');
+    assert.equal((await post(ctx, who, eventBody(who, ctx.store.now()))).outcome, 'accepted');
+    const client = await lockConnection(ctx, who.connectionId);
+    try {
+      await client.query(`UPDATE external_task_connections SET revoked_at=$2,revoked_reason='detach' WHERE id=$1`, [who.connectionId, ctx.store.now()]);
+      const claimed = await ctx.store.claimDelivery();
+      assert.ok(claimed);
+      assert.equal(claimed.state, 'pending');
+      assert.equal(await ctx.store.dispatchDelivery(claimed), false);
+      await client.query('COMMIT');
+    } finally { await client.query('ROLLBACK').catch(() => {}); client.release(); }
+    await ctx.db.query(`UPDATE outbox SET available_at=0`);
+    const again = await ctx.store.claimDelivery();
+    assert.equal(again?.state, 'blocked');
+    assert.equal(await ctx.store.dispatchDelivery(again!), false);
+    assert.equal(await ctx.count(`external_task_events WHERE post_state='blocked'`), 1);
+  } finally { await ctx.close(); }
+});
+
+test('R08 실제 PostgreSQL: 발송 실패로 돌아오는 행과 폐기가 겹쳐도 교착 없이 끝나고 폐기 뒤에는 다시 발송되지 않는다', { skip }, async () => {
+  const ctx = await database();
+  try {
+    for (let round = 0; round < 20; round++) {
+      const who = await ctx.attach(`retry-${round}`);
+      assert.equal((await post(ctx, who, eventBody(who, ctx.store.now()))).outcome, 'accepted');
+      const row = (await ctx.store.claimDelivery())!;
+      assert.equal(await ctx.store.dispatchDelivery(row), true);
+      const resend = async () => {
+        await ctx.store.deliveryState(row, 'pending');
+        const again = await ctx.store.claimDelivery();
+        return again ? ctx.store.dispatchDelivery(again) : false;
+      };
+      // 폐기가 끝나기 전에 시작한 발송은 정상 경합이다. 폐기가 끝난 뒤의 재시도만 막혀야 한다.
+      await Promise.all([resend(), ctx.links.detach(who.connectionId, OWNER)]);
+      const current = (await ctx.db.query<{ state: string; lease_token: string }>('SELECT state,lease_token FROM outbox WHERE id=$1', [row.id])).rows[0]!;
+      if (current.state === 'sending') await ctx.store.deliveryState({ ...row, lease_token: current.lease_token }, 'pending');
+      await ctx.db.query(`UPDATE outbox SET available_at=0 WHERE state='pending'`);
+      const last = await ctx.store.claimDelivery();
+      if (last) assert.equal(await ctx.store.dispatchDelivery(last), false);
+      assert.equal(await ctx.count(`outbox WHERE id=$1 AND state='blocked'`, [row.id]), 1);
+    }
+  } finally { await ctx.close(); }
+});
+
+test('R08 실제 PostgreSQL: 동의 철회가 잠금을 쥔 동안 들어온 요약은 철회 커밋 뒤 거절된다', { skip }, async () => {
+  const ctx = await database();
+  try {
+    const who = await ctx.attach('consent-race', true);
+    const client = await lockConnection(ctx, who.connectionId);
+    let settled;
+    try {
+      await client.query('UPDATE external_task_connections SET summary_consent=false WHERE id=$1', [who.connectionId]);
+      settled = post(ctx, who, eventBody(who, ctx.store.now(), { summary: '철회 경합 요약' }));
+      await until(async () => await lockWaiters(ctx) === 1);
+      await client.query('COMMIT');
+    } finally { await client.query('ROLLBACK').catch(() => {}); client.release(); }
+    assert.deepEqual(await settled, { status: 403, outcome: 'summary_consent_required' });
+    assert.equal(await ctx.count('outbox'), 0);
+    assert.equal(await ctx.count('external_task_events'), 0);
+    // 실제 API끼리 겹쳐도 오류 없이 둘 중 하나로 끝나고, 철회가 끝난 뒤의 요약은 모두 거절된다.
+    for (let round = 0; round < 5; round++) {
+      const racer = await ctx.attach(`consent-${round}`, true);
+      const posts = Array.from({ length: 6 }, () => post(ctx, racer, eventBody(racer, ctx.store.now(), { summary: '겹친 요약' })));
+      await ctx.links.setSummaryConsent(racer.connectionId, OWNER, false);
+      for (const reply of await Promise.all(posts)) assert.ok(['accepted', 'summary_consent_required'].includes(reply.outcome), reply.outcome);
+      assert.equal((await post(ctx, racer, eventBody(racer, ctx.store.now(), { summary: '철회 뒤 요약' }))).outcome, 'summary_consent_required');
+    }
+  } finally { await ctx.close(); }
+});
+
+test('R08 실제 PostgreSQL: 잠금을 기다리는 사이 만료된 연결은 잠금을 얻은 시각으로 판단해 거절한다', { skip }, async () => {
+  let offset = 0;
+  const ctx = await database({}, () => Date.now() + offset);
+  try {
+    const who = await ctx.attach('expiry-race');
+    await ctx.db.query('UPDATE external_task_connections SET expires_at=$2 WHERE id=$1', [who.connectionId, ctx.store.now() + 1000]);
+    const client = await lockConnection(ctx, who.connectionId);
+    let settled;
+    try {
+      settled = post(ctx, who, eventBody(who, ctx.store.now()));
+      await until(async () => await lockWaiters(ctx) === 1);
+      offset = 1500;
+      await client.query('COMMIT');
+    } finally { await client.query('ROLLBACK').catch(() => {}); client.release(); }
+    assert.deepEqual(await settled, { status: 401, outcome: 'unauthorized' });
+    assert.equal(await ctx.count('outbox'), 0);
+  } finally { await ctx.close(); }
+});
+
+test('R08 실제 PostgreSQL: 복원 울타리가 잠금에 걸려도 처리 기한에 DB 대기가 끊겨 슬롯을 돌려받고, 잠금이 풀리면 수락한다', { skip }, async () => {
+  const ctx = await database({ processingTimeoutMs: 300, dbSlots: 1, dbQueue: 1 });
+  const server = externalTaskServer(ctx.receiver);
+  await listen(server);
+  const client = await ctx.pool.connect();
+  const send = async (who: ReturnType<typeof sender>) => {
+    const body = eventBody(who, ctx.store.now());
+    return raw(server, request('POST', EXTERNAL_TASK_PATH, signedHeaders(who, body, ctx.store.now()), body));
+  };
+  try {
+    const who = await ctx.attach('fence-locked');
+    await client.query('BEGIN');
+    await client.query('LOCK TABLE external_task_link_fence IN ACCESS EXCLUSIVE MODE');
+    assert.equal((await send(who)).status, 503);
+    await until(async () => await lockWaiters(ctx) === 0);
+    assert.equal((await send(who)).status, 503);
+    await until(async () => await lockWaiters(ctx) === 0);
+    await client.query('ROLLBACK');
+    assert.equal((await send(who)).status, 202);
+  } finally {
+    await client.query('ROLLBACK').catch(() => {});
+    client.release();
+    await shut(server);
+    await ctx.close();
+  }
+});
+
+test('R08 실제 PostgreSQL: 기한 트랜잭션이 transaction_timeout으로 세션을 잃어도 프로세스가 죽지 않고 풀이 회복한다', { skip }, async () => {
+  const ctx = await database();
+  try {
+    const deadline = () => ({ expiresAt: Date.now() + 100, now: Date.now });
+    for (let round = 0; round < 3; round++) {
+      // 문장 사이에서 기한이 지나면 진행 중인 질의가 없어 FATAL이 그대로 클라이언트 error 이벤트가 된다.
+      await assert.rejects(ctx.db.transaction(async tx => {
+        await tx.query('SELECT 1');
+        await new Promise(resolve => setTimeout(resolve, 300));
+        await tx.query('SELECT 2');
+      }, deadline()));
+      // 문장 실행 중에 기한이 지나는 경로다.
+      const holder = await ctx.pool.connect();
+      try {
+        await holder.query('BEGIN');
+        await holder.query('LOCK TABLE external_task_link_fence IN ACCESS EXCLUSIVE MODE');
+        await Promise.allSettled(Array.from({ length: 4 }, () => ctx.db.transaction(tx => tx.query('SELECT * FROM external_task_link_fence'), deadline())));
+      } finally { await holder.query('ROLLBACK'); holder.release(); }
+    }
+    // 죽은 연결을 풀이 다시 내주지 않는다. 풀 크기보다 많이 돌려 모든 자리를 거치게 한다.
+    for (let attempt = 0; attempt < 16; attempt++) assert.equal((await ctx.db.transaction(tx => tx.query<{ one: number }>('SELECT 1 AS one'))).rows[0]!.one, 1);
+    const who = await ctx.attach('after-fatal');
+    assert.equal((await post(ctx, who, eventBody(who, ctx.store.now()))).outcome, 'accepted');
   } finally { await ctx.close(); }
 });
 

@@ -2,7 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { externalTaskServer, EXTERNAL_TASK_PATH, FIXED_SUMMARY, RECEIVER_LIMITS, formatNotice, kstTime, signatureInput, suspectSummary } from '../src/external-task-receiver.js';
+import { connect } from 'node:net';
+import type { AddressInfo } from 'node:net';
+import { externalTaskServer, EXTERNAL_TASK_PATH, FIXED_SUMMARY, ProcessingExpired, RECEIVER_LIMITS, Slots, SlotsFull, formatNotice, kstTime, signatureInput, suspectSummary } from '../src/external-task-receiver.js';
 import { thread } from './helpers.js';
 import { SESSION, atomicityScenario, eventBody, listen, raw, rawClient, receiverFixture, request, sender, shut, signedHeaders } from './external-task-fixture.js';
 
@@ -179,6 +181,32 @@ test('R08 요약: 기본은 고정 문구만 받고, 동의한 연결만 500자�
       assert.equal((await reply(ctx, consent, { summary })).outcome, 'summary_rejected', summary);
     }
     assert.equal(suspectSummary('빌드와 시험을 마쳤습니다. 다음은 배포 확인입니다.'), false);
+  } finally { await ctx.close(); }
+});
+
+test('R08 요약: 처음 읽은 뒤 잠그기 전에 동의가 철회되면 새 요약을 저장하지 않고, 고정 문구와 이미 받은 요약의 재전송은 그대로다', async () => {
+  // 권한 확인은 처음 읽은 연결 행과 잠금 사이에 있다. 그 자리에서 철회가 커밋된 상황을 만든다.
+  let withdraw = false;
+  const ctx = await receiverFixture({ connectionBurst: 100 }, { authorize: async (_owner, _scope, db) => {
+    if (withdraw) await db.query('UPDATE external_task_connections SET summary_consent=false');
+    return { revision: 'fixture-v1' };
+  } });
+  const consent = 'UPDATE external_task_connections SET summary_consent=true';
+  try {
+    const who = await ctx.attach(SESSION, true);
+    const accepted = eventBody(who, ctx.f.now(), { summary: '먼저 받은 요약' });
+    assert.equal((await ctx.receiver.receive(signedHeaders(who, accepted, ctx.f.now()), Buffer.from(accepted))).outcome, 'accepted');
+    withdraw = true;
+    assert.deepEqual(await reply(ctx, who, { summary: '철회 뒤 요약' }), { status: 403, outcome: 'summary_consent_required' });
+    assert.equal(await ctx.count('outbox'), 1);
+    assert.equal(await ctx.count('external_task_events'), 1);
+    const dump = JSON.stringify((await ctx.db.query('SELECT payload FROM outbox')).rows);
+    assert.equal(dump.includes('철회 뒤 요약'), false);
+    await ctx.db.query(consent);
+    assert.equal((await ctx.receiver.receive(signedHeaders(who, accepted, ctx.f.now()), Buffer.from(accepted))).outcome, 'duplicate');
+    await ctx.db.query(consent);
+    assert.equal((await reply(ctx, who)).outcome, 'accepted');
+    assert.equal(await ctx.count('outbox'), 2);
   } finally { await ctx.close(); }
 });
 
@@ -381,6 +409,140 @@ test('R08 HTTP: 동시 처리 상한을 넘으면 503과 Retry-After, 끝나면 
     assert.match(await ctx.receiver.metrics(), /homelab_bot_external_task_in_flight 0/);
     const after = await raw(server, request('POST', EXTERNAL_TASK_PATH, { 'content-type': 'application/json' }, '{}'));
     assert.equal(after.status, 400);
+  } finally { await shut(server); await ctx.close(); }
+});
+
+const until = async (check: () => boolean | Promise<boolean>, ms = 2000) => {
+  const deadline = Date.now() + ms;
+  while (!await check()) {
+    assert.ok(Date.now() < deadline, 'until_timeout');
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+};
+// 첫 DB 단계가 풀어 줄 때까지 멈춘다. 슬롯을 쥔 작업이 DB에 묶인 상황이다.
+function stuckFence() {
+  let calls = 0;
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  return { links: { enforceRestoreFence: async () => { calls++; await held; return { fenced: 0 }; } }, calls: () => calls, release: () => release() };
+}
+const postEvent = (ctx: Awaited<ReturnType<typeof receiverFixture>>, server: Parameters<typeof raw>[0], who: ReturnType<typeof sender>) => {
+  const body = eventBody(who, ctx.f.now());
+  return raw(server, request('POST', EXTERNAL_TASK_PATH, signedHeaders(who, body, ctx.f.now()), body));
+};
+
+test('R08 DB 대기: 대기열이 차면 곧바로 503 overloaded이고, 슬롯이 묶인 채 요청이 계속 와도 대기가 상한을 넘지 않는다', async () => {
+  const stuck = stuckFence();
+  const ctx = await receiverFixture({ globalBurst: 100_000, connectionBurst: 1000, concurrent: 64, dbSlots: 1, dbQueue: 1, processingTimeoutMs: 200 }, { links: stuck.links });
+  const server = externalTaskServer(ctx.receiver);
+  await listen(server);
+  try {
+    const who = await ctx.attach();
+    const running = postEvent(ctx, server, who);
+    await until(() => stuck.calls() === 1);
+    const queued = postEvent(ctx, server, who);
+    await until(async () => /external_task_db_waiting 1/.test(await ctx.receiver.metrics()));
+    const started = Date.now();
+    const full = await postEvent(ctx, server, who);
+    assert.equal(full.status, 503);
+    assert.match(full.text, /"error":"overloaded"/);
+    assert.match(full.text, /retry-after: 5/i);
+    assert.ok(Date.now() - started < 150, '대기열이 찼으면 기한까지 기다리지 않는다');
+    for (const response of [await running, await queued]) {
+      assert.equal(response.status, 503);
+      assert.match(response.text, /"error":"unavailable"/);
+    }
+    // 앞 응답이 닫혀 HTTP 동시 수는 줄었지만 DB 대기는 쌓이지 않는다.
+    for (let round = 0; round < 4; round++) {
+      const replies = await Promise.all(Array.from({ length: 5 }, () => postEvent(ctx, server, who)));
+      assert.deepEqual(replies.map(response => response.status), Array(5).fill(503));
+      assert.equal(replies.filter(response => /"error":"overloaded"/.test(response.text)).length, 4);
+    }
+    const metrics = await ctx.receiver.metrics();
+    assert.match(metrics, /homelab_bot_external_task_db_waiting 0/);
+    assert.match(metrics, /homelab_bot_external_task_db_busy 1/);
+    stuck.release();
+    await until(async () => /external_task_db_busy 0/.test(await ctx.receiver.metrics()));
+    assert.equal(stuck.calls(), 1);
+    assert.equal(await ctx.count('external_task_events'), 0);
+    assert.equal((await postEvent(ctx, server, who)).status, 202);
+    assert.deepEqual([RECEIVER_LIMITS.dbSlots, RECEIVER_LIMITS.dbQueue], [2, 6]);
+  } finally { stuck.release(); await shut(server); await ctx.close(); }
+});
+
+test('R08 DB 대기: 기한이 지난 대기 작업은 슬롯이 풀려도 시작하지 않고, 기한이 지난 실행 작업은 다음 단계로 가지 않는다', async () => {
+  const stuck = stuckFence();
+  const ctx = await receiverFixture({ globalBurst: 100_000, connectionBurst: 1000, concurrent: 64, dbSlots: 1, dbQueue: 100, processingTimeoutMs: 100 }, { links: stuck.links });
+  const server = externalTaskServer(ctx.receiver);
+  await listen(server);
+  try {
+    const who = await ctx.attach();
+    const replies = await Promise.all(Array.from({ length: 6 }, () => postEvent(ctx, server, who)));
+    for (const response of replies) {
+      assert.equal(response.status, 503);
+      assert.match(response.text, /"error":"unavailable"/);
+      assert.match(response.text, /retry-after: 5/i);
+    }
+    stuck.release();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(stuck.calls(), 1);
+    assert.equal(await ctx.count('external_task_events'), 0);
+    assert.equal(await ctx.count('outbox'), 0);
+  } finally { stuck.release(); await shut(server); await ctx.close(); }
+});
+
+test('R08 DB 대기: 슬롯을 넘겨받은 직후 기한이 지났으면 작업을 시작하지 않고 슬롯을 다음에 넘긴다', async () => {
+  const slots = new Slots(1, 2);
+  let release!: () => void;
+  const first = slots.run(new AbortController().signal, () => new Promise<void>(resolve => { release = resolve; }));
+  const late = new AbortController();
+  const started: string[] = [];
+  const second = slots.run(late.signal, async () => { started.push('late'); });
+  const third = slots.run(new AbortController().signal, async () => { started.push('next'); });
+  assert.equal(slots.queued, 2);
+  await assert.rejects(slots.run(new AbortController().signal, async () => {}), SlotsFull);
+  release();
+  // 첫 작업의 finally가 슬롯을 넘긴 뒤, 넘겨받은 쪽이 이어 달리기 전에 기한이 지난다.
+  while (slots.queued === 2) await Promise.resolve();
+  late.abort(new ProcessingExpired());
+  await first;
+  await assert.rejects(second, ProcessingExpired);
+  await third;
+  assert.deepEqual(started, ['next']);
+  assert.deepEqual([slots.busy, slots.queued], [0, 0]);
+  // 줄에서 기다리다 기한이 지나면 곧바로 빠진다.
+  const holder = new Slots(1, 1);
+  let open!: () => void;
+  const held = holder.run(new AbortController().signal, () => new Promise<void>(resolve => { open = resolve; }));
+  const waiting = new AbortController();
+  const gone = holder.run(waiting.signal, async () => { started.push('gone'); });
+  waiting.abort(new ProcessingExpired());
+  await assert.rejects(gone, ProcessingExpired);
+  assert.equal(holder.queued, 0);
+  open();
+  await held;
+  assert.equal(holder.busy, 0);
+  assert.deepEqual(started, ['next']);
+});
+
+test('R08 HTTP: 거절한 소켓을 상대가 닫지 않아도 서버가 닫아 소켓 상한 자리를 돌려받는다', async () => {
+  const ctx = await receiverFixture({ globalBurst: 1000 });
+  const server = externalTaskServer(ctx.receiver);
+  await listen(server);
+  const open = () => new Promise<number>(resolve => server.getConnections((_error, count) => resolve(count)));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    for (const text of ['NOT HTTP\r\n\r\n', `POST ${EXTERNAL_TASK_PATH} HTTP/1.1\r\nHost: fixture\r\nx-fill: ${'x'.repeat(8200)}\r\n\r\n`, request('POST', '/nope', {})]) {
+      // FIN을 받아도 자기 쪽은 닫지 않는 클라이언트다.
+      const socket = connect({ port, host: '127.0.0.1', allowHalfOpen: true });
+      const answered = new Promise<void>(resolve => { socket.once('end', () => resolve()); });
+      socket.on('data', () => {});
+      socket.on('error', () => {});
+      socket.write(text);
+      await answered;
+      await until(async () => await open() === 0, 1000);
+      socket.destroy();
+    }
   } finally { await shut(server); await ctx.close(); }
 });
 

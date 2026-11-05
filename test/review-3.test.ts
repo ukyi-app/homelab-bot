@@ -184,7 +184,7 @@ for (const scope of [thread, parent]) test(`4313740783 최종 accepted UPDATE �
 });
 test('4313740783 Postgres deadline은 statement 잔여 예산과 COMMIT까지 제한', async () => {
   const commands: string[] = []; let time = 0;
-  const client = { query: async (sql: string) => { commands.push(sql); return { rows: [] }; }, release: () => {} };
+  const client = { query: async (sql: string) => { commands.push(sql); return { rows: [] }; }, release: () => {}, on: () => {}, removeListener: () => {} };
   const db = new Postgres({ connect: async () => client } as unknown as pg.Pool);
   await db.transaction(async tx => { time = 700; await tx.query('SELECT 1'); time = 1400; }, { expiresAt: 1500, now: () => time });
   assert.ok(commands.includes("SET LOCAL transaction_timeout = '1500ms'"));

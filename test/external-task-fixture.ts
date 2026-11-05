@@ -40,7 +40,7 @@ export async function receiverFixture(limits: Partial<ReceiverLimits> = {}, opti
   const f = await fixture(db);
   await seedConversation(db, f.store, f.now());
   const links = new ExternalTaskLinks(f.store);
-  const receiver = new ExternalTaskReceiver({ store: f.store, links, authorize: (owner, scope) => f.gate.authorize(owner, scope), environment: ENVIRONMENT, limits, ...options });
+  const receiver = new ExternalTaskReceiver({ store: f.store, links, authorize: (owner, scope, tx) => f.gate.withDatabase(tx).authorize(owner, scope), environment: ENVIRONMENT, limits, ...options });
   const attach = async (externalTaskId = SESSION, summaryConsent = false) =>
     sender(await links.attach({ owner: 'fixture-owner', scope: thread, externalTaskId, executor: 'claude', summaryConsent }));
   const count = async (table: string) => Number((await db.query<{ n: string }>(`SELECT count(*)::text AS n FROM ${table}`)).rows[0]!.n);

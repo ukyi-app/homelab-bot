@@ -19,6 +19,10 @@ export class Postgres implements Database {
   }
   async transaction<T>(fn: (tx: Database) => Promise<T>, deadline?: TransactionDeadline): Promise<T> {
     const client = await this.pool.connect();
+    // transaction_timeout은 세션을 끊는다(FATAL). 대여 중인 클라이언트의 error를 듣는 쪽이 없으면 uncaught로 프로세스가 죽는다.
+    // 끊긴 클라이언트는 release 때 풀이 버리므로 여기서는 받아 두기만 한다.
+    const sessionLost = () => {};
+    client.on('error', sessionLost);
     const budget = async () => {
       if (deadline) {
         await client.query(`SET LOCAL statement_timeout = '${Math.min(1500, remaining(deadline))}ms'`);
@@ -47,7 +51,10 @@ export class Postgres implements Database {
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
       throw error;
-    } finally { client.release(); }
+    } finally {
+      client.removeListener('error', sessionLost);
+      client.release();
+    }
   }
 }
 // 파일마다 자기 버전을 같은 transaction 안에서 schema_migrations에 남긴다. 새 파일은 이 목록에도 더한다

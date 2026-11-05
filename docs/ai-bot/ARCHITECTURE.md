@@ -1309,7 +1309,7 @@ Grafana/K8s/Argo CD의 실제 응답을 `ReadTransport`의 제한된 observation
 | 표 | 내용 |
 |---|---|
 | `external_task_connections` | owner, 대화·scope, 등록한 외부 세션 ID, 실행기(`claude`·`codex`), Ed25519 public key, `key_id`, 만료(30일), 폐기 시각·사유, 요약 동의, 마지막 수신 시각. 개인 seed 열은 없다 |
-| `external_task_events` | `connection_id`+`event_id` PK, 본문 SHA-256, 발생·수신 시각, `outbox_key`, `post_state`(`pending`·`posted`·`blocked`). 요약 원문은 없다 |
+| `external_task_events` | `connection_id`+`event_id` PK, 본문 SHA-256, 수락한 `accepted_key_id`, 발생·수신 시각, `outbox_key`, `post_state`(`pending`·`posted`·`blocked`). 요약 원문은 없다 |
 | `external_task_link_fence` | 복원 감지 값 한 행 |
 
 `post_state`의 원천은 `outbox.state`다. 게시자는 R08을 모르므로 트리거 `outbox_external_task_post_state`가 같은 트랜잭션에서 따라간다. `unknown`은 보냈는지 모르므로 미게시로 센다. 중복 방지 ID는 게시가 끝난 뒤 7일 보관하고 `ExternalTaskLinks.purge()`가 지운다(주기 호출은 B5). 지운 뒤의 재생은 `occurred_at` 24시간 창에서 거절된다.
@@ -1319,6 +1319,8 @@ Grafana/K8s/Argo CD의 실제 응답을 `ReadTransport`의 제한된 observation
 - `attach`는 서버에서 키쌍을 만들고 seed를 `OneTimeSeed`로 돌려준다. `reveal()`은 한 번만 되고, 문자열·JSON·`inspect`는 `[redacted]`다. 그래서 outbox·감사·오류 수집에 실수로 실려도 값이 남지 않는다. 전달은 호출자가 ephemeral로 한다.
 - `rotate`는 같은 행의 키를 덮어써 이전 키를 즉시 무효로 하고, 이전 키로 들어온 미게시 행을 막는다.
 - `revoke`·`detach`는 `pending`과 발송 시작 전 `sending`을 `blocked`로 바꾼다. 게시자의 dispatch 표시가 `state='sending'`을 요구하므로 이 트랜잭션 뒤에는 나갈 수 없다. 이미 발송을 시작한 행은 보냈을 수 있어 그대로 둔다. 전달 실패 때는 `revoke(...,'delivery_failed')`로 닫는다.
+- **발송 중 폐기·재발급.** 그대로 둔 행의 발송이 429·401로 실패하면 게시자가 `pending`으로 되돌린다. 트리거 `outbox_external_task_claim`이 `pending`→`sending` 전이마다 연결 폐기, 수락한 키와 현재 키의 일치, WAL timeline을 다시 보고 어긋나면 `blocked`로 바꾼다. 게시자는 R08을 모르고 재시도 경로가 여럿이라 모든 발송이 지나는 이 전이에 둔다. 폐기·재발급·동의 변경이 연결 행을 잠근 동안에는 기다리지 않고(교착 방지) lease 30초만큼 미룬다.
+- **동의 철회.** `setSummaryConsent`와 수락이 같은 연결 행 잠금으로 직렬화된다. 철회가 끝난 뒤 새로 저장되는 요약은 없고, 철회 전에 큐에 든 행과 이미 받은 이벤트의 재전송은 그대로다.
 
 **복원.** 복원하면 폐기한 키가 DB 행과 함께 되살아난다. `enforceRestoreFence`는 attach·재발급·수신마다 지금 값(`timeline:<WAL timeline>;epoch:<restoreEpoch>`)을 저장 값과 비교하고, 다르면 활성 연결을 모두 `restore_fence`로 닫고 미게시 행을 막고 감사를 남긴다. 복원된 DB에는 어느 키가 폐기됐는지 알 근거가 없으므로 전부 닫고 사람이 다시 연결한다.
 
@@ -1326,6 +1328,7 @@ Grafana/K8s/Argo CD의 실제 응답을 `ReadTransport`의 제한된 observation
 - **pg_dump 복원은 timeline이 그대로라 자동으로 못 잡는다.** 복원 절차에서 `restoreEpoch` 설정값을 올려야 한다.
 - **장애 조치(promote)도 timeline을 올려 모든 연결이 닫힌다.** 안전한 쪽의 오탐이다.
 - 값을 읽지 못하면 수신이 503으로 닫힌다.
+- **조립(B5).** 게시 루프를 시작하기 전에 `enforceRestoreFence()`를 한 번 부른다. 게시 트리거는 timeline만 볼 수 있어 pg_dump 복원의 `restoreEpoch` 변경은 이 호출이 있어야 미게시 행보다 먼저 잡힌다.
 
 **수신(`src/external-task-receiver.ts`).** `ExternalTaskReceiver`는 판정, `externalTaskServer`는 전용 HTTP 서버이고 listen은 조립하는 쪽이 한다. 이 서버에는 다른 경로가 없다(`/metrics`·`/readyz` 없음).
 
@@ -1338,7 +1341,7 @@ Grafana/K8s/Argo CD의 실제 응답을 `ReadTransport`의 제한된 observation
 | 연결별 속도 | 서명 검증 뒤 분당 30·burst 5·시간당 300(429). 프로세스별이다. 남의 connection_id로 quota를 깎을 수 없다 |
 | 역압 | 미게시 연결별 100(429)·전체 1,000(503). advisory 잠금으로 세기와 삽입을 묶어 동시에 들어와도 넘지 않는다. 이미 받은 이벤트의 재전송은 대상이 아니다 |
 | 시각 | `sent_at` ±5분(422 `clock_skew`), `occurred_at` 미래 5분·과거 24시간(422) |
-| DB | R08 동시 DB 작업 2개, 수락 트랜잭션 2초, 처리 전체 5초(503). GitHub·Discord 처리를 굶기지 않기 위해서다 |
+| DB | R08 동시 DB 작업 2개, 대기 6개(초과는 곧바로 503 `overloaded`), DB 단계마다 2초(복원 울타리·연결 조회·권한·수락), 처리 전체 5초(503 `unavailable`). GitHub·Discord 처리를 굶기지 않기 위해서다. 기한이 지난 대기는 줄에서 빠지고, 실행 중 작업은 다음 단계로 가지 않는다. 슬롯은 작업이 실제로 끝나야 돌아오므로 응답이 닫혀도 DB에 남는 작업은 2개를 넘지 않는다. 연결을 빌리는 대기(`pool.connect`)만 이 기한 밖이고 풀의 `connectionTimeoutMillis`로 끊긴다 |
 
 요청 헤더는 `x-r08-connection-id`, `x-r08-key-id`, `x-r08-sent-at`(ms), `x-r08-signature`(Ed25519 base64url)다. 서명 입력은 아래 값을 개행으로 이은 UTF-8이고, JSON을 다시 직렬화하지 않는다.
 
@@ -1353,14 +1356,15 @@ POST
 <SHA-256(raw body) hex>
 ```
 
-본문 필드는 `version`(1), `connection_id`(헤더와 같아야 함), `event_id`, `external_task_id`, `type`(`turn_complete`), `occurred_at`(ms), `summary`뿐이고 나머지는 거절한다. 판정 순서는 HTTP 상한 → 헤더 형식 → `sent_at` → 복원 울타리 → 서명 → 연결별 속도 → 본문 → 외부 ID·요약 동의 → 현재 owner 권한 → 수락 트랜잭션이다.
+본문 필드는 `version`(1), `connection_id`(헤더와 같아야 함), `event_id`, `external_task_id`, `type`(`turn_complete`), `occurred_at`(ms), `summary`뿐이고 나머지는 거절한다. 판정 순서는 HTTP 상한 → 헤더 형식 → `sent_at` → 복원 울타리 → 서명 → 연결별 속도 → 본문 → 외부 ID·요약 동의 → 현재 owner 권한 → 수락 트랜잭션이다. 수락 트랜잭션은 연결 행을 잠근 뒤 폐기·`key_id`·만료를 잠금 시각으로, 새 요약의 동의를 잠근 행으로 다시 본다.
 
 - **응답.** 수락과 중복은 같은 202다. 미등록·위조·폐기·만료·옛 키는 모두 같은 401이라 구별해 주지 않는다. 같은 ID 다른 내용은 409, 다른 외부 ID·동의 없는 요약·권한 거부는 403이다.
 - **목적지.** 연결 레코드로만 정한다. 클라이언트의 owner·채널 필드는 거절한다.
 - **요약.** 동의 없는 연결은 고정 문구 `턴 완료`만 받는다. 동의한 연결도 500 코드 포인트·2,000바이트·제어 문자 없음이고 경로·토큰 의심 표현은 거절한다. 같은 표가 helper에 있고 시험이 일치를 확인한다. 이 표는 완전한 비밀 탐지가 아니다.
 - **게시.** "사람 세션이 턴을 끝냈다고 알림", 발생·수신 시각(KST), 지연을 적는다. `allowed_mentions.parse=[]`는 게시자가 건다. 게시자의 본문에 `flags` 칸이 없어 링크 미리보기는 내용 쪽에서 막는다. 사용자 값을 모두 코드 스팬에 넣는다.
-- **게시 직전 권한.** 게시자가 `PolicyGate`와 대화 활성 여부를 다시 본다. 연결 폐기는 위 `blocked` 처리로 막는다. 만료는 게시를 막지 않는다. 만료 전에 정상으로 받은 이벤트이기 때문이다.
-- **관측.** `metrics()`가 사유별 수·지연·동시 처리·미게시 수를 고정 라벨로 낸다. 전용 포트에 두지 않으므로 8080 `/metrics`에 조립한다. 본문·인증 헤더·연결 ID는 없다.
+- **게시 직전 권한.** 게시자가 `PolicyGate`와 대화 활성 여부를 다시 본다. 연결 폐기·재발급은 위 `blocked` 처리와 claim 트리거로 막는다. 만료는 게시를 막지 않는다. 만료 전에 정상으로 받은 이벤트이기 때문이다. 다시 연결해 옛 행이 `expired`로 닫혀도 같다.
+- **권한 조립(B5).** `authorize`는 기한이 걸린 트랜잭션 `db`를 받는다. `(owner, scope, db) => gate.withDatabase(db).authorize(owner, scope)`로 넘긴다.
+- **관측.** `metrics()`가 사유별 수·지연·동시 처리·DB 슬롯 사용·DB 대기·미게시 수를 고정 라벨로 낸다. 전용 포트에 두지 않으므로 8080 `/metrics`에 조립한다. 본문·인증 헤더·연결 ID는 없다.
 
 **사람 쪽 helper(`tools/r08-helper/`).** 설치 안내는 그 디렉터리의 README다. 봇 이미지 런타임 단계는 `src`만 복사하므로 helper가 이미지에 들어가지 않고, Node 내장 모듈만 써서 기기에 복사해 쓴다. 시험 단계는 저장소 전체를 복사하므로 시험이 함께 돈다.
 

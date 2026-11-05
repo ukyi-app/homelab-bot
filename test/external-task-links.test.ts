@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { sign, verify, createPublicKey, createPrivateKey } from 'node:crypto';
 import { inspect } from 'node:util';
-import { Denied } from '../src/contracts.js';
+import { Denied, DiscordUnauthorized, RateLimited } from '../src/contracts.js';
 import type { Scope } from '../src/contracts.js';
 import { AlreadyAttached, ConnectionClosed, EXTERNAL_EVENT_RETENTION_MS, EXTERNAL_LINK_TTL_MS, EXTERNAL_TASK_CAPABILITIES, ExternalTaskLinks, OneTimeSeed } from '../src/external-task-links.js';
 import { Store } from '../src/store.js';
@@ -126,6 +126,66 @@ test('R08 연결: 해제·전달 실패 폐기는 수신을 막고, 미게시 ou
     assert.equal(ctx.f.rest.messages.length, 0);
     const states = (await ctx.db.query<{ post_state: string }>('SELECT post_state FROM external_task_events')).rows.map(row => row.post_state).sort();
     assert.deepEqual(states, ['blocked', 'blocked', 'pending']);
+  } finally { await ctx.close(); }
+});
+
+// 발송 도중에 action이 끝나고 그 발송이 error로 확정 실패하게 만든다. 행은 게시자 손에서 pending으로 돌아간다.
+async function failWhileSending(ctx: Awaited<ReturnType<typeof receiverFixture>>, action: () => Promise<unknown>, error: Error): Promise<void> {
+  const { rest, publisher } = ctx.f;
+  const send = rest.sendMessage;
+  rest.sendMessage = async () => { rest.sendMessage = send; await action(); throw error; };
+  assert.equal(await publisher.deliver(), true);
+  assert.equal((await ctx.db.query<{ state: string }>('SELECT state FROM outbox')).rows[0]!.state, 'pending');
+  // 429·일시 정지가 풀린 뒤의 재시도다.
+  ctx.f.advance(60_000);
+}
+const rowStates = async (ctx: Awaited<ReturnType<typeof receiverFixture>>) => ({
+  outbox: (await ctx.db.query<{ state: string }>('SELECT state FROM outbox ORDER BY created_at,id')).rows.map(row => row.state),
+  events: (await ctx.db.query<{ post_state: string }>('SELECT post_state FROM external_task_events ORDER BY received_at,event_id')).rows.map(row => row.post_state),
+});
+
+for (const [name, close, error] of [
+  ['폐기 뒤 429', (ctx, id) => ctx.links.detach(id, OWNER), new RateLimited(1000)],
+  ['재발급 뒤 429', (ctx, id) => ctx.links.rotate(id, OWNER), new RateLimited(1000)],
+  ['폐기 뒤 401', (ctx, id) => ctx.links.detach(id, OWNER), new DiscordUnauthorized()],
+  ['재발급 뒤 401', (ctx, id) => ctx.links.rotate(id, OWNER), new DiscordUnauthorized()],
+  ['복원 감지 뒤 429', ctx => ctx.db.query(`UPDATE external_task_link_fence SET token='timeline:00000000;epoch:0'`), new RateLimited(1000)],
+] as [string, (ctx: Awaited<ReturnType<typeof receiverFixture>>, id: string) => Promise<unknown>, Error][]) {
+  test(`R08 게시 재시도: 발송 중 ${name}로 되돌아온 행은 다시 나가지 않는다`, async () => {
+    const ctx = await receiverFixture();
+    try {
+      const who = await ctx.attach();
+      assert.equal((await accept(ctx, who)).reply.outcome, 'accepted');
+      await failWhileSending(ctx, () => close(ctx, who.connectionId), error);
+      assert.equal(await ctx.f.publisher.deliver(), true);
+      assert.equal(ctx.f.rest.messages.length, 0);
+      assert.deepEqual(await rowStates(ctx), { outbox: ['blocked'], events: ['blocked'] });
+    } finally { await ctx.close(); }
+  });
+}
+
+test('R08 게시 재시도: 연결이 그대로면 429 뒤 재시도가 나가고, 재발급 뒤 새 키로 받은 이벤트는 나가며, 만료로 닫힌 연결의 수락분도 나간다', async () => {
+  const ctx = await receiverFixture();
+  try {
+    const who = await ctx.attach();
+    assert.equal((await accept(ctx, who)).reply.outcome, 'accepted');
+    await failWhileSending(ctx, async () => {}, new RateLimited(1000));
+    assert.equal(await ctx.f.publisher.deliver(), true);
+    assert.equal(ctx.f.rest.messages.length, 1);
+    assert.deepEqual(await rowStates(ctx), { outbox: ['sent'], events: ['posted'] });
+
+    const after = sender(await ctx.links.rotate(who.connectionId, OWNER));
+    assert.equal((await accept(ctx, after)).reply.outcome, 'accepted');
+    assert.equal(await ctx.f.publisher.deliver(), true);
+    assert.equal(ctx.f.rest.messages.length, 2);
+
+    assert.equal((await accept(ctx, after)).reply.outcome, 'accepted');
+    ctx.f.advance(EXTERNAL_LINK_TTL_MS);
+    // 다시 연결하면 옛 행은 revoked_reason='expired'가 된다. 만료 전에 정상으로 받은 이벤트라 게시를 막지 않는다.
+    await ctx.attach();
+    assert.equal((await ctx.db.query<{ revoked_reason: string }>(`SELECT revoked_reason FROM external_task_connections WHERE id=$1`, [who.connectionId])).rows[0]!.revoked_reason, 'expired');
+    assert.equal(await ctx.f.publisher.deliver(), true);
+    assert.equal(ctx.f.rest.messages.length, 3);
   } finally { await ctx.close(); }
 });
 
