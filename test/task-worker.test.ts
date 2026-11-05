@@ -1,9 +1,13 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, randomUUID } from 'node:crypto';
+import { once } from 'node:events';
 import { chmod, lstat, mkdir, open, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { TASK_CAPABILITY_AUDIENCE, TASK_ENDPOINTS, TASK_LIMITS, TaskRejectionSchema, TaskResponseSchema, TaskStatusResponseSchema, TaskWorkerSigner } from '../src/task-contracts.js';
+import { taskWorkerServer } from '../src/task-http.js';
+import { TaskRouteError } from '../src/task-worker.js';
+import type { TaskWorkerService } from '../src/task-worker.js';
 import { WorkerSigner, capabilityDigest, sealCapability } from '../src/worker.js';
 import { WorkerStartError } from '../src/worker-state.js';
 import { workerConfig } from '../src/worker-main.js';
@@ -18,6 +22,32 @@ const rejected = (response: { json: unknown }) => assert.deepEqual(TaskRejection
 const control = (request: { job: string; lease: string; generation: number; sessionId: string }, expectedWorker: unknown = null) =>
   ({ version: 1, job: request.job, lease: request.lease, generation: request.generation, sessionId: request.sessionId, expectedWorker });
 const receipt = { outcome: 'failed', persistedAt: 1, resultDigest: null };
+
+test('라우트 로그: 거부와 오류는 끝점·상태·사유 상수만 남기고 본문·capability를 담지 않는다', async () => {
+  const logs: Record<string, unknown>[] = [];
+  const failures: unknown[] = [new TaskRouteError(409, 'busy'), new Error('요청본문표식')];
+  const service = { intake: { startupClean: true, open: true, reasons: [] }, execute: async () => { throw failures.shift(); } } as unknown as TaskWorkerService;
+  const server = taskWorkerServer(service, {}, item => logs.push(item));
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  try {
+    const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/v1/task`;
+    const request = startRequest({ untrusted: { request: '요청본문표식' } });
+    const post = (headers: Record<string, string>, payload: string) => fetch(url, { method: 'POST', headers, body: payload });
+    const signed = { authorization: 'Capability 토큰표식'.replace('토큰표식', 'capability-mark') };
+    assert.equal((await post({}, JSON.stringify(request))).status, 401);
+    assert.equal((await post(signed, '{"broken":true}')).status, 400);
+    assert.equal((await post(signed, JSON.stringify(request))).status, 409);
+    assert.equal((await post(signed, JSON.stringify(request))).status, 500);
+    assert.deepEqual(logs, [
+      { level: 'warn', event: 'task_route_rejected', endpoint: '/v1/task', status: 401, reason: 'capability_missing' },
+      { level: 'warn', event: 'task_route_rejected', endpoint: '/v1/task', status: 400, reason: 'request_invalid' },
+      { level: 'warn', event: 'task_route_rejected', endpoint: '/v1/task', status: 409, reason: 'busy' },
+      { level: 'error', event: 'task_route_failed', endpoint: '/v1/task', error: 'Error' },
+    ]);
+  } finally { server.close(); server.closeAllConnections(); }
+});
+
 const intake = async (f: WorkerFixture) => (await fetch(`${f.url}/v1/task/intake`)).json() as Promise<{ open: boolean; reasons: string[]; capabilities: Record<string, unknown> }>;
 const ready = async (f: WorkerFixture) => (await fetch(`${f.url}/readyz`)).status;
 const waitUntil = async (check: () => Promise<boolean> | boolean) => {

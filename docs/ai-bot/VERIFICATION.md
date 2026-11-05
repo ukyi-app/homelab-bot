@@ -976,3 +976,47 @@ R2·R2b·R3의 `--settings`는 `sandbox.enabled`, `failIfUnavailable: true`, `al
 | 메시징 소켓 가림의 효과와 부작용 | 도구 호출이 필요하다 | 운영 SEC-02 |
 | 실제 모델 응답의 재개 흐름(`--resume` 뒤 도구·`structured_output`) | 모델을 부르지 않았다. assistant·result 모양은 합성 fixture다 | live TASK-02 |
 | 실제 디스크 부족 | ENOSPC를 쓰기 호출에 주입했다 | 운영 |
+
+## T18 live 시험 1: 정책 밖 변경 실패와 샌드박스 흔적 (2026-11-05)
+
+규칙은 [ARCHITECTURE](ARCHITECTURE.md) "T18 작업 레인 실행·정리"의 "샌드박스 흔적"이다.
+
+**결과.** 운영에서 `/task project:homelab-smoke`로 "README.md 맨 아래에 절을 만들고 한 줄 설명, 다른 파일은 바꾸지 마"를 요청했다(20:44 KST). 1분 안에 `jobs.wait_reason = task_change_outside_policy`(작업자 응답 `failed(change_outside_policy)`)로 실패했다. 정책 허용 경로는 `src`, `tests`, `docs`, `README.md`다. 작업자와 게시 서버 모두 로그가 없었고 세션 공간은 finalize로 지워져 당시 파일은 볼 수 없었다.
+
+**원인.** 고정 CLI 2.1.308은 `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`이면 시작할 때 작업 디렉터리에 빈 stub 17개를 만들고 끝나도 지우지 않는다. 변경 계산이 이것을 허용 경로 밖 추가로 봤다. 도구 호출 없이도 생긴다. 처음 세운 가설(Bash 도구의 bwrap 마운트 지점)은 일부만 맞았다. 마운트 지점은 실제로 생기지만 CLI가 정상 종료하면 지운다.
+
+**재현 방법.** 모델·실토큰·외부 네트워크 없이 고정 바이너리를 작업 레인의 실제 argv·settings·env로 띄웠다. 로컬 가짜 Messages API가 정해 둔 도구 호출과 structured output을 돌려주므로 Bash·Read·Edit·Write가 실제 샌드박스에서 돈다. `HTTPS_PROXY`도 그 서버를 가리켜 외부로 나가는 호출을 끊었다. 호스트는 tmpfs와 bubblewrap 0.11.1이고 socat은 패키지를 풀어 썼다. 파드 이미지는 bubblewrap 0.12.0이다.
+
+| 턴 | 작업 공간에 남은 것 |
+|---|---|
+| 도구 없이 structured output만 | stub 파일 17개, 빈 디렉터리 `.claude/agents`, `.claude/commands`, `node_modules/.bin` |
+| Bash | 위와 같고 빈 `.claude/.cc-writes`가 더 있다. 실행 중에는 마운트 지점 12개가 `/dev/null` bind로 보이고 정상 종료 뒤 사라진다 |
+| Write·Read·Edit | 요청한 변경 말고 더 없다 |
+| 같은 세션 `--resume` | 더 없다 |
+| Bash 실행 중 SIGKILL | 마운트 지점 12개가 mode 444 빈 파일로 남는다. `.vscode`, `.idea`, `.github`, `scripts`도 파일이다 |
+| 하위 경로 | 없다. `src/.gitconfig` 같은 자리는 만들지 않는다. deny 탐색은 이미 있는 파일만 찾고, 없는 경로의 자리는 최상위만 만든다. 중첩 저장소의 `.git/hooks`만 예외인데 경로에 `.git`이 있으면 `change_path_invalid`다 |
+
+바이너리 코드도 같다. stub은 scrub 초기화, 마운트 지점은 샌드박스 인자 조립과 명령 뒤 정리에 있다. stub 17개는 `package.json`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `.npmrc`, `.yarnrc`, `.yarnrc.yml`, `bunfig.toml`, `.gitmodules`, `.env`, `.env.local`, `.env.development`, `.env.development.local`, `.env.test`, `.env.test.local`, `.env.production`, `.env.production.local`이다. 마운트 지점 12개는 `.gitconfig`, `.bashrc`, `.bash_profile`, `.zshrc`, `.zprofile`, `.profile`, `.ripgreprc`, `.mcp.json`, `.vscode`, `.idea`, `.github`, `scripts`다.
+
+**수정 확인.** 위 방법의 실제 CLI 턴(Bash로 README 수정)을 `TaskSessions.collect`로 잰 결과다.
+
+| 흔적 처리 | 결과 |
+|---|---|
+| 끔 | `failed(change_outside_policy)`, 정책 밖 추가 17개(모두 최상위). live와 같은 증상이다 |
+| 켬 | 완료, 변경은 `README.md` modified 하나, 흔적 17개 뺌 |
+
+**시험.** `test/task-workspace.test.ts`가 실행 전후 스냅샷으로 다음을 본다. 최상위 빈 stub·마운트 지점·빈 디렉터리는 빠지고 README 변경만 남는다. 같은 이름에 내용이나 실행 비트가 있으면, 하위 경로면, 실행 전에 있던 경로면, 심링크·FIFO·hardlink면 정책 판정을 받는다. `test/task-stream.test.ts`·`test/task-worker.test.ts`·`test/task-bridge.test.ts`는 로그가 요청·요약·파일 내용·경로 이름·토큰을 담지 않는지 단언한다. `npm run check` 통과. 네트워크 없는 임시 `postgres:18-alpine`(18.6, 기본 사용자 postgres)을 소켓으로 주면 **1373/1373 pass**. 시험 뒤 컨테이너를 지웠다. Node 24.22.0.
+
+**아직 확인하지 못한 것.**
+
+| 항목 | 왜 못 봤나 | 어디서 본다 |
+|---|---|---|
+| live 시험 1에서 실제로 남은 파일 목록 | 세션 공간이 지워졌고 로그가 없었다. 위 결론은 같은 CLI·같은 설정의 로컬 재현이 근거다 | live 재시험(이제 `task_sandbox_traces_ignored`와 `task_change_outside_policy`가 남는다) |
+| 파드 조건에서 같은 목록인지 | 호스트는 tmpfs·bubblewrap 0.11.1이고 파드는 PVC·0.12.0이다. stub·마운트 지점 목록은 CLI 코드라 같을 것으로 본다 | live 재시험 |
+
+**함께 본 것.**
+
+- scrub 샌드박스 안에서 Bash는 `package.json`, `.env`, 저장소에 있는 `scripts/`·`.github/` 아래를 쓰지 못한다(`read-only file system` 실측). Write 도구는 `package.json`과 `scripts/x.sh`에 쓸 수 있었고 이것은 내용이 있어 정책 판정을 받는다. 이 경로를 허용한 프로젝트에서 Bash로 고치는 작업(`npm install`, 스크립트 수정)은 실패한다.
+- 빈 stub은 모델 턴 내내 있다. 저장소에 `package.json`이 없어도 `npm`이 빈 파일을 볼 수 있다.
+- stub 초기화는 `.git/commondir`, `.git/config.worktree`, `.git/info/exclude`도 건드린다. 증거는 `.git`을 읽지 않아 영향이 없다. 파드의 `/tmp/inline-comments-buffer.jsonl`도 만든다.
+- 로컬에서 `config` 가림과 Bash 도구는 함께 돌았다. 위 "아직 확인하지 못한 것"의 공존 항목을 운영에서 볼 때 참고한다.

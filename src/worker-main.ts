@@ -154,7 +154,7 @@ async function startTaskWorker(config: WorkerConfig, stateRoot: string, options:
   const service = new TaskWorkerService({ root: stateRoot, nonceDir: config.nonceDir, publicKey: config.publicKey, homes, startup,
     runTurn: ({ worker, sessions }, request, signal) => {
       if (!control) throw new Error('task_control_unavailable');
-      return runTaskTurn({ control, sessions, fetchArchive, worker, model: config.model, auth: 'subscription-token', credentialDir }, request, signal);
+      return runTaskTurn({ control, sessions, fetchArchive, worker, model: config.model, auth: 'subscription-token', credentialDir, ...(options.log ? { log: options.log } : {}) }, request, signal);
     },
     stop: async job => control ? control.stop(job) : false,
     survivors: async job => launcher ? launcher.survivors(job) : null,
@@ -162,7 +162,7 @@ async function startTaskWorker(config: WorkerConfig, stateRoot: string, options:
     credentialReady: () => credential.ready(),
     log: options.log,
     ...options.taskProbe });
-  const server = taskWorkerServer(service, config.profile.taskCapabilities!);
+  const server = taskWorkerServer(service, config.profile.taskCapabilities!, options.log);
   // 볼륨·자격 문제는 여기서 끝내지 않고 수락만 닫는다. 값 없는 사유가 로그와 /v1/task/intake에 남는다.
   await service.start();
   server.listen(options.port ?? PORTS.worker, options.host);
