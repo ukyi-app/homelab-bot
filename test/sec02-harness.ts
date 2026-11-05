@@ -1,27 +1,42 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { closeSync, constants, openSync } from 'node:fs';
-import { lstat, readdir, readlink, rm } from 'node:fs/promises';
+import { lstat, mkdir, readdir, readlink, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { TASK_OUTPUT_JSON_SCHEMA } from '../src/codex-events.js';
 import { ClaudeTaskAdapter } from '../src/executor-claude-task.js';
-import type { ClaudeTaskOperation, TaskSandboxPaths } from '../src/executor-claude-task.js';
+import type { ClaudeTaskOperation, ClaudeTaskTurn } from '../src/executor-claude-task.js';
 import { assertLaunchSafe, baseEnvironment } from '../src/run-control.js';
 import type { RunDirs } from '../src/executor.js';
 import { FakeMessagesApi, RefusingProxy, TOOL_CALL_BUDGET } from './sec02-fake-api.js';
 import type { ApiStats, ToolOutcome, TurnScript } from './sec02-fake-api.js';
-import { SYNTHETIC_MODEL_ID, Sec02Layout, caseTable } from './sec02-fixture.js';
+import { SYNTHETIC_MODEL_ID, Sec02Layout, caseTable, fallbackSocketDir, fallbackTable, namesTable, scopeTable, unlistedTable } from './sec02-fixture.js';
 import type { ProbeContext, Row, Sec02Step } from './sec02-fixture.js';
 
 // SEC-02 1단계 하네스. 고정 CLI를 작업 레인의 실제 argv·settings·env로 띄우고 가짜 Messages API로 도구 호출을 고정한다.
 // 진짜 토큰·모델·외부 호출이 없다. 네트워크 없는 컨테이너 안에서만 돈다. 음성 대조가 deny를 풀기 때문에 운영 파드나 실제 자격이 있는 환경에서는 실행하지 않는다.
 export const SEC02_LIMITS = Object.freeze({ totalMs: 300_000, turnMs: 90_000, bashMs: 5_000, retries: 0, toolCalls: TOOL_CALL_BUDGET, apiRequestBytes: 8 * 1024 * 1024, reportBytes: 64 * 1024, killGraceMs: 5_000 });
 
-// enforced만 운영 설정이다. 나머지는 이 합성 환경에서만 쓰는 대조군이다.
+// enforced_*와 long_tmpdir는 운영 argv·settings 그대로이고 사례표나 경로 길이만 다르다. 나머지는 이 합성 환경에서만 쓰는 대조군이다.
 // unguarded는 검사기가 노출을 잡는지(거짓 통과 방지), no_*는 도구마다 어느 설정이 막는지를 가른다.
-// candidate_fix는 enforced에서 뚫린 두 건(작업 공간 밖 Write, 메시징 소켓)의 원인을 확인하는 후보다. 운영 설정이 아니다.
-export type Variant = 'enforced' | 'unguarded' | 'no_permission_deny' | 'no_sandbox_filesystem' | 'no_deny_rules' | 'no_block_outside' | 'no_scrub' | 'candidate_fix';
-export const VARIANTS: readonly Variant[] = ['enforced', 'unguarded', 'no_permission_deny', 'no_sandbox_filesystem', 'no_deny_rules', 'no_block_outside', 'no_scrub', 'candidate_fix'];
+// legacy_*는 쓰기 허용을 도구 이름으로 되돌리고 실제 소켓 자리 가림을 뺀다. 같은 사례가 뚫리는 것으로 검사기가 위반을 잡음을 보인다.
+export type Variant = 'enforced' | 'enforced_scope' | 'enforced_names' | 'long_tmpdir' | 'unlisted_tools' | 'unguarded' | 'no_permission_deny' | 'no_sandbox_filesystem' | 'no_deny_rules' | 'no_block_outside' | 'no_scrub' | 'legacy_unscoped' | 'legacy_scope';
+export const VARIANTS: readonly Variant[] = ['enforced', 'enforced_scope', 'enforced_names', 'long_tmpdir', 'unlisted_tools', 'unguarded', 'no_permission_deny', 'no_sandbox_filesystem', 'no_deny_rules', 'no_block_outside', 'no_scrub', 'legacy_unscoped', 'legacy_scope'];
+// 재개까지 도는 변형. 도구 호출 상한은 변형 하나의 시작·재개 합계다.
+export const RESUMED_VARIANTS: readonly Variant[] = ['enforced', 'enforced_scope'];
+const LEGACY_ALLOW: readonly Variant[] = ['unguarded', 'legacy_unscoped', 'legacy_scope'];
+function stepsFor(variant: Variant, layout: Sec02Layout): Sec02Step[] {
+  switch (variant) {
+    case 'enforced_scope': return scopeTable(layout);
+    case 'enforced_names': return namesTable(layout);
+    case 'long_tmpdir': return fallbackTable(layout);
+    case 'unlisted_tools': return unlistedTable(layout);
+    case 'legacy_scope': return [...scopeTable(layout), ...namesTable(layout)];
+    default: return caseTable(layout);
+  }
+}
+// TMPDIR 아래 소켓 경로가 CLI 한도(103바이트)를 넘도록 길게 만든 상태 루트 이름.
+const LONG_ROOT_NAME = 'l'.repeat(40);
 export interface TurnReport {
   variant: Variant; phase: ClaudeTaskOperation; status: 'finished' | 'timeout' | 'launch_failed' | 'not_run';
   exit_code: number | null; signal: string | null; outcome_kind: string | null; outcome_reason: string | null;
@@ -62,15 +77,22 @@ export function variantSettings(variant: Variant, production: string): string {
       const { blockReadsOutsideWorkingDirectories: _dropped, ...permissions } = settings.permissions;
       return JSON.stringify({ ...settings, permissions });
     }
-    case 'no_scrub':
-    case 'candidate_fix': return production;
+    case 'legacy_unscoped':
+    case 'legacy_scope': {
+      const realSocket = /\/cc-socks(\/|$)/;
+      const keep = (list: unknown) => (list as string[]).filter(item => !realSocket.test(item));
+      const filesystem = settings.sandbox.filesystem as Record<string, unknown>;
+      return JSON.stringify({ ...settings, sandbox: { ...settings.sandbox, filesystem: { denyRead: keep(filesystem.denyRead), denyWrite: keep(filesystem.denyWrite) } },
+        permissions: { ...settings.permissions, deny: keep(settings.permissions.deny) } });
+    }
+    default: return production;
   }
 }
-// 쓰기 도구의 허용을 작업 공간으로 좁힌 인자. Edit 규칙은 Write에도 걸린다.
-export function scopedAllowArgs(args: readonly string[], workspace: string): string[] {
+// 쓰기 허용을 경로 없는 도구 이름으로 되돌린 인자. 운영 argv가 아니라 대조군 전용이다.
+export function unscopedAllowArgs(args: readonly string[]): string[] {
   const start = args.indexOf('--allowedTools');
   const next = args.findIndex((arg, index) => index > start && arg.startsWith('--'));
-  return [...args.slice(0, start + 1), 'Bash', 'Read', `Edit(/${workspace}/**)`, ...args.slice(next)];
+  return [...args.slice(0, start + 1), 'Bash', 'Read', 'Edit', 'Write', ...args.slice(next)];
 }
 
 function versionOf(command: string, args: readonly string[], pattern: RegExp, env: NodeJS.ProcessEnv): string | null {
@@ -86,7 +108,7 @@ async function waitGone(pgid: number, ms: number): Promise<boolean> {
 const signalGroup = (pgid: number, signal: NodeJS.Signals) => { try { process.kill(-pgid, signal); } catch { /* 이미 끝났다. */ } };
 const notRunRows = (steps: readonly Sec02Step[]): Row[] => steps.map(step => ({ case_id: step.name, tool: step.tool, attempted: false, outcome: 'not_run', error_code: null, bytes: null }));
 
-interface TurnInput { variant: Variant; operation: ClaudeTaskOperation; dirs: RunDirs; sandbox: TaskSandboxPaths; deadline: number }
+interface TurnInput { variant: Variant; operation: ClaudeTaskOperation; dirs: RunDirs; sandbox: ClaudeTaskTurn['sandbox']; deadline: number }
 const SYSTEM_PATH = '/usr/local/bin:/usr/bin:/bin';
 
 class Runner {
@@ -113,10 +135,9 @@ class Runner {
   }
 
   private async turn(layout: Sec02Layout, api: FakeMessagesApi, proxy: RefusingProxy, ports: { api: number; proxy: number }, input: TurnInput): Promise<TurnReport> {
-    const { variant, operation, dirs } = input;
-    const sandbox: TaskSandboxPaths = variant === 'candidate_fix' ? { ...input.sandbox, socketDir: join(dirs.tmp, 'cc-socks') } : input.sandbox;
+    const { variant, operation, dirs, sandbox } = input;
     const started = Date.now();
-    const steps = caseTable(layout);
+    const steps = stepsFor(variant, layout);
     const rows: Row[] = [];
     const counts: Record<string, number> = {};
     const before = { ...api.stats };
@@ -124,6 +145,7 @@ class Runner {
     let cursor = 0;
     let current: Sec02Step | null = null;
     let socketPathMatches = false;
+    const socketFile = (pid: number) => join(variant === 'long_tmpdir' ? fallbackSocketDir() : join(dirs.tmp, 'cc-socks'), `${pid}.sock`);
     const context: ProbeContext = { cliPid: 0, sentinelPid: this.startSentinel(layout), apiPort: ports.api };
     const script: TurnScript = {
       structured: { status: 'completed', summary: 'sec02', question: '' },
@@ -137,8 +159,8 @@ class Runner {
         rows.push(...judged.rows);
         Object.assign(counts, judged.counts);
         // 샌드박스 안 소켓 사례의 결과가 소켓 부재 때문이 아님을 바깥에서 확인한다. init이 알린 경로와 같은 자리다 [실측].
-        if (current.name === 'probe.cred_control') {
-          const socket = await lstat(join(dirs.tmp, 'cc-socks', `${context.cliPid}.sock`)).catch(() => null);
+        if (current.name === 'probe.cred_control' || current.name === 'probe.fallback') {
+          const socket = await lstat(socketFile(context.cliPid)).catch(() => null);
           counts['socket.own_exists_outside'] = socket?.isSocket() ? 1 : 0;
           counts['socket.init_path_matches'] = socketPathMatches ? 1 : 0;
         }
@@ -152,7 +174,7 @@ class Runner {
     const plan = await adapter.start({ job: layout.job, model: SYNTHETIC_MODEL_ID, dirs, credential, schema: TASK_OUTPUT_JSON_SCHEMA });
     const base = { ...plan.env, ...baseEnvironment(dirs, layout.job, { https: `http://127.0.0.1:${ports.proxy}`, noProxy: '127.0.0.1,localhost' }) };
     await assertLaunchSafe(adapter, plan, base, credential, null);
-    const args = variant === 'candidate_fix' ? scopedAllowArgs(plan.args, dirs.workspace) : [...plan.args];
+    const args = LEGACY_ALLOW.includes(variant) ? unscopedAllowArgs(plan.args) : [...plan.args];
     args[args.indexOf('--settings') + 1] = variantSettings(variant, args[args.indexOf('--settings') + 1]!);
     const env: Record<string, string> = { ...base, ANTHROPIC_BASE_URL: `http://127.0.0.1:${ports.api}`, CLAUDE_CODE_MAX_RETRIES: '0', API_TIMEOUT_MS: '5000' };
     if (variant === 'unguarded' || variant === 'no_scrub') delete env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB;
@@ -185,7 +207,7 @@ class Runner {
         report.init_seen = true;
         report.session_matched = parsed.session_id === layout.sessionId;
         const raw = JSON.parse(line) as { messaging_socket_path?: unknown };
-        socketPathMatches = raw.messaging_socket_path === join(dirs.tmp, 'cc-socks', `${pgid}.sock`);
+        socketPathMatches = raw.messaging_socket_path === socketFile(pgid);
       }
     };
     child.stdout!.setEncoding('utf8');
@@ -225,10 +247,11 @@ class Runner {
     for (const dir of [this.config.root, this.config.credentialDir]) {
       for (const name of await readdir(dir).catch(() => [] as string[])) await rm(join(dir, name), { recursive: true, force: true });
     }
+    // long_tmpdir에서 CLI가 만드는 자리. 남으면 다음 변형의 fallback 사례 코드가 달라진다.
+    await rm(fallbackSocketDir(), { recursive: true, force: true });
   }
-  private sandboxOf(layout: Sec02Layout): TaskSandboxPaths {
-    const { dirs } = layout.session;
-    return { credentialDir: this.config.credentialDir, controlDir: layout.sessions.controlDir, config: dirs.config, run: dirs.run, others: layout.others };
+  private sandboxOf(layout: Sec02Layout): ClaudeTaskTurn['sandbox'] {
+    return { credentialDir: this.config.credentialDir, controlDir: layout.sessions.controlDir, others: layout.others };
   }
 
   async run(): Promise<Sec02Report> {
@@ -244,7 +267,9 @@ class Runner {
     for (const variant of this.config.variants ?? VARIANTS) {
       if (Date.now() >= deadline) { aborted = 'total_time'; break; }
       await this.clean();
-      const layout = new Sec02Layout({ root: this.config.root, credentialDir: this.config.credentialDir });
+      const root = variant === 'long_tmpdir' ? join(this.config.root, LONG_ROOT_NAME) : this.config.root;
+      await mkdir(root, { recursive: true, mode: 0o700 });
+      const layout = new Sec02Layout({ root, credentialDir: this.config.credentialDir });
       await layout.build();
       let stopTurn: () => void = () => {};
       const api = new FakeMessagesApi({ token: layout.token, onViolation: () => stopTurn() });
@@ -253,7 +278,7 @@ class Runner {
       try {
         stopTurn = () => { for (const pgid of this.groups) if (pgid !== this.sentinel?.pid) signalGroup(pgid, 'SIGTERM'); };
         this.turns.push(await this.turn(layout, api, proxy, ports, { variant, operation: 'start', dirs: layout.session.dirs, sandbox: this.sandboxOf(layout), deadline }));
-        if (variant === 'enforced') {
+        if (RESUMED_VARIANTS.includes(variant)) {
           // 재개는 운영과 같이 세션 기록과 대화 파일을 확인한 뒤에만 연다.
           await layout.recordTurn(1);
           const { session } = await layout.openResume();

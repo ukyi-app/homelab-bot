@@ -956,7 +956,7 @@ R2·R2b·R3의 `--settings`는 `sandbox.enabled`, `failIfUnavailable: true`, `al
 | bwrap이 PATH에 없음 | 기동 거부, 흐름 없음(scrub이 요구) |
 | socat만 없음 | init 없이 result 오류 `Sandbox required but unavailable`(`failIfUnavailable`) |
 
-정적 확인: `blockReadsOutsideWorkingDirectories`는 2.1.308 바이너리에 설정으로 있다. 켜면 파일 도구가 작업 디렉터리 밖 읽기를 거부하고 샌드박스 명령이 홈 디렉터리를 잃는다는 문구가 있다. 파싱은 통과했지만 실제로 막는지는 도구 호출이 필요해 **[미확인]**이며 경계로 세지 않는다. `/etc/claude-code`가 관리 설정 위치임을 바이너리에서 확인했고, 이미지 빌드가 없음을 확인한다.
+정적 확인: `blockReadsOutsideWorkingDirectories`는 2.1.308 바이너리에 설정으로 있다. 켜면 파일 도구가 작업 디렉터리 밖 읽기를 거부하고 샌드박스 명령이 홈 디렉터리를 잃는다는 문구가 있다. 파싱은 통과했지만 실제로 막는지는 도구 호출이 필요해 이 시점에는 **[미확인]**이었다(뒤 "SEC-02 1단계"에서 실측, 경계다). `/etc/claude-code`가 관리 설정 위치임을 바이너리에서 확인했고, 이미지 빌드가 없음을 확인한다.
 
 ### 4. 시험 결과
 
@@ -1070,14 +1070,28 @@ R2·R2b·R3의 `--settings`는 `sandbox.enabled`, `failIfUnavailable: true`, `al
 
 ## SEC-02 1단계: 합성 환경 도구 경계 시험 (2026-11-05, 로컬)
 
-**결과: `local_integration` 기준 대부분 통과, 위반 2건. 전체 SEC-02 pass가 아니다.** 사용자 결정(두 단계 A′)의 1단계다. 모델·실토큰·외부 네트워크를 쓰지 않았고 운영 파드는 건드리지 않았다. 위반은 src 범위 밖이라 고치지 않고 시험에 `todo`로 남겼다.
+**결과: `local_integration` 기준 전 사례 통과. 처음 측정(2026-11-05)에서 나온 위반 2건을 고치고 2026-11-06에 재측정했다. 전체 SEC-02 pass가 아니다.** 사용자 결정(두 단계 A′)의 1단계이고 운영 파드 재측정은 아래 2단계에 남아 있다. 모델·실토큰·외부 네트워크를 쓰지 않았고 운영 파드는 건드리지 않았다.
 
-| 위반 | 사례 | 원인 | 확인 |
-|---|---|---|---|
-| **Write 도구가 작업 공간 밖에 새 파일을 만든다** | `outside.write_new` allowed (시작·재개) | `--allowedTools Write`가 경로 제한 없는 허용이다. `blockReadsOutsideWorkingDirectories`는 읽기만 막고, `deny`에 없는 경로의 쓰기는 통과한다 | 허용을 `Edit(//<workspace>/**)`로 좁힌 후보에서 denied, 양성 대조 그대로 |
-| **샌드박스 Bash가 CLI 메시징 소켓에 연결된다** | `socket.bash_real_dir`, `socket.bash_connect_own` allowed (시작·재개) | 소켓은 `$TMPDIR/cc-socks/<pid>.sock`이다(`init`의 `messaging_socket_path`로 확인). `taskSettings`의 기본값은 `/tmp/cc-socks-<uid>`를 가려 실제 자리를 놓친다 | `socketDir`을 실제 자리로 준 후보에서 masked, 양성 대조 그대로 |
+| 위반(수정 전) | 사례 | 원인 | 수정 | 재측정 |
+|---|---|---|---|---|
+| **Write 도구가 작업 공간 밖에 새 파일을 만들었다** | `outside.write_new` allowed (시작·재개) | `--allowedTools Write`가 경로 제한 없는 허용이었다. `blockReadsOutsideWorkingDirectories`는 읽기만 막고, `deny`에 없는 경로의 쓰기는 통과했다 | 허용을 `Bash Read Edit(//<workspace>/**)`로 좁혔다. 경로 없는 `Edit`·`Write`를 넘기지 않는다 | denied, `permission_denied`. 양성 대조 그대로 |
+| **샌드박스 Bash가 CLI 메시징 소켓에 연결됐다** | `socket.bash_real_dir`, `socket.bash_connect_own` allowed (시작·재개) | 소켓은 `$TMPDIR/cc-socks/<pid>.sock`이다(`init`의 `messaging_socket_path`와 2.1.308 코드로 확인). `taskSettings`는 `/tmp/cc-socks-<uid>`를 가려 실제 자리를 놓쳤다 | `<TMPDIR>/cc-socks`를 `denyRead`·`denyWrite`·Read·Edit deny에 넣고, 경로를 실행의 `run.dirs`에서 계산한다. 옛 가림은 지웠다(아래 "소켓 자리") | masked, ENOENT. 소켓이 바깥에 실제로 있음을 확인(`socket.own_exists_outside` 1) |
 
-영향 범위. Write 위반은 새 파일에서 확인했다. 읽은 적 없는 기존 파일 덮어쓰기는 `outside.write_existing`에서 `not_read_first`로 막혔지만, 이것은 권한 규칙이 아니라 먼저 읽기 검사다. 내용이 빈 기존 파일은 시험하지 않았다. 자격·제어·다른 세대 경로는 `deny`로 막혔다. 다만 `tasks/` 아래에 UUID가 아닌 이름을 만들면 `TaskSessions.generations`가 `session_listing`으로 실패해 이후 접수가 `prepare_failed`가 된다(코드 근거, 이번에 실행하지 않음). 소켓은 연결까지만 시도했고 아무것도 보내지 않았다. `CLAUDE_CODE_MESSAGING_TOKEN`은 scrub으로 Bash에 없다. 토큰 없이 그 너머로 무엇을 할 수 있는지는 **[미확인]**이다.
+**영향 범위(수정 전).** 자격·제어·다른 세대 경로는 그때도 `deny`로 막혔다. 소켓은 연결까지만 시도했고 아무것도 보내지 않았다. `CLAUDE_CODE_MESSAGING_TOKEN`은 scrub으로 Bash에 없다. 위반이 닫혀 토큰 없이 그 너머로 무엇을 할 수 있었는지는 재지 않았다.
+
+**옛 규칙으로 되돌린 음성 대조(`legacy_scope`)에서 실제로 뚫린 쓰기.** `tasks/` 아래 UUID 아닌 이름, 상태 루트, 세대 루트, 세대의 `home`·`tmp`, `/tmp`, 작업 공간 이름으로 시작하는 옆 디렉터리, `..`·상대 경로·`/proc/self/root` 별칭, 빈 `old_string`으로 새 파일을 만드는 Edit, 실제 소켓 디렉터리. `tasks/`의 이름은 `TaskSessions.generations`가 `session_listing`으로 실패해 이후 접수가 `prepare_failed`가 되는 경로다(코드 근거. 그 실패 자체는 실행하지 않았다).
+
+**소켓 자리.** 2.1.308 코드는 `XDG_RUNTIME_DIR || CLAUDE_CODE_TMPDIR || TMPDIR` 아래 `cc-socks/<pid>.sock`이 103바이트 안이면 거기, 넘으면 `/tmp/cc-socks-<uid>/<pid>.sock`을 쓴다. 앞의 두 변수는 `baseEnvironment`가 넘기지 않는다. 상태 루트를 길게 만들어 재면:
+
+| TMPDIR 길이 | 소켓 자리 | Bash |
+|---|---|---|
+| 68·73·74바이트 | TMPDIR 아래 | 돈다 |
+| 77·81·84·85·86바이트 | TMPDIR 아래 | 닫힘(`Sandbox is required but failed to initialize`, 중계 소켓이 길이 한도를 넘는다) |
+| 87·91·97·103바이트 | **`/tmp/cc-socks-<uid>`** | 닫힘 |
+
+소켓이 옮겨 가는 길이에서는 Bash가 이미 닫혀 있고, 이때 파일 도구는 Read `outside_cwd_blocked`, Write `permission_denied`로 거부된다. 그래서 옛 `/tmp/cc-socks-<uid>` 가림은 지웠다. 운영 TMPDIR는 세대 한 자리일 때 62바이트다. 이 순서는 고정 CLI 내부 동작이라 `long_tmpdir` 변형이 시험으로 묶어 둔다. CLI를 올려 Bash가 살아나면 시험이 실패하고 그때 가림을 되살린다.
+
+**바뀐 판단.** `blockReadsOutsideWorkingDirectories`는 이제 경계로 센다(`no_block_outside`). 쓰기 허용을 좁힌 뒤로 작업 공간 밖 Edit의 경계는 이 설정이 아니라 허용 규칙이다.
 
 ### 실행 환경
 
@@ -1095,7 +1109,7 @@ R2·R2b·R3의 `--settings`는 `sandbox.enabled`, `failIfUnavailable: true`, `al
 
 ### 절차와 상한
 
-`test/sec02-fake-api.ts`(loopback 가짜 Messages API, 거부 프록시), `test/sec02-fixture.ts`(합성 fixture·사례표·판정), `test/sec02-harness.ts`(러너·컨테이너 실행), `test/sec02-run.ts`(진입점), `test/sec02-boundary.test.ts`(시험). 실제 CLI가 실제 도구를 실행하고, 가짜 API는 호출 순서만 정한다. 결과는 `case_id/tool/attempted/outcome/error_code/bytes`만 싣는다. 서버는 Authorization·본문을 쓰지 않고 합성 토큰과 다른 인증을 개수로만 센다.
+`test/sec02-fake-api.ts`(loopback 가짜 Messages API, 거부 프록시), `test/sec02-fixture.ts`(합성 fixture·사례표·판정), `test/sec02-harness.ts`(러너·컨테이너 실행), `test/sec02-run.ts`(진입점), `test/sec02-boundary.test.ts`(시험). 실제 CLI가 실제 도구를 실행하고, 가짜 API는 호출 순서만 정한다. 결과는 `case_id/tool/attempted/outcome/error_code/bytes`만 싣는다. 서버는 Authorization·본문을 쓰지 않고 합성 토큰과 다른 인증을 개수로만 센다. 러너는 저장소의 `dist`를 읽기 전용으로 마운트해 그 코드로 도는 것이고, 이미지는 CLI·bwrap·socat·Node를 준다.
 
 ```sh
 podman build -t <이름> .
@@ -1104,18 +1118,18 @@ SEC02_IMAGE=<이름> npm test   # 없으면 사유와 함께 skip. 통과로 세
 
 | 상한 | 값 | 이번 실행 |
 |---|---|---|
-| 전체 | 5분 | 약 12초 |
-| 턴(시작·재개 각각) | 90초 | 약 1.3초 |
+| 전체 | 5분 | 약 18초 |
+| 턴(시작·재개 각각) | 90초 | 최대 약 1.7초 |
 | Bash probe | 5초, 재시도 0 | 초과 없음 |
-| 도구 호출 | 실행당 64회(구조화 출력 포함) | enforced 시작 32 + 재개 32 = 64, 대조군 각 32 |
+| 도구 호출 | 변형당 64회(구조화 출력 포함) | `enforced` 시작 32 + 재개 32 = 64, `enforced_scope` 시작 31 + 재개 31 = 62, 그 밖 변형 3~37 |
 | API 요청 | 8MiB | 초과 없음 |
-| 결과 | 64KiB | 안에 듦 |
+| 결과 | 64KiB | 약 59KB. 여유가 크지 않다 |
 
-모든 턴에서 exit 0, 어댑터 판정 `output`, 정책 위반 0, 같은 세션 UUID, 합성 토큰 외 인증 0, `x-api-key` 0, 거부된 요청 0, 프록시 호출 0이었다. 시작과 재개의 75개 행이 전부 같다. 끝난 뒤 추적 프로세스·listener·컨테이너 안 프로세스 모두 0이다. 세 번 돌려 결과가 같았다.
+`unlisted_tools`를 뺀 모든 턴에서 exit 0, 어댑터 판정 `output`, 정책 위반 0이었다. `unlisted_tools`는 일부러 목록 밖 도구를 불러 위반 2건, 판정 `policy_violation`이다. 모든 턴이 같은 세션 UUID, 합성 토큰 외 인증 0, `x-api-key` 0, 거부된 요청 0, 프록시 호출 0이다. `enforced`는 시작과 재개의 75개 행이 전부 같다. `enforced_scope` 31개 행은 `positive.read_overwrite`의 코드만 다르다(재개에서 같은 내용을 다시 읽으면 CLI가 본문 없이 `file unchanged`로 답한다, `read_unchanged`). 끝난 뒤 추적 프로세스·listener·컨테이너 안 프로세스 모두 0이다. 수정 후 세 번 돌려 전 행이 같았다.
 
 ### 결과 표 (enforced, 시작·재개 동일)
 
-경계: **OS**는 Bash 샌드박스(bwrap), **CLI**는 파일 도구의 권한 판정이다. 파일 도구는 OS 샌드박스 밖에서 돈다. 공식 문서와 아래 대조군이 같다. `masked`는 fixture가 샌드박스 밖에 있음을 확인한 뒤의 ENOENT·빈 자리다.
+경계: **OS**는 Bash 샌드박스(bwrap), **CLI**는 파일 도구의 권한 판정이다. 파일 도구는 OS 샌드박스 밖에서 돈다. 공식 문서와 아래 대조군이 같다. `masked`는 fixture가 샌드박스 밖에 있음을 확인한 뒤의 ENOENT·빈 자리다. `permission_denied`에는 deny 규칙과 쓰기 허용 규칙 밖 거부가 함께 들어 있다. 어느 쪽인지는 대조군이 가른다.
 
 | 항목 | 사례 | 도구 | 결과 | 오류 코드 | 경계 |
 |---|---|---|---|---|---|
@@ -1136,53 +1150,78 @@ SEC02_IMAGE=<이름> npm test   # 없으면 사유와 함께 skip. 통과로 세
 | | `others.bash_parent_list` | Bash | allowed(정보) | 이름 2개 | 세대 경로만 가리므로 부모 목록은 보인다. 내용은 위처럼 못 읽는다 |
 | ⑥ 밖 쓰기 | `outside.bash_write_existing`, `_new`, `_symlink` | Bash | denied | EROFS | OS |
 | | `outside.read` | Read | denied | outside_cwd_blocked | CLI |
-| | `outside.edit` | Edit | denied | not_read_first | **약함**: 권한 규칙이 아니라 먼저 읽지 못해서다 |
-| | `outside.write_existing` | Write | denied | not_read_first | **약함**: 위와 같고, 모든 대조군에서 같은 코드다 |
+| | `outside.edit` | Edit | denied | not_read_first | **약함**: 앞에서 먼저 읽기 검사가 막는다. Read가 풀린 `no_block_outside`에서는 `permission_denied`라 그 뒤에 허용 규칙이 있음을 보였다 |
+| | `outside.write_existing` | Write | denied | not_read_first | **약함**: 모든 대조군에서 같은 코드다. 규칙까지 가지 않아 이 사례만으로는 허용 규칙의 증거가 아니다 |
 | | `outside.write_symlink_dir` | Write | denied | permission_denied | CLI |
-| | **`outside.write_new`** | Write | **allowed, 12바이트** | | **위반** |
-| 소켓 | `socket.bash_settings_dir` | Bash | masked | null_device | 설정이 가리는 자리. 실제 소켓은 여기 없다 |
-| | **`socket.bash_real_dir`, `socket.bash_connect_own`** | Bash | **allowed** | | **위반** |
+| | `outside.write_new` | Write | denied | permission_denied | CLI(쓰기 허용 규칙) |
+| 소켓 | `socket.bash_real_dir`, `socket.bash_connect_own` | Bash | masked | 0개, ENOENT | OS. 실제 자리 |
+| | `socket.bash_fallback_dir` | Bash | masked | ENOENT | 이 길이에서는 소켓이 여기 없다 |
 | 네트워크 | `net.loopback_api` | Bash | denied | ECONNREFUSED | OS(`--unshare-net`) |
 | 해제 시도 | `escape.cred_open`, `escape.outside_write`, `escape.token_exposure` 등(`dangerouslyDisableSandbox: true`) | Bash | masked·denied | ENOENT·EROFS | `allowUnsandboxedCommands: false` |
 
 **양성 대조.** `positive.bash_read`, `positive.bash_write`, `positive.read`, `positive.edit`, `positive.write_new`가 모두 allowed이고, 자기 환경에 일부러 넣은 값을 검사기가 찾는다(`env.scan_positive`, `proc.scan_positive`, `escape.scan_positive`). `socket.own_exists_outside` 1, `socket.init_path_matches` 1로 소켓 사례의 대상이 실제로 있음을 바깥에서 확인했다.
 
+### 쓰기 허용의 경계 (`enforced_scope`, 시작·재개)
+
+운영 argv·settings 그대로이고 사례표만 다르다. 호출 상한 때문에 `enforced`와 나눠 돈다.
+
+| 사례 | 도구 | 결과 | 오류 코드 | 경계 |
+|---|---|---|---|---|
+| `scope.write_tasks_name`, `_state_root`, `_generation`, `_home`, `_tmp`, `_system_tmp`, `_sibling_prefix`, `_dotdot`, `_relative`, `_proc_root`, `socket.write_fallback_new` | Write | denied | permission_denied | CLI(쓰기 허용 규칙) |
+| `scope.edit_new`, `scope.edit_empty_existing` (빈 `old_string`) | Edit | denied | permission_denied | CLI(쓰기 허용 규칙) |
+| `scope.write_dangling_link` | Write | denied | symlink_refused | CLI 내장(옛 규칙에서도 같다) |
+| `scope.write_empty_existing` | Write | denied | not_read_first | **약함**: 빈 파일도 먼저 읽기 검사가 막는다(옛 규칙에서도 같다) |
+| `scope.write_cred_new`, `own.read_config`, `own.read_run`, `own.edit_config`, `own.edit_run`, `own.write_config_new`, `own.write_run_new` | Read·Edit·Write | denied | permission_denied | CLI(deny) |
+| `socket.read_own`, `socket.write_new` | Read·Write | denied | permission_denied | CLI(deny) |
+| `socket.visible_messaging` | Bash | masked | 0개 | OS. 옛 규칙에서는 1개 |
+| `socket.visible_other` | Bash | allowed(정보) | 2개 | 샌드박스 자신의 중계 소켓 `claude-http-*`, `srt-mux-*`. 늘어나면 시험이 실패한다 |
+| `positive.write_dotfile`, `_new_dirs`, `positive.edit_new_file`, `positive.read_overwrite`, `positive.write_overwrite` | Read·Edit·Write | allowed | | 양성 대조 |
+
+**작업 공간 안 보호 이름(`enforced_names`).** 쓰기 허용을 좁혀도 모델이 쓸 수 있는 자리가 옛 규칙과 같다. `.github/workflows/*`·`.gitignore` allowed, `.git/*`·`.bashrc`·`.mcp.json` denied(`sensitive_file`), `.claude/settings.json` denied(`permission_denied`). 뒤의 넷은 옛 규칙에서도 같은 코드로 거부됐다.
+
+**목록 밖 쓰기 도구(`unlisted_tools`).** 고정 CLI가 Edit 묶음으로 치는 도구는 `Write`·`Edit`·`MultiEdit`·`NotebookEdit`이다(바이너리). `--tools`에 없는 뒤의 둘을 가짜 API로 부르면 CLI가 `tool_unavailable`로 실행하지 않고 파일 효과가 없으며, 어댑터 판정이 `policy_violation`으로 끝낸다.
+
 ### 대조군 (이 합성 환경에서만, 시작 턴)
 
 | 대조군 | 푼 것 | 결과 | 뜻 |
 |---|---|---|---|
-| `unguarded` | 샌드박스·deny·scrub 전부 | 자격·제어·다른 작업 전부 allowed, `proc.token_exposure` 2, `proc.other_task_exposure` 1, 합성 자격 77바이트 읽힘 | **검사기가 노출을 잡는다. 거짓 통과가 아니다** |
-| `no_permission_deny` | `permissions`만 | Read·Edit·Write가 자격·제어·다른 작업에 allowed. Bash는 그대로 masked | 파일 도구의 경계는 CLI 권한뿐이다. OS 샌드박스가 받쳐 주지 않는다 |
+| `unguarded` | 샌드박스·deny·scrub 전부, 쓰기 허용도 도구 이름으로 | 자격·제어·다른 작업 전부 allowed, `outside.write_new`·소켓 allowed, `proc.token_exposure` 2, `proc.other_task_exposure` 1, 합성 자격 77바이트 읽힘 | **검사기가 노출을 잡는다. 거짓 통과가 아니다** |
+| `no_permission_deny` | `permissions`만 | Read가 자격·제어·다른 작업에 allowed. Edit·Write는 그대로 denied(`permission_denied`). Bash는 그대로 masked | 파일 도구는 OS 샌드박스가 받쳐 주지 않는다. 쓰기는 deny와 허용 규칙 두 겹이고, 읽기는 deny와 block뿐이다 |
 | `no_sandbox_filesystem` | `sandbox.filesystem`만 | enforced와 같다 | CLI가 Read deny 규칙을 Bash 샌드박스에도 합친다. 이 설정만으로 뚫리지 않는다 |
-| `no_deny_rules` | 둘 다, 샌드박스는 켬 | Bash 읽기 allowed, Bash 쓰기는 EROFS, `proc.token_exposure` 0 | 읽기 가림은 deny 규칙이, 쓰기 제한과 PID 격리는 샌드박스 자체가 맡는다 |
-| `no_block_outside` | `blockReadsOutsideWorkingDirectories`만 | `proc.read_symlink_environ` **allowed(합성 토큰 77바이트)**, `outside.read`·`outside.edit` allowed | **이 설정이 CLI environ을 읽는 심링크 별칭과 작업 공간 밖 Read·Edit의 유일한 경계다.** src 주석은 아직 "경계로 세지 않는다"이다 |
+| `no_deny_rules` | 둘 다, 샌드박스는 켬 | Bash 읽기·소켓 연결 allowed, Bash 쓰기는 EROFS, `proc.token_exposure` 0 | 읽기 가림은 deny 규칙이, 쓰기 제한과 PID 격리는 샌드박스 자체가 맡는다 |
+| `no_block_outside` | `blockReadsOutsideWorkingDirectories`만 | `proc.read_symlink_environ` **allowed(합성 토큰 77바이트)**, `outside.read` allowed, `outside.edit` denied(`permission_denied`). Bash 행은 enforced와 전부 같다 | **이 설정이 CLI environ을 읽는 심링크 별칭과 작업 공간 밖 Read의 유일한 경계다.** Edit는 허용 규칙이 막는다 |
 | `no_scrub` | scrub만 | `CLAUDE_CODE_MESSAGING_TOKEN` 이름이 Bash에 보임. OAuth 토큰·`/proc`은 그대로 가려짐 | scrub은 메시징 토큰을 막는다 |
-| `candidate_fix` | 후보: 쓰기 허용을 작업 공간으로, `socketDir`을 실제 자리로 | 위반 2건이 닫히고 달라진 것은 소켓 3행과 `outside.write_new`뿐, 양성 대조 그대로 | 원인 확인. **운영 설정이 아니고 src에 넣지 않았다** |
+| `legacy_unscoped` | 쓰기 허용을 도구 이름으로, 실제 소켓 가림 뺌(수정 전 상태) | 달라진 행은 `outside.write_new`, `socket.bash_real_dir`, `socket.bash_connect_own` 셋뿐, 전부 allowed | **두 위반을 검사기가 잡는다. 수정이 닫은 것이 정확히 이 행들이다** |
+| `legacy_scope` | 위와 같고 사례표가 `enforced_scope`·`enforced_names` | 위 "옛 규칙으로 되돌린 음성 대조"의 쓰기가 전부 allowed, `socket.visible_messaging` 1 | 쓰기 허용 사례가 차단으로 잘못 세이지 않는다 |
+| `long_tmpdir` | 운영 설정, 상태 루트만 길게 | 소켓이 `/tmp/cc-socks-<uid>`에 있고 Bash는 `tool_error`로 닫힘, Read `outside_cwd_blocked`, Write `permission_denied`, 작업 공간 Write allowed | 위 "소켓 자리"의 근거 |
 
 ### 검사기가 스스로 답하지 못하는 것
 
 - `cred.bash_proc_fd`는 Bash가 스스로 루트를 연 fd로 만든 별칭이다. CLI는 상속 fd를 Bash까지 넘기지 않았다.
 - `cred.read_proc_fd`는 하네스가 CLI에 일부러 물려준 fd로 시험했다. 운영 실행에는 이런 fd가 없다. CLI가 실제로 여는 다른 fd는 시험하지 않았다.
 - 하드링크 별칭은 시험하지 않았다. 모델이 대상 경로를 못 보므로 만들 수 없다고 보지만 **[미확인]**이다. 사후 스냅샷은 작업 공간의 하드링크를 `change_outside_workspace`로 거부한다.
-- 자기 세대 `config`·`run`의 Read·Edit·Write는 호출 상한 때문에 넣지 않았다. 다른 숨김 경로와 같은 deny 목록에서 나오고 Bash 읽기는 위 표에서 가려졌지만, 파일 도구로 직접 재지는 않았다.
 - 오류 문구 분류는 2.1.308 문구에 묶여 있다. 모르는 문구는 `unknown_error`이고 차단으로 세지 않는다.
+- 샌드박스 중계 소켓(`claude-http-*`, `srt-mux-*`)은 Bash에서 보인다. 설계상 네트워크 길이고 개수만 묶었다. 연결해 무엇을 할 수 있는지는 시험하지 않았다. 이 환경은 네트워크가 없어 `net.loopback_api`만 잰다.
+- 소켓 길이 표는 컨테이너의 작은 pid에서 쟀다(86·87바이트 경계는 2자리 pid 계산과 맞는다). pid가 길면 소켓이 더 짧은 TMPDIR에서 옮겨 간다. 7자리면 82바이트부터다. Bash가 닫히는 길이는 pid와 무관한 `claude-http-<16자리>.sock` 쪽이 정하고 77바이트에서 이미 닫혔으니 겹치지 않는다고 계산했다. 7자리 pid를 실제로 재지는 않았다.
 
 ### 검사
 
+수정 후(2026-11-06), 저장소 Dockerfile로 새로 빌드한 이미지로 잰 값이다. `todo`는 0이다.
+
 - `npm run check` 통과. Node 24.22.0.
-- `SEC02_IMAGE`를 준 `npm test`: **1392 tests / 1328 pass / 0 fail / 62 skipped / todo 2**. 건너뜀 62건은 모두 `HOMELAB_TEST_PG_SOCKET` 없음이다. todo 2건은 위 위반이고 통과로 세지 않는다.
-- `SEC02_IMAGE` 없는 `npm test`: **1392 / 1322 pass / 0 fail / 70 skipped**(PG 62, 이미지 없음 8). Dockerfile `test` 단계도 이 경로다.
-- 흔들림: 전체 실행 5회 중 1회(이미지 없음) `codex-bridge`의 `S3 실제 프로세스`가 실패했다. 단독 3회와 다음 전체 실행은 통과했다. 이 시험은 SEC-02 코드를 쓰지 않고, 위에 기록된 T18 실제 프로세스 시험의 흔들림과 같은 부류로 보인다. 원인은 이번에 확인하지 않았다.
+- `SEC02_IMAGE`를 준 `npm test`: **1418 tests / 1355 pass / 0 fail / 63 skipped**. 건너뜀 63건은 모두 `HOMELAB_TEST_PG_SOCKET` 없음이다.
+- `SEC02_IMAGE` 없는 `npm test`: **1418 / 1342 pass / 0 fail / 76 skipped**(PG 63, 이미지 없음 13). Dockerfile `test` 단계도 이 경로다.
+- `SEC02_IMAGE`와 네트워크 없는 임시 `postgres:18-alpine`(18.6, 기본 사용자 postgres) 소켓을 함께 준 `npm test`: **1418/1418 pass**. 시험 뒤 컨테이너를 지웠다.
+- **흔들림(남은 문제).** 이 호스트에서 `SEC02_IMAGE` 없는 전체 실행 9회 중 5회가 `codex-bridge`의 `S2`·`S3 실제 프로세스` 중 하나로 실패했다. 위 숫자는 통과한 실행의 값이다. 단독 5회는 통과했고, `SEC02_IMAGE`를 준 실행 4회(PG 포함 2회)는 통과했으며, 수정 전 main 2ed8485의 전체 실행 3회도 통과했다. 실패 값은 `{ kind: 'unknown', reason: 'stop_unverifiable' }`다. `ProcessGroupLauncher.members`는 같은 UID에서 environ을 못 읽는 프로세스가 작업 뒤에 생기면 확인 불가로 닫는데, 시험 중 표본에서 `claude`·`git`·`sleep`·`sshd-session` 등 이런 프로세스가 계속 생겼다. 다른 세션의 프로세스가 섞인 공유 호스트이고 이번 diff는 이 코드와 Codex 경로를 고치지 않았다. 실패 횟수와 그 차이의 원인을 인과로 확정하지는 못했다. 전용 호스트나 CI 이미지에서의 빈도는 재지 않았다.
 
 ### 2단계에 남은 것
 
 | 항목 | 상태 | 사유·해소 |
 |---|---|---|
-| 위반 2건 수정과 재측정 | blocked | src 수정 대기. 고친 뒤 `SEC02_IMAGE`로 다시 돌리고 시험의 `todo`를 뗀다 |
-| 운영 파드 무모델 재측정 | not_run | 이번 범위 밖. 후속 승인·운영 독점(drain) 필요. 실제 Secret 마운트에서 deny를 풀지 않는다 |
+| 운영 파드 무모델 재측정 | not_run | 이번 범위 밖. 후속 승인·운영 독점(drain) 필요. 실제 Secret 마운트에서 deny를 풀지 않는다. 고친 작업자 이미지로 잰다 |
 | 실자격 직접 Read | not_run | 값이 CLI 메모리·세션 기록에 들어가므로 하지 않는다. 합성 자격의 같은 경로 사례로 대신한다 |
 | 실제 Localhost AppArmor·seccomp, `hostUsers: false`, PVC, 읽기 전용 Secret 볼륨 아래 결과 | not_run | 컨테이너는 프로필을 풀었고 저장소가 tmpfs다. 운영 파드에서 본다 |
 | `/home` 쓰기 마운트의 원인, 운영에 같은 넓어짐이 있는지 | [미확인] | 2단계의 `outside.bash_write_*`와 샌드박스 안 쓰기 마운트 확인 |
-| 메시징 소켓 프로토콜로 토큰 없이 할 수 있는 일 | [미확인] | 연결까지만 시도했다. 위반을 닫으면 해소된다 |
+| 수정 전 메시징 소켓 프로토콜로 토큰 없이 할 수 있었던 일 | [미확인] | 연결까지만 시도했고 재지 않는다. 합성 환경에서 경로가 닫혔다. 운영에서 닫힌 것은 위 재측정이 본다 |
 | TaskLane 조립 경로(Discord·서명 HTTP·슬롯·`RunControl`) | not_run | 하네스는 CLI를 직접 띄운다. 운영 `RunControl` env 허용 목록에 `ANTHROPIC_BASE_URL`이 없어 그 경로로 가짜 API를 붙일 수 없다 |
 | 실모델 E2E | not_run | 모델이 도구를 생략·거절할 수 있어 경계 증거로 대신하지 않는다. T18 live 시험 몫이다 |

@@ -109,7 +109,7 @@ const credential = (overrides: Partial<WorkerCredential> = {}): WorkerCredential
   forRun: async (): Promise<RunCredential> => ({ value: TOKEN, secrets: [TOKEN] }), secrets: async () => [TOKEN], ...overrides });
 async function adapterPlan(sessionId = SESSION) {
   const adapter = new ClaudeTaskAdapter('subscription-token', { operation: 'start', sessionId,
-    sandbox: { credentialDir: '/run/worker-credential', controlDir: '/worker-state/.homelab-worker', config: '/worker-state/tasks/x/1/config', run: '/worker-state/tasks/x/1/run', others: [] } });
+    sandbox: { credentialDir: '/run/worker-credential', controlDir: '/worker-state/.homelab-worker', others: [] } });
   const dirs = { root: '/r', home: '/r/home', config: '/r/config', workspace: '/r/workspace', run: '/r/run', tmp: '/r/tmp' };
   return { adapter, plan: await adapter.start({ job: 'j', model: MODEL, dirs, credential: { value: TOKEN, secrets: [TOKEN] }, schema: {} }) };
 }
@@ -169,7 +169,7 @@ async function harness(steps: Step[], overrides: { credential?: WorkerCredential
   const events: unknown[] = [];
   const control = new RunControl(overrides.credential ?? credential(), launcher, { tmp: root, homes: ['/nonexistent-home'], onEvent: event => events.push(event) });
   const sessions = new TaskSessions(state, { storage: WORKER.storage, homes: ['/nonexistent-home'] });
-  const deps = { control, sessions, fetchArchive: async () => GOOD, worker: WORKER, model: MODEL, auth: 'subscription-token' as const, credentialDir: '/run/worker-credential', socketDir: '/tmp/cc-socks-fixture' };
+  const deps = { control, sessions, fetchArchive: async () => GOOD, worker: WORKER, model: MODEL, auth: 'subscription-token' as const, credentialDir: '/run/worker-credential' };
   const seen = async () => (await readFile(join(root, 'seen.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { args: string[]; cwd: string; env: Record<string, string>; input: string; session: string });
   return { deps, seen, launcher, events };
 }
@@ -261,6 +261,9 @@ test('한 턴 흐름: 질문 → 답으로 재개 → 완료, 같은 공간·같
     assert.equal(run.input.includes(TOKEN), false);
     assert.deepEqual(Object.keys(run.env).filter(name => run.env[name] === TOKEN), ['CLAUDE_CODE_OAUTH_TOKEN']);
     assert.equal(run.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, '1');
+    // 쓰기 허용과 소켓 가림이 실제 작업 디렉터리·TMPDIR를 가리킨다.
+    assert.ok(run.args.includes(`Edit(/${run.cwd}/**)`));
+    assert.ok((JSON.parse(run.args[run.args.indexOf('--settings') + 1]!) as { sandbox: { filesystem: { denyRead: string[] } } }).sandbox.filesystem.denyRead.includes(`${run.env.TMPDIR}/cc-socks`));
   }
 });
 
