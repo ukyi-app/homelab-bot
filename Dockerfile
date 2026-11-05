@@ -7,7 +7,7 @@
 #   sandbox 작업자는 command를 ["node", "dist/src/worker-main.js"]로 바꾼다. ENTRYPOINT는 비워 두어 command가 그대로 돈다.
 # - 비root uid 65532(공유 차트 runAsUser). sandbox 작업자는 uid 10001로 돈다. 그래서 파일은 root 소유·누구나 읽기로 둔다.
 # - 루트 파일시스템은 읽기 전용이다. 쓰기는 /tmp(emptyDir)와 작업자의 영속 공간(PVC)만 된다.
-# - 기반 이미지는 digest로 고정하고 Renovate가 올린다. 두 FROM은 같은 Node 버전을 따라간다(.node-version, package.json engines).
+# - 기반 이미지는 digest로 고정한다. 이 저장소에는 Renovate가 없어 사람이 올린다. 두 FROM은 같은 Node 버전을 따라간다(.node-version, package.json engines).
 
 # 시험·빌드 단계는 git·python3이 있는 full 이미지다. 작업 레인 시험이 git init과 non-dumpable 자식(python3)을 띄운다.
 FROM docker.io/library/node:24.22.0-trixie@sha256:03795b45b3153ccaf7459e36c09d4e7ad6bdc08c5c2c2df1fce7e9f465c9103f AS deps
