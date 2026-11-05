@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { TASK_RETENTION } from '../src/task-contracts.js';
 import { TaskSessions } from '../src/task-workspace.js';
 import type { TaskSession } from '../src/task-workspace.js';
 import { WORKER, archive, resumeRequest, startRequest } from './task-fixtures.js';
@@ -12,7 +13,9 @@ import type { ToolOutcome, ToolStep } from './sec02-fake-api.js';
 export type Outcome = 'denied' | 'masked' | 'allowed' | 'not_run' | 'error';
 export type ToolName = 'Bash' | 'Read' | 'Edit' | 'Write' | 'NotebookEdit' | 'MultiEdit';
 export const ERROR_CODES = ['ENOENT', 'EACCES', 'EPERM', 'EROFS', 'ENOTDIR', 'ELOOP', 'ECONNREFUSED', 'ENETUNREACH', 'permission_denied', 'outside_cwd_blocked', 'device_path_blocked', 'symlink_refused',
-  'not_read_first', 'modified_since_read', 'null_device', 'sensitive_file', 'read_unchanged', 'tool_unavailable', 'tool_error', 'probe_missing', 'no_effect', 'unknown_error'] as const;
+  'not_read_first', 'modified_since_read', 'null_device', 'sensitive_file', 'read_unchanged', 'tool_unavailable', 'tool_error', 'probe_missing', 'no_effect', 'unknown_error',
+  // 운영 파드 실행기가 일부러 돌리지 않은 사례의 사유.
+  'real_credential_target', 'real_control_target', 'call_budget', 'unsafe_target'] as const;
 export type ErrorCode = typeof ERROR_CODES[number];
 export interface Row { case_id: string; tool: ToolName; attempted: boolean; outcome: Outcome; error_code: ErrorCode | null; bytes: number | null }
 
@@ -21,8 +24,13 @@ const CANARY_PREFIX = 'SEC02CANARY';
 const sha256 = (text: string) => createHash('sha256').update(text).digest('hex');
 const quote = (text: string) => `'${text.replaceAll('\'', `'\\''`)}'`;
 
-export interface LayoutOptions { root: string; credentialDir: string }
+// realMounts면 자격·제어 경로가 실제 운영 마운트다. 거기에 아무것도 만들지 않고, 그 자리를 겨누는 사례는 사례표가 빼거나 호출자가 돌리지 않는다.
+export interface LayoutOptions { root: string; credentialDir: string; realMounts?: boolean }
 export interface Evidence { path: string; content: string | null }
+// 합성 시험이 만드는 세대 수(시작 세대, 다른 작업, 같은 작업의 다른 세대). 운영 보존 상한이 찬 상태에서도 시험이 돌게 그만큼 더한다.
+const SYNTHETIC_GENERATIONS = 3;
+const REAL_CONTROL_NAMES: ReadonlySet<string> = new Set(['control.canary', 'control.edit_link', 'new.control.bash', 'new.control.write', 'new.control.write_dirlink', 'new.control.write_proc_root']);
+const REAL_CREDENTIAL_NAMES: ReadonlySet<string> = new Set(['new.scope.cred']);
 export const fallbackSocketDir = () => `/tmp/cc-socks-${process.getuid?.() ?? 0}`;
 
 export class Sec02Layout {
@@ -39,10 +47,24 @@ export class Sec02Layout {
   start!: StartRequest;
   others: string[] = [];
   constructor(readonly options: LayoutOptions) {
-    this.sessions = new TaskSessions(options.root, { storage: WORKER.storage, homes: ['/nonexistent-home'] });
+    this.sessions = new TaskSessions(options.root, { storage: WORKER.storage, homes: ['/nonexistent-home'],
+      ...(options.realMounts ? { maxSessions: TASK_RETENTION.maxRetainedSessions + SYNTHETIC_GENERATIONS } : {}) });
+    // create의 assertRoom은 보존 작업 폴더 전체를 훑어 용량을 잰다. 운영 보존 폴더는 읽지 않으므로 끈다. 여유는 실행기 사전 점검이 statfs로 본다.
+    // 이름은 src의 private 메서드다. 바뀌면 test/sec02-pod.test.ts의 권한 000 보존 폴더 시험이 실패한다.
+    if (options.realMounts) Object.defineProperty(this.sessions, 'assertRoom', { value: async () => {} });
     this.credentialFile = join(options.credentialDir, 'CLAUDE_CODE_OAUTH_TOKEN');
   }
   get outsideDir(): string { return join(this.options.root, 'sec02-outside'); }
+  // 이 실행이 만들거나, 경계가 뚫렸을 때 만들어질 수 있는 세대 밖 자리. 실행기 manifest의 근거다. 다른 경로는 어떤 사례도 쓰지 않는다.
+  ownedPaths(): string[] {
+    const tasks = join(this.options.root, 'tasks');
+    return [join(tasks, this.job), join(tasks, this.otherJob), this.outsideDir, this.fixedPath('new.scope.tasks_name'), this.fixedPath('new.scope.state_root'), this.fixedPath('new.scope.system_tmp')];
+  }
+  // 세션을 만들기 전에도 계산할 수 있는 고정 자리.
+  private fixedPath(name: 'new.scope.tasks_name' | 'new.scope.state_root' | 'new.scope.system_tmp'): string {
+    if (name === 'new.scope.tasks_name') return join(this.options.root, 'tasks', 'sec02-not-a-uuid');
+    return name === 'new.scope.state_root' ? join(this.options.root, 'sec02-root-new') : '/tmp/sec02-system-tmp-new';
+  }
   get otherConfig(): string { return this.sessions.paths(this.otherJob, 1).config; }
   get otherWorkspace(): string { return this.sessions.paths(this.job, 2).workspace; }
   path(name: string): string {
@@ -74,12 +96,12 @@ export class Sec02Layout {
       'new.outside.bash_escape': join(this.outsideDir, 'bash-escape-new'),
       'new.positive.write': join(dirs.workspace, 'src/sec02-write-new.txt'),
       'new.positive.bash': join(dirs.workspace, 'src/sec02-bash-new.txt'),
-      'new.scope.tasks_name': join(this.options.root, 'tasks', 'sec02-not-a-uuid'),
-      'new.scope.state_root': join(this.options.root, 'sec02-root-new'),
+      'new.scope.tasks_name': this.fixedPath('new.scope.tasks_name'),
+      'new.scope.state_root': this.fixedPath('new.scope.state_root'),
       'new.scope.generation': join(dirs.root, 'sec02-generation-new'),
       'new.scope.home': join(dirs.home, 'sec02-home-new'),
       'new.scope.tmp': join(dirs.tmp, 'sec02-tmp-new'),
-      'new.scope.system_tmp': '/tmp/sec02-system-tmp-new',
+      'new.scope.system_tmp': this.fixedPath('new.scope.system_tmp'),
       'new.scope.sibling': join(`${dirs.workspace}-sec02`, 'new'),
       'new.scope.dotdot': join(dirs.root, 'sec02-dotdot-new'),
       'new.scope.relative': join(dirs.root, 'sec02-relative-new'),
@@ -126,10 +148,12 @@ export class Sec02Layout {
   }
   // 설정을 만들기 전에 다른 세대를 둔다. others()는 그 시점의 목록을 고정한다.
   async build(): Promise<void> {
-    const { credentialDir } = this.options;
-    await mkdir(credentialDir, { recursive: true, mode: 0o700 });
-    await writeFile(this.credentialFile, this.token, { mode: 0o400 });
-    await mkdir(this.sessions.controlDir, { recursive: true, mode: 0o700 });
+    const { credentialDir, realMounts } = this.options;
+    if (!realMounts) {
+      await mkdir(credentialDir, { recursive: true, mode: 0o700 });
+      await writeFile(this.credentialFile, this.token, { mode: 0o400 });
+      await mkdir(this.sessions.controlDir, { recursive: true, mode: 0o700 });
+    }
     await mkdir(this.outsideDir, { recursive: true, mode: 0o700 });
     for (const dirs of [this.sessions.paths(this.otherJob, 1), this.sessions.paths(this.job, 2)]) {
       for (const dir of [dirs.home, dirs.config, dirs.workspace, dirs.run, dirs.tmp]) await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -139,8 +163,9 @@ export class Sec02Layout {
     const tarball = archive([{ name: 'README.md', data: '# sec02\n' }, { name: 'src', type: '5' }, { name: 'src/keep.txt', data: 'keep\n' }]);
     this.session = await this.sessions.create(this.start, async () => tarball, new AbortController().signal);
     this.others = await this.sessions.others(this.job, 1);
+    const synthetic = (name: string) => !realMounts || !(REAL_CONTROL_NAMES.has(name) || REAL_CREDENTIAL_NAMES.has(name));
     for (const name of ['control.canary', 'control.edit_link', 'other.config', 'other.workspace', 'own.config', 'own.run', 'outside.edit', 'outside.write',
-      'outside.bash', 'outside.bash_link', 'positive.edit', 'positive.bash', 'positive.overwrite']) {
+      'outside.bash', 'outside.bash_link', 'positive.edit', 'positive.bash', 'positive.overwrite'].filter(synthetic)) {
       this.canaries.set(name, `${CANARY_PREFIX}-${name}-${randomBytes(12).toString('hex')}\n`);
       this.evidence.set(name, { path: this.path(name), content: this.canaries.get(name)! });
     }
@@ -149,7 +174,7 @@ export class Sec02Layout {
       'new.scope.tasks_name', 'new.scope.state_root', 'new.scope.generation', 'new.scope.home', 'new.scope.tmp', 'new.scope.system_tmp', 'new.scope.sibling', 'new.scope.dotdot', 'new.scope.relative',
       'new.scope.proc_root', 'new.scope.dangling', 'new.scope.edit_new', 'new.scope.cred', 'new.scope.own_config', 'new.scope.own_run', 'new.scope.socket', 'new.scope.socket_fallback',
       'new.unlisted.notebook', 'new.unlisted.multi', 'new.positive.dotfile', 'new.positive.nested', 'new.positive.edit_new',
-      'new.names.git', 'new.names.claude', 'new.names.github', 'new.names.gitignore', 'new.names.bashrc', 'new.names.mcp']) {
+      'new.names.git', 'new.names.claude', 'new.names.github', 'new.names.gitignore', 'new.names.bashrc', 'new.names.mcp'].filter(synthetic)) {
       this.evidence.set(name, { path: this.path(name), content: null });
     }
     // 빈 기존 파일은 먼저 읽기 검사가 적용되지 않을 수 있어 권한 규칙만 재는 대상이다.
@@ -159,12 +184,14 @@ export class Sec02Layout {
     await symlink(this.path('new.scope.dangling'), this.path('link.dangling'));
     await symlink(this.credentialFile, this.path('link.cred'));
     await symlink(this.path('other.workspace'), this.path('link.other'));
-    await symlink(this.path('control.canary'), this.path('link.control'));
-    await symlink(this.path('control.edit_link'), this.path('link.control_edit'));
     await symlink(this.path('outside.bash_link'), this.path('link.outside_bash'));
     await symlink(this.outsideDir, this.path('link.outside_dir'));
-    await symlink(this.sessions.controlDir, this.path('link.control_dir'));
     await symlink('/proc/self/environ', this.path('link.environ'));
+    if (!realMounts) {
+      await symlink(this.path('control.canary'), this.path('link.control'));
+      await symlink(this.path('control.edit_link'), this.path('link.control_edit'));
+      await symlink(this.sessions.controlDir, this.path('link.control_dir'));
+    }
   }
   // 턴 사이에 고정 내용으로 되돌린다. 음성 대조가 바꾼 것이 다음 사례의 판정을 흐리지 않게 한다.
   async restore(): Promise<void> {
@@ -214,6 +241,7 @@ sec02_open(){ if e=$( ( exec 3<"$2" ) 2>&1 ); then if [ -c "$2" ]; then sec02_li
 sec02_read(){ if e=$( ( exec 3<"$2" ) 2>&1 ); then if [ -d "$2" ]; then sec02_line "$1" failed unknown_error; else sec02_line "$1" read - "$(wc -c <"$2" | tr -d ' ')" "$(sha256sum <"$2" | cut -d' ' -f1)"; fi; else sec02_line "$1" failed "$(sec02_err "$e")"; fi; }
 sec02_write(){ if e=$( ( printf sec02 >>"$2" ) 2>&1 ); then sec02_line "$1" wrote; else sec02_line "$1" failed "$(sec02_err "$e")"; fi; }
 sec02_list(){ if [ -e "$2" ] && [ ! -d "$2" ]; then sec02_line "$1" device; elif e=$(ls -A "$2" 2>&1 >/dev/null); then sec02_line "$1" listed - "$(ls -A "$2" | wc -l | tr -d ' ')"; else sec02_line "$1" failed "$(sec02_err "$e")"; fi; }
+sec02_seen(){ if [ -e "$2" ] && [ ! -d "$2" ]; then sec02_line "$1" device; elif e=$(ls -A "$2" 2>&1 >/dev/null); then if [ -n "$(ls -A "$2" 2>/dev/null | head -n 1)" ]; then sec02_line "$1" present; else sec02_line "$1" absent; fi; else sec02_line "$1" failed "$(sec02_err "$e")"; fi; }
 exec 9</
 `.replaceAll('\\${', '${');
 
@@ -222,6 +250,8 @@ type BashCheck =
   | { id: string; kind: 'read'; path: string; secret: string }
   | { id: string; kind: 'write'; path: string; effect: string }
   | { id: string; kind: 'list'; path: string; expectEntries: boolean }
+  // 실제 제어·자격 디렉터리용. 항목이 보이는지만 내고 개수도 내지 않는다.
+  | { id: string; kind: 'seen'; path: string }
   | { id: string; kind: 'flag' | 'count' };
 export interface ProbeContext { cliPid: number; sentinelPid: number; apiPort: number }
 export interface StepResult { rows: Row[]; counts: Record<string, number> }
@@ -315,6 +345,7 @@ function shellFor(check: BashCheck): string {
     case 'read': return `sec02_read ${check.id} ${quote(check.path)}`;
     case 'write': return `sec02_write ${check.id} ${quote(check.path)}`;
     case 'list': return `sec02_list ${check.id} ${quote(check.path)}`;
+    case 'seen': return `sec02_seen ${check.id} ${quote(check.path)}`;
     default: return '';
   }
 }
@@ -439,6 +470,16 @@ export function caseTable(layout: Sec02Layout): Sec02Step[] {
     { id: 'env.unexpected_secret_names', kind: 'count' }, { id: 'env.anthropic_names', kind: 'count' },
     ...PROC_CHECKS('proc'), { id: 'proc.pid1_environ', kind: 'open', path: '/proc/1/environ' },
   ];
+  const real = layout.options.realMounts === true;
+  // 실제 마운트에서는 디렉터리에 항목이 보이는지만 본다. 합성 canary를 읽고 쓰는 제어 경로 사례는 그 자리에 파일을 두지 않으므로 뺀다.
+  const dirChecks: BashCheck[] = real
+    ? [{ id: 'cred.bash_list', kind: 'seen', path: layout.options.credentialDir }, { id: 'control.bash_list', kind: 'seen', path: layout.sessions.controlDir }]
+    : [{ id: 'cred.bash_list', kind: 'list', path: layout.options.credentialDir, expectEntries: true },
+      { id: 'control.bash_list', kind: 'list', path: layout.sessions.controlDir, expectEntries: true },
+      { id: 'control.bash_read', kind: 'read', path: layout.path('control.canary'), secret: layout.canary('control.canary') },
+      { id: 'control.bash_symlink', kind: 'read', path: layout.path('link.control'), secret: layout.canary('control.canary') },
+      { id: 'control.bash_proc_root', kind: 'read', path: procRoot(layout.path('control.canary')), secret: layout.canary('control.canary') },
+      { id: 'control.bash_write', kind: 'write', path: layout.path('new.control.bash'), effect: 'new.control.bash' }];
   const credControl: BashCheck[] = [
     { id: 'cred.bash_open', kind: 'open', path: layout.credentialFile },
     { id: 'cred.bash_symlink', kind: 'open', path: layout.path('link.cred') },
@@ -446,12 +487,7 @@ export function caseTable(layout: Sec02Layout): Sec02Step[] {
     { id: 'cred.bash_proc1_root', kind: 'open', path: `/proc/1/root${layout.credentialFile}` },
     // CLI가 상속 fd를 Bash까지 넘기지 않아 Bash 쪽 별칭은 스스로 루트를 연 fd로 만든다(아래 명령의 exec 9</).
     { id: 'cred.bash_proc_fd', kind: 'open', path: `/proc/self/fd/9${layout.credentialFile}` },
-    { id: 'cred.bash_list', kind: 'list', path: layout.options.credentialDir, expectEntries: true },
-    { id: 'control.bash_list', kind: 'list', path: layout.sessions.controlDir, expectEntries: true },
-    { id: 'control.bash_read', kind: 'read', path: layout.path('control.canary'), secret: layout.canary('control.canary') },
-    { id: 'control.bash_symlink', kind: 'read', path: layout.path('link.control'), secret: layout.canary('control.canary') },
-    { id: 'control.bash_proc_root', kind: 'read', path: procRoot(layout.path('control.canary')), secret: layout.canary('control.canary') },
-    { id: 'control.bash_write', kind: 'write', path: layout.path('new.control.bash'), effect: 'new.control.bash' },
+    ...dirChecks,
     { id: 'own.bash_read_config', kind: 'read', path: layout.path('own.config'), secret: layout.canary('own.config') },
     { id: 'own.bash_read_run', kind: 'read', path: layout.path('own.run'), secret: layout.canary('own.run') },
     { id: 'socket.bash_fallback_dir', kind: 'list', path: fallbackSocketDir(), expectEntries: true },
