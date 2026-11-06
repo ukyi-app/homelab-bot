@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   ARTIFACT_LIMITS, ApprovalSubjectSchema, ArtifactManifestSchema, CHANGE_ID, ChangeBriefSchema, DeploymentObservationSchema, EFFECT_LEASE_MS, EFFECT_STAGES,
-  EffectExpectedSchema, EffectResultSchema, EvidenceBundleSchema, GENERATION_RESTART, MAX_GENERATION, ReasonCodeSchema, ReviewReceiptSchema, UNKNOWN_RECONCILE_MS,
+  EffectExpectedSchema, EffectResultSchema, EvidenceBundleSchema, GENERATION_RESTART, MAX_GENERATION, ReasonCodeSchema, ReviewReceiptSchema, RevisionSchema, UNKNOWN_RECONCILE_MS,
   VerificationReceiptSchema, approvalDigest, artifactDigest, briefDigest, canTransition, changeBranchName, effectResultMatches, evidenceBundleDigest, isTerminalPhase,
   labelAllowsAuthorInput, newChangeId, previousEffectStage, propagateLabel, raiseLabel, reviewReceiptDigest, sha256Hex, validateArtifactFiles, verificationReceiptDigest,
 } from './change-contracts.js';
@@ -182,6 +182,8 @@ export class ChangeStore {
   async admit(input: ChangeKey & { brief: ChangeBrief; policyRevision: string }): Promise<StoreResult<ChangeRequest>> {
     const parsed = ChangeBriefSchema.safeParse(input.brief);
     if (!parsed.success) return fail('invalid_input', { detail: parsed.error.issues[0]?.message });
+    // 이 값은 증거 묶음으로 복사되고 저장 뒤에는 고칠 수 없다. 묶음이 받지 않을 값을 들이면 이 generation이 검증 단계에서 멈춘다.
+    if (!RevisionSchema.safeParse(input.policyRevision).success) return fail('invalid_input', { detail: 'policy_revision' });
     const brief = parsed.data;
     return attempt(this.database, async tx => {
       const locked = await this.lock(tx, input, 'requested');

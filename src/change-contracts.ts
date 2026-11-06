@@ -66,7 +66,7 @@ export const GIT_SHA = /^[0-9a-f]{40}$/;
 export const SHA256_HEX = /^[0-9a-f]{64}$/;
 export const GitShaSchema = z.string().regex(GIT_SHA);
 export const Sha256Schema = z.string().regex(SHA256_HEX);
-const RevisionSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$/);
+export const RevisionSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$/);
 const OpaqueRefSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
 // 검증은 ID로만 받는다. ID의 argv·cwd·한도·toolchain은 B1의 registry가 정한다. 공백·셸 문자가 없어 사용자 문자열이 여기로 들어올 수 없다.
 export const COMMAND_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;

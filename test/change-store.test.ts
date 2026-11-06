@@ -589,6 +589,19 @@ test('T19 B0 끝 상태 뒤의 미전송 반납은 재시도 대기로 남기지
   } finally { await s.close(); }
 });
 
+test('T19 B0 잘못된 policy revision은 저장되지 않아 같은 change를 고쳐 admission할 수 있다', async () => {
+  const s = await setup();
+  try {
+    const r = await newRequest(s.store);
+    const key = { changeId: r.id, generation: 1 };
+    for (const bad of ['', 'has space', '-leading', 'x'.repeat(129)]) failure(await s.store.admit({ ...key, brief: fixtureBrief(), policyRevision: bad }), 'invalid_input');
+    const current = ok(await s.store.get(r.id));
+    assert.equal(current.phase, 'requested');
+    assert.equal(current.policyRevision, null);
+    assert.equal(ok(await s.store.admit({ ...key, brief: fixtureBrief(), policyRevision: 'fixture-policy-1' })).phase, 'admitted');
+  } finally { await s.close(); }
+});
+
 test('T19 B0 잘못된 verifier revision은 묶음 칸에 남지 않아 같은 generation을 고쳐 진행할 수 있다', async () => {
   const s = await setup();
   try {
