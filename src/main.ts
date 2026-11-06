@@ -35,6 +35,7 @@ import { advisoryLedgerLock, lockClient } from './ledger-lock.js';
 import { MemoryService } from './memory.js';
 import type { DocumentSource } from './memory.js';
 import { MemoryCommands } from './memory-commands.js';
+import type { TaskGateClosedReason } from './ops-metrics.js';
 import { PORTS, receivers } from './http.js';
 import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
@@ -85,7 +86,7 @@ export function reviewPrecondition(config: Pick<PublisherConfig, 'reviewEnabled'
   return { open: true, app: config.githubReviewApp, review: review.data };
 }
 // 작업 레인의 정적 조건. 하나라도 어긋나면 작업 레인만 닫고 대화·리뷰는 그대로 뜬다. 정책 변경은 재시작으로만 반영된다.
-export type TaskPrecondition = { open: true; workerUrl: string } | { open: false; reason: 'switch_off' | 'policy_invalid' };
+export type TaskPrecondition = { open: true; workerUrl: string } | { open: false; reason: TaskGateClosedReason };
 export function taskPrecondition(config: Pick<PublisherConfig, 'taskLane' | 'policy'>): TaskPrecondition {
   if (!config.taskLane) return { open: false, reason: 'switch_off' };
   if (!TaskPolicySchema.safeParse(config.policy.task).success) return { open: false, reason: 'policy_invalid' };
@@ -194,6 +195,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   // 객체는 만들기만 한다(I/O 없음). 작업자가 답하기 전에는 명령이 닫혀 있고 루프는 첫 READY 장벽 뒤에 돈다.
   const taskGate = taskPrecondition(config);
   log('task_gate', taskGate.open ? { state: 'waiting_worker' } : { state: 'closed', reason: taskGate.reason });
+  health.watchTaskGate(() => taskGate.open ? null : taskGate.reason);
   const taskBridge = taskGate.open ? new ClaudeTaskBridge(store, gate, new HttpTaskWorker(taskGate.workerUrl, new TaskWorkerSigner(config.workerKey, now), send),
     new PolicyTaskPlans(store, send),
     // undefined를 그대로 넘기면 브리지 기본값을 덮어 드레인 없이 바로 끊는다.
@@ -248,7 +250,9 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     const observations: ObservationSource[] = deps.observations
       ?? briefingSources({ kubernetes, certificates }, now, config.briefing?.timezone);
     const briefing = new BriefingScheduler(store, gate, memory, observations,
-      { time: config.briefing?.time ?? null, timezone: config.briefing?.timezone ?? null });
+      { time: config.briefing?.time ?? null, timezone: config.briefing?.timezone ?? null },
+      { gate: () => taskGate.open ? { open: true, routed: taskIntake.routed, intakeOpen: taskIntake.open } : taskGate,
+        ...(external ? { externalConnections: () => external.links.activeCount() } : {}) });
     return { ledger, memory, briefing };
   })() : undefined;
   let briefingEnabled = false;

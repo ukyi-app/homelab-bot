@@ -1,6 +1,6 @@
 import { DEFAULTS } from './contracts.js';
 import { MEMORY_DISABLED, opsMetrics } from './ops-metrics.js';
-import type { MemoryMetrics, TaskLaneMetrics } from './ops-metrics.js';
+import type { MemoryMetrics, TaskGateClosedReason, TaskLaneMetrics } from './ops-metrics.js';
 import type { Store } from './store.js';
 
 export class Health {
@@ -12,6 +12,7 @@ export class Health {
   private gatewayState: () => { halted: boolean } = () => ({ halted: false });
   private memoryState: () => MemoryMetrics = () => MEMORY_DISABLED;
   private taskState: (() => TaskLaneMetrics) | undefined;
+  private taskGateClosed: () => TaskGateClosedReason | null = () => null;
   private externalTaskMetrics: (() => Promise<string>) | undefined;
   public receivers = { app: false, alerts: false };
   constructor(private readonly store: Store, private readonly ping: () => Promise<void>) {}
@@ -27,6 +28,8 @@ export class Health {
   watchMemory(state: () => MemoryMetrics): void { this.memoryState = state; }
   // 작업 레인을 조립했을 때만 부른다. 부르지 않으면 지표에 레인 계열이 없다.
   watchTaskLane(state: () => TaskLaneMetrics): void { this.taskState = state; }
+  // 작업 레인 조립 여부와 무관하게 부른다. 열렸거나 작업자 대기 중이면 null이다.
+  watchTaskGate(closed: () => TaskGateClosedReason | null): void { this.taskGateClosed = closed; }
   // R08을 켰을 때만 부른다. readiness에는 묶지 않는다(R08 장애로 경보·webhook 수신까지 끊기지 않게).
   watchExternalTasks(metrics: () => Promise<string>): void { this.externalTaskMetrics = metrics; }
   async ready(): Promise<boolean> {
@@ -56,7 +59,7 @@ export class Health {
       + `homelab_bot_outbox_unknown ${unknown.count}\n`
       + `homelab_bot_outbox_oldest_seconds ${row.oldest === null ? 0 : Math.max(0, (this.store.now() - Number(row.oldest)) / 1000)}\n`
       + `homelab_bot_gateway_halted ${Number(this.gatewayState().halted)}\n`
-      + await opsMetrics(this.store.db, this.store.now(), this.memoryState(), this.taskState?.())
+      + await opsMetrics(this.store.db, this.store.now(), this.memoryState(), this.taskState?.(), this.taskGateClosed())
       + (await this.externalTaskMetrics?.() ?? '');
   }
 }

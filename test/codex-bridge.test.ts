@@ -286,7 +286,7 @@ test('TASK-01 Discord 작업 요청 → codex exec 완료 → 결과 기록 → 
   assert.equal(spec.cwd, taskPaths(root, job.id).workspace);
   const session = (await rows('codex_sessions'))[0]!;
   assert.equal(session.thread_id, THREAD); assert.equal(session.turn, 1); assert.equal(session.host, 'worker');
-  assert.equal(session.capabilities.tool_approval_relay, false); assert.equal(session.capabilities.attach_task, 'undecided');
+  assert.equal(session.capabilities.tool_approval_relay, false); assert.equal(session.capabilities.attach_task, false);
   const result = (await rows('results'))[0]!;
   assert.deepEqual(result.result.changes, ['src/a.ts']);
   assert.equal(result.evidence.threadId, THREAD); assert.equal(result.evidence.stopConfirmed, true);
@@ -299,14 +299,15 @@ test('TASK-01 Discord 작업 요청 → codex exec 완료 → 결과 기록 → 
   assert.ok(await nodeFiles.read(join(taskPaths(root, job.id).workspace, '.git', 'HEAD')));
   assert.equal((await outbox())[0]!.state, 'sent');
 });
-test('TASK-01 능력표: tool approval false, attach 미정, 타인·다른 스레드·미등록 작업 접근 차단', async () => {
+test('TASK-01 능력표: tool approval false, attach false, 타인·다른 스레드·미등록 작업 접근 차단', async () => {
   assert.equal(CODEX_CAPABILITIES.tool_approval_relay, false);
-  assert.equal(CODEX_CAPABILITIES.attach_task, 'undecided');
+  assert.equal(CODEX_CAPABILITIES.attach_task, false);
   assert.equal(CODEX_CAPABILITIES.answer_question, 'clarification_only');
   assert.equal(adapter.capabilities(), CODEX_CAPABILITIES);
-  assert.match(describeCapabilities(), /지원 안 함\(capability=false\)[\s\S]*결정 대기\(미정\)/);
+  assert.match(describeCapabilities(), /승인 중계: 지원 안 함\(capability=false\)[\s\S]*연결\(attach\): 지원 안 함\(capability=false\)/);
+  assert.doesNotMatch(describeCapabilities(), /미정|결정 대기/);
   await assert.rejects(bridge.attach('fixture-owner', thread, 'personal-session-id'),
-    (error: unknown) => error instanceof CapabilityUnavailable && error.state === 'undecided');
+    (error: unknown) => error instanceof CapabilityUnavailable && error.state === 'false' && error.message === 'capability_false:attach_task');
   await assert.rejects(bridge.attach('intruder', thread, 'personal-session-id'), Denied);
   const { job } = await asked();
   const status = await bridge.status('fixture-owner', thread, job.id);
@@ -343,6 +344,16 @@ test('TASK-02 질문을 대화로 중계 → owner 답 → 같은 스레드 resu
   assert.equal((await rows('codex_questions'))[0]!.state, 'resumed');
   await f.publisher.deliver();
   assert.match(f.rest.messages[1]!.body.content, new RegExp(`Codex 작업 완료 \\(작업 ${job.id}\\)[\\s\\S]*main 기준`));
+});
+test('TASK-02 옛 능력표 JSON(attach_task undecided)이 저장된 세션도 상태 조회·재개가 그대로 됨', async () => {
+  const { job, question } = await asked();
+  await database.db.query(`UPDATE codex_sessions SET capabilities=jsonb_set(capabilities,'{attach_task}','"undecided"') WHERE job_id=$1`, [job.id]);
+  assert.equal((await rows('codex_sessions'))[0]!.capabilities.attach_task, 'undecided');
+  assert.equal((await bridge.status('fixture-owner', thread, job.id)).state, 'waiting_user');
+  await owner(question, 'main 기준', 'answer-1');
+  launcher.scripts.push(finished(out('completed', '고쳤습니다.'), [], null));
+  await runtime.tick();
+  assert.equal((await jobs())[0]!.state, 'succeeded');
 });
 test('TASK-02 중복·다른 사람·다른 스레드·없는 질문·지난 질문·빈 답 거부', async () => {
   const { question } = await asked();

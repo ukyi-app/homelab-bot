@@ -1,6 +1,7 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Health } from '../src/health.js';
+import { TASK_GATE_CLOSED_REASONS } from '../src/ops-metrics.js';
 import { Store } from '../src/store.js';
 import { localDatabase } from './helpers.js';
 
@@ -54,7 +55,7 @@ async function conversation(gap: boolean) {
 
 test('B5 작업 레인 지표: 켠 배치에서만 나오고, 레인별 대기·실행·unknown·닫힘 사유·정리 실패·보존 수를 낸다', async () => {
   const off = await health.metrics();
-  assert.doesNotMatch(off, /homelab_bot_(lane_jobs|task_)/);
+  assert.doesNotMatch(off, /homelab_bot_(lane_jobs|task_(?!gate_closed))/);
   health.watchTaskLane(() => ({ workerRouted: true, intakeOpen: false }));
   const lane = (name: string, state: string) => `homelab_bot_lane_jobs{lane="${name}",state="${state}"}`;
   const closed = (reason: string) => `homelab_bot_task_lane_closed{reason="${reason}"}`;
@@ -81,6 +82,17 @@ test('B5 작업 레인 지표: 켠 배치에서만 나오고, 레인별 대기·
   assert.equal(m.get('homelab_bot_task_sessions_retained'), 1);
 });
 
+test('T18 게이트 지표: 작업 레인 조립과 무관하게 사유 전체를 내고 닫힌 사유 줄만 1', async () => {
+  const gateKey = (reason: string) => `homelab_bot_task_gate_closed{reason="${reason}"}`;
+  const values = async () => { const m = parse(await health.metrics()); return TASK_GATE_CLOSED_REASONS.map(reason => m.get(gateKey(reason))); };
+  assert.deepEqual([...TASK_GATE_CLOSED_REASONS], ['switch_off', 'policy_invalid']);
+  assert.deepEqual(await values(), [0, 0]);
+  for (const [reason, expected] of [['switch_off', [1, 0]], ['policy_invalid', [0, 1]], [null, [0, 0]]] as const) {
+    health.watchTaskGate(() => reason);
+    assert.deepEqual(await values(), expected, String(reason));
+  }
+});
+
 test('OPS-M1 빈 DB: 모든 상태×종류·gap·outbox·제어 계열이 0으로 나옴(계열 안정)', async () => {
   const m = parse(await health.metrics());
   for (const type of TYPES) for (const state of OPEN) assert.equal(m.get(jobKey(type, state)), 0, jobKey(type, state));
@@ -90,8 +102,8 @@ test('OPS-M1 빈 DB: 모든 상태×종류·gap·outbox·제어 계열이 0으�
   // 원장을 켜지 않은 기본은 disabled만 1, 삭제 대기·브리핑은 0.
   for (const state of LEDGER) assert.equal(m.get(ledgerKey(state)), state === 'disabled' ? 1 : 0, state);
   for (const name of T20_SCALARS) assert.equal(m.get(name), 0, name);
-  // 기본 3개 + jobs 24 + outbox 4 + gap·paused·emergency·halted 4 + 원장 상태 6·스칼라 3.
-  assert.equal(m.size, 3 + TYPES.length * OPEN.length + OUTBOX.length + 4 + LEDGER.length + T20_SCALARS.length);
+  // 기본 3개 + jobs 24 + outbox 4 + gap·paused·emergency·halted 4 + 원장 상태 6·스칼라 3 + 게이트 사유 2.
+  assert.equal(m.size, 3 + TYPES.length * OPEN.length + OUTBOX.length + 4 + LEDGER.length + T20_SCALARS.length + TASK_GATE_CLOSED_REASONS.length);
 });
 
 test('OPS-M2 작업 상태·종류별 개수, 종결 상태는 내보내지 않음', async () => {
@@ -161,7 +173,7 @@ test('OPS-M8 라벨은 화이트리스트뿐: 모르는 종류·ID·본문·채�
     if (!labels) continue;
     for (const pair of labels.split(',')) {
       const [name, value] = pair.split('=') as [string, string];
-      const allowed = name === 'type' ? TYPES : name === 'state' ? [...OPEN, ...OUTBOX, ...LEDGER] : [];
+      const allowed: readonly string[] = name === 'type' ? TYPES : name === 'state' ? [...OPEN, ...OUTBOX, ...LEDGER] : name === 'reason' ? TASK_GATE_CLOSED_REASONS : [];
       assert.ok(allowed.includes(JSON.parse(value)), `허용 밖 라벨: ${pair}`);
     }
   }

@@ -207,6 +207,12 @@ export class ExternalTaskLinks {
     const now = this.now;
     return { items: rows.slice(0, limit).map(row => this.summarize(row, now)), more: rows.length > limit };
   }
+  // 브리핑용 수. 공개 채널로 나가므로 수만 돌려준다.
+  async activeCount(): Promise<number> {
+    const { total } = (await this.store.db.query<{ total: string }>(
+      'SELECT count(*)::text AS total FROM external_task_connections WHERE revoked_at IS NULL AND expires_at>$1', [this.now])).rows[0]!;
+    return Number(total);
+  }
   // read_events: 메타데이터만 돌려준다. 요약 원문은 이 표에 없다.
   async events(connectionId: string, owner: string, scope: Scope, limit = 20) {
     await this.visible(connectionId, owner, scope);

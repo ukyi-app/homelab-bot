@@ -186,7 +186,33 @@ test('B5 호환(새 게시 서버 + 옛 작업자, 둘 다 새 + task off): 명�
   assert.equal((await rows('SELECT id FROM events')).length, 0, '수신에서 닫힌다');
   assert.deepEqual(sends.filter(s => s.url.includes('/v1/task')), []);
   assert.deepEqual(sends.filter(s => s.url.includes('api.github.com')), []);
-  assert.doesNotMatch(await metrics(p), /homelab_bot_(lane_jobs|task_)/);
+  assert.doesNotMatch(await metrics(p), /homelab_bot_(lane_jobs|task_(?!gate_closed))/);
+});
+
+const gateLines = (text: string) => text.split('\n').filter(line => line.startsWith('homelab_bot_task_gate_closed'));
+test('게이트 지표 꺼짐: 레인 지표는 없고 switch_off 줄만 1', async () => {
+  const text = await metrics(await boot({}));
+  assert.deepEqual(gateLines(text), ['homelab_bot_task_gate_closed{reason="switch_off"} 1', 'homelab_bot_task_gate_closed{reason="policy_invalid"} 0']);
+  assert.doesNotMatch(text, /homelab_bot_(lane_jobs|task_lane_closed|task_worker_)/);
+});
+test('게이트 지표 켜짐·정책 틀림: 레인 지표는 없고 policy_invalid 줄만 1', async () => {
+  const text = await metrics(await boot({ policy: policyWith({ projects: [] }), taskLane: { workerUrl: 'http://127.0.0.1:9/' } }));
+  assert.deepEqual(gateLines(text), ['homelab_bot_task_gate_closed{reason="switch_off"} 0', 'homelab_bot_task_gate_closed{reason="policy_invalid"} 1']);
+  assert.doesNotMatch(text, /homelab_bot_(lane_jobs|task_lane_closed|task_worker_)/);
+});
+test('게이트 지표 켜짐·정책 맞음: 작업자 대기 중에도, 열린 뒤에도 모두 0이고 레인 지표가 함께 나옴', async () => {
+  let answering = false;
+  const p = await boot({ policy: policyWith(TASK_POLICY), taskLane: { workerUrl: 'http://worker-task.fixture/' } }, async input =>
+    new URL(String(input)).pathname === '/v1/task/intake' && answering
+      ? Response.json({ version: 1, open: true, reasons: [], capabilities: { lanes: { task: true } } }) : new Response('OK'));
+  const zero = ['homelab_bot_task_gate_closed{reason="switch_off"} 0', 'homelab_bot_task_gate_closed{reason="policy_invalid"} 0'];
+  const waiting = await metrics(p);
+  assert.deepEqual(gateLines(waiting), zero);
+  assert.match(waiting, /homelab_bot_task_worker_routed 0/);
+  answering = true;
+  await waitFor(async () => (await metrics(p)).includes('homelab_bot_task_worker_intake_open 1'));
+  assert.deepEqual(gateLines(await metrics(p)), zero);
+  assert.match(await metrics(p), /homelab_bot_task_lane_closed\{reason="unknown"\} 0/);
 });
 
 test('B5 닫힘: task 절이 없거나 틀리면 작업 레인만 닫히고 작업자에 묻지 않음', async () => {
