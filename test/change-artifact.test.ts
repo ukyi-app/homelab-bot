@@ -531,6 +531,32 @@ test('작성 port 재개: 답을 나르던 턴이 한도로 끝나면 질문을 
   assert.equal((await h.db.query<{ state: string }>('SELECT state FROM codex_questions WHERE id=$1', [question.id])).rows[0]!.state, 'answered');
 });
 
+test('작성 port 취소: 대기 중 세션을 취소하면 job·세션·질문을 닫고 공간을 지운다. 뒤의 fetchResult는 옛 결과를 주지 않는다', async () => {
+  const asked = await authorHarness();
+  await asked.f.script([QUESTION]);
+  const first = await asked.author.start(startInput(asked));
+  assert.equal((await pollAuthor(asked, first.receiptId)).kind, 'needs_input');
+  await asked.author.cancel(first.receiptId);
+  assert.deepEqual(await statesOf(asked), { job: 'cancelled', session: 'cancelled' });
+  assert.equal((await asked.db.query<{ state: string }>('SELECT state FROM codex_questions WHERE job_id=$1', [asked.job.id])).rows[0]!.state, 'cancelled');
+  assert.equal((await asked.author.fetchResult(first.receiptId)).kind, 'cancelled');
+  assert.deepEqual((await asked.db.query('SELECT session_retained,cleanup_state FROM codex_sessions WHERE job_id=$1', [asked.job.id])).rows[0], { session_retained: false, cleanup_state: 'cleaned' });
+  // 모델 한도 대기는 scheduler까지 푼다. 대화·리뷰가 함께 멈춰 있기 때문이다.
+  const limited = await authorHarness();
+  await limited.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  const second = await limited.author.start(startInput(limited));
+  assert.equal((await pollAuthor(limited, second.receiptId)).kind, 'snapshot');
+  endResult(limited, 'limited');
+  assert.deepEqual(await limited.author.fetchResult(second.receiptId), { kind: 'unknown', code: 'model_limit' });
+  const paused = async () => (await limited.db.query<{ value: boolean }>(`SELECT value FROM controls WHERE key='scheduler'`)).rows[0]!.value;
+  assert.equal(await paused(), true);
+  limited.calls.intercept = undefined;
+  await limited.author.cancel(second.receiptId);
+  assert.deepEqual(await statesOf(limited), { job: 'cancelled', session: 'cancelled' });
+  assert.equal(await paused(), false);
+  assert.equal((await limited.author.fetchResult(second.receiptId)).kind, 'cancelled');
+});
+
 test('작성 port 정리: job 성공 전이가 막히면 세션을 완료로 두지 않고 작업자 결과를 지우지 않는다. 풀리면 다시 된다', async () => {
   const h = await authorHarness();
   await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);

@@ -258,6 +258,11 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
   }
   reportChangeEnd(job: string, settled: Settled): void { if (settled.end) this.report(job, settled.end); }
   finalizeChangeSession(job: string): Promise<void> { return this.finalizeJob(job); }
+  // /cancel로 끝난 job의 세션·질문을 sweep을 기다리지 않고 닫고 공간을 지운다.
+  async closeChangeSession(job: string): Promise<void> {
+    await this.closeAbandoned();
+    await this.finalizeJob(job);
+  }
   cancelChangeTurn(session: SessionRow, job: string): Promise<CancelFacts | null> {
     const expected = session.worker_instance && session.worker_storage ? { instance: session.worker_instance, storage: session.worker_storage } : null;
     return this.cancelTurn(this.control(job, session, expected));
@@ -775,6 +780,11 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
     const session = await this.session(job, generation);
     if (!session) return;
     await this.deps.bridge.cancelChangeTurn(session, job);
+    // 실행 중인 턴은 fetchResult가 aborted로 닫는다. 대기 세션은 턴이 소멸을 확인하고 이미 끝났고 작업자의 저장 결과가 취소로 바뀌지 않아, 여기서 닫지 않으면 fetchResult가 옛 결과를 계속 준다.
+    if (session.state !== 'waiting_answer' && session.state !== 'waiting_model') return;
+    const row = await this.jobRow(job);
+    await this.deps.store.control(row.owner_id, row.conversation_id, 'cancel', job);
+    await this.deps.bridge.closeChangeSession(job);
   }
   private cancelledOrFailed(session: SessionRow, code: string | null): AuthorResult {
     return session.state === 'cancelled' ? { kind: 'cancelled', code: code ?? 'cancelled' } : { kind: 'failed', code: code ?? 'task_failed' };

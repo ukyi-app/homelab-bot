@@ -1694,7 +1694,7 @@ writer·정책·CI 판정·게시 흐름·공개 문구만 넣었고 어떤 진�
 
 ## T19 B1 artifact·검증 (2026-11-06, 로컬·podman)
 
-**Codex 리뷰 P2 4건(#83).** 모두 시험을 먼저 넣어 수정 전 실패를 봤다. (1) 결과를 잃고 소멸을 확인한 `unknown`이 v1 `settle`에서 `unexpected_status`로 터졌다. 이제 모델을 다시 돌리지 않고 `failed(task_worker_lost)`로 닫고, 소멸을 못 봤으면 그대로 `unknown`이다. (2) 답을 나르던 재개 턴이 한도로 끝나면 질문이 `resumed`로 남아 다음 재개가 답 없이 돌았다. (3) `finalize`가 job 전이 실패를 무시해 세션만 `completed`가 되고 결과를 지웠다. 이제 `change_job_not_settled`로 전체를 되돌린다. (4) 작업자 재시작 뒤 검증 조회가 옛 instance로 거부되어 저장된 receipt를 못 받았다. 이제 저장소를 대조하는 쪽으로 다시 묻는다.
+**Codex 리뷰 P2 5건(#83).** 모두 시험을 먼저 넣어 수정 전 실패를 봤다. (5) 질문·한도로 대기 중인 세션을 `cancel()`해도 작업자 fence만 남아 job·세션·질문이 그대로였고 `fetchResult`가 옛 결과를 계속 줬다. 이제 v1 `/cancel`처럼 job을 `cancelled`로 옮기고 scheduler를 풀고 세션 공간을 지운다. (1) 결과를 잃고 소멸을 확인한 `unknown`이 v1 `settle`에서 `unexpected_status`로 터졌다. 이제 모델을 다시 돌리지 않고 `failed(task_worker_lost)`로 닫고, 소멸을 못 봤으면 그대로 `unknown`이다. (2) 답을 나르던 재개 턴이 한도로 끝나면 질문이 `resumed`로 남아 다음 재개가 답 없이 돌았다. (3) `finalize`가 job 전이 실패를 무시해 세션만 `completed`가 되고 결과를 지웠다. 이제 `change_job_not_settled`로 전체를 되돌린다. (4) 작업자 재시작 뒤 검증 조회가 옛 instance로 거부되어 저장된 receipt를 못 받았다. 이제 저장소를 대조하는 쪽으로 다시 묻는다.
 
 **결과: 코드와 로컬 격리는 통과했고 운영 프로필 아래 동작은 보지 못했다.** 조립은 B5 몫이라 운영에 영향이 없다. 계약은 ARCHITECTURE "작업 레인 v2"다. 모델·실토큰·클러스터를 쓰지 않았다.
 
