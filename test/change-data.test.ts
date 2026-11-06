@@ -29,7 +29,7 @@ test('T19 B3 DATA-01: 깨끗한 공개 payload는 지난다', () => {
 });
 
 test('T19 B3 DATA-01: 비밀·내부 표식이 파일·경로·문구 어디에 있든 마스킹 없이 전체를 막는다', () => {
-  const secrets = [TOKEN, `github_pat_${'x1'.repeat(15)}`, `sk-${'y2'.repeat(15)}`, '-----BEGIN RSA PRIVATE KEY-----', 'fixture-node.fixture-tail.ts.net', '100.72.1.2', '"refresh_token": "x"'];
+  const secrets = [TOKEN, `github_pat_${'x1'.repeat(15)}`, `sk-${'y2'.repeat(15)}`, '-----BEGIN RSA PRIVATE KEY-----', ['fixture-node', 'fixture-tail', 'ts', 'net'].join('.'), [100, 72, 1, 2].join('.'), '"refresh_token": "x"'];
   for (const secret of secrets) {
     blocked(inFile(`const value = ${JSON.stringify(secret)};\n`), 'secret_detected');
     blocked(inBody(`본문 ${secret}`), 'secret_detected');
