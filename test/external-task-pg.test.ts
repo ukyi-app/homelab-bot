@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import type { Clock } from '../src/contracts.js';
 import { Postgres } from '../src/database.js';
+import { ExternalTaskCommands } from '../src/external-task-commands.js';
 import { ExternalTaskLinks } from '../src/external-task-links.js';
 import { externalTaskServer, EXTERNAL_TASK_PATH, ExternalTaskReceiver } from '../src/external-task-receiver.js';
 import type { ReceiverLimits } from '../src/external-task-receiver.js';
@@ -259,6 +260,28 @@ test('R08 실제 PostgreSQL: 기한 트랜잭션이 transaction_timeout으로 �
     for (let attempt = 0; attempt < 16; attempt++) assert.equal((await ctx.db.transaction(tx => tx.query<{ one: number }>('SELECT 1 AS one'))).rows[0]!.one, 1);
     const who = await ctx.attach('after-fatal');
     assert.equal((await post(ctx, who, eventBody(who, ctx.store.now()))).outcome, 'accepted');
+  } finally { await ctx.close(); }
+});
+
+test('R08 실제 PostgreSQL: 동시 /attach는 하나만 키를 내고, 목록·해제가 돌고, seed는 어느 표에도 없다', { skip }, async () => {
+  const ctx = await database();
+  try {
+    const handler = new ExternalTaskCommands(ctx.links, ENVIRONMENT, () => {});
+    const delivered: string[] = [];
+    const replies = await Promise.all(Array.from({ length: 4 }, () => handler.handle({ actor: OWNER, scope: thread, command: 'attach', text: 'claude', target: 'pg-session' },
+      async content => { delivered.push(content); return true; })));
+    assert.deepEqual(replies.map(reply => reply.outcome).sort(), ['already_attached', 'already_attached', 'already_attached', 'attached']);
+    assert.equal(delivered.length, 1);
+    const seed = /^seed: `([^`]+)`$/m.exec(delivered[0]!)![1]!;
+    const connectionId = /^connection_id: `([^`]+)`$/m.exec(delivered[0]!)![1]!;
+    const list = await handler.handle({ actor: OWNER, scope: thread, command: 'attach-list', text: '' }, async () => true);
+    assert.ok(list.content!.includes(connectionId));
+    const tables = (await ctx.pool.query<{ tablename: string }>("SELECT tablename FROM pg_tables WHERE schemaname='public'")).rows.map(row => row.tablename);
+    const dump = JSON.stringify(await Promise.all(tables.map(async table => (await ctx.pool.query(`SELECT * FROM ${table}`)).rows)));
+    assert.ok(dump.includes(connectionId));
+    assert.equal(dump.includes(seed), false);
+    assert.equal((await handler.handle({ actor: OWNER, scope: thread, command: 'detach', text: '', target: connectionId }, async () => true)).outcome, 'detached');
+    assert.equal(await ctx.count('external_task_connections WHERE revoked_at IS NULL'), 0);
   } finally { await ctx.close(); }
 });
 

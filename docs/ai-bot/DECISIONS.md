@@ -605,6 +605,22 @@ Workflows 권한이 없으므로 **봇은 `.github/workflows` 변경 PR을 만�
 
 작업 레인의 unknown·정리 실패는 작업 레인만 닫는다. 작업 파드 하나의 불확실성 때문에 대화까지 멈춘 채로 두지 않기 위해서다. 비상 중지 해제(`/resume-model target:emergency-stop`)는 interactive 레인의 unknown만 막고, task 레인의 unknown은 `execution_lanes.closed_reason`으로 닫힘이 기록돼 있으면 막지 않는다. 풀린 뒤에도 그 레인은 닫혀 있어 소멸을 확인(`/task-release`)하기 전에는 새 작업을 받지 않고, 응답·감사·Discord 안내에 이 사실을 드러낸다. 실행 중·중지 요청 중인 job과 interactive unknown의 거부, 작업 루프를 켜지 않은 배치의 task unknown 거부는 그대로다. 세부는 [ARCHITECTURE](ARCHITECTURE.md) "T18 게시 서버 스케줄링과 질문"이다.
 
+### R08 수신 경로: tailnet 전용 (사용자 2026-11-06)
+
+A안 읽기 전용 알림은 그대로 두고 수신 경로만 정했다. 근거는 독립 리뷰(후보 ① 공개+서명, ② tailnet 전용+서명, ③ 공개+Access+서명, ④ Discord webhook 경유)다.
+
+- **결정.** 사람 helper → `https://<일반 서비스명>.<tailnet>.ts.net/external-task-events` → 전용 Tailscale operator 프록시(태그 `tag:k8s-r08` 하나) → 전용 ClusterIP Service → 게시 서버의 R08 전용 리스너(8082). 인터넷 공개 경로, Cloudflare WAF 변경, Funnel, NodePort, NUC 443 개방은 없다. 연결별 Ed25519 서명과 읽기 능력 둘(`read_status`·`read_events`)은 그대로다.
+- **이유.**
+  - 발신자가 명시적으로 연결한 개인 기기뿐이라 공개 웹 애플리케이션이 필요한 요구가 아니다.
+  - 익명 요청이 봇의 서명 검증·DB 조회까지 닿는 길을 늘리지 않는다. 기존 공개 경계(`/github` WAF)를 넓히지 않아도 된다.
+  - 기존 Tailscale operator를 다시 쓴다. D-11(NUC → 사람 없음)도 그대로다. 사람이 먼저 보내는 요청의 응답이라 역방향 허용이 필요 없다.
+- **남는 위험.**
+  - **모든 발신 기기에 Tailscale이 필요하다.** 로그아웃·다른 VPN 충돌·회사 기기의 설치 제한이면 알림이 늦거나 나가지 않는다. Tailscale을 쓸 수 없는 기기가 필수가 되면 ③으로 다시 판단한다.
+  - **NUC·집 인터넷·PostgreSQL·Discord가 단일 장애점이다.** 경로를 어떻게 골라도 없어지지 않는다. helper의 로컬 큐(24시간·100건·1 MiB)가 메울 수 있는 만큼만 메운다.
+  - 허용된 기기가 침해되면 그 기기의 연결로 허위 알림이나 부하를 만들 수 있다. 서명은 이것을 막지 않는다. 네트워크 경로도 NUC 자체 침해를 막는 경계가 아니다.
+  - 전용 리스너는 경로 노출을 나눌 뿐 프로세스 자원을 나누지 않는다. R08 수신 상한(ARCHITECTURE §15)이 다른 처리를 굶기지 않게 막는 전부다.
+- **구현 선택(사용자 결정 아님).** 명령 이름은 `/attach`·`/detach`·`/attach-list`다. 재발급 명령은 두지 않고 해제 뒤 다시 연결한다. 연결 ID가 바뀌지만 명령과 helper 설정 변경이 하나로 끝난다. 요약 동의도 연결할 때만 정한다.
+
 ## T20 기억·삭제 원장·브리핑 (로컬·mock, 2026-10-29)
 
 **상태:** 삭제 원장 위치는 정함(아래, 사용자 2026-11-02). 나머지는 T20 구현 선택이고 사용자 결정이 아니다. 코드는 `src/memory.ts`, `src/deletion-ledger.ts`, `src/ledger-lock.ts`, `src/briefing.ts`, `migrations/010_memory_briefing.sql`·`012_deletion_ledger_generation.sql`, 시험은 `test/memory-briefing.test.ts`, `test/deletion-ledger.test.ts`, `test/deletion-ledger-pg.test.ts`다. 실제 SSD·Discord는 쓰지 않았다.

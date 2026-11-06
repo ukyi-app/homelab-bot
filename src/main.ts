@@ -8,7 +8,7 @@ import type { ObservationSource } from './briefing.js';
 import { briefingSources } from './briefing-observations.js';
 import { ARGOCD_APPLICATIONS, GRAFANA_DATASOURCES, SERVICES, TEMPLATES } from './catalog.js';
 import { ClaudeTaskBridge } from './claude-task-bridge.js';
-import { FOUNDATION_COMMANDS, MEMORY_COMMANDS, REVIEW_COMMANDS, TASK_COMMANDS, commandDefinitions, registerCommands } from './commands.js';
+import { EXTERNAL_TASK_COMMANDS, FOUNDATION_COMMANDS, MEMORY_COMMANDS, REVIEW_COMMANDS, TASK_COMMANDS, commandDefinitions, registerCommands } from './commands.js';
 import { ConfigError, databasePoolConfig, loadPublisherConfig } from './config.js';
 import type { PublisherConfig } from './config.js';
 import { z } from 'zod';
@@ -23,6 +23,9 @@ import { DiscordIngress, DiscordPublisher } from './discord.js';
 import { githubDocuments } from './document-source.js';
 import { DiscordProtocol, discordHttpApi } from './discord-protocol.js';
 import type { DiscordApi } from './discord-protocol.js';
+import { ExternalTaskCommands } from './external-task-commands.js';
+import { ExternalTaskLinks } from './external-task-links.js';
+import { ExternalTaskReceiver, externalTaskServer } from './external-task-receiver.js';
 import { GatewaySession, discordGatewayUrl } from './gateway.js';
 import type { GatewaySocket } from './gateway.js';
 import { GatewayBudget, Health } from './health.js';
@@ -59,6 +62,7 @@ import { HttpWorker } from './worker-http.js';
 // 리뷰는 네 조건이 모두 맞을 때만 열고, 아니면 /github을 리뷰 비활성으로만 받는다(D6).
 // 작업 레인은 스위치·주소·유효한 task 절이 있을 때만 조립하고, 작업 모드 작업자가 답할 때 명령을 연다. 조립하지 않으면 명령·루프·HTTP 클라이언트가 모두 없다.
 // 기억·브리핑은 MEMORY_LEDGER_DIR이 있을 때만 만들고 기동 장벽·주기 루프까지 잇는다. 기억 명령(memory-*)도 그때만 등록·수신한다.
+// R08은 EXTERNAL_TASK_EVENTS_ENABLED가 켜졌을 때만 리스너(8082)·명령·루프·지표를 만든다. 작업 레인 스위치와 독립이다.
 
 // 닫혀 있으면 정책 JSON에 리뷰 절이 있어도 리뷰 경로를 열지 않는다. 기본 정책을 못 읽으면 503(PolicyUnavailable)이다.
 class GatedReviewPolicy extends ReviewPolicySource {
@@ -103,6 +107,8 @@ const T20_PERIODS = { briefingTickMs: 30_000, memoryResumeMs: 60_000, ledgerReop
 // 재조정 주기. PR 재조정은 열린 PR마다 compare를 한 번 부르므로 길게 두고(webhook이 주 경로), 게시 대조는 응답 유실 행만 본다.
 const REVIEW_PERIODS = { workerProbeMs: 30_000, deliveryReconcileMs: 60_000, pullRequestReconcileMs: 900_000 };
 const TASK_WORKER_PROBE_MS = 30_000;
+// 중복 방지 ID의 보관 기한은 7일이라 정리는 드물어도 된다.
+const EXTERNAL_PURGE_MS = 3_600_000;
 const closedReader: GitHubReader = {
   pullRequest: async () => { throw new Error('review_disabled'); },
   openPullRequests: async () => { throw new Error('review_disabled'); },
@@ -121,7 +127,7 @@ export interface PublisherDeps {
   connect?: (url: string) => GatewaySocket;
   allowGatewayUrl?: (url: URL) => boolean;
   serviceAccount?: { tokenFile: string; caFile: string | null };
-  ports?: { app: number; alerts: number };
+  ports?: { app: number; alerts: number; externalEvents?: number };
   idleMs?: number;
   heartbeatEveryMs?: number;
   reconcileEveryMs?: number;
@@ -144,9 +150,12 @@ export interface PublisherDeps {
   reviewPullRequestReconcileMs?: number;
   // 작업 레인 작업자 확인 주기. 시험만 바꾼다.
   taskWorkerProbeMs?: number;
+  // R08 보관 정리 주기. 시험만 바꾼다.
+  externalPurgeMs?: number;
 }
 export interface Publisher {
-  health: Health; gateway: GatewaySession; ports: { app: number; alerts: number };
+  // externalEvents는 R08을 켰을 때만 있다.
+  health: Health; gateway: GatewaySession; ports: { app: number; alerts: number; externalEvents?: number };
   stop(): Promise<void>;
 }
 const listen = (server: Server, port: number) => new Promise<number>((resolve, reject) => {
@@ -213,6 +222,16 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   const github = new GitHubIngress(config.githubWebhookSecret, store, reviewPolicy, review?.queue ?? new ReviewQueue(store, closedReader),
     review?.reader ?? closedReader);
   const servers = receivers(health, new AlertIngress(store, gate), { github: githubWebhook(github) });
+  // 객체는 만들기만 한다(I/O 없음). 수신 판정은 요청마다 복원 울타리·서명·현재 owner 권한을 본다.
+  const external = config.externalTask ? (() => {
+    const { environment, restoreEpoch } = config.externalTask;
+    const links = new ExternalTaskLinks(store, restoreEpoch === undefined ? {} : { restoreEpoch });
+    const receiver = new ExternalTaskReceiver({ store, links, environment, log,
+      authorize: (owner, scope, db) => gate.withDatabase(db).authorize(owner, scope) });
+    return { links, receiver, server: externalTaskServer(receiver), commands: new ExternalTaskCommands(links, environment, log) };
+  })() : undefined;
+  log('external_task_gate', external ? { state: 'open' } : { state: 'closed', reason: 'switch_off' });
+  if (external) health.watchExternalTasks(() => external.receiver.metrics());
   // 기억·브리핑 객체는 만들기만 한다(I/O 없음). 원장 잠금 연결·파일은 첫 READY의 기동 장벽에서 연다.
   // 잠금은 풀과 다른 전용 연결이다. 풀은 연결을 돌려쓰거나 닫아 세션 잠금이 유지되지 않는다(ledger-lock.ts).
   const t20 = config.memory ? (() => {
@@ -236,13 +255,14 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   health.watchMemory(() => ({ ledger: t20 ? t20.ledger.status().state : 'disabled', briefingEnabled }));
   let taskIntake: TaskIntakeStatus = TASK_INTAKE_UNREACHED;
   if (taskBridge) health.watchTaskLane(() => ({ workerRouted: taskIntake.routed, intakeOpen: taskIntake.open }));
-  let ports: { app: number; alerts: number };
+  let ports: Publisher['ports'];
   try {
     ports = { app: await listen(servers.app, deps.ports?.app ?? PORTS.publisher),
       alerts: await listen(servers.alerts, deps.ports?.alerts ?? PORTS.alerts) };
+    if (external) ports.externalEvents = await listen(external.server, deps.ports?.externalEvents ?? PORTS.externalEvents);
   } catch (error) {
     // 한쪽만 열린 채 남으면 프로세스가 반쪽으로 살아 있다(이벤트 루프를 붙잡음). 연 것을 모두 닫고 다시 던진다.
-    await Promise.all([closeServer(servers.app, 1000), closeServer(servers.alerts, 1000)]);
+    await Promise.all([closeServer(servers.app, 1000), closeServer(servers.alerts, 1000), external && closeServer(external.server, 1000)]);
     await kubernetes.close();
     throw error;
   }
@@ -253,7 +273,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   let protocol: DiscordProtocol | undefined;
   let runtimeStarted = false;
   // 수신 허용 목록. 리뷰가 열리면 같은 Set에 더한다(DiscordIngress는 이 참조를 본다).
-  const acceptedCommands = new Set<string>([...FOUNDATION_COMMANDS, ...(t20 ? MEMORY_COMMANDS : [])]);
+  const acceptedCommands = new Set<string>([...FOUNDATION_COMMANDS, ...(t20 ? MEMORY_COMMANDS : []), ...(external ? EXTERNAL_TASK_COMMANDS : [])]);
   const background = new Set<Promise<void>>();
   const track = (task: Promise<void>) => { background.add(task); void task.finally(() => background.delete(task)); };
   const typingHint = typingHints(store, gate, log, track, { shutdown: stop.signal });
@@ -291,6 +311,17 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       catch (error) { log('recovery_barrier_failed', errorInfo(error)); await pause(Math.min(30_000, 1000 * 2 ** Math.min(attempt, 5))); }
     }
   };
+  // R08 복원 장벽. 게시 트리거는 WAL timeline만 볼 수 있어 pg_dump 복원의 restoreEpoch 변경은 이 호출이 미게시 행보다 먼저 잡아야 한다.
+  // Discord를 기다리지 않는다. 울타리를 세우지 못한 동안에는 게시자를 열지 않는다.
+  const externalFence = async (): Promise<boolean> => {
+    for (let attempt = 0; !stop.signal.aborted; attempt++) {
+      try { log('external_task_fence', await external!.links.enforceRestoreFence()); return true; }
+      catch (error) { log('external_task_fence_failed', errorInfo(error)); await pause(Math.min(30_000, 1000 * 2 ** Math.min(attempt, 5))); }
+    }
+    return false;
+  };
+  const externalFenced = external ? externalFence() : undefined;
+  if (externalFenced) loops.push(externalFenced.then(() => {}));
   // 기동 장벽(DECISIONS T20 기동 순서): 원장 열기·재적용(memory.open) → 예약 반영(ensure) → 첫 tick → 게시자.
   // 첫 tick이 지난 회차·12시간 넘은 대기 브리핑을 막기 전에 게시자가 그것을 보내지 않게 한다.
   let memoryOpen = false;
@@ -403,7 +434,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       for (const delay of deps.registerDelaysMs ?? [0, 5000, 30_000, 120_000, 300_000]) {
         if (delay) await pause(delay);
         if (stop.signal.aborted) return;
-        try { log('commands_registered', await registerCommands(api, applicationId, config.policy.guild, commandDefinitions(!!t20, reviewOpened, taskOpened))); return; }
+        try { log('commands_registered', await registerCommands(api, applicationId, config.policy.guild, commandDefinitions(!!t20, reviewOpened, taskOpened, !!external))); return; }
         catch (error) {
           log('commands_register_failed', errorInfo(error));
           if (error instanceof RateLimited) await pause(error.retryAfterMs);
@@ -465,7 +496,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
         // 기억 명령은 원장이 켜졌을 때만 받는다. 장벽 전·기억이 닫힌 동안은 MemoryNotReady로, 종료 중이면 바로 "쓸 수 없음"으로 답한다.
         const memoryCommands = t20 && new MemoryCommands(t20.memory, () => t20.ledger.status().state, () => stop.signal.aborted, now);
         const taskCommands = taskBridge && new TaskCommands(store, gate, taskBridge, () => taskIntake, track, log);
-        discord = { ingress: new DiscordIngress(store, gate, protocol, true, acceptedCommands, log, memoryCommands || undefined, taskCommands),
+        discord = { ingress: new DiscordIngress(store, gate, protocol, true, acceptedCommands, log, memoryCommands || undefined, taskCommands, external?.commands),
           publisher: new DiscordPublisher(store, gate, protocol) };
         const publisher = discord.publisher;
         const publish = () => {
@@ -477,12 +508,15 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
         };
         // 기억·브리핑이 켜져 있으면 게시자(reconcile·deliver 모두)는 기동 장벽 뒤에 연다. 대화 수신·복구 장벽·runtime claim은 기다리지 않는다
         // (그동안 나온 답은 outbox에 쌓였다가 게시자가 열리면 나간다). 장벽은 이벤트 순서 밖에서 돌아 Gateway 이벤트를 막지 않는다.
-        if (!t20) publish();
-        else loops.push(t20Barrier().then(passed => {
-          if (!passed || stop.signal.aborted) return;
+        // R08 복원 장벽도 같은 자리에서 게시자 앞에 선다.
+        if (!t20 && !externalFenced) publish();
+        else loops.push((async () => {
+          if (externalFenced && !await externalFenced) return;
+          if (t20 && !await t20Barrier()) return;
+          if (stop.signal.aborted) return;
           publish();
-          t20Loops();
-        }));
+          if (t20) t20Loops();
+        })());
         loop('recovery', () => recovery.runDue(), false);
         loop('typing', typingActivity(store, gate, api, log, stop.signal), false);
       }
@@ -516,6 +550,10 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     if (before.routed !== taskIntake.routed || before.open !== taskIntake.open) log('task_worker_intake', { routed: taskIntake.routed, open: taskIntake.open, reasons: taskIntake.reasons });
     if (taskIntake.routed && !taskOpened && !stop.signal.aborted) openTaskLane();
   });
+  if (external) every('external_task_purge', deps.externalPurgeMs ?? EXTERNAL_PURGE_MS, async () => {
+    const purged = await external.links.purge();
+    if (purged.events || purged.connections) log('external_task_purged', purged);
+  });
   gateway.start();
   log('publisher_started', { ports, policyRevision: config.policy.revision, services: SERVICES.length });
 
@@ -529,7 +567,8 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     stop.abort();
     clearInterval(heartbeat);
     await Promise.all([gateway.stop(Math.min(2000, left())),
-      closeServer(servers.app, Math.min(5000, left())), closeServer(servers.alerts, Math.min(5000, left()))]);
+      closeServer(servers.app, Math.min(5000, left())), closeServer(servers.alerts, Math.min(5000, left())),
+      external && closeServer(external.server, Math.min(5000, left()))]);
     // 진행 중인 한 바퀴(드레인·취소 확인 포함)는 기한까지 기다린다. 넘으면 lease 만료가 unknown으로 남긴다.
     await Promise.race([Promise.all([...loops, ...background]), sleep(left())]);
     // 원장: 위에서 루프가 멈춰 새 tick·resume·재열기가 없다. close()가 줄 선 쓰기를 마친 뒤 파일을 닫고 잠금을 놓는다.

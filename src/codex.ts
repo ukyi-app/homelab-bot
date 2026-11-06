@@ -21,7 +21,7 @@ import type { Store } from './store.js';
 export const CODEX_CAPABILITIES = Object.freeze({
   version: '0.163.0', adapter: 'exec',
   start_task: true,
-  // R08 연결 방식은 읽기 전용 알림으로 정했다(DECISIONS "T18 결정" (1)). 연결이 구현되지 않아 attach는 이 값으로 거부한다.
+  // 이 어댑터는 사람 세션에 붙지 않는다. R08 연결은 별도 경로와 능력표다(/attach, EXTERNAL_TASK_CAPABILITIES). attach는 이 값으로 거부한다.
   attach_task: 'undecided',
   read_status: true, read_events: true, read_final_result: true,
   answer_question: 'clarification_only',

@@ -5,6 +5,7 @@ import type { EventInput, Scope } from './contracts.js';
 import { controlText, taskLaneClosedText } from './control-format.js';
 import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
+import type { ExternalTaskCommand, ExternalTaskCommandHandler } from './external-task-commands.js';
 import type { MemoryCommand, MemoryCommandHandler } from './memory-commands.js';
 import type { PolicyGate } from './policy.js';
 import { LaneClosed } from './store.js';
@@ -33,9 +34,12 @@ const taskDirect = new Set<string>(['task-status', 'task-release']);
 export type RecoveryOutcome = 'done' | 'budget' | 'skipped';
 // 기억 명령. 대화 작업·제어와 달리 받은 자리에서 기억 서비스로 처리하고 상호작용 응답으로만 답한다.
 const memoryCommands = new Set<string>(['memory-save', 'memory-search', 'memory-correct', 'memory-exclude', 'memory-delete']);
-export const ALL_COMMANDS: ReadonlySet<string> = new Set(['chat', 'urgent', 'task', 'read', ...controls, ...memoryCommands]);
+// R08 연결 명령. 처리기가 없으면(스위치 꺼짐) 닫는다. 키가 든 응답을 다루므로 대화 작업·제어 경로를 타지 않는다.
+const externalCommands = new Set<string>(['attach', 'detach', 'attach-list']);
+export const ALL_COMMANDS: ReadonlySet<string> = new Set(['chat', 'urgent', 'task', 'read', ...controls, ...memoryCommands, ...externalCommands]);
 // 기억 명령 응답을 전하지 못했을 때 그 채널에 남기는 안내. 결과(기억 내용)는 싣지 않는다.
 export const MEMORY_ACK_NOTICE = '기억 명령의 응답을 전하지 못했습니다(상호작용 만료·전송 실패). 처리됐는지는 /memory-search로 확인하세요.';
+export const EXTERNAL_ACK_NOTICE = '세션 연결 명령의 응답을 전하지 못했습니다(상호작용 만료·전송 실패). 결과는 /attach-list로 확인하세요.';
 const EventSchema = z.strictObject({
   id: z.string().min(1), actor: z.string().min(1), scope: ScopeSchema,
   text: z.string().max(DEFAULTS.maxInputChars), kind: z.enum(['message', 'command', 'button']),
@@ -46,25 +50,30 @@ export class DiscordIngress {
   constructor(private readonly store: Store, private readonly gate: PolicyGate,
     private readonly rest: DiscordRest, public readonly messageContent = true,
     private readonly commands: ReadonlySet<string> = ALL_COMMANDS, private readonly log: Log = jsonLog,
-    private readonly memory?: MemoryCommandHandler, private readonly tasks?: TaskCommandHandler) {}
+    private readonly memory?: MemoryCommandHandler, private readonly tasks?: TaskCommandHandler,
+    private readonly external?: ExternalTaskCommandHandler) {}
   async receive(input: EventInput, recovered = false, recovery?: { token: string; epoch: number }): Promise<string | undefined> {
     const event = EventSchema.parse(input);
     if (event.bot || event.webhook) return;
     // 이 단계에서 열지 않은 명령·버튼은 저장·권한 확인 전에 닫는다(task·review-*는 FOUNDATION 밖).
     if (event.kind !== 'message' && !this.commands.has(event.command ?? '')) throw new Denied();
     if (event.kind !== 'message' && taskControls.has(event.command ?? '') && !this.tasks) throw new Denied();
+    if (event.kind !== 'message' && externalCommands.has(event.command ?? '') && !this.external) throw new Denied();
     const p = await this.gate.authorize(event.actor, event.scope);
     if (!this.messageContent && event.kind === 'message') return;
     const conversation = await this.store.conversation(event.scope);
     const explicit = event.mention || event.kind === 'command';
     const isControl = event.kind !== 'message' && controls.has(event.command ?? '');
     const isMemory = event.kind === 'command' && memoryCommands.has(event.command ?? '');
+    const isExternal = event.kind === 'command' && externalCommands.has(event.command ?? '');
     if (event.scope.kind === 'channel' && !explicit) return;
     if (conversation && event.scope.kind !== 'channel' && conversation.owner_id !== event.actor) throw new Denied();
     if (event.kind === 'button' && !conversation) throw new Denied();
     // 기억 명령도 제어처럼 알림 채널에서 쓸 수 있다(기억의 접근 채널은 대화·알림 채널 둘이다, memory.ts access).
-    if (event.scope.kind === 'channel' && event.scope.channel !== p.conversationChannel && !isControl && !isMemory) throw new Denied();
+    // 연결 명령도 채널까지 들어와 "스레드에서 쓰세요"로 답한다. 실패 표시만 보면 왜 안 되는지 알 수 없다.
+    if (event.scope.kind === 'channel' && event.scope.channel !== p.conversationChannel && !isControl && !isMemory && !isExternal) throw new Denied();
     if ((!conversation || !conversation.active) && !explicit && !isControl) return;
+    if (isExternal) return this.externalCommand(event, p.revision, recovered);
     // Unsupported commands cannot acquire model or control authority.
     if (event.kind !== 'message' && !['chat', 'urgent', 'task', 'read', ...controls, ...memoryCommands].includes(event.command ?? '')) throw new Denied();
     if (isMemory) return this.memoryCommand(event, p.revision, recovered);
@@ -211,13 +220,53 @@ export class DiscordIngress {
     }
     // 로그에는 명령과 결과 코드만 남긴다(진술·검색어·기억 내용 없음).
     this.log('memory_command', { command: event.command!, outcome: reply.outcome });
-    await this.acknowledge(event, saved.id, reply.content, { revision });
+    await this.acknowledge(event, saved.id, reply.content, { revision, notice: MEMORY_ACK_NOTICE });
     return saved.id;
+  }
+  // 연결 명령. 처리 방식은 기억 명령과 같다(같은 상호작용은 한 번만 처리하고 상호작용 응답으로만 답한다).
+  // 실행기 선택(text)은 처리에만 쓰고 events에 두지 않는다. events는 대화 맥락으로 모델에 들어간다.
+  private async externalCommand(event: z.infer<typeof EventSchema>, revision: string, recovered: boolean): Promise<string | undefined> {
+    if (recovered || !this.external) throw new Denied();
+    const started = this.store.now();
+    const saved = await this.store.save({ ...event, text: '' }, revision, false);
+    if (this.store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
+    if (!await this.claimOnce(event, saved.id, started)) return saved.id;
+    let reply;
+    try {
+      reply = await this.external.handle({ actor: event.actor, scope: event.scope, command: event.command as ExternalTaskCommand, text: event.text, target: event.target },
+        content => this.deliverPrivate(event, saved.id, content));
+    } catch (error) {
+      this.log('external_task_command_failed', { command: event.command!, ...errorInfo(error) });
+      reply = { content: '처리하지 못했습니다(일시 오류). /attach-list로 결과를 확인한 뒤 다시 시도하세요.', outcome: 'error' };
+    }
+    // 로그에는 명령과 결과 코드만 남긴다(세션 ID·키 ID·seed 없음).
+    this.log('external_task_command', { command: event.command!, outcome: reply.outcome });
+    if (reply.content !== undefined) await this.acknowledge(event, saved.id, reply.content, { revision, notice: EXTERNAL_ACK_NOTICE });
+    return saved.id;
+  }
+  // 키가 든 응답. acknowledge와 달리 실패를 돌려준다. 호출자가 그 키를 폐기해야 하기 때문이다.
+  // 명령 상호작용이라 rest.acknowledge는 EPHEMERAL callback만 쓴다. 메시지 이벤트의 채널 게시 대체 경로로 가지 않는다.
+  // 오류는 고정 사유 코드로만 남긴다. 전송 계층 오류에 요청 본문이 실려도 여기서 끊긴다.
+  private async deliverPrivate(event: z.infer<typeof EventSchema>, id: string, content: string): Promise<boolean> {
+    try {
+      await this.gate.authorize(event.actor, event.scope);
+      await this.store.ownedConversation(event.scope, event.actor);
+      const pause = await this.store.discordPauseUntil(event.scope.channel);
+      if (pause > this.store.now()) throw new Error('discord_global_pause');
+      await this.rest.acknowledge(event, content, { ...noMentions, flags: SUPPRESS_EMBEDS });
+      return true;
+    } catch (error) {
+      try {
+        if (error instanceof RateLimited) await this.store.recordRateLimit(error, event.scope.channel);
+        await this.store.audit('ack_uncertain', id, { processing: 'durable', reason: ackFailureReason(error) });
+      } catch (recording) { this.log('ack_failure_unrecorded', { kind: event.kind, ...errorInfo(recording) }); }
+      return false;
+    }
   }
   // 처리는 이미 영속됐다. 여기서 나는 오류(ACK 실패를 기록하는 DB 쓰기 포함)는 수신 결과를 바꾸지 않는다.
   // 메시지 이벤트에서 던지면 main의 guard()가 그 대화에 history gap 장벽을 세운다.
-  // content: 상호작용 응답 본문(기억 명령은 처리 결과). memory가 있으면 응답 실패 안내를 기억 명령용 문구로 남긴다.
-  private async acknowledge(event: EventInput, id: string, content?: string, memory?: { revision: string }): Promise<void> {
+  // content: 상호작용 응답 본문(기억·연결 명령은 처리 결과). direct가 있으면 응답 실패 때 결과 대신 그 고정 안내를 채널에 남긴다.
+  private async acknowledge(event: EventInput, id: string, content?: string, direct?: { revision: string; notice: string }): Promise<void> {
     let outcome: AckOutcome | void;
     try {
       try {
@@ -228,17 +277,17 @@ export class DiscordIngress {
         // 일반 메시지는 👀 리액션이고 이 문구는 권한 거부 때의 대체 텍스트로만 쓰인다.
         outcome = await this.rest.acknowledge(event, content
           ?? (this.messageContent ? '수신·처리 기록 저장됨. 처리·대기 상태는 별도로 안내합니다.' : '명령/버튼 모드: 수신·처리 기록 저장됨.'),
-        memory ? { ...noMentions, flags: SUPPRESS_EMBEDS } : noMentions);
+        direct ? { ...noMentions, flags: SUPPRESS_EMBEDS } : noMentions);
       } catch (error) {
         if (error instanceof RateLimited) await this.store.recordRateLimit(error, event.scope.channel);
         await this.store.atomic(async store => {
           await store.audit('ack_uncertain', id, { processing: 'durable', reason: ackFailureReason(error) });
           if (event.kind !== 'message') {
             await store.db.query(`UPDATE events SET payload=payload || '{"ackUncertain":true}'::jsonb WHERE id=$1`, [id]);
-            // 기억 명령의 결과는 채널에 다시 게시하지 않는다(본인만 볼 응답이었다). 고정 안내만 남긴다.
-            if (memory) await store.enqueue({ key: `ack-notice:${id}`, actor: event.actor, scope: event.scope,
-              revision: memory.revision,
-              payload: { kind: 'message', channel: event.scope.channel, content: MEMORY_ACK_NOTICE, classification: 'safe_summary' } });
+            // 기억·연결 명령의 결과는 채널에 다시 게시하지 않는다(본인만 볼 응답이었다). 고정 안내만 남긴다.
+            if (direct) await store.enqueue({ key: `ack-notice:${id}`, actor: event.actor, scope: event.scope,
+              revision: direct.revision,
+              payload: { kind: 'message', channel: event.scope.channel, content: direct.notice, classification: 'safe_summary' } });
             else await store.ackNotice(id);
           }
         });

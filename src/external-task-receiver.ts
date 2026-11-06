@@ -13,7 +13,7 @@ import { errorInfo } from './log.js';
 import type { Log } from './log.js';
 import type { Store } from './store.js';
 
-// R08 수신 처리(ARCHITECTURE §15). 경로·포트·노출 방식과 무관하다. 이 모듈은 listen하지 않고 main.ts에 연결되어 있지도 않다.
+// R08 수신 처리(ARCHITECTURE §15). 경로·포트·노출 방식과 무관하다. 이 모듈은 listen하지 않고 조립과 포트는 main.ts가 맡는다.
 export const EXTERNAL_TASK_PATH = '/external-task-events';
 export const FIXED_SUMMARY = '턴 완료';
 export const RECEIVER_LIMITS = Object.freeze({
@@ -199,7 +199,7 @@ export class ExternalTaskReceiver {
     return { expiresAt: budget ? Math.min(expiresAt, budget.expiresAt) : expiresAt, now: this.store.now };
   }
   count(outcome: ExternalOutcome): void { this.counts.set(outcome, (this.counts.get(outcome) ?? 0) + 1); }
-  // 전용 포트에는 /metrics를 두지 않는다. 8080의 /metrics를 조립하는 쪽(B5)이 이 값을 덧붙인다.
+  // 전용 포트에는 /metrics를 두지 않는다. main.ts가 8080의 /metrics에 이 값을 덧붙인다.
   // 라벨은 고정 이름뿐이고 본문·인증 헤더·연결 ID는 넣지 않는다.
   async metrics(): Promise<string> {
     const { total } = await this.store.atomic(async store =>
@@ -405,7 +405,7 @@ export class ExternalTaskReceiver {
   }
 }
 
-// 전용 포트용 HTTP 서버. listen은 조립하는 쪽(B5)이 한다. 이 서버에는 다른 경로가 없다.
+// 전용 포트용 HTTP 서버. listen은 main.ts가 한다. 이 서버에는 다른 경로가 없다.
 // connectionsCheckingInterval: Node 기본 30초면 5초 시간 제한이 그만큼 늦게 걸린다.
 export function externalTaskServer(receiver: ExternalTaskReceiver): Server {
   const { limits } = receiver;

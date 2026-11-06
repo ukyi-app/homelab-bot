@@ -6,6 +6,8 @@ import { loadRuntimePolicy } from './policy.js';
 import type { Policy } from './policy.js';
 import { PORTS } from './http.js';
 import { validTime, validZone } from './briefing.js';
+import { RESTORE_EPOCH } from './external-task-links.js';
+import { ENVIRONMENT_ID } from './external-task-receiver.js';
 
 // 게시 서버 env. 비밀은 Infisical /apps/homelab-bot/ → 공유 차트 secretKeyRef, 주소는 차트 values env.
 // 주소도 기본값을 두지 않는다. 하나라도 없거나 틀리면 기동하지 않고, 오류에는 키 이름과 사유만 남긴다(값은 남기지 않는다).
@@ -19,6 +21,8 @@ export const MEMORY_KEYS = Object.freeze(['MEMORY_LEDGER_DIR', 'MEMORY_LEDGER_AC
 export const REVIEW_APP_KEYS = Object.freeze(['GITHUB_REVIEW_APP_ID', 'GITHUB_REVIEW_APP_PRIVATE_KEY'] as const);
 // 작업 레인(비밀 아님, 차트 env). 스위치가 true가 아니면 주소를 읽지도 않는다. 켰는데 주소가 없거나 틀리면 기동하지 않는다.
 export const TASK_KEYS = Object.freeze(['TASK_LANE_ENABLED', 'TASK_WORKER_URL'] as const);
+// R08 외부 세션 알림(비밀 아님, 차트 env). 없거나 false면 리스너·명령·루프를 만들지 않는다. 작업 레인 스위치와 무관하다.
+export const EXTERNAL_TASK_KEYS = Object.freeze(['EXTERNAL_TASK_EVENTS_ENABLED', 'EXTERNAL_TASK_ENVIRONMENT', 'EXTERNAL_TASK_RESTORE_EPOCH'] as const);
 // 원장 PVC 마운트(계약 v1 /var/lib/homelab-bot/ledger)가 들어갈 수 있는 곳. 그 밖 경로는 컨테이너 쓰기 층이라 재시작에 사라진다.
 export const LEDGER_ROOT = '/var/lib/homelab-bot/';
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -39,6 +43,8 @@ export interface PublisherConfig {
   reviewEnabled?: boolean;
   // null(또는 없음)이면 작업 레인을 조립하지 않는다. 있어도 정책과 작업자 조건이 맞아야 열린다(main.ts taskPrecondition).
   taskLane?: { workerUrl: string } | null;
+  // null(또는 없음)이면 R08 리스너·명령을 만들지 않는다. environment는 서명 입력에 들어가는 값이고 helper 설정과 같아야 한다.
+  externalTask?: { environment: string; restoreEpoch?: string } | null;
 }
 type Env = Readonly<Record<string, string | undefined>>;
 const token = (value: string) => value.length > 0 && !/\s/.test(value);
@@ -88,10 +94,23 @@ export function loadPublisherConfig(env: Env, loadedAt: number): PublisherConfig
   const githubReviewApp = reviewAppConfig(env, problems);
   const reviewEnabled = reviewSwitch(env, problems);
   const taskLane = taskLaneConfig(env, problems);
+  const externalTask = externalTaskConfig(env, problems);
   if (problems.length || !policy || !workerKey) throw new ConfigError(problems.length ? problems : ['unknown']);
   return { databaseUrl, discordToken, policy, grafana: { url: grafanaUrl, token: grafanaToken },
     kubernetes: { url: kubernetesUrl }, workerUrl, healthchecksUrl,
-    workerKey, githubWebhookSecret, memory, briefing, githubReviewApp, reviewEnabled, taskLane };
+    workerKey, githubWebhookSecret, memory, briefing, githubReviewApp, reviewEnabled, taskLane, externalTask };
+}
+// 형식이 틀린 값은 스위치와 무관하게 기동 오류다. 켜는 PR에서 처음 터지지 않게 꺼진 동안에도 값을 본다.
+function externalTaskConfig(env: Env, problems: string[]): PublisherConfig['externalTask'] {
+  const raw = env.EXTERNAL_TASK_EVENTS_ENABLED;
+  const environment = env.EXTERNAL_TASK_ENVIRONMENT;
+  const restoreEpoch = env.EXTERNAL_TASK_RESTORE_EPOCH;
+  if (raw !== undefined && raw !== 'true' && raw !== 'false') problems.push('EXTERNAL_TASK_EVENTS_ENABLED(invalid)');
+  if (environment !== undefined && !ENVIRONMENT_ID.test(environment)) problems.push('EXTERNAL_TASK_ENVIRONMENT(invalid)');
+  if (restoreEpoch !== undefined && !RESTORE_EPOCH.test(restoreEpoch)) problems.push('EXTERNAL_TASK_RESTORE_EPOCH(invalid)');
+  if (raw !== 'true') return null;
+  if (environment === undefined) { problems.push('EXTERNAL_TASK_ENVIRONMENT(missing)'); return null; }
+  return { environment, ...(restoreEpoch === undefined ? {} : { restoreEpoch }) };
 }
 function taskLaneConfig(env: Env, problems: string[]): PublisherConfig['taskLane'] {
   const raw = env.TASK_LANE_ENABLED;

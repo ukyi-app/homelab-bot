@@ -70,6 +70,6 @@ RUN ln -s /app/node_modules/@anthropic-ai/claude-code-linux-x64/claude /usr/loca
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 claude --version 2>/dev/null)" = "2.1.308 (Claude Code)" \
   && test -z "$(ls -A /tmp)"
 USER 65532:65532
-EXPOSE 8080 8081
+EXPOSE 8080 8081 8082
 ENTRYPOINT []
 CMD ["node", "dist/src/main.js"]
