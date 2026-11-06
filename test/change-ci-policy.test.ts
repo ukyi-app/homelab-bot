@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { gitBlobSha } from '../src/change-contracts.js';
-import { evaluateCi, parseWorkflowSubset, readCiSnapshot } from '../src/change-ci-policy.js';
+import { CiPolicySchema, REUSABLE_USES, evaluateCi, parseWorkflowSubset, readCiSnapshot } from '../src/change-ci-policy.js';
 import type { CiPolicy, CiSnapshot } from '../src/change-ci-policy.js';
 
 // 합성 workflow다. 실제 저장소의 파일을 복사하지 않았다.
@@ -65,6 +65,15 @@ const closed = (caller: string, reason: string, policy?: CiPolicy, reusable?: st
   assert.equal(result.ok, false, `닫혀야 한다: ${reason}`);
   assert.equal((result as { reason: string }).reason, reason);
 };
+
+test('T19 B3 CI: reusable은 움직이지 않는 ref만 받는다(40자 SHA, 서버가 잠근 app-build 태그)', () => {
+  const uses = (ref: string) => `fixture-org/fixture-platform/.github/workflows/app-build.yaml@${ref}`;
+  for (const ref of ['app-build-v1.0.1', 'app-build-v12.34.56', 'a'.repeat(40)]) assert.equal(REUSABLE_USES.test(uses(ref)), true, ref);
+  for (const ref of ['main', 'master', 'feat-x', 'v1', 'v1.0.1', 'app-build-v1', 'app-build-v1.0', 'app-build-v1.0.1-rc', 'app-build-latest', 'app-chart-v1.0.0', 'a'.repeat(39), 'A'.repeat(40), `${'a'.repeat(40)}0`]) {
+    assert.equal(REUSABLE_USES.test(uses(ref)), false, ref);
+    assert.equal(CiPolicySchema.safeParse({ approvedFingerprint: 'a'.repeat(64), reusable: [{ uses: uses(ref), blobSha: 'b'.repeat(40) }], pushBranches: ['main'] }).success, false, ref);
+  }
+});
 
 test('T19 B3 CI: 승인된 형태·fingerprint만 통과한다', () => {
   const { policy, fingerprint } = approved();

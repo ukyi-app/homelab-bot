@@ -6,7 +6,9 @@ import type { ChangeTarget } from './change-contracts.js';
 // 후보 코드가 CI에서 쓰기 권한·비밀과 함께 돌지 않는 알려진 형태인지 보는 좁은 판정이다. 임의 workflow의 안전을 증명하지 않는다.
 // 사람이 승인한 fingerprint와 정확히 같아야 하고, 모르는 구문은 추측하지 않고 닫는다.
 
-export const REUSABLE_USES = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/(\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml)@([A-Za-z0-9._-]+)$/;
+// ref는 움직이지 않는 것만 받는다. 브랜치나 움직이는 태그면 검사 뒤 PR 실행 전에 승인 안 된 workflow로 바뀔 수 있어서다.
+// SHA로만 제한하지 못한다. 배포 키 identity가 app-build-v* 태그 ref에 묶여 앱 저장소는 태그로 불러야 하고, 그 태그는 ruleset D1이 bypass 없이 잠근다.
+export const REUSABLE_USES = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/(\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml)@([0-9a-f]{40}|app-build-v\d+\.\d+\.\d+)$/;
 export const CiPolicySchema = z.strictObject({
   approvedFingerprint: Sha256Schema,
   // 태그 이동을 잡으려고 해석된 blob까지 승인값에 둔다.

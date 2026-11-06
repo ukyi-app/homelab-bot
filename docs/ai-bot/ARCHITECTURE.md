@@ -1660,7 +1660,6 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 **조회 주기.** `DEPLOYMENT_POLL`은 60초 간격·10분 초기 창이다. `deploymentPollStep`이 `settled`·`poll`·`report_late`를 돌려준다. 창이 지나도 끝 상태로 바꾸지 않고 마지막 `pending`·`unknown`과 관측 시각을 알린다. 루프는 B5가 조립한다.
 
 **한계.** D가 정말 M에서 빌드됐는지 다시 검증하지 않는다. `image.yaml`에 적힌 값을 믿고 출처 검증은 자동 병합 조건 5(`deploy-merge`)의 몫이다. 사람이 병합한 `image.yaml`은 그 검사를 거치지 않을 수 있다.
-||||||| parent of 6229583 (feat(t19): 공개 전 후보를 새 세션이 검토하는 경로를 조립 없이 더한다)
 
 ### 16.2 미게시 후보 리뷰 (B2)
 
@@ -1711,7 +1710,6 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 **job과 dispatcher.** generation마다 `type='review'` job 하나이고 `change_child_jobs(role='review')`로 묶인다. `pr_reviews` 행이 없다. `ReviewRuntime`의 `changeReview` 옵션이 없으면 그 job을 집지 않고, 있으면 `pr_reviews`가 없는 job만 넘긴다. `pr_reviews`도 자식 job 연결도 없는 job은 모델 없이 `review_source_unknown` 실패로 닫는다. 게시 PR 리뷰 경로와 T17 시험은 그대로다. 같은 interactive 슬롯을 나눠 쓰고 대화가 먼저다.
 
 **응답 유실.** 작업자는 멈춤을 확인한 결과를 ack 전까지 보관한다. 게시 서버는 비공개 저장 → `recordReview` → job 종료 → ack 순서로 처리해 어디서 끊겨도 `fetchReceipt`가 결과를 다시 받아 같은 receipt를 만든다. `recordReview` 뒤에 끊겼으면 저장된 receipt를 돌려주는 `fetchReceipt`와 `review`가 job 종료와 ack를 마저 한다. 닫히지 않은 `unknown`은 대화 레인을 막기 때문이다. 회수한 결과가 `limited`·`auth_expired`이면 정상 응답처럼 `waiting_user`로 두고 scheduler를 멈춘 뒤 owner에게 알려, `/review-resume`으로 재개한다. 같은 lease로 실행을 다시 보내도 보관한 결과를 준다. 결과가 없으면(작업자 디스크 유실 등) null이고 모델을 다시 돌리지 않는다. job은 기존 unknown 조사로 멈춤을 확인해 실패로 끝나고, 새 generation이 필요하다.
-||||||| parent of 9896c59 (feat(t19): 승인된 후보를 공개하는 GitHub writer와 게시 경계를 조립 없이 더한다)
 
 ### 16.3 T19 B3 writer·공개 경계
 
