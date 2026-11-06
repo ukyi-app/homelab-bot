@@ -805,7 +805,7 @@ S16에서 찾은 결함을 봇 저장소에서 고치고 병합·배포했다(�
 2. 기억 검색 응답의 URL에 Discord 링크 미리보기가 붙는다(owner에게만 보이는 응답이라 누출은 아님, 미리보기 끄기 후보). → 고침(2026-11-04, 로컬): 기억 명령 응답만 `SUPPRESS_EMBEDS`(플래그 4)를 더한다(본인만 보는 64와 함께 68). 다른 명령 응답은 64 그대로. 시험 `T20 명령 [원장 켜짐]`. 실제 Discord 모습은 다음 기억 명령 사용 때 본다.
 3. 정정한 기억이 같은 주제의 active 결정과 충돌하면 candidate로 남는다(설계 한계). `memory-correct`는 ID 여러 개를 받으므로 충돌 상대도 함께 정정하면 확정될 것으로 보이나 실연동으로 확인하지 않았다. 응답에 이 안내를 넣는 것이 후보다. → 고침(2026-11-04, 로컬): 저장·정정 응답의 충돌 줄이 "memory-correct의 target에 이 ID와 충돌 ID를 쉼표로 함께(최대 5개) 넣어 정정하면 그 충돌이 풀립니다"로 안내한다. 실연동 순서(한쪽만 정정 → candidate, 새 ID와 충돌 ID를 함께 정정 → active)는 시험 `MEM-01 [T20 실연동 후속]`으로 고정.
 4. CLI `homelab db restore` 재개 단계는 Deployment Ready만 본다. 원장이 있는 앱은 restore.md 2.1 블록을 따로 돌려야 `--finish`할 수 있다(이번에도 따로 돌림). → 고침(2026-11-04, homelab #1040 `f43c4c1`, 로컬): 앱 ns에 원장 PVC `deletion-ledger`가 있으면 재개 단계가 원장 지표를 읽어 `ready`·삭제 대기 0일 때만 재개를 기록한다(읽기 실패·`disabled`도 대기로 멈춤). 실클러스터 확인은 다음 실제 복원 때.
-5. 브리핑 인증서·복원 검증 칸 원본(플랫폼 변경, homelab T24): 해소(2026-11-04, 아래 "T24 실연동 결과"). Codex 작업 상태·질문 대기 칸(T18)은 남음.
+5. 브리핑 인증서·복원 검증 칸 원본(플랫폼 변경, homelab T24): 해소(2026-11-04, 아래 "T24 실연동 결과"). Codex 작업 상태·질문 대기 칸(T18)은 해소(2026-11-06, 봇 #78, 아래 "T18 후속: 브리핑 칸·게이트 지표").
 6. 기억을 모델 맥락에 넣는 경로(SEC-01)는 V1 코드에 없다(`memories`는 `src/memory.ts`만 읽고, 쓰는 곳은 기억 명령과 모델을 부르지 않는 브리핑). T21이 경로 부재를 다시 확인하고, 경로를 여는 변경이 비신뢰 자료 표시와 SEC-01 시험을 함께 맡는다.
 
 ## T24 브리핑 관측 원본: 인증서·복원 검증 (2026-11-03, 로컬·mock)
@@ -898,6 +898,8 @@ R2·R2b·R3의 `--settings`는 `sandbox.enabled`, `failIfUnavailable: true`, `al
 - **R3:** `Read(...)` deny가 Read 도구를 막았다. 진짜 자격 경로는 Read로 시험하지 않았다.
 
 ### T18 남은 것
+
+아래 두 줄은 2026-11-04 시점의 기록이다. 운영 반영과 재확인은 끝났고 결과는 아래 "T18 완료 판정" 절이다.
 
 - 운영 반영: 호스트 프로필 설치·재부팅 유지(homelab `host/`), 봇 이미지에 bubblewrap·socat, 작업 레인 실행 설정(scrub, 샌드박스, `denyRead`, Read deny, `--allowedTools`), 작업 레인 파드(`hostUsers: false`, Localhost 프로필). 순서는 호스트 프로필이 먼저다. 노드에 없는 프로필을 참조하면 파드가 뜨지 않는다.
 - 이 절의 R2b 조합을 운영 작업 레인에서 다시 확인한다(SEC-02 작업 레인 사례).
@@ -1066,7 +1068,7 @@ R2·R2b·R3의 `--settings`는 `sandbox.enabled`, `failIfUnavailable: true`, `al
 |---|---|---|
 | 실제 API 오류에서 이 필드들이 나오는 모양 | fixture는 고정 CLI 2.1.308의 SDK 스키마를 읽어 만들었고 실제 오류 흐름과 대조하지 않았다. `api_error_code`·`api_error_origin`은 내부 필드라 유지 보장이 없다 | 다음 live 원인 진단 |
 | 위 표의 [미확인] 칸 | 작업 계약 자료에 값이 없다 | 운영 작업자 로그 |
-| 거절의 별도 응답 사유 | `model_refusal`을 응답까지 싣으려면 `TASK_FAILURE_REASONS`(B1 계약)를 바꿔야 하고 게시 서버·작업자 배포 순서가 얽힌다. 지금은 응답이 `model_cannot_complete`, 게시 서버 사유가 `task_model_cannot_complete`다 | lead 결정 |
+| 거절의 별도 응답 사유 | `model_refusal`을 응답까지 싣으려면 `TASK_FAILURE_REASONS`(B1 계약)를 바꿔야 하고 게시 서버·작업자 배포 순서가 얽힌다. 지금은 응답이 `model_cannot_complete`, 게시 서버 사유가 `task_model_cannot_complete`다 | lead 결정(2026-11-06): 더하지 않는다. 작업자 로그의 `engine_reason`에 `model_refusal`이 남아 원인은 가를 수 있고, 계약을 바꿔 얻는 것은 응답의 사유 이름뿐이다 |
 
 ## SEC-02 1단계: 합성 환경 도구 경계 시험 (2026-11-05, 로컬)
 
@@ -1477,6 +1479,37 @@ manifest는 정확한 경로만 받는다. **올릴 때 그 경로가 비어 있
 - 새 시험 파일과 `memory-briefing-pg`·`ops-metrics`를 실제 PostgreSQL과 함께 3회 반복: 46건 모두 통과.
 
 **시험의 한계.** 실제 Discord 채널에서 본 모습, 운영 `/metrics`, homelab 룰의 평가는 보지 않았다.
+
+## T18 완료 판정 (2026-11-06, 사용자 확인)
+
+homelab T18 티켓의 완료 조건 6개를 아래 기록과 대조했다. 위 2026-10-29 표는 Codex 전제의 로컬 기록이고, 이 절이 Claude 작업 레인 기준의 최종 판정이다.
+
+| 완료 조건 | 근거 |
+|---|---|
+| TASK-01~03, SEC-02, 질문 경로 AUTH-02 결과가 있다 | 아래 시험 표 |
+| 배정 시험에 `fail`이 없고, `blocked`·`not_run`은 사유와 해소 티켓이 있다. SEC-02는 이 경로에서 최소 mock·local_integration `pass`다 | 아래 시험 표. `blocked` 없음. SEC-02는 "SEC-02 1단계"(로컬), "SEC-02 2단계 실행안"의 운영 결과(운영 파드 무모델) |
+| 어댑터 능력표가 있다 | [ARCHITECTURE](ARCHITECTURE.md) §12 작업 레인 능력표(`CLAUDE_TASK_LANE_CAPABILITIES`), §4·§12 Codex 어댑터(`CODEX_CAPABILITIES`), §15 R08(`EXTERNAL_TASK_CAPABILITIES`) |
+| R08 연결 방식이 사용자 결정으로 정해져 있고 근거가 있다 | [DECISIONS](DECISIONS.md) "T18 결정 (Claude 실행기 기준)" (1), "R08 수신 경로: tailnet 전용" |
+| §5.1 열린 항목 둘의 판단과 근거가 있다. 설계 C.8을 바꾸는 판단은 사용자 결정이다 | [DECISIONS](DECISIONS.md) "T18 결정" (2)(3), "(2) 파드 실측 결과와 대가 수용". 파드 둘은 사용자 결정이고 homelab 설계 C.8을 같은 변경에서 고쳤다 |
+| HANDOFF가 있다 | private 운영 저장소 `handoffs/codex-bridge.md` |
+
+**시험 표.**
+
+| 시험 | 판정 | 근거 | 운영에서 만들지 않은 것 → 해소 |
+|---|---|---|---|
+| TASK-01 | live / pass | 봇 소유 작업 `c36d1d92`, "T18 R08 운영 시험"의 경로·서명 E2E. 능력 표시는 `test/task-assembly.test.ts` "B5 능력표"와 `test/external-task-links.test.ts`. 1차 `26e39cd8`의 실패는 scrub 흔적이 원인이었고 #71로 고쳐 재시험했다 | 다른 member 차단(시험 기기 없음), 집 밖 기기, 실제 Codex `notify`(사람 쪽 helper는 로컬 시험만). `not_run` → T21 |
+| TASK-02 | live·local_integration / pass | `165ec7a2`의 질문·`/answer`·같은 세션 resume. 타인·다른 스레드·기한·중복·경합은 `test/task-bridge.test.ts`, `test/task-lane-pg.test.ts`, `test/task-assembly.test.ts` | 타인의 답·늦은 답의 운영 실례. `not_run`, 로컬 pass → T21 |
+| TASK-03 | live·local_integration / pass | `9c8b705f`의 취소·소멸 확인. 가짜 완료 문자열과 깨진 줄은 `test/task-stream.test.ts`, 소멸 미확인 unknown은 `test/task-worker.test.ts`·`test/task-process-containment.test.ts`, 오류 사유는 `test/task-diagnostics.test.ts`, 취소 안내는 `test/task-cancel-notice.test.ts` | 취소 완료 안내(#72)의 운영 재확인. `not_run`, 로컬 pass → T21 |
+| SEC-02 | live(운영 파드 무모델)·local_integration / pass | "SEC-02 1단계", "SEC-02 2단계 실행안" 운영 결과(도구 64/64, 어긋남 0), "T18 작업 레인 격리 파드 실측"의 진짜 토큰 시험(노출 0건, 대조군 1건), `test/task-settings-boundary.test.ts` | live `38778ff1`은 도구 0회 `task_api_error`라 `not_run`. 실자격 직접 Read, TaskLane 조립 경로의 같은 시험, 실모델 SEC-02는 `not_run` → T19(변경 작업자 경로), T21 |
+| AUTH-02(질문 경로) | local_integration / pass | `test/task-bridge.test.ts`의 AUTH-02 사례 4건(답 직전 교체·철회·정책 확인 불가, 수락 뒤 철회, dispatch 직전, 실행 중, 마지막 감시 뒤). 실제 PostgreSQL 포함 | 운영 정책을 바꿔 철회하는 실례는 `RUNTIME_POLICIES` 변경 승인 대상이라 하지 않았다. `not_run` → T21 |
+
+**티켓의 할 일 중 측정이 남은 것.** 완료 조건은 아니지만 숨기지 않는다.
+
+- 호스트 프로필·작업 볼륨의 재부팅 유지: 확인했다. 2026-11-06 14:38 커널 크래시와 15:03 복구 재부팅에서 `worker-task` 파드가 Localhost 프로필로 다시 뜨고 작업 볼륨이 재마운트됐다. 커널 고정은 homelab `docs/runbooks-public/nuc-kernel-pin.md`.
+- 실제 디스크 고갈: ENOSPC 주입 시험뿐이다. 다 찼을 때의 동작은 homelab #1140이 코드 기준으로 적었다.
+- R08 복원 세대, 30일 만료, 절전 복귀: 코드·로컬 시험만.
+
+운영에서 만들지 않은 사례를 로컬 증거로 두고 T21이 다시 보는 것은 사용자 결정이다.
 
 ## T19 B0 계약·저장 (2026-11-06, 로컬·PG)
 
