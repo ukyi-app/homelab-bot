@@ -1409,3 +1409,35 @@ manifest는 정확한 경로만 받는다. **올릴 때 그 경로가 비어 있
 - 네트워크 없는 임시 `postgres:18-alpine`(18.6) 소켓을 준 `npm test`: **1490 / 1477 pass / 0 fail / 13 skipped**(`SEC02_IMAGE` 없음). 끝난 뒤 컨테이너 삭제.
 - PG 없는 `npm test`: **1490 / 1411 pass / 1 fail / 78 skipped**(PG 65, 이미지 13). 실패는 `S3 실제 프로세스: 한 줄·전체 출력 상한`(`test/codex-bridge.test.ts`) 하나이고 단독 재실행 6회 모두 통과했다. 같은 코드에서 시험 하나만 적은 직전 실행은 **1489 / 1411 / 0 fail / 78**이었다. 이번 변경은 그 경로의 파일(`process-launcher`·`executor-codex`·`run-control`)을 건드리지 않는다.
 - R08 시험 네 파일(조립·실제 PostgreSQL·수신·연결) 74건을 실제 PostgreSQL과 함께 5회 반복: 모두 통과.
+
+## T18 R08 운영 시험 (2026-11-06, 운영 + owner 기기)
+
+봇 main `c39b074`, homelab `c02f075`(운영에서 켬, VM 꺼짐), owner macOS 기기, Claude Code 2.1.318. 값(주소·키·연결 ID)은 적지 않는다.
+
+**경로(서명 없는 요청).** 등급: 운영 실측.
+
+| 어디서 | 요청 | 결과 |
+|---|---|---|
+| owner 기기 | `POST /external-task-events` | 415, 리스너 도달(프록시 라벨로 좁힌 NetworkPolicy 통과) |
+| owner 기기 | `GET /external-task-events` | 405 |
+| owner 기기 | 후행 슬래시, 하위 경로, 쿼리 | 404, 리스너 거절(`not_found` 증가) |
+| owner 기기 | 다른 경로, `/metrics`, `/readyz`, `/github`, `/` | 404, 프록시 거절(지표 그대로) |
+| `tag:nuc` | 프록시 IP로 직접 | 연결 시간 초과, 이름도 풀리지 않음 |
+| 공개 DNS(1.1.1.1, 8.8.8.8) | A 조회 | 응답 0 |
+
+프록시 기기 태그는 `tag:k8s-r08` 하나이고 Funnel은 없다.
+
+**서명 E2E.** 시험 세션으로 실제 CLI 턴을 돌렸다.
+
+- 실제 Claude Stop 훅 → helper 큐 → 전송기 서명 → `accepted` 1 → 대화 스레드에 게시. 발생에서 수신까지 2초, `unposted` 0, 전송 큐 0, 실패 0. 알림에 "봇이 결과를 확인한 것은 아닙니다"가 들어간다.
+- `/attach-list` 활성 → `/detach` → `닫힘(detach)`. 해제 뒤 같은 세션의 다음 턴은 전송기 `rejected_401_unauthorized`, 봇 `unauthorized` 1, `accepted`는 그대로.
+- 연결이 없는 세션의 Stop은 큐에 들어가지 않는다(큐 0, 실패 0).
+
+**이번 시험의 조작 방식.** 사용자 지시로 Discord 조작을 Mac Codex 화면 조작으로 했다. `/attach` 응답의 seed가 그 기록에 남을 수 있어 시험 전용으로 쓰고 끝난 뒤 폐기했다(`/detach`, Keychain 항목 삭제). seed는 클립보드에서 GUI 세션의 일회용 작업이 읽어 `security -i`로 넣어, 모델 출력·명령 인자·파일을 거치지 않았다.
+
+**실측으로 안 함정.**
+
+- macOS SSH 세션은 Keychain을 쓰지 못한다(`User interaction is not allowed`). `launchctl asuser`는 root가 필요하다. seed는 그 기기의 로컬 터미널에서 넣는다. 전송기는 GUI 세션의 LaunchAgent(`gui/<uid>`)로 돌아야 Keychain을 읽는다.
+- R08 프록시는 호스트 TLS 감시(`tag:k8s`만 봄, ACL이 호스트를 막음)가 확인할 수 없다. `TailnetTLSMissing`이 울려 homelab #1146에서 대상에서 뺐다. 그 인증서는 만료 경보가 없다.
+
+**미확인.** 다른 member 차단(시험 기기 없음), 집 밖 기기, 실제 Codex notify, 절전 복귀, 30일 만료 실측, 복원 세대 장벽의 운영 실측.
