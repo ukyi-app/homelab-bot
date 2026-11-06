@@ -40,6 +40,11 @@ function seedMessage(link: IssuedLink, environment: string): string {
     '이 키로는 턴 완료 알림만 보낼 수 있습니다. 모델 호출·작업 시작·답·취소·재개 권한은 없습니다.'].join('\n');
 }
 const STATE_TEXT = { active: '활성', expired: '만료', revoked: '닫힘' } as const;
+// Discord 응답 상한은 2,000자이고 목록은 최대 10건, 외부 세션 ID는 128자까지다. 그대로 쓰면 넘어 응답 전체가 거절된다.
+// 해제에 쓰는 연결 ID는 그대로 두고 세션 ID만 앞 40자로 줄인다(Claude 세션 UUID 36자는 그대로 보인다). 그러면 최악의 10건도 상한 안이다(시험이 길이를 고정한다).
+// 세션 ID는 ASCII만 받아(EXTERNAL_TASK_ID) 문자 수와 length가 같다.
+const LIST_TASK_ID_CHARS = 40;
+const shortTaskId = (id: string) => id.length > LIST_TASK_ID_CHARS ? `${id.slice(0, LIST_TASK_ID_CHARS)}…` : id;
 
 export class ExternalTaskCommands implements ExternalTaskCommandHandler {
   constructor(private readonly links: Pick<ExternalTaskLinks, 'attach' | 'detach' | 'list' | 'revoke'>, private readonly environment: string, private readonly log: Log) {}
@@ -85,8 +90,8 @@ export class ExternalTaskCommands implements ExternalTaskCommandHandler {
     if (request.scope.kind === 'channel') return { content: THREAD_ONLY, outcome: 'wrong_scope' };
     const { items, more } = await this.links.list(request.actor, request.scope);
     if (!items.length) return { content: '이 스레드에 연결한 세션이 없습니다.', outcome: 'empty' };
-    const lines = items.map(item => `\`${item.connectionId}\` ${item.executor} \`${item.externalTaskId}\` · ${STATE_TEXT[item.state]}${item.revokedReason ? `(${item.revokedReason})` : ''}`
+    const lines = items.map(item => `\`${item.connectionId}\` ${item.executor} \`${shortTaskId(item.externalTaskId)}\` · ${STATE_TEXT[item.state]}${item.revokedReason ? `(${item.revokedReason})` : ''}`
       + ` · 요약 ${item.summaryConsent ? '동의' : '없음'} · 만료 ${kstTime(item.expiresAt)} · 마지막 알림 ${item.lastEventAt === null ? '없음' : kstTime(item.lastEventAt)}`);
-    return { content: ['읽기 전용 연결입니다. 사람 세션의 자기 보고만 받고 봇이 결과를 확인하지 않습니다.', ...lines, ...(more ? ['(더 있음. 최근 10건만 표시)'] : [])].join('\n'), outcome: 'listed' };
+    return { content: ['읽기 전용 연결입니다. 사람 세션의 자기 보고만 받고 봇이 결과를 확인하지 않습니다.', ...lines, ...(more ? ['(더 있음. 활성 연결부터 최근 10건만 표시)'] : [])].join('\n'), outcome: 'listed' };
   }
 }

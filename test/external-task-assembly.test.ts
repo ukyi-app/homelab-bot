@@ -60,6 +60,23 @@ test('R08 조립 설정: 없거나 false면 꺼짐, true·false 밖이면 기동
   assert.deepEqual(problems({ EXTERNAL_TASK_RESTORE_EPOCH: 'a b' }), ['EXTERNAL_TASK_RESTORE_EPOCH(invalid)']);
 });
 
+test('R08 연결 목록: 최장 세션 ID 10건과 더 있음 표시도 Discord 2,000자 안이고, 해제에 쓰는 연결 ID는 줄이지 않음', async () => {
+  const thread: Scope = { kind: 'thread', guild: GUILD, channel: 'fixture-list-thread', parent: CHAT };
+  const connectionId = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+  const longId = 'a'.repeat(128);
+  const items = Array.from({ length: 10 }, (_, n) => ({ connectionId: connectionId(n), externalTaskId: longId, executor: 'claude', summaryConsent: true,
+    state: 'revoked' as const, revokedReason: 'delivery_failed', expiresAt: Date.UTC(2026, 11, 31, 23, 59, 59), lastEventAt: Date.UTC(2026, 11, 31, 23, 59, 59) }));
+  const links = { list: async () => ({ items, more: true }) } as unknown as ConstructorParameters<typeof ExternalTaskCommands>[0];
+  const reply = await new ExternalTaskCommands(links, ENVIRONMENT, () => {}).handle({ actor: OWNER, scope: thread, command: 'attach-list', text: '' }, async () => true);
+  assert.equal(reply.outcome, 'listed');
+  const content = reply.content!;
+  assert.ok(content.length <= 2000, `길이 ${content.length}`);
+  for (let n = 0; n < 10; n++) assert.ok(content.includes(`\`${connectionId(n)}\``));
+  assert.ok(content.includes(`\`${'a'.repeat(40)}…\``));
+  assert.ok(!content.includes('a'.repeat(41)));
+  assert.match(content, /더 있음/);
+});
+
 test('R08 조립 명령: 켰을 때만 세 명령, 작업 레인과 독립, Discord 한도 안, 옵션은 수신이 읽는 이름', () => {
   assert.equal(commandDefinitions(false), COMMAND_DEFINITIONS);
   assert.deepEqual([...EXTERNAL_TASK_COMMANDS], ['attach', 'detach', 'attach-list']);
