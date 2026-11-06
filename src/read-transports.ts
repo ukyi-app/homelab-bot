@@ -191,6 +191,153 @@ export function kubernetesTransport(options: { base: string; tokenFile: string; 
   };
 }
 
+// ---- 병합 뒤 배포 읽기(T19 DEPLOY-01) ----
+// 위 /read 경로의 응답 모양을 건드리지 않게 스키마를 따로 둔다. 값 투영은 revision·digest·이미지·준비 상태뿐이다.
+// 경로는 SA bot-reader의 ClusterRole homelab-readonly가 이미 허용한 읽기 셋(applications, deployments, pods)이다.
+
+const SHA_TEXT = /^[0-9a-f]{40}$/;
+const DIGEST_TEXT = /^sha256:[0-9a-f]{64}$/;
+const DeployedValues = z.object({ repository: z.string().max(256).optional(), digest: z.string().regex(DIGEST_TEXT).optional(),
+  revision: z.string().regex(SHA_TEXT).optional() });
+const HelmSource = z.object({ helm: z.object({ valuesObject: DeployedValues.optional() }).optional() });
+const DeployApplication = z.object({ metadata: z.object({ name: z.string(), namespace: z.string() }),
+  spec: z.object({ source: HelmSource.optional() }),
+  status: z.object({ sync: z.object({ status: z.string().optional(), comparedTo: z.object({ source: HelmSource.optional() }).optional() }).optional(),
+    operationState: z.object({ phase: z.string().optional() }).optional() }).optional() });
+const DeployWorkload = z.object({ metadata: z.object({ name: z.string(), namespace: z.string(), generation: z.number().int().optional() }),
+  spec: z.object({ replicas: z.number().int().nonnegative().optional(),
+    template: z.object({ spec: z.object({ containers: z.array(z.object({ name: z.string(), image: z.string().optional() })) }) }) }),
+  status: z.object({ observedGeneration: z.number().int().optional(), readyReplicas: z.number().int().optional(),
+    availableReplicas: z.number().int().optional(), updatedReplicas: z.number().int().optional() }).optional() });
+const DeployPods = z.object({ metadata: z.object({ continue: z.string().optional() }).optional(),
+  items: z.array(z.object({ metadata: z.object({ deletionTimestamp: z.string().nullable().optional(),
+    ownerReferences: z.array(z.object({ kind: z.string() })).optional() }),
+  status: z.object({ phase: z.string().optional(), conditions: z.array(z.object({ type: z.string(), status: z.string() })).optional(),
+    containerStatuses: z.array(z.object({ name: z.string(), ready: z.boolean().optional(), imageID: z.string().optional() })).optional() }).optional() })) });
+const POD_LIST_LIMIT = 50;
+export interface DeployedValuesReading { repository: string | null; digest: string | null; revision: string | null }
+export interface DeployedApplicationReading { desired: DeployedValuesReading | null; compared: DeployedValuesReading | null; syncStatus: string | null; operationPhase: string | null }
+export interface DeployedWorkloadReading { generation: number | null; observedGeneration: number | null; replicas: number; ready: number; available: number; updated: number; image: string | null }
+export interface DeployedPodReading { ready: boolean; imageId: string | null; terminating: boolean }
+export interface DeploymentKubernetesReader {
+  application(application: string, signal: AbortSignal): Promise<DeployedApplicationReading>;
+  workload(namespace: string, deployment: string, container: string, signal: AbortSignal): Promise<DeployedWorkloadReading>;
+  pods(namespace: string, app: string, container: string, signal: AbortSignal): Promise<DeployedPodReading[]>;
+}
+const projectValues = (source: z.infer<typeof HelmSource> | undefined): DeployedValuesReading | null => {
+  const values = source?.helm?.valuesObject;
+  return values ? { repository: values.repository ?? null, digest: values.digest ?? null, revision: values.revision ?? null } : null;
+};
+export function deploymentKubernetesReader(client: Pick<KubernetesClient, 'get'>): DeploymentKubernetesReader {
+  const names = async (...values: string[]) => { if (!values.every(value => name.test(value))) throw new Error('unsupported_query'); };
+  return {
+    async application(application, signal) {
+      await names(application);
+      const raw = DeployApplication.parse(await client.get(`/apis/argoproj.io/v1alpha1/namespaces/${ARGOCD_NAMESPACE}/applications/${application}`, signal));
+      if (raw.metadata.name !== application || raw.metadata.namespace !== ARGOCD_NAMESPACE) throw new Error('unexpected_object');
+      return { desired: projectValues(raw.spec.source), compared: projectValues(raw.status?.sync?.comparedTo?.source),
+        syncStatus: raw.status?.sync?.status ?? null, operationPhase: raw.status?.operationState?.phase ?? null };
+    },
+    async workload(namespace, deployment, container, signal) {
+      await names(namespace, deployment, container);
+      const raw = DeployWorkload.parse(await client.get(`/apis/apps/v1/namespaces/${namespace}/deployments/${deployment}`, signal));
+      if (raw.metadata.name !== deployment || raw.metadata.namespace !== namespace) throw new Error('unexpected_object');
+      return { generation: raw.metadata.generation ?? null, observedGeneration: raw.status?.observedGeneration ?? null, replicas: raw.spec.replicas ?? 1,
+        ready: raw.status?.readyReplicas ?? 0, available: raw.status?.availableReplicas ?? 0, updated: raw.status?.updatedReplicas ?? 0,
+        image: raw.spec.template.spec.containers.find(item => item.name === container)?.image ?? null };
+    },
+    async pods(namespace, app, container, signal) {
+      await names(namespace, app, container);
+      const selector = encodeURIComponent(`homelab.ukyi.app/app=${app}`);
+      const raw = DeployPods.parse(await client.get(`/api/v1/namespaces/${namespace}/pods?labelSelector=${selector}&limit=${POD_LIST_LIMIT}`, signal));
+      if (raw.metadata?.continue) throw new Error('unexpected_object');
+      // 같은 라벨을 쓰는 마이그레이션 Job 파드와 끝난 파드(퇴거된 옛 파드 포함)는 지금 서비스하는 파드가 아니다. homelab status와 같은 판정이다.
+      return raw.items.filter(pod => !pod.metadata.ownerReferences?.some(owner => owner.kind === 'Job')
+        && pod.status?.phase !== 'Succeeded' && pod.status?.phase !== 'Failed').map(pod => {
+        const status = pod.status?.containerStatuses?.find(item => item.name === container);
+        const ready = pod.status?.conditions?.some(item => item.type === 'Ready' && item.status === 'True') === true && status?.ready === true;
+        return { ready, imageId: status?.imageID || null, terminating: Boolean(pod.metadata.deletionTimestamp) };
+      });
+    },
+  };
+}
+
+// 공개 저장소 읽기. 어떤 자격도 받지 않아 writer·리뷰 App 토큰이 이 경로로 나가지 못한다.
+// 함정: 익명 한도는 출구 IP당 시간 60회다. 넘으면 403·429이고 호출자는 unknown으로 낸다. 자동으로 다른 자격으로 넘어가지 않는다.
+const GITHUB_API = 'https://api.github.com';
+const REPOSITORY_TEXT = /^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/;
+const REF_TEXT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const FILE_TEXT = /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/;
+const FILE_CONTENT_LIMIT = 8192;
+export const PULL_FILES_PAGE = 100;
+const Sha = z.string().regex(SHA_TEXT);
+const GithubPull = z.object({ number: z.number().int().positive(), state: z.enum(['open', 'closed']), merged: z.boolean(), merge_commit_sha: Sha.nullable(),
+  head: z.object({ sha: Sha }), base: z.object({ repo: z.object({ id: z.number().int().positive(), full_name: z.string() }) }) });
+const GithubCommits = z.array(z.object({ sha: Sha })).max(1);
+const GithubFile = z.object({ type: z.literal('file'), encoding: z.literal('base64'), content: z.string().max(FILE_CONTENT_LIMIT) });
+const GithubCompare = z.object({ status: z.enum(['ahead', 'behind', 'diverged', 'identical']) });
+const GithubCommitPulls = z.array(z.object({ number: z.number().int().positive(), merge_commit_sha: Sha.nullable(), head: z.object({ sha: Sha }) }));
+const GithubPullFiles = z.array(z.object({ filename: z.string().max(4096), previous_filename: z.string().max(4096).optional() })).max(PULL_FILES_PAGE);
+export interface PublicPullReading { number: number; state: 'open' | 'closed'; merged: boolean; mergeCommit: string | null; headSha: string; baseRepoId: number; baseRepository: string }
+export type CompareStatus = z.infer<typeof GithubCompare>['status'];
+export interface PublicGithubReader {
+  pull(repository: string, number: number, signal: AbortSignal): Promise<PublicPullReading>;
+  // 그 ref에서 이 파일을 마지막으로 바꾼 commit. 파일 역사가 없으면 null이다.
+  latestFileCommit(repository: string, path: string, ref: string, signal: AbortSignal): Promise<string | null>;
+  // commit SHA로만 읽는다. 내용이 바뀌지 않아 호출자가 기억해 둘 수 있다. 파일이 없으면 null이다.
+  fileAt(repository: string, path: string, commit: string, signal: AbortSignal): Promise<string | null>;
+  // base 기준 head의 관계. 둘 중 하나가 저장소에 없으면 null이다.
+  compare(repository: string, base: string, head: string, signal: AbortSignal): Promise<CompareStatus | null>;
+  // 이 commit을 만든 병합 PR 목록.
+  commitPulls(repository: string, commit: string, signal: AbortSignal): Promise<{ number: number; mergeCommit: string | null; headSha: string }[]>;
+  // 한 쪽만 읽는다. 쪽이 가득 차면 뒤가 더 있을 수 있어 complete=false다.
+  pullFiles(repository: string, number: number, signal: AbortSignal): Promise<{ complete: boolean; files: { path: string; previousPath: string | null }[] }>;
+}
+export function publicGithubReader(options: { send?: typeof fetch } = {}): PublicGithubReader {
+  const send = options.send ?? fetch;
+  const repo = (value: string) => { if (!REPOSITORY_TEXT.test(value) || value.split('/').some(part => part === '.' || part === '..')) throw new Error('unsupported_query'); return value; };
+  const commit = (value: string) => { if (!SHA_TEXT.test(value)) throw new Error('unsupported_query'); return value; };
+  const positive = (value: number) => { if (!Number.isSafeInteger(value) || value < 1) throw new Error('unsupported_query'); return value; };
+  const file = (value: string) => { if (!FILE_TEXT.test(value) || value.split('/').some(part => part === '.' || part === '..')) throw new Error('unsupported_query'); return value; };
+  const get = (path: string, signal: AbortSignal) => call(send, `${GITHUB_API}${path}`, { method: 'GET', signal,
+    headers: { accept: 'application/vnd.github+json', 'user-agent': 'homelab-bot', 'x-github-api-version': '2022-11-28' } });
+  const notFoundIsNull = async <T>(read: () => Promise<T>): Promise<T | null> => {
+    try { return await read(); } catch (error) {
+      if (error instanceof Error && error.message === 'read_http_404') return null;
+      throw error;
+    }
+  };
+  return {
+    async pull(repository, number, signal) {
+      const raw = GithubPull.parse(await get(`/repos/${repo(repository)}/pulls/${positive(number)}`, signal));
+      return { number: raw.number, state: raw.state, merged: raw.merged, mergeCommit: raw.merge_commit_sha, headSha: raw.head.sha,
+        baseRepoId: raw.base.repo.id, baseRepository: raw.base.repo.full_name };
+    },
+    async latestFileCommit(repository, path, ref, signal) {
+      if (!REF_TEXT.test(ref)) throw new Error('unsupported_query');
+      const query = new URLSearchParams({ sha: ref, path: file(path), per_page: '1' });
+      const raw = GithubCommits.parse(await get(`/repos/${repo(repository)}/commits?${query}`, signal));
+      return raw[0]?.sha ?? null;
+    },
+    async fileAt(repository, path, at, signal) {
+      const target = `/repos/${repo(repository)}/contents/${file(path)}?ref=${commit(at)}`;
+      return notFoundIsNull(async () => Buffer.from(GithubFile.parse(await get(target, signal)).content, 'base64').toString('utf8'));
+    },
+    async compare(repository, base, head, signal) {
+      const target = `/repos/${repo(repository)}/compare/${commit(base)}...${commit(head)}?per_page=1`;
+      return notFoundIsNull(async () => GithubCompare.parse(await get(target, signal)).status);
+    },
+    async commitPulls(repository, at, signal) {
+      const raw = GithubCommitPulls.parse(await get(`/repos/${repo(repository)}/commits/${commit(at)}/pulls`, signal));
+      return raw.map(pull => ({ number: pull.number, mergeCommit: pull.merge_commit_sha, headSha: pull.head.sha }));
+    },
+    async pullFiles(repository, number, signal) {
+      const raw = GithubPullFiles.parse(await get(`/repos/${repo(repository)}/pulls/${positive(number)}/files?per_page=${PULL_FILES_PAGE}`, signal));
+      return { complete: raw.length > 0 && raw.length < PULL_FILES_PAGE, files: raw.map(item => ({ path: item.filename, previousPath: item.previous_filename ?? null })) };
+    },
+  };
+}
+
 // 템플릿의 datasource 이름으로 transport를 고른다. 모르는 이름은 요청 없이 실패(관측 불가)다.
 export function routedTransport(routes: Readonly<Record<string, ReadTransport>>): ReadTransport & { routes: readonly string[] } {
   return { routes: Object.freeze(Object.keys(routes)), async query(request) {

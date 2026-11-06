@@ -1608,3 +1608,55 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 조립과 스위치는 B5의 몫이다. 브랜치는 `changeBranchName`만 만들고 `bot/change/<32자리 hex>/g<n>` 외에는 `parseChangeBranch`가 거부한다.
 
 **V1 제한.** manifest의 모든 항목이 mode `100644`·`100755`여야 한다. 변경하지 않아도 T0에 symlink·gitlink가 있으면 manifest를 만들 수 없어 그 저장소는 시작부터 닫힌다. 변경 내용 합계 1 MiB, HTTP body 2 MiB를 넘으면 차단한다. 변경 파일 256개, manifest 5,000항목은 제안값이다. command·리뷰는 generation당 한 번이라 실패한 결과를 같은 generation에서 다시 받지 못한다.
+
+### 16.1 배포 읽기 (B4)
+
+`src/change-deployment.ts`의 `DeploymentReader`가 `ChangeDeploymentPort`를 구현한다. 아직 조립되지 않았고 쓰기가 없다. 이 관측은 **배포된 버전만** 말한다. 기능·DB·성능은 보지 않고 `describeDeployment`가 그 범위 문장을 늘 함께 낸다.
+
+**H·M·K·D.** 넷을 따로 둔다. H(PR head)는 나르기만 하고 어떤 값과도 대조하지 않는다. squash면 H와 M은 다르다.
+
+| 값 | 어디서 | 뜻 |
+|---|---|---|
+| M | `GET pulls/{n}`의 `merge_commit_sha` | 병합 commit. `image.yaml`의 `revision`과 같아야 한다 |
+| K | homelab main에서 `image.yaml`을 마지막으로 바꾼 commit | 그 시점의 내용이 지금 배포 설정이다 |
+| D | K 시점 `image.yaml`의 `digest` | 이 값이 Argo values·Deployment·pod imageID까지 이어져야 한다 |
+
+**K는 Argo revision으로 대조하지 않는다.** `platform/appsets/apps`의 Application은 `targetRevision`이 chart 태그이고 `image.yaml`은 ApplicationSet이 `helm.valuesObject`로 넣는다. 그래서 `status.sync.revision`은 chart 태그의 commit이다. 대신 `spec.source`와 `status.sync.comparedTo.source`의 values에서 `repository`·`digest`·`revision`을 읽어 K의 내용과 비교한다. homelab main HEAD는 읽지 않아 다른 commit이 더 붙어도 불일치가 되지 않는다.
+
+**판정 순서.** 앞에서 처음 걸린 값을 낸다. `observed`는 끝까지 모두 맞을 때뿐이다. revision이 M이 아니면 K·D를 비워 둔다. 다른 revision의 값을 M의 것으로 기록하지 않기 위해서다.
+
+| 단계 | 상태 | 사유 코드 |
+|---|---|---|
+| 매핑 | `blocked` | `deployment_target_unregistered` |
+| 설정 파일 | `blocked` | `deploy_config_unregistered`, `image_config_invalid`, `image_repository_mismatch` |
+| revision ≠ M | `blocked` | `image_hold`, `image_revision_superseded`(더 새 revision), `image_revision_unrelated`(갈라졌거나 저장소에 없음) |
+| revision ≠ M | `pending` | `image_revision_behind`(M이 아직 안 옴) |
+| Argo | `pending` | `argo_application_missing`, `argo_config_stale`, `argo_compare_stale`, `argo_sync_running`, `argo_sync_failed`, `argo_out_of_sync` |
+| Deployment | `pending` | `workload_missing`, `workload_image_mismatch`, `workload_generation_stale`, `workload_suspended`, `workload_unready` |
+| pod | `pending` | `pod_missing`, `pod_terminating`, `pod_image_mismatch`, `pod_unready` |
+| 어느 읽기든 | `unknown` | `github_unavailable`·`_refused`·`_response_invalid`, `kubernetes_unavailable`·`_refused`·`_response_invalid` |
+
+`blocked`는 기다려도 풀리지 않는 경우다. `image_revision_superseded`는 M의 코드가 새 revision에 들어 있을 수 있지만 M 빌드 자체를 관측할 수 없어 `observed`로 올리지 않는다.
+
+**해당 없음.** `not_applicable`은 설정 저장소(`kind: 'config'`) PR의 파일이 끝까지 읽혔고 전부 `noDeployPrefixes` 안일 때만이다(`docs_only`). 파일 목록은 M이 아니라 PR에서 읽는다. rebase 병합이면 M 하나의 diff는 PR 일부뿐이기 때문이다. 100개 이상이거나 PR을 못 찾으면 `unknown`, 밖이 하나라도 있으면 `blocked: config_change_outside_docs`다. 앱 저장소의 문서 변경은 새 이미지를 만들 수 있어 이 경로를 타지 않는다.
+
+**읽기 경로.** `read-transports.ts`에 새로 더했고 기존 `/read` 응답 모양은 그대로다. `DEPLOY_TARGETS`(`catalog.ts`)는 `/read`의 `SERVICES`·`ARGOCD_APPLICATIONS`와 따로 있어 여기 있어도 `/read`로 열리지 않는다. 저장소 ID를 서비스에 잇는 `resolveService`는 조립할 때 정책으로 준다.
+
+| 읽기 | 경로 | 자격 |
+|---|---|---|
+| Argo Application | `GET /apis/argoproj.io/v1alpha1/namespaces/argocd/applications/{앱}` | SA `bot-reader` |
+| Deployment | `GET /apis/apps/v1/namespaces/{ns}/deployments/{앱}` | SA `bot-reader` |
+| pod 목록 | `GET /api/v1/namespaces/{ns}/pods?labelSelector=homelab.ukyi.app/app={앱}&limit=50` | SA `bot-reader` |
+| PR | `GET /repos/{저장소}/pulls/{n}` | 없음 |
+| 설정 commit | `GET /repos/{설정 저장소}/commits?sha=main&path={image.yaml}&per_page=1` | 없음 |
+| 설정 내용 | `GET /repos/{설정 저장소}/contents/{image.yaml}?ref={K}` | 없음 |
+| revision 관계 | `GET /repos/{저장소}/compare/{M}...{revision}?per_page=1` | 없음 |
+| 병합 PR·파일 | `GET /repos/{설정 저장소}/commits/{M}/pulls`, `.../pulls/{n}/files?per_page=100` | 없음 |
+
+`spec.source`에서 Helm values를 받아도 위 세 키만 투영한다. 지금 RBAC로 충분해 Secret·ConfigMap·log·exec·Argo sync·restart는 없다. GitHub 경로는 자격을 받는 입력이 없어 writer·리뷰 토큰이 나갈 수 없다.
+
+**익명 한도.** GitHub 익명 읽기는 출구 IP당 시간 60회다. commit SHA로 정해지는 내용은 프로세스 안에서 기억해 `pending` 중 조회는 분당 1회로 줄인다. 넘으면 `github_refused`로 `unknown`이고 다른 자격으로 넘어가지 않는다.
+
+**조회 주기.** `DEPLOYMENT_POLL`은 60초 간격·10분 초기 창이다. `deploymentPollStep`이 `settled`·`poll`·`report_late`를 돌려준다. 창이 지나도 끝 상태로 바꾸지 않고 마지막 `pending`·`unknown`과 관측 시각을 알린다. 루프는 B5가 조립한다.
+
+**한계.** D가 정말 M에서 빌드됐는지 다시 검증하지 않는다. `image.yaml`에 적힌 값을 믿고 출처 검증은 자동 병합 조건 5(`deploy-merge`)의 몫이다. 사람이 병합한 `image.yaml`은 그 검사를 거치지 않을 수 있다.
