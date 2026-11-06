@@ -1524,3 +1524,87 @@ POST
 - 전달 보장이 아니다. 훅이 큐에 넣기 전에 죽거나 기기·봇이 24시간 넘게 꺼져 있으면 알림이 없다.
 
 **시험의 한계.** Claude·Codex 입력은 공식 문서의 필드로 만든 합성 입력이다. 실제 CLI 버전별 필드, 절전 복귀, Keychain 동작, NUC 자원 안의 부하, 실제 tailnet 경로(ACL·프록시 태그·집 밖 기기)는 시험하지 않았다.
+
+## 16. T19 CHANGE_PR 계약
+
+**아직 조립되지 않았다.** `src/change-contracts.ts`, `src/change-store.ts`, `migrations/017_change_pr.sql`만 있다. 어떤 진입점도 이 파일을 import하지 않고 명령·루프·writer·네트워크 호출이 없다. migration이 표를 만들 뿐이고 행은 생기지 않는다. 운영 봇의 동작은 그대로다.
+
+**흐름.** 부모 change는 `jobs` 행이 아니라서 승인·배포를 기다리는 동안 실행 slot을 잡지 않는다. 모델 실행만 자식 job이다.
+
+```
+requested → admitted → authoring → snapshot_ready → verifying → reviewing
+  → awaiting_publish_approval → approved → publishing → proposed → merged → observing_deploy
+```
+
+| 전이 | 전용 저장 메서드 | 그때 고정되는 것 |
+|---|---|---|
+| → admitted | `admit` | brief, policy revision. label이 private·unknown이면 대신 `blocked` |
+| → authoring | `pinBase` | B, T0, 브랜치 이름 |
+| → snapshot_ready | `recordSnapshot` | manifest, 변경 파일 바이트, patch, T1, A |
+| → verifying | `startVerification` | verifier revision. 이 시점에 증거 묶음이 완성된다 |
+| → reviewing | `finishVerification` | 필수 command 전부 통과 확인 |
+| → awaiting_publish_approval | `prepareApproval` | 승인 대상과 공개 텍스트, 승인 digest |
+| → approved | `approve` | owner의 승인. 대상 digest가 정확히 같아야 한다 |
+| → merged | `recordMerge` | H, M, PR 번호. 게시한 PR·head가 아니면 거부 |
+| 나머지 | `transition`(CAS) | 없음 |
+
+**끝 상태와 재시작.** `superseded`, `blocked`, `cancelled`, `failed`에서는 나가지 못한다. 새 generation은 전이 표 밖의 `startNextGeneration` 하나로, `superseded`에서만 `requested`로 열고 admission부터 다시 받는다. 성공 경로에는 끝 상태가 없다. `observing_deploy`에 남고 `change_deployments.state`가 `DEPLOYMENT_SETTLED_STATES`면 조회를 멈춘다. PR이 병합 없이 닫히면 `proposed → cancelled`다.
+
+**표.** 모두 새 표이고 기존 표를 고치지 않는다. 시드 행이 없다.
+
+| 표 | 키 | 담는 것 |
+|---|---|---|
+| `change_requests` | `id`, `event_id` unique | 부모. phase, generation, label |
+| `change_request_inputs` | `event_id` | 요청 원문·추가 답변과 label. 공개 경로가 읽지 않는다 |
+| `change_generations` | `(change_id, generation)` | 묶음 필드와 브랜치 이름. 정해지면 안 바뀐다 |
+| `change_artifacts`, `change_artifact_files` | 위 키, 위 키+`path` | manifest·patch, 내용이 있는 변경의 바이트 |
+| `change_child_jobs` | `job_id` → `jobs` | 자식 job 연결과 역할 |
+| `change_verifications` | 위 키+`command_id` | 시험 receipt. command마다 하나라 통과만 골라 쓰지 못한다 |
+| `change_reviews` | 위 키, `job_id` → `change_child_jobs` | 리뷰 receipt. generation마다 하나 |
+| `change_approval_subjects` | 위 키 | 승인 대상 전체와 digest |
+| `change_approvals` | `event_id` unique, 살아 있는 승인 generation당 하나 | 승인과 무효화 |
+| `change_delivery_effects` | `(change_id, generation, stage)` | 게시 effect |
+| `change_deployments` | 위 키 | H, M, K, D, 관측 시각, 상태 |
+
+**DB가 직접 막는 것.** 코드를 거치지 않은 쓰기도 막는다. 위반은 `CH001`과 사유 코드로 나오고 저장 계층이 값으로 바꾼다.
+
+- phase CHECK, 전이 표(`change_phase_transition_allowed`), generation은 `superseded → requested`로 1씩만.
+- 단계 진입 조건: `reviewing`은 brief의 필수 command마다 살아 있는 `passed`, `awaiting_publish_approval`은 완전한 통과 리뷰와 승인 대상, `approved`·`publishing`은 살아 있는 승인, `proposed`는 확정된 `pull` effect, `merged`는 배포 행.
+- label은 내려가지 않고, private·unknown이면 진행 단계에 있을 수 없다.
+- 묶음·artifact·승인 대상·receipt 내용·effect intent는 바뀌지 않는다. receipt·승인은 무효 표시만 더한다.
+- 토큰·키·자격 열이 없다. 시험이 열 이름을 확인한다.
+
+**effect 상태.** `blob → tree → commit → ref → pull` 순서이고 앞 stage가 `confirmed`여야 다음 intent를 받는다. blob은 stage당 행 하나이고 파일별 SHA를 `expected`에 담는다. 같은 내용은 같은 SHA라 재전송해도 중복이 없다.
+
+| 상태 | 나가는 곳 | 뜻 |
+|---|---|---|
+| `pending` | `sending`, `blocked` | intent만 커밋됨. 아직 안 보냄 |
+| `sending` | `confirmed`, `unknown`, `pending`, `blocked` | lease를 쥔 게시자가 전송 중. `pending` 복귀는 확실히 안 나간 경우만 |
+| `unknown` | `confirmed`, `blocked` | 보냈는지 모름. 다시 보내지 않고 대조만 한다. 24시간 뒤 `blockExpiredUnknownEffects`가 `blocked`로 |
+| `confirmed` | 없음 | 응답이 저장한 기대값과 같음 |
+| `blocked` | 없음 | 사람 해소(`resolveBlockedEffect`) 대기. 해소해도 행은 남는다 |
+
+- 미확정 effect는 generation당 하나다(부분 unique 인덱스). 해소 안 된 `blocked`도 센다.
+- `pending → sending`과 intent 생성은 부모가 지금 `publishing`이고 살아 있는 승인이 있을 때만 된다. 트리거가 부모를 `FOR SHARE`로 읽어 취소·무효화와 직렬화하므로 취소 커밋 뒤에 시작되는 전송이 없다.
+- 어느 generation에든 미해소 effect가 있으면 새 generation을 열지 못한다. 미해소 effect는 지울 수 없다.
+- 끝 상태로 가면 그 generation의 살아 있는 승인을 무효로 하고 `pending` effect를 닫는다. 이미 보낸 effect는 대조 대상으로 남는다.
+- 호출자는 intent·claim을 커밋한 뒤 트랜잭션 밖에서 네트워크를 부른다. `ChangeStore`는 네트워크를 부르지 않는다.
+
+**digest.** `canonicalJson`이 키를 정렬해 필드 순서에 흔들리지 않는다. 종류마다 domain이 달라 다른 digest로 재사용되지 않는다. 승인 digest는 묶음 8개 필드, change ID, base·head 브랜치, 시험·리뷰 receipt digest, 제목·본문·commit 메시지·author·committer·날짜·draft, CI fingerprint를 묶는다. 내용이 바뀌면 `invalidateEvidence`로 승인·시험·리뷰를 함께 무효로 하고 끝 상태로 옮긴다. 승인 대상은 generation마다 하나이므로 공개 텍스트만 바꿔도 새 generation이다.
+
+**출처.** `public < approved_public_summary < unknown < private` 순서이고 결과는 입력 중 가장 제한적인 값이다. 입력이 없으면 `unknown`이다. 신고는 올릴 수만 있다(`raiseLabel`). 원문은 `ChangePrivateInputs`로만 읽고 시험이 다른 파일의 표 이름 사용을 잡는다. 공개 렌더러·writer·리뷰 입력에 이 객체를 주지 않는다.
+
+**port.** 선언만 있고 구현은 아래 PR이 넣는다.
+
+| port | 구현 | 하는 일 |
+|---|---|---|
+| `ChangeAuthorPort` | B1 | 작업자 v2 시작·재개·취소, receipt로 결과 재조회, 저장 뒤 finalize |
+| `ChangeArtifactPort` | B1 | 스냅샷 저장·조회. `ChangeStore` 위 어댑터로 충분하다 |
+| `ChangeVerificationPort` | B1 | command ID로 무자격 시험, receipt 재조회 |
+| `ChangeReviewPort` | B2 | 새 세션의 미게시 리뷰, receipt 재조회 |
+| `ChangeWriterPort` | B3 | blob·tree·commit·ref·PR 생성과 대조용 읽기. 결과는 `confirmed`·`not_sent`·`rejected`·`unknown` |
+| `ChangeDeploymentPort` | B4 | 병합 사실 읽기, H·M·K·D 관측 |
+
+조립과 스위치는 B5의 몫이다. 브랜치는 `changeBranchName`만 만들고 `bot/change/<32자리 hex>/g<n>` 외에는 `parseChangeBranch`가 거부한다.
+
+**V1 제한.** manifest의 모든 항목이 mode `100644`·`100755`여야 한다. 변경하지 않아도 T0에 symlink·gitlink가 있으면 manifest를 만들 수 없어 그 저장소는 시작부터 닫힌다. 변경 내용 합계 1 MiB, HTTP body 2 MiB를 넘으면 차단한다. 변경 파일 256개, manifest 5,000항목은 제안값이다. command·리뷰는 generation당 한 번이라 실패한 결과를 같은 generation에서 다시 받지 못한다.

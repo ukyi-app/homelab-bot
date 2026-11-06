@@ -1477,3 +1477,48 @@ manifest는 정확한 경로만 받는다. **올릴 때 그 경로가 비어 있
 - 새 시험 파일과 `memory-briefing-pg`·`ops-metrics`를 실제 PostgreSQL과 함께 3회 반복: 46건 모두 통과.
 
 **시험의 한계.** 실제 Discord 채널에서 본 모습, 운영 `/metrics`, homelab 룰의 평가는 보지 않았다.
+||||||| parent of 416fe7b (feat(t19): CHANGE_PR 계약과 저장 계층을 조립 없이 더한다 (017))
+
+## T19 B0 계약·저장 (2026-11-06, 로컬·PG)
+
+계약과 저장만 넣었고 어떤 진입점에도 조립하지 않았다. 등급은 mock·local_integration이고 입력은 모두 합성이다. GitHub·Discord·모델·클러스터에 닿지 않았다. T19의 CHANGE·DEPLOY·DATA·EVENT 시험을 통과했다는 뜻이 아니다. 그 시험은 B1~B5 뒤에 돈다.
+
+| 시험 파일 | 수 | 본 것 |
+|---|---|---|
+| `test/change-contracts.test.ts` | 27 | 전이 표 고정, label 전파, 직렬화, 승인·묶음·artifact digest의 필드별 변화와 필드 순서 불변, 브랜치 형식과 `refs/heads/bot/**/*`, manifest 경로·mode·상한, 바이트 대조, receipt·공개 metadata·배포 관측 스키마 |
+| `test/change-store.test.ts`(PGlite) | 31 | 정상 경로 전체, CAS 실패 값, DB 함수와 코드 표의 전 쌍 대조, 코드를 거치지 않은 쓰기 거부, 이벤트 중복, 출처 차단, 원문 표 분리, 스냅샷 멱등, receipt·승인·무효화, 새 generation, effect 순서·lease·unknown 24시간·사람 해소, 병합·배포, 016 업그레이드와 파일 재실행, 기존 표·제약 불변 |
+| `test/change-store-pg.test.ts`(PostgreSQL 18.6) | 11 | 다중 연결 경합: 같은 전이, 다른 전이, 같은 effect claim, 같은 intent, 중복 이벤트, claim과 취소, 승인과 무효화, 새 generation, 대조 확정. 016 업그레이드, 겹친 마이그레이션 Job |
+
+**결과.** 저장소의 다른 시험이 쓰는 방식대로 네트워크 없는 임시 `postgres:18-alpine`(18.6) 소켓을 줬고 끝난 뒤 컨테이너를 지웠다. Node 24.22.0.
+
+- `npm run check`: 통과.
+- PostgreSQL 포함 `npm test`(봇 #78 위, 아래 리뷰 반영 뒤): **1594 / 1581 pass / 0 fail / 13 skipped**. skip은 전부 `SEC02_IMAGE` 없음이다.
+- 리뷰 반영 전 기준: PostgreSQL 없는 `npm test` **1554 / 1465 pass / 0 fail / 89 skipped**, PG 시험 11건을 5회 더 반복해 모두 통과.
+
+**수정 전 실패.** 시험을 먼저 넣었을 때 구현 모듈이 없어 `tsc` 오류 128건으로 실패했다. 컴파일 실패이므로 시험별 실패 수는 없다.
+
+**PR 리뷰 반영(P2 5건, 모두 수용).** 시험을 먼저 넣어 수정 전 실패를 확인했다.
+
+- 삭제·mode 변경만 있는 artifact는 blob 기대값을 만들 수 없어 게시로 못 갔다. 빈 목록을 받고, 빈 결과와만 맞는다.
+- 잘못된 `verifierRevision`·`policyRevision`이 커밋되어 그 generation을 진행할 수 없었다. 쓰기 전에 검사한다. 같은 종류(실패 값을 돌려줘도 커밋)를 저장 계층 전체에서 봤고 나머지는 의도한 닫힘 기록이거나 쓰기 전 검사다.
+- 부모가 끝 상태가 된 뒤 미전송을 반납하면 `pending`으로 남아 다음 generation이 막혔다. 게시 단계가 아니면 `not_sent`로 해소한다.
+- 파일을 지우고 그 자리를 디렉터리로 바꾸는 변경이 거부됐다. 파일·디렉터리 충돌을 T0와 T1에서 따로 본다.
+
+**변이 확인.** 임시 사본에 변이를 하나씩 넣고 새 시험 세 파일을 돌렸다. 원본 대조는 63/63 pass다. 12건 모두 실패로 잡혔다.
+
+| 변이 | 잡은 시험 수 |
+|---|---|
+| 직렬화 키 정렬 제거 | 6 |
+| 승인 digest의 시험 정렬 제거 | 1 |
+| `raiseLabel`이 신고값을 그대로 따름 | 2 |
+| 브랜치 형식이 임의 ID를 받음 | 1 |
+| claim의 `state='pending'` 조건 제거 | 1(PG 경합) |
+| 전이의 `phase` CAS 제거 | 5 |
+| 승인의 부모 잠금 제거 | 1(PG 경합) |
+| 미확정 effect 부분 unique 인덱스 제거 | 1 |
+| `pending → sending` 트리거 조건 제거 | 1 |
+| label 하향 트리거 제거 | 1 |
+| 새 generation의 미해소 effect 트리거 조건 제거 | 1 |
+| SQL 전이 표에서 한 행 제거 | 1 |
+
+**하지 않은 것.** 실제 조립·운영 migration 적용, 실제 작업자·GitHub 응답과의 대조, artifact 원문 보존 기간의 삭제 경로. 부하 아래 잠금 시한(`busy`) 값은 경합 시험에서 나오지 않아 직접 재현하지 않았다.
