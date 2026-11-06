@@ -300,19 +300,20 @@ export function patchProblems(manifest: ArtifactManifest, patch: string, files: 
 // patch를 base 바이트에 실제로 적용한다. 왼쪽 줄이 base와 다르거나 hunk 위치가 겹치면 null이다.
 function applyHunks(base: Uint8Array, section: PatchSection): Buffer | null {
   const { lines, endsWithNewline } = contentLines(base);
-  const result: string[] = [];
+  // 파일의 줄 수가 V8 함수 인수 한도를 넘을 수 있어 push로 펼치지 않는다. 한 줄만 고친 patch도 나머지 줄을 전부 옮긴다.
+  const parts: (readonly string[])[] = [];
   let cursor = 0;
   let noEol = !endsWithNewline && lines.length > 0;
   for (const hunk of section.hunks) {
     // 지운 줄이 없는 hunk의 시작 번호는 끼워 넣을 자리의 앞줄이다.
     const start = hunk.before.length ? hunk.oldStart - 1 : hunk.oldStart;
     if (start < cursor || start + hunk.before.length > lines.length || hunk.before.some((line, index) => lines[start + index] !== line)) return null;
-    result.push(...lines.slice(cursor, start), ...hunk.after);
+    parts.push(lines.slice(cursor, start), hunk.after);
     cursor = start + hunk.before.length;
     if (cursor === lines.length) noEol = hunk.afterNoEol;
   }
-  result.push(...lines.slice(cursor));
-  return fullImage(result, noEol);
+  parts.push(lines.slice(cursor));
+  return fullImage(parts.flat(), noEol);
 }
 // 고정 base에 patch를 적용한 결과가 manifest와 같아야 diff가 변경 전부를 보여 준 것이다. T0 바이트는 작업자의 압축본에만 있어 작업자가 본다.
 // 압축본은 export-ignore·export-subst·eol 속성의 영향을 받는다. 그런 저장소는 여기서 막히고(닫힌 쪽) 통과로 새지 않는다.
@@ -737,13 +738,13 @@ export class ChangeReviewService implements ChangeReviewPort {
   // 끝날 때까지 기다린다. 긴 대기가 곤란한 호출자는 submit과 fetchReceipt로 나눠 쓴다.
   async review(input: ReviewPortInput, signal?: AbortSignal): Promise<ReviewReceipt> {
     await this.validate(input);
-    const stored = await this.storedReceipt(input.key);
+    const stored = await this.settledReceipt(input.key);
     if (stored) return stored;
     await this.submit(input);
     let lastProbe = 0;
     for (;;) {
       if (signal?.aborted || this.deps.shutdown?.aborted) throw new ChangeReviewFailed('interrupted');
-      const receipt = await this.storedReceipt(input.key);
+      const receipt = await this.settledReceipt(input.key);
       if (receipt) return receipt;
       const job = await this.reviewJob(input.key);
       if (!job) throw new ChangeReviewFailed('job_missing');
@@ -759,10 +760,21 @@ export class ChangeReviewService implements ChangeReviewPort {
   }
   // 저장된 receipt가 먼저다. 없고 실행 결과가 불명이면 작업자에 남은 결과만 받아 온다. 모델은 다시 부르지 않는다.
   async fetchReceipt(key: ChangeKey): Promise<ReviewReceipt | null> {
-    const stored = await this.storedReceipt(key);
+    const stored = await this.settledReceipt(key);
     if (stored) return stored;
     const job = await this.reviewJob(key);
     return job && this.recoverable(job) ? this.recover(job, key) : null;
+  }
+  // receipt 기록과 job 종료 사이에서 끊겼으면 돌려주기 전에 마저 닫는다. 닫히지 않은 unknown은 대화 레인을 막고 작업자 결과도 남긴다.
+  private async settledReceipt(key: ChangeKey): Promise<ReviewReceipt | null> {
+    const receipt = await this.storedReceipt(key);
+    if (!receipt) return null;
+    const job = await this.reviewJob(key);
+    if (job?.lease_token && (['running', 'verifying', 'cancel_requested', 'unknown'].includes(job.state) || this.recoverable(job))) {
+      await this.closeJob(job, 'succeeded', null);
+      await this.acknowledge(job);
+    }
+    return receipt;
   }
   private async storedReceipt(key: ChangeKey): Promise<ReviewReceipt | null> {
     const row = (await this.db.query<{ receipt: unknown; invalidated_at: unknown }>('SELECT receipt,invalidated_at FROM change_reviews WHERE change_id=$1 AND generation=$2', [key.changeId, key.generation])).rows[0];

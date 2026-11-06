@@ -328,6 +328,17 @@ test('T19 B2 patchBaseProblems: base에 적용한 결과가 manifest와 다르�
   assert.deepEqual(patchBaseProblems(changedOf(entries), 'not a patch\n', base), ['patch_unparseable']);
 });
 
+test('T19 B2 patchBaseProblems: 짧은 줄이 아주 많은 파일도 어느 위치의 hunk든 함수 인수 한도에 걸리지 않고 적용한다', () => {
+  const count = 200_000;
+  const header = ['diff --git a/big.txt b/big.txt', '--- a/big.txt', '+++ b/big.txt'];
+  const body = 'x\n'.repeat(count);
+  const base = readArchive(tarGz({ 'big.txt': body }), 1024 * 1024);
+  const applied = (hunk: readonly string[], result: string) => patchBaseProblems([{ path: 'big.txt', changeKind: 'modified', sha256: sha256Hex(Buffer.from(result)) }], [...header, ...hunk, ''].join('\n'), base);
+  // 첫 줄 hunk는 뒤에 남은 줄을, 끝 줄 hunk는 앞에 남은 줄을 한꺼번에 옮긴다.
+  assert.deepEqual(applied(['@@ -1 +1 @@', '-x', '+y'], `y\n${'x\n'.repeat(count - 1)}`), []);
+  assert.deepEqual(applied([`@@ -${count} +${count} @@`, '-x', '+y'], `${'x\n'.repeat(count - 1)}y\n`), []);
+});
+
 test('T19 B2 incomplete: 수정 파일의 hunk가 통째로 빠지면 모델을 부르지 않고 blocked다', async () => {
   const hunk = (start: number, before: string, after: string) => [`@@ -${start} +${start} @@`, `-${before}`, `+${after}`];
   const lines = (first: string, last: string) => [first, ...NUMBERED.slice(1, 15).map(line => line.trimEnd()), last].join('\n') + '\n';
@@ -585,6 +596,43 @@ test('T19 B2 응답 유실: 저장된 결과를 다시 받아 receipt를 만들�
   assert.equal(reviewReceiptDigest(receipt), reviewReceiptDigest((await storedReviews(input.key))[0]!.receipt as typeof receipt));
   // 저장을 확인했으니 작업자가 결과를 지웠다.
   assert.equal(await h.results.get(job.id, job.lease_token), null);
+});
+
+test('T19 B2 응답 유실: receipt 기록 뒤 job 종료 전에 끊기면 저장된 receipt를 돌려줄 때 job을 닫고 작업자 결과를 지운다', async () => {
+  // fetchReceipt·review 두 입구가 같은 복구를 거친다. resolved는 unknown 조사가 먼저 실패로 닫은 경우다.
+  for (const { entry, resolved } of [
+    { entry: 'fetchReceipt', resolved: false },
+    { entry: 'review', resolved: false },
+    { entry: 'fetchReceipt', resolved: true },
+  ]) {
+    const h = harness();
+    const input = await reviewing();
+    const record = changes.recordReview.bind(changes);
+    let interrupted = false;
+    changes.recordReview = async review => {
+      await record(review);
+      interrupted = true;
+      throw new Error('publisher_lost_after_record');
+    };
+    await h.service.submit(portInput(input));
+    await h.runtime.tick();
+    changes.recordReview = record;
+    assert.equal(interrupted, true);
+    const job = await jobOf(input.key);
+    assert.equal(job.state, 'unknown');
+    assert.equal(await f.store.laneBusy('interactive'), true);
+    assert.equal((await storedReviews(input.key)).length, 1);
+    if (resolved) {
+      const row = (await database.db.query<Record<string, unknown>>('SELECT * FROM jobs WHERE id=$1', [job.id])).rows[0]!;
+      assert.equal(await f.store.resolveUnknown(row as never), true);
+    }
+    const receipt = entry === 'review' ? await h.service.review(portInput(input)) : (await h.service.fetchReceipt(input.key))!;
+    assert.equal(receipt.verdict, 'pass');
+    assert.equal((await jobOf(input.key)).state, 'succeeded');
+    assert.equal(await f.store.laneBusy('interactive'), false);
+    assert.equal(await h.results.get(job.id, job.lease_token), null);
+    assert.equal(h.inputs.length, 1);
+  }
 });
 
 test('T19 B2 응답 유실: unknown 조사가 먼저 실패로 닫아도 남은 결과로 회수한다', async () => {
