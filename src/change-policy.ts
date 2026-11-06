@@ -199,8 +199,13 @@ export function inspectCandidate(input: { base: BaseTreeSnapshot; manifest: Arti
   // 대소문자·정규화로 같은 이름이 되는 경로를 새로 만들지 않는다. T0에 이미 있는 충돌을 그대로 두는 것은 변경이 아니다.
   const folded = new Map<string, string[]>();
   for (const entry of result) folded.set(fold(entry.path), [...(folded.get(fold(entry.path)) ?? []), entry.path]);
+  // 접었을 때 파일이 다른 파일의 상위 디렉터리가 되어도 그런 파일 시스템에는 함께 받을 수 없다. 원래 경로로 보는 gitTreeSha 검사는 이 경우를 잡지 못한다.
+  const parentsOf = (path: string) => path.split('/').slice(0, -1).map((_, index, parts) => parts.slice(0, index + 1).join('/'));
+  const foldedParents = new Set([...folded.keys()].flatMap(parentsOf));
   for (const entry of changed) {
-    if (entry.changeKind !== 'deleted' && (folded.get(fold(entry.path))?.length ?? 0) > 1) return { ok: false, reason: 'path_collision', path: entry.path };
+    if (entry.changeKind === 'deleted') continue;
+    const name = fold(entry.path);
+    if ((folded.get(name)?.length ?? 0) > 1 || foldedParents.has(name) || parentsOf(name).some(parent => folded.has(parent))) return { ok: false, reason: 'path_collision', path: entry.path };
   }
   // rename은 deleted+added로 나타나 두 쪽이 모두 여기를 지난다. 보호 판정이 허용 목록보다 먼저다.
   for (const entry of changed) if (isProtectedPath(entry.path)) return { ok: false, reason: 'protected_path', path: entry.path };

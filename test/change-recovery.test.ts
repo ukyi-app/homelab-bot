@@ -154,6 +154,35 @@ test('T19 B3 복구: 미전송 재시도는 간격을 늘리고 횟수를 넘으
   } finally { await close(); }
 });
 
+test('T19 B3 복구: 토큰 발급의 호출 한도 초과는 막지 않고 미룬 뒤 이어 간다', async () => {
+  for (const headers of [{ 'retry-after': '60' }, { 'x-ratelimit-remaining': '0' }] as Record<string, string>[]) {
+    const { env, close } = await setup();
+    try {
+      const key = await env.approve();
+      env.github.tokenOverride = () => new Response('{}', { status: 403, headers });
+      assert.equal((await env.publisher.publish(key)).kind, 'deferred');
+      assert.equal(env.github.mutations().length, 0);
+      env.github.tokenOverride = undefined;
+      env.clock.now += 60_000;
+      assert.equal((await env.newPublisher().publish(key)).kind, 'proposed');
+    } finally { await close(); }
+  }
+});
+
+test('T19 B3 복구: 대조 중 막힌 effect도 reconcile 보고서의 blocked에 들어간다', async () => {
+  const { env, close } = await setup();
+  try {
+    const key = await env.approve();
+    env.github.fail(ROUTES.ref, 'reset_before_apply');
+    assert.deepEqual(await env.publisher.publish(key), { kind: 'unknown', stage: 'ref' });
+    env.github.refs.set(`heads/${branchOf(key)}`, 'a'.repeat(40));
+    const report = await env.newPublisher().reconcile();
+    assert.deepEqual(report.blocked, [{ ...key, stage: 'ref' }]);
+    assert.deepEqual(report.stillUnknown, []);
+    assert.equal(ok(await env.store.get(key.changeId)).phase, 'blocked');
+  } finally { await close(); }
+});
+
 test('T19 B3 복구: 재시도해도 소용없는 미전송은 바로 닫는다(토큰 권한·저장소 불일치)', async () => {
   for (const [name, response, reason] of [
     ['권한 불일치', (now: number) => new Response(JSON.stringify({ token: 'ghs_fixtureX', expires_at: new Date(now + 3_600_000).toISOString(), permissions: { contents: 'write', actions: 'write' }, repositories: [{ id: REPO.id, full_name: REPO.fullName }] }), { status: 201 }), 'token_permission_mismatch'],

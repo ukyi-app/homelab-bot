@@ -164,6 +164,10 @@ test('T19 B3 정책: 대소문자·정규화 충돌과 파일·디렉터리 충�
   rejected(inspectCandidate({ base, manifest: conflicted, files, policies: [smokePolicy()] }), 'manifest_invalid');
   const swap = inspect([{ path: 'src/a.ts', kind: 'deleted' }, { path: 'src/a.ts/x', kind: 'added' }]);
   assert.equal(swap.ok, true, '지운 파일 자리를 디렉터리로 바꾸는 변경은 받는다');
+  // 접으면 파일이 다른 파일의 상위 디렉터리가 되는 경우다. 대소문자를 안 가리는 파일 시스템에는 함께 받을 수 없다.
+  rejected(inspect([{ path: 'src/A.ts/x.ts', kind: 'added' }]), 'path_collision');
+  rejected(inspect([{ path: 'src/LIB', kind: 'added' }], { base: baseOf([...baseLeaves(), leaf('src/lib/x.ts', '1\n')]) }), 'path_collision');
+  assert.equal(inspect([{ path: 'src/a.ts', kind: 'deleted' }, { path: 'src/A.ts/x.ts', kind: 'added' }]).ok, true, '지운 파일과는 충돌하지 않는다');
   // 입력 순서와 상관없이 같은 이름의 파일과 디렉터리는 한 tree에 있을 수 없다. 조용히 덮으면 그 아래 파일이 빠진 SHA가 나온다.
   const dirAndFile = [leaf('a/b', '1\n'), leaf('a', '2\n')];
   assert.throws(() => gitTreeSha(dirAndFile), /tree_file_directory_conflict/);

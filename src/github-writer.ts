@@ -177,7 +177,8 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
     let jwt: string;
     try { jwt = appJwt(app, now()); } catch { throw new TokenFailure('token_jwt_failed'); }
     const result = await exchange('POST', `/app/installations/${repo.installationId}/access_tokens`, jwt, { repository_ids: [repo.id], permissions: wanted }, LIMIT.small);
-    if (result.kind === 'http') throw new TokenFailure(`token_http_${result.status}`);
+    // 한도 초과는 쓰기 요청과 같이 다뤄 게시를 닫지 않고 미룬다. 토큰 발급 전이라 공개 쓰기는 나가지 않았다.
+    if (result.kind === 'http') throw new TokenFailure(result.limited ? 'rate_limited' : `token_http_${result.status}`);
     if (result.kind === 'not_sent') throw new TokenFailure(result.code);
     if (result.kind === 'lost') throw new TokenFailure(result.code === 'response_lost' ? 'token_unavailable' : 'token_response_invalid');
     const parsed = TokenResponse.safeParse(result.json);

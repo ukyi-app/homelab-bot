@@ -43,7 +43,7 @@ const DEFAULT_RETRY_MS = 60_000;
 const MAX_RETRY_MS = 3_600_000;
 const MAX_SEND_ATTEMPTS = 8;
 // 나중에 다시 하면 풀릴 수 있는 미전송만 재시도한다. 입력·권한·저장소 불일치는 다시 해도 같아서 사람에게 넘긴다.
-const TRANSIENT_NOT_SENT = new Set(['connection_refused', 'connection_failed', 'rate_limited', 'policy_unavailable', 'token_unavailable', 'token_http_429', 'token_response_invalid']);
+const TRANSIENT_NOT_SENT = new Set(['connection_refused', 'connection_failed', 'rate_limited', 'policy_unavailable', 'token_unavailable', 'token_response_invalid']);
 const isTransientNotSent = (code: string) => TRANSIENT_NOT_SENT.has(code) || /^token_http_5\d\d$/.test(code);
 
 interface Plan {
@@ -459,6 +459,8 @@ export class ChangePublisher {
       const verdict = await this.reconcileEffect(effect);
       if (verdict === 'confirmed') report.confirmed.push(key);
       else if (verdict === 'unresolved') report.stillUnknown.push(key);
+      // 이미 막힌 effect는 아래 기한 처리에 다시 나오지 않아 여기서 빼면 사람 해소가 필요한 건이 보고서에서 사라진다.
+      else report.blocked.push(key);
     }
     for (const effect of await this.store.blockExpiredUnknownEffects()) {
       const key = { changeId: effect.changeId, generation: effect.generation, stage: effect.stage };

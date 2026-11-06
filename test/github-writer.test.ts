@@ -282,6 +282,9 @@ test('T19 B3 writer: 토큰 응답의 저장소·권한·만료를 대조한다.
     ['스키마 어긋남', () => new Response('{"token":""}', { status: 201 }), 'token_response_invalid'],
     ['JSON 아님', () => new Response('x', { status: 201 }), 'token_response_invalid'],
     ['발급 거부', () => new Response('{}', { status: 403 }), 'token_http_403'],
+    ['발급 한도 초과 Retry-After', () => new Response('{}', { status: 403, headers: { 'retry-after': '60' } }), 'rate_limited'],
+    ['발급 한도 초과 남은 횟수 0', () => new Response('{}', { status: 403, headers: { 'x-ratelimit-remaining': '0' } }), 'rate_limited'],
+    ['발급 429', () => new Response('{}', { status: 429 }), 'rate_limited'],
   ];
   for (const [name, response, code] of cases) {
     const { github, writer } = setup();
