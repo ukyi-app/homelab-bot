@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
 import { changeBranchName, gitBlobSha, sha256Hex } from '../src/change-contracts.js';
-import type { ArtifactFile, ArtifactManifest, ChangeBrief, ChangeKey, ManifestChangeKind, ReviewReceipt } from '../src/change-contracts.js';
+import type { ArtifactFile, ArtifactManifest, ChangeBrief, ChangeKey, ChangeTarget, ManifestChangeKind, ReviewReceipt } from '../src/change-contracts.js';
 import { evaluateCi } from '../src/change-ci-policy.js';
 import { ChangeRepositoryPolicySchema, gitCommitSha, gitTreeSha } from '../src/change-policy.js';
 import type { BaseLeaf, ChangeRepositoryPolicy } from '../src/change-policy.js';
@@ -268,6 +268,8 @@ export interface PublishEnv {
   publisher: ChangePublisher; newPublisher: () => ChangePublisher;
   base: { sha: string; tree: string; leaves: BaseLeaf[] };
   writerIO: ReturnType<typeof createGitHubWriter>;
+  // 쓰기 직전 권한 확인의 대역. 기본은 통과이고 시험이 check를 바꿔 끼운다.
+  writeGuard: { check: (target: ChangeTarget) => Promise<void> };
   approve: (changes?: FileChange[], overrides?: { brief?: Partial<ChangeBrief> }) => Promise<ChangeKey>;
   // 현재 generation을 admit부터 approve 직전(reviewing)까지 민다.
   driveToReview: (key: ChangeKey, changes: FileChange[], overrides?: { brief?: Partial<ChangeBrief> }) => Promise<ReviewReceipt>;
@@ -293,7 +295,8 @@ export async function publishEnv(db: Database, options: { files?: Record<string,
   policy.current = repositoryPolicy({ ci: { ...policy.current!.ci, approvedFingerprint: fingerprint } });
   const source = async () => policy.current;
   const syncedNow = () => { github.clock = clock.now; return clock.now; };
-  const writerIO = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: policyWriterRepositories(source), send: github.send, now: syncedNow });
+  const writeGuard: PublishEnv['writeGuard'] = { check: async () => {} };
+  const writerIO = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: policyWriterRepositories(source), authorizeWrite: target => writeGuard.check(target), send: github.send, now: syncedNow });
   const newPublisher = () => new ChangePublisher({ store, writer: writerIO.writer, preflight: writerIO.preflight, policy: source, authorize: async () => {}, now: () => clock.now, retryMs: 60_000 });
   const newRequest = async () => {
     const request = ok(await store.createRequest({ eventId: newEvent(), ownerId: OWNER, conversationId: CONVERSATION, scope: { guild: 'fixture-guild', channel: 'fixture-thread', parent: 'fixture-chat', kind: 'thread' },
@@ -329,7 +332,7 @@ export async function publishEnv(db: Database, options: { files?: Record<string,
   };
   approveKeyFor.set(store, approveKey);
   const approve: PublishEnv['approve'] = async (changes = DEFAULT_CHANGES, overrides = {}) => approveKey(await newRequest(), changes, overrides);
-  return { db, store, github, clock, policy, publisher, newPublisher, base, writerIO, approve, driveToReview, newRequest };
+  return { db, store, github, clock, policy, publisher, newPublisher, base, writerIO, writeGuard, approve, driveToReview, newRequest };
 }
 const approveKeyFor = new WeakMap<ChangeStore, (key: ChangeKey, changes: FileChange[]) => Promise<ChangeKey>>();
 // 새 generation도 같은 경로로 민다.

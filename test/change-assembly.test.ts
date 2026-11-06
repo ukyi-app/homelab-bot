@@ -1181,6 +1181,113 @@ test('권한 조회 불가: 정책을 읽지 못하면 쓰지 않고 부모를 �
   });
 });
 
+// 맞는 요청 하나를 세워 그 사이에 철회를 끼운다. before면 GitHub이 받기 전에, after면 처리한 뒤 응답만 세운다.
+const holdOnce = (h: Harness, match: (method: string, url: string) => boolean, when: 'before' | 'after' = 'before') => {
+  const send = h.env.github.send;
+  let arrive!: () => void;
+  let release!: () => void;
+  let used = false;
+  const arrived = new Promise<void>(resolve => { arrive = resolve; });
+  const released = new Promise<void>(resolve => { release = resolve; });
+  (h.env.github as { send: typeof fetch }).send = async (input, init) => {
+    const hit = !used && match(init?.method ?? 'GET', String(input));
+    if (hit) used = true;
+    if (hit && when === 'before') { arrive(); await released; }
+    const response = await send(input, init);
+    if (hit && when === 'after') { arrive(); await released; }
+    return response;
+  };
+  return { arrived, release };
+};
+const toApproved = async (h: Harness) => {
+  const id = await toAwaiting(h);
+  await h.command('101', 'change-publish', { target: id, text: await digestOf(h, id) });
+  return id;
+};
+const PULL_POST = /POST .*\/pulls$/;
+// ref가 만들어진 뒤의 봇 브랜치 조회는 PR 직전 신선도 검사의 마지막 읽기다.
+const lastHeadRead = (h: Harness) => (method: string, url: string) => method === 'GET' && /\/git\/ref\/heads\//.test(url) && !url.endsWith('/heads/main') && h.env.github.count(/POST .*\/git\/refs$/) > 0;
+const effectRow = async (h: Harness, id: string, stage: string) => (await h.db.query<{ state: string; blocked_reason: string | null; resolution: string | null }>('SELECT state,blocked_reason,resolution FROM change_delivery_effects WHERE change_id=$1 AND stage=$2', [id, stage])).rows[0];
+
+test('쓰기 직전 철회: 마지막 head 조회를 세운 동안 /revoke면 PR 요청이 0회이고 effect가 묶이지 않으며 해제해도 다시 게시하지 않는다', async () => {
+  await withHarness({}, async h => {
+    const id = await toApproved(h);
+    const hold = holdOnce(h, lastHeadRead(h));
+    const tick = h.runtime.publishTick();
+    await hold.arrived;
+    await h.command('102', 'revoke', { target: OWNER });
+    hold.release();
+    await tick;
+    assert.equal(h.env.github.count(PULL_POST), 0, 'PR 요청 0회');
+    assert.equal(await h.phase(id), 'cancelled', '입구와 같은 게이트가 부모를 닫는다');
+    assert.equal((await h.changes.get(id) as any).value.phaseReason, 'authorization_revoked');
+    assert.deepEqual(await effectRow(h, id, 'pull'), { state: 'blocked', blocked_reason: 'abandoned_unsent', resolution: 'not_sent' }, '안 나간 것으로 해소한다');
+    assert.deepEqual(await h.changes.unresolvedEffects({ changeId: id }), [], 'sending·unknown으로 남지 않는다');
+    assert.equal(h.env.github.mutations(/DELETE|PATCH/).length, 0, '이미 공개된 객체를 되돌리지 않는다');
+    // 철회를 풀어도 cancelled는 끝 상태다. 권한이 돌아왔다고 닫힌 건을 게시하지 않는다.
+    await h.db.query('DELETE FROM denied_actors');
+    await h.runtime.reconcile();
+    await h.runtime.publishTick();
+    assert.equal(h.env.github.count(PULL_POST), 0);
+    assert.equal(await h.phase(id), 'cancelled');
+  });
+});
+test('쓰기 직전 철회: 첫 blob 응답을 세운 동안 철회하면 남은 blob이 0회다', async () => {
+  await withHarness({}, async h => {
+    const id = await toApproved(h);
+    const hold = holdOnce(h, (method, url) => method === 'POST' && url.endsWith('/git/blobs'), 'after');
+    const tick = h.runtime.publishTick();
+    await hold.arrived;
+    await h.command('102', 'revoke', { target: OWNER });
+    hold.release();
+    await tick;
+    assert.equal(h.env.github.count(/POST .*\/git\/blobs$/), 1, '첫 blob 뒤로 나가지 않는다');
+    assert.equal(h.env.github.count(/POST .*\/git\/trees$/), 0);
+    assert.equal(await h.phase(id), 'cancelled');
+    assert.deepEqual(await effectRow(h, id, 'blob'), { state: 'blocked', blocked_reason: 'abandoned_unsent', resolution: 'not_sent' });
+  });
+});
+test('쓰기 직전 철회: 권한 확인 자체가 실패하면 PR 요청이 0회이고 닫지 않으며 확인이 돌아오면 이어 게시한다', async () => {
+  await withHarness({}, async h => {
+    const id = await toApproved(h);
+    const hold = holdOnce(h, lastHeadRead(h));
+    const tick = h.runtime.publishTick();
+    await hold.arrived;
+    const real = h.gate.authorize.bind(h.gate);
+    h.gate.authorize = async () => { throw new Error('fixture_database_down'); };
+    hold.release();
+    await tick.catch(() => {});
+    h.gate.authorize = real;
+    assert.equal(h.env.github.count(PULL_POST), 0, 'PR 요청 0회');
+    assert.equal(await h.phase(id), 'publishing', '철회가 아니라 부모를 닫지 않는다');
+    assert.equal((await effectRow(h, id, 'pull'))!.state, 'pending', '다시 보낼 수 있게 놓아 둔다');
+    await h.db.query('UPDATE change_delivery_effects SET available_at=0 WHERE change_id=$1', [id]);
+    const report = await h.runtime.reconcile();
+    assert.equal(report.resumed[0]?.outcome.kind, 'proposed');
+    assert.equal(h.env.github.count(PULL_POST), 1);
+  });
+});
+test('쓰기 직전 철회: 이미 보낸 요청의 응답을 잃으면 철회와 겹쳐도 unknown 대조는 계속되고 다시 보내지 않는다', async () => {
+  await withHarness({}, async h => {
+    const id = await toApproved(h);
+    const { result_tree: resultTree } = (await h.db.query<{ result_tree: string }>('SELECT result_tree FROM change_generations WHERE change_id=$1', [id])).rows[0]!;
+    const hold = holdOnce(h, (method, url) => method === 'POST' && url.endsWith('/git/trees'));
+    h.env.github.fail(/POST .*\/git\/trees$/, 'lose_response');
+    h.env.github.fail(new RegExp(`GET .*/git/trees/${resultTree}`), { status: 500 });
+    const tick = h.runtime.publishTick();
+    await hold.arrived;
+    await h.command('102', 'revoke', { target: OWNER });
+    hold.release();
+    await tick;
+    assert.equal((await effectRow(h, id, 'tree'))!.state, 'unknown', '보냈을 수 있어 미전송으로 치지 않는다');
+    const report = await h.runtime.reconcile();
+    assert.deepEqual(report.confirmed.map(item => item.stage), ['tree'], '철회 뒤에도 읽기 대조로 확정한다');
+    assert.equal(h.env.github.count(/POST .*\/git\/trees$/), 1, '다시 보내지 않는다');
+    assert.equal(h.env.github.count(/POST .*\/git\/commits$/), 0);
+    assert.equal(await h.phase(id), 'cancelled');
+  });
+});
+
 // ---- 굶주림 ----
 
 const observedDeployment = (changeId: string, at: number) => ({ state: 'observed' as const, headSha: git('h'), mergeCommit: git('m'), configCommit: git('k'), imageDigest: `sha256:${hex('d')}`, argoObservedAt: at, workloadObservedAt: at, observedAt: at, reason: null, changeId });

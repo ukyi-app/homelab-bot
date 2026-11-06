@@ -30,7 +30,7 @@ export type PublishOutcome =
 export interface ChangePublisherOptions {
   store: ChangeStore; writer: ChangeWriterPort; preflight: ChangePreflightPort;
   policy: (repoId: number) => Promise<ChangeRepositoryPolicy | null>;
-  // 요청자의 지금 권한. 정책 조회와 writer는 /revoke의 거부 목록을 보지 않아 쓰기 경로마다 이 값을 따로 물어야 한다. 철회면 Denied, 정책을 못 읽으면 PolicyUnavailable을 던진다.
+  // 요청자의 지금 권한. 정책 조회는 /revoke의 거부 목록을 보지 않아 따로 물어야 한다. 전송 직전 확인은 writer의 authorizeWrite가 맡고, 이 값은 부모를 닫을지 정한다. 철회면 Denied, 정책을 못 읽으면 PolicyUnavailable을 던진다.
   authorize: (request: Pick<ChangeRequest, 'ownerId' | 'scope'>) => Promise<unknown>;
   now?: () => number; log?: Log; retryMs?: number; leaseRenewMs?: number;
 }
@@ -46,7 +46,7 @@ const DEFAULT_RETRY_MS = 60_000;
 const MAX_RETRY_MS = 3_600_000;
 const MAX_SEND_ATTEMPTS = 8;
 // 나중에 다시 하면 풀릴 수 있는 미전송만 재시도한다. 입력·권한·저장소 불일치는 다시 해도 같아서 사람에게 넘긴다.
-const TRANSIENT_NOT_SENT = new Set(['connection_refused', 'connection_failed', 'rate_limited', 'policy_unavailable', 'token_unavailable', 'token_response_invalid']);
+const TRANSIENT_NOT_SENT = new Set(['connection_refused', 'connection_failed', 'rate_limited', 'policy_unavailable', 'authorization_check_failed', 'token_unavailable', 'token_response_invalid']);
 const isTransientNotSent = (code: string) => TRANSIENT_NOT_SENT.has(code) || /^token_http_5\d\d$/.test(code);
 
 interface Plan {
@@ -107,7 +107,7 @@ export class ChangePublisher {
     return this.finish(key, plan.generation, pull);
   }
 
-  // 게시 입구와 stage마다 부른다. 대조 주기의 재개도 이 길을 지난다. 철회면 부모만 닫고 이미 공개된 객체는 그대로 둔다. 미확정 effect의 읽기 대조는 reconcile이 계속한다.
+  // 게시 입구와 stage마다, 그리고 writer가 쓰기 직전 철회를 돌려줬을 때 부른다. 대조 주기의 재개도 이 길을 지난다. 철회면 부모만 닫고 이미 공개된 객체는 그대로 둔다. 미확정 effect의 읽기 대조는 reconcile이 계속한다.
   private async assertAuthorized(key: ChangeKey): Promise<void> {
     const request = this.must(await this.store.get(key.changeId));
     try {
@@ -374,6 +374,14 @@ export class ChangePublisher {
         await this.confirm(plan, stage, leaseId, outcome.value);
         return;
       case 'not_sent': {
+        // writer의 쓰기 직전 철회다. effect를 막지 않고 놓아 둔 뒤 입구와 같은 게이트에 맡긴다. 철회가 맞으면 부모가 닫히고, 그사이 권한이 돌아왔으면 이어 간다.
+        if (outcome.code === 'authorization_revoked') {
+          const retryAt = this.now() + this.retryMs;
+          const released = await this.store.releaseUnsentEffect({ ...key, stage, leaseId, retryAt });
+          if (!released.ok) throw new Stop({ kind: 'busy' });
+          await this.assertAuthorized(key);
+          throw new Stop({ kind: 'deferred', reason: outcome.code, retryAt });
+        }
         if (!isTransientNotSent(outcome.code)) throw await this.blockStage(key, stage, outcome.code);
         if (attempt >= MAX_SEND_ATTEMPTS) throw await this.blockStage(key, stage, 'send_attempts_exhausted');
         const retryAt = this.now() + Math.min(this.retryMs * 2 ** (attempt - 1), MAX_RETRY_MS);

@@ -2,7 +2,7 @@ import { DEPLOY_TARGETS } from './catalog.js';
 import type { DeployTarget } from './catalog.js';
 import { ChangeStoreArtifacts } from './change-artifact.js';
 import { ChangeAnswerGuard, ChangeCommands } from './change-commands.js';
-import type { ChangeKey } from './change-contracts.js';
+import type { ChangeKey, ChangeTarget } from './change-contracts.js';
 import { DeploymentReader } from './change-deployment.js';
 import { compilePathPolicy, taskPathRules } from './change-policy.js';
 import { ChangePublisher } from './change-publisher.js';
@@ -14,6 +14,7 @@ import { VERIFIER_REVISION, WorkerChangeVerification } from './change-verifier.j
 import { ClaudeChangeAuthor } from './claude-task-bridge.js';
 import type { ClaudeTaskBridge } from './claude-task-bridge.js';
 import type { PublisherConfig } from './config.js';
+import type { Scope } from './contracts.js';
 import type { GitHubAppCredentials } from './github-app.js';
 import { createGitHubWriter, policyWriterRepositories } from './github-writer.js';
 import type { Log } from './log.js';
@@ -97,8 +98,15 @@ export interface ChangeAssembly { runtime: ChangeRuntime; author: ClaudeChangeAu
 export function assembleChange(options: ChangeAssemblyOptions): ChangeAssembly {
   const { store, gate, changes, send, now, log } = options;
   const policy = changeRepositoryPolicies(gate);
-  const io = (options.createWriter ?? createGitHubWriter)({ app: options.app, repositories: policyWriterRepositories(policy), send, now });
-  const publisher = new ChangePublisher({ store: changes, writer: io.writer, preflight: io.preflight, policy, authorize: request => gate.authorize(request.ownerId, request.scope), now, log });
+  const authorize = (request: { ownerId: string; scope: Scope }) => gate.authorize(request.ownerId, request.scope);
+  const authorizeWrite = async (target: ChangeTarget): Promise<void> => {
+    const request = await changes.get(target.key.changeId);
+    // 요청자를 모르면 권한을 말할 수 없다. 철회로 닫지 않고 writer가 보내지 않게만 한다.
+    if (!request.ok || request.value.generation !== target.key.generation) throw new Error('change_request_unavailable');
+    await authorize(request.value);
+  };
+  const io = (options.createWriter ?? createGitHubWriter)({ app: options.app, repositories: policyWriterRepositories(policy), authorizeWrite, send, now });
+  const publisher = new ChangePublisher({ store: changes, writer: io.writer, preflight: io.preflight, policy, authorize, now, log });
   const artifacts = new ChangeStoreArtifacts(changes);
   const inputs = new ChangePrivateInputs(store.db, now);
   const source = changeAuthorSource({ store, gate, preflight: io.preflight, policy });

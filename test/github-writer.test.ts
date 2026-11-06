@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { inspect } from 'node:util';
 import { changeBranchName, gitBlobSha } from '../src/change-contracts.js';
 import type { ChangeTarget, ChangeWriterPort } from '../src/change-contracts.js';
-import { Denied } from '../src/contracts.js';
+import { Denied, PolicyUnavailable } from '../src/contracts.js';
 import { assertAllowed } from '../src/github-app.js';
 import { createGitHubWriter, writerRouteAllowed } from '../src/github-writer.js';
 import type { WriterRepository } from '../src/github-writer.js';
@@ -21,9 +21,10 @@ const METADATA = { message: '메시지\n', author: IDENTITY, committer: IDENTITY
 const FILE = { path: 'src/a.ts', content: Buffer.from('export {};\n'), blobSha: gitBlobSha(Buffer.from('export {};\n')) };
 const TREE_ENTRY = { path: 'src/a.ts', mode: '100644' as const, blobSha: FILE.blobSha };
 
-function setup(lookup: (id: number) => Promise<WriterRepository> = async id => { if (id !== REPO.id) throw new Denied(); return REPOSITORY; }) {
+const ALLOW = async () => {};
+function setup(lookup: (id: number) => Promise<WriterRepository> = async id => { if (id !== REPO.id) throw new Denied(); return REPOSITORY; }, authorizeWrite: (target: ChangeTarget) => Promise<void> = ALLOW) {
   const github = new FakeGitHub();
-  const io = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: lookup, send: github.send, now: () => github.clock });
+  const io = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: lookup, authorizeWrite, send: github.send, now: () => github.clock });
   return { github, ...io };
 }
 function seeded() {
@@ -348,7 +349,7 @@ test('T19 B3 writer: blob은 내용 대조하고 일부 실패를 그대로 알�
   assert.deepEqual(await rejected.writer.createBlobs({ target: TARGET, files: [second] }), { kind: 'rejected', status: 422, code: 'http_422' });
   const wrong = setup();
   const send = wrong.github.send;
-  const odd = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, now: () => wrong.github.clock,
+  const odd = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => wrong.github.clock,
     send: async (input, init) => String(input).endsWith('/git/blobs') ? new Response(JSON.stringify({ sha: sha('e') }), { status: 201 }) : send(input, init) });
   assert.deepEqual(await odd.writer.createBlobs({ target: TARGET, files: [FILE] }), { kind: 'rejected', status: 201, code: 'blob_sha_mismatch' });
   const ok = seeded();
@@ -387,7 +388,7 @@ test('T19 B3 writer: 대조 읽기는 PR 토큰을 쓰고 내용 쓰기 토큰�
 test('T19 B3 writer: 읽기 응답을 믿지 않는다', async () => {
   const lying = (body: unknown) => {
     const s = seeded();
-    const writerIO = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, now: () => s.github.clock,
+    const writerIO = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => s.github.clock,
       send: async (input, init) => init?.method === 'GET' ? new Response(JSON.stringify(body), { status: 200 }) : s.github.send(input, init) });
     return writerIO;
   };
@@ -429,7 +430,7 @@ test('T19 B3 writer: findPulls는 정확한 head·base만 돌려주고 상한을
   assert.match(list.path, new RegExp(`state=all&head=fixture-org:${BRANCH.replaceAll('/', '/')}&base=main&per_page=100$`));
   // 응답이 섞여 와도(다른 브랜치·포크) 정확한 것만 남긴다.
   const send = github.send;
-  const mixed = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, now: () => github.clock, send: async (input, init) => {
+  const mixed = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => github.clock, send: async (input, init) => {
     if (String(input).includes('state=all')) {
       const row = (ref: string, baseRef: string, headRepo: number | null, baseRepo: number) => ({ number: 1, state: 'open', merged_at: null, title: 't', body: 'b', user: { id: BOT_USER }, head: { ref, sha: sha('a'), repo: headRepo === null ? null : { id: headRepo } }, base: { ref: baseRef, repo: { id: baseRepo } } });
       return new Response(JSON.stringify([row(`${BRANCH}-x`, 'main', REPO.id, REPO.id), row(BRANCH, 'dev', REPO.id, REPO.id), row(BRANCH, 'main', 5, REPO.id), row(BRANCH, 'main', null, REPO.id), row(BRANCH, 'main', REPO.id, REPO.id)]), { status: 200 });
@@ -438,13 +439,50 @@ test('T19 B3 writer: findPulls는 정확한 head·base만 돌려주고 상한을
   } });
   const found = await mixed.writer.findPulls({ target: TARGET, headBranch: BRANCH, baseBranch: 'main' });
   assert.equal(found.length, 1);
-  const full = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, now: () => github.clock, send: async (input, init) => {
+  const full = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => github.clock, send: async (input, init) => {
     if (String(input).includes('state=all')) return new Response(JSON.stringify(Array.from({ length: 100 }, () => ({ number: 1, state: 'open', merged_at: null, title: 't', body: 'b', user: { id: BOT_USER }, head: { ref: BRANCH, sha: sha('a'), repo: { id: REPO.id } }, base: { ref: 'main', repo: { id: REPO.id } } }))), { status: 200 });
     return send(input, init);
   } });
   await assert.rejects(full.writer.findPulls({ target: TARGET, headBranch: BRANCH, baseBranch: 'main' }), /pull_list_incomplete/);
 });
 
+const WRITE_POST = /POST .*\/(?:git\/(?:blobs|trees|commits|refs)|pulls)$/;
+for (const [name, error, code] of [['철회', new Denied(), 'authorization_revoked'], ['정책 조회 불가', new PolicyUnavailable(), 'policy_unavailable'], ['확인 오류', new Error('fixture_database_down'), 'authorization_check_failed']] as const) {
+  test(`쓰기 경계: ${name}면 쓰기 다섯 종류 모두 토큰을 받은 뒤 요청을 보내지 않고 not_sent다`, async () => {
+    const s = setup(undefined, async () => { throw error; });
+    const pull = { target: TARGET, branch: BRANCH, baseBranch: 'main', title: 't', body: 'b', draft: false };
+    const outcomes = [await s.writer.createBlobs({ target: TARGET, files: [FILE] }), await s.writer.createTree({ target: TARGET, baseTree: sha('a'), entries: [TREE_ENTRY] }),
+      await s.writer.createCommit({ target: TARGET, treeSha: sha('a'), parent: sha('b'), metadata: METADATA }), await s.writer.createRef({ target: TARGET, branch: BRANCH, sha: sha('a') }), await s.writer.createPull(pull)];
+    assert.deepEqual(outcomes, Array.from({ length: 5 }, () => ({ kind: 'not_sent', code })));
+    assert.equal(s.github.count(WRITE_POST), 0, '쓰기 요청 0회');
+    assert.ok(s.github.tokenPosts > 0, '확인은 토큰 발급 뒤다');
+  });
+}
+test('쓰기 경계: blob은 하나마다 확인해 철회 뒤의 blob을 보내지 않고, 응답을 잃은 blob이 앞에 있어도 not_sent다', async () => {
+  const second = { path: 'src/b.ts', content: Buffer.from('b\n'), blobSha: gitBlobSha(Buffer.from('b\n')) };
+  let revoked = false;
+  const s = setup(undefined, async () => { if (revoked) throw new Denied(); });
+  const send = s.github.send;
+  const counted = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: async () => { if (revoked) throw new Denied(); }, now: () => s.github.clock,
+    send: async (input, init) => { const response = await send(input, init); if (String(input).endsWith('/git/blobs')) revoked = true; return response; } });
+  assert.deepEqual(await counted.writer.createBlobs({ target: TARGET, files: [FILE, second] }), { kind: 'not_sent', code: 'authorization_revoked' });
+  assert.equal(s.github.count(WRITE_POST), 1);
+  revoked = false;
+  const lost = setup(undefined, async () => { if (lost.github.count(WRITE_POST) >= 1) throw new Denied(); });
+  lost.github.fail(/POST .*\/git\/blobs$/, 'lose_response');
+  assert.deepEqual(await lost.writer.createBlobs({ target: TARGET, files: [FILE, second] }), { kind: 'not_sent', code: 'authorization_revoked' });
+  assert.equal(lost.github.count(WRITE_POST), 1);
+});
+test('쓰기 경계: 읽기는 확인을 부르지 않아 철회 뒤에도 대조가 돈다', async () => {
+  const s = seeded();
+  let checks = 0;
+  const io = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: async () => { checks++; throw new Denied(); }, send: s.github.send, now: () => s.github.clock });
+  assert.deepEqual(await io.writer.readBranchHead({ target: TARGET, branch: 'main' }), { sha: s.base.sha });
+  assert.ok(await io.writer.readCommit({ target: TARGET, sha: s.base.sha }));
+  assert.deepEqual(await io.writer.findPulls({ target: TARGET, headBranch: BRANCH, baseBranch: 'main' }), []);
+  assert.equal(await io.writer.readBlobExists({ target: TARGET, sha: FILE.blobSha }), false);
+  assert.equal(checks, 0);
+});
 test('T19 B3 writer: ChangeWriterPort 형태를 만족한다', () => {
   const { writer } = setup();
   const port: ChangeWriterPort = writer;
