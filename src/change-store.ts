@@ -733,28 +733,70 @@ export class ChangeStore {
   }
 }
 
+// 리뷰 자유문의 비공개 저장. 응답 유실 뒤 같은 결과가 다시 와도 한 행이다. 공개 렌더러·writer에 이 객체를 주지 않는다.
+export class ChangeReviewFindings {
+  constructor(private readonly database: Database, private readonly now: Clock = Date.now) {}
+  async save(entry: { key: ChangeKey; jobId: string; sessionId: string; instructionRevision: string; findingsDigest: string; problems: readonly string[]; output: unknown }): Promise<void> {
+    await this.database.query(`INSERT INTO change_review_findings(change_id,generation,job_id,session_id,instruction_revision,findings_digest,problems,output,created_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING`, [entry.key.changeId, entry.key.generation, entry.jobId, entry.sessionId, entry.instructionRevision, entry.findingsDigest,
+      JSON.stringify(entry.problems), entry.output === null ? null : JSON.stringify(entry.output), this.now()]);
+  }
+}
+
+// 끝난 지 이만큼 지난 건의 artifact 바이트와 리뷰 원문을 지운다.
+export const CHANGE_RETENTION_MS = 7 * 86_400_000;
+const PURGE_BATCH = 20;
+// receipt·digest·effect 기록은 남긴다. 진행 중이거나 미확정 effect·정리 안 끝난 세션이 있는 건은 고르지 않는다. 시각 기준은 끝 상태에 든 때다.
+export async function purgeExpiredChangeContent(database: Database, now: number, retentionMs = CHANGE_RETENTION_MS): Promise<number> {
+  const cutoff = now - retentionMs;
+  const due = (await database.query<{ id: string }>(`SELECT r.id FROM change_requests r
+    LEFT JOIN change_deployments d ON d.change_id=r.id AND d.generation=r.generation
+    LEFT JOIN change_deployment_windows w ON w.change_id=r.id AND w.generation=r.generation
+    WHERE ((r.phase IN ('superseded','blocked','cancelled','failed') AND r.updated_at<=$1)
+      OR (r.phase='observing_deploy' AND ((d.state IN ('observed','not_applicable','blocked') AND d.observed_at<=$1) OR w.late_reported_at<=$1)))
+    AND NOT EXISTS (SELECT 1 FROM change_delivery_effects e WHERE e.change_id=r.id AND e.state<>'confirmed' AND e.resolution IS NULL)
+    AND NOT EXISTS (SELECT 1 FROM change_child_jobs c JOIN jobs j ON j.id=c.job_id WHERE c.change_id=r.id AND j.state IN ('queued','running','verifying','cancel_requested','waiting_user','unknown'))
+    AND NOT EXISTS (SELECT 1 FROM change_child_jobs c JOIN codex_sessions s ON s.job_id=c.job_id WHERE c.change_id=r.id AND (s.state IN ('running','waiting_answer','waiting_model','unknown') OR s.cleanup_state='pending'))
+    AND (EXISTS (SELECT 1 FROM change_artifacts a WHERE a.change_id=r.id AND a.purged_at IS NULL) OR EXISTS (SELECT 1 FROM change_review_findings f WHERE f.change_id=r.id))
+    ORDER BY r.updated_at LIMIT ${PURGE_BATCH}`, [cutoff])).rows;
+  for (const row of due) {
+    await database.transaction(async tx => {
+      // 고른 뒤 사람이 새 generation을 열었으면 진행 중인 건이다. 부모 행을 잠그고 다시 본다.
+      const current = (await tx.query<{ phase: string }>('SELECT phase FROM change_requests WHERE id=$1 FOR UPDATE', [row.id])).rows[0];
+      if (!current || !['superseded', 'blocked', 'cancelled', 'failed', 'observing_deploy'].includes(current.phase)) return;
+      await tx.query('DELETE FROM change_artifact_files WHERE change_id=$1', [row.id]);
+      await tx.query(`UPDATE change_artifacts SET patch='',purged_at=$2 WHERE change_id=$1 AND purged_at IS NULL`, [row.id, now]);
+      await tx.query('DELETE FROM change_review_findings WHERE change_id=$1', [row.id]);
+      await audit(tx, 'change_content_purged', row.id, { retentionMs }, now);
+    });
+  }
+  return due.length;
+}
+
 // 요청 원문을 읽는 유일한 경로다. 공개 렌더러·writer·리뷰 입력에 이 객체를 주지 않는다.
 export class ChangePrivateInputs {
   constructor(private readonly database: Database, private readonly now: Clock = Date.now) {}
   // 추가 답변도 label을 올린다. 게시 가능하지 않은 label이면 진행 중 change를 닫는다. 답변을 받기 전 author에 넘기지 않는 것은 호출자 몫이고, 닫힌 뒤 게시는 DB CHECK가 막는다.
   async record(input: ChangeKey & { eventId: string; label: ProvenanceLabel; text: string }): Promise<StoreResult<ChangeRequest>> {
-    return attempt(this.database, async tx => {
-      const row = (await tx.query<Record<string, unknown>>('SELECT * FROM change_requests WHERE id=$1 FOR UPDATE', [input.changeId])).rows[0];
-      if (!row) return fail('not_found');
-      const request = requestRow(row);
-      if (request.generation !== input.generation || isTerminalPhase(request.phase)) return fail('phase_conflict', { current: { phase: request.phase, generation: request.generation } });
-      const now = this.now();
-      if (!await insertPrivateInput(tx, { changeId: input.changeId, generation: input.generation, eventId: input.eventId, label: input.label, text: input.text, now })) return fail('duplicate_event');
-      const label = propagateLabel([request.label, input.label]);
-      if (labelAllowsAuthorInput(label)) {
-        const updated = (await tx.query<Record<string, unknown>>('UPDATE change_requests SET label=$2,updated_at=$3 WHERE id=$1 RETURNING *', [input.changeId, label, now])).rows[0]!;
-        return success(requestRow(updated));
-      }
-      await tx.query(`UPDATE change_requests SET label=$2,phase='blocked',phase_reason='label_blocked',updated_at=$3 WHERE id=$1`, [input.changeId, label, now]);
-      await settleTerminal(tx, input, 'label_blocked', now);
-      await audit(tx, 'change_phase', input.changeId, { generation: input.generation, from: request.phase, to: 'blocked', reason: 'label_blocked' }, now);
-      return fail('label_blocked');
-    });
+    return attempt(this.database, tx => this.recordIn(tx, input));
+  }
+  // 호출자가 연 트랜잭션 안에서 부른다. /answer의 수신 처리와 답 쓰기를 한 번에 확정하는 경계다. 트리거 거부는 값이 아니라 예외로 올라가 호출자의 트랜잭션을 되돌린다.
+  async recordIn(tx: Database, input: ChangeKey & { eventId: string; label: ProvenanceLabel; text: string }): Promise<StoreResult<ChangeRequest>> {
+    const row = (await tx.query<Record<string, unknown>>('SELECT * FROM change_requests WHERE id=$1 FOR UPDATE', [input.changeId])).rows[0];
+    if (!row) return fail('not_found');
+    const request = requestRow(row);
+    if (request.generation !== input.generation || isTerminalPhase(request.phase)) return fail('phase_conflict', { current: { phase: request.phase, generation: request.generation } });
+    const now = this.now();
+    if (!await insertPrivateInput(tx, { changeId: input.changeId, generation: input.generation, eventId: input.eventId, label: input.label, text: input.text, now })) return fail('duplicate_event');
+    const label = propagateLabel([request.label, input.label]);
+    if (labelAllowsAuthorInput(label)) {
+      const updated = (await tx.query<Record<string, unknown>>('UPDATE change_requests SET label=$2,updated_at=$3 WHERE id=$1 RETURNING *', [input.changeId, label, now])).rows[0]!;
+      return success(requestRow(updated));
+    }
+    await tx.query(`UPDATE change_requests SET label=$2,phase='blocked',phase_reason='label_blocked',updated_at=$3 WHERE id=$1`, [input.changeId, label, now]);
+    await settleTerminal(tx, input, 'label_blocked', now);
+    await audit(tx, 'change_phase', input.changeId, { generation: input.generation, from: request.phase, to: 'blocked', reason: 'label_blocked' }, now);
+    return fail('label_blocked');
   }
   async read(filter: { changeId: string }): Promise<{ eventId: string; generation: number; label: ProvenanceLabel; text: string; textSha256: string; createdAt: number }[]> {
     const rows = (await this.database.query<Record<string, unknown>>('SELECT * FROM change_request_inputs WHERE change_id=$1 ORDER BY created_at,event_id', [filter.changeId])).rows;

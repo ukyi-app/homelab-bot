@@ -5,6 +5,7 @@ import type { EventInput, Scope } from './contracts.js';
 import { controlText, taskLaneClosedText } from './control-format.js';
 import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
+import type { ChangeCommand, ChangeCommandHandler } from './change-commands.js';
 import type { ExternalTaskCommand, ExternalTaskCommandHandler } from './external-task-commands.js';
 import type { MemoryCommand, MemoryCommandHandler } from './memory-commands.js';
 import type { PolicyGate } from './policy.js';
@@ -36,7 +37,10 @@ export type RecoveryOutcome = 'done' | 'budget' | 'skipped';
 const memoryCommands = new Set<string>(['memory-save', 'memory-search', 'memory-correct', 'memory-exclude', 'memory-delete']);
 // R08 연결 명령. 처리기가 없으면(스위치 꺼짐) 닫는다. 키가 든 응답을 다루므로 대화 작업·제어 경로를 타지 않는다.
 const externalCommands = new Set<string>(['attach', 'detach', 'attach-list']);
-export const ALL_COMMANDS: ReadonlySet<string> = new Set(['chat', 'urgent', 'task', 'read', ...controls, ...memoryCommands, ...externalCommands]);
+// 변경 명령. 처리기가 없으면(스위치 꺼짐) 닫는다. 구독·gap·작업 큐를 거치지 않고 받은 자리에서 처리한다.
+const changeCommands = new Set<string>(['change', 'change-status', 'change-cancel', 'change-publish']);
+export const ALL_COMMANDS: ReadonlySet<string> = new Set(['chat', 'urgent', 'task', 'read', ...controls, ...memoryCommands, ...externalCommands, ...changeCommands]);
+export const CHANGE_ACK_NOTICE = '변경 명령의 응답을 전하지 못했습니다(상호작용 만료·전송 실패). 결과는 이 스레드의 알림과 /change-status로 확인하세요.';
 // 기억 명령 응답을 전하지 못했을 때 그 채널에 남기는 안내. 결과(기억 내용)는 싣지 않는다.
 export const MEMORY_ACK_NOTICE = '기억 명령의 응답을 전하지 못했습니다(상호작용 만료·전송 실패). 처리됐는지는 /memory-search로 확인하세요.';
 export const EXTERNAL_ACK_NOTICE = '세션 연결 명령의 응답을 전하지 못했습니다(상호작용 만료·전송 실패). 결과는 /attach-list로 확인하세요.';
@@ -51,7 +55,7 @@ export class DiscordIngress {
     private readonly rest: DiscordRest, public readonly messageContent = true,
     private readonly commands: ReadonlySet<string> = ALL_COMMANDS, private readonly log: Log = jsonLog,
     private readonly memory?: MemoryCommandHandler, private readonly tasks?: TaskCommandHandler,
-    private readonly external?: ExternalTaskCommandHandler) {}
+    private readonly external?: ExternalTaskCommandHandler, private readonly changes?: ChangeCommandHandler) {}
   async receive(input: EventInput, recovered = false, recovery?: { token: string; epoch: number }): Promise<string | undefined> {
     const event = EventSchema.parse(input);
     if (event.bot || event.webhook) return;
@@ -59,6 +63,7 @@ export class DiscordIngress {
     if (event.kind !== 'message' && !this.commands.has(event.command ?? '')) throw new Denied();
     if (event.kind !== 'message' && taskControls.has(event.command ?? '') && !this.tasks) throw new Denied();
     if (event.kind !== 'message' && externalCommands.has(event.command ?? '') && !this.external) throw new Denied();
+    if (event.kind !== 'message' && changeCommands.has(event.command ?? '') && !this.changes) throw new Denied();
     const p = await this.gate.authorize(event.actor, event.scope);
     if (!this.messageContent && event.kind === 'message') return;
     const conversation = await this.store.conversation(event.scope);
@@ -66,14 +71,16 @@ export class DiscordIngress {
     const isControl = event.kind !== 'message' && controls.has(event.command ?? '');
     const isMemory = event.kind === 'command' && memoryCommands.has(event.command ?? '');
     const isExternal = event.kind === 'command' && externalCommands.has(event.command ?? '');
+    const isChange = event.kind === 'command' && changeCommands.has(event.command ?? '');
     if (event.scope.kind === 'channel' && !explicit) return;
     if (conversation && event.scope.kind !== 'channel' && conversation.owner_id !== event.actor) throw new Denied();
     if (event.kind === 'button' && !conversation) throw new Denied();
     // 기억 명령도 제어처럼 알림 채널에서 쓸 수 있다(기억의 접근 채널은 대화·알림 채널 둘이다, memory.ts access).
     // 연결 명령도 채널까지 들어와 "스레드에서 쓰세요"로 답한다. 실패 표시만 보면 왜 안 되는지 알 수 없다.
-    if (event.scope.kind === 'channel' && event.scope.channel !== p.conversationChannel && !isControl && !isMemory && !isExternal) throw new Denied();
+    if (event.scope.kind === 'channel' && event.scope.channel !== p.conversationChannel && !isControl && !isMemory && !isExternal && !isChange) throw new Denied();
     if ((!conversation || !conversation.active) && !explicit && !isControl) return;
     if (isExternal) return this.externalCommand(event, p.revision, recovered);
+    if (isChange) return this.changeCommand(event, p.revision, recovered);
     // Unsupported commands cannot acquire model or control authority.
     if (event.kind !== 'message' && !['chat', 'urgent', 'task', 'read', ...controls, ...memoryCommands].includes(event.command ?? '')) throw new Denied();
     if (isMemory) return this.memoryCommand(event, p.revision, recovered);
@@ -242,6 +249,24 @@ export class DiscordIngress {
     // 로그에는 명령과 결과 코드만 남긴다(세션 ID·키 ID·seed 없음).
     this.log('external_task_command', { command: event.command!, outcome: reply.outcome });
     if (reply.content !== undefined) await this.acknowledge(event, saved.id, reply.content, { revision, notice: EXTERNAL_ACK_NOTICE });
+    return saved.id;
+  }
+  // 변경 명령. 요청 글은 events에 두지 않는다(대화 맥락으로 모델에 들어간다). 처리기는 DB만 만져 응답 기한 안에 끝난다.
+  private async changeCommand(event: z.infer<typeof EventSchema>, revision: string, recovered: boolean): Promise<string | undefined> {
+    if (recovered || !this.changes) throw new Denied();
+    const started = this.store.now();
+    const saved = await this.store.save({ ...event, text: '' }, revision, false);
+    if (this.store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
+    if (!await this.claimOnce(event, saved.id, started)) return saved.id;
+    let reply;
+    try {
+      reply = await this.changes.handle({ id: event.id, actor: event.actor, scope: event.scope, command: event.command as ChangeCommand, text: event.text, target: event.target });
+    } catch (error) {
+      this.log('change_command_failed', { command: event.command!, ...errorInfo(error) });
+      reply = { content: '처리하지 못했습니다(일시 오류). /change-status로 상태를 확인한 뒤 다시 시도하세요.', outcome: 'error' };
+    }
+    this.log('change_command', { command: event.command!, outcome: reply.outcome });
+    await this.acknowledge(event, saved.id, reply.content, { revision, notice: CHANGE_ACK_NOTICE });
     return saved.id;
   }
   // 키가 든 응답. acknowledge와 달리 실패를 돌려준다. 호출자가 그 키를 폐기해야 하기 때문이다.

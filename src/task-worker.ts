@@ -416,6 +416,9 @@ export class TaskWorkerService {
     if (stored) return this.verificationReply(request, worker, stored, false);
     const active0 = this.turn;
     if (active0?.job === request.job && active0.generation === request.generation && active0.verifying === request.commandId) return this.verificationReply(request, worker, null, true);
+    // 앞선 실행이 receipt 없이 끊겼다. 다시 돌려 통과하면 첫 실행의 실패가 가려진다. 읽지 못하면 시작 여부를 모르므로 돌리지 않는다.
+    const started = await this.results.verificationStarted(request.job, request.generation, request.commandId).catch(() => true);
+    if (started) return this.verificationReply(request, worker, null, false);
     if (active0 || this.sweeps || this.unconfirmed.size) throw new TaskRouteError(409, 'busy');
     const receipt = this.receipts.generation(request.job, request.generation);
     if (!receipt || receipt.fenced || receipt.finalized) throw new TaskRouteError(409, 'fenced');
@@ -440,6 +443,12 @@ export class TaskWorkerService {
       release(true);
       if (error instanceof TaskRouteError) throw error;
       throw new TaskRouteError(409, 'result_unavailable');
+    }
+    try { await this.results.writeVerificationStart(request.job, request.generation, request.commandId); }
+    catch {
+      this.intake.close('receipt_write_failed');
+      release(true);
+      throw new TaskRouteError(503, 'receipt_write_failed');
     }
     void (async () => {
       let stopped = false;

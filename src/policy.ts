@@ -1,10 +1,17 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
+import { RevisionSchema } from './change-contracts.js';
+import { ChangeRepositoryPolicySchema } from './change-policy.js';
 import { Denied, PolicyUnavailable, ScopeSchema } from './contracts.js';
 import type { Clock, Scope } from './contracts.js';
 import type { Database } from './database.js';
 
-const PolicySchema = z.strictObject({
+// 변경 PR 정책. 키가 없는 옛 정책은 그대로 통과하고 CHANGE만 닫힌다. 있으면 값이 잘못된 것을 스위치와 무관하게 기동 전에 막는다.
+const ChangePolicySchema = z.strictObject({ repositories: z.array(ChangeRepositoryPolicySchema).min(1).max(16) }).superRefine((policy, ctx) => {
+  if (new Set(policy.repositories.map(repository => repository.repoId)).size !== policy.repositories.length) ctx.addIssue({ code: 'custom', path: ['repositories'], message: 'duplicate_repository' });
+  if (new Set(policy.repositories.map(repository => repository.fullName)).size !== policy.repositories.length) ctx.addIssue({ code: 'custom', path: ['repositories'], message: 'duplicate_repository' });
+});
+const PolicyFields = z.strictObject({
   revision: z.string().min(1), confirmedAt: z.number().int().nonnegative(),
   owner: z.string().min(1), guild: z.string().min(1),
   conversationChannel: z.string().min(1), notificationChannel: z.string().min(1),
@@ -14,10 +21,16 @@ const PolicySchema = z.strictObject({
   review: z.unknown().optional(),
   // 작업 레인 프로젝트 정책. 형식 검사는 task-policy.ts가 하고, 없으면 작업 레인만 닫힌다.
   task: z.unknown().optional(),
+  change: ChangePolicySchema.optional(),
 });
+// 이 값이 증거 묶음의 policy revision이 된다. 묶음이 받지 않는 모양이면 모델을 돌린 뒤에야 막힌다.
+const changeRevisionShape = (policy: { revision: string; change?: unknown }, ctx: z.RefinementCtx) => {
+  if (policy.change && !RevisionSchema.safeParse(policy.revision).success) ctx.addIssue({ code: 'custom', path: ['revision'], message: 'revision_shape' });
+};
+const PolicySchema = PolicyFields.superRefine(changeRevisionShape);
 export type Policy = z.infer<typeof PolicySchema>;
 // 사람이 Infisical에 두는 값(env RUNTIME_POLICIES)의 모양. confirmedAt은 봇이 읽은 시각으로 채우므로 받지 않는다.
-const RuntimePolicyInputSchema = PolicySchema.omit({ confirmedAt: true });
+const RuntimePolicyInputSchema = PolicyFields.omit({ confirmedAt: true }).superRefine(changeRevisionShape);
 function frozen<T>(value: T): T {
   if (value !== null && typeof value === 'object') {
     for (const child of Object.values(value)) frozen(child);

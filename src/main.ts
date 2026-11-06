@@ -8,7 +8,11 @@ import type { ObservationSource } from './briefing.js';
 import { briefingSources } from './briefing-observations.js';
 import { ARGOCD_APPLICATIONS, GRAFANA_DATASOURCES, SERVICES, TEMPLATES } from './catalog.js';
 import { ClaudeTaskBridge } from './claude-task-bridge.js';
-import { EXTERNAL_TASK_COMMANDS, FOUNDATION_COMMANDS, MEMORY_COMMANDS, REVIEW_COMMANDS, TASK_COMMANDS, commandDefinitions, registerCommands } from './commands.js';
+import { assembleChange, assembleChangeReview, changeCommandHandler, changePrecondition, guardedTaskCommands, workerRouteAnswers } from './change-assembly.js';
+import type { ChangeAssemblyOptions } from './change-assembly.js';
+import { CHANGE_PERIODS } from './change-runtime.js';
+import { ChangeStore } from './change-store.js';
+import { CHANGE_COMMANDS, EXTERNAL_TASK_COMMANDS, FOUNDATION_COMMANDS, MEMORY_COMMANDS, REVIEW_COMMANDS, TASK_COMMANDS, commandDefinitions, registerCommands } from './commands.js';
 import { ConfigError, databasePoolConfig, loadPublisherConfig } from './config.js';
 import type { PublisherConfig } from './config.js';
 import { z } from 'zod';
@@ -53,7 +57,7 @@ import { Runtime } from './runtime.js';
 import { Store } from './store.js';
 import { TaskCommands } from './task-commands.js';
 import { TaskWorkerSigner } from './task-contracts.js';
-import { HttpTaskWorker, TASK_INTAKE_UNREACHED, taskWorkerIntake } from './task-http.js';
+import { HttpTaskV2Worker, HttpTaskWorker, TASK_INTAKE_UNREACHED, taskWorkerChangeContract, taskWorkerIntake } from './task-http.js';
 import type { TaskIntakeStatus } from './task-http.js';
 import { PolicyTaskPlans, TaskPolicySchema } from './task-policy.js';
 import { WorkerSigner } from './worker.js';
@@ -64,6 +68,7 @@ import { HttpWorker } from './worker-http.js';
 // 작업 레인은 스위치·주소·유효한 task 절이 있을 때만 조립하고, 작업 모드 작업자가 답할 때 명령을 연다. 조립하지 않으면 명령·루프·HTTP 클라이언트가 모두 없다.
 // 기억·브리핑은 MEMORY_LEDGER_DIR이 있을 때만 만들고 기동 장벽·주기 루프까지 잇는다. 기억 명령(memory-*)도 그때만 등록·수신한다.
 // R08은 EXTERNAL_TASK_EVENTS_ENABLED가 켜졌을 때만 리스너(8082)·명령·루프·지표를 만든다. 작업 레인 스위치와 독립이다.
+// 변경 PR은 CHANGE_PR_ENABLED가 true일 때만 명령을 등록하고, 키·정책·작업 레인·리뷰가 모두 있을 때만 writer와 루프를 만든다. 작업자가 v2로 답하기 전에는 접수만 닫힌다.
 
 // 닫혀 있으면 정책 JSON에 리뷰 절이 있어도 리뷰 경로를 열지 않는다. 기본 정책을 못 읽으면 503(PolicyUnavailable)이다.
 class GatedReviewPolicy extends ReviewPolicySource {
@@ -153,6 +158,8 @@ export interface PublisherDeps {
   taskWorkerProbeMs?: number;
   // R08 보관 정리 주기. 시험만 바꾼다.
   externalPurgeMs?: number;
+  // 변경 PR 조립의 시험 주입 자리. 켜져 있을 때만 쓴다.
+  change?: Pick<ChangeAssemblyOptions, 'createWriter' | 'deployTargets' | 'periods' | 'verificationPollMs' | 'instrument'>;
 }
 export interface Publisher {
   // externalEvents는 R08을 켰을 때만 있다.
@@ -196,16 +203,24 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   const taskGate = taskPrecondition(config);
   log('task_gate', taskGate.open ? { state: 'waiting_worker' } : { state: 'closed', reason: taskGate.reason });
   health.watchTaskGate(() => taskGate.open ? null : taskGate.reason);
-  const taskBridge = taskGate.open ? new ClaudeTaskBridge(store, gate, new HttpTaskWorker(taskGate.workerUrl, new TaskWorkerSigner(config.workerKey, now), send),
+  // 변경 PR. 스위치가 꺼져 있으면 writer·리뷰 서비스·명령·루프를 만들지 않는다.
+  const reviewGate = reviewPrecondition(config);
+  const changeGate = changePrecondition(config, { taskOpen: taskGate.open, reviewOpen: reviewGate.open });
+  log('change_gate', changeGate.open ? { state: 'waiting_worker' } : { state: 'closed', reason: changeGate.reason });
+  const taskSigner = taskGate.open ? new TaskWorkerSigner(config.workerKey, now) : undefined;
+  // 호출은 v2 세션이 있을 때만 나간다. 스위치를 끄고 되돌릴 때 남은 작성 세션을 /task-release로 정리하려면 이 경로가 있어야 한다. 없으면 레인이 cleanup_pending으로 닫힌 채 남는다.
+  const changeWorker = taskGate.open ? new HttpTaskV2Worker(taskGate.workerUrl, taskSigner!, send) : undefined;
+  const taskBridge = taskGate.open ? new ClaudeTaskBridge(store, gate, new HttpTaskWorker(taskGate.workerUrl, taskSigner!, send),
     new PolicyTaskPlans(store, send),
     // undefined를 그대로 넘기면 브리지 기본값을 덮어 드레인 없이 바로 끊는다.
-    { shutdown: stop.signal, ...(deps.drainMs !== undefined ? { drainMs: deps.drainMs } : {}) }) : undefined;
+    { shutdown: stop.signal, ...(deps.drainMs !== undefined ? { drainMs: deps.drainMs } : {}) }, changeWorker) : undefined;
   // taskLoop와 lanes는 함께 켠다. 하나만 켜면 해제 문구와 실제 슬롯이 어긋난다.
   const taskLoop = !!taskBridge;
   const runtime = new Runtime(store, gate, new HttpWorker(config.workerUrl, send), signer, reader,
     taskBridge, { shutdown: stop.signal, drainMs: deps.drainMs, taskLoop });
+  const changeReview = changeGate.open ? assembleChangeReview({ store, gate, signer, workerUrl: config.workerUrl, send, now, shutdown: stop.signal, log, ...(deps.drainMs !== undefined ? { drainMs: deps.drainMs } : {}) }) : undefined;
   // 객체는 만들기만 한다(I/O 없음). 조건 (d)를 확인하기 전에는 reviewOpened가 false라 webhook·명령이 닫힌 그대로다.
-  const precondition = reviewPrecondition(config);
+  const precondition = reviewGate;
   let reviewOpened = false;
   const reviewPolicy = new GatedReviewPolicy(gate, () => reviewOpened);
   const review = precondition.open ? (() => {
@@ -213,7 +228,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     const queue = new ReviewQueue(store, io.reader);
     return { queue, reader: io.reader,
       runtime: new ReviewRuntime(store, reviewPolicy, queue, io.reader, new HttpReviewWorker(config.workerUrl, send), signer, undefined,
-        { shutdown: stop.signal, drainMs: deps.drainMs, lanes: taskLoop }),
+        { shutdown: stop.signal, drainMs: deps.drainMs, lanes: taskLoop, ...(changeReview ? { changeReview: changeReview.service } : {}) }),
       publisher: new ReviewPublisher(store, reviewPolicy, io.reader, new RestrictedGitHub(io.transport), queue, undefined, stop.signal),
       reconciler: new ReviewReconciler(store, reviewPolicy, queue, io.reader, stop.signal) };
   })() : undefined;
@@ -259,6 +274,13 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   health.watchMemory(() => ({ ledger: t20 ? t20.ledger.status().state : 'disabled', briefingEnabled }));
   let taskIntake: TaskIntakeStatus = TASK_INTAKE_UNREACHED;
   if (taskBridge) health.watchTaskLane(() => ({ workerRouted: taskIntake.routed, intakeOpen: taskIntake.open }));
+  // 옛 작업자면 이 값이 false라 CHANGE만 닫히고 v1 /task는 그대로 돈다. 작업자는 나중에 바뀌므로 주기로 다시 본다.
+  const changeWorkers = { task: false, review: false };
+  const change = changeGate.open && changeReview && taskBridge && changeWorker ? assembleChange({ app: changeGate.app, store, gate, changes: changeReview.changes, review: changeReview.service, bridge: taskBridge, worker: changeWorker,
+    kubernetes, send, now, log, shutdown: stop.signal, intakeOpen: () => taskIntake.routed && taskIntake.open, ...deps.change }) : undefined;
+  const changeClosedReason = (): string | null => !changeGate.open ? changeGate.reason : !changeWorkers.task ? 'task_worker_unsupported' : !changeWorkers.review ? 'review_worker_unsupported'
+    : !reviewOpened ? 'review_closed' : !taskIntake.open ? 'task_intake_closed' : null;
+  const changeCommands = config.changePr ? changeCommandHandler({ store, gate, changes: changeReview?.changes ?? new ChangeStore(deps.db, now), log, closedReason: changeClosedReason, ...(change ? { runtime: change.runtime } : {}) }) : undefined;
   let ports: Publisher['ports'];
   try {
     ports = { app: await listen(servers.app, deps.ports?.app ?? PORTS.publisher),
@@ -277,7 +299,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   let protocol: DiscordProtocol | undefined;
   let runtimeStarted = false;
   // 수신 허용 목록. 리뷰가 열리면 같은 Set에 더한다(DiscordIngress는 이 참조를 본다).
-  const acceptedCommands = new Set<string>([...FOUNDATION_COMMANDS, ...(t20 ? MEMORY_COMMANDS : []), ...(external ? EXTERNAL_TASK_COMMANDS : [])]);
+  const acceptedCommands = new Set<string>([...FOUNDATION_COMMANDS, ...(t20 ? MEMORY_COMMANDS : []), ...(external ? EXTERNAL_TASK_COMMANDS : []), ...(config.changePr ? CHANGE_COMMANDS : [])]);
   const background = new Set<Promise<void>>();
   const track = (task: Promise<void>) => { background.add(task); void task.finally(() => background.delete(task)); };
   const typingHint = typingHints(store, gate, log, track, { shutdown: stop.signal });
@@ -426,6 +448,23 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       return false;
     }, false);
   };
+  // 변경 루프. 부모는 슬롯을 잡지 않고 자식 job만 레인을 쓴다. 긴 시험 대기가 대화·작업 루프를 늦추지 않게 따로 돈다. 첫 READY 장벽 뒤에 시작한다.
+  let changeLoopsStarted = false;
+  const startChangeLoops = () => {
+    if (!change || !runtimeStarted || changeLoopsStarted || stop.signal.aborted) return;
+    changeLoopsStarted = true;
+    loop('change_lane', () => change.runtime.laneTick(), false);
+    loop('change_children', () => change.runtime.childrenTick(), false);
+    loop('change_publish', () => change.runtime.publishTick(), false);
+    every('change_reconcile', CHANGE_PERIODS.reconcileMs, async () => {
+      const report = await change.runtime.reconcile();
+      if (report.confirmed.length || report.blocked.length) log('change_reconciled', { confirmed: report.confirmed.length, stillUnknown: report.stillUnknown.length, blocked: report.blocked.length });
+    });
+    every('change_retention', CHANGE_PERIODS.retentionMs, async () => {
+      const purged = await change.runtime.retention();
+      if (purged) log('change_content_purged', { purged });
+    });
+  };
   // REST 요청 하나가 시간 초과(5초)·일시 오류로 실패할 수 있다. 다음 READY(며칠 뒤일 수도)까지 미루지 않고 몇 번 더 시도한다.
   let registering: string | undefined;
   let registerAgain = false;
@@ -438,7 +477,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       for (const delay of deps.registerDelaysMs ?? [0, 5000, 30_000, 120_000, 300_000]) {
         if (delay) await pause(delay);
         if (stop.signal.aborted) return;
-        try { log('commands_registered', await registerCommands(api, applicationId, config.policy.guild, commandDefinitions(!!t20, reviewOpened, taskOpened, !!external))); return; }
+        try { log('commands_registered', await registerCommands(api, applicationId, config.policy.guild, commandDefinitions(!!t20, reviewOpened, taskOpened, !!external, !!config.changePr))); return; }
         catch (error) {
           log('commands_register_failed', errorInfo(error));
           if (error instanceof RateLimited) await pause(error.retryAfterMs);
@@ -499,8 +538,9 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
         protocol = new DiscordProtocol(api, ready.userId, now);
         // 기억 명령은 원장이 켜졌을 때만 받는다. 장벽 전·기억이 닫힌 동안은 MemoryNotReady로, 종료 중이면 바로 "쓸 수 없음"으로 답한다.
         const memoryCommands = t20 && new MemoryCommands(t20.memory, () => t20.ledger.status().state, () => stop.signal.aborted, now);
-        const taskCommands = taskBridge && new TaskCommands(store, gate, taskBridge, () => taskIntake, track, log);
-        discord = { ingress: new DiscordIngress(store, gate, protocol, true, acceptedCommands, log, memoryCommands || undefined, taskCommands, external?.commands),
+        const plainTaskCommands = taskBridge && new TaskCommands(store, gate, taskBridge, () => taskIntake, track, log);
+        const taskCommands = plainTaskCommands && change ? guardedTaskCommands(plainTaskCommands, change.inputs, gate) : plainTaskCommands;
+        discord = { ingress: new DiscordIngress(store, gate, protocol, true, acceptedCommands, log, memoryCommands || undefined, taskCommands, external?.commands, changeCommands),
           publisher: new DiscordPublisher(store, gate, protocol) };
         const publisher = discord.publisher;
         const publish = () => {
@@ -534,6 +574,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
         loop('read', () => runtime.tickRead());
         startReviewLoops();
         startTaskLoop();
+        startChangeLoops();
       }
       // 명령 등록과 history 대조 자체는 이벤트 처리 순서 밖에서 돈다(대조가 30초까지 걸려도 상호작용 ACK가 밀리지 않게).
       knownApplication = ready.applicationId;
@@ -553,6 +594,13 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     taskIntake = await taskWorkerIntake(taskGate.workerUrl, send, stop.signal);
     if (before.routed !== taskIntake.routed || before.open !== taskIntake.open) log('task_worker_intake', { routed: taskIntake.routed, open: taskIntake.open, reasons: taskIntake.reasons });
     if (taskIntake.routed && !taskOpened && !stop.signal.aborted) openTaskLane();
+  });
+  if (change && taskGate.open) every('change_worker_probe', deps.taskWorkerProbeMs ?? TASK_WORKER_PROBE_MS, async () => {
+    const task = await taskWorkerChangeContract(taskGate.workerUrl, send, stop.signal);
+    const routed = await workerRouteAnswers(config.workerUrl, '/v1/change-review', send, stop.signal);
+    if (task !== changeWorkers.task || routed !== changeWorkers.review) log('change_workers', { task, review: routed });
+    changeWorkers.task = task;
+    changeWorkers.review = routed;
   });
   if (external) every('external_task_purge', deps.externalPurgeMs ?? EXTERNAL_PURGE_MS, async () => {
     const purged = await external.links.purge();

@@ -23,6 +23,8 @@ export const REVIEW_APP_KEYS = Object.freeze(['GITHUB_REVIEW_APP_ID', 'GITHUB_RE
 export const TASK_KEYS = Object.freeze(['TASK_LANE_ENABLED', 'TASK_WORKER_URL'] as const);
 // R08 외부 세션 알림(비밀 아님, 차트 env). 없거나 false면 리스너·명령·루프를 만들지 않는다. 작업 레인 스위치와 무관하다.
 export const EXTERNAL_TASK_KEYS = Object.freeze(['EXTERNAL_TASK_EVENTS_ENABLED', 'EXTERNAL_TASK_ENVIRONMENT', 'EXTERNAL_TASK_RESTORE_EPOCH'] as const);
+// 변경 PR(T19). 스위치가 true가 아니면 App 키를 읽지도 않는다. 켰는데 키가 없으면 CHANGE만 닫고, 있는데 틀리면 기동하지 않는다.
+export const CHANGE_KEYS = Object.freeze(['CHANGE_PR_ENABLED', 'GITHUB_WRITER_APP_ID', 'GITHUB_WRITER_APP_PRIVATE_KEY'] as const);
 // 원장 PVC 마운트(계약 v1 /var/lib/homelab-bot/ledger)가 들어갈 수 있는 곳. 그 밖 경로는 컨테이너 쓰기 층이라 재시작에 사라진다.
 export const LEDGER_ROOT = '/var/lib/homelab-bot/';
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -45,6 +47,8 @@ export interface PublisherConfig {
   taskLane?: { workerUrl: string } | null;
   // null(또는 없음)이면 R08 리스너·명령을 만들지 않는다. environment는 서명 입력에 들어가는 값이고 helper 설정과 같아야 한다.
   externalTask?: { environment: string; restoreEpoch?: string } | null;
+  // null(또는 없음)이면 스위치가 꺼진 것이다. writer 객체·명령·루프를 만들지 않는다. writerApp이 null이면 켰는데 키가 부족한 것이고 CHANGE만 닫힌다.
+  changePr?: { writerApp: { appId: string; privateKey: KeyObject } | null } | null;
 }
 type Env = Readonly<Record<string, string | undefined>>;
 const token = (value: string) => value.length > 0 && !/\s/.test(value);
@@ -95,10 +99,29 @@ export function loadPublisherConfig(env: Env, loadedAt: number): PublisherConfig
   const reviewEnabled = reviewSwitch(env, problems);
   const taskLane = taskLaneConfig(env, problems);
   const externalTask = externalTaskConfig(env, problems);
+  const changePr = changePrConfig(env, problems);
   if (problems.length || !policy || !workerKey) throw new ConfigError(problems.length ? problems : ['unknown']);
   return { databaseUrl, discordToken, policy, grafana: { url: grafanaUrl, token: grafanaToken },
     kubernetes: { url: kubernetesUrl }, workerUrl, healthchecksUrl,
-    workerKey, githubWebhookSecret, memory, briefing, githubReviewApp, reviewEnabled, taskLane, externalTask };
+    workerKey, githubWebhookSecret, memory, briefing, githubReviewApp, reviewEnabled, taskLane, externalTask, changePr };
+}
+function changePrConfig(env: Env, problems: string[]): PublisherConfig['changePr'] {
+  const raw = env.CHANGE_PR_ENABLED;
+  if (raw === undefined || raw === 'false') return null;
+  if (raw !== 'true') { problems.push('CHANGE_PR_ENABLED(invalid)'); return null; }
+  const rawId = env.GITHUB_WRITER_APP_ID, rawKey = env.GITHUB_WRITER_APP_PRIVATE_KEY;
+  if (rawId === undefined || rawKey === undefined) return { writerApp: null };
+  const appId = /^[1-9]\d{0,15}$/.test(rawId.trim()) ? rawId.trim() : undefined;
+  if (!appId) problems.push('GITHUB_WRITER_APP_ID(invalid)');
+  const privateKey = rsaKey(rawKey);
+  if (!privateKey) problems.push('GITHUB_WRITER_APP_PRIVATE_KEY(invalid)');
+  return { writerApp: appId && privateKey ? { appId, privateKey } : null };
+}
+function rsaKey(raw: string): KeyObject | undefined {
+  try {
+    const key = createPrivateKey(raw.trim().replaceAll('\\n', '\n'));
+    return key.asymmetricKeyType === 'rsa' && (key.asymmetricKeyDetails?.modulusLength ?? 0) >= 2048 ? key : undefined;
+  } catch { return undefined; }
 }
 // 형식이 틀린 값은 스위치와 무관하게 기동 오류다. 켜는 PR에서 처음 터지지 않게 꺼진 동안에도 값을 본다.
 function externalTaskConfig(env: Env, problems: string[]): PublisherConfig['externalTask'] {
