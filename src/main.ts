@@ -11,7 +11,7 @@ import { ClaudeTaskBridge } from './claude-task-bridge.js';
 import { assembleChange, assembleChangeReview, changeCommandHandler, changePrecondition, guardedTaskCommands, workerRouteAnswers } from './change-assembly.js';
 import type { ChangeAssemblyOptions } from './change-assembly.js';
 import { CHANGE_PERIODS } from './change-runtime.js';
-import { ChangeStore } from './change-store.js';
+import { ChangePrivateInputs, ChangeStore } from './change-store.js';
 import { CHANGE_COMMANDS, EXTERNAL_TASK_COMMANDS, FOUNDATION_COMMANDS, MEMORY_COMMANDS, REVIEW_COMMANDS, TASK_COMMANDS, commandDefinitions, registerCommands } from './commands.js';
 import { ConfigError, databasePoolConfig, loadPublisherConfig } from './config.js';
 import type { PublisherConfig } from './config.js';
@@ -539,7 +539,8 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
         // 기억 명령은 원장이 켜졌을 때만 받는다. 장벽 전·기억이 닫힌 동안은 MemoryNotReady로, 종료 중이면 바로 "쓸 수 없음"으로 답한다.
         const memoryCommands = t20 && new MemoryCommands(t20.memory, () => t20.ledger.status().state, () => stop.signal.aborted, now);
         const plainTaskCommands = taskBridge && new TaskCommands(store, gate, taskBridge, () => taskIntake, track, log);
-        const taskCommands = plainTaskCommands && change ? guardedTaskCommands(plainTaskCommands, change.inputs, gate) : plainTaskCommands;
+        // 답 봉인은 스위치와 무관하다. 켰다가 끈 뒤에도 남은 CHANGE 질문의 답이 events로 들어가면 대화 모델에 샌다.
+        const taskCommands = plainTaskCommands && guardedTaskCommands(plainTaskCommands, change?.inputs ?? new ChangePrivateInputs(deps.db, now), gate);
         discord = { ingress: new DiscordIngress(store, gate, protocol, true, acceptedCommands, log, memoryCommands || undefined, taskCommands, external?.commands, changeCommands),
           publisher: new DiscordPublisher(store, gate, protocol) };
         const publisher = discord.publisher;

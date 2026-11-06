@@ -191,6 +191,22 @@ test('호환 진입점: 스위치 false면 명령·writer·루프·GitHub 호출
     assert.equal(Number((await database.db.query<{ count: string }>('SELECT count(*) FROM change_requests')).rows[0]!.count), 0);
   } finally { await b.close(); }
 });
+test('호환 진입점: 스위치를 꺼도 남은 CHANGE 질문의 답은 events에 원문을 남기지 않는다', async () => {
+  await withHarness({ steps: [QUESTION, WRITE_STEP] }, async h => {
+    const { question } = await toQuestion(h);
+    const task = { projects: [{ id: 'fixture', revision: 'r1', allowedPaths: ['src', 'tests', 'docs', 'README.md'], forbiddenPaths: [], verifyCommands: [], repository: REPO.fullName, branch: 'main' }] };
+    const b = await bootPublisher({ changePr: null }, undefined, { task }, {});
+    try {
+      assert.deepEqual(gate(b.logs), { state: 'closed', reason: 'switch_off' });
+      await until(() => b.rest.guildCommands.some(item => item.name === 'answer'), 6000);
+      b.gw.dispatch(b.gw.latest, 2, 'INTERACTION_CREATE', interaction('905', 'answer', { target: question, text: `label=private | ${CANARY}` }));
+      await new Promise(resolve => setTimeout(resolve, 400));
+      // 음성 대조: 명령이 실제로 저장됐다. 저장 전에 막혀 원문이 없는 것과 가른다.
+      assert.ok((await h.db.query(`SELECT 1 FROM events WHERE payload->>'command'='answer'`)).rows.length > 0, '명령이 events에 저장됐다');
+      assert.ok(!(await eventsText(h)).includes(CANARY), 'events에 원문이 없다');
+    } finally { await b.close(); }
+  });
+});
 test('호환 진입점: 켰는데 키가 없으면 CHANGE만 닫힌다. 명령은 안내하고 writer는 없다', async () => {
   const b = await bootPublisher({ changePr: { writerApp: null } }, undefined, { change: { repositories: [repositoryPolicy()] } });
   try {
@@ -1044,6 +1060,25 @@ test('사람 취소: 시험을 기다리는 중에도 /change-cancel이 시한�
     await until(() => h.runs.verify === 1, 8000);
     await h.command('101', 'change-cancel', { target: id });
     assert.equal(await h.phase(id), 'cancelled');
+    for (let round = 0; round < 400 && await h.store.laneBusy('task'); round++) { await h.runtime.childrenTick(); await new Promise(resolve => setTimeout(resolve, 5)); }
+    stopping = true;
+    await lane;
+    assert.equal(await h.store.laneBusy('task'), false);
+    assert.equal(h.reviewInputs.length, 0);
+  });
+});
+
+test('사람 취소: 시험을 기다리는 중에 자식 /cancel이 오면 시험을 멈추고 부모를 닫는다. 리뷰로 넘어가지 않는다', async () => {
+  await withHarness({ sandbox: (_args, _limits, signal) => new Promise(resolve => { signal.addEventListener('abort', () => resolve({ started: true, exitCode: null, timedOut: false, overflow: false, aborted: true, log: Buffer.from(''), logBytes: 0, logDigest: 'a'.repeat(64) })); }) }, async h => {
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    let stopping = false;
+    const lane = (async () => { while (!stopping) { await h.runtime.laneTick(); await new Promise(resolve => setTimeout(resolve, 3)); } })();
+    await until(() => h.runs.verify === 1, 8000);
+    await h.command('101', 'cancel', { target: (await childOf(h.db, id))!.id });
+    let phase = '';
+    for (let round = 0; round < 1600 && phase !== 'cancelled'; round++) { phase = await h.phase(id); await new Promise(resolve => setTimeout(resolve, 5)); }
+    assert.equal(phase, 'cancelled', '자식이 취소되면 부모도 닫힌다');
     for (let round = 0; round < 400 && await h.store.laneBusy('task'); round++) { await h.runtime.childrenTick(); await new Promise(resolve => setTimeout(resolve, 5)); }
     stopping = true;
     await lane;

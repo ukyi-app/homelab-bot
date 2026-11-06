@@ -905,7 +905,13 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
   }
   async verificationKeepalive(key: ChangeKey): Promise<void> {
     const jobId = await this.deps.source.authorJob(key);
-    if (jobId) await this.deps.store.heartbeat(await this.jobRow(jobId));
+    if (!jobId) return;
+    const job = await this.jobRow(jobId);
+    await this.deps.store.heartbeat(job);
+    // 시험 중 자식 /cancel은 부모가 verifying이라 정리 바퀴가 멈춰 주지 않는다. 시한까지 기다리지 않게 시험을 여기서 멈춘다.
+    if ((job as unknown as { state: string }).state !== 'cancel_requested') return;
+    const session = await this.session(jobId);
+    if (session) await this.deps.bridge.cancelChangeTurn(session, jobId);
   }
   // WorkerChangeVerification에 넘기는 호출 묶음.
   verificationWorker(): ChangeVerificationWorker {

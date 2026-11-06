@@ -450,8 +450,13 @@ export class ChangeRuntime {
       if (statuses.get(commandId) !== 'passed') break;
     }
     const bad = required.map(commandId => statuses.get(commandId)).find(status => status !== 'passed');
-    // 저장·시험이 끝난 결과만 지운다. 실패해도 부모 진행을 막지 않고 closeFinishedChildren이 다시 부른다.
+    // 시험을 기다리는 동안 들어온 자식 /cancel이다. 진입 때 본 값은 낡았다. 부모를 닫지 않으면 자식은 취소됐는데 리뷰·승인이 이어진다.
     const child = await this.authorChild(request).catch(() => null);
+    if (child?.state === 'cancel_requested' || child?.state === 'cancelled') {
+      await this.close(request, 'verifying', { to: 'cancelled', reason: 'owner_cancelled' });
+      return true;
+    }
+    // 저장·시험이 끝난 결과만 지운다. 실패해도 부모 진행을 막지 않고 closeFinishedChildren이 다시 부른다.
     if (child?.session_generation) await this.deps.author.finalize(receiptOf(child)).catch(error => { this.deps.log('change_author_finalize_deferred', errorInfo(error)); });
     if (bad !== undefined) {
       await this.close(request, 'verifying', { to: 'blocked', reason: `verification_${bad}` });

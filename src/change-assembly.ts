@@ -26,7 +26,7 @@ import type { TaskV2WorkerPort } from './task-http.js';
 import { TaskPolicySchema } from './task-policy.js';
 import type { WorkerSigner } from './worker.js';
 
-// 변경 PR의 정적 조건과 조립. 하나라도 어긋나면 CHANGE만 닫고 대화·작업·리뷰는 그대로 뜬다. 스위치가 꺼져 있으면 이 파일의 어떤 객체도 만들어지지 않는다.
+// 변경 PR의 정적 조건과 조립. 하나라도 어긋나면 CHANGE만 닫고 대화·작업·리뷰는 그대로 뜬다. 스위치가 꺼져 있으면 답 봉인(guardedTaskCommands) 말고는 이 파일의 어떤 객체도 만들어지지 않는다.
 
 export type ChangeGateClosedReason = 'switch_off' | 'writer_key_missing' | 'policy_missing' | 'task_lane_closed' | 'review_closed' | 'task_policy_mismatch';
 export type ChangePrecondition = { open: true; app: GitHubAppCredentials } | { open: false; reason: ChangeGateClosedReason };

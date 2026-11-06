@@ -1817,6 +1817,8 @@ SEC02_IMAGE=<이름> npm test   # 없으면 사유와 함께 skip. 통과로 세
 
 ## T19 B5 조립 (2026-11-06, 로컬·PG·podman)
 
+**Codex 리뷰 2라운드 P2 2건(#85).** 둘 다 시험을 먼저 넣어 수정 전 실패를 봤다. (1) 스위치를 끄면 답 봉인이 빠져, 켰다가 끈 뒤 남은 CHANGE 질문의 비공개 답이 `events`와 대화 맥락으로 샜다. 이제 봉인은 스위치와 무관하게 조립한다. 시험은 진입점을 스위치 false로 띄우고 명령이 저장된 것까지 음성 대조한다. (2) 시험을 기다리는 동안 자식 `/cancel`이 오면 시험이 시한까지 돌고 부모가 `reviewing`으로 넘어갔다. 이제 `verificationKeepalive`가 시험을 멈추고, 결과 처리 전에 자식 상태를 다시 봐 부모를 `cancelled`로 닫는다.
+
 **범위.** B0~B4를 게시 서버·작업자 진입점에 잇고 기본 꺼짐으로 둔다. 구조는 `ARCHITECTURE.md` §16.5다. 실제 모델·GitHub·Discord·클러스터에 닿지 않았다. 값은 모두 합성이다.
 
 **시험 도구(`test/change-assembly-harness.ts`).** main과 같은 조립 함수로 실제 `ChangeRuntime`·`ClaudeTaskBridge`·`TaskWorkerService`·`runChangeTurn`·`IsolatedVerifier`·`ChangeReviewService`·`ChangePublisher`·저장 계층을 잇는다. 가짜는 셋이다. `claude` 실행 파일, GitHub HTTP, 리뷰 모델. 작업자와 후보 리뷰 경로는 실제 HTTP로 돈다.
