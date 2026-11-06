@@ -396,7 +396,7 @@ test('T19 B3 writer: 읽기 응답을 믿지 않는다', async () => {
   await assert.rejects(lying({ sha: sha('b'), tree: { sha: sha('c') }, parents: [] }).writer.readCommit({ target: TARGET, sha: sha('a') }), /read_response_invalid/);
   await assert.rejects(lying({ sha: sha('b'), truncated: false, tree: [] }).writer.readTreeLeaves({ target: TARGET, sha: sha('a') }), /read_response_invalid/);
   await assert.rejects(lying({ sha: sha('b'), size: 1, encoding: 'base64', content: '' }).writer.readBlobExists({ target: TARGET, sha: sha('a') }), /read_response_invalid/);
-  await assert.rejects(lying({ type: 'file', encoding: 'base64', sha: sha('b'), content: Buffer.from('x').toString('base64') }).preflight.readPinnedWorkflow({ uses: 'o/r/.github/workflows/a.yaml@v1' }), /read_response_invalid/);
+  await assert.rejects(lying({ type: 'file', encoding: 'base64', sha: sha('b'), content: Buffer.from('x').toString('base64') }).preflight.readPinnedWorkflow({ uses: 'o/r/.github/workflows/a.yaml@app-build-v1.0.1' }), /read_response_invalid/);
 });
 
 test('T19 B3 writer: 잘린 tree는 제한된 비재귀 탐색으로 입증하거나 complete=false다', async () => {
