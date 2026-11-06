@@ -1522,3 +1522,50 @@ manifest는 정확한 경로만 받는다. **올릴 때 그 경로가 비어 있
 | SQL 전이 표에서 한 행 제거 | 1 |
 
 **하지 않은 것.** 실제 조립·운영 migration 적용, 실제 작업자·GitHub 응답과의 대조, artifact 원문 보존 기간의 삭제 경로. 부하 아래 잠금 시한(`busy`) 값은 경합 시험에서 나오지 않아 직접 재현하지 않았다.
+
+## T19 B4 배포 읽기 (2026-11-06, 로컬·mock)
+
+`ChangeDeploymentPort` 구현과 읽기 경로만 넣었고 어떤 진입점에도 조립하지 않았다. 등급은 mock이고 입력은 모두 합성이다. 실제 클러스터·GitHub에 닿지 않았다. **DEPLOY-01 live는 아직 아니다.** H0 smoke 등록과 사람 병합 뒤 실제 변경 한 건으로 따로 확인한다.
+
+`test/change-deployment.test.ts`(44건)는 실제 `publicGithubReader`·`kubernetesClient`·`deploymentKubernetesReader`를 가짜 HTTP에 연결해 돈다.
+
+| 묶음 | 본 것 |
+|---|---|
+| 병합 읽기 | H≠M, 열림과 `closed_unmerged` 구분, merge commit 없음, 다른 저장소·PR 번호, 미등록, 조회 실패·스키마 위반은 미병합으로 바꾸지 않음 |
+| 일치 | H·M·K·D 분리, Argo `sync.revision`이 chart commit이어도 통과, main HEAD를 읽지 않음, `sync.revision`이 K와 같아도 values가 옛것이면 통과 못 함 |
+| image.yaml | revision 뒤처짐·H가 적힘·더 새 revision·저장소에 없음·hold, 형식 위반 6종, 다른 repository, 잘못된 digest |
+| Argo | 옛 값, 미비교, OutOfSync, 진행 중, 실패, Application 없음 |
+| workload | spec image, stale generation, unready, suspended, pod 없음·부족, imageID 불일치, 옛 파드 잔존, terminating. 마이그레이션 Job·퇴거 파드 제외 |
+| 조회 실패 | GitHub의 5xx·403·429·깨진 JSON·연결 실패, Kubernetes의 5xx·403·시한 초과는 `unknown`. 확인한 K·D는 남김 |
+| 스키마 위반 | GitHub 4종, Argo·Deployment·pod 8종, Helm values 다른 키 비투영 |
+| 해당 없음·미등록 | docs-only는 파일을 끝까지 읽었을 때만 `not_applicable`, 경로 밖·rename 원래 경로·`..`는 `blocked`, 앱 저장소 문서 변경은 이 경로를 안 탐, 미등록과 H0 전은 `blocked` |
+| 경계 | GitHub는 고정 origin·GET·자격 없음·redirect 거부. Kubernetes는 세 경로 GET만. 입력이 어긋나면 요청 0회. `/read`의 `SERVICES`·`ARGOCD_APPLICATIONS` 불변 |
+| 그 밖 | commit SHA로 정해진 내용 재조회 없음, 60초·10분 값과 창 경계, 문구가 기능·DB·성능을 말하지 않음 |
+
+**결과.** Node 24.22.0. 네트워크 없는 임시 `postgres:18-alpine`(18.6) 소켓을 줬고 끝난 뒤 컨테이너를 지웠다.
+
+- `npm run check`: 통과.
+- PostgreSQL 포함 `npm test`: **1639 / 1626 pass / 0 fail / 13 skipped**. skip은 전부 `SEC02_IMAGE` 없음이다.
+- PostgreSQL 없는 `npm test`: **1639 / 1550 pass / 0 fail / 89 skipped**.
+- 회귀 `test/publisher-read.test.ts`: 13/13 pass.
+
+**수정 전 실패.** 시험을 먼저 넣었을 때 구현 모듈이 없어 `tsc` 오류 12건으로 실패했다. 컴파일 실패이므로 시험별 실패 수는 없다.
+
+**변이 확인.** 임시 사본에 변이를 하나씩 넣고 이 시험 파일만 돌렸다. 원본 대조는 앞뒤 모두 44/44 pass다. 52건 모두 실패로 잡혔다. 첫 회에는 Argo values의 repository 대조 제거가 살아남아 시험을 더했고, 변이 정의 문제로 돌지 못한 2건은 고쳐 다시 돌렸다.
+
+| 변이 묶음 | 수 |
+|---|---|
+| revision·values 대조 제거 | 4 |
+| Argo 판정 제거·실패를 `pending`으로 | 6 |
+| workload·pod 판정 제거·실패를 `pending`으로 | 9 |
+| image.yaml 판정 변경(hold, 더 새 revision, repository, 형식, 없음, GitHub 실패) | 6 |
+| docs-only 판정 변경 | 5 |
+| 미등록을 `not_applicable`로 | 1 |
+| 병합 읽기 대조 제거 | 4 |
+| 캐시 3종, 창 경계, 문구 | 5 |
+| 파드 제외·목록 잘림·객체 대조·이름 검사 | 6 |
+| GitHub 자격 추가, redirect, commit·파일 입력 검사, 파일 쪽 완결성 | 6 |
+
+**운영 대조(2026-11-06, 읽기 전용, 이 코드를 돌린 것은 아니다).** `homelab-bot` Application에 `spec.source.helm.valuesObject`와 `status.sync.comparedTo.source.helm.valuesObject`가 있고 둘 다 `repository`·`digest`·`revision`을 담는다. `spec.sources`는 없다. pod `imageID`는 `<저장소>@sha256:<digest>`이고 마이그레이션 파드의 owner는 `Job`이다. SA `bot-reader`는 Application get과 pod list를 할 수 있다. 시험의 합성 응답이 이 모양과 같다.
+
+**하지 않은 것.** 이 코드로 실제 클러스터·GitHub를 읽기. GitHub 응답은 합성값이다. 첫 live 조회에서 모양이 다르면 `argo_config_stale`로 멈추고 `observed`로 가지 않는다. D의 출처 재검증, 조립·루프(B5)도 하지 않았다.
