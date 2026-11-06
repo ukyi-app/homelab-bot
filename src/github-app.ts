@@ -111,11 +111,11 @@ export class GitHubTokenError extends GitHubError {
     this.message = reason;
   }
 }
-const TokenResponse = z.object({
+export const TokenResponse = z.object({
   token: z.string().regex(/^[\x21-\x7e]{1,8192}$/), expires_at: z.string(), permissions: z.record(z.string(), z.string()),
   repositories: z.array(z.object({ id: z.number(), full_name: z.string() })).optional(),
 });
-function grantedExactly(granted: Record<string, string>, wanted: Readonly<Record<string, string>>): boolean {
+export function grantedExactly(granted: Record<string, string>, wanted: Readonly<Record<string, string>>): boolean {
   // metadata:read는 모든 App에 따라붙어 요청하지 않아도 응답에 올 수 있다. 그 밖의 추가 권한은 받지 않는다.
   const extra = Object.keys(granted).filter(name => !(name in wanted));
   return extra.every(name => name === 'metadata' && granted[name] === 'read')
