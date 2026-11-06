@@ -435,6 +435,9 @@ export class ChangeStore {
     });
   }
 
+  async hasLiveApproval(key: ChangeKey): Promise<boolean> {
+    return (await this.database.query('SELECT 1 FROM change_approvals WHERE change_id=$1 AND generation=$2 AND invalidated_at IS NULL', [key.changeId, key.generation])).rows.length > 0;
+  }
   // 게시 직전 재검사. 지금 계산한 대상이 승인한 대상과 같은지 본다.
   async checkLiveApproval(input: ChangeKey & { subject: ApprovalSubject }): Promise<StoreResult<{ digest: string }>> {
     const live = (await this.database.query<{ approval_digest: string }>('SELECT approval_digest FROM change_approvals WHERE change_id=$1 AND generation=$2 AND invalidated_at IS NULL',

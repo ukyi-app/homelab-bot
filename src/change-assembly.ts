@@ -16,7 +16,7 @@ import type { ClaudeTaskBridge } from './claude-task-bridge.js';
 import type { PublisherConfig } from './config.js';
 import type { Scope } from './contracts.js';
 import type { GitHubAppCredentials } from './github-app.js';
-import { createGitHubWriter, policyWriterRepositories } from './github-writer.js';
+import { PublicationStopped, createGitHubWriter, policyWriterRepositories } from './github-writer.js';
 import type { Log } from './log.js';
 import type { Policy, PolicyGate } from './policy.js';
 import { deploymentKubernetesReader, publicGithubReader } from './read-transports.js';
@@ -102,7 +102,9 @@ export function assembleChange(options: ChangeAssemblyOptions): ChangeAssembly {
   const authorizeWrite = async (target: ChangeTarget): Promise<void> => {
     const request = await changes.get(target.key.changeId);
     // 요청자를 모르면 권한을 말할 수 없다. 철회로 닫지 않고 writer가 보내지 않게만 한다.
-    if (!request.ok || request.value.generation !== target.key.generation) throw new Error('change_request_unavailable');
+    if (!request.ok) throw new Error('change_request_unavailable');
+    // /change-cancel은 권한을 건드리지 않아 권한 확인만으로는 못 잡는다. 취소·막힘은 부모를 끝내고 승인을 무효로 한다.
+    if (request.value.generation !== target.key.generation || request.value.phase !== 'publishing' || !await changes.hasLiveApproval(target.key)) throw new PublicationStopped();
     await authorize(request.value);
   };
   const io = (options.createWriter ?? createGitHubWriter)({ app: options.app, repositories: policyWriterRepositories(policy), authorizeWrite, send, now });

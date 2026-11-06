@@ -1751,6 +1751,7 @@ V1에는 `PATCH git/refs`와 `PATCH pulls`가 없다. 병합·`/merges`·dispatc
 | 연결 전 실패·한도 초과 | `not_sent`, 간격을 늘려 8회까지 재시도 뒤 `send_attempts_exhausted`로 막힘 |
 | 입력·권한·저장소 불일치 | `not_sent`지만 재시도 없이 막힘 |
 | 쓰기 직전 권한 철회 | `not_sent(authorization_revoked)`. effect를 `pending`으로 놓고 게이트를 다시 본다. 철회가 맞으면 부모 `cancelled`, effect는 `abandoned_unsent`. 그사이 권한이 돌아왔으면 미뤘다가 이어 감 |
+| 쓰기 직전 취소·막힘 | `not_sent(publication_stopped)`. 끝난 부모를 다시 닫지 않고 effect를 `abandoned_unsent`로 해소한다. 부모가 아직 게시 중인데 승인만 무효면 `pending`으로 놓고 다음 claim이 막는다 |
 | 쓰기 직전 권한 확인 실패 | `not_sent(policy_unavailable·authorization_check_failed)`. 보내지 않고 위 연결 전 실패처럼 재시도 |
 | blob·tree·commit 응답 유실 | `unknown`, 예상 SHA를 GET해 있으면 확정, 없으면 unknown 유지 |
 | ref 응답 유실·422 | 정확한 ref를 GET. 예상 H면 회수, 다른 SHA면 `head_changed`로 막힘, 없으면 unknown(422는 막힘) |
@@ -1870,7 +1871,7 @@ ChangeRuntime
 
 **쓰기 전 인가.** `ChangePublisher`는 `publish` 입구와 stage마다 요청자의 owner·scope를 `gate.authorize`로 다시 본다. 정책 조회는 `/revoke`의 거부 목록을 보지 않기 때문이다. 대조 주기의 재개도 `publish`를 지나므로 쓰기로 가는 길은 이 확인을 거친다. 철회면 부모를 `cancelled(authorization_revoked)`로 닫고 이미 공개된 객체는 건드리지 않는다. 정책을 읽지 못하면 쓰지 않고 미룬다. 미확정 effect의 읽기 대조는 권한과 무관하게 계속 돌아 응답을 잃은 객체를 기록으로 맞춘다.
 
-단계 입구의 확인 뒤에도 GitHub 조회와 토큰 발급을 기다리므로, 그사이의 `/revoke`를 위해 writer가 쓰기 요청마다 토큰을 받은 뒤 한 번 더 본다(`authorizeWrite`, 필수 옵션). blob은 하나마다 본다. 철회면 `authorization_revoked`, 정책을 못 읽으면 `policy_unavailable`, 확인 자체가 실패하면 `authorization_check_failed`로 그 요청을 보내지 않고 `not_sent`를 돌려준다. 이미 나간 객체는 되돌리지 않는다. 앞 blob의 응답을 잃었어도 `not_sent`다. blob은 내용 주소라 다시 보내도 중복이 없고, 안 나간 blob이 있으면 대조로 확정할 수 없기 때문이다. 읽기는 이 확인을 지나지 않는다. 확인과 전송 사이의 아주 짧은 틈은 남고, 그 틈에 나간 요청은 기존 결과 분류를 따른다.
+단계 입구의 확인 뒤에도 GitHub 조회와 토큰 발급을 기다리므로, 그사이의 `/revoke`와 `/change-cancel`을 위해 writer가 쓰기 요청마다 토큰을 받은 뒤 한 번 더 본다(`authorizeWrite`, 필수 옵션). 같은 generation이 게시 중이고 승인이 살아 있으며 요청자 권한이 있어야 보낸다. blob은 하나마다 본다. 철회면 `authorization_revoked`, 부모가 끝났거나 승인이 무효면 `publication_stopped`, 정책을 못 읽으면 `policy_unavailable`, 확인 자체가 실패하면 `authorization_check_failed`로 그 요청을 보내지 않고 `not_sent`를 돌려준다. 이미 나간 객체는 되돌리지 않는다. 앞 blob의 응답을 잃었어도 `not_sent`다. blob은 내용 주소라 다시 보내도 중복이 없고, 안 나간 blob이 있으면 대조로 확정할 수 없기 때문이다. 읽기는 이 확인을 지나지 않는다. 확인과 전송 사이의 아주 짧은 틈은 남고, 그 틈에 나간 요청은 기존 결과 분류를 따른다.
 
 **v1 분리.** 작성 job은 부모 연결과 한 트랜잭션으로 만든다. `Store.claim`이 `change_child_jobs`에 묶인 job을 집지 않고 `claimChangeAuthor`만 같은 잠금 순서·슬롯 규칙으로 집는다. v1 `run`으로 가면 세션이 `task_session_mismatch`로 닫히고 저장 전 결과가 지워지기 때문이다. `/retry`도 자식 job을 되살리지 않는다. `/cancel`·`/resume-model`·`/answer`·`/task-release`는 작성 job에 그대로 쓴다.
 

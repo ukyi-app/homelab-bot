@@ -382,6 +382,14 @@ export class ChangePublisher {
           await this.assertAuthorized(key);
           throw new Stop({ kind: 'deferred', reason: outcome.code, retryAt });
         }
+        // 쓰기 직전 취소·막힘이다. 부모는 이미 끝나 다시 닫지 않는다. 놓아 두기가 안 나간 effect를 해소한다. 아직 게시 중이면 승인만 무효인 것이라 claim이 다음 바퀴를 막는다.
+        if (outcome.code === 'publication_stopped') {
+          const retryAt = this.now() + this.retryMs;
+          const released = await this.store.releaseUnsentEffect({ ...key, stage, leaseId, retryAt });
+          if (!released.ok) throw new Stop({ kind: 'busy' });
+          await this.assertStillPublishing(key);
+          throw new Stop({ kind: 'deferred', reason: outcome.code, retryAt });
+        }
         if (!isTransientNotSent(outcome.code)) throw await this.blockStage(key, stage, outcome.code);
         if (attempt >= MAX_SEND_ATTEMPTS) throw await this.blockStage(key, stage, 'send_attempts_exhausted');
         const retryAt = this.now() + Math.min(this.retryMs * 2 ** (attempt - 1), MAX_RETRY_MS);

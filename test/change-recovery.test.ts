@@ -4,6 +4,7 @@ import { EFFECT_LEASE_MS, UNKNOWN_RECONCILE_MS } from '../src/change-contracts.j
 import type { ChangeKey, EffectStage } from '../src/change-contracts.js';
 import { ChangePublisher } from '../src/change-publisher.js';
 import { Denied } from '../src/contracts.js';
+import { PublicationStopped } from '../src/github-writer.js';
 import { ok } from './change-store-fixture.js';
 import { BOT_USER, REPO, branchOf, publishEnv } from './change-github-fake.js';
 import type { FaultMode, PublishEnv } from './change-github-fake.js';
@@ -580,6 +581,23 @@ test('쓰기 직전 철회: 일부 blob의 응답을 잃은 뒤 철회돼도 unk
     assert.equal((await env.publisher.publish(key)).kind, 'proposed');
   } finally { await close(); }
 });
+test('쓰기 직전 중단: 끝난 부모는 다시 바꾸지 않고, 아직 게시 중이면 막지 않고 미룬다', async () => {
+  const { env, close } = await setup();
+  try {
+    const key = await env.approve();
+    env.writeGuard.check = async () => { throw new PublicationStopped(); };
+    const held = await env.publisher.publish(key);
+    assert.equal(held.kind, 'deferred', JSON.stringify(held));
+    assert.equal((held as { reason: string }).reason, 'publication_stopped');
+    assert.equal(ok(await env.store.get(key.changeId)).phase, 'publishing');
+    assert.equal((await effect(env, key, 'blob'))?.state, 'pending', 'sending·unknown·blocked가 아니다');
+    ok(await env.store.transition({ ...key, from: 'publishing', to: 'cancelled', reason: 'owner_cancelled' }));
+    assert.deepEqual(await env.publisher.publish(key), { kind: 'stopped', phase: 'cancelled' });
+    assert.equal(ok(await env.store.get(key.changeId)).phaseReason, 'owner_cancelled');
+    assert.equal(posts(env, 'blob'), 0);
+  } finally { await close(); }
+});
+
 test('쓰기 직전 철회: 권한 확인 오류의 미전송을 막지 않고 미룬다', async () => {
   const { env, close } = await setup();
   try {

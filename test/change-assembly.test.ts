@@ -1247,6 +1247,42 @@ test('쓰기 직전 철회: 첫 blob 응답을 세운 동안 철회하면 남은
     assert.deepEqual(await effectRow(h, id, 'blob'), { state: 'blocked', blocked_reason: 'abandoned_unsent', resolution: 'not_sent' });
   });
 });
+test('쓰기 직전 취소: 첫 blob 응답을 세운 동안 /change-cancel이면 남은 blob이 0회이고 닫힌 사유를 다시 바꾸지 않는다', async () => {
+  await withHarness({}, async h => {
+    const id = await toApproved(h);
+    const hold = holdOnce(h, (method, url) => method === 'POST' && url.endsWith('/git/blobs'), 'after');
+    const tick = h.runtime.publishTick();
+    await hold.arrived;
+    await h.command('102', 'change-cancel', { target: id });
+    assert.equal(await h.phase(id), 'cancelled');
+    hold.release();
+    await tick;
+    assert.equal(h.env.github.count(/POST .*\/git\/blobs$/), 1, '취소 뒤의 blob이 나가지 않는다');
+    assert.equal(h.env.github.count(/POST .*\/git\/trees$/), 0);
+    assert.equal((await h.changes.get(id) as any).value.phaseReason, 'owner_cancelled', '끝난 부모를 다시 닫지 않는다');
+    assert.deepEqual(await effectRow(h, id, 'blob'), { state: 'blocked', blocked_reason: 'abandoned_unsent', resolution: 'not_sent' });
+    assert.deepEqual(await h.changes.unresolvedEffects({ changeId: id }), [], 'sending·unknown으로 남지 않는다');
+  });
+});
+test('쓰기 직전 취소: PR effect를 claim한 뒤 전송 전에 /change-cancel이면 PR 요청이 0회다', async () => {
+  await withHarness({}, async h => {
+    const id = await toApproved(h);
+    const claim = h.changes.claimEffect.bind(h.changes);
+    let claimedPull = false;
+    h.changes.claimEffect = async input => {
+      const claimed = await claim(input);
+      if (input.stage === 'pull') { claimedPull = claimed.ok; await h.command('102', 'change-cancel', { target: id }); }
+      return claimed;
+    };
+    await h.runtime.publishTick();
+    assert.equal(claimedPull, true, '전송 직전까지 왔다');
+    assert.equal(h.env.github.count(PULL_POST), 0, 'PR 요청 0회');
+    assert.equal(await h.phase(id), 'cancelled');
+    assert.equal((await h.changes.get(id) as any).value.phaseReason, 'owner_cancelled');
+    assert.deepEqual(await effectRow(h, id, 'pull'), { state: 'blocked', blocked_reason: 'abandoned_unsent', resolution: 'not_sent' });
+    assert.deepEqual(await h.changes.unresolvedEffects({ changeId: id }), []);
+  });
+});
 test('쓰기 직전 철회: 권한 확인 자체가 실패하면 PR 요청이 0회이고 닫지 않으며 확인이 돌아오면 이어 게시한다', async () => {
   await withHarness({}, async h => {
     const id = await toApproved(h);

@@ -6,7 +6,7 @@ import { changeBranchName, gitBlobSha } from '../src/change-contracts.js';
 import type { ChangeTarget, ChangeWriterPort } from '../src/change-contracts.js';
 import { Denied, PolicyUnavailable } from '../src/contracts.js';
 import { assertAllowed } from '../src/github-app.js';
-import { createGitHubWriter, writerRouteAllowed } from '../src/github-writer.js';
+import { PublicationStopped, createGitHubWriter, writerRouteAllowed } from '../src/github-writer.js';
 import type { WriterRepository } from '../src/github-writer.js';
 import { FAKE_APP_KEY, FakeGitHub, REPO, BOT_USER } from './change-github-fake.js';
 
@@ -447,7 +447,7 @@ test('T19 B3 writer: findPulls는 정확한 head·base만 돌려주고 상한을
 });
 
 const WRITE_POST = /POST .*\/(?:git\/(?:blobs|trees|commits|refs)|pulls)$/;
-for (const [name, error, code] of [['철회', new Denied(), 'authorization_revoked'], ['정책 조회 불가', new PolicyUnavailable(), 'policy_unavailable'], ['확인 오류', new Error('fixture_database_down'), 'authorization_check_failed']] as const) {
+for (const [name, error, code] of [['철회', new Denied(), 'authorization_revoked'], ['게시 중단', new PublicationStopped(), 'publication_stopped'], ['정책 조회 불가', new PolicyUnavailable(), 'policy_unavailable'], ['확인 오류', new Error('fixture_database_down'), 'authorization_check_failed']] as const) {
   test(`쓰기 경계: ${name}면 쓰기 다섯 종류 모두 토큰을 받은 뒤 요청을 보내지 않고 not_sent다`, async () => {
     const s = setup(undefined, async () => { throw error; });
     const pull = { target: TARGET, branch: BRANCH, baseBranch: 'main', title: 't', body: 'b', draft: false };

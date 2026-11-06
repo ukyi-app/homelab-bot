@@ -73,12 +73,14 @@ export interface ChangePreflightPort extends CiContentReader {
 }
 export interface GitHubWriterOptions {
   app: GitHubAppCredentials; repositories: WriterRepositoryLookup;
-  // 요청자의 지금 권한. 철회면 Denied, 정책을 못 읽으면 PolicyUnavailable을 던진다. 필수값이라 빼먹은 writer를 만들 수 없다.
+  // 지금 이 쓰기를 보내도 되는가. 철회면 Denied, 부모가 끝났거나 승인이 무효면 PublicationStopped, 정책을 못 읽으면 PolicyUnavailable을 던진다. 필수값이라 빼먹은 writer를 만들 수 없다.
   authorizeWrite: (target: ChangeTarget) => Promise<void>;
   send?: typeof fetch; now?: () => number;
 }
 
 class WriterReadError extends Error {}
+// 부모가 더는 게시 중이 아니거나 승인이 무효다. 끝난 부모를 다시 닫지 않도록 권한 철회(Denied)와 나눠 돌려준다.
+export class PublicationStopped extends Error { constructor() { super('publication_stopped'); } }
 const readFailure = (code: string) => new WriterReadError(code);
 type Scope = 'contents' | 'pull';
 const SCOPES: Readonly<Record<Scope, Readonly<Record<string, string>>>> = Object.freeze({
@@ -167,13 +169,13 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
     catch { return { kind: 'lost', code: 'response_invalid' }; }
   };
 
-  // 공개 저장소로 나가는 쓰기는 모두 여기를 지난다. 게시자의 단계 입구 검사 뒤에도 GitHub 조회·토큰 발급을 기다리므로 그사이의 /revoke는 여기서만 잡힌다.
+  // 공개 저장소로 나가는 쓰기는 모두 여기를 지난다. 게시자의 단계 입구 검사 뒤에도 GitHub 조회·토큰 발급을 기다리므로 그사이의 /revoke·/change-cancel은 여기서만 잡힌다.
   // 확인이 실패해도 보내지 않는다. 읽기는 이 길을 지나지 않아 보냈을 수 있는 effect의 대조가 철회로 막히지 않는다.
   // 이 확인과 전송 사이의 아주 짧은 틈은 남는다. 이미 나간 요청과 같게 대조로 다룬다.
   const sendWrite = async (target: ChangeTarget, path: string, token: string, body: unknown, limit: number): Promise<Exchange> => {
     try { await authorizeWrite(target); }
     catch (error) {
-      return { kind: 'not_sent', code: error instanceof Denied ? 'authorization_revoked' : error instanceof PolicyUnavailable ? 'policy_unavailable' : 'authorization_check_failed' };
+      return { kind: 'not_sent', code: error instanceof Denied ? 'authorization_revoked' : error instanceof PublicationStopped ? 'publication_stopped' : error instanceof PolicyUnavailable ? 'policy_unavailable' : 'authorization_check_failed' };
     }
     return exchange('POST', path, token, body, limit);
   };
