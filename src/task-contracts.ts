@@ -1,5 +1,7 @@
 import type { KeyObject } from 'node:crypto';
 import { z } from 'zod';
+import { ARTIFACT_LIMITS, ArtifactManifestSchema, ChangePathSchema, CommandIdSchema, EvidenceBundleSchema, GenerationSchema, GitShaSchema, ReasonCodeSchema, RepoIdSchema, Sha256Schema,
+  VerificationReceiptSchema } from './change-contracts.js';
 import { CODEX_DEFAULTS, CODEX_LIMITS, EVIDENCE_PATHS } from './codex.js';
 import { DEFAULTS, Denied } from './contracts.js';
 import type { Clock } from './contracts.js';
@@ -233,14 +235,133 @@ export type TaskStatusResponse = z.infer<typeof TaskStatusResponseSchema>;
 export const TaskRejectionSchema = z.strictObject({ status: z.literal('rejected'), started: z.literal(false) });
 export type TaskRejection = z.infer<typeof TaskRejectionSchema>;
 
+// ---- v2: CHANGE_PR 작성·검증 계약 ----
+// v1과 병존한다. v2는 턴을 접수만 하고 돌려주며 결과는 같은 식별자로 몇 번이든 다시 받는다. 그래서 응답을 잃어도 모델을 다시 돌리지 않는다.
+// 취소·상태는 v1 끝점을 함께 쓴다. 같은 직렬 슬롯을 보는 같은 동작이다.
+
+export const TASK_V2_CONTRACT = 2 as const;
+// 작업자 판정이 v2에서만 낼 수 있는 차단 사유. 전부 자르지 않고 닫는다는 뜻이다.
+export const CHANGE_ARTIFACT_REASONS = ['baseline_mismatch', 'baseline_unsupported', 'artifact_too_large', 'artifact_unsupported', 'artifact_binary',
+  'artifact_no_changes', 'artifact_incomplete', 'artifact_path_invalid', 'result_unavailable'] as const;
+export type ChangeArtifactReason = typeof CHANGE_ARTIFACT_REASONS[number];
+export const TASK_V2_FAILURE_REASONS = [...TASK_FAILURE_REASONS, ...CHANGE_ARTIFACT_REASONS] as const;
+export type TaskV2FailureReason = typeof TASK_V2_FAILURE_REASONS[number];
+
+// 게시 서버가 Git tree API로 읽은 T0의 잎. 모드는 일단 다 받는다. symlink·gitlink가 있으면 작업자가 "지원 안 함"으로 닫아 사유가 남는다.
+export const BaselineLeafSchema = z.strictObject({ path: z.string().min(1).max(ARTIFACT_LIMITS.pathBytes * 2),
+  mode: z.string().regex(/^[0-7]{6}$/), blobSha: GitShaSchema });
+export type BaselineLeaf = z.infer<typeof BaselineLeafSchema>;
+const TaskV2BaselineSchema = z.strictObject({ repoId: RepoIdSchema, changeGeneration: GenerationSchema, baseTree: GitShaSchema,
+  leaves: z.array(BaselineLeafSchema).min(1).max(ARTIFACT_LIMITS.manifestEntries) });
+// 공개 brief 전체가 들어가는 자리라 v1의 사용자 입력 상한보다 넓다. brief 최대 길이에 맞춘 값이다.
+export const TASK_V2_REQUEST_CHARS = 48_000;
+const v2Text = z.string().max(TASK_V2_REQUEST_CHARS).refine(text => text.trim().length > 0, 'empty_text');
+const v2Identity = { version: z.literal(TASK_V2_CONTRACT), job: uuid, lease: uuid, generation, sessionId: uuid };
+const { version: _v1Version, ...sharedExecution } = executionShape;
+const v2Execution = { ...sharedExecution, ...v2Identity };
+const TaskV2StartSchema = z.strictObject({ ...v2Execution, operation: z.literal('start'), turn: z.literal(1),
+  baseline: TaskV2BaselineSchema, untrusted: z.strictObject({ request: v2Text }) });
+// 답의 출처를 다시 확인한다. private·unknown은 모양부터 받지 않는다.
+const TaskV2ResumeSchema = z.strictObject({ ...v2Execution, operation: z.literal('resume'), turn: turn.min(2),
+  expectedWorker: TaskWorkerIdentitySchema, resumeReason: z.enum(['clarification', 'model_limit', 'auth_expired']),
+  questionId: z.string().max(100).optional(),
+  untrusted: z.strictObject({ answer: untrustedText, label: z.enum(['public', 'approved_public_summary']) }).optional() });
+export const TaskV2RequestSchema = z.discriminatedUnion('operation', [TaskV2StartSchema, TaskV2ResumeSchema]).superRefine((request, ctx) => {
+  if (request.timeoutMs > request.runBudgetRemainingMs) ctx.addIssue({ code: 'custom', path: ['timeoutMs'], message: 'over_run_budget' });
+  if (request.operation !== 'resume') return;
+  if (request.resumeReason === 'clarification' && !request.questionId) ctx.addIssue({ code: 'custom', path: ['questionId'], message: 'question_required' });
+  if ((request.questionId === undefined) !== (request.untrusted === undefined)) ctx.addIssue({ code: 'custom', path: ['untrusted'], message: 'answer_question_mismatch' });
+  if (request.questionId !== undefined) {
+    const [job, session, asked, ...rest] = request.questionId.split(':');
+    const number = Number(asked);
+    if (job !== request.job || session !== request.sessionId || rest.length || !Number.isInteger(number) || number < 1 || number >= request.turn) {
+      ctx.addIssue({ code: 'custom', path: ['questionId'], message: 'question_mismatch' });
+    }
+  }
+});
+export type TaskV2Request = z.infer<typeof TaskV2RequestSchema>;
+const v2Response = { ...v2Identity, worker: TaskWorkerIdentitySchema };
+export const TaskV2AcceptedSchema = z.strictObject({ ...v2Response, status: z.literal('accepted'), turn });
+export type TaskV2Accepted = z.infer<typeof TaskV2AcceptedSchema>;
+
+const v2Control = { ...v2Identity, expectedWorker: TaskWorkerIdentitySchema.nullable() };
+export const TaskV2ResultRequestSchema = z.strictObject(v2Control);
+export type TaskV2ResultRequest = z.infer<typeof TaskV2ResultRequestSchema>;
+// 작업자 저장소에서 서명까지 지나는 바이트다. 파일 내용은 base64로만 나른다.
+const WireFileSchema = z.strictObject({ path: ChangePathSchema, contentBase64: z.string() });
+export const WireArtifactSchema = z.strictObject({ manifest: ArtifactManifestSchema, files: z.array(WireFileSchema).max(ARTIFACT_LIMITS.changedFiles), patch: z.string() });
+export type WireArtifact = z.infer<typeof WireArtifactSchema>;
+const turnedResponse = { ...v2Response, turn, usage: TaskUsageSchema };
+export const TaskV2ResultResponseSchema = z.discriminatedUnion('status', [
+  z.strictObject({ ...v2Response, status: z.literal('running'), turn: turn.nullable(), stopped: z.literal(false) }),
+  // 이 저장소가 이 세대를 모른다(finalized:false). 옛 파드의 소멸 증명이 아니고 접수를 잃었다는 증명도 아니다.
+  z.strictObject({ ...v2Response, status: z.literal('absent'), finalized: z.boolean(), stopped: z.boolean() }),
+  z.strictObject({ ...turnedResponse, status: z.literal('needs_input'), stopped: z.literal(true), sessionRetained: z.literal(true), cleanupPending: z.literal(false),
+    question: z.string().max(TASK_LIMITS.questionChars).refine(text => text.trim().length > 0, 'empty_text') }),
+  z.strictObject({ ...turnedResponse, status: z.enum(['limited', 'auth_expired']), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.boolean() }),
+  z.strictObject({ ...turnedResponse, status: z.literal('failed'), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.boolean(), reason: z.enum(TASK_V2_FAILURE_REASONS) }),
+  // 소멸을 확인하지 못했거나 그 턴의 결과를 잃었다. 다시 돌리지 않는다.
+  z.strictObject({ ...turnedResponse, status: z.literal('unknown'), stopped: z.boolean(), sessionRetained: z.literal(true), cleanupPending: z.boolean() }),
+  // 프로세스 소멸을 확인한 뒤 실제 파일로 계산한 결과다. 모델의 요약은 싣지 않는다.
+  z.strictObject({ ...turnedResponse, status: z.literal('snapshot'), stopped: z.literal(true), sessionRetained: z.literal(true), cleanupPending: z.literal(false),
+    artifactDigest: Sha256Schema, artifact: WireArtifactSchema }),
+]);
+export type TaskV2ResultResponse = z.infer<typeof TaskV2ResultResponseSchema>;
+// 저장해 두는 결과. identity는 읽을 때 지금 작업자로 다시 채운다. 파드가 바뀌어도 같은 저장소면 같은 결과다.
+export type TaskV2TurnResult = Extract<TaskV2ResultResponse, { turn: number; usage: unknown }>;
+
+const LogNoteSchema = z.strictObject({
+  // 비공개 경로 전용 제한 길이 사본이다. 민감정보가 나온 로그는 null이고 저장도 하지 않는다.
+  excerpt: z.string().nullable(), truncated: z.boolean(), sensitive: z.boolean(),
+  // 왜 그 상태인지의 상수 코드. 공개 경로로 복사하지 않는다.
+  detail: ReasonCodeSchema.nullable(),
+});
+export const TaskV2VerifyRequestSchema = z.strictObject({ ...v2Identity, expectedWorker: TaskWorkerIdentitySchema, commandId: CommandIdSchema, bundle: EvidenceBundleSchema });
+export type TaskV2VerifyRequest = z.infer<typeof TaskV2VerifyRequestSchema>;
+export const TaskV2VerificationRequestSchema = z.strictObject({ ...v2Control, commandId: CommandIdSchema });
+export type TaskV2VerificationRequest = z.infer<typeof TaskV2VerificationRequestSchema>;
+export const TaskV2VerificationResponseSchema = z.discriminatedUnion('status', [
+  z.strictObject({ ...v2Response, status: z.literal('running'), commandId: CommandIdSchema }),
+  z.strictObject({ ...v2Response, status: z.literal('absent'), commandId: CommandIdSchema }),
+  z.strictObject({ ...v2Response, status: z.literal('done'), commandId: CommandIdSchema, receipt: VerificationReceiptSchema, log: LogNoteSchema }),
+]);
+export type TaskV2VerificationResponse = z.infer<typeof TaskV2VerificationResponseSchema>;
+
+// 결과 저장 ACK. saved는 게시 서버가 저장한 artifact의 digest로 대조하고 다르면 지우지 않는다. discarded는 결과 없이 끝낸 job의 정리다.
+export const TaskV2FinalizeRequestSchema = z.strictObject({ ...v2Identity, expectedWorker: TaskWorkerIdentitySchema,
+  receipt: z.discriminatedUnion('outcome', [
+    z.strictObject({ outcome: z.literal('saved'), artifactDigest: Sha256Schema, persistedAt: z.number().int().positive() }),
+    z.strictObject({ outcome: z.literal('discarded'), persistedAt: z.number().int().positive() }),
+  ]) });
+export type TaskV2FinalizeRequest = z.infer<typeof TaskV2FinalizeRequestSchema>;
+export const TaskV2FinalizeResponseSchema = z.strictObject({ ...v2Response, stopped: z.boolean(), cleaned: z.boolean(), cleanupPending: z.boolean(), sessionRetained: z.boolean() }).superRefine((facts, ctx) => {
+  cleanupFacts(facts, ctx);
+  if (facts.cleaned && facts.sessionRetained) ctx.addIssue({ code: 'custom', path: ['sessionRetained'], message: 'cleaned_but_retained' });
+});
+export type TaskV2FinalizeResponse = z.infer<typeof TaskV2FinalizeResponseSchema>;
+
+export const TASK_V2_OPERATIONS = ['task_v2_execute', 'task_v2_result', 'task_v2_verify', 'task_v2_verification', 'task_v2_finalize'] as const;
+export type TaskV2Operation = typeof TASK_V2_OPERATIONS[number];
+export const TASK_V2_ENDPOINTS = Object.freeze({
+  '/v2/task': { operation: 'task_v2_execute', request: TaskV2RequestSchema, response: TaskV2AcceptedSchema },
+  '/v2/task/result': { operation: 'task_v2_result', request: TaskV2ResultRequestSchema, response: TaskV2ResultResponseSchema },
+  '/v2/task/verify': { operation: 'task_v2_verify', request: TaskV2VerifyRequestSchema, response: TaskV2VerificationResponseSchema },
+  '/v2/task/verification': { operation: 'task_v2_verification', request: TaskV2VerificationRequestSchema, response: TaskV2VerificationResponseSchema },
+  '/v2/task/finalize': { operation: 'task_v2_finalize', request: TaskV2FinalizeRequestSchema, response: TaskV2FinalizeResponseSchema },
+} as const);
+export type TaskV2Endpoint = keyof typeof TASK_V2_ENDPOINTS;
+
 // 서명 capability. 대화·리뷰의 homelab-worker capability와 audience·operation·필드가 달라 어느 쪽 검증도 다른 쪽 토큰을 받지 않는다.
 export const TASK_CAPABILITY_AUDIENCE = 'homelab-task-worker';
 export const TASK_OPERATIONS = ['task_execute', 'task_cancel', 'task_status', 'task_finalize'] as const;
 export type TaskOperation = typeof TASK_OPERATIONS[number];
+export type AnyTaskOperation = TaskOperation | TaskV2Operation;
+const isV2Operation = (operation: string) => (TASK_V2_OPERATIONS as readonly string[]).includes(operation);
+// operation과 version을 함께 묶는다. 옛 작업자는 version 2를 모양에서 거부하고, 새 작업자는 v1 operation에 version 2를 받지 않는다.
 export const TaskCapabilitySchema = z.strictObject({
-  audience: z.literal(TASK_CAPABILITY_AUDIENCE), operation: z.enum(TASK_OPERATIONS), version: z.literal(1),
+  audience: z.literal(TASK_CAPABILITY_AUDIENCE), operation: z.enum([...TASK_OPERATIONS, ...TASK_V2_OPERATIONS]), version: z.union([z.literal(1), z.literal(TASK_V2_CONTRACT)]),
   job: uuid, lease: uuid, generation, digest: sha256, issued: z.number().int(), expires: z.number().int(),
-});
+}).refine(claims => isV2Operation(claims.operation) === (claims.version === TASK_V2_CONTRACT), 'operation_version_mismatch');
 export type TaskCapability = z.infer<typeof TaskCapabilitySchema>;
 export const TASK_CAPABILITY = Object.freeze({ ttlMs: CAPABILITY_TTL_MS, skewMs: DEFAULTS.capabilitySkewMs, nonceRetentionMs: NONCE_RETENTION_MS });
 
@@ -255,10 +376,10 @@ export type TaskEndpoint = keyof typeof TASK_ENDPOINTS;
 
 // digest는 본문 전체에 걸린다. 저장소·답·예산·세션·정책 revision을 바꾼 요청은 거부된다.
 // 양쪽 모두 schema로 파싱한 값을 넘겨야 한다. 파싱이 필드 순서를 정해 digest가 같아진다.
-export interface TaskSignedBody { version: 1; job: string; lease: string; generation: number }
+export interface TaskSignedBody { version: 1 | typeof TASK_V2_CONTRACT; job: string; lease: string; generation: number }
 export class TaskWorkerSigner {
   constructor(private readonly privateKey: KeyObject, private readonly now: Clock = Date.now) {}
-  issue(operation: TaskOperation, body: TaskSignedBody): string {
+  issue(operation: AnyTaskOperation, body: TaskSignedBody): string {
     const issued = this.now();
     return sealCapability({ audience: TASK_CAPABILITY_AUDIENCE, operation, version: body.version, job: body.job, lease: body.lease,
       generation: body.generation, digest: capabilityDigest(body), issued, expires: issued + TASK_CAPABILITY.ttlMs }, this.privateKey);
@@ -267,7 +388,7 @@ export class TaskWorkerSigner {
 export class TaskWorkerVerifier {
   constructor(private readonly publicKey: KeyObject,
     private readonly consume: (nonce: string) => Promise<boolean>, private readonly now: Clock = Date.now) {}
-  async check(token: string, operation: TaskOperation, body: TaskSignedBody): Promise<void> {
+  async check(token: string, operation: AnyTaskOperation, body: TaskSignedBody): Promise<void> {
     try {
       const { claims, nonce } = openCapability(token, this.publicKey);
       const c = TaskCapabilitySchema.parse(claims);

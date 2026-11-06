@@ -1607,8 +1607,6 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 
 조립과 스위치는 B5의 몫이다. 브랜치는 `changeBranchName`만 만들고 `bot/change/<32자리 hex>/g<n>` 외에는 `parseChangeBranch`가 거부한다.
 
-**V1 제한.** manifest의 모든 항목이 mode `100644`·`100755`여야 한다. 변경하지 않아도 T0에 symlink·gitlink가 있으면 manifest를 만들 수 없어 그 저장소는 시작부터 닫힌다. 변경 내용 합계 1 MiB, HTTP body 2 MiB를 넘으면 차단한다. 변경 파일 256개, manifest 5,000항목은 제안값이다. command·리뷰는 generation당 한 번이라 실패한 결과를 같은 generation에서 다시 받지 못한다.
-
 ### 16.1 배포 읽기 (B4)
 
 `src/change-deployment.ts`의 `DeploymentReader`가 `ChangeDeploymentPort`를 구현한다. 아직 조립되지 않았고 쓰기가 없다. 이 관측은 **배포된 버전만** 말한다. 기능·DB·성능은 보지 않고 `describeDeployment`가 그 범위 문장을 늘 함께 낸다.
@@ -1766,3 +1764,67 @@ V1에는 `PATCH git/refs`와 `PATCH pulls`가 없다. 병합·`/merges`·dispatc
 **최신성.** base는 첫 blob 전, ref 전, PR 전후에 읽는다. PR 전까지 다르면 `superseded`이고 새 generation은 새 브랜치에서 처음부터다. PR 뒤에 다르면 `blocked: pull_stale_base`로 두고 PR을 닫거나 덮지 않는다. 자동으로 새 PR을 만들면 열린 PR이 둘이 되기 때문이다. 다른 SHA의 브랜치는 `head_changed`로 막고 덮지 않는다. PR이 확정된 뒤의 재호출은 공개 검사를 되풀이하지 않고 사후 검사만 한다. 사후 검사는 head·base·열림 상태만 본다. 사람이 확정된 PR의 제목·본문을 고치면 되돌리지 않는다(`PATCH pulls`가 없다). 응답을 잃어 대조로 회수하는 경우에는 제목·본문이 달라도 내 PR로 인정하지 않고 `pull_mismatch`로 막는다.
 
 **commit SHA.** author·committer·date·메시지를 승인 때 고정해 H를 미리 계산한다. 로컬 `git`과 같음을 시험하지만 GitHub과의 일치는 live 한 건에서 본다. GitHub이 서명을 붙이거나 메시지를 정규화하면 SHA가 달라져 `result_mismatch`로 막힌다.
+
+### 16.4 작업 레인 v2: artifact와 무자격 검증 (B1)
+
+**아직 조립되지 않았다.** `TaskWorkerOptions.change`를 넘기는 진입점이 없어 운영 작업자에 v2 끝점이 없고 intake가 지원을 말하지 않는다. v1 `/task`는 그대로 돈다. `task-contracts.ts`가 `change-contracts.ts`의 schema를 import하지만 진입점이 쓰는 v1 경로의 동작은 같다.
+
+| 파일 | 맡는 것 |
+|---|---|
+| `src/task-contracts.ts` | `TASK_V2_ENDPOINTS`, version 2 계약 |
+| `src/task-worker.ts` | 슬롯·서명·lease·fence, 결과 저장과 재조회, 저장 ACK |
+| `src/executor-claude-task.ts` | `runChangeTurn`. v1 판정 순서 앞뒤에 T0 대조와 수집을 끼운다 |
+| `src/change-artifact.ts` | T0 대조, 수집, T1 계산, 전송 인코딩, 제어 볼륨 보존, `ChangeStoreArtifacts` |
+| `src/change-verifier.ts` | command 표, bwrap 인자, `IsolatedVerifier`, `WorkerChangeVerification` |
+| `src/claude-task-bridge.ts` | `ClaudeChangeAuthor`(`ChangeAuthorPort`) |
+
+**끝점.** 모두 POST, 서명은 v1과 같은 audience `homelab-task-worker`이고 operation과 `version:2`가 묶인다. 옛 작업자는 version 2를 모양에서 거부하고 경로도 404다. 취소·상태는 v1 `/v1/task/cancel`·`/v1/task/status`를 함께 쓴다.
+
+| 끝점 | operation | 응답 |
+|---|---|---|
+| `/v2/task` | `task_v2_execute` | `accepted`. 턴을 접수만 하고 돌려준다 |
+| `/v2/task/result` | `task_v2_result` | `running`·`needs_input`·`limited`·`auth_expired`·`failed`·`unknown`·`absent`·`snapshot` |
+| `/v2/task/verify` | `task_v2_verify` | `running`·`done`. 같은 command의 receipt가 있으면 다시 돌리지 않는다 |
+| `/v2/task/verification` | `task_v2_verification` | `running`·`absent`·`done` |
+| `/v2/task/finalize` | `task_v2_finalize` | `stopped`·`cleaned`·`cleanupPending`·`sessionRetained` |
+
+`GET /v1/task/intake`에 `change:{contract:2,verifierRevision}`이 있어야 지원이다(`taskWorkerChangeContract`). 없거나 닿지 않으면 `false`이고 CHANGE만 닫는다.
+
+**결과 보존.** 턴이 끝나면 결과를 `<TASK_STATE_ROOT>/.homelab-worker/change-results/<job>.<generation>.result.json`에 fsync 뒤 rename으로 쓴 다음 슬롯을 놓는다. 제어 디렉터리라 모델에서 가려져 있고, 세션 생성이 실패해도 답을 남긴다. 같은 lease·turn이면 몇 번이든 같은 값을 준다. 재시작해도 같은 저장소면 같다. 모델을 다시 돌리는 길은 없고, 시작을 기록했는데 결과가 없으면 `unknown`이다.
+
+**지우는 순서.** 저장 ACK(`saved` + artifact digest)가 작업자 결과와 같을 때만 세대와 결과 파일을 지운다. 다르면 409이고 아무것도 지우지 않는다. v1 finalize의 `succeeded`는 저장되지 않은 snapshot을 지우지 못하고(409 `result_unacknowledged`), `failed`·`cancelled`는 버린다고 정한 뒤라 통과한다. 게시 서버는 저장한 digest를 세션 행 `capabilities`에 먼저 쓰므로 정리 응답을 잃어도 sweep이 같은 ACK를 다시 보낸다.
+
+**수집.** 시작 턴에 모델을 띄우기 전, 압축본과 게시 서버의 T0 잎을 대조한다. 경로 집합, Git blob SHA, 실행 비트, 다시 계산한 tree SHA가 모두 같아야 한다. 어긋나면 `baseline_mismatch`(export-ignore·export-subst 포함), symlink·gitlink·submodule·LFS는 `baseline_unsupported`다. 그래서 압축본에서 빠진 파일이 삭제로 둔갑하지 못한다. 턴이 끝나면 소멸 확인·정책·반사 검사를 지난 뒤 실제 파일에서 path·mode·blob SHA·SHA-256을 계산한다. 작업 공간의 `.git`을 읽지 않고, 샌드박스 흔적 규칙은 위 "T18 작업 레인 실행·정리" 그대로다.
+
+| 차단 사유 | 조건 |
+|---|---|
+| `artifact_too_large` | 변경 합계 1 MiB, 변경 파일 256개, manifest 5,000항목, 잘린 patch, 응답 본문 2 MiB 초과 |
+| `artifact_unsupported` | symlink·hardlink·FIFO 등 일반 파일이 아닌 항목, 모델이 새로 넣거나 고친 `.gitmodules`·`filter=lfs` 선언·LFS 포인터 |
+| `artifact_binary` | NUL 포함 또는 UTF-8이 아닌 변경 내용 |
+| `artifact_path_invalid` | `ChangePathSchema` 위반, 파일·디렉터리 충돌 |
+| `artifact_no_changes` | 변경 없음 |
+| `artifact_incomplete` | 읽는 중 값이 다름, 대조 파일 없음 |
+
+모델의 요약은 결과에 싣지 않는다. 받는 쪽은 `decodeArtifact`로 digest·바이트·patch를 다시 대조하고 본문을 2 MiB까지만 읽는다.
+
+**검증.** ID 하나로 `VERIFICATION_COMMANDS`에서 argv·cwd·시한·출력 한도·scratch 크기·toolchain을 찾는다. 표에 없으면 `not_run`이다. 순서: 묶음 대조 → toolchain 해시 대조 → 정리·소멸 확인 → 압축본과 artifact 바이트로 source를 새로 짓고 잠금 → bwrap 실행 → 정리·소멸 확인 → source 대조 → 로그 판정 → source 삭제. 작업 공간을 쓰지 않으므로 흔적·`.git`·무시된 파일이 시험에 닿지 않는다.
+
+bwrap은 `--unshare-all --die-with-parent --new-session --cap-drop ALL --clearenv`로 빈 루트에서 시작하고 `/usr`, `/bin`, `/lib`, `/lib64`, `/etc/ld.so.cache`, `/etc/alternatives`, toolchain, source만 읽기 전용으로 올린다. 쓰기는 크기 제한 tmpfs `/scratch`뿐이고(`HOME`·`TMPDIR`), 빈 루트와 `/dev`는 `--remount-ro`로 닫는다. 자격·nonce·다른 세션·CLI 소켓 경로를 가리지 않는다. 올리지 않아 없다. Claude를 감싸는 방식과 다르다(T18 결정). 시험 프로세스만 감싸고 작성자가 끝난 뒤 같은 슬롯에서 돈다.
+
+| 결과 | receipt status |
+|---|---|
+| 표에 없음, 묶음 불일치, toolchain 불일치, 작성자 생존, bwrap이 시험을 못 띄움(`--json-status-fd`의 `child-pid` 없음) | `not_run` |
+| 소멸 미확인, 로그에 작업자 자격, 자격 재확인 실패, 취소, 출력 상한 | `unknown` |
+| source 변경 | `source_changed` |
+| 시한 초과 | `timed_out` |
+| 종료 코드 | `passed`·`failed` |
+
+앞줄이 더 나쁜 사실이고 시험 결과가 덮지 못한다. `author_not_stopped`와 `stop_unconfirmed` 뒤에는 정리로 소멸을 확인할 때까지 슬롯을 내주지 않는다. 로그 원문은 receipt에 없다. digest만 있고 64 KiB 사본은 v2 응답의 `log.excerpt`로만 나간다. 자격·DATA-01 패턴이 나오면 사본은 `null`이고 저장하지 않는다. 메모리·PID 상한은 파드 cgroup에 기댄다.
+
+**`ClaudeChangeAuthor`.** 세션을 v1과 같은 `codex_sessions`에 `capabilities.version:2`로 둔다. 레인 닫힘·보존 칸·소멸 확인이 같은 규칙으로 돈다. receipt는 `v2:<job>:<세션 generation>`이고 lease·세션·작업자는 그 행에서 읽는다. 세션은 저장 ACK 전까지 `running`이라 v1 정리 sweep이 건드리지 않고, v1 `run`이 이 세션을 이으려 하면 `task_session_mismatch`로 끝난다. T0 잎·프로젝트 정책·자식 job은 `ChangeAuthorSource`로 받는다. 모델 입력은 공개 brief뿐이고 `ChangePrivateInputs`를 읽지 않는다.
+
+**호출 순서.** `fetchResult` → `artifacts.save` → `verification.run`과 `recordVerification` → `finalize`다. `finalize` 뒤에는 시험할 결과가 작업자에 없다. CHANGE 자식 job은 v1 `run` 경로로 claim되면 안 된다. 그 경로는 세션을 `task_session_mismatch`로 닫고, 저장 전 결과가 정리 sweep의 `discarded`로 지워진다.
+
+**port 결과의 코드.** `model_limit`·`auth_expired`는 세션을 유지하고 사람 재개를 기다리는 경우이고 `unknown`으로 돌려준다. `stop_unconfirmed`, `start_unconfirmed`, `worker_unreachable`도 같은 종류라 부모를 끝내지 말고 다시 묻는다. `failed`는 작업자가 차단 사유를 낸 것이다.
+
+**V1 제한.** manifest의 모든 항목이 mode `100644`·`100755`여야 한다. 변경하지 않아도 T0에 symlink·gitlink가 있으면 manifest를 만들 수 없어 그 저장소는 시작부터 닫힌다. 변경 내용 합계 1 MiB, HTTP body 2 MiB를 넘으면 차단한다. 변경 파일 256개, manifest 5,000항목은 제안값이다. command·리뷰는 generation당 한 번이라 실패한 결과를 같은 generation에서 다시 받지 못한다.

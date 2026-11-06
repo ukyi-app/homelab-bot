@@ -1691,3 +1691,93 @@ writer·정책·CI 판정·게시 흐름·공개 문구만 넣었고 어떤 진�
 - 실제 GitHub 응답 모양과 익명 읽기의 캐시·한도. 가짜 HTTP는 문서를 보고 만든 것이다.
 - 실제 `ukyi-writer` 토큰 발급과 AC-P8. 조립과 정책 값은 B5 몫이다.
 - 전송 직전 재검사(`exchange`의 route·body 표)는 도메인 메서드가 항상 맞는 값만 넘겨 시험이 직접 칠 수 없다. route 표 함수만 시험한다.
+
+## T19 B1 artifact·검증 (2026-11-06, 로컬·podman)
+
+**Codex 리뷰 P2 5건(#83).** 모두 시험을 먼저 넣어 수정 전 실패를 봤다. (5) 질문·한도로 대기 중인 세션을 `cancel()`해도 작업자 fence만 남아 job·세션·질문이 그대로였고 `fetchResult`가 옛 결과를 계속 줬다. 이제 v1 `/cancel`처럼 job을 `cancelled`로 옮기고 scheduler를 풀고 세션 공간을 지운다. (1) 결과를 잃고 소멸을 확인한 `unknown`이 v1 `settle`에서 `unexpected_status`로 터졌다. 이제 모델을 다시 돌리지 않고 `failed(task_worker_lost)`로 닫고, 소멸을 못 봤으면 그대로 `unknown`이다. (2) 답을 나르던 재개 턴이 한도로 끝나면 질문이 `resumed`로 남아 다음 재개가 답 없이 돌았다. (3) `finalize`가 job 전이 실패를 무시해 세션만 `completed`가 되고 결과를 지웠다. 이제 `change_job_not_settled`로 전체를 되돌린다. (4) 작업자 재시작 뒤 검증 조회가 옛 instance로 거부되어 저장된 receipt를 못 받았다. 이제 저장소를 대조하는 쪽으로 다시 묻는다.
+
+**결과: 코드와 로컬 격리는 통과했고 운영 프로필 아래 동작은 보지 못했다.** 조립은 B5 몫이라 운영에 영향이 없다. 계약은 ARCHITECTURE "작업 레인 v2"다. 모델·실토큰·클러스터를 쓰지 않았다.
+
+**Bun 고정값.** homelab-smoke main(`.bun-version`, Dockerfile)이 1.4.3이다. 1.4.4 갱신은 smoke PR #16으로 열려 있고 병합 전이다(2026-11-06 다시 확인).
+
+| 항목 | 값 | 출처 |
+|---|---|---|
+| 이미지 | `docker.io/oven/bun:1.4.3-slim@sha256:14a223fa35747ec728bce300ef85888bc5f7958164d15bbba6a54b22b52a3288` | smoke main Dockerfile의 digest 그대로 |
+| 릴리스 압축 | `bun-linux-x64.zip` sha256 `3e730528d89775f03f87f05c06787c4df4099d0a37f3f252e7b829cb23816e18` | GitHub 릴리스 `bun-v1.4.3`의 `SHASUMS256.txt`, 자산 digest와 내려받은 파일이 같다 |
+| 실행 파일 | sha256 `7ce7d6b654eddeec20afddf2396317fba6dc19ab52788a27e894e1806bf8f24b` | 위 압축 안의 파일과 위 이미지의 `/usr/local/bin/bun`을 직접 재어 같음을 확인 |
+
+이미지 빌드가 이 해시와 `--version`을 확인하고, 실행기가 띄우기 전에 다시 잰다. 런타임 다운로드는 없다.
+
+**실측 환경.** 저장소 Dockerfile로 새로 빌드한 이미지, rootless podman, `--network none`, `--init`, uid 10001, 읽기 전용 루트, tmpfs 상태·자격, AppArmor·seccomp `unconfined`, `unmask=ALL`. SEC-02 1단계와 같은 조건이다. 안에서 실제 `IsolatedVerifier`, 실제 `PodPidSpace`(`kill(-1)` 포함), 고정 Bun, 운영 인자(`sandboxArgs`)로 돈다. bubblewrap 0.12.0.
+
+```sh
+podman build -t <이름> .
+SEC02_IMAGE=<이름> npm test   # 없으면 사유와 함께 skip. 통과로 세지 않는다
+```
+
+**smoke 실제 시험.** 공개 smoke main `e45f9f6`의 소스를 위 이미지와 운영 인자(`sandboxArgs`, `spawnSandbox`)로 실행했다. `bun test src/server.test.ts`가 3 pass, 0 fail이다. 설치 없이, 네트워크 없이 돈다. 시험 안의 loopback 접속 실패도 기대대로 난다. 소스를 저장소에 넣지 않아 시험에는 같은 꼴의 합성 시험이 있다.
+
+**악성 후보(`test/change-sec02.test.ts`).** 모델이 쓴 것처럼 `src/server.test.ts`, `package.json`의 `postinstall`·`test` script, `.git/hooks`를 심고 작업 공간에서 수집한 artifact로 돌렸다. 값은 합성 카나리다.
+
+| 시험 | 결과 |
+|---|---|
+| 합성 자격, nonce 자리, 다른 세션, 자기 `config`·`run` 읽기 | ENOENT |
+| `/proc/1/root`, `/proc/self/root`로 같은 경로 | ENOENT |
+| 상태 볼륨·`/app` 목록 | ENOENT |
+| `/proc/*/environ`·`cmdline`의 카나리, 자격 이름 env | 없음 |
+| CLI 메시징 소켓 자리(실제 listener) | ENOENT, 연결 0 |
+| 작업자 쪽 loopback listener, 외부 IP | ECONNREFUSED, 연결 0 |
+| DNS | 실패 |
+| source 새 파일·디렉터리·symlink·chmod, `/usr`, 빈 루트 쓰기 | EROFS |
+| source 기존 파일 쓰기 | EACCES(잠근 권한이 먼저 답한다. 마운트는 chmod가 본다) |
+| source에서 scratch로 hardlink | EXDEV |
+| scratch 쓰기 | 된다 |
+| `bun install`·`bun run test`가 자격을 읽음 | 없음. 바깥 `/tmp` 변화 없음 |
+| 새 세션으로 빠져나가 시그널을 무시하는 자식 | 끝난 뒤 0개, `PodPidSpace` 0개 확인 |
+| 같은 자식이 도는 중 취소 | 사라짐, 0개 확인, `unknown(aborted)` |
+| bwrap 상태 fd(3번)에 `exit-code:0`을 써서 종료 코드 위조 | 쓰지 못함. `exit 7`이 `failed`, 7로 온다 |
+| source 삭제 | 끝난 뒤 없음 |
+
+**음성 대조.** 같은 시험을 상태·자격 경로 읽기 전용 마운트와 `--share-net`을 더한 인자로 돌리면 자격·제어·다른 세션 값을 읽고 소켓과 loopback에 연결한다. 위 결과가 검사기의 거짓 통과가 아니다. 운영 코드에는 이 인자를 넣는 경로가 없다.
+
+**시험 중 찾은 결함.** 처음 인자로는 bwrap의 빈 루트와 `/dev`가 쓰기 가능한 tmpfs라 `/x`, `/etc/x`, `/dev/shm/x`에 쓸 수 있었다. 값이 남지는 않지만 scratch 상한 밖이다. `--remount-ro`로 닫고 `실제 bwrap` 시험이 본다. 계약 대조에서 넷을 더 고쳤고 시험을 먼저 넣어 4건 실패를 확인했다.
+
+| 결함 | 고친 동작 |
+|---|---|
+| 모델이 결과에 새로 넣은 `.gitmodules`·`filter=lfs`·LFS 포인터가 수집을 통과했다. T0 대조는 기준 저장소만 본다 | `artifact_unsupported` |
+| 작성자가 남아 있어(`author_not_stopped`) 시험을 안 돌렸는데 슬롯을 내줬다 | 소멸을 확인할 때까지 다른 턴을 409로 거부 |
+| bwrap 시작 증거가 없으면 소멸 확인 없이 `not_run`이었다 | 생존 프로세스가 있으면 `unknown(stop_unconfirmed)` |
+| 시작을 기록한 턴의 결과가 없을 때 앞 턴 snapshot으로 시험할 수 있었다 | 409 `result_unavailable` |
+
+**못 본 것.**
+
+| 항목 | 왜 | 어디서 본다 |
+|---|---|---|
+| Localhost AppArmor·seccomp, `hostUsers: false`, `procMount: Unmasked` 아래 이 인자(`--tmpfs` 크기 지정, `--remount-ro`, `--cap-drop`, `--json-status-fd`) | 컨테이너에서 프로필을 풀었다. 운영 프로필은 CLI 샌드박스 인자로만 쟀다 | 무모델 운영 측정. 실패하면 `not_run(sandbox_unavailable)`로 닫힌다 |
+| PVC·Secret 볼륨 위 수집 | tmpfs였다 | 같은 측정 |
+| TaskLane 조립 경로 전체, 실모델 | B5 전이다 | H2·H3 |
+| 메모리·PID 폭주 | 코드에 상한이 없고 파드 cgroup에 기댄다 | 운영 측정 시 확인 |
+
+격리 실측은 부하를 겹치지 않고 단독으로 돌렸다. 여러 작업을 동시에 돌리는 조건의 커널 안정성은 이 절차로 판단하지 못한다.
+
+**검사.** Node 24.22.0. `npm run check` 통과.
+
+| 명령 | 결과 |
+|---|---|
+| PG 포함 `npm run build && node --test --test-concurrency=6 dist/test/*.test.js` | 1653 tests, 1631 pass, 0 fail, 22 skipped(전부 `SEC02_IMAGE` 없음). PG 18.6, 네트워크 없음, 끝나고 삭제 |
+| `SEC02_IMAGE=<이름> node --test dist/test/change-sec02.test.js` 단독 | 10 pass, 0 fail, 0 skip. 5회 같음 |
+| `SEC02_IMAGE=<이름> node --test dist/test/sec02-boundary.test.js` 단독 | 24 pass, 0 fail, 0 skip. Bun을 더한 Dockerfile에서 기존 1단계 회귀 없음 |
+
+위 두 파일이 전체 실행의 skip 22건을 모두 덮는다. 각 파일의 수에는 이미지와 무관하게 도는 시험이 들어 있다.
+
+**변이 확인.** `dist` 복사본의 경계 코드를 한 군데씩 바꿔 해당 시험 파일을 돌렸다. 15건 모두 잡혔고, 원본은 묶음마다 fail 0이다(`change-verification` 18 pass, `change-artifact` 30 pass).
+
+| 대상 | 변이 |
+|---|---|
+| `sandboxArgs` | `--remount-ro` 제거, `--clearenv` 제거 |
+| 판정 | source 변경, 로그의 자격, 소멸 미확인, 시작 증거만 보는 `not_run` |
+| 실행 전 대조 | 증거 묶음, toolchain 해시 |
+| 작업자 | `author_not_stopped` 슬롯 해제, 앞 턴 snapshot 시험, 영수증 미로드 때 결과 prune, finalize digest, v1 성공 정리의 snapshot 삭제 |
+| 수집 | 새 submodule·LFS 선언, T0 파일 수 |
+
+변이가 고른 경계 밖의 코드, 예를 들어 `ClaudeChangeAuthor`의 재개 분기는 이번 변이 대상이 아니다.

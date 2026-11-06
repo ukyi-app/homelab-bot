@@ -1,5 +1,8 @@
-import { lstat } from 'node:fs/promises';
+import { lstat, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { collectArtifact, compareBaseline, encodeArtifact, readBaseline, writeBaseline } from './change-artifact.js';
+import { ARTIFACT_LIMITS, artifactDigest } from './change-contracts.js';
+import type { ArtifactBundle } from './change-contracts.js';
 import { TASK_OUTPUT_JSON_SCHEMA, TaskOutputSchema, echoesSecret } from './codex-events.js';
 import { CLAUDE_AUTH, CLAUDE_CLI_VERSION, CLAUDE_FIXED_ENV, ClaudeChatAdapter, MODEL_REFUSAL, REVIEW_DISABLED_BUILTIN_PLUGINS, STRUCTURED_OUTPUT_TOOL,
   compactClaudeEvent, interpretClaudeStream, modelViolation, noteClaudeError, safeIdentifier, seenApiError, seenStopReason } from './executor-claude.js';
@@ -8,10 +11,10 @@ import type { AdapterRun, ChatAdapter, ChatRun, EngineOutcome, ExecutorCapabilit
 import { bounded } from './format.js';
 import type { ArchiveFetcher } from './review-input.js';
 import type { RunControl, RunReport } from './run-control.js';
-import { TASK_FAILURE_REASONS, TASK_INSTRUCTIONS_REVISION, TASK_LIMITS, TaskResponseSchema } from './task-contracts.js';
-import type { TaskFailureReason, TaskRequest, TaskResponse, TaskWorkerIdentity } from './task-contracts.js';
-import { TaskWorkspaceError } from './task-workspace.js';
-import type { TaskSession, TaskSessions } from './task-workspace.js';
+import { TASK_FAILURE_REASONS, TASK_INSTRUCTIONS_REVISION, TASK_LIMITS, TASK_V2_CONTRACT, TaskResponseSchema } from './task-contracts.js';
+import type { ChangeArtifactReason, TaskFailureReason, TaskRequest, TaskResponse, TaskV2FailureReason, TaskV2Request, TaskV2TurnResult, TaskWorkerIdentity } from './task-contracts.js';
+import { TaskWorkspaceError, parseTaskArchive } from './task-workspace.js';
+import type { TaskEvidence, TaskSession, TaskSessions } from './task-workspace.js';
 
 // 작업 레인 Claude 어댑터(PLAN §2.3, DECISIONS "T18 결정"). 대화·리뷰의 무도구 경계와 별개다. 그쪽 argv·금지 목록·판정은 그대로 둔다.
 // 근거 표기: [실측]은 고정 바이너리 2.1.308을 가짜 토큰·네트워크 없이 띄운 결과(VERIFICATION "T18 할 일 6·작업 레인 실행 부품", 도구 경계는 "SEC-02 1단계"),
@@ -268,6 +271,13 @@ export function taskPrompt(request: TaskRequest): string {
     : `${head}끊긴 지점부터 이어서 작업한다.`;
 }
 
+// v2 턴이 v1 판정 순서 안에 끼우는 두 자리. 둘 다 차단 사유를 호출자 쪽에 남기고 false를 돌려준다. v1 턴에는 없다.
+export interface TaskTurnChange {
+  // 세션을 얻은 뒤, 모델을 띄우기 전.
+  prepared(session: TaskSession): Promise<boolean>;
+  // 소멸 확인·정책·반사 검사가 모두 끝난 뒤.
+  completed(session: TaskSession, evidence: TaskEvidence): Promise<boolean>;
+}
 export interface TaskTurnDeps {
   control: RunControl;
   sessions: TaskSessions;
@@ -277,6 +287,7 @@ export interface TaskTurnDeps {
   auth: ClaudeAuth;
   credentialDir: string;
   log?: TaskLog;
+  change?: TaskTurnChange;
 }
 // 값 없는 필드만 받는다. 사용자 요청·모델 출력·파일 내용·경로 이름·토큰을 넘기지 않는다.
 export type TaskLog = (fields: Record<string, unknown>) => void;
@@ -290,8 +301,8 @@ const failedResponse = (base: Base, reason: TaskFailureReason, sessionRetained: 
 
 // 판정 순서가 계약이다: 정리 확인 → 실행 중 집행(상한·위반·중단) → stream 무결성 → 종료·오류 → structured_output → 실제 diff·반사 검사.
 // 소멸을 확인하지 못하면 어떤 결과도 읽지 않는다. 살아 있는 프로세스가 파일을 바꿔치기할 수 있다.
-export async function judgeTaskRun(input: { request: TaskRequest; base: Base; report: RunReport; cancelled: boolean; session: TaskSession; sessions: TaskSessions; log?: TaskLog }): Promise<TaskResponse> {
-  const { request, base, report, cancelled, session, sessions, log } = input;
+export async function judgeTaskRun(input: { request: TaskRequest; base: Base; report: RunReport; cancelled: boolean; session: TaskSession; sessions: TaskSessions; log?: TaskLog; change?: TaskTurnChange }): Promise<TaskResponse> {
+  const { request, base, report, cancelled, session, sessions, log, change } = input;
   if (report.survivors !== 0) return { ...base, status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: false };
   if (report.refused) return failedResponse(base, REFUSALS[report.refused], true, report.refused === 'cleanup_pending');
   if (report.launchFailed) return failedResponse(base, 'launch_failed', true);
@@ -328,6 +339,7 @@ export async function judgeTaskRun(input: { request: TaskRequest; base: Base; re
     if (seen.outside) log?.({ level: 'warn', event: 'task_change_outside_policy', ...turn, reason: seen.reason, ...seen.outside });
   });
   if (!evidence.ok) return failedResponse(base, evidence.reason, true);
+  if (change && !await change.completed(session, evidence.evidence).catch(() => false)) return failedResponse(base, 'diff_unavailable', true);
   return { ...base, status: 'completed', stopped: true, sessionRetained: true, cleanupPending: false,
     summary: bounded(parsed.data.summary, TASK_LIMITS.summaryChars), ...evidence.evidence,
     // 검증 명령은 아직 돌리지 않는다. 돌렸다고 적지 않는다.
@@ -356,6 +368,51 @@ export async function runTaskTurn(deps: TaskTurnDeps, request: TaskRequest, sign
     throw error;
   }
 }
+// v2 한 턴. v1과 같은 실행·판정을 지나고, 앞뒤로 T0 대조와 artifact 수집을 끼운다. 응답은 저장해 두었다가 몇 번이든 다시 준다.
+// 모델이 낸 요약은 결과에 싣지 않는다. 작성자 설명은 증거가 아니고 공개 경로로 샐 수 있다.
+export async function runChangeTurn(deps: TaskTurnDeps, request: TaskV2Request, signal: AbortSignal): Promise<TaskV2TurnResult> {
+  let blocked: ChangeArtifactReason | undefined;
+  let artifact: ArtifactBundle | undefined;
+  const change: TaskTurnChange = {
+    prepared: async session => {
+      if (request.operation === 'resume') {
+        if (await readBaseline(session.dirs)) return true;
+        blocked = 'baseline_mismatch';
+        return false;
+      }
+      const record = await readFile(join(session.dirs.run, 'session.json'), 'utf8').then(text => JSON.parse(text) as { limits: { files: number; fileBytes: number } });
+      const parsed = await parseTaskArchive(await readFile(join(session.dirs.run, 'baseline.tar.gz')), record.limits);
+      const compared = compareBaseline(parsed, { repoId: request.baseline.repoId, changeGeneration: request.baseline.changeGeneration, base: request.base,
+        baseTree: request.baseline.baseTree, leaves: request.baseline.leaves });
+      if (!compared.ok) { blocked = compared.reason; return false; }
+      await writeBaseline(session.dirs, compared.value);
+      return true;
+    },
+    completed: async (session, evidence) => {
+      const baseline = await readBaseline(session.dirs);
+      if (!baseline) { blocked = 'artifact_incomplete'; return false; }
+      const collected = await collectArtifact({ dirs: session.dirs, baseline, patch: evidence.patch });
+      if (!collected.ok) { blocked = collected.reason; return false; }
+      artifact = collected.value;
+      return true;
+    },
+  };
+  // 두 판은 모양이 같고 version·입력 상한만 다르다. v1 조립 코드는 그 둘을 보지 않는다.
+  const { baseline: _baseline, ...shared } = request as Extract<TaskV2Request, { operation: 'start' }>;
+  const v1 = { ...shared, version: 1 } as unknown as TaskRequest;
+  const response = await runTaskTurn({ ...deps, change }, v1, signal);
+  const identity = { version: TASK_V2_CONTRACT, job: response.job, lease: response.lease, generation: response.generation, sessionId: response.sessionId, turn: response.turn, worker: response.worker, usage: response.usage } as const;
+  if (response.status === 'unknown') return { ...identity, status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: response.cleanupPending };
+  if (response.status === 'limited' || response.status === 'auth_expired') return { ...identity, status: response.status, stopped: true, sessionRetained: response.sessionRetained, cleanupPending: response.cleanupPending };
+  if (response.status === 'needs_input') return { ...identity, status: 'needs_input', stopped: true, sessionRetained: true, cleanupPending: false, question: response.question };
+  const failed = (reason: TaskV2FailureReason, sessionRetained: boolean, cleanupPending = false): TaskV2TurnResult => ({ ...identity, status: 'failed', stopped: true, sessionRetained, cleanupPending, reason });
+  if (response.status === 'failed') return failed(blocked ?? response.reason, response.sessionRetained, response.cleanupPending);
+  if (!artifact) return failed(blocked ?? 'artifact_incomplete', response.sessionRetained);
+  const snapshot: TaskV2TurnResult = { ...identity, status: 'snapshot', stopped: true, sessionRetained: true, cleanupPending: false, artifactDigest: artifactDigest(artifact.manifest), artifact: encodeArtifact(artifact) };
+  // 결과 전체가 한 응답에 들어가야 한다. 넘으면 자르지 않고 닫는다.
+  if (Buffer.byteLength(JSON.stringify(snapshot)) > ARTIFACT_LIMITS.httpBodyBytes) return failed('artifact_too_large', response.sessionRetained);
+  return snapshot;
+}
 async function executeTaskTurn(deps: TaskTurnDeps, request: TaskRequest, signal: AbortSignal, trace: TaskTurnTrace): Promise<TaskResponse> {
   const base: Base = { version: 1, job: request.job, lease: request.lease, generation: request.generation, sessionId: request.sessionId,
     turn: request.turn, worker: deps.worker, usage: { toolCalls: null, model: null } };
@@ -368,6 +425,7 @@ async function executeTaskTurn(deps: TaskTurnDeps, request: TaskRequest, signal:
   } catch (error) {
     return failedResponse(base, error instanceof TaskWorkspaceError ? error.reason : 'workspace_failed', await retained());
   }
+  if (deps.change && !await deps.change.prepared(session).catch(() => false)) return failedResponse(base, 'workspace_failed', await retained());
   let others: string[];
   try { others = await deps.sessions.others(request.job, request.generation); }
   catch { return failedResponse(base, 'prepare_failed', await retained()); }
@@ -380,7 +438,7 @@ async function executeTaskTurn(deps: TaskTurnDeps, request: TaskRequest, signal:
   base.usage = { toolCalls: report.toolCalls ?? null, model: adapter.usage };
   const launched = report.survivors === 0 && !report.refused && !report.launchFailed;
   if (launched) await deps.sessions.recordTurn(session, request.turn).catch(() => {});
-  const judged = await judgeTaskRun({ request, base, report, cancelled: signal.aborted, session, sessions: deps.sessions, ...(deps.log ? { log: deps.log } : {}) });
+  const judged = await judgeTaskRun({ request, base, report, cancelled: signal.aborted, session, sessions: deps.sessions, ...(deps.log ? { log: deps.log } : {}), ...(deps.change ? { change: deps.change } : {}) });
   // 판정은 공간이 남아 있다고 가정하고 값을 채운다. 소멸을 확인한 응답은 실제 경로로 덮는다. needs_input은 보존이 계약이라 공간이 없으면 아래에서 실패가 된다.
   const response = judged.status === 'unknown' ? judged : { ...judged, sessionRetained: await retained() } as TaskResponse;
   // 계약에 맞지 않는 응답은 내보내지 않는다. 소멸을 확인한 경우에만 실패로 바꿀 수 있고, 아니면 unknown 그대로다.

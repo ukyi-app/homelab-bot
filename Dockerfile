@@ -32,6 +32,9 @@ RUN npm run build \
   && npm prune --omit=dev \
   && chmod -R a+rX,go-w node_modules dist package.json migrations
 
+# CHANGE_PR 검증 실행기의 고정 Bun. homelab-smoke main이 쓰는 이미지와 같은 digest다. 올릴 때는 smoke 고정값·src/change-verifier.ts의 해시와 함께 올린다.
+FROM docker.io/oven/bun:1.4.3-slim@sha256:14a223fa35747ec728bce300ef85888bc5f7958164d15bbba6a54b22b52a3288 AS verifier-bun
+
 FROM docker.io/library/node:24.22.0-trixie-slim@sha256:a6155384446670e9719bdc4fd0ebe4d4b29fb32a8d6aa523da3547a6cfbcf22c
 WORKDIR /app
 # 작업 레인의 Claude 샌드박스(CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1)는 bubblewrap과 socat을 PATH에서 찾는다(DECISIONS T18 "(2) 파드
@@ -68,6 +71,13 @@ RUN ln -s /app/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-
 RUN ln -s /app/node_modules/@anthropic-ai/claude-code-linux-x64/claude /usr/local/bin/claude \
   && test "$(env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/tmp CLAUDE_CONFIG_DIR=/tmp TMPDIR=/tmp DISABLE_UPDATES=1 \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 claude --version 2>/dev/null)" = "2.1.308 (Claude Code)" \
+  && test -z "$(ls -A /tmp)"
+# 검증 실행기만 쓰는 Bun. 런타임에 받지 않는다. 해시는 GitHub 릴리스 bun-linux-x64.zip(SHASUMS256 3e730528…6e18) 안의 실행 파일과 위 이미지의 실행 파일이 같음을 확인한 값이고,
+# 실행기가 띄우기 전에 같은 값으로 다시 대조한다. 빌드 확인은 빈 /tmp를 HOME으로 줘서 이미지에 Bun 파일을 남기지 않는다.
+COPY --from=verifier-bun --chown=root:root /usr/local/bin/bun /opt/verifier/bun-1.4.3/bun
+RUN chmod 0555 /opt/verifier/bun-1.4.3/bun \
+  && test "$(sha256sum /opt/verifier/bun-1.4.3/bun | cut -d' ' -f1)" = 7ce7d6b654eddeec20afddf2396317fba6dc19ab52788a27e894e1806bf8f24b \
+  && test "$(env -i HOME=/tmp TMPDIR=/tmp /opt/verifier/bun-1.4.3/bun --version)" = 1.4.3 \
   && test -z "$(ls -A /tmp)"
 USER 65532:65532
 EXPOSE 8080 8081 8082
