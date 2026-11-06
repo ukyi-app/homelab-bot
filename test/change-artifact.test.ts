@@ -1,6 +1,7 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { chmod, link, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -479,6 +480,92 @@ test('작성 port 재개: 답한 질문을 같은 세션으로 잇고 결과를 
   assert.equal(calls.length, 2);
   assert.equal(calls[1]!.resume, true);
   assert.equal(calls[1]!.session, calls[0]!.session);
+});
+
+// 작업자 응답을 턴 결말로 바꾼다. 가짜 CLI가 만들지 못하는 결말(한도, 결과 유실)을 게시 서버 쪽 처리로 보기 위해서다.
+const turnEnd = (response: any, status: string, stopped = true) => ({ version: response.version, job: response.job, lease: response.lease, generation: response.generation, sessionId: response.sessionId,
+  worker: response.worker, turn: response.turn, usage: { toolCalls: 0, model: null }, status, stopped, sessionRetained: true, cleanupPending: false });
+const endResult = (h: AuthorHarness, status: string, stopped = true) => {
+  h.calls.intercept = async (endpoint, send) => {
+    const sent = await send();
+    return endpoint === '/v2/task/result' ? { ...sent, response: turnEnd(sent.response, status, stopped) } : sent;
+  };
+};
+const statesOf = async (h: AuthorHarness) => ({
+  job: (await h.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [h.job.id])).rows[0]!.state,
+  session: (await h.db.query<{ state: string }>('SELECT state FROM codex_sessions WHERE job_id=$1', [h.job.id])).rows[0]!.state,
+});
+
+test('작성 port 복구: 결과를 잃었고 소멸을 확인했으면 예외 없이 실패로 닫는다. 소멸을 못 봤으면 unknown이다. 모델을 다시 돌리지 않는다', async () => {
+  const lost = await authorHarness();
+  await lost.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  const first = await lost.author.start(startInput(lost));
+  assert.equal((await pollAuthor(lost, first.receiptId)).kind, 'snapshot');
+  endResult(lost, 'unknown', true);
+  assert.deepEqual(await lost.author.fetchResult(first.receiptId), { kind: 'failed', code: 'task_worker_lost' });
+  assert.deepEqual(await statesOf(lost), { job: 'failed', session: 'failed' });
+  assert.equal((await lost.f.calls()).length, 1);
+  const alive = await authorHarness();
+  await alive.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  const second = await alive.author.start(startInput(alive));
+  assert.equal((await pollAuthor(alive, second.receiptId)).kind, 'snapshot');
+  endResult(alive, 'unknown', false);
+  assert.deepEqual(await alive.author.fetchResult(second.receiptId), { kind: 'unknown', code: 'stop_unconfirmed' });
+  assert.equal((await statesOf(alive)).job, 'unknown');
+});
+
+test('작성 port 재개: 답을 나르던 턴이 한도로 끝나면 질문을 answered로 되돌려 다음 재개가 같은 답을 잇는다', async () => {
+  const h = await authorHarness();
+  await h.f.script([QUESTION, writeStep({ 'src/app.txt': 'answered\n' })]);
+  const { receiptId } = await h.author.start(startInput(h));
+  assert.equal((await pollAuthor(h, receiptId)).kind, 'needs_input');
+  const question = (await h.db.query<{ id: string }>(`SELECT id FROM codex_questions WHERE job_id=$1 AND state='open'`, [h.job.id])).rows[0]!;
+  assert.equal((await h.bridge.answer({ question: question.id, actor: 'fixture-owner', scope: thread, text: 'src를 고쳐라', event: 'answer-1' })).ok, true);
+  assert.equal((await h.app.store.claim('task'))!.id, h.job.id);
+  await h.author.resume({ receiptId, answer: 'src를 고쳐라', label: 'public' });
+  assert.equal((await h.db.query<{ state: string }>('SELECT state FROM codex_questions WHERE id=$1', [question.id])).rows[0]!.state, 'resumed');
+  assert.equal((await pollAuthor(h, receiptId)).kind, 'snapshot');
+  endResult(h, 'limited');
+  assert.deepEqual(await h.author.fetchResult(receiptId), { kind: 'unknown', code: 'model_limit' });
+  assert.deepEqual(await statesOf(h), { job: 'waiting_user', session: 'waiting_model' });
+  assert.equal((await h.db.query<{ state: string }>('SELECT state FROM codex_questions WHERE id=$1', [question.id])).rows[0]!.state, 'answered');
+});
+
+test('작성 port 정리: job 성공 전이가 막히면 세션을 완료로 두지 않고 작업자 결과를 지우지 않는다. 풀리면 다시 된다', async () => {
+  const h = await authorHarness();
+  await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  const { receiptId } = await h.author.start(startInput(h));
+  const result = await pollAuthor(h, receiptId);
+  assert.ok(result.kind === 'snapshot');
+  await new ChangeStoreArtifacts(h.store).save(h.key, result.artifact, result.transportBytes);
+  const lease = (await h.db.query<{ lease_until: string }>('SELECT lease_until FROM jobs WHERE id=$1', [h.job.id])).rows[0]!.lease_until;
+  await h.db.query('UPDATE jobs SET lease_until=1 WHERE id=$1', [h.job.id]);
+  await assert.rejects(h.author.finalize(receiptId), /change_job_not_settled/);
+  assert.deepEqual(await statesOf(h), { job: 'running', session: 'running' });
+  assert.equal(h.calls.finalize, 0);
+  await h.db.query('UPDATE jobs SET lease_until=$2 WHERE id=$1', [h.job.id, lease]);
+  await h.author.finalize(receiptId);
+  assert.deepEqual(await statesOf(h), { job: 'succeeded', session: 'completed' });
+  assert.equal(h.calls.finalize, 1);
+});
+
+test('작성 port 검증 조회: 작업자가 재시작해도 같은 저장소면 다시 묻고, 다른 저장소의 답은 쓰지 않는다', async () => {
+  const h = await authorHarness();
+  await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  const { receiptId } = await h.author.start(startInput(h));
+  assert.equal((await pollAuthor(h, receiptId)).kind, 'snapshot');
+  await h.f.restart();
+  const control = (await h.author.verificationControl(h.key))!;
+  assert.ok(control.worker);
+  const reply = await h.author.verificationWorker().verification(control, 'smoke-unit');
+  assert.equal(reply.status, 'absent');
+  assert.equal(reply.worker.storage, control.worker.storage);
+  assert.notEqual(reply.worker.instance, control.worker.instance);
+  h.calls.intercept = async (endpoint, send) => {
+    const sent = await send();
+    return endpoint === '/v2/task/verification' ? { ...sent, response: { ...(sent.response as object), worker: { ...reply.worker, storage: randomUUID() } } } : sent;
+  };
+  await assert.rejects(h.author.verificationWorker().verification(control, 'smoke-unit'), /worker_storage_changed/);
 });
 
 test('작성 port 응답 유실: 시작 응답을 잃어도 다시 보내지 않고 저장된 결과를 받는다', async () => {
