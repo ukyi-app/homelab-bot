@@ -1477,7 +1477,6 @@ manifest는 정확한 경로만 받는다. **올릴 때 그 경로가 비어 있
 - 새 시험 파일과 `memory-briefing-pg`·`ops-metrics`를 실제 PostgreSQL과 함께 3회 반복: 46건 모두 통과.
 
 **시험의 한계.** 실제 Discord 채널에서 본 모습, 운영 `/metrics`, homelab 룰의 평가는 보지 않았다.
-||||||| parent of 416fe7b (feat(t19): CHANGE_PR 계약과 저장 계층을 조립 없이 더한다 (017))
 
 ## T19 B0 계약·저장 (2026-11-06, 로컬·PG)
 
@@ -1569,7 +1568,6 @@ manifest는 정확한 경로만 받는다. **올릴 때 그 경로가 비어 있
 **운영 대조(2026-11-06, 읽기 전용, 이 코드를 돌린 것은 아니다).** `homelab-bot` Application에 `spec.source.helm.valuesObject`와 `status.sync.comparedTo.source.helm.valuesObject`가 있고 둘 다 `repository`·`digest`·`revision`을 담는다. `spec.sources`는 없다. pod `imageID`는 `<저장소>@sha256:<digest>`이고 마이그레이션 파드의 owner는 `Job`이다. SA `bot-reader`는 Application get과 pod list를 할 수 있다. 시험의 합성 응답이 이 모양과 같다.
 
 **하지 않은 것.** 이 코드로 실제 클러스터·GitHub를 읽기. GitHub 응답은 합성값이다. 첫 live 조회에서 모양이 다르면 `argo_config_stale`로 멈추고 `observed`로 가지 않는다. D의 출처 재검증, 조립·루프(B5)도 하지 않았다.
-||||||| parent of 6229583 (feat(t19): 공개 전 후보를 새 세션이 검토하는 경로를 조립 없이 더한다)
 
 ## T19 B2 미게시 리뷰 (2026-11-06, 로컬·PG)
 
@@ -1611,3 +1609,85 @@ manifest는 정확한 경로만 받는다. **올릴 때 그 경로가 비어 있
 `review-lane.ts`의 `toolCalls: 0`을 5로 바꾼 변이는 살아남았다. `run-control.ts`가 `tools:'none'` 어댑터의 예산을 `spec.toolCalls`와 상관없이 0으로 고정하므로 동작이 같은 변이다. 그래서 위 표에서 고정 줄 자체를 바꿨다.
 
 **하지 않은 것.** 실제 모델 호출과 실제 CLI 출력 대조, 실제 작업자·codeload 압축본 대조, 조립과 운영 migration, 리뷰 원문 비공개 표(`ChangeReviewFindingsSink`의 실제 구현), `ChangeReviewPort.review` 호출 경로의 부모 전이 연결. `export-ignore` 같은 압축본 속성이 있는 저장소가 `patch_base_mismatch`로 닫히는 것은 코드로 확인했을 뿐 시험 사례가 없다.
+
+## T19 B3 writer·공개 경계 (2026-11-06, 로컬·PG)
+
+writer·정책·CI 판정·게시 흐름·공개 문구만 넣었고 어떤 진입점에도 조립하지 않았다. 등급은 mock·local_integration이고 GitHub은 가짜 HTTP다. 입력·키·토큰은 모두 합성이고 실제 GitHub·Discord·모델·클러스터에 닿지 않았다. CHANGE-02·03, DATA-01, EVENT-02의 게시 경로 부분만 본 것이고, 조립을 거친 인수 판정은 B5 뒤에 한다.
+
+| 시험 파일 | 수 | 본 것 |
+|---|---|---|
+| `test/github-writer.test.ts` | 37 | route 표, D-24 거부 전부와 raw fetch 0회, 토큰 응답 대조, 응답 분류, 잘린 tree, 정확한 PR 조회 |
+| `test/change-policy.test.ts` | 37 | workflow 생성·수정·삭제·rename 양쪽, mode만, symlink·gitlink, 보호 파일, 빈 정책, 잘린 tree, 경로 정규화, 로컬 `git` SHA 대조 |
+| `test/change-ci-policy.test.ts` | 9 | 승인 fingerprint, bot 브랜치 push, `pull_request_target`·`workflow_run`, 동적·미승인·이동한 참조, 읽을 수 없는 YAML |
+| `test/change-publication.test.ts` | 7 | 렌더러 입력 스키마, mention·참조·주석 무력화, marker 위조, 넘치면 차단, label |
+| `test/change-data.test.ts` | 11 | canary·비밀의 위치별 차단, 분할·인코딩, 공개 metadata, 승인 뒤 비공개 입력 |
+| `test/change-freshness.test.ts` | 23 | stage 순서, 첫 blob 전 전체 차단, 토큰 발급 시점, base 이동, ref 충돌, 사람 head·PR 수정 |
+| `test/change-recovery.test.ts` | 44 | stage별 응답 유실·미적용·DB 실패·연결 전 실패·거부, 422, 24시간 unknown, 취소 |
+| `test/change-pg.test.ts`(PostgreSQL 18.6) | 8 | 동시 게시자의 stage당 POST 1회, 전송 뒤 중단과 동시 재시작, 동시 대조, claim과 취소 경합 |
+
+**D-24 거부 사례 대조.**
+
+| 사례 | 시험 위치(`test/github-writer.test.ts`) |
+|---|---|
+| `PUT /pulls/{n}/merge`, `POST /merges`, `/dispatches`, workflow dispatch, update-branch, 리뷰 API | route 표 거부 시험 |
+| GraphQL `mergePullRequest`·`enablePullRequestAutoMerge` | route 표에 `/graphql` 변형 없음, 도메인 입력으로 실어도 `/graphql`로 나가지 않음 |
+| encoded 경로·method·body 우회 | route 표 거부 시험, 추가 필드 거부 시험 |
+| `bot/` 밖 ref(main·deploy·tag·`botx/`·임의 `bot/`·다른 change·generation) | 잘못된 브랜치 시험 14건 |
+| `force` | 입력의 `force:true` 거부, 실제 body의 키가 `ref`·`sha`뿐임을 단언 |
+| 워크플로 파일 | blob·tree 양쪽 거부, 허용 파일 뒤에 숨겨도 0회. 전체 경로는 `test/change-freshness.test.ts` |
+| 다른 저장소 | 토큰 발급 전 거부 |
+
+**결과.** Node 24.22.0. 네트워크 없는 임시 `postgres:18-alpine`(18.6) 소켓을 줬고 끝난 뒤 컨테이너를 지웠다.
+
+- `npm run check`: 통과.
+- `npm run build && node --test --test-concurrency=6 dist/test/*.test.js`(PostgreSQL 포함): **1771 / 1758 pass / 0 fail / 13 skipped**. skip은 전부 `SEC02_IMAGE` 없음이다.
+- `test/change-pg.test.ts`를 단독으로 2회 더 돌려 8/8 pass.
+
+**수정 전 실패.** 작업 기록상 처음 구현 때 새 시험은 구현 없이 `tsc` 오류 49건으로 실패했다(재부팅 뒤 재현하지 못한 기록값이다). 이어받은 뒤 대조에서는 시험을 먼저 넣어 5건이 실패하는 것을 직접 확인하고 고쳤다.
+
+- 입력 순서에 따라 `gitTreeSha`가 같은 이름의 디렉터리를 파일로 조용히 덮었다. 충돌로 던진다. `manifest`는 스키마가 먼저 막아 공개까지 간 경로는 없었다.
+- 금지 목록이 글자 그대로 비교해 `src/SECRET/x`가 `src/secret/**`를 비껴갔다. 접어서 비교한다.
+- `runs-on`의 `group` 형태와 `Self-Hosted`가 자체 러너 판정을 비껴갔다.
+- 이스케이프한 큰따옴표 키(`"permissions"`)가 다른 이름으로 읽혀 `write-all` 검사를 비껴갔다. 닫는다.
+- `createBlobs`가 합계 1 MiB를 넘어도 토큰을 발급하고 보냈다. 토큰 발급 전에 멈춘다.
+
+**변이 확인.** 임시 사본의 컴파일 결과에 변이를 하나씩 넣고 해당 시험만 돌렸다. 묶음마다 원본을 먼저 돌렸고 모두 fail 0이었다(37, 60, 71, 18, 44 pass). 20건 모두 잡혔다. 처음 돌렸을 때 3건은 패턴이 컴파일 결과와 달라 도구 실패(무효)였고 패턴을 고쳐 다시 돌렸다. 2건은 살아남았다.
+
+- `unknown` 재전송 변이: 앞선 대조가 먼저 잡아 두 번째 방어가 시험되지 않았다. 대조 뒤 경합 시험을 더해 잡았다.
+- PR 후보가 여럿인 변이: 변이한 줄이 군더더기라 결과가 같았다. 그 줄을 지우고 남은 조건을 변이해 잡았다.
+
+| 영역 | 변이 | 잡은 시험 수 |
+|---|---|---|
+| 허용 API | route 표에 merge 추가 | 1 |
+| 허용 API | route 표에 graphql 추가 | 1 |
+| 허용 API | 브랜치 소유 판정 제거 | 15 |
+| 허용 API | `maintainer_can_modify: true` | 2 |
+| 허용 API | `createBlobs` 보호 경로 검사 제거 | 1 |
+| 허용 API | 변경 내용 상한 제거 | 1 |
+| 토큰 대조 | 응답 저장소 대조 제거 | 1 |
+| 토큰 대조 | 응답 권한 대조 제거 | 1 |
+| 토큰 대조 | 선행 읽기에 토큰 사용 | 11 |
+| 첫 blob 전 | 보호 경로 판정 제거 | 24 |
+| 첫 blob 전 | 교차 적용을 `some`으로 | 1 |
+| 첫 blob 전 | T0 재해시 입증 제거 | 1 |
+| 첫 blob 전 | 게시 흐름의 공개 검사 생략 | 1 |
+| 공개 렌더러 | mention 무력화 제거 | 1 |
+| 공개 렌더러 | label 차단 제거 | 1 |
+| 공개 렌더러 | 렌더링 뒤 공개 검사 제거 | 1 |
+| 복구 | stage 직전 `unknown` 재전송 | 1 |
+| 복구 | PR 후보가 여럿이어도 채택 | 1 |
+| 복구 | PR 대조가 marker만 봄 | 1 |
+| 복구 | 422를 대조 없이 막음 | 2 |
+
+**Codex 리뷰 P2 3건(#82).** 모두 시험을 먼저 넣어 수정 전 실패를 봤다. (1) `reconcile`이 대조 중 막힌 effect를 보고서에서 뺐다. 이미 막힌 effect는 기한 처리에도 다시 나오지 않아 사람 해소가 필요한 건이 사라졌다. (2) 토큰 발급의 한도 초과 403이 `token_http_403`이 되어 게시가 바로 막혔다. 이제 `rate_limited`로 미룬다. (3) 접으면 파일이 다른 파일의 상위 디렉터리가 되는 경로(`src/Foo`와 `src/foo/bar.ts`)가 통과했다. 양방향 모두 `path_collision`이고 지운 파일과는 충돌하지 않는다.
+
+**Codex 보안 리뷰 P2 1건(#82).** reusable workflow ref가 브랜치나 움직이는 태그도 통과했다. "SHA만 허용"이라는 제안은 그대로 받지 않았다. 배포 키 identity가 `app-build-v*` 태그 ref에 묶여 있어 `homelab-smoke`의 실제 호출(`@app-build-v1.0.1`)이 막히기 때문이다. 그 태그는 `release-tags-lock`이 갱신·삭제를 bypass 없이 막는 것을 운영 ruleset에서 읽어 확인했다. 그래서 40자 SHA와 `app-build-v<x.y.z>`만 받는다. `main`, `v1`, `app-chart-v1.0.0`, 대문자 SHA 등은 시험에서 거부된다. 수정 전 실패를 먼저 봤다.
+
+**SHA 대조.** 계산기를 로컬 `git` 2.53.0과 대조해 20항목이 모두 같았다. 이 저장소 실제 HEAD tree(파일 229개, 입력 역순 포함), 실제 blob 200개, 합성 blob(빈 파일·한글 경로), `a.b`·`a/`·`a0`·`a-b` 정렬 함정, 수정·삭제·mode·추가 뒤 tree, commit(부모 없음·하나·둘, 한글과 폭 없는 문자가 든 메시지, `TZ`가 달라도 같은 값)을 봤다. `test/change-policy.test.ts`에도 같은 대조가 들어 있다.
+
+**하지 않은 것.**
+
+- 실제 GitHub과 SHA 대조. GitHub이 commit에 서명을 붙이거나 메시지·이름을 정규화하면 SHA가 달라 `result_mismatch`로 막힌다. live 한 건에서 본다.
+- 실제 GitHub 응답 모양과 익명 읽기의 캐시·한도. 가짜 HTTP는 문서를 보고 만든 것이다.
+- 실제 `ukyi-writer` 토큰 발급과 AC-P8. 조립과 정책 값은 B5 몫이다.
+- 전송 직전 재검사(`exchange`의 route·body 표)는 도메인 메서드가 항상 맞는 값만 넘겨 시험이 직접 칠 수 없다. route 표 함수만 시험한다.

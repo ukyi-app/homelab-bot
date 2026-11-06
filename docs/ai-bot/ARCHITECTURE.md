@@ -1660,7 +1660,6 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 **조회 주기.** `DEPLOYMENT_POLL`은 60초 간격·10분 초기 창이다. `deploymentPollStep`이 `settled`·`poll`·`report_late`를 돌려준다. 창이 지나도 끝 상태로 바꾸지 않고 마지막 `pending`·`unknown`과 관측 시각을 알린다. 루프는 B5가 조립한다.
 
 **한계.** D가 정말 M에서 빌드됐는지 다시 검증하지 않는다. `image.yaml`에 적힌 값을 믿고 출처 검증은 자동 병합 조건 5(`deploy-merge`)의 몫이다. 사람이 병합한 `image.yaml`은 그 검사를 거치지 않을 수 있다.
-||||||| parent of 6229583 (feat(t19): 공개 전 후보를 새 세션이 검토하는 경로를 조립 없이 더한다)
 
 ### 16.2 미게시 후보 리뷰 (B2)
 
@@ -1711,3 +1710,59 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 **job과 dispatcher.** generation마다 `type='review'` job 하나이고 `change_child_jobs(role='review')`로 묶인다. `pr_reviews` 행이 없다. `ReviewRuntime`의 `changeReview` 옵션이 없으면 그 job을 집지 않고, 있으면 `pr_reviews`가 없는 job만 넘긴다. `pr_reviews`도 자식 job 연결도 없는 job은 모델 없이 `review_source_unknown` 실패로 닫는다. 게시 PR 리뷰 경로와 T17 시험은 그대로다. 같은 interactive 슬롯을 나눠 쓰고 대화가 먼저다.
 
 **응답 유실.** 작업자는 멈춤을 확인한 결과를 ack 전까지 보관한다. 게시 서버는 비공개 저장 → `recordReview` → job 종료 → ack 순서로 처리해 어디서 끊겨도 `fetchReceipt`가 결과를 다시 받아 같은 receipt를 만든다. `recordReview` 뒤에 끊겼으면 저장된 receipt를 돌려주는 `fetchReceipt`와 `review`가 job 종료와 ack를 마저 한다. 닫히지 않은 `unknown`은 대화 레인을 막기 때문이다. 회수한 결과가 `limited`·`auth_expired`이면 정상 응답처럼 `waiting_user`로 두고 scheduler를 멈춘 뒤 owner에게 알려, `/review-resume`으로 재개한다. 같은 lease로 실행을 다시 보내도 보관한 결과를 준다. 결과가 없으면(작업자 디스크 유실 등) null이고 모델을 다시 돌리지 않는다. job은 기존 unknown 조사로 멈춤을 확인해 실패로 끝나고, 새 generation이 필요하다.
+
+### 16.3 T19 B3 writer·공개 경계
+
+**아직 조립되지 않았다.** `src/github-writer.ts`, `src/change-policy.ts`, `src/change-ci-policy.ts`, `src/change-publisher.ts`, `src/change-publication.ts`만 있고 어떤 진입점도 import하지 않는다.
+
+**구조.** GitHub 쓰기는 `createGitHubWriter` 안의 `exchange` 한 곳에서 나간다. 밖으로는 도메인 메서드만 나가고 URL·method·token을 받는 함수가 없다. `exchange`는 전송 직전 route 표와 body 키를 다시 본다. 응용 내부 강제이고 OS 경계가 아니다. 키가 새면 우회되며, 그때 남는 상한은 설치 저장소와 서버 ruleset이다.
+
+| 메서드·경로 | 자격 | 제약 |
+|---|---|---|
+| `POST /app/installations/{id}/access_tokens` | App JWT | 고정 installation, `repository_ids` 하나, 정확한 permissions. 응답의 저장소 하나·ID·이름, 권한(metadata read 외 추가 없음), 만료를 대조 |
+| `POST …/git/blobs` | contents 토큰 | 계산한 blob SHA와 일치하는 바이트만, 합계 1 MiB까지(넘으면 토큰 발급 전에 거부), 응답 SHA 대조 |
+| `POST …/git/trees` | contents 토큰 | `base_tree` 필수, `type` 항상 `blob`, 보호 경로 거부. subtree·gitlink 자리 없음 |
+| `POST …/git/commits` | contents 토큰 | `parents` 하나, 고정 author·committer·date·메시지 |
+| `POST …/git/refs` | contents 토큰 | 자기 change·generation의 `refs/heads/bot/change/…/g<n>`만. `force` 필드 없음 |
+| `POST …/pulls` | PR 토큰 | 자기 브랜치, 정책의 base, `maintainer_can_modify:false`, 제목·본문·draft만 |
+| `GET …/git/ref/heads/{branch}`, `git/commits/{sha}`, `git/trees/{sha}`, `git/trees/{sha}?recursive=1` | 없음(선행 읽기) 또는 PR 토큰(대조) | 정확한 이름·SHA. 응답의 이름·SHA를 다시 대조 |
+| `GET …/git/blobs/{sha}` | 없음(workflow 읽기) 또는 PR 토큰(대조) | 내용·SHA 대조 |
+| `GET …/pulls?state=all&head=…&base=…&per_page=100` | PR 토큰 | 정확한 head·base만 남긴다. 100건이면 완결성을 입증하지 못해 실패 |
+| `GET …/contents/.github/workflows/{file}?ref={tag}` | 없음 | 정책이 고정한 reusable workflow. 다른 저장소라 writer 토큰을 쓰지 않는다 |
+
+V1에는 `PATCH git/refs`와 `PATCH pulls`가 없다. 병합·`/merges`·dispatch·update-branch·GraphQL·리뷰 API·DELETE도 없다. `github-app.ts`의 리뷰 allowlist는 그대로이고 `TokenResponse`·`grantedExactly`만 공유한다.
+
+**토큰.** contents `{contents:'write'}`, PR `{contents:'read',pull_requests:'write'}` 두 종류다. 캐시 키는 change ID·generation·저장소·설치·scope이고 closure 안에만 있다. 만료 5분 전부터 새로 받는다. 쓰기 토큰은 첫 쓰기 때 발급하므로 공개 검사가 끝나기 전에는 존재하지 않는다. mutation은 401이어도 다시 보내지 않는다.
+
+**선행 읽기는 자격이 없다.** `preflight`는 토큰 경로에 닿지 못하는 익명 GET이다. 그래서 "모든 공개 검사 뒤 토큰 발급"이 구조로 지켜진다. 함정 셋: 대상이 공개 저장소여야 하고(비공개면 404로 닫힌다), 익명 호출 한도가 IP당 시간 60회이며(넘으면 공개 효과 없이 미룬다), 익명 응답은 짧게 캐시될 수 있다. 캐시 때문에 첫 blob 전 base 대조는 방금 움직인 base를 놓칠 수 있고, 그 경우에도 ref 전·PR 전후의 PR 토큰 읽기가 잡는다.
+
+**정책 컴파일.** `compilePathPolicy`가 한 곳에서 glob을 컴파일한다. 받는 모양은 `디렉터리/**`(그 아래 전부, 디렉터리 자체는 아님)와 정확한 파일 경로 둘뿐이고, `*`·`?`·`{}`·`[]`·`!`, `**` 단독, 공통 거부와 겹치는 허용은 컴파일 실패다. 허용은 글자 그대로, 금지와 공통 거부는 NFKC·소문자로 접어 비교한다. 작업 정책은 prefix 비교라 뜻이 달라, `taskPathRules`가 `src/**`→`src`로 내리고 최종 판정은 게시 서버가 원래 의미로 다시 한다. 저장소 정책과 brief 규칙을 교차 적용한다.
+
+**첫 blob 전 검사 순서.** 정책·승인·artifact 대조(네트워크 없음) → base head = B → commit B의 tree = T0 → T0 잎 읽기 → `inspectCandidate` → `scanPublicPayload` → CI 판정 → 브랜치 head 대조. `inspectCandidate`는 T0 잎을 다시 해시해 빠진 잎이 없음을 입증하고, manifest의 kind를 T0와 대조하고, T1을 계산하고, 경로 비정규·충돌을 거부한 뒤 보호 경로와 허용 목록을 보고 바이트를 대조한다. 결과로 나온 계획으로만 blob·tree를 보낸다.
+
+**CI 판정.** `.github` 아래 전체 잎의 path·mode·blob, 고정 reusable의 해석된 blob, 승인된 push 브랜치로 fingerprint를 만들어 정책의 승인값과 승인 시점 값에 대조한다. 형태 검사는 좁은 YAML 부분집합만 읽고 anchor·태그·여러 줄 평문 등은 `ci_yaml_unsupported`로 닫는다. 트리거는 `pull_request`와 승인 브랜치 `push`(호출부), `workflow_call`(reusable)만 받는다. `secrets: inherit`, `permissions: write-all`, 자체 러너(라벨 대소문자 무시, `group` 형태 포함), PR head checkout도 닫는다. `permissions`가 지도 형태로 쓰기 권한을 주는 job은 형태 검사가 막지 않고 사람의 fingerprint 승인에 맡긴다. 임의 workflow의 안전을 증명하지 않는다.
+
+**공개 문구.** `renderPublication`은 승인 brief와 구조화 값만 받는다(strict 스키마). 위험은 고정 enum의 건수만 쓰고 리뷰어가 쓴 코드 문자열을 싣지 않는다. mention·이슈 참조·HTML 주석·이미지·URL을 무력화한다. 시각은 호출자가 한 번 정한다. `scanPublicPayload`는 비밀·내부 표식이 나오면 마스킹하지 않고 전체를 막는다. 탐지기는 완전성 증거가 아니고 출처 label 차단이 우선이다.
+
+**유실 지점별 복구.** 재시작한 게시자는 `publish`나 `reconcile`을 다시 부르기만 한다. 프로세스 상태가 없다.
+
+| 지점 | 결과 |
+|---|---|
+| intent 커밋 뒤 전송 전 중단 | `pending`, 같은 digest로 이어 감 |
+| claim 뒤 전송 전 중단 | 임대 만료 뒤 `unknown`. 보냈는지 몰라 다시 보내지 않음 |
+| 연결 전 실패·한도 초과 | `not_sent`, 간격을 늘려 8회까지 재시도 뒤 `send_attempts_exhausted`로 막힘 |
+| 입력·권한·저장소 불일치 | `not_sent`지만 재시도 없이 막힘 |
+| blob·tree·commit 응답 유실 | `unknown`, 예상 SHA를 GET해 있으면 확정, 없으면 unknown 유지 |
+| ref 응답 유실·422 | 정확한 ref를 GET. 예상 H면 회수, 다른 SHA면 `head_changed`로 막힘, 없으면 unknown(422는 막힘) |
+| PR 응답 유실 | `state=all` 정확 조회. 한 건이고 저장소·작성자 숫자 ID·head·base·제목·본문·marker가 모두 맞으면 회수. 어긋나면 `pull_mismatch`, 여러 건·미발견이면 unknown |
+| PR 422 | 위와 같은 대조. 없으면 `http_422`로 막힘. 다시 보내지 않음 |
+| 응답 뒤 DB 기록 실패 | `sending`으로 남고 임대 만료 뒤 대조로 회수 |
+| 그 밖의 4xx·응답 불일치 | 막힘 |
+| 임대 중 재시작 | `busy` |
+| 잠금 시한 초과 | `busy`. 막힘·교체로 보고하지 않음 |
+| 24시간 지난 unknown | `blockExpiredUnknownEffects`로 막힘과 사람 해소. 행은 남고 새 게시 안 열림 |
+| 취소 뒤 | 새 stage 없음. 공개된 객체는 기록만 |
+
+**최신성.** base는 첫 blob 전, ref 전, PR 전후에 읽는다. PR 전까지 다르면 `superseded`이고 새 generation은 새 브랜치에서 처음부터다. PR 뒤에 다르면 `blocked: pull_stale_base`로 두고 PR을 닫거나 덮지 않는다. 자동으로 새 PR을 만들면 열린 PR이 둘이 되기 때문이다. 다른 SHA의 브랜치는 `head_changed`로 막고 덮지 않는다. PR이 확정된 뒤의 재호출은 공개 검사를 되풀이하지 않고 사후 검사만 한다. 사후 검사는 head·base·열림 상태만 본다. 사람이 확정된 PR의 제목·본문을 고치면 되돌리지 않는다(`PATCH pulls`가 없다). 응답을 잃어 대조로 회수하는 경우에는 제목·본문이 달라도 내 PR로 인정하지 않고 `pull_mismatch`로 막는다.
+
+**commit SHA.** author·committer·date·메시지를 승인 때 고정해 H를 미리 계산한다. 로컬 `git`과 같음을 시험하지만 GitHub과의 일치는 live 한 건에서 본다. GitHub이 서명을 붙이거나 메시지를 정규화하면 SHA가 달라져 `result_mismatch`로 막힌다.
