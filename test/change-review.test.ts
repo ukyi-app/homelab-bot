@@ -635,6 +635,41 @@ test('T19 B2 응답 유실: receipt 기록 뒤 job 종료 전에 끊기면 저�
   }
 });
 
+test('T19 B2 응답 유실: 회수한 한도·인증 결과는 정상 응답처럼 사용자 대기로 두고 owner에게 알리며 재개할 수 있다', async () => {
+  for (const [status, reason] of [['limited', 'model_limit'], ['auth_expired', 'auth_expired']] as const) {
+    for (const resolved of [false, true]) {
+      const h = harness({ reply: () => ({ status }), client: worker => ({ ...bind(worker), review: async (task, capability, signal) => {
+        await worker.review(task, capability, signal);
+        throw new Error('worker_response_uncertain');
+      } }) });
+      const input = await reviewing();
+      await h.service.submit(portInput(input));
+      await h.runtime.tick();
+      const job = await jobOf(input.key);
+      assert.equal(job.state, 'unknown');
+      if (resolved) {
+        const row = (await database.db.query<Record<string, unknown>>('SELECT * FROM jobs WHERE id=$1', [job.id])).rows[0]!;
+        assert.equal(await f.store.resolveUnknown(row as never), true);
+      }
+      assert.equal(await h.service.fetchReceipt(input.key), null);
+      const waiting = await jobOf(input.key);
+      assert.equal(waiting.state, 'waiting_user');
+      assert.equal(waiting.wait_reason, reason);
+      assert.deepEqual(h.waits, [reason]);
+      // 원인이 풀릴 때까지 새 모델 호출이 멈춘다.
+      assert.equal((await database.db.query<{ value: boolean }>(`SELECT value FROM controls WHERE key='scheduler'`)).rows[0]!.value, true);
+      assert.equal(await h.results.get(job.id, job.lease_token), null);
+      // 다시 불러도 알림이 늘지 않는다.
+      assert.equal(await h.service.fetchReceipt(input.key), null);
+      assert.deepEqual(h.waits, [reason]);
+      const resumed = await f.store.control('fixture-owner', 'fixture-conversation', 'review-resume', job.id, undefined, { review: true }) as { ok: boolean };
+      assert.equal(resumed.ok, true);
+      assert.equal((await jobOf(input.key)).state, 'queued');
+      await database.pg.exec(`DELETE FROM change_child_jobs; DELETE FROM jobs; DELETE FROM events;`);
+    }
+  }
+});
+
 test('T19 B2 응답 유실: unknown 조사가 먼저 실패로 닫아도 남은 결과로 회수한다', async () => {
   const h = harness({ client: worker => ({ ...bind(worker), review: async (task, capability, signal) => {
     await worker.review(task, capability, signal);

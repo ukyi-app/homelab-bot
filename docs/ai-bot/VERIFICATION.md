@@ -1606,7 +1606,7 @@ manifest는 정확한 경로만 받는다. **올릴 때 그 경로가 비어 있
 | claim을 `pr_reviews` 있는 job으로 제한 | `리뷰 claim`(기존 T17 시험), `맡을 PR이 없는 review job` |
 | 작업자의 base 대조 제거 | `incomplete: 수정 파일의 hunk가 통째로 빠지면` |
 
-**Codex 리뷰 P2 2건(#81).** 둘 다 시험을 먼저 넣어 수정 전 실패를 봤다. (1) `applyHunks`가 줄 배열을 `push`로 펼쳐 20만 줄 파일에서 `RangeError: Maximum call stack size exceeded`. (2) `recordReview` 뒤 job 종료 전에 끊기면 저장된 receipt만 돌려주고 job이 `unknown`으로 남아 `laneBusy('interactive')`가 true. 시험은 `fetchReceipt`·`review`·unknown 조사가 먼저 닫은 경우 셋을 본다.
+**Codex 리뷰 P2 3건(#81).** 모두 시험을 먼저 넣어 수정 전 실패를 봤다. (1) `applyHunks`가 줄 배열을 `push`로 펼쳐 20만 줄 파일에서 `RangeError: Maximum call stack size exceeded`. (2) `recordReview` 뒤 job 종료 전에 끊기면 저장된 receipt만 돌려주고 job이 `unknown`으로 남아 `laneBusy('interactive')`가 true. 시험은 `fetchReceipt`·`review`·unknown 조사가 먼저 닫은 경우 셋을 본다. (3) 회수한 `limited`·`auth_expired`가 `failed`로 닫혀 owner 안내와 `/review-resume`이 없었다. 시험은 두 상태와 unknown 조사가 먼저 닫은 경우까지 본다.
 
 `review-lane.ts`의 `toolCalls: 0`을 5로 바꾼 변이는 살아남았다. `run-control.ts`가 `tools:'none'` 어댑터의 예산을 `spec.toolCalls`와 상관없이 0으로 고정하므로 동작이 같은 변이다. 그래서 위 표에서 고정 줄 자체를 바꿨다.
 

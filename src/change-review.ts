@@ -795,12 +795,31 @@ export class ChangeReviewService implements ChangeReviewPort {
     try { found = await this.deps.worker.result(lookup, this.deps.signer.issue(job, 'execute', lookup)); }
     catch { return null; }
     if (!found.found || found.result.status === 'unknown') return null;
+    if (found.result.status === 'limited' || found.result.status === 'auth_expired') {
+      const reason = found.result.status === 'limited' ? 'model_limit' : 'auth_expired';
+      if (await this.waitRecovered(job, reason)) await this.deps.notifyWaiting(job, reason);
+      await this.acknowledge(job);
+      return null;
+    }
     if (found.result.status !== 'succeeded') {
       await this.closeJob(job, 'failed', found.result.status === 'failed' ? reasonCode(found.result.reason) : found.result.status);
       await this.acknowledge(job);
       return null;
     }
     return this.settle(job, key, found.result);
+  }
+  // 정상 응답의 store.waitForUser와 같은 대기다. 그 함수는 실행 중 lease만 받아 회수 경로의 unknown을 옮기지 못한다.
+  private async waitRecovered(job: Job, reason: 'model_limit' | 'auth_expired'): Promise<boolean> {
+    return this.db.transaction(async tx => {
+      await this.deps.store.lockScheduler(tx);
+      const moved = (await tx.query(`UPDATE jobs SET state='waiting_user',wait_reason=$3,finished_at=$4 WHERE id=$1 AND lease_token=$2
+        AND (state='unknown' OR (state='failed' AND wait_reason='stop_confirmed_after_unknown')) RETURNING id`, [job.id, job.lease_token, reason, this.deps.store.now()])).rows.length > 0;
+      if (moved) {
+        await tx.query(`UPDATE controls SET value='true' WHERE key='scheduler'`);
+        await tx.query('DELETE FROM controls WHERE key=$1', [`unknown_probe:${job.id}`]);
+      }
+      return moved;
+    });
   }
   private async acknowledge(job: Job): Promise<void> {
     const ack = AckSchema.parse({ version: 1, kind: 'ack', job: job.id, lease: job.lease_token });
