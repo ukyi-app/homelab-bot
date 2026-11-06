@@ -5,8 +5,10 @@ import type { Database } from './database.js';
 import { bounded } from './format.js';
 import { MemoryNotReady } from './memory.js';
 import type { MemoryService, MemoryView } from './memory.js';
+import type { TaskGateClosedReason } from './ops-metrics.js';
 import type { Policy, PolicyGate } from './policy.js';
 import type { Store } from './store.js';
+import type { ExecutionLaneClosedReason } from './task-contracts.js';
 
 export const BRIEFING = Object.freeze({
   scheduleId: 'daily-briefing', leaseMs: 120_000, retryMs: 1000, lateMs: 600_000,
@@ -29,6 +31,9 @@ export interface RestoreCheck {
 export interface ObservationSource {
   id: string; label: string; kind: 'backup' | 'certificate' | 'scheduled_job'; read(): Promise<Observation>;
 }
+// 작업 레인 칸의 원본. DB에 없는 사실(설정 게이트·작업자 응답)을 게시 서버가 넘긴다. externalConnections는 R08을 켰을 때만 준다.
+export type BriefingTaskGate = { open: false; reason: TaskGateClosedReason } | { open: true; routed: boolean; intakeOpen: boolean };
+export interface BriefingTaskSource { gate(): BriefingTaskGate; externalConnections?(): Promise<number> }
 interface ScheduleRow {
   id: string; owner_id: string; scope: Scope; timezone: string; next_run: string | number;
   payload: { kind?: string; time?: string }; enabled: boolean;
@@ -112,6 +117,23 @@ function restoreText(observation: Observation, zone: string): { text: string; pr
   const problem = check.status === 'problem';
   return { text: `${problem ? '확인 필요: ' : ''}${parts.join(' · ')} · CLI 기록 기준, 백업 성공과 별개`, problem };
 }
+const TASK_GATE_TEXT: Record<TaskGateClosedReason, string> = { switch_off: '꺼짐', policy_invalid: '닫힘(정책 오류)' };
+const TASK_LANE_CLOSED: Record<ExecutionLaneClosedReason, string> = { unknown: '종료 미확인', cleanup_pending: '정리 대기', retention_full: '보존 세션 가득 참' };
+interface TaskCounts { running: number; question: number; waiting: number; unknown: number; oldest: number | null; closed: string | null }
+// 사실을 하나라도 확인하지 못하면 열림이라 말하지 않는다.
+function taskLaneState(gate: BriefingTaskGate | undefined, counts: TaskCounts | undefined): string {
+  if (!gate) return '상태 미확인';
+  if (!gate.open) return TASK_GATE_TEXT[gate.reason];
+  const reasons = [...(!gate.routed ? ['작업자 대기'] : !gate.intakeOpen ? ['작업자 수락 닫힘'] : []),
+    ...(counts?.closed ? [TASK_LANE_CLOSED[counts.closed as ExecutionLaneClosedReason] ?? '사유 미상'] : [])];
+  if (reasons.length) return `닫힘(${reasons.join(', ')})`;
+  return counts ? '열림' : '상태 미확인';
+}
+function waited(ms: number): string {
+  const minutes = Math.floor(Math.max(0, ms) / 60_000);
+  if (minutes < 1) return '1분 미만';
+  return minutes < 60 ? `${minutes}분` : `${Math.floor(minutes / 60)}시간 ${minutes % 60}분`;
+}
 function deadline<T>(work: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   return Promise.race([work, new Promise<T>((_, reject) => { timer = setTimeout(() => reject(new Error('source_timeout')), ms); })])
@@ -120,7 +142,7 @@ function deadline<T>(work: Promise<T>, ms: number): Promise<T> {
 
 export class BriefingScheduler {
   constructor(private readonly store: Store, private readonly gate: PolicyGate, private readonly memory: MemoryService,
-    private readonly sources: ObservationSource[], private readonly config: BriefingConfig) {}
+    private readonly sources: ObservationSource[], private readonly config: BriefingConfig, private readonly task?: BriefingTaskSource) {}
   private get db(): Database { return this.store.db; }
   async ensure(): Promise<'enabled' | 'unconfigured'> {
     const { time, timezone } = this.config;
@@ -247,8 +269,7 @@ export class BriefingScheduler {
       const content = [
         ...this.header(claim), ...await this.history(claim), '',
         ...await this.observations(schedule.timezone), '',
-        '■ 모델·작업', ...await this.modelLines(),
-        '- Codex 작업 상태·승인/질문 대기: 연결 전(T18) · 미확인', '',
+        '■ 모델·작업', ...await this.modelLines(), await this.taskLaneLine(), '',
         '■ 다시 확인할 기억', ...memory.lines,
       ].join('\n');
       return await this.db.transaction(async tx => {
@@ -378,6 +399,30 @@ export class BriefingScheduler {
       : '- 모델 호출: 중지 신호 없음'];
     if (unknown) lines.push(`- 종료를 확인하지 못한 작업: ${unknown}건(unknown, 자동 재실행 안 함)`);
     return lines;
+  }
+  private async taskCounts(): Promise<TaskCounts> {
+    const row = (await this.db.query<Record<string, string | number | null>>(`SELECT
+      count(*) FILTER (WHERE state IN ('running','verifying','cancel_requested')) AS running,
+      count(*) FILTER (WHERE state='waiting_user' AND wait_reason='clarification') AS question,
+      count(*) FILTER (WHERE state='waiting_user' AND wait_reason IN ('model_limit','auth_expired')) AS waiting,
+      count(*) FILTER (WHERE state='unknown') AS unknown,
+      (SELECT min(q.created_at) FROM codex_questions q JOIN jobs j ON j.id=q.job_id
+        WHERE q.state='open' AND j.execution_lane='task' AND j.state='waiting_user' AND j.wait_reason='clarification') AS oldest,
+      (SELECT closed_reason FROM execution_lanes WHERE lane='task') AS closed_reason
+      FROM jobs WHERE execution_lane='task'`)).rows[0]!;
+    return { running: Number(row.running), question: Number(row.question), waiting: Number(row.waiting), unknown: Number(row.unknown),
+      oldest: row.oldest === null ? null : Number(row.oldest), closed: row.closed_reason === null ? null : String(row.closed_reason) };
+  }
+  // 알림 채널에 공개되는 줄이라 상태 상수와 건수만 담는다. tool approval은 V1에 없어 세지 않고 지원 안 함으로 적는다.
+  private async taskLaneLine(): Promise<string> {
+    let gate: BriefingTaskGate | undefined;
+    try { gate = this.task?.gate(); } catch { gate = undefined; }
+    const [counts, connections] = await Promise.all([this.taskCounts().catch(() => undefined),
+      this.task?.externalConnections?.().catch(() => null)]);
+    const question = !counts?.question ? '' : counts.oldest === null ? '(대기 시간 미확인)' : `(가장 오래된 ${waited(this.store.now() - counts.oldest)})`;
+    const numbers = counts ? `실행 중 ${counts.running}건 · 질문 대기 ${counts.question}건${question} · 한도·인증 대기 ${counts.waiting}건 · unknown ${counts.unknown}건` : '건수 미확인';
+    const external = connections === undefined ? '' : ` · R08 연결 ${connections === null ? '미확인' : `${connections}건`}`;
+    return `- 작업 레인: ${taskLaneState(gate, counts)} · ${numbers} · 도구 승인 대기: 지원 안 함${external}`;
   }
   private async memoryLines(owner: string, scope: Scope, zone: string): Promise<{ lines: string[]; items: MemoryView[]; services: string[] }> {
     try {

@@ -14,6 +14,10 @@ export interface MemoryMetrics { ledger: LedgerMetricState; briefingEnabled: boo
 export const MEMORY_DISABLED: MemoryMetrics = Object.freeze({ ledger: 'disabled', briefingEnabled: false });
 // 게시 서버가 작업자에 물어 안 값. 수락 사유는 라벨에 넣지 않는다(값이 늘 수 있다). 사유는 작업자 로그와 /v1/task/intake에 있다.
 export interface TaskLaneMetrics { workerRouted: boolean; intakeOpen: boolean }
+// taskPrecondition이 작업 레인을 닫을 때 내는 사유 전체. 레인 계열은 조립할 때만 나오므로 "정책이 틀려 조립 못 함"을
+// 경보 룰이 가르려면 이 계열이 스위치·정책과 무관하게 항상 있어야 한다.
+export const TASK_GATE_CLOSED_REASONS = ['switch_off', 'policy_invalid'] as const;
+export type TaskGateClosedReason = (typeof TASK_GATE_CLOSED_REASONS)[number];
 const EXECUTION_LANES = ['interactive', 'task'] as const;
 const LANE_REASONS = ['unknown', 'cleanup_pending', 'retention_full'] as const;
 const LANE_QUERY = `
@@ -48,7 +52,8 @@ const QUERY = `
 
 // 삭제 대기는 DB의 정리 안 끝난 삭제 요청(memory_deletions.applied_at IS NULL)이다. 원장 기록 전(ledger_unconfirmed)과
 // 원장 기록 뒤 DB 정리 전(db_purge_pending)을 함께 센다. 복원으로 요청 행이 사라진 원장 재적용 대기는 여기 없다(원장 상태로 본다).
-export async function opsMetrics(db: Database, now: number, memory: MemoryMetrics = MEMORY_DISABLED, task?: TaskLaneMetrics): Promise<string> {
+export async function opsMetrics(db: Database, now: number, memory: MemoryMetrics = MEMORY_DISABLED, task?: TaskLaneMetrics,
+  gateClosed: TaskGateClosedReason | null = null): Promise<string> {
   const rows = (await db.query<{ kind: string; a: string; b: string; n: string }>(QUERY, [OPEN_STATES, OUTBOX_STATES])).rows;
   const jobs = new Map<string, number>();
   const outbox = new Map<string, number>();
@@ -72,6 +77,7 @@ export async function opsMetrics(db: Database, now: number, memory: MemoryMetric
     `homelab_bot_memory_deletions_pending ${deletions}`,
     `homelab_bot_memory_deletion_pending_oldest_seconds ${oldest}`,
     `homelab_bot_briefing_enabled ${memory.briefingEnabled ? 1 : 0}`,
+    ...TASK_GATE_CLOSED_REASONS.map(reason => `homelab_bot_task_gate_closed{reason="${reason}"} ${gateClosed === reason ? 1 : 0}`),
     ...(task ? await taskLaneLines(db, task) : []),
   ];
   return `${lines.join('\n')}\n`;

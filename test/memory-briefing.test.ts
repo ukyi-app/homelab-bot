@@ -468,7 +468,8 @@ test('BRIEF-01 읽기 불가·오래된 관측은 미확인, 정상은 현재 �
   assert.doesNotMatch(first, /jobs: 정상/);
   assert.match(first, /malformed: 읽기 불가 · 마지막 정상 수집 없음 · 미확인/);
   assert.match(first, /fractional: 읽기 불가 · 마지막 정상 수집 없음 · 미확인/);
-  assert.match(first, /Codex 작업 상태·승인\/질문 대기: 연결 전\(T18\) · 미확인/);
+  assert.match(first, /- 작업 레인: 상태 미확인 · 실행 중 0건 · 질문 대기 0건 · 한도·인증 대기 0건 · unknown 0건 · 도구 승인 대기: 지원 안 함/);
+  assert.doesNotMatch(first, /연결 전\(T18\)/);
   certificate = { observedAt: SLOT + DAY - 1000, status: 'problem', summary: '14일 뒤 만료' };
   at(SLOT + DAY); await s.tick();
   assert.match((await briefings())[1]!.payload.content, /certificate: 확인 필요 · 14일 뒤 만료/);

@@ -94,7 +94,7 @@
 |---|---|---|
 | `capabilities()` | true. 고정 버전 + `--help` 대조 | [실측: `codex --version`, `codex exec --help`] |
 | `start_task` | true. 작업 레인에서 `codex exec --json`, 작업 공간은 고정 SHA의 `codeload.github.com` 압축본 + `git init` 한 번 커밋(D-15) | [확인: https://learn.chatgpt.com/docs/non-interactive-mode] |
-| `attach_task` | **이 어댑터로는 하지 않는다.** R08은 읽기 전용 알림이고 별도 경로와 능력표다(§15, `EXTERNAL_TASK_CAPABILITIES`, `/attach`, 스위치 기본 꺼짐). 어댑터 값은 `undecided` 그대로이고 부르면 거부한다. 봇 소유 세션의 재개는 `resume_task`(R10 경로)다. herdr 경유는 쓰지 않는다 | 사용자 결정(2026-11-04, DECISIONS "T18 결정" (1)). herdr는 상태를 화면으로 추정하고 소켓에 인증이 없다 [확인: https://raw.githubusercontent.com/herdrdev/herdr/v0.9.5/docs/next/website/src/content/docs/integrations.mdx , 실측: 소켓 0600] |
+| `attach_task` | **이 어댑터로는 하지 않는다.** R08은 읽기 전용 알림이고 별도 경로와 능력표다(§15, `EXTERNAL_TASK_CAPABILITIES`, `/attach`, 스위치 기본 꺼짐). 어댑터 값은 `false`이고 부르면 거부한다. 봇 소유 세션의 재개는 `resume_task`(R10 경로)다. herdr 경유는 쓰지 않는다 | 사용자 결정(2026-11-04, DECISIONS "T18 결정" (1)). herdr는 상태를 화면으로 추정하고 소켓에 인증이 없다 [확인: https://raw.githubusercontent.com/herdrdev/herdr/v0.9.5/docs/next/website/src/content/docs/integrations.mdx , 실측: 소켓 0600] |
 | `read_status`, `read_events` | true. JSONL 이벤트 + 프로세스 생존 | [확인: https://learn.chatgpt.com/docs/non-interactive-mode] |
 | `read_final_result` | true. `-o` 파일 + `--output-schema` + 작업 공간 diff. "완료"라는 문자열은 판정 근거가 아니다 | `01` §6 완료 기준 |
 | `answer_question` | **clarification만.** 모델이 턴을 끝내며 묻고, 봇이 `exec resume <id> "<답>"`으로 잇는다. 질문 ID는 봇이 `job_id + thread_id + 턴 순번`으로 만든다 | [실측: exec에 승인 플래그 없음] |
@@ -160,6 +160,7 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 **열린 항목 (T18에서 판단. 단 인증 파일 분리는 T17·T18 중 먼저 공개 저장소 내용으로 모델을 부르는 단계 전에 정하고 SEC-02로 확인한다. 대화 레인의 경로·동시성은 T16a)**
 
 - **인증 파일을 작업 레인 프로세스·파일시스템에서 떼는 방법.** 후보는 비신뢰 코드 실행(설치·시험)을 인증 파일이 없는 별도 컨테이너나 파드로 나누는 것이다 [가정]. 공식 `codex-responses-api-proxy`는 키를 stdin으로 받아 `/v1/responses`만 전달하는 도구라 [확인: https://github.com/openai/codex/blob/main/codex-rs/responses-api-proxy/README.md] API 키용이고, 구독 `auth.json`에는 그대로 맞지 않는다 [가정].
+  - **판단 끝(사용자 2026-11-04).** Claude 실행기 기준으로 정했다. 같은 파드에 두고 env 제거와 bubblewrap 샌드박스로 자격을 가린다. 위 후보는 그 전의 Codex 기준 서술이다. [DECISIONS.md](DECISIONS.md) "T18 결정 (Claude 실행기 기준)" (2)와 "(2) 파드 실측 결과와 대가 수용"을 본다.
 - **작업별 세션 저장 공간 [가정].** 대화 레인과 리뷰·작업 레인이 영속 CODEX_HOME 하나를 같이 쓰면 각 작업의 세션 파일이 같은 파일시스템에 남는다. 악성 PR 지시를 처리하는 `codex exec` 셸이 이전 비공개 Discord 대화나 다른 작업의 세션 파일을 읽어 구조화 결과에 넣으면, 그 결과가 공개 PR 댓글로 게시될 수 있다. 그래서 작업마다 세션 저장 공간을 나누고, 리뷰·작업 레인은 다른 작업의 이전 세션을 재개하지 않는다(같은 작업의 `exec resume`만, §4). 디렉터리만 나누면 같은 UID라 다른 세션 디렉터리 읽기를 막지 못한다(위 남는 위험). 수단 후보:
   - 작업별 UID나 마운트 namespace로 자기 세션 디렉터리만 보이게 한다.
   - 대화·리뷰 레인은 `--ephemeral`로 세션 파일을 남기지 않는 것을 검토한다. 재개가 필요한 작업 레인은 §4대로 `--ephemeral`을 쓰지 않는다.
@@ -168,6 +169,7 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 
   이 항목은 T18 열린 항목이지만 T17은 이 결정 뒤에 시작한다([V1_PLAN.md](V1_PLAN.md) §2·§5). 세션 파일 보존 기간과 기억 삭제(R17) 때 세션 기록 처리도 열린 항목이다. 시험은 DATA-01·SEC-02다.
 - **대화 레인과 작업 레인의 분리 검토.** 같은 파드·같은 `auth.json`이면 직렬 1개를 나눠 쓴다. 파드를 나누면 대화 레인은 비신뢰 코드와 떨어지지만, 레인마다 따로 로그인한 `auth.json`이 필요하다 [확인: https://learn.chatgpt.com/docs/auth/ci-cd-auth "Use one auth.json per runner or per serialized workflow stream"]. 같은 계정으로 사본 둘을 둘 수 있는지는 [미확인]이다. D-14 조건 5(여러 계정 순회 금지)와 어떻게 맞출지 함께 본다.
+  - **판단 끝(사용자 2026-11-04).** 작업 레인을 열 때 파드를 둘로 나누고 레인마다 setup-token을 따로 쓴다. 한도는 계정을 함께 쓰므로 합산으로 본다. [DECISIONS.md](DECISIONS.md) "T18 결정 (Claude 실행기 기준)" (3)을 본다.
 - **구독 인증 Codex의 egress 도메인 목록** [미확인. T16b 실측].
 - **작업자 제어 끝점 인증 (T16a 계약, T18).** 상주 제어 프로세스의 HTTP 끝점(작업자 포트 8080)은 같은 파드의 작업 프로세스(설치 스크립트, 시험, 모델 셸)가 loopback이나 파드 IP로 닿을 수 있다. Service 쪽 NetworkPolicy는 이 경로를 가르지 않고 [가정], init 방화벽(U13)도 loopback을 허용한다 [확인: 설계 부록 1 U13]. 인증이 없으면 악성 코드가 모델 작업을 넣어 구독 한도를 쓰거나 상태·취소 요청을 보낼 수 있다. 제안과 대안은 [DECISIONS.md](DECISIONS.md) D-15 "작업자 제어 끝점"이고, 시험은 SEC-02다.
 - SEC-02에 "작업 레인 비신뢰 코드에서 `auth.json`·CODEX_HOME·환경 변수 읽기"와 "다른 작업·대화 레인의 세션 디렉터리 읽기" 사례를 넣는다([V1_PLAN.md](V1_PLAN.md) §3).
@@ -619,11 +621,13 @@ POST 거부·GET 대조 거부·확정 ID 보존·인가 철회·local confirm �
 
 ### 어댑터 능력표 (T18 로컬 값)
 
+이 표는 Codex 프로필(`CODEX_CAPABILITIES`) 기준이다. 운영에 켠 Claude 작업 레인의 표는 아래 "T18 작업 레인 계약"의 "작업 레인 능력표"다.
+
 | 계약 | 값 | 로컬 시험 | 남은 실측·결정 |
 |---|---|---|---|
 | `capabilities()` | `CODEX_CAPABILITIES` 고정 표, 버전 0.163.0. 작업마다 `codex_sessions`에 기록 | TASK-01 | 설치 CLI `--help` 대조(T16b) |
 | `start_task` | true. `codex exec --json --output-schema … -o … -`, 지시는 stdin | TASK-01 | 실제 실행(T16b) |
-| `attach_task` | **이 어댑터로는 하지 않는다.** R08은 읽기 전용 알림이고 별도 경로·능력표다(§15). 어댑터 값은 `undecided` 그대로이고 부르면 `CapabilityUnavailable(undecided)`다 | TASK-01 | 없음. R08 개방은 §15 "켜는 순서" |
+| `attach_task` | **이 어댑터로는 하지 않는다.** R08은 읽기 전용 알림이고 별도 경로·능력표다(§15). 어댑터 값은 `false`이고 부르면 `CapabilityUnavailable(false)`다. 저장된 옛 세션 JSON에 `undecided`가 남아도 `codex_sessions.capabilities`를 읽는 코드가 없어 동작이 같다 | TASK-01 | 없음. R08 개방은 §15 "켜는 순서" |
 | `read_status`, `read_events` | true. `status()`는 owner·같은 대화만. 이벤트는 판정에만 쓰고 원문 로그를 Discord로 흘리지 않는다 | TASK-01 | 없음 |
 | `read_final_result` | true. 완료 = 종료 코드 0 + 마지막 turn 이벤트가 `turn.completed` + `-o` 파일이 출력 스키마 `completed` + 작업 그룹 소멸 확인 + 작업 공간 실제 diff를 얻음. 게시하는 변경 목록은 실제 diff 기준이고, Codex 보고와 다른 파일은 증거(`unconfirmedReports`)와 안내 문구로 남긴다. 작업 공간 밖을 바꿨다는 보고는 실패다. "완료" 문자열·로그는 근거가 아니다 | TASK-03 | 실제 저장소 압축본 작업 공간(T16b·T19), `file_change` 경로 형식 [미확인] |
 | `answer_question` | clarification만. 질문은 모델이 `status=needs_input`으로 턴을 끝낼 때만 생긴다 | TASK-02 | 없음 |
@@ -1000,6 +1004,24 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 **실행기 관측.** `Observation.tools`는 그 줄에서 시작한 도구 호출 ID 목록이다. 한 assistant 메시지의 `tool_use`를 모두 세고, ID가 없는 호출은 서로 합치지 않는다. 대화·리뷰는 도구 예산이 0이라 호출 하나로 멈춘다. 능력표 값 `tools:'sandboxed-task'`·`sessionPersistence:'per-job'`과 위반 종류 `tool_not_allowed`·`session_mismatch`는 아래 작업 어댑터만 낸다. 어떤 프로필에도 들어가지 않았다.
 
+**작업 레인 능력표.** `src/claude-task-bridge.ts`의 `CLAUDE_TASK_LANE_CAPABILITIES` 값이다. 값 전체는 `test/task-assembly.test.ts`의 "B5 능력표"가 고정하고, 아래 근거 시험은 각 값이 실제 경로와 맞는지 본다. 사람이 연 세션 연결(R08)은 이 표에 없고 별도 능력표 `EXTERNAL_TASK_CAPABILITIES`가 §15에 있다.
+
+| 계약 | 값 | 근거 시험 |
+|---|---|---|
+| `adapter` | `claude-print` | `test/task-settings-boundary.test.ts` "argv 시작" |
+| `start_task` | `true` | `test/task-assembly.test.ts` "B5 수직 흐름" |
+| `answer_question` | `clarification_only` | `test/task-bridge.test.ts` "TASK-02 질문 중계", "질문은 유효한 needs_input과 턴 프로세스 0 확인 뒤에만" |
+| `request_cancel` | `true` | `test/task-bridge.test.ts` "TASK-03 취소는 소멸 확인 뒤에만", `test/task-assembly.test.ts` "B5 /task-status·/task-cancel" |
+| `read_status` | `true` | `test/task-assembly.test.ts` "B5 /task-status·/task-cancel" |
+| `read_final_result` | `true` | `test/task-assembly.test.ts` "B5 수직 흐름" |
+| `confirm_stop` | `pod_pid_space` | `test/task-process-containment.test.ts` "실제 프로세스: 작업자가 PID 1이어도" |
+| `resume_task` | `same_job_session_only` | `test/task-bridge.test.ts` "재개 전 확인", "재개 대조" |
+| `tool_approval_relay` | `false` | `test/task-settings-boundary.test.ts` "argv: 금지 플래그가 없고" |
+| `attach_task` | `false` | `test/task-assembly.test.ts` "B5 능력표". `ClaudeTaskBridge`에 attach 경로가 없다 |
+| `read_events` | `false` | `test/task-contracts.test.ts` "T18 B1 끝점 표"(끝점이 넷뿐이고 진행 이벤트 끝점이 없다) |
+
+이 상수를 읽는 코드는 시험뿐이다. Claude 세션 행의 `capabilities`에는 이 표가 아니라 `{version:1,lane:'task',tool_approval_relay:false}`를 저장한다.
+
 **R08은 이 계약 밖이다.** 계약·테이블은 §15에 따로 둔다.
 
 ### T18 작업 레인 실행·정리 (Claude, 2026-11-05)
@@ -1124,7 +1146,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 ### T18 작업 레인 조립 (2026-11-05)
 
-**기본은 꺼짐이다.** `TASK_LANE_ENABLED`가 없거나 `false`면 작업 레인 객체를 만들지 않는다. 명령 등록·수신, 루프, 작업 HTTP 클라이언트, 지표 계열이 모두 없고 `taskLoop`·`lanes`도 꺼져 지금과 같다. 작업자 이미지는 사람 PR로만 바뀌고 `WORKER_LANES`가 없으면 대화·리뷰 작업자 그대로다. R08(외부 세션 알림)은 이 조립에 없다. `attach_task`는 작업 레인 능력표에서 `false`이고, R08 조립은 §15 "조립"이다.
+**기본은 꺼짐이다.** `TASK_LANE_ENABLED`가 없거나 `false`면 작업 레인 객체를 만들지 않는다. 명령 등록·수신, 루프, 작업 HTTP 클라이언트, 레인 지표 계열이 모두 없고(게이트 지표는 항상 나온다, 아래 "지표") `taskLoop`·`lanes`도 꺼져 지금과 같다. 작업자 이미지는 사람 PR로만 바뀌고 `WORKER_LANES`가 없으면 대화·리뷰 작업자 그대로다. R08(외부 세션 알림)은 이 조립에 없다. `attach_task`는 작업 레인 능력표에서 `false`이고, R08 조립은 §15 "조립"이다.
 
 **구성.**
 
@@ -1173,6 +1195,10 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 **정책 키.** `task.projects[]`: `id`, `revision`, `repository`, `branch` 또는 `base`, `allowedPaths`, `forbiddenPaths`, `verifyCommands`, `limits`(선택, `TaskRunLimitsSchema` 상한 안). 값은 Infisical에만 둔다. `task` 키는 이 코드 이전의 게시 서버가 거부하므로(strict) 코드 배포 뒤에 넣는다.
 
 **설정 키.** 게시 서버: `TASK_LANE_ENABLED`(`true`·`false`만), `TASK_WORKER_URL`(켰을 때 필수, http, 경로 `/`). 작업자: `WORKER_LANES`(미설정·`chat,review`·`task`), `TASK_STATE_ROOT`, `WORKER_NONCE_DIR`(`<TASK_STATE_ROOT>/.homelab-worker` 아래. 밖이면 샌드박스가 가리지 않아 기동 오류).
+
+**게이트 지표(항상).** `homelab_bot_task_gate_closed{reason}`의 사유는 `taskPrecondition`이 내는 `switch_off`·`policy_invalid` 둘이다. 닫힌 사유 줄만 1이고 열렸거나 작업자 대기 중이면 모두 0이다. 레인 지표가 조립할 때만 나와서, 스위치를 켰는데 정책이 틀린 경우를 룰이 가르려면 이 계열이 필요하다.
+
+**브리핑 칸.** 일일 브리핑의 "모델·작업"에 한 줄로 낸다. 상태는 꺼짐·열림·닫힘(사유)이고, 건수는 실행 중(`running`·`verifying`·`cancel_requested`)·질문 대기·한도·인증 대기·unknown이다. 질문이 있으면 가장 오래된 대기 시간을 붙이고, 대기열에 있는 작업은 세지 않는다. tool approval은 V1에 없어 세지 않고 지원 안 함으로 적는다. R08을 켰으면 활성 연결 수가 같은 줄에 붙는다. 알림 채널에 공개되므로 상태 상수와 숫자만 담는다. 읽지 못한 값은 `미확인`이고, 확인하지 못한 사실이 있으면 열림이라 말하지 않으며, 조회 실패가 브리핑을 막지 않는다.
 
 **지표(작업 레인을 조립했을 때만).** `homelab_bot_lane_jobs{lane,state}`, `homelab_bot_task_lane_closed{reason}`, `homelab_bot_task_cleanup_pending`, `homelab_bot_task_sessions_retained`, `homelab_bot_task_worker_routed`, `homelab_bot_task_worker_intake_open`.
 

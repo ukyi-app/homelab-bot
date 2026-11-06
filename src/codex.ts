@@ -22,7 +22,7 @@ export const CODEX_CAPABILITIES = Object.freeze({
   version: '0.163.0', adapter: 'exec',
   start_task: true,
   // 이 어댑터는 사람 세션에 붙지 않는다. R08 연결은 별도 경로와 능력표다(/attach, EXTERNAL_TASK_CAPABILITIES). attach는 이 값으로 거부한다.
-  attach_task: 'undecided',
+  attach_task: false,
   read_status: true, read_events: true, read_final_result: true,
   answer_question: 'clarification_only',
   // exec에는 승인 정책 플래그가 없다 [실측: 0.163.0 `codex exec --help`]. --approve-for-me도 쓰지 않는다.
@@ -38,11 +38,11 @@ export function describeCapabilities(c: CodexCapabilities = CODEX_CAPABILITIES):
     '- 새 작업 시작·상태·완료 결과: 지원',
     '- 질문 답: 모델이 턴을 끝내며 묻는 clarification만 지원',
     '- 도구 실행 승인 중계: 지원 안 함(capability=false). 답으로 권한·샌드박스를 바꿀 수 없음',
-    '- 기존 Codex 세션 연결(attach): 연결 방식 결정 대기(미정)',
+    '- 기존 Codex 세션 연결(attach): 지원 안 함(capability=false). 읽기 전용 알림(R08)은 별도 경로',
     '- 취소: 작업 프로세스 정리를 확인한 뒤에만 cancelled, 확인 못 하면 unknown'].join('\n');
 }
 export class CapabilityUnavailable extends Error {
-  constructor(public readonly capability: string, public readonly state: 'false' | 'undecided') { super(`capability_${state}:${capability}`); }
+  constructor(public readonly capability: string, public readonly state: 'false') { super(`capability_${state}:${capability}`); }
 }
 
 // 프로세스 실행 계약은 실행기 공통(process-launcher)이다. 작업 레인은 같은 계약을 이 이름으로 쓴다.
@@ -409,7 +409,7 @@ export class CodexBridge extends TaskBridge {
   }
   async attach(actor: string, scope: Scope, _external: string): Promise<never> {
     await this.gate.authorize(actor, scope);
-    throw new CapabilityUnavailable('attach_task', 'undecided');
+    throw new CapabilityUnavailable('attach_task', 'false');
   }
   async release(actor: string, scope: Scope, jobId: string): Promise<{ ok: boolean; status: string }> {
     const job = await this.releasable(actor, scope, jobId);
