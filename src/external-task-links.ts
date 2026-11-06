@@ -74,7 +74,7 @@ export class ConnectionClosed extends Error { constructor() { super('external_co
 // timeline은 물리 복원·PITR만 잡으므로 pg_dump 복원에 대비해 운영자가 올리는 restoreEpoch를 함께 비교한다.
 // 함정: 장애 조치(promote)도 timeline을 올리므로 그때도 모든 연결이 닫히고 다시 /attach 해야 한다. 안전한 쪽의 오탐이다.
 const CURRENT_TIMELINE = "SELECT substr(pg_walfile_name(pg_current_wal_lsn()),1,8) AS timeline";
-const RESTORE_EPOCH = /^[A-Za-z0-9._-]{1,64}$/;
+export const RESTORE_EPOCH = /^[A-Za-z0-9._-]{1,64}$/;
 
 export interface ExternalTaskLinksOptions { restoreEpoch?: string }
 export class ExternalTaskLinks {
@@ -191,13 +191,21 @@ export class ExternalTaskLinks {
       return { fenced: ids.length };
     }, deadline);
   }
-  // read_status: owner·같은 대화만 본다. "살아 있다"가 아니라 마지막으로 알림을 받은 시각만 말한다.
-  async status(connectionId: string, owner: string, scope: Scope) {
-    const row = await this.visible(connectionId, owner, scope);
-    const now = this.now;
+  private summarize(row: ExternalConnection, now: number) {
     return { connectionId: row.id, externalTaskId: row.external_task_id, executor: row.executor, summaryConsent: row.summary_consent,
       state: row.revoked_at !== null ? 'revoked' as const : row.expires_at <= now ? 'expired' as const : 'active' as const,
       revokedReason: row.revoked_reason, expiresAt: row.expires_at, lastEventAt: row.last_event_at, capabilities: EXTERNAL_TASK_CAPABILITIES };
+  }
+  // read_status: owner·같은 대화만 본다. "살아 있다"가 아니라 마지막으로 알림을 받은 시각만 말한다.
+  async status(connectionId: string, owner: string, scope: Scope) {
+    return this.summarize(await this.visible(connectionId, owner, scope), this.now);
+  }
+  // 이 대화에서 owner가 만든 연결. 활성을 먼저, 그 안에서는 최근 것부터. more는 limit 밖에 더 있다는 뜻이다.
+  async list(owner: string, scope: Scope, limit = 10) {
+    const rows = (await this.store.db.query<ExternalConnection>(`SELECT * FROM external_task_connections WHERE owner_id=$1 AND conversation_id=$2
+      ORDER BY (revoked_at IS NULL) DESC,created_at DESC,id LIMIT $3`, [owner, this.store.scopeId(scope), limit + 1])).rows.map(connectionRow);
+    const now = this.now;
+    return { items: rows.slice(0, limit).map(row => this.summarize(row, now)), more: rows.length > limit };
   }
   // read_events: 메타데이터만 돌려준다. 요약 원문은 이 표에 없다.
   async events(connectionId: string, owner: string, scope: Scope, limit = 20) {

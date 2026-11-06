@@ -10,8 +10,8 @@
 
 1. **작은 제어 서비스 하나 + PostgreSQL + 격리 작업자 하나.** 게시 서버(ns `app-homelab-bot`, replicas 1)가 수신·조율·읽기 조회·게시를 맡고, 상태와 큐는 공유 PostgreSQL의 봇 전용 DB에 둔다. 모델 호출은 ns `sandbox`의 작업자만 한다.
 2. **모델 자격은 작업자에만, 게시 자격은 게시 서버에만.** 모델 자격은 봇 전용 구독 계정의 `auth.json` 하나이고 작업자 전용 영속 CODEX_HOME에 있다(D-14). 비신뢰 자료(로그, PR, 댓글)를 읽는 모델은 Discord 토큰·GitHub App 키와 다른 파드에서 돈다.
-3. **Codex는 `codex exec --json` 경로.** 질문은 턴 종료 + `exec resume`으로만, 도구 승인 중계는 `capability=false`. `codex app-server`는 어댑터 뒤 실험 후보로만 둔다. 사람이 연결한 기존 작업(R08)은 읽기 전용 알림으로 정했고 아직 켜지 않았다(§15).
-4. **Discord는 Gateway로만 받는다.** 새 공개 수신 경로가 없다. 공개 경로는 GitHub webhook 한 경로뿐이다(설계 C.8).
+3. **Codex는 `codex exec --json` 경로.** 질문은 턴 종료 + `exec resume`으로만, 도구 승인 중계는 `capability=false`. `codex app-server`는 어댑터 뒤 실험 후보로만 둔다. 사람이 연결한 기존 작업(R08)은 읽기 전용 알림이고 tailnet 전용 리스너로 받는다. 스위치 기본은 꺼짐이다(§15).
+4. **Discord는 Gateway로만 받는다.** 새 공개 수신 경로가 없다. 공개 경로는 GitHub webhook 한 경로뿐이다(설계 C.8). R08 수신은 tailnet 안에서만 닿는다(§15).
 5. **복구의 기본은 "외부 상태를 다시 읽고 대조"다.** Discord는 `after=` 대조, GitHub은 열린 PR 대조(webhook 수동 재전송은 3일 한정), 결과를 모르는 작업은 `unknown`으로 두고 다시 실행하지 않는다.
 6. **작업자의 모델 호출은 한 번에 하나다.** `auth.json` 사본 하나를 대화 레인과 작업 레인이 함께 쓰기 때문이다(D-14 조건 3). 긴 작업 중 대화 응답성, 인증 파일 노출, 작업 사이 세션 파일 격리는 열린 항목이다(§5.1, §10).
 
@@ -94,7 +94,7 @@
 |---|---|---|
 | `capabilities()` | true. 고정 버전 + `--help` 대조 | [실측: `codex --version`, `codex exec --help`] |
 | `start_task` | true. 작업 레인에서 `codex exec --json`, 작업 공간은 고정 SHA의 `codeload.github.com` 압축본 + `git init` 한 번 커밋(D-15) | [확인: https://learn.chatgpt.com/docs/non-interactive-mode] |
-| `attach_task` | **결정 완료·구현 비활성.** R08은 읽기 전용 알림으로 정했다(§15). 핵심은 구현했지만 수신 경로가 미정이고 `/attach`·리스너가 연결되지 않아 어댑터 값은 아직 `undecided`이고 부르면 거부한다. 봇 소유 세션의 재개는 `resume_task`(R10 경로)다. herdr 경유는 쓰지 않는다 | 사용자 결정(2026-11-04, DECISIONS "T18 결정" (1)). herdr는 상태를 화면으로 추정하고 소켓에 인증이 없다 [확인: https://raw.githubusercontent.com/herdrdev/herdr/v0.9.5/docs/next/website/src/content/docs/integrations.mdx , 실측: 소켓 0600] |
+| `attach_task` | **이 어댑터로는 하지 않는다.** R08은 읽기 전용 알림이고 별도 경로와 능력표다(§15, `EXTERNAL_TASK_CAPABILITIES`, `/attach`, 스위치 기본 꺼짐). 어댑터 값은 `undecided` 그대로이고 부르면 거부한다. 봇 소유 세션의 재개는 `resume_task`(R10 경로)다. herdr 경유는 쓰지 않는다 | 사용자 결정(2026-11-04, DECISIONS "T18 결정" (1)). herdr는 상태를 화면으로 추정하고 소켓에 인증이 없다 [확인: https://raw.githubusercontent.com/herdrdev/herdr/v0.9.5/docs/next/website/src/content/docs/integrations.mdx , 실측: 소켓 0600] |
 | `read_status`, `read_events` | true. JSONL 이벤트 + 프로세스 생존 | [확인: https://learn.chatgpt.com/docs/non-interactive-mode] |
 | `read_final_result` | true. `-o` 파일 + `--output-schema` + 작업 공간 diff. "완료"라는 문자열은 판정 근거가 아니다 | `01` §6 완료 기준 |
 | `answer_question` | **clarification만.** 모델이 턴을 끝내며 묻고, 봇이 `exec resume <id> "<답>"`으로 잇는다. 질문 ID는 봇이 `job_id + thread_id + 턴 순번`으로 만든다 | [실측: exec에 승인 플래그 없음] |
@@ -274,7 +274,7 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 - 하트비트를 Gateway 연결에 묶는 대안의 채택 여부와 N(§8 "대안") [T16a].
 - runtime policy의 현재 revision 확인 방법과 최대 나이(§6 "허용 목록 반영") [T16a]. → T16b D1로 정함: 기동 때 env 읽기, 나이 검사 없음(§11).
 - 삭제 원장의 보존 기간(§7) [T20]. 저장소는 정함(SSD 파일, DECISIONS T20), 쓰기 순서와 부분 실패 처리는 T20에서 구현.
-- R08 수신 경로 [H3]. 연결 방식은 정했다(§15).
+- R08 수신 경로: **정함(tailnet 전용, 사용자 2026-11-06, DECISIONS).** 노출은 homelab `platform/bot-slot`의 몫이고 켜는 순서는 §15다.
 
 ## 11. T16a 확정 계약과 로컬 구현 (2026-10-19)
 
@@ -623,7 +623,7 @@ POST 거부·GET 대조 거부·확정 ID 보존·인가 철회·local confirm �
 |---|---|---|---|
 | `capabilities()` | `CODEX_CAPABILITIES` 고정 표, 버전 0.163.0. 작업마다 `codex_sessions`에 기록 | TASK-01 | 설치 CLI `--help` 대조(T16b) |
 | `start_task` | true. `codex exec --json --output-schema … -o … -`, 지시는 stdin | TASK-01 | 실제 실행(T16b) |
-| `attach_task` | **결정 완료·구현 비활성.** 연결 방식은 읽기 전용 알림으로 정했다(§15). 어댑터 값은 아직 `undecided`이고 부르면 `CapabilityUnavailable(undecided)`다. `false`로 정한 것이 아니다 | TASK-01 | 수신 경로 결정(H3), `/attach`·리스너 조립(B5) |
+| `attach_task` | **이 어댑터로는 하지 않는다.** R08은 읽기 전용 알림이고 별도 경로·능력표다(§15). 어댑터 값은 `undecided` 그대로이고 부르면 `CapabilityUnavailable(undecided)`다 | TASK-01 | 없음. R08 개방은 §15 "켜는 순서" |
 | `read_status`, `read_events` | true. `status()`는 owner·같은 대화만. 이벤트는 판정에만 쓰고 원문 로그를 Discord로 흘리지 않는다 | TASK-01 | 없음 |
 | `read_final_result` | true. 완료 = 종료 코드 0 + 마지막 turn 이벤트가 `turn.completed` + `-o` 파일이 출력 스키마 `completed` + 작업 그룹 소멸 확인 + 작업 공간 실제 diff를 얻음. 게시하는 변경 목록은 실제 diff 기준이고, Codex 보고와 다른 파일은 증거(`unconfirmedReports`)와 안내 문구로 남긴다. 작업 공간 밖을 바꿨다는 보고는 실패다. "완료" 문자열·로그는 근거가 아니다 | TASK-03 | 실제 저장소 압축본 작업 공간(T16b·T19), `file_change` 경로 형식 [미확인] |
 | `answer_question` | clarification만. 질문은 모델이 `status=needs_input`으로 턴을 끝낼 때만 생긴다 | TASK-02 | 없음 |
@@ -1124,7 +1124,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 ### T18 작업 레인 조립 (2026-11-05)
 
-**기본은 꺼짐이다.** `TASK_LANE_ENABLED`가 없거나 `false`면 작업 레인 객체를 만들지 않는다. 명령 등록·수신, 루프, 작업 HTTP 클라이언트, 지표 계열이 모두 없고 `taskLoop`·`lanes`도 꺼져 지금과 같다. 작업자 이미지는 사람 PR로만 바뀌고 `WORKER_LANES`가 없으면 대화·리뷰 작업자 그대로다. R08(외부 세션 알림)은 이 조립에 없다. `attach_task`는 작업 레인 능력표에서 `false`이고, 조립 자리는 아래 "R08"이다.
+**기본은 꺼짐이다.** `TASK_LANE_ENABLED`가 없거나 `false`면 작업 레인 객체를 만들지 않는다. 명령 등록·수신, 루프, 작업 HTTP 클라이언트, 지표 계열이 모두 없고 `taskLoop`·`lanes`도 꺼져 지금과 같다. 작업자 이미지는 사람 PR로만 바뀌고 `WORKER_LANES`가 없으면 대화·리뷰 작업자 그대로다. R08(외부 세션 알림)은 이 조립에 없다. `attach_task`는 작업 레인 능력표에서 `false`이고, R08 조립은 §15 "조립"이다.
 
 **구성.**
 
@@ -1185,7 +1185,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 되돌리기는 `TASK_LANE_ENABLED`를 끈 게시 서버 배포가 먼저다. 실행 중 턴은 드레인·취소 확인을 거치고, 못 하면 `unknown`이다. 켠 채 작업자를 옛 이미지로 내리지 않는다.
 
-**R08(B5b).** 수신 경로가 정해지면 `main.ts`의 `receivers` 라우트, `commands.ts`의 별도 명령 목록, `DiscordIngress` 처리기 인자, `CLAUDE_TASK_LANE_CAPABILITIES`와 별개의 연결 능력표에 더한다. 작업 레인 스위치와 묶지 않는다.
+**R08.** 작업 레인 스위치와 묶지 않는다. 조립은 §15다.
 
 ## 13. 개선안 v2 적용 (2026-10-30)
 
@@ -1297,7 +1297,7 @@ README에 있던 운영 세부 중 §1~13과 다른 `docs/ai-bot/` 문서에 없
 ```sh
 npm run build
 node dist/src/migrate-main.js   # DATABASE_URL만 필요. 적용된 버전은 건너뛴다
-node dist/src/main.js           # 게시 서버. 8080(/readyz·/metrics·/github), 8081(/alerts)
+node dist/src/main.js           # 게시 서버. 8080(/readyz·/metrics·/github), 8081(/alerts), R08을 켜면 8082(/external-task-events)
 ```
 
 - 비밀 env(Infisical `/apps/homelab-bot/`): `DATABASE_URL`(차트가 넣음), `DISCORD_BOT_TOKEN`, `RUNTIME_POLICIES`, `GRAFANA_READER_TOKEN`, `HEALTHCHECKS_PING_URL`, `WORKER_CONTROL_PRIVATE_KEY`(Ed25519 PKCS8 PEM), `GITHUB_REVIEW_WEBHOOK_SECRET`(16자 이상).
@@ -1380,8 +1380,52 @@ Grafana/K8s/Argo CD의 실제 응답을 `ReadTransport`의 제한된 observation
 
 사용자가 자기 기기에서 직접 돌리는 Claude Code·Codex 세션을 봇에 명시적으로 연결해, 턴이 끝나면 Discord로 알린다(DECISIONS "T18 결정" (1)). 사람 세션의 자기 보고이고 봇이 결과·프로세스 소멸을 검증한 것이 아니다.
 
-- **아직 켜지 않았다.** `src/main.ts`가 이 모듈을 읽지 않고, `/attach`도 수신 포트도 없다. 수신 경로(tailnet 전용 또는 공개+Access)는 미정이고 조립은 B5, 노출은 H3이 한다. 어댑터의 `attach_task`는 그때까지 `undecided`다.
-- **능력.** `EXTERNAL_TASK_CAPABILITIES`는 `read_status`·`read_events`만 true다. 이벤트로 모델 호출·작업 시작·답·취소·재개가 생기지 않는다. `jobs`·`codex_sessions`·`events`에 행을 만들지 않는다.
+- **기본은 꺼짐이다.** 스위치가 없거나 `false`면 리스너·명령·루프·지표가 없다. 아래 "조립"과 "켜는 순서"를 본다.
+- **수신 경로는 tailnet 전용이다**(사용자 2026-11-06, DECISIONS "R08 수신 경로"). 인터넷 공개 경로가 없다.
+- **능력.** `EXTERNAL_TASK_CAPABILITIES`는 `read_status`·`read_events`만 true다. 작업 레인 능력표(`CLAUDE_TASK_LANE_CAPABILITIES`)와 어댑터 능력표(`CODEX_CAPABILITIES`)와 별개다. 이벤트로 모델 호출·작업 시작·답·취소·재개가 생기지 않는다. `jobs`·`codex_sessions`에 행을 만들지 않고 수신은 `events`에도 행을 만들지 않는다.
+
+**조립(`src/main.ts`).**
+
+| 항목 | 내용 |
+|---|---|
+| 스위치 | `EXTERNAL_TASK_EVENTS_ENABLED`: `true`·`false`만. 없으면 꺼짐, 다른 값은 기동 오류. 작업 레인·리뷰 스위치와 독립 |
+| 환경 식별자 | `EXTERNAL_TASK_ENVIRONMENT`: 서명 입력에 들어간다. 켰을 때 필수(예: 운영 `prod`), helper 설정과 같아야 한다 |
+| 복원 세대 | `EXTERNAL_TASK_RESTORE_EPOCH`: 선택. pg_dump 복원 절차에서 올린다(아래 "복원") |
+| 형식 위반 | 환경·세대의 형식이 틀리면 스위치와 무관하게 기동 오류다. 켜는 PR에서 처음 터지지 않게 꺼진 동안에도 본다. 오류에는 키 이름만 남는다 |
+| 리스너 | `PORTS.externalEvents`(8082)에 `externalTaskServer`. `POST /external-task-events`만 있고 `/metrics`·`/readyz`·webhook은 없다. 8080·8081에는 이 경로가 없어 404다 |
+| 기동 실패 | 8082를 열지 못하면 8080·8081과 같이 기동 실패다. 연 포트를 모두 닫고 끝난다 |
+| 종료 | `stop` 뒤 8080·8081과 함께 닫는다(같은 5초 안, 남은 소켓은 끊는다). 처리 중인 수신은 DB 단계 기한이 끝낸다 |
+| readiness | 8082는 `/readyz`에 묶지 않는다. R08 장애로 GitHub·경보 수신까지 끊지 않는다 |
+| 지표 | 켰을 때만 8080 `/metrics`에 `homelab_bot_external_task_*`를 덧붙인다 |
+| 복원 장벽 | 기동 때 `enforceRestoreFence()`를 Discord와 무관하게 돌려 성공할 때까지 다시 시도한다. 게시 루프는 그 뒤에 연다. 기억·브리핑 장벽이 있으면 그 앞이다 |
+| 보관 정리 | 켰을 때만 1시간마다 `purge()` |
+
+**명령(`src/commands.ts` `EXTERNAL_TASK_COMMANDS`, `src/external-task-commands.ts`).** 기존 명령처럼 정책 owner만, 자기 스레드에서만이다. 응답은 모두 상호작용 응답(EPHEMERAL)이다.
+
+| 명령 | 옵션 | 처리 |
+|---|---|---|
+| `/attach` | `target`(세션 ID), `text`(`claude`·`codex`, 동의하면 뒤에 `summary=on`) | owner·scope·대화·세션 ID를 묶어 연결을 만들고 키를 한 번 보여 준다. 활성 스레드에서만. 채널에서는 안내만 한다 |
+| `/detach` | `target`(연결 ID) | 폐기. 새 수신을 거절하고 미게시 행을 막는다. 타인·없는 연결은 같은 문구다 |
+| `/attach-list` | 없음 | 이 스레드의 연결. 활성 먼저, 최근 10건 |
+
+재발급 명령은 없다. 해제 뒤 다시 연결한다. 요약 동의도 연결할 때만 정한다. `rotate`·`setSummaryConsent`는 핵심에 남아 있지만 명령에 잇지 않았다.
+
+**seed 경계.** 평문이 되는 곳은 `seedMessage` 한 곳이고, 그 글은 `DiscordIngress.deliverPrivate`로만 나간다.
+
+- 명령 상호작용이라 EPHEMERAL callback만 쓴다. 메시지 이벤트의 채널 게시 대체 경로로 가지 않는다.
+- `deliverPrivate`는 오류를 고정 사유 코드로만 남긴다. 전송 계층 오류에 요청 본문이 실려도 감사·로그로 가지 않는다.
+- 전달에 실패하면(상호작용 만료, 전송 실패, 일시 정지, 권한 변경) `revoke(...,'delivery_failed')`로 닫고 고정 안내만 남긴다. 키 글은 다시 보내지 않는다. 폐기까지 실패하면 `/detach`를 안내하고 `external_task_revoke_failed`를 남긴다.
+- events에는 세션 ID(`target`)만 남고 `text`는 비운다.
+- **남는 틈.** `attach` 커밋과 응답 사이에 프로세스가 죽으면 아무도 키를 모르는 활성 연결이 남는다. 쓰이지 않는 키라 위험은 없고, 다시 `/attach`하면 "이미 연결"로 답해 `/detach`를 안내한다.
+
+**켜는 순서.** 스위치는 **기본 꺼짐으로 병합한다.**
+
+1. 봇 병합. 게시 서버 자동 배포. 꺼져 있어 변화 없음.
+2. homelab 병합(`platform/bot-slot`의 R08 값 기본 꺼짐).
+3. 사람이 Tailscale ACL을 적용한다. 태그 없이 Ingress를 만들면 프록시가 태그를 받지 못한다.
+4. 켜는 PR: 봇 env `EXTERNAL_TASK_EVENTS_ENABLED=true`, `EXTERNAL_TASK_ENVIRONMENT=prod`와 bot-slot 값. 사람이 기기별로 helper를 설치한다(`tools/r08-helper/README.md`).
+
+되돌리기는 스위치를 끈 배포다. 연결 행은 남고, 리스너·명령이 사라져 수신이 없다. 꺼진 동안 쌓인 미게시 행은 게시자가 계속 내보낸다.
 
 **저장(`migrations/016_external_task_links.sql`).** 015는 B3가 쓴다. 번호는 운영 적용 순서를 단조롭게 두려는 것이다.
 
@@ -1391,11 +1435,11 @@ Grafana/K8s/Argo CD의 실제 응답을 `ReadTransport`의 제한된 observation
 | `external_task_events` | `connection_id`+`event_id` PK, 본문 SHA-256, 수락한 `accepted_key_id`, 발생·수신 시각, `outbox_key`, `post_state`(`pending`·`posted`·`blocked`). 요약 원문은 없다 |
 | `external_task_link_fence` | 복원 감지 값 한 행 |
 
-`post_state`의 원천은 `outbox.state`다. 게시자는 R08을 모르므로 트리거 `outbox_external_task_post_state`가 같은 트랜잭션에서 따라간다. `unknown`은 보냈는지 모르므로 미게시로 센다. 중복 방지 ID는 게시가 끝난 뒤 7일 보관하고 `ExternalTaskLinks.purge()`가 지운다(주기 호출은 B5). 지운 뒤의 재생은 `occurred_at` 24시간 창에서 거절된다.
+`post_state`의 원천은 `outbox.state`다. 게시자는 R08을 모르므로 트리거 `outbox_external_task_post_state`가 같은 트랜잭션에서 따라간다. `unknown`은 보냈는지 모르므로 미게시로 센다. 중복 방지 ID는 게시가 끝난 뒤 7일 보관하고 `ExternalTaskLinks.purge()`가 지운다(1시간 주기). 지운 뒤의 재생은 `occurred_at` 24시간 창에서 거절된다.
 
 **수명(`src/external-task-links.ts`).**
 
-- `attach`는 서버에서 키쌍을 만들고 seed를 `OneTimeSeed`로 돌려준다. `reveal()`은 한 번만 되고, 문자열·JSON·`inspect`는 `[redacted]`다. 그래서 outbox·감사·오류 수집에 실수로 실려도 값이 남지 않는다. 전달은 호출자가 ephemeral로 한다.
+- `attach`는 서버에서 키쌍을 만들고 seed를 `OneTimeSeed`로 돌려준다. `reveal()`은 한 번만 되고, 문자열·JSON·`inspect`는 `[redacted]`다. 그래서 outbox·감사·오류 수집에 실수로 실려도 값이 남지 않는다. 전달은 위 "seed 경계"다.
 - `rotate`는 같은 행의 키를 덮어써 이전 키를 즉시 무효로 하고, 이전 키로 들어온 미게시 행을 막는다.
 - `revoke`·`detach`는 `pending`과 발송 시작 전 `sending`을 `blocked`로 바꾼다. 게시자의 dispatch 표시가 `state='sending'`을 요구하므로 이 트랜잭션 뒤에는 나갈 수 없다. 이미 발송을 시작한 행은 보냈을 수 있어 그대로 둔다. 전달 실패 때는 `revoke(...,'delivery_failed')`로 닫는다.
 - **발송 중 폐기·재발급.** 그대로 둔 행의 발송이 429·401로 실패하면 게시자가 `pending`으로 되돌린다. 트리거 `outbox_external_task_claim`이 `pending`→`sending` 전이마다 연결 폐기, 수락한 키와 현재 키의 일치, WAL timeline을 다시 보고 어긋나면 `blocked`로 바꾼다. 게시자는 R08을 모르고 재시도 경로가 여럿이라 모든 발송이 지나는 이 전이에 둔다. 폐기·재발급·동의 변경이 연결 행을 잠근 동안에는 기다리지 않고(교착 방지) lease 30초만큼 미룬다.
@@ -1404,10 +1448,10 @@ Grafana/K8s/Argo CD의 실제 응답을 `ReadTransport`의 제한된 observation
 **복원.** 복원하면 폐기한 키가 DB 행과 함께 되살아난다. `enforceRestoreFence`는 attach·재발급·수신마다 지금 값(`timeline:<WAL timeline>;epoch:<restoreEpoch>`)을 저장 값과 비교하고, 다르면 활성 연결을 모두 `restore_fence`로 닫고 미게시 행을 막고 감사를 남긴다. 복원된 DB에는 어느 키가 폐기됐는지 알 근거가 없으므로 전부 닫고 사람이 다시 연결한다.
 
 - 물리 복원·PITR은 timeline이 올라가 자동으로 잡힌다.
-- **pg_dump 복원은 timeline이 그대로라 자동으로 못 잡는다.** 복원 절차에서 `restoreEpoch` 설정값을 올려야 한다.
+- **pg_dump 복원은 timeline이 그대로라 자동으로 못 잡는다.** 복원 절차에서 `EXTERNAL_TASK_RESTORE_EPOCH`를 올려야 한다.
 - **장애 조치(promote)도 timeline을 올려 모든 연결이 닫힌다.** 안전한 쪽의 오탐이다.
 - 값을 읽지 못하면 수신이 503으로 닫힌다.
-- **조립(B5).** 게시 루프를 시작하기 전에 `enforceRestoreFence()`를 한 번 부른다. 게시 트리거는 timeline만 볼 수 있어 pg_dump 복원의 `restoreEpoch` 변경은 이 호출이 있어야 미게시 행보다 먼저 잡힌다.
+- **기동 장벽.** 게시 루프를 시작하기 전에 `enforceRestoreFence()`를 성공할 때까지 부른다. 게시 트리거는 timeline만 볼 수 있어 pg_dump 복원의 세대 변경은 이 호출이 있어야 미게시 행보다 먼저 잡힌다.
 
 **수신(`src/external-task-receiver.ts`).** `ExternalTaskReceiver`는 판정, `externalTaskServer`는 전용 HTTP 서버이고 listen은 조립하는 쪽이 한다. 이 서버에는 다른 경로가 없다(`/metrics`·`/readyz` 없음).
 
@@ -1442,8 +1486,9 @@ POST
 - **요약.** 동의 없는 연결은 고정 문구 `턴 완료`만 받는다. 동의한 연결도 500 코드 포인트·2,000바이트·제어 문자 없음이고 경로·토큰 의심 표현은 거절한다. 같은 표가 helper에 있고 시험이 일치를 확인한다. 이 표는 완전한 비밀 탐지가 아니다.
 - **게시.** "사람 세션이 턴을 끝냈다고 알림", 발생·수신 시각(KST), 지연을 적는다. `allowed_mentions.parse=[]`는 게시자가 건다. 게시자의 본문에 `flags` 칸이 없어 링크 미리보기는 내용 쪽에서 막는다. 사용자 값을 모두 코드 스팬에 넣는다.
 - **게시 직전 권한.** 게시자가 `PolicyGate`와 대화 활성 여부를 다시 본다. 연결 폐기·재발급은 위 `blocked` 처리와 claim 트리거로 막는다. 만료는 게시를 막지 않는다. 만료 전에 정상으로 받은 이벤트이기 때문이다. 다시 연결해 옛 행이 `expired`로 닫혀도 같다.
-- **권한 조립(B5).** `authorize`는 기한이 걸린 트랜잭션 `db`를 받는다. `(owner, scope, db) => gate.withDatabase(db).authorize(owner, scope)`로 넘긴다.
-- **관측.** `metrics()`가 사유별 수·지연·동시 처리·DB 슬롯 사용·DB 대기·미게시 수를 고정 라벨로 낸다. 전용 포트에 두지 않으므로 8080 `/metrics`에 조립한다. 본문·인증 헤더·연결 ID는 없다.
+- **권한.** `authorize`는 기한이 걸린 트랜잭션 `db`를 받아 `gate.withDatabase(db).authorize(owner, scope)`를 부른다. owner 철회(거부 목록, 정책 owner 교체)면 수신은 403 `scope_denied`이고, 미게시 행은 게시 직전 권한 확인에서 `blocked`가 된다.
+- **만료(30일).** 수신은 401이다. 만료 전에 받은 미게시 행은 위 "게시 직전 권한"대로 나간다.
+- **관측.** `metrics()`가 사유별 수·지연·동시 처리·DB 슬롯 사용·DB 대기·미게시 수를 고정 라벨로 낸다. 전용 포트에 두지 않고 8080 `/metrics`에 붙인다. 본문·인증 헤더·연결 ID는 없다.
 
 **사람 쪽 helper(`tools/r08-helper/`).** 설치 안내는 그 디렉터리의 README다. 봇 이미지 런타임 단계는 `src`만 복사하므로 helper가 이미지에 들어가지 않고, Node 내장 모듈만 써서 기기에 복사해 쓴다. 시험 단계는 저장소 전체를 복사하므로 시험이 함께 돈다.
 
@@ -1452,4 +1497,4 @@ POST
 - 큐는 기기당 100건 또는 1 MiB, 발생 후 24시간이다. 초과·만료·서버 거절은 사유 코드로 남고 `sender.mjs status`가 보여 준다.
 - 전달 보장이 아니다. 훅이 큐에 넣기 전에 죽거나 기기·봇이 24시간 넘게 꺼져 있으면 알림이 없다.
 
-**시험의 한계.** Claude·Codex 입력은 공식 문서의 필드로 만든 합성 입력이다. 실제 CLI 버전별 필드, 절전 복귀, Keychain 동작, NUC 자원 안의 부하는 시험하지 않았다.
+**시험의 한계.** Claude·Codex 입력은 공식 문서의 필드로 만든 합성 입력이다. 실제 CLI 버전별 필드, 절전 복귀, Keychain 동작, NUC 자원 안의 부하, 실제 tailnet 경로(ACL·프록시 태그·집 밖 기기)는 시험하지 않았다.

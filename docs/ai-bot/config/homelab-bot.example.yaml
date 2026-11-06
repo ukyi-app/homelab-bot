@@ -104,7 +104,7 @@ codex:
   auth_fallback: none                         # D-14 확정. Codex 밖 OAuth 프록시·여러 계정 순회 금지
   capabilities:                               # 01 §6 추상 계약. DISCOVERY 제안값(T18에서 실측으로 확정)
     start_task: null                          # 제안: true
-    attach_task: null                         # 보류. R08 연결 방식은 T18에서 다시 판단한다(사용자 2026-10-18, T15)
+    attach_task: null                         # 이 어댑터로는 하지 않는다. R08은 별도 경로·능력표(ARCHITECTURE §15, 사용자 2026-11-04·2026-11-06)
     answer_question: null                     # 제안: clarification_only(exec resume)
     tool_approval_relay: false                # exec에 승인 플래그 없음. 무응답 자동 승인 금지
     request_cancel: null                      # 제안: process_signal(작업 process group 또는 cgroup 전체). 자식이 모두 사라졌음을 확인한 뒤에만

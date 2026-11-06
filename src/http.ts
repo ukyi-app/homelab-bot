@@ -4,7 +4,8 @@ import type { AlertIngress } from './alerts.js';
 import type { Health } from './health.js';
 import { z } from 'zod';
 
-export const PORTS = Object.freeze({ publisher: 8080, alerts: 8081, worker: 8080 });
+// externalEvents: R08 전용 리스너(POST /external-task-events만). 8080·8081과 경로를 섞지 않는다. 프로세스 자원까지 나누는 것은 아니다.
+export const PORTS = Object.freeze({ publisher: 8080, alerts: 8081, worker: 8080, externalEvents: 8082 });
 export async function body(request: IncomingMessage, limit = 65_536): Promise<unknown> {
   const chunks: Buffer[] = [];
   let size = 0;

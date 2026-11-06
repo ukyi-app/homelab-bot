@@ -597,11 +597,10 @@ test('R08 관측: 지표에는 고정 라벨과 수만 있고 본문·연결 ID�
   } finally { await shut(server); await ctx.close(); }
 });
 
-test('R08 경계: 수신 모듈은 main.ts에 연결되지 않았고 모델·작업·제어 코드를 import하지 않는다', async () => {
-  const main = await readFile('src/main.ts', 'utf8');
-  assert.doesNotMatch(main, /external-task/);
-  const source = `${await readFile('src/external-task-receiver.ts', 'utf8')}\n${await readFile('src/external-task-links.ts', 'utf8')}`;
+test('R08 경계: 수신·연결·명령 모듈은 모델·작업·제어 코드를 import하지 않는다', async () => {
+  const files = ['src/external-task-receiver.ts', 'src/external-task-links.ts', 'src/external-task-commands.ts'];
+  const source = (await Promise.all(files.map(file => readFile(file, 'utf8')))).join('\n');
   for (const match of source.matchAll(/from '\.\/([a-z-]+)\.js'/g)) {
-    assert.ok(['contracts', 'database', 'external-task-links', 'log', 'store'].includes(match[1]!), match[1]);
+    assert.ok(['contracts', 'database', 'external-task-links', 'external-task-receiver', 'log', 'store'].includes(match[1]!), match[1]);
   }
 });
