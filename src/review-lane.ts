@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { ChangeReviewOutputSchema } from './change-review.js';
+import type { ChangeReviewerInput, ChangeReviewerModel } from './change-review.js';
 import { echoesSecret } from './codex-events.js';
 import type { Executor } from './executor-profiles.js';
 import { ReviewOutputSchema } from './review-input.js';
@@ -37,7 +39,7 @@ const texts = (value: unknown): string[] => typeof value === 'string' ? [value]
 const failed = (reason: string): ReviewerResult => ({ status: 'failed', reason });
 // 판정 순서는 대화(interpretChat)와 같다: 소멸 확인 → 집행한 상한·정책 위반·중단 → 실행기 결과 → 스키마 → 반사 검사.
 // 대화와 달리 자르지 않는다. 게시 서버가 같은 스키마로 다시 거르므로 넘친 답을 잘라 넘겨도 쓸 수 없다.
-export function interpretReview(report: RunReport): ReviewerResult {
+export function interpretReview(report: RunReport, schema: z.ZodType = ReviewOutputSchema): ReviewerResult {
   if (report.launchFailed && report.survivors === 0) return failed(report.refused ?? 'launch_failed');
   if (!report.exit || report.survivors !== 0) return { status: 'unknown' };
   if (report.exceeded) return failed(report.exceeded);
@@ -47,7 +49,7 @@ export function interpretReview(report: RunReport): ReviewerResult {
   const outcome = report.outcome;
   if (outcome.kind === 'limited' || outcome.kind === 'auth_expired') return { status: outcome.kind === 'limited' ? 'limited' : 'auth_expired' };
   if (outcome.kind === 'failed') return failed(outcome.reason);
-  const parsed = ReviewOutputSchema.safeParse(outcome.value);
+  const parsed = schema.safeParse(outcome.value);
   if (!parsed.success) return failed('output_invalid');
   // 비밀을 모른 채 통과시키지 않는다.
   if (!report.secrets?.length) return failed('credential_secrets_missing');
@@ -76,4 +78,20 @@ export function createReviewerModel(executor: Pick<Executor, 'reviewAdapter'>, c
   return async (input, signal, run) => interpretReview(await control.run({ adapter, lane: 'review', job: run.job, model: options.model,
     prefix: RUN_PREFIX.review, timeoutMs: run.timeoutMs, toolCalls: 0, schema: REVIEW_OUTPUT_JSON_SCHEMA,
     prompt: reviewPrompt(input), limits: options.limits ?? REVIEW_LIMITS }, signal));
+}
+
+// 미게시 후보 리뷰. 실행 경계(도구 0개, MCP·hooks·skills 없음, 임시 공간, 반사 검사)는 위와 같고 지시·입력·출력 스키마만 다르다.
+const { $schema: _changeDialect, ...changeSchema } = z.toJSONSchema(ChangeReviewOutputSchema);
+export const CHANGE_REVIEW_OUTPUT_JSON_SCHEMA: object = Object.freeze(changeSchema);
+// 자료는 마지막 한 줄의 JSON 안에만 둔다. 줄바꿈·따옴표가 이스케이프되어 후보 문장이 프롬프트 구조를 끊지 못한다.
+export function changeReviewPrompt(input: ChangeReviewerInput): string {
+  return [input.instructions, '', JSON.stringify({ trusted: input.trusted, untrusted: input.untrusted })].join('\n');
+}
+export function createChangeReviewerModel(executor: Pick<Executor, 'reviewAdapter'>, control: RunControl, options: ReviewerOptions): ChangeReviewerModel {
+  const adapter = executor.reviewAdapter;
+  if (!adapter?.capabilities.lanes.review) throw new WorkerStartError('review_unsupported');
+  assertEgressBound(control.proxy);
+  return async (input, signal, run) => interpretReview(await control.run({ adapter, lane: 'review', job: run.job, model: options.model,
+    prefix: RUN_PREFIX.review, timeoutMs: run.timeoutMs, toolCalls: 0, schema: CHANGE_REVIEW_OUTPUT_JSON_SCHEMA,
+    prompt: changeReviewPrompt(input), limits: options.limits ?? REVIEW_LIMITS }, signal), ChangeReviewOutputSchema);
 }

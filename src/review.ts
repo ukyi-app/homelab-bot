@@ -9,7 +9,7 @@ import { DRAIN_MS } from './runtime.js';
 import type { Store } from './store.js';
 import type { CancelRequest, WorkerSigner } from './worker.js';
 import { archiveContract } from './worker.js';
-import { CoverageSchema, FindingSchema, InputLimitsSchema, REVIEW_INSTRUCTIONS, ReviewOutputSchema, ReviewTaskSchema,
+import { CoverageSchema, FindingSchema, InputLimitsSchema, REVIEW_INSTRUCTIONS, ReviewOutputSchema, ReviewTaskSchema, SECRET_PATTERNS,
   reviewOutcome } from './review-input.js';
 import type { Change, Coverage, ReviewOutput, ReviewTask, ReviewWorkerResult } from './review-input.js';
 
@@ -442,9 +442,6 @@ export const ReviewResultSchema = z.strictObject({
 export type ReviewResult = z.infer<typeof ReviewResultSchema>;
 const PositionsSchema = z.array(z.strictObject({ path: z.string(), lines: z.array(z.number().int().positive()).max(100_000) })).max(1000);
 // DATA-01: 운영 비밀·내부 표식이 모델 출력에 섞이면 공개 PR에 올리지 않는다. 마스킹이 아니라 게시 차단이다.
-const SECRET_PATTERNS = [/\b(?:ghp|gho|ghs|ghu|ghr|github_pat)_[A-Za-z0-9_]{20,}/, /\bsk-[A-Za-z0-9_-]{20,}/,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/, /\b[a-z0-9-]+\.ts\.net\b/i, /\b100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b/,
-  /"refresh_token"\s*:/];
 export function classify(output: Pick<ReviewOutput, 'findings' | 'open_questions' | 'public_summary'>, review: ReviewPolicy): ReviewResult['output_classification'] {
   // JSON 문자열화는 따옴표를 이스케이프해 패턴을 피해 가므로 원문 문자열을 그대로 모은다.
   const text = [...output.findings.flatMap(f => Object.values(f).map(String)), ...output.open_questions, output.public_summary].join('\n');
@@ -463,18 +460,22 @@ export interface ReviewWorkerClient {
 // 종료 규칙은 대화 runtime과 같다(ARCHITECTURE "정상 종료"). 신호 뒤에는 claim하지 않고, dispatch 전이면 대기열로 되돌리고,
 // 실행 중이면 drainMs를 기다린 뒤 cancel한다. 멈춤이 확인된 리뷰는 자동 재실행하지 않고 failed다.
 // lanes: 작업 루프를 켠 배치. 리뷰는 대화와 interactive 레인을 나눠 쓰고 작업 레인의 실행·대기에 막히지 않는다.
-export interface ReviewRuntimeOptions { shutdown?: AbortSignal; drainMs?: number; lanes?: boolean }
+// changeReview: 미게시 후보 job을 맡을 실행기. 없으면 그 job을 집지 않는다. 있든 없든 게시 PR 리뷰 경로는 그대로다.
+export interface ChangeReviewDispatcher { run(job: Job): Promise<void> }
+export interface ReviewRuntimeOptions { shutdown?: AbortSignal; drainMs?: number; lanes?: boolean; changeReview?: ChangeReviewDispatcher }
 class ReviewShutdown extends Error {}
 export class ReviewRuntime {
   private readonly shutdown?: AbortSignal;
   private readonly drainMs: number;
   private readonly lanes: boolean;
+  private readonly changeReview?: ChangeReviewDispatcher;
   constructor(private readonly store: Store, private readonly policy: ReviewPolicySource, private readonly queue: ReviewQueue,
     private readonly reader: GitHubReader, private readonly worker: ReviewWorkerClient, private readonly signer: WorkerSigner,
     private readonly pollMs = 1000, options: ReviewRuntimeOptions = {}) {
     this.shutdown = options.shutdown;
     this.drainMs = options.drainMs ?? DRAIN_MS;
     this.lanes = options.lanes ?? false;
+    if (options.changeReview) this.changeReview = options.changeReview;
   }
   // dispatch 전 GitHub 조회를 종료 기한까지 기다리지 않는다. 끝까지 기다리면 프로세스가 먼저 끝나
   // 모델을 부르지 않은 작업이 lease 만료로 unknown이 되고 전역 슬롯을 잡는다.
@@ -502,7 +503,9 @@ export class ReviewRuntime {
       if ((await tx.query(`SELECT j.id FROM jobs j JOIN events e ON e.id=j.event_id JOIN conversations c ON c.id=j.conversation_id
         WHERE j.state='queued' AND e.accepted=true AND c.active=true AND c.gap=false AND c.owner_id=j.owner_id
         AND e.actor_id=j.owner_id AND j.available_at<=$1 ${this.lanes ? "AND j.execution_lane='interactive'" : ''} LIMIT 1`, [this.store.now()])).rows.length) return;
-      const row = (await tx.query<{ id: string }>(`SELECT id FROM jobs WHERE type='review' AND state='queued' AND available_at<=$1
+      // type='review'에는 게시 PR 리뷰와 미게시 후보(change_child_jobs)가 함께 있다. 맡을 실행기가 없으면 미게시 후보를 집지 않고 대기열에 둔다.
+      const unassigned = this.changeReview ? '' : `AND NOT EXISTS (SELECT 1 FROM change_child_jobs c WHERE c.job_id=jobs.id AND c.role='review')`;
+      const row = (await tx.query<{ id: string }>(`SELECT id FROM jobs WHERE type='review' AND state='queued' AND available_at<=$1 ${unassigned}
         ORDER BY priority,created_at FOR UPDATE SKIP LOCKED LIMIT 1`, [this.store.now()])).rows[0];
       if (!row) return;
       return (await tx.query<Job & Record<string, unknown>>(`UPDATE jobs SET state='running',attempt=attempt+1,lease_token=$2,
@@ -514,7 +517,13 @@ export class ReviewRuntime {
     await this.store.expire();
     const job = await this.claim();
     if (!job) return false;
-    const review = (await this.store.db.query<ReviewRow>('SELECT * FROM pr_reviews WHERE job_id=$1', [job.id])).rows[0]!;
+    const review = (await this.store.db.query<ReviewRow>('SELECT * FROM pr_reviews WHERE job_id=$1', [job.id])).rows[0];
+    if (!review) {
+      // 맡을 PR이 없다. 실행기는 자식 job 연결을 다시 보고 출처를 모르면 실패로 닫는다. 모델을 부르지 않는다.
+      if (this.changeReview) await this.changeReview.run(asJob(job));
+      else await this.store.transition(asJob(job), 'failed', 'review_source_unknown');
+      return true;
+    }
     let dispatched = false;
     let stopped = false;
     // dispatch 전 GitHub 조회가 lease(30초)보다 길어질 수 있어 그동안에도 lease를 늘린다.

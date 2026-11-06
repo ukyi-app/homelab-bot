@@ -1660,3 +1660,54 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 **조회 주기.** `DEPLOYMENT_POLL`은 60초 간격·10분 초기 창이다. `deploymentPollStep`이 `settled`·`poll`·`report_late`를 돌려준다. 창이 지나도 끝 상태로 바꾸지 않고 마지막 `pending`·`unknown`과 관측 시각을 알린다. 루프는 B5가 조립한다.
 
 **한계.** D가 정말 M에서 빌드됐는지 다시 검증하지 않는다. `image.yaml`에 적힌 값을 믿고 출처 검증은 자동 병합 조건 5(`deploy-merge`)의 몫이다. 사람이 병합한 `image.yaml`은 그 검사를 거치지 않을 수 있다.
+||||||| parent of 6229583 (feat(t19): 공개 전 후보를 새 세션이 검토하는 경로를 조립 없이 더한다)
+
+### 16.2 미게시 후보 리뷰 (B2)
+
+**아직 조립되지 않았다.** `src/change-review.ts`가 입력 계약, diff 완전성, 판정, 작업자, HTTP, `ChangeReviewPort` 구현을 함께 둔다. 실행기는 `review-lane.ts`의 `createChangeReviewerModel`이고 T17과 같은 `RunControl`·어댑터를 쓴다. 다른 점은 지시·입력·출력 스키마뿐이다. 도구 0개, MCP·hooks·skills 없음, 실행별 임시 공간, 도구 호출 즉시 중단, 반사 검사는 그대로다.
+
+**끝점.** 작업자 포트의 별도 경로다. 인증 없는 POST는 본문을 읽기 전에 401이다.
+
+| 경로 | capability | 본문 | 응답 |
+|---|---|---|---|
+| `/v1/change-review` | `execute` | `ChangeReviewTaskSchema` | `succeeded`(sessionId, problems, output) · `limited`·`auth_expired`·`failed` · `unknown` |
+| `/v1/change-review/result` | `execute` | `{version, job, lease, kind:'result'}` | `{found:true, result}` · `{found:false}` |
+| `/v1/change-review/ack` | `execute` | `{version, job, lease, kind:'ack'}` | `{acknowledged:true}` |
+| `/v1/change-review/cancel` | `cancel` | `{job, lease}` | `{stopped}` |
+
+서명 규칙은 기존과 같다(audience `homelab-worker`, job·lease·본문 digest, 일회 nonce). 본문 모양이 끝점마다 달라 한 끝점의 capability를 다른 끝점에 쓸 수 없다. 본문 상한은 6 MiB다. 게시 서버가 보내기 전에 재서 넘으면 `body_too_large`로 incomplete다.
+
+**입력.** author 세션 ID·대화·기억·MCP·도구·작성자 설명은 자리가 없고 strict라 넣으면 거부된다.
+
+| 필드 | 내용 | 취급 |
+|---|---|---|
+| `trusted.evidence`, `trusted.repository` | 증거 묶음, 저장소 이름 | 게시 서버가 저장 값에서 다시 읽음 |
+| `trusted.guidelines` | 고정 base의 codeload 주소, manifest가 말하는 T0 blob, 대조 가능 여부(`verifiable`) | 작업자가 압축본의 `AGENTS.md`를 blob SHA와 대조한다. 다르면 incomplete. 후보가 `AGENTS.md`를 고쳤으면 manifest에 T0 blob이 없어 대조하지 않고, 보호 경로 변경으로 어차피 막힌다 |
+| `trusted.verifications` | command ID와 상태만 | exit code·로그 digest도 보내지 않는다 |
+| `trusted.expected` | 변경 항목의 경로·종류·SHA-256 | 작업자의 base 대조에만 쓰고 모델에 주지 않는다 |
+| `untrusted.brief` | 요약, 목표, 인수 조건, 허용·금지 경로 | 판정 기준이지만 지시가 아니다 |
+| `untrusted.changes`, `untrusted.patch` | 변경 경로·종류·mode·크기, 전체 diff | 자료. 프롬프트의 마지막 한 줄 JSON 안에만 있다 |
+
+**diff 완전성.** patch는 표시용이지만 리뷰가 읽으므로 빠진 것이 없어야 한다. 두 곳에서 본다. 어느 쪽이든 어긋나면 모델을 부르지 않고 incomplete다.
+
+- 게시 서버 `patchProblems`: hunk 줄 수를 끝까지 세어 지운 줄이 파일 머리로 위장하지 못하게 한다. 변경 항목마다 diff가 있어야 하고, 변경 밖 파일의 diff가 없어야 하며, 새 파일·삭제는 전체 내용이 manifest SHA와 같아야 하고, 수정 파일은 오른쪽 줄이 실제 결과 바이트의 그 위치와 같아야 한다. 게시 서버에는 base 바이트가 없어 수정 파일의 왼쪽 줄과 통째로 빠진 hunk는 여기서 잡지 못한다.
+- 작업자 `patchBaseProblems`: 고정 base 압축본에 patch를 실제로 적용한 결과가 `trusted.expected`의 SHA와 같아야 한다. 빠진 hunk, 왼쪽 위조, 거짓 변경 종류는 `patch_base_mismatch`다. 압축본은 `export-ignore`·`export-subst`·eol 속성의 영향을 받으므로 그런 저장소는 여기서 막힌다. 닫힌 쪽 실패이고 통과로 새지 않는다.
+
+**판정(`decideReview`).** 코드가 정하고 모델 문장은 쓰지 않는다.
+
+| 조건 | 결과 |
+|---|---|
+| diff·지침·시험 receipt 누락, `reviewed_paths`에 빠진 변경, 평가 안 한 인수 조건 | `coverage: incomplete`, `blocked` |
+| P0·P1, `data_exposure` 범주, 목표·인수 조건 `not_met`, 통과 아닌 시험, 보호 경로 변경, 모델 자유문의 비밀 패턴·내부 표식 | `blocked` |
+| 그 밖의 위험(P2·P3, `unverifiable`) | `pass_with_warnings` |
+| 없음 | `pass` |
+
+모델이 고르는 위험 코드는 고정 목록이다. 자유 문자열이면 공개 receipt로 값을 실어 나를 수 있어서다. 실패 사유도 코드 형식이 아니면 `model_failed`로 바꾼다.
+
+**리뷰 원문 위치.** receipt에는 `findingsDigest`만 있다. 원문은 게시 서버 PostgreSQL의 비공개 표에 둔다(`ChangeReviewFindingsSink`, 표는 B5가 다음 migration으로 만든다). `change_request_inputs`처럼 공개 렌더러·writer에 주지 않는다. 작업자 상태 볼륨에도 ack 전까지 결과 사본이 남는다(`ChangeReviewResults`, 0600, 16건 상한).
+
+**세션 독립.** 작업자가 실행마다 UUID를 새로 정해 receipt의 `sessionId`로 돌려준다. CLI는 `--no-session-persistence`이고 `--resume`·`--session-id`가 금지 플래그라 이어 쓸 세션이 없다. 이 값은 CLI가 보고한 세션 ID가 아니라 실행 식별자다. 게시 서버는 receipt를 만들기 전에 이 change의 `role='author'` 자식 job에 묶인 `codex_sessions`와 대조해 같으면 `author_session_reused`로 실패시킨다. job 쪽은 `linkChildJob`·`recordReview`가 막는다.
+
+**job과 dispatcher.** generation마다 `type='review'` job 하나이고 `change_child_jobs(role='review')`로 묶인다. `pr_reviews` 행이 없다. `ReviewRuntime`의 `changeReview` 옵션이 없으면 그 job을 집지 않고, 있으면 `pr_reviews`가 없는 job만 넘긴다. `pr_reviews`도 자식 job 연결도 없는 job은 모델 없이 `review_source_unknown` 실패로 닫는다. 게시 PR 리뷰 경로와 T17 시험은 그대로다. 같은 interactive 슬롯을 나눠 쓰고 대화가 먼저다.
+
+**응답 유실.** 작업자는 멈춤을 확인한 결과를 ack 전까지 보관한다. 게시 서버는 비공개 저장 → `recordReview` → job 종료 → ack 순서로 처리해 어디서 끊겨도 `fetchReceipt`가 결과를 다시 받아 같은 receipt를 만든다. `recordReview` 뒤에 끊겼으면 저장된 receipt를 돌려주는 `fetchReceipt`와 `review`가 job 종료와 ack를 마저 한다. 닫히지 않은 `unknown`은 대화 레인을 막기 때문이다. 회수한 결과가 `limited`·`auth_expired`이면 정상 응답처럼 `waiting_user`로 두고 scheduler를 멈춘 뒤 owner에게 알려, `/review-resume`으로 재개한다. 같은 lease로 실행을 다시 보내도 보관한 결과를 준다. 결과가 없으면(작업자 디스크 유실 등) null이고 모델을 다시 돌리지 않는다. job은 기존 unknown 조사로 멈춤을 확인해 실패로 끝나고, 새 generation이 필요하다.

@@ -46,6 +46,10 @@ export const ReviewOutputSchema = z.strictObject({
   public_summary: z.string().min(1).max(2000),
 });
 export type ReviewOutput = z.infer<typeof ReviewOutputSchema>;
+// DATA-01: 운영 비밀 모양. 게시 PR 리뷰와 미게시 후보 리뷰가 같은 목록으로 모델 출력을 거른다.
+export const SECRET_PATTERNS = Object.freeze([/\b(?:ghp|gho|ghs|ghu|ghr|github_pat)_[A-Za-z0-9_]{20,}/, /\bsk-[A-Za-z0-9_-]{20,}/,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/, /\b[a-z0-9-]+\.ts\.net\b/i, /\b100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b/,
+  /"refresh_token"\s*:/]);
 export const ReviewTaskSchema = z.strictObject({
   version: z.literal(1), job: z.string().uuid(), lease: z.string().uuid(), lane: z.literal('review'),
   repository: z.string().regex(REPOSITORY_NAME), base: Sha, head: Sha,
