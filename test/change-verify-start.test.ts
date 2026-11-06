@@ -86,6 +86,182 @@ test('슬롯 경합: 다른 시험이 도는 중의 시작 요청은 HTTP로 bus
   } finally { await s.f.close(); }
 });
 
+// 두 호출이 모두 여기까지 온 뒤에야 함께 진행한다. 비동기 조회 사이에 끼어드는 순서를 시간에 맡기지 않고 고정한다.
+function barrier<T>(results: any, method: string, parties: number): void {
+  const original = (results[method] as (...args: unknown[]) => Promise<T>).bind(results);
+  let waiting = 0;
+  let open!: () => void;
+  const opened = new Promise<void>(resolve => { open = resolve; });
+  results[method] = async (...args: unknown[]) => {
+    const value = await original(...args);
+    if (++waiting >= parties) open();
+    await opened;
+    return value;
+  };
+}
+// 시험 준비가 샌드박스 호출보다 오래 걸릴 수 있어 이미 취소된 신호도 받는다. 그러지 않으면 정리가 영원히 기다린다.
+const holding = (counter: { ran: number }): SandboxRunner => (_args, _limits, signal) => {
+  counter.ran++;
+  const stopped = () => ({ ...pass(), aborted: true, exitCode: null });
+  if (signal.aborted) return Promise.resolve(stopped());
+  return new Promise<SandboxRun>(resolve => { signal.addEventListener('abort', () => resolve(stopped())); });
+};
+const serviceOf = (s: Awaited<ReturnType<typeof verifying>>) => s.f.service as any;
+// 샌드박스까지 간 뒤에 잰다. 고정 대기는 느린 환경에서 "아직 안 돌았음"과 "1회 돌았음"을 가르지 못한다.
+const ranOnce = async (counter: { ran: number }) => {
+  for (let attempt = 0; attempt < 6000 && !counter.ran; attempt++) await new Promise(resolve => setTimeout(resolve, 5));
+  await settle();
+  assert.equal(counter.ran, 1, '샌드박스 실행은 1회');
+};
+const settle = () => new Promise(resolve => setTimeout(resolve, 60));
+
+test('동시 시작: 같은 command 요청 둘이 함께 와도 시험은 1회이고 둘 다 running이다', async () => {
+  const counter = { ran: 0 };
+  const s = await verifying(holding(counter));
+  try {
+    barrier(serviceOf(s).results, 'verificationStarted', 2);
+    const first = s.f.signed('/v2/task/verify', s.body);
+    // 같은 본문을 같은 밀리초에 서명하면 토큰까지 같아 재사용으로 거부된다. 유효한 요청 둘을 만들려고 발급 시각을 띄운다.
+    await new Promise(resolve => setTimeout(resolve, 3));
+    const replies = await Promise.all([first, s.f.signed('/v2/task/verify', s.body)]);
+    assert.deepEqual(replies.map(reply => [reply.status, reply.json.status]), [[200, 'running'], [200, 'running']]);
+    await ranOnce(counter);
+  } finally { await s.f.close(); }
+});
+test('동시 시작: 다른 command 요청 둘이면 하나만 돌고 다른 하나는 busy다', async () => {
+  const counter = { ran: 0 };
+  const s = await verifying(holding(counter));
+  try {
+    barrier(serviceOf(s).results, 'verificationStarted', 2);
+    const replies = await Promise.all([s.f.signed('/v2/task/verify', s.body), s.f.signed('/v2/task/verify', { ...s.body, commandId: 'other-command' })]);
+    assert.deepEqual(replies.map(reply => reply.status).sort(), [200, 409]);
+    await ranOnce(counter);
+  } finally { await s.f.close(); }
+});
+test('동시 시작: 조회 사이에 끝난 줄 모르고 슬롯까지 와도 시작 기록의 배타 생성이 다시 돌리지 않는다', async () => {
+  const counter = { ran: 0 };
+  const s = await verifying(async () => { counter.ran++; return pass(); });
+  try {
+    const results = serviceOf(s).results;
+    assert.equal(await results.writeVerificationStart(s.request.job, 1, 'unit'), true);
+    assert.equal(await results.writeVerificationStart(s.request.job, 1, 'unit'), false, '이미 있으면 만들지 않는다');
+    // 시작 기록을 읽을 때는 없었고 슬롯을 잡을 때는 있는 순서다.
+    results.verificationStarted = async () => false;
+    const reply = await s.f.signed('/v2/task/verify', s.body);
+    assert.deepEqual([reply.status, reply.json.status], [200, 'absent']);
+    await settle();
+    assert.equal(counter.ran, 0);
+    assert.equal(serviceOf(s).turn, undefined, '슬롯을 놓는다');
+  } finally { await s.f.close(); }
+});
+test('동시 시작: 시작 기록을 읽는 사이 종료가 시작되면 슬롯을 잡지 않는다', async () => {
+  const counter = { ran: 0 };
+  const s = await verifying(holding(counter));
+  try {
+    const service = serviceOf(s);
+    const original = service.results.verificationStarted.bind(service.results);
+    service.results.verificationStarted = async (...args: unknown[]) => { const value = await original(...args); service.options = { ...service.options, accepting: () => false }; return value; };
+    const reply = await s.f.signed('/v2/task/verify', s.body);
+    assert.equal(reply.status, 403);
+    await settle();
+    assert.equal(counter.ran, 0);
+  } finally { await s.f.close(); }
+});
+test('경합: 시작 요청이 시작 기록을 읽는 사이 시험이 끝나도 absent가 아니라 done으로 답한다', async () => {
+  let finishRun!: () => void;
+  const hold = new Promise<void>(resolve => { finishRun = resolve; });
+  const s = await verifying(async () => { await hold; return pass(); });
+  try {
+    assert.equal((await s.f.signed('/v2/task/verify', s.body)).json.status, 'running');
+    const service = serviceOf(s);
+    const started = service.results.verificationStarted.bind(service.results);
+    service.results.verificationStarted = async (...args: unknown[]) => {
+      finishRun();
+      for (let attempt = 0; attempt < 6000 && service.turn; attempt++) await new Promise(resolve => setTimeout(resolve, 5));
+      return started(...args);
+    };
+    assert.equal((await s.f.signed('/v2/task/verify', s.body)).json.status, 'done');
+  } finally { await s.f.close(); }
+});
+test('경합: 슬롯까지 와서 시작 기록이 이미 있으면 그 사이 쓰인 receipt로 답한다', async () => {
+  const counter = { ran: 0 };
+  const s = await verifying(async () => { counter.ran++; return pass(); });
+  try {
+    const service = serviceOf(s);
+    assert.equal((await s.f.signed('/v2/task/verify', s.body)).json.status, 'running');
+    for (let attempt = 0; attempt < 6000 && service.turn; attempt++) await new Promise(resolve => setTimeout(resolve, 5));
+    // 앞선 두 조회가 끝나기 전의 값을 본 요청이다. 슬롯에 도착했을 때는 시작 기록과 receipt가 모두 있다.
+    const read = service.results.readVerification.bind(service.results);
+    let stale = true;
+    service.results.readVerification = async (...args: unknown[]) => { if (stale) { stale = false; return null; } return read(...args); };
+    service.results.verificationStarted = async () => false;
+    assert.equal((await s.f.signed('/v2/task/verify', s.body)).json.status, 'done');
+    assert.equal(counter.ran, 1);
+  } finally { await s.f.close(); }
+});
+test('동시 시작: 턴 시작의 서명을 확인하는 사이 종료가 시작되면 슬롯을 잡지 않는다', async () => {
+  const f = await changeWorkerFixture();
+  try {
+    const service = f.service as any;
+    const verify = service.verify.bind(service);
+    service.verify = async (...args: unknown[]) => { await verify(...args); service.options = { ...service.options, accepting: () => false }; };
+    assert.equal((await f.signed('/v2/task', f.start())).status, 403);
+    assert.equal(service.turn, undefined);
+    assert.equal((await f.calls()).length, 0);
+  } finally { await f.close(); }
+});
+test('경합: receipt를 읽은 뒤 시험이 끝나도 재조회가 absent로 답하지 않는다. 다음 조회가 done을 받는다', async () => {
+  let finishRun!: () => void;
+  const hold = new Promise<void>(resolve => { finishRun = resolve; });
+  const s = await verifying(async () => { await hold; return pass(); });
+  try {
+    assert.equal((await s.f.signed('/v2/task/verify', s.body)).json.status, 'running');
+    const service = serviceOf(s);
+    const original = service.results.readVerification.bind(service.results);
+    let staged = false;
+    service.results.readVerification = async (...args: unknown[]) => {
+      const value = await original(...args);
+      if (!staged) {
+        staged = true;
+        finishRun();
+        for (let attempt = 0; attempt < 6000 && service.turn; attempt++) await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      return value;
+    };
+    const reply = await s.f.signed('/v2/task/verification', { ...identity(s.request), expectedWorker: null, commandId: 'unit' });
+    assert.notEqual(reply.json.status, 'absent', '끝난 시험을 시작만 기록된 것으로 답하면 port가 unknown으로 닫는다');
+    assert.equal((await s.f.signed('/v2/task/verification', { ...identity(s.request), expectedWorker: null, commandId: 'unit' })).json.status, 'done');
+  } finally { await s.f.close(); }
+});
+test('경합: 정리가 결과를 읽는 사이 시험이 슬롯을 잡으면 세션을 지우지 않고 파드 정리도 하지 않는다', async () => {
+  const counter = { ran: 0 };
+  const s = await verifying(holding(counter));
+  try {
+    const service = serviceOf(s);
+    const original = service.results.readResult.bind(service.results);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let reached!: () => void;
+    const entered = new Promise<void>(resolve => { reached = resolve; });
+    let first = true;
+    service.results.readResult = async (...args: unknown[]) => {
+      const value = await original(...args);
+      if (first) { first = false; reached(); await gate; }
+      return value;
+    };
+    const finalize = s.f.signed('/v2/task/finalize', { ...identity(s.request), expectedWorker: s.result.worker, receipt: { outcome: 'saved', artifactDigest: s.result.artifactDigest, persistedAt: 1 } });
+    await entered;
+    assert.equal((await s.f.signed('/v2/task/verify', s.body)).json.status, 'running');
+    for (let attempt = 0; attempt < 6000 && !counter.ran; attempt++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(counter.ran, 1);
+    const swept = s.f.cleanup.terminated;
+    release();
+    const reply = await finalize;
+    assert.deepEqual([reply.status, reply.json.stopped, reply.json.cleaned], [200, false, false]);
+    assert.equal(s.f.cleanup.terminated, swept, '돌고 있는 시험을 파드 정리가 죽이지 않는다');
+    assert.ok(serviceOf(s).turn, '시험이 슬롯을 그대로 쥔다');
+  } finally { await s.f.close(); }
+});
 test('7-1 시작 기록은 receipt와 함께 정리된다. 같은 프로세스에서 끝난 시험은 그대로 done이다', async () => {
   const s = await verifying(async () => pass());
   try {

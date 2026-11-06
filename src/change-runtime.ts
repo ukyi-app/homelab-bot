@@ -45,7 +45,13 @@ const LANE_PHASES = ['requested', 'admitted', 'authoring', 'snapshot_ready', 've
 const PUBLISH_PHASES = ['reviewing', 'approved', 'publishing', 'proposed', 'merged', 'observing_deploy'] as const;
 const NOTICE_PHASES = ['awaiting_publish_approval', 'proposed', 'superseded', 'blocked', 'cancelled', 'failed'] as const;
 const STEP_BATCH = 32;
+// 다시 할 일이 없는 관측이다. 알림은 따로 고르므로 바퀴에서 빼도 빠지지 않는다.
+const OBSERVATION_FINISHED = `r.phase='observing_deploy' AND (
+  EXISTS (SELECT 1 FROM change_deployments d WHERE d.change_id=r.id AND d.generation=r.generation AND d.state IN ('observed','not_applicable','blocked'))
+  OR EXISTS (SELECT 1 FROM change_deployment_windows w WHERE w.change_id=r.id AND w.generation=r.generation AND w.late_reported_at IS NOT NULL))`;
 
+type Cursor = { at: number; id: string };
+type PageRow = { id: string; order_at: string | number };
 type Outcome = { to: TerminalChangePhase; reason: string };
 const safeReason = (code: string, fallback = 'change_failed') => ReasonCodeSchema.safeParse(code).success ? code : fallback;
 const keyOf = (request: Pick<ChangeRequest, 'id' | 'generation'>): ChangeKey => ({ changeId: request.id, generation: request.generation });
@@ -136,6 +142,7 @@ export class ChangeRuntime {
   // 재시도 시각과 연속 실패 수. 잃어도 다음 바퀴가 바로 다시 볼 뿐이라 메모리에 둔다.
   private readonly nextAt = new Map<string, number>();
   private readonly failures = new Map<string, number>();
+  private readonly cursors = new Map<string, Cursor>();
   private readonly now: () => number;
   constructor(private readonly deps: ChangeRuntimeDeps) {
     this.periods = { ...CHANGE_PERIODS, ...deps.periods };
@@ -166,8 +173,18 @@ export class ChangeRuntime {
   reconcile() { return this.deps.publisher.reconcile(); }
   retention(): Promise<number> { return purgeExpiredChangeContent(this.db, this.now()); }
 
+  // 사람의 병합·답을 기다리거나 일시 오류로 머무는 행은 시각이 그대로라 앞자리를 계속 차지한다. 정렬값과 ID의 커서로 한 쪽씩 돌아 뒤의 행도 차례를 받게 한다.
+  // 쪽이 차지 않으면 끝까지 본 것이라 처음으로 돌아간다. 커서를 잃어도 처음부터 다시 볼 뿐이다.
+  private async page<T extends PageRow>(name: string, read: (after: Cursor) => Promise<T[]>): Promise<T[]> {
+    const rows = await read(this.cursors.get(name) ?? { at: -1, id: '' });
+    const last = rows.at(-1);
+    if (rows.length < STEP_BATCH || !last) this.cursors.delete(name);
+    else this.cursors.set(name, { at: Number(last.order_at), id: last.id });
+    return rows;
+  }
   private async requests(phases: readonly ChangePhase[]): Promise<ChangeRequest[]> {
-    const rows = (await this.db.query<{ id: string }>('SELECT id FROM change_requests WHERE phase=ANY($1::text[]) ORDER BY updated_at LIMIT $2', [phases, STEP_BATCH])).rows;
+    const rows = await this.page(`requests:${phases.join()}`, async after => (await this.db.query<PageRow>(`SELECT r.id,r.updated_at AS order_at FROM change_requests r
+      WHERE r.phase=ANY($1::text[]) AND NOT (${OBSERVATION_FINISHED}) AND (r.updated_at,r.id)>($2::bigint,$3::text) ORDER BY r.updated_at,r.id LIMIT $4`, [phases, after.at, after.id, STEP_BATCH])).rows);
     const found: ChangeRequest[] = [];
     for (const row of rows) {
       const request = await this.deps.changes.get(row.id);
@@ -466,13 +483,14 @@ export class ChangeRuntime {
   // 끝난 부모의 자식과 저장을 마친 세션을 정리한다. 작성·시험이 레인을 쥔 채 남지 않게 한다. 실행 중인 턴은 작업자 취소를 거쳐 소멸을 확인한다.
   // 시험을 기다리는 바퀴와 따로 돈다. 그래야 취소가 시험 시한까지 기다리지 않는다.
   async childrenTick(): Promise<boolean> {
-    const rows = (await this.db.query<ChildRow & { role: string; change_id: string; has_artifact: boolean; phase: string }>(`SELECT c.role,c.change_id,r.phase,
+    // 소멸을 확인하지 못한 자식은 사람이 풀 때까지 남는다. 그런 행이 뒤의 정리를 막지 않게 커서로 돈다.
+    const rows = await this.page('children', async after => (await this.db.query<ChildRow & { role: string; change_id: string; has_artifact: boolean; phase: string; order_at: string | number }>(`SELECT c.role,c.change_id,r.phase,c.created_at AS order_at,
       EXISTS (SELECT 1 FROM change_artifacts a WHERE a.change_id=c.change_id AND a.generation=c.generation) AS has_artifact,
       j.id,j.state,j.wait_reason,j.lease_token,j.lease_until,j.conversation_id,j.owner_id,s.state AS session_state,s.generation AS session_generation,s.updated_at AS session_updated_at
       FROM change_child_jobs c JOIN change_requests r ON r.id=c.change_id JOIN jobs j ON j.id=c.job_id LEFT JOIN codex_sessions s ON s.job_id=j.id AND s.executor='claude'
       WHERE (r.generation<>c.generation OR (c.role='author' AND r.phase NOT IN ('requested','admitted','authoring','snapshot_ready','verifying')) OR (c.role='review' AND r.phase<>'reviewing'))
       AND (j.state IN ('queued','running','verifying','cancel_requested','waiting_user','unknown') OR (c.role='author' AND s.state IN ('running','waiting_answer','waiting_model')))
-      ORDER BY c.created_at LIMIT $1`, [STEP_BATCH])).rows;
+      AND (c.created_at,j.id)>($1::bigint,$2::text) ORDER BY c.created_at,j.id LIMIT $3`, [after.at, after.id, STEP_BATCH])).rows);
     let busy = false;
     for (const row of rows) {
       const slot = `child:${row.id}`;
@@ -657,19 +675,22 @@ export class ChangeRuntime {
   // ---- 알림 ----
 
   // 알림은 outbox 키로 한 번만 들어간다. 넣기 전에 끊기면 다음 바퀴가 다시 넣고, Discord ACK를 잃어도 게시자가 같은 nonce로 대조한다. 공개 PR과 분리돼 있어 통지 실패가 게시를 되풀이시키지 않는다.
+  // 문구를 만들지 못하는 행은 outbox에 들어가지 않아 시효까지 남는다. 그런 행이 뒤의 알림을 막지 않게 커서로 돈다.
   private async sendNotices(): Promise<void> {
-    const rows = (await this.db.query<{ id: string }>(`SELECT r.id FROM change_requests r WHERE r.phase=ANY($1::text[]) AND r.updated_at>$2
-      AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.idempotency_key='change-phase:'||r.id||':'||r.generation||':'||r.phase) ORDER BY r.updated_at LIMIT $3`, [NOTICE_PHASES, this.now() - NOTICE_WINDOW_MS, STEP_BATCH])).rows;
+    const rows = await this.page('notices', async after => (await this.db.query<PageRow>(`SELECT r.id,r.updated_at AS order_at FROM change_requests r WHERE r.phase=ANY($1::text[]) AND r.updated_at>$2
+      AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.idempotency_key='change-phase:'||r.id||':'||r.generation||':'||r.phase)
+      AND (r.updated_at,r.id)>($3::bigint,$4::text) ORDER BY r.updated_at,r.id LIMIT $5`, [NOTICE_PHASES, this.now() - NOTICE_WINDOW_MS, after.at, after.id, STEP_BATCH])).rows);
     for (const row of rows) {
       const request = await this.deps.changes.get(row.id);
       if (!request.ok) continue;
       try { await this.notifyPhase(request.value); }
       catch (error) { this.deps.log('change_notice_failed', errorInfo(error)); }
     }
-    const deployments = (await this.db.query<{ id: string }>(`SELECT r.id FROM change_requests r JOIN change_deployments d ON d.change_id=r.id AND d.generation=r.generation
+    const deployments = await this.page('deployment-notices', async after => (await this.db.query<PageRow>(`SELECT r.id,r.updated_at AS order_at FROM change_requests r JOIN change_deployments d ON d.change_id=r.id AND d.generation=r.generation
       LEFT JOIN change_deployment_windows w ON w.change_id=r.id AND w.generation=r.generation
       WHERE r.phase='observing_deploy' AND r.updated_at>$1 AND (d.state IN ('observed','not_applicable','blocked') OR w.late_reported_at IS NOT NULL)
-      AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.idempotency_key='change-deploy:'||r.id||':'||r.generation) ORDER BY r.updated_at LIMIT $2`, [this.now() - NOTICE_WINDOW_MS, STEP_BATCH])).rows;
+      AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.idempotency_key='change-deploy:'||r.id||':'||r.generation)
+      AND (r.updated_at,r.id)>($2::bigint,$3::text) ORDER BY r.updated_at,r.id LIMIT $4`, [this.now() - NOTICE_WINDOW_MS, after.at, after.id, STEP_BATCH])).rows);
     for (const row of deployments) {
       const request = await this.deps.changes.get(row.id);
       const stored = request.ok ? await this.deps.changes.deployment(keyOf(request.value)) : null;

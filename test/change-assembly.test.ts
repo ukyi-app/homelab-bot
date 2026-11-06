@@ -10,6 +10,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { changePrecondition, changeTaskPathsMatch } from '../src/change-assembly.js';
 import { parseChangeRequest } from '../src/change-commands.js';
+import { ChangePublisher } from '../src/change-publisher.js';
+import type { ChangeRuntimeDeps } from '../src/change-runtime.js';
 import { CHANGE_RETENTION_MS, purgeExpiredChangeContent } from '../src/change-store.js';
 import { CHANGE_COMMANDS, FOUNDATION_COMMANDS, commandDefinitions } from '../src/commands.js';
 import { ConfigError, loadPublisherConfig } from '../src/config.js';
@@ -26,7 +28,8 @@ import { FakeGateway, until } from './fake-gateway.js';
 import { FAKE_APP_KEY, REPO, repositoryPolicy } from './change-github-fake.js';
 import { OTHER_THREAD, REQUEST_TEXT, THREAD, WRITE_STEP, bwrapReady, changeHarness } from './change-assembly-harness.js';
 import type { Harness } from './change-assembly-harness.js';
-import { OWNER } from './change-store-fixture.js';
+import { OWNER, driveTo, git, hex, insertChildJob, ok, seedConversation } from './change-store-fixture.js';
+import { chatContext } from '../src/chat-context.js';
 import { localDatabase } from './helpers.js';
 import { QUESTION } from './task-worker-harness.js';
 
@@ -50,6 +53,11 @@ const toAwaiting = async (h: Harness, id = '100') => {
   const change = await h.changeId();
   await h.pump(async () => await h.phase(change) === 'awaiting_publish_approval');
   return change;
+};
+// 세션 행은 작업자가 접수했다는 뜻이고 프로세스는 그 뒤에 뜬다. 느린 환경에서는 고정 대기 안에 호출 기록이 남지 않는다.
+const modelStarted = async (h: Harness) => {
+  for (let attempt = 0; attempt < 6000 && !(await h.f.calls()).length; attempt++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal((await h.f.calls()).length, 1, '가짜 모델이 시작됐다');
 };
 const toProposed = async (h: Harness, event = '100') => {
   const change = await toAwaiting(h, event);
@@ -793,6 +801,7 @@ test('EVENT-02 결과 유실: 작업자가 결과를 잃은 턴은 모델을 다
     await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
     const id = await h.changeId();
     await h.pump(async () => (await h.db.query(`SELECT 1 FROM codex_sessions WHERE state='running'`)).rows.length > 0);
+    await modelStarted(h);
     await new Promise(resolve => setTimeout(resolve, 400));
     const { readdir, rm: remove } = await import('node:fs/promises');
     await h.f.restart(async () => {
@@ -859,7 +868,7 @@ test('호환 unknown: 소멸을 확인하지 못한 작성 job은 레인을 닫�
     await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
     const id = await h.changeId();
     await h.pump(async () => (await h.db.query(`SELECT 1 FROM codex_sessions WHERE state='running'`)).rows.length > 0);
-    await new Promise(resolve => setTimeout(resolve, 100));
+    await modelStarted(h);
     const child = (await childOf(h.db, id))!;
     // 작업자가 닿지 않는 동안 lease가 끝났다. 여러 바퀴가 돌아도 지우거나 되찾지 않는다.
     h.worker.unreachable = true;
@@ -1042,6 +1051,296 @@ test('사람 취소: 시험을 기다리는 중에도 /change-cancel이 시한�
     assert.equal(h.reviewInputs.length, 0);
   });
 });
+// ---- 권한 철회 뒤 게시 ----
+
+test('권한 철회: 승인 뒤 /revoke면 대조 루프가 GitHub에 쓰지 않고 토큰도 받지 않으며 부모를 닫는다', async () => {
+  await withHarness({}, async h => {
+    const id = await toAwaiting(h);
+    await h.command('101', 'change-publish', { target: id, text: await digestOf(h, id) });
+    assert.equal(await h.phase(id), 'approved');
+    await h.command('102', 'revoke', { target: OWNER });
+    const seen = h.env.github.sent.length;
+    const report = await h.runtime.reconcile();
+    assert.equal(h.env.github.mutations().length, 0, 'GitHub 쓰기 0회');
+    assert.equal(h.env.github.issued.length, 0, '쓰기 토큰도 없다');
+    assert.equal(h.env.github.sent.length, seen, '게시 전 검사도 돌지 않는다');
+    assert.deepEqual(report.resumed.map(item => item.outcome.kind), ['stopped']);
+    assert.equal(await h.phase(id), 'cancelled');
+    assert.equal((await h.changes.get(id) as any).value.phaseReason, 'authorization_revoked');
+    // 다음 바퀴도 그대로다.
+    await h.runtime.reconcile();
+    await h.runtime.publishTick();
+    assert.equal(h.env.github.mutations().length, 0);
+  });
+});
+test('권한 철회: 게시 중 단계 사이에 /revoke면 다음 단계를 보내지 않고 이미 공개된 객체를 건드리지 않는다', async () => {
+  await withHarness({}, async h => {
+    const id = await toAwaiting(h);
+    await h.command('101', 'change-publish', { target: id, text: await digestOf(h, id) });
+    const send = h.env.github.send;
+    let revoked = false;
+    (h.env.github as { send: typeof fetch }).send = async (input, init) => {
+      const response = await send(input, init);
+      if (!revoked && init?.method === 'POST' && String(input).endsWith('/git/commits')) { revoked = true; await h.gate.revoke(OWNER, THREAD, OWNER); }
+      return response;
+    };
+    await h.runtime.publishTick();
+    assert.equal(revoked, true, '게시가 commit 단계까지 갔다');
+    await h.runtime.reconcile();
+    assert.equal(await h.phase(id), 'cancelled');
+    assert.equal(h.env.github.count(/POST .*\/git\/refs$/), 0, 'ref를 만들지 않는다');
+    assert.equal(h.env.github.count(/POST .*\/pulls$/), 0, 'PR을 만들지 않는다');
+    assert.equal(h.env.github.mutations(/DELETE|PATCH/).length, 0, '공개된 객체를 지우거나 고치지 않는다');
+    assert.ok(h.env.github.commits.size > 0);
+  });
+});
+test('권한 철회: 미확정 effect의 읽기 대조는 철회 뒤에도 돌아 확정하고, 쓰기는 더 없다', async () => {
+  await withHarness({}, async h => {
+    const id = await toAwaiting(h);
+    await h.command('101', 'change-publish', { target: id, text: await digestOf(h, id) });
+    // 응답을 잃은 tree다. 게시자 안의 즉시 대조도 그 tree를 읽지 못해 unknown으로 남는다.
+    const { result_tree: resultTree } = (await h.db.query<{ result_tree: string }>('SELECT result_tree FROM change_generations WHERE change_id=$1', [id])).rows[0]!;
+    h.env.github.fail(/POST .*\/git\/trees$/, 'lose_response');
+    h.env.github.fail(new RegExp(`GET .*/git/trees/${resultTree}`), { status: 500 });
+    await h.runtime.publishTick();
+    const unresolved = await h.changes.unresolvedEffects({ changeId: id });
+    assert.deepEqual(unresolved.map(effect => [effect.stage, effect.state]), [['tree', 'unknown']]);
+    await h.command('102', 'revoke', { target: OWNER });
+    const writes = h.env.github.mutations().length;
+    const report = await h.runtime.reconcile();
+    assert.deepEqual(report.confirmed.map(item => item.stage), ['tree'], '읽기 대조로 확정한다');
+    assert.equal(h.env.github.mutations().length, writes, '쓰기는 늘지 않는다');
+    assert.equal(await h.phase(id), 'cancelled');
+  });
+});
+test('대조 재개: 한 건의 인가 오류가 뒤의 건을 막지 않는다', async () => {
+  await withHarness({}, async h => {
+    const first = await toAwaiting(h, '100');
+    await h.f.script([WRITE_STEP]);
+    const second = await toAwaiting(h, '102');
+    await h.command('101', 'change-publish', { target: first, text: await digestOf(h, first) });
+    await h.command('103', 'change-publish', { target: second, text: await digestOf(h, second) });
+    const seen: string[] = [];
+    const logs: string[] = [];
+    const publisher = new ChangePublisher({ store: h.changes, writer: h.env.writerIO.writer, preflight: h.env.writerIO.preflight, policy: async () => h.env.policy.current, now: Date.now, log: event => { logs.push(event); },
+      authorize: async () => { seen.push('call'); if (seen.length === 1) throw new Error('fixture_database_down'); } });
+    const report = await publisher.reconcile();
+    assert.ok(logs.includes('change_publish_resume_failed'));
+    assert.equal(report.resumed.length, 1, '뒤의 건은 이어 간다');
+    assert.equal(report.resumed[0]!.outcome.kind, 'proposed');
+  });
+});
+test('권한 조회 불가: 정책을 읽지 못하면 쓰지 않고 부모를 닫지도 않는다. 풀리면 이어 간다', async () => {
+  await withHarness({}, async h => {
+    const id = await toAwaiting(h);
+    await h.command('101', 'change-publish', { target: id, text: await digestOf(h, id) });
+    const open = h.policy.current;
+    h.policy.current = { ...open, confirmedAt: Date.now() + 3_600_000 };
+    const report = await h.runtime.reconcile();
+    assert.equal(report.resumed[0]?.outcome.kind, 'deferred');
+    assert.equal(h.env.github.mutations().length, 0);
+    assert.equal(await h.phase(id), 'approved');
+    h.policy.current = open;
+    await h.pump(async () => await h.phase(id) === 'proposed');
+    assert.equal(h.env.github.pulls.length, 1);
+  });
+});
+
+// ---- 굶주림 ----
+
+const observedDeployment = (changeId: string, at: number) => ({ state: 'observed' as const, headSha: git('h'), mergeCommit: git('m'), configCommit: git('k'), imageDigest: `sha256:${hex('d')}`, argoObservedAt: at, workloadObservedAt: at, observedAt: at, reason: null, changeId });
+const seedObserved = async (h: Harness, count: number) => {
+  await seedConversation(h.db);
+  const ids: string[] = [];
+  for (let index = 0; index < count; index++) {
+    const request = await driveTo(h.changes, 'observing_deploy');
+    const { changeId: _changeId, ...observation } = observedDeployment(request.id, Date.now() + 1000);
+    ok(await h.changes.recordDeployment({ changeId: request.id, generation: 1, observation }));
+    await h.db.query('INSERT INTO change_deployment_windows(change_id,generation,started_at) VALUES ($1,1,$2)', [request.id, Date.now()]);
+    ids.push(request.id);
+  }
+  return ids;
+};
+const seedPhase = async (h: Harness, phase: Parameters<typeof driveTo>[1], count: number) => {
+  await seedConversation(h.db);
+  const ids: string[] = [];
+  for (let index = 0; index < count; index++) ids.push((await driveTo(h.changes, phase)).id);
+  return ids;
+};
+test('굶주림: 끝난 관측 33개와 오래 기다리는 proposed 33개가 있어도 새 요청이 게시까지 간다. 끝난 관측은 다시 읽지 않고 기다리는 건도 차례를 받는다', async () => {
+  await withHarness({}, async h => {
+    const observed = new Set(await seedObserved(h, 33));
+    const waiting = await seedPhase(h, 'proposed', 33);
+    const polled = new Set<string>();
+    let observedReads = 0;
+    const instrument = (deps: ChangeRuntimeDeps): ChangeRuntimeDeps => ({ ...deps,
+      deployment: { readMerge: async input => { polled.add(input.target.key.changeId); if (waiting.includes(input.target.key.changeId)) return { state: 'open' }; return deps.deployment.readMerge(input); }, observe: deps.deployment.observe.bind(deps.deployment) },
+      changes: new Proxy(deps.changes, { get(target, property) {
+        if (property === 'deployment') return async (key: { changeId: string; generation: number }) => { if (observed.has(key.changeId)) observedReads++; return target.deployment(key); };
+        const value = Reflect.get(target, property) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      } }) });
+    h.restart({ instrument });
+    // 알림을 먼저 내보낸다. 재시도 간격이 메모리에 남아 있으면 끝난 관측을 다시 읽어도 보이지 않아 새 프로세스에서 잰다.
+    for (let round = 0; round < 6; round++) await h.runtime.publishTick();
+    h.restart({ instrument });
+    observedReads = 0;
+    for (let round = 0; round < 4; round++) await h.runtime.publishTick();
+    assert.equal(observedReads, 0, '끝난 관측은 조회에서 빠진다');
+    assert.equal(polled.size, 33, '기다리는 건 33개 모두 차례를 받는다');
+    const id = await toProposed(h, '100');
+    assert.equal(await h.phase(id), 'proposed');
+    assert.equal(h.env.github.pulls.length, 1);
+  });
+});
+test('굶주림: 작성 쪽에서 일시 오류로 머무는 33개가 있어도 새 요청이 진행한다', async () => {
+  await withHarness({}, async h => {
+    const stuck = new Set<string>();
+    h.restart({ instrument: deps => ({ ...deps, preflight: new Proxy(deps.preflight, { get(target, property) {
+      const value = Reflect.get(target, property) as (...args: any[]) => unknown;
+      if (property === 'readBranchHead') return async (input: { target: { key: { changeId: string } } }) => { if (stuck.has(input.target.key.changeId)) throw new Error('fixture_github_down'); return value.call(target, input); };
+      return typeof value === 'function' ? value.bind(target) : value;
+    } }) }) });
+    for (let index = 0; index < 33; index++) {
+      await h.command(`3${index}`, 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+      stuck.add(await h.changeId());
+    }
+    const seeded = await h.db.query<{ phase: string }>('SELECT DISTINCT phase FROM change_requests');
+    assert.deepEqual(seeded.rows.map(row => row.phase), ['admitted']);
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    await h.pump(async () => await h.phase(id) === 'awaiting_publish_approval', 300);
+    assert.equal(await h.phase(id), 'awaiting_publish_approval');
+  });
+});
+test('굶주림: 끝난 부모의 자식 중 정리가 안 끝나는 33개가 있어도 새로 취소한 자식을 정리해 레인을 놓는다', async () => {
+  await withHarness({ steps: [{ kind: 'hang' }] }, async h => {
+    const seeded = await seedPhase(h, 'awaiting_publish_approval', 33);
+    const stuck = new Set<string>();
+    for (const change of seeded) {
+      ok(await h.changes.transition({ changeId: change, generation: 1, from: 'awaiting_publish_approval', to: 'cancelled', reason: 'owner_cancelled' }));
+      const job = (await childOf(h.db, change, 'review'))!;
+      await h.db.query(`UPDATE jobs SET state='unknown' WHERE id=$1`, [job.id]);
+      stuck.add(job.id);
+    }
+    h.restart({ instrument: deps => ({ ...deps, store: new Proxy(deps.store, { get(target, property) {
+      const value = Reflect.get(target, property) as (...args: any[]) => unknown;
+      if (property === 'control') return async (...args: any[]) => stuck.has(args[3]) ? { status: 'fixture_stuck' } : value.apply(target, args);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } }) }) });
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    await h.pump(async () => (await h.db.query(`SELECT 1 FROM codex_sessions WHERE state='running'`)).rows.length > 0);
+    await h.command('101', 'change-cancel', { target: id });
+    await h.pump(async () => !(await h.store.laneBusy('task')), 300);
+    assert.equal(await h.store.laneBusy('task'), false);
+  });
+});
+test('굶주림: 알림을 만들 수 없는 33개가 있어도 뒤의 건은 단계·배포 알림을 받는다', async () => {
+  await withHarness({}, async h => {
+    const poisoned = new Set(await seedPhase(h, 'awaiting_publish_approval', 33));
+    const broken = new Set(await seedObserved(h, 33));
+    const [late] = await seedObserved(h, 1);
+    h.restart({ instrument: deps => ({ ...deps, changes: new Proxy(deps.changes, { get(target, property) {
+      const value = Reflect.get(target, property) as (...args: any[]) => unknown;
+      if (property === 'approvalSubject') return async (key: { changeId: string }, ...rest: unknown[]) => poisoned.has(key.changeId) ? { ok: false, reason: 'not_found' } : value.call(target, key, ...rest);
+      if (property === 'deployment') return async (key: { changeId: string }, ...rest: unknown[]) => broken.has(key.changeId) ? { ok: false, reason: 'not_found' } : value.call(target, key, ...rest);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } }) }) });
+    await h.command('100', 'change', { target: REPO.fullName, text: `요약 | accept=조건 | label=private` });
+    const blocked = await h.changeId();
+    for (let round = 0; round < 6; round++) await h.runtime.publishTick();
+    const keys = (await h.db.query<{ idempotency_key: string }>('SELECT idempotency_key FROM outbox')).rows.map(row => row.idempotency_key);
+    assert.ok(keys.includes(`change-phase:${blocked}:1:blocked`), '단계 알림');
+    assert.ok(keys.includes(`change-deploy:${late}:1`), '배포 알림');
+  });
+});
+
+// ---- DATA-01 CHANGE 답 원문 ----
+
+const toQuestion = async (h: Harness) => {
+  await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+  const id = await h.changeId();
+  await h.pump(async () => (await h.db.query(`SELECT 1 FROM codex_questions WHERE state='open'`)).rows.length > 0);
+  return { id, question: (await h.db.query<{ id: string }>(`SELECT id FROM codex_questions WHERE state='open'`)).rows[0]!.id };
+};
+const nextChat = async (h: Harness) => {
+  const saved = await h.store.save({ id: '900', actor: OWNER, scope: THREAD, kind: 'message', text: '다음 대화' }, 'fixture-policy-1', true);
+  await h.db.query('UPDATE events SET accepted=true WHERE id=$1', [saved.id]);
+  return chatContext(h.db, h.store.scopeId(THREAD), saved.id);
+};
+const eventsText = async (h: Harness) => JSON.stringify((await h.db.query('SELECT payload FROM events')).rows);
+test('DATA-01 답 원문: label=private 답은 events·다음 대화 맥락에 없고 비공개 입력 표에만 있다', async () => {
+  await withHarness({ steps: [QUESTION, WRITE_STEP] }, async h => {
+    const { id, question } = await toQuestion(h);
+    await h.command('101', 'answer', { target: question, text: `label=private | ${CANARY}` });
+    assert.equal(await h.phase(id), 'blocked');
+    assert.ok(!(await eventsText(h)).includes(CANARY), 'events에 원문이 없다');
+    const stored = (await h.db.query<{ label: string; text: string }>('SELECT label,text FROM change_request_inputs WHERE change_id=$1 AND label=$2', [id, 'private'])).rows;
+    assert.equal(stored.length, 1);
+    assert.ok(stored[0]!.text.includes(CANARY), '원문의 자리는 비공개 입력 표다');
+    const context = await nextChat(h);
+    assert.ok(!JSON.stringify(context).includes(CANARY), '대화 모델에 들어가지 않는다');
+    assert.ok(context.some(item => 'command' in item && item.command === 'answer' && item.text === ''), '명령 사실은 남고 원문만 빠진다');
+    assert.equal(context.at(-1)!.text, '다음 대화', '음성 대조: 지금 입력은 맥락에 있다');
+  });
+});
+for (const [name, text] of [['label 없는 답', `${CANARY} 라벨 없는 답`], ['틀린 label', `label=open | ${CANARY}`], ['label=unknown', `label=unknown | ${CANARY}`]] as const) {
+  test(`DATA-01 답 원문: ${name}도 events·대화 맥락에 없다`, async () => {
+    await withHarness({ steps: [QUESTION, WRITE_STEP] }, async h => {
+      const { question } = await toQuestion(h);
+      await h.command('101', 'answer', { target: question, text });
+      assert.ok(!(await eventsText(h)).includes(CANARY));
+      assert.ok(!JSON.stringify(await nextChat(h)).includes(CANARY));
+    });
+  });
+}
+test('DATA-01 답 원문: 공개 답도 events에는 없고 작성자에게는 그대로 간다', async () => {
+  await withHarness({ steps: [QUESTION, WRITE_STEP] }, async h => {
+    const { id, question } = await toQuestion(h);
+    await h.command('101', 'answer', { target: question, text: `label=public | ${CANARY}` });
+    assert.ok(!(await eventsText(h)).includes(CANARY));
+    assert.equal((await h.db.query<{ text: string }>('SELECT text FROM change_request_inputs WHERE change_id=$1 AND label=$2 AND event_id<>$3', [id, 'public', (await h.changes.get(id) as any).value.eventId])).rows[0]!.text, CANARY);
+    await h.pump(async () => await h.phase(id) === 'awaiting_publish_approval');
+    assert.ok((await h.f.calls())[1]!.input.includes(CANARY), '작성자에게 전달된다');
+    assert.ok(!JSON.stringify(await nextChat(h)).includes(CANARY));
+  });
+});
+test('DATA-01 답 원문: 닫힌 CHANGE 질문에 다시 답해도 events에 남지 않는다', async () => {
+  await withHarness({ steps: [QUESTION, WRITE_STEP] }, async h => {
+    const { question } = await toQuestion(h);
+    await h.command('101', 'answer', { target: question, text: 'label=public | 첫 답' });
+    await h.command('102', 'answer', { target: question, text: `label=public | ${CANARY}` });
+    assert.ok(!(await eventsText(h)).includes(CANARY));
+  });
+});
+test('DATA-01 변경 명령 대상: /change의 project에 적은 글도 events·대화 맥락에 없다', async () => {
+  await withHarness({}, async h => {
+    await h.command('100', 'change', { target: CANARY, text: `${CANARY} | accept=조건 | label=public` });
+    assert.match(h.acknowledgements().at(-1)!, /정책에 없는 저장소/);
+    await h.command('101', 'change-status', { target: CANARY });
+    assert.ok(!(await eventsText(h)).includes(CANARY));
+    assert.ok(!JSON.stringify(await nextChat(h)).includes(CANARY));
+  });
+});
+test('호환 /answer: CHANGE에 묶이지 않은 v1 질문은 같은 처리기를 거쳐도 지금처럼 원문을 events에 두고 답을 받는다', async () => {
+  await withHarness({}, async h => {
+    const conversation = h.store.scopeId(THREAD);
+    await h.store.save({ id: '50', actor: OWNER, scope: THREAD, kind: 'message', text: '시작' }, 'fixture-policy-1', true);
+    await insertChildJob(h.db, 'fixture-v1-job', 'task');
+    await h.db.query(`UPDATE jobs SET conversation_id=$1,state='waiting_user',wait_reason='clarification' WHERE id='fixture-v1-job'`, [conversation]);
+    await h.db.query(`INSERT INTO codex_questions(id,job_id,conversation_id,thread_id,turn,kind,responder_id,prompt,state,created_at,expires_at)
+      VALUES ('fixture-v1-question','fixture-v1-job',$1,'thread',1,'clarification',$2,'질문','open',1,$3)`, [conversation, OWNER, Date.now() + 3_600_000]);
+    await h.command('101', 'answer', { target: 'fixture-v1-question', text: 'v1 답입니다' });
+    const event = (await h.db.query<{ payload: { text: string }; accepted: boolean }>(`SELECT payload,accepted FROM events WHERE delivery_id='101'`)).rows[0]!;
+    assert.equal(event.payload.text, 'v1 답입니다');
+    assert.equal(event.accepted, true);
+    const question = (await h.db.query<{ state: string; answer: string }>(`SELECT state,answer FROM codex_questions WHERE id='fixture-v1-question'`)).rows[0]!;
+    assert.deepEqual([question.state, question.answer], ['answered', 'v1 답입니다']);
+    assert.ok((await nextChat(h)).some(item => item.text === 'v1 답입니다'));
+  });
+});
+
 test('호환 작업자: 옛 작업자(v2 없음)면 CHANGE는 admitted에서 멈추고 부모를 닫지 않는다', async () => {
   await withHarness({ change: false }, async h => {
     assert.equal(await h.f.port.supportsChange(), false);

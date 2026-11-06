@@ -6,6 +6,7 @@ import type { ChangePrivateInputs, ChangeRequest, ChangeStore } from './change-s
 import { describeDeployment } from './change-deployment.js';
 import { Denied } from './contracts.js';
 import type { Scope } from './contracts.js';
+import type { Database } from './database.js';
 import { errorInfo } from './log.js';
 import type { Log } from './log.js';
 import type { PolicyGate } from './policy.js';
@@ -206,6 +207,10 @@ export class ChangeAnswerGuard implements TaskCommandHandler {
   cancelIn(store: Store, actor: string, conversation: string, job: string, cursor: string) { return this.inner.cancelIn(store, actor, conversation, job, cursor); }
   status(actor: string, scope: Scope, job: string) { return this.inner.status(actor, scope, job); }
   release(request: { id: string; actor: string; scope: Scope; job: string; revision: string }) { return this.inner.release(request); }
+  // CHANGE 질문의 답은 label을 읽기 전의 글이다. events는 대화 맥락으로 모델에 들어가므로 원문의 자리는 재개가 읽는 칸과 ChangePrivateInputs 표뿐이다.
+  async sealsAnswer(db: Database, question: string): Promise<boolean> {
+    return (await db.query(`SELECT 1 FROM codex_questions q JOIN change_child_jobs c ON c.job_id=q.job_id AND c.role='author' WHERE q.id=$1`, [question])).rows.length > 0;
+  }
   async answerIn(store: Store, input: TaskAnswerInput): Promise<TaskAnswerResult> {
     const link = (await store.db.query<{ change_id: string; generation: number | string; conversation_id: string; responder_id: string; state: string }>(`SELECT c.change_id,c.generation,q.conversation_id,q.responder_id,q.state
       FROM codex_questions q JOIN change_child_jobs c ON c.job_id=q.job_id AND c.role='author' WHERE q.id=$1`, [input.question])).rows[0];

@@ -98,7 +98,7 @@ export function assembleChange(options: ChangeAssemblyOptions): ChangeAssembly {
   const { store, gate, changes, send, now, log } = options;
   const policy = changeRepositoryPolicies(gate);
   const io = (options.createWriter ?? createGitHubWriter)({ app: options.app, repositories: policyWriterRepositories(policy), send, now });
-  const publisher = new ChangePublisher({ store: changes, writer: io.writer, preflight: io.preflight, policy, now, log });
+  const publisher = new ChangePublisher({ store: changes, writer: io.writer, preflight: io.preflight, policy, authorize: request => gate.authorize(request.ownerId, request.scope), now, log });
   const artifacts = new ChangeStoreArtifacts(changes);
   const inputs = new ChangePrivateInputs(store.db, now);
   const source = changeAuthorSource({ store, gate, preflight: io.preflight, policy });

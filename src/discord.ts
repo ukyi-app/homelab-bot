@@ -91,7 +91,10 @@ export class DiscordIngress {
     const started = this.store.now();
     // 작업 접수를 막은 안내. 받은 자리면 상호작용 응답으로, 복구 중이면 대화에 게시한다.
     let refused: string | undefined;
-    const saved = await this.store.save(event, p.revision, !!explicit && (!isControl || event.command === 'resume'));
+    // 처리기가 맡은 답은 events에 원문을 남기지 않고 이 호출의 값으로만 넘긴다. /answer는 버퍼에 들어가지 않아 저장한 원문으로 되살릴 일이 없다.
+    const spoken = event.text;
+    const sealed = event.kind !== 'message' && event.command === 'answer' && !!event.target && await this.tasks?.sealsAnswer?.(this.store.db, event.target) === true;
+    const saved = await this.store.save(sealed ? { ...event, text: '' } : event, p.revision, !!explicit && (!isControl || event.command === 'resume'));
     if (!recovered && this.store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
     // Route durably before ACK: a lost response or process exit cannot orphan an acknowledged request.
     const routed = await this.store.atomic(async store => {
@@ -104,7 +107,7 @@ export class DiscordIngress {
       // Replay durable input, not a later delivery's content. Scope/actor must agree.
       if (inbox.actor_id !== event.actor || store.scopeId(inbox.scope) !== store.scopeId(event.scope)
         || inbox.scope.parent !== event.scope.parent) throw new Denied();
-      event.text = inbox.payload.text; event.command = inbox.payload.command;
+      event.text = sealed ? spoken : inbox.payload.text; event.command = inbox.payload.command;
       event.target = inbox.payload.target; event.kind = inbox.payload.kind; event.urgent = inbox.payload.urgent; event.mention = inbox.payload.mention;
       const durableControl = event.kind !== 'message' && controls.has(event.command ?? '');
       const gate = this.gate.withDatabase(store.db);
@@ -255,9 +258,11 @@ export class DiscordIngress {
   private async changeCommand(event: z.infer<typeof EventSchema>, revision: string, recovered: boolean): Promise<string | undefined> {
     if (recovered || !this.changes) throw new Denied();
     const started = this.store.now();
-    const saved = await this.store.save({ ...event, text: '' }, revision, false);
+    // text와 target 모두 owner가 자유롭게 적는 칸이다. events는 대화 맥락으로 모델에 들어가므로 명령 이름만 남긴다.
+    const recorded = { ...event, text: '', target: undefined };
+    const saved = await this.store.save(recorded, revision, false);
     if (this.store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
-    if (!await this.claimOnce(event, saved.id, started)) return saved.id;
+    if (!await this.claimOnce(recorded, saved.id, started)) return saved.id;
     let reply;
     try {
       reply = await this.changes.handle({ id: event.id, actor: event.actor, scope: event.scope, command: event.command as ChangeCommand, text: event.text, target: event.target });

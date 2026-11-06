@@ -2,6 +2,7 @@ import type { ClaudeTaskBridge } from './claude-task-bridge.js';
 import { Denied } from './contracts.js';
 import type { Scope } from './contracts.js';
 import { taskLaneClosedText } from './control-format.js';
+import type { Database } from './database.js';
 import { errorInfo } from './log.js';
 import type { Log } from './log.js';
 import type { PolicyGate } from './policy.js';
@@ -16,6 +17,8 @@ export interface TaskCommandHandler {
   // 접수 전 확인. 막을 안내 글, 받으면 null. 호출자의 트랜잭션 안에서 부른다.
   admit(store: Store, project: string | undefined): Promise<string | null>;
   answerIn(store: Store, input: TaskAnswerInput): Promise<TaskAnswerResult>;
+  // 답 원문을 events에 두면 안 되는 질문인지. 없으면 지금처럼 둔다.
+  sealsAnswer?(db: Database, question: string): Promise<boolean>;
   cancelIn(store: Store, actor: string, conversation: string, job: string, cursor: string): Promise<unknown>;
   status(actor: string, scope: Scope, job: string): Promise<string>;
   // 받았다는 안내를 돌려주고 소멸 확인은 뒤에서 한다. 결과는 대화에 게시한다.

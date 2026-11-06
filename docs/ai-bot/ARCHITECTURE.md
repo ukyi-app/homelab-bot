@@ -1829,7 +1829,9 @@ bwrap은 `--unshare-all --die-with-parent --new-session --cap-drop ALL --clearen
 
 **V1 제한.** manifest의 모든 항목이 mode `100644`·`100755`여야 한다. 변경하지 않아도 T0에 symlink·gitlink가 있으면 manifest를 만들 수 없어 그 저장소는 시작부터 닫힌다. 변경 내용 합계 1 MiB, HTTP body 2 MiB를 넘으면 차단한다. 변경 파일 256개, manifest 5,000항목은 제안값이다. command·리뷰는 generation당 한 번이라 실패한 결과를 같은 generation에서 다시 받지 못한다.
 
-**시작 기록.** `changeVerify`는 시험 프로세스를 띄우기 전에 `<job>.<generation>.verification.<command>.started`를 fsync 뒤 rename으로 남긴다. 재시작 뒤 이 기록만 있고 receipt가 없으면 다시 돌리지 않고 `absent`로 답해 `WorkerChangeVerification.run`이 `unknown`으로 닫는다. 첫 실행의 실패가 재실행 통과로 가려지지 않게 하려는 것이다. 슬롯 경합은 시험 결과가 아니라서 `/v2/task/verify`만 409 `{status:'busy'}`로 따로 말하고, 게시 서버(`TaskWorkerBusy`)는 receipt를 남기지 않고 다시 부른다.
+**시작 기록.** `changeVerify`는 시험 프로세스를 띄우기 전에 `<job>.<generation>.verification.<command>.started`를 배타적으로 만들어(`O_EXCL`) fsync한다. 이미 있으면 시험을 띄우지 않는다. 재시작 뒤 이 기록만 있고 receipt가 없으면 다시 돌리지 않고 `absent`로 답해 `WorkerChangeVerification.run`이 `unknown`으로 닫는다. 첫 실행의 실패가 재실행 통과로 가려지지 않게 하려는 것이다. 슬롯 경합은 시험 결과가 아니라서 `/v2/task/verify`만 409 `{status:'busy'}`로 따로 말하고, 게시 서버(`TaskWorkerBusy`)는 receipt를 남기지 않고 다시 부른다.
+
+**슬롯을 보는 순서.** 파드 정리는 프로세스를 가리지 않아 슬롯이 겹치면 상대 시험까지 죽인다. 그래서 슬롯은 비동기 조회가 모두 끝난 뒤에 보고 같은 틱에 잡는다. `changeVerify`의 슬롯 확보, `removeGeneration`의 정리 판단이 이 순서를 따르고, 조회 사이에 종료가 시작됐는지도 슬롯 직전에 다시 본다. 재조회(`changeVerification`)는 반대로 슬롯을 receipt보다 먼저 본다. receipt는 슬롯을 놓기 전에 쓰므로, 이 순서면 막 끝난 시험을 `absent`로 답하지 않는다.
 
 ### 16.5 조립과 꺼짐 배포 (B5)
 
@@ -1862,6 +1864,10 @@ ChangeRuntime
 
 부모는 `jobs` 행이 아니라 슬롯을 잡지 않는다. 작성 job은 `type='task'`이고 시험까지 작업 레인 슬롯을 쥔다. 리뷰 job은 `type='review'`이고 대화 레인이다. 승인·병합을 기다리는 부모는 어느 슬롯도 잡지 않는다.
 
+**차례.** 바퀴는 한 번에 32행을 본다. 사람의 병합·답을 기다리거나 일시 오류로 머무는 행은 `updated_at`이 그대로라, 부모·자식·단계 알림·배포 알림 조회 모두 `(정렬값, ID)` 커서로 한 쪽씩 돌고 쪽이 차지 않으면 처음으로 돌아간다. 커서는 메모리에 있고 잃어도 처음부터 다시 볼 뿐이다. 관측을 마친 건(배포 상태 `observed`·`not_applicable`·`blocked`, 또는 `late_reported_at` 있음)은 부모 조회에서 뺀다. 알림은 따로 고르므로 빠지지 않는다.
+
+**쓰기 전 인가.** `ChangePublisher`는 `publish` 입구와 stage마다 요청자의 owner·scope를 `gate.authorize`로 다시 본다. 정책 조회와 writer는 `/revoke`의 거부 목록을 보지 않기 때문이다. 대조 주기의 재개도 `publish`를 지나므로 쓰기로 가는 길은 이 확인 하나를 거친다. 철회면 부모를 `cancelled(authorization_revoked)`로 닫고 이미 공개된 객체는 건드리지 않는다. 정책을 읽지 못하면 쓰지 않고 미룬다. 미확정 effect의 읽기 대조는 권한과 무관하게 계속 돌아 응답을 잃은 객체를 기록으로 맞춘다.
+
 **v1 분리.** 작성 job은 부모 연결과 한 트랜잭션으로 만든다. `Store.claim`이 `change_child_jobs`에 묶인 job을 집지 않고 `claimChangeAuthor`만 같은 잠금 순서·슬롯 규칙으로 집는다. v1 `run`으로 가면 세션이 `task_session_mismatch`로 닫히고 저장 전 결과가 지워지기 때문이다. `/retry`도 자식 job을 되살리지 않는다. `/cancel`·`/resume-model`·`/answer`·`/task-release`는 작성 job에 그대로 쓴다.
 
 **명령.** 네 명령 모두 owner·요청한 스레드에서만 답하고, 다른 곳에는 존재도 알리지 않는다. 처리기는 DB만 만져 상호작용 기한 안에 끝난다.
@@ -1874,9 +1880,9 @@ ChangeRuntime
 | `/change-cancel` | `target:<변경 ID>` | 부모를 먼저 닫고 돌던 턴·시험의 소멸을 확인해 정리한다. 공개된 객체·PR은 닫지 않는다. 병합 뒤에는 취소하지 않는다 |
 | `/change-publish` | `target:<변경 ID> text:<digest>` | 미리보기의 digest에 대한 승인. `writerAccepted`가 false면 승인을 받지 않고 대기에 둔다 |
 
-**출처.** label은 owner의 명령 입력만 말할 수 있고, 적지 않으면 `unknown`이다. private·unknown이면 `admit`이 그 자리에서 `blocked`로 닫아 작성 모델·GitHub에 아무것도 가지 않는다. 요청 글은 `events`에 남기지 않는다. `events`는 대화 맥락으로 모델에 들어가기 때문이다. 입력에서 비밀·내부 표식이 나오면 `label=public`을 적어도 private로 올린다. 이 검사는 추가 방어이고 완전성 증거가 아니다. `approved_public_summary`는 owner가 이 명령에 직접 적은 글에만 효력이 있고 입력 표의 SHA-256에 묶인다.
+**출처.** label은 owner의 명령 입력만 말할 수 있고, 적지 않으면 `unknown`이다. private·unknown이면 `admit`이 그 자리에서 `blocked`로 닫아 작성 모델·GitHub에 아무것도 가지 않는다. 요청 글은 `events`에 남기지 않는다. `events`는 대화 맥락으로 모델에 들어가기 때문이다. 입력에서 비밀·내부 표식이 나오면 `label=public`을 적어도 private로 올린다. 이 검사는 추가 방어이고 완전성 증거가 아니다. `approved_public_summary`는 owner가 이 명령에 직접 적은 글에만 효력이 있고 입력 표의 SHA-256에 묶인다. 변경 명령의 `events` 행에는 `text`·`target`을 남기지 않는다. 둘 다 owner가 자유롭게 적는 칸이다.
 
-CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없으면 답을 받지 않고 질문을 열어 둔다. private·unknown이면 기록하고 부모를 닫아 작성자에 넘기지 않는다. 모델 입력은 공개 brief와 공개 label의 답뿐이고 스레드 대화·기억·다른 스레드 글을 읽는 경로가 없다.
+CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없으면 답을 받지 않고 질문을 열어 둔다. private·unknown이면 기록하고 부모를 닫아 작성자에 넘기지 않는다. 모델 입력은 공개 brief와 공개 label의 답뿐이고 스레드 대화·기억·다른 스레드 글을 읽는 경로가 없다. 이 답의 원문도 `events`에 두지 않는다. 수신이 저장 전에 처리기(`sealsAnswer`)에 물어 CHANGE 질문이면 빈 글로 저장하고 원문은 그 호출의 값으로만 넘긴다. 원문의 자리는 `change_request_inputs`와, 공개 답이면 재개가 읽는 `codex_questions.answer`다. v1 `/answer`와 일반 대화의 저장은 그대로다.
 
 **단계별 복구.** 부모의 다음 할 일은 DB의 phase가 정한다. 메모리에는 재시도 시각만 있다. 일시 오류는 부모를 닫지 않고 간격을 5초에서 10분까지 늘려 다시 본다.
 

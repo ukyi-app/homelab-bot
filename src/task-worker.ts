@@ -300,6 +300,8 @@ export class TaskWorkerService {
     if (!this.intake.open) throw new TaskRouteError(503, 'intake_closed');
     const context = this.ready();
     await this.verify(operation, token, request);
+    // 서명 확인이 볼륨을 기다리는 사이에 종료가 시작됐으면 shutdown이 이 턴을 보지 못한다.
+    if (!this.options.accepting()) throw new TaskRouteError(403, 'worker_closing');
     this.assertWorker(request.operation === 'resume' ? request.expectedWorker : null, context.worker);
     if (this.turn || this.sweeps || this.unconfirmed.size) throw new TaskRouteError(409, 'busy');
     const job = this.receipts.job(request.job);
@@ -414,12 +416,15 @@ export class TaskWorkerService {
     this.assertLease(request.job, request.generation, request.lease);
     const stored = await this.storedRecord(request.job, request.generation, request.commandId);
     if (stored) return this.verificationReply(request, worker, stored, false);
-    const active0 = this.turn;
-    if (active0?.job === request.job && active0.generation === request.generation && active0.verifying === request.commandId) return this.verificationReply(request, worker, null, true);
-    // 앞선 실행이 receipt 없이 끊겼다. 다시 돌려 통과하면 첫 실행의 실패가 가려진다. 읽지 못하면 시작 여부를 모르므로 돌리지 않는다.
     const started = await this.results.verificationStarted(request.job, request.generation, request.commandId).catch(() => true);
-    if (started) return this.verificationReply(request, worker, null, false);
-    if (active0 || this.sweeps || this.unconfirmed.size) throw new TaskRouteError(409, 'busy');
+    // 슬롯은 비동기 조회가 모두 끝난 뒤에 보고 같은 틱에 잡는다. 앞에서 보면 함께 온 요청 둘이 모두 비었다고 읽고 서로의 슬롯을 덮어쓴다.
+    if (!this.options.accepting()) throw new TaskRouteError(403, 'worker_closing');
+    const holder = this.turn;
+    if (holder?.job === request.job && holder.generation === request.generation && holder.verifying === request.commandId) return this.verificationReply(request, worker, null, true);
+    // 앞선 실행이 receipt 없이 끊겼다. 다시 돌려 통과하면 첫 실행의 실패가 가려진다. 읽지 못하면 시작 여부를 모르므로 돌리지 않는다.
+    // 조회하는 사이에 시험이 끝났을 수 있어 receipt를 다시 본다. receipt는 슬롯을 놓기 전에 쓰므로 슬롯이 빈 뒤의 이 조회는 놓치지 않는다.
+    if (started) return this.verificationReply(request, worker, await this.storedRecord(request.job, request.generation, request.commandId), false);
+    if (holder || this.sweeps || this.unconfirmed.size) throw new TaskRouteError(409, 'busy');
     const receipt = this.receipts.generation(request.job, request.generation);
     if (!receipt || receipt.fenced || receipt.finalized) throw new TaskRouteError(409, 'fenced');
     let finish!: (stopped: boolean) => void;
@@ -444,11 +449,16 @@ export class TaskWorkerService {
       if (error instanceof TaskRouteError) throw error;
       throw new TaskRouteError(409, 'result_unavailable');
     }
-    try { await this.results.writeVerificationStart(request.job, request.generation, request.commandId); }
+    let created: boolean;
+    try { created = await this.results.writeVerificationStart(request.job, request.generation, request.commandId); }
     catch {
       this.intake.close('receipt_write_failed');
       release(true);
       throw new TaskRouteError(503, 'receipt_write_failed');
+    }
+    if (!created) {
+      release(true);
+      return this.verificationReply(request, worker, await this.storedRecord(request.job, request.generation, request.commandId), false);
     }
     void (async () => {
       let stopped = false;
@@ -468,9 +478,10 @@ export class TaskWorkerService {
     await this.verify('task_v2_verification', token, request);
     this.assertWorker(request.expectedWorker, worker);
     this.assertLease(request.job, request.generation, request.lease);
-    const record = await this.storedRecord(request.job, request.generation, request.commandId);
+    // 슬롯을 먼저 본다. receipt를 먼저 읽으면 그 사이에 끝난 시험이 "receipt 없음·슬롯 빔"으로 보여 absent가 되고, port가 끝난 시험을 unknown으로 닫는다.
     const active = this.turn;
-    return this.verificationReply(request, worker, record, active?.job === request.job && active.generation === request.generation && active.verifying === request.commandId);
+    const running = active?.job === request.job && active.generation === request.generation && active.verifying === request.commandId;
+    return this.verificationReply(request, worker, await this.storedRecord(request.job, request.generation, request.commandId), running);
   }
   // 저장 ACK. saved는 저장한 artifact digest가 이 작업자의 결과와 같을 때만 지운다. 다르면 게시 서버와 작업자가 다른 결과를 보고 있으므로 아무것도 지우지 않는다.
   async changeFinalize(request: TaskV2FinalizeRequest, token: string): Promise<TaskV2FinalizeResponse> {
@@ -485,10 +496,13 @@ export class TaskWorkerService {
       const gone = this.receipts.generation(request.job, request.generation)?.finalized === true;
       if (!gone && (stored?.status !== 'snapshot' || stored.artifactDigest !== request.receipt.artifactDigest)) throw new TaskRouteError(409, 'digest_mismatch');
     }
-    const removed = await this.removeGeneration(request, sessions, active);
+    const removed = await this.removeGeneration(request, sessions);
     return { ...shape, stopped: removed.stopped, cleaned: removed.cleaned, cleanupPending: removed.stopped && !removed.cleaned, sessionRetained: !removed.cleaned };
   }
-  private async removeGeneration(request: { job: string; generation: number }, sessions: TaskSessions, active: ActiveTurn | undefined): Promise<{ stopped: boolean; cleaned: boolean }> {
+  // 슬롯은 호출자가 결과를 읽은 뒤인 여기서 본다. 그 사이에 시험이 슬롯을 잡았으면 세션을 지우면 안 되고, 파드 정리는 돌던 시험까지 죽인다.
+  private async removeGeneration(request: { job: string; generation: number }, sessions: TaskSessions): Promise<{ stopped: boolean; cleaned: boolean }> {
+    const active = this.turn;
+    if (active?.job === request.job && active.generation === request.generation) return { stopped: false, cleaned: false };
     const removed = await sessions.finalize(request.job, request.generation,
       async () => active ? !this.unconfirmed.has(request.job) : this.sweep(request.job));
     if (removed.stopped && !await this.receipts.note(request.job, request.generation,
@@ -556,7 +570,7 @@ export class TaskWorkerService {
     if (active?.job === request.job && active.generation === request.generation) return { ...shape, stopped: false, cleaned: false, cleanupPending: false, sessionRetained: true };
     // v1 경로의 "성공"은 v1 결과의 영수증이다. 저장 ACK를 받지 못한 v2 결과를 이 길로 지우지 않는다. 실패·취소의 정리는 결과를 버리기로 정한 뒤라 통과한다.
     if (request.receipt.outcome === 'succeeded' && (await this.results.readResult(request.job, request.generation).catch(() => null))?.status === 'snapshot') throw new TaskRouteError(409, 'result_unacknowledged');
-    const removed = await this.removeGeneration(request, sessions, active);
+    const removed = await this.removeGeneration(request, sessions);
     return { ...shape, stopped: removed.stopped, cleaned: removed.cleaned, cleanupPending: removed.stopped && !removed.cleaned, sessionRetained: !removed.cleaned };
   }
   // 종료 신호. 준비 중인 턴까지 멈추고 그 응답이 나가길 기다린다.

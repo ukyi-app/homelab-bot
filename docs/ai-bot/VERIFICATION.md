@@ -1868,3 +1868,51 @@ SEC02_IMAGE=<이름> npm test   # 없으면 사유와 함께 skip. 통과로 세
 **D-23.** `app-build.yaml`의 공개 금지 패턴으로 `git grep -nIiE --untracked -l`을 돌려 0건이다.
 
 **고친 기존 시험.** migration이 하나 늘어 `publisher-migrate`·`publisher-pg`·`change-store`·`change-store-pg`의 버전 고정값을 고쳤다. `change-artifact`의 세 곳은 `store.claim`이 자식 job을 일부러 집지 않게 되어 `claimChangeAuthor`로 바꿨고, `v1 격리`는 두 방어를 모두 본다.
+
+### 리뷰 지적 수정 (#85, 2026-11-06)
+
+시험을 먼저 넣어 수정 전 21건 실패를 봤다. `change-assembly` 15건(대상 18건 중), `change-verify-start` 6건(10건 중)이다. 실패 사유는 하나씩 확인했다. `tree` 대조 시험 1건은 시험의 fault가 앞선 읽기에 먼저 소모돼 실패한 것이라 시드를 고쳤다.
+
+| 지적 | 재현 | 수정 | 수정 뒤 |
+|---|---|---|---|
+| P1 철회 뒤 게시 | 승인·`/revoke` 뒤 `reconcile` 한 번에 GitHub 쓰기 6회, phase `proposed` | `ChangePublisher`가 `publish` 입구와 stage마다 `authorize`(필수 옵션). 철회면 `cancelled(authorization_revoked)`, 정책 불가면 `deferred` | 쓰기·토큰·읽기 0회. 단계 사이 철회면 다음 단계 없음. 미확정 effect는 읽기 대조로 확정 |
+| P1 후속 요청 멈춤 | 끝난 관측 33개면 proposed 33개 중 조회 0개. 작성·자식·알림 조회도 같은 모양 | 네 조회에 `(정렬값, ID)` 커서. 끝난 관측은 부모 조회에서 뺌 | 새 요청이 게시까지 감. 기다리는 33개 모두 차례를 받음 |
+| P1 검증 동시 실행 | 함께 온 요청 둘이 모두 실행. 작업 공간이 겹쳐 `EACCES`·`ENOTEMPTY` | 조회가 끝난 뒤 같은 틱에 슬롯을 보고 잡음. 시작 기록 `O_EXCL` | 샌드박스 1회. 재시작 경로 기존 시험 통과 |
+| P2 비공개 답 유출 | `label=private` 답이 `events.payload.text`에 남음 | `sealsAnswer`면 빈 글로 저장하고 원문은 호출 값으로만 전달 | `events`·`chatContext`에 없음. 공개 답은 작성자에 전달. v1은 그대로 |
+| CI 실패 | `호환 unknown`의 마지막 단언. 고정 100ms를 0으로 줄이면 코어 하나에서 5회 중 5회 `actual: 0`, 800ms 뒤에도 0 | 코드 경합이 아니라 시험의 시간 가정이다. 단언은 그대로 두고 대기를 "가짜 모델 시작"으로 바꿈. `EVENT-02 결과 유실`도 같은 조건을 더함 | 통과 |
+
+**같은 종류로 더 찾아 고친 것.**
+
+- 재조회가 receipt를 슬롯보다 먼저 읽어 막 끝난 시험을 `absent`로 답했다. port가 끝난 시험을 `unknown`으로 닫는 경로다.
+- 정리(`removeGeneration`)가 결과를 읽기 전의 슬롯 값으로 판단해, 그 사이 시작한 시험의 세션을 지우고 파드 정리로 죽일 수 있었다.
+- `reconcile`의 재개 한 건이 던지면 뒤의 건이 막혔다.
+- 턴 시작·후보 리뷰가 비동기 대기 뒤 종료 여부를 다시 보지 않았다.
+- 변경 명령의 `target`도 자유 입력인데 `events`에 남아 대화 맥락에 들어갔다.
+
+**고쳤던 기존 시험.** `authorize`가 필수가 되어 `change-github-fake`·`change-freshness`·`change-recovery`·`change-pg`의 게시자 생성에 인가 통과 대역을 넣었다. 단언은 바꾸지 않았다.
+
+**시험 구성에서 배운 것.** 능력 토큰은 서명이 결정적이고 nonce가 서명 해시라, 같은 본문을 같은 밀리초에 발급하면 토큰이 같아 재사용으로 거부된다. 동시 요청 시험은 발급 시각을 띄워야 유효한 요청 둘이 된다.
+
+**변이 확인.** `dist` 사본을 한 군데씩 바꿔 대상 시험을 돌렸고, 묶음마다 원본을 먼저 돌려 fail 0을 봤다. 29건 모두 잡혔다.
+
+| 묶음 | 건수 | 내용 |
+|---|---|---|
+| 인가 | 6 | 입구·stage 인가, 조립의 인가, 정책 불가 미룸, 철회 닫기, 재개 오류 격리 |
+| 차례 | 6 | 끝난 관측 제외, 커서 전진, 부모·자식·단계 알림·배포 알림 커서 |
+| 슬롯 | 11 | 배타 생성, 이미 있을 때 미실행, 슬롯 판정 3종, 종료 재확인 2종, 재조회 순서, receipt 재조회 2종, 정리의 슬롯 판정 |
+| 리뷰 종료 | 1 | 조회 뒤 닫힘 재확인 |
+| 답 원문 | 5 | 봉인, 호출 값 전달, 모든 답 봉인(v1 호환), 명령 `target`·`text` |
+
+첫 회에 살아남은 2건(끝난 관측 제외, 시작 기록 뒤 receipt 재조회)은 시험이 약했다. 시험을 고쳐 다시 잡았다.
+
+**검사.** Node 24.22.0.
+
+| 명령 | 결과 |
+|---|---|
+| `npm run check` | 통과 |
+| PG 포함 `npm run build && node --test --test-concurrency=6 dist/test/*.test.js` | 2057 tests, 2035 pass, 0 fail, 22 skipped(전부 `SEC02_IMAGE` 없음). 3분 14초, load 최대 4.06. PG 18.6, 네트워크 없음 |
+| 위 실행 뒤 시험만 고친 파일 | `change-verify-start` 코어 하나 8회 모두 13 pass. `change-pg`의 새 시험 2 pass. `change-assembly`의 차례 4건·답 원문 8건 원본 통과 |
+
+**못 한 검증(예산 초과).** 시험을 마지막으로 고친 뒤의 전체 재실행, `taskset -c 0-1`의 `change-assembly` 파일 전체 실행, `change-sec02`·`sec02-boundary` 이미지 재실행.
+
+**D-23.** 공개 금지 패턴 0건.
