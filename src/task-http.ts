@@ -5,8 +5,10 @@ import { z } from 'zod';
 import { body } from './http.js';
 import { TaskWorkerRejected } from './task-bridge.js';
 import type { TaskEndpointRequest, TaskEndpointResponse, TaskWorkerPort } from './task-bridge.js';
-import { TASK_ENDPOINTS, TASK_LIMITS, TaskRejectionSchema } from './task-contracts.js';
-import type { TaskEndpoint, TaskRequest, TaskWorkerSigner } from './task-contracts.js';
+import { ARTIFACT_LIMITS } from './change-contracts.js';
+import { VERIFIER_REVISION } from './change-verifier.js';
+import { TASK_ENDPOINTS, TASK_LIMITS, TASK_V2_CONTRACT, TASK_V2_ENDPOINTS, TaskRejectionSchema } from './task-contracts.js';
+import type { TaskEndpoint, TaskRequest, TaskSignedBody, TaskV2Endpoint, TaskWorkerSigner } from './task-contracts.js';
 import { TaskRouteError } from './task-worker.js';
 import type { TaskWorkerService } from './task-worker.js';
 import { beforeConnection } from './worker-http.js';
@@ -21,7 +23,9 @@ const CONTROL_TIMEOUT_MS = 8000;
 // 무모델·무서명 상태 응답. 값 없는 사유 상수와 능력표뿐이다. 게시 서버가 이 경로로 "작업 모드 작업자인가"와 "수락 중인가"를 본다.
 // 옛 이미지와 대화·리뷰 작업자는 404라, 거기에 실행을 보내 응답 불명으로 레인을 닫는 일을 미리 막는다.
 export const TaskIntakeSchema = z.object({ version: z.literal(1), open: z.boolean(), reasons: z.array(z.string().max(64)).max(32),
-  capabilities: z.object({ lanes: z.object({ task: z.literal(true) }) }).loose() });
+  capabilities: z.object({ lanes: z.object({ task: z.literal(true) }) }).loose(),
+  // v2 계약을 받는 작업자에만 있다.
+  change: z.object({ contract: z.number().int(), verifierRevision: z.string().max(128) }).optional() });
 export type TaskIntakeStatus = { routed: boolean; open: boolean; reasons: readonly string[] };
 export const TASK_INTAKE_UNREACHED: TaskIntakeStatus = Object.freeze({ routed: false, open: false, reasons: [] });
 export async function taskWorkerIntake(workerUrl: string, send: typeof fetch, signal: AbortSignal): Promise<TaskIntakeStatus> {
@@ -31,6 +35,74 @@ export async function taskWorkerIntake(workerUrl: string, send: typeof fetch, si
     const parsed = TaskIntakeSchema.safeParse(await response.json());
     return parsed.success ? { routed: true, open: parsed.data.open, reasons: parsed.data.reasons } : TASK_INTAKE_UNREACHED;
   } catch { return TASK_INTAKE_UNREACHED; }
+}
+
+// 이 작업자가 CHANGE_PR v2 계약을 받는가. 옛 작업자는 칸이 없어 false다. CHANGE만 닫히고 /task는 그대로 돈다. 확인하지 못해도 false다.
+export async function taskWorkerChangeContract(workerUrl: string, send: typeof fetch, signal: AbortSignal): Promise<boolean> {
+  try {
+    const response = await send(new URL(TASK_INTAKE_PATH, workerUrl).href, { method: 'GET', redirect: 'error', signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]) });
+    if (!response.ok) { await response.body?.cancel().catch(() => {}); return false; }
+    const parsed = TaskIntakeSchema.safeParse(await response.json());
+    return parsed.success && parsed.data.change?.contract === TASK_V2_CONTRACT;
+  } catch { return false; }
+}
+
+// 응답 본문을 상한까지만 읽는다. 잘라서 쓰지 않고 넘으면 실패다. 읽은 바이트 수는 저장 상한 대조에 그대로 쓴다.
+async function boundedJson(response: Response, maxBytes: number): Promise<{ response: unknown; bytes: number }> {
+  const reader = response.body?.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  while (reader) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bytes += value.byteLength;
+    if (bytes > maxBytes) { await reader.cancel().catch(() => {}); throw new Error('task_response_too_large'); }
+    chunks.push(value);
+  }
+  return { response: JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown, bytes };
+}
+export type TaskV2EndpointRequest<E extends TaskV2Endpoint> = z.infer<(typeof TASK_V2_ENDPOINTS)[E]['request']>;
+export type TaskV2EndpointResponse<E extends TaskV2Endpoint> = z.infer<(typeof TASK_V2_ENDPOINTS)[E]['response']>;
+export interface TaskV2WorkerPort {
+  // bytes는 실제로 받은 본문 크기다.
+  callV2<E extends TaskV2Endpoint>(endpoint: E, input: TaskV2EndpointRequest<E>, signal?: AbortSignal): Promise<{ response: unknown; bytes: number }>;
+  supportsChange(signal?: AbortSignal): Promise<boolean>;
+}
+// v2는 긴 턴을 기다리지 않는다. 모든 호출이 제어 호출 기한 안에 끝난다. 거부 판별은 v1과 같다. 응답 검증은 호출자가 계약 schema로 한다.
+export class HttpTaskV2Worker implements TaskV2WorkerPort {
+  private readonly origin: string;
+  constructor(endpoint: string, private readonly signer: TaskWorkerSigner, private readonly send: typeof fetch) {
+    const url = new URL(endpoint);
+    if (url.protocol !== 'http:' || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('invalid_worker_service');
+    this.origin = url.origin;
+  }
+  supportsChange(signal: AbortSignal = AbortSignal.timeout(CONTROL_TIMEOUT_MS)): Promise<boolean> {
+    return taskWorkerChangeContract(this.origin, this.send, signal);
+  }
+  async callV2<E extends TaskV2Endpoint>(endpoint: E, input: TaskV2EndpointRequest<E>, signal?: AbortSignal): Promise<{ response: unknown; bytes: number }> {
+    const spec = TASK_V2_ENDPOINTS[endpoint];
+    let payload: string;
+    let token: string;
+    try {
+      const parsed = spec.request.parse(input) as TaskSignedBody;
+      payload = JSON.stringify(parsed);
+      if (Buffer.byteLength(payload) > TASK_LIMITS.bodyBytes) throw new Error('task_request_too_large');
+      token = this.signer.issue(spec.operation, parsed);
+    } catch { throw new TaskWorkerRejected(); }
+    let response: Response;
+    try {
+      response = await this.send(`${this.origin}${endpoint}`, { method: 'POST', redirect: 'error',
+        headers: { 'content-type': 'application/json', authorization: `Capability ${token}` }, body: payload, signal: signal ?? AbortSignal.timeout(CONTROL_TIMEOUT_MS) });
+    } catch (error) {
+      if (error instanceof Error && beforeConnection(error.cause)) throw new TaskWorkerRejected();
+      throw error;
+    }
+    if (!response.ok) {
+      if ([400, 401, 403, 409].includes(response.status) && TaskRejectionSchema.safeParse(await response.json().catch(() => null)).success) throw new TaskWorkerRejected();
+      throw new Error('task_worker_uncertain');
+    }
+    return boundedJson(response, ARTIFACT_LIMITS.httpBodyBytes);
+  }
 }
 
 // 게시 서버 쪽 포트. 400·401·403·409 거부와 연결 전 실패만 미시작의 증거다(TaskWorkerRejected).
@@ -108,11 +180,41 @@ export function taskRoutes(service: TaskWorkerService, capabilities: object, log
       send(500, JSON.stringify({ status: 'unknown', stopped: false }));
     }
   };
+  const routeV2 = (endpoint: TaskV2Endpoint): WorkerRoute => async (req, res) => {
+    const send = (status: number, payload: string) => { if (!res.headersSent) res.writeHead(status, { 'content-type': 'application/json' }).end(payload); };
+    const refuse = (status: number, reason: string) => {
+      log?.({ level: 'warn', event: 'task_route_rejected', endpoint, status, reason });
+      send(status, REJECTED);
+    };
+    try {
+      if (req.method !== 'POST') { res.writeHead(404).end(); return; }
+      const auth = req.headers.authorization;
+      if (!auth?.startsWith('Capability ')) { refuse(401, 'capability_missing'); return; }
+      let input: unknown;
+      try { input = await body(req, TASK_LIMITS.bodyBytes); } catch { refuse(400, 'body_invalid'); return; }
+      const parsed = TASK_V2_ENDPOINTS[endpoint].request.safeParse(input);
+      if (!parsed.success) { refuse(400, 'request_invalid'); return; }
+      const token = auth.slice(11);
+      const result = endpoint === '/v2/task' ? await service.changeExecute(parsed.data as never, token)
+        : endpoint === '/v2/task/result' ? await service.changeResult(parsed.data as never, token)
+          : endpoint === '/v2/task/verify' ? await service.changeVerify(parsed.data as never, token)
+            : endpoint === '/v2/task/verification' ? await service.changeVerification(parsed.data as never, token)
+              : await service.changeFinalize(parsed.data as never, token);
+      send(200, JSON.stringify(result));
+    } catch (error) {
+      if (error instanceof TaskRouteError) { refuse(error.status, error.message); return; }
+      log?.({ level: 'error', event: 'task_route_failed', endpoint, error: error instanceof Error ? error.name : typeof error });
+      send(500, JSON.stringify({ status: 'unknown', stopped: false }));
+    }
+  };
   const intake: WorkerRoute = async (req, res) => {
     if (req.method !== 'GET') { res.writeHead(404).end(); return; }
-    res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ version: 1, open: service.intake.open, reasons: service.intake.reasons, capabilities }));
+    res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ version: 1, open: service.intake.open, reasons: service.intake.reasons, capabilities,
+      ...(service.changeEnabled ? { change: { contract: TASK_V2_CONTRACT, verifierRevision: VERIFIER_REVISION } } : {}) }));
   };
-  return new Map<string, WorkerRoute>([...(Object.keys(TASK_ENDPOINTS) as TaskEndpoint[]).map(endpoint => [endpoint, route(endpoint)] as const), [TASK_INTAKE_PATH, intake]]);
+  return new Map<string, WorkerRoute>([...(Object.keys(TASK_ENDPOINTS) as TaskEndpoint[]).map(endpoint => [endpoint, route(endpoint)] as const),
+    ...(service.changeEnabled ? (Object.keys(TASK_V2_ENDPOINTS) as TaskV2Endpoint[]).map(endpoint => [endpoint, routeV2(endpoint)] as const) : []),
+    [TASK_INTAKE_PATH, intake]]);
 }
 
 // 작업 모드 작업자의 서버. 대화·리뷰 끝점이 없어 경로 자체가 404다.

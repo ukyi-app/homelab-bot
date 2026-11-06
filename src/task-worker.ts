@@ -5,10 +5,15 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import { Denied } from './contracts.js';
 import type { Clock } from './contracts.js';
-import { TASK_CAPABILITY, TaskWorkerIdentitySchema, TaskWorkerVerifier } from './task-contracts.js';
-import type { TaskCancelRequest, TaskCancelResponse, TaskFinalizeRequest, TaskFinalizeResponse, TaskOperation, TaskRequest, TaskResponse, TaskStatusRequest,
-  TaskStatusResponse, TaskWorkerIdentity } from './task-contracts.js';
+import { ChangeResults, decodeArtifact, readBaseline } from './change-artifact.js';
+import { VerificationRecordSchema } from './change-verifier.js';
+import type { IsolatedVerifier, VerificationInput, VerificationRecord } from './change-verifier.js';
+import { TASK_CAPABILITY, TASK_V2_CONTRACT, TaskWorkerIdentitySchema, TaskWorkerVerifier } from './task-contracts.js';
+import type { AnyTaskOperation, TaskCancelRequest, TaskCancelResponse, TaskFinalizeRequest, TaskFinalizeResponse, TaskRequest, TaskResponse, TaskSignedBody, TaskStatusRequest,
+  TaskStatusResponse, TaskV2Accepted, TaskV2FinalizeRequest, TaskV2FinalizeResponse, TaskV2Request, TaskV2ResultRequest, TaskV2ResultResponse, TaskV2TurnResult, TaskV2VerificationRequest,
+  TaskV2VerificationResponse, TaskV2VerifyRequest, TaskWorkerIdentity } from './task-contracts.js';
 import { TaskSessions } from './task-workspace.js';
+import type { ArchiveLimits } from './task-workspace.js';
 import { FileNonceStore } from './worker-state.js';
 import type { NonceOutcome } from './worker-state.js';
 
@@ -144,13 +149,19 @@ export class TaskNonces {
   };
 }
 
-interface ActiveTurn { job: string; lease: string; generation: number; turn: number; controller: AbortController; done: Promise<boolean> }
+interface ActiveTurn { job: string; lease: string; generation: number; turn: number; controller: AbortController; done: Promise<boolean>; verifying?: string }
 export interface TaskTurnContext { worker: TaskWorkerIdentity; sessions: TaskSessions }
+// v2 실행 부품. 없으면 v2 끝점을 열지 않고 intake도 지원을 말하지 않는다. 게시 서버는 그때 CHANGE만 닫는다.
+export interface TaskChangeRuntime {
+  runTurn(context: TaskTurnContext, request: TaskV2Request, signal: AbortSignal): Promise<TaskV2TurnResult>;
+  verifier: IsolatedVerifier;
+}
 export interface TaskWorkerOptions {
   root: string; nonceDir: string; publicKey: KeyObject; homes: readonly string[];
   // 기동 검사에서 나온 사유. 하나라도 있으면 수락하지 않고 /readyz도 503이다.
   startup: readonly string[];
   runTurn(context: TaskTurnContext, request: TaskRequest, signal: AbortSignal): Promise<TaskResponse>;
+  change?: TaskChangeRuntime;
   // RunControl.stop. 작업자 쪽 파드 전체 정리와 소멸 확인이다.
   stop(job: string): Promise<boolean>;
   survivors(job: string): Promise<number | null>;
@@ -191,6 +202,7 @@ export class TaskWorkerService {
   private readonly executeVerifier: TaskWorkerVerifier;
   private readonly controlVerifier: TaskWorkerVerifier;
   private readonly receipts: TaskReceipts;
+  private readonly results: ChangeResults;
   // 볼륨을 처음 읽기 전에는 없다. 그동안 모든 끝점이 503이다. identity를 지어내면 게시 서버가 세션을 잃은 것으로 읽는다.
   private state: { worker: TaskWorkerIdentity; sessions: TaskSessions } | undefined;
   private turn: ActiveTurn | undefined;
@@ -210,7 +222,9 @@ export class TaskWorkerService {
     this.executeVerifier = new TaskWorkerVerifier(options.publicKey, this.nonces.execute, this.now);
     this.controlVerifier = new TaskWorkerVerifier(options.publicKey, this.nonces.control, this.now);
     this.receipts = new TaskReceipts(join(this.controlDir, 'receipts'), this.now);
+    this.results = new ChangeResults(join(this.controlDir, 'change-results'));
   }
+  get changeEnabled(): boolean { return this.options.change !== undefined; }
   // 기동 때 한 번, 그 뒤로 주기마다. 어떤 실패도 던지지 않는다.
   async start(): Promise<void> {
     await this.probe();
@@ -238,6 +252,8 @@ export class TaskWorkerService {
     await this.check('credential_unavailable', async () => { if (!await this.options.credentialReady()) throw new Error('credential'); });
     // 없음을 확인하지 못하면 공간이 있는 것으로 본다.
     await this.receipts.prune(job => lstat(join(this.options.root, 'tasks', job)).then(() => true, (error: { code?: string }) => error.code !== 'ENOENT')).catch(() => {});
+    // 영수증을 읽지 못한 동안에는 모든 결과가 주인 없어 보인다. 저장 ACK 전의 결과를 지우면 복구할 수 없다.
+    if (this.state) await this.results.prune(job => this.receipts.job(job) !== undefined).catch(() => {});
   }
   private async check(reason: string, step: () => Promise<void>): Promise<void> {
     try { await step(); this.intake.recover(reason); } catch { this.intake.close(reason); }
@@ -257,11 +273,13 @@ export class TaskWorkerService {
   private assertWorker(expected: TaskWorkerIdentity | null, worker: TaskWorkerIdentity): void {
     if (expected && (expected.instance !== worker.instance || expected.storage !== worker.storage)) throw new TaskRouteError(409, 'worker_mismatch');
   }
-  private async verify(operation: TaskOperation, token: string, body: { version: 1; job: string; lease: string; generation: number }): Promise<void> {
+  private async verify(operation: AnyTaskOperation, token: string, body: TaskSignedBody): Promise<void> {
     const failures = this.nonces.failures;
-    try { await (operation === 'task_execute' ? this.executeVerifier : this.controlVerifier).check(token, operation, body); }
+    // 프로세스를 띄우는 요청만 영속 nonce를 요구한다. 결과 재조회와 정리를 볼륨 장애로 막으면 결과를 회수할 길이 없다.
+    const launches = operation === 'task_execute' || operation === 'task_v2_execute' || operation === 'task_v2_verify';
+    try { await (launches ? this.executeVerifier : this.controlVerifier).check(token, operation, body); }
     catch (error) {
-      if (operation === 'task_execute' && this.nonces.failures > failures) throw new TaskRouteError(503, 'nonce_write_failed');
+      if (launches && this.nonces.failures > failures) throw new TaskRouteError(503, 'nonce_write_failed');
       if (error instanceof Denied) throw new TaskRouteError(403, 'denied');
       throw error;
     }
@@ -276,22 +294,26 @@ export class TaskWorkerService {
     this.sweepChain = run;
     return run;
   }
-  async execute(request: TaskRequest, token: string): Promise<TaskResponse> {
+  // 서명 뒤 실행 슬롯을 잡는 공통 앞부분. 슬롯은 검사와 같은 틱에 잡아 await 사이에 다른 요청이 끼어들지 못한다.
+  private async claim(operation: 'task_execute' | 'task_v2_execute', request: TaskRequest | TaskV2Request, token: string) {
     if (!this.options.accepting()) throw new TaskRouteError(403, 'worker_closing');
     if (!this.intake.open) throw new TaskRouteError(503, 'intake_closed');
     const context = this.ready();
-    await this.verify('task_execute', token, request);
+    await this.verify(operation, token, request);
     this.assertWorker(request.operation === 'resume' ? request.expectedWorker : null, context.worker);
     if (this.turn || this.sweeps || this.unconfirmed.size) throw new TaskRouteError(409, 'busy');
     const job = this.receipts.job(request.job);
     const receipt = this.receipts.generation(request.job, request.generation);
     if (job && request.generation < job.highest) throw new TaskRouteError(409, 'generation_stale');
     if (receipt && (request.operation === 'start' || receipt.fenced || receipt.finalized || request.turn <= receipt.turn)) throw new TaskRouteError(409, 'fenced');
-    // 슬롯은 위 검사와 같은 틱에 잡는다. 아래 await 사이에 다른 요청이 끼어들지 못한다.
     let finish!: (stopped: boolean) => void;
     const active: ActiveTurn = { job: request.job, lease: request.lease, generation: request.generation, turn: request.turn,
       controller: new AbortController(), done: new Promise<boolean>(resolve => { finish = resolve; }) };
     this.turn = active;
+    return { context, active, finish };
+  }
+  async execute(request: TaskRequest, token: string): Promise<TaskResponse> {
+    const { context, active, finish } = await this.claim('task_execute', request, token);
     try {
       if (!await this.receipts.begin(request.job, request.generation, request.lease, request.turn)) {
         this.intake.close('receipt_write_failed');
@@ -311,6 +333,159 @@ export class TaskWorkerService {
       return { version: 1, job: request.job, lease: request.lease, generation: request.generation, sessionId: request.sessionId, turn: request.turn,
         worker: context.worker, usage: { toolCalls: null, model: null }, status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: false };
     } finally { if (this.turn === active) this.turn = undefined; }
+  }
+  // ---- v2 ----
+
+  private changeRuntime(): TaskChangeRuntime {
+    if (!this.options.change) throw new TaskRouteError(503, 'change_unavailable');
+    return this.options.change;
+  }
+  // 턴을 접수만 하고 돌려준다. 응답을 잃어도 /v2/task/result가 같은 값을 준다. 끝난 결과는 프로세스 소멸 판정이 나온 뒤 먼저 저장하고 슬롯을 놓는다.
+  async changeExecute(request: TaskV2Request, token: string): Promise<TaskV2Accepted> {
+    const change = this.changeRuntime();
+    const { context, active, finish } = await this.claim('task_v2_execute', request, token);
+    const release = (stopped: boolean) => { finish(stopped); if (this.turn === active) this.turn = undefined; };
+    try {
+      if (!await this.receipts.begin(request.job, request.generation, request.lease, request.turn)) {
+        this.intake.close('receipt_write_failed');
+        throw new TaskRouteError(503, 'receipt_write_failed');
+      }
+    } catch (error) { release(true); throw error; }
+    void (async () => {
+      let result: TaskV2TurnResult;
+      let stopped = false;
+      try {
+        result = await change.runTurn(context, request, active.controller.signal);
+        stopped = result.stopped;
+        if (!stopped) this.unconfirmed.add(request.job);
+        if (result.status === 'failed' && result.reason === 'storage_full') void this.probe();
+      } catch {
+        // 깨진 실행은 프로세스가 멈췄다는 증거가 아니다.
+        this.unconfirmed.add(request.job);
+        result = { version: TASK_V2_CONTRACT, job: request.job, lease: request.lease, generation: request.generation, sessionId: request.sessionId, turn: request.turn,
+          worker: context.worker, usage: { toolCalls: null, model: null }, status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: false };
+      }
+      // 저장하지 못하면 재조회가 unknown을 답한다. 결과 없는 성공으로 넘어가지 않는다.
+      await this.results.writeResult(result).catch(() => { this.intake.close('receipt_write_failed'); });
+      release(stopped);
+    })();
+    return { version: TASK_V2_CONTRACT, job: request.job, lease: request.lease, generation: request.generation, sessionId: request.sessionId, worker: context.worker, status: 'accepted', turn: request.turn };
+  }
+  // lease는 그 턴을 시작한 값이다. 게시 서버가 재시작해 job lease가 바뀌어도 세션 행의 값으로 같은 결과를 받는다.
+  private assertLease(job: string, generation: number, lease: string): void {
+    const receipt = this.receipts.generation(job, generation);
+    if (receipt && receipt.lease !== lease) throw new TaskRouteError(409, 'lease_mismatch');
+  }
+  async changeResult(request: TaskV2ResultRequest, token: string): Promise<TaskV2ResultResponse> {
+    const { worker } = this.ready();
+    await this.verify('task_v2_result', token, request);
+    this.assertWorker(request.expectedWorker, worker);
+    this.assertLease(request.job, request.generation, request.lease);
+    const shape = { version: TASK_V2_CONTRACT, job: request.job, lease: request.lease, generation: request.generation, sessionId: request.sessionId, worker };
+    const receipt = this.receipts.generation(request.job, request.generation);
+    const active = this.turn;
+    if (active?.job === request.job && active.generation === request.generation && !active.verifying) return { ...shape, status: 'running', turn: active.turn, stopped: false };
+    if (!receipt) return { ...shape, status: 'absent', finalized: false, stopped: !this.unconfirmed.has(request.job) && !active };
+    if (receipt.finalized) return { ...shape, status: 'absent', finalized: true, stopped: true };
+    const stored = await this.results.readResult(request.job, request.generation).catch(() => null);
+    if (stored && stored.turn === receipt.turn && stored.lease === request.lease) return { ...stored, worker };
+    // 시작을 기록한 턴의 결과가 없다. 재시작 뒤라면 그 프로세스는 없지만 결과도 없다. 모델을 다시 돌리지 않고 그대로 말한다.
+    const gone = !this.unconfirmed.has(request.job) && (!!active || !!this.sweeps || await this.options.survivors(request.job).catch(() => null) === 0);
+    return { ...shape, turn: receipt.turn, usage: { toolCalls: null, model: null }, status: 'unknown', stopped: gone, sessionRetained: true, cleanupPending: receipt.cleanupPending };
+  }
+  private async storedRecord(job: string, generation: number, commandId: string): Promise<VerificationRecord | null> {
+    const raw = await this.results.readVerification(job, generation, commandId).catch(() => null);
+    const parsed = VerificationRecordSchema.safeParse(raw);
+    return parsed.success ? parsed.data : null;
+  }
+  private verificationReply(request: { job: string; lease: string; generation: number; sessionId: string; commandId: string }, worker: TaskWorkerIdentity, record: VerificationRecord | null, running: boolean): TaskV2VerificationResponse {
+    const shape = { version: TASK_V2_CONTRACT, job: request.job, lease: request.lease, generation: request.generation, sessionId: request.sessionId, worker, commandId: request.commandId };
+    if (record) return { ...shape, status: 'done', receipt: record.receipt, log: record.log };
+    return { ...shape, status: running ? 'running' : 'absent' };
+  }
+  // 고정된 결과에서 시험을 돌린다. 턴과 같은 슬롯을 잡아 작성자 프로세스와 겹치지 않고, 취소·상태도 턴과 같게 돈다.
+  // 같은 command의 receipt가 있으면 다시 돌리지 않는다. command는 generation당 한 번이다.
+  async changeVerify(request: TaskV2VerifyRequest, token: string): Promise<TaskV2VerificationResponse> {
+    const change = this.changeRuntime();
+    if (!this.options.accepting()) throw new TaskRouteError(403, 'worker_closing');
+    const { worker, sessions } = this.ready();
+    await this.verify('task_v2_verify', token, request);
+    this.assertWorker(request.expectedWorker, worker);
+    this.assertLease(request.job, request.generation, request.lease);
+    const stored = await this.storedRecord(request.job, request.generation, request.commandId);
+    if (stored) return this.verificationReply(request, worker, stored, false);
+    const active0 = this.turn;
+    if (active0?.job === request.job && active0.generation === request.generation && active0.verifying === request.commandId) return this.verificationReply(request, worker, null, true);
+    if (active0 || this.sweeps || this.unconfirmed.size) throw new TaskRouteError(409, 'busy');
+    const receipt = this.receipts.generation(request.job, request.generation);
+    if (!receipt || receipt.fenced || receipt.finalized) throw new TaskRouteError(409, 'fenced');
+    let finish!: (stopped: boolean) => void;
+    const active: ActiveTurn = { job: request.job, lease: request.lease, generation: request.generation, turn: receipt.turn,
+      controller: new AbortController(), done: new Promise<boolean>(resolve => { finish = resolve; }), verifying: request.commandId };
+    this.turn = active;
+    const release = (stopped: boolean) => { finish(stopped); if (this.turn === active) this.turn = undefined; };
+    let input: VerificationInput;
+    try {
+      const dirs = sessions.paths(request.job, request.generation);
+      const result = await this.results.readResult(request.job, request.generation);
+      const baseline = await readBaseline(dirs);
+      const record = JSON.parse(await readFile(join(dirs.run, 'session.json'), 'utf8')) as { policyRevision: string; base: string; limits: ArchiveLimits };
+      const artifact = result?.status === 'snapshot' ? decodeArtifact(result.artifact, result.artifactDigest) : null;
+      // changeResult와 같은 기준이다. 시작을 기록한 뒤 턴의 결과가 없으면 앞 턴의 snapshot은 지금 결과가 아니다.
+      if (!artifact || result?.status !== 'snapshot' || result.turn !== receipt.turn || !baseline) throw new TaskRouteError(409, 'result_unavailable');
+      input = { job: request.job, generation: request.generation, dirs, commandId: request.commandId, bundle: request.bundle, artifact, artifactDigest: result.artifactDigest,
+        archive: await readFile(join(dirs.run, 'baseline.tar.gz')), limits: record.limits,
+        baseline: { repoId: baseline.repoId, changeGeneration: baseline.changeGeneration, baseCommit: baseline.baseCommit, baseTree: baseline.baseTree, policyRevision: record.policyRevision } };
+    } catch (error) {
+      release(true);
+      if (error instanceof TaskRouteError) throw error;
+      throw new TaskRouteError(409, 'result_unavailable');
+    }
+    void (async () => {
+      let stopped = false;
+      try {
+        const outcome = await change.verifier.run(input, active.controller.signal);
+        // 시험 전에 작성자가 남아 있던 경우도 프로세스가 살아 있을 수 있는 상태다. 슬롯을 다음 턴에 내주지 않는다.
+        stopped = outcome.log.detail !== 'stop_unconfirmed' && outcome.log.detail !== 'author_not_stopped';
+        if (!stopped) this.unconfirmed.add(request.job);
+        await this.results.writeVerification(request.job, request.generation, request.commandId, outcome);
+      } catch { this.unconfirmed.add(request.job); }
+      release(stopped);
+    })();
+    return this.verificationReply(request, worker, null, true);
+  }
+  async changeVerification(request: TaskV2VerificationRequest, token: string): Promise<TaskV2VerificationResponse> {
+    const { worker } = this.ready();
+    await this.verify('task_v2_verification', token, request);
+    this.assertWorker(request.expectedWorker, worker);
+    this.assertLease(request.job, request.generation, request.lease);
+    const record = await this.storedRecord(request.job, request.generation, request.commandId);
+    const active = this.turn;
+    return this.verificationReply(request, worker, record, active?.job === request.job && active.generation === request.generation && active.verifying === request.commandId);
+  }
+  // 저장 ACK. saved는 저장한 artifact digest가 이 작업자의 결과와 같을 때만 지운다. 다르면 게시 서버와 작업자가 다른 결과를 보고 있으므로 아무것도 지우지 않는다.
+  async changeFinalize(request: TaskV2FinalizeRequest, token: string): Promise<TaskV2FinalizeResponse> {
+    const { worker, sessions } = this.ready();
+    await this.verify('task_v2_finalize', token, request);
+    this.assertWorker(request.expectedWorker, worker);
+    const shape = { version: TASK_V2_CONTRACT, job: request.job, lease: request.lease, generation: request.generation, sessionId: request.sessionId, worker };
+    const active = this.turn;
+    if (active?.job === request.job && active.generation === request.generation) return { ...shape, stopped: false, cleaned: false, cleanupPending: false, sessionRetained: true };
+    if (request.receipt.outcome === 'saved') {
+      const stored = await this.results.readResult(request.job, request.generation).catch(() => null);
+      const gone = this.receipts.generation(request.job, request.generation)?.finalized === true;
+      if (!gone && (stored?.status !== 'snapshot' || stored.artifactDigest !== request.receipt.artifactDigest)) throw new TaskRouteError(409, 'digest_mismatch');
+    }
+    const removed = await this.removeGeneration(request, sessions, active);
+    return { ...shape, stopped: removed.stopped, cleaned: removed.cleaned, cleanupPending: removed.stopped && !removed.cleaned, sessionRetained: !removed.cleaned };
+  }
+  private async removeGeneration(request: { job: string; generation: number }, sessions: TaskSessions, active: ActiveTurn | undefined): Promise<{ stopped: boolean; cleaned: boolean }> {
+    const removed = await sessions.finalize(request.job, request.generation,
+      async () => active ? !this.unconfirmed.has(request.job) : this.sweep(request.job));
+    if (removed.stopped && !await this.receipts.note(request.job, request.generation,
+      { fenced: true, finalized: removed.cleaned, cleanupPending: !removed.cleaned })) this.intake.close('receipt_write_failed');
+    if (removed.cleaned) await this.results.remove(request.job, request.generation).catch(() => {});
+    return removed;
   }
   // 옛 lease의 취소는 지금 세대를 막지 않는다. 그 턴은 이미 끝났고 뒤 턴이 새 lease로 돌 수 있다.
   private async fence(request: TaskCancelRequest): Promise<void> {
@@ -370,10 +545,9 @@ export class TaskWorkerService {
     const shape = { version: 1 as const, job: request.job, lease: request.lease, generation: request.generation, sessionId: request.sessionId, worker };
     const active = this.turn;
     if (active?.job === request.job && active.generation === request.generation) return { ...shape, stopped: false, cleaned: false, cleanupPending: false, sessionRetained: true };
-    const removed = await sessions.finalize(request.job, request.generation,
-      async () => active ? !this.unconfirmed.has(request.job) : this.sweep(request.job));
-    if (removed.stopped && !await this.receipts.note(request.job, request.generation,
-      { fenced: true, finalized: removed.cleaned, cleanupPending: !removed.cleaned })) this.intake.close('receipt_write_failed');
+    // v1 경로의 "성공"은 v1 결과의 영수증이다. 저장 ACK를 받지 못한 v2 결과를 이 길로 지우지 않는다. 실패·취소의 정리는 결과를 버리기로 정한 뒤라 통과한다.
+    if (request.receipt.outcome === 'succeeded' && (await this.results.readResult(request.job, request.generation).catch(() => null))?.status === 'snapshot') throw new TaskRouteError(409, 'result_unacknowledged');
+    const removed = await this.removeGeneration(request, sessions, active);
     return { ...shape, stopped: removed.stopped, cleaned: removed.cleaned, cleanupPending: removed.stopped && !removed.cleaned, sessionRetained: !removed.cleaned };
   }
   // 종료 신호. 준비 중인 턴까지 멈추고 그 응답이 나가길 기다린다.

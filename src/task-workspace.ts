@@ -526,7 +526,7 @@ function classifyChanges(changed: readonly string[], before: Snapshot, after: Sn
 }
 
 // echoesSecret과 같은 기준(영숫자만 남겨 16자 조각 비교)을 조각으로 흘려 잰다. 변경 파일은 메모리에 다 올리기엔 클 수 있다.
-class SecretScanner {
+export class SecretScanner {
   private readonly windows: string[] = [];
   private tail = '';
   private hit = false;

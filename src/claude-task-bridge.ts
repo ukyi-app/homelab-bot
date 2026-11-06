@@ -1,4 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { decodeArtifact } from './change-artifact.js';
+import { labelAllowsAuthorInput } from './change-contracts.js';
+import type { AuthorResult, ChangeArtifactPort, ChangeAuthorPort, ChangeBrief, ChangeKey, ProvenanceLabel } from './change-contracts.js';
+import type { ChangeVerificationControl, ChangeVerificationWorker } from './change-verifier.js';
 import { Denied, PolicyUnavailable, DEFAULTS } from './contracts.js';
 import type { Job, Scope } from './contracts.js';
 import { bounded } from './format.js';
@@ -10,8 +14,9 @@ import type { TaskLane } from './runtime.js';
 import type { Store } from './store.js';
 import { FOREIGN_SESSION_STATUS, TaskBridge, TaskWorkerRejected } from './task-bridge.js';
 import type { TaskStatus, TaskWorkerPort } from './task-bridge.js';
-import { TASK_ENDPOINTS, TASK_INSTRUCTIONS_REVISION, TASK_LIMITS, TASK_RETENTION, taskQuestionId } from './task-contracts.js';
-import type { TaskCancelResponse, TaskRequest, TaskResponse, TaskStatusResponse, TaskWorkerIdentity } from './task-contracts.js';
+import type { TaskV2WorkerPort } from './task-http.js';
+import { TASK_ENDPOINTS, TASK_INSTRUCTIONS_REVISION, TASK_LIMITS, TASK_RETENTION, TASK_V2_CONTRACT, TASK_V2_ENDPOINTS, TASK_V2_REQUEST_CHARS, taskQuestionId } from './task-contracts.js';
+import type { BaselineLeaf, TaskCancelResponse, TaskRequest, TaskResponse, TaskStatusResponse, TaskV2Request, TaskV2TurnResult, TaskV2VerificationResponse, TaskWorkerIdentity } from './task-contracts.js';
 
 // 작업 레인(Claude)의 게시 서버 쪽 턴 조율. 한 run이 /v1/task 한 번, 곧 한 턴이다. 작업자 호출은 TaskWorkerPort로만 한다.
 // 결과는 프로세스 소멸 확인을 전제로만 확정하고, 확인을 못 하면 unknown으로 두어 작업 레인의 새 접수를 닫는다.
@@ -56,9 +61,12 @@ interface SessionRow {
   run_budget_ms: string | number | null; run_used_ms: string | number; session_retained: boolean; cleanup_state: 'none' | 'pending' | 'cleaned';
   state: string; updated_at: string | number; wait_reason: 'model_limit' | 'auth_expired' | null;
   waiting_since: string | number | null; owner_confirm_requested_at: string | number | null;
+  capabilities?: unknown;
   // 턴을 시작할 때만 함께 읽는다. 답했지만 아직 이어 가지 않은 질문이다.
   question_id?: string | null; question_answer?: string | null;
 }
+const parseCapabilities = (session: Pick<SessionRow, 'capabilities'>) =>
+  (typeof session.capabilities === 'string' ? JSON.parse(session.capabilities) : session.capabilities) as { version?: number; artifactDigest?: string } | null | undefined;
 type Stop = 'cancel' | 'revoked' | 'lease' | 'timeout' | 'shutdown' | 'monitor';
 // 턴의 결말. rejected는 시작하지 않았다는 증거, lost는 응답을 못 받아 시작 여부를 모르는 경우다.
 type Turn = { kind: 'response'; response: TaskResponse } | { kind: 'rejected' } | { kind: 'lost' };
@@ -97,7 +105,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
   // 정리 재시도 시각. 잃어도 다음 sweep이 바로 다시 시도할 뿐이라 메모리에 둔다.
   private readonly nextFinalize = new Map<string, number>();
   constructor(store: Store, gate: PolicyGate, private readonly worker: TaskWorkerPort, private readonly plans: TaskPlanSource,
-    options: Partial<ClaudeTaskBridgeOptions> = {}) {
+    options: Partial<ClaudeTaskBridgeOptions> = {}, private readonly change?: TaskV2WorkerPort) {
     const merged = { ...CLAUDE_TASK_DEFAULTS, ...options };
     super(store, gate, TEXT, merged);
     this.options = merged;
@@ -172,6 +180,11 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       await this.giveUp(job, session, 'task_session_mismatch', store => store.fail(job, 'task_session_mismatch'));
       return;
     }
+    // CHANGE 작성 세션을 v1로 이으면 artifact 없는 "완료"가 된다. 그 job은 ClaudeChangeAuthor로만 잇는다.
+    if (session && parseCapabilities(session)?.version === TASK_V2_CONTRACT) {
+      await this.giveUp(job, session, 'task_session_mismatch');
+      return;
+    }
     const event = (await this.store.db.query<{ payload: { text: string } }>('SELECT payload FROM events WHERE id=$1', [job.event_id])).rows[0]!;
     const plan = await this.plans.plan(job, policy, event.payload.text);
     const waiting = session?.state === 'waiting_answer' || session?.state === 'waiting_model';
@@ -227,8 +240,31 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       ...(prior.question_id ? { questionId: prior.question_id, untrusted: { answer: prior.question_answer } } : {}),
     } : { ...shape, operation: 'start', turn, generation: (session?.generation ?? 0) + 1, sessionId: randomUUID(), untrusted: { request: text } });
   }
+  // v2 턴의 저장. 시작·재개의 CAS와 응답 해석을 v1과 한 벌로 쓴다. v2는 응답을 기다리지 않아 결과 확정이 다른 시점에 일어난다.
+  beginChangeTurn(job: Job, request: TaskV2Request, session: SessionRow | undefined): Promise<'started' | 'stale' | 'conflict'> {
+    return this.begin(job, request, session, { version: TASK_V2_CONTRACT, lane: 'task', tool_approval_relay: false });
+  }
+  // snapshot 외의 턴 결말을 v1과 같은 규칙으로 확정한다.
+  settleChangeTurn(job: Job, session: SessionRow, result: Exclude<TaskV2TurnResult, { status: 'snapshot' }> | null, stop?: Stop): Promise<Settled> {
+    const request = { operation: session.turn > 1 ? 'resume' : 'start', lease: session.worker_lease!, generation: session.generation!, sessionId: session.claude_session_id!, turn: session.turn } as unknown as TaskRequest;
+    const usedMs = this.store.now() - Number(session.updated_at);
+    if (!result) return this.settle(job, request, job.revision.policy, { kind: 'rejected' }, { stopped: true, retained: session.turn > 1, cleanupPending: false, worker: null, tools: 0 }, stop, usedMs);
+    const facts: Facts = { stopped: result.stopped, retained: result.sessionRetained, cleanupPending: result.cleanupPending, worker: result.worker, tools: result.usage.toolCalls };
+    return this.settle(job, request, job.revision.policy, { kind: 'response', response: result as unknown as TaskResponse }, facts, stop, usedMs);
+  }
+  reportChangeEnd(job: string, settled: Settled): void { if (settled.end) this.report(job, settled.end); }
+  finalizeChangeSession(job: string): Promise<void> { return this.finalizeJob(job); }
+  cancelChangeTurn(session: SessionRow, job: string): Promise<CancelFacts | null> {
+    const expected = session.worker_instance && session.worker_storage ? { instance: session.worker_instance, storage: session.worker_storage } : null;
+    return this.cancelTurn(this.control(job, session, expected));
+  }
+  statusOfChange(job: string, session: SessionRow): Promise<TaskStatusResponse> { return this.statusOf(job, session); }
+  async bindChangeWorker(jobId: string, session: SessionRow, worker: TaskWorkerIdentity): Promise<void> {
+    await this.store.db.query(`UPDATE codex_sessions SET ${bindWorker('$2', '$3')},updated_at=updated_at WHERE job_id=$1 AND generation=$4 AND claude_session_id=$5`,
+      [jobId, worker.instance, worker.storage, session.generation, session.claude_session_id]);
+  }
   // 턴을 세션에 고정한다. 대기→실행 CAS라 같은 세션의 재개가 겹쳐도 하나만 띄운다.
-  private async begin(job: Job, request: TaskRequest, session: SessionRow | undefined): Promise<'started' | 'stale' | 'conflict'> {
+  private async begin(job: Job, request: TaskRequest | TaskV2Request, session: SessionRow | undefined, capabilities: object = { version: 1, lane: 'task', tool_approval_relay: false }): Promise<'started' | 'stale' | 'conflict'> {
     return this.store.atomic(async store => {
       await store.lockTaskControl(job.conversation_id);
       const row = (await store.db.query<{ state: string; lease_token: string; lease_until: string }>(
@@ -246,7 +282,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
           owner_confirm_requested_at=NULL,wait_reason=NULL,worker_instance=NULL,worker_storage=NULL
           WHERE codex_sessions.executor='claude' AND codex_sessions.state NOT IN ('running','waiting_answer','waiting_model','unknown')
           AND NOT codex_sessions.session_retained AND codex_sessions.cleanup_state<>'pending' RETURNING job_id`,
-        [job.id, request.sessionId, request.repository, JSON.stringify({ version: 1, lane: 'task', tool_approval_relay: false }), now,
+        [job.id, request.sessionId, request.repository, JSON.stringify(capabilities), now,
           request.generation, request.lease, request.base, request.policyRevision, request.project.id, request.project.revision,
           request.timeoutMs, request.runBudgetRemainingMs]);
         if (!written.rows.length) return 'conflict';
@@ -557,6 +593,16 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     if (cleaned || waitingClean) this.nextFinalize.delete(jobId);
   }
   private async finalizeTurn(job: string, session: SessionRow, worker: TaskWorkerIdentity): Promise<boolean> {
+    // v2 세션의 저장 ACK. 저장한 결과가 있으면 그 digest로, 결과 없이 끝났으면 버린다고 말한다. 저장 없이 이 줄에 올 수 있는 행은 completed가 아니다.
+    const capabilities = parseCapabilities(session);
+    if (capabilities?.version === TASK_V2_CONTRACT) {
+      if (!this.change) throw new Error('change_worker_unavailable');
+      const saved = session.state === 'completed' && capabilities.artifactDigest ? { outcome: 'saved' as const, artifactDigest: capabilities.artifactDigest } : { outcome: 'discarded' as const };
+      const body = TASK_V2_ENDPOINTS['/v2/task/finalize'].request.parse({ ...this.control(job, session, worker), version: TASK_V2_CONTRACT, receipt: { ...saved, persistedAt: Number(session.updated_at) } });
+      const { response: raw } = await this.change.callV2('/v2/task/finalize', body);
+      const response = echoed(body, TASK_V2_ENDPOINTS['/v2/task/finalize'].response.parse(raw));
+      return response.stopped && response.cleaned && response.worker.storage === worker.storage;
+    }
     const outcome = session.state === 'completed' ? 'succeeded' : session.state === 'cancelled' ? 'cancelled' : 'failed';
     const digestRow = outcome === 'succeeded' ? (await this.store.db.query<{ digest: string | null }>(`SELECT evidence->>'resultDigest' AS digest FROM results WHERE job_id=$1`, [job])).rows[0] : undefined;
     const body = TASK_ENDPOINTS['/v1/task/finalize'].request.parse({ ...this.control(job, session, worker), disposition: 'terminal',
@@ -614,5 +660,208 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       const status = await this.statusOf(job, session);
       return status.stopped && status.worker.storage === session.worker_storage;
     } catch { return false; }
+  }
+}
+
+// ---- CHANGE_PR 작성 port ----
+
+export const CHANGE_RECEIPT = /^v2:([0-9a-f-]{36}):([1-9]\d*)$/;
+const changeReceipt = (job: string, generation: number) => `v2:${job}:${generation}`;
+// 공개 brief만 모델에 준다. 사용자 원문(ChangePrivateInputs)을 읽지 않는다.
+export function renderChangeBrief(brief: ChangeBrief): string {
+  const text = [`요약: ${brief.summary}`, `목표: ${brief.goal}`, '인수 조건:', ...brief.acceptanceCriteria.map(item => `- ${item}`)].join('\n');
+  if (text.length > TASK_V2_REQUEST_CHARS) throw new Error('change_brief_too_long');
+  return text;
+}
+export interface ChangeAuthorPlan {
+  // 이미 claim되어 running이고 lease를 쥔 자식 job. change_child_jobs에 author로 묶은 뒤 넘긴다.
+  job: Job;
+  repository: string; project: TaskRequest['project']; limits: TaskRequest['limits'];
+  // API로 읽어 완결을 확인한 T0의 잎 전체. 잘린 tree를 넘기지 않는다.
+  baseline: readonly BaselineLeaf[];
+}
+export interface ChangeAuthorSource {
+  plan(input: Parameters<ChangeAuthorPort['start']>[0]): Promise<ChangeAuthorPlan>;
+  // 재개 턴의 프로젝트 정책과 상한. 세션의 고정값과 대조한다.
+  settings(jobId: string): Promise<Pick<ChangeAuthorPlan, 'project' | 'limits'>>;
+  // 재개 때 claim된 자식 job. 없으면 슬롯을 잡지 않은 것이라 띄우지 않는다.
+  claimed(jobId: string): Promise<Job | null>;
+  // change generation의 작성 job.
+  authorJob(key: ChangeKey): Promise<string | null>;
+  keyOf(jobId: string): Promise<ChangeKey | null>;
+}
+export interface ChangeAuthorDeps { bridge: ClaudeTaskBridge; store: Store; gate: PolicyGate; worker: TaskV2WorkerPort; source: ChangeAuthorSource; artifacts: ChangeArtifactPort }
+const TERMINAL_SESSION = new Set(['completed', 'failed', 'cancelled']);
+// 작업자 v2 경로. 세션 행을 v1과 같은 표에 두어 레인 닫힘·보존 칸·소멸 확인이 같은 규칙으로 돈다. receipt는 job·세션 세대이고 나머지는 그 행에서 읽는다.
+// 저장 전에 작업자 결과를 지우지 않는다: 세션은 저장 ACK 전까지 running이라 v1 정리 sweep이 건드리지 않는다.
+export class ClaudeChangeAuthor implements ChangeAuthorPort {
+  constructor(private readonly deps: ChangeAuthorDeps) {}
+  supportsV2(): Promise<boolean> { return this.deps.worker.supportsChange().catch(() => false); }
+  private async session(jobId: string, generation?: number): Promise<SessionRow | undefined> {
+    const row = (await this.deps.store.db.query<SessionRow>(`SELECT * FROM codex_sessions WHERE job_id=$1 AND executor='claude'`, [jobId])).rows[0];
+    return row && (generation === undefined || row.generation === generation) ? row : undefined;
+  }
+  private parse(receiptId: string): { job: string; generation: number } {
+    const match = CHANGE_RECEIPT.exec(receiptId);
+    if (!match) throw new Error('change_receipt_invalid');
+    return { job: match[1]!, generation: Number(match[2]) };
+  }
+  private async jobRow(id: string): Promise<Job> { return (await this.deps.store.db.query<Job>('SELECT * FROM jobs WHERE id=$1', [id])).rows[0]!; }
+  private async send(job: Job, session: SessionRow | undefined, request: TaskV2Request): Promise<void> {
+    const begun = await this.deps.bridge.beginChangeTurn(job, request, session);
+    if (begun !== 'started') throw new Error(`change_turn_${begun}`);
+    try {
+      const { response } = await this.deps.worker.callV2('/v2/task', request);
+      const accepted = TASK_V2_ENDPOINTS['/v2/task'].response.safeParse(response);
+      if (accepted.success && accepted.data.job === request.job && accepted.data.turn === request.turn) {
+        await this.deps.bridge.bindChangeWorker(job.id, { generation: request.generation, claude_session_id: request.sessionId } as SessionRow, accepted.data.worker);
+      }
+    } catch (error) {
+      // 시작하지 않았다는 증거면 그 턴을 닫는다. 그 밖은 시작 여부를 모른다. 다시 보내지 않고 fetchResult가 작업자에게 묻는다.
+      if (!(error instanceof TaskWorkerRejected)) return;
+      const row = await this.session(job.id, request.generation);
+      if (row) this.deps.bridge.reportChangeEnd(job.id, await this.deps.bridge.settleChangeTurn(job, row, null));
+    }
+  }
+  async start(input: Parameters<ChangeAuthorPort['start']>[0]): Promise<{ receiptId: string }> {
+    if (!labelAllowsAuthorInput(input.brief.label)) throw new Error('label_blocked');
+    const plan = await this.deps.source.plan(input);
+    const { job } = plan;
+    await this.deps.gate.authorize(job.owner_id, job.target);
+    const prior = await this.session(job.id);
+    if (prior && !TERMINAL_SESSION.has(prior.state)) throw new Error('change_session_active');
+    const generation = (prior?.generation ?? 0) + 1;
+    const timeoutMs = Math.min(job.budget.timeoutMs, TASK_LIMITS.turnTimeoutMs);
+    const request = TASK_V2_ENDPOINTS['/v2/task'].request.parse({ version: TASK_V2_CONTRACT, lane: 'task', job: job.id, lease: job.lease_token, generation, policyRevision: input.policyRevision,
+      instructions: TASK_INSTRUCTIONS_REVISION, sessionId: randomUUID(), repository: plan.repository, base: input.baseCommit, project: plan.project, timeoutMs,
+      runBudgetRemainingMs: TASK_LIMITS.runBudgetMs, toolCalls: Math.min(job.budget.toolCalls, TASK_LIMITS.toolCalls), limits: plan.limits, operation: 'start', turn: 1,
+      baseline: { repoId: input.target.repoId, changeGeneration: input.target.key.generation, baseTree: input.baseTree, leaves: plan.baseline },
+      untrusted: { request: renderChangeBrief(input.brief) } });
+    await this.send(job, prior, request);
+    return { receiptId: changeReceipt(job.id, generation) };
+  }
+  async resume(input: { receiptId: string; answer: string; label: ProvenanceLabel }): Promise<void> {
+    if (!labelAllowsAuthorInput(input.label)) throw new Error('label_blocked');
+    const { job: jobId, generation } = this.parse(input.receiptId);
+    const session = await this.session(jobId, generation);
+    if (!session || (session.state !== 'waiting_answer' && session.state !== 'waiting_model')) throw new Error('change_session_not_waiting');
+    const job = await this.deps.source.claimed(jobId);
+    if (!job) throw new Error('change_job_not_claimed');
+    const policy = await this.deps.gate.authorize(job.owner_id, job.target);
+    if (policy.revision !== session.policy_revision) throw new Error('change_policy_changed');
+    const status = await this.deps.bridge.statusOfChange(jobId, session);
+    if (status.worker.storage !== session.worker_storage || status.state !== 'waiting' || !status.sessionExists || !status.stopped) throw new Error('change_session_missing');
+    const question = (await this.deps.store.db.query<{ id: string }>(`SELECT id FROM codex_questions WHERE job_id=$1 AND thread_id=$2 AND state='answered'`, [jobId, session.claude_session_id])).rows[0];
+    if (session.state === 'waiting_answer' && !question) throw new Error('change_question_not_answered');
+    const remaining = Number(session.run_budget_ms) - Number(session.run_used_ms);
+    if (remaining <= 0) throw new Error('change_run_budget_exhausted');
+    const toolCalls = Math.min(job.budget.toolCalls - (session.tool_calls ?? 0), TASK_LIMITS.toolCalls);
+    if (session.tool_calls === null || toolCalls <= 0) throw new Error('change_tool_budget_exhausted');
+    const plan = await this.deps.source.settings(jobId);
+    if (plan.project.id !== session.project_id || plan.project.revision !== session.project_revision) throw new Error('change_session_mismatch');
+    const request = TASK_V2_ENDPOINTS['/v2/task'].request.parse({ version: TASK_V2_CONTRACT, lane: 'task', job: jobId, lease: job.lease_token, generation, policyRevision: session.policy_revision,
+      instructions: TASK_INSTRUCTIONS_REVISION, sessionId: session.claude_session_id, repository: session.repository, base: session.base_sha, project: plan.project,
+      timeoutMs: Math.min(job.budget.timeoutMs, TASK_LIMITS.turnTimeoutMs, remaining), runBudgetRemainingMs: remaining, toolCalls, limits: plan.limits,
+      operation: 'resume', turn: session.turn + 1, expectedWorker: status.worker, resumeReason: session.state === 'waiting_answer' ? 'clarification' : session.wait_reason,
+      ...(question ? { questionId: question.id, untrusted: { answer: input.answer, label: input.label } } : {}) });
+    await this.send(job, session, request);
+  }
+  async cancel(receiptId: string): Promise<void> {
+    const { job, generation } = this.parse(receiptId);
+    const session = await this.session(job, generation);
+    if (!session) return;
+    await this.deps.bridge.cancelChangeTurn(session, job);
+  }
+  private cancelledOrFailed(session: SessionRow, code: string | null): AuthorResult {
+    return session.state === 'cancelled' ? { kind: 'cancelled', code: code ?? 'cancelled' } : { kind: 'failed', code: code ?? 'task_failed' };
+  }
+  async fetchResult(receiptId: string): Promise<AuthorResult> {
+    const { job: jobId, generation } = this.parse(receiptId);
+    const session = await this.session(jobId, generation);
+    if (!session) return { kind: 'unknown', code: 'session_missing' };
+    const job = await this.jobRow(jobId);
+    if (TERMINAL_SESSION.has(session.state)) return session.state === 'completed' ? { kind: 'failed', code: 'already_finalized' } : this.cancelledOrFailed(session, (job as unknown as { wait_reason: string | null }).wait_reason);
+    const expected = session.worker_instance && session.worker_storage ? { instance: session.worker_instance, storage: session.worker_storage } : null;
+    const body = { version: TASK_V2_CONTRACT, job: jobId, lease: session.worker_lease!, generation, sessionId: session.claude_session_id!, expectedWorker: expected };
+    let raw: { response: unknown; bytes: number };
+    // 파드가 바뀌면 instance가 달라 거부된다. 같은 저장소면 같은 결과이므로 저장소를 대조하는 쪽으로 다시 묻는다.
+    try { raw = await this.deps.worker.callV2('/v2/task/result', body); }
+    catch (error) {
+      if (!(error instanceof TaskWorkerRejected) || !expected) return { kind: 'unknown', code: 'worker_unreachable' };
+      try { raw = await this.deps.worker.callV2('/v2/task/result', { ...body, expectedWorker: null }); }
+      catch { return { kind: 'unknown', code: 'worker_unreachable' }; }
+    }
+    const parsed = TASK_V2_ENDPOINTS['/v2/task/result'].response.safeParse(raw.response);
+    if (!parsed.success || parsed.data.job !== jobId || parsed.data.lease !== session.worker_lease || parsed.data.generation !== generation || parsed.data.sessionId !== session.claude_session_id) {
+      return { kind: 'unknown', code: 'response_invalid' };
+    }
+    const result = parsed.data;
+    // 다른 저장소의 답은 이 세션의 사실이 아니다.
+    if (session.worker_storage && result.worker.storage !== session.worker_storage) return { kind: 'unknown', code: 'worker_storage_changed' };
+    if (result.status === 'running') { await this.deps.store.heartbeat(job).catch(() => {}); return { kind: 'running' }; }
+    if (result.status === 'absent') return { kind: 'unknown', code: result.finalized ? 'already_finalized' : 'start_unconfirmed' };
+    if (result.turn !== session.turn) return { kind: 'unknown', code: 'turn_mismatch' };
+    if (result.status === 'snapshot') {
+      const artifact = decodeArtifact(result.artifact, result.artifactDigest);
+      if (!artifact) return { kind: 'unknown', code: 'artifact_response_invalid' };
+      await this.deps.bridge.bindChangeWorker(jobId, session, result.worker);
+      await this.deps.store.heartbeat(job).catch(() => {});
+      return { kind: 'snapshot', artifact, transportBytes: raw.bytes };
+    }
+    const stop = result.status === 'failed' && result.reason === 'aborted' ? 'cancel' as const : undefined;
+    this.deps.bridge.reportChangeEnd(jobId, await this.settled(job, session, result, stop));
+    if (result.status === 'needs_input') return { kind: 'needs_input', question: result.question };
+    if (result.status === 'failed') return stop ? { kind: 'cancelled', code: 'aborted' } : { kind: 'failed', code: result.reason };
+    if (result.status === 'unknown') return { kind: 'unknown', code: 'stop_unconfirmed' };
+    return { kind: 'unknown', code: result.status === 'limited' ? 'model_limit' : 'auth_expired' };
+  }
+  private async settled(job: Job, session: SessionRow, result: Exclude<TaskV2TurnResult, { status: 'snapshot' }>, stop?: 'cancel') {
+    const settled = await this.deps.bridge.settleChangeTurn(job, session, result, stop);
+    if (settled.terminal) await this.deps.bridge.finalizeChangeSession(job.id).catch(() => {});
+    return settled;
+  }
+  // 저장을 확인한 뒤에만 작업자 결과를 지운다. 저장한 digest를 세션 행에 먼저 남겨, 정리 응답을 잃어도 sweep이 같은 ACK로 다시 보낸다.
+  async finalize(receiptId: string): Promise<void> {
+    const { job: jobId, generation } = this.parse(receiptId);
+    const session = await this.session(jobId, generation);
+    if (!session) throw new Error('session_missing');
+    if (session.state === 'completed') { await this.deps.bridge.finalizeChangeSession(jobId); return; }
+    const key = await this.deps.source.keyOf(jobId);
+    const saved = key ? await this.deps.artifacts.load(key) : null;
+    if (!saved) throw new Error('artifact_not_saved');
+    const job = await this.jobRow(jobId);
+    await this.deps.store.atomic(async store => {
+      await store.lockTaskControl(job.conversation_id);
+      const moved = await store.db.query(`UPDATE codex_sessions SET state='completed',stopped=true,updated_at=$2,capabilities=$3 WHERE job_id=$1 AND generation=$4 AND claude_session_id=$5 AND state='running' RETURNING job_id`,
+        [jobId, store.now(), JSON.stringify({ version: TASK_V2_CONTRACT, lane: 'task', tool_approval_relay: false, artifactDigest: saved.artifactDigest }), generation, session.claude_session_id]);
+      if (!moved.rows.length) throw new Error('change_session_conflict');
+      await store.transition(job, 'succeeded', 'change_author_saved');
+      await store.syncTaskLane();
+    });
+    await this.deps.bridge.finalizeChangeSession(jobId);
+  }
+  // 검증 port가 같은 세션을 가리키게 한다.
+  async verificationControl(key: ChangeKey): Promise<ChangeVerificationControl | null> {
+    const jobId = await this.deps.source.authorJob(key);
+    const session = jobId ? await this.session(jobId) : undefined;
+    if (!jobId || !session?.worker_lease || !session.claude_session_id || !session.generation) return null;
+    return { job: jobId, lease: session.worker_lease, generation: session.generation, sessionId: session.claude_session_id,
+      worker: session.worker_instance && session.worker_storage ? { instance: session.worker_instance, storage: session.worker_storage } : null };
+  }
+  async verificationKeepalive(key: ChangeKey): Promise<void> {
+    const jobId = await this.deps.source.authorJob(key);
+    if (jobId) await this.deps.store.heartbeat(await this.jobRow(jobId));
+  }
+  // WorkerChangeVerification에 넘기는 호출 묶음.
+  verificationWorker(): ChangeVerificationWorker {
+    const call = async (endpoint: '/v2/task/verify' | '/v2/task/verification', body: object): Promise<TaskV2VerificationResponse> => {
+      const { response } = await this.deps.worker.callV2(endpoint, body as never);
+      return TASK_V2_ENDPOINTS[endpoint].response.parse(response);
+    };
+    const ids = (control: ChangeVerificationControl) => ({ version: TASK_V2_CONTRACT, job: control.job, lease: control.lease, generation: control.generation, sessionId: control.sessionId });
+    return {
+      verify: (control, commandId, bundle) => call('/v2/task/verify', { ...ids(control), expectedWorker: control.worker, commandId, bundle }),
+      verification: (control, commandId) => call('/v2/task/verification', { ...ids(control), expectedWorker: control.worker, commandId }),
+    };
   }
 }

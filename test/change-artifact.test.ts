@@ -1,0 +1,568 @@
+import { after, test } from 'node:test';
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { chmod, link, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { ChangeStoreArtifacts, collectArtifact, compareBaseline, decodeArtifact, encodeArtifact, gitTreeSha } from '../src/change-artifact.js';
+import type { ChangeBaseline } from '../src/change-artifact.js';
+import { ARTIFACT_LIMITS, artifactDigest, gitBlobSha, sha256Hex } from '../src/change-contracts.js';
+import type { ChangeKey } from '../src/change-contracts.js';
+import type { Database } from '../src/database.js';
+import { ChangeStore } from '../src/change-store.js';
+import { ClaudeChangeAuthor, ClaudeTaskBridge, renderChangeBrief } from '../src/claude-task-bridge.js';
+import type { ChangeAuthorSource } from '../src/claude-task-bridge.js';
+import { fileWorkspace } from '../src/codex-workspace.js';
+import type { Job } from '../src/contracts.js';
+import type { RunDirs } from '../src/executor.js';
+import { TASK_ENDPOINTS, TASK_V2_ENDPOINTS, TaskV2RequestSchema } from '../src/task-contracts.js';
+import { TaskWorkerRejected } from '../src/task-bridge.js';
+import { HttpTaskV2Worker, taskWorkerChangeContract } from '../src/task-http.js';
+import { parseTaskArchive } from '../src/task-workspace.js';
+import type { TaskEvidence } from '../src/task-workspace.js';
+import { BASE_ITEMS, baseTreeOf, changeWorkerFixture, identity, leavesOf, settledResult } from './change-worker-harness.js';
+import type { ChangeWorkerFixture } from './change-worker-harness.js';
+import { REPO_ID, fixtureBrief, git } from './change-store-fixture.js';
+import { fixture as dbFixture, localDatabase, thread } from './helpers.js';
+import { FakeTaskWorker, PLAN, task } from './task-lane-fixture.js';
+import { LIMITS, SHA, archive } from './task-fixtures.js';
+import type { TarItem } from './task-fixtures.js';
+import { QUESTION, COMPLETED } from './task-worker-harness.js';
+
+const scratch = await realpath(await mkdtemp(join(tmpdir(), 't19-artifact-')));
+after(async () => { await rm(scratch, { recursive: true, force: true }); });
+let counter = 0;
+const gitEnv = { PATH: process.env.PATH ?? '/usr/bin:/bin', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', HOME: scratch };
+
+const parsed = (items: readonly TarItem[]) => parseTaskArchive(archive(items), { files: LIMITS.files, fileBytes: LIMITS.fileBytes });
+async function baselineFor(items: readonly TarItem[]): Promise<ChangeBaseline> {
+  const result = compareBaseline(await parsed(items), { repoId: 1, changeGeneration: 1, base: SHA, baseTree: baseTreeOf(items), leaves: leavesOf(items) });
+  assert.ok(result.ok);
+  return result.value;
+}
+// 실제 실행과 같은 자리의 작업 공간. 기준 해시를 남기고 바꾼 뒤 수집한다.
+async function workspace(items: readonly TarItem[], change: (dir: string) => Promise<void>) {
+  const root = join(scratch, `w${++counter}`);
+  const dirs: RunDirs = { root, home: join(root, 'home'), config: join(root, 'config'), workspace: join(root, 'workspace'), run: join(root, 'run'), tmp: join(root, 'tmp') };
+  for (const dir of [dirs.home, dirs.config, dirs.workspace, dirs.run, dirs.tmp]) await mkdir(dir, { recursive: true });
+  for (const item of items) {
+    const path = join(dirs.workspace, item.name);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, item.data ?? '', { mode: item.mode ?? 0o644 });
+    await chmod(path, item.mode ?? 0o644);
+  }
+  await writeFile(join(dirs.run, 'baseline.json'), JSON.stringify(await fileWorkspace.snapshot(dirs.workspace)));
+  await change(dirs.workspace);
+  return dirs;
+}
+const patchOf = (text = 'patch\n'): TaskEvidence['patch'] => ({ text, bytes: Buffer.byteLength(text), digest: sha256Hex(Buffer.from(text)), truncated: false });
+const collect = async (change: (dir: string) => Promise<void>, items: readonly TarItem[] = BASE_ITEMS, patch = patchOf()) =>
+  collectArtifact({ dirs: await workspace(items, change), baseline: await baselineFor(items), patch });
+
+test('T1 계산: 실제 git write-tree와 같은 SHA다(디렉터리 정렬 함정 포함)', async () => {
+  const dir = join(scratch, 'tree');
+  await mkdir(join(dir, 'a'), { recursive: true });
+  const files: Record<string, string> = { 'a.b': '1', 'a/b': '2', a0: '3', 'z/y/x.txt': '4', 'run.sh': '#!/bin/sh\n' };
+  for (const [path, data] of Object.entries(files)) { await mkdir(dirname(join(dir, path)), { recursive: true }); await writeFile(join(dir, path), data); }
+  await chmod(join(dir, 'run.sh'), 0o755);
+  const git_ = (...args: string[]) => execFileSync('git', args, { cwd: dir, env: gitEnv, encoding: 'utf8' }).trim();
+  git_('init', '-q'); git_('add', '--all');
+  const leaves = Object.entries(files).map(([path, data]) => ({ path, mode: path === 'run.sh' ? '100755' : '100644', blobSha: gitBlobSha(Buffer.from(data)) }));
+  assert.equal(gitTreeSha(leaves), git_('write-tree'));
+  assert.throws(() => gitTreeSha([{ path: 'a', mode: '100644', blobSha: git('x') }, { path: 'a/b', mode: '100644', blobSha: git('y') }]), /file_directory/);
+});
+
+test('T0 대조: 압축본과 게시 서버 값이 같으면 통과한다', async () => {
+  const baseline = await baselineFor(BASE_ITEMS);
+  assert.deepEqual(baseline.entries.map(entry => [entry.path, entry.mode]), [['README.md', '100644'], ['src/app.txt', '100644'], ['src/old.txt', '100644'], ['src/run.sh', '100755']]);
+});
+
+test('T0 대조 음성: 압축본에서 빠진 파일(export-ignore)·바뀐 내용·모드·tree 불일치는 모델을 띄우기 전에 닫는다', async () => {
+  const leaves = leavesOf(BASE_ITEMS);
+  const check = async (items: readonly TarItem[], override: Partial<Parameters<typeof compareBaseline>[1]>) =>
+    compareBaseline(await parsed(items), { repoId: 1, changeGeneration: 1, base: SHA, baseTree: baseTreeOf(BASE_ITEMS), leaves, ...override });
+  const missing = await check(BASE_ITEMS.slice(1), {});
+  assert.deepEqual(missing, { ok: false, reason: 'baseline_mismatch' }, 'T0에는 있는데 압축본에 없는 파일');
+  assert.deepEqual(await check([...BASE_ITEMS, { name: 'extra', data: 'x' }], {}), { ok: false, reason: 'baseline_mismatch' }, '압축본에만 있는 파일');
+  assert.deepEqual(await check(BASE_ITEMS.map(item => item.name === 'README.md' ? { ...item, data: 'substituted' } : item), {}), { ok: false, reason: 'baseline_mismatch' }, 'export-subst처럼 내용이 달라짐');
+  assert.deepEqual(await check(BASE_ITEMS.map(item => item.name === 'src/run.sh' ? { ...item, mode: 0o644 } : item), {}), { ok: false, reason: 'baseline_mismatch' }, '모드');
+  assert.deepEqual(await check(BASE_ITEMS, { baseTree: git('other') }), { ok: false, reason: 'baseline_mismatch' }, '잎이 T0와 다름');
+});
+
+test('T0 대조 음성: symlink·gitlink·submodule·LFS 저장소는 지원하지 않음으로 닫는다', async () => {
+  const leaves = leavesOf(BASE_ITEMS);
+  const check = async (items: readonly TarItem[], extra: typeof leaves = []) =>
+    compareBaseline(await parsed(items), { repoId: 1, changeGeneration: 1, base: SHA, baseTree: git('any'), leaves: [...leaves, ...extra] });
+  assert.deepEqual(await check(BASE_ITEMS, [{ path: 'vendor/lib', mode: '160000', blobSha: git('sub') }]), { ok: false, reason: 'baseline_unsupported' }, 'gitlink');
+  assert.deepEqual(await check(BASE_ITEMS, [{ path: 'link', mode: '120000', blobSha: git('l') }]), { ok: false, reason: 'baseline_unsupported' }, 'symlink');
+  assert.deepEqual(await check([...BASE_ITEMS, { name: 'link', type: '2', link: 'README.md' }]), { ok: false, reason: 'baseline_unsupported' }, '압축본의 symlink');
+  assert.deepEqual(await check([...BASE_ITEMS, { name: '.gitmodules', data: '[submodule]\n' }]), { ok: false, reason: 'baseline_unsupported' }, 'submodule');
+  assert.deepEqual(await check([...BASE_ITEMS, { name: '.gitattributes', data: '*.bin filter=lfs diff=lfs\n' }]), { ok: false, reason: 'baseline_unsupported' }, 'LFS');
+  assert.deepEqual(await check(BASE_ITEMS, [{ path: '.git/config', mode: '100644', blobSha: git('c') }]), { ok: false, reason: 'baseline_unsupported' }, '.git 경로');
+});
+
+test('수집: 추가·수정·삭제·mode 변경·rename을 실제 파일로 계산하고 T1이 실제 git과 같다', async () => {
+  const dirs = await workspace(BASE_ITEMS, async dir => {
+    await writeFile(join(dir, 'src/app.txt'), 'two\n');
+    await writeFile(join(dir, 'src/new.txt'), 'new\n');
+    await rm(join(dir, 'src/old.txt'));
+    await chmod(join(dir, 'README.md'), 0o755);
+    await chmod(join(dir, 'src/run.sh'), 0o644);
+  });
+  const result = await collectArtifact({ dirs, baseline: await baselineFor(BASE_ITEMS), patch: patchOf() });
+  assert.ok(result.ok);
+  const { manifest, files } = result.value;
+  assert.deepEqual(manifest.entries.map(entry => [entry.path, entry.changeKind, entry.mode]), [
+    ['README.md', 'mode_changed', '100755'], ['src/app.txt', 'modified', '100644'], ['src/new.txt', 'added', '100644'], ['src/old.txt', 'deleted', '100644'], ['src/run.sh', 'mode_changed', '100644']]);
+  assert.deepEqual(files.map(file => [file.path, file.content.toString()]), [['src/app.txt', 'two\n'], ['src/new.txt', 'new\n']], '내용이 바뀐 파일만 바이트를 싣는다');
+  assert.equal(manifest.baseTree, baseTreeOf(BASE_ITEMS));
+  const repo = join(scratch, `t1-${++counter}`);
+  await mkdir(join(repo, 'src'), { recursive: true });
+  await writeFile(join(repo, 'README.md'), '# fixture\n', { mode: 0o755 });
+  await writeFile(join(repo, 'src/app.txt'), 'two\n');
+  await writeFile(join(repo, 'src/new.txt'), 'new\n');
+  await writeFile(join(repo, 'src/run.sh'), '#!/bin/sh\n', { mode: 0o644 });
+  const run = (...args: string[]) => execFileSync('git', args, { cwd: repo, env: gitEnv, encoding: 'utf8' }).trim();
+  run('init', '-q'); run('add', '--all');
+  assert.equal(manifest.resultTree, run('write-tree'));
+});
+
+test('수집: 작업 공간의 .git·hook·config와 샌드박스 흔적은 결과에 없다. 흔적 규칙은 v1 그대로다', async () => {
+  const result = await collect(async dir => {
+    await writeFile(join(dir, 'src/app.txt'), 'two\n');
+    await mkdir(join(dir, '.git/hooks'), { recursive: true });
+    await writeFile(join(dir, '.git/config'), '[core]\n  fsmonitor = /tmp/evil\n');
+    await writeFile(join(dir, '.git/hooks/pre-commit'), '#!/bin/sh\nexit 1\n');
+    // scrub stub과 마운트 지점. 실행 전에 없던 빈 최상위 파일.
+    await writeFile(join(dir, 'package.json'), '');
+    await writeFile(join(dir, '.gitconfig'), '');
+  });
+  assert.ok(result.ok);
+  assert.deepEqual(result.value.manifest.entries.filter(entry => entry.changeKind !== 'unchanged').map(entry => entry.path), ['src/app.txt']);
+  assert.ok(!result.value.manifest.entries.some(entry => entry.path.startsWith('.git') || entry.path === 'package.json'));
+});
+
+test('수집 음성: 같은 이름이라도 내용이 있으면 흔적이 아니라 변경이다', async () => {
+  const result = await collect(async dir => { await writeFile(join(dir, 'package.json'), '{"scripts":{"postinstall":"x"}}'); });
+  assert.ok(result.ok);
+  assert.deepEqual(result.value.manifest.entries.filter(entry => entry.changeKind !== 'unchanged').map(entry => [entry.path, entry.changeKind]), [['package.json', 'added']]);
+});
+
+test('수집 음성: symlink·hardlink·FIFO·중첩 .git은 차단한다', async () => {
+  const blocked = async (name: string, change: (dir: string) => Promise<void>, reason: string) => {
+    const result = await collect(change);
+    assert.deepEqual(result, { ok: false, reason }, name);
+  };
+  await blocked('symlink 추가', dir => symlink('README.md', join(dir, 'src/link')), 'artifact_unsupported');
+  await blocked('symlink로 교체', async dir => { await rm(join(dir, 'src/app.txt')); await symlink('../README.md', join(dir, 'src/app.txt')); }, 'artifact_unsupported');
+  await blocked('hardlink', dir => link(join(dir, 'README.md'), join(dir, 'src/hard')), 'artifact_unsupported');
+  await blocked('FIFO', async dir => { execFileSync('mkfifo', [join(dir, 'src/pipe')]); }, 'artifact_unsupported');
+  await blocked('중첩 .git', async dir => { await mkdir(join(dir, 'src/.git')); await writeFile(join(dir, 'src/.git/config'), 'x'); }, 'artifact_path_invalid');
+  await blocked('제어 문자 이름', dir => writeFile(join(dir, 'src/a\nb'), 'x'), 'artifact_path_invalid');
+});
+
+test('수집 음성: 모델이 결과에 새로 넣은 submodule·LFS 선언과 LFS 포인터는 차단한다', async () => {
+  const blocked = async (name: string, change: (dir: string) => Promise<void>) => assert.deepEqual(await collect(change), { ok: false, reason: 'artifact_unsupported' }, name);
+  await blocked('.gitmodules 추가', dir => writeFile(join(dir, '.gitmodules'), '[submodule "x"]\n\tpath = x\n\turl = https://example.invalid/x\n'));
+  await blocked('대소문자만 다른 .gitmodules', dir => writeFile(join(dir, '.GitModules'), '[submodule "x"]\n'));
+  await blocked('루트 LFS 선언', dir => writeFile(join(dir, '.gitattributes'), '*.bin filter=lfs diff=lfs merge=lfs -text\n'));
+  await blocked('중첩 LFS 선언', dir => writeFile(join(dir, 'src/.gitattributes'), '*.bin filter=lfs\n'));
+  await blocked('LFS 포인터 내용', dir => writeFile(join(dir, 'src/asset.txt'), 'version https://git-lfs.github.com/spec/v1\noid sha256:0000\nsize 1\n'));
+  const plain = await collect(dir => writeFile(join(dir, '.gitattributes'), '*.txt text eol=lf\n'));
+  assert.ok(plain.ok, 'LFS가 아닌 속성 파일은 일반 변경이다');
+});
+
+test('수집 음성: 상한을 넘거나 불완전하면 자르지 않고 닫는다. 변경 없음도 결과가 아니다', async () => {
+  const over = Buffer.alloc(ARTIFACT_LIMITS.changedContentBytes + 1, 0x61);
+  assert.deepEqual(await collect(dir => writeFile(join(dir, 'src/big.txt'), over)), { ok: false, reason: 'artifact_too_large' }, '파일 하나로 1MiB 초과');
+  const half = Buffer.alloc(ARTIFACT_LIMITS.changedContentBytes / 2 + 1, 0x61);
+  assert.deepEqual(await collect(async dir => { await writeFile(join(dir, 'src/a.txt'), half); await writeFile(join(dir, 'src/b.txt'), half); }), { ok: false, reason: 'artifact_too_large' }, '합계 1MiB 초과');
+  assert.deepEqual(await collect(async dir => { for (let index = 0; index <= ARTIFACT_LIMITS.changedFiles; index++) await writeFile(join(dir, `src/f${index}.txt`), 'x'); }), { ok: false, reason: 'artifact_too_large' }, '변경 파일 수');
+  assert.deepEqual(await collect(async () => {}), { ok: false, reason: 'artifact_no_changes' });
+  assert.deepEqual(await collect(dir => writeFile(join(dir, 'src/bin'), Buffer.from([0, 1, 2]))), { ok: false, reason: 'artifact_binary' }, 'NUL');
+  assert.deepEqual(await collect(dir => writeFile(join(dir, 'src/bin'), Buffer.from([0xff, 0xfe]))), { ok: false, reason: 'artifact_binary' }, '깨진 UTF-8');
+  const truncated: TaskEvidence['patch'] = { ...patchOf(), truncated: true };
+  assert.deepEqual(await collect(dir => writeFile(join(dir, 'src/a.txt'), 'x'), BASE_ITEMS, truncated), { ok: false, reason: 'artifact_too_large' }, '잘린 patch');
+  const lying: TaskEvidence['patch'] = { ...patchOf(), digest: 'a'.repeat(64) };
+  assert.deepEqual(await collect(dir => writeFile(join(dir, 'src/a.txt'), 'x'), BASE_ITEMS, lying), { ok: false, reason: 'artifact_too_large' }, 'digest가 다른 patch');
+});
+
+test('전송: 다시 대조해 변조된 응답을 받지 않는다', async () => {
+  const result = await collect(dir => writeFile(join(dir, 'src/app.txt'), 'two\n'));
+  assert.ok(result.ok);
+  const digest = artifactDigest(result.value.manifest);
+  const wire = encodeArtifact(result.value);
+  const decoded = decodeArtifact(wire, digest);
+  assert.ok(decoded);
+  assert.deepEqual(decoded.files[0]!.content.toString(), 'two\n');
+  assert.equal(decodeArtifact(wire, 'a'.repeat(64)), null, '다른 digest');
+  assert.equal(decodeArtifact({ ...wire, patch: 'other' }, digest), null, 'patch 바꿔치기');
+  assert.equal(decodeArtifact({ ...wire, files: [{ path: 'src/app.txt', contentBase64: Buffer.from('evil\n').toString('base64') }] }, digest), null, '내용 바꿔치기');
+  assert.equal(decodeArtifact({ ...wire, files: [{ path: 'src/app.txt', contentBase64: `${wire.files[0]!.contentBase64}\n` }] }, digest), null, '표현이 둘인 base64');
+  assert.equal(decodeArtifact({ ...wire, files: [] }, digest), null, '파일 누락');
+});
+
+test('계약: 답의 출처 private·unknown은 v2 재개 모양에서 거부한다', () => {
+  const start = { version: 2, lane: 'task', job: '11111111-1111-4111-8111-111111111111', lease: '22222222-2222-4222-8222-222222222222', generation: 1, policyRevision: 'p', instructions: 'task-v1',
+    sessionId: '33333333-3333-4333-8333-333333333333', repository: 'fixture/repo', base: SHA, project: { id: 'x', revision: 'r', allowedPaths: ['src'], forbiddenPaths: [], verifyCommands: [] },
+    timeoutMs: 1000, runBudgetRemainingMs: 1000, toolCalls: 1, limits: LIMITS, operation: 'resume', turn: 2, expectedWorker: { instance: '44444444-4444-4444-8444-444444444444', storage: '55555555-5555-4555-8555-555555555555' },
+    resumeReason: 'clarification', questionId: '11111111-1111-4111-8111-111111111111:33333333-3333-4333-8333-333333333333:1' };
+  const shape = (label: string) => TaskV2RequestSchema.safeParse({ ...start, untrusted: { answer: 'a', label } }).success;
+  assert.equal(shape('public'), true);
+  assert.equal(shape('approved_public_summary'), true);
+  assert.equal(shape('private'), false);
+  assert.equal(shape('unknown'), false);
+});
+
+// ---- 작업자 HTTP ----
+
+let open: ChangeWorkerFixture | undefined;
+const fresh = async (options: Parameters<typeof changeWorkerFixture>[0] = {}) => { await open?.close().catch(() => {}); open = await changeWorkerFixture(options); return open; };
+after(async () => { await open?.close().catch(() => {}); });
+const writeStep = (write: Record<string, string>) => ({ ...COMPLETED, write });
+const relative = (name: string) => name;
+
+test('v2 흐름: 접수 → 실제 파일 수집 → 같은 결과 재조회. 모델을 다시 돌리지 않고 base64 바이트가 그대로 온다', async () => {
+  const f = await fresh();
+  await f.script([writeStep({ [relative('src/app.txt')]: 'two\n' })]);
+  const request = f.start();
+  const accepted = await f.signed('/v2/task', request);
+  assert.equal(accepted.status, 200);
+  assert.equal(TASK_V2_ENDPOINTS['/v2/task'].response.parse(accepted.json).status, 'accepted');
+  const first = await settledResult(f, request);
+  assert.equal(first.status, 'snapshot', JSON.stringify(first.reason ?? ''));
+  const again = await f.signed('/v2/task/result', { ...identity(request), expectedWorker: first.worker });
+  assert.deepEqual(again.json, first, '응답을 잃어도 같은 값');
+  assert.equal((await f.calls()).length, 1, '모델 실행은 한 번');
+  assert.equal(TASK_V2_ENDPOINTS['/v2/task/result'].response.safeParse(first).success, true);
+  const decoded = decodeArtifact(first.artifact, first.artifactDigest);
+  assert.ok(decoded);
+  assert.deepEqual(decoded.manifest.entries.filter(entry => entry.changeKind !== 'unchanged').map(entry => entry.path), ['src/app.txt']);
+  assert.equal(decoded.files[0]!.content.toString(), 'two\n');
+  assert.match(decoded.patch, /\+two/);
+  assert.equal(first.summary, undefined, '모델 요약을 싣지 않는다');
+  // 같은 턴을 다시 보내도 띄우지 않는다.
+  assert.equal((await f.signed('/v2/task', request)).status, 409, '같은 세대의 start는 새 서명이어도 받지 않는다');
+  assert.equal((await f.calls()).length, 1);
+});
+
+test('v2 T0 불일치: 모델을 띄우지 않고 사유를 남긴다', async () => {
+  const f = await fresh();
+  const request = f.start({ baseline: { repoId: 1, changeGeneration: 1, baseTree: git('other'), leaves: leavesOf(BASE_ITEMS) } });
+  assert.equal((await f.signed('/v2/task', request)).status, 200);
+  const result = await settledResult(f, request);
+  assert.equal(result.status, 'failed');
+  assert.equal(result.reason, 'baseline_mismatch');
+  assert.equal((await f.calls()).length, 0);
+});
+
+test('v2 정책: 허용 경로 밖 변경은 artifact가 되지 않는다', async () => {
+  const f = await fresh();
+  await f.script([writeStep({ [relative('package.json')]: '{"scripts":{"postinstall":"evil"}}' })]);
+  const request = f.start();
+  await f.signed('/v2/task', request);
+  const result = await settledResult(f, request);
+  assert.equal(result.status, 'failed');
+  assert.equal(result.reason, 'change_outside_policy');
+});
+
+test('v2 재개: 질문 뒤 같은 세션을 잇고 결과를 받는다. 답의 출처가 모양에 묶인다', async () => {
+  const f = await fresh();
+  await f.script([QUESTION, writeStep({ 'src/app.txt': 'answered\n' })]);
+  const request = f.start();
+  await f.signed('/v2/task', request);
+  const asked = await settledResult(f, request);
+  assert.equal(asked.status, 'needs_input');
+  const resume = { ...request, baseline: undefined, operation: 'resume', turn: 2, untrusted: { answer: 'src를 고쳐라', label: 'public' },
+    expectedWorker: asked.worker, resumeReason: 'clarification', questionId: `${request.job}:${request.sessionId}:1` };
+  delete (resume as { baseline?: unknown }).baseline;
+  assert.equal((await f.signed('/v2/task', resume)).status, 200);
+  const result = await settledResult(f, request);
+  assert.equal(result.status, 'snapshot');
+  assert.equal(result.turn, 2);
+  assert.equal((await f.calls()).length, 2);
+});
+
+test('finalize 순서: digest가 다르면 지우지 않고, v1 성공 정리 길로도 지우지 못한다. 저장 ACK로만 지운다', async () => {
+  const f = await fresh();
+  await f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  const request = f.start();
+  await f.signed('/v2/task', request);
+  const result = await settledResult(f, request);
+  assert.equal(result.status, 'snapshot');
+  const wrong = await f.signed('/v2/task/finalize', { ...identity(request), expectedWorker: result.worker, receipt: { outcome: 'saved', artifactDigest: 'a'.repeat(64), persistedAt: 1 } });
+  assert.equal(wrong.status, 409);
+  const v1Body = TASK_V2_ENDPOINTS['/v2/task/finalize'].request.parse({ ...identity(request), expectedWorker: result.worker, receipt: { outcome: 'saved', artifactDigest: result.artifactDigest, persistedAt: 1 } });
+  assert.equal((await f.signed('/v2/task/result', { ...identity(request), expectedWorker: null })).json.status, 'snapshot', '거부 뒤에도 결과가 있다');
+  const v1Finalize = TASK_ENDPOINTS['/v1/task/finalize'].request.parse({ version: 1, job: request.job, lease: request.lease, generation: 1, sessionId: request.sessionId, expectedWorker: result.worker, disposition: 'terminal',
+    receipt: { outcome: 'succeeded', persistedAt: 1, resultDigest: 'b'.repeat(64) } });
+  const unacknowledged = await f.raw('/v1/task/finalize', v1Finalize, f.signer.issue('task_finalize', v1Finalize));
+  assert.deepEqual([unacknowledged.status, unacknowledged.json.status], [409, 'rejected'], 'v1 성공 영수증으로 v2 결과를 지우지 못한다');
+  const done = await f.signed('/v2/task/finalize', v1Body);
+  assert.equal(done.status, 200);
+  assert.deepEqual([done.json.stopped, done.json.cleaned, done.json.sessionRetained], [true, true, false]);
+  const gone = await f.signed('/v2/task/result', { ...identity(request), expectedWorker: null });
+  assert.deepEqual([gone.json.status, gone.json.finalized], ['absent', true]);
+  assert.deepEqual((await readdir(join(f.root, '.homelab-worker', 'change-results'))).length, 0);
+  const again = await f.signed('/v2/task/finalize', v1Body);
+  assert.equal(again.json.cleaned, true, '응답을 잃어 다시 보내도 같다');
+});
+
+test('재시작: 저장한 결과를 같은 저장소의 새 작업자가 그대로 준다. 모델을 다시 돌리지 않는다', async () => {
+  const f = await fresh();
+  await f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  const request = f.start();
+  await f.signed('/v2/task', request);
+  const before = await settledResult(f, request);
+  await f.restart();
+  const after_ = await settledResult(f, request);
+  assert.equal(after_.artifactDigest, before.artifactDigest);
+  assert.equal(after_.worker.storage, before.worker.storage);
+  assert.notEqual(after_.worker.instance, before.worker.instance);
+  assert.equal((await f.calls()).length, 1);
+});
+
+test('재시작: 영수증을 읽지 못하는 동안 저장 ACK 전의 결과를 지우지 않는다', async () => {
+  const f = await fresh();
+  await f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  const request = f.start();
+  await f.signed('/v2/task', request);
+  assert.equal((await settledResult(f, request)).status, 'snapshot');
+  const receipts = join(f.root, '.homelab-worker', 'receipts');
+  const results = join(f.root, '.homelab-worker', 'change-results');
+  const file = join(receipts, `${request.job}.json`);
+  const saved = await readFile(file, 'utf8');
+  await f.restart(() => writeFile(file, '{broken'));
+  await f.service.probe();
+  assert.equal(f.service.intake.open, false, '상태를 읽지 못하면 받지 않는다');
+  assert.equal((await readdir(results)).length, 1, '결과가 남아 있다');
+  await f.restart(() => writeFile(file, saved));
+  assert.equal((await settledResult(f, request)).status, 'snapshot', '복구되면 같은 결과를 준다');
+  assert.equal((await f.calls()).length, 1);
+});
+
+test('능력 표시: v2 부품이 없는 작업자(옛 작업자와 같은 모양)는 말하지 않고 끝점도 없다. 게시 서버는 CHANGE만 닫는다', async () => {
+  const f = await fresh({ change: false });
+  assert.equal(await taskWorkerChangeContract(f.url, fetch, AbortSignal.timeout(2000)), false);
+  assert.equal(await new HttpTaskV2Worker(f.url, f.signer, fetch).supportsChange(), false);
+  for (const path of Object.keys(TASK_V2_ENDPOINTS)) assert.equal((await fetch(`${f.url}${path}`, { method: 'POST' })).status, 404, path);
+  // 아직 v1은 그대로 있다.
+  assert.equal((await fetch(`${f.url}/v1/task`, { method: 'POST' })).status, 401);
+  const g = await fresh();
+  assert.equal(await new HttpTaskV2Worker(g.url, g.signer, fetch).supportsChange(), true);
+  assert.equal(await taskWorkerChangeContract('http://127.0.0.1:9', fetch, AbortSignal.timeout(2000)), false, '닿지 않으면 false');
+  const v1Intake = await (await fetch(`${g.url}/v1/task/intake`)).json() as { version: number; change: { contract: number } };
+  assert.deepEqual([v1Intake.version, v1Intake.change.contract], [1, 2]);
+});
+
+test('응답 상한: 받는 쪽도 2MiB를 넘으면 자르지 않고 실패다', async () => {
+  const huge = new Response(JSON.stringify({ padding: 'x'.repeat(ARTIFACT_LIMITS.httpBodyBytes + 1) }));
+  const worker = new HttpTaskV2Worker('http://worker.invalid/', (await fresh()).signer, (async () => huge) as unknown as typeof fetch);
+  const request = { ...identity(open!.start()), expectedWorker: null };
+  await assert.rejects(worker.callV2('/v2/task/result', request), /task_response_too_large/);
+});
+
+// ---- 게시 서버 port ----
+
+interface AuthorHarness { f: ChangeWorkerFixture; author: ClaudeChangeAuthor; bridge: ClaudeTaskBridge; app: Awaited<ReturnType<typeof dbFixture>>; job: Job; db: Database; key: ChangeKey; store: ChangeStore; baseCommit: string; baseTree: string;
+  calls: { finalize: number; intercept?: (endpoint: string, send: () => Promise<{ response: unknown; bytes: number }>) => Promise<{ response: unknown; bytes: number }> } }
+async function authorHarness(options: { items?: TarItem[] } = {}): Promise<AuthorHarness> {
+  const f = await fresh(options);
+  const { db } = await localDatabase();
+  const app = await dbFixture(db);
+  const jobRow = await task(app, db, 'author-1', '자식 작업');
+  const jobId = jobRow.id as string;
+  const row = (await app.store.claim('task'))!;
+  assert.equal(row.id, jobId);
+  const store = new ChangeStore(db);
+  const created = await store.createRequest({ eventId: 'change-1', ownerId: 'fixture-owner', conversationId: app.store.scopeId(thread), scope: thread, repoId: REPO_ID, baseBranch: 'main', label: 'public', input: { text: '공개 요청' } });
+  assert.ok(created.ok);
+  const key = { changeId: created.value.id, generation: 1 };
+  const brief = fixtureBrief();
+  assert.ok((await store.admit({ ...key, brief, policyRevision: row.revision.policy })).ok);
+  const baseTree = baseTreeOf(options.items ?? BASE_ITEMS);
+  assert.ok((await store.pinBase({ ...key, baseCommit: SHA, baseTree })).ok);
+  assert.ok((await store.linkChildJob({ ...key, jobId, role: 'author' })).ok);
+  const source: ChangeAuthorSource = {
+    plan: async () => ({ job: (await db.query<Job>('SELECT * FROM jobs WHERE id=$1', [jobId])).rows[0]!, repository: 'fixture/repo', project: { ...PLAN.project, allowedPaths: ['src', 'README.md'], forbiddenPaths: [], verifyCommands: ['smoke-unit'] }, limits: { ...LIMITS }, baseline: leavesOf(options.items ?? BASE_ITEMS) }),
+    settings: async () => ({ project: { ...PLAN.project, allowedPaths: ['src', 'README.md'], forbiddenPaths: [], verifyCommands: ['smoke-unit'] }, limits: { ...LIMITS } }),
+    claimed: async id => (await db.query<Job>(`SELECT * FROM jobs WHERE id=$1 AND state='running'`, [id])).rows[0] ?? null,
+    authorJob: async () => jobId,
+    keyOf: async () => key,
+  };
+  const calls: AuthorHarness['calls'] = { finalize: 0 };
+  const counted: HttpTaskV2Worker = Object.create(f.port) as HttpTaskV2Worker;
+  counted.callV2 = (async (endpoint: never, body: never, signal?: AbortSignal) => {
+    if (endpoint === '/v2/task/finalize') calls.finalize++;
+    const send = () => f.port.callV2(endpoint, body, signal);
+    return calls.intercept ? calls.intercept(endpoint, send) : send();
+  }) as HttpTaskV2Worker['callV2'];
+  const v1 = new FakeTaskWorker();
+  v1.call = (async (endpoint: string, body: unknown) => {
+    const spec = TASK_ENDPOINTS[endpoint as '/v1/task/status'];
+    const parsed = spec.request.parse(body);
+    const response = await fetch(`${f.url}${endpoint}`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Capability ${f.signer.issue(spec.operation, parsed)}` }, body: JSON.stringify(parsed) });
+    return response.json();
+  }) as FakeTaskWorker['call'];
+  const bridge = new ClaudeTaskBridge(app.store, app.gate, v1, { plan: async () => PLAN }, { log: () => {} }, counted);
+  const author = new ClaudeChangeAuthor({ bridge, store: app.store, gate: app.gate, worker: counted, source, artifacts: new ChangeStoreArtifacts(store) });
+  return { f, author, bridge, app, job: row, db, key, store, baseCommit: SHA, baseTree, calls };
+}
+const startInput = (h: AuthorHarness) => ({ target: { key: h.key, repoId: REPO_ID }, baseCommit: h.baseCommit, baseTree: h.baseTree, policyRevision: h.job.revision.policy, brief: fixtureBrief() });
+async function pollAuthor(h: AuthorHarness, receiptId: string) {
+  for (let attempt = 0; attempt < 400; attempt++) {
+    const result = await h.author.fetchResult(receiptId);
+    if (result.kind !== 'running') return result;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error('author_timeout');
+}
+
+test('작성 port: 저장을 끝내기 전에는 finalize가 작업자를 부르지 않고, 저장 뒤에만 지운다', async () => {
+  const h = await authorHarness();
+  await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  assert.equal(await h.author.supportsV2(), true);
+  const { receiptId } = await h.author.start(startInput(h));
+  const result = await pollAuthor(h, receiptId);
+  assert.equal(result.kind, 'snapshot');
+  assert.ok(result.kind === 'snapshot');
+  assert.ok(result.transportBytes > 0 && result.transportBytes <= ARTIFACT_LIMITS.httpBodyBytes);
+  await assert.rejects(h.author.finalize(receiptId), /artifact_not_saved/);
+  assert.equal(h.calls.finalize, 0, '저장 전 finalize는 작업자에 닿지 않는다');
+  assert.equal((await h.f.signed('/v2/task/result', { version: 2, job: h.job.id, lease: h.job.lease_token, generation: 1, sessionId: (await h.db.query<{ claude_session_id: string }>('SELECT claude_session_id FROM codex_sessions WHERE job_id=$1', [h.job.id])).rows[0]!.claude_session_id, expectedWorker: null })).json.status, 'snapshot');
+  const artifacts = new ChangeStoreArtifacts(h.store);
+  const saved = await artifacts.save(h.key, result.artifact, result.transportBytes);
+  assert.deepEqual(saved, { ok: true, artifactDigest: artifactDigest(result.artifact.manifest) });
+  // 저장 응답을 잃은 재시도는 멱등이다.
+  assert.deepEqual(await artifacts.save(h.key, result.artifact, result.transportBytes), saved);
+  const loaded = await artifacts.load(h.key);
+  assert.equal(loaded?.artifactDigest, artifactDigest(result.artifact.manifest));
+  assert.equal(loaded?.files[0]?.content.toString(), 'two\n');
+  await h.author.finalize(receiptId);
+  assert.equal(h.calls.finalize, 1);
+  const session = (await h.db.query<{ state: string; session_retained: boolean; cleanup_state: string }>('SELECT state,session_retained,cleanup_state FROM codex_sessions WHERE job_id=$1', [h.job.id])).rows[0]!;
+  assert.deepEqual(session, { state: 'completed', session_retained: false, cleanup_state: 'cleaned' });
+  assert.equal((await h.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [h.job.id])).rows[0]!.state, 'succeeded');
+});
+
+test('작성 port: 모델 질문·실패를 v1과 같은 상태로 확정하고 차단 사유를 코드로 돌려준다', async () => {
+  const h = await authorHarness();
+  await h.f.script([QUESTION]);
+  const { receiptId } = await h.author.start(startInput(h));
+  const asked = await pollAuthor(h, receiptId);
+  assert.deepEqual(asked.kind, 'needs_input');
+  assert.equal((await h.db.query<{ state: string }>('SELECT state FROM codex_sessions WHERE job_id=$1', [h.job.id])).rows[0]!.state, 'waiting_answer');
+  await assert.rejects(h.author.resume({ receiptId, answer: '답', label: 'private' }), /label_blocked/);
+  await assert.rejects(h.author.resume({ receiptId, answer: '답', label: 'unknown' }), /label_blocked/);
+  const i = await authorHarness();
+  const wrong = { ...startInput(i), baseTree: i.baseTree };
+  await i.f.script([COMPLETED]);
+  const started = await i.author.start(wrong);
+  assert.deepEqual(await pollAuthor(i, started.receiptId), { kind: 'failed', code: 'artifact_no_changes' }, '변경 없는 완료는 결과가 아니다');
+});
+
+test('작성 port 재개: 답한 질문을 같은 세션으로 잇고 결과를 받는다. claim 안 된 job은 띄우지 않는다', async () => {
+  const h = await authorHarness();
+  await h.f.script([QUESTION, writeStep({ 'src/app.txt': 'answered\n' })]);
+  const { receiptId } = await h.author.start(startInput(h));
+  assert.equal((await pollAuthor(h, receiptId)).kind, 'needs_input');
+  await assert.rejects(h.author.resume({ receiptId, answer: '답', label: 'public' }), /change_job_not_claimed/);
+  const question = (await h.db.query<{ id: string }>(`SELECT id FROM codex_questions WHERE job_id=$1 AND state='open'`, [h.job.id])).rows[0]!;
+  const answered = await h.bridge.answer({ question: question.id, actor: 'fixture-owner', scope: thread, text: 'src를 고쳐라', event: 'answer-1' });
+  assert.equal(answered.ok, true);
+  const claimed = (await h.app.store.claim('task'))!;
+  assert.equal(claimed.id, h.job.id);
+  await h.author.resume({ receiptId, answer: 'src를 고쳐라', label: 'public' });
+  const result = await pollAuthor(h, receiptId);
+  assert.equal(result.kind, 'snapshot');
+  const calls = await h.f.calls();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1]!.resume, true);
+  assert.equal(calls[1]!.session, calls[0]!.session);
+});
+
+test('작성 port 응답 유실: 시작 응답을 잃어도 다시 보내지 않고 저장된 결과를 받는다', async () => {
+  const h = await authorHarness();
+  await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  let sent = 0;
+  h.calls.intercept = async (endpoint, send) => {
+    if (endpoint !== '/v2/task') return send();
+    sent++;
+    await send();
+    throw new Error('connection reset');
+  };
+  const { receiptId } = await h.author.start(startInput(h));
+  const result = await pollAuthor(h, receiptId);
+  assert.equal(result.kind, 'snapshot');
+  assert.equal(sent, 1);
+  assert.equal((await h.f.calls()).length, 1);
+  assert.deepEqual((await h.author.fetchResult(receiptId)).kind, 'snapshot', '몇 번이든 같다');
+  assert.equal((await h.f.calls()).length, 1);
+});
+
+test('작성 port 응답 유실: 닿았는지 모르는 시작은 unknown이고 다시 보내지 않는다. 거부는 실패로 닫는다', async () => {
+  const lost = await authorHarness();
+  lost.calls.intercept = async (endpoint, send) => { if (endpoint === '/v2/task') throw new Error('connection reset'); return send(); };
+  const { receiptId } = await lost.author.start(startInput(lost));
+  assert.deepEqual(await lost.author.fetchResult(receiptId), { kind: 'unknown', code: 'start_unconfirmed' });
+  assert.equal((await lost.f.calls()).length, 0);
+  const rejected = await authorHarness();
+  rejected.calls.intercept = async (endpoint, send) => { if (endpoint === '/v2/task') throw new TaskWorkerRejected(); return send(); };
+  const started = await rejected.author.start(startInput(rejected));
+  assert.equal((await rejected.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [rejected.job.id])).rows[0]!.state, 'failed');
+  assert.equal((await rejected.author.fetchResult(started.receiptId)).kind, 'failed');
+});
+
+test('작성 port 정리: finalize 응답을 잃으면 저장한 digest로 sweep이 다시 ACK한다', async () => {
+  const h = await authorHarness();
+  await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  const { receiptId } = await h.author.start(startInput(h));
+  const result = await pollAuthor(h, receiptId);
+  assert.ok(result.kind === 'snapshot');
+  await new ChangeStoreArtifacts(h.store).save(h.key, result.artifact, result.transportBytes);
+  h.calls.intercept = async (endpoint, send) => { if (endpoint === '/v2/task/finalize') { await send(); throw new Error('connection reset'); } return send(); };
+  await h.author.finalize(receiptId);
+  const pending = (await h.db.query<{ state: string; cleanup_state: string; session_retained: boolean }>('SELECT state,cleanup_state,session_retained FROM codex_sessions WHERE job_id=$1', [h.job.id])).rows[0]!;
+  assert.deepEqual(pending, { state: 'completed', cleanup_state: 'pending', session_retained: true });
+  h.calls.intercept = undefined;
+  await h.author.finalize(receiptId);
+  const cleaned = (await h.db.query<{ cleanup_state: string; session_retained: boolean }>('SELECT cleanup_state,session_retained FROM codex_sessions WHERE job_id=$1', [h.job.id])).rows[0]!;
+  assert.deepEqual(cleaned, { cleanup_state: 'cleaned', session_retained: false });
+});
+
+test('v1 격리: CHANGE 세션을 v1 실행으로 잇지 않는다', async () => {
+  const h = await authorHarness();
+  await h.f.script([QUESTION]);
+  const { receiptId } = await h.author.start(startInput(h));
+  assert.equal((await pollAuthor(h, receiptId)).kind, 'needs_input');
+  const question = (await h.db.query<{ id: string }>(`SELECT id FROM codex_questions WHERE job_id=$1 AND state='open'`, [h.job.id])).rows[0]!;
+  await h.bridge.answer({ question: question.id, actor: 'fixture-owner', scope: thread, text: '답', event: 'answer-2' });
+  const claimed = (await h.app.store.claim('task'))!;
+  await h.bridge.run(claimed);
+  assert.equal((await h.db.query<{ state: string; wait_reason: string }>('SELECT state,wait_reason FROM jobs WHERE id=$1', [h.job.id])).rows[0]!.wait_reason, 'task_session_mismatch');
+  assert.equal((await h.f.calls()).length, 1);
+});
+
+test('작성 port: 입력 출처를 시작 전에 막고, 공개 brief만 모델에 준다', async () => {
+  const h = await authorHarness();
+  await assert.rejects(h.author.start({ ...startInput(h), brief: fixtureBrief({ label: 'private' }) }), /label_blocked/);
+  assert.equal((await h.f.calls()).length, 0);
+  const text = renderChangeBrief(fixtureBrief());
+  assert.match(text, /공개 목표/);
+  await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  const { receiptId } = await h.author.start(startInput(h));
+  await pollAuthor(h, receiptId);
+  const [call] = await h.f.calls();
+  assert.match(call!.input, /공개 목표/);
+  assert.ok(!call!.input.includes('공개 요청'), '요청 원문은 쓰지 않는다');
+});
+
+test('옛 작업자 호환: v2 없는 작업자면 supportsV2가 false이고 v1 /task 계약은 그대로다', async () => {
+  const f = await fresh({ change: false });
+  const { db } = await localDatabase();
+  const app = await dbFixture(db);
+  const bridge = new ClaudeTaskBridge(app.store, app.gate, new FakeTaskWorker(), { plan: async () => PLAN }, { log: () => {} }, f.port);
+  const author = new ClaudeChangeAuthor({ bridge, store: app.store, gate: app.gate, worker: f.port, source: {} as ChangeAuthorSource, artifacts: new ChangeStoreArtifacts(new ChangeStore(db)) });
+  assert.equal(await author.supportsV2(), false);
+  assert.ok(await readFile(join(f.root, '.homelab-worker', 'storage-id'), 'utf8'));
+});
