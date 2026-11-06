@@ -1569,3 +1569,43 @@ manifest는 정확한 경로만 받는다. **올릴 때 그 경로가 비어 있
 **운영 대조(2026-11-06, 읽기 전용, 이 코드를 돌린 것은 아니다).** `homelab-bot` Application에 `spec.source.helm.valuesObject`와 `status.sync.comparedTo.source.helm.valuesObject`가 있고 둘 다 `repository`·`digest`·`revision`을 담는다. `spec.sources`는 없다. pod `imageID`는 `<저장소>@sha256:<digest>`이고 마이그레이션 파드의 owner는 `Job`이다. SA `bot-reader`는 Application get과 pod list를 할 수 있다. 시험의 합성 응답이 이 모양과 같다.
 
 **하지 않은 것.** 이 코드로 실제 클러스터·GitHub를 읽기. GitHub 응답은 합성값이다. 첫 live 조회에서 모양이 다르면 `argo_config_stale`로 멈추고 `observed`로 가지 않는다. D의 출처 재검증, 조립·루프(B5)도 하지 않았다.
+||||||| parent of 6229583 (feat(t19): 공개 전 후보를 새 세션이 검토하는 경로를 조립 없이 더한다)
+
+## T19 B2 미게시 리뷰 (2026-11-06, 로컬·PG)
+
+입력 계약, 판정, 작업자, HTTP, `ChangeReviewPort` 구현을 넣었고 어떤 진입점에도 조립하지 않았다. 등급은 mock·local_integration이고 입력은 모두 합성이다. 실제 모델·GitHub·Discord·클러스터에 닿지 않았다. 실행기 시험은 가짜 CLI로 돈다. T19의 CHANGE·DATA·EVENT 시험을 통과했다는 뜻이 아니다. 그 시험은 B5 조립 뒤에 돈다.
+
+| 시험 파일 | 수 | 본 것 |
+|---|---|---|
+| `test/change-review.test.ts`(PGlite) | 51 | 통과·경고·차단·incomplete, patch 완전성과 base 대조, author 세션 재사용 거부, 입력 묶음 불일치, 비신뢰 필드의 지시문 격리, 응답 유실 재조회, 도구 호출 중단, MCP·반사·계약 밖 출력, 합성 canary, capability, 슬롯, HTTP |
+| `test/change-review-dispatch.test.ts`(PGlite) | 3 | dispatcher 없는 `ReviewRuntime`은 미게시 후보를 집지 않음, 있으면 미게시 후보만 넘김, 출처 없는 job은 모델 없이 실패로 닫음 |
+| `test/change-review-pg.test.ts`(PostgreSQL 18.6) | 2 | 동시 제출·동시 tick이 job 하나와 실행 한 번으로 모임, 응답을 잃은 job 회수와 unknown 슬롯 해제 |
+
+**결과.** Node 24.22.0, 네트워크 없는 임시 `postgres:18-alpine`(18.6) 소켓, 끝난 뒤 컨테이너 삭제.
+
+- `npm run check`: 통과.
+- PostgreSQL 포함 전체(`npm run build && node --test --test-concurrency=6 dist/test/*.test.js`): **1651 / 1638 pass / 0 fail / 13 skipped**. skip은 전부 `SEC02_IMAGE` 없음이다. 기존 `review*`·`pr-review`·`task-bridge` 시험은 파일을 고치지 않고 통과했다.
+- 동시 실행을 6으로 제한한 까닭은 기본 동시 실행의 부하다. 같은 트리의 기본 동시 실행 1회에서는 아래 흔들림 1건으로 **1651 / 1637 pass / 1 fail / 13 skipped**였다.
+
+**흔들림 1건과 처리.** `T19 B2 실제 PostgreSQL: 동시 제출은...`이 전체 실행에서 `terminating connection due to administrator command`로 실패했다. 시험 정리 코드가 `pool.end()` 직후 `DROP DATABASE ... WITH (FORCE)`를 불러 닫히는 중인 연결이 FATAL을 받은 것으로 판단했다. `pg-pool`의 `end()`는 연결이 실제로 닫히기를 기다리지 않는다. 같은 함정이 `test/external-task-pg.test.ts`에 적혀 있다. 그 파일 단독 15회 반복에서는 재현되지 않아 수정으로 사라졌다고 직접 보이지는 못했고, 저장소 관례인 재시도 삭제로 바꾼 뒤 전체 1회와 단독 1회에서 나오지 않았다. 제품 코드는 고치지 않았다.
+
+**수정 전 실패.** 구현 전 기록은 `tsc` 오류 49건과 dispatcher 시험 1건 실패다. 이 기록은 이어받은 것이고 다시 재현하지 않았다. 지금 트리의 근거는 아래 변이 확인이다.
+
+**변이 확인.** 저장소 사본에서 한 곳씩 바꾸고 관련 시험만 돌렸다. 묶음마다 원본도 함께 돌려 125건 통과, `tsc` 0을 확인했다.
+
+| 변이 | 잡은 시험 |
+|---|---|
+| author 세션 대조 제거 | `author 세션 재사용` |
+| 프롬프트 머리에 patch 원문 삽입 | `격리` |
+| 도구 예산을 5로 (`run-control.ts`의 `tools:'none'` 고정 제거) | `실행기: 도구 호출`, `전체: 도구 호출` |
+| 입력 묶음 digest 대조 제거 | `입력 묶음 불일치`(assert가 아니라 대기 중 시간 초과로 취소) |
+| `reviewed_paths` 누락 검사 제거 | `incomplete: 모델이 보지 않았다고 답한 변경 파일` |
+| 고위험을 P0만으로 축소 | `차단` 계열 등 7건 |
+| claim의 미게시 후보 제외 제거 | `dispatcher 없는 기존 ReviewRuntime` |
+| 모든 job을 dispatcher로 | `dispatcher가 있으면 미게시 후보 job만` |
+| claim을 `pr_reviews` 있는 job으로 제한 | `리뷰 claim`(기존 T17 시험), `맡을 PR이 없는 review job` |
+| 작업자의 base 대조 제거 | `incomplete: 수정 파일의 hunk가 통째로 빠지면` |
+
+`review-lane.ts`의 `toolCalls: 0`을 5로 바꾼 변이는 살아남았다. `run-control.ts`가 `tools:'none'` 어댑터의 예산을 `spec.toolCalls`와 상관없이 0으로 고정하므로 동작이 같은 변이다. 그래서 위 표에서 고정 줄 자체를 바꿨다.
+
+**하지 않은 것.** 실제 모델 호출과 실제 CLI 출력 대조, 실제 작업자·codeload 압축본 대조, 조립과 운영 migration, 리뷰 원문 비공개 표(`ChangeReviewFindingsSink`의 실제 구현), `ChangeReviewPort.review` 호출 경로의 부모 전이 연결. `export-ignore` 같은 압축본 속성이 있는 저장소가 `patch_base_mismatch`로 닫히는 것은 코드로 확인했을 뿐 시험 사례가 없다.
