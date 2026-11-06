@@ -25,6 +25,8 @@
 
 4. seed를 비밀 저장소에 넣습니다. **명령 인자·셸 이력·설정 파일에 값을 쓰지 말고**, 아래처럼 프롬프트에 붙여 넣습니다.
 
+   macOS는 그 기기의 로컬 터미널에서 합니다. SSH 세션은 Keychain을 쓰지 못합니다(`User interaction is not allowed`). 같은 이유로 전송기는 7단계처럼 로그인 세션의 LaunchAgent로 돌립니다.
+
    ```sh
    # macOS: -w를 맨 끝에 값 없이 두면 프롬프트로 묻습니다.
    security add-generic-password -U -s r08-helper -a <connection_id> -w
@@ -143,4 +145,4 @@ node <helper>/sender.mjs status
 - **연결은 30일 뒤 만료됩니다.** 그 뒤에는 수신이 401이고 `/attach`로 다시 연결합니다. 봇 DB를 복원하거나 장애 조치가 일어나면 모든 연결이 닫혀 다시 연결해야 합니다.
 - **비밀 저장소도 같은 사용자 권한의 악성 코드까지 막지는 못합니다.**
 
-실제 CLI 버전별 필드와 절전 복귀 동작은 시험하지 않았습니다. 시험은 공식 문서의 필드로 만든 합성 입력을 씁니다.
+Claude Code 2.1.318의 Stop 훅은 운영에서 끝까지 확인했습니다. Codex notify, 다른 CLI 버전의 필드, 절전 복귀는 시험하지 않았고, 시험은 공식 문서의 필드로 만든 합성 입력을 씁니다.
