@@ -294,7 +294,7 @@ export async function publishEnv(db: Database, options: { files?: Record<string,
   const source = async () => policy.current;
   const syncedNow = () => { github.clock = clock.now; return clock.now; };
   const writerIO = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: policyWriterRepositories(source), send: github.send, now: syncedNow });
-  const newPublisher = () => new ChangePublisher({ store, writer: writerIO.writer, preflight: writerIO.preflight, policy: source, now: () => clock.now, retryMs: 60_000 });
+  const newPublisher = () => new ChangePublisher({ store, writer: writerIO.writer, preflight: writerIO.preflight, policy: source, authorize: async () => {}, now: () => clock.now, retryMs: 60_000 });
   const newRequest = async () => {
     const request = ok(await store.createRequest({ eventId: newEvent(), ownerId: OWNER, conversationId: CONVERSATION, scope: { guild: 'fixture-guild', channel: 'fixture-thread', parent: 'fixture-chat', kind: 'thread' },
       repoId: REPO.id, baseBranch: 'main', label: 'public', input: { text: '공개 요청문' } }));

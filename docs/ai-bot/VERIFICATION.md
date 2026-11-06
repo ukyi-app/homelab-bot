@@ -1814,3 +1814,107 @@ SEC02_IMAGE=<이름> npm test   # 없으면 사유와 함께 skip. 통과로 세
 | 수집 | 새 submodule·LFS 선언, T0 파일 수 |
 
 변이가 고른 경계 밖의 코드, 예를 들어 `ClaudeChangeAuthor`의 재개 분기는 이번 변이 대상이 아니다.
+
+## T19 B5 조립 (2026-11-06, 로컬·PG·podman)
+
+**Codex 리뷰 2라운드 P2 2건(#85).** 둘 다 시험을 먼저 넣어 수정 전 실패를 봤다. (1) 스위치를 끄면 답 봉인이 빠져, 켰다가 끈 뒤 남은 CHANGE 질문의 비공개 답이 `events`와 대화 맥락으로 샜다. 이제 봉인은 스위치와 무관하게 조립한다. 시험은 진입점을 스위치 false로 띄우고 명령이 저장된 것까지 음성 대조한다. (2) 시험을 기다리는 동안 자식 `/cancel`이 오면 시험이 시한까지 돌고 부모가 `reviewing`으로 넘어갔다. 이제 `verificationKeepalive`가 시험을 멈추고, 결과 처리 전에 자식 상태를 다시 봐 부모를 `cancelled`로 닫는다.
+
+**범위.** B0~B4를 게시 서버·작업자 진입점에 잇고 기본 꺼짐으로 둔다. 구조는 `ARCHITECTURE.md` §16.5다. 실제 모델·GitHub·Discord·클러스터에 닿지 않았다. 값은 모두 합성이다.
+
+**시험 도구(`test/change-assembly-harness.ts`).** main과 같은 조립 함수로 실제 `ChangeRuntime`·`ClaudeTaskBridge`·`TaskWorkerService`·`runChangeTurn`·`IsolatedVerifier`·`ChangeReviewService`·`ChangePublisher`·저장 계층을 잇는다. 가짜는 셋이다. `claude` 실행 파일, GitHub HTTP, 리뷰 모델. 작업자와 후보 리뷰 경로는 실제 HTTP로 돈다.
+
+| 시험 | 수준 | 판정 | 사례 | 못 본 것 |
+|---|---|---|---|---|
+| 호환·스위치 | local_integration | pass | false·키 없음에서 진입점 기동, 명령·writer·루프·GitHub 호출·행 0개, 옛 정책 통과, 값이 틀린 설정은 기동 전 거부, 키·정책·레인·리뷰 부족은 CHANGE만 닫힘, 옛 작업자, task·review slot, unknown 유지, 종료, 016→018 | 운영 Secret·정책 값 |
+| CHANGE-01 | local_integration | pass | `/change`→v2 작성→무자격 검증→별도 리뷰→승인→가짜 GitHub, H.tree=T1, parent=B, 공개 입력만 흐름, 다른 묶음·generation 거부, 시험 실패·리뷰 차단, 경고 표시 | 실제 GitHub의 SHA 일치(live) |
+| CHANGE-03 연결 | local_integration | pass | 승인 뒤 base 이동은 `superseded`이고 자동 재시도 없음, `text:next`만 새 generation, 사람 head 변경 | live |
+| DATA-01 | local_integration | pass | private·unknown·label 누락 요청, 합성 canary, 입력의 내부 표식, 추가 답변의 label, 기록 없는 답, 다른 스레드 답, 같은·다른 스레드 대화 유입, DM·알림 채널. GitHub 쓰기·작성 모델 0회, 알림·`events`에 원문 없음 | 실모델이 공개 입력으로 비공개 값을 지어내는 경우 |
+| EVENT-02 | local_integration(PGlite·PG 18.6) | pass | 전이 13지점 앞뒤 중단과 재시작, 게시 5단계 응답 유실, lease 만료(시작 전·턴 중·시험 중), finalize 실패, Discord ACK 유실, 시작 불명, 결과 유실, 게시 서버 둘 동시. 모델·시험·리뷰·PR이 각각 하나 | 실제 프로세스 kill(시험은 예외와 새 객체로 끊는다) |
+| SEC-02 조립 | local_integration | pass(닿는 범위) | 실제 bwrap으로 합성 자격이 있는 작업자의 시험을 돌려 자격 경로·상태 볼륨·환경 없음, source 쓰기 실패, 음성 대조. `change-sec02` 10건, `sec02-boundary` 24건 이미지 재실행 | 아래 not_run |
+| DEPLOY-01 | mock(B4) + 부모 전이 local | pass | `readMerge` 실패 유지, 미병합 닫힘, 병합, 창 시작 보존, 끝·늦음에서 멈춤 | live, 실제 Application CR |
+
+**SEC-02 not_run.**
+
+| 항목 | 이유 |
+|---|---|
+| TaskLane + 실모델 | 모델 호출 금지. H3 승인 뒤 |
+| 실자격 직접 Read | 실자격을 쓰지 않는다. 기존 결정 |
+| Localhost AppArmor·seccomp, `hostUsers: false` 아래 verifier | 운영 파드에서만 잰다. H2 무모델 측정 |
+| PVC·Secret 볼륨 위 수집, 메모리·PID 폭주 | 위와 같다. 상한은 파드 cgroup이다 |
+
+**수정 전 실패.** 7-1 시작 기록은 시험을 먼저 넣어 3건 중 2건 실패를 봤다. 조립 시험은 API를 함께 지어 수정 전 실패 수를 따로 재지 않았다. 변이 확인이 그 몫을 한다.
+
+**변이 확인.** `dist` 사본을 한 군데씩 바꿔 대상 시험 파일을 돌렸고, 묶음마다 원본을 함께 돌려 fail 0을 봤다. 42건 중 41건이 잡혔다.
+
+| 묶음 | 변이 |
+|---|---|
+| 슬롯·복구 | 자식 claim 제외, `/retry` 제외, lease 되찾기, 줄 복귀, 시험 중 되찾기, 시험 실패 차단, 시작 불명 닫기, CI 선확인, 권한 철회 |
+| 출처·권한 | label 기본값, private 답, label 없는 답, 기록 없는 답, 요청 스레드 대조, `writerAccepted`, 스레드 제한, 입력 검사, `events`의 원문 |
+| 스위치 | 명령 등록, 설정 파싱, 키·경로 조건, 옛 작업자, 정책 키 optional, revision 모양 |
+| 시작 기록 | 기록 쓰기, 기록 확인, port·HTTP의 busy |
+| 병합·보존 | 열린 PR, 병합 불가 알림, 늦음·끝에서 멈춤, 추적 안 함 문구, 새 generation의 스레드 대조, 미확정 effect·기간·진행 중·receipt 보존, 리뷰 원문 저장, 취소 |
+
+- 첫 회에 시험이 약해 살아남은 5건은 시험을 고쳐 다시 잡았다. 열린 PR, 끝난 뒤 재시작, 새 generation의 스레드 대조, private 답, 자식 claim(`change-artifact`의 `v1 격리`가 잡는다)이다.
+- 잡지 못한 1건은 수신 허용 목록(`CHANGE_COMMANDS`)이다. 스위치가 꺼지면 처리기가 없어 `DiscordIngress`가 같은 명령을 다시 막는 이중 방어라 동작이 같다.
+- 3건(lease 되찾기, 시험 중 되찾기, 정책 키 optional)은 이름 있는 시험이 실패한 뒤 파일이 끝나지 않아 도구가 집계 줄을 받지 못했다. 잡힌 것으로 셌고 실패한 시험 이름을 직접 확인했다.
+- 창 시작을 먼저 남기는 줄은 변이하지 않았다. `observing`이 없으면 다시 남기는 대비 경로가 있어 동작이 같다.
+
+**검사.** Node 24.22.0. `npm run check` 통과.
+
+| 명령 | 결과 |
+|---|---|
+| PG 포함 `npm run build && node --test --test-concurrency=6 dist/test/*.test.js` | 2032 tests, 2010 pass, 0 fail, 22 skipped(전부 `SEC02_IMAGE` 없음). 3분 13초, load 최대 2.84. PG 18.6, 네트워크 없음, 끝나고 삭제 |
+| `SEC02_IMAGE=<이름> node --test dist/test/change-sec02.test.js` 단독 | 10 pass, 0 fail, 0 skip |
+| `SEC02_IMAGE=<이름> node --test dist/test/sec02-boundary.test.js` 단독 | 24 pass, 0 fail, 0 skip |
+
+**D-23.** `app-build.yaml`의 공개 금지 패턴으로 `git grep -nIiE --untracked -l`을 돌려 0건이다.
+
+**고친 기존 시험.** migration이 하나 늘어 `publisher-migrate`·`publisher-pg`·`change-store`·`change-store-pg`의 버전 고정값을 고쳤다. `change-artifact`의 세 곳은 `store.claim`이 자식 job을 일부러 집지 않게 되어 `claimChangeAuthor`로 바꿨고, `v1 격리`는 두 방어를 모두 본다.
+
+### 리뷰 지적 수정 (#85, 2026-11-06)
+
+시험을 먼저 넣어 수정 전 21건 실패를 봤다. `change-assembly` 15건(대상 18건 중), `change-verify-start` 6건(10건 중)이다. 실패 사유는 하나씩 확인했다. `tree` 대조 시험 1건은 시험의 fault가 앞선 읽기에 먼저 소모돼 실패한 것이라 시드를 고쳤다.
+
+| 지적 | 재현 | 수정 | 수정 뒤 |
+|---|---|---|---|
+| P1 철회 뒤 게시 | 승인·`/revoke` 뒤 `reconcile` 한 번에 GitHub 쓰기 6회, phase `proposed` | `ChangePublisher`가 `publish` 입구와 stage마다 `authorize`(필수 옵션). 철회면 `cancelled(authorization_revoked)`, 정책 불가면 `deferred` | 쓰기·토큰·읽기 0회. 단계 사이 철회면 다음 단계 없음. 미확정 effect는 읽기 대조로 확정 |
+| P1 후속 요청 멈춤 | 끝난 관측 33개면 proposed 33개 중 조회 0개. 작성·자식·알림 조회도 같은 모양 | 네 조회에 `(정렬값, ID)` 커서. 끝난 관측은 부모 조회에서 뺌 | 새 요청이 게시까지 감. 기다리는 33개 모두 차례를 받음 |
+| P1 검증 동시 실행 | 함께 온 요청 둘이 모두 실행. 작업 공간이 겹쳐 `EACCES`·`ENOTEMPTY` | 조회가 끝난 뒤 같은 틱에 슬롯을 보고 잡음. 시작 기록 `O_EXCL` | 샌드박스 1회. 재시작 경로 기존 시험 통과 |
+| P2 비공개 답 유출 | `label=private` 답이 `events.payload.text`에 남음 | `sealsAnswer`면 빈 글로 저장하고 원문은 호출 값으로만 전달 | `events`·`chatContext`에 없음. 공개 답은 작성자에 전달. v1은 그대로 |
+| CI 실패 | `호환 unknown`의 마지막 단언. 고정 100ms를 0으로 줄이면 코어 하나에서 5회 중 5회 `actual: 0`, 800ms 뒤에도 0 | 코드 경합이 아니라 시험의 시간 가정이다. 단언은 그대로 두고 대기를 "가짜 모델 시작"으로 바꿈. `EVENT-02 결과 유실`도 같은 조건을 더함 | 통과 |
+
+**같은 종류로 더 찾아 고친 것.**
+
+- 재조회가 receipt를 슬롯보다 먼저 읽어 막 끝난 시험을 `absent`로 답했다. port가 끝난 시험을 `unknown`으로 닫는 경로다.
+- 정리(`removeGeneration`)가 결과를 읽기 전의 슬롯 값으로 판단해, 그 사이 시작한 시험의 세션을 지우고 파드 정리로 죽일 수 있었다.
+- `reconcile`의 재개 한 건이 던지면 뒤의 건이 막혔다.
+- 턴 시작·후보 리뷰가 비동기 대기 뒤 종료 여부를 다시 보지 않았다.
+- 변경 명령의 `target`도 자유 입력인데 `events`에 남아 대화 맥락에 들어갔다.
+
+**고쳤던 기존 시험.** `authorize`가 필수가 되어 `change-github-fake`·`change-freshness`·`change-recovery`·`change-pg`의 게시자 생성에 인가 통과 대역을 넣었다. 단언은 바꾸지 않았다.
+
+**시험 구성에서 배운 것.** 능력 토큰은 서명이 결정적이고 nonce가 서명 해시라, 같은 본문을 같은 밀리초에 발급하면 토큰이 같아 재사용으로 거부된다. 동시 요청 시험은 발급 시각을 띄워야 유효한 요청 둘이 된다.
+
+**변이 확인.** `dist` 사본을 한 군데씩 바꿔 대상 시험을 돌렸고, 묶음마다 원본을 먼저 돌려 fail 0을 봤다. 29건 모두 잡혔다.
+
+| 묶음 | 건수 | 내용 |
+|---|---|---|
+| 인가 | 6 | 입구·stage 인가, 조립의 인가, 정책 불가 미룸, 철회 닫기, 재개 오류 격리 |
+| 차례 | 6 | 끝난 관측 제외, 커서 전진, 부모·자식·단계 알림·배포 알림 커서 |
+| 슬롯 | 11 | 배타 생성, 이미 있을 때 미실행, 슬롯 판정 3종, 종료 재확인 2종, 재조회 순서, receipt 재조회 2종, 정리의 슬롯 판정 |
+| 리뷰 종료 | 1 | 조회 뒤 닫힘 재확인 |
+| 답 원문 | 5 | 봉인, 호출 값 전달, 모든 답 봉인(v1 호환), 명령 `target`·`text` |
+
+첫 회에 살아남은 2건(끝난 관측 제외, 시작 기록 뒤 receipt 재조회)은 시험이 약했다. 시험을 고쳐 다시 잡았다.
+
+**검사.** Node 24.22.0.
+
+| 명령 | 결과 |
+|---|---|
+| `npm run check` | 통과 |
+| PG 포함 `npm run build && node --test --test-concurrency=6 dist/test/*.test.js` | 2057 tests, 2035 pass, 0 fail, 22 skipped(전부 `SEC02_IMAGE` 없음). 3분 14초, load 최대 4.06. PG 18.6, 네트워크 없음 |
+| 위 실행 뒤 시험만 고친 파일 | `change-verify-start` 코어 하나 8회 모두 13 pass. `change-pg`의 새 시험 2 pass. `change-assembly`의 차례 4건·답 원문 8건 원본 통과 |
+
+**못 한 검증(예산 초과).** 시험을 마지막으로 고친 뒤의 전체 재실행, `taskset -c 0-1`의 `change-assembly` 파일 전체 실행, `change-sec02`·`sec02-boundary` 이미지 재실행.
+
+**D-23.** 공개 금지 패턴 0건.

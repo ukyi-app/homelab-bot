@@ -5,10 +5,14 @@ import pg from 'pg';
 import { EFFECT_LEASE_MS } from '../src/change-contracts.js';
 import type { EffectStage } from '../src/change-contracts.js';
 import { ChangePublisher } from '../src/change-publisher.js';
-import { Postgres } from '../src/database.js';
+import { readFile } from 'node:fs/promises';
+import { MIGRATIONS, Postgres, migrationVersion } from '../src/database.js';
 import { runMigrations } from '../src/migrate-main.js';
-import { ok } from './change-store-fixture.js';
-import { publishEnv } from './change-github-fake.js';
+import { REQUEST_TEXT, WRITE_STEP, changeHarness } from './change-assembly-harness.js';
+import type { Harness } from './change-assembly-harness.js';
+import { OWNER, driveTo, git, hex, ok, seedConversation } from './change-store-fixture.js';
+import { REPO, publishEnv } from './change-github-fake.js';
+import { QUESTION } from './task-worker-harness.js';
 
 // 실제 PostgreSQL(18) 시험. HOMELAB_TEST_PG_SOCKET(유닉스 소켓 디렉터리)이 없으면 건너뛴다. GitHub은 가짜다.
 const socket = process.env.HOMELAB_TEST_PG_SOCKET;
@@ -75,7 +79,7 @@ for (const stage of ['blob', 'tree', 'commit', 'ref', 'pull'] as const) {
       const sent = d.env.github.count(ROUTES[stage]);
 
       // 임대가 살아 있는 동안에는 아무도 대조·재전송하지 않는다.
-      assert.deepEqual(await new ChangePublisher({ store: d.env.store, writer: d.env.writerIO.writer, preflight: d.env.writerIO.preflight, policy: async () => d.env.policy.current, now: () => d.env.clock.now, retryMs: 60_000 }).publish(key), { kind: 'busy' });
+      assert.deepEqual(await new ChangePublisher({ store: d.env.store, writer: d.env.writerIO.writer, preflight: d.env.writerIO.preflight, policy: async () => d.env.policy.current, authorize: async () => {}, now: () => d.env.clock.now, retryMs: 60_000 }).publish(key), { kind: 'busy' });
 
       d.env.clock.now += EFFECT_LEASE_MS + 1;
       const outcomes = await Promise.all(Array.from({ length: CONCURRENCY }, () => d.env.newPublisher().publish(key)));
@@ -148,5 +152,164 @@ test('T19 B3 실제 PostgreSQL: claim과 취소가 겹쳐도 취소 뒤 시작�
         assert.ok(d.env.github.mutations().length > before);
       }
     }
+  } finally { await d.close(); }
+});
+
+// ---- T19 B5 조립: 부모 runtime 전체를 실제 PostgreSQL에서 돌린다 ----
+
+async function bare() {
+  const admin = new pg.Pool({ host: socket, user: 'postgres', database: 'postgres', max: 1 });
+  const name = `t19b5_${randomUUID().replaceAll('-', '').slice(0, 12)}`;
+  await admin.query(`CREATE DATABASE ${name}`);
+  const raw = new pg.Pool({ host: socket, user: 'postgres', database: name, max: CONCURRENCY + 2 });
+  return { raw, db: new Postgres(raw), close: async () => {
+    await raw.end();
+    for (let attempt = 0; ; attempt++) {
+      try { await admin.query(`DROP DATABASE ${name}`); break; } catch (error) {
+        if (attempt >= 50 || !/being accessed by other users/.test((error as Error).message)) throw error;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+    await admin.end();
+  } };
+}
+const childState = async (h: Harness, id: string) => (await h.db.query<{ state: string }>(`SELECT j.state FROM jobs j JOIN change_child_jobs c ON c.job_id=j.id WHERE c.change_id=$1 AND c.role='author'`, [id])).rows[0]!.state;
+const digest = async (h: Harness, id: string) => (await h.db.query<{ approval_digest: string }>('SELECT approval_digest FROM change_approval_subjects WHERE change_id=$1', [id])).rows[0]!.approval_digest;
+
+test('T19 B5 EVENT-02 실제 PostgreSQL: 전이 지점마다 끊고 재시작해도 모델·시험·리뷰·게시가 한 번씩이다', { skip }, async () => {
+  const points = ['changes.admit', 'changes.pinBase', 'author.start', 'author.fetchResult', 'artifacts.save', 'changes.startVerification', 'verification.run', 'changes.recordVerification', 'author.finalize', 'changes.finishVerification', 'review.submit', 'publisher.prepareApproval', 'publisher.publish'];
+  for (const point of points) for (const when of ['before', 'after'] as const) {
+    const d = await bare();
+    await runMigrations(d.raw);
+    const h = await changeHarness(d.db, { crash: { point, when } });
+    try {
+      const fired = () => h.logs.some(entry => entry.event === 'change_step_failed');
+      await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+      const id = await h.changeId();
+      await h.pump(async () => fired() || await h.phase(id) === 'awaiting_publish_approval');
+      h.restart({ crash: { point, when } });
+      await h.pump(async () => await h.phase(id) === 'awaiting_publish_approval');
+      await h.command('101', 'change-publish', { target: id, text: await digest(h, id) });
+      await h.pump(async () => await h.phase(id) === 'proposed');
+      h.restart();
+      await h.pump(async () => await childState(h, id) === 'succeeded');
+      assert.equal((await h.f.calls()).length, 1, `${point} ${when}: 모델 1회`);
+      assert.equal(h.runs.verify, 1, `${point} ${when}: 시험 1회`);
+      assert.equal(h.reviewInputs.length, 1, `${point} ${when}: 리뷰 1회`);
+      assert.equal(h.env.github.pulls.length, 1, `${point} ${when}: PR 하나`);
+      assert.equal(h.env.github.count(ROUTES.pull), 1);
+      assert.equal(await h.store.laneBusy('task'), false);
+    } finally { await h.close(); await d.close(); }
+  }
+});
+test('T19 B5 EVENT-02 실제 PostgreSQL: 게시 서버 둘이 같은 부모를 동시에 밀어도 모델·시험·PR이 하나다', { skip }, async () => {
+  const d = await bare();
+  await runMigrations(d.raw);
+  const h = await changeHarness(d.db);
+  try {
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    const first = h.runtime;
+    const firstReview = h.reviewRuntime;
+    h.restart();
+    const second = h.runtime;
+    const secondReview = h.reviewRuntime;
+    const both = async () => { await Promise.allSettled([first.childrenTick(), second.childrenTick(), first.laneTick(), second.laneTick(), first.publishTick(), second.publishTick(), firstReview.tick(), secondReview.tick()]); };
+    for (let round = 0; round < 400 && await h.phase(id) !== 'awaiting_publish_approval'; round++) { await both(); await new Promise(resolve => setTimeout(resolve, 3)); }
+    assert.equal(await h.phase(id), 'awaiting_publish_approval');
+    await h.command('101', 'change-publish', { target: id, text: await digest(h, id) });
+    for (let round = 0; round < 400 && await h.phase(id) !== 'proposed'; round++) { await both(); await new Promise(resolve => setTimeout(resolve, 3)); }
+    assert.equal(await h.phase(id), 'proposed');
+    assert.equal((await h.f.calls()).length, 1);
+    assert.equal(h.runs.verify, 1);
+    assert.equal(h.reviewInputs.length, 1);
+    assert.equal(h.env.github.pulls.length, 1);
+    for (const stage of ['tree', 'commit', 'ref', 'pull'] as const) assert.equal(h.env.github.count(ROUTES[stage]), 1, stage);
+  } finally { await h.close(); await d.close(); }
+});
+test('T19 B5 굶주림·철회 실제 PostgreSQL: 끝난 관측과 오래된 proposed가 33개씩 있어도 새 요청이 진행하고, 승인 뒤 /revoke면 대조가 쓰지 않는다', { skip }, async () => {
+  const d = await bare();
+  await runMigrations(d.raw);
+  const h = await changeHarness(d.db);
+  try {
+    await seedConversation(h.db);
+    for (let index = 0; index < 33; index++) {
+      const request = await driveTo(h.changes, 'observing_deploy');
+      const at = Date.now() + 1000;
+      ok(await h.changes.recordDeployment({ changeId: request.id, generation: 1, observation: { state: 'observed', headSha: git('h'), mergeCommit: git('m'), configCommit: git('k'), imageDigest: `sha256:${hex('d')}`, argoObservedAt: at, workloadObservedAt: at, observedAt: at, reason: null } }));
+      await h.db.query('INSERT INTO change_deployment_windows(change_id,generation,started_at) VALUES ($1,1,$2)', [request.id, Date.now()]);
+    }
+    const waiting = new Set<string>();
+    for (let index = 0; index < 33; index++) waiting.add((await driveTo(h.changes, 'proposed')).id);
+    const polled = new Set<string>();
+    h.restart({ instrument: deps => ({ ...deps, deployment: { readMerge: async input => {
+      polled.add(input.target.key.changeId);
+      return waiting.has(input.target.key.changeId) ? { state: 'open' } : deps.deployment.readMerge(input);
+    }, observe: deps.deployment.observe.bind(deps.deployment) } }) });
+    for (let round = 0; round < 4; round++) await h.runtime.publishTick();
+    assert.equal(polled.size, 33, '커서가 끝까지 돈다');
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    await h.pump(async () => await h.phase(id) === 'awaiting_publish_approval', 300);
+    await h.command('101', 'change-publish', { target: id, text: await digest(h, id) });
+    await h.command('102', 'revoke', { target: OWNER });
+    await h.runtime.reconcile();
+    assert.equal(h.env.github.mutations().length, 0);
+    assert.equal(await h.phase(id), 'cancelled');
+  } finally { await h.close(); await d.close(); }
+});
+test('T19 B5 DATA-01 실제 PostgreSQL: CHANGE 답의 원문은 events에 없고 작성자 재개가 읽는 자리에는 있다', { skip }, async () => {
+  const d = await bare();
+  await runMigrations(d.raw);
+  const h = await changeHarness(d.db, { steps: [QUESTION, WRITE_STEP] });
+  try {
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    await h.pump(async () => (await h.db.query(`SELECT 1 FROM codex_questions WHERE state='open'`)).rows.length > 0);
+    const question = (await h.db.query<{ id: string }>(`SELECT id FROM codex_questions WHERE state='open'`)).rows[0]!.id;
+    const canary = ['fixture', 'answer', 'canary', '42b1'].join('-');
+    await h.command('101', 'answer', { target: question, text: `label=public | ${canary}` });
+    assert.ok(!JSON.stringify((await h.db.query('SELECT payload FROM events')).rows).includes(canary));
+    await h.pump(async () => await h.phase(id) === 'awaiting_publish_approval');
+    assert.ok((await h.f.calls())[1]!.input.includes(canary));
+  } finally { await h.close(); await d.close(); }
+});
+test('T19 B5 EVENT-02 실제 PostgreSQL: 프로세스가 죽어 lease가 끝난 뒤 새 프로세스가 되찾아 끝내고 레인을 연다', { skip }, async () => {
+  const d = await bare();
+  await runMigrations(d.raw);
+  const h = await changeHarness(d.db);
+  try {
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    await h.pump(async () => (await h.db.query(`SELECT 1 FROM codex_sessions WHERE state='running'`)).rows.length > 0);
+    await h.db.query(`UPDATE jobs SET lease_until=1 WHERE type='task'`);
+    await h.store.expire();
+    assert.equal(await childState(h, id), 'unknown');
+    h.restart();
+    await h.pump(async () => await h.phase(id) === 'awaiting_publish_approval');
+    assert.equal((await h.f.calls()).length, 1);
+    await h.pump(async () => await childState(h, id) === 'succeeded');
+    assert.equal(await h.store.laneBusy('task'), false);
+    assert.equal(await h.store.syncTaskLane(), null);
+  } finally { await h.close(); await d.close(); }
+});
+test('T19 B5 호환 실제 PostgreSQL: 016까지 적용된 DB를 018로 올려도 기존 행이 그대로이고 artifact는 비우는 변경만 받는다', { skip }, async () => {
+  const d = await bare();
+  try {
+    for (const file of MIGRATIONS.filter(name => migrationVersion(name) <= 16)) await d.raw.query(await readFile(`migrations/${file}`, 'utf8'));
+    await d.raw.query(`INSERT INTO conversations(id,owner_id,scope,channel_id,created_at,active) VALUES ('c','o','{}'::jsonb,'c',1,true)`);
+    assert.deepEqual(await runMigrations(d.raw), [17, 18]);
+    assert.equal((await d.raw.query(`SELECT 1 FROM conversations WHERE id='c'`)).rows.length, 1);
+    assert.deepEqual(await runMigrations(d.raw), []);
+    const h = await changeHarness(d.db);
+    try {
+      await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+      const id = await h.changeId();
+      await h.pump(async () => await h.phase(id) === 'awaiting_publish_approval');
+      await assert.rejects(d.raw.query(`UPDATE change_artifacts SET patch='x' WHERE change_id=$1`, [id]), /change_evidence_immutable/);
+      await assert.rejects(d.raw.query(`UPDATE change_artifacts SET patch='',purged_at=1,label='public',result_tree=$2 WHERE change_id=$1`, [id, 'd'.repeat(40)]), /change_evidence_immutable/);
+      assert.equal((await d.raw.query(`UPDATE change_artifacts SET patch='',purged_at=1 WHERE change_id=$1`, [id])).rowCount, 1);
+      await assert.rejects(d.raw.query(`UPDATE change_artifacts SET purged_at=2 WHERE change_id=$1`, [id]), /change_evidence_immutable/);
+    } finally { await h.close(); }
   } finally { await d.close(); }
 });

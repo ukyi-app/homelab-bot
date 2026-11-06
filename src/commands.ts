@@ -14,13 +14,15 @@ export const REVIEW_COMMANDS = Object.freeze(['review-status', 'review-resume', 
 export const TASK_COMMANDS = Object.freeze(['task', 'answer', 'task-status', 'task-cancel', 'task-release'] as const);
 // R08 사람 세션 연결. EXTERNAL_TASK_EVENTS_ENABLED가 켜졌을 때만 등록·수신한다. 작업 레인과 묶지 않는다.
 export const EXTERNAL_TASK_COMMANDS = Object.freeze(['attach', 'detach', 'attach-list'] as const);
+// 변경 PR. CHANGE_PR_ENABLED가 true일 때만 등록·수신한다. owner·스레드·요청 소유 검사는 DiscordIngress와 ChangeCommands가 한다.
+export const CHANGE_COMMANDS = Object.freeze(['change', 'change-status', 'change-cancel', 'change-publish'] as const);
 // DiscordProtocol은 옵션 값을 문자열로만 받는다(type 3 STRING). project·question은 수신에서 target으로 읽는다.
 const option = (name: 'text' | 'target' | 'project' | 'question', description: string, maxLength: number) =>
   ({ type: 3, name, description, required: true, max_length: maxLength });
 const text = (description: string, maxLength = 6000) => option('text', description, maxLength);
 const target = (description: string, maxLength = 100) => option('target', description, maxLength);
 type CommandName = typeof FOUNDATION_COMMANDS[number] | typeof MEMORY_COMMANDS[number] | typeof REVIEW_COMMANDS[number] | typeof TASK_COMMANDS[number]
-  | typeof EXTERNAL_TASK_COMMANDS[number];
+  | typeof EXTERNAL_TASK_COMMANDS[number] | typeof CHANGE_COMMANDS[number];
 const command = (name: CommandName, description: string, options: ReturnType<typeof option>[] = []) =>
   // type 1(CHAT_INPUT), 서버 안에서만(contexts 0 GUILD, integration_types 0 GUILD_INSTALL). DM은 끔(D-17).
   ({ name, type: 1, description, options, contexts: [0], integration_types: [0] });
@@ -73,10 +75,18 @@ export const EXTERNAL_TASK_COMMAND_DEFINITIONS = Object.freeze([
   command('detach', '세션 연결 해제(수신과 미게시 알림을 막음)', [target('연결 ID(/attach-list)', 36)]),
   command('attach-list', '이 스레드의 세션 연결 목록'),
 ]);
-// 등록할 명령 목록. 원장·리뷰·작업 레인·R08이 꺼져 있으면 FOUNDATION 목록과 같다.
-export const commandDefinitions = (memory: boolean, review = false, task = false, external = false) => !memory && !review && !task && !external ? COMMAND_DEFINITIONS
+// /change의 서식은 text 하나에 받는다(옵션이 문자열뿐이다). 서식 전체는 change-commands.ts의 안내가 알려 준다.
+export const CHANGE_COMMAND_DEFINITIONS = Object.freeze([
+  command('change', '저장소 변경 요청. 수정·시험·검토까지 하고 게시하지 않음(스레드에서, 정책에 있는 저장소만)', [option('project', '저장소 이름 또는 새 generation을 열 변경 ID', 140),
+    text('요약 | goal=목표 | accept=인수 조건 | label=public (공개 가능한 내용만)', 6000)]),
+  command('change-status', '변경 상태(요청한 스레드에서)', [target('변경 ID', 32)]),
+  command('change-cancel', '변경 취소(요청한 스레드에서, 공개된 객체는 기록만 남음)', [target('변경 ID', 32)]),
+  command('change-publish', '미리보기의 승인 digest를 승인해 게시(요청한 스레드에서)', [target('변경 ID', 32), text('승인 digest', 64)]),
+]);
+// 등록할 명령 목록. 원장·리뷰·작업 레인·R08·변경 PR이 꺼져 있으면 FOUNDATION 목록과 같다.
+export const commandDefinitions = (memory: boolean, review = false, task = false, external = false, change = false) => !memory && !review && !task && !external && !change ? COMMAND_DEFINITIONS
   : Object.freeze([...COMMAND_DEFINITIONS, ...(memory ? MEMORY_COMMAND_DEFINITIONS : []), ...(review ? REVIEW_COMMAND_DEFINITIONS : []),
-    ...(task ? TASK_COMMAND_DEFINITIONS : []), ...(external ? EXTERNAL_TASK_COMMAND_DEFINITIONS : [])]);
+    ...(task ? TASK_COMMAND_DEFINITIONS : []), ...(external ? EXTERNAL_TASK_COMMAND_DEFINITIONS : []), ...(change ? CHANGE_COMMAND_DEFINITIONS : [])]);
 
 const Remote = z.array(z.object({ name: z.string(), type: z.number().optional(), description: z.string(),
   options: z.array(z.object({ type: z.number(), name: z.string(), description: z.string(), required: z.boolean().optional(),

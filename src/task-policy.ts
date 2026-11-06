@@ -27,7 +27,7 @@ export const taskProject = (policy: Policy, id: string | undefined): TaskProject
   return parsed.success ? parsed.data.projects.find(project => project.id === id) : undefined;
 };
 
-const DEFAULT_LIMITS = Object.freeze({ archiveBytes: TASK_LIMITS.archiveBytes, files: TASK_LIMITS.files, fileBytes: TASK_LIMITS.fileBytes,
+export const DEFAULT_LIMITS = Object.freeze({ archiveBytes: TASK_LIMITS.archiveBytes, files: TASK_LIMITS.files, fileBytes: TASK_LIMITS.fileBytes,
   patchBytes: TASK_LIMITS.patchBytes, lineBytes: TASK_LIMITS.lineBytes, outputBytes: TASK_LIMITS.outputBytes, events: TASK_LIMITS.events });
 
 // 기준 SHA: 공개 GitHub REST를 자격 없이 읽는다(commits/<branch>, sha 미디어 타입).

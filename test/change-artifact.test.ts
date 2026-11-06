@@ -471,7 +471,7 @@ test('작성 port 재개: 답한 질문을 같은 세션으로 잇고 결과를 
   const question = (await h.db.query<{ id: string }>(`SELECT id FROM codex_questions WHERE job_id=$1 AND state='open'`, [h.job.id])).rows[0]!;
   const answered = await h.bridge.answer({ question: question.id, actor: 'fixture-owner', scope: thread, text: 'src를 고쳐라', event: 'answer-1' });
   assert.equal(answered.ok, true);
-  const claimed = (await h.app.store.claim('task'))!;
+  const claimed = (await h.app.store.claimChangeAuthor(h.job.id))!;
   assert.equal(claimed.id, h.job.id);
   await h.author.resume({ receiptId, answer: 'src를 고쳐라', label: 'public' });
   const result = await pollAuthor(h, receiptId);
@@ -521,7 +521,7 @@ test('작성 port 재개: 답을 나르던 턴이 한도로 끝나면 질문을 
   assert.equal((await pollAuthor(h, receiptId)).kind, 'needs_input');
   const question = (await h.db.query<{ id: string }>(`SELECT id FROM codex_questions WHERE job_id=$1 AND state='open'`, [h.job.id])).rows[0]!;
   assert.equal((await h.bridge.answer({ question: question.id, actor: 'fixture-owner', scope: thread, text: 'src를 고쳐라', event: 'answer-1' })).ok, true);
-  assert.equal((await h.app.store.claim('task'))!.id, h.job.id);
+  assert.equal((await h.app.store.claimChangeAuthor(h.job.id))!.id, h.job.id);
   await h.author.resume({ receiptId, answer: 'src를 고쳐라', label: 'public' });
   assert.equal((await h.db.query<{ state: string }>('SELECT state FROM codex_questions WHERE id=$1', [question.id])).rows[0]!.state, 'resumed');
   assert.equal((await pollAuthor(h, receiptId)).kind, 'snapshot');
@@ -650,7 +650,9 @@ test('v1 격리: CHANGE 세션을 v1 실행으로 잇지 않는다', async () =>
   assert.equal((await pollAuthor(h, receiptId)).kind, 'needs_input');
   const question = (await h.db.query<{ id: string }>(`SELECT id FROM codex_questions WHERE job_id=$1 AND state='open'`, [h.job.id])).rows[0]!;
   await h.bridge.answer({ question: question.id, actor: 'fixture-owner', scope: thread, text: '답', event: 'answer-2' });
-  const claimed = (await h.app.store.claim('task'))!;
+  // 첫째 방어는 claim이 자식 job을 집지 않는 것이다. 둘째 방어는 어떻게든 닿아도 브리지가 잇지 않는 것이다.
+  assert.equal(await h.app.store.claim('task'), undefined);
+  const claimed = (await h.app.store.claimChangeAuthor(h.job.id))!;
   await h.bridge.run(claimed);
   assert.equal((await h.db.query<{ state: string; wait_reason: string }>('SELECT state,wait_reason FROM jobs WHERE id=$1', [h.job.id])).rows[0]!.wait_reason, 'task_session_mismatch');
   assert.equal((await h.f.calls()).length, 1);

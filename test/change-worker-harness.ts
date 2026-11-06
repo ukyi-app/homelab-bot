@@ -43,7 +43,7 @@ export interface ChangeWorkerFixture {
   raw(endpoint: string, body: unknown, token?: string): Promise<{ status: number; json: any }>;
   signed(endpoint: TaskV2Endpoint, body: unknown): Promise<{ status: number; json: any }>;
 }
-export async function changeWorkerFixture(options: { items?: TarItem[]; verifier?: Partial<VerifierOptions>; change?: boolean } = {}): Promise<ChangeWorkerFixture> {
+export async function changeWorkerFixture(options: { items?: TarItem[]; currentItems?: () => TarItem[]; verifier?: Partial<VerifierOptions>; change?: boolean } = {}): Promise<ChangeWorkerFixture> {
   const base = await realpath(await mkdtemp(join(tmpdir(), 't19-b1-')));
   const fake = join(base, 'fake');
   const credential = join(base, 'credential');
@@ -62,7 +62,7 @@ export async function changeWorkerFixture(options: { items?: TarItem[]; verifier
   const cleanup = new FakeCleanup(join(fake, 'pids'));
   const items = options.items ?? BASE_ITEMS;
   const archiveUrls: string[] = [];
-  const fetchArchive: ArchiveFetcher = async url => { archiveUrls.push(url); return archive(items); };
+  const fetchArchive: ArchiveFetcher = async url => { archiveUrls.push(url); return archive(options.currentItems?.() ?? items); };
   const boot = async (): Promise<{ service: TaskWorkerService; running: Server; url: string; close: () => Promise<void> }> => {
     const credentialStore = new StaticEnvCredential(credentialFile, []);
     const launcher = new ProcessGroupLauncher([bin], { cleanup });

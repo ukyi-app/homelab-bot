@@ -778,7 +778,7 @@ test('T19 B0 migration: 016 DB에 017만 더하고 기존 표·제약·행을 �
   try {
     const db = migrationDatabase(pg);
     const upTo016 = MIGRATIONS.filter(file => Number.parseInt(file, 10) <= 16);
-    assert.equal(upTo016.length, MIGRATIONS.length - 1);
+    assert.equal(upTo016.length, MIGRATIONS.length - 2);
     for (const file of upTo016) await pg.exec(await readFile(`migrations/${file}`, 'utf8'));
     await seedConversation(db);
     await insertChildJob(db, 'existing-job', 'task');
@@ -786,7 +786,7 @@ test('T19 B0 migration: 016 DB에 017만 더하고 기존 표·제약·행을 �
     const constraints = await constraintsOf(db);
     const jobs = JSON.stringify((await db.query('SELECT * FROM jobs')).rows);
 
-    assert.deepEqual(await migrate(db), [17]);
+    assert.deepEqual(await migrate(db), [17, 18]);
     assert.equal(await schemaOf(db), schema);
     assert.equal(await constraintsOf(db), constraints);
     assert.equal(JSON.stringify((await db.query('SELECT * FROM jobs')).rows), jobs);

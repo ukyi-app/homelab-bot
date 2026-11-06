@@ -10,7 +10,7 @@ import { classify } from './review.js';
 import type { RunDirs } from './executor.js';
 import type { ProcessCleanup } from './process-launcher.js';
 import type { TaskV2VerificationResponse } from './task-contracts.js';
-import { TaskWorkerRejected } from './task-bridge.js';
+import { TaskWorkerBusy, TaskWorkerRejected } from './task-bridge.js';
 import { SecretScanner, removeTree } from './task-workspace.js';
 import type { ArchiveLimits } from './task-workspace.js';
 
@@ -257,7 +257,11 @@ export class WorkerChangeVerification implements ChangeVerificationPort {
     let reply: TaskV2VerificationResponse | null = null;
     try { reply = await this.options.worker.verify({ ...control, worker }, input.commandId, input.bundle); }
     // 거부는 시작하지 않았다는 증거다. 그 밖은 시작했는지 모르니 아래에서 저장된 값을 본다.
-    catch (error) { if (error instanceof TaskWorkerRejected) return this.local(input, 'not_run'); }
+    catch (error) {
+      // 슬롯이 잠깐 찬 것은 시험 결과가 아니다. receipt는 command당 하나라 not_run으로 굳히면 이 generation을 살릴 수 없다.
+      if (error instanceof TaskWorkerBusy) throw error;
+      if (error instanceof TaskWorkerRejected) return this.local(input, 'not_run');
+    }
     const deadline = Date.now() + this.waitMs;
     while (reply?.status !== 'done') {
       if (reply?.status === 'absent' || Date.now() >= deadline) return this.local(input, 'unknown');

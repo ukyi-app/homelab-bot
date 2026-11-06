@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Agent } from 'undici';
 import { z } from 'zod';
 import { body } from './http.js';
-import { TaskWorkerRejected } from './task-bridge.js';
+import { TaskWorkerBusy, TaskWorkerRejected } from './task-bridge.js';
 import type { TaskEndpointRequest, TaskEndpointResponse, TaskWorkerPort } from './task-bridge.js';
 import { ARTIFACT_LIMITS } from './change-contracts.js';
 import { VERIFIER_REVISION } from './change-verifier.js';
@@ -61,6 +61,7 @@ async function boundedJson(response: Response, maxBytes: number): Promise<{ resp
   }
   return { response: JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown, bytes };
 }
+const TaskBusySchema = z.strictObject({ status: z.literal('busy'), started: z.literal(false) });
 export type TaskV2EndpointRequest<E extends TaskV2Endpoint> = z.infer<(typeof TASK_V2_ENDPOINTS)[E]['request']>;
 export type TaskV2EndpointResponse<E extends TaskV2Endpoint> = z.infer<(typeof TASK_V2_ENDPOINTS)[E]['response']>;
 export interface TaskV2WorkerPort {
@@ -98,7 +99,9 @@ export class HttpTaskV2Worker implements TaskV2WorkerPort {
       throw error;
     }
     if (!response.ok) {
-      if ([400, 401, 403, 409].includes(response.status) && TaskRejectionSchema.safeParse(await response.json().catch(() => null)).success) throw new TaskWorkerRejected();
+      const refused: unknown = await response.json().catch(() => null);
+      if (response.status === 409 && TaskBusySchema.safeParse(refused).success) throw new TaskWorkerBusy();
+      if ([400, 401, 403, 409].includes(response.status) && TaskRejectionSchema.safeParse(refused).success) throw new TaskWorkerRejected();
       throw new Error('task_worker_uncertain');
     }
     return boundedJson(response, ARTIFACT_LIMITS.httpBodyBytes);
@@ -151,6 +154,7 @@ export class HttpTaskWorker implements TaskWorkerPort {
 }
 
 const REJECTED = JSON.stringify({ status: 'rejected', started: false });
+const BUSY = JSON.stringify({ status: 'busy', started: false });
 // 로그에는 끝점·상태·사유 상수만 남긴다. 요청 본문과 capability는 넘기지 않는다.
 export function taskRoutes(service: TaskWorkerService, capabilities: object, log?: (fields: Record<string, unknown>) => void): ReadonlyMap<string, WorkerRoute> {
   const route = (endpoint: TaskEndpoint): WorkerRoute => async (req, res) => {
@@ -202,6 +206,8 @@ export function taskRoutes(service: TaskWorkerService, capabilities: object, log
               : await service.changeFinalize(parsed.data as never, token);
       send(200, JSON.stringify(result));
     } catch (error) {
+      // 슬롯 경합은 시작하지 않았다는 사실 말고 결과가 없다. v2를 부르는 게시 서버만 이 끝점을 쓰므로 옛 게시 서버의 거부 판별과 부딪히지 않는다.
+      if (error instanceof TaskRouteError && error.message === 'busy') { send(409, BUSY); return; }
       if (error instanceof TaskRouteError) { refuse(error.status, error.message); return; }
       log?.({ level: 'error', event: 'task_route_failed', endpoint, error: error instanceof Error ? error.name : typeof error });
       send(500, JSON.stringify({ status: 'unknown', stopped: false }));

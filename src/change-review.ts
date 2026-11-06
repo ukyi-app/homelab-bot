@@ -459,6 +459,8 @@ export class ChangeReviewWorker {
     // 응답을 잃은 뒤 같은 lease로 다시 와도 모델을 다시 부르지 않는다.
     const kept = await this.results.get(task.job, task.lease).catch(() => null);
     if (kept) return kept;
+    // 조회하는 사이에 닫혔으면 close가 이 실행을 보지 못한다.
+    if (this.closed) throw new WorkerRejected('worker_closing');
     const started = Date.now();
     const abort = new AbortController();
     let settle!: (stopped: boolean) => void;

@@ -357,7 +357,7 @@ test('T19 B3 복구: ref 응답이 422이면 정확한 ref를 읽어 내 H면 �
       if (input.branch === branchOf(key) && ++branchReads <= 2) return null;
       return readHead(input);
     } };
-    const publisher = new ChangePublisher({ store: mine.env.store, writer, preflight: mine.env.writerIO.preflight, policy: async () => mine.env.policy.current, now: () => mine.env.clock.now, retryMs: 60_000 });
+    const publisher = new ChangePublisher({ store: mine.env.store, writer, preflight: mine.env.writerIO.preflight, policy: async () => mine.env.policy.current, authorize: async () => {}, now: () => mine.env.clock.now, retryMs: 60_000 });
     const claim = mine.env.store.claimEffect.bind(mine.env.store);
     mine.env.store.claimEffect = async input => {
       const claimed = await claim(input);
@@ -552,7 +552,7 @@ test('T19 B3 복구: 긴 전송 중에는 임대를 갱신한다', async () => {
     const real = env.store.renewEffectLease.bind(env.store);
     env.store.renewEffectLease = async input => { renewals++; return real(input); };
     const publisher = new ChangePublisher({
-      store: env.store, preflight: env.writerIO.preflight, policy: async () => env.policy.current, now: () => env.clock.now, retryMs: 60_000, leaseRenewMs: 5,
+      store: env.store, preflight: env.writerIO.preflight, policy: async () => env.policy.current, authorize: async () => {}, now: () => env.clock.now, retryMs: 60_000, leaseRenewMs: 5,
       writer: { ...env.writerIO.writer, createBlobs: async input => {
         await new Promise(resolve => setTimeout(resolve, 40));
         return env.writerIO.writer.createBlobs(input);

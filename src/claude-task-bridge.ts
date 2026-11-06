@@ -12,7 +12,7 @@ import type { Policy, PolicyGate } from './policy.js';
 import { DRAIN_MS } from './runtime.js';
 import type { TaskLane } from './runtime.js';
 import type { Store } from './store.js';
-import { FOREIGN_SESSION_STATUS, TaskBridge, TaskWorkerRejected } from './task-bridge.js';
+import { FOREIGN_SESSION_STATUS, TaskBridge, TaskWorkerBusy, TaskWorkerRejected } from './task-bridge.js';
 import type { TaskStatus, TaskWorkerPort } from './task-bridge.js';
 import type { TaskV2WorkerPort } from './task-http.js';
 import { TASK_ENDPOINTS, TASK_INSTRUCTIONS_REVISION, TASK_LIMITS, TASK_RETENTION, TASK_V2_CONTRACT, TASK_V2_ENDPOINTS, TASK_V2_REQUEST_CHARS, taskQuestionId } from './task-contracts.js';
@@ -701,6 +701,8 @@ export interface ChangeAuthorSource {
 }
 export interface ChangeAuthorDeps { bridge: ClaudeTaskBridge; store: Store; gate: PolicyGate; worker: TaskV2WorkerPort; source: ChangeAuthorSource; artifacts: ChangeArtifactPort }
 const TERMINAL_SESSION = new Set(['completed', 'failed', 'cancelled']);
+// 작업자 정리(유예 1.5초 + KILL 2초)보다 길게 기다린다. null은 마지막 시도다.
+const BUSY_RETRY_MS = [500, 1000, 2000, 4000, null] as const;
 // 작업자 v2 경로. 세션 행을 v1과 같은 표에 두어 레인 닫힘·보존 칸·소멸 확인이 같은 규칙으로 돈다. receipt는 job·세션 세대이고 나머지는 그 행에서 읽는다.
 // 저장 전에 작업자 결과를 지우지 않는다: 세션은 저장 ACK 전까지 running이라 v1 정리 sweep이 건드리지 않는다.
 export class ClaudeChangeAuthor implements ChangeAuthorPort {
@@ -720,8 +722,16 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
     const begun = await this.deps.bridge.beginChangeTurn(job, request, session);
     if (begun !== 'started') throw new Error(`change_turn_${begun}`);
     try {
-      const { response } = await this.deps.worker.callV2('/v2/task', request);
-      const accepted = TASK_V2_ENDPOINTS['/v2/task'].response.safeParse(response);
+      // 정리 요청이 도는 잠깐 동안 슬롯이 찬다. 시작하지 않았다는 답이라 같은 턴을 다시 보내도 안전하다. 이것으로 턴을 닫으면 일시 경합이 끝 상태가 된다.
+      let reply: { response: unknown; bytes: number } | undefined;
+      for (const delay of BUSY_RETRY_MS) {
+        try { reply = await this.deps.worker.callV2('/v2/task', request); break; }
+        catch (error) {
+          if (!(error instanceof TaskWorkerBusy) || delay === null) throw error;
+          await new Promise(resolve => { setTimeout(resolve, delay); });
+        }
+      }
+      const accepted = TASK_V2_ENDPOINTS['/v2/task'].response.safeParse(reply?.response);
       if (accepted.success && accepted.data.job === request.job && accepted.data.turn === request.turn) {
         await this.deps.bridge.bindChangeWorker(job.id, { generation: request.generation, claude_session_id: request.sessionId } as SessionRow, accepted.data.worker);
       }
@@ -856,6 +866,35 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
     });
     await this.deps.bridge.finalizeChangeSession(jobId);
   }
+  // 재시작으로 lease를 잃은 job을 되찾기 전에 쓴다. 같은 저장소의 작업자가 이 세션을 안다고 답할 때만 known이다. 닿지 않으면 던진다.
+  async workerFacts(receiptId: string): Promise<{ known: boolean; stopped: boolean }> {
+    const { job, generation } = this.parse(receiptId);
+    const session = await this.session(job, generation);
+    if (!session) return { known: false, stopped: false };
+    const status = await this.deps.bridge.statusOfChange(job, session);
+    const sameStorage = session.worker_storage ? status.worker.storage === session.worker_storage : status.state !== 'absent';
+    return { known: sameStorage, stopped: sameStorage && status.stopped };
+  }
+  // 저장하지 않기로 한 결과를 버린다. 부모가 먼저 끝난 경우다. job을 끝내야 세션을 닫고 공간을 지울 수 있다.
+  async abandon(receiptId: string): Promise<boolean> {
+    const { job: jobId } = this.parse(receiptId);
+    const job = await this.jobRow(jobId);
+    if (!await this.deps.store.transition(job, 'cancelled', 'change_closed')) return false;
+    await this.deps.bridge.closeChangeSession(jobId);
+    return true;
+  }
+  // 시작 요청이 작업자에 닿았는지 끝내 모를 때 쓴다. 취소로 늦게 닿는 시작까지 막고 소멸을 확인한 뒤에만 그 턴을 닫는다. 다시 보내지 않는다.
+  async closeUnstarted(receiptId: string): Promise<boolean> {
+    const { job: jobId, generation } = this.parse(receiptId);
+    const session = await this.session(jobId, generation);
+    if (session?.state !== 'running') return false;
+    const facts = await this.deps.bridge.cancelChangeTurn(session, jobId);
+    if (!facts?.stopped) return false;
+    const settled = await this.deps.bridge.settleChangeTurn(await this.jobRow(jobId), session, null);
+    this.deps.bridge.reportChangeEnd(jobId, settled);
+    if (settled.terminal) await this.deps.bridge.finalizeChangeSession(jobId).catch(() => {});
+    return settled.terminal;
+  }
   // 검증 port가 같은 세션을 가리키게 한다.
   async verificationControl(key: ChangeKey): Promise<ChangeVerificationControl | null> {
     const jobId = await this.deps.source.authorJob(key);
@@ -866,7 +905,13 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
   }
   async verificationKeepalive(key: ChangeKey): Promise<void> {
     const jobId = await this.deps.source.authorJob(key);
-    if (jobId) await this.deps.store.heartbeat(await this.jobRow(jobId));
+    if (!jobId) return;
+    const job = await this.jobRow(jobId);
+    await this.deps.store.heartbeat(job);
+    // 시험 중 자식 /cancel은 부모가 verifying이라 정리 바퀴가 멈춰 주지 않는다. 시한까지 기다리지 않게 시험을 여기서 멈춘다.
+    if ((job as unknown as { state: string }).state !== 'cancel_requested') return;
+    const session = await this.session(jobId);
+    if (session) await this.deps.bridge.cancelChangeTurn(session, jobId);
   }
   // WorkerChangeVerification에 넘기는 호출 묶음.
   verificationWorker(): ChangeVerificationWorker {

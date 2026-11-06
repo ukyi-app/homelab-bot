@@ -6,7 +6,8 @@ import { evaluateCi, readCiSnapshot } from './change-ci-policy.js';
 import { compilePathPolicy, gitCommitSha, inspectCandidate } from './change-policy.js';
 import type { BaseLeaf, ChangeRepositoryPolicy, PublishPlan } from './change-policy.js';
 import { publicationMarker, renderPublication, scanPublicPayload } from './change-publication.js';
-import type { ChangeStore, EffectKey, EffectRecord, GenerationRecord } from './change-store.js';
+import type { ChangeRequest, ChangeStore, EffectKey, EffectRecord, GenerationRecord } from './change-store.js';
+import { Denied, PolicyUnavailable } from './contracts.js';
 import type { ChangePreflightPort } from './github-writer.js';
 import type { Log } from './log.js';
 
@@ -29,6 +30,8 @@ export type PublishOutcome =
 export interface ChangePublisherOptions {
   store: ChangeStore; writer: ChangeWriterPort; preflight: ChangePreflightPort;
   policy: (repoId: number) => Promise<ChangeRepositoryPolicy | null>;
+  // 요청자의 지금 권한. 정책 조회와 writer는 /revoke의 거부 목록을 보지 않아 쓰기 경로마다 이 값을 따로 물어야 한다. 철회면 Denied, 정책을 못 읽으면 PolicyUnavailable을 던진다.
+  authorize: (request: Pick<ChangeRequest, 'ownerId' | 'scope'>) => Promise<unknown>;
   now?: () => number; log?: Log; retryMs?: number; leaseRenewMs?: number;
 }
 export interface ReconcileReport {
@@ -56,12 +59,13 @@ export class ChangePublisher {
   private readonly writer: ChangeWriterPort;
   private readonly preflight: ChangePreflightPort;
   private readonly policy: ChangePublisherOptions['policy'];
+  private readonly authorize: ChangePublisherOptions['authorize'];
   private readonly now: () => number;
   private readonly log: Log;
   private readonly retryMs: number;
   private readonly leaseRenewMs: number;
   constructor(options: ChangePublisherOptions) {
-    this.store = options.store; this.writer = options.writer; this.preflight = options.preflight; this.policy = options.policy;
+    this.store = options.store; this.writer = options.writer; this.preflight = options.preflight; this.policy = options.policy; this.authorize = options.authorize;
     this.now = options.now ?? Date.now; this.log = options.log ?? (() => {});
     this.retryMs = options.retryMs ?? DEFAULT_RETRY_MS; this.leaseRenewMs = options.leaseRenewMs ?? Math.floor(EFFECT_LEASE_MS / 3);
   }
@@ -84,6 +88,7 @@ export class ChangePublisher {
       if (pull?.stage === 'pull') return { kind: 'proposed', prNumber: pull.number, headSha: pull.headSha };
     }
     if (request.phase !== 'approved' && request.phase !== 'publishing') return { kind: 'stopped', phase: request.phase };
+    await this.assertAuthorized(key);
     const expired = await this.store.expireSendingEffects();
     if (expired.length) this.log('change_effects_expired', { count: expired.length });
     await this.settlePrevious(key);
@@ -100,6 +105,22 @@ export class ChangePublisher {
     const pull = await this.confirmedResult(key, 'pull');
     if (pull?.stage !== 'pull') throw new Stop({ kind: 'unknown', stage: 'pull' });
     return this.finish(key, plan.generation, pull);
+  }
+
+  // 게시 입구와 stage마다 부른다. 대조 주기의 재개도 이 길을 지난다. 철회면 부모만 닫고 이미 공개된 객체는 그대로 둔다. 미확정 effect의 읽기 대조는 reconcile이 계속한다.
+  private async assertAuthorized(key: ChangeKey): Promise<void> {
+    const request = this.must(await this.store.get(key.changeId));
+    try {
+      await this.authorize(request);
+      return;
+    } catch (error) {
+      if (error instanceof PolicyUnavailable) throw new Stop(this.deferred('policy_unavailable'));
+      if (!(error instanceof Denied)) throw error;
+    }
+    const moved = await this.store.transition({ ...key, from: request.phase, to: 'cancelled', reason: 'authorization_revoked' });
+    if (!moved.ok) throw this.storeStop(moved);
+    this.log('change_publish_closed', { to: 'cancelled', reason: 'authorization_revoked' });
+    throw new Stop({ kind: 'stopped', phase: 'cancelled' });
   }
 
   // 미확정 effect가 있으면 새 stage로 가지 않는다. 대조 가능한 것은 여기서 대조한다.
@@ -248,6 +269,7 @@ export class ChangePublisher {
     if (existing?.state === 'blocked') throw new Stop({ kind: 'blocked', reason: existing.blockedReason ?? 'effect_blocked' });
     if (existing?.state === 'sending') throw new Stop({ kind: 'busy' });
     if (existing?.state === 'unknown') throw new Stop({ kind: 'unknown', stage });
+    await this.assertAuthorized(key);
     await this.freshnessBefore(plan, stage);
     const { requestDigest, expected } = this.intentFor(plan, stage);
     const intent = await this.store.recordEffectIntent({ ...key, stage, requestDigest, expected });
@@ -450,6 +472,7 @@ export class ChangePublisher {
   // ---- 대조 ----
 
   // 재시작·주기 실행의 입구다. 만료된 전송을 unknown으로 옮기고, 대조하고, 기한 넘은 unknown을 사람 해소로 넘긴 뒤, 승인·게시 중인 건을 이어 간다.
+  // 대조는 읽기뿐이라 권한과 무관하게 돈다. 쓰기로 가는 재개는 publish의 인가를 지난다.
   async reconcile(): Promise<ReconcileReport> {
     const report: ReconcileReport = { confirmed: [], stillUnknown: [], blocked: [], resumed: [] };
     await this.store.expireSendingEffects();
@@ -472,7 +495,9 @@ export class ChangePublisher {
     for (const row of rows) {
       const key = { changeId: row.id, generation: Number(row.generation) };
       if ((await this.store.unresolvedEffects({ changeId: key.changeId })).some(effect => effect.state === 'unknown' || effect.state === 'sending' || effect.state === 'blocked')) continue;
-      report.resumed.push({ key, outcome: await this.publish(key) });
+      // 한 건의 오류가 뒤의 건을 막지 않는다. 다음 주기에 다시 본다.
+      try { report.resumed.push({ key, outcome: await this.publish(key) }); }
+      catch (error) { this.log('change_publish_resume_failed', { reason: this.code(error) }); }
     }
     return report;
   }

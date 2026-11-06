@@ -150,15 +150,60 @@ export class Store {
       // 보존 칸이 찼어도 이미 보존 중인 세션을 잇는 일은 칸을 늘리지 않는다. 막으면 그 세션이 끝나지 못해 칸이 영영 비지 않는다.
       const retained = startsClosed ? `AND EXISTS (SELECT 1 FROM codex_sessions s WHERE s.job_id=j.id AND s.executor='claude'
         AND s.session_retained AND s.state IN ('waiting_answer','waiting_model'))` : '';
+      // CHANGE 자식 job은 v1 실행 경로로 가면 세션이 task_session_mismatch로 닫히고 저장 전 결과가 지워진다. change-runtime만 claimChangeAuthor로 집는다.
       const row = (await tx.query<Job>(`SELECT j.* FROM jobs j JOIN events e ON e.id=j.event_id
         JOIN conversations c ON c.id=j.conversation_id WHERE j.state='queued' AND j.type<>'read' AND e.accepted=true
         AND c.active=true AND c.gap=false AND c.owner_id=j.owner_id AND e.actor_id=j.owner_id AND j.available_at<=$1
+        AND NOT EXISTS (SELECT 1 FROM change_child_jobs cc WHERE cc.job_id=j.id)
         ${lane ? 'AND j.execution_lane=$2' : ''} ${retained}
         ORDER BY j.priority,j.created_at,e.event_order FOR UPDATE OF j SKIP LOCKED LIMIT 1`, lane ? [this.now(), lane] : [this.now()])).rows[0];
       if (!row) return;
       return (await tx.query<Job>(`UPDATE jobs SET state='running',attempt=attempt+1,
         lease_token=$2,lease_until=$3,started_at=$4 WHERE id=$1 RETURNING *`,
       [row.id, randomUUID(), this.now() + DEFAULTS.leaseMs, this.now()])).rows[0];
+    });
+  }
+  // CHANGE 작성 job 하나를 claim과 같은 잠금 순서·같은 슬롯 규칙으로 집는다. 슬롯이 차 있으면 undefined이고 부모는 다음 바퀴에 다시 본다.
+  async claimChangeAuthor(jobId: string): Promise<Job | undefined> {
+    return this.db.transaction(async tx => {
+      await tx.query(`INSERT INTO controls VALUES ('scheduler','false') ON CONFLICT DO NOTHING`);
+      await tx.query(`SELECT value FROM controls WHERE key='scheduler' FOR UPDATE`);
+      if (await this.taskLaneStopped(tx)) return;
+      await tx.query(`SELECT lane FROM execution_lanes WHERE lane='task' FOR UPDATE`);
+      const closed = await this.syncTaskLane(tx);
+      if (closed && closed !== 'retention_full') return;
+      if (await this.laneBusy('task', tx)) return;
+      const retained = closed === 'retention_full' ? `AND EXISTS (SELECT 1 FROM codex_sessions s WHERE s.job_id=j.id AND s.executor='claude'
+        AND s.session_retained AND s.state IN ('waiting_answer','waiting_model'))` : '';
+      const row = (await tx.query<{ id: string }>(`SELECT j.id FROM jobs j JOIN change_child_jobs c ON c.job_id=j.id
+        WHERE j.id=$1 AND c.role='author' AND j.state='queued' AND j.available_at<=$2 ${retained} FOR UPDATE OF j SKIP LOCKED`, [jobId, this.now()])).rows[0];
+      if (!row) return;
+      return (await tx.query<Job>(`UPDATE jobs SET state='running',attempt=attempt+1,lease_token=$2,lease_until=$3,started_at=$4 WHERE id=$1 RETURNING *`,
+        [row.id, randomUUID(), this.now() + DEFAULTS.leaseMs, this.now()])).rows[0];
+    });
+  }
+  // 턴을 보내기 전에 lease가 끝난 CHANGE 작성 job을 대기열로 돌린다. 세션이 실행 중이 아니면 작업자에 프로세스가 없다. 그대로 두면 unknown이 레인을 닫는다.
+  async requeueChangeAuthor(jobId: string, conversation: string): Promise<boolean> {
+    return this.atomic(async store => {
+      await store.lockTaskControl(conversation);
+      const moved = await store.db.query(`UPDATE jobs SET state='queued',attempt=GREATEST(0,attempt-1),available_at=$2,lease_token=NULL,lease_until=NULL,started_at=NULL,wait_reason='lease_lost_before_dispatch'
+        WHERE id=$1 AND state='unknown' AND EXISTS (SELECT 1 FROM change_child_jobs c WHERE c.job_id=jobs.id AND c.role='author')
+        AND NOT EXISTS (SELECT 1 FROM codex_sessions s WHERE s.job_id=jobs.id AND s.state IN ('running','unknown')) RETURNING id`, [jobId, store.now()]);
+      await store.syncTaskLane();
+      return moved.rows.length === 1;
+    });
+  }
+  // 재시작으로 lease만 끝난 CHANGE 작성 job을 같은 lease로 되찾는다. 턴과 시험은 작업자에서 그 lease로 계속 돌고, 결과를 되찾은 뒤에야 정상 경로로 닫을 수 있다.
+  // 호출자가 작업자의 답을 먼저 받아 둔다. 세션이 그 lease로 실행 중일 때만 옮겨 해제·다른 실행이 끝낸 job을 되살리지 않는다.
+  async reacquireChangeAuthor(job: Pick<Job, 'id' | 'lease_token' | 'conversation_id'>): Promise<boolean> {
+    return this.atomic(async store => {
+      await store.lockTaskControl(job.conversation_id);
+      const moved = await store.db.query(`UPDATE jobs SET state='running',wait_reason=NULL,finished_at=NULL,lease_until=$3
+        WHERE id=$1 AND lease_token=$2 AND state='unknown' AND wait_reason='lease_expired'
+        AND EXISTS (SELECT 1 FROM change_child_jobs c WHERE c.job_id=jobs.id AND c.role='author')
+        AND EXISTS (SELECT 1 FROM codex_sessions s WHERE s.job_id=jobs.id AND s.executor='claude' AND s.state='running' AND s.worker_lease=$2) RETURNING id`, [job.id, job.lease_token, store.now() + DEFAULTS.leaseMs]);
+      await store.syncTaskLane();
+      return moved.rows.length === 1;
     });
   }
   // 레인의 실행 슬롯을 잡고 있는 job이 있는지. 질문 대기는 프로세스가 없어 슬롯을 놓는다. 같은 job의 동시 턴은 그 job이 queued로
@@ -687,8 +732,10 @@ export class Store {
       const kind = (await this.db.query<{ type: Job['type'] }>('SELECT type FROM jobs WHERE id=$1 AND owner_id=$2 AND conversation_id=$3',
         [target, actor, conversation])).rows[0]?.type ?? 'chat';
       if (await this.queueFull(kind)) return { ok: false, status: '대기열이 가득 찼습니다. 불필요한 작업을 취소한 뒤 재시도하세요.' };
+      // CHANGE 자식 job을 다시 돌리지 않는다. 모델을 다시 부르는 길은 새 generation뿐이다.
       const changed = await this.db.query(`UPDATE jobs SET state='queued',available_at=$4,wait_reason=NULL
-        WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND state='failed' AND attempt<$5 RETURNING id`,
+        WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND state='failed' AND attempt<$5
+        AND NOT EXISTS (SELECT 1 FROM change_child_jobs cc WHERE cc.job_id=jobs.id) RETURNING id`,
       [target, actor, conversation, this.now(), DEFAULTS.maxRetries + 1]);
       if (!changed.rows.length) return { ok: false, status: '재시도할 작업이 현재 대화에 없거나 상태·재시도 한도가 허용하지 않습니다.' };
       return { status: '확인된 실패 작업만 재시도합니다.' };

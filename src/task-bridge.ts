@@ -19,6 +19,8 @@ export interface TaskWorkerPort {
 export class TaskWorkerRejected extends Error {
   constructor() { super('task_worker_rejected'); }
 }
+// 지금 슬롯이 차서 시작하지 않았다. 결과가 아니라 일시 상태라 receipt로 남기지 않고 다시 부른다.
+export class TaskWorkerBusy extends TaskWorkerRejected {}
 
 export interface TaskBridgeOptions { questionTtlMs: number; answerChars: number }
 // 실행기마다 다른 안내 문구와 멱등 키·감사 접두사. executor는 이 브리지가 맡는 세션의 codex_sessions.executor 값이다.

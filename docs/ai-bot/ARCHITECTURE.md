@@ -1527,7 +1527,7 @@ POST
 
 ## 16. T19 CHANGE_PR 계약
 
-**아직 조립되지 않았다.** `src/change-contracts.ts`, `src/change-store.ts`, `migrations/017_change_pr.sql`만 있다. 어떤 진입점도 이 파일을 import하지 않고 명령·루프·writer·네트워크 호출이 없다. migration이 표를 만들 뿐이고 행은 생기지 않는다. 운영 봇의 동작은 그대로다.
+**기본은 꺼짐이다.** 조립과 스위치는 §16.5에 있다. `CHANGE_PR_ENABLED`가 true가 아니면 명령·루프·writer·네트워크 호출이 없고 migration이 표를 만들 뿐 행이 생기지 않는다. 운영 봇의 동작은 그대로다.
 
 **흐름.** 부모 change는 `jobs` 행이 아니라서 승인·배포를 기다리는 동안 실행 slot을 잡지 않는다. 모델 실행만 자식 job이다.
 
@@ -1605,11 +1605,11 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 | `ChangeWriterPort` | B3 | blob·tree·commit·ref·PR 생성과 대조용 읽기. 결과는 `confirmed`·`not_sent`·`rejected`·`unknown` |
 | `ChangeDeploymentPort` | B4 | 병합 사실 읽기, H·M·K·D 관측 |
 
-조립과 스위치는 B5의 몫이다. 브랜치는 `changeBranchName`만 만들고 `bot/change/<32자리 hex>/g<n>` 외에는 `parseChangeBranch`가 거부한다.
+브랜치는 `changeBranchName`만 만들고 `bot/change/<32자리 hex>/g<n>` 외에는 `parseChangeBranch`가 거부한다.
 
 ### 16.1 배포 읽기 (B4)
 
-`src/change-deployment.ts`의 `DeploymentReader`가 `ChangeDeploymentPort`를 구현한다. 아직 조립되지 않았고 쓰기가 없다. 이 관측은 **배포된 버전만** 말한다. 기능·DB·성능은 보지 않고 `describeDeployment`가 그 범위 문장을 늘 함께 낸다.
+`src/change-deployment.ts`의 `DeploymentReader`가 `ChangeDeploymentPort`를 구현한다. 쓰기가 없다. 이 관측은 **배포된 버전만** 말한다. 기능·DB·성능은 보지 않고 `describeDeployment`가 그 범위 문장을 늘 함께 낸다.
 
 **H·M·K·D.** 넷을 따로 둔다. H(PR head)는 나르기만 하고 어떤 값과도 대조하지 않는다. squash면 H와 M은 다르다.
 
@@ -1655,13 +1655,13 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 
 **익명 한도.** GitHub 익명 읽기는 출구 IP당 시간 60회다. commit SHA로 정해지는 내용은 프로세스 안에서 기억해 `pending` 중 조회는 분당 1회로 줄인다. 넘으면 `github_refused`로 `unknown`이고 다른 자격으로 넘어가지 않는다.
 
-**조회 주기.** `DEPLOYMENT_POLL`은 60초 간격·10분 초기 창이다. `deploymentPollStep`이 `settled`·`poll`·`report_late`를 돌려준다. 창이 지나도 끝 상태로 바꾸지 않고 마지막 `pending`·`unknown`과 관측 시각을 알린다. 루프는 B5가 조립한다.
+**조회 주기.** `DEPLOYMENT_POLL`은 60초 간격·10분 초기 창이다. `deploymentPollStep`이 `settled`·`poll`·`report_late`를 돌려준다. 창이 지나도 끝 상태로 바꾸지 않고 마지막 `pending`·`unknown`과 관측 시각을 알린다.
 
 **한계.** D가 정말 M에서 빌드됐는지 다시 검증하지 않는다. `image.yaml`에 적힌 값을 믿고 출처 검증은 자동 병합 조건 5(`deploy-merge`)의 몫이다. 사람이 병합한 `image.yaml`은 그 검사를 거치지 않을 수 있다.
 
 ### 16.2 미게시 후보 리뷰 (B2)
 
-**아직 조립되지 않았다.** `src/change-review.ts`가 입력 계약, diff 완전성, 판정, 작업자, HTTP, `ChangeReviewPort` 구현을 함께 둔다. 실행기는 `review-lane.ts`의 `createChangeReviewerModel`이고 T17과 같은 `RunControl`·어댑터를 쓴다. 다른 점은 지시·입력·출력 스키마뿐이다. 도구 0개, MCP·hooks·skills 없음, 실행별 임시 공간, 도구 호출 즉시 중단, 반사 검사는 그대로다.
+`src/change-review.ts`가 입력 계약, diff 완전성, 판정, 작업자, HTTP, `ChangeReviewPort` 구현을 함께 둔다. 실행기는 `review-lane.ts`의 `createChangeReviewerModel`이고 T17과 같은 `RunControl`·어댑터를 쓴다. 다른 점은 지시·입력·출력 스키마뿐이다. 도구 0개, MCP·hooks·skills 없음, 실행별 임시 공간, 도구 호출 즉시 중단, 반사 검사는 그대로다.
 
 **끝점.** 작업자 포트의 별도 경로다. 인증 없는 POST는 본문을 읽기 전에 401이다.
 
@@ -1701,7 +1701,7 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 
 모델이 고르는 위험 코드는 고정 목록이다. 자유 문자열이면 공개 receipt로 값을 실어 나를 수 있어서다. 실패 사유도 코드 형식이 아니면 `model_failed`로 바꾼다.
 
-**리뷰 원문 위치.** receipt에는 `findingsDigest`만 있다. 원문은 게시 서버 PostgreSQL의 비공개 표에 둔다(`ChangeReviewFindingsSink`, 표는 B5가 다음 migration으로 만든다). `change_request_inputs`처럼 공개 렌더러·writer에 주지 않는다. 작업자 상태 볼륨에도 ack 전까지 결과 사본이 남는다(`ChangeReviewResults`, 0600, 16건 상한).
+**리뷰 원문 위치.** receipt에는 `findingsDigest`만 있다. 원문은 게시 서버 PostgreSQL의 비공개 표 `change_review_findings`에 둔다(`ChangeReviewFindings`, migration 018). `change_request_inputs`처럼 공개 렌더러·writer에 주지 않는다. 작업자 상태 볼륨에도 ack 전까지 결과 사본이 남는다(`ChangeReviewResults`, 0600, 16건 상한).
 
 **세션 독립.** 작업자가 실행마다 UUID를 새로 정해 receipt의 `sessionId`로 돌려준다. CLI는 `--no-session-persistence`이고 `--resume`·`--session-id`가 금지 플래그라 이어 쓸 세션이 없다. 이 값은 CLI가 보고한 세션 ID가 아니라 실행 식별자다. 게시 서버는 receipt를 만들기 전에 이 change의 `role='author'` 자식 job에 묶인 `codex_sessions`와 대조해 같으면 `author_session_reused`로 실패시킨다. job 쪽은 `linkChildJob`·`recordReview`가 막는다.
 
@@ -1711,7 +1711,7 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 
 ### 16.3 T19 B3 writer·공개 경계
 
-**아직 조립되지 않았다.** `src/github-writer.ts`, `src/change-policy.ts`, `src/change-ci-policy.ts`, `src/change-publisher.ts`, `src/change-publication.ts`만 있고 어떤 진입점도 import하지 않는다.
+`src/github-writer.ts`, `src/change-policy.ts`, `src/change-ci-policy.ts`, `src/change-publisher.ts`, `src/change-publication.ts`가 맡는다. 스위치가 꺼져 있으면 writer를 만들지 않는다(§16.5).
 
 **구조.** GitHub 쓰기는 `createGitHubWriter` 안의 `exchange` 한 곳에서 나간다. 밖으로는 도메인 메서드만 나가고 URL·method·token을 받는 함수가 없다. `exchange`는 전송 직전 route 표와 body 키를 다시 본다. 응용 내부 강제이고 OS 경계가 아니다. 키가 새면 우회되며, 그때 남는 상한은 설치 저장소와 서버 ruleset이다.
 
@@ -1767,7 +1767,7 @@ V1에는 `PATCH git/refs`와 `PATCH pulls`가 없다. 병합·`/merges`·dispatc
 
 ### 16.4 작업 레인 v2: artifact와 무자격 검증 (B1)
 
-**아직 조립되지 않았다.** `TaskWorkerOptions.change`를 넘기는 진입점이 없어 운영 작업자에 v2 끝점이 없고 intake가 지원을 말하지 않는다. v1 `/task`는 그대로 돈다. `task-contracts.ts`가 `change-contracts.ts`의 schema를 import하지만 진입점이 쓰는 v1 경로의 동작은 같다.
+작업자 진입점은 PID 정리 수단이 있으면 `TaskWorkerOptions.change`를 넘겨 v2 끝점을 열고 intake로 지원을 말한다. 게시 서버가 CHANGE를 끄면 이 끝점을 부르는 쪽이 없다. v1 `/task`는 그대로 돈다.
 
 | 파일 | 맡는 것 |
 |---|---|
@@ -1828,3 +1828,83 @@ bwrap은 `--unshare-all --die-with-parent --new-session --cap-drop ALL --clearen
 **port 결과의 코드.** `model_limit`·`auth_expired`는 세션을 유지하고 사람 재개를 기다리는 경우이고 `unknown`으로 돌려준다. `stop_unconfirmed`, `start_unconfirmed`, `worker_unreachable`도 같은 종류라 부모를 끝내지 말고 다시 묻는다. `failed`는 작업자가 차단 사유를 낸 것이다.
 
 **V1 제한.** manifest의 모든 항목이 mode `100644`·`100755`여야 한다. 변경하지 않아도 T0에 symlink·gitlink가 있으면 manifest를 만들 수 없어 그 저장소는 시작부터 닫힌다. 변경 내용 합계 1 MiB, HTTP body 2 MiB를 넘으면 차단한다. 변경 파일 256개, manifest 5,000항목은 제안값이다. command·리뷰는 generation당 한 번이라 실패한 결과를 같은 generation에서 다시 받지 못한다.
+
+**시작 기록.** `changeVerify`는 시험 프로세스를 띄우기 전에 `<job>.<generation>.verification.<command>.started`를 배타적으로 만들어(`O_EXCL`) fsync한다. 이미 있으면 시험을 띄우지 않는다. 재시작 뒤 이 기록만 있고 receipt가 없으면 다시 돌리지 않고 `absent`로 답해 `WorkerChangeVerification.run`이 `unknown`으로 닫는다. 첫 실행의 실패가 재실행 통과로 가려지지 않게 하려는 것이다. 슬롯 경합은 시험 결과가 아니라서 `/v2/task/verify`만 409 `{status:'busy'}`로 따로 말하고, 게시 서버(`TaskWorkerBusy`)는 receipt를 남기지 않고 다시 부른다.
+
+**슬롯을 보는 순서.** 파드 정리는 프로세스를 가리지 않아 슬롯이 겹치면 상대 시험까지 죽인다. 그래서 슬롯은 비동기 조회가 모두 끝난 뒤에 보고 같은 틱에 잡는다. `changeVerify`의 슬롯 확보, `removeGeneration`의 정리 판단이 이 순서를 따르고, 조회 사이에 종료가 시작됐는지도 슬롯 직전에 다시 본다. 재조회(`changeVerification`)는 반대로 슬롯을 receipt보다 먼저 본다. receipt는 슬롯을 놓기 전에 쓰므로, 이 순서면 막 끝난 시험을 `absent`로 답하지 않는다.
+
+### 16.5 조립과 꺼짐 배포 (B5)
+
+**스위치.** 조건은 `changePrecondition` 한 곳에서 본다. 정책은 기동 때 읽고 작업자 조건만 주기로 다시 본다.
+
+| 상황 | 동작 |
+|---|---|
+| `CHANGE_PR_ENABLED` 없음·`false` | writer 객체·명령·루프·GitHub 호출·변경 행이 모두 없다. App 키를 읽지도 않아 새 Secret 없이 뜬다 |
+| `CHANGE_PR_ENABLED`가 그 밖의 값, 키가 있는데 형식이 틀림, `change` 절이 틀림 | 기동 오류. 값 없이 키 이름·필드 경로만 남긴다 |
+| 켰는데 키 부족·`change` 절 없음·작업 레인 닫힘·리뷰 닫힘·작업 정책과 경로 뜻이 다름 | 명령은 등록하고 `/change`·`/change-publish`가 사유를 안내한다. writer·루프는 없다. 조회·취소는 된다. 대화·작업·리뷰는 그대로다 |
+| 조건은 맞는데 작업자가 v2가 아니거나(`intake.change` 없음) 후보 리뷰 경로가 없음(`/v1/change-review` 404) | writer와 루프는 있고 접수만 닫힌다. 30초마다 다시 본다 |
+
+정책 parser가 게시 서버와 함께 먼저 배포된다. 옛 정책(키 없음)은 그대로 통과한다. `change`가 있으면 `revision`이 `RevisionSchema`를 지켜야 한다. 이 값이 증거 묶음의 policy revision이고 작성 세션·시험·리뷰·게시가 모두 이 값으로 대조한다. 저장소 절의 `revision`은 작업 프로젝트 revision으로만 쓴다. 그래서 실행 정책의 revision이 바뀌면 진행 중인 건은 `policy_changed`로 막힌다.
+
+**조립 그림.**
+
+```
+Discord /change → DiscordIngress.changeCommand → ChangeCommands(DB만) → change_requests·change_request_inputs
+ChangeRuntime
+  laneTick     requested → admitted(CI 선확인) → authoring → snapshot_ready → verifying → reviewing
+               ClaudeChangeAuthor ─ HttpTaskV2Worker ─ 작업 레인 작업자(runChangeTurn, IsolatedVerifier)
+               WorkerChangeVerification ─ 같은 작업자
+  childrenTick 끝난 부모의 자식 취소·정리, 저장을 마친 세션 finalize
+  publishTick  reviewing → awaiting_publish_approval → approved → publishing → proposed → merged → observing_deploy, 알림
+               ChangeReviewService ─ ReviewRuntime ─ HttpChangeReviewWorker ─ 대화·리뷰 작업자(createChangeReviewerModel)
+               ChangePublisher ─ createGitHubWriter(writer·preflight)
+               DeploymentReader ─ publicGithubReader·deploymentKubernetesReader
+  reconcile(5분)·retention(1시간)
+```
+
+부모는 `jobs` 행이 아니라 슬롯을 잡지 않는다. 작성 job은 `type='task'`이고 시험까지 작업 레인 슬롯을 쥔다. 리뷰 job은 `type='review'`이고 대화 레인이다. 승인·병합을 기다리는 부모는 어느 슬롯도 잡지 않는다.
+
+**차례.** 바퀴는 한 번에 32행을 본다. 사람의 병합·답을 기다리거나 일시 오류로 머무는 행은 `updated_at`이 그대로라, 부모·자식·단계 알림·배포 알림 조회 모두 `(정렬값, ID)` 커서로 한 쪽씩 돌고 쪽이 차지 않으면 처음으로 돌아간다. 커서는 메모리에 있고 잃어도 처음부터 다시 볼 뿐이다. 관측을 마친 건(배포 상태 `observed`·`not_applicable`·`blocked`, 또는 `late_reported_at` 있음)은 부모 조회에서 뺀다. 알림은 따로 고르므로 빠지지 않는다.
+
+**쓰기 전 인가.** `ChangePublisher`는 `publish` 입구와 stage마다 요청자의 owner·scope를 `gate.authorize`로 다시 본다. 정책 조회와 writer는 `/revoke`의 거부 목록을 보지 않기 때문이다. 대조 주기의 재개도 `publish`를 지나므로 쓰기로 가는 길은 이 확인 하나를 거친다. 철회면 부모를 `cancelled(authorization_revoked)`로 닫고 이미 공개된 객체는 건드리지 않는다. 정책을 읽지 못하면 쓰지 않고 미룬다. 미확정 effect의 읽기 대조는 권한과 무관하게 계속 돌아 응답을 잃은 객체를 기록으로 맞춘다.
+
+**v1 분리.** 작성 job은 부모 연결과 한 트랜잭션으로 만든다. `Store.claim`이 `change_child_jobs`에 묶인 job을 집지 않고 `claimChangeAuthor`만 같은 잠금 순서·슬롯 규칙으로 집는다. v1 `run`으로 가면 세션이 `task_session_mismatch`로 닫히고 저장 전 결과가 지워지기 때문이다. `/retry`도 자식 job을 되살리지 않는다. `/cancel`·`/resume-model`·`/answer`·`/task-release`는 작성 job에 그대로 쓴다.
+
+**명령.** 네 명령 모두 owner·요청한 스레드에서만 답하고, 다른 곳에는 존재도 알리지 않는다. 처리기는 DB만 만져 상호작용 기한 안에 끝난다.
+
+| 명령 | 서식 | 동작 |
+|---|---|---|
+| `/change` | `project:<저장소> text:<요약> \| goal=<목표> \| accept=<조건> \| label=public` | 대화 채널 스레드에서만. 수정·시험·검토까지 하고 미리보기를 보낸다 |
+| `/change` | `project:<변경 ID> text:next` | `superseded`인 건의 새 generation을 연다. 이 명령 말고 자동으로 여는 길이 없다 |
+| `/change-status` | `target:<변경 ID>` | phase, 자식 job, 승인 digest, 미확정 effect, PR, 배포 관측 |
+| `/change-cancel` | `target:<변경 ID>` | 부모를 먼저 닫고 돌던 턴·시험의 소멸을 확인해 정리한다. 공개된 객체·PR은 닫지 않는다. 병합 뒤에는 취소하지 않는다 |
+| `/change-publish` | `target:<변경 ID> text:<digest>` | 미리보기의 digest에 대한 승인. `writerAccepted`가 false면 승인을 받지 않고 대기에 둔다 |
+
+**출처.** label은 owner의 명령 입력만 말할 수 있고, 적지 않으면 `unknown`이다. private·unknown이면 `admit`이 그 자리에서 `blocked`로 닫아 작성 모델·GitHub에 아무것도 가지 않는다. 요청 글은 `events`에 남기지 않는다. `events`는 대화 맥락으로 모델에 들어가기 때문이다. 입력에서 비밀·내부 표식이 나오면 `label=public`을 적어도 private로 올린다. 이 검사는 추가 방어이고 완전성 증거가 아니다. `approved_public_summary`는 owner가 이 명령에 직접 적은 글에만 효력이 있고 입력 표의 SHA-256에 묶인다. 변경 명령의 `events` 행에는 `text`·`target`을 남기지 않는다. 둘 다 owner가 자유롭게 적는 칸이다.
+
+CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없으면 답을 받지 않고 질문을 열어 둔다. private·unknown이면 기록하고 부모를 닫아 작성자에 넘기지 않는다. 모델 입력은 공개 brief와 공개 label의 답뿐이고 스레드 대화·기억·다른 스레드 글을 읽는 경로가 없다. 이 답의 원문도 `events`에 두지 않는다. 수신이 저장 전에 처리기(`sealsAnswer`)에 물어 CHANGE 질문이면 빈 글로 저장하고 원문은 그 호출의 값으로만 넘긴다. 원문의 자리는 `change_request_inputs`와, 공개 답이면 재개가 읽는 `codex_questions.answer`다. v1 `/answer`와 일반 대화의 저장은 그대로다.
+
+**단계별 복구.** 부모의 다음 할 일은 DB의 phase가 정한다. 메모리에는 재시도 시각만 있다. 일시 오류는 부모를 닫지 않고 간격을 5초에서 10분까지 늘려 다시 본다.
+
+| 지점 | 결과 |
+|---|---|
+| job을 집고 턴을 보내기 전 끊김 | 세션이 없거나 대기 상태라 프로세스가 없다. lease 만료 뒤 `requeueChangeAuthor`로 줄에 돌린다. 레인을 막지 않는다 |
+| 턴·시험 중 게시 서버 재시작 | 작업자가 그 세션을 안다고 답하면 `reacquireChangeAuthor`로 같은 lease를 되찾고 정상 경로로 간다. 작업자가 닿지 않으면 unknown을 유지하고 레인을 닫아 둔다 |
+| `/v2/task` 응답 유실 | 다시 보내지 않고 `fetchResult`로 묻는다. 2분이 지나도 `absent`면 취소로 늦은 시작까지 막고 그 턴을 닫는다 |
+| `fetchResult`의 결과 유실(`task_worker_lost`) | 모델을 다시 돌리지 않고 부모 `failed` |
+| `save` 응답 유실 | `recordSnapshot`이 멱등이다 |
+| 시험 응답 유실 | 작업자의 receipt를 다시 받는다. 시작 기록만 있으면 `unknown` |
+| `finalize` 실패(`change_job_not_settled` 등) | 부모는 나아간다. `childrenTick`이 소멸을 확인하고 다시 부른다 |
+| 리뷰 응답 유실 | `fetchReceipt`가 회수한다. 끝난 job에 receipt가 없으면 10분 더 물은 뒤 부모 `failed` |
+| 게시 effect | §16.3 표와 같다. 부모 runtime은 `publish`를 다시 부를 뿐이다 |
+| 첫 CI fingerprint 미승인 | `admitted`에서 모델을 부르기 전에 `blocked`이고 값이 로그에 남는다. 사람이 등록한 뒤 새 `/change` |
+| `readMerge` 조회 실패·대상 오류 | 미병합으로 처리하지 않고 `proposed`를 유지한다 |
+| 알림·Discord ACK 유실 | outbox 키가 하나라 중복이 없다. `/change`의 ID도 스레드 게시로 남는다. PR·모델을 되풀이하지 않는다 |
+
+**끝 상태 PR.** `proposed`에서 `blocked`·`superseded`로 간 PR을 사람이 병합해도 V1은 배포를 추적하지 않는다. `/change-status`가 그렇게 말한다. 사람이 확정된 PR의 제목·본문을 고쳐도 `proposed`로 둔다.
+
+**배포 관측.** 병합을 읽으면 `change_deployment_windows`에 창 시작을 먼저 남긴다. `recordDeployment`가 `observed_at`을 덮어써 그 값으로는 재시작 뒤 창을 잴 수 없다. 60초마다 관측하고, `settled`면 멈추고, 10분 창이 지나면 `late_reported_at`을 적고 멈춰 마지막 관측을 알린다. 익명 GitHub 한도(IP당 시간 60회) 때문에 `proposed`의 병합 읽기는 5분 간격이다.
+
+**비공개 저장과 보존.** migration 018은 additive다. `change_review_findings`(리뷰 원문), `change_deployment_windows`, `change_artifacts.purged_at`을 더한다. `purgeExpiredChangeContent`가 시간마다 끝 상태 뒤 7일이 지난 건의 `change_artifact_files`, `change_artifacts.patch`, 리뷰 원문을 지운다. receipt·digest·manifest·effect는 남는다. 진행 중이거나, 미확정 effect·살아 있는 자식 job·정리 안 끝난 세션이 있는 건은 고르지 않는다. 트리거는 artifact에 "아직 비우지 않은 행의 patch를 빈 값으로 만들고 시각을 적는" 변경만 받는다. 요청 원문(`change_request_inputs`)은 지금 지우지 않는다.
+
+**되돌리기.** 스위치를 끄면 새 접수와 루프만 멈춘다. 남은 작성 세션은 lease 만료 뒤 unknown으로 레인을 닫으므로 `/task-release`로 해제한다. `HttpTaskV2Worker`를 스위치와 무관하게 브리지에 넘겨 두는 이유다. 미확정 effect는 스위치를 켜야 대조가 돈다. `change` 절을 모르는 옛 게시 서버로 되돌릴 때는 정책 키를 먼저 뺀다.

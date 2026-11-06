@@ -338,7 +338,7 @@ test('T19 B3 최신성: 응답의 tree·commit·head가 기대와 다르면 즉�
     // 고정한 공개 문구와 다른 commit을 돌려주는 GitHub을 흉내 낸다(예: 서명이 붙어 SHA가 다른 경우).
     const real = env.writerIO.writer.createCommit;
     const publisher = new ChangePublisher({
-      store: env.store, preflight: env.writerIO.preflight, policy: async () => env.policy.current, now: () => env.clock.now, retryMs: 60_000,
+      store: env.store, preflight: env.writerIO.preflight, policy: async () => env.policy.current, authorize: async () => {}, now: () => env.clock.now, retryMs: 60_000,
       writer: { ...env.writerIO.writer, createCommit: async input => {
         const outcome = await real(input);
         return outcome.kind === 'confirmed' ? { kind: 'confirmed', value: { ...outcome.value, commitSha: 'c'.repeat(40) } } : outcome;
@@ -368,7 +368,7 @@ test('T19 B3 게시: 토큰·JWT가 로그·DB·결과에 남지 않는다', asy
   try {
     const key = await env.approve();
     const logs: string[] = [];
-    const publisher = new ChangePublisher({ store: env.store, writer: env.writerIO.writer, preflight: env.writerIO.preflight, policy: async () => env.policy.current, now: () => env.clock.now,
+    const publisher = new ChangePublisher({ store: env.store, writer: env.writerIO.writer, preflight: env.writerIO.preflight, policy: async () => env.policy.current, authorize: async () => {}, now: () => env.clock.now,
       log: (event, detail) => logs.push(JSON.stringify({ event, detail })) });
     env.github.fail(/POST .*\/git\/refs$/, 'lose_response');
     const outcome = await publisher.publish(key);
@@ -390,7 +390,7 @@ test('T19 B3 승인 준비: 승인되지 않은 CI는 승인 대상을 만들지
     const review = await env.driveToReview(key, [{ path: 'src/a.ts', kind: 'modified', content: '수정\n' }]);
     env.policy.current = { ...env.policy.current!, ci: { ...env.policy.current!.ci, approvedFingerprint: 'e'.repeat(64) } };
     const logs: { event: string; detail?: Record<string, unknown> }[] = [];
-    const publisher = new ChangePublisher({ store: env.store, writer: env.writerIO.writer, preflight: env.writerIO.preflight, policy: async () => env.policy.current, now: () => env.clock.now, log: (event, detail) => logs.push({ event, ...(detail ? { detail } : {}) }) });
+    const publisher = new ChangePublisher({ store: env.store, writer: env.writerIO.writer, preflight: env.writerIO.preflight, policy: async () => env.policy.current, authorize: async () => {}, now: () => env.clock.now, log: (event, detail) => logs.push({ event, ...(detail ? { detail } : {}) }) });
     assert.deepEqual(await publisher.prepareApproval(key, { review, at: Date.UTC(2026, 0, 2) }), { ok: false, reason: 'ci_fingerprint_unapproved' });
     assert.equal((await phaseOf(env, key.changeId)).phase, 'reviewing');
     assert.match(String(logs.find(item => item.event === 'change_ci_fingerprint_unapproved')?.detail?.fingerprint), /^[0-9a-f]{64}$/);

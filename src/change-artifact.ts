@@ -195,6 +195,7 @@ export function decodeArtifact(wire: unknown, expectedDigest: string): ArtifactB
 // 제어 디렉터리에 둔다. 세션 공간과 달리 준비 실패로 세션이 없을 때도 답을 남길 수 있고 모델에서 가려져 있다. finalize나 기록 정리까지 지우지 않는다.
 const RESULT_NAME = (job: string, generation: number) => `${job}.${generation}.result.json`;
 const RECEIPT_NAME = (job: string, generation: number, command: string) => `${job}.${generation}.verification.${command}.json`;
+const RECEIPT_START_NAME = (job: string, generation: number, command: string) => `${job}.${generation}.verification.${command}.started`;
 const StoredResultSchema = TaskV2ResultResponseSchema;
 async function writeAtomic(path: string, content: string): Promise<void> {
   const temporary = `${path}.${randomUUID()}.tmp`;
@@ -220,6 +221,28 @@ export class ChangeResults {
   async writeVerification(job: string, generation: number, command: string, record: unknown): Promise<void> {
     await mkdir(this.dir, { recursive: true, mode: 0o700 });
     await writeAtomic(join(this.dir, RECEIPT_NAME(job, generation, command)), JSON.stringify(record));
+  }
+  // 시험 프로세스를 띄우기 전에 남긴다. 재시작 뒤 이 기록만 있으면 앞선 실행의 결과를 모르는 것이라 다시 돌리지 않는다.
+  // 배타적으로 만든다. 이미 있으면 false이고 호출자는 시험을 띄우지 않는다. 내용은 보지 않으므로 쓰기 도중 끊겨 빈 파일이 남아도 "시작함"으로 읽혀 안전하다.
+  async writeVerificationStart(job: string, generation: number, command: string): Promise<boolean> {
+    await mkdir(this.dir, { recursive: true, mode: 0o700 });
+    const path = join(this.dir, RECEIPT_START_NAME(job, generation, command));
+    let handle;
+    try { handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600); }
+    catch (error) {
+      if ((error as { code?: string }).code === 'EEXIST') return false;
+      throw error;
+    }
+    try { await handle.writeFile('{}'); await handle.sync(); }
+    catch (error) { await rm(path, { force: true }).catch(() => {}); throw error; }
+    finally { await handle.close(); }
+    return true;
+  }
+  async verificationStarted(job: string, generation: number, command: string): Promise<boolean> {
+    return readFile(join(this.dir, RECEIPT_START_NAME(job, generation, command)), 'utf8').then(() => true, (error: { code?: string }) => {
+      if (error.code === 'ENOENT') return false;
+      throw error;
+    });
   }
   async readVerification(job: string, generation: number, command: string): Promise<unknown> {
     const raw = await readFile(join(this.dir, RECEIPT_NAME(job, generation, command)), 'utf8').catch(() => null);

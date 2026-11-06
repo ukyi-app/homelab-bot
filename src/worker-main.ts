@@ -9,7 +9,11 @@ import { createArchiveFetcher } from './archive-fetcher.js';
 import { ChatLane } from './chat-lane.js';
 import { StaticEnvCredential } from './credentials.js';
 import { ClaudeChatAdapter } from './executor-claude.js';
-import { runTaskTurn, taskImageProblems } from './executor-claude-task.js';
+import { RevisionSchema } from './change-contracts.js';
+import { ChangeReviewResults, ChangeReviewWorker, changeReviewRoutes } from './change-review.js';
+import { IsolatedVerifier } from './change-verifier.js';
+import type { VerifierOptions } from './change-verifier.js';
+import { runChangeTurn, runTaskTurn, taskImageProblems } from './executor-claude-task.js';
 import { createExecutor, executorVersion, selectProfile } from './executor-profiles.js';
 import type { ExecutorProfile } from './executor-profiles.js';
 import { PORTS } from './http.js';
@@ -18,12 +22,12 @@ import type { ProcessCleanup, ProcessLauncher } from './process-launcher.js';
 import { reviewRoutes } from './review-http.js';
 import { ReviewWorker } from './review-input.js';
 import type { ArchiveFetcher } from './review-input.js';
-import { createReviewerModel } from './review-lane.js';
+import { createChangeReviewerModel, createReviewerModel } from './review-lane.js';
 import { RunControl } from './run-control.js';
 import { ContainmentUnavailable, PodPidSpace } from './task-containment.js';
 import { taskWorkerServer } from './task-http.js';
 import { TaskWorkerService } from './task-worker.js';
-import type { TaskWorkerOptions } from './task-worker.js';
+import type { TaskChangeRuntime, TaskTurnContext, TaskWorkerOptions } from './task-worker.js';
 import { ExecutionSlot, SerialWorker, WorkerVerifier } from './worker.js';
 import { workerServer } from './worker-http.js';
 import { FileNonceStore, WorkerStartError, assertNotPersonal, humanHomes } from './worker-state.js';
@@ -49,6 +53,8 @@ export interface WorkerConfig {
   proxy?: { https: string; noProxy: string };
   // 있으면 작업 레인 전용 작업자다. 없으면 지금처럼 대화·리뷰다.
   task?: { stateRoot: string };
+  // 시험 receipt에 남는 이미지 식별값. 판정에 쓰지 않고 어떤 이미지에서 돌았는지 추적하려고 남긴다.
+  imageRevision: string;
 }
 
 // 미설정과 chat,review는 대화·리뷰 작업자다. 그 밖의 값은 오타일 수 있어 기동하지 않는다.
@@ -96,8 +102,10 @@ export function workerConfig(env: Record<string, string | undefined>): WorkerCon
   const https = env.HTTPS_PROXY?.trim();
   const proxy = https ? { https, noProxy: env.NO_PROXY?.trim() || '127.0.0.1,localhost' } : undefined;
   const task = taskLaneConfig(env, profile, nonceDir);
+  const imageRevision = env.WORKER_IMAGE_REVISION?.trim() || 'unversioned';
+  if (!RevisionSchema.safeParse(imageRevision).success) throw new WorkerStartError('config_invalid:WORKER_IMAGE_REVISION');
   return { profile, model: value('WORKER_MODEL'), credentialFile: join(credentialDir, value('WORKER_CREDENTIAL_KEY')), nonceDir,
-    publicKey, executorBin, ...(codexHome ? { codexHome } : {}), ...(proxy ? { proxy } : {}), ...(task ? { task } : {}) };
+    publicKey, executorBin, ...(codexHome ? { codexHome } : {}), ...(proxy ? { proxy } : {}), ...(task ? { task } : {}), imageRevision };
 }
 
 // 압축본 다운로더 기본값(시험·조립용). 운영 진입점 main()은 createArchiveFetcher를 넘긴다. 이 값이면 리뷰는 archive_fetch_failed로 끝나고 모델을 부르지 않는다.
@@ -118,6 +126,8 @@ export interface StartWorkerOptions {
   log?: (fields: Record<string, unknown>) => void;
   // 시험 주입. 운영은 PodPidSpace.record의 결과를 쓴다. 개발 기계에서 kill(-1)이 나가지 않게 시험은 가짜를 넘긴다.
   cleanup?: ProcessCleanup;
+  // 시험이 무자격 실행기 대신 쓰는 자리. 운영은 기본값이다.
+  verifier?: Partial<Pick<VerifierOptions, 'registry' | 'sandbox'>>;
   fsRoot?: string;
   taskProbe?: Pick<TaskWorkerOptions, 'probeMs' | 'nonceIo' | 'probeVolume' | 'freeBytes'>;
 }
@@ -151,11 +161,18 @@ async function startTaskWorker(config: WorkerConfig, stateRoot: string, options:
   }
   const credentialDir = dirname(config.credentialFile);
   const fetchArchive = options.fetchArchive ?? closedArchiveFetcher;
+  const turnDeps = (context: TaskTurnContext) => {
+    if (!control) throw new Error('task_control_unavailable');
+    return { control, sessions: context.sessions, fetchArchive, worker: context.worker, model: config.model, auth: 'subscription-token' as const, credentialDir, ...(options.log ? { log: options.log } : {}) };
+  };
+  // v2는 프로세스 정리 수단이 있을 때만 연다. 없으면 intake가 지원을 말하지 않아 게시 서버가 CHANGE만 닫는다.
+  const change: TaskChangeRuntime | undefined = cleanup ? {
+    runTurn: (context, request, signal) => runChangeTurn(turnDeps(context), request, signal),
+    verifier: new IsolatedVerifier({ imageRevision: config.imageRevision, cleanup, secrets: () => credential.secrets(), ...(options.log ? { log: options.log } : {}), ...options.verifier }),
+  } : undefined;
   const service = new TaskWorkerService({ root: stateRoot, nonceDir: config.nonceDir, publicKey: config.publicKey, homes, startup,
-    runTurn: ({ worker, sessions }, request, signal) => {
-      if (!control) throw new Error('task_control_unavailable');
-      return runTaskTurn({ control, sessions, fetchArchive, worker, model: config.model, auth: 'subscription-token', credentialDir, ...(options.log ? { log: options.log } : {}) }, request, signal);
-    },
+    runTurn: (context, request, signal) => runTaskTurn(turnDeps(context), request, signal),
+    ...(change ? { change } : {}),
     stop: async job => control ? control.stop(job) : false,
     survivors: async job => launcher ? launcher.survivors(job) : null,
     accepting: () => control?.accepting() ?? true,
@@ -209,10 +226,20 @@ export async function startWorker(config: WorkerConfig, options: StartWorkerOpti
   const worker = new SerialWorker(verifier, (request, signal) => chat.run(request, signal), request => chat.stop(request), slot);
   let reviewClosed: string | undefined;
   let review: ReviewWorker | undefined;
+  let changeReview: ChangeReviewWorker | undefined;
   if (!config.profile.capabilities.lanes.review) reviewClosed = 'review_unsupported';
   else try {
     review = new ReviewWorker(verifier, options.fetchArchive ?? closedArchiveFetcher,
       createReviewerModel(executor, control, { model: config.model }), REVIEW_STOP_WAIT_MS, slot);
+    // 미게시 후보 리뷰. 슬롯·서명 검증을 대화·T17과 함께 쓴다. 결과 저장 공간은 nonce와 같은 영속 공간이다. 못 열면 후보 리뷰만 닫혀 게시 서버가 CHANGE만 닫는다.
+    const results = new ChangeReviewResults(join(dirname(config.nonceDir), 'change-review'));
+    try {
+      await results.open();
+      changeReview = new ChangeReviewWorker(verifier, options.fetchArchive ?? closedArchiveFetcher, createChangeReviewerModel(executor, control, { model: config.model }), results, REVIEW_STOP_WAIT_MS, slot);
+    } catch (error) {
+      if (error instanceof WorkerStartError) throw error;
+      options.log?.({ level: 'warn', event: 'change_review_closed', reason: 'results_unavailable' });
+    }
   } catch (error) {
     if (!(error instanceof WorkerStartError)) throw error;
     // 프록시 경계를 못 세우면 리뷰만 닫는다. 대화는 이 조건을 요구하지 않는다.
@@ -220,15 +247,16 @@ export async function startWorker(config: WorkerConfig, options: StartWorkerOpti
     options.log?.({ level: 'warn', event: 'review_lane_closed', reason: error.code });
   }
   const accepting = () => control.accepting();
+  const routes = review && new Map([...reviewRoutes(review, accepting), ...(changeReview ? changeReviewRoutes(changeReview, accepting) : [])]);
   // 종료가 시작되면 새 실행 요청은 실행 전에 거부한다(취소는 계속 받는다).
-  const server = workerServer(worker, () => control.ready(), accepting, review && reviewRoutes(review, accepting));
+  const server = workerServer(worker, () => control.ready(), accepting, routes);
   server.listen(options.port ?? PORTS.worker, options.host);
   await once(server, 'listening');
   return { server, profile: config.profile.id, cliVersion, credential: state, ...(reviewClosed ? { reviewClosed } : {}), async close() {
     // 먼저 새 실행을 닫는다(동기). 이미 받은 요청이 본문 수신·서명 확인 중이어도 이 뒤에는 모델 CLI를 띄우지 않는다.
     // 그다음 새 연결을 받지 않고, 실행 중인 모델 CLI와 압축본 받기를 멈춘 뒤 그 요청의 응답(failed)을 보내고 닫는다.
     // 연결을 먼저 끊으면 게시 서버는 결과를 몰라 unknown으로 둔다.
-    const stopping = Promise.all([control.shutdown(), review?.shutdown()]);
+    const stopping = Promise.all([control.shutdown(), review?.shutdown(), changeReview?.shutdown()]);
     const closed = new Promise<void>(resolve => server.close(() => resolve()));
     server.closeIdleConnections();
     await stopping;

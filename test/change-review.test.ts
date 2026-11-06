@@ -131,6 +131,17 @@ const jobOf = async (key: ChangeKey) => (await database.db.query<{ id: string; s
   `SELECT j.id,j.state,j.wait_reason,j.lease_token FROM jobs j JOIN change_child_jobs c ON c.job_id=j.id WHERE c.change_id=$1 AND c.generation=$2 AND c.role='review'`, [key.changeId, key.generation])).rows[0]!;
 const storedReviews = async (key: ChangeKey) => (await database.db.query<{ receipt: unknown }>('SELECT receipt FROM change_reviews WHERE change_id=$1', [key.changeId])).rows;
 
+test('T19 B2 종료 경합: 저장된 결과를 찾는 사이 작업자가 닫히면 모델을 부르지 않는다', async () => {
+  const h = harness();
+  const input = await reviewing();
+  const get = h.results.get.bind(h.results);
+  let closing = true;
+  h.results.get = async (...args: Parameters<typeof get>) => { if (closing) { closing = false; await h.worker.shutdown(); } return get(...args); };
+  await h.service.submit(portInput(input));
+  await h.runtime.tick();
+  assert.equal(closing, false, '작업자까지 갔다');
+  assert.equal(h.inputs.length, 0);
+});
 test('T19 B2 통과: 새 세션의 receipt가 기록되고 승인 대상 준비까지 간다', async () => {
   const h = harness();
   const input = await reviewing();
