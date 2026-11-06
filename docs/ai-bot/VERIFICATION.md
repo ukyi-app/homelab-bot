@@ -1485,18 +1485,24 @@ manifest는 정확한 경로만 받는다. **올릴 때 그 경로가 비어 있
 
 | 시험 파일 | 수 | 본 것 |
 |---|---|---|
-| `test/change-contracts.test.ts` | 25 | 전이 표 고정, label 전파, 직렬화, 승인·묶음·artifact digest의 필드별 변화와 필드 순서 불변, 브랜치 형식과 `refs/heads/bot/**/*`, manifest 경로·mode·상한, 바이트 대조, receipt·공개 metadata·배포 관측 스키마 |
-| `test/change-store.test.ts`(PGlite) | 27 | 정상 경로 전체, CAS 실패 값, DB 함수와 코드 표의 전 쌍 대조, 코드를 거치지 않은 쓰기 거부, 이벤트 중복, 출처 차단, 원문 표 분리, 스냅샷 멱등, receipt·승인·무효화, 새 generation, effect 순서·lease·unknown 24시간·사람 해소, 병합·배포, 016 업그레이드와 파일 재실행, 기존 표·제약 불변 |
+| `test/change-contracts.test.ts` | 27 | 전이 표 고정, label 전파, 직렬화, 승인·묶음·artifact digest의 필드별 변화와 필드 순서 불변, 브랜치 형식과 `refs/heads/bot/**/*`, manifest 경로·mode·상한, 바이트 대조, receipt·공개 metadata·배포 관측 스키마 |
+| `test/change-store.test.ts`(PGlite) | 30 | 정상 경로 전체, CAS 실패 값, DB 함수와 코드 표의 전 쌍 대조, 코드를 거치지 않은 쓰기 거부, 이벤트 중복, 출처 차단, 원문 표 분리, 스냅샷 멱등, receipt·승인·무효화, 새 generation, effect 순서·lease·unknown 24시간·사람 해소, 병합·배포, 016 업그레이드와 파일 재실행, 기존 표·제약 불변 |
 | `test/change-store-pg.test.ts`(PostgreSQL 18.6) | 11 | 다중 연결 경합: 같은 전이, 다른 전이, 같은 effect claim, 같은 intent, 중복 이벤트, claim과 취소, 승인과 무효화, 새 generation, 대조 확정. 016 업그레이드, 겹친 마이그레이션 Job |
 
 **결과.** 저장소의 다른 시험이 쓰는 방식대로 네트워크 없는 임시 `postgres:18-alpine`(18.6) 소켓을 줬고 끝난 뒤 컨테이너를 지웠다. Node 24.22.0.
 
 - `npm run check`: 통과.
-- PostgreSQL 포함 `npm test`: **1554 / 1541 pass / 0 fail / 13 skipped**. skip은 전부 `SEC02_IMAGE` 없음이다.
-- PostgreSQL 없는 `npm test`: **1554 / 1465 pass / 0 fail / 89 skipped**.
-- PG 시험 11건을 5회 더 반복: 모두 통과.
+- PostgreSQL 포함 `npm test`(봇 #78 위, 아래 리뷰 반영 뒤): **1594 / 1581 pass / 0 fail / 13 skipped**. skip은 전부 `SEC02_IMAGE` 없음이다.
+- 리뷰 반영 전 기준: PostgreSQL 없는 `npm test` **1554 / 1465 pass / 0 fail / 89 skipped**, PG 시험 11건을 5회 더 반복해 모두 통과.
 
 **수정 전 실패.** 시험을 먼저 넣었을 때 구현 모듈이 없어 `tsc` 오류 128건으로 실패했다. 컴파일 실패이므로 시험별 실패 수는 없다.
+
+**PR 리뷰 반영(P2 4건, 모두 수용).** 시험 5건을 먼저 넣어 수정 전 실패를 확인했다(57건 중 5 fail).
+
+- 삭제·mode 변경만 있는 artifact는 blob 기대값을 만들 수 없어 게시로 못 갔다. 빈 목록을 받고, 빈 결과와만 맞는다.
+- 잘못된 `verifierRevision`이 커밋되어 그 generation을 진행할 수 없었다. 쓰기 전에 묶음 전체를 검사한다. 같은 종류(실패 값을 돌려줘도 커밋)를 저장 계층 전체에서 봤고 나머지는 의도한 닫힘 기록이거나 쓰기 전 검사다.
+- 부모가 끝 상태가 된 뒤 미전송을 반납하면 `pending`으로 남아 다음 generation이 막혔다. 게시 단계가 아니면 `not_sent`로 해소한다.
+- 파일을 지우고 그 자리를 디렉터리로 바꾸는 변경이 거부됐다. 파일·디렉터리 충돌을 T0와 T1에서 따로 본다.
 
 **변이 확인.** 임시 사본에 변이를 하나씩 넣고 새 시험 세 파일을 돌렸다. 원본 대조는 63/63 pass다. 12건 모두 실패로 잡혔다.
 

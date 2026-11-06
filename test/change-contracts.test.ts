@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
   ARTIFACT_LIMITS, ApprovalSubjectSchema, ArtifactManifestSchema, CHANGE_PHASES, CHANGE_PHASE_TRANSITIONS, ChangeBriefSchema, DEPLOYMENT_STATES,
-  DeploymentObservationSchema, EFFECT_STAGES, EFFECT_STATES, EFFECT_TRANSITIONS, EffectExpectedSchema, EvidenceBundleSchema, GENERATION_RESTART,
+  DeploymentObservationSchema, EFFECT_STAGES, EFFECT_STATES, EFFECT_TRANSITIONS, EffectExpectedSchema, EffectResultSchema, EvidenceBundleSchema, GENERATION_RESTART,
   PROVENANCE_LABELS, PublicMetadataSchema, ReviewReceiptSchema, TERMINAL_CHANGE_PHASES, UNKNOWN_RECONCILE_MS, VerificationReceiptSchema,
   approvalDigest, artifactDigest, canTransition, canTransitionEffect, canonicalJson, changeBranchName, changeBranchRef, effectResultMatches,
   evidenceBundleDigest, gitBlobSha, isTerminalPhase, labelAllowsAuthorInput, labelIsLowering, newChangeId, nextEffectStage, parseChangeBranch,
@@ -252,6 +252,23 @@ test('T19 B0 manifest는 비정규 경로·순서·중복·디렉터리 충돌·
     assert.equal(ArtifactManifestSchema.safeParse(withEntries([{ ...entry('a', 'added'), mode } as never])).success, false, mode);
   }
   assert.equal(ArtifactManifestSchema.safeParse(withEntries([entry('a', 'unchanged')])).success, false, '변경 없음');
+});
+
+test('T19 B0 manifest 경로 충돌은 T0·T1을 따로 본다: 파일↔디렉터리 교체는 받고 한 트리 안의 충돌은 거부한다', () => {
+  const parses = (...entries: ArtifactManifest['entries']) => ArtifactManifestSchema.safeParse(withEntries(entries)).success;
+  assert.equal(parses(entry('a', 'deleted'), entry('a/b', 'added')), true, '파일을 지우고 그 자리에 디렉터리');
+  assert.equal(parses(entry('a', 'added'), entry('a/b', 'deleted')), true, '디렉터리를 지우고 그 자리에 파일');
+  assert.equal(parses(entry('a', 'added'), entry('a/b', 'added')), false, 'T1 안의 충돌');
+  assert.equal(parses(entry('a', 'modified'), entry('a/b', 'unchanged')), false, 'T0·T1 모두의 충돌');
+  assert.equal(parses(entry('a', 'deleted'), entry('a/b', 'unchanged')), false, 'T0 안의 충돌');
+  assert.equal(parses(entry('a', 'deleted'), entry('a/b', 'deleted')), false, 'T0 안의 충돌(둘 다 삭제)');
+});
+
+test('T19 B0 내용 변경이 없는 generation의 blob 기대값은 빈 목록이고 빈 결과와만 맞는다', () => {
+  const empty = EffectExpectedSchema.parse({ stage: 'blob', shas: [] });
+  assert.equal(effectResultMatches(empty, EffectResultSchema.parse({ stage: 'blob', shas: [] })), true);
+  assert.equal(effectResultMatches(empty, { stage: 'blob', shas: [git('a')] }), false);
+  assert.equal(effectResultMatches(EffectExpectedSchema.parse({ stage: 'blob', shas: [git('a')] }), { stage: 'blob', shas: [] }), false);
 });
 
 test('T19 B0 manifest 변경 내용 합계가 1 MiB를 넘으면 자르지 않고 거부한다', () => {

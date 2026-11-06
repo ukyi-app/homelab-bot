@@ -569,6 +569,67 @@ test('T19 B0 lease 갱신과 확실한 미전송 반납: 반납은 재시도 시
   } finally { await s.close(); }
 });
 
+test('T19 B0 끝 상태 뒤의 미전송 반납은 재시도 대기로 남기지 않고 해소해 다음 generation을 막지 않는다', async () => {
+  const s = await setup();
+  try {
+    const r = await driveTo(s.store, 'publishing');
+    const key = stageKey(r.id, 'blob');
+    ok(await intent(s.store, r.id, 'blob'));
+    const claim = ok(await s.store.claimEffect(key));
+    ok(await s.store.transition({ changeId: r.id, generation: 1, from: 'publishing', to: 'superseded', reason: 'base_moved' }));
+    assert.equal(ok(await s.store.get(r.id)).phase, 'superseded');
+    failure(await s.store.startNextGeneration({ changeId: r.id, generation: 1 }), 'unresolved_effects');
+    const released = ok(await s.store.releaseUnsentEffect({ ...key, leaseId: claim.leaseId, retryAt: s.clock.now }));
+    assert.equal(released.state, 'blocked');
+    assert.equal(released.resolution, 'not_sent');
+    assert.deepEqual(await s.store.unresolvedEffects({ changeId: r.id }), []);
+    assert.equal(ok(await s.store.startNextGeneration({ changeId: r.id, generation: 1 })).generation, 2);
+    // 이미 해소된 행은 다시 반납할 수 없다.
+    failure(await s.store.releaseUnsentEffect({ ...key, leaseId: claim.leaseId, retryAt: s.clock.now }), 'lease_mismatch');
+  } finally { await s.close(); }
+});
+
+test('T19 B0 잘못된 verifier revision은 묶음 칸에 남지 않아 같은 generation을 고쳐 진행할 수 있다', async () => {
+  const s = await setup();
+  try {
+    const r = await driveTo(s.store, 'snapshot_ready');
+    const key = { changeId: r.id, generation: 1 };
+    for (const bad of ['', 'has space', '-leading', 'x'.repeat(129)]) failure(await s.store.startVerification({ ...key, verifierRevision: bad }), 'invalid_input');
+    assert.equal(ok(await s.store.generationRecord(key)).verifierRevision, null);
+    assert.equal(ok(await s.store.get(r.id)).phase, 'snapshot_ready');
+    assert.equal(ok(await s.store.startVerification({ ...key, verifierRevision: 'fixture-verifier-1' })).verifierRevision, 'fixture-verifier-1');
+  } finally { await s.close(); }
+});
+
+test('T19 B0 삭제만 있는 artifact도 빈 blob 단계를 지나 tree까지 게시할 수 있다', async () => {
+  const s = await setup();
+  try {
+    const r = await newRequest(s.store);
+    const key = { changeId: r.id, generation: 1 };
+    const patch = '--- a/src/old.ts\n+++ /dev/null\n';
+    const manifest = { ...fixtureManifest(), patchSha256: sha256Hex(Buffer.from(patch)),
+      entries: [{ path: 'src/old.ts', mode: '100644' as const, changeKind: 'deleted' as const, blobSha: git('old'), sha256: hex('old'), size: 3 }] };
+    ok(await s.store.admit({ ...key, brief: fixtureBrief(), policyRevision: 'fixture-policy-1' }));
+    ok(await s.store.pinBase({ ...key, baseCommit: git('b'), baseTree: git('t0') }));
+    ok(await s.store.recordSnapshot({ ...key, manifest, files: [], patch, transportBytes: 1024 }));
+    const bundle = ok(await s.store.startVerification({ ...key, verifierRevision: 'fixture-verifier-1' }));
+    ok(await s.store.recordVerification({ ...key, receipt: fixtureVerification({ bundle }) }));
+    ok(await s.store.finishVerification(key));
+    await insertChildJob(s.db, 'fixture-delete-review');
+    ok(await s.store.linkChildJob({ ...key, jobId: 'fixture-delete-review', role: 'review' }));
+    ok(await s.store.recordReview({ ...key, receipt: fixtureReview({ bundle, jobId: 'fixture-delete-review' }) }));
+    const subject = ok(await s.store.prepareApproval({ ...key, publication: fixtureMetadata(), ciFingerprint: hex('ci') }));
+    ok(await s.store.approve({ ...key, approvalDigest: subject.digest, eventId: newEvent(), actor: OWNER }));
+    ok(await s.store.transition({ ...key, from: 'approved', to: 'publishing', reason: null }));
+
+    failure(await s.store.recordEffectIntent({ ...stageKey(r.id, 'blob'), requestDigest: hex('blob'), expected: { stage: 'blob', shas: [git('old')] } }), 'evidence_mismatch');
+    ok(await s.store.recordEffectIntent({ ...stageKey(r.id, 'blob'), requestDigest: hex('blob'), expected: { stage: 'blob', shas: [] } }));
+    const claim = ok(await s.store.claimEffect(stageKey(r.id, 'blob')));
+    ok(await s.store.confirmEffect({ ...stageKey(r.id, 'blob'), leaseId: claim.leaseId, result: { stage: 'blob', shas: [] } }));
+    ok(await intent(s.store, r.id, 'tree'));
+  } finally { await s.close(); }
+});
+
 test('T19 B0 취소·끝 상태 뒤: 새 intent·claim은 막히고 미전송은 닫히며 이미 보낸 effect는 대조로 남는다', async () => {
   const s = await setup();
   try {

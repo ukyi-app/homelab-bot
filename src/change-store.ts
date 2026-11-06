@@ -102,6 +102,7 @@ async function settleTerminal(tx: Database, key: ChangeKey, reason: string, now:
 }
 
 // 트랜잭션을 돌리고, 트리거 거부와 잠금 시한 초과를 값으로 바꾼다. 경합의 손해는 호출자가 다시 판단할 일이지 프로세스 오류가 아니다.
+// 함정: work가 실패 값을 돌려줘도 커밋한다. 되돌려야 하는 쓰기는 앞에 두지 않고, 검사를 먼저 끝낸다. label_blocked처럼 닫힘을 남기려는 경우만 쓰기 뒤에 실패를 돌려준다.
 async function attempt<T>(db: Database, work: (tx: Database) => Promise<StoreResult<T>>): Promise<StoreResult<T>> {
   try {
     return await db.transaction(work);
@@ -299,11 +300,12 @@ export class ChangeStore {
     return attempt(this.database, async tx => {
       const locked = await this.lock(tx, input, 'snapshot_ready');
       if (!locked.ok) return locked;
-      const row = (await tx.query<Record<string, unknown>>(`UPDATE change_generations SET verifier_revision=$3 WHERE change_id=$1 AND generation=$2 RETURNING *`,
-        [input.changeId, input.generation, input.verifierRevision])).rows[0];
+      const row = (await tx.query<Record<string, unknown>>('SELECT * FROM change_generations WHERE change_id=$1 AND generation=$2', [input.changeId, input.generation])).rows[0];
       if (!row) return fail('not_found');
-      const bundle = toBundle(generationRow(row));
+      // 쓰기 전에 묶음 전체를 검사한다. 이 칸은 한 번 쓰면 트리거가 고치지 못하게 막아, 잘못된 값이 커밋되면 이 generation을 진행할 수 없다.
+      const bundle = toBundle({ ...generationRow(row), verifierRevision: input.verifierRevision });
       if (!bundle) return fail('invalid_input', { detail: 'bundle_invalid' });
+      await tx.query('UPDATE change_generations SET verifier_revision=$3 WHERE change_id=$1 AND generation=$2', [input.changeId, input.generation, input.verifierRevision]);
       await this.step(tx, locked.value, 'verifying', this.now());
       return success(bundle);
     });
@@ -504,10 +506,20 @@ export class ChangeStore {
   }
 
   // 연결 전 실패처럼 확실히 안 나간 경우에만 쓴다. 조금이라도 불명확하면 markEffectUnknown이다.
+  // 그사이 부모가 게시 단계를 떠났으면 다시 보낼 일이 없다. pending으로 두면 claim도 만료 처리도 못 건드려 다음 generation이 영영 막히므로 안 나간 것으로 해소한다.
   async releaseUnsentEffect(input: EffectKey & { leaseId: string; retryAt: number }): Promise<StoreResult<EffectRecord>> {
-    const row = (await this.database.query<Record<string, unknown>>(`UPDATE change_delivery_effects SET state='pending',lease_id=NULL,lease_until=NULL,available_at=$5,updated_at=$6
-      WHERE change_id=$1 AND generation=$2 AND stage=$3 AND state='sending' AND lease_id=$4 RETURNING *`, [input.changeId, input.generation, input.stage, input.leaseId, input.retryAt, this.now()])).rows[0];
-    return row ? success(effectRow(row)) : fail('lease_mismatch');
+    return attempt(this.database, async tx => {
+      const request = await this.read(tx, input.changeId, 'FOR SHARE');
+      if (!request.ok) return request;
+      const now = this.now();
+      const publishing = request.value.generation === input.generation && request.value.phase === 'publishing';
+      const row = (publishing
+        ? await tx.query<Record<string, unknown>>(`UPDATE change_delivery_effects SET state='pending',lease_id=NULL,lease_until=NULL,available_at=$5,updated_at=$6
+            WHERE change_id=$1 AND generation=$2 AND stage=$3 AND state='sending' AND lease_id=$4 RETURNING *`, [input.changeId, input.generation, input.stage, input.leaseId, input.retryAt, now])
+        : await tx.query<Record<string, unknown>>(`UPDATE change_delivery_effects SET state='blocked',blocked_reason='abandoned_unsent',resolution='not_sent',resolved_by='system',resolved_at=$5,lease_id=NULL,lease_until=NULL,updated_at=$5
+            WHERE change_id=$1 AND generation=$2 AND stage=$3 AND state='sending' AND lease_id=$4 RETURNING *`, [input.changeId, input.generation, input.stage, input.leaseId, now])).rows[0];
+      return row ? success(effectRow(row)) : fail('lease_mismatch');
+    });
   }
 
   async markEffectUnknown(input: EffectKey & { leaseId: string; code: string }): Promise<StoreResult<EffectRecord>> {

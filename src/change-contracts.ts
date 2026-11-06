@@ -181,7 +181,9 @@ export const ArtifactManifestSchema = z.strictObject({
   entries: z.array(ArtifactManifestEntrySchema).min(1).max(ARTIFACT_LIMITS.manifestEntries),
 }).superRefine((manifest, context) => {
   const problem = (message: string) => context.addIssue({ code: 'custom', message });
-  const paths = new Set(manifest.entries.map(entry => entry.path));
+  // deleted는 T0에만, added는 T1에만 있다. 한 트리 안에서만 파일·디렉터리가 부딪힌다. 그래서 파일을 지우고 그 자리를 디렉터리로 바꾸는 변경은 받는다.
+  const inBase = new Set(manifest.entries.filter(entry => entry.changeKind !== 'added').map(entry => entry.path));
+  const inResult = new Set(manifest.entries.filter(entry => entry.changeKind !== 'deleted').map(entry => entry.path));
   let previous: string | null = null;
   let changed = 0;
   let contentBytes = 0;
@@ -190,7 +192,8 @@ export const ArtifactManifestSchema = z.strictObject({
     previous = entry.path;
     const segments = entry.path.split('/');
     for (let depth = 1; depth < segments.length; depth++) {
-      if (paths.has(segments.slice(0, depth).join('/'))) problem('manifest_file_directory_conflict');
+      const ancestor = segments.slice(0, depth).join('/');
+      if ((entry.changeKind !== 'added' && inBase.has(ancestor)) || (entry.changeKind !== 'deleted' && inResult.has(ancestor))) problem('manifest_file_directory_conflict');
     }
     if (entry.changeKind !== 'unchanged') changed++;
     if (carriesContent(entry.changeKind)) contentBytes += entry.size;
@@ -324,7 +327,8 @@ export type EffectResolution = typeof EFFECT_RESOLUTIONS[number];
 
 const ChangeRefSchema = z.string().refine(ref => ref.startsWith('refs/heads/') && parseChangeBranch(ref.slice('refs/heads/'.length)) !== null, 'change_ref_invalid');
 const ChangeBranchSchema = z.string().refine(name => parseChangeBranch(name) !== null, 'change_branch_invalid');
-const ShaListSchema = z.array(GitShaSchema).min(1).max(ARTIFACT_LIMITS.changedFiles);
+// 삭제·mode 변경만 있는 generation은 올릴 내용이 없어 빈 목록이다. 게시자는 요청 없이 이 stage를 확정하고 tree로 넘어간다.
+const ShaListSchema = z.array(GitShaSchema).max(ARTIFACT_LIMITS.changedFiles);
 // stage마다 응답을 대조할 값이다. intent와 함께 네트워크 호출 전에 저장한다.
 export const EffectExpectedSchema = z.discriminatedUnion('stage', [
   z.strictObject({ stage: z.literal('blob'), shas: ShaListSchema }),
