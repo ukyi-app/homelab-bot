@@ -1,7 +1,7 @@
 import { CHANGE_ID, labelAllowsAuthorInput, PROVENANCE_LABELS, propagateLabel } from './change-contracts.js';
 import type { ChangeKey, ProvenanceLabel } from './change-contracts.js';
 import type { ChangeRepositoryPolicy } from './change-policy.js';
-import { scanPublicPayload } from './change-publication.js';
+import { scanPublicText } from './change-publication.js';
 import type { ChangePrivateInputs, ChangeRequest, ChangeStore } from './change-store.js';
 import { describeDeployment } from './change-deployment.js';
 import { Denied } from './contracts.js';
@@ -191,10 +191,7 @@ export class ChangeCommands implements ChangeCommandHandler {
 }
 // 추가 방어다. 탐지기는 완전성 증거가 아니고 owner의 label이 우선이다. 찾으면 모델을 부르기 전에 막아 값을 작성자에 넘기지 않는다.
 function scanBrief(parsed: ParsedChangeRequest, policy: ChangeRepositoryPolicy): string | null {
-  const identity = { name: policy.identity.name, email: policy.identity.email, date: '2000-01-01T00:00:00Z' };
-  const scanned = scanPublicPayload({ paths: [], files: [], branch: 'change', marker: 'change', publication: { title: parsed.summary.slice(0, 256), body: [parsed.goal, ...parsed.acceptance, parsed.summary].join('\n'),
-    commitMessage: 'change', author: identity, committer: identity, draft: false } }, { internalMarkers: policy.internalMarkers });
-  return scanned.ok ? null : scanned.reason;
+  return scanPublicText({ title: parsed.summary, body: [parsed.goal, ...parsed.acceptance, parsed.summary].join('\n') }, policy);
 }
 
 const ANSWER_LABEL = /^\s*label=([a-z_]+)\s*\|\s*([\s\S]*)$/;
@@ -212,10 +209,10 @@ export class ChangeAnswerGuard implements TaskCommandHandler {
     return (await db.query(`SELECT 1 FROM codex_questions q JOIN change_child_jobs c ON c.job_id=q.job_id AND c.role='author' WHERE q.id=$1`, [question])).rows.length > 0;
   }
   async answerIn(store: Store, input: TaskAnswerInput): Promise<TaskAnswerResult> {
-    const link = (await store.db.query<{ change_id: string; generation: number | string; conversation_id: string; responder_id: string; state: string }>(`SELECT c.change_id,c.generation,q.conversation_id,q.responder_id,q.state
-      FROM codex_questions q JOIN change_child_jobs c ON c.job_id=q.job_id AND c.role='author' WHERE q.id=$1`, [input.question])).rows[0];
+    const link = (await store.db.query<{ change_id: string; generation: number | string; repo_id: number | string; conversation_id: string; responder_id: string; state: string }>(`SELECT c.change_id,c.generation,r.repo_id,q.conversation_id,q.responder_id,q.state
+      FROM codex_questions q JOIN change_child_jobs c ON c.job_id=q.job_id AND c.role='author' JOIN change_requests r ON r.id=c.change_id WHERE q.id=$1`, [input.question])).rows[0];
     if (!link) return this.inner.answerIn(store, input);
-    await this.gate.withDatabase(store.db).authorize(input.actor, input.scope);
+    const policy = await this.gate.withDatabase(store.db).authorize(input.actor, input.scope);
     // 다른 스레드에서 답해 이 질문의 출처를 정하지 못한다.
     if (link.conversation_id !== store.scopeId(input.scope) || link.responder_id !== input.actor) throw new Denied();
     // 닫힌 질문은 기록할 것이 없다. 안내는 원래 경로가 한다.
@@ -228,6 +225,15 @@ export class ChangeAnswerGuard implements TaskCommandHandler {
     if (!labelAllowsAuthorInput(label as ProvenanceLabel)) {
       await this.inputs.recordIn(store.db, { ...key, eventId: input.event, label: label as ProvenanceLabel, text: body });
       return { ok: false, status: `출처가 ${label}인 답이라 작성 모델에 넘기지 않고 이 변경을 막았습니다.` };
+    }
+    const repository = policy.change?.repositories.find(item => item.repoId === Number(link.repo_id));
+    // 내부 표식을 볼 수 없으면 공개 답이라고 말할 수 없다. 기록도 닫기도 하지 않아 정책이 돌아오면 다시 답할 수 있다.
+    if (!repository) return { ok: false, status: '이 변경의 저장소가 정책에 없어 답을 검사하지 못했습니다. 작성 모델에 넘기지 않았고 질문은 열려 있습니다.' };
+    // 첫 요청의 scanBrief와 같은 규칙이다. owner가 public이라 적었어도 찾으면 private로 올린다.
+    const sensitive = scanPublicText({ title: body, body }, repository);
+    if (sensitive) {
+      await this.inputs.recordIn(store.db, { ...key, eventId: input.event, label: propagateLabel([label as ProvenanceLabel, 'private']), text: body });
+      return { ok: false, status: `답에서 공개하면 안 되는 값(${sensitive})을 찾아 작성 모델에 넘기지 않고 이 변경을 막았습니다. 공개해도 되는 내용만 담아 새로 요청하세요.` };
     }
     const answered = await this.inner.answerIn(store, { ...input, text: body });
     if (!answered.ok || answered.duplicate) return answered;

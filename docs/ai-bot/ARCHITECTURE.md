@@ -1886,7 +1886,11 @@ ChangeRuntime
 
 **출처.** label은 owner의 명령 입력만 말할 수 있고, 적지 않으면 `unknown`이다. private·unknown이면 `admit`이 그 자리에서 `blocked`로 닫아 작성 모델·GitHub에 아무것도 가지 않는다. 요청 글은 `events`에 남기지 않는다. `events`는 대화 맥락으로 모델에 들어가기 때문이다. 입력에서 비밀·내부 표식이 나오면 `label=public`을 적어도 private로 올린다. 이 검사는 추가 방어이고 완전성 증거가 아니다. `approved_public_summary`는 owner가 이 명령에 직접 적은 글에만 효력이 있고 입력 표의 SHA-256에 묶인다. 변경 명령의 `events` 행에는 `text`·`target`을 남기지 않는다. 둘 다 owner가 자유롭게 적는 칸이다.
 
-CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없으면 답을 받지 않고 질문을 열어 둔다. private·unknown이면 기록하고 부모를 닫아 작성자에 넘기지 않는다. 모델 입력은 공개 brief와 공개 label의 답뿐이고 스레드 대화·기억·다른 스레드 글을 읽는 경로가 없다. 이 답의 원문도 `events`에 두지 않는다. 수신이 저장 전에 처리기(`sealsAnswer`)에 물어 CHANGE 질문이면 빈 글로 저장하고 원문은 그 호출의 값으로만 넘긴다. 원문의 자리는 `change_request_inputs`와, 공개 답이면 재개가 읽는 `codex_questions.answer`다. v1 `/answer`와 일반 대화의 저장은 그대로다.
+CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없으면 답을 받지 않고 질문을 열어 둔다. private·unknown이면 기록하고 부모를 닫아 작성자에 넘기지 않는다. 공개 label의 답도 첫 요청과 같은 검사(`scanPublicText`)를 거친다. 비밀·내부 표식이 나오면 private로 올려 기록하고 부모를 `blocked(label_blocked)`로 닫는다. 응답에는 사유 코드만 싣고 값을 되풀이하지 않는다. 저장소가 정책에서 빠져 내부 표식을 볼 수 없으면 답을 받지 않고 질문을 열어 둔다.
+
+모델의 CHANGE 질문도 스레드로 내보내기 전에 같은 검사를 거친다. 걸리면 질문 행과 outbox를 만들지 않고 턴을 `task_question_sensitive`로 실패 처리해 부모를 `blocked`로 닫으며, 스레드에는 고정 문구만 알린다. 저장소가 정책에 없을 때도 같다. 정책을 잠시 못 읽으면 아무것도 내보내지 않고 다음 바퀴에 같은 결과를 다시 본다. 이 검사는 CHANGE 경로에만 있고 `/task`의 v1 질문은 그대로다. 탐지기는 완전성 증거가 아니라 추가 방어이고, 공개 metadata 기준이라 이메일·긴 숫자 ID·사설 IP가 든 평범한 질문도 닫힌다.
+
+모델 입력은 공개 brief와 공개 label의 답뿐이고 스레드 대화·기억·다른 스레드 글을 읽는 경로가 없다. 이 답의 원문도 `events`에 두지 않는다. 수신이 저장 전에 처리기(`sealsAnswer`)에 물어 CHANGE 질문이면 빈 글로 저장하고 원문은 그 호출의 값으로만 넘긴다. 원문의 자리는 `change_request_inputs`와, 공개 답이면 재개가 읽는 `codex_questions.answer`다. v1 `/answer`와 일반 대화의 저장은 그대로다.
 
 **단계별 복구.** 부모의 다음 할 일은 DB의 phase가 정한다. 메모리에는 재시도 시각만 있다. 일시 오류는 부모를 닫지 않고 간격을 5초에서 10분까지 늘려 다시 본다.
 

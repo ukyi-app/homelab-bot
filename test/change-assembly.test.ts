@@ -1448,6 +1448,67 @@ test('DATA-01 답 원문: 공개 답도 events에는 없고 작성자에게는 �
     assert.ok(!JSON.stringify(await nextChat(h)).includes(CANARY));
   });
 });
+const SENSITIVE_VALUES = [['토큰', ['ghp', 'F'.repeat(36)].join('_'), 'secret_detected'], ['내부 표식', 'fixture-corp-host', 'internal_marker']] as const;
+for (const [name, value, reason] of SENSITIVE_VALUES) {
+  test(`공개 답 검사: ${name}이 든 label=public 답은 모델·응답·events에 값이 없고 private로 막힌다`, async () => {
+    await withHarness({ steps: [QUESTION, WRITE_STEP] }, async h => {
+      const { id, question } = await toQuestion(h);
+      await h.command('101', 'answer', { target: question, text: `label=public | 값은 ${value} 입니다` });
+      assert.equal(await h.phase(id), 'blocked');
+      const parent = (await h.changes.get(id) as any).value;
+      assert.equal(parent.phaseReason, 'label_blocked');
+      assert.equal(parent.label, 'private', '첫 요청과 같이 private로 올린다');
+      assert.equal((await h.db.query<{ answer: string | null }>('SELECT answer FROM codex_questions WHERE id=$1', [question])).rows[0]!.answer, null, '재개가 읽는 자리에 답이 없다');
+      const stored = (await h.db.query<{ text: string }>('SELECT text FROM change_request_inputs WHERE change_id=$1 AND label=$2', [id, 'private'])).rows;
+      assert.equal(stored.length, 1, '원문의 자리는 비공개 입력 표뿐이다');
+      for (let round = 0; round < 10; round++) { await h.runtime.childrenTick(); await h.runtime.laneTick(); await h.runtime.publishTick(); }
+      await h.deliver();
+      const calls = await h.f.calls();
+      assert.equal(calls.length, 1, '답으로 턴을 다시 띄우지 않았다');
+      assert.ok(!JSON.stringify(calls).includes(value), '모델 입력에 값이 없다');
+      assert.ok(h.messages().some(text => text.includes(reason)), '걸린 사유 코드로 답한다');
+      assert.ok([...h.messages(), ...h.acknowledgements()].every(text => !text.includes(value)), '응답에 값을 되풀이하지 않는다');
+      assert.ok(!(await eventsText(h)).includes(value));
+      assert.equal(h.env.github.mutations().length, 0);
+    });
+  });
+  test(`공개 질문 검사: ${name}이 든 모델 질문은 Discord로 나가지 않고 고정 문구로 알린 뒤 부모를 닫는다`, async () => {
+    await withHarness({ steps: [{ output: { status: 'needs_input', summary: '', question: `어느 값을 쓸까요? ${value}` } }, WRITE_STEP] }, async h => {
+      await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+      const id = await h.changeId();
+      await h.pump(async () => await h.phase(id) === 'blocked');
+      assert.equal((await h.changes.get(id) as any).value.phaseReason, 'task_question_sensitive');
+      assert.equal((await h.db.query('SELECT 1 FROM codex_questions')).rows.length, 0, '질문 행을 만들지 않는다');
+      for (let round = 0; round < 20; round++) { await h.runtime.childrenTick(); await h.runtime.publishTick(); }
+      await h.deliver();
+      assert.ok(h.messages().every(text => !text.includes(value)), '본문이 스레드에 없다');
+      assert.ok(h.messages().some(text => text.includes('모델 질문')), '고정 문구로 알린다');
+      assert.ok(!JSON.stringify((await h.db.query('SELECT payload FROM outbox')).rows).includes(value), 'outbox에도 없다');
+      assert.equal((await childOf(h.db, id))!.state, 'failed', '턴을 닫는다');
+      const session = (await h.db.query<{ state: string; cleanup_state: string | null }>(`SELECT state,cleanup_state FROM codex_sessions WHERE executor='claude'`)).rows[0]!;
+      assert.equal(session.state, 'failed', '세션을 대기로 남기지 않는다');
+      assert.notEqual(session.cleanup_state, 'pending', '작업자에 남은 질문 결과까지 지운다');
+      assert.equal(await h.store.laneBusy('task'), false, '레인을 놓는다');
+      assert.equal((await h.f.calls()).length, 1, '턴을 다시 띄우지 않는다');
+      assert.equal(h.env.github.mutations().length, 0);
+    });
+  });
+}
+test('공개 답 검사: 저장소가 정책에서 빠져 표식을 볼 수 없으면 답을 받지 않고 질문을 열어 둔다', async () => {
+  await withHarness({ steps: [QUESTION, WRITE_STEP] }, async h => {
+    const { id, question } = await toQuestion(h);
+    const open = h.policy.current;
+    h.policy.current = { ...open, change: { repositories: [{ ...open.change!.repositories[0]!, repoId: REPO.id + 1 }] } };
+    await h.command('101', 'answer', { target: question, text: `label=public | ${CANARY}` });
+    h.policy.current = open;
+    assert.equal((await h.db.query<{ state: string; answer: string | null }>('SELECT state,answer FROM codex_questions WHERE id=$1', [question])).rows[0]!.state, 'open');
+    assert.notEqual(await h.phase(id), 'blocked');
+    await h.deliver();
+    assert.ok(h.messages().some(text => text.includes('검사하지 못했습니다')));
+    assert.ok([...h.messages(), ...h.acknowledgements()].every(text => !text.includes(CANARY)));
+    assert.equal((await h.db.query('SELECT 1 FROM change_request_inputs WHERE change_id=$1 AND event_id<>$2', [id, (await h.changes.get(id) as any).value.eventId])).rows.length, 0, '기록하지 않는다');
+  });
+});
 test('DATA-01 답 원문: 닫힌 CHANGE 질문에 다시 답해도 events에 남지 않는다', async () => {
   await withHarness({ steps: [QUESTION, WRITE_STEP] }, async h => {
     const { question } = await toQuestion(h);
