@@ -11,7 +11,7 @@ import { ClaudeTaskBridge } from './claude-task-bridge.js';
 import { assembleChange, assembleChangeReview, changeCommandHandler, changePrecondition, guardedTaskCommands, workerRouteAnswers } from './change-assembly.js';
 import type { ChangeAssemblyOptions } from './change-assembly.js';
 import { CHANGE_PERIODS } from './change-runtime.js';
-import { ChangePrivateInputs, ChangeStore } from './change-store.js';
+import { ChangePrivateInputs, ChangeStore, purgeExpiredChangeContent } from './change-store.js';
 import { CHANGE_COMMANDS, EXTERNAL_TASK_COMMANDS, FOUNDATION_COMMANDS, MEMORY_COMMANDS, REVIEW_COMMANDS, TASK_COMMANDS, commandDefinitions, registerCommands } from './commands.js';
 import { ConfigError, databasePoolConfig, loadPublisherConfig } from './config.js';
 import type { PublisherConfig } from './config.js';
@@ -448,11 +448,6 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       if (!stop.signal.aborted) await taskBridge.sweep();
       return false;
     }, false);
-    // 질문 답 원문의 7일 보존. CHANGE를 꺼도 작업 레인 질문은 생기므로 CHANGE 루프가 아니라 여기서 돈다. 작업자 수락과 무관하게 돈다.
-    every('task_answer_retention', TASK_ANSWER_PURGE_EVERY_MS, async () => {
-      const purged = await purgeExpiredTaskAnswers(store.db, store.now());
-      if (purged) log('task_answers_purged', { purged });
-    });
   };
   // 변경 루프. 부모는 슬롯을 잡지 않고 자식 job만 레인을 쓴다. 긴 시험 대기가 대화·작업 루프를 늦추지 않게 따로 돈다. 첫 READY 장벽 뒤에 시작한다.
   let changeLoopsStarted = false;
@@ -465,10 +460,6 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     every('change_reconcile', CHANGE_PERIODS.reconcileMs, async () => {
       const report = await change.runtime.reconcile();
       if (report.confirmed.length || report.blocked.length) log('change_reconciled', { confirmed: report.confirmed.length, stillUnknown: report.stillUnknown.length, blocked: report.blocked.length });
-    });
-    every('change_retention', CHANGE_PERIODS.retentionMs, async () => {
-      const purged = await change.runtime.retention();
-      if (purged) log('change_content_purged', { purged });
     });
   };
   // REST 요청 하나가 시간 초과(5초)·일시 오류로 실패할 수 있다. 다음 READY(며칠 뒤일 수도)까지 미루지 않고 몇 번 더 시도한다.
@@ -608,6 +599,16 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     if (task !== changeWorkers.task || routed !== changeWorkers.review) log('change_workers', { task, review: routed });
     changeWorkers.task = task;
     changeWorkers.review = routed;
+  });
+  // 원문 보존 정리(CHANGE 원문·artifact 7일, 작업 레인 질문 답 7일)는 DB만 쓴다. 레인 스위치·작업자 수락·READY 장벽과 묶으면
+  // 레인을 끈 채 재시작했을 때 이미 지울 때가 된 원문이 다시 켤 때까지 남으므로 늘 돈다.
+  every('change_retention', CHANGE_PERIODS.retentionMs, async () => {
+    const purged = await purgeExpiredChangeContent(store.db, store.now());
+    if (purged) log('change_content_purged', { purged });
+  });
+  every('task_answer_retention', TASK_ANSWER_PURGE_EVERY_MS, async () => {
+    const purged = await purgeExpiredTaskAnswers(store.db, store.now());
+    if (purged) log('task_answers_purged', { purged });
   });
   if (external) every('external_task_purge', deps.externalPurgeMs ?? EXTERNAL_PURGE_MS, async () => {
     const purged = await external.links.purge();

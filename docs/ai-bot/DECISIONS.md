@@ -485,8 +485,8 @@ T21 감사 A03: 7일 정리가 CHANGE artifact·리뷰 원문에만 걸려 작�
 | 예외 | change: 진행 중, 미확정 effect, 살아 있는 자식 job, 정리 안 끝난 세션(기존 그대로). 질문 답: job이 끝 상태가 아님(`waiting_user`·`unknown` 포함), 세션이 `running`·`waiting_answer`·`waiting_model`·`unknown`이거나 `cleanup_state='pending'` | 재개(`codex.ts`·`claude-task-bridge.ts`·CHANGE `resumeAuthor`)는 대기 세션일 때만 답을 읽는다. 대기 세션을 가진 `failed`는 `/retry`가 같은 답으로 이을 수 있어 남긴다 |
 | 지운 표시 | 요청 원문은 `text=''`와 `purged_at`(`text`가 NOT NULL이라 옛 코드가 읽어도 깨지지 않는다). 질문 답은 `answer=NULL`, `answer_purged_at`, `answer_sha256` | migration 019는 칸을 더하기만 한다. 질문 답의 digest는 답을 쓰는 옛 코드가 칸을 몰라도 남도록 지울 때 DB가 계산한다(UTF-8 SHA-256) |
 | 재개방 | 원문을 지운 superseded 건의 `/change … text:next`는 `input_purged`로 거절한다 | 새 generation 접수가 원문을 다시 읽는다. 열어 두면 `request_invalid`로 막혀 이유가 가려진다 |
-| 부르는 자리 | 요청 원문은 기존 `change_retention`(1시간). 질문 답은 새 `task_answer_retention`(1시간, 작업 루프 시작 때) | CHANGE를 꺼도 작업 레인 질문은 생긴다 |
-| 복원 | 시각 기준이라 복원된 옛 행도 다음 정리가 다시 지운다. 원문이 다시 보이는 창은 복원부터 다음 정리까지, 최대 1시간(재시작이면 루프 시작까지). 정리는 한 바퀴에 change 20건×20번, 답 200행×20번까지 지운다 | 백업 자체에 든 원문은 백업 보존 기간(14일) 동안 남는다. 이 결정의 범위 밖이다 |
+| 부르는 자리 | 요청 원문은 기존 `change_retention`(1시간), 질문 답은 새 `task_answer_retention`(1시간). 둘 다 게시 서버가 뜨면 레인 스위치와 무관하게 돈다 | DB만 쓰는 정리를 레인 루프에 묶으면 레인을 끈 채 재시작했을 때 지울 때가 된 원문이 다시 켤 때까지 남는다(#94 Codex P2) |
+| 복원 | 시각 기준이라 복원된 옛 행도 다음 정리가 다시 지운다. 원문이 다시 보이는 창은 복원부터 다음 정리까지, 최대 1시간(재시작이면 게시 서버가 뜬 직후 첫 바퀴까지). 정리는 한 바퀴에 change 20건×20번, 답 200행×20번까지 지운다 | 백업 자체에 든 원문은 백업 보존 기간(14일) 동안 남는다. 이 결정의 범위 밖이다 |
 
 **정리 경로가 없는 다른 원문 칸(사용자 결정 대기).** `events.payload.text`(`/task` 요청문, CHANGE가 아닌 `/answer` 답 사본), `codex_questions.prompt`(모델 질문), `results.result`(작업 완료 요약 등 모델 출력), `outbox.payload.content`(Discord로 보낸 질문·요약 본문), `change_requests.brief`(요청 원문에서 뽑은 summary·goal·acceptance). 감사 기록(`audit.detail`)에는 원문을 넣지 않는다.
 
