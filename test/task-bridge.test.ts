@@ -9,6 +9,7 @@ import { ReviewRuntime } from '../src/review.js';
 import { Runtime } from '../src/runtime.js';
 import { LaneClosed, Store } from '../src/store.js';
 import { TASK_RETENTION, taskQuestionId } from '../src/task-contracts.js';
+import { repositoryPolicy } from './change-github-fake.js';
 import { event, fixture, localDatabase, thread } from './helpers.js';
 import { ABSENT, FakeTaskWorker, OTHER_STORAGE, PLAN, allRows, answer, answerOnAbort, codexBridge, codexSession, control, conversationId, expiredWhileWaiting, hang, jobs, lane, laneRow, rejectStart, reply, retainedThenStorageReplaced, task, until } from './task-lane-fixture.js';
 import type { Fixture } from './task-lane-fixture.js';
@@ -94,13 +95,108 @@ test('게시 서버 로그: dispatch 전 오류는 사유 코드만 남기고 Ru
   assert.equal(JSON.stringify(events).includes('요청본문표식'), false);
 });
 
-test('TASK-02 질문 중계: 공개 검사는 CHANGE 경로에만 있어 작업 레인의 질문은 그대로 나간다', async () => {
-  const value = ['ghp', 'F'.repeat(36)].join('_');
-  const { question } = await asked(`이 값을 쓸까요? ${value}`);
-  assert.equal((await rows('codex_questions'))[0]!.id, question);
-  assert.equal((await jobs(db()))[0]!.state, 'waiting_user');
-  await f.publisher.deliver();
-  assert.ok(f.rest.messages[0]!.body.content.includes(value));
+// 작업 레인 출력 공개 검사. 모델이 쓴 글이 Discord로 나가는 자리는 질문과 완료 요약 둘이다.
+// 아래 변형은 scanPublicText가 실제로 잡는 형태만 둔다(zero-width 제거, 따옴표·+ 이음, 대소문자·구분자 접기, base64).
+const TOKEN = ['ghp', 'F'.repeat(36)].join('_');
+const MARKER = ['fixture', 'corp', 'host'].join('-');
+const ZWSP = String.fromCodePoint(0x200b);
+const OUTPUT_CASES: { name: string; text: string; fragment: string; reason: string }[] = [
+  { name: '합성 토큰', text: `이 값을 쓸까요? ${TOKEN}`, fragment: TOKEN, reason: 'secret_detected' },
+  { name: 'zero-width로 끊은 토큰', text: `값: ghp_${ZWSP}${'E'.repeat(36)}`, fragment: 'E'.repeat(36), reason: 'secret_detected' },
+  { name: '따옴표·더하기로 이은 토큰', text: `"ghp_${'D'.repeat(18)}" + "${'C'.repeat(18)}"`, fragment: 'D'.repeat(18), reason: 'secret_detected' },
+  { name: '내부 표식', text: `${MARKER}에 배포할까요?`, fragment: MARKER, reason: 'internal_marker' },
+  { name: '대소문자·구분자를 바꾼 내부 표식', text: `${MARKER.toUpperCase().replaceAll('-', ' ')} 쪽을 볼까요?`, fragment: MARKER.toUpperCase().replaceAll('-', ' '), reason: 'internal_marker' },
+  { name: 'base64로 감싼 내부 표식', text: `참고: ${Buffer.from(MARKER).toString('base64').replace(/=+$/, '')}`, fragment: Buffer.from(MARKER).toString('base64').replace(/=+$/, ''), reason: 'internal_marker' },
+];
+// deliver는 한 번에 한 행만 보낸다.
+const deliverAll = async () => { while (await f.publisher.deliver()); };
+const withMarkers = () => { f.policy.change = { repositories: [repositoryPolicy({ internalMarkers: [MARKER] })] }; };
+// 원문 조각이 Discord REST 본문·outbox payload·질문 행·로그 어디에도 없어야 한다.
+async function exposed(fragment: string, logs: unknown) {
+  const places = { rest: f.rest.messages.map(m => m.body), outbox: (await outbox()).map(row => row.payload), questions: await rows('codex_questions'), logs };
+  return Object.entries(places).filter(([, value]) => JSON.stringify(value).includes(fragment)).map(([name]) => name);
+}
+test('TASK-02 질문 공개 검사: 비밀·내부 표식이 든 질문은 보내지 않고 작업을 실패로 닫으며 사유 코드만 알린다', async () => {
+  withMarkers();
+  const events: [string, Record<string, unknown> | undefined][] = [];
+  const local = lane(f, { log: (event, detail) => { events.push([event, detail]); } });
+  const blocked: { id: string; fragment: string; reason: string; name: string }[] = [];
+  for (const [index, item] of OUTPUT_CASES.entries()) {
+    local.worker.scripts.push(reply.question(item.text));
+    const job = await newTask(`q-${index}`);
+    assert.equal(await local.runtime.tickTask(), true);
+    const current = (await jobs(db())).find(row => row.id === job.id)!;
+    assert.equal(current.state, 'failed', item.name); assert.equal(current.wait_reason, 'task_question_sensitive', item.name);
+    blocked.push({ id: job.id, ...item });
+  }
+  assert.equal((await rows('codex_questions')).length, 0);
+  // CHANGE와 같이 세션을 닫고 공간을 지운다.
+  assert.ok((await rows('codex_sessions')).every(row => row.state === 'failed' && row.cleanup_state === 'cleaned'));
+  assert.equal(local.worker.finalizes.length, OUTPUT_CASES.length);
+  // 대조: 같은 정책에서 평범한 질문은 그대로 중계된다.
+  local.worker.scripts.push(reply.question('어느 브랜치 기준으로 고칠까요?'));
+  const normal = await newTask('q-normal');
+  await local.runtime.tickTask();
+  assert.equal((await jobs(db())).find(row => row.id === normal.id)!.state, 'waiting_user');
+  assert.equal((await rows('codex_questions')).length, 1);
+  await deliverAll();
+  for (const item of blocked) {
+    assert.deepEqual(await exposed(item.fragment, events), [], item.name);
+    const notices = f.rest.messages.filter(m => m.body.content.includes(`작업 ${item.id}의 질문이 공개 검사에 걸려(사유: ${item.reason})`));
+    assert.equal(notices.length, 1, item.name);
+    assert.ok(events.some(([event, detail]) => event === 'task_output_blocked' && detail?.job === item.id && detail.output === 'question' && detail.reason === item.reason), item.name);
+  }
+  assert.ok(f.rest.messages.some(m => m.body.content.includes('어느 브랜치 기준으로 고칠까요?')));
+});
+test('TASK-02 완료 요약 공개 검사: 걸린 요약은 그 줄만 고정 문구로 바꾸고 완료·변경 수·검증 집계는 그대로 둔다', async () => {
+  withMarkers();
+  const events: [string, Record<string, unknown> | undefined][] = [];
+  const local = lane(f, { log: (event, detail) => { events.push([event, detail]); } });
+  const done: { id: string; fragment: string; reason: string; name: string }[] = [];
+  for (const [index, item] of OUTPUT_CASES.entries()) {
+    local.worker.scripts.push(reply.completed(item.text));
+    const job = await newTask(`s-${index}`);
+    await local.runtime.tickTask();
+    assert.equal((await jobs(db())).find(row => row.id === job.id)!.state, 'succeeded', item.name);
+    const result = (await rows('results')).find(row => row.job_id === job.id)!;
+    assert.equal(result.evidence.summaryWithheld, item.reason, item.name);
+    done.push({ id: job.id, ...item });
+  }
+  local.worker.scripts.push(reply.completed('main 기준으로 고쳤습니다.'));
+  const normal = await newTask('s-normal');
+  await local.runtime.tickTask();
+  await deliverAll();
+  for (const item of done) {
+    assert.deepEqual(await exposed(item.fragment, events), [], item.name);
+    // 게시자가 끝에 붙이는 대조용 ref 줄은 뺀다.
+    const message = f.rest.messages.find(m => m.body.content.startsWith(`작업 완료 (작업 ${item.id})`))!.body.content.replace(/\n\[ref:[0-9a-f]+\]$/, '');
+    assert.equal(message, [`작업 완료 (작업 ${item.id})`, `요약이 공개 검사에 걸려(사유: ${item.reason}) 보내지 않았습니다. 작업 완료는 기록했습니다.`,
+      '변경 파일(작업자 diff 기준): 0개', '검증: 통과 0 · 실패 0 · 미실행 0'].join('\n'), item.name);
+  }
+  const control = f.rest.messages.find(m => m.body.content.startsWith(`작업 완료 (작업 ${normal.id})`))!.body.content;
+  assert.match(control, /main 기준으로 고쳤습니다\./);
+  assert.equal((await rows('results')).find(row => row.job_id === normal.id)!.evidence.summaryWithheld, undefined);
+});
+test('TASK-02 출력 공개 검사: 정책·표식을 읽지 못하면 질문·요약을 보내지 않는다(policy_unavailable)', async () => {
+  const question = '평범한 질문이지만 정책을 못 읽었습니다';
+  setup.worker.scripts.push((r, w) => { f.setPolicyUnavailable(true); return reply.question(question)(r, w); });
+  const asking = await newTask('p-question');
+  await setup.runtime.tickTask();
+  f.setPolicyUnavailable(false);
+  assert.equal((await jobs(db())).find(row => row.id === asking.id)!.wait_reason, 'task_question_sensitive');
+  // 리뷰 정책이 있는데 형식이 틀리면 그 표식을 모른다.
+  f.policy.review = { internalMarkers: 'broken' };
+  const summary = '평범한 요약이지만 표식을 모릅니다';
+  setup.worker.scripts.push(reply.completed(summary));
+  const finishing = await newTask('p-summary');
+  await setup.runtime.tickTask();
+  assert.equal((await jobs(db())).find(row => row.id === finishing.id)!.state, 'succeeded');
+  delete f.policy.review;
+  await deliverAll();
+  const sent = JSON.stringify(f.rest.messages.map(m => m.body));
+  assert.equal(sent.includes(question), false); assert.equal(sent.includes(summary), false);
+  assert.ok(sent.includes(`작업 ${asking.id}의 질문이 공개 검사에 걸려(사유: policy_unavailable)`));
+  assert.ok(sent.includes('요약이 공개 검사에 걸려(사유: policy_unavailable)'));
 });
 test('TASK-02 질문 중계 → owner 답 → 같은 세션 resume → 완료 → 영속 뒤 세션 정리', async () => {
   const { job, sid, question } = await asked('어느 브랜치 기준으로 고칠까요?');
