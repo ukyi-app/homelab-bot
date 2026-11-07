@@ -460,6 +460,16 @@ Workflows 권한이 없으므로 **봇은 `.github/workflows` 변경 PR을 만�
 
 사람 작업(T19 시작 전, `approvals.md` 기록): App 생성·설치, 키를 Infisical `/apps/homelab-bot/`에 등록.
 
+### T19 운영 결정 (사용자 2026-11-06~07)
+
+| 항목 | 결정 | 근거·함정 |
+|---|---|---|
+| 사람 단계 범위 | H2 작업자 갱신과 운영 파드 무모델 측정 → 정책 등록 → H1 실제 writer AC-P8 → H0 시험 앱 임시 등록 → H3 켜기와 live 한 건(모델 호출 최대 4회). 시험 PR의 게시와 병합은 결과마다 따로 승인 | 순서는 T19 계획의 배포 순서다. 기준이 어긋나면 멈춘다 |
+| `writerAccepted` | 정책을 먼저 false로 등록하고, 실제 신원 AC-P8 통과 뒤 true | 확인 전에는 게시가 막힌다 |
+| 켜기 전 보안 확인 | #85 `cf1d3c2` 보안 지적은 내용을 볼 수 없어 Codex CLI로 #85 전체를 다시 보고, P0·P1이 없을 때 켠다 | 3회 만에 P0·P1 0. 수정은 #86(VERIFICATION "T19 보안 재검토와 수정") |
+| 켠 범위 | `CHANGE_PR_ENABLED` true, 정책의 `homelab-smoke` 하나 | 시험 앱은 뺐으므로 smoke 변경의 배포 관측은 `deploy_config_unregistered`로 닫힌다 |
+| homelab 설치 | AC-P8 동안만 설치했다가 뺐고, homelab의 ruleset E는 남긴다 | 설치가 없으면 E의 bypass는 쓰일 곳이 없다. E를 지우는 것은 ruleset 삭제(파괴 명령)다. 다시 설치는 별도 승인이다 |
+
 ---
 
 ## R08 명시적 Codex 연결 (결정 ID 없음)
