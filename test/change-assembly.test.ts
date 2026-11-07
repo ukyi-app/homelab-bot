@@ -24,6 +24,8 @@ import type { Publisher } from '../src/main.js';
 import { loadRuntimePolicy } from '../src/policy.js';
 import { createGitHubWriter } from '../src/github-writer.js';
 import { TaskWorkerBusy } from '../src/task-bridge.js';
+import { spawnSandbox } from '../src/change-verifier.js';
+import type { SandboxRunner } from '../src/change-verifier.js';
 import { FakeGateway, until } from './fake-gateway.js';
 import { FAKE_APP_KEY, REPO, repositoryPolicy } from './change-github-fake.js';
 import { OTHER_THREAD, REQUEST_TEXT, THREAD, WRITE_STEP, bwrapReady, changeHarness } from './change-assembly-harness.js';
@@ -364,6 +366,19 @@ test('CHANGE-01 차단: 시험 실패면 리뷰·승인으로 가지 않고 결�
     assert.equal(h.reviewInputs.length, 0);
     await h.pump(async () => (await childOf(h.db, id))!.state === 'succeeded');
     assert.equal(await h.store.laneBusy('task'), false);
+    assert.equal(h.env.github.mutations().length, 0);
+  });
+});
+test('CHANGE-01 차단: 샌드박스 준비 실패(not_run)도 리뷰·승인·게시로 가지 않는다', async () => {
+  await withHarness({ sandbox: async () => ({ started: false, exitCode: 1, timedOut: false, overflow: false, aborted: false, log: Buffer.from("bwrap: Can't chdir\n"), logBytes: 20, logDigest: 'b'.repeat(64) }) }, async h => {
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    await h.pump(async () => await h.phase(id) === 'blocked');
+    assert.equal((await h.changes.get(id) as any).value.phaseReason, 'verification_not_run');
+    const row = (await h.db.query<{ status: string; exit_code: number | null }>('SELECT status,exit_code FROM change_verifications WHERE change_id=$1', [id])).rows[0]!;
+    assert.deepEqual([row.status, row.exit_code], ['not_run', null]);
+    assert.equal(h.reviewInputs.length, 0);
+    assert.equal((await h.db.query('SELECT 1 FROM change_approval_subjects WHERE change_id=$1', [id])).rows.length, 0, '승인 대상이 생기지 않는다');
     assert.equal(h.env.github.mutations().length, 0);
   });
 });
@@ -1004,6 +1019,20 @@ test('SEC-02 조립 음성 대조: 경계 검사가 실제로 실패할 수 있�
     const id = await h.changeId();
     await h.pump(async () => await h.phase(id) === 'blocked');
     assert.equal((await h.changes.get(id) as any).value.phaseReason, 'verification_failed');
+  });
+});
+test('SEC-02 조립 준비 실패: 실제 bwrap이 마운트를 못 하면 시험 실패가 아니라 verification_not_run으로 막힌다', { skip: bwrapReady ? false : 'bwrap으로 namespace를 만들 수 없다' }, async () => {
+  const badMount: SandboxRunner = (args, limits, signal) => {
+    const split = args.indexOf('--');
+    return spawnSandbox([...args.slice(0, split), '--ro-bind', '/deliberately-absent-source', '/x', ...args.slice(split)], limits, signal);
+  };
+  await withHarness({ sandbox: badMount }, async h => {
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    await h.pump(async () => await h.phase(id) === 'blocked');
+    assert.equal((await h.changes.get(id) as any).value.phaseReason, 'verification_not_run');
+    assert.equal(h.reviewInputs.length, 0);
+    assert.equal(h.env.github.mutations().length, 0);
   });
 });
 test('DATA-01 메모리: 변경 경로의 어떤 모듈도 기억 서비스와 대화 맥락을 import하지 않는다', async () => {

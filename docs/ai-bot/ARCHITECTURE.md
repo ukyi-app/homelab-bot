@@ -1835,13 +1835,15 @@ bwrap은 `--unshare-all --die-with-parent --new-session --cap-drop ALL --clearen
 
 | 결과 | receipt status |
 |---|---|
-| 표에 없음, 묶음 불일치, toolchain 불일치, 작성자 생존, bwrap이 시험을 못 띄움(`--json-status-fd`의 `child-pid` 없음) | `not_run` |
-| 소멸 미확인, 로그에 작업자 자격, 자격 재확인 실패, 취소, 출력 상한 | `unknown` |
+| 표에 없음, 묶음 불일치, toolchain 불일치, 작성자 생존, 시작 표식 없음(bwrap 준비 실패, `sandbox_unavailable`), 표식 전 취소(`aborted`) | `not_run` |
+| 소멸 미확인, 로그에 작업자 자격, 자격 재확인 실패, 표식 뒤 취소, 출력 상한 | `unknown` |
 | source 변경 | `source_changed` |
 | 시한 초과 | `timed_out` |
-| 종료 코드 | `passed`·`failed` |
+| 표식 뒤 종료 코드 | `passed`·`failed` |
 
-앞줄이 더 나쁜 사실이고 시험 결과가 덮지 못한다. `author_not_stopped`와 `stop_unconfirmed` 뒤에는 정리로 소멸을 확인할 때까지 슬롯을 내주지 않는다. 로그 원문은 receipt에 없다. digest만 있고 64 KiB 사본은 v2 응답의 `log.excerpt`로만 나간다. 자격·DATA-01 패턴이 나오면 사본은 `null`이고 저장하지 않는다. 메모리·PID 상한은 파드 cgroup에 기댄다.
+앞줄이 더 나쁜 사실이고 시험 결과가 덮지 못한다. `not_run`도 `passed`가 아니므로 부모는 `verification_not_run`으로 닫히고 리뷰·승인·게시로 가지 않는다.
+
+**시작 표식.** bwrap의 `--json-status-fd` `child-pid`(`--info-fd`와 같은 값)는 clone 직후에 나온다. 마운트·chdir 실패도 그 뒤에 일어나므로 시작 증거가 아니다. 설치된 0.12.0(이미지)과 0.11.1(호스트)에서 준비 실패는 `child-pid`만 쓰고 `exit-code` 줄 없이 1로 끝나며, 시험 프로세스가 1로 끝난 것과 종료 코드로는 가를 수 없다. 그래서 `spawnSandbox`가 명령 경계(`--`) 바로 뒤에 고정 `/bin/sh`를 끼운다. bwrap이 모든 준비를 마치고 이 셸을 exec하면, 셸이 toolchain 실행 가능 여부를 보고 fd 4에 `payload-start`를 쓴 뒤 fd 4를 닫고 시험 argv로 exec한다. 이 표식이 있어야 `started`이고, 없으면 종료 코드와 상관없이 `not_run(sandbox_unavailable)`이다. 시험 코드는 fd 4를 받지 못해 표식을 쓰거나 지우지 못하고, bwrap의 pid 1도 fd 4를 들고 있지 않다. 남는 틈: 표식 뒤 toolchain exec 자체가 실패하면(ELF 해석기 없음 등) 셸이 126·127로 끝나 `failed`가 된다. bash `execfail`로 이것까지 가르려면 실패 알림 fd를 시험 프로세스에 넘겨야 해 쓰지 않았다. 표식 뒤 시한 초과는 `timed_out`이고, 표식 전에 시한을 넘기면(준비가 시한 넘게 멈춤) 시험이 돌지 않았으므로 `not_run(sandbox_unavailable)`이다. `author_not_stopped`와 `stop_unconfirmed` 뒤에는 정리로 소멸을 확인할 때까지 슬롯을 내주지 않는다. 로그 원문은 receipt에 없다. digest만 있고 64 KiB 사본은 v2 응답의 `log.excerpt`로만 나간다. 자격·DATA-01 패턴이 나오면 사본은 `null`이고 저장하지 않는다. 메모리·PID 상한은 파드 cgroup에 기댄다.
 
 **`ClaudeChangeAuthor`.** 세션을 v1과 같은 `codex_sessions`에 `capabilities.version:2`로 둔다. 레인 닫힘·보존 칸·소멸 확인이 같은 규칙으로 돈다. receipt는 `v2:<job>:<세션 generation>`이고 lease·세션·작업자는 그 행에서 읽는다. 세션은 저장 ACK 전까지 `running`이라 v1 정리 sweep이 건드리지 않고, v1 `run`이 이 세션을 이으려 하면 `task_session_mismatch`로 끝난다. T0 잎·프로젝트 정책·자식 job은 `ChangeAuthorSource`로 받는다. 모델 입력은 공개 brief뿐이고 `ChangePrivateInputs`를 읽지 않는다.
 

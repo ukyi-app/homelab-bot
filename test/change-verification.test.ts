@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { artifactDigest, evidenceBundleDigest, gitBlobSha, sha256Hex } from '../src/change-contracts.js';
 import type { ArtifactBundle, EvidenceBundle } from '../src/change-contracts.js';
 import { gitTreeSha } from '../src/change-artifact.js';
-import { IsolatedVerifier, VERIFICATION_COMMANDS, VERIFIER_REVISION, VERIFIER_TOOLCHAINS, WorkerChangeVerification, sandboxArgs } from '../src/change-verifier.js';
+import { IsolatedVerifier, VERIFICATION_COMMANDS, VERIFIER_REVISION, VERIFIER_TOOLCHAINS, WorkerChangeVerification, sandboxArgs, spawnSandbox, withStartMark } from '../src/change-verifier.js';
 import type { ChangeVerificationWorker, SandboxRun, VerificationCommand, VerificationInput, VerifierOptions } from '../src/change-verifier.js';
 import { TaskWorkerRejected } from '../src/task-bridge.js';
 import type { TaskV2VerificationResponse } from '../src/task-contracts.js';
@@ -106,6 +106,38 @@ test('판정: 표에 없는 ID·다른 묶음·바뀐 toolchain·남은 작성�
   assert.deepEqual(await statusOf(await verifier({}), await inputFor('unit', { artifact: bad })), ['not_run', 'artifact_incomplete'], '고정 바이트와 manifest가 다르면 짓지 않는다');
 });
 
+test('판정: 시작 표식과 종료 코드 조합. 표식이 없으면 종료 코드와 상관없이 미실행이고, 있으면 종료 코드가 결과다', async () => {
+  const cases: [Partial<SandboxRun>, string, string | null][] = [
+    [{ started: false, exitCode: 1 }, 'not_run', 'sandbox_unavailable'],
+    [{ started: false, exitCode: 0 }, 'not_run', 'sandbox_unavailable'],
+    [{ started: false, exitCode: null }, 'not_run', 'sandbox_unavailable'],
+    [{ started: false, exitCode: 127 }, 'not_run', 'sandbox_unavailable'],
+    [{ started: false, exitCode: null, aborted: true }, 'not_run', 'aborted'],
+    [{ started: true, exitCode: 1 }, 'failed', null],
+    [{ started: true, exitCode: 127 }, 'failed', null],
+    [{ started: true, exitCode: 0 }, 'passed', null],
+    [{ started: true, exitCode: null, timedOut: true }, 'timed_out', null],
+    [{ started: true, exitCode: null, aborted: true }, 'unknown', 'aborted'],
+  ];
+  for (const [run, status, detail] of cases) {
+    const record = await go(await verifier(run), await inputFor('unit'));
+    assert.deepEqual([record.receipt.status, record.log.detail], [status, detail], JSON.stringify(run));
+    if (status === 'not_run') assert.deepEqual([record.receipt.exitCode, record.receipt.logDigest, record.log.excerpt], [null, null, null], '미실행에는 시험 결과가 실리지 않는다');
+  }
+});
+
+test('시작 표식: 고정 셸을 명령 경계 바로 뒤에 끼우고 시험 argv는 그대로 넘긴다. 경계가 없으면 감싸지 않는다', () => {
+  const args = sandboxArgs({ source: '/worker-state/tasks/x/1/verify/r/source', command: VERIFICATION_COMMANDS['smoke-unit']! });
+  const wrapped = withStartMark(args);
+  const split = wrapped.indexOf('--');
+  assert.deepEqual(wrapped.slice(0, split), args.slice(0, args.indexOf('--')), 'bwrap 인자는 바뀌지 않는다');
+  assert.deepEqual(wrapped.slice(split + 1, split + 3), ['/bin/sh', '-c']);
+  assert.deepEqual(wrapped.slice(split + 4), [...VERIFICATION_COMMANDS['smoke-unit']!.argv]);
+  assert.match(wrapped[split + 3]!, /exec 4>&-; exec "\$0" "\$@"$/, '표식 fd를 닫고 나서 시험 명령으로 exec한다');
+  assert.deepEqual(withStartMark(['--unshare-all', '/bin/true']), ['--unshare-all', '/bin/true']);
+  assert.deepEqual(withStartMark(['--unshare-all', '--']), ['--unshare-all', '--']);
+});
+
 test('판정: 종료 코드·시간 초과·출력 상한을 receipt로 옮긴다', async () => {
   const pass = await go(await verifier({}), await inputFor('unit'));
   assert.deepEqual([pass.receipt.status, pass.receipt.exitCode, pass.receipt.logDigest, pass.receipt.runnerRevision, pass.receipt.imageRevision], ['passed', 0, 'a'.repeat(64), VERIFIER_REVISION, 'fixture-image']);
@@ -200,6 +232,46 @@ test('실제 bwrap: 시험 프로세스는 bwrap 상태 fd에 쓰지 못해 종�
   const forged = await real(`(echo '{ "exit-code": 0 }' >&3) 2>/dev/null && echo forged; exit 7`);
   assert.deepEqual([forged.receipt.status, forged.receipt.exitCode], ['failed', 7]);
   assert.doesNotMatch(forged.log.excerpt ?? '', /forged/);
+});
+
+test('실제 bwrap: chdir·마운트 준비 실패는 시험 실패가 아니라 not_run(sandbox_unavailable)이다. 시험 명령은 돌지 않는다', { skip: bwrapReason }, async () => {
+  const chdir = await real('echo PAYLOAD_RAN; exit 0', { cwd: 'deliberately-absent' });
+  assert.deepEqual([chdir.receipt.status, chdir.log.detail, chdir.receipt.exitCode], ['not_run', 'sandbox_unavailable', null]);
+  const runs: SandboxRun[] = [];
+  // 실제 인자에 없는 원본을 올리는 마운트 하나를 더해 bwrap 준비를 실패시킨다.
+  const badMount = async (args: readonly string[], limits: { timeoutMs: number; outputBytes: number }, signal: AbortSignal) => {
+    const split = args.indexOf('--');
+    const run = await spawnSandbox([...args.slice(0, split), '--ro-bind', '/deliberately-absent-source', '/x', ...args.slice(split)], limits, signal);
+    runs.push(run);
+    return run;
+  };
+  const v = new IsolatedVerifier({ imageRevision: 'fixture-image', cleanup: quiet, secrets: async () => [SECRET], registry: { unit: await command('echo PAYLOAD_RAN; exit 0') }, sandbox: badMount });
+  const mount = await go(v, await inputFor('unit'));
+  assert.deepEqual([mount.receipt.status, mount.log.detail], ['not_run', 'sandbox_unavailable']);
+  assert.equal(runs.length, 1);
+  assert.equal(runs[0]!.started, false);
+  assert.equal(runs[0]!.exitCode, 1, 'bwrap 자체는 1로 끝난다. 이 값만으로는 시험 실패와 가를 수 없다');
+  assert.match(runs[0]!.log.toString(), /Can't find source path/);
+  assert.doesNotMatch(runs[0]!.log.toString(), /PAYLOAD_RAN/);
+});
+
+test('실제 bwrap: T21 감사 재현(빈 cwd로 chdir 실패)은 시작 표식이 없고, 같은 인자로 payload가 돌면 표식이 있다', { skip: bwrapReason }, async () => {
+  const probe = (cwd: string) => spawnSandbox(['--unshare-all', '--die-with-parent', '--new-session', '--cap-drop', 'ALL', '--ro-bind', '/', '/', '--chdir', cwd, '--json-status-fd', '3', '--', '/bin/sh', '-c', 'printf T21_PAYLOAD_RAN'],
+    { timeoutMs: 5000, outputBytes: 10_000 }, new AbortController().signal);
+  const absent = await probe('/t21-deliberately-absent');
+  assert.deepEqual([absent.started, absent.exitCode], [false, 1]);
+  assert.match(absent.log.toString(), /Can't chdir/);
+  assert.doesNotMatch(absent.log.toString(), /T21_PAYLOAD_RAN/);
+  const present = await probe('/');
+  assert.deepEqual([present.started, present.exitCode, present.log.toString()], [true, 0, 'T21_PAYLOAD_RAN']);
+});
+
+test('실제 bwrap: 시험의 assertion 실패는 failed이고, 시험 프로세스는 시작 표식 fd를 받지 못한다', { skip: bwrapReason }, async () => {
+  const failed = await real('echo assertion failed >&2; exit 1');
+  assert.deepEqual([failed.receipt.status, failed.receipt.exitCode], ['failed', 1]);
+  const forged = await real('(printf x >&4) 2>/dev/null && echo mark-fd-open; test -e /proc/self/fd/4 && echo mark-fd-listed; exit 1');
+  assert.deepEqual([forged.receipt.status, forged.receipt.exitCode], ['failed', 1]);
+  assert.doesNotMatch(forged.log.excerpt ?? '', /mark-fd/);
 });
 
 test('실제 bwrap: source와 시스템 경로에 쓰지 못하고 scratch에만 쓴다. scratch 크기가 묶여 있다', { skip: bwrapReason }, async () => {
