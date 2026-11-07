@@ -390,6 +390,7 @@ async function authorHarness(options: { items?: TarItem[] } = {}): Promise<Autho
     claimed: async id => (await db.query<Job>(`SELECT * FROM jobs WHERE id=$1 AND state='running'`, [id])).rows[0] ?? null,
     authorJob: async () => jobId,
     keyOf: async () => key,
+    questionRisk: async () => null,
   };
   const calls: AuthorHarness['calls'] = { finalize: 0 };
   const counted: HttpTaskV2Worker = Object.create(f.port) as HttpTaskV2Worker;

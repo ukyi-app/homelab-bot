@@ -69,7 +69,8 @@ const parseCapabilities = (session: Pick<SessionRow, 'capabilities'>) =>
   (typeof session.capabilities === 'string' ? JSON.parse(session.capabilities) : session.capabilities) as { version?: number; artifactDigest?: string } | null | undefined;
 type Stop = 'cancel' | 'revoked' | 'lease' | 'timeout' | 'shutdown' | 'monitor';
 // 턴의 결말. rejected는 시작하지 않았다는 증거, lost는 응답을 못 받아 시작 여부를 모르는 경우다.
-type Turn = { kind: 'response'; response: TaskResponse } | { kind: 'rejected' } | { kind: 'lost' };
+// question_blocked는 CHANGE 질문이 공개 검사에 걸린 턴이다. 질문 행과 게시 큐를 지나지 않게 응답을 싣지 않는다.
+type Turn = { kind: 'response'; response: TaskResponse } | { kind: 'rejected' } | { kind: 'lost' } | { kind: 'question_blocked' };
 type CancelFacts = Pick<TaskCancelResponse, 'stopped' | 'cleanupPending' | 'sessionRetained' | 'worker'>;
 // job의 끝 기록. 값은 전이를 시도한 트랜잭션에서 읽은 jobs.state·wait_reason이다. 커밋된 뒤에 로그로 남긴다.
 // intended가 있으면 그 전이가 일어나지 않은 것이고, state·reason은 남아 있는 DB 값이다(DB를 읽지 못했으면 null).
@@ -77,6 +78,8 @@ type JobEnd = { intended?: undefined; state: string; reason: string | null } | {
 // terminal은 세션 공간을 지울 차례인지다.
 interface Settled { terminal: boolean; end?: JobEnd }
 interface Facts { stopped: boolean; retained: boolean | null; cleanupPending: boolean; worker: TaskWorkerIdentity | null; tools: number | null }
+// 끝난 세션을 다시 읽어도 같은 코드가 나와야 부모가 같은 판정으로 닫힌다. 그래서 job의 사유와 fetchResult가 이 값을 함께 쓴다.
+const CHANGE_QUESTION_BLOCKED = 'task_question_sensitive';
 const TEXT = Object.freeze({
   executor: 'claude' as const, prefix: 'task', question: '작업 질문', accepted: '답을 받았습니다. 같은 세션을 이어서 실행합니다.',
   blocked: (job: string) => `작업 ${job}의 프로세스 종료를 확인하지 못했습니다(unknown). 다시 실행하지 않고 작업 레인의 새 접수를 닫았습니다. 대화·리뷰는 계속 동작합니다. 작업자 프로세스 0개를 확인한 뒤 /task-release target:${job} 로 해제하세요.`,
@@ -245,7 +248,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     return this.begin(job, request, session, { version: TASK_V2_CONTRACT, lane: 'task', tool_approval_relay: false });
   }
   // snapshot 외의 턴 결말을 v1과 같은 규칙으로 확정한다.
-  async settleChangeTurn(job: Job, session: SessionRow, result: Exclude<TaskV2TurnResult, { status: 'snapshot' }> | null, stop?: Stop): Promise<Settled> {
+  async settleChangeTurn(job: Job, session: SessionRow, result: Exclude<TaskV2TurnResult, { status: 'snapshot' }> | null, stop?: Stop, questionBlocked = false): Promise<Settled> {
     // 이 턴이 나르던 답이다. 한도·인증으로 끝나면 settle이 answered로 되돌려 다음 재개가 같은 답을 잇는다. 앞 턴의 질문도 resumed로 남아 있어 가장 뒤의 것이다.
     const question = session.turn > 1 ? (await this.store.db.query<{ id: string }>(`SELECT id FROM codex_questions WHERE job_id=$1 AND thread_id=$2 AND state='resumed' ORDER BY turn DESC LIMIT 1`, [job.id, session.claude_session_id])).rows[0] : undefined;
     const request = { operation: session.turn > 1 ? 'resume' : 'start', lease: session.worker_lease!, generation: session.generation!, sessionId: session.claude_session_id!, turn: session.turn, ...(question ? { questionId: question.id } : {}) } as unknown as TaskRequest;
@@ -253,7 +256,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     if (!result) return this.settle(job, request, job.revision.policy, { kind: 'rejected' }, { stopped: true, retained: session.turn > 1, cleanupPending: false, worker: null, tools: 0 }, stop, usedMs);
     const facts: Facts = { stopped: result.stopped, retained: result.sessionRetained, cleanupPending: result.cleanupPending, worker: result.worker, tools: result.usage.toolCalls };
     // 작업자가 시작을 기록한 뒤 결과 없이 재시작하면 v1에 없는 "소멸 확인 + 결과 없음"이 온다. 모델을 다시 돌리지 않고 결과를 잃은 턴으로 닫는다.
-    const turn: Turn = result.status === 'unknown' && result.stopped ? { kind: 'lost' } : { kind: 'response', response: result as unknown as TaskResponse };
+    const turn: Turn = questionBlocked ? { kind: 'question_blocked' } : result.status === 'unknown' && result.stopped ? { kind: 'lost' } : { kind: 'response', response: result as unknown as TaskResponse };
     return this.settle(job, request, job.revision.policy, turn, facts, stop, usedMs);
   }
   reportChangeEnd(job: string, settled: Settled): void { if (settled.end) this.report(job, settled.end); }
@@ -464,6 +467,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       if (turn.kind === 'rejected') return fail('task_worker_rejected');
       if (stop) return fail(`task_${stop}`);
       if (turn.kind === 'lost') return fail('task_worker_lost');
+      if (turn.kind === 'question_blocked') return fail(CHANGE_QUESTION_BLOCKED);
       const response = turn.response;
       if (response.status === 'failed') return fail(`task_${response.reason}`);
       if (response.status === 'limited' || response.status === 'auth_expired') {
@@ -698,6 +702,8 @@ export interface ChangeAuthorSource {
   // change generation의 작성 job.
   authorJob(key: ChangeKey): Promise<string | null>;
   keyOf(jobId: string): Promise<ChangeKey | null>;
+  // 모델 질문을 스레드에 내보내면 안 되는 사유 코드. 없으면 null이다.
+  questionRisk(jobId: string, question: string): Promise<string | null>;
 }
 export interface ChangeAuthorDeps { bridge: ClaudeTaskBridge; store: Store; gate: PolicyGate; worker: TaskV2WorkerPort; source: ChangeAuthorSource; artifacts: ChangeArtifactPort }
 const TERMINAL_SESSION = new Set(['completed', 'failed', 'cancelled']);
@@ -833,15 +839,18 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
       return { kind: 'snapshot', artifact, transportBytes: raw.bytes };
     }
     const stop = result.status === 'failed' && result.reason === 'aborted' ? 'cancel' as const : undefined;
-    const settled = await this.settled(job, session, result, stop);
+    // 질문 경로는 스레드로 바로 나간다. 질문 행을 만들기 전에 본다. 정책을 못 읽어 던지면 아무것도 나가지 않고 다음 바퀴에 같은 결과를 다시 본다.
+    const risky = result.status === 'needs_input' && await this.deps.source.questionRisk(jobId, result.question) !== null;
+    const settled = await this.settled(job, session, result, stop, risky);
     this.deps.bridge.reportChangeEnd(jobId, settled);
+    if (risky) return { kind: 'failed', code: CHANGE_QUESTION_BLOCKED };
     if (result.status === 'needs_input') return { kind: 'needs_input', question: result.question };
     if (result.status === 'failed') return stop ? { kind: 'cancelled', code: 'aborted' } : { kind: 'failed', code: result.reason };
     if (result.status === 'unknown') return settled.terminal ? { kind: 'failed', code: 'task_worker_lost' } : { kind: 'unknown', code: 'stop_unconfirmed' };
     return { kind: 'unknown', code: result.status === 'limited' ? 'model_limit' : 'auth_expired' };
   }
-  private async settled(job: Job, session: SessionRow, result: Exclude<TaskV2TurnResult, { status: 'snapshot' }>, stop?: 'cancel') {
-    const settled = await this.deps.bridge.settleChangeTurn(job, session, result, stop);
+  private async settled(job: Job, session: SessionRow, result: Exclude<TaskV2TurnResult, { status: 'snapshot' }>, stop?: 'cancel', questionBlocked = false) {
+    const settled = await this.deps.bridge.settleChangeTurn(job, session, result, stop, questionBlocked);
     if (settled.terminal) await this.deps.bridge.finalizeChangeSession(job.id).catch(() => {});
     return settled;
   }

@@ -94,6 +94,14 @@ test('게시 서버 로그: dispatch 전 오류는 사유 코드만 남기고 Ru
   assert.equal(JSON.stringify(events).includes('요청본문표식'), false);
 });
 
+test('TASK-02 질문 중계: 공개 검사는 CHANGE 경로에만 있어 작업 레인의 질문은 그대로 나간다', async () => {
+  const value = ['ghp', 'F'.repeat(36)].join('_');
+  const { question } = await asked(`이 값을 쓸까요? ${value}`);
+  assert.equal((await rows('codex_questions'))[0]!.id, question);
+  assert.equal((await jobs(db()))[0]!.state, 'waiting_user');
+  await f.publisher.deliver();
+  assert.ok(f.rest.messages[0]!.body.content.includes(value));
+});
 test('TASK-02 질문 중계 → owner 답 → 같은 세션 resume → 완료 → 영속 뒤 세션 정리', async () => {
   const { job, sid, question } = await asked('어느 브랜치 기준으로 고칠까요?');
   const current = (await jobs(db()))[0]!;

@@ -118,6 +118,12 @@ function hasMarker(text: string, markers: readonly string[]): boolean {
     return markerEncodings(marker).some(encoded => visible.includes(encoded) || lowered.includes(encoded.toLowerCase()));
   });
 }
+// owner의 입력이나 모델의 질문처럼 파일이 없는 글을 공개 문구와 같은 기준으로 본다. 걸린 사유 코드만 돌려주고 값은 돌려주지 않는다.
+export function scanPublicText(text: { title: string; body: string }, policy: ScanPolicy & { identity: { name: string; email: string } }): Exclude<ScanResult, { ok: true }>['reason'] | null {
+  const identity = { name: policy.identity.name, email: policy.identity.email, date: '2000-01-01T00:00:00Z' };
+  const scanned = scanPublicPayload({ paths: [], files: [], branch: 'change', marker: 'change', publication: { title: text.title.slice(0, 256), body: text.body, commitMessage: 'change', author: identity, committer: identity, draft: false } }, { internalMarkers: policy.internalMarkers });
+  return scanned.ok ? null : scanned.reason;
+}
 export function scanPublicPayload(payload: PublicPayload, policy: ScanPolicy): ScanResult {
   const { publication } = payload;
   // 신원 이메일은 스키마가 noreply로 고정한다. 그래서 여기에는 넣지 않는다.

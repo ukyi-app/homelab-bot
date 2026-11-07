@@ -1181,6 +1181,149 @@ test('권한 조회 불가: 정책을 읽지 못하면 쓰지 않고 부모를 �
   });
 });
 
+// 맞는 요청 하나를 세워 그 사이에 철회를 끼운다. before면 GitHub이 받기 전에, after면 처리한 뒤 응답만 세운다.
+const holdOnce = (h: Harness, match: (method: string, url: string) => boolean, when: 'before' | 'after' = 'before') => {
+  const send = h.env.github.send;
+  let arrive!: () => void;
+  let release!: () => void;
+  let used = false;
+  const arrived = new Promise<void>(resolve => { arrive = resolve; });
+  const released = new Promise<void>(resolve => { release = resolve; });
+  (h.env.github as { send: typeof fetch }).send = async (input, init) => {
+    const hit = !used && match(init?.method ?? 'GET', String(input));
+    if (hit) used = true;
+    if (hit && when === 'before') { arrive(); await released; }
+    const response = await send(input, init);
+    if (hit && when === 'after') { arrive(); await released; }
+    return response;
+  };
+  return { arrived, release };
+};
+const toApproved = async (h: Harness) => {
+  const id = await toAwaiting(h);
+  await h.command('101', 'change-publish', { target: id, text: await digestOf(h, id) });
+  return id;
+};
+const PULL_POST = /POST .*\/pulls$/;
+// ref가 만들어진 뒤의 봇 브랜치 조회는 PR 직전 신선도 검사의 마지막 읽기다.
+const lastHeadRead = (h: Harness) => (method: string, url: string) => method === 'GET' && /\/git\/ref\/heads\//.test(url) && !url.endsWith('/heads/main') && h.env.github.count(/POST .*\/git\/refs$/) > 0;
+const effectRow = async (h: Harness, id: string, stage: string) => (await h.db.query<{ state: string; blocked_reason: string | null; resolution: string | null }>('SELECT state,blocked_reason,resolution FROM change_delivery_effects WHERE change_id=$1 AND stage=$2', [id, stage])).rows[0];
+
+test('쓰기 직전 철회: 마지막 head 조회를 세운 동안 /revoke면 PR 요청이 0회이고 effect가 묶이지 않으며 해제해도 다시 게시하지 않는다', async () => {
+  await withHarness({}, async h => {
+    const id = await toApproved(h);
+    const hold = holdOnce(h, lastHeadRead(h));
+    const tick = h.runtime.publishTick();
+    await hold.arrived;
+    await h.command('102', 'revoke', { target: OWNER });
+    hold.release();
+    await tick;
+    assert.equal(h.env.github.count(PULL_POST), 0, 'PR 요청 0회');
+    assert.equal(await h.phase(id), 'cancelled', '입구와 같은 게이트가 부모를 닫는다');
+    assert.equal((await h.changes.get(id) as any).value.phaseReason, 'authorization_revoked');
+    assert.deepEqual(await effectRow(h, id, 'pull'), { state: 'blocked', blocked_reason: 'abandoned_unsent', resolution: 'not_sent' }, '안 나간 것으로 해소한다');
+    assert.deepEqual(await h.changes.unresolvedEffects({ changeId: id }), [], 'sending·unknown으로 남지 않는다');
+    assert.equal(h.env.github.mutations(/DELETE|PATCH/).length, 0, '이미 공개된 객체를 되돌리지 않는다');
+    // 철회를 풀어도 cancelled는 끝 상태다. 권한이 돌아왔다고 닫힌 건을 게시하지 않는다.
+    await h.db.query('DELETE FROM denied_actors');
+    await h.runtime.reconcile();
+    await h.runtime.publishTick();
+    assert.equal(h.env.github.count(PULL_POST), 0);
+    assert.equal(await h.phase(id), 'cancelled');
+  });
+});
+test('쓰기 직전 철회: 첫 blob 응답을 세운 동안 철회하면 남은 blob이 0회다', async () => {
+  await withHarness({}, async h => {
+    const id = await toApproved(h);
+    const hold = holdOnce(h, (method, url) => method === 'POST' && url.endsWith('/git/blobs'), 'after');
+    const tick = h.runtime.publishTick();
+    await hold.arrived;
+    await h.command('102', 'revoke', { target: OWNER });
+    hold.release();
+    await tick;
+    assert.equal(h.env.github.count(/POST .*\/git\/blobs$/), 1, '첫 blob 뒤로 나가지 않는다');
+    assert.equal(h.env.github.count(/POST .*\/git\/trees$/), 0);
+    assert.equal(await h.phase(id), 'cancelled');
+    assert.deepEqual(await effectRow(h, id, 'blob'), { state: 'blocked', blocked_reason: 'abandoned_unsent', resolution: 'not_sent' });
+  });
+});
+test('쓰기 직전 취소: 첫 blob 응답을 세운 동안 /change-cancel이면 남은 blob이 0회이고 닫힌 사유를 다시 바꾸지 않는다', async () => {
+  await withHarness({}, async h => {
+    const id = await toApproved(h);
+    const hold = holdOnce(h, (method, url) => method === 'POST' && url.endsWith('/git/blobs'), 'after');
+    const tick = h.runtime.publishTick();
+    await hold.arrived;
+    await h.command('102', 'change-cancel', { target: id });
+    assert.equal(await h.phase(id), 'cancelled');
+    hold.release();
+    await tick;
+    assert.equal(h.env.github.count(/POST .*\/git\/blobs$/), 1, '취소 뒤의 blob이 나가지 않는다');
+    assert.equal(h.env.github.count(/POST .*\/git\/trees$/), 0);
+    assert.equal((await h.changes.get(id) as any).value.phaseReason, 'owner_cancelled', '끝난 부모를 다시 닫지 않는다');
+    assert.deepEqual(await effectRow(h, id, 'blob'), { state: 'blocked', blocked_reason: 'abandoned_unsent', resolution: 'not_sent' });
+    assert.deepEqual(await h.changes.unresolvedEffects({ changeId: id }), [], 'sending·unknown으로 남지 않는다');
+  });
+});
+test('쓰기 직전 취소: PR effect를 claim한 뒤 전송 전에 /change-cancel이면 PR 요청이 0회다', async () => {
+  await withHarness({}, async h => {
+    const id = await toApproved(h);
+    const claim = h.changes.claimEffect.bind(h.changes);
+    let claimedPull = false;
+    h.changes.claimEffect = async input => {
+      const claimed = await claim(input);
+      if (input.stage === 'pull') { claimedPull = claimed.ok; await h.command('102', 'change-cancel', { target: id }); }
+      return claimed;
+    };
+    await h.runtime.publishTick();
+    assert.equal(claimedPull, true, '전송 직전까지 왔다');
+    assert.equal(h.env.github.count(PULL_POST), 0, 'PR 요청 0회');
+    assert.equal(await h.phase(id), 'cancelled');
+    assert.equal((await h.changes.get(id) as any).value.phaseReason, 'owner_cancelled');
+    assert.deepEqual(await effectRow(h, id, 'pull'), { state: 'blocked', blocked_reason: 'abandoned_unsent', resolution: 'not_sent' });
+    assert.deepEqual(await h.changes.unresolvedEffects({ changeId: id }), []);
+  });
+});
+test('쓰기 직전 철회: 권한 확인 자체가 실패하면 PR 요청이 0회이고 닫지 않으며 확인이 돌아오면 이어 게시한다', async () => {
+  await withHarness({}, async h => {
+    const id = await toApproved(h);
+    const hold = holdOnce(h, lastHeadRead(h));
+    const tick = h.runtime.publishTick();
+    await hold.arrived;
+    const real = h.gate.authorize.bind(h.gate);
+    h.gate.authorize = async () => { throw new Error('fixture_database_down'); };
+    hold.release();
+    await tick.catch(() => {});
+    h.gate.authorize = real;
+    assert.equal(h.env.github.count(PULL_POST), 0, 'PR 요청 0회');
+    assert.equal(await h.phase(id), 'publishing', '철회가 아니라 부모를 닫지 않는다');
+    assert.equal((await effectRow(h, id, 'pull'))!.state, 'pending', '다시 보낼 수 있게 놓아 둔다');
+    await h.db.query('UPDATE change_delivery_effects SET available_at=0 WHERE change_id=$1', [id]);
+    const report = await h.runtime.reconcile();
+    assert.equal(report.resumed[0]?.outcome.kind, 'proposed');
+    assert.equal(h.env.github.count(PULL_POST), 1);
+  });
+});
+test('쓰기 직전 철회: 이미 보낸 요청의 응답을 잃으면 철회와 겹쳐도 unknown 대조는 계속되고 다시 보내지 않는다', async () => {
+  await withHarness({}, async h => {
+    const id = await toApproved(h);
+    const { result_tree: resultTree } = (await h.db.query<{ result_tree: string }>('SELECT result_tree FROM change_generations WHERE change_id=$1', [id])).rows[0]!;
+    const hold = holdOnce(h, (method, url) => method === 'POST' && url.endsWith('/git/trees'));
+    h.env.github.fail(/POST .*\/git\/trees$/, 'lose_response');
+    h.env.github.fail(new RegExp(`GET .*/git/trees/${resultTree}`), { status: 500 });
+    const tick = h.runtime.publishTick();
+    await hold.arrived;
+    await h.command('102', 'revoke', { target: OWNER });
+    hold.release();
+    await tick;
+    assert.equal((await effectRow(h, id, 'tree'))!.state, 'unknown', '보냈을 수 있어 미전송으로 치지 않는다');
+    const report = await h.runtime.reconcile();
+    assert.deepEqual(report.confirmed.map(item => item.stage), ['tree'], '철회 뒤에도 읽기 대조로 확정한다');
+    assert.equal(h.env.github.count(/POST .*\/git\/trees$/), 1, '다시 보내지 않는다');
+    assert.equal(h.env.github.count(/POST .*\/git\/commits$/), 0);
+    assert.equal(await h.phase(id), 'cancelled');
+  });
+});
+
 // ---- 굶주림 ----
 
 const observedDeployment = (changeId: string, at: number) => ({ state: 'observed' as const, headSha: git('h'), mergeCommit: git('m'), configCommit: git('k'), imageDigest: `sha256:${hex('d')}`, argoObservedAt: at, workloadObservedAt: at, observedAt: at, reason: null, changeId });
@@ -1339,6 +1482,67 @@ test('DATA-01 답 원문: 공개 답도 events에는 없고 작성자에게는 �
     await h.pump(async () => await h.phase(id) === 'awaiting_publish_approval');
     assert.ok((await h.f.calls())[1]!.input.includes(CANARY), '작성자에게 전달된다');
     assert.ok(!JSON.stringify(await nextChat(h)).includes(CANARY));
+  });
+});
+const SENSITIVE_VALUES = [['토큰', ['ghp', 'F'.repeat(36)].join('_'), 'secret_detected'], ['내부 표식', 'fixture-corp-host', 'internal_marker']] as const;
+for (const [name, value, reason] of SENSITIVE_VALUES) {
+  test(`공개 답 검사: ${name}이 든 label=public 답은 모델·응답·events에 값이 없고 private로 막힌다`, async () => {
+    await withHarness({ steps: [QUESTION, WRITE_STEP] }, async h => {
+      const { id, question } = await toQuestion(h);
+      await h.command('101', 'answer', { target: question, text: `label=public | 값은 ${value} 입니다` });
+      assert.equal(await h.phase(id), 'blocked');
+      const parent = (await h.changes.get(id) as any).value;
+      assert.equal(parent.phaseReason, 'label_blocked');
+      assert.equal(parent.label, 'private', '첫 요청과 같이 private로 올린다');
+      assert.equal((await h.db.query<{ answer: string | null }>('SELECT answer FROM codex_questions WHERE id=$1', [question])).rows[0]!.answer, null, '재개가 읽는 자리에 답이 없다');
+      const stored = (await h.db.query<{ text: string }>('SELECT text FROM change_request_inputs WHERE change_id=$1 AND label=$2', [id, 'private'])).rows;
+      assert.equal(stored.length, 1, '원문의 자리는 비공개 입력 표뿐이다');
+      for (let round = 0; round < 10; round++) { await h.runtime.childrenTick(); await h.runtime.laneTick(); await h.runtime.publishTick(); }
+      await h.deliver();
+      const calls = await h.f.calls();
+      assert.equal(calls.length, 1, '답으로 턴을 다시 띄우지 않았다');
+      assert.ok(!JSON.stringify(calls).includes(value), '모델 입력에 값이 없다');
+      assert.ok(h.messages().some(text => text.includes(reason)), '걸린 사유 코드로 답한다');
+      assert.ok([...h.messages(), ...h.acknowledgements()].every(text => !text.includes(value)), '응답에 값을 되풀이하지 않는다');
+      assert.ok(!(await eventsText(h)).includes(value));
+      assert.equal(h.env.github.mutations().length, 0);
+    });
+  });
+  test(`공개 질문 검사: ${name}이 든 모델 질문은 Discord로 나가지 않고 고정 문구로 알린 뒤 부모를 닫는다`, async () => {
+    await withHarness({ steps: [{ output: { status: 'needs_input', summary: '', question: `어느 값을 쓸까요? ${value}` } }, WRITE_STEP] }, async h => {
+      await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+      const id = await h.changeId();
+      await h.pump(async () => await h.phase(id) === 'blocked');
+      assert.equal((await h.changes.get(id) as any).value.phaseReason, 'task_question_sensitive');
+      assert.equal((await h.db.query('SELECT 1 FROM codex_questions')).rows.length, 0, '질문 행을 만들지 않는다');
+      for (let round = 0; round < 20; round++) { await h.runtime.childrenTick(); await h.runtime.publishTick(); }
+      await h.deliver();
+      assert.ok(h.messages().every(text => !text.includes(value)), '본문이 스레드에 없다');
+      assert.ok(h.messages().some(text => text.includes('모델 질문')), '고정 문구로 알린다');
+      assert.ok(!JSON.stringify((await h.db.query('SELECT payload FROM outbox')).rows).includes(value), 'outbox에도 없다');
+      assert.equal((await childOf(h.db, id))!.state, 'failed', '턴을 닫는다');
+      const session = (await h.db.query<{ state: string; cleanup_state: string | null }>(`SELECT state,cleanup_state FROM codex_sessions WHERE executor='claude'`)).rows[0]!;
+      assert.equal(session.state, 'failed', '세션을 대기로 남기지 않는다');
+      assert.notEqual(session.cleanup_state, 'pending', '작업자에 남은 질문 결과까지 지운다');
+      assert.equal(await h.store.laneBusy('task'), false, '레인을 놓는다');
+      assert.equal((await h.f.calls()).length, 1, '턴을 다시 띄우지 않는다');
+      assert.equal(h.env.github.mutations().length, 0);
+    });
+  });
+}
+test('공개 답 검사: 저장소가 정책에서 빠져 표식을 볼 수 없으면 답을 받지 않고 질문을 열어 둔다', async () => {
+  await withHarness({ steps: [QUESTION, WRITE_STEP] }, async h => {
+    const { id, question } = await toQuestion(h);
+    const open = h.policy.current;
+    h.policy.current = { ...open, change: { repositories: [{ ...open.change!.repositories[0]!, repoId: REPO.id + 1 }] } };
+    await h.command('101', 'answer', { target: question, text: `label=public | ${CANARY}` });
+    h.policy.current = open;
+    assert.equal((await h.db.query<{ state: string; answer: string | null }>('SELECT state,answer FROM codex_questions WHERE id=$1', [question])).rows[0]!.state, 'open');
+    assert.notEqual(await h.phase(id), 'blocked');
+    await h.deliver();
+    assert.ok(h.messages().some(text => text.includes('검사하지 못했습니다')));
+    assert.ok([...h.messages(), ...h.acknowledgements()].every(text => !text.includes(CANARY)));
+    assert.equal((await h.db.query('SELECT 1 FROM change_request_inputs WHERE change_id=$1 AND event_id<>$2', [id, (await h.changes.get(id) as any).value.eventId])).rows.length, 0, '기록하지 않는다');
   });
 });
 test('DATA-01 답 원문: 닫힌 CHANGE 질문에 다시 답해도 events에 남지 않는다', async () => {

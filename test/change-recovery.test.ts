@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { EFFECT_LEASE_MS, UNKNOWN_RECONCILE_MS } from '../src/change-contracts.js';
 import type { ChangeKey, EffectStage } from '../src/change-contracts.js';
 import { ChangePublisher } from '../src/change-publisher.js';
+import { Denied } from '../src/contracts.js';
+import { PublicationStopped } from '../src/github-writer.js';
 import { ok } from './change-store-fixture.js';
 import { BOT_USER, REPO, branchOf, publishEnv } from './change-github-fake.js';
 import type { FaultMode, PublishEnv } from './change-github-fake.js';
@@ -541,6 +543,74 @@ test('T19 B3 복구: 다른 generation의 미해소 effect가 있으면 새 게�
     const next = await env.store.startNextGeneration(key);
     assert.equal(next.ok, false, '옛 unknown을 지우고 넘어가는 길이 없다');
     assert.equal(!next.ok && next.reason, 'unresolved_effects');
+  } finally { await close(); }
+});
+
+test('쓰기 직전 철회: 게이트에서 권한이 돌아왔으면 막지 않고 미뤘다가 이어 게시한다', async () => {
+  const { env, close } = await setup();
+  try {
+    const key = await env.approve();
+    let denied = 0;
+    env.writeGuard.check = async () => { if (posts(env, 'ref') === 1 && !denied) { denied++; throw new Denied(); } };
+    const first = await env.publisher.publish(key);
+    assert.equal(first.kind, 'deferred', JSON.stringify(first));
+    assert.equal((first as { reason: string }).reason, 'authorization_revoked');
+    assert.equal(denied, 1);
+    assert.equal(env.github.pulls.length, 0);
+    assert.equal(posts(env, 'pull'), 0);
+    assert.equal((await effect(env, key, 'pull'))?.state, 'pending', 'sending·unknown·blocked가 아니다');
+    assert.equal(ok(await env.store.get(key.changeId)).phase, 'publishing');
+    env.clock.now += 60_001;
+    const second = await env.publisher.publish(key);
+    assert.equal(second.kind, 'proposed', JSON.stringify(second));
+    assert.equal(posts(env, 'pull'), 1);
+  } finally { await close(); }
+});
+test('쓰기 직전 철회: 일부 blob의 응답을 잃은 뒤 철회돼도 unknown에 묶이지 않는다. 안 나간 blob은 대조로 확정할 수 없다', async () => {
+  const { env, close } = await setup();
+  try {
+    const key = await env.approve();
+    env.github.fail(ROUTES.blob, 'lose_response');
+    env.writeGuard.check = async () => { if (posts(env, 'blob') >= 1) throw new Denied(); };
+    const first = await env.publisher.publish(key);
+    assert.equal(first.kind, 'deferred', JSON.stringify(first));
+    assert.equal(posts(env, 'blob'), 1);
+    assert.equal((await effect(env, key, 'blob'))?.state, 'pending');
+    env.writeGuard.check = async () => {};
+    env.clock.now += 60_001;
+    assert.equal((await env.publisher.publish(key)).kind, 'proposed');
+  } finally { await close(); }
+});
+test('쓰기 직전 중단: 끝난 부모는 다시 바꾸지 않고, 아직 게시 중이면 막지 않고 미룬다', async () => {
+  const { env, close } = await setup();
+  try {
+    const key = await env.approve();
+    env.writeGuard.check = async () => { throw new PublicationStopped(); };
+    const held = await env.publisher.publish(key);
+    assert.equal(held.kind, 'deferred', JSON.stringify(held));
+    assert.equal((held as { reason: string }).reason, 'publication_stopped');
+    assert.equal(ok(await env.store.get(key.changeId)).phase, 'publishing');
+    assert.equal((await effect(env, key, 'blob'))?.state, 'pending', 'sending·unknown·blocked가 아니다');
+    ok(await env.store.transition({ ...key, from: 'publishing', to: 'cancelled', reason: 'owner_cancelled' }));
+    assert.deepEqual(await env.publisher.publish(key), { kind: 'stopped', phase: 'cancelled' });
+    assert.equal(ok(await env.store.get(key.changeId)).phaseReason, 'owner_cancelled');
+    assert.equal(posts(env, 'blob'), 0);
+  } finally { await close(); }
+});
+
+test('쓰기 직전 철회: 권한 확인 오류의 미전송을 막지 않고 미룬다', async () => {
+  const { env, close } = await setup();
+  try {
+    const key = await env.approve();
+    env.writeGuard.check = async () => { throw new Error('fixture_database_down'); };
+    const first = await env.publisher.publish(key);
+    assert.equal(first.kind, 'deferred', JSON.stringify(first));
+    assert.equal((first as { reason: string }).reason, 'authorization_check_failed');
+    assert.equal(env.github.mutations().length, 0, '쓰기 0회');
+    assert.equal((await effect(env, key, 'blob'))?.state, 'pending');
+    env.writeGuard.check = async () => {};
+    env.clock.now += 60_001;
+    assert.equal((await env.publisher.publish(key)).kind, 'proposed');
   } finally { await close(); }
 });
 

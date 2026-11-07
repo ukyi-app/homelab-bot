@@ -7,7 +7,7 @@ import { REUSABLE_USES } from './change-ci-policy.js';
 import type { CiContentReader } from './change-ci-policy.js';
 import { isProtectedPath } from './change-policy.js';
 import type { ChangeRepositoryPolicy } from './change-policy.js';
-import { Denied } from './contracts.js';
+import { Denied, PolicyUnavailable } from './contracts.js';
 import { REFRESH_MARGIN_MS, TokenResponse, appJwt, grantedExactly } from './github-app.js';
 import type { GitHubAppCredentials } from './github-app.js';
 
@@ -71,9 +71,16 @@ export interface ChangePreflightPort extends CiContentReader {
   readCommit: ChangeWriterPort['readCommit'];
   readTreeLeaves: ChangeWriterPort['readTreeLeaves'];
 }
-export interface GitHubWriterOptions { app: GitHubAppCredentials; repositories: WriterRepositoryLookup; send?: typeof fetch; now?: () => number }
+export interface GitHubWriterOptions {
+  app: GitHubAppCredentials; repositories: WriterRepositoryLookup;
+  // 지금 이 쓰기를 보내도 되는가. 철회면 Denied, 부모가 끝났거나 승인이 무효면 PublicationStopped, 정책을 못 읽으면 PolicyUnavailable을 던진다. 필수값이라 빼먹은 writer를 만들 수 없다.
+  authorizeWrite: (target: ChangeTarget) => Promise<void>;
+  send?: typeof fetch; now?: () => number;
+}
 
 class WriterReadError extends Error {}
+// 부모가 더는 게시 중이 아니거나 승인이 무효다. 끝난 부모를 다시 닫지 않도록 권한 철회(Denied)와 나눠 돌려준다.
+export class PublicationStopped extends Error { constructor() { super('publication_stopped'); } }
 const readFailure = (code: string) => new WriterReadError(code);
 type Scope = 'contents' | 'pull';
 const SCOPES: Readonly<Record<Scope, Readonly<Record<string, string>>>> = Object.freeze({
@@ -119,7 +126,7 @@ const snapshot = (row: PullRow): WriterPullSnapshot => ({
 
 export interface GitHubWriterIO { writer: ChangeWriterPort; preflight: ChangePreflightPort }
 export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO {
-  const { app, repositories } = options;
+  const { app, repositories, authorizeWrite } = options;
   const send = options.send ?? fetch;
   const now = options.now ?? Date.now;
   const tokens = new Map<string, { token: string; expiresAt: number }>();
@@ -160,6 +167,17 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
     if (size > limit) return { kind: 'lost', code: 'response_too_large' };
     try { return { kind: 'ok', status: response.status, json: JSON.parse(Buffer.concat(chunks).toString('utf8')) }; }
     catch { return { kind: 'lost', code: 'response_invalid' }; }
+  };
+
+  // 공개 저장소로 나가는 쓰기는 모두 여기를 지난다. 게시자의 단계 입구 검사 뒤에도 GitHub 조회·토큰 발급을 기다리므로 그사이의 /revoke·/change-cancel은 여기서만 잡힌다.
+  // 확인이 실패해도 보내지 않는다. 읽기는 이 길을 지나지 않아 보냈을 수 있는 effect의 대조가 철회로 막히지 않는다.
+  // 이 확인과 전송 사이의 아주 짧은 틈은 남는다. 이미 나간 요청과 같게 대조로 다룬다.
+  const sendWrite = async (target: ChangeTarget, path: string, token: string, body: unknown, limit: number): Promise<Exchange> => {
+    try { await authorizeWrite(target); }
+    catch (error) {
+      return { kind: 'not_sent', code: error instanceof Denied ? 'authorization_revoked' : error instanceof PublicationStopped ? 'publication_stopped' : error instanceof PolicyUnavailable ? 'policy_unavailable' : 'authorization_check_failed' };
+    }
+    return exchange('POST', path, token, body, limit);
   };
 
   const resolve = async (repoId: number): Promise<WriterRepository | { denied: string }> => {
@@ -254,8 +272,9 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
         const shas: string[] = [];
         let lost: { kind: 'unknown'; code: string } | null = null;
         for (const file of parsed.files) {
-          const result = await exchange('POST', `/repos/${repo.fullName}/git/blobs`, token, { content: Buffer.from(file.content).toString('base64'), encoding: 'base64' }, LIMIT.small);
-          // blob은 내용 주소라 일부만 올라간 뒤 처음부터 다시 보내도 중복이 생기지 않는다. 그래서 not_sent를 그대로 돌려줘도 안전하다.
+          const result = await sendWrite(raw.target, `/repos/${repo.fullName}/git/blobs`, token, { content: Buffer.from(file.content).toString('base64'), encoding: 'base64' }, LIMIT.small);
+          // blob은 내용 주소라 일부만 올라간 뒤 처음부터 다시 보내도 중복이 생기지 않는다. 그래서 앞 blob의 응답을 잃었어도 not_sent를 그대로 돌려줘도 안전하다.
+          // unknown으로 돌려주면 안 나간 blob 때문에 대조로 영영 확정하지 못한다.
           const outcome = classify<string>(result, (json, status) => {
             const created = CreatedSha.safeParse(json);
             if (!created.success) return invalid;
@@ -276,7 +295,7 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
       return withWriteAccess(raw.target, 'contents', async (repo, token) => {
         // type은 항상 blob이다. 임의 subtree·gitlink를 끼워 넣을 자리가 없다. base_tree가 없으면 기존 파일이 사라지므로 필수다.
         const body = { base_tree: parsed.baseTree, tree: parsed.entries.map(entry => ({ path: entry.path, mode: entry.mode, type: 'blob', sha: entry.blobSha })) };
-        return classify(await exchange('POST', `/repos/${repo.fullName}/git/trees`, token, body, LIMIT.large), json => {
+        return classify(await sendWrite(raw.target, `/repos/${repo.fullName}/git/trees`, token, body, LIMIT.large), json => {
           const created = CreatedSha.safeParse(json);
           return created.success ? { kind: 'confirmed', value: { treeSha: created.data.sha } } : invalid;
         });
@@ -287,7 +306,7 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
       if (!parsed) return notSent('input_invalid');
       return withWriteAccess(raw.target, 'contents', async (repo, token) => {
         const body = { message: parsed.metadata.message, tree: parsed.treeSha, parents: [parsed.parent], author: parsed.metadata.author, committer: parsed.metadata.committer };
-        return classify(await exchange('POST', `/repos/${repo.fullName}/git/commits`, token, body, LIMIT.small), json => {
+        return classify(await sendWrite(raw.target, `/repos/${repo.fullName}/git/commits`, token, body, LIMIT.small), json => {
           const created = CreatedCommit.safeParse(json);
           return created.success ? { kind: 'confirmed', value: { commitSha: created.data.sha, treeSha: created.data.tree.sha, parents: created.data.parents.map(parent => parent.sha) } } : invalid;
         });
@@ -299,7 +318,7 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
       if (!ownsBranch(raw.target, parsed.branch)) return notSent('branch_not_allowed');
       return withWriteAccess(raw.target, 'contents', async (repo, token) => {
         const ref = `refs/heads/${parsed.branch}`;
-        return classify(await exchange('POST', `/repos/${repo.fullName}/git/refs`, token, { ref, sha: parsed.sha }, LIMIT.small), json => {
+        return classify(await sendWrite(raw.target, `/repos/${repo.fullName}/git/refs`, token, { ref, sha: parsed.sha }, LIMIT.small), json => {
           const created = CreatedRef.safeParse(json);
           return created.success && created.data.ref === ref && created.data.object.type === 'commit' ? { kind: 'confirmed', value: { ref, sha: created.data.object.sha } } : invalid;
         });
@@ -311,7 +330,7 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
       if (!ownsBranch(raw.target, parsed.branch)) return notSent('branch_not_allowed');
       return withWriteAccess(raw.target, 'pull', async (repo, token) => {
         const body = { title: parsed.title, body: parsed.body, head: parsed.branch, base: parsed.baseBranch, draft: parsed.draft, maintainer_can_modify: false };
-        return classify(await exchange('POST', `/repos/${repo.fullName}/pulls`, token, body, LIMIT.pull), json => {
+        return classify(await sendWrite(raw.target, `/repos/${repo.fullName}/pulls`, token, body, LIMIT.pull), json => {
           const created = PullRow.safeParse(json);
           return created.success && created.data.base.repo.id === repo.id && created.data.head.repo?.id === repo.id ? { kind: 'confirmed', value: snapshot(created.data) } : invalid;
         });

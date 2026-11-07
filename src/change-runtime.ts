@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { evaluateCi, readCiSnapshot } from './change-ci-policy.js';
 import { isTerminalPhase, labelAllowsAuthorInput, ReasonCodeSchema } from './change-contracts.js';
+import { scanPublicText } from './change-publication.js';
 import { ChangeReviewFailed, ChangeReviewRejected } from './change-review.js';
 import type { ChangeArtifactPort, ChangeDeploymentPort, ChangeKey, ChangePhase, ChangeTarget, ChangeVerificationPort, DeploymentObservation, MergeReading, ProvenanceLabel, ReviewReceipt, TerminalChangePhase } from './change-contracts.js';
 import { DEPLOYMENT_POLL, DeploymentTargetError, deploymentPollStep, describeDeployment } from './change-deployment.js';
@@ -97,6 +98,14 @@ export function changeAuthorSource(deps: { store: Store; gate: PolicyGate; prefl
   };
   return {
     claimed, authorJob, keyOf: keyOfJob,
+    async questionRisk(jobId, question) {
+      const key = await keyOfJob(jobId);
+      const row = key ? (await db.query<{ repo_id: number | string }>('SELECT repo_id FROM change_requests WHERE id=$1', [key.changeId])).rows[0] : undefined;
+      const policy = row ? await deps.policy(Number(row.repo_id)) : null;
+      // 내부 표식을 볼 수 없으면 공개해도 되는 글이라고 말할 수 없다. 정책을 잠시 못 읽는 예외는 그대로 올라가 다음 바퀴에 다시 본다.
+      if (!policy) return 'policy_revoked';
+      return scanPublicText({ title: question, body: question }, policy);
+    },
     async plan(input) {
       const jobId = await authorJob(input.target.key);
       const job = jobId ? await claimed(jobId) : null;
@@ -133,7 +142,7 @@ const WAITING_SESSION = new Set(['waiting_answer', 'waiting_model']);
 const JOB_ENDED = new Set(['succeeded', 'failed', 'cancelled', 'superseded']);
 const receiptOf = (child: Pick<ChildRow, 'id' | 'session_generation'>) => `v2:${child.id}:${child.session_generation}`;
 // 작업자가 고칠 수 없는 입력·경계 문제를 말한 경우다. 내부 실패(failed)와 구분해 owner가 사유를 읽게 둔다.
-const blockedAuthorCode = (code: string) => /^(artifact_|baseline_|label_|task_artifact_|task_baseline_)/.test(code);
+const blockedAuthorCode = (code: string) => /^(artifact_|baseline_|label_|task_artifact_|task_baseline_|task_question_)/.test(code);
 // prepareApproval이 돌려주는 값 중 다시 해도 같은 것들. 그 밖의 읽기 실패는 다음 바퀴에 다시 본다.
 const FINAL_APPROVAL = /^(label_blocked|review_mismatch|review_incomplete|policy_revoked|policy_changed|publication_|secret_detected|internal_marker|metadata_sensitive|base_tree_incomplete|evidence_missing|ci_(?!unreadable))/;
 
@@ -720,7 +729,8 @@ export class ChangeRuntime {
       ? `자동으로 다시 시작하지 않습니다. 필요하면 /change project:${request.id} text:next 로 새 generation을 여세요.`
       : '자동으로 다시 시작하지 않습니다. 필요하면 새 /change로 요청하세요.';
     const untracked = pull ? ` PR #${pull.number}은 그대로 있고, 이 뒤로 병합돼도 배포를 추적하지 않습니다.` : '';
-    await this.send(request, key, `변경 ${request.id} g${request.generation}: ${request.phase}(${reason}).${untracked} ${tail}`);
+    const withheld = reason === 'task_question_sensitive' ? ' 모델 질문에서 공개하면 안 되는 값을 찾아 질문을 이 스레드에 내보내지 않았습니다.' : '';
+    await this.send(request, key, `변경 ${request.id} g${request.generation}: ${request.phase}(${reason}).${withheld}${untracked} ${tail}`);
   }
   private async send(request: ChangeRequest, key: string, content: string): Promise<void> {
     const policy = await this.deps.gate.current();
