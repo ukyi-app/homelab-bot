@@ -1135,6 +1135,15 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - 권한 재확인 지점: 답 수락, 재개 dispatch 직전, 실행 중 감시, 결과 확정 전.
 - 한도·인증으로 끊긴 턴이 나르던 답은 `answered`로 되돌려 `/resume-model` 뒤 같은 답으로 잇는다. 대기 사유는 세션의 `wait_reason`(migration 015)에 남는다. `/resume-model`이 `jobs.wait_reason`을 비우기 때문이다.
 
+**출력 공개 검사(T25).** v1 턴에서 모델이 쓴 글이 Discord로 나가는 자리는 질문(`needs_input.question`)과 완료 요약(`completed.summary`) 둘뿐이다. 실패 사유는 계약 enum이고, 대기·막힘·만료·확인 요청 안내는 job·질문 ID만 넣은 고정 문구다. 두 글은 결과 확정 전에 `src/task-output.ts`의 `taskOutputRisk`로 CHANGE 질문과 같은 `scanPublicText`를 거친다.
+
+- 표식: 작업 레인 정책에는 내부 표식 칸이 없어 `change.repositories[].internalMarkers` 전체와 `review.internalMarkers`를 합쳐 쓴다. 표식은 저장소와 무관하게 밖에 보이면 안 되는 값이고, 운영 정책을 새로 고치지 않고 적용된다.
+- 닫는 쪽: 결과 확정 직전 재인가에서 정책을 못 읽었거나(`PolicyUnavailable`) 리뷰 정책이 있는데 형식이 틀리면 `policy_unavailable`로 걸린 것으로 본다. v1 응답은 다시 받을 수 없어 CHANGE처럼 다음 바퀴로 미루지 않는다.
+- 질문이 걸리면 `codex_questions` 행과 질문 outbox를 만들지 않고 job을 `failed`(`task_question_sensitive`, CHANGE와 같은 코드)로 닫아 세션 공간을 지운다. 일반 실패 안내에 더해 `task-question-blocked:<job>:<attempt>` 안내 한 건에 사유 코드만 싣는다.
+- 요약이 걸리면 완료는 그대로 기록하고 Discord 메시지의 요약 줄만 고정 문구(사유 코드 포함)로 바꾼다. 변경 파일 수·검증 집계 줄은 남고, 증거에 `summaryWithheld`로 사유를 적는다. `results.result`의 요약 원문은 그대로다(보존 정책은 T27).
+- 로그는 `task_output_blocked`에 job·`question|summary`·사유 코드만 남긴다.
+- 한계: 탐지기는 패턴이 잡는 형태(비밀 형식, zero-width·따옴표 이음, 표식의 대소문자·구분자·URL·base64·hex 변형, 메타데이터 패턴)만 막는다. 공개 메타데이터 기준이라 이메일·17~20자리 숫자·`/home/` 경로·사설 IP가 든 질문·요약도 걸린다.
+
 **수명.** `sweep`이 매 바퀴 하는 일: 기한 지난 질문 닫기, unknown 알림, `/cancel`·철회로 끝난 job의 세션·질문 닫기, 24시간 넘은 모델 대기에 `owner_confirm_requested_at` 표시와 알림 한 번(자동 재개·폐기 없음), 정리 재시도. 정리는 최종 상태를 DB에 남긴 뒤에만 `/v1/task/finalize`로 보내고 먼저 `/v1/task/status`로 identity를 얻는다. 다른 storage의 `absent`·`finalized`는 소멸 증명으로 쓰지 않는다. 실패하면 `cleanup_pending`이고 `finalizeRetryMs`(기본 30초) 뒤 다시 시도한다. 대기 세션의 `cleanupPending`은 세션을 지우지 않고 작업자가 `waiting`이라고 답하면 막힘만 푼다. unknown 해제(`release`)는 작업자의 소멸 확인 뒤에만 `cancelled`로 바꾸고 정리까지 시도하며 다시 실행하지 않는다.
 
 **저장소 identity.** `codex_sessions.worker_storage`는 한 번 알면 그 세대가 끝날 때까지 바뀌지 않는다. status·cancel·finalize·턴 응답의 어떤 경로도 다른 storage로 덮어쓰지 않고, 같은 storage면 `worker_instance`만 파드 교체를 따라간다. 덮어쓰면 다음 재시도에서 새 저장소가 원래 저장소로 보여 그 `absent`만으로 `cleaned`가 되기 때문이다. 다른 storage가 답한 취소·해제 응답은 소멸 증명이 아니라 확인 실패로 보고, 다른 storage의 finalize 응답은 지운 것으로 치지 않는다. storage를 아직 모르는 세션(첫 턴 응답을 잃음)은 세션을 봤다고 답한 작업자에만 묶는다. `absent`·`unknown` 상태나 `sessionRetained:false`인 취소 응답으로는 묶지 않는다. 턴 시작의 재개 CAS는 storage를 조건에 넣고, 새 세대 시작은 앞 세대가 보존·정리 대기면 덮어쓰지 않는다. 정리 결론은 물어본 세대와 세션에만 쓴다.

@@ -13,6 +13,8 @@ import { DRAIN_MS } from './runtime.js';
 import type { TaskLane } from './runtime.js';
 import type { Store } from './store.js';
 import { FOREIGN_SESSION_STATUS, TaskBridge, TaskWorkerBusy, TaskWorkerRejected } from './task-bridge.js';
+import { taskOutputRisk } from './task-output.js';
+import type { TaskOutputRisk } from './task-output.js';
 import type { TaskStatus, TaskWorkerPort } from './task-bridge.js';
 import type { TaskV2WorkerPort } from './task-http.js';
 import { TASK_ENDPOINTS, TASK_INSTRUCTIONS_REVISION, TASK_LIMITS, TASK_RETENTION, TASK_V2_CONTRACT, TASK_V2_ENDPOINTS, TASK_V2_REQUEST_CHARS, taskQuestionId } from './task-contracts.js';
@@ -351,13 +353,25 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     }
     const facts = await this.factsOf(turn, request, turn.kind === 'lost' || stop ? cancel : undefined);
     // 마지막 감시 뒤의 철회를 결과 확정 전에 다시 본다. 철회면 완료·질문·대기보다 취소가 앞선다.
-    try { await this.gate.authorize(job.owner_id, job.target); }
+    let policy: Policy | undefined;
+    try { policy = await this.gate.authorize(job.owner_id, job.target); }
     catch (error) { if (error instanceof Denied) stop = 'revoked'; else if (!(error instanceof PolicyUnavailable)) stop ??= 'monitor'; }
+    // v1 응답은 다시 받을 수 없어 정책을 못 읽었어도 미루지 않고 막는 쪽으로 확정한다.
+    const output = this.outputRisk(turn, policy);
+    if (output) this.options.log('task_output_blocked', { job: job.id, output: output.kind, reason: output.risk });
     let settled: Settled;
-    try { settled = await this.settle(job, request, revision, turn, facts, stop, this.store.now() - started); }
+    try { settled = await this.settle(job, request, revision, turn, facts, stop, this.store.now() - started, output?.risk ?? null); }
     catch { settled = { terminal: false, end: await this.recordFailed(job) }; }
     if (settled.end) this.report(job.id, settled.end);
     if (settled.terminal) await this.finalizeJob(job.id).catch(() => {});
+  }
+  // 모델이 쓴 글 중 Discord로 나가는 것은 질문과 완료 요약뿐이다. 실패 사유는 enum이고 나머지 안내는 고정 문구다.
+  private outputRisk(turn: Turn, policy: Policy | undefined): { kind: 'question' | 'summary'; risk: TaskOutputRisk } | null {
+    if (turn.kind !== 'response') return null;
+    const response = turn.response;
+    const text = response.status === 'needs_input' ? response.question : response.status === 'completed' ? response.summary : '';
+    const risk = text ? taskOutputRisk(text, policy) : null;
+    return risk ? { kind: response.status === 'needs_input' ? 'question' : 'summary', risk } : null;
   }
   // 기록 실패는 결과를 모르는 것과 같다. 이 갱신이 막히거나 DB에 닿지 못해도 lease가 끝나면 expire()가 unknown으로 둔다.
   // 세션은 running으로 남는다. 해제가 그 상태를 받고, 레인은 job의 unknown으로 닫힌다.
@@ -418,7 +432,9 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     } catch { return null; } finally { clearTimeout(wait); }
   }
   // 턴 결과를 한 트랜잭션으로 확정한다. job 행을 잠가 두므로 전이 뒤에 읽은 값이 커밋될 값이다. 끝 기록은 커밋이 돌려준 값만 남아 되돌려진 끝이 로그로 새지 않는다.
-  private async settle(job: Job, request: TaskRequest, revision: string, turn: Turn, facts: Facts, stop: Stop | undefined, usedMs: number): Promise<Settled> {
+  // risk는 응답의 질문·요약이 공개 검사에 걸린 사유다. 질문이면 행·게시 큐를 지나지 않고 실패로, 요약이면 그 줄만 고정 문구로 바꾼다.
+  private async settle(job: Job, request: TaskRequest, revision: string, turn: Turn, facts: Facts, stop: Stop | undefined, usedMs: number,
+    risk: TaskOutputRisk | null = null): Promise<Settled> {
     return this.store.atomic(async (store): Promise<Settled> => {
       await store.lockTaskControl(job.conversation_id);
       const row = (await store.db.query<{ state: string; lease_token: string; lease_until: string }>(
@@ -488,6 +504,16 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
         return { terminal: false };
       }
       if (response.status === 'needs_input') {
+        // CHANGE 질문이 걸렸을 때와 같이 실패로 닫고 세션 공간을 지운다. 안내에는 사유 코드만 싣는다.
+        if (risk) {
+          const settled = await fail(CHANGE_QUESTION_BLOCKED);
+          if (settled.end && !settled.end.intended && settled.end.state === 'failed') {
+            await store.enqueue({ key: `task-question-blocked:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id, actor: job.owner_id,
+              scope: job.target, revision, payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary',
+                content: `작업 ${job.id}의 질문이 공개 검사에 걸려(사유: ${risk}) 질문을 보내지 않고 작업을 멈췄습니다(failed). 요청을 고쳐 새 작업으로 요청하거나 /retry target:${job.id} 로 다시 실행하세요.` } });
+          }
+          return settled;
+        }
         if (await this.ask(job, revision, taskQuestionId(job.id, request.sessionId, request.turn), request.sessionId, request.turn, response.question, store)) {
           await end('waiting_answer');
           return { terminal: false };
@@ -501,8 +527,9 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       const resultDigest = digest(result);
       const verified = response.verification.reduce((sum, item) => ({ ...sum, [item.status]: sum[item.status] + 1 }), { passed: 0, failed: 0, not_run: 0 });
       await store.finish(job, result, { source: 'task_worker', sessionId: request.sessionId, generation: request.generation, turns: request.turn,
-        worker: response.worker, stopConfirmed: true, diff: 'worker_computed', usage: response.usage, resultDigest },
-      [`작업 완료 (작업 ${job.id})`, bounded(response.summary || '요약 없음', TASK_LIMITS.summaryChars),
+        worker: response.worker, stopConfirmed: true, diff: 'worker_computed', usage: response.usage, resultDigest, ...(risk ? { summaryWithheld: risk } : {}) },
+      [`작업 완료 (작업 ${job.id})`,
+        risk ? `요약이 공개 검사에 걸려(사유: ${risk}) 보내지 않았습니다. 작업 완료는 기록했습니다.` : bounded(response.summary || '요약 없음', TASK_LIMITS.summaryChars),
         `변경 파일(작업자 diff 기준): ${response.changes.total}개`,
         `검증: 통과 ${verified.passed} · 실패 ${verified.failed} · 미실행 ${verified.not_run}`].join('\n'), job.target);
       // 구독이 멈춘 대화에서 finish는 막혀도 던지지 않는다.
