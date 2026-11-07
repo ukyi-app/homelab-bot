@@ -12,7 +12,7 @@ import { parseChangeRequest } from './change-commands.js';
 import type { ChangePublisher } from './change-publisher.js';
 import type { ChangeReviewService } from './change-review.js';
 import type { ChangePrivateInputs, ChangeRequest, ChangeStore } from './change-store.js';
-import { purgeExpiredChangeContent } from './change-store.js';
+import { CHANGE_PURGE_BATCH, purgeExpiredChangeContent } from './change-store.js';
 import type { ChangeAuthorSource, ClaudeChangeAuthor } from './claude-task-bridge.js';
 import { DEFAULTS, Denied, PolicyUnavailable } from './contracts.js';
 import type { Job } from './contracts.js';
@@ -41,6 +41,7 @@ export const CHANGE_PERIODS = Object.freeze({
   failureBackoffMaxMs: 600_000,
 });
 export type ChangePeriods = Record<keyof typeof CHANGE_PERIODS, number>;
+const RETENTION_ROUNDS = 20;
 // 끝난 부모에게 알리는 시효. 재시작 때 지난 건을 몰아 보내지 않는다.
 const NOTICE_WINDOW_MS = 7 * 86_400_000;
 const LANE_PHASES = ['requested', 'admitted', 'authoring', 'snapshot_ready', 'verifying'] as const;
@@ -181,7 +182,16 @@ export class ChangeRuntime {
   }
   // 게시 대조. 응답을 잃은 effect를 정확한 값과 맞추고 기한 넘은 unknown을 사람 해소로 넘긴다. 승인·게시 중인 건도 이어 간다.
   reconcile() { return this.deps.publisher.reconcile(); }
-  retention(): Promise<number> { return purgeExpiredChangeContent(this.db, this.now()); }
+  // 한 바퀴에 여러 쪽을 고른다. 복원 직후 밀린 건이 많아도 다음 주기(1시간)마다 20건씩만 지우지 않게 한다. 고른 뒤 다시 열린 건은 다시 골라지므로 횟수로 끝을 둔다.
+  async retention(): Promise<number> {
+    let total = 0;
+    for (let round = 0; round < RETENTION_ROUNDS; round++) {
+      const purged = await purgeExpiredChangeContent(this.db, this.now());
+      total += purged;
+      if (purged < CHANGE_PURGE_BATCH) break;
+    }
+    return total;
+  }
 
   // 사람의 병합·답을 기다리거나 일시 오류로 머무는 행은 시각이 그대로라 앞자리를 계속 차지한다. 정렬값과 ID의 커서로 한 쪽씩 돌아 뒤의 행도 차례를 받게 한다.
   // 쪽이 차지 않으면 끝까지 본 것이라 처음으로 돌아간다. 커서를 잃어도 처음부터 다시 볼 뿐이다.

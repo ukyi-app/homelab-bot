@@ -1,6 +1,7 @@
 import type { z } from 'zod';
 import { Denied, PolicyUnavailable } from './contracts.js';
 import type { Job, Scope } from './contracts.js';
+import type { Database } from './database.js';
 import { bounded } from './format.js';
 import type { PolicyGate } from './policy.js';
 import type { Store } from './store.js';
@@ -38,6 +39,35 @@ export const FOREIGN_SESSION_STATUS = '다른 실행기의 세션을 가진 작�
 interface Question {
   id: string; job_id: string; conversation_id: string; thread_id: string; turn: number; responder_id: string;
   state: string; expires_at: number; answer: string | null; answer_event: string | null;
+}
+// 질문 답 원문의 보존 기간. CHANGE 원문(CHANGE_RETENTION_MS)과 같은 7일이다(DECISIONS T27).
+export const TASK_ANSWER_RETENTION_MS = 7 * 86_400_000;
+export const TASK_ANSWER_PURGE_BATCH = 200;
+const TASK_ANSWER_PURGE_ROUNDS = 20;
+// 정리 주기. CHANGE 보존 정리(CHANGE_PERIODS.retentionMs)와 같은 1시간이다.
+export const TASK_ANSWER_PURGE_EVERY_MS = 3_600_000;
+const JOB_FINAL = ['succeeded', 'failed', 'cancelled', 'superseded'];
+// 끝난 작업의 질문 답 원문을 비운다. 시각 기준은 작업이 끝 상태에 든 때(finished_at, 없으면 답한 시각)다.
+// 재개는 세션이 대기(waiting_answer·waiting_model)일 때만 답을 읽으므로, 세션이 돌거나 기다리거나 unknown이거나 정리 전인 작업은 고르지 않는다.
+// /retry로 되살아날 수 있는 failed도 세션이 대기가 아니면 새 스레드로 시작해 답을 읽지 않는다.
+// answer_event·answered_by·answered_at은 영수증이라 남기고, 지우기 전 원문의 digest를 answer_sha256에 남긴다.
+// 백업에서 옛 행이 돌아와도 시각이 그대로라 다음 정리가 다시 고른다.
+// 한 번에 BATCH씩, 한 바퀴에 최대 ROUNDS번 돈다. 복원 직후 밀린 행이 많아도 다음 주기까지 기다리지 않게 하되 한 바퀴가 끝없이 돌지는 않는다.
+export async function purgeExpiredTaskAnswers(db: Database, now: number, retentionMs = TASK_ANSWER_RETENTION_MS): Promise<number> {
+  let total = 0;
+  for (let round = 0; round < TASK_ANSWER_PURGE_ROUNDS; round++) {
+    const purged = (await db.query<{ id: string }>(`UPDATE codex_questions q SET answer=NULL,answer_purged_at=$2,
+        answer_sha256=COALESCE(q.answer_sha256, encode(sha256(convert_to(q.answer,'UTF8')),'hex'))
+      WHERE q.id IN (SELECT q2.id FROM codex_questions q2 JOIN jobs j ON j.id=q2.job_id
+        WHERE q2.answer IS NOT NULL AND j.state=ANY($3::text[]) AND COALESCE(j.finished_at, q2.answered_at, q2.created_at)<=$1
+        AND NOT EXISTS (SELECT 1 FROM codex_sessions s WHERE s.job_id=q2.job_id
+          AND (s.state IN ('running','waiting_answer','waiting_model','unknown') OR s.cleanup_state='pending'))
+        ORDER BY q2.id LIMIT ${TASK_ANSWER_PURGE_BATCH})
+      AND q.answer IS NOT NULL RETURNING q.id`, [now - retentionMs, now, JOB_FINAL])).rows.length;
+    total += purged;
+    if (purged < TASK_ANSWER_PURGE_BATCH) break;
+  }
+  return total;
 }
 export abstract class TaskBridge {
   protected constructor(protected readonly store: Store, protected readonly gate: PolicyGate,

@@ -11,7 +11,7 @@ import { ClaudeTaskBridge } from './claude-task-bridge.js';
 import { assembleChange, assembleChangeReview, changeCommandHandler, changePrecondition, guardedTaskCommands, workerRouteAnswers } from './change-assembly.js';
 import type { ChangeAssemblyOptions } from './change-assembly.js';
 import { CHANGE_PERIODS } from './change-runtime.js';
-import { ChangePrivateInputs, ChangeStore } from './change-store.js';
+import { ChangePrivateInputs, ChangeStore, purgeExpiredChangeContent } from './change-store.js';
 import { CHANGE_COMMANDS, EXTERNAL_TASK_COMMANDS, FOUNDATION_COMMANDS, MEMORY_COMMANDS, REVIEW_COMMANDS, TASK_COMMANDS, commandDefinitions, registerCommands } from './commands.js';
 import { ConfigError, databasePoolConfig, loadPublisherConfig } from './config.js';
 import type { PublisherConfig } from './config.js';
@@ -55,6 +55,7 @@ import { HttpReviewWorker } from './review-http.js';
 import { RecoveryScheduler } from './recovery.js';
 import { Runtime } from './runtime.js';
 import { Store } from './store.js';
+import { TASK_ANSWER_PURGE_EVERY_MS, purgeExpiredTaskAnswers } from './task-bridge.js';
 import { TaskCommands } from './task-commands.js';
 import { TaskWorkerSigner } from './task-contracts.js';
 import { HttpTaskV2Worker, HttpTaskWorker, TASK_INTAKE_UNREACHED, taskWorkerChangeContract, taskWorkerIntake } from './task-http.js';
@@ -460,10 +461,6 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       const report = await change.runtime.reconcile();
       if (report.confirmed.length || report.blocked.length) log('change_reconciled', { confirmed: report.confirmed.length, stillUnknown: report.stillUnknown.length, blocked: report.blocked.length });
     });
-    every('change_retention', CHANGE_PERIODS.retentionMs, async () => {
-      const purged = await change.runtime.retention();
-      if (purged) log('change_content_purged', { purged });
-    });
   };
   // REST 요청 하나가 시간 초과(5초)·일시 오류로 실패할 수 있다. 다음 READY(며칠 뒤일 수도)까지 미루지 않고 몇 번 더 시도한다.
   let registering: string | undefined;
@@ -602,6 +599,16 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     if (task !== changeWorkers.task || routed !== changeWorkers.review) log('change_workers', { task, review: routed });
     changeWorkers.task = task;
     changeWorkers.review = routed;
+  });
+  // 원문 보존 정리(CHANGE 원문·artifact 7일, 작업 레인 질문 답 7일)는 DB만 쓴다. 레인 스위치·작업자 수락·READY 장벽과 묶으면
+  // 레인을 끈 채 재시작했을 때 이미 지울 때가 된 원문이 다시 켤 때까지 남으므로 늘 돈다.
+  every('change_retention', CHANGE_PERIODS.retentionMs, async () => {
+    const purged = await purgeExpiredChangeContent(store.db, store.now());
+    if (purged) log('change_content_purged', { purged });
+  });
+  every('task_answer_retention', TASK_ANSWER_PURGE_EVERY_MS, async () => {
+    const purged = await purgeExpiredTaskAnswers(store.db, store.now());
+    if (purged) log('task_answers_purged', { purged });
   });
   if (external) every('external_task_purge', deps.externalPurgeMs ?? EXTERNAL_PURGE_MS, async () => {
     const purged = await external.links.purge();

@@ -20,7 +20,7 @@ export type StoreFailureReason =
   | 'base_mismatch' | 'artifact_invalid' | 'artifact_too_large' | 'artifact_conflict' | 'bundle_mismatch' | 'command_not_allowed' | 'receipt_conflict' | 'verification_incomplete'
   | 'review_incomplete' | 'job_not_found' | 'job_not_linked' | 'job_already_linked' | 'digest_mismatch' | 'approval_missing' | 'unresolved_effects'
   | 'effect_conflict' | 'effect_not_due' | 'predecessor_unconfirmed' | 'branch_mismatch' | 'evidence_mismatch' | 'lease_mismatch' | 'result_mismatch'
-  | 'head_mismatch' | 'pull_mismatch' | 'deployment_conflict' | 'deployment_stale' | 'generation_limit' | 'guard_rejected' | 'busy';
+  | 'head_mismatch' | 'pull_mismatch' | 'deployment_conflict' | 'deployment_stale' | 'generation_limit' | 'input_purged' | 'guard_rejected' | 'busy';
 export interface StoreFailure {
   ok: false; reason: StoreFailureReason; detail?: string;
   current?: { phase: ChangePhase; generation: number };
@@ -237,6 +237,8 @@ export class ChangeStore {
       if (!locked.ok) return locked;
       if (key.generation >= MAX_GENERATION) return fail('generation_limit');
       if ((await tx.query(`SELECT 1 FROM change_delivery_effects WHERE change_id=$1 AND state<>'confirmed' AND resolution IS NULL LIMIT 1`, [key.changeId])).rows.length) return fail('unresolved_effects');
+      // 새 generation의 접수는 요청 원문을 다시 읽는다. 보존 기간이 지나 지웠으면 열어도 request_invalid로 막힐 뿐이라 여기서 사유를 돌려준다.
+      if (await ChangePrivateInputs.purgedIn(tx, key.changeId)) return fail('input_purged');
       const now = this.now();
       const row = (await tx.query<Record<string, unknown>>(`UPDATE change_requests SET generation=generation+1,phase=$2,phase_reason=NULL,brief=NULL,brief_digest=NULL,policy_revision=NULL,updated_at=$3
         WHERE id=$1 RETURNING *`, [key.changeId, GENERATION_RESTART.to, now])).rows[0]!;
@@ -746,10 +748,11 @@ export class ChangeReviewFindings {
   }
 }
 
-// 끝난 지 이만큼 지난 건의 artifact 바이트와 리뷰 원문을 지운다.
+// 끝난 지 이만큼 지난 건의 artifact 바이트, 리뷰 원문, 요청 원문(추가 답변 포함)을 지운다.
 export const CHANGE_RETENTION_MS = 7 * 86_400_000;
-const PURGE_BATCH = 20;
-// receipt·digest·effect 기록은 남긴다. 진행 중이거나 미확정 effect·정리 안 끝난 세션이 있는 건은 고르지 않는다. 시각 기준은 끝 상태에 든 때다.
+export const CHANGE_PURGE_BATCH = 20;
+// receipt·digest·effect 기록과 요청 원문의 text_sha256은 남긴다. 진행 중이거나 미확정 effect·정리 안 끝난 세션이 있는 건은 고르지 않는다. 시각 기준은 끝 상태에 든 때다.
+// 백업에서 옛 행이 돌아와도 시각이 그대로라 다음 정리가 다시 고른다.
 export async function purgeExpiredChangeContent(database: Database, now: number, retentionMs = CHANGE_RETENTION_MS): Promise<number> {
   const cutoff = now - retentionMs;
   const due = (await database.query<{ id: string }>(`SELECT r.id FROM change_requests r
@@ -760,8 +763,9 @@ export async function purgeExpiredChangeContent(database: Database, now: number,
     AND NOT EXISTS (SELECT 1 FROM change_delivery_effects e WHERE e.change_id=r.id AND e.state<>'confirmed' AND e.resolution IS NULL)
     AND NOT EXISTS (SELECT 1 FROM change_child_jobs c JOIN jobs j ON j.id=c.job_id WHERE c.change_id=r.id AND j.state IN ('queued','running','verifying','cancel_requested','waiting_user','unknown'))
     AND NOT EXISTS (SELECT 1 FROM change_child_jobs c JOIN codex_sessions s ON s.job_id=c.job_id WHERE c.change_id=r.id AND (s.state IN ('running','waiting_answer','waiting_model','unknown') OR s.cleanup_state='pending'))
-    AND (EXISTS (SELECT 1 FROM change_artifacts a WHERE a.change_id=r.id AND a.purged_at IS NULL) OR EXISTS (SELECT 1 FROM change_review_findings f WHERE f.change_id=r.id))
-    ORDER BY r.updated_at LIMIT ${PURGE_BATCH}`, [cutoff])).rows;
+    AND (EXISTS (SELECT 1 FROM change_artifacts a WHERE a.change_id=r.id AND a.purged_at IS NULL) OR EXISTS (SELECT 1 FROM change_review_findings f WHERE f.change_id=r.id)
+      OR ${ChangePrivateInputs.HELD})
+    ORDER BY r.updated_at LIMIT ${CHANGE_PURGE_BATCH}`, [cutoff])).rows;
   for (const row of due) {
     await database.transaction(async tx => {
       // 고른 뒤 사람이 새 generation을 열었으면 진행 중인 건이다. 부모 행을 잠그고 다시 본다.
@@ -770,6 +774,7 @@ export async function purgeExpiredChangeContent(database: Database, now: number,
       await tx.query('DELETE FROM change_artifact_files WHERE change_id=$1', [row.id]);
       await tx.query(`UPDATE change_artifacts SET patch='',purged_at=$2 WHERE change_id=$1 AND purged_at IS NULL`, [row.id, now]);
       await tx.query('DELETE FROM change_review_findings WHERE change_id=$1', [row.id]);
+      await ChangePrivateInputs.purgeIn(tx, row.id, now);
       await audit(tx, 'change_content_purged', row.id, { retentionMs }, now);
     });
   }
@@ -778,6 +783,15 @@ export async function purgeExpiredChangeContent(database: Database, now: number,
 
 // 요청 원문을 읽는 유일한 경로다. 공개 렌더러·writer·리뷰 입력에 이 객체를 주지 않는다.
 export class ChangePrivateInputs {
+  // 보존 정리와 재개방 확인이 쓰는 자리. 원문 표를 만지는 SQL을 이 클래스에 모은다. HELD는 change_requests를 r로 부르는 질의 안에 넣는다.
+  static readonly HELD = 'EXISTS (SELECT 1 FROM change_request_inputs i WHERE i.change_id=r.id AND i.purged_at IS NULL)';
+  // 원문만 비우고 지운 시각을 적는다. text_sha256·label·event_id는 증거라 남긴다. 호출자가 부모 행을 잠근 트랜잭션 안에서 부른다.
+  static async purgeIn(tx: Database, changeId: string, now: number): Promise<void> {
+    await tx.query(`UPDATE change_request_inputs SET text='',purged_at=$2 WHERE change_id=$1 AND purged_at IS NULL`, [changeId, now]);
+  }
+  static async purgedIn(tx: Database, changeId: string): Promise<boolean> {
+    return (await tx.query('SELECT 1 FROM change_request_inputs WHERE change_id=$1 AND purged_at IS NOT NULL LIMIT 1', [changeId])).rows.length > 0;
+  }
   constructor(private readonly database: Database, private readonly now: Clock = Date.now) {}
   // 추가 답변도 label을 올린다. 게시 가능하지 않은 label이면 진행 중 change를 닫는다. 답변을 받기 전 author에 넘기지 않는 것은 호출자 몫이고, 닫힌 뒤 게시는 DB CHECK가 막는다.
   async record(input: ChangeKey & { eventId: string; label: ProvenanceLabel; text: string }): Promise<StoreResult<ChangeRequest>> {
