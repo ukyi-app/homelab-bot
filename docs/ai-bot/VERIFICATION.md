@@ -1918,3 +1918,98 @@ SEC02_IMAGE=<이름> npm test   # 없으면 사유와 함께 skip. 통과로 세
 **못 한 검증(예산 초과).** 시험을 마지막으로 고친 뒤의 전체 재실행, `taskset -c 0-1`의 `change-assembly` 파일 전체 실행, `change-sec02`·`sec02-boundary` 이미지 재실행.
 
 **D-23.** 공개 금지 패턴 0건.
+
+## T19 운영 무모델 측정 (H2, 2026-11-07, 운영 파드)
+
+**범위.** 작업자 이미지를 봇 `d4c8bda` 빌드(digest `b3331339…`, `gh attestation verify` 대조, homelab #1161)로 올린 뒤, 작업·리뷰 레인을 닫고 작업이 없을 때 운영 `worker-task` 파드에서 `kubectl exec` 한 번으로 검증 실행기(`IsolatedVerifier`, 고정 Bun 1.4.3)를 쟀다. 모델·실자격·외부 데이터 전송은 없다. 직접 exec이라 `execution_path`는 `direct_exec_not_tasklane`이다. 측정 도구는 저장소 밖 일회성이다. 실행 전 독립 리뷰(Codex)에서 P1 4건(PID 격리가 깨지면 실제 env를 읽음, 시험 자식이 무기한 남음, 작업 세션을 막는 비 UUID 폴더, 프로필이 어긋나도 실행)과 P2 5건을 찾아 고쳤고, 재확인에서 P0·P1은 없었다.
+
+| 묶음 | 결과 |
+|---|---|
+| 프로필 | uid 10001, AppArmor `homelab-sandbox-worker-v1` enforce, seccomp 2, no_new_privs, CapEff 0, uid 매핑 비항등(`hostUsers: false`), `/proc` 가림 0, 루트·자격 읽기 전용, 상태 볼륨 ext4 |
+| 양성 | 실제 `smoke-unit` 정의(argv·cwd·120초)로 `passed`, exit 0, pass 3, fail 0. 고정 Bun 해시 일치 |
+| 격리(악성 시험) | 자격 폴더·상태 볼륨·제어 폴더·`/app`·다른 세션이 안 보임. 바깥 PID와 작업자가 안 보임. source·`/usr`·`/`·`/dev`·상태 볼륨 쓰기 거부(scratch만 씀). loopback·작업자 포트·프록시·외부·kube API·unix·abstract 소켓 모두 불통, `lo` 밖 인터페이스 0 |
+| 양성 대조(밖) | 같은 프로세스 밖에서는 자격 폴더가 보이고 프록시·loopback·8080이 연결된다. 안쪽 불통이 설정 때문임을 보인다 |
+| 생존·취소 | `setsid` 자식은 샌드박스와 함께 사라짐(표식 0, 중첩 PID 0). `AbortSignal`은 `unknown(aborted)`, 시간 초과는 `timed_out`, 둘 다 소멸 확인 |
+| 정리·사후 | 측정 공간 잔여 0, `tasks` 그대로, 파드 재시작 0, 프로세스 기준 상태 같음 |
+| 대화·리뷰 작업자 | `change-review` 폴더 쓰기 가능. `/v1/change-review`·`/v2/task/verify`가 인증 없는 요청에 401 |
+
+판정 pass(83건 통과, 실패 0, info 3). 이것으로 닫지 않는 것: TaskLane 조립 경로의 같은 시험, 실모델 악성 시험, 실자격 직접 Read.
+
+**측정 중 찾은 실행기 결함(고치지 않음).** bwrap은 샌드박스를 세우기 전에 `child-pid`를 낸다. 그래서 설정 단계 실패(예: hostname)도 `started=true`, `failed`가 되고 `not_run(sandbox_unavailable)`로 가지 않는다. 통과로 세지는 않지만 샌드박스 고장이 후보 시험 실패로 기록되어 작성 쪽을 잘못 이끈다. → T21.
+
+## T19 실제 writer AC-P8 (H1, 2026-11-07)
+
+ruleset E를 `homelab`에도 두고(homelab #1162, Terraform apply 뒤 verify exit 0) `ukyi-writer`를 homelab에 잠시 설치한 뒤, 저장소 밖 일회성 도구로 실제 writer 신원을 시험했다. 모델 0회.
+
+| 단계 | 기대 | 결과 |
+|---|---|---|
+| 사전 대조 | ruleset·bypass·main SHA·설치 범위·토큰 권한 | 50건, 불일치 0 |
+| `bot/ac-p8-*` push(smoke, homelab) | 성공 | 성공 |
+| homelab `main` push | 거부 | GH013(필수 검사, PR 필요, 보호 ref) |
+| homelab `deploy/ac-p8-*` 생성 | 거부 | GH013(생성 제한) |
+| smoke `main` push | 거부 | GH013(보호 ref, PR 필요) |
+| digest 모양 PR(homelab #1165, `apps/homelab-bot/image.yaml` 한 줄) | 자동 병합 없음 | `ci` success, `deploy-merge`가 조건 1(작성자)·2(브랜치) 불일치로 미병합 |
+| 정리 | PR 닫기, 시험 브랜치 삭제 | 완료. 밖에서 다시 읽음: 두 main 그대로, `bot/` 0개 |
+
+쓰기 요청 10회. `PUT merge`는 승인 범위 밖이라 시도하지 않았다(대역 App #953은 405). 인수 뒤 homelab 설치는 뺐고(App JWT로 homelab 404), homelab의 E는 사용자 결정으로 남겼다(DECISIONS "T19 운영 결정").
+
+## T19 보안 재검토와 수정 (#86, 2026-11-07)
+
+#85 `cf1d3c2`의 Codex 보안 리뷰가 지적 있음을 표시했지만 내용이 PR에 보이지 않았다. 사용자 결정으로 #85 전체를 Codex CLI(읽기 전용)로 다시 보안 리뷰했다. P0·P1이 있으면 켜지 않는다는 기준이다.
+
+| 회차(대상) | 지적 | 확인 | 수정 |
+|---|---|---|---|
+| 1(`d4c8bda`) | P1: 단계 입구 인가 뒤 GitHub 조회·토큰 발급을 기다리는 동안 `/revoke`가 끝나도 PR과 남은 blob이 나간다 | 시험으로 재현. head 조회를 세운 동안 철회해도 PR 요청 1회, 첫 blob 뒤 철회해도 blob 2회 | writer의 모든 쓰기(blob은 하나마다)가 토큰을 받은 뒤 `authorizeWrite`를 지난다. 철회면 `not_sent(authorization_revoked)`, 확인 실패도 보내지 않는다. 읽기 대조는 지나지 않는다 |
+| 1 | P2: 추가 답(`label=public`)과 모델 질문이 첫 요청의 비밀 검사를 건너뛴다 | 토큰이 든 공개 답이 그대로 받아짐 | `scanPublicText`를 답과 CHANGE 질문에도 적용. 답은 private로 올려 막고, 질문은 내보내지 않고 `blocked(task_question_sensitive)`. `/task` v1 질문은 그대로 |
+| 2(`4acdd57`) | P1: `/change-cancel`과 승인 무효는 권한을 건드리지 않아 위 확인을 통과한다 | 확인을 빼면 새 시험 2건 실패(첫 blob 뒤 취소, PR claim 뒤 취소) | `authorizeWrite`가 같은 generation, `publishing`, 살아 있는 승인도 본다. 아니면 `not_sent(publication_stopped)`. 끝난 부모는 다시 바꾸지 않고 effect는 `abandoned_unsent` |
+| 3(`1ffba8f`) | P0·P1 없음 | | 한계 기록: 스위치·정책 변경은 재시작 때 반영되고, 종료 중인 프로세스는 진행 중인 바퀴에서 쓰기를 보낼 수 있다. 즉시 중단 수단은 `/revoke`와 `/change-cancel`이다 |
+
+**검사.** 전체 2,085개 중 2,063 통과, 22 skip, 실패 0(PG 18.6). 코어 묶은 조립 114/114, `change-sec02` 10/10, `sec02-boundary` 24/24. PR의 Codex 코드·보안 리뷰 지적 없음. `cf1d3c2`의 원래 지적 내용은 끝내 보지 못했다.
+
+**간헐 실패.** 첫 전체 실행에서 `change-pg` "게시 서버 둘이 같은 부모"와 `codex-bridge` "SEC-02 한계 기록"이 한 번씩 실패했고 단독·재실행은 통과했다. 앞의 것은 부하에서 `blocked(verification_not_run)`로 닫히며, 수정 전 코드에서도 270회 중 21회 재현된다(안전 쪽, 운영은 게시 서버 하나). → T21.
+
+## T19 live 시험 (H3, 2026-11-07)
+
+`CHANGE_PR_ENABLED`를 정책의 `homelab-smoke` 하나로 켜고(homelab #1166, 정책 `writerAccepted` true) owner가 Discord #작업공간의 새 스레드에서 한 건을 돌렸다. 시험 앱 `homelab-smoke`는 H0으로 임시 등록했다가(homelab #1164) 인수 뒤 뺐다(homelab #1169).
+
+| 단계 | 결과 |
+|---|---|
+| `/change`(루트 응답 문구 변경, `label=public`) | 접수, 변경 `6bbee515` g1 |
+| 작성 | 1턴, 도구 6회, 15초, `stopped: true` |
+| 무자격 시험 | `smoke-unit` passed |
+| 미게시 리뷰 | pass, 범위 complete |
+| 미리보기 | 변경 파일 2개(`src/server.ts`, `src/server.test.ts`). 승인 digest가 미리보기와 `/change-status`에서 같음. 이때 GitHub에 `bot/` 0개 |
+| `/change-publish` | `ukyi-writer`가 `homelab-smoke#18` 게시. 커밋 tree = 미리보기의 결과 tree(`5cdc89e`), parent = base(`e45f9f6`). diff는 문구 한 줄과 시험 하나 |
+| 게시 후 리뷰(T17) | 지적 없음. 확인 질문 1(마지막 `return`이 처리되지 않은 모든 경로에 적용, 기존 동작과 같음) |
+| 사람 병합 | squash `f0f5298` |
+| DEPLOY-01 | 배포 App PR(homelab #1168) 자동 병합, 파드 새 이미지·재시작 0, `GET /`가 새 문구. 봇이 스레드에 `observed`: H `355af39`, M `f0f5298`, K `a4f1005`, D `sha256:ea8fc024…`. 네 값 모두 GitHub·클러스터와 일치 |
+
+모델 호출 3회(작성 1, 미게시 리뷰 1, 게시 후 리뷰 1), 상한 4회 안.
+
+**운영에서 본 빈틈.** 게시 서버는 CHANGE 단계 전이를 로그로 남기지 않는다(`change_command`, `change_publish_outcome`만). 작성 뒤 시험·리뷰가 도는 동안 운영자는 로그로 진행을 볼 수 없어 `/change-status`로 확인했다. → T21.
+
+## T19 완료 판정 (2026-11-07, 사용자 확인)
+
+homelab T19 티켓의 완료 조건을 아래 기록과 대조했다.
+
+| 완료 조건 | 근거 |
+|---|---|
+| CHANGE-01~03, DEPLOY-01, DATA-01, 변경 작업자 경로의 SEC-02, 게시 경로의 EVENT-02 결과가 있다 | 아래 시험 표 |
+| 배정 시험에 `fail`이 없고, `blocked`·`not_run`은 사유와 해소 티켓이 있다. 보안 경계 시험(SEC-02, DATA-01, CHANGE-02)은 이 경로에서 최소 mock·local_integration `pass`다 | 아래 시험 표. `blocked` 없음 |
+| CHANGE-02에 D-24 사례(merge, `/merges`, `/dispatches`, update-branch, GraphQL 병합·auto-merge, `bot/` 밖 ref, force push, 워크플로 파일 변경 거부)가 있다 | "T19 B3 writer·공개 경계", 실제 신원은 "T19 실제 writer AC-P8" |
+| HANDOFF가 있다 | private 운영 저장소 `handoffs/change-pr.md` |
+
+**시험 표.**
+
+| 시험 | 판정 | 근거 | 운영에서 만들지 않은 것 → 해소 |
+|---|---|---|---|
+| CHANGE-01 | live·local_integration / pass | "T19 live 시험"(H.tree=T1, parent=B, 시험·리뷰 receipt), "T19 B5 조립", "T19 B1 artifact·검증" | 질문·`/answer`를 거치는 여러 턴 작성의 live. `not_run`, 로컬 pass → T21 |
+| CHANGE-02 | local_integration·live(AC-P8) / pass | "T19 B3 writer·공개 경계"(D-24 사례, 첫 blob 전 전체 검사, 거부 요청 0회), "T19 보안 재검토와 수정"(철회·취소 뒤 쓰기), "T19 실제 writer AC-P8" | 실제 신원의 `PUT merge`, 워크플로 파일 git push 거부. `not_run` → T21 |
+| CHANGE-03 | local_integration / pass | "T19 B3"·"T19 B5"의 base 이동, ref 충돌, 사람 commit, PR 변경, 승인 뒤 정책 변경 | live 경합 PR은 계획상 생략. `not_run` → T21 |
+| DEPLOY-01 | live·mock / pass | "T19 live 시험" `observed`, "T19 B4 배포 읽기"의 H≠M, 잘못된 revision·digest, Argo 옛 revision, unready, 조회 실패, n/a·unknown 구분 | Argo stale·unready의 live. `not_run`, mock pass → T21 |
+| DATA-01 | local_integration / pass | "T19 B5 조립" DATA-01, "T19 보안 재검토와 수정"(답·질문 검사), "T19 B3"의 공개 경계 | 실모델이 공개 입력으로 비공개 값을 지어내는 경우. `not_run` → T21 |
+| SEC-02(변경 작업자 경로) | live(운영 파드 무모델)·local_integration / pass | "T19 운영 무모델 측정", "T19 B1"(`change-sec02`), "T19 B5" | TaskLane 조립 경로의 같은 시험, 실모델 악성 시험, 실자격 직접 Read. `not_run` → T21 |
+| EVENT-02(게시 경로) | local_integration(PG) / pass | "T19 B5 조립" EVENT-02, "T19 B3"의 PG 중단·재시작 | 실제 프로세스 kill, live fault 주입. `not_run` → T21 |
+| 호환·스위치 | local_integration·live / pass | "T19 B5", 운영에서 꺼짐(#85·#86 배포)과 켬(homelab #1166) 기동 | 없음 |
+
+운영에서 만들지 않은 사례를 로컬 증거로 두고 T21이 다시 보는 것은 T18과 같은 방식이다. T21에 넘긴 결함·한계 목록은 homelab T21 티켓 "T19에서 넘긴 것"에 있다.
