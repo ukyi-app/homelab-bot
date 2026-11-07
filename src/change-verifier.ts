@@ -57,14 +57,28 @@ export function sandboxArgs(input: { source: string; command: VerificationComman
 }
 
 export interface SandboxRun {
-  // bwrap이 시험 프로세스를 띄웠다는 증거(json-status의 child-pid)가 있는가. 없으면 시험 실패가 아니라 미실행이다.
+  // bwrap 준비(마운트·chdir·namespace)가 끝나고 시험 명령의 exec 직전까지 왔다는 표식이 있는가. 없으면 시험 실패가 아니라 미실행이다.
   started: boolean; exitCode: number | null; timedOut: boolean; overflow: boolean; aborted: boolean;
   log: Buffer; logBytes: number; logDigest: string;
 }
 export type SandboxRunner = (args: readonly string[], limits: { timeoutMs: number; outputBytes: number }, signal: AbortSignal) => Promise<SandboxRun>;
+
+// 시작 표식. json-status의 child-pid는 bwrap이 clone한 직후에 나와 마운트·chdir 실패 뒤에도 있다. 그래서 bwrap이 준비를 다 마치고 exec한
+// 고정 셸이 fd 4에 표식을 쓰고, fd 4를 닫은 뒤 시험 명령으로 exec한다. 시험 코드는 fd 4를 받지 못해 표식을 지우거나 덧쓰지 못한다.
+// 남는 틈: 표식 뒤 시험 명령의 exec 자체가 실패하면(ELF 해석기 없음 등) 셸이 126·127로 끝나 failed가 된다. 실행 파일 유무는 표식 전에 본다.
+const START_FD = 4;
+const START_MARK = 'payload-start';
+const START_SHIM = `[ -x "$0" ] || exit 127; printf ${START_MARK} >&${START_FD} || exit 127; exec ${START_FD}>&-; exec "$0" "$@"`;
+export function withStartMark(args: readonly string[]): string[] {
+  const split = args.indexOf('--');
+  // 명령 경계가 없으면 감싸지 않는다. 표식이 없으니 미실행으로 닫힌다.
+  if (split < 0 || split === args.length - 1) return [...args];
+  return [...args.slice(0, split + 1), '/bin/sh', '-c', START_SHIM, ...args.slice(split + 1)];
+}
+
 // 자식 env는 비운다. 작업자 env에 공개 키·프록시·플랫폼 값이 있다. bwrap 안 env는 위 --setenv가 전부다.
 export const spawnSandbox: SandboxRunner = (args, limits, signal) => new Promise(resolve => {
-  const child = spawn('/usr/bin/bwrap', [...args], { env: {}, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'pipe'] });
+  const child = spawn('/usr/bin/bwrap', withStartMark(args), { env: {}, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'] });
   const hash = createHash('sha256');
   const kept: Buffer[] = [];
   let keptBytes = 0;
@@ -85,6 +99,9 @@ export const spawnSandbox: SandboxRunner = (args, limits, signal) => new Promise
   let status = '';
   (child.stdio[3] as NodeJS.ReadableStream).setEncoding('utf8');
   (child.stdio[3] as NodeJS.ReadableStream).on('data', (chunk: string) => { if (status.length < 16_384) status += chunk; });
+  let mark = '';
+  (child.stdio[START_FD] as NodeJS.ReadableStream).setEncoding('utf8');
+  (child.stdio[START_FD] as NodeJS.ReadableStream).on('data', (chunk: string) => { if (mark.length < 64) mark += chunk; });
   const timer = setTimeout(() => { timedOut = true; kill(); }, limits.timeoutMs);
   const onAbort = () => { aborted = true; kill(); };
   signal.addEventListener('abort', onAbort, { once: true });
@@ -95,7 +112,7 @@ export const spawnSandbox: SandboxRunner = (args, limits, signal) => new Promise
     done = true;
     clearTimeout(timer);
     signal.removeEventListener('abort', onAbort);
-    const started = /"child-pid"\s*:/.test(status);
+    const started = mark === START_MARK;
     const reported = /"exit-code"\s*:\s*(-?\d+)/.exec(status)?.[1];
     resolve({ started, exitCode: reported !== undefined ? Number(reported) : code, timedOut, overflow, aborted, log: Buffer.concat(kept, keptBytes), logBytes, logDigest: hash.digest('hex') });
   };
