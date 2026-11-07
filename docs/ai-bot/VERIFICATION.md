@@ -2031,3 +2031,22 @@ T21 1회차 감사([V1_RELEASE_REPORT](V1_RELEASE_REPORT.md))의 출시 차단 �
 - PR의 Codex 코드·보안 리뷰 지적 없음, `build / test` 통과(둘 다).
 
 **배포.** homelab #1175(`f83afd4`, T25·T26 함께) 자동 병합. 게시 서버 파드 1/1 Ready, imageID = `image.yaml`, Argo CD Synced·Healthy. 재시작 뒤 작업·리뷰·외부 작업 게이트 open, 로그 오류 0. 작업자 이미지는 바뀌지 않았다(두 수정 모두 게시 서버 코드). 실제 Discord에서 차단을 일으키는 live 시험은 하지 않았다. DATA-01 실모델 시험은 homelab T30 INT-07, AUTH-02 재판정은 T21 재실행이 한다.
+
+## T21 현 버전 필수 수정 T27·T28·T29 (#92·#93·#94, 2026-11-07)
+
+T21 1회차 감사의 현 버전 필수 수정 세 건이다. homelab 티켓 T27(A03)·T28(A04)·T29(A06). 구현은 Claude 작업자, 대조·통합 시험은 lead, 리뷰는 PR의 Codex 코드·보안 리뷰다.
+
+| 티켓(PR, 병합) | 고친 것 | 경계 |
+|---|---|---|
+| T27 (#94, `630c48d`) | 사용자 결정(2026-11-07)대로 작업 레인 질문의 답(`codex_questions.answer`)과 변경 요청 원문(`change_request_inputs.text`)을 7일 뒤 지운다. migration 019는 칸만 더한다(`purged_at`, `answer_sha256`, `answer_purged_at`). 요청 원문은 끝난 변경 요청 기준으로 artifact 정리와 같은 트랜잭션에서 `text=''`로, 답은 끝난 작업 기준(`COALESCE(finished_at, answered_at, created_at)`)으로 `answer=NULL`로 지우고 digest를 남긴다. 원문을 지운 superseded 변경의 `text:next`는 `input_purged`로 거절한다. 두 정리(`change_retention`, `task_answer_retention`, 1시간)는 게시 서버가 뜨면 레인 스위치와 무관하게 돈다 | 예외: 끝나지 않은 작업, 세션이 `running`·`waiting_answer`·`waiting_model`·`unknown`이거나 정리 전. 대기 세션을 가진 `failed` 작업의 답과 끝나지 않는 변경 요청의 원문은 7일을 넘겨 남을 수 있다. 복원 뒤 원문이 다시 보이는 창은 다음 정리까지 최대 1시간. 백업 속 원문은 백업 보존 기간(14일). 다른 원문 칸(`events.payload.text`, `codex_questions.prompt`, `results.result`, `outbox.payload.content`, `change_requests.brief`)은 정리 경로가 없고 homelab T31로 넘겼다 |
+| T28 (#92, `b1e2b52`) | 검증 실행기의 `spawnSandbox`가 `--` 뒤에 고정 `/bin/sh` 표식 셸을 끼운다. bwrap 준비가 끝나야 이 셸이 돌고, fd 4에 `payload-start`를 쓰고 닫은 뒤 시험 명령으로 exec한다. 표식이 없으면 `not_run(sandbox_unavailable)`, 있으면 종료 코드대로 `failed`·`timed_out` | bwrap의 `child-pid`는 clone 직후에 나와 준비 실패 뒤에도 있고(이미지 0.12.0, 호스트 0.11.1 실측), `--info-fd`도 같다. 시험 코드는 fd 4를 받지 못한다. 표식 뒤 시험 명령 exec 실패(ELF 해석기 없음 등)는 여전히 `failed`, 표식 전 시한 초과는 `not_run`. 하류는 `passed`만 통과로 보므로 `not_run`은 `verification_not_run`으로 닫힌다 |
+| T29 (#93, `d014c0e`) | `Store.fail`이 `change_child_jobs`를 보고 CHANGE 자식이면 `/retry` 대신 `/change-status`와 새 `/change` 안내를 보낸다. 부모·자식 문구는 `src/change-advice.ts` 한 곳에 둔다 | `/retry`를 권하는 안내 셋 중 자식에게 나가는 것은 `Store.fail` 하나다(`resolveUnknown`은 chat·review만, T25 질문 차단 안내는 CHANGE 경로를 지나지 않음). `/resume-model` 안내도 자식에게 나갈 수 있으나 그 명령은 자식을 거부하지 않는다(재개 뒤 CHANGE 흐름은 확인하지 않음) |
+
+**검사.**
+
+- T27: `raw-input-retention` 7/7(실제 PG 1개: 018 DB에 019를 올린 뒤 옛 행 정리), cutoff 전후·예외·멱등·복원 시뮬레이션. 감사 A03 조건(8일 뒤 정리)에서 두 원문이 남지 않고 digest·영수증은 남는다. lead가 두 가지를 고쳤다: `publisher-pg` 시험의 고정 migration 목록에 19가 빠져 main과 합친 PostgreSQL 전체 시험에서 1건 실패했고, Codex P2(답 정리가 작업 루프에 묶여 레인을 끄면 멈춤)에 따라 두 정리를 레인 루프 밖으로 옮겼다.
+- T28: `change-verification` 23/23(호스트)·23/23(감사 방식 컨테이너의 실제 bwrap: chdir·마운트 준비 실패 `not_run`, assertion 실패 `failed`, timeout `timed_out`), `change-assembly` 116/116, `change-sec02` 10/10, `sec02-boundary` 24/24. 감사 재현(`bwrap-probe`)은 기준 dist에서 `started:true`, 이 브랜치 dist에서 `started:false, setupError:true`.
+- T29: 새 시험 "A06 자식 실패 안내…"(실제 Store·ChangeStore, PGlite): 게시된 메시지에 `/retry` 없음, 부모·자식 안내의 꼬리가 같음, 안내한 `/change-status`와 새 `/change`가 동작, 자식 `/retry`는 여전히 거부. `change-assembly` 115/115, `unknown-probe` 15/15.
+- 전체(PG 18, concurrency 6): T28 브랜치 2,115 중 실패 0, T29 브랜치 2,109 중 실패 0, main(T28)+T29 2,116 중 실패 0, main(T28·T29)+T27 최종 head 2,123 중 실패 0. 각 PR의 Codex 코드·보안 리뷰는 최종 head에서 지적 없음, `build / test` 통과.
+
+**배포.** 게시 서버는 homelab #1179(`630c48d`, T25~T29 모두 포함) 자동 병합. 파드 1/1 Ready, imageID 일치, migration 019 성공, 게이트 open, 로그 오류 0. 정리 기록(`change_content_purged`, `task_answers_purged`)은 지운 행이 있을 때만 남는데 첫 바퀴에 없었다. 작업 레인 작업자(`task.image`)는 homelab #1180으로 같은 빌드(`sha256:ff5d453e…`, `gh attestation verify` 통과)로 올렸다. `worker-task` 파드 Ready, 기동 기록 `worker_started`(CLI 2.1.308, 자격 present, 수락 막힘 사유 없음), 게시 서버의 30초 작업자 확인에 상태 변화 기록 없음(수락이 계속 열림). 대화·리뷰 작업자(`worker.image`)는 bwrap을 쓰지 않아 그대로 `d4c8bda`다. 운영 작업자 파드의 AppArmor·seccomp Localhost 프로필 아래에서 표식 셸을 실측하지는 않았다(프로필은 `file,`로 실행을 막지 않음). 막히면 CHANGE 검증이 `not_run`으로 닫혀 게시로 가지 않는다. 첫 CHANGE 실행이 실제 확인이 된다.
