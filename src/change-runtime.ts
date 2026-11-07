@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { CHANGE_RESTART, changeNextGeneration } from './change-advice.js';
 import { evaluateCi, readCiSnapshot } from './change-ci-policy.js';
 import { isTerminalPhase, labelAllowsAuthorInput, ReasonCodeSchema } from './change-contracts.js';
 import { scanPublicText } from './change-publication.js';
@@ -725,9 +726,7 @@ export class ChangeRuntime {
     }
     const reason = request.phaseReason ?? request.phase;
     const pull = await this.pullOf(request);
-    const tail = request.phase === 'superseded'
-      ? `자동으로 다시 시작하지 않습니다. 필요하면 /change project:${request.id} text:next 로 새 generation을 여세요.`
-      : '자동으로 다시 시작하지 않습니다. 필요하면 새 /change로 요청하세요.';
+    const tail = request.phase === 'superseded' ? changeNextGeneration(request.id) : CHANGE_RESTART;
     const untracked = pull ? ` PR #${pull.number}은 그대로 있고, 이 뒤로 병합돼도 배포를 추적하지 않습니다.` : '';
     const withheld = reason === 'task_question_sensitive' ? ' 모델 질문에서 공개하면 안 되는 값을 찾아 질문을 이 스레드에 내보내지 않았습니다.' : '';
     await this.send(request, key, `변경 ${request.id} g${request.generation}: ${request.phase}(${reason}).${withheld}${untracked} ${tail}`);
