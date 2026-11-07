@@ -2013,3 +2013,21 @@ homelab T19 티켓의 완료 조건을 아래 기록과 대조했다.
 | 호환·스위치 | local_integration·live / pass | "T19 B5", 운영에서 꺼짐(#85·#86 배포)과 켬(homelab #1166) 기동 | 없음 |
 
 운영에서 만들지 않은 사례를 로컬 증거로 두고 T21이 다시 보는 것은 T18과 같은 방식이다. T21에 넘긴 결함·한계 목록은 homelab T21 티켓 "T19에서 넘긴 것"에 있다.
+
+## T21 출시 차단 수정 T25·T26 (#89·#90, 2026-11-07)
+
+T21 1회차 감사([V1_RELEASE_REPORT](V1_RELEASE_REPORT.md))의 출시 차단 두 건을 고쳤다. homelab 티켓 T25(A01)·T26(A02). 구현은 Claude 작업자, 대조·통합 시험은 lead, 리뷰는 PR의 Codex 코드·보안 리뷰다.
+
+| 티켓(PR, 병합) | 고친 것 | 경계 |
+|---|---|---|
+| T25 (#89, `8e21a9c`) | `/task` v1 작업 레인의 질문과 완료 요약이 Discord로 나가기 전 `scanPublicText`를 지난다(`src/task-output.ts`). 내부 표식은 모든 CHANGE 저장소의 `internalMarkers`와 `review.internalMarkers`의 합이다. 질문이 걸리면 질문 행·질문 outbox 없이 `failed(task_question_sensitive)`로 닫고 사유 코드만 안내한다. 완료 요약이 걸리면 그 줄만 고정 문구로 바꾸고 완료는 기록한다. 정책을 못 읽으면 `policy_unavailable`로 막는다 | 검사는 결과 확정 직전 재인가가 돌려준 정책으로 한다. 작업 레인에서 모델 글이 Discord로 나가는 경로는 질문과 완료 요약뿐이다(실패 사유는 enum, 나머지 안내는 고정 문구, `/list`는 상수, patch·경로는 개수만). 운영에서 만들지 않는 `CodexBridge`(`src/codex.ts`)에는 같은 경로가 남아 있다. 결과 JSON의 요약 원문 보존은 T27 |
+| T26 (#90, `f83afd4`) | 발송 시작의 기준점을 `Store.dispatchDelivery`의 UPDATE 한 문장으로 둔다. 이 문장이 lease와 함께 `denied_actors`(owner), 대화 소유자, 구독(`active`), gap을 보고 `dispatched`·`blocked`·`gap`·`lost`를 돌려준다. 철회·대화 거부는 같은 문장에서 `blocked`로 닫고 `delivery_blocked_before_dispatch`를 감사에 남긴다. 상호작용 응답·리액션·대체 게시는 철회 조회를 REST 전 마지막 DB 읽기로 옮겼고, typing은 REST 직전 재조회에 철회 조건을 넣었다 | READ COMMITTED에서 이 문장 전에 커밋된 `/revoke`는 반드시 보인다. 그 뒤에 커밋된 철회는 이미 시작한 요청을 되돌리지 못한다(outbox는 confirm 재인가로 `unknown`, 대조 뒤 `blocked`). 상호작용 응답·typing은 영속 표시가 없어 조회와 fetch 사이 짧은 창이 남는다. 읽기 전용 REST와 기동 때 명령 등록은 그대로 |
+
+**검사.**
+
+- T25: `task-bridge` 74/74. 질문 차단·요약 차단·`policy_unavailable` 시험 셋이 사례 6개(합성 토큰, zero-width 분리, 따옴표·`+` 연결, 내부 표식, 대소문자·구분자, base64 표식)에서 REST 본문·outbox payload·`codex_questions`·로그에 원문 0을 보고, 정상 글은 그대로 중계된다. 감사 재현 A01(이 빌드)은 질문·요약 모두 Discord 도달 0. 검사기가 잡지 않는 변형(토큰을 base64로 감싼 것 등)은 시험에 넣지 않았다.
+- T26: `revoke-dispatch` 16/16(PGlite), `revoke-dispatch-pg` 5/5(PostgreSQL 두 연결: 철회 먼저 커밋 → REST 0·`blocked`, dispatch가 먼저면 1건과 `unknown`, 커밋 전 철회는 막지 않음). 고치기 전 코드에서는 새 시험 16개 실패. 관련 기존 시험 719개 통과.
+- 전체(PG 18, concurrency 6): T25 브랜치 2,087 중 2,065 통과·22 skip·실패 0, T26 브랜치 2,106 중 2,084·22·0. main(T25)+T26 합친 트리는 2,108 중 2,085·22·실패 1이었다. 실패는 `external-task-pg` "R08 실제 PostgreSQL: 같은 event_id를 동시에 보내도…"의 `event_conflict` 6 !== 7(나머지 응답 하나의 종류는 기록되지 않음)이고, 바꾼 경로 밖이며 단독 8/8 통과라 부하 간헐로 분류했다. 원인은 확정하지 못했다.
+- PR의 Codex 코드·보안 리뷰 지적 없음, `build / test` 통과(둘 다).
+
+**배포.** homelab #1175(`f83afd4`, T25·T26 함께) 자동 병합. 게시 서버 파드 1/1 Ready, imageID = `image.yaml`, Argo CD Synced·Healthy. 재시작 뒤 작업·리뷰·외부 작업 게이트 open, 로그 오류 0. 작업자 이미지는 바뀌지 않았다(두 수정 모두 게시 서버 코드). 실제 Discord에서 차단을 일으키는 live 시험은 하지 않았다. DATA-01 실모델 시험은 homelab T30 INT-07, AUTH-02 재판정은 T21 재실행이 한다.
