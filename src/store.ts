@@ -21,6 +21,9 @@ export interface Delivery {
   payload: { kind: 'message' | 'thread'; channel: string; content: string; classification: 'safe_summary' };
   state: string; external_id: string | null; lease_token: string; attempt: number;
 }
+// dispatched: 발송을 시작해도 된다. blocked: 철회·대화 거부로 막았다(행은 blocked). gap: 대화가 history gap이라 미룬다.
+// lost: lease를 잃었다(행을 건드리지 않았다).
+export type DispatchOutcome = 'dispatched' | 'blocked' | 'gap' | 'lost';
 const json = (value: unknown) => JSON.stringify(value);
 // 전역 상한 중 read 몫. contracts.ts의 DEFAULTS는 공용 계약이라 여기 둔다.
 export const READ_QUEUE_RESERVE = 10;
@@ -530,9 +533,30 @@ export class Store {
         lease_until=$2,lease_token=$3 WHERE id=$1 RETURNING *`, [row.id, this.now() + DEFAULTS.leaseMs, randomUUID()])).rows[0];
     });
   }
-  async dispatchDelivery(row: Delivery): Promise<boolean> {
-    return (await this.db.query(`UPDATE outbox SET dispatch_started=true WHERE id=$1 AND lease_token=$2
-      AND state='sending' AND lease_until>$3 RETURNING id`, [row.id, row.lease_token, this.now()])).rows.length === 1;
+  // 발송 시작의 기준점. 이 UPDATE 한 문장이 lease와 함께 최신 철회(denied_actors)·대화 소유자·구독 상태를 보고
+  // dispatch_started를 세운다. READ COMMITTED라 이 문장 시작 전에 커밋된 /revoke는 반드시 보인다. 그 뒤에 커밋된 철회는
+  // 이미 시작한 발송을 되돌리지 못한다(confirm의 재인가가 unknown으로 남긴다).
+  // 조건은 DiscordPublisher.authorized()의 대화 검사와 같다. 대화 id는 Store.scopeId와 같은 식이다.
+  // 철회·대화 거부는 같은 문장에서 blocked로 닫는다(우리 lease일 때만). gap은 일시 상태라 sending 그대로 두고 호출자가 미룬다.
+  // 행이 없으면 lease를 잃었다(다른 상태로 옮겨졌거나 만료). 예약 끄기는 state를 바꿔 여기서 lost가 된다.
+  async dispatchDelivery(row: Pick<Delivery, 'id' | 'lease_token'>): Promise<DispatchOutcome> {
+    const result = (await this.db.query<{ reason: 'ok' | 'revoked' | 'conversation' | 'gap' }>(`WITH gate AS (
+      SELECT o.id, CASE
+        WHEN EXISTS (SELECT 1 FROM denied_actors d WHERE d.actor_id=o.owner_id) THEN 'revoked'
+        WHEN o.scope->>'kind'='channel' THEN 'ok'
+        WHEN EXISTS (SELECT 1 FROM conversations c WHERE c.id=s.id AND c.owner_id<>o.owner_id) THEN 'conversation'
+        WHEN o.conversation_id IS NULL THEN 'ok'
+        WHEN NOT EXISTS (SELECT 1 FROM conversations c WHERE c.id=s.id AND c.active) THEN 'conversation'
+        WHEN EXISTS (SELECT 1 FROM conversations c WHERE c.id=s.id AND c.gap) THEN 'gap'
+        ELSE 'ok' END AS reason
+      FROM outbox o CROSS JOIN LATERAL (SELECT (o.scope->>'kind') || ':' || COALESCE(o.scope->>'guild','direct') || ':' || (o.scope->>'channel') AS id) s
+      WHERE o.id=$1)
+    UPDATE outbox o SET dispatch_started=(gate.reason='ok'),
+      state=CASE WHEN gate.reason IN ('revoked','conversation') THEN 'blocked' ELSE o.state END
+    FROM gate WHERE o.id=gate.id AND o.lease_token=$2 AND o.state='sending' AND o.lease_until>$3
+    RETURNING gate.reason`, [row.id, row.lease_token, this.now()])).rows[0];
+    if (!result) return 'lost';
+    return result.reason === 'ok' ? 'dispatched' : result.reason === 'gap' ? 'gap' : 'blocked';
   }
   async deliveryState(row: Delivery, state: string, externalId: string | null = null, delay = 0): Promise<void> {
     await this.db.query(`UPDATE outbox SET state=$3,external_id=COALESCE($4,external_id),available_at=$5,pause_reason=NULL,pause_count=0,

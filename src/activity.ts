@@ -41,10 +41,12 @@ export function typingActivity(store: Store, gate: PolicyGate, api: DiscordApi, 
         if (await store.discordPauseUntil(target.channel) > store.now() || stopped()) continue;
         await gate.authorize(owner, target);
         // 조회 뒤 대기 사이에 끝났거나(완료·취소·재큐잉) 구독이 꺼진 작업에는 표시를 갱신하지 않는다.
-        // 채널당 8초에 한 번, 실행 중 행만 보는 작은 조회다.
+        // 채널당 8초에 한 번, 실행 중 행만 보는 작은 조회다. REST 전 마지막 DB 읽기라 철회도 여기서 다시 본다.
+        // authorize 뒤에 커밋된 /revoke가 이 조회 전이면 보내지 않는다.
         const still = (await store.db.query(`SELECT 1 FROM jobs j JOIN conversations c ON c.id=j.conversation_id
           WHERE j.state='running' AND j.type='chat' AND j.owner_id=$1 AND j.target->>'channel'=$2
-            AND c.active=true AND c.gap=false AND c.owner_id=j.owner_id LIMIT 1`, [owner, target.channel])).rows.length;
+            AND c.active=true AND c.gap=false AND c.owner_id=j.owner_id
+            AND NOT EXISTS (SELECT 1 FROM denied_actors d WHERE d.actor_id=j.owner_id) LIMIT 1`, [owner, target.channel])).rows.length;
         if (!still || stopped()) continue;
         await api.request('POST', `/channels/${encodeURIComponent(target.channel)}/typing`);
       } catch (error) {

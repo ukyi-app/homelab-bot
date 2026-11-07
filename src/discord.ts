@@ -279,10 +279,7 @@ export class DiscordIngress {
   // 오류는 고정 사유 코드로만 남긴다. 전송 계층 오류에 요청 본문이 실려도 여기서 끊긴다.
   private async deliverPrivate(event: z.infer<typeof EventSchema>, id: string, content: string): Promise<boolean> {
     try {
-      await this.gate.authorize(event.actor, event.scope);
-      await this.store.ownedConversation(event.scope, event.actor);
-      const pause = await this.store.discordPauseUntil(event.scope.channel);
-      if (pause > this.store.now()) throw new Error('discord_global_pause');
+      await this.beforeReply(event);
       await this.rest.acknowledge(event, content, { ...noMentions, flags: SUPPRESS_EMBEDS });
       return true;
     } catch (error) {
@@ -293,6 +290,14 @@ export class DiscordIngress {
       return false;
     }
   }
+  // 상호작용 응답·👀·대체 게시 직전의 확인. outbox와 달리 영속 표시가 없으므로 철회 확인(authorize의 denied_actors 조회)을
+  // REST 전 마지막 DB 읽기로 둔다. 그 조회 전에 커밋된 /revoke면 보내지 않는다. 그 뒤의 철회는 이미 시작한 요청을 막지 못한다.
+  private async beforeReply(event: EventInput): Promise<void> {
+    const pause = await this.store.discordPauseUntil(event.scope.channel);
+    if (pause > this.store.now()) throw new Error('discord_global_pause');
+    await this.store.ownedConversation(event.scope, event.actor);
+    await this.gate.authorize(event.actor, event.scope);
+  }
   // 처리는 이미 영속됐다. 여기서 나는 오류(ACK 실패를 기록하는 DB 쓰기 포함)는 수신 결과를 바꾸지 않는다.
   // 메시지 이벤트에서 던지면 main의 guard()가 그 대화에 history gap 장벽을 세운다.
   // content: 상호작용 응답 본문(기억·연결 명령은 처리 결과). direct가 있으면 응답 실패 때 결과 대신 그 고정 안내를 채널에 남긴다.
@@ -300,10 +305,7 @@ export class DiscordIngress {
     let outcome: AckOutcome | void;
     try {
       try {
-        await this.gate.authorize(event.actor, event.scope);
-        await this.store.ownedConversation(event.scope, event.actor);
-        const pause = await this.store.discordPauseUntil(event.scope.channel);
-        if (pause > this.store.now()) throw new Error('discord_global_pause');
+        await this.beforeReply(event);
         // 일반 메시지는 👀 리액션이고 이 문구는 권한 거부 때의 대체 텍스트로만 쓰인다.
         outcome = await this.rest.acknowledge(event, content
           ?? (this.messageContent ? '수신·처리 기록 저장됨. 처리·대기 상태는 별도로 안내합니다.' : '명령/버튼 모드: 수신·처리 기록 저장됨.'),
@@ -492,7 +494,7 @@ export class DiscordPublisher {
     }
   }
   // 예약 브리핑 사본은 그 예약이 지금 켜져 있을 때만 보낸다. 예약 끄기가 막지 못한 행(발송 중에 끈 뒤 429로 돌아온 행)을 여기서 막는다.
-  // 이 확인 뒤에 끄기가 끝나도 발송 전 sending은 끄기가 blocked로 바꾸고 dispatch 표시가 실패한다.
+  // 이 확인 뒤에 끄기가 끝나도 발송 전 sending은 끄기가 blocked로 바꾸고 dispatch 표시가 lost로 실패한다.
   // reconcile(unknown 확인)에는 걸지 않는다. 보냈을 수 있는 행을 blocked로 바꾸면 안 된다.
   private async scheduled(row: Delivery): Promise<void> {
     const copy = (await this.store.db.query<{ enabled: boolean | null }>(`SELECT s.enabled FROM briefing_copies c
@@ -511,7 +513,11 @@ export class DiscordPublisher {
       if (pause > this.store.now()) { await this.store.pauseDelivery(row, 'discord_global_pause'); return true; }
       const marker = deliveryMarker(row);
       if (row.payload.kind === 'message' && row.payload.content.length > 1900) throw new Denied();
-      if (!await this.store.dispatchDelivery(row)) return true;
+      // authorized() 뒤의 대기 사이에 커밋된 /revoke·구독 끄기는 여기서 막힌다(발송 시작 기준점, store.dispatchDelivery).
+      const dispatch = await this.store.dispatchDelivery(row);
+      if (dispatch === 'gap') throw new HistoryGap();
+      if (dispatch === 'blocked') await this.store.audit('delivery_blocked_before_dispatch', row.id, { attempt: row.attempt });
+      if (dispatch !== 'dispatched') return true;
       dispatched = true;
       const sent = row.payload.kind === 'thread'
         ? await this.rest.createThread(row.payload.channel, { name: `homelab-${marker}`, type: 11, auto_archive_duration: 1440 })
