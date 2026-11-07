@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { changeChildFailed } from './change-advice.js';
 import { chatContext } from './chat-context.js';
 import { DEFAULTS, Denied, RateLimited } from './contracts.js';
 import type { Clock, EventInput, Job, Scope, State } from './contracts.js';
@@ -356,9 +357,12 @@ export class Store {
       await store.lockConversation(job);
       const next = await store.complete(job, 'failed', reason);
       if (next !== 'failed') return next;
+      // CHANGE 자식은 /retry가 받지 않으므로 부모 안내와 같은 복구 행동을 말한다.
+      const change = (await store.db.query<{ change_id: string }>('SELECT change_id FROM change_child_jobs WHERE job_id=$1', [job.id])).rows[0]?.change_id;
+      const content = change ? changeChildFailed(job.id, change) : '작업 실패가 확인됐습니다. /list로 상태를 확인하고 /retry로 재시도할 수 있습니다.';
       await store.enqueue({ key: `failure:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id,
         actor: job.owner_id, scope: job.target, revision: job.revision.policy,
-        payload: { kind: 'message', channel: job.target.channel, content: '작업 실패가 확인됐습니다. /list로 상태를 확인하고 /retry로 재시도할 수 있습니다.', classification: 'safe_summary' } });
+        payload: { kind: 'message', channel: job.target.channel, content, classification: 'safe_summary' } });
       return next;
     });
   }

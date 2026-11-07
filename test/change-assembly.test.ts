@@ -8,6 +8,7 @@ import type { AddressInfo } from 'node:net';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { CHANGE_RESTART, changeChildFailed } from '../src/change-advice.js';
 import { changePrecondition, changeTaskPathsMatch } from '../src/change-assembly.js';
 import { parseChangeRequest } from '../src/change-commands.js';
 import { ChangePublisher } from '../src/change-publisher.js';
@@ -867,6 +868,36 @@ test('호환 슬롯: CHANGE 자식 job은 v1 claim에 잡히지 않고 /retry로
     assert.equal((await childOf(h.db, id))!.state, 'failed');
   });
 });
+// 게시자가 붙이는 [ref:…] 꼬리를 뗀 본문.
+const bodies = (h: Harness) => h.messages().map(text => text.replace(/\n\[ref:[^\]]+\]$/, ''));
+// T21 감사 A06: 연결된 자식이 실패하면 일반 실패 안내가 거부될 /retry를 권했다.
+test('A06 자식 실패 안내: 작성 모델이 실패하면 자식·부모 안내가 /retry 없이 같은 복구 행동을 말하고, 안내한 명령이 동작한다', async () => {
+  await withHarness({ steps: [{ output: { status: 'cannot_complete', summary: '', question: '' } }] }, async h => {
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    await h.pump(async () => await h.phase(id) === 'failed');
+    const child = (await childOf(h.db, id))!;
+    assert.equal(child.state, 'failed');
+    for (let round = 0; round < 5; round++) await h.runtime.publishTick();
+    await h.deliver();
+    const childNotice = bodies(h).find(text => text.includes(`작업 ${child.id} 실패`));
+    assert.equal(childNotice, changeChildFailed(child.id, id));
+    const parentNotice = bodies(h).find(text => text.startsWith(`변경 ${id} g1: failed`));
+    assert.ok(parentNotice, '부모 안내도 나간다');
+    assert.ok(parentNotice.endsWith(CHANGE_RESTART) && childNotice!.endsWith(CHANGE_RESTART), '두 안내가 같은 복구 행동을 말한다');
+    assert.ok(h.messages().every(text => !text.includes('/retry')), '어느 안내도 /retry를 말하지 않는다');
+    // 안내한 /change-status는 이 변경을 보여 준다.
+    await h.command('300', 'change-status', { target: id });
+    assert.match(h.acknowledgements().at(-1)!, new RegExp(`^변경 ${id} g1: failed`));
+    assert.match(h.acknowledgements().at(-1)!, new RegExp(`작성 작업 ${child.id}: failed`));
+    // 자식을 되살리지 않는 보호 조건은 그대로다.
+    const retried = await h.store.control(OWNER, h.store.scopeId(THREAD), 'retry', child.id) as { ok?: boolean };
+    assert.equal(retried.ok, false);
+    // 안내한 새 /change는 받는다.
+    await h.command('301', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    assert.match(h.acknowledgements().at(-1)!, /을 받았습니다/);
+  });
+});
 test('호환 슬롯: 리뷰는 대화 레인이고 작업 레인과 겹치지 않는다. 승인 대기 중인 부모는 어느 슬롯도 잡지 않는다', async () => {
   await withHarness({}, async h => {
     const id = await toAwaiting(h);
@@ -1519,6 +1550,9 @@ for (const [name, value, reason] of SENSITIVE_VALUES) {
       await h.deliver();
       assert.ok(h.messages().every(text => !text.includes(value)), '본문이 스레드에 없다');
       assert.ok(h.messages().some(text => text.includes('모델 질문')), '고정 문구로 알린다');
+      const child = (await childOf(h.db, id))!;
+      assert.ok(bodies(h).includes(changeChildFailed(child.id, id)), '자식 실패는 변경 상태 확인을 안내한다');
+      assert.ok(h.messages().every(text => !text.includes('/retry')), '거부될 /retry를 권하지 않는다');
       assert.ok(!JSON.stringify((await h.db.query('SELECT payload FROM outbox')).rows).includes(value), 'outbox에도 없다');
       assert.equal((await childOf(h.db, id))!.state, 'failed', '턴을 닫는다');
       const session = (await h.db.query<{ state: string; cleanup_state: string | null }>(`SELECT state,cleanup_state FROM codex_sessions WHERE executor='claude'`)).rows[0]!;

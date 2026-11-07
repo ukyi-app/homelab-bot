@@ -212,7 +212,11 @@ for (const kind of ['worker_disconnected', 'runtime_uncertain'] as const) test(`
   const job = (await rows('jobs'))[0]!;
   assert.equal(calls.length, 1);
   assert.equal(job.state, 'failed'); assert.equal(job.wait_reason, 'stop_confirmation');
-  assert.equal((await notices(`failure:${job.id}:1`)).length, 1);
+  const failure = await notices(`failure:${job.id}:1`);
+  assert.equal(failure.length, 1);
+  // 일반 작업은 /retry를 그대로 안내하고, 그 /retry는 받아들여진다.
+  assert.equal(failure[0]!.payload.content, '작업 실패가 확인됐습니다. /list로 상태를 확인하고 /retry로 재시도할 수 있습니다.');
+  assert.notEqual(((await f.store.control(f.policy.owner, job.conversation_id, 'retry', job.id)) as { ok?: boolean }).ok, false);
   assert.equal((await notices('unknown:')).length, 0);
 });
 
