@@ -128,6 +128,7 @@ export class ChangeCommands implements ChangeCommandHandler {
       return { content: `변경 ${found.id}의 generation ${opened.value.generation}을 열었습니다. 최신 base에서 수정·시험·검토·승인을 처음부터 다시 받습니다.`, outcome: 'next_generation' };
     }
     const why = opened.reason === 'unresolved_effects' ? '확인되지 않은 게시 기록이 남아 있습니다. 먼저 해소해야 합니다'
+      : opened.reason === 'input_purged' ? '보존 기간(7일)이 지나 요청 원문을 지웠습니다. 같은 내용을 /change로 새로 요청하세요'
       : opened.reason === 'phase_conflict' ? `superseded 상태에서만 열 수 있습니다(지금 ${opened.current?.phase ?? found.phase})` : opened.reason;
     return { content: `새 generation을 열지 않았습니다: ${why}.`, outcome: opened.reason };
   }
@@ -185,7 +186,7 @@ export class ChangeCommands implements ChangeCommandHandler {
       const { prNumber: _pr, ...observation } = deployment.value;
       lines.push(describeDeployment(observation));
     }
-    if ((await db.query(`SELECT 1 FROM change_artifacts WHERE change_id=$1 AND purged_at IS NOT NULL LIMIT 1`, [found.id])).rows.length) lines.push('보존 기간이 지나 artifact 바이트와 리뷰 원문을 지웠습니다. digest와 receipt는 남아 있습니다.');
+    if ((await db.query(`SELECT 1 FROM change_artifacts WHERE change_id=$1 AND purged_at IS NOT NULL LIMIT 1`, [found.id])).rows.length) lines.push('보존 기간이 지나 artifact 바이트·리뷰 원문·요청 원문을 지웠습니다. digest와 receipt는 남아 있습니다.');
     return { content: lines.join('\n'), outcome: 'status' };
   }
 }

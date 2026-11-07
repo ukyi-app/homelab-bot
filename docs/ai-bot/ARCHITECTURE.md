@@ -1144,6 +1144,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - `TaskBridge.answerIn(store, input)`은 호출자가 연 트랜잭션 안에서 답을 처리한다. 수신 경로가 이벤트 처리와 답 쓰기를 한 번에 확정하는 경계다. 인가도 그 연결로 해 같은 대화의 `/revoke`와 대화 행으로 직렬화된다. `answer`는 이것을 자기 트랜잭션으로 감싼다.
 - 권한 재확인 지점: 답 수락, 재개 dispatch 직전, 실행 중 감시, 결과 확정 전.
 - 한도·인증으로 끊긴 턴이 나르던 답은 `answered`로 되돌려 `/resume-model` 뒤 같은 답으로 잇는다. 대기 사유는 세션의 `wait_reason`(migration 015)에 남는다. `/resume-model`이 `jobs.wait_reason`을 비우기 때문이다.
+- 답 원문 보존 7일(T27, migration 019). `purgeExpiredTaskAnswers`가 1시간마다(`task_answer_retention`, 작업 루프와 함께 시작해 CHANGE를 꺼도 돈다) job이 끝 상태(`succeeded`·`failed`·`cancelled`·`superseded`)에 든 시각(`finished_at`, 없으면 답한 시각) 뒤 7일이 지난 답을 NULL로 두고 `answer_purged_at`을 적는다. 지우기 전 원문의 SHA-256을 `answer_sha256`에 남기고 `answer_event`·`answered_by`·`answered_at`은 그대로다. 재개는 세션이 `waiting_answer`·`waiting_model`일 때만 답을 읽으므로, 세션이 `running`·대기·`unknown`이거나 `cleanup_state='pending'`인 job의 답은 고르지 않는다. `/retry`로 되살아나는 `failed`도 세션이 대기가 아니면 새 스레드로 시작해 답을 읽지 않는다. 한 번에 200행씩 최대 20번이다.
 
 **출력 공개 검사(T25).** v1 턴에서 모델이 쓴 글이 Discord로 나가는 자리는 질문(`needs_input.question`)과 완료 요약(`completed.summary`) 둘뿐이다. 실패 사유는 계약 enum이고, 대기·막힘·만료·확인 요청 안내는 job·질문 ID만 넣은 고정 문구다. 두 글은 결과 확정 전에 `src/task-output.ts`의 `taskOutputRisk`로 CHANGE 질문과 같은 `scanPublicText`를 거친다.
 
@@ -1933,6 +1934,6 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 
 **배포 관측.** 병합을 읽으면 `change_deployment_windows`에 창 시작을 먼저 남긴다. `recordDeployment`가 `observed_at`을 덮어써 그 값으로는 재시작 뒤 창을 잴 수 없다. 60초마다 관측하고, `settled`면 멈추고, 10분 창이 지나면 `late_reported_at`을 적고 멈춰 마지막 관측을 알린다. 익명 GitHub 한도(IP당 시간 60회) 때문에 `proposed`의 병합 읽기는 5분 간격이다.
 
-**비공개 저장과 보존.** migration 018은 additive다. `change_review_findings`(리뷰 원문), `change_deployment_windows`, `change_artifacts.purged_at`을 더한다. `purgeExpiredChangeContent`가 시간마다 끝 상태 뒤 7일이 지난 건의 `change_artifact_files`, `change_artifacts.patch`, 리뷰 원문을 지운다. receipt·digest·manifest·effect는 남는다. 진행 중이거나, 미확정 effect·살아 있는 자식 job·정리 안 끝난 세션이 있는 건은 고르지 않는다. 트리거는 artifact에 "아직 비우지 않은 행의 patch를 빈 값으로 만들고 시각을 적는" 변경만 받는다. 요청 원문(`change_request_inputs`)은 지금 지우지 않는다.
+**비공개 저장과 보존.** migration 018은 additive다. `change_review_findings`(리뷰 원문), `change_deployment_windows`, `change_artifacts.purged_at`을 더한다. `purgeExpiredChangeContent`가 시간마다 끝 상태 뒤 7일이 지난 건의 `change_artifact_files`, `change_artifacts.patch`, 리뷰 원문을 지운다. receipt·digest·manifest·effect는 남는다. 진행 중이거나, 미확정 effect·살아 있는 자식 job·정리 안 끝난 세션이 있는 건은 고르지 않는다. 트리거는 artifact에 "아직 비우지 않은 행의 patch를 빈 값으로 만들고 시각을 적는" 변경만 받는다. 요청 원문과 추가 답변(`change_request_inputs.text`)도 같은 건·같은 기준 시각으로 같은 트랜잭션에서 빈 값으로 두고 `purged_at`을 적는다(migration 019, T27). `text_sha256`·label·event_id는 남는다. 이 SQL은 `ChangePrivateInputs`의 정적 함수(`HELD`·`purgeIn`·`purgedIn`)에 있어 원문 표를 만지는 코드가 그 클래스와 공용 INSERT뿐이다. 새 generation의 접수는 요청 원문을 다시 읽으므로, 원문을 지운 superseded 건은 `startNextGeneration`이 `input_purged`로 거절하고 `/change` 새 요청을 안내한다. `retention()`은 한 바퀴에 20건씩 최대 20번 골라 복원 직후 밀린 건도 한 주기 안에 지운다.
 
 **되돌리기.** 스위치를 끄면 새 접수와 루프만 멈춘다. 남은 작성 세션은 lease 만료 뒤 unknown으로 레인을 닫으므로 `/task-release`로 해제한다. `HttpTaskV2Worker`를 스위치와 무관하게 브리지에 넘겨 두는 이유다. 미확정 effect는 스위치를 켜야 대조가 돈다. `change` 절을 모르는 옛 게시 서버로 되돌릴 때는 정책 키를 먼저 뺀다.

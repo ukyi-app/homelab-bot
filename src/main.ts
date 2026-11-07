@@ -55,6 +55,7 @@ import { HttpReviewWorker } from './review-http.js';
 import { RecoveryScheduler } from './recovery.js';
 import { Runtime } from './runtime.js';
 import { Store } from './store.js';
+import { TASK_ANSWER_PURGE_EVERY_MS, purgeExpiredTaskAnswers } from './task-bridge.js';
 import { TaskCommands } from './task-commands.js';
 import { TaskWorkerSigner } from './task-contracts.js';
 import { HttpTaskV2Worker, HttpTaskWorker, TASK_INTAKE_UNREACHED, taskWorkerChangeContract, taskWorkerIntake } from './task-http.js';
@@ -447,6 +448,11 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       if (!stop.signal.aborted) await taskBridge.sweep();
       return false;
     }, false);
+    // 질문 답 원문의 7일 보존. CHANGE를 꺼도 작업 레인 질문은 생기므로 CHANGE 루프가 아니라 여기서 돈다. 작업자 수락과 무관하게 돈다.
+    every('task_answer_retention', TASK_ANSWER_PURGE_EVERY_MS, async () => {
+      const purged = await purgeExpiredTaskAnswers(store.db, store.now());
+      if (purged) log('task_answers_purged', { purged });
+    });
   };
   // 변경 루프. 부모는 슬롯을 잡지 않고 자식 job만 레인을 쓴다. 긴 시험 대기가 대화·작업 루프를 늦추지 않게 따로 돈다. 첫 READY 장벽 뒤에 시작한다.
   let changeLoopsStarted = false;

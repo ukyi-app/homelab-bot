@@ -470,6 +470,26 @@ Workflows 권한이 없으므로 **봇은 `.github/workflows` 변경 PR을 만�
 | 켠 범위 | `CHANGE_PR_ENABLED` true, 정책의 `homelab-smoke` 하나 | 시험 앱은 뺐으므로 smoke 변경의 배포 관측은 `deploy_config_unregistered`로 닫힌다 |
 | homelab 설치 | AC-P8 동안만 설치했다가 뺐고, homelab의 ruleset E는 남긴다 | 설치가 없으면 E의 bypass는 쓰일 곳이 없다. E를 지우는 것은 ruleset 삭제(파괴 명령)다. 다시 설치는 별도 승인이다 |
 
+## T27 사람 입력 원문 보존 (사용자 2026-11-07)
+
+T21 감사 A03: 7일 정리가 CHANGE artifact·리뷰 원문에만 걸려 작업 레인 질문의 답과 변경 요청 원문이 남았다.
+
+**사용자 결정.** `codex_questions.answer`와 `change_request_inputs.text`를 **7일** 보존한다. digest와 영수증은 증거라 남긴다. CHANGE artifact·리뷰 원문과 같은 기간이다. 다른 원문 칸은 이 결정에 들지 않는다.
+
+**구현에서 정한 것(사용자 결정 아님).**
+
+| 항목 | 정한 값 | 이유 |
+|---|---|---|
+| 요청 원문 기준 시각 | change가 끝 상태에 든 때. artifact 정리와 같은 질의·같은 트랜잭션 | 기존 정리 기준과 맞춘다. 진행 중 건은 접수·재개가 원문을 읽는다 |
+| 질문 답 기준 시각 | 그 job이 끝 상태(`succeeded`·`failed`·`cancelled`·`superseded`)에 든 때(`finished_at`, 없으면 답한 시각) | 작업 레인은 change가 없을 수 있다. CHANGE 작성 job의 답은 change보다 먼저 끝나 더 일찍 지워질 수 있고, 같은 답은 `change_request_inputs`에도 있어 change 끝 기준으로 따로 지워진다 |
+| 예외 | change: 진행 중, 미확정 effect, 살아 있는 자식 job, 정리 안 끝난 세션(기존 그대로). 질문 답: job이 끝 상태가 아님(`waiting_user`·`unknown` 포함), 세션이 `running`·`waiting_answer`·`waiting_model`·`unknown`이거나 `cleanup_state='pending'` | 재개(`codex.ts`·`claude-task-bridge.ts`·CHANGE `resumeAuthor`)는 대기 세션일 때만 답을 읽는다. 대기 세션을 가진 `failed`는 `/retry`가 같은 답으로 이을 수 있어 남긴다 |
+| 지운 표시 | 요청 원문은 `text=''`와 `purged_at`(`text`가 NOT NULL이라 옛 코드가 읽어도 깨지지 않는다). 질문 답은 `answer=NULL`, `answer_purged_at`, `answer_sha256` | migration 019는 칸을 더하기만 한다. 질문 답의 digest는 답을 쓰는 옛 코드가 칸을 몰라도 남도록 지울 때 DB가 계산한다(UTF-8 SHA-256) |
+| 재개방 | 원문을 지운 superseded 건의 `/change … text:next`는 `input_purged`로 거절한다 | 새 generation 접수가 원문을 다시 읽는다. 열어 두면 `request_invalid`로 막혀 이유가 가려진다 |
+| 부르는 자리 | 요청 원문은 기존 `change_retention`(1시간). 질문 답은 새 `task_answer_retention`(1시간, 작업 루프 시작 때) | CHANGE를 꺼도 작업 레인 질문은 생긴다 |
+| 복원 | 시각 기준이라 복원된 옛 행도 다음 정리가 다시 지운다. 원문이 다시 보이는 창은 복원부터 다음 정리까지, 최대 1시간(재시작이면 루프 시작까지). 정리는 한 바퀴에 change 20건×20번, 답 200행×20번까지 지운다 | 백업 자체에 든 원문은 백업 보존 기간(14일) 동안 남는다. 이 결정의 범위 밖이다 |
+
+**정리 경로가 없는 다른 원문 칸(사용자 결정 대기).** `events.payload.text`(`/task` 요청문, CHANGE가 아닌 `/answer` 답 사본), `codex_questions.prompt`(모델 질문), `results.result`(작업 완료 요약 등 모델 출력), `outbox.payload.content`(Discord로 보낸 질문·요약 본문), `change_requests.brief`(요청 원문에서 뽑은 summary·goal·acceptance). 감사 기록(`audit.detail`)에는 원문을 넣지 않는다.
+
 ---
 
 ## R08 명시적 Codex 연결 (결정 ID 없음)
