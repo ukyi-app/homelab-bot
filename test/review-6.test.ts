@@ -178,12 +178,12 @@ test('4314746184 응답 유실과 확정 DB 실패는 unknown 유지·대조 후
 });
 for (const dispatched of [false, true]) test(`R6-AUDIT outbox crash dispatch_started=${dispatched} lease 만료 분류·늦은 작업 차단`, async () => {
   await enqueue('lease'); const row = (await f.store.claimDelivery())!;
-  if (dispatched) assert.equal(await f.store.dispatchDelivery(row), true);
+  if (dispatched) assert.equal(await f.store.dispatchDelivery(row), 'dispatched');
   f.advance(DEFAULTS.leaseMs + 1); await f.store.expire();
   const current = (await rows('outbox'))[0]!;
   assert.equal(current.state, dispatched ? 'unknown' : 'pending');
   assert.equal(current.attempt, dispatched ? 1 : 0);
-  assert.equal(await f.store.dispatchDelivery(row), false);
+  assert.equal(await f.store.dispatchDelivery(row), 'lost');
 });
 test('R6-AUDIT 대조 확정 뒤 늦은 REST 오류는 sent를 덮어쓰지 않음', async () => {
   await enqueue('fenced'); const row = (await f.store.claimDelivery())!;

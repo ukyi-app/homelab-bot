@@ -554,7 +554,7 @@ test('DATA-02 게시자가 잡았지만 아직 보내지 않은 브리핑은 삭
   assert.equal(claimed.state, 'sending');
   const result = await memory.delete('fixture-owner', notifications, stored.id);
   assert.deepEqual([result.status, result.publishedCopies], ['deleted', 0]);
-  assert.equal(await f.store.dispatchDelivery(claimed), false);
+  assert.equal(await f.store.dispatchDelivery(claimed), 'lost');
   f.advance(31_000); f.policy.confirmedAt = f.now(); await f.store.expire();
   await f.publisher.deliver();
   assert.equal(f.rest.messages.length, 0);
@@ -578,7 +578,7 @@ test('DATA-02 발송을 시작한 브리핑이 429로 대기열에 돌아와도 
   const s = scheduler(); await s.ensure();
   at(SLOT); await s.tick();
   const claimed = (await f.store.claimDelivery())!;
-  assert.equal(await f.store.dispatchDelivery(claimed), true);
+  assert.equal(await f.store.dispatchDelivery(claimed), 'dispatched');
   const result = await memory.delete('fixture-owner', notifications, stored.id);
   assert.deepEqual([result.status, result.publishedCopies], ['deleted', 1]);
   await f.store.deliveryState(claimed, 'pending');
@@ -942,7 +942,7 @@ test('BRIEF-01 [T20 예약 해제] 게시자가 잡았지만 발송을 시작하
   const claimed = (await f.store.claimDelivery())!;
   assert.equal(claimed.state, 'sending');
   assert.equal(await disable(BAD[1]), 'unconfigured');
-  assert.equal(await f.store.dispatchDelivery(claimed), false);
+  assert.equal(await f.store.dispatchDelivery(claimed), 'lost');
   f.advance(31_000); f.policy.confirmedAt = f.now(); await f.store.expire();
   await drain();
   assert.equal(f.rest.messages.length, 0);
@@ -956,7 +956,7 @@ test('BRIEF-01 [T20 예약 해제] 이미 보냈거나 발송을 시작한 브�
   assert.equal(await s.ensure(), 'enabled');
   at(SLOT + DAY); assert.equal(await s.tick(), 'enqueued');
   const claimed = (await f.store.claimDelivery())!;
-  assert.equal(await f.store.dispatchDelivery(claimed), true);
+  assert.equal(await f.store.dispatchDelivery(claimed), 'dispatched');
   assert.equal(await disable(BAD[2]), 'unconfigured');
   const started = (await briefings())[1] as unknown as { state: string; dispatch_started: boolean };
   assert.deepEqual([started.state, started.dispatch_started], ['sending', true]);

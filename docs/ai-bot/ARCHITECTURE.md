@@ -381,6 +381,16 @@ outbox를 함께 기록하고 종료 불확실만 unknown이다. monitor에서 �
 보존한다. 종료 확인 뒤 cancelled/authorization_revoked, 종료가 불명하면 unknown/authorization_revoked로
 기록하고 실패 안내 outbox 자체를 만들지 않는다. /retry는 두 상태 모두 거부한다.
 거부 목록 해제는 §6의 명시적 `revocationRestores` 승인과 새 revision, 철회 뒤 기동(읽은 시각 `confirmedAt` > 철회 시각) 조건을 모두 요구한다.
+
+**철회와 Discord 발송의 기준점(T26, 감사 A02).** "철회 완료"는 `/revoke`의 `denied_actors` 행이 커밋된 때다. 경로마다 기준점은 다음과 같다.
+
+- **outbox 발송(답·제어 결과·안내·새 스레드·경보·예약 브리핑 사본):** 기준점은 `Store.dispatchDelivery`의 UPDATE 한 문장이다. 이 문장이 lease·`state='sending'`과 함께 owner의 최신 철회, 대화 소유자, 구독(`active`)을 보고 `dispatch_started`를 세운다(조건은 `authorized()`의 대화 검사와 같다). READ COMMITTED라 문장 시작 전에 커밋된 철회는 반드시 보이고, 그때는 REST를 부르지 않고 같은 문장에서 행을 `blocked`로 닫는다(감사 `delivery_blocked_before_dispatch`). gap은 일시 상태라 `blocked`가 아니라 pending으로 미룬다. 행이 갱신되지 않으면 lease 상실이고 행을 건드리지 않는다(만료 처리가 pending/unknown으로 나눈다). 철회는 어느 대화·채널에서 했든 owner 단위로 막는다.
+- **상호작용 응답·👀·대체 게시(`DiscordIngress.acknowledge`·`deliverPrivate`):** 영속 표식이 없어 철회 확인(`authorize`의 거부 목록 조회)을 REST 전 마지막 DB 읽기로 둔다. 그 조회 전에 커밋된 철회면 응답하지 않고 `ack_uncertain(denied)`로 남긴다.
+- **입력 중 표시(`typingActivity`):** REST 직전의 실행 중 재조회에 거부 목록 조건을 넣었다.
+- **읽기 REST(history 복구, 대조 `findDelivery`, 채널 조회, 명령 등록, gateway URL):** Discord에 아무것도 쓰지 않으므로 기준점 밖이다. 대조는 인가 실패면 기존처럼 `blocked`로 둔다.
+
+**한계.** 기준점 뒤에 커밋된 철회는 이미 시작한 외부 요청을 취소할 수 없다. outbox는 보낸 뒤 confirm의 재인가가 실패해 `unknown`으로 남고, 대조가 인가 실패로 `blocked`로 닫는다(보낸 글은 회수하지 않는다). 커밋되지 않은 철회 트랜잭션은 발송을 기다리게 하지 않는다. 기준점이 철회 쪽 커밋이라서다. `test/revoke-dispatch-pg.test.ts`가 실제 PostgreSQL 두 연결로 두 순서를 모두 고정한다.
+
 Discord 401은 별도 오류로 pending을 유지한다. 토큰 갱신 후 새 REST 어댑터를 주입해 재개한다.
 
 부모 채널은 비활성이며 매번 멘션/명령이 필요하다. 활성 스레드만 멘션 없는 후속 메시지를 수집한다.
@@ -521,8 +531,8 @@ T16b 진입점의 "조율 루프가 돎"은 한 바퀴가 DB에 닿은 루프(ru
 - **게시:** 채널별 비전역 429 시각은 DB controls에 max로 저장하고 global 시각과 함께 검사한다.
   같은 채널의 다른 route도 대기하는 보수적 선택이며, 다른 채널의 backlog는 진행한다.
   bucket 헤더는 오류/감사에 남긴다. claim·dispatch·ACK·history·대조에서 공유 중지를 적용한다.
-  호출 전 DB 오류는 attempt를 돌려놓고 1초~60초 pending backoff한다. REST 직전 lease/state CAS로
-  dispatch_started를 기록한다. 표식 전 lease 만료는 pending, 표식 후 만료는 unknown이다.
+  호출 전 DB 오류는 attempt를 돌려놓고 1초~60초 pending backoff한다. REST 직전 lease/state·철회·대화 CAS로
+  dispatch_started를 기록한다("저장·권한·게시"의 "철회와 Discord 발송의 기준점"). 표식 전 lease 만료는 pending, 표식 후 만료는 unknown이다.
   marker와 외부 ID로 대조하며, confirm 실패는 외부 ID를 보존한 unknown이다. terminal 상태는 늦은 오류가
   덮어쓰지 못한다. migration 007은 기존 sending/unknown을 보수적으로 표식 있는 상태로 이관한다.
 - **실행/제어:** context 조회 뒤 모델 호출 직전 현재 policy·owner·cancel·active·gap·lease를 다시 본다.

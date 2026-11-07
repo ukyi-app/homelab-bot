@@ -129,13 +129,13 @@ test('R08 실제 PostgreSQL: 폐기 트랜잭션이 커밋 전이면 게시 행�
       const claimed = await ctx.store.claimDelivery();
       assert.ok(claimed);
       assert.equal(claimed.state, 'pending');
-      assert.equal(await ctx.store.dispatchDelivery(claimed), false);
+      assert.equal(await ctx.store.dispatchDelivery(claimed), 'lost');
       await client.query('COMMIT');
     } finally { await client.query('ROLLBACK').catch(() => {}); client.release(); }
     await ctx.db.query(`UPDATE outbox SET available_at=0`);
     const again = await ctx.store.claimDelivery();
     assert.equal(again?.state, 'blocked');
-    assert.equal(await ctx.store.dispatchDelivery(again!), false);
+    assert.equal(await ctx.store.dispatchDelivery(again!), 'lost');
     assert.equal(await ctx.count(`external_task_events WHERE post_state='blocked'`), 1);
   } finally { await ctx.close(); }
 });
@@ -147,7 +147,7 @@ test('R08 실제 PostgreSQL: 발송 실패로 돌아오는 행과 폐기가 겹�
       const who = await ctx.attach(`retry-${round}`);
       assert.equal((await post(ctx, who, eventBody(who, ctx.store.now()))).outcome, 'accepted');
       const row = (await ctx.store.claimDelivery())!;
-      assert.equal(await ctx.store.dispatchDelivery(row), true);
+      assert.equal(await ctx.store.dispatchDelivery(row), 'dispatched');
       const resend = async () => {
         await ctx.store.deliveryState(row, 'pending');
         const again = await ctx.store.claimDelivery();
@@ -159,7 +159,7 @@ test('R08 실제 PostgreSQL: 발송 실패로 돌아오는 행과 폐기가 겹�
       if (current.state === 'sending') await ctx.store.deliveryState({ ...row, lease_token: current.lease_token }, 'pending');
       await ctx.db.query(`UPDATE outbox SET available_at=0 WHERE state='pending'`);
       const last = await ctx.store.claimDelivery();
-      if (last) assert.equal(await ctx.store.dispatchDelivery(last), false);
+      if (last) assert.equal(await ctx.store.dispatchDelivery(last), 'lost');
       assert.equal(await ctx.count(`outbox WHERE id=$1 AND state='blocked'`, [row.id]), 1);
     }
   } finally { await ctx.close(); }

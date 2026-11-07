@@ -115,7 +115,7 @@ test('R08 연결: 해제·전달 실패 폐기는 수신을 막고, 미게시 ou
     assert.equal(await state(rows[2]!.id), 'blocked');
     // 발송 시작 전 sending은 게시자의 dispatch 표시가 실패해 나가지 못한다.
     const stale = { id: rows[0]!.id, lease_token: 'a' } as Parameters<typeof ctx.f.store.dispatchDelivery>[0];
-    assert.equal(await ctx.f.store.dispatchDelivery(stale), false);
+    assert.equal(await ctx.f.store.dispatchDelivery(stale), 'lost');
     assert.equal((await accept(ctx, who)).reply.outcome, 'unauthorized');
     // 두 번 닫아도 처음 사유가 남는다.
     assert.deepEqual(await ctx.links.revoke(who.connectionId, OWNER, 'lost_device'), { blocked: 0 });
