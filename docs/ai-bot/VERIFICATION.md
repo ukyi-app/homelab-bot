@@ -2050,3 +2050,14 @@ T21 1회차 감사의 현 버전 필수 수정 세 건이다. homelab 티켓 T27
 - 전체(PG 18, concurrency 6): T28 브랜치 2,115 중 실패 0, T29 브랜치 2,109 중 실패 0, main(T28)+T29 2,116 중 실패 0, main(T28·T29)+T27 최종 head 2,123 중 실패 0. 각 PR의 Codex 코드·보안 리뷰는 최종 head에서 지적 없음, `build / test` 통과.
 
 **배포.** 게시 서버는 homelab #1179(`630c48d`, T25~T29 모두 포함) 자동 병합. 파드 1/1 Ready, imageID 일치, migration 019 성공, 게이트 open, 로그 오류 0. 정리 기록(`change_content_purged`, `task_answers_purged`)은 지운 행이 있을 때만 남는데 첫 바퀴에 없었다. 작업 레인 작업자(`task.image`)는 homelab #1180으로 같은 빌드(`sha256:ff5d453e…`, `gh attestation verify` 통과)로 올렸다. `worker-task` 파드 Ready, 기동 기록 `worker_started`(CLI 2.1.308, 자격 present, 수락 막힘 사유 없음), 게시 서버의 30초 작업자 확인에 상태 변화 기록 없음(수락이 계속 열림). 대화·리뷰 작업자(`worker.image`)는 bwrap을 쓰지 않아 그대로 `d4c8bda`다. 운영 작업자 파드의 AppArmor·seccomp Localhost 프로필 아래에서 표식 셸을 실측하지는 않았다(프로필은 `file,`로 실행을 막지 않음). 막히면 CHANGE 검증이 `not_run`으로 닫혀 게시로 가지 않는다. 첫 CHANGE 실행이 실제 확인이 된다.
+
+## T30 승인·연동 시험 진행 (2026-11-07~)
+
+T21 1회차 감사의 blocked 7건(homelab 티켓 T30)을 항목마다 사용자 승인으로 실행하거나 사람이 대체 증거를 정한다. 실행안·원본 기록은 private `homelab-bot-ops`의 `evidence/t30/`.
+
+| 항목 | 시험 | 결과 | 등급 |
+|---|---|---|---|
+| INT-05 | CHANGE-02 | **pass**(2026-11-08). `homelab-smoke`에서 `ukyi-writer` 신원(설치는 이 저장소 하나, 권한 `contents`·`pull_requests` write, `workflows` 없음)으로 시험 PR #19의 SHA 고정 `PUT merge` 1회 → 405 ruleset 거부(`app-main`, code owner 리뷰 대기). workflow 파일이 든 커밋의 `git push` 1회 → GH013(App에 `workflows` 권한 없음). main 불변, PR 미병합으로 닫음, 시험 ref 삭제, 토큰 폐기. 정상 bot ref 생성(201)은 양성 대조. 봇 코드가 이 요청들을 내보내지 못하는 것(`src/github-writer.ts` allowlist)은 별도 `local_integration` 증거다 | `authorized_external` |
+| INT-01 | SEC-02 | **기존 증거 수용**(사용자 결정 2026-11-08), live 격리 시험 `not_run`. 받은 증거: 운영 파드 직접 실행(`5fb4a20` 강제 도구 64/64, `d4c8bda` 검증 실행기 83 pass)과 로컬 조립(`change-sec02` 10/10, `sec02-boundary` 24/24). **남은 제약:** 서명된 작업 레인 전체 경로(서명 수신 → `TaskWorkerService` → 세션·자격 → CLI·verifier → 소멸)를 운영 Localhost 프로필 아래 한 흐름으로 잰 증거가 없다. 격리 하네스는 Claude 작업자 두 번 모두 작업 중 모델 안전 분류기에 막혀 만들지 못했고, 만들어도 운영 작업자가 모델 API 주소를 바꾸는 설정을 받지 않아 진입 래퍼(가짜 API·압축본·정리 기록 시점)가 필요해 운영과 달라진다 | 기존 `authorized_external`·`local_integration` |
+
+나머지 INT-02·03·04·06·07은 진행 중이거나 미실시다. 판정은 T21 재감사가 한다.
