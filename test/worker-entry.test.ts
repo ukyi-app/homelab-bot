@@ -7,9 +7,9 @@ import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlin
 import { connect } from 'node:net';
 import type { AddressInfo } from 'node:net';
 import { join, resolve } from 'node:path';
-import { Denied, SYSTEM_INSTRUCTIONS } from '../src/contracts.js';
+import { Denied, SYSTEM_INSTRUCTIONS, SYSTEM_INSTRUCTIONS_V2 } from '../src/contracts.js';
 import type { Job } from '../src/contracts.js';
-import { CHAT_OUTPUT_JSON_SCHEMA, ChatLane, chatDeadline, interpretChat } from '../src/chat-lane.js';
+import { CHAT_OUTPUT_JSON_SCHEMA, CHAT_REPLY_JSON_SCHEMA, ChatLane, chatDeadline, interpretChat } from '../src/chat-lane.js';
 import type { ChatLaneOptions, ChatReport } from '../src/chat-lane.js';
 import { FORBIDDEN_FLAGS } from '../src/codex-config.js';
 import { FileMutableCredential } from '../src/credentials.js';
@@ -18,7 +18,7 @@ import type { CodexChatReport } from '../src/executor-codex.js';
 import { createExecutor, executorVersion, selectProfile } from '../src/executor-profiles.js';
 import type { ProcessLauncher } from '../src/process-launcher.js';
 import { SerialWorker, WorkerSigner, WorkerVerifier } from '../src/worker.js';
-import type { WorkerRequest } from '../src/worker.js';
+import type { WorkerRequestV1, WorkerRequestV2 } from '../src/worker.js';
 import { HttpWorker } from '../src/worker-http.js';
 import { WORKER_ENV, startWorker, workerConfig } from '../src/worker-main.js';
 import { FileNonceStore, NONCE_RETENTION_MS, WorkerStartError, seedAuth } from '../src/worker-state.js';
@@ -95,7 +95,7 @@ const mode = (value: unknown) => writeFile(join(fakeDir, 'mode.json'), JSON.stri
 const seen = async () => JSON.parse(await readFile(join(fakeDir, 'seen.json'), 'utf8')) as {
   args: string[]; cwd: string; entries: string[]; env: Record<string, string>; input: string; config: string; schema: string };
 const job = (): Job => ({ id: randomUUID(), lease_token: randomUUID() }) as Job;
-const chatRequest = (j: Job, overrides: Partial<WorkerRequest> = {}): WorkerRequest => ({ version: 1, job: j.id, lease: j.lease_token,
+const chatRequest = (j: Job, overrides: Partial<WorkerRequestV1> = {}): WorkerRequestV1 => ({ version: 1, job: j.id, lease: j.lease_token,
   lane: 'chat', policyRevision: 'fixture-v1', instructions: SYSTEM_INSTRUCTIONS, untrusted: [{ text: '상태 알려줘' }],
   timeoutMs: 60_000, toolCalls: 8, ...overrides });
 const env = (overrides: Record<string, string | undefined> = {}) => ({ WORKER_EXECUTOR: 'codex', WORKER_MODEL: 'cli-default',
@@ -236,6 +236,20 @@ test('WRK-05 대화 레인: --ephemeral·--skip-git-repo-check·read-only 설정
   assert.ok(s.input.startsWith(SYSTEM_INSTRUCTIONS) && s.input.includes('상태 알려줘'));
   // 실행마다 만든 임시 디렉터리는 정리한다.
   assert.deepEqual((await readdir(base)).filter(name => name.startsWith('homelab-chat-')), []);
+});
+test('C02 Codex 프로필: v2 요청이면 레인이 준 v2 출력 스키마를 answer.schema.json으로 넘기고 v2 답 모양으로 돌려준다', async () => {
+  await seedAuth(codexHome, join(seedDir, 'CODEX_AUTH_JSON'));
+  const output = { reply: '배포는 정상이에요.', proposal: { action: 'read', target: 'homelab-bot-deployment', content: null }, ack_only: false };
+  await mode({ kind: 'answer', answer: output });
+  const lane = codexLane(new SpawnLauncher(fakeBin));
+  const j = job();
+  const request: WorkerRequestV2 = { version: 2, job: j.id, lease: j.lease_token, lane: 'chat', policyRevision: 'fixture-v1',
+    instructions: SYSTEM_INSTRUCTIONS_V2, surface: 'speech', earlierPurged: false, untrusted: [{ from: 'owner', text: '상태 알려줘' }],
+    timeoutMs: 60_000, toolCalls: 8 };
+  assert.deepEqual(await lane.run(request, new AbortController().signal), { status: 'succeeded', stopped: true, output, rateLimit: null });
+  const s = await seen();
+  assert.deepEqual(JSON.parse(s.schema), CHAT_REPLY_JSON_SCHEMA);
+  assert.ok(s.input.startsWith(SYSTEM_INSTRUCTIONS_V2));
 });
 test('WRK-06 대화 레인은 세션 파일을 남기지 않고 auth.json은 그대로 둠', async () => {
   await seedAuth(codexHome, join(seedDir, 'CODEX_AUTH_JSON'));
