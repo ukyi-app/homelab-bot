@@ -85,8 +85,43 @@ export function policyRepositories(policy: Pick<ReviewPolicySource, 'current'>):
   };
 }
 
-export function githubReviewIO(options: { app: GitHubAppCredentials; repositories: RepositoryLookup; send?: typeof fetch; now?: () => number }):
-  { reader: GitHubReader; transport: GitHubTransport } {
+// ---- 수정 요청 자료(PR 리뷰·리뷰 댓글·대화 댓글) ----
+
+// 목록마다 읽는 쪽 수, 세 목록을 합친 항목 수, 본문 하나와 합계의 글자 수 상한이다. 넘으면 잘라 truncated로 알린다.
+// 목록은 오래된 것부터 오므로 잘리면 최근 글이 빠진다.
+export const DISCUSSION_LIMITS = Object.freeze({ pages: 3, items: 300, bodyChars: 8_192, totalChars: 131_072 });
+const PAGE_SIZE = 100;
+export type DiscussionAuthorKind = 'review_app' | 'writer_app' | 'bot' | 'user';
+// 탈퇴한 계정의 글은 user가 null로 온다.
+export interface DiscussionAuthor { id: number; login: string; kind: DiscussionAuthorKind }
+export interface DiscussionComment { id: number; author: DiscussionAuthor | null; association: string; createdAt: string | null; body: string }
+export interface DiscussionReview extends DiscussionComment { state: string; commitId: string | null }
+export interface DiscussionReviewComment extends DiscussionComment {
+  reviewId: number | null; inReplyTo: number | null; path: string; line: number | null; side: 'LEFT' | 'RIGHT' | null; commitId: string;
+}
+export interface PullDiscussion {
+  repository: string; pr: number; truncated: boolean;
+  reviews: DiscussionReview[]; reviewComments: DiscussionReviewComment[]; comments: DiscussionComment[];
+}
+// 본문은 해석하지 않고 그대로 넘긴다. 지시로 쓸지는 부르는 쪽이 자료 블록으로 정한다.
+export interface PullDiscussionReader {
+  read(input: { repository: string; pr: number; selfAuthors: { reviewApp: readonly number[]; writerApp: readonly number[] } }): Promise<PullDiscussion>;
+}
+const Association = z.enum(['COLLABORATOR', 'CONTRIBUTOR', 'FIRST_TIMER', 'FIRST_TIME_CONTRIBUTOR', 'MANNEQUIN', 'MEMBER', 'NONE', 'OWNER']);
+const Author = z.object({ id: z.number().int().positive(), login: z.string().min(1).max(100), type: z.string() }).nullable();
+const RemoteReviewRow = z.object({ id: z.number().int().positive(), user: Author, body: z.string().nullable(), state: z.string().max(40),
+  commit_id: Sha.nullable(), author_association: Association, submitted_at: z.string().nullable().optional(), pull_request_url: z.string() });
+const RemoteReviewComment = z.object({ id: z.number().int().positive(), pull_request_review_id: z.number().int().positive().nullable(),
+  in_reply_to_id: z.number().int().positive().optional(), path: z.string().min(1).max(MAX_PATH_CHARS), line: z.number().int().positive().nullable().optional(),
+  side: z.enum(['LEFT', 'RIGHT']).nullable().optional(), commit_id: Sha, user: Author, author_association: Association, created_at: z.string(),
+  body: z.string(), pull_request_url: z.string() });
+const RemoteIssueComment = z.object({ id: z.number().int().positive(), user: Author, author_association: Association, created_at: z.string(),
+  body: z.string().optional(), issue_url: z.string() });
+
+export const guidanceMarker = (key: string) => `<!-- homelab-bot-guidance:${key} -->`;
+
+export interface GitHubReviewIO { reader: GitHubReader; transport: GitHubTransport; discussion: PullDiscussionReader }
+export function githubReviewIO(options: { app: GitHubAppCredentials; repositories: RepositoryLookup; send?: typeof fetch; now?: () => number }): GitHubReviewIO {
   const now = options.now ?? Date.now;
   const api = new GitHubApi(options.send ?? fetch, now);
   const auth = new GitHubAppAuth(options.app, api, now);
@@ -150,5 +185,61 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
       throw error;
     }
   };
-  return { reader, transport };
+  const discussion: PullDiscussionReader = {
+    async read({ repository, pr, selfAuthors }) {
+      const pullUrl = `https://api.github.com/repos/${repository}/pulls/${pr}`;
+      const issueUrl = `https://api.github.com/repos/${repository}/issues/${pr}`;
+      let truncated = false;
+      let items = 0;
+      let chars = 0;
+      const author = (user: z.infer<typeof Author>): DiscussionAuthor | null => user && { id: user.id, login: user.login,
+        kind: selfAuthors.reviewApp.includes(user.id) ? 'review_app' : selfAuthors.writerApp.includes(user.id) ? 'writer_app' : user.type === 'Bot' ? 'bot' : 'user' };
+      // 상한 안이면 본문을 잘라서라도 받고, 항목 수나 합계를 넘으면 그 항목부터 버린다.
+      const admit = (raw: string): string | null => {
+        let body = raw;
+        if (body.length > DISCUSSION_LIMITS.bodyChars) {
+          body = body.slice(0, DISCUSSION_LIMITS.bodyChars);
+          if (/[\uD800-\uDBFF]$/.test(body)) body = body.slice(0, -1);
+          truncated = true;
+        }
+        if (items >= DISCUSSION_LIMITS.items || chars + body.length > DISCUSSION_LIMITS.totalChars) { truncated = true; return null; }
+        items++;
+        chars += body.length;
+        return body;
+      };
+      const pages = async <T>(suffix: string, schema: z.ZodType<T>, sameTarget: (row: T) => boolean): Promise<T[]> => {
+        const rows: T[] = [];
+        for (let page = 1; page <= DISCUSSION_LIMITS.pages; page++) {
+          const batch = parse(z.array(schema), await read(repository, `${suffix}?per_page=${PAGE_SIZE}&page=${page}`));
+          // 다른 PR의 글이 섞인 응답은 통째로 버린다. 일부만 걸러 쓰면 무엇이 빠졌는지 모른다.
+          if (!batch.every(sameTarget)) throw new Error('github_pull_mismatch');
+          rows.push(...batch);
+          if (batch.length < PAGE_SIZE) return rows;
+        }
+        truncated = true;
+        return rows;
+      };
+      const reviews = await pages(`/pulls/${pr}/reviews`, RemoteReviewRow, row => row.pull_request_url === pullUrl);
+      const reviewComments = await pages(`/pulls/${pr}/comments`, RemoteReviewComment, row => row.pull_request_url === pullUrl);
+      const comments = await pages(`/issues/${pr}/comments`, RemoteIssueComment, row => row.issue_url === issueUrl);
+      const result: PullDiscussion = { repository, pr, truncated: false, reviews: [], reviewComments: [], comments: [] };
+      for (const row of reviews) {
+        const body = admit(row.body ?? '');
+        if (body !== null) result.reviews.push({ id: row.id, author: author(row.user), association: row.author_association, createdAt: row.submitted_at ?? null,
+          body, state: row.state, commitId: row.commit_id });
+      }
+      for (const row of reviewComments) {
+        const body = admit(row.body);
+        if (body !== null) result.reviewComments.push({ id: row.id, author: author(row.user), association: row.author_association, createdAt: row.created_at, body,
+          reviewId: row.pull_request_review_id, inReplyTo: row.in_reply_to_id ?? null, path: row.path, line: row.line ?? null, side: row.side ?? null, commitId: row.commit_id });
+      }
+      for (const row of comments) {
+        const body = admit(row.body ?? '');
+        if (body !== null) result.comments.push({ id: row.id, author: author(row.user), association: row.author_association, createdAt: row.created_at, body });
+      }
+      result.truncated = truncated;
+      return result;
+    },
+  };
+  return { reader, transport, discussion };
 }
