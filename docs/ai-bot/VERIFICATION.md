@@ -2140,6 +2140,28 @@ T21 1회차 감사의 blocked 7건(homelab 티켓 T30)을 항목마다 사용자
 - **못 잡는 범위(S5):** 실제 GitHub의 fast-forward 거부 응답 모양(문서는 `force` 거짓이면 fast-forward만이라고 하고 실패 상태로 409·422를 적는다. 둘 다 ref를 다시 읽어 대조한다)과 ruleset E 동작, 인라인 위치 표시.
 - **[미확인] issue 댓글 읽기 권한:** 리뷰 App 읽기 토큰은 `contents:read`·`pull_requests:read`다. GitHub "Permissions required for GitHub Apps" 표에서 `GET /repos/{owner}/{repo}/issues/{issue_number}/comments`가 Issues(read)와 Pull requests(read) 양쪽에 "Additional permissions" 표시로 실린 것으로 읽혔다(그 표시는 "any one permission from a set"이라는 뜻). 문서 원문을 끝까지 받지 못해 확인은 요약 수준이다(확인 2026-11-09, docs.github.com). 권한을 더하지 않았고, live 첫 수정 요청에서 403이 나면 App 권한 `issues:read` 추가가 사람 작업이다.
 
+## C02 작업자 계약 v2 (2026-11-09)
+
+동료 봇 명세 §4.2·§4.4의 작업자 쪽 계약이다(homelab 계획 티켓 C02). 작업자가 대화 요청 v1·v2와 리뷰 지시문 v1·v2를 함께 받는다. 게시 서버는 아직 v1만 보내므로 병합해도 운영 대화·리뷰 동작은 그대로다. 모양은 [ARCHITECTURE](ARCHITECTURE.md) §13 "봇 답 문맥"·"대화 답 형식", 공존 결정은 [DECISIONS](DECISIONS.md) "동료 봇 전환: 작업자 계약 v1·v2 공존".
+
+**시험(경계 S2: 게시 서버 `HttpWorker` → 작업자 HTTP → 가짜 Claude·Codex CLI → 응답, 모델 호출 없음).** 새 `worker-contract-v2` 10개, `worker-entry`·`review-lane`에 C02 시험 1개씩.
+
+| 완료 조건 | 시험 |
+|---|---|
+| v1 서버 + v2 작업자, v2 서버 + v2 작업자 대화 성공(AC-4) | `C02 v1 서버 + v2 작업자`, `C02 v2 요청`, `C02 배포 순서`(게시 서버는 v1만 만들고 조립 상한 20개·32KiB 그대로) |
+| v1 작업자 + v2 요청은 요청 거부(AC-4) | `C02 v2 서버 + v1 작업자`(v1 schema 작업자 403 → `WorkerRejected`, v2 요청에 v1 성공 모양이 오면 `failed`), `C02 지시문 literal`(판·지시문 불일치·공백 한 칸·모르는 판 모두 403, 실행기 0회) |
+| v2 응답 모양, 다르면 실패(AC-3 S2) | `C02 v2 요청`(reply·proposal·ack_only 세 모양, `rateLimit: null`, v2 지시문·`--json-schema`), `C02 v2 스키마`(v1 모양, 칸 빠짐·추가, 목록 밖 동작, 제안 값 상한 초과 → `failed`, reply는 12,000자에서 잘라 받음), `C02 v2 반사 검사`(reply·content·target) |
+| 50개·80KiB 기록과 정리 표시(AC-5 작업자) | `C02 기록 상한`(50개·80KiB 수용과 실행기 stdin 전달, 51개·80KiB+1 거부, v1 21개 거부), `C02 정리 표시` |
+| speech 신뢰 문맥에 '/' 이름 없음(AC-11) | `C02 신뢰 문맥`(등록 명령 이름 전부와 `/` 시작 낱말 0, 서비스·템플릿 ID 있음, slash는 v1과 같음) |
+| 리뷰 v2 literal, 출력 스키마 그대로(AC-13 S2) | `C02 리뷰 지시문`(두 literal 수용, 그 지시문이 모델 첫 줄, `--json-schema` 같음, 다른 문자열은 압축본·모델 전 거부) |
+| Codex 프로필 형식 | `C02 Codex 프로필`(v2 스키마가 `answer.schema.json`으로 감) |
+
+**발견.** v1·v2를 한 schema 정의로 합치며 키 순서가 바뀌자, 옛 순서로 서명한 v1 요청이 capability digest 불일치로 모두 거부됐다(첫 시험에서 잡음). digest가 schema를 거친 본문의 `JSON.stringify`라서다. v1 키 순서를 옛 그대로 고정했다. 옛 게시 서버 + 새 작업자 조합이 운영에서 깨질 수 있던 자리다.
+
+**검사.** `npm run check` 통과. 바뀐 모듈(`worker`·`worker-http`·`chat-lane`·`bot-facts`·`review-input`)을 직접 가져오는 시험 24개 파일 640개 중 637 통과. 실패 3: `change-review-pg` 2개는 PostgreSQL 소켓 경로가 Unix 소켓 길이 상한을 넘은 연결 오류(`EINVAL`)라 짧은 경로로 다시 돌려 2/2 통과, `foundation` R1-12는 로컬 Node 26과 `@types/node` 24 major 차이(변경과 무관).
+
+**못 잡는 범위.** 실제 사람 배포 순서(C06 절차), 모델 말투 품질과 정리 표시를 보고 실제로 "기억나지 않는다"고 말하는지(S5, C24), 게시 서버 렌더·공개 검사(C11), 한도 칸의 실제 값(C03).
+
 ## C04 반응 수명 (2026-11-09, 로컬)
 
 AC-14 중 👀·⏳·지움·실패를 S1(가짜 Discord REST, PGlite)에서 고정했다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §13 "수신·진행 신호"의 반응 수명 문단이다. 동료 기능 스위치 밖이라 병합하면 바로 운영에 나간다.
