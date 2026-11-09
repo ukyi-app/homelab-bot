@@ -7,7 +7,7 @@ import type { AddressInfo } from 'node:net';
 import { join, resolve } from 'node:path';
 import { CHAT_OUTPUT_JSON_SCHEMA, ChatLane, chatDeadline } from '../src/chat-lane.js';
 import type { ChatLaneOptions } from '../src/chat-lane.js';
-import { Denied, SYSTEM_INSTRUCTIONS } from '../src/contracts.js';
+import { Denied, SYSTEM_INSTRUCTIONS, SYSTEM_INSTRUCTIONS_V2 } from '../src/contracts.js';
 import type { Job } from '../src/contracts.js';
 import { StaticEnvCredential } from '../src/credentials.js';
 import type { WorkerCredential } from '../src/credentials.js';
@@ -16,10 +16,11 @@ import { CLAUDE_CHAT_CAPABILITIES, CLAUDE_FIXED_ENV, CLAUDE_FORBIDDEN_FLAGS, Cla
 import type { AdapterRun, ChatRun } from '../src/executor.js';
 import { PROFILES, executorVersion, selectProfile } from '../src/executor-profiles.js';
 import { SerialWorker, WorkerSigner, WorkerVerifier } from '../src/worker.js';
-import type { WorkerRequestV1 } from '../src/worker.js';
+import type { WorkerRequestV1, WorkerRequestV2 } from '../src/worker.js';
 import { HttpWorker } from '../src/worker-http.js';
 import { WORKER_ENV, startWorker, workerConfig } from '../src/worker-main.js';
 import { WorkerStartError } from '../src/worker-state.js';
+import { LEAK_MARKER, RATE_LIMIT_EVENTS, RESETS_AT, WEEKLY_RESETS_AT, rateLimitEvent } from './rate-limit-fixture.js';
 import { SpawnLauncher } from './spawn-launcher.js';
 
 // Claude 프로필(claude-subscription: Claude Code CLI 2.1.308, 구독 장기 토큰, env-static 자격, D-14).
@@ -67,6 +68,7 @@ process.stdin.on('end', () => {
   emit({ type: 'system', subtype: 'init', cwd: process.cwd(), tools: ['StructuredOutput'], mcp_servers: [], model,
     permissionMode: 'dontAsk', apiKeySource: 'none', claude_code_version: '2.1.308', slash_commands: [], output_style: 'default',
     skills: [], plugins: [], uuid: 'u0', ...(mode.init || {}) });
+  for (const event of mode.events || []) emit(event);
   if (mode.kind === 'hang') { setInterval(() => {}, 1000); return; }
   // Opus 5.5 자동 모델 전환(refusal fallback) 이벤트 뒤 멈추지 않고 계속 도는 경우.
   if (mode.kind === 'fallback') {
@@ -658,4 +660,95 @@ test('CLD-16 [r1 P2] 실행 디렉터리 삭제 실패: 성공으로 내지 않�
     // 값 없는 사유만 알린다(경로·내용 없음).
     assert.deepEqual(events, [{ event: 'chat_cleanup_failed' }, { event: 'chat_cleanup_recovered' }]);
   } finally { if (locked) await chmod(locked, 0o700).catch(() => {}); }
+});
+
+// C03 한도 정보(명세 §4.2·§4.7, AC-16 S2). 한도 칸은 그 실행에서 마지막으로 본 rate_limit_event의 네 칸(event)과
+// 모델 멈춤의 원인·풀리는 시각(stop)이다. 원문의 다른 칸은 응답에 싣지 않는다.
+const REPLY = { reply: '지금은 괜찮아요.', proposal: null, ack_only: false };
+const chatV2 = (j: Job): WorkerRequestV2 => ({ version: 2, job: j.id, lease: j.lease_token, lane: 'chat', policyRevision: 'fixture-v1',
+  instructions: SYSTEM_INSTRUCTIONS_V2, surface: 'speech', earlierPurged: false, untrusted: [{ from: 'owner', text: '상태 알려줘' }],
+  timeoutMs: 60_000, toolCalls: 8 });
+const WARNING = { status: 'allowed_warning', resetsAt: WEEKLY_RESETS_AT, rateLimitType: 'seven_day', utilization: 0.91 };
+const REJECTED = { status: 'rejected', resetsAt: RESETS_AT, rateLimitType: 'five_hour', utilization: 1 };
+
+test('C03 대화 v2 한도 칸: 마지막 rate_limit_event가 응답 한도 칸으로 나오고 원문 칸은 새지 않는다, 이벤트가 없으면 null(AC-16 S2)', async () => {
+  const lane = claudeLane(new SpawnLauncher(fakeBin));
+  await mode({ kind: 'answer', answer: REPLY, events: [RATE_LIMIT_EVENTS.allowed, RATE_LIMIT_EVENTS.warning] });
+  const warned = await lane.run(chatV2(job()), new AbortController().signal);
+  assert.deepEqual(warned, { status: 'succeeded', stopped: true, output: REPLY, rateLimit: { event: WARNING } });
+  assert.ok(!JSON.stringify(warned).includes(LEAK_MARKER));
+  await mode({ kind: 'answer', answer: REPLY, events: [RATE_LIMIT_EVENTS.allowed] });
+  assert.deepEqual(await lane.run(chatV2(job()), new AbortController().signal), { status: 'succeeded', stopped: true, output: REPLY,
+    rateLimit: { event: { status: 'allowed', resetsAt: RESETS_AT, rateLimitType: 'five_hour' } } });
+  await mode({ kind: 'answer', answer: REPLY });
+  assert.deepEqual(await lane.run(chatV2(job()), new AbortController().signal), { status: 'succeeded', stopped: true, output: REPLY, rateLimit: null });
+});
+
+test('C03 대화 v2 한도 대기: rejected의 풀리는 시각이 멈춤에 붙고, 결제는 한도와 갈리며, 인증 만료 분류는 그대로다', async () => {
+  const lane = claudeLane(new SpawnLauncher(fakeBin));
+  await mode({ kind: 'error', error: 'rate_limit', status: 429, events: [RATE_LIMIT_EVENTS.rejected] });
+  assert.deepEqual(await lane.run(chatV2(job()), new AbortController().signal), { status: 'limited', stopped: true,
+    rateLimit: { event: REJECTED, stop: { cause: 'rate_limit', resetsAt: RESETS_AT } } });
+  // 이벤트 없는 한도 오류: 시각을 모르는 멈춤(게시 서버가 30분 재시도로 내려앉는다).
+  await mode({ kind: 'error', error: 'rate_limit', status: 429 });
+  assert.deepEqual(await lane.run(chatV2(job()), new AbortController().signal), { status: 'limited', stopped: true,
+    rateLimit: { stop: { cause: 'rate_limit' } } });
+  await mode({ kind: 'error', error: 'billing_error', status: 402 });
+  assert.deepEqual(await lane.run(chatV2(job()), new AbortController().signal), { status: 'limited', stopped: true,
+    rateLimit: { stop: { cause: 'billing' } } });
+  await mode({ kind: 'error', error: 'authentication_failed', status: 401, events: [RATE_LIMIT_EVENTS.allowed] });
+  assert.deepEqual(await lane.run(chatV2(job()), new AbortController().signal), { status: 'auth_expired', stopped: true,
+    rateLimit: { event: { status: 'allowed', resetsAt: RESETS_AT, rateLimitType: 'five_hour' } } });
+});
+
+test('C03 대화 v1 요청의 응답에는 한도 칸이 없다(게시 서버 v1 응답 스키마 그대로)', async () => {
+  const lane = claudeLane(new SpawnLauncher(fakeBin));
+  await mode({ kind: 'answer', answer: ANSWER, events: [RATE_LIMIT_EVENTS.warning] });
+  assert.deepEqual(await lane.run(chatRequest(job()), new AbortController().signal), { status: 'succeeded', stopped: true, answer: ANSWER });
+  await mode({ kind: 'error', error: 'rate_limit', status: 429, events: [RATE_LIMIT_EVENTS.rejected] });
+  assert.deepEqual(await lane.run(chatRequest(job()), new AbortController().signal), { status: 'limited', stopped: true });
+});
+
+test('C03 한도 정보 읽기: 모르는 상태 값은 이벤트 없음, 깨진 칸은 그 칸만 없음, 오류 분류(한도·인증·결제·실패)는 이벤트와 무관하다', () => {
+  const expect = { model: MODEL, apiKeySource: 'none', version: '2.1.308' };
+  const init = JSON.stringify({ type: 'system', subtype: 'init', tools: ['StructuredOutput'], mcp_servers: [], model: MODEL, apiKeySource: 'none',
+    claude_code_version: '2.1.308' });
+  const success = JSON.stringify({ type: 'result', subtype: 'success', is_error: false, structured_output: ANSWER });
+  const event = (info: unknown) => JSON.stringify(rateLimitEvent(info as Record<string, unknown>));
+  const ok = { code: 0, signal: null };
+  const read = (...events: string[]) => interpretClaudeStream([init, ...events, success], ok, expect);
+  // 이벤트가 없거나 상태를 모르면 칸이 없다.
+  assert.deepEqual(read(), { kind: 'output', value: ANSWER });
+  for (const info of [{ status: 'blocked', resetsAt: RESETS_AT }, { resetsAt: RESETS_AT }, null, 'rejected', [REJECTED]]) {
+    assert.deepEqual(read(event(info)), { kind: 'output', value: ANSWER }, JSON.stringify(info));
+  }
+  assert.deepEqual(read(JSON.stringify({ type: 'rate_limit_event' })), { kind: 'output', value: ANSWER });
+  // 깨진 칸(밀리초 시각, 소수 시각, 문자열 시각, 모르는 종류, 음수·문자열 사용률)은 그 칸만 빠진다.
+  for (const broken of [{ resetsAt: RESETS_AT * 1000 }, { resetsAt: RESETS_AT + 0.5 }, { resetsAt: String(RESETS_AT) }, { rateLimitType: 'hourly' },
+    { rateLimitType: 7 }, { utilization: -0.1 }, { utilization: '0.9' }, { utilization: Number.POSITIVE_INFINITY }]) {
+    const outcome = read(event({ status: 'allowed_warning', ...broken }));
+    assert.deepEqual(outcome, { kind: 'output', value: ANSWER, rateLimit: { event: { status: 'allowed_warning' } } }, JSON.stringify(broken));
+  }
+  // 마지막 이벤트가 칸에 남고, 멈춤의 시각은 마지막 rejected의 것이다.
+  const errored = (error: string, status: number, ...events: string[]) => interpretClaudeStream([init, ...events,
+    JSON.stringify({ type: 'assistant', error, api_error_status: status, message: { model: '<synthetic>', content: [] } }),
+    JSON.stringify({ type: 'result', subtype: 'success', is_error: true, api_error_status: status })], { code: 1, signal: null }, expect);
+  assert.deepEqual(errored('rate_limit', 429, event(REJECTED), event({ status: 'allowed', rateLimitType: 'seven_day' })),
+    { kind: 'limited', rateLimit: { event: { status: 'allowed', rateLimitType: 'seven_day' }, stop: { cause: 'rate_limit', resetsAt: RESETS_AT } } });
+  // rejected가 없으면 멈춤에 시각을 붙이지 않는다(경고의 풀리는 시각은 멈춤의 시각이 아니다).
+  assert.deepEqual(errored('rate_limit', 429, event(WARNING)),
+    { kind: 'limited', rateLimit: { event: WARNING, stop: { cause: 'rate_limit' } } });
+  assert.deepEqual(errored('billing_error', 402, event(REJECTED)),
+    { kind: 'limited', rateLimit: { event: REJECTED, stop: { cause: 'billing', resetsAt: RESETS_AT } } });
+  // 종류 없이 HTTP 상태로 고른 한도도 원인을 가른다.
+  const statusOnly = (status: number) => interpretClaudeStream([init, JSON.stringify({ type: 'result', subtype: 'success', is_error: true, api_error_status: status })],
+    { code: 1, signal: null }, expect);
+  assert.deepEqual(statusOnly(429), { kind: 'limited', rateLimit: { stop: { cause: 'rate_limit' } } });
+  assert.deepEqual(statusOnly(402), { kind: 'limited', rateLimit: { stop: { cause: 'billing' } } });
+  // rejected 이벤트가 있어도 분류는 CLI 오류 종류가 정한다.
+  assert.equal(errored('authentication_failed', 401, event(REJECTED)).kind, 'auth_expired');
+  const overloaded = errored('overloaded', 529, event(REJECTED));
+  assert.equal(overloaded.kind === 'failed' && overloaded.reason, 'api_error');
+  assert.deepEqual(overloaded.rateLimit, { event: REJECTED });
+  assert.deepEqual(read(event(REJECTED)), { kind: 'output', value: ANSWER, rateLimit: { event: REJECTED } });
 });

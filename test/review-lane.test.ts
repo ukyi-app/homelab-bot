@@ -15,12 +15,14 @@ import type { AdapterRun, ChatRun } from '../src/executor.js';
 import { PROFILES } from '../src/executor-profiles.js';
 import { REVIEW_INSTRUCTIONS, REVIEW_INSTRUCTIONS_V2, ReviewOutputSchema, ReviewWorker } from '../src/review-input.js';
 import type { ReviewerInput, ReviewerModel, ReviewerResult, ReviewTask } from '../src/review-input.js';
+import { HttpReviewWorker } from '../src/review-http.js';
 import { REVIEW_OMITTED_NOTE, REVIEW_OUTPUT_JSON_SCHEMA, assertEgressBound, createReviewerModel, interpretReview, reviewPrompt } from '../src/review-lane.js';
 import { RUN_PREFIX, RunControl } from '../src/run-control.js';
 import type { RunControlOptions, RunEvent } from '../src/run-control.js';
 import { archiveContract } from '../src/worker.js';
 import type { WorkerRequest, WorkerVerifier } from '../src/worker.js';
 import { WorkerStartError } from '../src/worker-state.js';
+import { LEAK_MARKER, RATE_LIMIT_EVENTS, RESETS_AT, WEEKLY_RESETS_AT } from './rate-limit-fixture.js';
 import { SpawnLauncher } from './spawn-launcher.js';
 
 // 리뷰 레인과 무도구 경계(사용자 결정: T17 인증 격리·SEC-02 조건을 이 시험으로 갈음). 모델 호출·로그인 없음.
@@ -482,7 +484,7 @@ test('T17 무도구 경계 (e) 삭제 실패여도 한도·인증 대기는 사�
   try {
     const result = await review(f.reviewer);
     locked = join((await seen()).env.CLAUDE_CONFIG_DIR!, 'projects', 'locked');
-    assert.deepEqual(result, { status: 'limited' });
+    assert.deepEqual(result, { status: 'limited', rateLimit: { stop: { cause: 'rate_limit' } } });
     assert.equal(await f.control.ready(), false);
   } finally { if (locked) await chmod(locked, 0o700).catch(() => {}); }
 });
@@ -720,4 +722,43 @@ test('ReviewWorker 계약: 한도·인증·실패는 멈춘 것으로 넘기고 
   assert.equal(runs[0]!.job, task.job);
   // 압축본 두 개를 받는 데 쓴 시간(60ms × 2)만큼 줄어 있다.
   assert.ok(runs[0]!.timeoutMs <= 60_000 - 100 && runs[0]!.timeoutMs > 0, String(runs[0]!.timeoutMs));
+});
+
+// C03 리뷰 응답의 한도 칸(명세 §4.7, AC-16 S2). 리뷰 요청은 판 구분 없이 같은 응답이라 선택 칸으로 싣는다.
+const WARNING = { status: 'allowed_warning', resetsAt: WEEKLY_RESETS_AT, rateLimitType: 'seven_day', utilization: 0.91 };
+const REJECTED = { status: 'rejected', resetsAt: RESETS_AT, rateLimitType: 'five_hour', utilization: 1 };
+test('C03 리뷰 한도 칸: rate_limit_event가 무도구 경계를 지나 리뷰 응답 한도 칸으로 나오고, 이벤트가 없으면 칸이 없다(AC-16 S2)', async () => {
+  const run = () => new ReviewWorker(verifier, archives, fixture().reviewer, 50).review(reviewTask(), 'capability', live());
+  await mode({ answer: OUTPUT, events: [RATE_LIMIT_EVENTS.allowed, RATE_LIMIT_EVENTS.warning] });
+  const warned = await run();
+  assert.equal(warned.status, 'succeeded');
+  assert.deepEqual(warned.status === 'succeeded' && warned.output, OUTPUT);
+  assert.deepEqual('rateLimit' in warned && warned.rateLimit, { event: WARNING });
+  assert.ok(!JSON.stringify(warned).includes(LEAK_MARKER));
+  await mode({ kind: 'error', error: 'rate_limit', status: 429, events: [RATE_LIMIT_EVENTS.rejected] });
+  assert.deepEqual(await run(), { status: 'limited', stopped: true, rateLimit: { event: REJECTED, stop: { cause: 'rate_limit', resetsAt: RESETS_AT } } });
+  await mode({ kind: 'error', error: 'billing_error', status: 402 });
+  assert.deepEqual(await run(), { status: 'limited', stopped: true, rateLimit: { stop: { cause: 'billing' } } });
+  await mode({ kind: 'error', error: 'authentication_failed', status: 401, events: [RATE_LIMIT_EVENTS.rejected] });
+  assert.deepEqual(await run(), { status: 'auth_expired', stopped: true, rateLimit: { event: REJECTED } });
+  await mode({ answer: OUTPUT });
+  const plain = await run();
+  assert.equal(plain.status, 'succeeded');
+  assert.ok(!('rateLimit' in plain));
+  assert.deepEqual(await spaces(), []);
+});
+
+test('C03 게시 서버 리뷰 응답 스키마: 한도 칸이 있는 응답과 없는 응답을 둘 다 받고, 칸 모양이 틀리면 확정 응답으로 읽지 않는다', async () => {
+  const reply = (body: unknown) => new HttpReviewWorker('http://worker.invalid/',
+    (async () => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch);
+  const coverage = { checked_files: ['src/app.ts'], omitted_files_with_reasons: [], limits_hit: [] };
+  const succeeded = { status: 'succeeded', stopped: true, coverage, positions: [{ path: 'src/app.ts', lines: [1] }], output: OUTPUT };
+  const accepted = [succeeded, { ...succeeded, rateLimit: { event: WARNING } }, { status: 'limited', stopped: true },
+    { status: 'limited', stopped: true, rateLimit: { event: REJECTED, stop: { cause: 'rate_limit', resetsAt: RESETS_AT } } },
+    { status: 'limited', stopped: true, rateLimit: { stop: { cause: 'billing' } } },
+    { status: 'failed', stopped: true, reason: 'api_error', rateLimit: { event: REJECTED } }];
+  for (const body of accepted) assert.deepEqual(await reply(body).review(reviewTask(), 'capability', live()), body);
+  const broken = [{ ...succeeded, rateLimit: null }, { ...succeeded, rateLimit: {} }, { status: 'limited', stopped: true, rateLimit: { event: { status: 'blocked' } } },
+    { status: 'limited', stopped: true, rateLimit: { event: { ...REJECTED, raw: LEAK_MARKER } } }, { status: 'unknown', stopped: false, rateLimit: { event: REJECTED } }];
+  for (const body of broken) await assert.rejects(reply(body).review(reviewTask(), 'capability', live()), /worker_response_uncertain/, JSON.stringify(body));
 });

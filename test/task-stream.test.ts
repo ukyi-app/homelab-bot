@@ -4,18 +4,21 @@ import { randomUUID } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { CLAUDE_TASK_CAPABILITIES, ClaudeTaskAdapter, compactTaskEvent, judgeTaskRun, runTaskTurn, taskImageProblems, taskPrompt, taskStreamPolicy } from '../src/executor-claude-task.js';
+import { CLAUDE_TASK_CAPABILITIES, ClaudeTaskAdapter, compactTaskEvent, judgeTaskRun, runChangeTurn, runTaskTurn, taskImageProblems, taskPrompt, taskStreamPolicy } from '../src/executor-claude-task.js';
 import { interpretClaudeStream } from '../src/executor-claude.js';
 import type { ClaudeExpectation } from '../src/executor-claude.js';
 import type { RunCredential, WorkerCredential } from '../src/credentials.js';
 import { RunControl } from '../src/run-control.js';
 import type { RunReport } from '../src/run-control.js';
-import { TaskResponseSchema } from '../src/task-contracts.js';
-import type { TaskRequest, TaskResponse } from '../src/task-contracts.js';
+import { TaskResponseSchema, TaskV2ResultResponseSchema } from '../src/task-contracts.js';
+import type { TaskRequest, TaskResponse, TaskV2Request } from '../src/task-contracts.js';
 import { TaskSessions } from '../src/task-workspace.js';
 import type { TaskSession } from '../src/task-workspace.js';
+import { baseTreeOf, leavesOf } from './change-worker-harness.js';
+import { LEAK_MARKER, RATE_LIMIT_EVENTS, RESETS_AT, WEEKLY_RESETS_AT } from './rate-limit-fixture.js';
 import { SpawnLauncher } from './spawn-launcher.js';
 import { WORKER, archive, initEvent, resumeRequest, startRequest } from './task-fixtures.js';
+import type { TarItem } from './task-fixtures.js';
 
 // stream 판정과 한 턴의 흐름. 모델·네트워크 없음: claude 자리에 같은 인자·stdin·env로 도는 가짜 실행 파일을 둔다.
 // init 모양은 실제 2.1.308 출력이다. assistant·result 모양은 같은 실행의 오류 경로와 대화 레인 fixture를 따른다.
@@ -90,7 +93,7 @@ test('stream 음성: hook·허용 밖 도구·다른 세션·다른 모델은 re
 
 test('stream 한도·인증은 구조화 필드로만 가른다(모델 글에 든 숫자는 보지 않는다)', () => {
   const init = initEvent(SESSION);
-  assert.deepEqual(judge([init, assistant([], { error: 'rate_limit' }), result({ is_error: true })]), { kind: 'limited' });
+  assert.deepEqual(judge([init, assistant([], { error: 'rate_limit' }), result({ is_error: true })]), { kind: 'limited', rateLimit: { stop: { cause: 'rate_limit' } } });
   assert.deepEqual(judge([init, assistant([], { error: 'authentication_failed' }), result({ is_error: true })]), { kind: 'auth_expired' });
   assert.deepEqual(judge([init, assistant([{ type: 'text', text: '401 rate limit' }]), result({ structured_output: { ...OUTPUT, summary: '429' } })]), { kind: 'output', value: { ...OUTPUT, summary: '429' } });
   // 실제 CLI가 네트워크 없을 때 낸 오류 모양 [실측].
@@ -123,6 +126,19 @@ test('관측: 한 메시지의 도구 호출을 모두 세고 ID 없는 호출�
   assert.equal(plan.observe(JSON.stringify({ type: 'system', subtype: 'hook_progress', session_id: SESSION })).violation, 'hooks_enabled');
   assert.equal(plan.observe(JSON.stringify(initEvent(randomUUID()))).violation, 'session_mismatch');
   assert.deepEqual(plan.observe('not json'), { line: '<malformed>', tools: [], violation: null });
+});
+
+test('C03 한도 이벤트 축약: 네 칸만 남고 다시 줄여도 같으며, 같은 세션이면 위반이 아니다', async () => {
+  const event = { ...RATE_LIMIT_EVENTS.warning, session_id: SESSION };
+  const once = JSON.stringify(compactTaskEvent(JSON.stringify(event)));
+  assert.deepEqual(JSON.parse(once), { type: 'rate_limit_event', session_id: SESSION, rate_limit_info: WARNING });
+  assert.equal(JSON.stringify(compactTaskEvent(once)), once);
+  assert.equal(once.includes(LEAK_MARKER), false);
+  const { plan } = await adapterPlan();
+  const seen = plan.observe(JSON.stringify(event));
+  assert.equal(seen.violation, null);
+  assert.equal(seen.line.includes(LEAK_MARKER), false);
+  assert.deepEqual(judge([initEvent(SESSION), event, result()]), { kind: 'output', value: OUTPUT, rateLimit: { event: WARNING } });
 });
 
 // 가짜 claude. 시나리오는 실행 파일 옆 파일로 받는다(자식 env는 허용 목록이라 env로 넘길 수 없다).
@@ -329,6 +345,57 @@ test('한 턴 흐름: 출력 스키마·반사·종료 코드·한도·인증', 
     assert.equal(response.status, status, reason);
     if (reason) assert.equal(response.status === 'failed' && response.reason, reason);
     assert.equal(response.sessionRetained, true);
+  }
+});
+
+// C03 작업 레인 응답의 한도 칸(명세 §4.7, AC-16 S2). v1·v2 모두 선택 칸이고, 이벤트가 없으면 칸이 없다.
+const WARNING = { status: 'allowed_warning', resetsAt: WEEKLY_RESETS_AT, rateLimitType: 'seven_day', utilization: 0.91 };
+const REJECTED = { status: 'rejected', resetsAt: RESETS_AT, rateLimitType: 'five_hour', utilization: 1 };
+const rateS = (event: object) => ({ ...event, session_id: 'SESSION' });
+const apiErrorS = (error: string) => ({ type: 'assistant', session_id: 'SESSION', error, message: { model: '<synthetic>', content: [] } });
+const limitedSteps = (error: string, ...events: object[]): Step => ({ lines: [INIT, ...events.map(rateS), apiErrorS(error), resultS(undefined, { is_error: true })], exit: 1 });
+const rateLimitOf = (response: object) => 'rateLimit' in response ? response.rateLimit : undefined;
+
+test('C03 작업 v1 한도 칸: 완료·질문·한도·실패 응답에 그 턴의 한도 정보가 실리고 원문 칸은 새지 않는다(AC-16 S2)', async () => {
+  const cases: [Step, string, unknown][] = [
+    [{ lines: [INIT, rateS(RATE_LIMIT_EVENTS.allowed), rateS(RATE_LIMIT_EVENTS.warning), resultS(OUTPUT)] }, 'completed', { event: WARNING }],
+    [{ lines: [INIT, rateS(RATE_LIMIT_EVENTS.warning), resultS({ status: 'needs_input', summary: '', question: '어느 파일인가요?' })] }, 'needs_input', { event: WARNING }],
+    [limitedSteps('rate_limit', RATE_LIMIT_EVENTS.rejected), 'limited', { event: REJECTED, stop: { cause: 'rate_limit', resetsAt: RESETS_AT } }],
+    [limitedSteps('billing_error'), 'limited', { stop: { cause: 'billing' } }],
+    [limitedSteps('authentication_failed', RATE_LIMIT_EVENTS.rejected), 'auth_expired', { event: REJECTED }],
+    [{ lines: [INIT, rateS(RATE_LIMIT_EVENTS.rejected), resultS({ status: 'done' })] }, 'failed', { event: REJECTED }],
+    [{ lines: [INIT, resultS(OUTPUT)] }, 'completed', undefined],
+    [limitedSteps('rate_limit'), 'limited', { stop: { cause: 'rate_limit' } }],
+  ];
+  for (const [step, status, expected] of cases) {
+    const { deps } = await harness([step]);
+    const response = parsed(await runTaskTurn(deps, startRequest(), new AbortController().signal));
+    assert.equal(response.status, status, JSON.stringify(step.lines.slice(1, -1)));
+    assert.deepEqual(rateLimitOf(response), expected, status);
+    assert.equal(JSON.stringify(response).includes(LEAK_MARKER), false);
+  }
+});
+
+test('C03 작업 v2 한도 칸: snapshot·한도 결과에 한도 정보가 실리고 v2 결과 스키마를 통과한다(AC-16 S2)', async () => {
+  const items: TarItem[] = [{ name: 'README.md', data: 'hello\n' }, { name: 'src', type: '5' }, { name: 'src/a.ts', data: 'a\n' }];
+  const changeRequest = (): TaskV2Request => {
+    const { version: _version, ...shared } = startRequest();
+    return { ...shared, version: 2, baseline: { repoId: 1, changeGeneration: 1, baseTree: baseTreeOf(items), leaves: leavesOf(items) } };
+  };
+  const cases: [Step, string, unknown][] = [
+    [{ lines: [INIT, rateS(RATE_LIMIT_EVENTS.warning), resultS(OUTPUT)], files: { 'src/a.ts': 'b\n' } }, 'snapshot', { event: WARNING }],
+    [limitedSteps('rate_limit', RATE_LIMIT_EVENTS.rejected), 'limited', { event: REJECTED, stop: { cause: 'rate_limit', resetsAt: RESETS_AT } }],
+    [limitedSteps('billing_error'), 'limited', { stop: { cause: 'billing' } }],
+    [{ lines: [INIT, rateS(RATE_LIMIT_EVENTS.warning), resultS({ status: 'needs_input', summary: '', question: '어느 파일인가요?' })] }, 'needs_input', { event: WARNING }],
+    [{ lines: [INIT, rateS(RATE_LIMIT_EVENTS.rejected), resultS({ status: 'done' })] }, 'failed', { event: REJECTED }],
+    [{ lines: [INIT, resultS(OUTPUT)], files: { 'src/a.ts': 'b\n' } }, 'snapshot', undefined],
+  ];
+  for (const [step, status, expected] of cases) {
+    const { deps } = await harness([step]);
+    const response = TaskV2ResultResponseSchema.parse(await runChangeTurn(deps, changeRequest(), new AbortController().signal));
+    assert.equal(response.status, status, JSON.stringify(step.lines.slice(1, -1)));
+    assert.deepEqual(rateLimitOf(response), expected, status);
+    assert.equal(JSON.stringify(response).includes(LEAK_MARKER), false);
   }
 });
 

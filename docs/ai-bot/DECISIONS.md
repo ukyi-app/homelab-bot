@@ -886,6 +886,10 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
   - unknown 해제: `ClaudeTaskBridge.release`·`CodexBridge.release(actor, scope, job)`이 `TaskBridge.releasable`에서 `authorize`와 작업 소유·대화 대조(또는 정책 owner의 후계 규칙)를 거친다. 필요한 변경: 작업 ID만으로 같은 소멸 확인을 거쳐 풀고 감사 행위자를 받는 관리용 경로.
   - 멈춘 작업 재개: `Store.control`의 `resume-model <job>`이 `owner_id = actor`, `conversation_id`, 대화 구독 활성을 요구한다. 필요한 변경: 작업 ID만으로 같은 상태·시도 한도 조건을 보고 재개하는 관리용 동작(리뷰 작업은 `review-resume`이 이미 actor를 감사에만 쓴다).
 
+## 동료 봇 전환 7 한도 정보 구현 위치 (C03, 2026-11-10)
+
+- "동료 봇 전환 (사용자 2026-11-09)" 7의 한도 정보 읽기 자리다. 결정은 바꾸지 않았다. 작업자가 `rate_limit_event`를 읽어 응답 한도 칸(`src/contracts.ts` `RateLimitInfoSchema`)에 싣는다: 해석 `src/executor-claude.ts`, 대화 v2 `src/chat-lane.ts`, 리뷰 `src/review-lane.ts`·`src/review-http.ts`, 작업 레인 `src/executor-claude-task.ts`·`src/task-contracts.ts`. 결제 멈춤은 칸의 `stop.cause: 'billing'`으로 한도와 가른다. 재개·리뷰 미루기는 C19다. 기록은 [ARCHITECTURE](ARCHITECTURE.md) §12 "T16b 실행기 프로필"의 "한도 정보", [VERIFICATION](VERIFICATION.md) "C03 작업자 한도 정보".
+
 ## C10 고정 문구: 기억·브리핑 (2026-11-10)
 
 "동료 봇 전환 (사용자 2026-11-09)" 4(말투)·6(기억)·9(스위치)의 기억·브리핑 쪽 구현 선택이다(사용자 결정 아님). 결정은 바꾸지 않았다. 시험·결과는 [VERIFICATION](VERIFICATION.md) "C10 고정 문구 2".

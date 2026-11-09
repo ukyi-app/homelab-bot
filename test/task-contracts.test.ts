@@ -8,7 +8,7 @@ import { CLAUDE_CHAT_CAPABILITIES } from '../src/executor-claude.js';
 import { MAX_TASK_BYTES } from '../src/review-http.js';
 import { EXECUTION_LANES, TASK_CAPABILITY, TASK_CAPABILITY_AUDIENCE, TASK_ENDPOINTS, TASK_INSTRUCTIONS_REVISION, TASK_LIMITS, TASK_OPERATIONS,
   TASK_RETENTION, TaskCancelRequestSchema, TaskCancelResponseSchema, TaskCapabilitySchema, TaskFinalizeRequestSchema, TaskFinalizeResponseSchema,
-  TaskRejectionSchema, TaskRequestSchema, TaskResponseSchema, TaskStatusRequestSchema, TaskStatusResponseSchema, TaskWorkerSigner, TaskWorkerVerifier,
+  TaskRejectionSchema, TaskRequestSchema, TaskResponseSchema, TaskStatusRequestSchema, TaskStatusResponseSchema, TaskV2ResultResponseSchema, TaskWorkerSigner, TaskWorkerVerifier,
   executionLaneOf, taskQuestionId } from '../src/task-contracts.js';
 import { CAPABILITY_TTL_MS, WorkerSigner, WorkerVerifier, sealCapability, capabilityDigest } from '../src/worker.js';
 import { NONCE_RETENTION_MS } from '../src/worker-state.js';
@@ -133,6 +133,27 @@ test('T18 B1 TaskResponse: strict union이 다른 결과의 필드·거짓 상�
     patchLarge: { ...completed(), patch: { text: 'x'.repeat(TASK_LIMITS.patchBytes + 1), bytes: TASK_LIMITS.patchBytes + 2, digest: DIGEST, truncated: true } },
   })) rejects(TaskResponseSchema, input, name);
   TaskResponseSchema.parse({ ...completed(), patch: { text: 'ab', bytes: 3, digest: DIGEST, truncated: true } });
+});
+
+// C03: 게시 서버가 같은 스키마로 작업자 응답을 읽는다. 한도 칸은 선택이라 옛 작업자(칸 없음)와 새 작업자(칸 있음)를 둘 다 받는다.
+test('C03 작업 응답 한도 칸: v1·v2 응답이 칸이 있는 것과 없는 것을 둘 다 받고, 모양이 틀리거나 unknown에 실리면 거부한다', () => {
+  const warning = { event: { status: 'allowed_warning', resetsAt: 1_794_528_000, rateLimitType: 'seven_day', utilization: 0.91 } };
+  const stop = { event: { status: 'rejected', resetsAt: 1_794_286_800 }, stop: { cause: 'rate_limit', resetsAt: 1_794_286_800 } };
+  const limited = { ...common(), status: 'limited', stopped: true, sessionRetained: true, cleanupPending: false };
+  for (const value of [completed(), { ...completed(), rateLimit: warning }, needsInput(), { ...needsInput(), rateLimit: warning }, limited, { ...limited, rateLimit: stop },
+    { ...limited, rateLimit: { stop: { cause: 'billing' } } }, { ...failed(), rateLimit: { event: { status: 'allowed' } } }]) TaskResponseSchema.parse(value);
+  for (const [name, input] of Object.entries({
+    empty: { ...limited, rateLimit: {} }, nullSlot: { ...limited, rateLimit: null }, unknownStatus: { ...limited, rateLimit: { event: { status: 'blocked' } } },
+    millis: { ...limited, rateLimit: { stop: { cause: 'rate_limit', resetsAt: 1_794_286_800_000 } } }, cause: { ...limited, rateLimit: { stop: { cause: 'quota' } } },
+    raw: { ...limited, rateLimit: { event: { status: 'rejected', overageStatus: 'rejected' } } }, onUnknown: { ...unknown(), rateLimit: warning },
+  })) rejects(TaskResponseSchema, input, name);
+  const turned = { version: 2, job: JOB, lease: LEASE, generation: 1, sessionId: SESSION, worker: WORKER, turn: 1, usage: { toolCalls: null, model: null } };
+  const v2Limited = { ...turned, status: 'limited', stopped: true, sessionRetained: true, cleanupPending: false };
+  const v2Unknown = { ...turned, status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: false };
+  for (const value of [v2Limited, { ...v2Limited, rateLimit: stop }, { ...turned, status: 'failed', stopped: true, sessionRetained: true, cleanupPending: false, reason: 'api_error', rateLimit: warning },
+    { ...turned, status: 'needs_input', stopped: true, sessionRetained: true, cleanupPending: false, question: '어느 파일인가요?', rateLimit: warning }]) TaskV2ResultResponseSchema.parse(value);
+  rejects(TaskV2ResultResponseSchema, { ...v2Limited, rateLimit: {} }, 'v2 empty');
+  rejects(TaskV2ResultResponseSchema, { ...v2Unknown, rateLimit: warning }, 'v2 onUnknown');
 });
 
 const control = () => ({ version: 1 as const, job: JOB, lease: LEASE, generation: 1, sessionId: SESSION });
