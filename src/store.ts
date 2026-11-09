@@ -392,7 +392,9 @@ export class Store {
   }
   // 작업이 cancelled로 확정되면 그 스레드에 한 번 알린다. cancelled는 끝 상태라(재시도는 failed만 받는다) job마다 키 하나다.
   // 권한 철회로 멈춘 대화에는 안내하지 않는다(게시도 막힌다). 대화·조회의 취소는 지금처럼 알리지 않는다.
+  // 모든 cancelled 확정이 여기를 지나므로 봇 반응 지우기도 여기서 한다(대화 메시지만 반응 행이 있다).
   private async cancelledNotice(job: Job, reason: string | null, tx: Database): Promise<void> {
+    await moveReactions(tx, [job.event_id], 'cleared');
     if (job.type !== 'task' || reason === 'authorization_revoked') return;
     await this.notice(job, `task-cancelled:${job.id}`, `작업 ${job.id} 취소를 완료했습니다(cancelled). 실행 중인 프로세스가 없음을 확인했고 다시 실행하지 않습니다. 필요하면 새 작업으로 요청하세요.`, tx);
   }

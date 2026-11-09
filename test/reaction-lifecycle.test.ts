@@ -104,6 +104,15 @@ test('흐름: unknown이 멈춤 확인으로 실패 확정되면 반응을 지�
   assert.deepEqual(log, ['post fixture-thread', 'remove fixture-thread/8202 👀']);
 });
 
+test('흐름: owner가 대기 중 작업을 /cancel하면 반응을 지운다', async () => {
+  await f.ingress.receive(event('8301'));
+  const job = (await database.db.query<{ id: string }>('SELECT id FROM jobs')).rows[0]!.id;
+  await f.ingress.receive(event('8302', { kind: 'command', command: 'cancel', target: job, mention: undefined, text: '' }));
+  assert.equal((await database.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job])).rows[0]!.state, 'cancelled');
+  await drain();
+  assert.deepEqual(log.filter(line => !line.startsWith('post') && !line.startsWith('ack')), ['remove fixture-thread/8301 👀']);
+});
+
 // 첫 대화 작업이 모델 자리를 쥔 채로 멈춰 있게 한다. release()로 답을 낸다.
 function holdModel() {
   let release!: () => void;
