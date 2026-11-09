@@ -169,3 +169,10 @@ test('T20 설정: 브리핑 둘 중 하나만 있거나, 원장 없이 원장 �
   assert.deepEqual(problems(publisherEnv({ WORKER_URL: undefined, MEMORY_LEDGER_DIR: '/tmp/x', BRIEFING_TIME: '25:00' })),
     ['WORKER_URL(missing)', 'MEMORY_LEDGER_DIR(invalid)', 'BRIEFING_TIME(invalid)', 'BRIEFING_TIMEZONE(missing)']);
 });
+
+test('C01 동료 기능 스위치: 정책에 칸이 없거나 false면 꺼짐, true면 켜짐', () => {
+  const withSwitch = (value: unknown) => publisherEnv({ RUNTIME_POLICIES: JSON.stringify({ ...policy, colleagueEnabled: value }) });
+  assert.equal(loadPublisherConfig(publisherEnv(), 1).colleagueEnabled, false);
+  assert.equal(loadPublisherConfig(withSwitch(false), 1).colleagueEnabled, false);
+  assert.equal(loadPublisherConfig(withSwitch(true), 1).colleagueEnabled, true);
+});
