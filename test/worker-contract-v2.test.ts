@@ -1,13 +1,19 @@
 import { afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, randomUUID } from 'node:crypto';
+import { once } from 'node:events';
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join, resolve } from 'node:path';
+import { EARLIER_PURGED_NOTE } from '../src/bot-facts.js';
+import { SERVICES, TEMPLATES } from '../src/catalog.js';
 import { CHAT_OUTPUT_JSON_SCHEMA, CHAT_REPLY_JSON_SCHEMA } from '../src/chat-lane.js';
+import { CHANGE_COMMANDS, EXTERNAL_TASK_COMMANDS, FOUNDATION_COMMANDS, MEMORY_COMMANDS, REVIEW_COMMANDS,
+  TASK_COMMANDS } from '../src/commands.js';
 import { SYSTEM_INSTRUCTIONS, SYSTEM_INSTRUCTIONS_V2, WorkerRejected } from '../src/contracts.js';
 import type { Job } from '../src/contracts.js';
-import { WorkerSigner } from '../src/worker.js';
+import { WorkerRequestV1Schema, WorkerSigner } from '../src/worker.js';
 import type { WorkerRequestV1, WorkerRequestV2, WorkerResult, WorkerResultV2 } from '../src/worker.js';
 import { HttpWorker } from '../src/worker-http.js';
 import { startWorker, workerConfig } from '../src/worker-main.js';
@@ -185,6 +191,81 @@ test('C02 기록 상한: v2는 50개·80KiB를 받고 51개·80KiB 초과는 시
     await assert.rejects(send(w, v1(job(), { untrusted: history(21, 4096) })), WorkerRejected);
     assert.equal((await send(w, v1(job(), { untrusted: history(20, 4096) }))).status, 'failed', 'v1 요청은 v1 답 모양이 아니면 실패');
     assert.equal(w.launcher.specs.length, launched + 1, '거부한 요청은 실행기를 띄우지 않는다');
+  } finally { await w.worker.close(); }
+});
+
+// v1 작업자의 수신 규칙: v1 schema가 아니면 시작 전 403 rejected다(배포 전 작업자 이미지의 workerServer와 같다).
+// answer를 주면 schema를 통과하지 못해도 v1 성공 답을 돌려주는 잘못된 작업자를 흉내 낸다.
+const v1Worker = async (answer?: unknown) => {
+  const server = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const parsed = WorkerRequestV1Schema.safeParse(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    if (!parsed.success && !answer) { res.writeHead(403, { 'content-type': 'application/json' }).end(JSON.stringify({ status: 'rejected', started: false })); return; }
+    res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ status: 'succeeded', stopped: true, answer: answer ?? V1_ANSWER }));
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  return { server, client: new HttpWorker(`http://127.0.0.1:${(server.address() as AddressInfo).port}/`, fetch) };
+};
+
+test('C02 v2 서버 + v1 작업자: v2 요청은 요청 거부로 닫히고 성공처럼 보이지 않는다(AC-4)', async () => {
+  const old = await v1Worker();
+  try {
+    const request = v2(job());
+    await assert.rejects(old.client.execute(request, capability(request), new AbortController().signal), WorkerRejected);
+    // 같은 작업자도 v1 요청은 그대로 성공한다(배포 순서를 지킨 지금의 운영).
+    const current = v1(job());
+    assert.deepEqual(await old.client.execute(current, capability(current), new AbortController().signal),
+      { status: 'succeeded', stopped: true, answer: V1_ANSWER });
+  } finally { old.server.close(); }
+  // v2 요청에 v1 성공 답 모양이 오면 게시 서버는 성공으로 읽지 않는다.
+  const wrong = await v1Worker(V1_ANSWER);
+  try {
+    const request = v2(job());
+    assert.deepEqual(await wrong.client.execute(request, capability(request), new AbortController().signal),
+      { status: 'failed', stopped: true, rateLimit: null });
+  } finally { wrong.server.close(); }
+});
+
+const COMMAND_NAMES = [...FOUNDATION_COMMANDS, ...MEMORY_COMMANDS, ...REVIEW_COMMANDS, ...TASK_COMMANDS, ...EXTERNAL_TASK_COMMANDS,
+  ...CHANGE_COMMANDS];
+const factsOf = (prompt: string) => prompt.slice(0, prompt.indexOf(JSON.stringify([{ from: 'owner', text: '상태 알려줘' }])));
+
+test("C02 신뢰 문맥: speech에는 '/' 명령 이름이 없고 말로 할 수 있는 일과 서비스 카탈로그가 있다, slash는 지금 내용 그대로(AC-11)", async () => {
+  const w = await boot();
+  try {
+    await mode({ reply: '네', proposal: null, ack_only: false });
+    await send(w, v2(job(), { surface: 'speech' }));
+    const speech = factsOf(w.launcher.specs.at(-1)!.stdin);
+    for (const name of COMMAND_NAMES) assert.ok(!speech.includes(`/${name}`), `/${name}`);
+    assert.doesNotMatch(speech, /(^|[\s(`'"])\/[a-z]/m);
+    for (const service of SERVICES) assert.ok(speech.includes(service.id) && speech.includes(service.namespace), service.id);
+    for (const template of TEMPLATES) assert.ok(speech.includes(template.id), template.id);
+    assert.match(speech, /제안/);
+
+    await send(w, v2(job(), { surface: 'slash' }));
+    const slash = factsOf(w.launcher.specs.at(-1)!.stdin);
+    await mode(V1_ANSWER);
+    await send(w, v1(job()));
+    // v1 요청의 신뢰 문맥이 지금 내용(기준)이다. v2 slash는 그와 같다.
+    assert.equal(slash.slice(SYSTEM_INSTRUCTIONS_V2.length), factsOf(w.launcher.specs.at(-1)!.stdin).slice(SYSTEM_INSTRUCTIONS.length));
+    assert.ok(slash.includes('/chat') && slash.includes('/read'));
+  } finally { await w.worker.close(); }
+});
+
+test('C02 정리 표시: earlierPurged면 신뢰 문맥에 한 줄로 알리고, 아니면 없다(AC-5 작업자)', async () => {
+  const w = await boot();
+  try {
+    await mode({ reply: '그 부분은 기억나지 않아요.', proposal: null, ack_only: false });
+    for (const surface of ['slash', 'speech'] as const) {
+      await send(w, v2(job(), { surface, earlierPurged: true }));
+      const marked = factsOf(w.launcher.specs.at(-1)!.stdin);
+      assert.equal(marked.split('\n').filter(line => line.includes(EARLIER_PURGED_NOTE)).length, 1, surface);
+      assert.ok(!EARLIER_PURGED_NOTE.includes('\n'));
+      assert.match(EARLIER_PURGED_NOTE, /기억나지 않는다/);
+      await send(w, v2(job(), { surface, earlierPurged: false }));
+      assert.ok(!factsOf(w.launcher.specs.at(-1)!.stdin).includes(EARLIER_PURGED_NOTE), surface);
+    }
   } finally { await w.worker.close(); }
 });
 
