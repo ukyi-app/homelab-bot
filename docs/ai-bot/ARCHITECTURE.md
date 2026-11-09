@@ -127,7 +127,7 @@
 | | `GITHUB_WRITER_APP_ID`, `GITHUB_WRITER_APP_PRIVATE_KEY` | 봇 쓰기 App(D-24) |
 | | `GRAFANA_READER_TOKEN` | 읽기 어댑터(Grafana). 설계에 보관 위치가 없던 자리. Argo CD 토큰은 두지 않는다(아래 D9) |
 | | `HEALTHCHECKS_PING_URL` | 봇 하트비트(§8) |
-| | `RUNTIME_POLICIES` | 허용 목록·runtime policy 실제 값(JSON). 모양은 [config/runtime-policy.example.json](config/runtime-policy.example.json). 공유 차트가 env로 넣고 봇은 기동 때 한 번 읽는다(D1, 사용자 2026-10-30, §11). §6 "허용 목록 반영" |
+| | `RUNTIME_POLICIES` | 허용 목록·runtime policy 실제 값(JSON). 모양은 [config/runtime-policy.example.json](config/runtime-policy.example.json). 공유 차트가 env로 넣고 봇은 기동 때 한 번 읽는다(D1, 사용자 2026-10-30, §11). §6 "허용 목록 반영". 동료 기능 스위치 `colleagueEnabled`(참·거짓, 없으면 꺼짐, 잘못된 값은 기동 실패)도 여기 두고, 코드는 `PublisherConfig.colleagueEnabled` 하나로만 읽는다(DECISIONS "동료 봇 전환" 9) |
 | `/apps/homelab-bot/worker` | 활성 프로필의 키 **하나**(D-14 변경, 사용자 2026-10-30): `CLAUDE_CODE_OAUTH_TOKEN`(Claude 구독 장기 토큰, `claude-subscription`) 또는 `CODEX_AUTH_JSON`(Codex 시드 `auth.json`, `codex-subscription`) | 작업자만. Claude 토큰은 실행마다 Secret 파일에서 읽어 그 실행의 자식 env 한 변수에만 넣는다(영속 공간 복사·되쓰기 없음). Codex 시드는 영속 CODEX_HOME에 `auth.json`이 없을 때만 쓴다. 두 키를 함께 넣어 인증 우선순위에 맡기지 않는다 |
 
 - 작업자 경로에는 모델 자격 외에 아무것도 두지 않는다 [확인: 설계 C.8]. Kubernetes SA `bot-reader` 토큰은 Infisical이 아니라 공유 차트의 `serviceAccountName`으로 받는다 [확인: 설계 C.4.5].
