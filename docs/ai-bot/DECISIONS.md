@@ -526,6 +526,8 @@ T27이 넘긴 다섯 칸에 정리 경로가 없어 같은 원문이나 그 사�
 
 **받아들인 영향.** 받은 지 7일이 지난 요청은 작업이 그 뒤에 실패해도 바로 비워져 `/retry`할 수 없다(같은 내용을 새로 요청). 끝나지 않는 작업·변경, 확정되지 않는 게시의 원문은 7일을 넘겨 남는다. 기억 삭제(T20)는 여전히 `events` 행을 지우지 않지만 원문은 7일 뒤 비워진다.
 
+**CHANGE 정리의 선정·삭제 경합 (T32, T21 재감사 A09).** `purgeExpiredChangeContent`는 후보를 잠금 밖에서 고른 뒤 건마다 트랜잭션에서 지운다. 그사이 owner가 새 generation을 열고 그 generation이 다시 끝나면, 부모 phase만 다시 보던 정리가 끝난 지 0ms인 새 generation의 artifact·리뷰 원문·요청 원문·brief까지 지우고 다음 generation을 `input_purged`로 막았다. 이 구조는 T27 전 artifact 정리부터 있었고 T27·T31이 지우는 범위를 넓혔다. 이제 부모 행을 `FOR UPDATE`로 잠근 뒤 선정 질의와 같은 조건 전체(현재 generation의 끝 상태와 기준 시각 cutoff, 배포 관측·늦음 표시, 미확정 effect, 진행 중 자식 job·정리 전 세션, 지울 것이 남았는지)를 그 id로 다시 돌고 맞을 때만 지운다. generation·`updated_at` CAS는 배포 관측·자식 job·effect 변화를 잡지 못해 쓰지 않았다. 잠금과 재검사를 한 문장(`SELECT … FOR UPDATE OF r`)에 두지 않는 이유는 PostgreSQL의 재평가가 잠근 행만 새로 읽고 조인·하위 질의는 옛 스냅숏으로 보기 때문이다. effect 기록·배포 관측·자식 job 연결은 모두 부모 행을 `FOR SHARE`/`FOR UPDATE`로 잡아 재검사와 커밋 사이에 끼어들지 못한다(`linkChildJob`도 부모를 `FOR SHARE`로 잡는다). 잠금 없이 바뀌는 자식 job·세션 상태와 늦음 표시는 진행 중에서 끝 쪽으로만 움직여 재검사를 뒤집지 않는다. 반환값은 실제로 지운 건수다. `raw-text-retention.ts`의 네 칸과 T27 `purgeExpiredTaskAnswers`는 고르기와 비우기가 UPDATE 한 문장이라 모든 조건을 한 스냅숏에서 보고 대상 행 자체의 조건은 재평가된다. 선정과 삭제 사이의 시간차가 없어 이 경합에 들지 않는다. `events` 원문과 `/retry`의 엇갈림은 위 scheduler 행 잠금이 맡는다. 재현은 `test/change-purge-race.test.ts`(PGlite, 실제 PostgreSQL 두 연결)다.
+
 ---
 
 ## R08 명시적 Codex 연결 (결정 ID 없음)
