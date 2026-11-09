@@ -50,6 +50,7 @@ test('T19 B3 writer: 허용 route 표가 정확하다', () => {
     ['GET', `${R}/git/ref/heads/main`], ['GET', `${R}/git/ref/heads/${BRANCH}`], ['GET', `${R}/git/commits/${sha('a')}`], ['GET', `${R}/git/blobs/${sha('a')}`],
     ['GET', `${R}/git/trees/${sha('a')}`], ['GET', `${R}/git/trees/${sha('a')}?recursive=1`], ['GET', `${R}/pulls?state=all&head=fixture-org:${BRANCH}&base=main&per_page=100`],
     ['GET', '/repos/fixture-org/fixture-platform/contents/.github/workflows/app-build.yaml?ref=app-build-v1.0.1'],
+    ['PATCH', `${R}/git/refs/heads/${BRANCH}`],
   ] as const) assert.equal(writerRouteAllowed(method, path), true, `${method} ${path}`);
 });
 
@@ -58,7 +59,11 @@ test('T19 B3 writer: D-24 거부 사례는 route 표에 없다(encoded·method �
   const denied: [string, string][] = [
     ['PUT', `${R}/pulls/1/merge`], ['POST', `${R}/pulls/1/merge`], ['POST', `${R}/merges`], ['POST', `${R}/dispatches`],
     ['POST', `${R}/actions/workflows/build.yaml/dispatches`], ['POST', `${R}/actions/workflows/1/dispatches`], ['PUT', `${R}/pulls/1/update-branch`],
-    ['POST', '/graphql'], ['POST', `${R}/pulls/1/reviews`], ['POST', `${R}/pulls/1/requested_reviewers`], ['PATCH', `${R}/pulls/1`], ['PATCH', `${R}/git/refs/heads/${BRANCH}`],
+    ['POST', '/graphql'], ['POST', `${R}/pulls/1/reviews`], ['POST', `${R}/pulls/1/requested_reviewers`], ['PATCH', `${R}/pulls/1`],
+    // 갱신은 변경 브랜치 모양 하나만 열린다.
+    ['PATCH', `${R}/git/refs/heads/deploy/app`], ['PATCH', `${R}/git/refs/heads/bot/anything`], ['PATCH', `${R}/git/refs/tags/v1`], ['PATCH', `${R}/git/refs/heads/${BRANCH}/x`],
+    ['PATCH', `${R}/git/refs/heads/${BRANCH}?force=true`], ['PATCH', `${R}/git/refs/heads/bot%2Fchange%2F${CHANGE}%2Fg3`], ['PATCH', `${R}/git/refs/heads/bot/change/${CHANGE}/../main`],
+    ['PATCH', `${R}/git/ref/heads/${BRANCH}`], ['PUT', `${R}/git/refs/heads/${BRANCH}`],
     ['DELETE', `${R}/git/refs/heads/${BRANCH}`], ['POST', `${R}/issues/1/comments`], ['PUT', `${R}/contents/src/a.ts`], ['DELETE', `${R}/contents/src/a.ts`],
     ['POST', `${R}%2Fpulls%2F1%2Fmerge`], ['POST', `${R}/pulls%2F1%2Fmerge`], ['POST', `${R}/git/blobs/../../merges`], ['POST', `${R}/git/blobs/%2e%2e/%2e%2e/merges`], ['POST', `${R}//git/blobs`],
     ['POST', `${R}/git/blobs?x=1`], ['POST', `${R}/git/blobs#x`], ['POST', `/repos/../fixture-org/x/git/blobs`], ['POST', `/repos/fixture-org/../git/blobs`],
@@ -132,13 +137,13 @@ test('T19 B3 writer: gitlink 행을 버리지 않고 돌려줘 호출자가 닫�
   assert.deepEqual(walked?.leaves.find(leaf => leaf.path === 'vendor')?.mode, '160000');
 });
 
-test('T19 B3 writer: 코드 구조. fetch는 closure 한 곳이고 범용 API가 없으며 리뷰 allowlist가 늘지 않았다', async () => {
+test('T19 B3 writer: 코드 구조. fetch는 closure 한 곳이고 범용 API가 없으며 리뷰 allowlist에 writer API가 없다', async () => {
   const source = await readFile(new URL('../../src/github-writer.ts', import.meta.url), 'utf8');
   assert.equal((source.match(/\bsend\(/g) ?? []).length, 1, 'send 호출 지점은 하나다');
   assert.equal((source.match(/\bfetch\(/g) ?? []).length, 0);
   assert.equal((source.match(/globalThis|require\(|node:https|node:http/g) ?? []).length, 0);
   const s = setup();
-  assert.deepEqual(Object.keys(s.writer).sort(), ['createBlobs', 'createCommit', 'createPull', 'createRef', 'createTree', 'findPulls', 'readBlobExists', 'readBranchHead', 'readCommit', 'readTreeLeaves']);
+  assert.deepEqual(Object.keys(s.writer).sort(), ['createBlobs', 'createCommit', 'createPull', 'createRef', 'createTree', 'fastForwardBranch', 'findPulls', 'readBlobExists', 'readBranchHead', 'readCommit', 'readTreeLeaves']);
   assert.deepEqual(Object.keys(s.preflight).sort(), ['readBlobText', 'readBranchHead', 'readCommit', 'readPinnedWorkflow', 'readTreeLeaves']);
   for (const [method, path] of [['POST', '/repos/o/r/git/blobs'], ['POST', '/repos/o/r/git/refs'], ['POST', '/repos/o/r/pulls'], ['GET', '/repos/o/r/git/ref/heads/main']] as const) {
     assert.throws(() => assertAllowed(method, path), Denied, '리뷰 allowlist에 writer API가 없다');
@@ -487,4 +492,118 @@ test('T19 B3 writer: ChangeWriterPort 형태를 만족한다', () => {
   const { writer } = setup();
   const port: ChangeWriterPort = writer;
   assert.ok(port);
+});
+
+// ---- C26 fast-forward 갱신 ----
+
+// 봇 브랜치를 A에 두고, A를 부모로 한 새 커밋 B를 만든다.
+function branchAhead() {
+  const s = seeded();
+  s.github.refs.set(`heads/${BRANCH}`, s.base.sha);
+  const next = s.github.commitFiles({ 'README.md': '# r\n', 'src/a.ts': 'new\n' }, [s.base.sha]);
+  return { ...s, from: s.base.sha, to: next.sha };
+}
+const PATCH_REF = /^PATCH .*\/git\/refs\//;
+
+test('C26 writer: 자기 변경 브랜치를 기대 head에서 새 커밋으로 fast-forward 갱신한다(force 거짓, 내용 토큰)', async () => {
+  const { github, writer, from, to } = branchAhead();
+  const outcome = await writer.fastForwardBranch({ target: TARGET, branch: BRANCH, expectedHead: from, sha: to });
+  assert.deepEqual(outcome, { kind: 'confirmed', value: { ref: `refs/heads/${BRANCH}`, sha: to } });
+  assert.equal(github.refs.get(`heads/${BRANCH}`), to);
+  const [patch, ...more] = github.mutations(PATCH_REF);
+  assert.equal(more.length, 0);
+  assert.equal(patch!.path, `/repos/${REPO.fullName}/git/refs/heads/${BRANCH}`);
+  assert.deepEqual(patch!.body, { sha: to, force: false });
+  const contents = github.issued.find(item => item.permissions.contents === 'write')!;
+  assert.equal(patch!.authorization, `Bearer ${contents.token}`);
+});
+
+test('C26 writer: 다른 브랜치·강제 갱신·추가 필드는 아무것도 보내지 않는다', async () => {
+  const { github, writer, from, to } = branchAhead();
+  const valid = { target: TARGET, branch: BRANCH, expectedHead: from, sha: to };
+  for (const branch of ['main', 'deploy/app', changeBranchName(OTHER_CHANGE, 3), changeBranchName(CHANGE, 4), `refs/heads/${BRANCH}`, 'bot/anything', `bot%2Fchange%2F${CHANGE}%2Fg3`]) {
+    await refused(github, () => writer.fastForwardBranch({ ...valid, branch }), 'branch_not_allowed');
+  }
+  for (const extra of [{ force: true }, { force: false }, { ref: 'refs/heads/main' }, { method: 'PUT' }]) {
+    await refused(github, () => writer.fastForwardBranch(asUnknown({ ...valid, ...extra })), 'input_invalid');
+  }
+  await refused(github, () => writer.fastForwardBranch({ ...valid, sha: 'main' }), 'input_invalid');
+  await refused(github, () => writer.fastForwardBranch({ ...valid, sha: from }), 'input_invalid');
+  await refused(github, () => writer.fastForwardBranch({ ...valid, target: { ...TARGET, repoId: 9999 } }), 'repository_denied');
+  assert.equal(github.refs.get(`heads/${BRANCH}`), from);
+});
+
+test('C26 writer: 기대 head가 아니거나 부모가 기대 head 하나가 아니면 갱신을 보내지 않는다', async () => {
+  const cases: [string, (s: ReturnType<typeof branchAhead>) => { expectedHead: string; sha: string }, string][] = [
+    ['사람이 브랜치를 옮김', s => { s.github.refs.set(`heads/${BRANCH}`, s.github.commitFiles({ 'x.txt': 'human\n' }, [s.from]).sha); return { expectedHead: s.from, sha: s.to }; }, 'head_changed'],
+    ['브랜치 없음', s => { s.github.refs.delete(`heads/${BRANCH}`); return { expectedHead: s.from, sha: s.to }; }, 'head_changed'],
+    ['새 커밋 없음', s => ({ expectedHead: s.from, sha: sha('e') }), 'not_fast_forward'],
+    ['부모가 다름', s => ({ expectedHead: s.from, sha: s.github.commitFiles({ 'y.txt': 'y\n' }, [s.to]).sha }), 'not_fast_forward'],
+    ['부모 둘', s => ({ expectedHead: s.from, sha: s.github.commitFiles({ 'z.txt': 'z\n' }, [s.from, s.to]).sha }), 'not_fast_forward'],
+  ];
+  for (const [name, arrange, code] of cases) {
+    const s = branchAhead();
+    const before = s.github.refs.get(`heads/${BRANCH}`);
+    const { expectedHead, sha: next } = arrange(s);
+    const head = s.github.refs.get(`heads/${BRANCH}`);
+    assert.deepEqual(await s.writer.fastForwardBranch({ target: TARGET, branch: BRANCH, expectedHead, sha: next }), { kind: 'not_sent', code }, name);
+    assert.equal(s.github.mutations(PATCH_REF).length, 0, `${name}: 갱신 요청 0회`);
+    assert.equal(s.github.issued.filter(item => item.permissions.contents === 'write').length, 0, `${name}: 쓰기 토큰을 받지 않는다`);
+    assert.equal(s.github.refs.get(`heads/${BRANCH}`), head, name);
+    assert.ok(before);
+  }
+});
+
+test('C26 writer: 응답 유실·422는 정확한 ref를 다시 읽어 대조하고 갱신을 다시 보내지 않는다', async () => {
+  const human = (s: ReturnType<typeof branchAhead>) => () => { s.github.refs.set(`heads/${BRANCH}`, s.github.commitFiles({ 'x.txt': 'human\n' }, [s.from]).sha); };
+  const cases: [string, Parameters<FakeGitHub['fail']>[1], ((s: ReturnType<typeof branchAhead>) => () => void) | null, object][] = [
+    ['적용 뒤 응답 유실', 'lose_response', null, { kind: 'confirmed', value: { ref: `refs/heads/${BRANCH}`, sha: 'TO' } }],
+    ['적용 전 연결 끊김', 'reset_before_apply', null, { kind: 'unknown', code: 'response_lost' }],
+    ['5xx·그대로', { status: 502 }, null, { kind: 'unknown', code: 'http_5xx' }],
+    ['422·그대로', { status: 422 }, null, { kind: 'rejected', status: 422, code: 'http_422' }],
+    ['422·사람이 옮김', { status: 422 }, human, { kind: 'rejected', status: 422, code: 'head_changed' }],
+    ['409·사람이 옮김', { status: 409 }, human, { kind: 'rejected', status: 409, code: 'head_changed' }],
+    ['403', { status: 403 }, human, { kind: 'rejected', status: 403, code: 'http_403' }],
+    ['유실·사람이 옮김', 'reset_before_apply', human, { kind: 'rejected', status: 0, code: 'head_changed' }],
+  ];
+  for (const [name, mode, interfere, expected] of cases) {
+    const s = branchAhead();
+    s.github.fail(PATCH_REF, mode);
+    const move = interfere?.(s);
+    // 갱신 요청이 끝난 직후 사람이 브랜치를 옮긴 상황을 만든다.
+    const io = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => s.github.clock, send: async (input, init) => {
+      try { return await s.github.send(input, init); } finally { if (init?.method === 'PATCH') move?.(); }
+    } });
+    const outcome = await io.writer.fastForwardBranch({ target: TARGET, branch: BRANCH, expectedHead: s.from, sha: s.to });
+    assert.deepEqual(outcome, JSON.parse(JSON.stringify(expected).replace('"TO"', `"${s.to}"`)), name);
+    assert.equal(s.github.mutations(PATCH_REF).length, 1, `${name}: 재전송하지 않는다`);
+  }
+});
+
+test('C26 writer: 응답의 ref·SHA가 요청과 다르면 확정하지 않는다', async () => {
+  const s = branchAhead();
+  const send = s.github.send;
+  const io = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => s.github.clock, send: async (input, init) => {
+    const response = await send(input, init);
+    if (init?.method !== 'PATCH') return response;
+    // 적용은 됐지만 응답이 다른 브랜치를 말한다. 다시 읽어 실제 브랜치로 판정한다.
+    return new Response(JSON.stringify({ ref: 'refs/heads/main', object: { type: 'commit', sha: s.to } }), { status: 200 });
+  } });
+  assert.deepEqual(await io.writer.fastForwardBranch({ target: TARGET, branch: BRANCH, expectedHead: s.from, sha: s.to }), { kind: 'confirmed', value: { ref: `refs/heads/${BRANCH}`, sha: s.to } });
+  // 적용되지 않았는데 응답이 다른 SHA를 말하면 브랜치가 그대로라 unknown으로 남는다.
+  const t = branchAhead();
+  const stale = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => t.github.clock, send: async (input, init) => {
+    if (init?.method !== 'PATCH') return t.github.send(input, init);
+    t.github.sent.push({ method: 'PATCH', path: new URL(String(input)).pathname, authorization: '', body: undefined, init: init ?? {} });
+    return new Response(JSON.stringify({ ref: `refs/heads/${BRANCH}`, object: { type: 'commit', sha: sha('f') } }), { status: 200 });
+  } });
+  assert.deepEqual(await stale.writer.fastForwardBranch({ target: TARGET, branch: BRANCH, expectedHead: t.from, sha: t.to }), { kind: 'unknown', code: 'response_invalid' });
+  assert.equal(t.github.mutations(PATCH_REF).length, 1);
+});
+
+test('C26 writer: 쓰기 직전 권한 확인이 실패하면 갱신을 보내지 않는다', async () => {
+  const s = branchAhead();
+  const io = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: async () => { throw new Denied(); }, send: s.github.send, now: () => s.github.clock });
+  assert.deepEqual(await io.writer.fastForwardBranch({ target: TARGET, branch: BRANCH, expectedHead: s.from, sha: s.to }), { kind: 'not_sent', code: 'authorization_revoked' });
+  assert.equal(s.github.mutations(PATCH_REF).length, 0);
 });
