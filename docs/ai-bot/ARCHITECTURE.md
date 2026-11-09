@@ -407,7 +407,7 @@ Discord 401은 별도 오류로 pending을 유지한다. 토큰 갱신 후 새 R
 
 부모 채널은 비활성이며 매번 멘션/명령이 필요하다. 활성 스레드만 멘션 없는 후속 메시지를 수집한다.
 스레드는 공개, 보관 시간 **1440분**이다. 모든 메시지/상호작용 응답의 `allowed_mentions.parse=[]`를 강제한다.
-제어 명령 결과(`/list`·`/stop`·`/resume`·`/cancel`·`/retry`·`/emergency-stop`·`/resume-model`·`/model-status`·리뷰 제어)는 `controlText`(`src/control-format.ts`)가 짧은 한국어 문장으로 바꿔 게시한다. 예: `/list` → "작업 N건" + 줄마다 `` `<작업 ID>` 상태(대기 사유) ``(최근 20건, 넘으면 머리줄에 "최근 20건만 표시"), 거절은 "실패: <안내>", `/model-status`는 모델 호출·비상 중지·실행 중 작업·한도/인증 대기 목록과 안내. 작업 ID는 `/cancel`·`/retry` target에 그대로 넣어야 해서 줄이지 않는다. 모르는 결과 모양은 JSON 그대로 둔다. 이전에는 결과를 `JSON.stringify`해 `{"ref":...,"data":[...]}`로 보였다(S16). 이제 제어 결과도 일반 문장이라 marker는 끝 줄 `[ref:…]`이고, JSON 본문의 marker 필드 방식(`markedContent`)은 JSON으로 읽히는 다른 본문을 위해 남겨 둔다.
+제어 명령 결과(`/list`·`/stop`·`/resume`·`/cancel`·`/retry`·`/emergency-stop`·`/resume-model`·`/model-status`·리뷰 제어)는 `controlText`(`src/control-format.ts`)가 짧은 한국어 문장으로 바꿔 게시한다. 예: `/list` → "작업 N건" + 줄마다 `` `<작업 ID>` 상태(대기 사유) ``(최근 20건, 넘으면 머리줄에 "최근 20건만 표시". 상태·사유 코드는 owner가 읽는 말로 풀고 모르는 코드는 그대로, `src/chat-task-text.ts`), 거절은 "처리하지 못했어요. <안내>", `/model-status`는 모델 호출·비상 중지·실행 중 작업·한도/인증 대기 목록과 안내. 작업 ID는 `/cancel`·`/retry` target에 그대로 넣어야 해서 줄이지 않는다. 모르는 결과 모양은 JSON 그대로 둔다. 이전에는 결과를 `JSON.stringify`해 `{"ref":...,"data":[...]}`로 보였다(S16). 이제 제어 결과도 일반 문장이라 marker는 끝 줄 `[ref:…]`이고, JSON 본문의 marker 필드 방식(`markedContent`)은 JSON으로 읽히는 다른 본문을 위해 남겨 둔다.
 outbox UUID별 멱등 키에서 24자 nonce와 게시 marker를 만든다. 응답 유실은 unknown으로 두고 게시자의 marker와
 스레드 이름을 제한 조회한다. 못 찾았다고 재게시하지 않는다.
 대조 중 429는 즉시 루프를 중단하고 전역 다음 대조 시각을 DB에 기록한다. 재기동해도

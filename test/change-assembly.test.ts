@@ -1,6 +1,7 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
+import { CHAT_TASK_TEXT } from '../src/chat-task-text.js';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { Server } from 'node:http';
@@ -879,7 +880,7 @@ test('호환 슬롯: CHANGE 자식 job은 v1 claim에 잡히지 않고 /retry로
     // 끝난 자식은 /retry로 되살아나지 않는다.
     await h.db.query(`UPDATE jobs SET state='failed' WHERE id=$1`, [child.id]);
     const retried = await h.store.control(OWNER, h.store.scopeId(THREAD), 'retry', child.id) as { status: string };
-    assert.match(retried.status, /재시도할 작업이/);
+    assert.equal(retried.status, CHAT_TASK_TEXT.retryRefused);
     assert.equal((await childOf(h.db, id))!.state, 'failed');
   });
 });

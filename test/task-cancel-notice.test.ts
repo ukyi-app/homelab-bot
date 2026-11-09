@@ -2,6 +2,7 @@ import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
+import { CHAT_TASK_TEXT } from '../src/chat-task-text.js';
 import { Denied } from '../src/contracts.js';
 import { Postgres, migrate } from '../src/database.js';
 import { taskQuestionId } from '../src/task-contracts.js';
@@ -54,8 +55,7 @@ test('실행 중 취소: 소멸을 확인하면 cancelled와 안내 1건이고, 
   assert.equal(row!.payload.kind, 'message');
   assert.equal(row!.payload.channel, job.target.channel);
   assert.equal(row!.payload.classification, 'safe_summary');
-  assert.ok(row!.payload.content.includes(job.id));
-  assert.ok(row!.payload.content.includes('cancelled'));
+  assert.equal(row!.payload.content, CHAT_TASK_TEXT.taskCancelled(false, job.id));
   assert.equal((await blocked()).length, 0);
 });
 

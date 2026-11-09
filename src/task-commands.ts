@@ -1,4 +1,5 @@
 import type { ClaudeTaskBridge } from './claude-task-bridge.js';
+import { CHAT_TASK_TEXT as T, jobStateText, waitReasonText } from './chat-task-text.js';
 import { Denied } from './contracts.js';
 import type { Scope } from './contracts.js';
 import { taskLaneClosedText } from './control-format.js';
@@ -25,6 +26,8 @@ export interface TaskCommandHandler {
   release(request: { id: string; actor: string; scope: Scope; job: string; revision: string }): string;
 }
 
+// codex_sessions.cleanup_state 값. none은 줄에 싣지 않는다.
+const CLEANUP: Readonly<Record<string, string>> = Object.freeze({ pending: '확인 중', cleaned: '마침' });
 const time = (value: number | null) => value === null ? null : new Date(value).toISOString();
 export class TaskCommands implements TaskCommandHandler {
   constructor(private readonly store: Store, private readonly gate: PolicyGate, private readonly bridge: ClaudeTaskBridge,
@@ -34,25 +37,25 @@ export class TaskCommands implements TaskCommandHandler {
     if (!taskProject(policy, project)) {
       const known = TaskPolicySchema.safeParse(policy.task);
       const names = known.success ? known.data.projects.map(item => item.id).join(', ') : '';
-      return `정책에 없는 프로젝트라 작업을 받지 않았습니다.${names ? ` 받는 프로젝트: ${names}` : ''}`;
+      return T.projectNotAllowed(store.colleague, names);
     }
     const closed = (await store.db.query<{ closed_reason: string | null }>(`SELECT closed_reason FROM execution_lanes WHERE lane='task'`)).rows[0]?.closed_reason;
-    if (closed) return taskLaneClosedText(closed);
+    if (closed) return taskLaneClosedText(closed, store.colleague);
     const intake = this.intake();
-    if (!intake.open) return `작업자가 지금 새 작업을 받지 않습니다${intake.reasons.length ? `(${intake.reasons.join(', ')})` : ''}. 작업을 받지 않았습니다. 대화·리뷰는 계속 동작합니다.`;
+    if (!intake.open) return T.intakeClosed(store.colleague, intake.reasons.join(', '));
     return null;
   }
   answerIn(store: Store, input: TaskAnswerInput): Promise<TaskAnswerResult> { return this.bridge.answerIn(store, input); }
   // /cancel과 같은 경로다. 이 이름으로는 작업 레인 작업만 건드린다.
   async cancelIn(store: Store, actor: string, conversation: string, job: string, cursor: string): Promise<unknown> {
     const row = (await store.db.query<{ type: string }>('SELECT type FROM jobs WHERE id=$1 AND owner_id=$2 AND conversation_id=$3', [job, actor, conversation])).rows[0];
-    if (row?.type !== 'task') return { ok: false, status: '취소할 작업이 현재 대화에 없습니다. 작업을 시작한 스레드에서 /list로 확인하세요.' };
+    if (row?.type !== 'task') return { ok: false, status: T.taskNotHere(store.colleague) };
     return store.control(actor, conversation, 'cancel', job, cursor);
   }
   async status(actor: string, scope: Scope, job: string): Promise<string> {
     const status = await this.bridge.status(actor, scope, job);
-    return [`작업 ${job}: ${status.state}${status.waitReason ? `(${status.waitReason})` : ''}`,
-      `세션: ${status.session ? `있음${status.generation ? `, 세대 ${status.generation}` : ''}` : '없음'}${status.cleanup && status.cleanup !== 'none' ? `, 정리 ${status.cleanup}` : ''}`,
+    return [`작업 ${job}: ${jobStateText(status.state)}${status.waitReason ? `(${waitReasonText(status.waitReason)})` : ''}`,
+      `세션: ${status.session ? `있음${status.generation ? `, 세대 ${status.generation}` : ''}` : '없음'}${status.cleanup && status.cleanup !== 'none' ? `, 정리 ${CLEANUP[status.cleanup] ?? status.cleanup}` : ''}`,
       ...(status.question ? [`열린 질문: ${status.question.id} (기한 ${time(status.question.expiresAt)})`] : []),
       ...(status.waitingSince !== null ? [`모델 대기 시작: ${time(status.waitingSince)}${status.ownerConfirmRequestedAt !== null ? ', owner 확인 요청함' : ''}`] : [])].join('\n');
   }
@@ -61,15 +64,15 @@ export class TaskCommands implements TaskCommandHandler {
       let content: string;
       try {
         const result = await this.bridge.release(request.actor, request.scope, request.job);
-        content = `작업 ${request.job} 해제 ${result.ok ? '완료' : '실패'}: ${result.status}`;
+        content = result.ok ? T.releaseDone(this.store.colleague, request.job, result.status) : T.releaseFailed(this.store.colleague, request.job, result.status);
       } catch (error) {
         // 타인 작업과 다른 대화의 작업은 존재 여부도 구별해 알리지 않는다.
         if (!(error instanceof Denied)) this.log('task_release_failed', errorInfo(error));
-        content = error instanceof Denied ? '해제할 수 있는 작업을 찾지 못했습니다.' : '해제 확인에 실패했습니다(일시 오류). 막힘은 그대로입니다. 다시 시도하세요.';
+        content = error instanceof Denied ? T.releaseNotFound : T.releaseError;
       }
       await this.store.enqueue({ key: `task-release:${request.id}`, actor: request.actor, scope: request.scope, revision: request.revision,
         payload: { kind: 'message', channel: request.scope.channel, content, classification: 'safe_summary' } });
     })().catch(error => { this.log('task_release_notice_failed', errorInfo(error)); }));
-    return '작업자 프로세스 소멸을 확인합니다. 결과는 이 대화에 게시합니다.';
+    return T.releaseStarted;
   }
 }

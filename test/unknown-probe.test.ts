@@ -1,6 +1,7 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { CHAT_TASK_TEXT } from '../src/chat-task-text.js';
 import { DEFAULTS } from '../src/contracts.js';
 import type { CancelRequest } from '../src/worker.js';
 import { localDatabase, fixture, event } from './helpers.js';
@@ -187,7 +188,7 @@ test('T17 /review-cancel은 unknown을 풀지 않고 이유를 알린다(확인 
   const job = await unknownReview();
   const result = await f.store.control(f.policy.owner, '', 'review-cancel', job.id, undefined, { review: true }) as { ok: boolean; status: string };
   assert.equal(result.ok, false);
-  assert.match(result.status, /종료를 확인하지 못한/);
+  assert.equal(result.status, CHAT_TASK_TEXT.reviewUnknownCancel);
   assert.equal((await rows('jobs'))[0]!.state, 'unknown');
   const none = await f.store.control(f.policy.owner, '', 'review-cancel', randomUUID(), undefined, { review: true }) as { ok: boolean; status: string };
   assert.match(none.status, /취소할 리뷰 작업이 없거나/);
@@ -215,7 +216,8 @@ for (const kind of ['worker_disconnected', 'runtime_uncertain'] as const) test(`
   const failure = await notices(`failure:${job.id}:1`);
   assert.equal(failure.length, 1);
   // 일반 작업은 /retry를 그대로 안내하고, 그 /retry는 받아들여진다.
-  assert.equal(failure[0]!.payload.content, '작업 실패가 확인됐습니다. /list로 상태를 확인하고 /retry로 재시도할 수 있습니다.');
+  assert.equal(failure[0]!.payload.content, CHAT_TASK_TEXT.jobFailed(false));
+  assert.match(failure[0]!.payload.content, /\/retry/);
   assert.notEqual(((await f.store.control(f.policy.owner, job.conversation_id, 'retry', job.id)) as { ok?: boolean }).ok, false);
   assert.equal((await notices('unknown:')).length, 0);
 });

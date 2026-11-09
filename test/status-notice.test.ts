@@ -1,6 +1,8 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { CHAT_TASK_TEXT } from '../src/chat-task-text.js';
 import { DEFAULTS } from '../src/contracts.js';
+import { Store } from '../src/store.js';
 import { localDatabase, fixture, event } from './helpers.js';
 
 // S4: 상태 알림. chat이 waiting_user·unknown이 될 때 같은 트랜잭션에서 그 대화에 안내를 넣는다.
@@ -26,7 +28,25 @@ test('S4 runtime이 unknown을 기록하면 안내 1개(종료 확인을 계속 
   assert.equal(job.state, 'unknown');
   const sent = await notices('unknown:');
   assert.deepEqual(sent.map(o => o.idempotency_key), [`unknown:${job.id}:1`]);
-  assert.match(sent[0]!.payload.content, /종료 확인을 계속/); assert.match(sent[0]!.payload.content, /\/model-status/);
+  assert.equal(sent[0]!.payload.content, CHAT_TASK_TEXT.unknownWait(false)); assert.match(sent[0]!.payload.content, /\/model-status/);
+});
+
+// 명세 §4.9: 스위치가 켜진 Store의 안내는 '/' 이름 없이 관리 기능을 CLI로 안내하고, 멱등 키·분류·멘션 막음은 그대로다.
+for (const kind of ['waiting', 'unknown'] as const) test(`동료 스위치 켜짐: ${kind} 안내에 '/' 명령 이름이 없고 멱등 키·분류·멘션 막음은 그대로`, async () => {
+  const on = new Store(database.db, f.now, true);
+  await queued();
+  const job = (await on.claim())!;
+  if (kind === 'waiting') await on.waitForUser(job, 'model_limit');
+  else await on.transition(job, 'unknown');
+  const sent = await notices(`${kind}:`);
+  assert.deepEqual(sent.map(o => o.idempotency_key), [`${kind}:${job.id}:1`]);
+  assert.equal(sent[0]!.payload.content, kind === 'waiting' ? CHAT_TASK_TEXT.modelWaitLimit(true, job.id) : CHAT_TASK_TEXT.unknownWait(true));
+  assert.equal(sent[0]!.payload.classification, 'safe_summary');
+  assert.doesNotMatch(sent[0]!.payload.content, /(^|\s)\/[a-z]/);
+  assert.match(sent[0]!.payload.content, /`homelab bot` CLI/);
+  while (await f.publisher.deliver()) { /* drain */ }
+  assert.ok(f.rest.messages.length);
+  for (const message of f.rest.messages) assert.deepEqual(message.body.allowed_mentions, { parse: [] });
 });
 
 test('S4 권한 철회로 인한 unknown은 안내하지 않음(철회된 대화에 게시하지 않는다)', async () => {
@@ -70,7 +90,7 @@ for (const status of ['limited', 'auth_expired'] as const) test(`S4 ${status} wa
   assert.deepEqual(sent.map(o => o.idempotency_key), [`waiting:${job.id}:1`]);
   assert.match(sent[0]!.payload.content, new RegExp(`/resume-model target:${job.id}`));
   assert.match(sent[0]!.payload.content, /\/model-status/);
-  assert.match(sent[0]!.payload.content, status === 'limited' ? /한도/ : /인증/);
+  assert.equal(sent[0]!.payload.content, status === 'limited' ? CHAT_TASK_TEXT.modelWaitLimit(false, job.id) : CHAT_TASK_TEXT.modelWaitAuth(false, job.id));
   while (await f.publisher.deliver()) { /* drain */ }
   const message = f.rest.messages.find(m => m.body.content.includes('/resume-model'))!;
   assert.deepEqual(message.body.allowed_mentions, { parse: [] });

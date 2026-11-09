@@ -207,7 +207,7 @@ export class DiscordIngress {
     } catch (error) {
       if (!(error instanceof Denied)) this.log('task_command_failed', { command: event.command!, ...errorInfo(error) });
       // 타인 작업과 다른 대화의 작업은 존재 여부도 구별해 알리지 않는다.
-      content = error instanceof Denied ? '이 대화에서 볼 수 있는 작업이 아닙니다.' : '처리하지 못했습니다(일시 오류). 다시 시도하세요.';
+      content = error instanceof Denied ? '이 대화에서 볼 수 있는 작업이 아니에요.' : '처리하지 못했어요(일시 오류). 다시 시도해 주세요.';
     }
     await this.acknowledge(event, saved.id, content);
     return saved.id;
@@ -326,7 +326,7 @@ export class DiscordIngress {
         await this.beforeReply(event);
         // 일반 메시지는 👀 리액션이고 이 문구는 권한 거부 때의 대체 텍스트로만 쓰인다.
         outcome = await this.rest.acknowledge(event, content
-          ?? (this.messageContent ? '수신·처리 기록 저장됨. 처리·대기 상태는 별도로 안내합니다.' : '명령/버튼 모드: 수신·처리 기록 저장됨.'),
+          ?? (this.messageContent ? '받아서 기록해 뒀어요. 처리 상태는 따로 알려 드릴게요.' : '받아서 기록해 뒀어요. 지금은 명령과 버튼으로만 받아요.'),
         direct ? { ...noMentions, flags: SUPPRESS_EMBEDS } : noMentions);
       } catch (error) {
         if (error instanceof RateLimited) await this.store.recordRateLimit(error, event.scope.channel);
