@@ -2118,6 +2118,14 @@ T21 1회차 감사의 blocked 7건(homelab 티켓 T30)을 항목마다 사용자
 
 **T30 7항목 끝(2026-11-09).** INT-02·03·04·05·06·07 pass, INT-01은 기존 증거 수용. 판정은 T21 재감사가 한다.
 
+## C01 동료 기능 스위치 (2026-11-09)
+
+동료 봇 전환의 기반 티켓(homelab 계획 C01, 명세 [COLLEAGUE_SPEC](COLLEAGUE_SPEC.md) §4.9·AC-23 배선). 런타임 정책(`RUNTIME_POLICIES`)에 `colleagueEnabled`를 두고 게시 서버 설정 `PublisherConfig.colleagueEnabled`로 노출한다. 이 칸을 읽는 기능은 아직 없어 Discord·작업자 동작은 그대로다(prefactor). 이유는 [DECISIONS](DECISIONS.md) "C01 동료 기능 스위치".
+
+**동작.** 칸이 없거나 `false`면 꺼짐, `true`면 켜짐. 참·거짓 밖의 값(문자열 `"true"`, 숫자, `null`, 객체·배열)은 기동 실패이고 오류는 `RUNTIME_POLICIES(invalid: colleagueEnabled)`처럼 필드 경로만 남긴다. 다른 정책 칸처럼 기동 때 한 번 읽고 얼린다(D1). 예시 [config/runtime-policy.example.json](config/runtime-policy.example.json)은 꺼진 값이다.
+
+**검사(경계 S1 게시 서버 설정 로드).** `publisher-config` 12/12(새 2: 칸 없음·꺼짐·켜짐, 잘못된 값의 기동 오류와 값 비노출), `publisher-policy` 7/7(새 1: 잘못된 값 8가지가 정확히 `runtime_policies_invalid: colleagueEnabled`, 받은 값은 얼림). 설정을 쓰는 `publisher-main`·`github-review-app`까지 함께 65/65, `npm run check` 통과. 두 상태의 실제 동작 차이(AC-23의 버튼·문구)는 그 기능을 만드는 뒤 티켓의 두 상태 시험이 본다.
+
 ## C26 GitHub 쓰기·읽기 확장 (2026-11-09)
 
 동료 봇 전환 16·17(수정 요청·안내 댓글)이 쓸 GitHub 포트 셋을 더했다. 부르는 곳이 없어 병합해도 GitHub에 나가는 요청과 owner가 보는 동작은 그대로다. 경계는 명세 §6 S1(가짜 GitHub)이고 네트워크·실제 GitHub은 쓰지 않았다. 설계는 [ARCHITECTURE](ARCHITECTURE.md) §6 리뷰 행과 §16.3 표.
