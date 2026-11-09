@@ -24,7 +24,8 @@ const target = (description: string, maxLength = 100) => option('target', descri
 type CommandName = typeof FOUNDATION_COMMANDS[number] | typeof MEMORY_COMMANDS[number] | typeof REVIEW_COMMANDS[number] | typeof TASK_COMMANDS[number]
   | typeof EXTERNAL_TASK_COMMANDS[number] | typeof CHANGE_COMMANDS[number];
 const command = (name: CommandName, description: string, options: ReturnType<typeof option>[] = []) =>
-  // type 1(CHAT_INPUT), 서버 안에서만(contexts 0 GUILD, integration_types 0 GUILD_INSTALL). DM은 끔(D-17).
+  // type 1(CHAT_INPUT). guild 명령으로만 등록해 서버 안에서만 쓰인다. DM은 끔(D-17).
+  // contexts 0 GUILD·integration_types 0 GUILD_INSTALL은 guild 명령에 효과가 없지만, 전역으로 옮겨도 DM이 열리지 않게 함께 보낸다.
   ({ name, type: 1, description, options, contexts: [0], integration_types: [0] });
 export const COMMAND_DEFINITIONS = Object.freeze([
   command('chat', '홈랩 조력자에게 묻기(스레드를 엽니다)', [text('질문이나 요청')]),
@@ -88,12 +89,18 @@ export const commandDefinitions = (memory: boolean, review = false, task = false
   : Object.freeze([...COMMAND_DEFINITIONS, ...(memory ? MEMORY_COMMAND_DEFINITIONS : []), ...(review ? REVIEW_COMMAND_DEFINITIONS : []),
     ...(task ? TASK_COMMAND_DEFINITIONS : []), ...(external ? EXTERNAL_TASK_COMMAND_DEFINITIONS : []), ...(change ? CHANGE_COMMAND_DEFINITIONS : [])]);
 
+// 비교는 이 봇이 정하는 필드만 본다. 나머지(id·version·nsfw·default_member_permissions·dm_permission·localization)는
+// zod가 버려 GET 응답에 있든 없든 결과가 같다. 그런 필드를 정의에 새로 넣으면 여기에도 넣어야 바뀐 값이 등록된다.
+// contexts·integration_types도 비교하지 않는다. Discord 문서(Application Commands, application command object)는 두 필드를
+// "only for globally-scoped commands"로 적고, Create Guild Application Command는 둘을 받지 않는다. 실제 guild GET도
+// 32개 명령 모두 두 필드를 생략했다(T30 INT-03). 비교에 넣으면 응답이 늘 어긋나 재시작마다 PUT이 나간다.
+// 함정: 정의에서 이 두 필드만 바꾸면 PUT하지 않는다. guild 명령에는 효과가 없는 필드라 맞는 동작이다.
 const Remote = z.array(z.object({ name: z.string(), type: z.number().optional(), description: z.string(),
   options: z.array(z.object({ type: z.number(), name: z.string(), description: z.string(), required: z.boolean().optional(),
-    max_length: z.number().optional() })).optional(),
-  contexts: z.array(z.number()).nullable().optional(), integration_types: z.array(z.number()).optional() }));
+    max_length: z.number().optional() })).optional() }));
+// 문서상 생략 가능한 값은 기본값으로 맞춘다: type 1(CHAT_INPUT), 옵션 required false, options 없음은 빈 목록.
 const canonical = (commands: z.infer<typeof Remote>) => JSON.stringify(commands.map(c => ({ name: c.name, type: c.type ?? 1,
-  description: c.description, contexts: c.contexts ?? null, integration_types: c.integration_types ?? null,
+  description: c.description,
   options: (c.options ?? []).map(o => ({ type: o.type, name: o.name, description: o.description, required: o.required ?? false,
     max_length: o.max_length ?? null })) })).sort((a, b) => a.name.localeCompare(b.name)));
 const part = encodeURIComponent;
