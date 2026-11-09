@@ -320,13 +320,17 @@ test('CHANGE-01 local_integration: /change → v2 작성 → 무자격 검증 �
     const row = (await h.db.query<{ result_tree: string; base_commit: string; artifact_digest: string; verifier_revision: string }>('SELECT * FROM change_generations WHERE change_id=$1', [id])).rows[0]!;
     assert.equal(row.verifier_revision, 'change-verifier-v1');
     assert.equal(h.runs.verify, 1);
-    // 미리보기는 digest를 담고 mention이 울리지 않는다.
+    // 미리보기는 digest를 담고, owner 한 사람만 부른다(AC-12 owner 호출). everyone·역할 파싱은 어느 글에도 없다.
     await h.deliver();
     const preview = h.messages().find(text => text.includes('게시 미리보기'))!;
     const digest = await digestOf(h, id);
     assert.ok(preview.includes(digest));
     assert.ok(preview.includes('src/new.ts'));
     assert.ok(h.rest.messages.every(message => message.body.allowed_mentions.parse.length === 0));
+    const called = h.rest.messages.filter(message => message.body.allowed_mentions.users !== undefined);
+    assert.equal(called.length, 1);
+    assert.deepEqual(called[0]!.body.allowed_mentions.users, [OWNER]);
+    assert.ok(called[0]!.body.content.startsWith(`<@${OWNER}> `) && called[0]!.body.content.includes('게시 미리보기'));
     // digest가 다르면 승인하지 않는다. 다른 스레드에서는 존재도 알리지 않는다.
     await h.command('101', 'change-publish', { target: id, text: 'f'.repeat(64) });
     assert.equal(await h.phase(id), 'awaiting_publish_approval');
@@ -884,8 +888,8 @@ test('호환 슬롯: CHANGE 자식 job은 v1 claim에 잡히지 않고 /retry로
     assert.equal((await childOf(h.db, id))!.state, 'failed');
   });
 });
-// 게시자가 붙이는 [ref:…] 꼬리를 뗀 본문.
-const bodies = (h: Harness) => h.messages().map(text => text.replace(/\n\[ref:[^\]]+\]$/, ''));
+// 게시자가 붙이는 owner 호출 머리와 대조 표식 꼬리(작은 글씨 줄)를 뗀 본문.
+const bodies = (h: Harness) => h.messages().map(text => text.replace(/^<@[^>]+> /, '').replace(/\n-# ref:[0-9a-f]+$/, ''));
 // T21 감사 A06: 연결된 자식이 실패하면 일반 실패 안내가 거부될 /retry를 권했다.
 test('A06 자식 실패 안내: 작성 모델이 실패하면 자식·부모 안내가 /retry 없이 같은 복구 행동을 말하고, 안내한 명령이 동작한다', async () => {
   await withHarness({ steps: [{ output: { status: 'cannot_complete', summary: '', question: '' } }] }, async h => {
@@ -901,6 +905,10 @@ test('A06 자식 실패 안내: 작성 모델이 실패하면 자식·부모 안
     const parentNotice = bodies(h).find(text => text.startsWith(`변경 ${id} g1: failed`));
     assert.ok(parentNotice, '부모 안내도 나간다');
     assert.ok(parentNotice.endsWith(CHANGE_RESTART) && childNotice!.endsWith(CHANGE_RESTART), '두 안내가 같은 복구 행동을 말한다');
+    // 변경 실패는 부모 안내 하나로만 owner를 부른다. 자식 실패 안내까지 부르면 한 실패에 알림이 둘이다.
+    const calls = h.rest.messages.filter(message => message.body.allowed_mentions.users !== undefined).map(message => message.body.content);
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0]!.startsWith(`<@${OWNER}> 변경 ${id} g1: failed`));
     assert.ok(h.messages().every(text => !text.includes('/retry')), '어느 안내도 /retry를 말하지 않는다');
     // 안내한 /change-status는 이 변경을 보여 준다.
     await h.command('300', 'change-status', { target: id });

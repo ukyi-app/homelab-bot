@@ -2268,3 +2268,19 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 **검사.** `npm run check` 통과. 바뀐 모듈을 쓰는 시험 10개 파일(`task-contracts`·`change-artifact`·`task-stream`·`task-worker`·`change-contracts`·`task-assembly`·`change-assembly`·`codex-bridge`·`task-settings-boundary`·`task-diagnostics`) 378개 모두 통과(새 C25 시험 11개 포함). 전체 시험은 통합 단계에서 돌린다.
 
 **못 잡는 범위.** 모델이 언제 가정하고 언제 묻는지의 판단 품질(S5, C24), 고정 CLI 2.1.308이 새 출력 스키마(중첩 객체 배열)를 실제로 지키는지(S5), Discord 질문 글·버튼(C28), 미리보기·PR 설명 반영과 공개 검사(C29), 실제 PR 브랜치 head에서의 수정·게시(C27).
+
+## C07 답장·owner 호출·스레드·표식 (2026-11-10, 로컬)
+
+동료 봇 명세 §4.4 "대조 표식·스레드 제목·답장과 owner 호출"과 AC-12를 S1(수신 `DiscordIngress` → PGlite·실제 PostgreSQL → 게시 `DiscordPublisher`, 가짜 Discord REST·`DiscordProtocol`에 가짜 API)에서 고정했다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §11 "표식·답장·스레드", 구현 선택은 [DECISIONS](DECISIONS.md) "동료 봇 전환 4·11 답장·owner 호출·스레드·표식 구현 위치". 스위치 밖이라 병합하면 바로 운영에 나간다.
+
+| 완료 조건 | 시험 |
+|---|---|
+| 표식이 작은 글씨 줄, 유실 뒤 새·옛 표식 모두 찾아 재게시 0 | `c07-reply-call-thread` "대조 표식은 메시지 끝의 작은 글씨 줄이고 …2000자 안", "응답 유실 뒤 대조는 새 표식 글을 찾아 …", "대조는 새 표식(작은 글씨)과 옛 표식([ref:]) 글을 모두 찾고 다른 작성자 글은 무시"(실제 `DiscordProtocol.findDelivery`), 기존 `review-1` R1-08·`review-9` 옛 표식 대조, `foundation` EVENT-02 |
+| 멘션 스레드 제목이 owner 메시지 앞부분, 같은 메시지로 두 번 만들지 않음 | "채널 멘션 대화는 owner 메시지에서 스레드를 열고 제목은 멘션·마크업을 뺀 앞 40자"(리터럴), "멘션만 있는 메시지의 스레드 제목은 고정 문구", "스레드 생성 응답 유실 뒤 그 메시지의 스레드로 대조해 두 번 만들지 않는다", "protocol: 메시지에서 스레드를 열고, 대조는 그 메시지에 달린 스레드를 본다" |
+| 봇 답이 owner 메시지에 대한 답장, 알림 없음 | "대화 답은 owner 메시지에 대한 답장이고 답장 알림을 울리지 않는다", "대화 실패 안내도 …답장", "명령으로 받은 대화의 답은 답장이 아니다", `foundation` EVENT-02(`replied_user: false`) |
+| owner 호출 넷만 owner를 부름 | "owner 호출 표시가 있는 글만 owner 한 사람을 부르고 …", "owner 호출은 여러 쪽 글의 첫 쪽에서만", `task-bridge` "AC-12 owner 호출: 작업 질문·완료·실패 글만 …막힘 안내는 부르지 않는다", `codex-bridge` TASK-01(완료 `users`), `change-assembly` CHANGE-01(미리보기만 호출)·A06(변경 실패는 부모 안내 하나만 호출, 자식 실패 안내는 안 부름), `status-notice`(상태 안내 `parse: []`) |
+| '/' 경로·경보 스레드는 그대로 | "'/' 명령으로 연 채널 스레드는 지금처럼 표식 이름의 독립 스레드", 기존 `foundation` CHAT-01, `review-4`·`review-5`·`review-6`·`publisher-pg` 경보 스레드 |
+
+- **실행(병합 결과 587905d, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 29개 파일(`c07-reply-call-thread`·`foundation`·`chat-format`·`chat-ack`·`s16-display`·`discord-rest-timeout`·`publisher-recovery`·`status-notice`·`status-notice-pg`·`task-bridge`·`codex-bridge`·`change-assembly`·`review-1`~`review-9`·`external-task-receiver`·`external-task-assembly`·`publisher-main`·`publisher-pg`·`task-assembly`·`revoke-dispatch`·`revoke-dispatch-pg`·`change-purge-race`) 770 통과, 실패 0, skip 0.
+- **바뀐 기존 시험:** 표식 꼬리를 떼던 정규식(`chat-format`·`review-4`·`review-9`·`task-bridge`·`change-assembly`)을 새 꼬리로, 완료 글의 `startsWith`(`task-bridge`·`codex-bridge`)를 owner 호출 머리를 포함한 모양으로 고쳤다. 가짜 REST(`test/helpers.ts` `MockDiscord`)는 메시지에서 연 스레드의 ID를 그 메시지 ID로 두고 같은 메시지로 다시 열면 400으로 거부한다(Discord 문서 규칙).
+- **못 잡는 범위.** Discord의 실제 알림 동작(답장 알림 꺼짐, owner 한 사람만 알림), `-#` 작은 글씨 표시, 메시지 스레드 ID 규칙과 `message.thread` 칸의 실제 응답, 지워진 답장 대상에서 `fail_if_not_exists:false`의 실제 동작은 S5(C24)다.

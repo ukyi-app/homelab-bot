@@ -272,7 +272,7 @@ export class CodexBridge extends TaskBridge {
     if (current.state !== 'running') return;
     const session = (await db.query<Session>('SELECT * FROM codex_sessions WHERE job_id=$1', [job.id])).rows[0];
     // Claude 세션을 잇거나 덮으면 그 세션의 보존·정리 기록을 잃는다. 행은 Claude 경로가 닫게 둔다.
-    if (session?.executor === 'claude') { await this.store.fail(job, 'task_session_mismatch'); return; }
+    if (session?.executor === 'claude') { await this.store.fail(job, 'task_session_mismatch', { ownerCall: true }); return; }
     // 이어 가기는 세션이 대기 상태로 남은 경우뿐이다. 실패로 정리된 세션은 /retry에서 새 스레드로 시작한다.
     const resumable = session?.state === 'waiting_answer' || session?.state === 'waiting_model';
     const answered = resumable && session?.thread_id ? (await db.query<Question>(`SELECT * FROM codex_questions
@@ -366,7 +366,7 @@ export class CodexBridge extends TaskBridge {
     }
     if (stop || outcome.kind === 'failed') {
       await sessionState('failed');
-      await this.store.fail(job, stop ? `codex_${stop}` : `codex_${outcome.kind === 'failed' ? outcome.reason : 'failed'}`);
+      await this.store.fail(job, stop ? `codex_${stop}` : `codex_${outcome.kind === 'failed' ? outcome.reason : 'failed'}`, { ownerCall: true });
       return;
     }
     if (outcome.kind === 'waiting') {
@@ -400,7 +400,7 @@ export class CodexBridge extends TaskBridge {
     await this.store.finish(job, { summary: outcome.summary, changes: keepPaths(outcome.changes), changeCount: outcome.changes.length },
       { source: 'codex_exec', threadId: outcome.threadId, turns: turn, exitCode: 0, stopConfirmed: true, diff: 'workspace_snapshot',
         reportedChanges: keepPaths(outcome.reported), reportedCount: outcome.reported.length,
-        unconfirmedReports: keepPaths(outcome.unconfirmed), unconfirmedCount: outcome.unconfirmed.length }, content, job.target);
+        unconfirmedReports: keepPaths(outcome.unconfirmed), unconfirmedCount: outcome.unconfirmed.length }, content, job.target, [], { ownerCall: true });
   }
   // Runtime.tick이 claim 전에 부른다.
   async sweep(): Promise<number> {

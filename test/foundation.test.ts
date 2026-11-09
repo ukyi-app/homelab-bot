@@ -129,7 +129,8 @@ test('EVENT-02 게시 성공 뒤 응답 유실을 대조하고 재게시하지 �
   await f.publisher.deliver(); assert.equal((await rows('outbox'))[0]!.state, 'unknown');
   await f.publisher.reconcile(); assert.equal((await rows('outbox'))[0]!.state, 'sent');
   await f.publisher.deliver(); assert.equal(f.rest.messages.length, 1);
-  assert.deepEqual(f.rest.messages[0]!.body.allowed_mentions, { parse: [] });
+  // 대화 답은 owner 메시지에 대한 답장이고 답장 알림은 끈다(AC-12). 그 밖의 멘션 파싱은 없다.
+  assert.deepEqual(f.rest.messages[0]!.body.allowed_mentions, { parse: [], replied_user: false });
 });
 test('EVENT-02 대조가 찾지 못하면 unknown 유지, 무한 재시도 없음', async () => {
   await queued(); await f.runtime.tick();

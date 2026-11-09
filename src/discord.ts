@@ -17,11 +17,17 @@ import type { TaskCommandHandler } from './task-commands.js';
 
 // 일반 메시지 수신 표시가 리액션 대신 텍스트로 대체됐을 때의 거부 상태(권한 점검 신호).
 export interface AckOutcome { fallback: 403 | 404 }
+// parse는 늘 비운다(everyone·역할·이름 파싱 없음). users는 owner 호출 글에서 owner 한 사람만, replied_user는 답장 알림을 끈다.
+// Discord는 parse와 users를 함께 받지만 parse에 'users'가 있으면 거부한다(parse가 비어 있으면 괜찮다).
+export interface AllowedMentions { parse: never[]; users?: [string]; replied_user?: false }
 export interface DiscordRest {
   acknowledge(event: EventInput, content: string, options: { allowed_mentions: { parse: never[] }; flags?: typeof SUPPRESS_EMBEDS }): Promise<AckOutcome | void>;
-  createThread(channel: string, body: { name: string; type: 11; auto_archive_duration: 1440 }): Promise<{ id: string }>;
-  sendMessage(channel: string, body: { content: string; nonce: string; enforce_nonce: true; allowed_mentions: { parse: never[] } }): Promise<{ id: string }>;
-  findDelivery(channel: string, marker: string, kind: 'message' | 'thread'): Promise<{ id: string } | undefined>;
+  // from이 있으면 그 메시지에서 스레드를 연다(스레드 ID = 메시지 ID). 없으면 채널에 독립 스레드를 만든다.
+  createThread(channel: string, body: { name: string; type: 11; auto_archive_duration: 1440 }, from?: string): Promise<{ id: string }>;
+  sendMessage(channel: string, body: { content: string; nonce: string; enforce_nonce: true; allowed_mentions: AllowedMentions;
+    message_reference?: { message_id: string; fail_if_not_exists: false } }): Promise<{ id: string }>;
+  // kind=thread이고 from이 있으면 그 메시지에 이미 달린 스레드로 대조한다. 없으면 표식 이름으로 찾는다.
+  findDelivery(channel: string, marker: string, kind: 'message' | 'thread', from?: string): Promise<{ id: string } | undefined>;
   history(channel: string, after: string | null, limit: 100): Promise<EventInput[]>;
   // 봇 자신의 반응만 더하고 지운다(경로 @me). 반응 상태는 src/reactions.ts가 정한다.
   addReaction(channel: string, message: string, emoji: string): Promise<void>;
@@ -173,9 +179,11 @@ export class DiscordIngress {
           scope: event.scope, revision: current.revision, payload: { kind: 'message', channel: event.scope.channel,
             content: controlText(event.command!, result, store.colleague), classification: 'safe_summary' } });
       } else if (event.scope.kind === 'channel') {
+        // 멘션 메시지는 그 메시지에서 스레드를 연다. '/' 명령은 원문 메시지가 없어 독립 스레드다.
         await store.enqueue({ key: `thread:${saved.id}`, conversation: conversationId,
           actor: event.actor, scope: event.scope, revision: current.revision,
-          payload: { kind: 'thread', channel: event.scope.channel, content: saved.id, classification: 'safe_summary' } });
+          payload: { kind: 'thread', channel: event.scope.channel, content: saved.id, classification: 'safe_summary',
+            ...(event.kind === 'message' ? { fromMessage: event.id } : {}) } });
       } else {
         // admit 뒤에 레인이 닫힌 경합. SQL 오류가 아니라 트랜잭션은 그대로 쓸 수 있다.
         try { await store.accept(saved.id, event.command === 'task' ? 'task' : event.command === 'read' ? 'read' : 'chat', current.revision, event.urgent || event.command === 'urgent'); }
@@ -484,15 +492,29 @@ function jsonBody(content: string): object | undefined {
   } catch { return undefined; }
 }
 // JSON 본문(목록 페이지·제어 결과)은 marker를 JSON 필드로 넣어 메시지 전체가 그대로 파싱되게 한다.
-// 일반 문장은 끝 줄에 붙인다. 감싸기는 42자를 더해 본문 상한 1900자에서도 Discord 2000자 안이다.
+// 일반 문장은 끝에 Discord 작은 글씨 줄(`-# `)로 붙인다(32자). 감싸기는 42자라 본문 상한 1900자에 owner 호출(최대 24자)이
+// 붙어도 Discord 2000자 안이다.
 export function markedContent(content: string, marker: string): string {
   const data = jsonBody(content);
-  return data === undefined ? `${content}\n[ref:${marker}]` : JSON.stringify({ ref: marker, data });
+  return data === undefined ? `${content}\n-# ref:${marker}` : JSON.stringify({ ref: marker, data });
 }
+// 옛 꼬리(`[ref:<marker>]`)도 찾는다. 배포 전에 보낸 글이 unknown으로 남아 있을 수 있어서다.
 export function hasMarker(content: string, marker: string): boolean {
-  if (content.endsWith(`[ref:${marker}]`)) return true;
+  if (content.endsWith(`\n-# ref:${marker}`) || content.endsWith(`[ref:${marker}]`)) return true;
   const body = jsonBody(content) as { ref?: unknown; data?: unknown } | undefined;
   return !!body && !Array.isArray(body) && body.ref === marker && 'data' in body;
+}
+// 멘션으로 연 스레드의 제목. owner 메시지 앞부분에서 멘션·채널·역할·사용자 이모지·시각 표기와 마크업을 뺀다.
+export const THREAD_TITLE_MAX = 40;
+export const THREAD_TITLE_FALLBACK = '새 대화';
+export function threadTitle(text: string): string {
+  const plain = text
+    .replace(/<(?:@[!&]?|#)\d+>|<a?:\w+:\d+>|<t:-?\d+(?::[tTdDfFR])?>|@(?:everyone|here)\b/g, ' ')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/^\s*(?:-#|#{1,3}|>{1,3}|[-*]|\d+\.)\s+/gm, '')
+    .replace(/[*_~`|]/g, '')
+    .replace(/\s+/g, ' ').trim();
+  return Array.from(plain).slice(0, THREAD_TITLE_MAX).join('').trim() || THREAD_TITLE_FALLBACK;
 }
 // 게시 루프 한 바퀴가 반응 동기화를 기다리는 상한. 반응 REST가 멈춰도 다음 답 게시는 이만큼만 늦는다.
 export const REACTION_WAIT_MS = 1000;
@@ -561,9 +583,9 @@ export class DiscordPublisher {
       if (dispatch !== 'dispatched') return true;
       dispatched = true;
       const sent = row.payload.kind === 'thread'
-        ? await this.rest.createThread(row.payload.channel, { name: `homelab-${marker}`, type: 11, auto_archive_duration: 1440 })
-        : await this.rest.sendMessage(row.payload.channel, { content: markedContent(row.payload.content, marker),
-          nonce: marker, enforce_nonce: true, ...noMentions });
+        ? await this.rest.createThread(row.payload.channel, { name: await this.threadName(row, marker), type: 11, auto_archive_duration: 1440 },
+          row.payload.fromMessage)
+        : await this.rest.sendMessage(row.payload.channel, this.messageBody(row, marker));
       remoteId = sent.id;
       await this.confirm(row, sent.id);
     } catch (error) {
@@ -585,6 +607,24 @@ export class DiscordPublisher {
     }
     return true;
   }
+  // 답장·owner 호출은 첫 쪽에만 건다. 뒤 쪽까지 걸면 한 답에 알림·답장 줄이 쪽 수만큼 붙는다.
+  // 답장 대상이 지워졌으면(fail_if_not_exists=false) Discord가 일반 글로 게시해 답이 막히지 않는다.
+  private messageBody(row: Delivery, marker: string): Parameters<DiscordRest['sendMessage']>[1] {
+    const first = row.page_index === 0;
+    const call = first && row.payload.ownerCall === true;
+    const reply = first ? row.payload.replyTo : undefined;
+    const content = call ? `<@${row.owner_id}> ${row.payload.content}` : row.payload.content;
+    const allowed: AllowedMentions = { parse: [], ...(call ? { users: [row.owner_id] as [string] } : {}), ...(reply ? { replied_user: false as const } : {}) };
+    return { content: markedContent(content, marker), nonce: marker, enforce_nonce: true, allowed_mentions: allowed,
+      ...(reply ? { message_reference: { message_id: reply, fail_if_not_exists: false as const } } : {}) };
+  }
+  // 메시지에서 여는 스레드는 owner 원문으로 제목을 짓는다. 원문은 outbox에 두지 않고 게시 때 events에서 읽는다
+  // (outbox 본문 보존 정리가 이 칸을 모른다). 경보·'/' 스레드는 표식 이름이고 대조도 그 이름으로 한다.
+  private async threadName(row: Delivery, marker: string): Promise<string> {
+    if (!row.payload.fromMessage) return `homelab-${marker}`;
+    const event = (await this.store.db.query<{ text: string | null }>("SELECT payload->>'text' AS text FROM events WHERE id=$1", [row.payload.content])).rows[0];
+    return threadTitle(event?.text ?? '');
+  }
   async reconcile(): Promise<void> {
     await this.store.retireUnknownDeliveries();
     const pause = (await this.store.db.query<{ value: number }>("SELECT value FROM controls WHERE key='discord_reconcile_after'")).rows[0];
@@ -600,7 +640,7 @@ export class DiscordPublisher {
         let found: { id: string } | undefined = row.external_id ? { id: row.external_id } : undefined;
         if (!found) {
           searched = true;
-          found = await this.rest.findDelivery(row.payload.channel, deliveryMarker(row), row.payload.kind);
+          found = await this.rest.findDelivery(row.payload.channel, deliveryMarker(row), row.payload.kind, row.payload.fromMessage);
         }
         if (found) await this.confirm(row, found.id);
         // A bounded search miss is not proof of absence; keep unknown, never auto-resend.

@@ -294,7 +294,9 @@ test('TASK-01 Discord 작업 요청 → codex exec 완료 → 결과 기록 → 
   assert.deepEqual(launcher.terminated, [job.id]);
   await f.publisher.deliver();
   assert.equal(f.rest.messages.length, 1);
-  assert.ok(f.rest.messages[0]!.body.content.startsWith(T.codexCompleted(false, job.id)));
+  // 작업 완료는 owner 호출 글이다(AC-12): owner 한 사람만 부른다.
+  assert.ok(f.rest.messages[0]!.body.content.startsWith(`<@fixture-owner> ${T.codexCompleted(false, job.id)}`));
+  assert.deepEqual(f.rest.messages[0]!.body.allowed_mentions, { parse: [], users: ['fixture-owner'] });
   assert.match(f.rest.messages[0]!.body.content, /시간대 고정[\s\S]*실제 diff 기준\): 1개/);
   assert.equal(result.evidence.diff, 'workspace_snapshot'); assert.deepEqual(result.evidence.reportedChanges, ['src/a.ts']);
   // codex exec의 Git 저장소 요구: 첫 실행 전에 작업 공간을 git init·기준 커밋한다(D-15).
@@ -345,7 +347,7 @@ test('TASK-02 질문을 대화로 중계 → owner 답 → 같은 스레드 resu
   assert.equal((await rows('codex_sessions'))[0]!.turn, 2);
   assert.equal((await rows('codex_questions'))[0]!.state, 'resumed');
   await f.publisher.deliver();
-  assert.ok(f.rest.messages[1]!.body.content.startsWith(T.codexCompleted(false, job.id)));
+  assert.ok(f.rest.messages[1]!.body.content.startsWith(`<@fixture-owner> ${T.codexCompleted(false, job.id)}`));
   assert.match(f.rest.messages[1]!.body.content, /main 기준/);
 });
 test('TASK-02 옛 능력표 JSON(attach_task undecided)이 저장된 세션도 상태 조회·재개가 그대로 됨', async () => {

@@ -269,8 +269,9 @@ test('채널 멘션: 스레드에서 답해도 반응은 채널에 있는 원문
   f.advance(DEFAULTS.debounceMs);
   assert.equal(await f.runtime.tick(), true);
   await drain();
+  // 채널 멘션은 그 메시지에서 스레드를 연다. Discord에서 그 스레드의 ID는 원문 메시지 ID와 같다.
   const replies = f.rest.messages.map(m => m.channel);
-  assert.deepEqual(replies, ['fixture-new-thread-0']);
+  assert.deepEqual(replies, ['8801']);
   assert.deepEqual(f.rest.reactions, [{ op: 'remove', channel: 'fixture-chat', message: '8801', emoji: '👀' }]);
 });
 

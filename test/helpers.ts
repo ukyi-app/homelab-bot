@@ -8,6 +8,7 @@ import { PolicyGate } from '../src/policy.js';
 import type { Policy } from '../src/policy.js';
 import { DiscordIngress, DiscordPublisher } from '../src/discord.js';
 import type { DiscordRest } from '../src/discord.js';
+import { DiscordRejected } from '../src/contracts.js';
 import type { EventInput, Scope } from '../src/contracts.js';
 import { SerialWorker, WorkerSigner, WorkerVerifier } from '../src/worker.js';
 import type { WorkerRequest, WorkerResult } from '../src/worker.js';
@@ -54,7 +55,7 @@ export const event = (id: string, options: Partial<EventInput> = {}): EventInput
 export class MockDiscord implements DiscordRest {
   acks: { event: EventInput; options: unknown }[] = [];
   messages: { id: string; channel: string; body: Parameters<DiscordRest['sendMessage']>[1] }[] = [];
-  threads: { id: string; channel: string; body: Parameters<DiscordRest['createThread']>[1] }[] = [];
+  threads: { id: string; channel: string; body: Parameters<DiscordRest['createThread']>[1]; from?: string }[] = [];
   pages: EventInput[][] = [];
   failAck = false;
   loseResponse = false;
@@ -63,8 +64,10 @@ export class MockDiscord implements DiscordRest {
     if (this.failAck) throw new Error('ack_lost');
     this.acks.push({ event: e, options });
   }
-  async createThread(channel: string, body: Parameters<DiscordRest['createThread']>[1]) {
-    const record = { id: `fixture-new-thread-${this.threads.length}`, channel, body };
+  // 메시지에서 연 스레드는 Discord처럼 ID가 그 메시지 ID이고, 같은 메시지로 두 번 열면 거부한다.
+  async createThread(channel: string, body: Parameters<DiscordRest['createThread']>[1], from?: string) {
+    if (from !== undefined && this.threads.some(t => t.from === from)) throw new DiscordRejected(400);
+    const record = from === undefined ? { id: `fixture-new-thread-${this.threads.length}`, channel, body } : { id: from, channel, body, from };
     this.threads.push(record);
     if (this.loseResponse) { this.loseResponse = false; throw new Error('response_lost'); }
     return record;
@@ -78,7 +81,8 @@ export class MockDiscord implements DiscordRest {
     if (this.loseResponse) { this.loseResponse = false; throw new Error('response_lost'); }
     return record;
   }
-  async findDelivery(channel: string, marker: string, kind: 'message' | 'thread'): Promise<{ id: string } | undefined> {
+  async findDelivery(channel: string, marker: string, kind: 'message' | 'thread', from?: string): Promise<{ id: string } | undefined> {
+    if (kind === 'thread' && from !== undefined) return this.threads.find(t => t.channel === channel && t.from === from);
     return kind === 'message' ? this.messages.find(m => m.channel === channel && m.body.content.includes(marker))
       : this.threads.find(t => t.channel === channel && t.body.name.includes(marker));
   }

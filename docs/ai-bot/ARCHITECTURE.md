@@ -190,7 +190,7 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 
 **외부인 입력:** 봇 저장소와 앱 저장소가 public이라(D-29) 모델 호출 전 게이트를 둔다. 설치·저장소 허용, fork 제외, `author_association` 또는 허용 봇 작성자 ID(D-16 하위 결정). `CONTRIBUTOR`는 허용하지 않는다. 댓글 트리거는 `comment.author_association`을 보고 Bot 댓글은 무시한다. 댓글 트리거도 대상 PR을 조회해, 같은 저장소 PR이고 PR 작성자가 자동 리뷰와 같은 조건일 때만 모델을 호출한다(DECISIONS D-16 규칙 스케치).
 
-**Discord 입력:** 매 이벤트마다 사용자 ID(문자열 snowflake)·guild·채널(스레드는 `parent_id`) 허용 검사. 봇·webhook 메시지 무시. 버튼은 누른 사람 ID를 질문 대상·작업 소유자와 대조. 모든 봇 메시지에 `allowed_mentions: {"parse": []}`(D-17).
+**Discord 입력:** 매 이벤트마다 사용자 ID(문자열 snowflake)·guild·채널(스레드는 `parent_id`) 허용 검사. 봇·webhook 메시지 무시. 버튼은 누른 사람 ID를 질문 대상·작업 소유자와 대조. 봇 메시지의 멘션은 기본 `allowed_mentions: {"parse": []}`(D-17)이고, **owner 호출** 넷(작업 질문, 작업 완료·실패, 변경 미리보기, 변경 실패)만 `users`에 owner 사용자 ID 하나를 허용한다. everyone·역할·다른 사용자는 늘 막는다. 답장은 `replied_user: false`로 알림을 끈다(C07, §11 "표식·답장·스레드").
 
 **허용 목록 반영(F01, AUTH-02):** T16b D1(사용자 2026-10-30)로 아래 제안 중 파일 마운트·최대 나이는 채택하지 않았다. 지금 계약은 §11이다(env를 기동 때 읽기, 즉시 차단은 `/revoke`). 아래는 당시 기록이다. Infisical에서 허용 목록을 바꾸면 ESO 동기화를 거쳐야 봇에 닿는다. 정책을 확인할 수 없거나 오래됐으면 거부하도록 **실패 시 닫힘**으로 설계한다. 다만 이것이 철회의 즉시 효력을 보장하지는 않는다(아래 "남는 창"). 아래는 제안이고 값은 T16a에서 정한다 [가정]:
 
@@ -406,10 +406,14 @@ outbox를 함께 기록하고 종료 불확실만 unknown이다. monitor에서 �
 Discord 401은 별도 오류로 pending을 유지한다. 토큰 갱신 후 새 REST 어댑터를 주입해 재개한다.
 
 부모 채널은 비활성이며 매번 멘션/명령이 필요하다. 활성 스레드만 멘션 없는 후속 메시지를 수집한다.
-스레드는 공개, 보관 시간 **1440분**이다. 모든 메시지/상호작용 응답의 `allowed_mentions.parse=[]`를 강제한다.
-제어 명령 결과(`/list`·`/stop`·`/resume`·`/cancel`·`/retry`·`/emergency-stop`·`/resume-model`·`/model-status`·리뷰 제어)는 `controlText`(`src/control-format.ts`)가 짧은 한국어 문장으로 바꿔 게시한다. 예: `/list` → "작업 N건" + 줄마다 `` `<작업 ID>` 상태(대기 사유) ``(최근 20건, 넘으면 머리줄에 "최근 20건만 표시". 상태·사유 코드는 owner가 읽는 말로 풀고 모르는 코드는 그대로, `src/chat-task-text.ts`), 거절은 "처리하지 못했어요. <안내>", `/model-status`는 모델 호출·비상 중지·실행 중 작업·한도/인증 대기 목록과 안내. 작업 ID는 `/cancel`·`/retry` target에 그대로 넣어야 해서 줄이지 않는다. 모르는 결과 모양은 JSON 그대로 둔다. 이전에는 결과를 `JSON.stringify`해 `{"ref":...,"data":[...]}`로 보였다(S16). 이제 제어 결과도 일반 문장이라 marker는 끝 줄 `[ref:…]`이고, JSON 본문의 marker 필드 방식(`markedContent`)은 JSON으로 읽히는 다른 본문을 위해 남겨 둔다.
+스레드는 공개, 보관 시간 **1440분**이다. 모든 메시지/상호작용 응답의 `allowed_mentions.parse=[]`를 강제한다(owner 호출의 `users` 하나는 아래 "표식·답장·스레드").
+제어 명령 결과(`/list`·`/stop`·`/resume`·`/cancel`·`/retry`·`/emergency-stop`·`/resume-model`·`/model-status`·리뷰 제어)는 `controlText`(`src/control-format.ts`)가 짧은 한국어 문장으로 바꿔 게시한다. 예: `/list` → "작업 N건" + 줄마다 `` `<작업 ID>` 상태(대기 사유) ``(최근 20건, 넘으면 머리줄에 "최근 20건만 표시". 상태·사유 코드는 owner가 읽는 말로 풀고 모르는 코드는 그대로, `src/chat-task-text.ts`), 거절은 "처리하지 못했어요. <안내>", `/model-status`는 모델 호출·비상 중지·실행 중 작업·한도/인증 대기 목록과 안내. 작업 ID는 `/cancel`·`/retry` target에 그대로 넣어야 해서 줄이지 않는다. 모르는 결과 모양은 JSON 그대로 둔다. 이전에는 결과를 `JSON.stringify`해 `{"ref":...,"data":[...]}`로 보였다(S16). 이제 제어 결과도 일반 문장이라 marker는 끝 줄(C07부터 작은 글씨 `-# ref:…`)이고, JSON 본문의 marker 필드 방식(`markedContent`)은 JSON으로 읽히는 다른 본문을 위해 남겨 둔다.
 outbox UUID별 멱등 키에서 24자 nonce와 게시 marker를 만든다. 응답 유실은 unknown으로 두고 게시자의 marker와
 스레드 이름을 제한 조회한다. 못 찾았다고 재게시하지 않는다.
+
+**표식·답장·스레드(C07, AC-12).** 일반 문장의 marker는 끝 줄 Discord 작은 글씨 `-# ref:<marker>`(32자)다. 대조(`hasMarker`)는 이 꼬리와 배포 전 꼬리 `[ref:<marker>]`를 모두 찾는다(배포 순간 unknown으로 남은 옛 글). JSON 본문의 marker 필드 규칙은 그대로다. 본문 상한 1900자에 owner 호출 머리(`<@id> `, 최대 24자)와 꼬리를 더해도 2000자 안이다.
+outbox 페이로드(`Delivery.payload`)에 세 칸이 있다. `replyTo`는 답장할 owner 메시지 ID다. `Store.finish`·`Store.fail`이 그 job을 만든 event가 일반 메시지이고 답과 같은 채널에 있을 때만 채운다(명령에는 답할 메시지가 없고, 채널 멘션은 그 메시지에서 스레드를 열었으니 따로 답장하지 않는다). 게시자는 첫 쪽에만 `message_reference{message_id, fail_if_not_exists:false}`와 `replied_user:false`를 건다. 원문이 지워졌으면 Discord가 일반 글로 게시해 답이 막히지 않는다. `ownerCall`은 작업 브리지(질문·완료·실패)와 `change-runtime`(미리보기·실패)만 켠다. 게시자는 첫 쪽 앞에 `<@owner> `를 붙이고 `users: [owner]`만 허용한다. CHANGE 자식 job의 실패 안내는 부모 변경 실패 알림이 부르므로 켜지 않는다. `fromMessage`(kind=thread)는 채널 멘션 메시지 ID다. 게시자는 `POST /channels/{c}/messages/{m}/threads`로 그 메시지에서 스레드를 열고, 제목은 게시 때 events 원문에서 멘션·채널·역할·이모지·시각 표기와 마크업을 빼고 공백을 줄인 앞 40자(비면 "새 대화")다. 원문 제목을 outbox에 두지 않는 것은 outbox 본문 정리가 그 칸을 모르기 때문이다. 응답 유실 뒤에는 `GET /channels/{c}/messages/{m}`의 `thread`가 있으면 그 스레드로 확정하고 다시 만들지 않는다. '/' 명령과 경보는 지금처럼 `homelab-<marker>` 이름의 독립 스레드이고 이름으로 대조한다.
+메시지 스레드 ID 규칙 확인(2026-11-10, https://docs.discord.com/developers/resources/channel "Start Thread from Message"): "The id of the created thread will be the same as the id of the source message, and as such a message can only have a single thread created from it." 같은 문서에 이미 스레드가 있을 때의 오류 코드는 적혀 있지 않아, 대조는 오류 코드가 아니라 메시지의 `thread` 칸(https://docs.discord.com/developers/resources/message, "the thread that was started from this message")으로 한다. 실제 응답 모양과 작은 글씨 표시(`-#`는 개발자 문서에 없고 Discord 앱 마크다운이다)는 S5(C24)에서 본다.
 대조 중 429는 즉시 루프를 중단하고 전역 다음 대조 시각을 DB에 기록한다. 재기동해도
 최소 1초 또는 retry_after 중 긴 쪽을 기다린다. 기존 unknown의 24시간 기한은 연장하지 않는다.
 HTTP 429의 global 필드를 보존하며 true면 controls.discord_global_after에 더 긴 중지 시각을 기록한다.
@@ -1306,7 +1310,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 | chat unknown 해소 | `unknown-resolved:<job>:<attempt>` | 멈춤 확인, `/retry target:<job>` |
 | read lease 만료 | `read-expired:<job>:<attempt>` | `/read`로 다시 요청 |
 
-권한 철회로 생긴 unknown은 안내하지 않는다(게시도 막힌다). 모두 `safe_summary`, `allowed_mentions.parse=[]`다. owner를 부르는 개입 알림(개선안 5-3)은 아직 넣지 않았다.
+권한 철회로 생긴 unknown은 안내하지 않는다(게시도 막힌다). 모두 `safe_summary`, `allowed_mentions.parse=[]`다. 이 표의 안내는 owner를 부르지 않는다. owner를 부르는 글은 **owner 호출** 넷(작업 질문, 작업 완료·실패, 변경 미리보기, 변경 실패)뿐이다(C07, §11 "표식·답장·스레드").
 
 ### 수신·진행 신호
 

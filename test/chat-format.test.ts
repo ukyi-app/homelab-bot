@@ -92,7 +92,7 @@ test('게시 경로: 400자 첫 가설이 Discord 본문에 온전히 실린다'
   await f.ingress.receive(event('9001')); f.advance(DEFAULTS.debounceMs);
   await f.runtime.tick();
   while (await f.publisher.deliver()) { /* 모든 페이지 */ }
-  const posted = f.rest.messages.map(m => m.body.content.replace(/\n\[ref:[0-9a-f]+\]$/, '')).join('');
+  const posted = f.rest.messages.map(m => m.body.content.replace(/\n-# ref:[0-9a-f]+$/, '')).join('');
   assert.ok(posted.includes(long), posted);
 });
 
@@ -100,5 +100,5 @@ test('게시 경로: 단순 답은 라벨 없이 한 문장', async () => {
   f.setRun(async () => ({ status: 'succeeded', stopped: true, answer: answer({ facts: ['네, 정상입니다.'] }) }));
   await f.ingress.receive(event('9002')); f.advance(DEFAULTS.debounceMs);
   await f.runtime.tick(); await f.publisher.deliver();
-  assert.match(f.rest.messages[0]!.body.content, /^네, 정상입니다\.\n\[ref:[0-9a-f]+\]$/);
+  assert.match(f.rest.messages[0]!.body.content, /^네, 정상입니다\.\n-# ref:[0-9a-f]+$/);
 });

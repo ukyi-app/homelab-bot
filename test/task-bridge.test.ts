@@ -169,12 +169,13 @@ test('TASK-02 완료 요약 공개 검사: 걸린 요약은 그 줄만 고정 �
   await deliverAll();
   for (const item of done) {
     assert.deepEqual(await exposed(item.fragment, events), [], item.name);
-    // 게시자가 끝에 붙이는 대조용 ref 줄은 뺀다.
-    const message = f.rest.messages.find(m => m.body.content.startsWith(T.taskCompleted(false, item.id)))!.body.content.replace(/\n\[ref:[0-9a-f]+\]$/, '');
+    // 게시자가 붙이는 owner 호출 머리와 끝의 대조 표식 줄은 뺀다.
+    const message = f.rest.messages.map(m => m.body.content.replace(/^<@fixture-owner> /, '').replace(/\n-# ref:[0-9a-f]+$/, ''))
+      .find(content => content.startsWith(T.taskCompleted(false, item.id)))!;
     assert.equal(message, [T.taskCompleted(false, item.id), T.summaryBlocked(false, item.reason),
       '변경 파일(작업자 diff 기준): 0개', '검증: 통과 0 · 실패 0 · 미실행 0'].join('\n'), item.name);
   }
-  const control = f.rest.messages.find(m => m.body.content.startsWith(T.taskCompleted(false, normal.id)))!.body.content;
+  const control = f.rest.messages.find(m => m.body.content.includes(T.taskCompleted(false, normal.id)))!.body.content;
   assert.match(control, /main 기준으로 고쳤습니다\./);
   assert.equal((await rows('results')).find(row => row.job_id === normal.id)!.evidence.summaryWithheld, undefined);
 });
@@ -225,8 +226,30 @@ test('TASK-02 질문 중계 → owner 답 → 같은 세션 resume → 완료 �
   assert.equal(finalize.receipt.resultDigest, (await rows('results'))[0]!.evidence.resultDigest);
   assert.equal((await session()).session_retained, false); assert.equal((await session()).cleanup_state, 'cleaned');
   await f.publisher.deliver();
-  assert.ok(f.rest.messages[1]!.body.content.startsWith(T.taskCompleted(false, job.id)));
+  // 작업 완료는 owner 호출 글이라 게시자가 owner 멘션을 앞에 붙인다(AC-12).
+  assert.ok(f.rest.messages[1]!.body.content.startsWith(`<@fixture-owner> ${T.taskCompleted(false, job.id)}`));
   assert.match(f.rest.messages[1]!.body.content, /main 기준/);
+});
+test('AC-12 owner 호출: 작업 질문·완료·실패 글만 owner를 부르고 작업 막힘 안내는 부르지 않는다', async () => {
+  const flush = async () => { while (await f.publisher.deliver()) { /* 쌓인 글 모두 */ } };
+  const calls = (content: string) => f.rest.messages.filter(m => m.body.content.includes(content))
+    .map(m => [m.body.content.startsWith('<@fixture-owner> '), m.body.allowed_mentions.users ?? null]);
+  const { job, question } = await asked('어느 브랜치 기준으로 고칠까요?');
+  await flush();
+  assert.deepEqual(calls(`질문 ID: ${question}`), [[true, ['fixture-owner']]]);
+  await answer(setup.bridge, question, 'main 기준', 'answer-c07');
+  setup.worker.scripts.push(reply.completed('main 기준으로 고쳤어요.'));
+  await setup.runtime.tickTask(); await flush();
+  assert.deepEqual(calls(T.taskCompleted(false, job.id)), [[true, ['fixture-owner']]]);
+  setup.worker.scripts.push(reply.failed('api_error'));
+  await newTask('c07-failed'); await setup.runtime.tickTask(); await flush();
+  assert.deepEqual(calls(T.jobFailed(false)), [[true, ['fixture-owner']]]);
+  const before = f.rest.messages.length;
+  setup.worker.scripts.push(reply.unknown()); setup.worker.stopped = false;
+  await newTask('c07-unknown'); await setup.runtime.tickTask(); await flush();
+  const blocked = f.rest.messages.slice(before);
+  assert.ok(blocked.length >= 1);
+  for (const m of blocked) { assert.deepEqual(m.body.allowed_mentions, { parse: [] }); assert.ok(!m.body.content.includes('<@')); }
 });
 test('TASK-02 중복·다른 사람·다른 스레드·없는 질문·지난 턴 질문·빈 답·2000자 초과 거부', async () => {
   const { question } = await asked();

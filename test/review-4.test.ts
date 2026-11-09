@@ -124,7 +124,7 @@ for (const obstruction of ['429', 'unknown', 'blocked']) test(`4314215638 ${obst
   if (obstruction === 'blocked') return;
   if (obstruction === 'unknown') await f.publisher.reconcile(); else f.advance(2000);
   while (await f.publisher.deliver()) { /* Ordered drain. */ }
-  const delivered = f.rest.messages.filter(m => !m.body.content.startsWith('다른 메시지')).map(m => m.body.content.split('\n[ref:')[0]!);
+  const delivered = f.rest.messages.filter(m => !m.body.content.startsWith('다른 메시지')).map(m => m.body.content.split('\n-# ref:')[0]!);
   assert.equal(delivered.join(''), content);
 });
 test('4314215638 기존 페이지·read migration을 두 번 실행해도 순서·유형 보존', async () => {
@@ -137,7 +137,7 @@ test('4314215638 기존 페이지·read migration을 두 번 실행해도 순서
   assert.deepEqual(pages.map(p => p.page_index), [0, 1, 2]); assert.ok(pages.every(p => p.message_key === 'legacy'));
   assert.equal((await rows('jobs'))[0]!.type, 'read');
   while (await f.publisher.deliver()) { /* Legacy pages preserve order. */ }
-  assert.equal(f.rest.messages.map(m => m.body.content.split('\n[ref:')[0]!).join(''), '문장'.repeat(2000));
+  assert.equal(f.rest.messages.map(m => m.body.content.split('\n-# ref:')[0]!).join(''), '문장'.repeat(2000));
 });
 
 for (const lane of ['chat', 'read']) test(`4314215647 복구 gap 중 ${lane} 완료 결과 보존, gap 해제 후 게시`, async () => {

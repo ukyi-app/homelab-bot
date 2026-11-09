@@ -407,6 +407,7 @@ issue_comment (PR 댓글로 리뷰 요청):
 | 봇 권한 | 관리자·MANAGE_THREADS·MENTION_EVERYONE 없음. 서버 역할이 아니라 허용 채널 overwrite로 준다 | MANAGE_THREADS는 모든 비공개 스레드 보기를 포함한다. 권한 정수 제안값은 309237763136(VIEW_CHANNEL, SEND_MESSAGES, SEND_MESSAGES_IN_THREADS, CREATE_PUBLIC_THREADS, READ_MESSAGE_HISTORY, EMBED_LINKS, ADD_REACTIONS, ATTACH_FILES)이다 [실측: 비트 합 계산. 실제 동작은 미확인, T16b] |
 | 앱 설정 | Public Bot 끔, 서버 설치만, Interactions Endpoint URL 비움(Gateway로 받음) | Gateway로 받으면 새 공개 수신 경로가 필요 없다(설계의 봇 공개 경로는 GitHub webhook 하나) [가정]. Requires OAuth2 Code Grant 끔과 Members·Presence intent 끔은 결정 목록 밖의 에이전트 추천으로 남는다 |
 | 멘션 기본값 | 모든 봇 메시지에 `allowed_mentions: {"parse": []}` | 일반 메시지의 기본값은 everyone까지 파싱한다 [확인: https://docs.discord.com/developers/resources/message] |
+| 멘션 기본값(동료 봇 전환 4·11, C07) | 기본은 그대로 `parse: []`. owner 호출 넷(작업 질문, 작업 완료·실패, 변경 미리보기, 변경 실패)만 `users: [owner]` 하나를 허용하고, 답장은 `replied_user: false`로 알림 없이 단다 | ARCHITECTURE §6 "Discord 입력", §11 "표식·답장·스레드" |
 
 - **경계는 봇 코드다.** 매 이벤트마다 사용자 ID(문자열 snowflake)를 허용 목록과 비교하고, 스레드는 `parent_id`로 채널을 대조하며, 봇·webhook 메시지는 무시한다. 슬래시 명령 권한 overwrite는 봇 토큰으로 설정할 수 없고 명령 표시 제어일 뿐이다 [확인: https://docs.discord.com/developers/interactions/application-commands]. 버튼은 메시지를 볼 수 있는 누구나 누를 수 있다고 보고 서버에서 검사한다 [가정].
 - D-14와 연결: Discord Developer Policy가 API로 얻은 메시지 내용으로 AI 모델을 학습시키는 것을 금지한다고 검색 요약이 전한다 [미확인: 원문 403]. D-14 A의 구독 계정은 입력이 기본으로 학습에 쓰일 수 있으므로 [확인: https://help.openai.com/en/articles/5722486] 그 설정을 끄는 것을 계정 준비에 넣는다.
@@ -910,6 +911,15 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 - **스위치 전달:** `MemoryCommands`는 다섯 번째 인수 `colleague`, 브리핑은 `BriefingConfig.colleague`로 받는다. 수신(`discord.ts`)은 처리기의 `guide`를 써서 생성자 모양을 바꾸지 않는다. 운영 배선(`src/main.ts`에서 `config.colleagueEnabled === true`를 넘기는 두 자리)은 이 티켓의 파일 밖이라 하지 않았다. 배선 전에는 늘 꺼짐 판이다.
 - **원문 7일 안내:** 삭제 응답(완료·대기 모두) 끝에 "이 스레드의 원래 메시지는 7일 뒤에 지워져요(제가 받아 둔 원문 기준이고, Discord에 올라간 메시지는 그대로 남아요)."를 붙인다. 기억 삭제는 원문을 지우지 않고 T31 정리(받은 지 7일, 끝나지 않은 작업이 가리키는 행은 남김)가 비운다. owner가 Discord에서 자기 메시지가 사라진다고 읽지 않게 괄호를 더했다. 7은 `RAW_TEXT_RETENTION_MS`에서 계산한다.
 - **안전 문장 유지:** 오류 응답은 입력값을 되풀이하지 않고(키 이름만), 삭제 응답은 완료/대기와 백업 최대 14일, 이미 Discord에 올라간 사본(브리핑, 기억 응답)을 지우지 않는다는 문장을 그대로 싣는다. 사본 범위 문구의 "이 명령들의 응답"은 켜짐 판에서 '/' 명령을 가리키지 않게 "기억 응답"으로 바꿨다.
+
+## 동료 봇 전환 4·11 답장·owner 호출·스레드·표식 구현 위치 (C07, 2026-11-10)
+
+"동료 봇 전환 (사용자 2026-11-09)" 4·11의 게시 쪽 구현 선택이다(사용자 결정 아님). 결정은 바꾸지 않았다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §11 "표식·답장·스레드", 시험은 [VERIFICATION](VERIFICATION.md) "C07 답장·owner 호출·스레드·표식". 스위치 밖이라 병합하면 바로 운영에 나간다.
+
+- **답장 범위:** 그 job을 만든 owner 일반 메시지가 답과 같은 채널에 있을 때의 대화 답·실패 안내(첫 쪽)만 답장한다. 명령으로 받은 대화, 채널 멘션으로 연 스레드의 첫 답은 답장하지 않는다(뒤는 스레드가 그 메시지에 묶여 있다). 상태 안내·제어 결과도 답장하지 않는다.
+- **owner 호출 범위:** 작업 질문, 작업 완료(`Store.finish`), 작업 실패(`Store.fail`을 부르는 Claude·Codex 작업 브리지 경로), 변경 미리보기(`awaiting_publish_approval`), 변경 실패(`failed`)만이다. 변경 `blocked`·`cancelled`·`superseded`·`proposed`, 작업 막힘(unknown)·한도 대기·owner 확인 요청 안내는 부르지 않는다. CHANGE 자식 job의 실패 안내도 부르지 않는다(부모 변경 실패 알림이 부른다).
+- **호출 모양:** 문구는 그대로 두고 게시자가 첫 쪽 앞에 `<@owner> `를 붙인다. `allowed_mentions.users`만으로는 본문에 멘션이 없어 알림이 가지 않는다.
+- **스레드 제목이 비면** "새 대화"다. 제목은 게시 때 events 원문에서 만든다(원문이 7일 정리로 비었으면 이 고정 문구).
 
 ## 동료 봇 전환 14·16 작업자 변경 작성 v2 판 (C25, 2026-11-10)
 
