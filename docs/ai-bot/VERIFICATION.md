@@ -2173,3 +2173,21 @@ AC-14 중 👀·⏳·지움·실패를 S1(가짜 Discord REST, PGlite)에서 고
 **PR #114 2차 리뷰 반영(2026-11-10, `reaction-lifecycle` 23).** 앞 답이 응답 유실로 `unknown`인 동안 뒤 메시지를 `/cancel`해도 앞 메시지의 👀는 남고, 대조가 `sent`로 확정한 뒤에 지움. history gap 동안 복구 버퍼에 둔 메시지를 복구 전에 `/stop`으로 버리면 👀를 지우고 `reaction:` 행이 남지 않음. 게시 서버 둘(`ReactionSync` 두 개, 같은 DB)에서 느린 서버의 앞 행 REST가 멈춘 사이 lease가 끝나 다른 서버가 뒤 행을 가져가 끝 상태까지 맞추면, 느린 서버는 그 행을 옛 상태로 다시 맞추지 않음(⏳ 다시 더하기 0). 두 서버는 PGlite 한 DB와 가짜 시계로 차례를 정해 재현했고, 실제 PostgreSQL 두 연결의 동시 실행은 이 시험 밖이다. 복구 중 `text_purged`·`subscription_boundary`·`Denied`로 버리는 경로도 같은 정리를 하지만 따로 시험하지 않았다.
 
 **못 잡는 범위.** Discord 반응 rate limit의 실제 영향(S5, C24), 👍(C11)·💤(C20)의 실제 사용. 반응 상태는 마이그레이션 없이 `controls` 행에 두었다(`src/database.ts` 목록이 이 티켓의 파일 밖이라). 전용 표로 옮기려면 마이그레이션 티켓이 필요하다.
+
+## C10 고정 문구 2 (2026-11-10, 로컬)
+
+동료 봇 명세 §4.3 "기억 원문"·§4.4·§4.9의 기억·브리핑 문구(homelab 계획 C10, AC-11·AC-23의 이 범위). 기억 명령 응답·오류·충돌·삭제 안내와 브리핑 문장 줄을 해요체로 바꾸고, 기억 삭제 응답에 원래 메시지 7일 정리 안내를 더했다. '/'·명령 이름을 안내하는 줄은 동료 기능 스위치로 두 판을 고른다. 구현 선택은 [DECISIONS](DECISIONS.md) "C10 고정 문구: 기억·브리핑".
+
+**시험(경계 S1: 수신 `DiscordIngress` → 기억 명령 처리기 → `MemoryService`(PGlite·실제 원장 파일), 브리핑 예약 → outbox).**
+
+| 완료 조건 | 시험 |
+|---|---|
+| 해요체, "봇" 자기 지칭 없음 | `memory-commands` "C10 말투: …"(문구 표 전체를 훑어 `습니다·합니다·입니다·하세요·봇` 없음) |
+| 삭제하면 7일 안내 | `memory-commands` "C10 기억 삭제: 완료·대기 응답 모두 …"(명세 문장 리터럴로 확인) |
+| 꺼짐은 '/' 안내, 켜짐은 '/'·명령 이름 없음 | `memory-commands` "C10 스위치 두 판: …", "C10 수신 안내 판: …"(응답 유실 안내), `memory-briefing` "C10 스위치 두 판: 모델 호출 중지 줄 …"(켜짐 브리핑 전체 검사) |
+| 입력값 비반복·완료/대기·게시 사본 비삭제·정상/미확인 | 기존 `memory-commands` "잘못된 입력"(상수 일치 + `비밀문구` 없음), "삭제 pending/deleted", `memory-briefing` "DATA-02 삭제는 파생 브리핑에 반영"(`Discord에서 지우지 않았어요`), "BRIEF-01 읽기 불가·오래된 관측은 미확인 …" |
+
+- 실행: 잠금 도우미(`npm run check`·`npm run build`, 실제 PostgreSQL 포함) → `node --test dist/test/{memory-commands,memory-commands-pg,t20-memory-commands,memory-briefing,memory-briefing-pg,briefing-observations,briefing-task-lane}.test.js` 139 pass, 0 fail, 0 skip.
+- 리터럴로 비교하던 기억 문구 시험은 `MEMORY_TEXT`·`INPUT_ERROR`·`REJECTED`·`MEMORY_GUIDE`·`DELETION_MESSAGE`·`BRIEFING_TEXT` 상수 참조로 옮겼다. 리터럴은 안전 문장(7일 안내, 게시 사본 비삭제, 백업 14일, 입력 비반복)에만 남겼다.
+- **운영 배선 없음:** `src/main.ts`가 `config.colleagueEnabled`를 `MemoryCommands`·`BriefingConfig`에 넘기지 않아, 운영은 스위치를 켜도 꺼짐 판이다. `main.ts`는 이 티켓의 파일 밖이다.
+- **못 잡는 범위.** 문구의 자연스러움(owner 검토, C24 말투 표본), 실제 Discord 표시(S5).
