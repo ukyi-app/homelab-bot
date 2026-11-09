@@ -890,6 +890,16 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 
 - "동료 봇 전환 (사용자 2026-11-09)" 7의 한도 정보 읽기 자리다. 결정은 바꾸지 않았다. 작업자가 `rate_limit_event`를 읽어 응답 한도 칸(`src/contracts.ts` `RateLimitInfoSchema`)에 싣는다: 해석 `src/executor-claude.ts`, 대화 v2 `src/chat-lane.ts`, 리뷰 `src/review-lane.ts`·`src/review-http.ts`, 작업 레인 `src/executor-claude-task.ts`·`src/task-contracts.ts`. 결제 멈춤은 칸의 `stop.cause: 'billing'`으로 한도와 가른다. 재개·리뷰 미루기는 C19다. 기록은 [ARCHITECTURE](ARCHITECTURE.md) §12 "T16b 실행기 프로필"의 "한도 정보", [VERIFICATION](VERIFICATION.md) "C03 작업자 한도 정보".
 
+## C10 고정 문구: 기억·브리핑 (2026-11-10)
+
+"동료 봇 전환 (사용자 2026-11-09)" 4(말투)·6(기억)·9(스위치)의 기억·브리핑 쪽 구현 선택이다(사용자 결정 아님). 결정은 바꾸지 않았다. 시험·결과는 [VERIFICATION](VERIFICATION.md) "C10 고정 문구 2".
+
+- **해요체 대상은 문장:** 기억 명령 응답·오류·충돌·삭제 안내, 브리핑의 누락·지난 회차 전달 줄은 해요체 문장으로 바꿨다. 브리핑 칸 이름(`■ 확인 필요` 등)과 상태 표시(정상·미확인·확인 필요·읽기 불가·연결된 조회 없음), 관측 칸 요약(`src/briefing-observations.ts`), 검색 결과의 상태 꼬리표(`active(확정)`)는 명사형 표시라 그대로 둔다. 그래서 `briefing-observations.ts`는 고치지 않았다. "정상"은 신선한 관측일 때만, 확인 못 하면 "미확인" 규칙도 그대로다.
+- **스위치로 고르는 줄:** 기억 명령 충돌 안내(`memory-search`·`memory-correct`), 저장 제외 뒤 삭제 안내(`memory-delete`), 응답 유실·일시 오류 안내(`/memory-search`), 브리핑 모델 호출 중지 줄(`/model-status`)이다. 표는 `src/memory-commands.ts` `MEMORY_GUIDE`와 `src/briefing.ts` `BRIEFING_TEXT.modelStopped`다. 켜짐 판은 말로 하는 안내("그 기억 지워 줘")이고, 모델 상태는 `homelab bot` CLI로 확인한다고만 적는다(하위 명령 이름은 C05가 정한다). 입력 서식 오류의 키 이름(`expires=` 등)은 명령 이름이 아니라 두 판이 같다.
+- **스위치 전달:** `MemoryCommands`는 다섯 번째 인수 `colleague`, 브리핑은 `BriefingConfig.colleague`로 받는다. 수신(`discord.ts`)은 처리기의 `guide`를 써서 생성자 모양을 바꾸지 않는다. 운영 배선(`src/main.ts`에서 `config.colleagueEnabled === true`를 넘기는 두 자리)은 이 티켓의 파일 밖이라 하지 않았다. 배선 전에는 늘 꺼짐 판이다.
+- **원문 7일 안내:** 삭제 응답(완료·대기 모두) 끝에 "이 스레드의 원래 메시지는 7일 뒤에 지워져요(제가 받아 둔 원문 기준이고, Discord에 올라간 메시지는 그대로 남아요)."를 붙인다. 기억 삭제는 원문을 지우지 않고 T31 정리(받은 지 7일, 끝나지 않은 작업이 가리키는 행은 남김)가 비운다. owner가 Discord에서 자기 메시지가 사라진다고 읽지 않게 괄호를 더했다. 7은 `RAW_TEXT_RETENTION_MS`에서 계산한다.
+- **안전 문장 유지:** 오류 응답은 입력값을 되풀이하지 않고(키 이름만), 삭제 응답은 완료/대기와 백업 최대 14일, 이미 Discord에 올라간 사본(브리핑, 기억 응답)을 지우지 않는다는 문장을 그대로 싣는다. 사본 범위 문구의 "이 명령들의 응답"은 켜짐 판에서 '/' 명령을 가리키지 않게 "기억 응답"으로 바꿨다.
+
 ## 동료 봇 전환 14·16 작업자 변경 작성 v2 판 (C25, 2026-11-10)
 
 "동료 봇 전환 (사용자 2026-11-09)" 14(변경 질문)·16(PR 수정 반복)의 작업자 쪽 자리다. 결정은 바꾸지 않았다. 지시문 `src/executor-claude-task.ts` `TASK_INSTRUCTIONS['change-v2']`, 출력 `CHANGE_OUTPUT_JSON_SCHEMA`·`judgeTaskRun`, 계약 `src/task-contracts.ts`, intake `src/task-http.ts`, port 타입 `src/change-contracts.ts`. 기록은 [ARCHITECTURE](ARCHITECTURE.md) §16.4 "변경 작성 v2 판", [VERIFICATION](VERIFICATION.md) "C25 작업자 변경 작성 v2".

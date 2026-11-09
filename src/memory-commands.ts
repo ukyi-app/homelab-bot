@@ -3,6 +3,7 @@ import type { Clock, Scope } from './contracts.js';
 import type { LedgerState } from './deletion-ledger.js';
 import { documentRevision } from './document-source.js';
 import { MemoryNotReady, MemoryRejected } from './memory.js';
+import { RAW_TEXT_RETENTION_MS } from './raw-text-retention.js';
 import type { MemoryInput, MemoryService, MemoryView, SourceRef } from './memory.js';
 
 // 기억 명령. 수신(discord.ts)이 owner·채널 확인과 중복 처리를 마친 명령만 여기로 온다.
@@ -13,7 +14,29 @@ export type MemoryCommand = 'memory-save' | 'memory-search' | 'memory-correct' |
 export interface MemoryCommandInput { id: string; actor: string; scope: Scope; command: MemoryCommand; text: string; target?: string }
 // outcome은 로그용 고정 코드다(ok, 거부 사유 코드). 내용을 담지 않는다.
 export interface MemoryCommandReply { content: string; outcome: string }
-export interface MemoryCommandHandler { handle(input: MemoryCommandInput): Promise<MemoryCommandReply> }
+// guide가 없으면 수신은 꺼짐 판(slash) 안내를 쓴다.
+export interface MemoryCommandHandler { handle(input: MemoryCommandInput): Promise<MemoryCommandReply>; readonly guide?: MemoryGuide }
+
+// '/'·명령 이름을 안내하는 문구는 동료 기능 스위치로 두 판을 고른다(명세 §4.9). slash는 꺼짐 판, colleague는 켜짐 판이고
+// 켜짐 판에는 '/' 이름도 기억 명령 이름도 쓰지 않는다. ackLost·failed는 수신(discord.ts)이 내용 없이 남기는 고정 안내다.
+export type MemorySurface = 'slash' | 'colleague';
+export interface MemoryGuide { moreConflicts: string; resolveConflict: string; deleteExcluded: string; ackLost: string; failed: string }
+export const MEMORY_GUIDE: Readonly<Record<MemorySurface, MemoryGuide>> = Object.freeze({
+  slash: {
+    moreConflicts: 'memory-search로 확인',
+    resolveConflict: 'memory-correct의 target에 이 ID와 충돌 ID를 쉼표로 함께(최대 5개) 넣어 정정하면 그 충돌이 풀려요.',
+    deleteExcluded: '지우려면 memory-delete를 써 주세요.',
+    ackLost: '기억 명령의 응답을 전하지 못했어요(상호작용 만료·전송 실패). 처리됐는지는 /memory-search로 확인해 주세요.',
+    failed: '처리하지 못했어요(일시 오류). /memory-search로 결과를 확인한 뒤 다시 해 주세요.',
+  },
+  colleague: {
+    moreConflicts: '기억을 다시 찾아 달라고 하면 보여 드려요',
+    resolveConflict: '이 기억과 충돌하는 기억을 함께(최대 5개) 정정해 달라고 하면 그 충돌이 풀려요.',
+    deleteExcluded: '지우려면 "그 기억 지워 줘"라고 말해 주세요.',
+    ackLost: '기억 요청의 결과를 전하지 못했어요(상호작용 만료·전송 실패). 처리됐는지는 그 기억을 다시 찾아 달라고 해서 확인해 주세요.',
+    failed: '처리하지 못했어요(일시 오류). 그 기억을 다시 찾아 달라고 해서 결과를 확인한 뒤 다시 해 주세요.',
+  },
+});
 type Memory = Pick<MemoryService, 'remember' | 'search' | 'correct' | 'exclude' | 'delete'>;
 
 // 서식 오류. 메시지는 사용자에게 그대로 보이는 한국어 문장이고 입력값을 되풀이하지 않는다.
@@ -27,8 +50,8 @@ const HOUR = 3_600_000;
 const UNITS: Record<string, number> = { h: HOUR, d: 24 * HOUR, w: 7 * 24 * HOUR };
 // 날짜만(시간대 없음)은 받지 않는다. 운영자 시간대를 짐작하지 않게 상대 기간이나 오프셋 있는 ISO 시각만 받는다.
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(Z|[+-]\d{2}:\d{2})$/;
-const FORMAT = '서식: `진술 | 키=값 | …`. 진술에는 `|`를 쓰지 않습니다.';
-const TIME_FORMAT = '시각은 `30d`·`12h`·`2w`(지금부터) 또는 `2026-12-31T09:00+09:00`처럼 씁니다.';
+const FORMAT = '서식은 `진술 | 키=값 | …`이에요. 진술에는 `|`를 쓰지 말아 주세요.';
+const TIME_FORMAT = '시각은 `30d`·`12h`·`2w`(지금부터)나 `2026-12-31T09:00+09:00`처럼 적어 주세요.';
 // 종류별로 받는 키. 반복 가능한 키는 목록으로 모은다.
 const COMMON = ['topic', 'service', 'recheck', 'expires', 'doc', 'briefing'];
 const KEYS: Record<Kind, string[]> = {
@@ -39,11 +62,27 @@ const KEYS: Record<Kind, string[]> = {
 };
 const REPEATABLE = new Set(['fact', 'hypothesis', 'cause', 'doc']);
 const REQUIRED: Record<Kind, string> = {
-  configuration: 'configuration은 `recheck=` 또는 `expires=`가 필요합니다(설정은 다시 확인할 때가 있어야 합니다).',
-  decision: 'decision은 `applies=`(적용 범위)가 필요합니다. `by=`(결정한 사람)·`decided=`(시각)는 없으면 나·지금입니다.',
+  configuration: 'configuration은 `recheck=`나 `expires=`가 있어야 해요(설정은 다시 확인할 때가 있어야 해요).',
+  decision: 'decision은 `applies=`(적용 범위)가 있어야 해요. `by=`(결정한 사람)·`decided=`(시각)를 빼면 요청한 분과 지금 시각으로 적어요.',
   incident: '',
-  preference: 'preference는 `expires=`(만료)와 `end=`(종료 조건)가 필요합니다.',
+  preference: 'preference는 `expires=`(만료)와 `end=`(종료 조건)가 있어야 해요.',
 };
+// 입력 오류 응답. 키 이름(영문 소문자로 검사된 값)만 되돌려 주고 진술·값은 싣지 않는다.
+export const INPUT_ERROR = Object.freeze({
+  time: (key: string) => `\`${key}=\` 값을 읽지 못했어요. ${TIME_FORMAT}`,
+  statement: `진술이 비어 있어요. ${FORMAT}`,
+  format: `\`키=값\` 모양이 아닌 조각이 있어요. ${FORMAT}`,
+  key: (key: string, allowed: string[]) => `\`${key}=\`는 이 요청·종류에는 쓸 수 없어요. 쓸 수 있는 키: ${allowed.join(' ')}`,
+  value: (key: string) => `\`${key}=\` 값이 비어 있어요.`,
+  repeat: (key: string) => `\`${key}=\`는 한 번만 써 주세요.`,
+  kind: `종류는 ${KINDS.join('·')} 중 하나예요.`,
+  docLength: '`doc=` 링크가 너무 길어요(500자까지).',
+  docCount: '`doc=`는 세 개까지 쓸 수 있어요.',
+  briefing: '`briefing=`은 yes나 no예요.',
+  required: REQUIRED,
+  ids: '기억 ID(검색 결과의 `…` 안 값)를 쉼표로 5개까지 적어 주세요.',
+  deleteOne: '지울 기억 ID는 하나만 적어 주세요.',
+});
 
 function time(key: string, value: string, now: number, relative: 'future' | 'past'): number {
   const rel = /^(\d{1,4})([hdw])$/.exec(value);
@@ -52,25 +91,25 @@ function time(key: string, value: string, now: number, relative: 'future' | 'pas
     return relative === 'future' ? now + span : now - span;
   }
   const at = ISO.test(value) ? Date.parse(value) : NaN;
-  if (!Number.isFinite(at) || at < 0) throw new CommandInputError('memory_cmd_time', `\`${key}=\` 값을 읽지 못했습니다. ${TIME_FORMAT}`);
+  if (!Number.isFinite(at) || at < 0) throw new CommandInputError('memory_cmd_time', INPUT_ERROR.time(key));
   return at;
 }
 interface Parsed { statement: string; fields: Map<string, string[]> }
 function split(text: string, allowed: string[]): Parsed {
   const [head, ...rest] = text.split('|');
   const statement = (head ?? '').trim();
-  if (!statement) throw new CommandInputError('memory_cmd_statement', `진술이 비어 있습니다. ${FORMAT}`);
+  if (!statement) throw new CommandInputError('memory_cmd_statement', INPUT_ERROR.statement);
   const fields = new Map<string, string[]>();
   for (const segment of rest) {
     const match = /^\s*([a-z]{1,20})=(.*)$/s.exec(segment);
     // 키 이름만 되돌려 준다(영문 소문자로 검사된 값). 진술·값은 응답에 다시 싣지 않는다.
-    if (!match) throw new CommandInputError('memory_cmd_format', `\`키=값\` 모양이 아닌 조각이 있습니다. ${FORMAT}`);
+    if (!match) throw new CommandInputError('memory_cmd_format', INPUT_ERROR.format);
     const [, key, raw] = match as unknown as [string, string, string];
     const value = raw.trim();
-    if (!allowed.includes(key)) throw new CommandInputError('memory_cmd_key', `\`${key}=\`는 이 명령·종류에서 쓰지 않습니다. 쓸 수 있는 키: ${allowed.join(' ')}`);
-    if (!value) throw new CommandInputError('memory_cmd_value', `\`${key}=\` 값이 비어 있습니다.`);
+    if (!allowed.includes(key)) throw new CommandInputError('memory_cmd_key', INPUT_ERROR.key(key, allowed));
+    if (!value) throw new CommandInputError('memory_cmd_value', INPUT_ERROR.value(key));
     const list = fields.get(key) ?? [];
-    if (list.length && !REPEATABLE.has(key)) throw new CommandInputError('memory_cmd_repeat', `\`${key}=\`는 한 번만 씁니다.`);
+    if (list.length && !REPEATABLE.has(key)) throw new CommandInputError('memory_cmd_repeat', INPUT_ERROR.repeat(key));
     list.push(value);
     fields.set(key, list);
   }
@@ -80,7 +119,7 @@ const one = (fields: Map<string, string[]>, key: string) => fields.get(key)?.[0]
 
 export function parseKind(value: string | undefined): Kind {
   const kind = value?.trim();
-  if (!KINDS.includes(kind as Kind)) throw new CommandInputError('memory_cmd_kind', `종류는 ${KINDS.join('·')} 중 하나입니다.`);
+  if (!KINDS.includes(kind as Kind)) throw new CommandInputError('memory_cmd_kind', INPUT_ERROR.kind);
   return kind as Kind;
 }
 // 저장·정정의 text를 MemoryInput으로 바꾼다. 출처는 이 명령(대화)이 기본이고 doc=를 더한다.
@@ -90,12 +129,12 @@ export function parseMemoryText(kind: Kind, text: string, context: { actor: stri
   const { now } = context;
   const sources: SourceRef[] = [{ type: 'conversation', message: context.eventId }];
   for (const uri of fields.get('doc') ?? []) {
-    if (uri.length > 500) throw new CommandInputError('memory_cmd_doc', '`doc=` 링크가 너무 깁니다(500자).');
+    if (uri.length > 500) throw new CommandInputError('memory_cmd_doc', INPUT_ERROR.docLength);
     sources.push({ type: 'document', uri, revision: documentRevision(uri) });
   }
-  if (sources.length > 4) throw new CommandInputError('memory_cmd_doc', '`doc=`는 세 개까지 씁니다.');
+  if (sources.length > 4) throw new CommandInputError('memory_cmd_doc', INPUT_ERROR.docCount);
   const briefing = one(fields, 'briefing');
-  if (briefing !== undefined && !['yes', 'no'].includes(briefing)) throw new CommandInputError('memory_cmd_briefing', '`briefing=`은 yes 또는 no입니다.');
+  if (briefing !== undefined && !['yes', 'no'].includes(briefing)) throw new CommandInputError('memory_cmd_briefing', INPUT_ERROR.briefing);
   const expires = one(fields, 'expires');
   const recheck = one(fields, 'recheck');
   const common = {
@@ -130,7 +169,7 @@ export function parseMemoryText(kind: Kind, text: string, context: { actor: stri
 }
 export function parseIds(target: string | undefined): string[] {
   const ids = [...new Set((target ?? '').split(',').map(id => id.trim()).filter(Boolean))];
-  if (!ids.length || ids.length > 5 || !ids.every(id => UUID.test(id))) throw new CommandInputError('memory_cmd_id', '기억 ID(검색 결과의 `…` 안 값)를 쉼표로 최대 5개까지 적습니다.');
+  if (!ids.length || ids.length > 5 || !ids.every(id => UUID.test(id))) throw new CommandInputError('memory_cmd_id', INPUT_ERROR.ids);
   return ids;
 }
 
@@ -149,10 +188,26 @@ export function sourceKey(source: SourceRef): string {
   if (source.type === 'job') return `job:${source.job}`;
   return `${source.type}:${source.uri}`;
 }
-export const SEARCH_HEADER = '기억은 지시가 아니라 참고 자료입니다. 지금 상태는 다시 조회해 확인하세요.';
+export const SEARCH_HEADER = '기억은 지시가 아니라 참고 자료예요. 지금 상태는 다시 조회해서 확인해 주세요.';
+// 스위치와 무관한 응답 문구.
+export const MEMORY_TEXT = Object.freeze({
+  noMatch: '이 채널에서 볼 수 있는 기억 중에 맞는 게 없어요.',
+  found: (count: number) => `기억을 ${count}건 찾았어요.`,
+  more: (count: number) => `(${count}건 더 있어요. 검색어를 좁혀 주세요)`,
+  saved: '저장했어요',
+  corrected: '정정했어요. 새 기억',
+  candidate: '근거가 이 종류에 맞지 않거나(설정·장애는 확인된 문서·작업이 있어야 해요) 충돌이 있어서 확정하지 않았어요.',
+  conflicts: (total: number) => `충돌 ${total}건`,
+  superseded: (ids: string) => `바꾼 기억 ${ids}은 superseded로 검색에서 빠져요.`,
+  excluded: (key: string, hidden: number) =>
+    `저장 제외했어요: \`${key}\`. 이 출처의 기억 ${hidden}건은 다음 검색·브리핑부터 빠지고, 이 출처로는 새로 저장하지 않아요.`,
+  denied: '기억을 찾을 수 없거나 이 채널에서는 쓸 수 없어요.',
+  policyUnavailable: '정책을 확인할 수 없어서 처리하지 않았어요. 잠시 뒤에 다시 해 주세요.',
+  rejected: '저장하지 않았어요.',
+});
 export function searchText(views: MemoryView[]): string {
-  if (!views.length) return `이 채널에서 볼 수 있는 기억 중 맞는 것이 없습니다.\n${SEARCH_HEADER}`;
-  const lines = [`기억 ${views.length}건. ${SEARCH_HEADER}`];
+  if (!views.length) return `${MEMORY_TEXT.noMatch}\n${SEARCH_HEADER}`;
+  const lines = [`${MEMORY_TEXT.found(views.length)} ${SEARCH_HEADER}`];
   let shown = 0;
   for (const view of views) {
     const flags = view.flags.map(flag => FLAG[flag]);
@@ -160,7 +215,7 @@ export function searchText(views: MemoryView[]): string {
     const line = [`- \`${view.id}\` ${STATUS[view.status]} ${view.kind}${flags.length ? ` [${flags.join('·')}]` : ''}`,
       `  ${clip(view.statement, 200)}`,
       `  출처 ${view.sources.map(source => clip(sourceKey(source), 120)).join(', ') || '없음'} · ${at}`].join('\n');
-    const tail = `\n(${views.length - shown}건 더 있음. 검색어를 좁히세요)`;
+    const tail = `\n${MEMORY_TEXT.more(views.length - shown)}`;
     if ([...lines, line].join('\n').length + tail.length > REPLY_LIMIT) { lines.push(tail.trim()); break; }
     lines.push(line);
     shown++;
@@ -170,47 +225,57 @@ export function searchText(views: MemoryView[]): string {
 // 충돌 ID 수에는 상한이 없다(같은 주제의 진술이 쌓이면 늘어난다). 저장·정정은 응답 전에 이미 끝났으므로 응답이 Discord 한도를
 // 넘어 거부되면 사용자는 결과를 못 본다. 검색처럼 전체 길이를 자르고 남은 충돌은 개수로 적는다.
 export function savedText(verb: string, result: { id: string; status: 'active' | 'candidate'; conflictsWith: string[] },
-  limit = REPLY_LIMIT): string {
+  limit = REPLY_LIMIT, surface: MemorySurface = 'slash'): string {
+  const guide = MEMORY_GUIDE[surface];
   const lines = [`${verb}: \`${result.id}\` · 상태 ${STATUS[result.status]}`,
-    ...(result.status === 'candidate' ? ['근거가 이 종류에 맞지 않거나(설정·장애는 확인된 문서·작업) 충돌이 있어 확정하지 않았습니다.'] : [])];
+    ...(result.status === 'candidate' ? [MEMORY_TEXT.candidate] : [])];
   const total = result.conflictsWith.length;
   if (!total) return lines.join('\n');
+  const line = (shown: string[], more: number) =>
+    `${MEMORY_TEXT.conflicts(total)}: ${shown.join(', ')}${more ? ` 외 ${more}건(${guide.moreConflicts})` : ''}. ${guide.resolveConflict}`;
   const ids: string[] = [];
   for (const [index, id] of result.conflictsWith.entries()) {
     const left = total - index - 1;
-    const line = (shown: string[], more: number) =>
-      `충돌 ${total}건: ${shown.join(', ')}${more ? ` 외 ${more}건(memory-search로 확인)` : ''}. memory-correct의 target에 이 ID와 충돌 ID를 쉼표로 함께(최대 5개) 넣어 정정하면 그 충돌이 풀립니다.`;
     if ([...lines, line([...ids, `\`${id}\``], left)].join('\n').length > limit) {
       lines.push(line(ids, total - ids.length));
       return lines.join('\n');
     }
     ids.push(`\`${id}\``);
   }
-  lines.push(`충돌 ${total}건: ${ids.join(', ')}. memory-correct의 target에 이 ID와 충돌 ID를 쉼표로 함께(최대 5개) 넣어 정정하면 그 충돌이 풀립니다.`);
+  lines.push(line(ids, 0));
   return lines.join('\n');
 }
 // 삭제 범위 문구. 서비스 메시지(memory.ts)를 그대로 싣고, Discord 사본 범위를 늘 덧붙인다.
-export const DELETE_SCOPE = '이미 Discord에 게시된 사본(브리핑·이 명령들의 응답)은 지우지 않습니다.';
-export const DELETE_PENDING_SCOPE = '완료돼도 백업에는 최대 14일 남을 수 있습니다. 같은 명령으로 다시 확인할 수 있습니다.';
+export const DELETE_SCOPE = '이미 Discord에 올라간 사본(브리핑, 기억 응답)은 지우지 않아요.';
+export const DELETE_PENDING_SCOPE = '완료돼도 백업에는 최대 14일 남을 수 있어요. 같은 삭제를 다시 요청하면 진행 상황을 볼 수 있어요.';
+// 원문 수명 안내(명세 §4.3 "기억 원문", DECISIONS T31). 기억 삭제는 원문을 지우지 않는다. 받아 둔 원문(events.payload.text)은
+// 받은 지 7일 뒤 T31 정리가 비우고, owner가 Discord에 올린 메시지는 봇이 지우지 않는다. 그래서 지금 지운다고 말하지 않는다.
+export const RAW_TEXT_NOTICE = `이 스레드의 원래 메시지는 ${RAW_TEXT_RETENTION_MS / 86_400_000}일 뒤에 지워져요(제가 받아 둔 원문 기준이고, Discord에 올라간 메시지는 그대로 남아요).`;
 
-export const UNAVAILABLE = '지금 기억을 쓸 수 없습니다. 삭제 원장이 준비되지 않았거나 닫혀 있습니다. 잠시 뒤 다시 시도하세요.';
-const REJECTED: Record<string, string> = {
-  memory_invalid: '입력이 기억 형식에 맞지 않습니다(진술 1000자, 값 길이·개수를 확인하세요).',
-  memory_source_required: '출처가 없습니다.',
+export const UNAVAILABLE = '지금은 기억을 쓸 수 없어요. 삭제 원장이 준비되지 않았거나 닫혀 있어요. 잠시 뒤에 다시 해 주세요.';
+export const REJECTED: Readonly<Record<string, string>> = Object.freeze({
+  memory_invalid: '기억 형식에 맞지 않아요(진술은 1000자까지예요. 값의 길이·개수를 확인해 주세요).',
+  memory_source_required: '출처가 없어요.',
   memory_recheck_required: REQUIRED.configuration,
-  memory_already_expired: '`expires=`가 이미 지난 시각입니다.',
-  memory_access_scope: '이 채널에서는 기억을 쓸 수 없습니다(대화·알림 채널과 그 스레드만).',
-  memory_service_scope: '허용되지 않은 서비스 범위입니다.',
-  memory_guild_scope: '허용되지 않은 서버 범위입니다.',
-  memory_source_excluded: '저장 제외한 출처(이 채널·대화)라 저장하지 않았습니다.',
-  memory_source_inaccessible: '출처를 확인할 수 없어 저장하지 않았습니다. 문서는 ukyi-app/homelab·ukyi-app/homelab-bot의 GitHub 링크만 받습니다.',
-  memory_correction_reason_required: '정정에는 `reason=`(사유)이 필요합니다.',
-  memory_exclusion_invalid: '출처 키 모양이 아닙니다. 예: here, channel:<ID>, conversation:<ID>, document:<URL>',
-};
+  memory_already_expired: '`expires=`가 이미 지난 시각이에요.',
+  memory_access_scope: '이 채널에서는 기억을 쓸 수 없어요(대화·알림 채널과 그 스레드에서만 돼요).',
+  memory_service_scope: '허용되지 않은 서비스 범위예요.',
+  memory_guild_scope: '허용되지 않은 서버 범위예요.',
+  memory_source_excluded: '저장 제외한 출처(이 채널·대화)라서 저장하지 않았어요.',
+  memory_source_inaccessible: '출처를 확인할 수 없어서 저장하지 않았어요. 문서는 ukyi-app/homelab·ukyi-app/homelab-bot의 GitHub 링크만 받아요.',
+  memory_correction_reason_required: '정정하려면 `reason=`(사유)이 있어야 해요.',
+  memory_exclusion_invalid: '출처 키 모양이 아니에요. 예: here, channel:<ID>, conversation:<ID>, document:<URL>',
+});
 
 export class MemoryCommands implements MemoryCommandHandler {
+  readonly guide: MemoryGuide;
+  private readonly surface: MemorySurface;
+  // colleague는 동료 기능 스위치 값(config.colleagueEnabled === true)이다. 기동 때 한 번 정해진다.
   constructor(private readonly memory: Memory, private readonly ledger: () => LedgerState,
-    private readonly closed: () => boolean = () => false, private readonly now: Clock = Date.now) {}
+    private readonly closed: () => boolean = () => false, private readonly now: Clock = Date.now, colleague = false) {
+    this.surface = colleague ? 'colleague' : 'slash';
+    this.guide = MEMORY_GUIDE[this.surface];
+  }
   async handle(input: MemoryCommandInput): Promise<MemoryCommandReply> {
     // 종료 중이거나 원장이 닫힘·실패·차단이면 쓰지 않는다. degraded는 다음 성공에 돌아오는 상태라 받는다
     // (그때 삭제는 pending으로 답한다).
@@ -218,10 +283,10 @@ export class MemoryCommands implements MemoryCommandHandler {
     try { return { content: await this.run(input), outcome: 'ok' }; } catch (error) {
       if (error instanceof CommandInputError) return { content: error.reply, outcome: error.code };
       if (error instanceof MemoryNotReady) return { content: UNAVAILABLE, outcome: 'memory_not_ready' };
-      if (error instanceof MemoryRejected) return { content: REJECTED[error.message] ?? '저장하지 않았습니다.', outcome: error.message };
+      if (error instanceof MemoryRejected) return { content: REJECTED[error.message] ?? MEMORY_TEXT.rejected, outcome: error.message };
       // 남의 기억·다른 채널 기억·없는 ID를 구분하지 않는다(존재 여부를 알리지 않음, memory.ts delete 주석).
-      if (error instanceof Denied) return { content: '기억을 찾을 수 없거나 이 채널에서 쓸 수 없습니다.', outcome: 'denied' };
-      if (error instanceof PolicyUnavailable) return { content: '정책을 확인할 수 없어 처리하지 않았습니다. 잠시 뒤 다시 시도하세요.', outcome: 'policy_unavailable' };
+      if (error instanceof Denied) return { content: MEMORY_TEXT.denied, outcome: 'denied' };
+      if (error instanceof PolicyUnavailable) return { content: MEMORY_TEXT.policyUnavailable, outcome: 'policy_unavailable' };
       throw error;
     }
   }
@@ -229,7 +294,7 @@ export class MemoryCommands implements MemoryCommandHandler {
     const context = { actor, eventId: id, now: this.now() };
     if (command === 'memory-save') {
       const { input } = parseMemoryText(parseKind(target), text, context);
-      return savedText('저장했습니다', await this.memory.remember(actor, scope, input));
+      return savedText(MEMORY_TEXT.saved, await this.memory.remember(actor, scope, input), REPLY_LIMIT, this.surface);
     }
     if (command === 'memory-search') return searchText(await this.memory.search(actor, scope, text));
     if (command === 'memory-correct') {
@@ -241,22 +306,22 @@ export class MemoryCommands implements MemoryCommandHandler {
       const reason = one(fields, 'reason');
       if (!reason) throw new CommandInputError('memory_cmd_reason', REJECTED.memory_correction_reason_required!);
       const result = await this.memory.correct(actor, scope, ids, input, reason);
-      const replaced = `바꾼 기억 ${ids.map(old => `\`${old}\``).join(', ')}은 superseded로 검색에서 빠집니다.`;
-      return `${savedText('정정했습니다. 새 기억', result, REPLY_LIMIT - replaced.length - 1)}\n${replaced}`;
+      const replaced = MEMORY_TEXT.superseded(ids.map(old => `\`${old}\``).join(', '));
+      return `${savedText(MEMORY_TEXT.corrected, result, REPLY_LIMIT - replaced.length - 1, this.surface)}\n${replaced}`;
     }
     if (command === 'memory-exclude') {
       const raw = (target ?? '').trim();
       // here: 이 명령을 쓴 채널·스레드. 그 채널을 출처로 한 대화·작업 기억이 모두 빠진다(memory.ts 출처 키).
       const key = raw === 'here' ? `channel:${scope.channel}` : raw;
       const { hidden } = await this.memory.exclude(actor, scope, key);
-      return `저장 제외했습니다: \`${clip(key, 200)}\`. 이 출처의 기억 ${hidden}건을 다음 검색·브리핑부터 뺍니다. 이 출처로는 새로 저장하지 않습니다. 지우려면 memory-delete.`;
+      return `${MEMORY_TEXT.excluded(clip(key, 200), hidden)} ${this.guide.deleteExcluded}`;
     }
     const ids = parseIds(target);
-    if (ids.length !== 1) throw new CommandInputError('memory_cmd_id', '삭제할 기억 ID 하나를 적습니다.');
+    if (ids.length !== 1) throw new CommandInputError('memory_cmd_id', INPUT_ERROR.deleteOne);
     const memoryId = ids[0]!;
     const result = await this.memory.delete(actor, scope, memoryId);
     return result.status === 'deleted'
-      ? `상태: 삭제 완료(deleted) \`${memoryId}\`\n${result.message}\n${DELETE_SCOPE}`
-      : `상태: 삭제 대기(pending) \`${memoryId}\`\n${result.message}\n${DELETE_PENDING_SCOPE} ${DELETE_SCOPE}`;
+      ? `상태: 삭제 완료(deleted) \`${memoryId}\`\n${result.message}\n${DELETE_SCOPE}\n${RAW_TEXT_NOTICE}`
+      : `상태: 삭제 대기(pending) \`${memoryId}\`\n${result.message}\n${DELETE_PENDING_SCOPE} ${DELETE_SCOPE}\n${RAW_TEXT_NOTICE}`;
   }
 }

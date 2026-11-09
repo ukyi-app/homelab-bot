@@ -76,6 +76,15 @@ export function terms(text: string): string[] {
 }
 const like = (term: string) => `${term.replace(/[!%_]/g, '!$&')}%`;
 const REDACTED = '[삭제된 기억이 포함돼 로컬 사본을 지웠습니다]';
+// 삭제 응답의 서비스 문구(memory-commands.ts가 상태 줄 뒤에 그대로 싣는다). 백업 최대 14일과 게시된 브리핑 비삭제는 빼지 않는다.
+export const DELETION_MESSAGE = Object.freeze({
+  already: '이미 삭제가 끝난 기억이에요.',
+  ledgerUnconfirmed: '삭제 원장 기록을 확인하지 못해서 아직 지우지 않았어요. 조회에서는 숨기고 원장 기록을 다시 시도할게요.',
+  deleted: '삭제했어요. 백업에는 최대 14일 남을 수 있고, 복원하면 기동할 때 다시 지워요.',
+  deletedWithCopies: (count: number) =>
+    `삭제했어요. 이미 보냈거나 전송 결과를 모르는 브리핑 ${count}건은 Discord에서 지우지 않았어요. 백업에는 최대 14일 남을 수 있고, 복원하면 기동할 때 다시 지워요.`,
+  purgePending: '삭제 원장에는 기록했지만 DB 정리가 끝나지 않았어요. 조회에서는 숨기고 정리를 다시 시도할게요.',
+});
 
 export class MemoryService {
   private ready = false;
@@ -249,7 +258,7 @@ export class MemoryService {
     const request = (await this.db.query<{ ledger_state: string; requested_at: string | number; applied_at: string | number | null }>(
       'SELECT * FROM memory_deletions WHERE memory_id=$1 AND memory_created_at=$2', [id, createdAt])).rows[0];
     if (!request) throw new Denied();
-    if (request.applied_at !== null) return { status: 'deleted', publishedCopies: 0, message: '이미 삭제가 끝난 기억입니다.' };
+    if (request.applied_at !== null) return { status: 'deleted', publishedCopies: 0, message: DELETION_MESSAGE.already };
     const key = erasedKey(id, createdAt);
     // DB의 recorded는 확인 뒤에만 쓰므로 믿는다. 원장에서 보기만 한 항목은 다시 써서 내구성을 확인한다.
     if (request.ledger_state !== 'recorded' && !this.recorded.has(key)) {
@@ -261,19 +270,17 @@ export class MemoryService {
       if (!recorded) {
         await this.audit('memory_deletion_pending', id, { reason: 'ledger_unconfirmed' }).catch(() => {});
         return { status: 'pending', reason: 'ledger_unconfirmed', publishedCopies: 0,
-          message: '삭제 원장 기록을 확인하지 못해 아직 삭제하지 않았습니다. 조회에서는 숨기고 원장 기록을 다시 시도합니다.' };
+          message: DELETION_MESSAGE.ledgerUnconfirmed };
       }
       this.recorded.add(key);
       this.hidden.add(key);
     }
     try {
       const { publishedCopies } = await this.purge(id, createdAt, Number(request.requested_at), false);
-      return { status: 'deleted', publishedCopies, message: publishedCopies
-        ? `삭제했습니다. 이미 보냈거나 전송 결과를 모르는 브리핑 ${publishedCopies}건은 Discord에서 지우지 않았습니다. 백업에는 최대 14일 남을 수 있고 복원하면 기동 때 다시 지웁니다.`
-        : '삭제했습니다. 백업에는 최대 14일 남을 수 있고 복원하면 기동 때 다시 지웁니다.' };
+      return { status: 'deleted', publishedCopies,
+        message: publishedCopies ? DELETION_MESSAGE.deletedWithCopies(publishedCopies) : DELETION_MESSAGE.deleted };
     } catch {
-      return { status: 'pending', reason: 'db_purge_pending', publishedCopies: 0,
-        message: '삭제 원장에는 기록했지만 DB 정리가 끝나지 않았습니다. 조회에서는 숨기고 정리를 다시 시도합니다.' };
+      return { status: 'pending', reason: 'db_purge_pending', publishedCopies: 0, message: DELETION_MESSAGE.purgePending };
     }
   }
   private async purge(id: string, createdAt: number, deletedAt: number, replay: boolean): Promise<{ applied: boolean; publishedCopies: number }> {
