@@ -19,7 +19,14 @@ export function messagePages(content: string): string[] {
   const pages: string[] = [];
   while (content.length) {
     let end = Math.min(PAGE_SIZE, content.length);
-    if (end < content.length && /[\uD800-\uDBFF]/.test(content[end - 1]!)) end--;
+    if (end < content.length) {
+      // PAGE_SIZE보다 짧은 줄은 두 메시지로 가르지 않는다. 승인 명령(/change-publish … text:<digest>)처럼
+      // 한 줄을 통째로 복사해야 하는 토큰이 경계에 걸려도 한 메시지에 남는다.
+      // 앞쪽이 공백뿐이면 Discord가 빈 메시지로 거부하므로 그때와 줄바꿈이 없을 때만 글자 수로 자른다.
+      const lineEnd = content.lastIndexOf('\n', end - 1) + 1;
+      if (lineEnd > 0 && /\S/.test(content.slice(0, lineEnd))) end = lineEnd;
+      else if (/[\uD800-\uDBFF]/.test(content[end - 1]!)) end--;
+    }
     pages.push(content.slice(0, end)); content = content.slice(end);
   }
   return pages;
