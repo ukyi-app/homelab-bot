@@ -100,7 +100,7 @@ export class Store {
         conversation_id,received_at,payload) VALUES ($1,'discord',$2,$3,$4,$5,$6,$7,$8)
         ON CONFLICT DO NOTHING RETURNING id`, [id, event.id, key, event.actor, json(event.scope), scopeId,
         this.now(), json({ text: event.text, command: event.command, target: event.target, kind: event.kind,
-          urgent: event.urgent, mention: event.mention, activate, revision })]);
+          urgent: event.urgent, mention: event.mention, activate, revision, bot_user: event.botUser, reply_to: event.replyTo })]);
       if (!inserted.rows.length) {
         const row = (await tx.query<{ id: string }>('SELECT id FROM events WHERE semantic_key=$1', [key])).rows[0]!;
         return { id: row.id, duplicate: true };

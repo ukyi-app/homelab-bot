@@ -59,6 +59,7 @@ const EventSchema = z.strictObject({
   text: z.string().max(DEFAULTS.maxInputChars), kind: z.enum(['message', 'command', 'button']),
   bot: z.boolean().optional(), webhook: z.boolean().optional(), mention: z.boolean().optional(),
   command: z.string().optional(), target: z.string().optional(), urgent: z.boolean().optional(),
+  botUser: z.string().regex(/^\d{1,20}$/).optional(), replyTo: z.string().regex(/^\d{1,20}$/).optional(),
 });
 export class DiscordIngress {
   constructor(private readonly store: Store, private readonly gate: PolicyGate,
@@ -87,7 +88,10 @@ export class DiscordIngress {
     if (event.kind === 'button' && !conversation) throw new Denied();
     // 기억 명령도 제어처럼 알림 채널에서 쓸 수 있다(기억의 접근 채널은 대화·알림 채널 둘이다, memory.ts access).
     // 연결 명령도 채널까지 들어와 "스레드에서 쓰세요"로 답한다. 실패 표시만 보면 왜 안 되는지 알 수 없다.
-    if (event.scope.kind === 'channel' && event.scope.channel !== p.conversationChannel && !isControl && !isMemory && !isExternal && !isChange) throw new Denied();
+    // 멘션 요청은 알림 채널 부모에서도 받는다(경보 글 아래에서 부르면 그 메시지에서 스레드가 열린다). '/' 대화 명령은 대화 채널만이다.
+    // 채널 부모의 일반 메시지는 위에서 멘션만 남았다.
+    const mentionHere = event.kind === 'message' && event.scope.channel === p.notificationChannel;
+    if (event.scope.kind === 'channel' && event.scope.channel !== p.conversationChannel && !mentionHere && !isControl && !isMemory && !isExternal && !isChange) throw new Denied();
     if ((!conversation || !conversation.active) && !explicit && !isControl) return;
     if (isExternal) return this.externalCommand(event, p.revision, recovered);
     if (isChange) return this.changeCommand(event, p.revision, recovered);
@@ -716,6 +720,8 @@ export class DiscordPublisher {
 export interface GatewayFrame {
   id: string; author: { id: string; bot?: boolean }; webhook_id?: string;
   channel_id: string; guild_id?: string; content?: string; mentions?: { id: string }[];
+  // 답장의 참조 글. 참조 글이 지워졌으면 null이고, Discord가 싣지 않으면 없다. 둘 다 답장 참조 없음으로 본다.
+  referenced_message?: { id: string; author: { id: string } } | null;
 }
 export async function gatewayMessage(frame: GatewayFrame, botId: string,
   lookup: (channel: string) => Promise<{ type: number; parent_id?: string; guild_id?: string }>): Promise<EventInput> {
@@ -725,5 +731,8 @@ export async function gatewayMessage(frame: GatewayFrame, botId: string,
   return { id: frame.id, actor: frame.author.id, bot: frame.author.bot, webhook: !!frame.webhook_id,
     // 일반 채널(type 0)의 parent_id는 카테고리다. scope.parent는 스레드의 부모 채널만 뜻한다.
     scope: { kind, guild: frame.guild_id ?? null, channel: frame.channel_id, parent: kind === 'thread' ? channel.parent_id ?? null : null },
-    text: frame.content ?? '', kind: 'message', mention: frame.mentions?.some(m => m.id === botId) };
+    text: frame.content ?? '', kind: 'message', mention: frame.mentions?.some(m => m.id === botId),
+    ...(snowflake(botId) ? { botUser: botId } : {}),
+    ...(frame.referenced_message?.author.id === botId && snowflake(frame.referenced_message.id) ? { replyTo: frame.referenced_message.id } : {}) };
 }
+const snowflake = (value: string) => /^\d{1,20}$/.test(value);

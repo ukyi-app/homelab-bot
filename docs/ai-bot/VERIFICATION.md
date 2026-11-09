@@ -2284,3 +2284,20 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 - **실행(병합 결과 587905d, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 29개 파일(`c07-reply-call-thread`·`foundation`·`chat-format`·`chat-ack`·`s16-display`·`discord-rest-timeout`·`publisher-recovery`·`status-notice`·`status-notice-pg`·`task-bridge`·`codex-bridge`·`change-assembly`·`review-1`~`review-9`·`external-task-receiver`·`external-task-assembly`·`publisher-main`·`publisher-pg`·`task-assembly`·`revoke-dispatch`·`revoke-dispatch-pg`·`change-purge-race`) 770 통과, 실패 0, skip 0.
 - **바뀐 기존 시험:** 표식 꼬리를 떼던 정규식(`chat-format`·`review-4`·`review-9`·`task-bridge`·`change-assembly`)을 새 꼬리로, 완료 글의 `startsWith`(`task-bridge`·`codex-bridge`)를 owner 호출 머리를 포함한 모양으로 고쳤다. 가짜 REST(`test/helpers.ts` `MockDiscord`)는 메시지에서 연 스레드의 ID를 그 메시지 ID로 두고 같은 메시지로 다시 열면 400으로 거부한다(Discord 문서 규칙).
 - **못 잡는 범위.** Discord의 실제 알림 동작(답장 알림 꺼짐, owner 한 사람만 알림), `-#` 작은 글씨 표시, 메시지 스레드 ID 규칙과 `message.thread` 칸의 실제 응답, 지워진 답장 대상에서 `fail_if_not_exists:false`의 실제 동작은 S5(C24)다.
+
+## C08 멘션 범위와 답장 맥락 (2026-11-10, 로컬)
+
+동료 봇 명세 §4.1(받는 자리, 봇 글 답장, 멘션 표기 제거)과 AC-1·AC-2를 S1(Gateway 프레임을 실제 `DiscordProtocol.gateway`·`history`에 가짜 API로 넣고 → `DiscordIngress` → PGlite·실제 PostgreSQL → 게시 `DiscordPublisher`와 작업자 요청의 `untrusted`)에서 고정했다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §6 "Discord 입력"·§13 "봇 답 문맥", 구현 위치는 [DECISIONS](DECISIONS.md) "동료 봇 전환 (사용자 2026-11-09)" 1. 스위치 밖이라 병합하면 바로 운영에 나간다.
+
+| 완료 조건 | 시험 |
+|---|---|
+| 대화·알림 채널 부모 멘션 → 스레드 열림, 답 | `c08-mention-scope` "AC-1 대화 채널 부모 멘션은 그 메시지에서 스레드를 열고 답한다", "AC-1 알림 채널 부모 멘션도 …"(고치기 전 실패 확인), `c08-reply-context` "AC-1·AC-2 알림 채널 부모에서 경보 글에 답장하며 부르면 …" |
+| 봇이 만들지 않은 스레드, 7일 넘게 쉰(보관된) 스레드의 멘션, 활성 스레드 이어 말하기 | "AC-1 봇이 만들지 않은 공개 스레드의 멘션에 답한다(대화·알림 채널 아래)", "AC-1 7일 넘게 쉬어 보관된 스레드의 멘션과, 활성 스레드의 멘션 없는 이어 말하기에 답한다". 고치기 전에도 통과했다(막는 곳 없음) |
+| 비 owner·허용 밖 채널·비공개 스레드는 무시 | "AC-1 비공개 스레드·허용 밖 채널·owner가 아닌 사람은 지금처럼 거부하고 아무것도 남기지 않는다", "AC-1 거부 목록에 오른 owner는 알림 채널 부모에서 멘션해도 거부한다", "AC-1 채널 부모의 멘션 없는 말은 대화·알림 채널 모두 받지 않는다" |
+| 봇 글 답장 → 자료 항목 있음, 남의 글 → 없음 | `c08-reply-context` "AC-2 봇 글에 답장하면 그 봇 글 본문(표식 줄 없이)이 …", "AC-2 남의 글 답장, 참조 글이 지워졌거나 Discord가 생략한 답장은 자료 항목이 없다", "AC-2 7일 정리로 본문을 비운 봇 글에 …넣지 않는다", "AC-2 history 복구 메시지도 봇 글 답장 참조만 읽는다" |
+| 참조 글은 자료 블록 안에만, 상한에 듦 | "AC-2 참조 글은 지시 자리가 아니라 untrusted 자료 배열 안에만 들어간다"(`chatPrompt`에서 지시문·신뢰 문맥 뒤 배열에 한 번만), "AC-2 답장 자료 항목도 대화 기록 상한(개수)에 들고, 현재 owner 메시지가 마지막이다" |
+| 모델에 가는 owner 원문에 봇 멘션 표기 없음 | "owner 원문의 봇 멘션 표기(<@id>·<@!id>)는 모델에 가지 않고, 다른 사람 멘션과 저장된 원문은 그대로다", `s16-display` "S16 문맥: owner 항목에 …"(`bot_user`·`reply_to` 칸이 owner 항목에 없음) |
+
+- **실행(머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 19개 파일(`c08-mention-scope`·`c08-reply-context`·`foundation`·`s16-display`·`chat-context`·`publisher-gateway`·`c07-reply-call-thread`·`chat-ack`·`publisher-recovery`·`discord-rest-timeout`·`reaction-lifecycle`·`memory-commands`·`revoke-dispatch`·`pr-review`·`review-1`·`raw-text-retention`·`raw-input-retention`·`publisher-pg`·`chat-format`) 377 통과, 실패·skip 0.
+- **운영 영향(스위치 밖).** 병합하면 알림 채널 부모의 owner 멘션이 스레드를 열고 답한다(이전에는 거부). 새 이벤트의 payload에 `bot_user`·`reply_to`(ID만)가 더해진다. 옛 이벤트는 멘션 표기가 남은 채로 간다.
+- **못 잡는 범위.** 실제 Discord 권한·intent·스레드 생성 응답, 알림 채널 overwrite의 스레드 생성 권한, 답장 프레임에 `referenced_message`가 실제로 실리는지와 Discord가 참조 글을 생략하는 실제 경우(삭제된 글 등)는 S5(C24)다. 작업자 프롬프트가 `replied_bot_post`를 설명하지 않는 것은 시험하지 않았다(ARCHITECTURE §13 "작업자 프롬프트(남은 것)").
