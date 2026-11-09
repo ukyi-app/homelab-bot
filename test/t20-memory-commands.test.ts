@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdir, rm } from 'node:fs/promises';
 import { closeLedgers, initLedger, ledgerAt } from './ledger-fixture.js';
 import { localDatabase } from './helpers.js';
-import { MEMORY_TEXT, SEARCH_HEADER, UNAVAILABLE } from '../src/memory-commands.js';
+import { MEMORY_GUIDE, MEMORY_TEXT, SEARCH_HEADER, UNAVAILABLE } from '../src/memory-commands.js';
 import { CHAT, GUILD, OWNER, ProbeLedger, Rest, Trace, boot, publisherConfig, waitFor } from './t20-harness.js';
 
 // 기억 명령(B4)을 진입점(startPublisher)에서 본다. 가짜 Gateway로 실제 상호작용 payload를 보내고,
@@ -35,7 +35,7 @@ class RecordingRest extends Rest {
     return super.request(method, path, body);
   }
 }
-async function start(trace: Trace, memory: boolean, options: { hold?: Promise<void> } = {}) {
+async function start(trace: Trace, memory: boolean, options: { hold?: Promise<void>; colleague?: boolean } = {}) {
   const rest = new RecordingRest(trace);
   let probe: ProbeLedger | undefined;
   let config = publisherConfig();
@@ -44,7 +44,8 @@ async function start(trace: Trace, memory: boolean, options: { hold?: Promise<vo
     dirs.push(dir);
     probe = new ProbeLedger(ledgerAt(dir, database.db), trace);
     probe.hold = options.hold;
-    config = publisherConfig({ memory: { ledgerDir: dir, acceptGeneration: null }, briefing: null });
+    config = publisherConfig({ memory: { ledgerDir: dir, acceptGeneration: null }, briefing: null,
+      ...(options.colleague === undefined ? {} : { colleagueEnabled: options.colleague }) });
   }
   const booted = await boot(database.db, config, trace, { discord: rest, ...(probe ? { ledger: probe } : {}) });
   closers.push(booted.close);
@@ -121,3 +122,20 @@ test('T20 명령 [장벽 전] 원장을 여는 중에 온 기억 명령은 "지�
   await waitFor(() => trace.index('t20_barrier_passed') >= 0);
   assert.equal((await database.db.query('SELECT 1 FROM memories')).rows.length, 0);
 });
+
+// 조립(main.ts)이 동료 기능 스위치 값을 기억 처리기에 넘기는지 본다. 판마다 다른 안내는 저장 제외 응답의 삭제 안내다.
+for (const colleague of [false, true]) {
+  test(`C10 조립: 스위치 ${colleague ? '켜짐' : '꺼짐'}이면 기억 응답의 안내가 ${colleague ? '켜짐' : '꺼짐'} 판이다`, async () => {
+    const trace = new Trace();
+    const booted = await start(trace, true, { colleague });
+    await waitFor(() => trace.index('t20_barrier_passed') >= 0 && trace.index('commands_registered') >= 0);
+    seq = 1;
+    const id = await send(booted, 'memory-exclude', { target: 'here' });
+    await waitFor(() => !!reply(booted.rest, id));
+    const content = reply(booted.rest, id)!.body.data.content as string;
+    const want = colleague ? MEMORY_GUIDE.colleague.deleteExcluded : MEMORY_GUIDE.slash.deleteExcluded;
+    const other = colleague ? MEMORY_GUIDE.slash.deleteExcluded : MEMORY_GUIDE.colleague.deleteExcluded;
+    assert.ok(content.includes(want), content);
+    assert.equal(content.includes(other), false, content);
+  });
+}
