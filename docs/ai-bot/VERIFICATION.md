@@ -2068,6 +2068,24 @@ T27이 남긴 정리 경로 없는 원문 칸 다섯 개를 사용자 결정(202
 
 **배포.** homelab #1196(`9a84772`) 자동 병합. 파드 1/1 Ready, migration 020 성공, 게이트 open, 로그 오류 0. 2026-11-09 02:09:17Z 첫 정리 `raw_text_purged` events 26·prompts 0·results 24·outbox 26. 백업 속 원문은 백업 보존 기간(14일) 동안 남는다.
 
+## T32 CHANGE 정리의 선정 조건 재확인 (#104·#106, 2026-11-09)
+
+T21 2회차 감사의 유일한 출시 차단 A09(medium)를 고친다(homelab 티켓 T32). 구현은 Claude 작업자, 대조·전체 시험은 lead, 리뷰는 PR의 Codex 코드·보안 리뷰다. 규칙과 이유는 [DECISIONS](DECISIONS.md) "CHANGE 정리의 선정·삭제 경합".
+
+**1차(#104).** `purgeExpiredChangeContent`는 후보를 고른 뒤 건마다 부모 행을 `FOR UPDATE`로 잠그고, 선정 질의와 같은 조건(`changePurgeDue`) 전체를 그 id로 다시 돌아 맞을 때만 지운다. 반환값은 실제로 지운 건수다. `linkChildJob`은 부모 행을 `FOR SHARE`로 잡아 재검사와 커밋 사이에 새 자식 job이 끼지 못한다. migration은 없다.
+
+1차 검사: 새 `change-purge-race` 7/7. 세 경합(후보를 고른 뒤 새 generation이 열렸다 다시 끝남, `observing_deploy` 후보의 배포 관측이 미확정으로 바뀜, 끝나지 않은 자식 job이 생김)을 PGlite와 실제 PostgreSQL 두 연결에서 각각 돌려 새 데이터가 남고 새 기준 시각+7일에 지워짐을 본다. 일곱째는 재검사 뒤 커밋 전에 다른 연결의 자식 job 연결이 부모 잠금에서 기다리는지다. lead 전체 시험(PG, concurrency 6) `f17f4be` 2,143 중 통과 2,121·실패 0·건너뜀 22. lead가 감사 재현 스크립트의 관찰값 사본(assert를 빼고 실제 값을 출력)을 새 코드에 PGlite·PostgreSQL 18로 돌려 A09가 재현되지 않음을 확인했다(지운 건 0, gen1·gen2 artifact·brief 남음, gen3 열기 성공). Codex 코드·보안 리뷰 지적 없음, `build / test` 통과.
+
+1차 배포: homelab #1200(`4a10f3c`) 자동 병합(2026-11-09 04:08:19Z). 파드 1/1 Ready, imageID가 `image.yaml`과 같음, error·warn 로그 0. 04:10:34Z 시작 직후 정리 `raw_text_purged` events 3·prompts 0·results 2·outbox 9.
+
+**3회차 재검증(T21, 2026-11-09).** 원래 새 generation 0ms 소거는 해소됐지만 A09 `partially_fixed`, DATA-02 fail, 판정 `NOT_READY` 유지. 정리 제외 조건이 정리 전 세션을 진행 중 상태와 `cleanup_state='pending'`으로만 알아봤다. `ClaudeChangeAuthor.finalize`가 세션을 `completed`로 커밋한 뒤 `finalizeJob`이 부모 잠금 없이 pending을 쓰므로, 그 사이(`completed`·`none`·`session_retained=true`)에 재검사를 통과한 정리가 부모 종료 7일 넘은 변경의 artifact·요청 원문·brief를 지우고 다음 generation을 `input_purged`로 막았다(PostgreSQL 두 연결, lead도 같은 결과 확인). 관련 83/83, 전체 2,143 중 실패 0.
+
+**2차(#106).** 같은 세션 줄에 `OR s.session_retained`를 더했다. retained는 작업자 정리를 확인한 뒤에만 `false`가 되고 `true`가 되는 곳은 세션 시작(job running, 이미 제외)뿐이라 재검사 뒤 "고름 → 제외"로 뒤집히지 않는다. 검사: `change-purge-race` 11/11(경합 없는 retained 세션 보존·정리 확인 뒤 원래 종료+7일 삭제를 PGlite·PG에서, 실제 finalize 경로로 pending이 부모 잠금 전·재검사 뒤 커밋되는 두 순서를 PG 두 연결에서). lead 전체 시험 `be0ef26` 2,147 중 통과 2,125·실패 0·건너뜀 22. lead가 감사 재현 사본을 새 빌드에 돌려 두 순서 모두 후보 0·삭제 0·다음 generation 열기 성공, 원래 A09 관찰과 7일 경계(7일-1ms 0건, 7일 1건)도 그대로임을 확인했다. Codex 코드·보안 리뷰 지적 없음, `build / test` 통과. 2차 배포: homelab #1202(`772599f`) 자동 병합(2026-11-09 07:06:32Z), 파드 1/1 Ready, imageID가 `image.yaml`과 같음, error·warn 로그 0. 바로 앞 #105 배포(homelab #1201, `1835f11`)는 `ci`가 GitHub 릴리스 다운로드 504로 두 번 실패해, 다운로드가 정상으로 돌아온 뒤 재실행해 06:36:59Z에 병합됐다.
+
+**4회차 재검증(T21, 2026-11-09).** 판정 `READY_FOR_SCOPED_PILOT`, A09 fixed, DATA-02 pass, 수용 시험 30 pass·0 fail. 감사자가 두 순서 모두 처음 고를 때부터 빠져 삭제 0·다음 generation 성공임을, 실제 `bridge.sweep`→작업자 정리 확인→`cleaned`·retained false 뒤에는 원래 종료+7일에 맞춰 지워짐(정리에서 보존 기간을 새로 세지 않음)을 PGlite·PostgreSQL 18로 확인했다. 관련 159/159, 전체(Node 24) 2,147 중 실패 0. 남은 조건: 작업자 정리를 끝내 확인하지 못한 retained·pending 세션은 그 변경의 원문을 계속 남긴다(지표로 수는 보이나 해소 시간은 보장하지 않음). 사용자가 판정을 제한 대상 범위로 수용했다(2026-11-09). 공개 보고서는 [V1_RELEASE_REPORT](V1_RELEASE_REPORT.md), 회차별 인계·증거는 private `homelab-bot-ops` `evidence/release-audit-3/`·`release-audit-4/`.
+
+**CI 경합 하나.** 문서만 바꾼 #103 병합(`1079cb4`)의 main 빌드가 `codex-bridge` "SEC-02 실제 프로세스: 작업자 환경 미상속…" 한 건으로 실패했다(`Unexpected end of JSON input`). 가짜 Codex가 `thread.started`를 낸 뒤 `env.json`을 쓰는데 `hang` 시험이 그 줄에서 중단하므로, 파일을 연 뒤 쓰기 전에 끝나면 빈 파일이 남는다. 제품 코드가 아니라 시험의 순서 문제이고, 같은 코드의 `f17f4be`·`4a10f3c` 빌드는 통과했다. #105(`1835f11`)로 `env.json`을 `thread.started`보다 먼저 쓰게 고쳤다(시험만).
+
 ## T30 승인·연동 시험 진행 (2026-11-07~)
 
 T21 1회차 감사의 blocked 7건(homelab 티켓 T30)을 항목마다 사용자 승인으로 실행하거나 사람이 대체 증거를 정한다. 실행안·원본 기록은 private `homelab-bot-ops`의 `evidence/t30/`.
