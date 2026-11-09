@@ -1,3 +1,4 @@
+import type { RateLimitInfo } from './contracts.js';
 import type { CredentialKind, RunCredential } from './credentials.js';
 
 // 작업자 안 모델 실행기의 내부 계약(D-14).
@@ -53,11 +54,13 @@ export type PolicyViolation = 'tools_enabled' | 'mcp_enabled' | 'skills_enabled'
 export interface Observation { line: string; tools: readonly string[]; violation: PolicyViolation | null }
 // 어댑터가 내는 실행기 중립 결과. 소멸 확인·중단·상한·스키마·반사 판정은 공통부가 한다.
 // violation은 로그 전용이다. 레인은 reason만 결과로 넘기므로 HTTP 계약에는 나가지 않는다.
+// rateLimit은 그 실행에서 본 한도 정보다. 어느 결과에도 붙을 수 있고, 레인이 응답의 한도 칸에 그대로 싣는다.
+// 한도 대기의 원인(rateLimit.stop)은 원인을 가를 근거가 없는 실행기(Codex)면 비어 있다.
 export type EngineOutcome =
-  | { kind: 'output'; value: unknown }
-  | { kind: 'limited' }
-  | { kind: 'auth_expired' }
-  | { kind: 'failed'; reason: string; violation?: PolicyViolation };
+  | { kind: 'output'; value: unknown; rateLimit?: RateLimitInfo }
+  | { kind: 'limited'; rateLimit?: RateLimitInfo }
+  | { kind: 'auth_expired'; rateLimit?: RateLimitInfo }
+  | { kind: 'failed'; reason: string; violation?: PolicyViolation; rateLimit?: RateLimitInfo };
 export interface ExitStatus { code: number | null; signal: string | null }
 
 export interface AdapterRun {

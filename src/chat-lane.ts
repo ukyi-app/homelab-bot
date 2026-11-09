@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { AnswerSchema, CHAT_REPLY_LIMITS, ChatReplySchema, PROPOSAL_ACTIONS } from './contracts.js';
-import type { Answer } from './contracts.js';
+import type { Answer, RateLimitInfo } from './contracts.js';
 import { botFacts } from './bot-facts.js';
 import { echoesSecret } from './codex-events.js';
 import type { WorkerCredential } from './credentials.js';
@@ -70,6 +70,7 @@ export const chatDeadline = runDeadline;
 export type ChatReport = RunReport;
 const FAILED: WorkerResult = Object.freeze({ status: 'failed', stopped: true });
 const FAILED_V2: WorkerResultV2 = Object.freeze({ status: 'failed', stopped: true, rateLimit: null });
+const failedV2 = (rateLimit: RateLimitInfo | null): WorkerResultV2 => ({ status: 'failed', stopped: true, rateLimit });
 const clip = (items: string[], cap: number) => items.slice(0, cap).map(item => bounded(item, 500));
 // 판정 순서가 계약이다(작업 레인 interpretRun과 같은 뜻): 소멸 확인 → 집행한 상한·정책 위반·중단 → 실행기 결과
 // (한도·인증 대기, 실행기 실패) → 공통 스키마 → 반사 검사. 남은 프로세스가 있거나 모르면 unknown이고 작업자는 새 실행을
@@ -82,9 +83,11 @@ export function interpretChat(report: ChatReport, version: 1 | 2 = 1): WorkerRes
   if (report.exceeded || report.aborted || !report.outcome) return version === 2 ? FAILED_V2 : FAILED;
   const outcome = report.outcome;
   if (version === 2) {
-    if (outcome.kind === 'limited' || outcome.kind === 'auth_expired') return { status: outcome.kind, stopped: true, rateLimit: null };
-    if (outcome.kind === 'failed') return FAILED_V2;
-    return replyResult(outcome.value, report.secrets ?? []);
+    // 한도 칸은 실행기가 본 그대로 싣는다. 답이 계약 밖이라 실패가 돼도 그 실행에서 본 한도 정보는 남긴다.
+    const rateLimit = outcome.rateLimit ?? null;
+    if (outcome.kind === 'limited' || outcome.kind === 'auth_expired') return { status: outcome.kind, stopped: true, rateLimit };
+    if (outcome.kind === 'failed') return failedV2(rateLimit);
+    return replyResult(outcome.value, report.secrets ?? [], rateLimit);
   }
   if (outcome.kind === 'limited') return { status: 'limited', stopped: true };
   if (outcome.kind === 'auth_expired') return { status: 'auth_expired', stopped: true };
@@ -101,15 +104,16 @@ export function interpretChat(report: ChatReport, version: 1 | 2 = 1): WorkerRes
 }
 // v2 답: 모양이 다르면 실패, reply만 v1처럼 상한에서 잘라 받는다. 제안 값은 자르면 뜻이 바뀌므로 상한을 넘으면 실패다.
 // 반사 검사는 reply와 제안 값 전체에 건다.
-function replyResult(value: unknown, secrets: readonly string[]): WorkerResultV2 {
+function replyResult(value: unknown, secrets: readonly string[], rateLimit: RateLimitInfo | null): WorkerResultV2 {
+  const failed = failedV2(rateLimit);
   const parsed = ChatReplyOutputSchema.safeParse(value);
-  if (!parsed.success) return FAILED_V2;
+  if (!parsed.success) return failed;
   const output = ChatReplySchema.safeParse({ ...parsed.data, reply: bounded(parsed.data.reply, CHAT_REPLY_LIMITS.reply) });
-  if (!output.success) return FAILED_V2;
+  if (!output.success) return failed;
   const proposal = output.data.proposal;
   const text = [output.data.reply, proposal?.action ?? '', proposal?.target ?? '', proposal?.content ?? ''].join('\n');
-  if (echoesSecret(text, secrets)) return FAILED_V2;
-  return { status: 'succeeded', stopped: true, output: output.data, rateLimit: null };
+  if (echoesSecret(text, secrets)) return failed;
+  return { status: 'succeeded', stopped: true, output: output.data, rateLimit };
 }
 
 export interface ChatLaneOptions extends Omit<RunControlOptions, 'onEvent'> {
