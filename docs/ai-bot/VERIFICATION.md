@@ -2218,3 +2218,25 @@ AC-14 중 👀·⏳·지움·실패를 S1(가짜 Discord REST, PGlite)에서 고
 **검사.** `npm run check` 통과. 바뀐 모듈을 쓰는 시험 14개 파일(`worker-claude`·`worker-contract-v2`·`worker-entry`·`worker-server`·`review-lane`·`task-stream`·`task-contracts`·`task-diagnostics`·`change-review`·`change-artifact`·`task-worker`·`task-assembly`·`pr-review`·`task-bridge`) 500개 모두 통과(새 C03 시험 11개 포함). 전체 시험은 통합 단계에서 돌린다.
 
 **못 잡는 범위.** 2.1.308 `-p` 구독 모드에서 실제 이벤트가 오는지(S5, C24), 재개 스케줄과 리뷰 미루기(C19, S1 가짜 시계), 운영 알림(C21). 미게시 후보 리뷰(`/v1/change-review`)는 같은 실행기를 쓰지만 결과 스키마에 칸을 더하지 않았다. 리뷰 미루기를 이 경로에도 걸지는 C19가 정한다.
+
+## C25 작업자 변경 작성 v2 (2026-11-10)
+
+동료 봇 명세 §4.10 "변경 질문 줄이기"·"수정 요청"·"안내 댓글", AC-25·AC-28(S2)의 작업자 쪽이다(homelab 계획 티켓 C25). 작업자가 새 지시문 판 `change-v2`를 받으면 가정해서 진행하고 확인할 것·남은 위험(위치 선택)을 `snapshot`에, 진행 불가면 선택지 2~4개를 `needs_input`에 싣는다. 수정 차례에는 owner 지시와 PR 리뷰·댓글 자료 블록을 따로 받는다. 게시 서버는 아직 옛 판만 보내므로 병합 즉시 바뀌는 owner 동작은 없다. 모양과 규칙은 [ARCHITECTURE](ARCHITECTURE.md) §16.4 "변경 작성 v2 판", 결정은 [DECISIONS](DECISIONS.md) "동료 봇 전환 14·16 작업자 변경 작성 v2 판".
+
+**시험(경계 S2: 작업자 요청 → 고정 stream-json을 내는 가짜 CLI → 응답, 모델 호출 없음).**
+
+| 완료 조건 | 시험 |
+|---|---|
+| 새 판 요청에 확인할 것(위치 선택)과 남은 위험이 `snapshot`에, 진행 불가면 선택지 2~4개가 `needs_input`에 실린다(AC-25 S2) | `change-artifact` `C25 가정 진행`(위치·위치 없음·저장소 밖·`.git`·음수 줄·빈 글·개수 자름, 요약 없음, 새 출력 스키마와 지시문으로 띄움)·`C25 진행 불가`(2개·4개), `task-contracts` `C25 결과 칸` |
+| 선택지 개수가 틀리거나 자격이 반사된 출력은 결과로 나가지 않는다 | `change-artifact` `C25 출력 검사: 선택지가 0·1·5개거나 빈 선택지`(`invalid_output`, 새 판에서 칸 빠진 출력 포함)·`C25 출력 검사: … 자격이 반사되면`(선택지·확인할 것·남은 위험 각각 `secret_echo`, artifact 없음) |
+| 수정 차례에서 PR 리뷰·댓글은 자료 태그 안에만, 지시 자리는 owner 지시뿐(AC-28 S2) | `change-artifact` `C25 수정 차례`(리뷰·인라인·대화 댓글 표식이 `review_material` 밖에 없음, `owner_instruction`은 지시 하나, `</review_material>`·`<owner_instruction>` 주입 제거, 작성자 ID·association·위치, "오래된 자료 3개" 잘림 표시), `task-contracts` `C25 수정 차례 입력`(새 판에서만, `head = base`, label `public`만, 칸 밖 거부, 경로 규칙, 개수·글자 상한)·`C25 자료 블록 상한`(오래된 것부터 빼고 뺀 수, 긴 본문 자름) |
+| 옛 판 요청의 작업자 응답과 게시 서버 동작이 지금과 같다 | `change-artifact` `C25 호환`(옛 판 프롬프트 바이트·`TASK_OUTPUT_JSON_SCHEMA`·`snapshot`·`needs_input` 응답 칸 집합이 리터럴과 같음), `task-contracts` `C25 지시문 판`(v1은 `change-v2` 거부, 보내는 판 상수 `task-v1`), 기존 v2 흐름·재개·`ClaudeChangeAuthor` 시험 그대로 통과 |
+| intake가 받는 판을 알리고 옛 작업자 intake도 게시 서버가 받는다 | `change-artifact` `C25 intake`(새 작업자 `['task-v1','change-v2']`, 칸 없는 옛 intake는 `taskWorkerChangeContract` true·`taskWorkerIntake` routed·판 `['task-v1']`, 모르는 판 뺌, v2 없으면 빈 목록) |
+
+**옛 작업자 거부의 근거(코드 대조).** origin/main `551f0ad`의 `TaskV2StartSchema`는 `executionShape`의 `instructions: z.literal('task-v1')`을 그대로 쓰는 strict 모양이다. 그래서 옛 작업자는 `change-v2`나 `amendment`가 든 요청을 400 `request_invalid`로 거부하고, 게시 서버의 `HttpTaskV2Worker`는 이를 `TaskWorkerRejected`(미시작)로 읽는다. 옛 작업자 이미지를 띄우는 시험은 없고, 같은 리터럴을 쓰는 v1 스키마의 거부를 `C25 지시문 판`이 고정한다.
+
+**되돌림.** 게시 서버만 되돌려도 깨지지 않는다(옛 판만 보내고 새 작업자는 옛 칸만 낸다, `C25 호환`). 작업자만 되돌리면 저장해 둔 새 판 결과를 읽지 못하므로, C27~C29가 새 판을 보내기 시작한 뒤에는 진행 중인 CHANGE 턴을 받아 두거나 drain한 뒤 되돌린다(C06 롤백 절차에 옮긴다).
+
+**검사.** `npm run check` 통과. 바뀐 모듈을 쓰는 시험 10개 파일(`task-contracts`·`change-artifact`·`task-stream`·`task-worker`·`change-contracts`·`task-assembly`·`change-assembly`·`codex-bridge`·`task-settings-boundary`·`task-diagnostics`) 378개 모두 통과(새 C25 시험 11개 포함). 전체 시험은 통합 단계에서 돌린다.
+
+**못 잡는 범위.** 모델이 언제 가정하고 언제 묻는지의 판단 품질(S5, C24), 고정 CLI 2.1.308이 새 출력 스키마(중첩 객체 배열)를 실제로 지키는지(S5), Discord 질문 글·버튼(C28), 미리보기·PR 설명 반영과 공개 검사(C29), 실제 PR 브랜치 head에서의 수정·게시(C27).
