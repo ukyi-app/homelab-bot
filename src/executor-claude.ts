@@ -1,3 +1,5 @@
+import { RateLimitEventSchema } from './contracts.js';
+import type { LimitCause, RateLimitEvent, RateLimitInfo } from './contracts.js';
 import type { AdapterRun, ChatAdapter, ChatRun, EngineOutcome, ExecutorCapabilities, ExitStatus, Observation, PolicyViolation } from './executor.js';
 
 // Claude Code CLI 대화 어댑터(D-14, 사용자 결정: Claude Code CLI, 구독 장기 토큰, 첫 모델 Opus 5.5).
@@ -62,6 +64,7 @@ export interface Compact {
   stop_reason?: unknown; tool_uses?: { id: unknown; name: unknown }[];
   is_error?: unknown; structured_output?: unknown; num_turns?: unknown;
   original_model?: unknown; fallback_model?: unknown;
+  rate_limit_info?: RateLimitEvent;
 }
 const record = (value: unknown): Record<string, unknown> | null =>
   typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -71,6 +74,21 @@ const IDENTIFIER = /^[a-z][a-z0-9_]{0,63}$/;
 export const safeIdentifier = (value: unknown): string | null => value === undefined || value === null ? null
   : typeof value === 'string' && IDENTIFIER.test(value) ? value : 'unknown';
 const keptIdentifier = (value: unknown) => value === undefined ? undefined : safeIdentifier(value);
+// rate_limit_event에서 상태·풀리는 시각·종류·사용률 네 칸만 모양을 검사해 남긴다. 상태를 모르면 이벤트가 없는 것으로 보고,
+// 다른 칸은 깨진 것만 버린다(종류가 늘어도 시각은 남는다). 원문의 나머지 칸(overage·창별 값 등)은 줄과 응답에 남기지 않는다.
+// 이미 줄인 값을 다시 줄여도 같다.
+const RATE_LIMIT_FIELDS = RateLimitEventSchema.shape;
+function rateLimitEventOf(value: unknown): RateLimitEvent | null {
+  const info = record(value);
+  const status = RATE_LIMIT_FIELDS.status.safeParse(info?.status);
+  if (!info || !status.success) return null;
+  const kept: RateLimitEvent = { status: status.data };
+  for (const key of ['resetsAt', 'rateLimitType', 'utilization'] as const) {
+    const field = RATE_LIMIT_FIELDS[key].safeParse(info[key]);
+    if (field.success && field.data !== undefined) Object.assign(kept, { [key]: field.data });
+  }
+  return kept;
+}
 const errorKinds = (event: Record<string, unknown>) => ({ api_error: keptIdentifier(event.api_error),
   api_error_code: keptIdentifier(event.api_error_code), api_error_origin: keptIdentifier(event.api_error_origin) });
 export function compactClaudeEvent(line: string): Compact | null {
@@ -97,6 +115,9 @@ export function compactClaudeEvent(line: string): Compact | null {
     const model = record(event.message)?.model ?? event.model;
     Object.assign(compact, { model, error: event.error, api_error_status: event.api_error_status, ...errorKinds(event),
       stop_reason: keptIdentifier(record(event.message)?.stop_reason ?? event.stop_reason), tool_uses: uses });
+  } else if (event.type === 'rate_limit_event') {
+    const info = rateLimitEventOf(event.rate_limit_info);
+    if (info) compact.rate_limit_info = info;
   } else if (event.type === 'system' && event.subtype === 'model_refusal_fallback') {
     Object.assign(compact, { original_model: event.original_model, fallback_model: event.fallback_model });
   } else if (event.type === 'result') {
@@ -132,16 +153,20 @@ export function modelViolation(event: Compact, expect: ClaudeExpectation): Polic
 // 한도·인증 분류. 근거는 CLI가 낸 구조화 필드뿐이다(assistant `error` 종류, HTTP 상태). 모델 답이나 결과 텍스트에
 // "401"·"rate limit"이 있어도 보지 않는다. 종류 이름은 2.1.308 바이너리의 SDK 스키마 enum이다 [가정: 실제 값 S12].
 const AUTH_KINDS = new Set(['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required']);
-// billing_error는 사람이 결제·한도를 확인해야 한다. 자동 재시도하지 않게 한도 대기로 둔다.
-const LIMIT_KINDS = new Set(['rate_limit', 'billing_error']);
+// billing_error는 사람이 결제·한도를 확인해야 한다. 자동 재시도하지 않게 한도 대기로 두고, 원인을 billing으로 갈라
+// 게시 서버가 저절로 재개하지 않게 한다. 402는 Messages API의 billing_error 상태다.
+const LIMIT_KINDS = new Map<string, LimitCause>([['rate_limit', 'rate_limit'], ['billing_error', 'billing']]);
+const LIMIT_STATUSES = new Map<unknown, LimitCause>([[429, 'rate_limit'], [402, 'billing']]);
+const limited = (cause: LimitCause): EngineOutcome => ({ kind: 'limited', rateLimit: { stop: { cause } } });
 export function classifyClaudeError(kind: unknown, status: unknown): EngineOutcome | null {
   if (typeof kind === 'string' && AUTH_KINDS.has(kind)) return { kind: 'auth_expired' };
-  if (typeof kind === 'string' && LIMIT_KINDS.has(kind)) return { kind: 'limited' };
+  const byKind = typeof kind === 'string' ? LIMIT_KINDS.get(kind) : undefined;
+  if (byKind) return limited(byKind);
   // overloaded·server_error 등 다른 종류는 대기가 아니다. 종류를 모를 때만 HTTP 상태를 본다.
   if (typeof kind === 'string' && kind !== 'unknown') return null;
   if (status === 401 || status === 403) return { kind: 'auth_expired' };
-  if (status === 429 || status === 402) return { kind: 'limited' };
-  return null;
+  const byStatus = LIMIT_STATUSES.get(status);
+  return byStatus ? limited(byStatus) : null;
 }
 
 // 오류 판정과 진단이 함께 보는 이벤트. 값은 result에 있으면 그것을, 없으면 마지막 assistant의 것을 쓴다.
@@ -173,15 +198,31 @@ const NO_TOOL_STREAM: ClaudeStreamPolicy = { compact: compactClaudeEvent, init: 
 const failed = (reason: string): EngineOutcome => ({ kind: 'failed', reason });
 // stream-json 해석. 순서: 흐름 무결성(init 하나, result 최대 하나) → init 정책 → 오류 결과(한도·인증 대기 또는 실패)
 // → 종료 코드 → structured_output. `subtype: success`만으로 성공을 확정하지 않는다(is_error=false와 구조화 출력이 있어야 한다).
+// 어떤 결과든 그 실행에서 본 한도 정보를 함께 싣는다.
 export function interpretClaudeStream(lines: readonly string[], exit: ExitStatus, expect: ClaudeExpectation,
   policy: ClaudeStreamPolicy = NO_TOOL_STREAM): EngineOutcome {
   const events: Compact[] = [];
+  let broken = false;
   for (const line of lines) {
     if (!line.trim()) continue;
     const parsed = policy.compact(line);
-    if (!parsed) return failed('invalid_stream');
+    if (!parsed) { broken = true; break; }
     events.push(parsed);
   }
+  return withRateLimit(broken ? failed('invalid_stream') : judgeClaudeStream(events, exit, expect, policy), events);
+}
+// event는 마지막 rate_limit_event다. 한도 대기면 원인에 같은 실행의 마지막 rejected가 알린 풀리는 시각을 붙인다.
+// 경고(allowed_warning)의 시각은 멈춤의 시각이 아니라 붙이지 않는다. 시각을 모르면 게시 서버가 30분 재시도로 내려앉는다.
+function withRateLimit(outcome: EngineOutcome, events: readonly Compact[]): EngineOutcome {
+  const seen = events.flatMap(e => e.type === 'rate_limit_event' && e.rate_limit_info ? [e.rate_limit_info] : []);
+  const event = seen.at(-1);
+  const cause = outcome.kind === 'limited' ? outcome.rateLimit?.stop?.cause : undefined;
+  const resetsAt = seen.filter(e => e.status === 'rejected').at(-1)?.resetsAt;
+  const info: RateLimitInfo = { ...(event ? { event } : {}),
+    ...(cause ? { stop: { cause, ...(resetsAt !== undefined ? { resetsAt } : {}) } } : {}) };
+  return info.event || info.stop ? { ...outcome, rateLimit: info } : outcome;
+}
+function judgeClaudeStream(events: readonly Compact[], exit: ExitStatus, expect: ClaudeExpectation, policy: ClaudeStreamPolicy): EngineOutcome {
   const inits = events.filter(e => e.type === 'system' && e.subtype === 'init');
   if (inits.length !== 1) return failed('invalid_stream');
   // 실행 중 관측(observe)을 지나친 위반의 마지막 보루. 종류를 실어 보내 공통부가 로그로 남긴다. 판정 순서는 init → 모델이다.

@@ -301,7 +301,14 @@ const failedResponse = (base: Base, reason: TaskFailureReason, sessionRetained: 
 
 // 판정 순서가 계약이다: 정리 확인 → 실행 중 집행(상한·위반·중단) → stream 무결성 → 종료·오류 → structured_output → 실제 diff·반사 검사.
 // 소멸을 확인하지 못하면 어떤 결과도 읽지 않는다. 살아 있는 프로세스가 파일을 바꿔치기할 수 있다.
-export async function judgeTaskRun(input: { request: TaskRequest; base: Base; report: RunReport; cancelled: boolean; session: TaskSession; sessions: TaskSessions; log?: TaskLog; change?: TaskTurnChange }): Promise<TaskResponse> {
+type JudgeInput = { request: TaskRequest; base: Base; report: RunReport; cancelled: boolean; session: TaskSession; sessions: TaskSessions; log?: TaskLog; change?: TaskTurnChange };
+// 실행기가 본 한도 정보는 판정이 무엇이든 응답의 선택 칸에 싣는다. 소멸을 확인하지 못한 unknown은 실행기 결과를 읽지 않으므로 싣지 않는다.
+export async function judgeTaskRun(input: JudgeInput): Promise<TaskResponse> {
+  const judged = await judgeTurn(input);
+  const rateLimit = input.report.outcome?.rateLimit;
+  return rateLimit && judged.status !== 'unknown' ? { ...judged, rateLimit } : judged;
+}
+async function judgeTurn(input: JudgeInput): Promise<TaskResponse> {
   const { request, base, report, cancelled, session, sessions, log, change } = input;
   if (report.survivors !== 0) return { ...base, status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: false };
   if (report.refused) return failedResponse(base, REFUSALS[report.refused], true, report.refused === 'cleanup_pending');
@@ -403,12 +410,13 @@ export async function runChangeTurn(deps: TaskTurnDeps, request: TaskV2Request, 
   const response = await runTaskTurn({ ...deps, change }, v1, signal);
   const identity = { version: TASK_V2_CONTRACT, job: response.job, lease: response.lease, generation: response.generation, sessionId: response.sessionId, turn: response.turn, worker: response.worker, usage: response.usage } as const;
   if (response.status === 'unknown') return { ...identity, status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: response.cleanupPending };
-  if (response.status === 'limited' || response.status === 'auth_expired') return { ...identity, status: response.status, stopped: true, sessionRetained: response.sessionRetained, cleanupPending: response.cleanupPending };
-  if (response.status === 'needs_input') return { ...identity, status: 'needs_input', stopped: true, sessionRetained: true, cleanupPending: false, question: response.question };
-  const failed = (reason: TaskV2FailureReason, sessionRetained: boolean, cleanupPending = false): TaskV2TurnResult => ({ ...identity, status: 'failed', stopped: true, sessionRetained, cleanupPending, reason });
+  const rateLimit = response.rateLimit ? { rateLimit: response.rateLimit } : {};
+  if (response.status === 'limited' || response.status === 'auth_expired') return { ...identity, status: response.status, stopped: true, sessionRetained: response.sessionRetained, cleanupPending: response.cleanupPending, ...rateLimit };
+  if (response.status === 'needs_input') return { ...identity, status: 'needs_input', stopped: true, sessionRetained: true, cleanupPending: false, question: response.question, ...rateLimit };
+  const failed = (reason: TaskV2FailureReason, sessionRetained: boolean, cleanupPending = false): TaskV2TurnResult => ({ ...identity, status: 'failed', stopped: true, sessionRetained, cleanupPending, reason, ...rateLimit });
   if (response.status === 'failed') return failed(blocked ?? response.reason, response.sessionRetained, response.cleanupPending);
   if (!artifact) return failed(blocked ?? 'artifact_incomplete', response.sessionRetained);
-  const snapshot: TaskV2TurnResult = { ...identity, status: 'snapshot', stopped: true, sessionRetained: true, cleanupPending: false, artifactDigest: artifactDigest(artifact.manifest), artifact: encodeArtifact(artifact) };
+  const snapshot: TaskV2TurnResult = { ...identity, status: 'snapshot', stopped: true, sessionRetained: true, cleanupPending: false, artifactDigest: artifactDigest(artifact.manifest), artifact: encodeArtifact(artifact), ...rateLimit };
   // 결과 전체가 한 응답에 들어가야 한다. 넘으면 자르지 않고 닫는다.
   if (Buffer.byteLength(JSON.stringify(snapshot)) > ARTIFACT_LIMITS.httpBodyBytes) return failed('artifact_too_large', response.sessionRetained);
   return snapshot;

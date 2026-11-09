@@ -3,7 +3,7 @@ import type { KeyObject } from 'node:crypto';
 import { z } from 'zod';
 import { AnswerSchema, ChatReplySchema, DEFAULTS, Denied, SYSTEM_INSTRUCTIONS, SYSTEM_INSTRUCTIONS_V2, WORKER_ACCEPT,
   WorkerRejected } from './contracts.js';
-import type { Answer, ChatReply, Clock, Job } from './contracts.js';
+import type { Answer, ChatReply, Clock, Job, RateLimitInfo } from './contracts.js';
 
 // 키 순서가 계약이다: capability digest는 schema를 거친 본문의 JSON.stringify라, 순서가 바뀌면 다른 판의 게시 서버가
 // 서명한 요청을 작업자가 거부한다. v1은 옛 순서 그대로 두고, 칸을 더할 때는 v2처럼 새 판에만 더한다.
@@ -37,10 +37,10 @@ export type WorkerResult =
   | { status: 'succeeded'; answer: Answer; stopped: true }
   | { status: 'limited' | 'auth_expired' | 'failed'; stopped: true }
   | { status: 'unknown'; stopped: false };
-// v2 응답. rateLimit은 C03이 채우기 전까지 null이다. 멈춤을 확인하지 못한 unknown에는 싣지 않는다.
+// v2 응답. rateLimit은 그 실행에서 본 한도 정보이고 없으면 null이다. 멈춤을 확인하지 못한 unknown에는 싣지 않는다.
 export type WorkerResultV2 =
-  | { status: 'succeeded'; output: ChatReply; stopped: true; rateLimit: null }
-  | { status: 'limited' | 'auth_expired' | 'failed'; stopped: true; rateLimit: null }
+  | { status: 'succeeded'; output: ChatReply; stopped: true; rateLimit: RateLimitInfo | null }
+  | { status: 'limited' | 'auth_expired' | 'failed'; stopped: true; rateLimit: RateLimitInfo | null }
   | { status: 'unknown'; stopped: false };
 // 게시 서버가 쓰는 작업자 꼴. 게시 서버는 아직 v1만 보낸다(v2 사용은 C11).
 export interface WorkerClient {

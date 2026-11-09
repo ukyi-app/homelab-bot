@@ -228,6 +228,24 @@ test('C02 v2 서버 + v1 작업자: v2 요청은 요청 거부로 닫히고 성�
   } finally { wrong.server.close(); }
 });
 
+test('C03 게시 서버 v2 응답 스키마: 한도 칸이 null인 응답과 한도 정보가 든 응답을 둘 다 받고, 칸이 깨지면 성공으로 읽지 않는다', async () => {
+  const reply = (body: unknown) => new HttpWorker('http://worker.invalid/',
+    (async () => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch);
+  const output = { reply: '네', proposal: null, ack_only: false };
+  const warning = { event: { status: 'allowed_warning', resetsAt: 1_794_528_000, rateLimitType: 'seven_day', utilization: 0.91 } };
+  const stopped = { event: { status: 'rejected', resetsAt: 1_794_286_800 }, stop: { cause: 'rate_limit', resetsAt: 1_794_286_800 } };
+  for (const body of [{ status: 'succeeded', stopped: true, output, rateLimit: null }, { status: 'succeeded', stopped: true, output, rateLimit: warning },
+    { status: 'limited', stopped: true, rateLimit: stopped }, { status: 'limited', stopped: true, rateLimit: { stop: { cause: 'billing' } } }]) {
+    const request = v2(job());
+    assert.deepEqual(await reply(body).execute(request, capability(request), new AbortController().signal), body);
+  }
+  for (const rateLimit of [{}, { event: { status: 'blocked' } }, { event: { status: 'rejected', overageStatus: 'rejected' } }, { stop: { cause: 'quota' } }]) {
+    const request = v2(job());
+    assert.deepEqual(await reply({ status: 'succeeded', stopped: true, output, rateLimit }).execute(request, capability(request), new AbortController().signal),
+      { status: 'failed', stopped: true, rateLimit: null }, JSON.stringify(rateLimit));
+  }
+});
+
 const COMMAND_NAMES = [...FOUNDATION_COMMANDS, ...MEMORY_COMMANDS, ...REVIEW_COMMANDS, ...TASK_COMMANDS, ...EXTERNAL_TASK_COMMANDS,
   ...CHANGE_COMMANDS];
 const factsOf = (prompt: string) => prompt.slice(0, prompt.indexOf(JSON.stringify([{ from: 'owner', text: '상태 알려줘' }])));
