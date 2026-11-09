@@ -31,6 +31,8 @@ const SHA = '[0-9a-f]{40}';
 const ROUTES: readonly RegExp[] = Object.freeze([
   'POST /app/installations/[1-9][0-9]{0,15}/access_tokens',
   `POST ${REPO}/git/blobs`, `POST ${REPO}/git/trees`, `POST ${REPO}/git/commits`, `POST ${REPO}/git/refs`, `POST ${REPO}/pulls`,
+  // 갱신은 변경 브랜치 모양만 연다. 어느 change·generation인지는 도메인 메서드가 ownsBranch로 다시 본다.
+  `PATCH ${REPO}/git/refs/heads/bot/change/[0-9a-f]{32}/g[1-9][0-9]{0,2}`,
   `GET ${REPO}/git/ref/heads/${BRANCH}`, `GET ${REPO}/git/commits/${SHA}`, `GET ${REPO}/git/blobs/${SHA}`,
   `GET ${REPO}/git/trees/${SHA}`, String.raw`GET ${REPO}/git/trees/${SHA}\?recursive=1`,
   String.raw`GET ${REPO}/pulls\?state=all&head=${SEGMENT}:${BRANCH}&base=${BRANCH}&per_page=100`,
@@ -47,6 +49,8 @@ const exactKeys = (body: unknown, keys: readonly string[]) => {
 // 도메인 메서드가 이미 본 값이지만 전송 직전에 다시 본다. 표에 없는 필드(force, merge_method 등)가 나갈 길을 닫는다.
 function bodyAllowed(method: string, path: string, body: unknown): boolean {
   if (method === 'GET') return body === undefined;
+  // force가 참이면 남의 커밋을 덮는다. 빠뜨려도 GitHub 기본값은 거짓이지만 보내는 값을 거짓 하나로 고정한다.
+  if (method === 'PATCH') return exactKeys(body, ['sha', 'force']) && (body as { force: unknown }).force === false;
   if (path.endsWith('/access_tokens')) return exactKeys(body, ['repository_ids', 'permissions']);
   if (path.endsWith('/git/blobs')) return exactKeys(body, ['content', 'encoding']);
   if (path.endsWith('/git/trees')) return exactKeys(body, ['base_tree', 'tree']);
@@ -105,6 +109,7 @@ const TreeInput = z.strictObject({ target: Target, baseTree: GitShaSchema, entri
 const CommitInput = z.strictObject({ target: Target, treeSha: GitShaSchema, parent: GitShaSchema,
   metadata: z.strictObject({ message: PublicMetadataSchema.shape.commitMessage, author: PublicMetadataSchema.shape.author, committer: PublicMetadataSchema.shape.committer }) });
 const RefInput = z.strictObject({ target: Target, branch: z.string(), sha: GitShaSchema });
+const FastForwardInput = z.strictObject({ target: Target, branch: z.string(), expectedHead: GitShaSchema, sha: GitShaSchema });
 const PullInput = z.strictObject({ target: Target, branch: z.string(), baseBranch: z.string(), title: PublicMetadataSchema.shape.title, body: PublicMetadataSchema.shape.body, draft: z.boolean() });
 
 const CreatedSha = z.object({ sha: GitShaSchema });
@@ -124,7 +129,13 @@ const snapshot = (row: PullRow): WriterPullSnapshot => ({
   authorId: row.user.id, title: row.title, body: row.body ?? '', repoId: row.base.repo.id,
 });
 
-export interface GitHubWriterIO { writer: ChangeWriterPort; preflight: ChangePreflightPort }
+// ChangeWriterPort(소유 C25)에 올리기 전까지 fast-forward 갱신은 이 타입에만 있다.
+export interface GitHubWriterPort extends ChangeWriterPort {
+  // 자기 change·generation 브랜치를 expectedHead에서 sha로만 옮긴다. sha의 부모가 expectedHead 하나여야 하고, 브랜치가 다른 SHA면 보내지 않는다(head_changed).
+  // 응답 유실·409·422는 브랜치를 다시 읽어 sha면 confirmed, 다른 SHA·없음이면 rejected(head_changed), 그대로면 원래 결과다.
+  fastForwardBranch(input: { target: ChangeTarget; branch: string; expectedHead: string; sha: string }): Promise<WriterOutcome<{ ref: string; sha: string }>>;
+}
+export interface GitHubWriterIO { writer: GitHubWriterPort; preflight: ChangePreflightPort }
 export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO {
   const { app, repositories, authorizeWrite } = options;
   const send = options.send ?? fetch;
@@ -133,7 +144,7 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
   const issuing = new Map<string, Promise<string>>();
 
   // 이 파일에서 네트워크로 나가는 유일한 지점이다. redirect를 따라가지 않아 자격이 다른 주소로 가지 않는다.
-  const exchange = async (method: 'GET' | 'POST', path: string, credential: string | null, body: unknown, limit: number): Promise<Exchange> => {
+  const exchange = async (method: 'GET' | 'POST' | 'PATCH', path: string, credential: string | null, body: unknown, limit: number): Promise<Exchange> => {
     if (!writerRouteAllowed(method, path) || !bodyAllowed(method, path, body)) return { kind: 'not_sent', code: 'route_denied' };
     let response: Response;
     try {
@@ -172,12 +183,12 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
   // 공개 저장소로 나가는 쓰기는 모두 여기를 지난다. 게시자의 단계 입구 검사 뒤에도 GitHub 조회·토큰 발급을 기다리므로 그사이의 /revoke·/change-cancel은 여기서만 잡힌다.
   // 확인이 실패해도 보내지 않는다. 읽기는 이 길을 지나지 않아 보냈을 수 있는 effect의 대조가 철회로 막히지 않는다.
   // 이 확인과 전송 사이의 아주 짧은 틈은 남는다. 이미 나간 요청과 같게 대조로 다룬다.
-  const sendWrite = async (target: ChangeTarget, path: string, token: string, body: unknown, limit: number): Promise<Exchange> => {
+  const sendWrite = async (target: ChangeTarget, path: string, token: string, body: unknown, limit: number, method: 'POST' | 'PATCH' = 'POST'): Promise<Exchange> => {
     try { await authorizeWrite(target); }
     catch (error) {
       return { kind: 'not_sent', code: error instanceof Denied ? 'authorization_revoked' : error instanceof PublicationStopped ? 'publication_stopped' : error instanceof PolicyUnavailable ? 'policy_unavailable' : 'authorization_check_failed' };
     }
-    return exchange('POST', path, token, body, limit);
+    return exchange(method, path, token, body, limit);
   };
 
   const resolve = async (repoId: number): Promise<WriterRepository | { denied: string }> => {
@@ -442,8 +453,48 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
   const signed = reads(pullToken);
   const anonymous = reads(async () => null);
 
-  const port: ChangeWriterPort = {
+  const fastForwardBranch: GitHubWriterPort['fastForwardBranch'] = async raw => {
+    const parsed = input(FastForwardInput, raw);
+    if (!parsed || parsed.expectedHead === parsed.sha) return notSent('input_invalid');
+    const { target, branch, expectedHead, sha } = parsed;
+    if (!ownsBranch(target, branch)) return notSent('branch_not_allowed');
+    const ref = `refs/heads/${branch}`;
+    // 쓰기 토큰을 받기 전에 본다. 사람이 브랜치에 커밋을 올렸으면 그 위에 덮지 않고, 부모가 다른 커밋은 GitHub이 받아도 내 변경이 아니다.
+    try {
+      const head = await signed.readBranchHead({ target, branch });
+      if (head?.sha !== expectedHead) return notSent('head_changed');
+      const commit = await signed.readCommit({ target, sha });
+      if (!commit || commit.parents.length !== 1 || commit.parents[0] !== expectedHead) return notSent('not_fast_forward');
+    } catch (error) {
+      if (error instanceof WriterReadError) return notSent(error.message);
+      throw error;
+    }
+    // 응답을 잃었거나 갱신이 거부되면 정확한 ref를 다시 읽는다. 읽기가 실패하면 처음 결과를 그대로 둔다.
+    const settle = async (sent: WriterOutcome<{ ref: string; sha: string }>): Promise<WriterOutcome<{ ref: string; sha: string }>> => {
+      let head: { sha: string } | null;
+      try { head = await signed.readBranchHead({ target, branch }); }
+      catch (error) {
+        if (error instanceof WriterReadError) return sent;
+        throw error;
+      }
+      if (head?.sha === sha) return { kind: 'confirmed', value: { ref, sha } };
+      // status 0은 응답을 받지 못해 HTTP 상태가 없다는 뜻이다.
+      if (head?.sha !== expectedHead) return { kind: 'rejected', status: sent.kind === 'rejected' ? sent.status : 0, code: 'head_changed' };
+      return sent;
+    };
+    return withWriteAccess(target, 'contents', async (repo, token) => {
+      const sent = classify(await sendWrite(target, `/repos/${repo.fullName}/git/refs/heads/${branch}`, token, { sha, force: false }, LIMIT.small, 'PATCH'), json => {
+        const updated = CreatedRef.safeParse(json);
+        return updated.success && updated.data.ref === ref && updated.data.object.type === 'commit' && updated.data.object.sha === sha ? { kind: 'confirmed', value: { ref, sha } } : invalid;
+      });
+      // GitHub 문서는 갱신 거부로 409·422를 적는다. 어느 쪽이든 브랜치가 그대로인지 다시 본다.
+      return sent.kind === 'unknown' || (sent.kind === 'rejected' && (sent.status === 422 || sent.status === 409)) ? settle(sent) : sent;
+    });
+  };
+
+  const port: GitHubWriterPort = {
     ...writer,
+    fastForwardBranch,
     readBranchHead: signed.readBranchHead,
     readCommit: signed.readCommit,
     readTreeLeaves: signed.readTreeLeaves,

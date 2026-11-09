@@ -166,6 +166,17 @@ export class FakeGitHub {
       }
       return new Response('{}', { status: 404 });
     }
+    const update = /^\/git\/refs\/(heads\/.+)$/.exec(rest);
+    if (method === 'PATCH' && update) {
+      if (!this.hasPermission(sent, 'contents', 'write')) return new Response('{}', { status: 403 });
+      const name = update[1]!;
+      const current = this.refs.get(name);
+      if (!current) return json({ message: 'Reference does not exist' }, 422);
+      if (!this.commits.has(object.sha)) return json({ message: 'Object does not exist' }, 422);
+      if (object.force !== true && !this.descends(object.sha, current)) return json({ message: 'Update is not a fast forward' }, 422);
+      this.refs.set(name, object.sha);
+      return json({ ref: `refs/${name}`, object: { type: 'commit', sha: object.sha } });
+    }
     if (method !== 'GET') return new Response('{}', { status: 405 });
     const ref = /^\/git\/ref\/(.+)$/.exec(rest);
     if (ref) {
@@ -198,6 +209,17 @@ export class FakeGitHub {
       return json(this.pulls.filter(pull => pull.head.ref === branch && pull.base.ref === list[2]));
     }
     return new Response('{}', { status: 404 });
+  }
+  private descends(sha: string, ancestor: string): boolean {
+    const queue = [sha];
+    for (const seen = new Set<string>(); queue.length;) {
+      const next = queue.shift()!;
+      if (next === ancestor) return true;
+      if (seen.has(next)) continue;
+      seen.add(next);
+      queue.push(...(this.commits.get(next)?.parents ?? []));
+    }
+    return false;
   }
   private createTree(object: Record<string, any>): Response {
     if (!this.trees.has(object.base_tree)) return json({ message: 'base_tree' }, 422);

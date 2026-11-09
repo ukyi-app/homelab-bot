@@ -2126,6 +2126,20 @@ T21 1회차 감사의 blocked 7건(homelab 티켓 T30)을 항목마다 사용자
 
 **검사(경계 S1 게시 서버 설정 로드).** `publisher-config` 12/12(새 2: 칸 없음·꺼짐·켜짐, 잘못된 값의 기동 오류와 값 비노출), `publisher-policy` 7/7(새 1: 잘못된 값 8가지가 정확히 `runtime_policies_invalid: colleagueEnabled`, 받은 값은 얼림). 설정을 쓰는 `publisher-main`·`github-review-app`까지 함께 65/65, `npm run check` 통과. 두 상태의 실제 동작 차이(AC-23의 버튼·문구)는 그 기능을 만드는 뒤 티켓의 두 상태 시험이 본다.
 
+## C26 GitHub 쓰기·읽기 확장 (2026-11-09)
+
+동료 봇 전환 16·17(수정 요청·안내 댓글)이 쓸 GitHub 포트 셋을 더했다. 부르는 곳이 없어 병합해도 GitHub에 나가는 요청과 owner가 보는 동작은 그대로다. 경계는 명세 §6 S1(가짜 GitHub)이고 네트워크·실제 GitHub은 쓰지 않았다. 설계는 [ARCHITECTURE](ARCHITECTURE.md) §6 리뷰 행과 §16.3 표.
+
+| 포트 | 시험(`test/github-writer.test.ts`, `test/github-review-app.test.ts`) | 잡는 실패 |
+|---|---|---|
+| writer `fastForwardBranch` | "C26 writer:" 6건, route 표 허용·거부 사례 | 강제 갱신(`force` 입력·`force:true` body), 남의 change·generation·base·임의 브랜치 갱신, 기대 head 불일치·부모 불일치 전송(쓰기 토큰도 받지 않음), 응답 유실·422 뒤 재전송, 응답 ref·SHA 불일치 확정 |
+| 리뷰 App `discussion.read` | "리뷰 App 허용 경로", "PR 자료 읽기:" 4건 | 허용 경로가 GET 두 줄 밖으로 늘어남, 다른 PR·저장소 글 혼입, 모르는 association, 쪽·항목·글자 상한 무시, 정책 목록 밖 저장소에 토큰 발급 |
+| 리뷰 App `guidance.post`·`find` | "안내 리뷰 게시:" 3건 | APPROVE·REQUEST_CHANGES·LEFT 인라인·인라인 51개, 옛 head·닫힌 PR·fork PR 게시, 표식 흉내 본문, 유실 뒤 재게시, 다른 head·다른 표식 종류(`homelab-bot-review:`)로 잘못 회수 |
+
+- 실행: `npm run check`, `npm run build && node --test dist/test/github-writer.test.js dist/test/github-review-app.test.js` → 83 pass, 0 fail, 0 skip.
+- **못 잡는 범위(S5):** 실제 GitHub의 fast-forward 거부 응답 모양(문서는 `force` 거짓이면 fast-forward만이라고 하고 실패 상태로 409·422를 적는다. 둘 다 ref를 다시 읽어 대조한다)과 ruleset E 동작, 인라인 위치 표시.
+- **[미확인] issue 댓글 읽기 권한:** 리뷰 App 읽기 토큰은 `contents:read`·`pull_requests:read`다. GitHub "Permissions required for GitHub Apps" 표에서 `GET /repos/{owner}/{repo}/issues/{issue_number}/comments`가 Issues(read)와 Pull requests(read) 양쪽에 "Additional permissions" 표시로 실린 것으로 읽혔다(그 표시는 "any one permission from a set"이라는 뜻). 문서 원문을 끝까지 받지 못해 확인은 요약 수준이다(확인 2026-11-09, docs.github.com). 권한을 더하지 않았고, live 첫 수정 요청에서 403이 나면 App 권한 `issues:read` 추가가 사람 작업이다.
+
 ## C04 반응 수명 (2026-11-09, 로컬)
 
 AC-14 중 👀·⏳·지움·실패를 S1(가짜 Discord REST, PGlite)에서 고정했다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §13 "수신·진행 신호"의 반응 수명 문단이다. 동료 기능 스위치 밖이라 병합하면 바로 운영에 나간다.
