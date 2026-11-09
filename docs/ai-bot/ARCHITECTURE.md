@@ -180,7 +180,7 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 |---|---|---|
 | 조회 vs 변경 | 읽기 계정(`bot-reader`: Grafana Viewer, Kubernetes SA. Argo CD 앱 상태도 SA로 Kubernetes API에서 읽는다, D9)과 NetworkPolicy. **로그 제외는 플랫폼 권한으로 서지 않으므로**(Grafana OSS Viewer가 모든 데이터소스 질의) 읽기 어댑터가 사전 승인 질의 템플릿만 보낸다. 템플릿마다 데이터소스·네임스페이스·시간창 상한·응답량 상한. 시간창 상한은 보존 기간(메트릭 30일, 로그 14일, 설계 C.3.7)과 따로 T16a에서 정한다 | READ-02에 "허용 밖 LogsQL·MetricsQL 거부" 사례를 넣는다. 더 강하게는 데이터소스 API 앞 읽기 프록시(U12 대안). Argo CD live ConfigMap 노출 질문은 D9로 봇 경로에서 빠졌다(봇에 Argo CD API 자격 없음). SA는 `argocd` ns Application CR 전체(spec의 인라인 Helm values 포함)를 읽을 수 있고, transport는 `status.health`·`status.sync`만 투영한다 |
 | 모델 vs 게시 | 모델은 작업자에만(방안 1), 게시 자격은 게시 서버에만. 작업자는 SA 토큰·kubeconfig·SSH agent·호스트 소켓·GitHub 자격 없음. 구독 인증 파일은 작업자 영속 공간에만(§5.1) | SEC-02: 작업자에서 환경 변수·CODEX_HOME·`auth.json`·SA 경로 접근, 다른 작업의 세션 디렉터리 읽기 시험 |
-| 리뷰 | 전용 리뷰 App(D-16 확정). 게시 서버가 `event=COMMENT`만, `commit_id`는 검토한 head SHA. APPROVE·REQUEST_CHANGES·dismiss·merge·auto-merge 거부 | REVIEW-04 |
+| 리뷰 | 전용 리뷰 App(D-16 확정). 게시 서버가 `event=COMMENT`만, `commit_id`는 검토한 head SHA. APPROVE·REQUEST_CHANGES·dismiss·merge·auto-merge 거부. 봇 PR의 안내 리뷰(C26 `guidance.post`, 부르는 곳은 C29)도 같은 `restrictGitHubWrite`를 지나고 인라인은 `side: RIGHT` 50개까지, 본문 앞에 안내 표식(`homelab-bot-guidance:`)을 둔다. 보내기 전에 PR이 열려 있고 head가 같은지 읽어 보며, 응답을 잃으면 다시 보내지 않고 `guidance.find`가 표식과 head SHA로 회수한다. 수정 요청 자료 읽기(C26 `discussion.read`, 부르는 곳은 C27)는 읽기 토큰으로 PR 하나의 리뷰·리뷰 댓글·대화 댓글을 읽고, 응답의 PR·저장소 URL이 다르면 통째로 거부한다. 두 포트 모두 리뷰 정책 저장소 목록(`policyRepositories`)으로만 토큰을 받는다. 목록 밖 저장소는 토큰 없이 `Denied`(게시는 `not_sent(repository_denied)`)이고, 목록 밖 조직 저장소의 설치 조회는 C30이 정한다 | REVIEW-04 |
 | 코드 수정 | 작업 공간은 고정 SHA의 `codeload.github.com` 압축본 + `git init` 한 번 커밋(D-15). diff는 base·head 압축본으로 만든다. 다만 리뷰 입력의 변경 목록은 압축본 비교로 정하지 않는다. 압축본에는 submodule 포인터(gitlink) 변경이 파일 내용으로 나타나지 않는다 [가정]. 게시 서버가 웹훅이나 조회로 head·base SHA를 먼저 고정하고, 같은 SHA 쌍으로 리뷰 App 토큰으로 Git tree API(recursive)나 compare API를 불러 경로·mode·object ID 차이(submodule gitlink 변경 포함)를 열거한 뒤, 같은 SHA의 압축본을 받아 blob 내용 수집에만 쓴다 [가정]. 기준 SHA는 `comparison_revision`과 같게 둔다. PR files API는 head SHA 대조에만 쓴다. 상한 초과나 `truncated`는 `partial`, 조회 실패는 `failed` 또는 `unknown`이고 압축본 비교로 대신하지 않는다. submodule 포인터 변경은 `01` §5의 누락 표시 규칙대로 결과에 드러낸다. 작업자에는 여전히 GitHub 자격이 없다(D-15) [가정]. 커밋·브랜치·PR은 게시 서버가 D-24 App(git data API)으로 만든다. 패키지 설치·시험은 비신뢰 코드 실행으로 본다 | SEC-02, CHANGE-01, REVIEW-03(submodule 포인터만 바뀐 PR, 열거 중 head 이동, 상한 초과) |
 | 변경 게시 | 게시 서버 허용 API 목록(D-24, 목록 초안은 DECISIONS D-24). ref는 `refs/heads/bot/` 고정, `force: false`. 기준 리비전이 움직였으면 보류 | CHANGE-02·03 |
 | 출처·공개 범위 | 결과마다 `output_classification`. 내부 출처(로그·메트릭·운영 기억)는 public PR·공개 스레드에 원문 게시 금지, 허용된 비민감 요약만. 마스킹만으로 충분하다고 보지 않는다 | DATA-01(다른 작업·대화 레인의 세션 파일을 읽어 공개 결과에 넣는 경로 포함, §5.1) |
@@ -1755,13 +1755,14 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 | `POST …/git/trees` | contents 토큰 | `base_tree` 필수, `type` 항상 `blob`, 보호 경로 거부. subtree·gitlink 자리 없음 |
 | `POST …/git/commits` | contents 토큰 | `parents` 하나, 고정 author·committer·date·메시지 |
 | `POST …/git/refs` | contents 토큰 | 자기 change·generation의 `refs/heads/bot/change/…/g<n>`만. `force` 필드 없음 |
+| `PATCH …/git/refs/heads/bot/change/{id}/g{n}` (C26) | contents 토큰 | `fastForwardBranch`만 부른다. 자기 change·generation 브랜치, body는 `sha`와 `force:false`뿐. 보내기 전에 브랜치 head가 호출자의 기대 head인지, 새 커밋의 부모가 그 head 하나인지 PR 토큰으로 읽어 보고 다르면 보내지 않는다(`head_changed`·`not_fast_forward`). 응답 유실·409·422는 정확한 ref를 다시 읽어 새 SHA면 확정, 다른 SHA·없음이면 `rejected(head_changed)`, 그대로면 원래 결과(unknown·`http_422`)다. `ChangeWriterPort`가 아니라 `GitHubWriterPort`에 있고 아직 부르는 곳이 없다(C27이 쓴다) |
 | `POST …/pulls` | PR 토큰 | 자기 브랜치, 정책의 base, `maintainer_can_modify:false`, 제목·본문·draft만 |
 | `GET …/git/ref/heads/{branch}`, `git/commits/{sha}`, `git/trees/{sha}`, `git/trees/{sha}?recursive=1` | 없음(선행 읽기) 또는 PR 토큰(대조) | 정확한 이름·SHA. 응답의 이름·SHA를 다시 대조 |
 | `GET …/git/blobs/{sha}` | 없음(workflow 읽기) 또는 PR 토큰(대조) | 내용·SHA 대조 |
 | `GET …/pulls?state=all&head=…&base=…&per_page=100` | PR 토큰 | 정확한 head·base만 남긴다. 100건이면 완결성을 입증하지 못해 실패 |
 | `GET …/contents/.github/workflows/{file}?ref={tag}` | 없음 | 정책이 고정한 reusable workflow. 다른 저장소라 writer 토큰을 쓰지 않는다 |
 
-V1에는 `PATCH git/refs`와 `PATCH pulls`가 없다. 병합·`/merges`·dispatch·update-branch·GraphQL·리뷰 API·DELETE도 없다. `github-app.ts`의 리뷰 allowlist는 그대로이고 `TokenResponse`·`grantedExactly`만 공유한다.
+writer의 `PATCH git/refs`는 위의 변경 브랜치 fast-forward 한 줄뿐이고(C26) 강제 갱신은 없다. `PATCH pulls`는 없다. 병합·`/merges`·dispatch·update-branch·GraphQL·리뷰 API·DELETE도 없다. PR 리뷰 읽기와 안내 리뷰 게시는 writer가 아니라 리뷰 App(`github-review-io.ts`)이 한다(§6 리뷰 행). `github-app.ts`의 리뷰 allowlist와 writer는 `TokenResponse`·`grantedExactly`만 공유한다.
 
 **토큰.** contents `{contents:'write'}`, PR `{contents:'read',pull_requests:'write'}` 두 종류다. 캐시 키는 change ID·generation·저장소·설치·scope이고 closure 안에만 있다. 만료 5분 전부터 새로 받는다. 쓰기 토큰은 첫 쓰기 때 발급하므로 공개 검사가 끝나기 전에는 존재하지 않는다. mutation은 401이어도 다시 보내지 않는다.
 

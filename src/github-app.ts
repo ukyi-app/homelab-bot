@@ -26,6 +26,9 @@ const ALLOWED = Object.freeze([
   `GET ${REPO}/pulls/${NUMBER}`,
   String.raw`GET ${REPO}/pulls\?state=open&sort=updated&direction=desc&per_page=100&page=${NUMBER}`,
   String.raw`GET ${REPO}/pulls/${NUMBER}/reviews\?per_page=100&page=${NUMBER}`,
+  // 수정 요청 때 그 PR의 리뷰 댓글과 대화 댓글을 자료로 읽는다. 대화 댓글은 issue 댓글 API로만 나온다.
+  String.raw`GET ${REPO}/pulls/${NUMBER}/comments\?per_page=100&page=${NUMBER}`,
+  String.raw`GET ${REPO}/issues/${NUMBER}/comments\?per_page=100&page=${NUMBER}`,
   String.raw`GET ${REPO}/compare/${SHA}\.\.\.${SHA}\?per_page=1`,
   `GET ${REPO}/git/commits/${SHA}`,
   String.raw`GET ${REPO}/git/trees/${SHA}\?recursive=1`,
