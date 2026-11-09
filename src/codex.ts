@@ -2,6 +2,7 @@ import { constants } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
 import { mkdir, open, readlink, realpath } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
+import { CHAT_TASK_TEXT as T } from './chat-task-text.js';
 import { DEFAULTS, Denied, PolicyUnavailable } from './contracts.js';
 import type { Job, Scope } from './contracts.js';
 import { FOREIGN_SESSION_STATUS, TaskBridge } from './task-bridge.js';
@@ -249,8 +250,7 @@ interface Session { job_id: string; thread_id: string | null; turn: number; tool
 interface Question { id: string; thread_id: string; answer: string | null }
 type Stop = 'cancel' | 'revoked' | 'lease' | 'timeout' | 'monitor';
 const CODEX_TEXT = Object.freeze({
-  executor: 'codex' as const, prefix: 'codex', question: 'Codex 작업 질문', accepted: '답을 받았습니다. 같은 Codex 세션을 이어서 실행합니다.',
-  blocked: (job: string) => `작업 ${job}의 Codex 프로세스 종료를 확인하지 못했습니다(unknown). 다시 실행하지 않고 새 모델 실행을 막았습니다. 작업자 프로세스 0개를 확인한 뒤 /codex-release target:${job} 로 해제하세요.`,
+  executor: 'codex' as const, prefix: 'codex', question: T.codexQuestion, accepted: T.codexAnswerAccepted, blocked: T.codexBlocked,
 });
 
 // 게시 서버 쪽 조율. 질문·완료는 Discord outbox로만 내보낸다. 실행기 중립 부분은 TaskBridge에 있다.
@@ -383,9 +383,8 @@ export class CodexBridge extends TaskBridge {
       const resumable = Number(now.attempt) < DEFAULTS.maxRetries + 1;
       await this.store.enqueue({ key: `codex-wait:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id,
         actor: job.owner_id, scope: job.target, revision, payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary',
-          content: `작업 ${job.id}이 ${outcome.reason === 'model_limit' ? '모델 사용 한도' : '모델 인증 만료'}로 멈췄습니다. 다른 계정·인증으로 바꾸지 않습니다. `
-            + (resumable ? `원인을 해소한 뒤 /resume-model target:${job.id} 로 재개하거나 /cancel 하세요.`
-              : `재시도 한도에 닿아 재개할 수 없습니다. /cancel 뒤 새 작업으로 요청하세요.`) } });
+          content: `${outcome.reason === 'model_limit' ? T.codexLimitPaused(this.store.colleague, job.id) : T.codexAuthPaused(this.store.colleague, job.id)} `
+            + (resumable ? T.modelPauseResume(this.store.colleague, job.id) : T.modelPauseFinal(this.store.colleague)) } });
       return;
     }
     if (outcome.kind === 'question') {
@@ -394,7 +393,7 @@ export class CodexBridge extends TaskBridge {
       return;
     }
     await sessionState('completed');
-    const content = [`Codex 작업 완료 (작업 ${job.id})`, bounded(outcome.summary || '요약 없음', 1500),
+    const content = [T.codexCompleted(this.store.colleague, job.id), bounded(outcome.summary || '요약 없음', 1500),
       `변경 파일(작업 공간 실제 diff 기준): ${outcome.changes.length}개`
         + (outcome.unconfirmed.length ? ` (Codex 보고와 다름: ${outcome.unconfirmed.length}개)` : '')].join('\n');
     const keepPaths = (paths: string[]) => paths.slice(0, EVIDENCE_PATHS);
@@ -413,15 +412,15 @@ export class CodexBridge extends TaskBridge {
   }
   async release(actor: string, scope: Scope, jobId: string): Promise<{ ok: boolean; status: string }> {
     const job = await this.releasable(actor, scope, jobId);
-    if (job.state !== 'unknown') return { ok: false, status: '종료를 확인하지 못한(unknown) 작업이 아닙니다.' };
+    if (job.state !== 'unknown') return { ok: false, status: T.releaseNotUnknown };
     // Claude 세션은 작업자가 달라 Codex 어댑터의 답이 소멸 증명이 되지 못한다.
     if (await this.foreignSession(jobId)) return { ok: false, status: FOREIGN_SESSION_STATUS };
     const confirmed = await this.adapter.confirmStop(jobId).catch(() => ({ stopped: false }));
-    if (!confirmed.stopped) return { ok: false, status: '작업자 프로세스가 남아 있거나 확인할 수 없습니다. 작업자 파드를 다시 만든 뒤 확인하세요.' };
+    if (!confirmed.stopped) return { ok: false, status: T.releaseWorkerAlive };
     const changed = await this.store.db.query(`UPDATE jobs SET state='cancelled',wait_reason='stop_confirmed_after_unknown',finished_at=$2
       WHERE id=$1 AND state='unknown' AND NOT EXISTS (SELECT 1 FROM codex_sessions s WHERE s.job_id=$1 AND s.executor='claude') RETURNING id`, [jobId, this.store.now()]);
-    if (!changed.rows.length) return { ok: false, status: '상태가 바뀌었습니다. /list로 확인하세요.' };
+    if (!changed.rows.length) return { ok: false, status: T.releaseStateChanged(this.store.colleague) };
     await this.store.audit('codex_unknown_released', jobId, { actor });
-    return { ok: true, status: '작업자 프로세스 0개를 확인하고 막힘을 해제했습니다. 작업은 다시 실행하지 않습니다.' };
+    return { ok: true, status: T.releaseConfirmed };
   }
 }

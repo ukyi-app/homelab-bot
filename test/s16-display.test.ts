@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { DEFAULTS, SYSTEM_INSTRUCTIONS } from '../src/contracts.js';
 import { chatPrompt } from '../src/chat-lane.js';
+import { CHAT_TASK_TEXT as T } from '../src/chat-task-text.js';
 import { controlText } from '../src/control-format.js';
 import { readSummary } from '../src/read.js';
 import type { ReadResult } from '../src/read.js';
@@ -61,22 +62,26 @@ test('S16 제어 결과: /list는 JSON이 아니라 짧은 한국어 목록', as
   const job = (await rows('jobs'))[0]!;
   const content = await control('list');
   assert.throws(() => JSON.parse(content));
-  assert.equal(content, `작업 1건\n- \`${job.id}\` ${job.state}${job.wait_reason ? `(${job.wait_reason})` : ''}`);
+  assert.equal(job.state, 'failed');
+  assert.ok(content.startsWith(`작업 1건\n- \`${job.id}\` 실패`), content);
 });
 
 test('S16 제어 결과: stop·resume·cancel·retry·model-status·없는 목록도 사람이 읽는 문장', async () => {
   const empty = await control('list');
-  assert.equal(empty, '현재 대화에 작업이 없습니다. 작업을 시작한 스레드에서 확인하세요.');
-  assert.equal(await control('stop'), '이 스레드의 후속 메시지 수집을 중지했습니다. 다시 받으려면 /resume.');
-  assert.equal(await control('resume'), '이 스레드의 후속 메시지 수집을 재개했습니다.');
+  assert.equal(empty, T.noJobs);
+  const stopped = await control('stop');
+  assert.equal(stopped, T.subscriptionStopped(false));
+  assert.match(stopped, /\/resume/);
+  assert.equal(await control('resume'), T.subscriptionResumed);
   const cancel = await control('cancel', randomUUID());
-  assert.equal(cancel, '실패: 취소할 작업이 현재 대화에 없거나 취소 가능한 상태가 아닙니다.');
+  assert.equal(cancel, T.controlFailed(false, T.jobNotCancellable));
   const retry = await control('retry', randomUUID());
-  assert.match(retry, /^실패: 재시도할 작업이/);
+  assert.equal(retry, T.controlFailed(false, T.retryRefused));
   const status = await control('model-status');
   assert.throws(() => JSON.parse(status));
-  assert.match(status, /^모델 호출: 정상\n비상 중지: 아님\n실행 중이거나 종료 미확인 작업: 없음\n한도·인증 대기: 없음\n/);
-  assert.ok(status.endsWith('/resume-model target:emergency-stop으로 확인하세요.'));
+  assert.match(status, /^모델 호출: 정상\n비상 정지: 꺼짐\n실행 중이거나 끝났는지 모르는 작업: 없음\n한도·인증 대기: 없음\n/);
+  assert.ok(status.endsWith(T.modelStatus(false)));
+  assert.match(status, /\/resume-model target:emergency-stop/);
   for (const content of [empty, cancel, retry, status]) assert.ok(!content.startsWith('{'));
 });
 
@@ -84,16 +89,18 @@ test('S16 제어 결과 형식: 대기 목록·리뷰 목록·정지 표시·많
   const id = '1c841086-0000-4000-8000-000000000000';
   assert.equal(controlText('model-status', { paused: true, emergency: true, executionPending: true,
     waiting: [{ id, wait_reason: 'model_limit' }], status: '안내' }),
-  `모델 호출: 정지\n비상 중지: 켜짐\n실행 중이거나 종료 미확인 작업: 있음\n한도·인증 대기 1건\n- \`${id}\` model_limit\n안내`);
+  `모델 호출: 멈춤\n비상 정지: 켜짐\n실행 중이거나 끝났는지 모르는 작업: 있음\n한도·인증 대기 1건\n- \`${id}\` 모델 사용 한도\n안내`);
   assert.equal(controlText('review-status', { ok: true, jobs: [{ id, state: 'waiting_user', wait_reason: 'auth_expired', target: { x: 1 } }], status: '안내' }),
-    `리뷰 작업 1건\n- \`${id}\` waiting_user(auth_expired)\n안내`);
+    `리뷰 작업 1건\n- \`${id}\` 확인 기다림(모델 인증 만료)\n안내`);
   assert.equal(controlText('review-status', { ok: true, jobs: [], status: '안내' }), '리뷰 작업: 없음\n안내');
   assert.equal(controlText('resume-model', { ok: true, paused: true, status: '재개했습니다.' }), '재개했습니다.');
   assert.equal(controlText('emergency-stop', { status: '새 모델 호출 차단' }), '새 모델 호출 차단');
   const many = Array.from({ length: 25 }, (_, i) => ({ id: `job-${i}`, state: 'succeeded', wait_reason: null }));
   const text = controlText('list', many);
   assert.ok(text.startsWith('작업 25건(최근 20건만 표시)\n'));
-  assert.ok(!text.includes('`job-4`')); assert.ok(text.includes('`job-5`')); assert.ok(text.endsWith('`job-24` succeeded'));
+  assert.ok(!text.includes('`job-4`')); assert.ok(text.includes('`job-5`')); assert.ok(text.endsWith('`job-24` 완료'));
+  // 모르는 상태·사유 코드는 버리지 않고 그대로 보인다.
+  assert.equal(controlText('list', [{ id: 'job-x', state: 'future_state', wait_reason: 'future_reason' }]), '작업 1건\n- `job-x` future_state(future_reason)');
   // 모르는 모양은 정보를 버리지 않고 JSON 그대로 둔다(새 제어를 더하고 형식을 잊어도 답이 비지 않게).
   assert.equal(controlText('future', { odd: 1 }), '{"odd":1}');
 });

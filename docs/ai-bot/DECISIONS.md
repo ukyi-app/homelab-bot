@@ -873,6 +873,17 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 
 - 작업자는 대화 요청 v1·v2와 리뷰 지시문 v1·v2 literal을 함께 받는다. 게시 서버는 자동 배포라 작업자(사람 배포, C06)가 먼저 두 판을 받아야 서버가 v2로 바꿀 수 있다(C11·C12). v1 수용은 시범이 끝난 뒤 뺀다(명세 §4.2 "계약 배포 순서" 3단계). 구현과 시험은 [ARCHITECTURE](ARCHITECTURE.md) §13 "봇 답 문맥"·"대화 답 형식", [VERIFICATION](VERIFICATION.md) "C02 작업자 계약 v2".
 
+## C09 고정 문구 1: 대화·작업·제어 (2026-11-10)
+
+"동료 봇 전환 (사용자 2026-11-09)" 4(말투)·9(스위치)의 대화·작업·제어 문구 자리다. 사용자 결정이 아니라 구현 선택이고, 말의 자연스러움은 owner 검토(C24 말투 표본)로 다시 본다. 시험·결과는 [VERIFICATION](VERIFICATION.md) "C09 고정 문구 1".
+
+- **문구 한곳:** `src/chat-task-text.ts` `CHAT_TASK_TEXT`. 항목마다 첫 인자가 스위치 값이고, 분기가 그 값 하나뿐이어야 시험이 모든 항목을 같은 인자로 불러 '/' 이름을 검사할 수 있다. 사유로 문장이 갈리는 곳(한도·인증, 이어 갈 수 있음·없음)은 항목을 나눴다.
+- **스위치를 읽는 곳:** `Store.colleague`(생성자 셋째 인자, 기본 `false`). 브리지·`TaskCommands`는 자기 `Store`에서 읽는다. `controlText`·`taskLaneClosedText`는 인자로 받는다(기본 `false`).
+- **관리 기능 안내:** 비상 정지 해제, unknown 해제, 모델 상태, 한도·인증 대기 작업 재개의 켜짐 판은 "`homelab bot` CLI로 …"까지만 말하고 하위 명령 이름은 적지 않는다. 이름이 C05에서 정해지고 바뀔 수 있어서다. 대기 작업 재개를 CLI 쪽에 둔 것은 지금 그 경로가 `/resume-model` 하나뿐이고 말로 하는 재개가 없어서다.
+- **말로 하는 안내:** 켜짐 판은 "작업 목록을 보여 달라고", "다시 해 달라고", "취소해 달라고", "리뷰를 재개하거나 취소해 달라고"처럼 할 일을 말로 적는다. 대화 모델이 그 말을 제안으로 바꾸는 것은 C11·C13 몫이다. 작업 질문 답은 C16 전까지 질문 ID를 함께 적어 달라고 안내한다.
+- **사유 코드 풀기:** owner가 읽는 문장에 괄호로 붙던 `unknown`·`cancelled`·`failed`·`cleanup_pending`·`retention_full`을 뜻으로 바꿨다. `/list`·리뷰 목록·`/task-status`의 상태·대기 사유는 표(`jobStateText`·`waitReasonText`)로 풀고, 표에 없는 코드는 그대로 보인다. DB·감사·로그·멱등 키의 코드는 그대로다. 작업자 접수 닫힘 사유(`intake.reasons`)와 공개 검사 사유는 코드 그대로 싣는다.
+- **그대로 둔 것:** `/stop`의 켜짐 판은 "구독을 다시 켜 주세요"로만 적었다. 말로 하는 구독 켜기가 없어서(명세 §4.1) 더 구체적으로 적을 수 없다.
+
 ## C05 관리 CLI (2026-11-10)
 
 "동료 봇 전환 (사용자 2026-11-09)" 3의 구현. 봇 `src/admin.ts`(명령 처리)·`src/admin-main.ts`(진입점), homelab `cli/src/commands/bot.ts`와 core `podops.ts`의 `bot` 어댑터. 시험·결과는 [VERIFICATION](VERIFICATION.md) "C05 관리 CLI".

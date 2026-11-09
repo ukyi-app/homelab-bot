@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { decodeArtifact } from './change-artifact.js';
+import { CHAT_TASK_TEXT as T } from './chat-task-text.js';
 import { labelAllowsAuthorInput } from './change-contracts.js';
 import type { AuthorResult, ChangeArtifactPort, ChangeAuthorPort, ChangeBrief, ChangeKey, ProvenanceLabel } from './change-contracts.js';
 import type { ChangeVerificationControl, ChangeVerificationWorker } from './change-verifier.js';
@@ -83,8 +84,7 @@ interface Facts { stopped: boolean; retained: boolean | null; cleanupPending: bo
 // 끝난 세션을 다시 읽어도 같은 코드가 나와야 부모가 같은 판정으로 닫힌다. 그래서 job의 사유와 fetchResult가 이 값을 함께 쓴다.
 const CHANGE_QUESTION_BLOCKED = 'task_question_sensitive';
 const TEXT = Object.freeze({
-  executor: 'claude' as const, prefix: 'task', question: '작업 질문', accepted: '답을 받았습니다. 같은 세션을 이어서 실행합니다.',
-  blocked: (job: string) => `작업 ${job}의 프로세스 종료를 확인하지 못했습니다(unknown). 다시 실행하지 않고 작업 레인의 새 접수를 닫았습니다. 대화·리뷰는 계속 동작합니다. 작업자 프로세스 0개를 확인한 뒤 /task-release target:${job} 로 해제하세요.`,
+  executor: 'claude' as const, prefix: 'task', question: T.taskQuestion, accepted: T.taskAnswerAccepted, blocked: T.taskBlocked,
 });
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const sameWorker = (expected: TaskWorkerIdentity | null, actual: TaskWorkerIdentity) => !expected
@@ -499,8 +499,8 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
         const resumable = Number(now.attempt) < DEFAULTS.maxRetries + 1;
         await store.enqueue({ key: `task-wait:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id, actor: job.owner_id, scope: job.target, revision,
           payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary',
-            content: `작업 ${job.id}이 ${reason === 'model_limit' ? '모델 사용 한도로 멈췄습니다. 같은 계정을 쓰는 대화·리뷰도 함께 멈춥니다' : '작업 레인 인증 만료로 멈췄습니다. 대화·리뷰는 계속 동작합니다'}. 다른 계정·인증으로 바꾸지 않습니다. `
-              + (resumable ? `원인을 해소한 뒤 /resume-model target:${job.id} 로 재개하거나 /cancel 하세요.` : '재시도 한도에 닿아 재개할 수 없습니다. /cancel 뒤 새 작업으로 요청하세요.') } });
+            content: `${reason === 'model_limit' ? T.taskLimitPaused(store.colleague, job.id) : T.taskAuthPaused(store.colleague, job.id)} `
+              + (resumable ? T.modelPauseResume(store.colleague, job.id) : T.modelPauseFinal(store.colleague)) } });
         return { terminal: false };
       }
       if (response.status === 'needs_input') {
@@ -510,7 +510,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
           if (settled.end && !settled.end.intended && settled.end.state === 'failed') {
             await store.enqueue({ key: `task-question-blocked:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id, actor: job.owner_id,
               scope: job.target, revision, payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary',
-                content: `작업 ${job.id}의 질문이 공개 검사에 걸려(사유: ${risk}) 질문을 보내지 않고 작업을 멈췄습니다(failed). 요청을 고쳐 새 작업으로 요청하거나 /retry target:${job.id} 로 다시 실행하세요.` } });
+                content: T.questionBlocked(store.colleague, job.id, risk) } });
           }
           return settled;
         }
@@ -528,8 +528,8 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       const verified = response.verification.reduce((sum, item) => ({ ...sum, [item.status]: sum[item.status] + 1 }), { passed: 0, failed: 0, not_run: 0 });
       await store.finish(job, result, { source: 'task_worker', sessionId: request.sessionId, generation: request.generation, turns: request.turn,
         worker: response.worker, stopConfirmed: true, diff: 'worker_computed', usage: response.usage, resultDigest, ...(risk ? { summaryWithheld: risk } : {}) },
-      [`작업 완료 (작업 ${job.id})`,
-        risk ? `요약이 공개 검사에 걸려(사유: ${risk}) 보내지 않았습니다. 작업 완료는 기록했습니다.` : bounded(response.summary || '요약 없음', TASK_LIMITS.summaryChars),
+      [T.taskCompleted(store.colleague, job.id),
+        risk ? T.summaryBlocked(store.colleague, risk) : bounded(response.summary || '요약 없음', TASK_LIMITS.summaryChars),
         `변경 파일(작업자 diff 기준): ${response.changes.total}개`,
         `검증: 통과 ${verified.passed} · 실패 ${verified.failed} · 미실행 ${verified.not_run}`].join('\n'), job.target);
       // 구독이 멈춘 대화에서 finish는 막혀도 던지지 않는다.
@@ -580,7 +580,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
         await store.audit('task_owner_confirm_requested', job.id, { waitingSince: Number(job.waiting_since) });
         await store.enqueue({ key: `task-owner-confirm:${job.id}:${job.waiting_since}`, job: job.id, conversation: job.conversation_id, actor: job.owner_id, scope: job.target,
           revision: job.revision.policy, payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary',
-            content: `작업 ${job.id}의 모델 대기가 24시간을 넘었습니다. 자동으로 재개하거나 버리지 않습니다. 세션을 계속 보존할지 확인하고 /resume-model target:${job.id} 또는 /cancel target:${job.id} 하세요.` } });
+            content: T.modelWaitLong(store.colleague, job.id) } });
       });
     }
     return rows.length;
@@ -664,10 +664,10 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     const session = (await this.store.db.query<SessionRow>('SELECT * FROM codex_sessions WHERE job_id=$1', [jobId])).rows[0];
     // Codex 세션은 작업자가 달라 여기서 소멸을 확인할 수 없다. CodexBridge.release가 그 작업자에게 묻는다.
     if (session && session.executor !== 'claude') return { ok: false, status: FOREIGN_SESSION_STATUS };
-    if (job.state !== 'unknown' && session?.state !== 'unknown') return { ok: false, status: '종료를 확인하지 못한(unknown) 작업이 아닙니다.' };
+    if (job.state !== 'unknown' && session?.state !== 'unknown') return { ok: false, status: T.releaseNotUnknown };
     // 세션 행이 없으면 어느 작업자에도 보낸 적이 없다. 턴 시작이 dispatch 전에 행을 남긴다.
     const stopped = session ? await this.confirmStopped(jobId, session) : true;
-    if (!stopped) return { ok: false, status: '작업자 프로세스가 남아 있거나 확인할 수 없습니다. 작업자 파드를 다시 만든 뒤 확인하세요.' };
+    if (!stopped) return { ok: false, status: T.releaseWorkerAlive };
     const changed = await this.store.atomic(async store => {
       await store.lockTaskControl(job.conversation_id);
       const held = (await store.db.query<{ lease_token: string | null }>('SELECT lease_token FROM jobs WHERE id=$1 FOR UPDATE', [jobId])).rows[0];
@@ -683,9 +683,9 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       await store.syncTaskLane();
       return true;
     });
-    if (!changed) return { ok: false, status: '상태가 바뀌었습니다. /list로 확인하세요.' };
+    if (!changed) return { ok: false, status: T.releaseStateChanged(this.store.colleague) };
     await this.finalizeJob(jobId).catch(() => {});
-    return { ok: true, status: '작업자 프로세스 0개를 확인하고 막힘을 해제했습니다. 작업은 다시 실행하지 않습니다.' };
+    return { ok: true, status: T.releaseConfirmed };
   }
   private async confirmStopped(job: string, session: SessionRow): Promise<boolean> {
     const expected = session.worker_instance && session.worker_storage ? { instance: session.worker_instance, storage: session.worker_storage } : null;

@@ -2,6 +2,7 @@ import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { CHAT_TASK_TEXT as T } from '../src/chat-task-text.js';
 import { ClaudeTaskBridge } from '../src/claude-task-bridge.js';
 import { DEFAULTS, Denied, PolicyUnavailable } from '../src/contracts.js';
 import type { Database } from '../src/database.js';
@@ -142,7 +143,7 @@ test('TASK-02 질문 공개 검사: 비밀·내부 표식이 든 질문은 보�
   await deliverAll();
   for (const item of blocked) {
     assert.deepEqual(await exposed(item.fragment, events), [], item.name);
-    const notices = f.rest.messages.filter(m => m.body.content.includes(`작업 ${item.id}의 질문이 공개 검사에 걸려(사유: ${item.reason})`));
+    const notices = f.rest.messages.filter(m => m.body.content.startsWith(T.questionBlocked(false, item.id, item.reason)));
     assert.equal(notices.length, 1, item.name);
     assert.ok(events.some(([event, detail]) => event === 'task_output_blocked' && detail?.job === item.id && detail.output === 'question' && detail.reason === item.reason), item.name);
   }
@@ -169,11 +170,11 @@ test('TASK-02 완료 요약 공개 검사: 걸린 요약은 그 줄만 고정 �
   for (const item of done) {
     assert.deepEqual(await exposed(item.fragment, events), [], item.name);
     // 게시자가 끝에 붙이는 대조용 ref 줄은 뺀다.
-    const message = f.rest.messages.find(m => m.body.content.startsWith(`작업 완료 (작업 ${item.id})`))!.body.content.replace(/\n\[ref:[0-9a-f]+\]$/, '');
-    assert.equal(message, [`작업 완료 (작업 ${item.id})`, `요약이 공개 검사에 걸려(사유: ${item.reason}) 보내지 않았습니다. 작업 완료는 기록했습니다.`,
+    const message = f.rest.messages.find(m => m.body.content.startsWith(T.taskCompleted(false, item.id)))!.body.content.replace(/\n\[ref:[0-9a-f]+\]$/, '');
+    assert.equal(message, [T.taskCompleted(false, item.id), T.summaryBlocked(false, item.reason),
       '변경 파일(작업자 diff 기준): 0개', '검증: 통과 0 · 실패 0 · 미실행 0'].join('\n'), item.name);
   }
-  const control = f.rest.messages.find(m => m.body.content.startsWith(`작업 완료 (작업 ${normal.id})`))!.body.content;
+  const control = f.rest.messages.find(m => m.body.content.startsWith(T.taskCompleted(false, normal.id)))!.body.content;
   assert.match(control, /main 기준으로 고쳤습니다\./);
   assert.equal((await rows('results')).find(row => row.job_id === normal.id)!.evidence.summaryWithheld, undefined);
 });
@@ -195,8 +196,8 @@ test('TASK-02 출력 공개 검사: 정책·표식을 읽지 못하면 질문·�
   await deliverAll();
   const sent = JSON.stringify(f.rest.messages.map(m => m.body));
   assert.equal(sent.includes(question), false); assert.equal(sent.includes(summary), false);
-  assert.ok(sent.includes(`작업 ${asking.id}의 질문이 공개 검사에 걸려(사유: policy_unavailable)`));
-  assert.ok(sent.includes('요약이 공개 검사에 걸려(사유: policy_unavailable)'));
+  assert.ok(sent.includes(T.questionBlocked(false, asking.id, 'policy_unavailable')));
+  assert.ok(sent.includes(T.summaryBlocked(false, 'policy_unavailable')));
 });
 test('TASK-02 질문 중계 → owner 답 → 같은 세션 resume → 완료 → 영속 뒤 세션 정리', async () => {
   const { job, sid, question } = await asked('어느 브랜치 기준으로 고칠까요?');
@@ -207,8 +208,8 @@ test('TASK-02 질문 중계 → owner 답 → 같은 세션 resume → 완료 �
   assert.equal(q.turn, 1); assert.equal(Number(q.expires_at), f.now() + TASK_RETENTION.questionTtlMs);
   assert.equal((await session()).state, 'waiting_answer'); assert.equal((await session()).executor, 'claude');
   await f.publisher.deliver();
-  assert.match(f.rest.messages[0]!.body.content, new RegExp(`질문 ID: ${question}[\\s\\S]*어느 브랜치[\\s\\S]*권한을 바꿀 수 없습니다`));
-  assert.deepEqual(await answer(setup.bridge, question, 'main 기준', 'answer-1'), { ok: true, status: '답을 받았습니다. 같은 세션을 이어서 실행합니다.' });
+  assert.match(f.rest.messages[0]!.body.content, new RegExp(`질문 ID: ${question}[\\s\\S]*어느 브랜치[\\s\\S]*/answer question:${question}[\\s\\S]*도구 실행을 승인하거나 권한을 바꿀 수는 없어요`));
+  assert.deepEqual(await answer(setup.bridge, question, 'main 기준', 'answer-1'), { ok: true, status: T.taskAnswerAccepted });
   assert.equal((await jobs(db()))[0]!.state, 'queued');
   setup.worker.scripts.push(reply.completed('main 기준으로 고쳤습니다.'));
   assert.equal(await setup.runtime.tickTask(), true);
@@ -224,7 +225,8 @@ test('TASK-02 질문 중계 → owner 답 → 같은 세션 resume → 완료 �
   assert.equal(finalize.receipt.resultDigest, (await rows('results'))[0]!.evidence.resultDigest);
   assert.equal((await session()).session_retained, false); assert.equal((await session()).cleanup_state, 'cleaned');
   await f.publisher.deliver();
-  assert.match(f.rest.messages[1]!.body.content, new RegExp(`작업 완료 \\(작업 ${job.id}\\)[\\s\\S]*main 기준`));
+  assert.ok(f.rest.messages[1]!.body.content.startsWith(T.taskCompleted(false, job.id)));
+  assert.match(f.rest.messages[1]!.body.content, /main 기준/);
 });
 test('TASK-02 중복·다른 사람·다른 스레드·없는 질문·지난 턴 질문·빈 답·2000자 초과 거부', async () => {
   const { question } = await asked();
@@ -238,7 +240,7 @@ test('TASK-02 중복·다른 사람·다른 스레드·없는 질문·지난 턴
   assert.equal((await answer(setup.bridge, question, 'x'.repeat(2001), 'x-5')).ok, false);
   assert.equal((await rows('codex_questions'))[0]!.state, 'open');
   assert.equal((await answer(setup.bridge, question, 'x'.repeat(2000), 'answer-1')).ok, true);
-  assert.deepEqual(await answer(setup.bridge, question, 'x'.repeat(2000), 'answer-1'), { ok: true, duplicate: true, status: '이미 받은 답입니다.' });
+  assert.deepEqual(await answer(setup.bridge, question, 'x'.repeat(2000), 'answer-1'), { ok: true, duplicate: true, status: T.answerDuplicate });
   assert.equal((await answer(setup.bridge, question, 'develop', 'answer-2')).ok, false);
   assert.equal((await rows('audit')).filter(a => a.kind === 'task_answer_accepted').length, 1);
   setup.worker.scripts.push(reply.question('시험도 고칠까요?'));
@@ -254,7 +256,7 @@ test('TASK-02 기한 1시간(가짜 시계): 지난 답은 거부하고 멈춤, 
   f.advance(TASK_RETENTION.questionTtlMs - 1); f.policy.confirmedAt = f.now();
   assert.equal(await setup.bridge.expireQuestions(), 0);
   f.advance(1); f.policy.confirmedAt = f.now();
-  assert.deepEqual(await answer(setup.bridge, question, 'main', 'late'), { ok: false, status: '기한이 지난 질문입니다. 작업을 멈췄습니다.' });
+  assert.deepEqual(await answer(setup.bridge, question, 'main', 'late'), { ok: false, status: T.questionExpired });
   const job = (await jobs(db()))[0]!;
   assert.equal(job.state, 'cancelled'); assert.equal(job.wait_reason, 'question_expired');
   assert.equal((await rows('codex_questions'))[0]!.state, 'expired');
@@ -276,7 +278,7 @@ test('TASK-02 sweep이 기한 지난 질문을 닫고 알림, 취소된 작업�
   await setup.runtime.tickTask();
   const open = (await db().query<Record<string, any>>("SELECT * FROM codex_questions WHERE state='open'")).rows[0]!;
   await control(f, 'cancel', second.id);
-  assert.deepEqual(await answer(setup.bridge, open.id, 'main', 'after-cancel'), { ok: false, status: '작업이 이 질문의 답을 기다리는 상태가 아닙니다.' });
+  assert.deepEqual(await answer(setup.bridge, open.id, 'main', 'after-cancel'), { ok: false, status: T.questionNotWaiting });
   await setup.runtime.tickTask();
   const closed = (await db().query<Record<string, any>>('SELECT * FROM codex_sessions WHERE job_id=$1', [second.id])).rows[0]!;
   assert.equal(closed.state, 'cancelled'); assert.equal(closed.session_retained, false);
@@ -960,7 +962,7 @@ test('작업 레인 unknown이 있어도 비상 중지를 풀 수 있다: 대화
   assert.equal(released.ok, true);
   assert.equal(released.paused, false);
   assert.deepEqual(released.taskLane, { closed: 'unknown', unknownJobs: [job.id] });
-  assert.match(released.status!, /작업 레인은 unknown으로 닫힌 채/);
+  assert.equal(released.status, `${T.emergencyReleased}${T.releaseUnknownNote(false, job.id)}`);
   assert.ok(released.status!.includes(job.id));
   const audit = (await rows('audit')).find(row => row.kind === 'model_emergency_released')!;
   const detail = typeof audit.detail === 'string' ? JSON.parse(audit.detail) : audit.detail;
@@ -974,7 +976,7 @@ test('작업 레인 unknown이 있어도 비상 중지를 풀 수 있다: 대화
   // /model-status에서도 보인다. /task-release 뒤에는 레인이 다시 열린다.
   const status = await control(f, 'model-status') as { status?: string; taskLaneClosed?: string | null };
   assert.equal(status.taskLaneClosed, 'unknown');
-  assert.match(status.status!, /작업 레인은 unknown으로 닫혀/);
+  assert.ok(status.status!.startsWith(T.laneUnknownNote(false)));
   assert.equal((await setup.bridge.release('fixture-owner', thread, job.id)).ok, true);
   assert.equal((await laneRow(db())).closed_reason, null);
 });
@@ -982,7 +984,7 @@ test('해제 안내는 Discord 제어 응답으로 게시된다', async () => {
   const job = await unknownTask();
   await f.ingress.receive(event('stop-1', { kind: 'command', command: 'emergency-stop' }));
   await f.ingress.receive(event('release-1', { kind: 'command', command: 'resume-model', target: 'emergency-stop' }));
-  const posted = (await outbox()).map(row => JSON.stringify(row.payload)).find(text => text.includes('작업 레인은 unknown으로 닫힌 채'));
+  const posted = (await outbox()).map(row => row.payload.content as string).find(text => text.includes(T.releaseUnknownNote(false, job.id)));
   assert.ok(posted, '제어 응답에 레인 상태가 있다');
   assert.ok(posted.includes(job.id));
 });
@@ -991,7 +993,7 @@ test('대화 레인 unknown은 지금처럼 비상 중지 해제를 거부한다
   await control(f, 'emergency-stop');
   const refused = await emergencyReleased();
   assert.equal(refused.ok, false);
-  assert.match(refused.status!, /종료를 확인하지 못한 작업/);
+  assert.equal(refused.status, T.executionPending);
   assert.equal(await f.store.claim('interactive'), undefined);
   assert.equal((await rows('audit')).filter(row => row.kind === 'model_emergency_released').length, 0);
 });
@@ -1262,7 +1264,7 @@ test('최종 상태 뒤 늦은 응답: /retry로 같은 lease가 남은 queued j
     await until(() => local.worker.executes.length === 1);
     // 다른 경로가 실패로 끝내고 /retry한 상태. lease_token은 다음 claim 때까지 그대로다.
     await db().query("UPDATE jobs SET state='failed',wait_reason='fixture',finished_at=$2 WHERE id=$1", [job.id, f.now()]);
-    assert.equal((await control(f, 'retry', job.id)).status, '확인된 실패 작업만 재시도합니다.');
+    assert.equal((await control(f, 'retry', job.id)).status, T.retryAccepted);
     const queued = (await jobs(db()))[0]!;
     assert.equal(queued.state, 'queued'); assert.ok(queued.lease_token);
     deliver();

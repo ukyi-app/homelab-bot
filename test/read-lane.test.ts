@@ -1,5 +1,6 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { CHAT_TASK_TEXT } from '../src/chat-task-text.js';
 import { DEFAULTS } from '../src/contracts.js';
 import { localDatabase, fixture, event, thread, service, template } from './helpers.js';
 
@@ -94,7 +95,8 @@ test('S1 read lease 만료는 unknown이 아니라 failed + 안내 1개, 늦은 
   const row = await job('read');
   assert.equal(row.state, 'failed'); assert.equal(row.wait_reason, 'lease_expired');
   const notices = (await rows('outbox')).filter(o => o.idempotency_key.startsWith('read-expired:'));
-  assert.equal(notices.length, 1); assert.match(notices[0]!.payload.content, /\/read로 다시 요청/);
+  assert.equal(notices.length, 1); assert.equal(notices[0]!.payload.content, CHAT_TASK_TEXT.readTimeout(false));
+  assert.match(notices[0]!.payload.content, /\/read/);
   assert.deepEqual(notices[0]!.payload.channel, thread.channel);
   await assert.rejects(f.store.finish(claimed, {}, {}, 'late', thread), /stale_result/);
   await chat();

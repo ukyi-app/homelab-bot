@@ -2237,6 +2237,16 @@ AC-14 중 👀·⏳·지움·실패를 S1(가짜 Discord REST, PGlite)에서 고
 - **운영 배선 없음:** `src/main.ts`가 `config.colleagueEnabled`를 `MemoryCommands`·`BriefingConfig`에 넘기지 않아, 운영은 스위치를 켜도 꺼짐 판이다. `main.ts`는 이 티켓의 파일 밖이다.
 - **못 잡는 범위.** 문구의 자연스러움(owner 검토, C24 말투 표본), 실제 Discord 표시(S5).
 
+## C09 고정 문구 1 (2026-11-10, 로컬)
+
+AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 Discord REST·Gateway, PGlite)에서 고정했다. 판단은 [DECISIONS](DECISIONS.md) "C09 고정 문구 1".
+
+- **바꾼 문구:** `src/chat-task-text.ts` `CHAT_TASK_TEXT` 83항목(Store 상태 안내·제어 결과, 작업 레인 닫힘, 작업 접수·취소·해제, 작업 질문·답, 모델 멈춤·완료·해제)과 `src/discord.ts` 두 줄(작업 직접 명령 일시 오류, 텍스트 ACK 대체), 제어 결과 형식의 상태·사유 표시. 두 판(스위치로 갈리는 항목)은 26항목이고 나머지는 말투만 바꿔 배포하면 바로 나간다.
+- **배선:** `src/main.ts`가 `new Store(db, now, config.colleagueEnabled === true)`로 스위치 값을 넘기고, 브리지·`TaskCommands`·`DiscordIngress`의 문구 호출은 그 `Store`에서 읽는다.
+- **시험:** `chat-task-text` 6(켜짐 판 전체 항목과 제어 결과 형식에 등록 명령 이름·`/이름` 모양 0, 꺼짐 판 '/' 안내 유지, 관리 기능은 `homelab bot` CLI, 해요체·"봇" 자기 지칭 없음, 질문 ID와 승인·권한 변경이 아니라는 문장 두 판 유지, 모르는 코드 그대로). `chat-task-text-assembly` 2(`startPublisher` 조립 → Gateway `/stop`·`/model-status` → 게시 본문이 꺼짐이면 '/' 안내, 켜짐이면 '/' 이름 없음). `status-notice`에 켜짐 Store의 unknown·한도 대기 안내 2(멱등 키·`safe_summary`·`allowed_mentions.parse=[]` 그대로). 옛 문구를 리터럴로 비교하던 시험 12개 파일은 상수 참조로 옮겼다.
+- **실행(병합 결과 b33d7fc 위 d1cc3e0, 머신 잠금 도우미, node 24.22.0):** `npm run check`, `npm run build`, `node --test` 20개 파일(`chat-task-text`·`chat-task-text-assembly`·`status-notice`·`s16-display`·`task-bridge`·`task-assembly`·`codex-bridge`·`unknown-probe`·`read-lane`·`foundation`·`review-9`·`pr-review`·`task-contracts`·`raw-text-retention`·`review-1`·`chat-ack`·`task-cancel-notice`·`change-assembly`·`admin-cli`·`publisher-main`) → 621개 중 619 통과, 실패 0, skip 2(로컬 PostgreSQL이 필요한 `raw-text-retention`·`task-cancel-notice`의 기존 시험, 문구를 보지 않음).
+- **못 잡는 범위:** 문구의 자연스러움(owner 검토, C24 말투 표본). 켜짐 판이 가리키는 `homelab bot` CLI는 아직 unknown 해제·멈춘 작업 재개를 받지 않는다(DECISIONS "C05 관리 CLI"). 기억·브리핑(C10), 변경·리뷰·세션 연결(C18) 문구는 이 절 밖이다.
+
 ## C25 작업자 변경 작성 v2 (2026-11-10)
 
 동료 봇 명세 §4.10 "변경 질문 줄이기"·"수정 요청"·"안내 댓글", AC-25·AC-28(S2)의 작업자 쪽이다(homelab 계획 티켓 C25). 작업자가 새 지시문 판 `change-v2`를 받으면 가정해서 진행하고 확인할 것·남은 위험(위치 선택)을 `snapshot`에, 진행 불가면 선택지 2~4개를 `needs_input`에 싣는다. 수정 차례에는 owner 지시와 PR 리뷰·댓글 자료 블록을 따로 받는다. 게시 서버는 아직 옛 판만 보내므로 병합 즉시 바뀌는 owner 동작은 없다. 모양과 규칙은 [ARCHITECTURE](ARCHITECTURE.md) §16.4 "변경 작성 v2 판", 결정은 [DECISIONS](DECISIONS.md) "동료 봇 전환 14·16 작업자 변경 작성 v2 판".

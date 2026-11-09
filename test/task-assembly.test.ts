@@ -7,6 +7,7 @@ import { once } from 'node:events';
 import { lstat } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
+import { CHAT_TASK_TEXT as T } from '../src/chat-task-text.js';
 import { CLAUDE_TASK_LANE_CAPABILITIES } from '../src/claude-task-bridge.js';
 import { COMMAND_DEFINITIONS, FOUNDATION_COMMANDS, TASK_COMMANDS, TASK_COMMAND_DEFINITIONS, commandDefinitions } from '../src/commands.js';
 import type { PublisherConfig } from '../src/config.js';
@@ -267,7 +268,7 @@ test('B5 수직 흐름(둘 다 새 + gate on): /task → needs_input → /answer
   command('task', CHAT, { project: 'fixture', text: '실패하는 시험을 고쳐줘' });
   await waitFor(() => rest.threads.length === 1);
   const channel = rest.threads[0]!;
-  await waitFor(() => rest.threadText(channel).includes('작업 질문'));
+  await waitFor(() => rest.threadText(channel).includes(T.taskQuestion));
   const [job] = await rows<{ id: string; state: string; wait_reason: string }>(`SELECT id,state,wait_reason FROM jobs WHERE type='task'`);
   assert.deepEqual([job!.state, job!.wait_reason], ['waiting_user', 'clarification']);
   const text = rest.threadText(channel);
@@ -283,7 +284,7 @@ test('B5 수직 흐름(둘 다 새 + gate on): /task → needs_input → /answer
   assert.match(metric, /homelab_bot_lane_jobs\{lane="task",state="waiting_user"\} 1/);
   assert.match(metric, /homelab_bot_task_sessions_retained 1/);
   command('answer', channel, { question, text: 'src/app.txt 하나만' });
-  await waitFor(() => rest.threadText(channel).includes('작업 완료'));
+  await waitFor(() => rest.threadText(channel).includes(T.taskCompleted(false, job!.id)));
   const calls = await worker.calls();
   assert.equal(calls.length, 2);
   assert.ok(calls[0]!.args.includes('--session-id') && !calls[0]!.resume);
@@ -348,7 +349,6 @@ for (const reason of ['unknown', 'cleanup_pending', 'retention_full']) {
     await database.db.query(`UPDATE execution_lanes SET closed_reason=$1,closed_at=1 WHERE lane='task'`, [reason]);
     await ingress.receive(task('t1', { scope: CHANNEL }));
     assert.equal(acks[0]!.content, taskLaneClosedText(reason));
-    assert.match(acks[0]!.content, new RegExp(reason));
     assert.deepEqual([(await rows('SELECT id FROM jobs')).length, (await outbox()).length], [0, 0]);
   });
 }
@@ -417,11 +417,11 @@ test('B5 /answer: 수신 트랜잭션 안에서 답을 확정하고 같은 세�
   // 2,000자 초과는 질문을 닫지 않고 안내한다.
   await ingress.receive(event('a1', { kind: 'command', command: 'answer', target: q!.id, text: 'x'.repeat(2001) }));
   assert.equal((await rows<{ state: string }>('SELECT state FROM codex_questions'))[0]!.state, 'open');
-  assert.ok((await outbox()).some(row => row.payload.content.includes('실패: 답이 비었거나 너무 깁니다')));
+  assert.ok((await outbox()).some(row => row.payload.content === T.controlFailed(false, T.answerInvalid)));
   await ingress.receive(event('a2', { kind: 'command', command: 'answer', target: q!.id, text: '메인 기준으로' }));
   const [answered] = await rows<{ state: string; answer: string; answer_event: string }>('SELECT state,answer,answer_event FROM codex_questions');
   assert.deepEqual([answered!.state, answered!.answer, answered!.answer_event], ['answered', '메인 기준으로', 'a2']);
-  assert.ok((await outbox()).some(row => row.payload.content.includes('답을 받았습니다')));
+  assert.ok((await outbox()).some(row => row.payload.content === T.taskAnswerAccepted));
   // 같은 상호작용 재전달은 그대로 끝난다.
   await ingress.receive(event('a2', { kind: 'command', command: 'answer', target: q!.id, text: '메인 기준으로' }));
   assert.equal((await rows(`SELECT id FROM jobs WHERE state='queued' AND type='task'`)).length, 1);
@@ -440,21 +440,21 @@ test('B5 /task-status·/task-cancel: 이 대화의 작업만, 대화 작업은 �
   const job = (await jobs(database.db))[0]!;
   await ingress.receive(event('s1', { kind: 'command', command: 'task-status', target: job.id }));
   const status = acks.find(a => a.id === 's1')!.content;
-  assert.match(status, /waiting_user\(clarification\)/);
+  assert.match(status, /확인 기다림\(질문 답 기다림\)/);
   assert.match(status, /열린 질문/);
   assert.match(status, /세대 1/);
   // 다른 대화에서는 존재를 구별해 알리지 않는다.
   const other = { ...thread, channel: 'fixture-other-thread' };
   await ingress.receive(event('o1', { kind: 'command', command: 'chat', scope: other, text: '다른 대화' }));
   await ingress.receive(event('s2', { kind: 'command', command: 'task-status', target: job.id, scope: other }));
-  assert.equal(acks.find(a => a.id === 's2')!.content, '이 대화에서 볼 수 있는 작업이 아닙니다.');
+  assert.equal(acks.find(a => a.id === 's2')!.content, '이 대화에서 볼 수 있는 작업이 아니에요.');
   // 대화 작업은 /task-cancel로 건드리지 않는다.
   const chat = (await jobs(database.db)).find(row => row.type === 'chat')!;
   await ingress.receive(event('c0', { kind: 'command', command: 'task-cancel', target: chat.id, scope: other }));
   assert.equal((await rows<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [chat.id]))[0]!.state, 'queued');
   await ingress.receive(event('c1', { kind: 'command', command: 'task-cancel', target: job.id }));
   assert.equal((await rows<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id]))[0]!.state, 'cancelled');
-  assert.ok((await outbox()).some(row => row.payload.content.includes('취소 요청')));
+  assert.ok((await outbox()).some(row => row.payload.content === T.cancelRequested));
   // 재전달은 한 번만 처리한다(상호작용 응답도 한 번).
   const before = acks.length;
   await ingress.receive(event('s1', { kind: 'command', command: 'task-status', target: job.id }));
@@ -471,14 +471,14 @@ test('B5 /task-release: 먼저 답하고 소멸 확인 결과를 대화에 게�
   assert.equal(job.state, 'unknown');
   assert.equal((await laneRow(database.db)).closed_reason, 'unknown');
   await ingress.receive(event('r1', { kind: 'command', command: 'task-release', target: job.id }));
-  assert.match(acks.find(a => a.id === 'r1')!.content, /소멸을 확인합니다/);
+  assert.equal(acks.find(a => a.id === 'r1')!.content, T.releaseStarted);
   await Promise.all(background);
-  assert.ok((await outbox()).some(row => row.payload.content.includes('해제 실패')));
+  assert.ok((await outbox()).some(row => row.payload.content === T.releaseFailed(false, job.id, T.releaseWorkerAlive)));
   assert.equal((await laneRow(database.db)).closed_reason, 'unknown', '확인하지 못하면 닫힌 채');
   local.worker.stopped = true;
   await ingress.receive(event('r2', { kind: 'command', command: 'task-release', target: job.id }));
   await Promise.all(background);
-  assert.ok((await outbox()).some(row => row.payload.content.includes('해제 완료')));
+  assert.ok((await outbox()).some(row => row.payload.content === T.releaseDone(false, job.id, T.releaseConfirmed)));
   assert.equal((await rows<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id]))[0]!.state, 'cancelled');
   assert.equal((await laneRow(database.db)).closed_reason, null);
   // 남의 대화에서는 Denied 문구만.
@@ -486,7 +486,7 @@ test('B5 /task-release: 먼저 답하고 소멸 확인 결과를 대화에 게�
   await ingress.receive(event('o1', { kind: 'command', command: 'chat', scope: other, text: '다른 대화' }));
   await ingress.receive(event('r3', { kind: 'command', command: 'task-release', target: job.id, scope: other }));
   await Promise.all(background);
-  assert.ok((await outbox()).some(row => row.payload.content === '해제할 수 있는 작업을 찾지 못했습니다.'));
+  assert.ok((await outbox()).some(row => row.payload.content === T.releaseNotFound));
 });
 
 test('B5 처리기 없음: 스위치를 끈 수신은 작업 제어를 닫고, 처리기 없는 /task는 지금 경로 그대로', async () => {
