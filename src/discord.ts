@@ -21,6 +21,9 @@ export interface DiscordRest {
   sendMessage(channel: string, body: { content: string; nonce: string; enforce_nonce: true; allowed_mentions: { parse: never[] } }): Promise<{ id: string }>;
   findDelivery(channel: string, marker: string, kind: 'message' | 'thread'): Promise<{ id: string } | undefined>;
   history(channel: string, after: string | null, limit: 100): Promise<EventInput[]>;
+  // 봇 자신의 반응만 더하고 지운다(경로 @me). 반응 상태는 src/reactions.ts가 정한다.
+  addReaction(channel: string, message: string, emoji: string): Promise<void>;
+  removeOwnReaction(channel: string, message: string, emoji: string): Promise<void>;
 }
 const noMentions = { allowed_mentions: { parse: [] as never[] } };
 // Discord 메시지 플래그 SUPPRESS_EMBEDS. 기억 명령 응답의 문서 링크(`doc=`)에 미리보기 카드가 붙는다(실연동).
