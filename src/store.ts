@@ -761,11 +761,19 @@ export class Store {
         [target, actor, conversation])).rows[0]?.type ?? 'chat';
       if (await this.queueFull(kind)) return { ok: false, status: '대기열이 가득 찼습니다. 불필요한 작업을 취소한 뒤 재시도하세요.' };
       // CHANGE 자식 job을 다시 돌리지 않는다. 모델을 다시 부르는 길은 새 generation뿐이다.
+      // 다시 시작하면 요청 원문(events.payload.text)을 읽는다. 보존 기간이 지나 지웠으면 빈 요청으로 모델을 부르게 되므로 받지 않는다.
+      // 원문 정리도 scheduler 행을 잠그고 지우므로 이 판정과 엇갈리지 않는다(raw-text-retention.ts).
       const changed = await this.db.query(`UPDATE jobs SET state='queued',available_at=$4,wait_reason=NULL
         WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND state='failed' AND attempt<$5
-        AND NOT EXISTS (SELECT 1 FROM change_child_jobs cc WHERE cc.job_id=jobs.id) RETURNING id`,
+        AND NOT EXISTS (SELECT 1 FROM change_child_jobs cc WHERE cc.job_id=jobs.id)
+        AND NOT EXISTS (SELECT 1 FROM events e WHERE e.id=jobs.event_id AND e.text_purged_at IS NOT NULL) RETURNING id`,
       [target, actor, conversation, this.now(), DEFAULTS.maxRetries + 1]);
-      if (!changed.rows.length) return { ok: false, status: '재시도할 작업이 현재 대화에 없거나 상태·재시도 한도가 허용하지 않습니다.' };
+      if (!changed.rows.length) {
+        const purged = (await this.db.query(`SELECT 1 FROM jobs j JOIN events e ON e.id=j.event_id
+          WHERE j.id=$1 AND j.owner_id=$2 AND j.conversation_id=$3 AND e.text_purged_at IS NOT NULL`, [target, actor, conversation])).rows.length > 0;
+        if (purged) return { ok: false, status: '보존 기간(7일)이 지나 요청 원문을 지워 재시도할 수 없습니다. 같은 내용을 새로 요청하세요.' };
+        return { ok: false, status: '재시도할 작업이 현재 대화에 없거나 상태·재시도 한도가 허용하지 않습니다.' };
+      }
       return { status: '확인된 실패 작업만 재시도합니다.' };
     }
     if (action === 'emergency-stop') {

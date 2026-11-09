@@ -11,7 +11,7 @@ import { ClaudeTaskBridge } from './claude-task-bridge.js';
 import { assembleChange, assembleChangeReview, changeCommandHandler, changePrecondition, guardedTaskCommands, workerRouteAnswers } from './change-assembly.js';
 import type { ChangeAssemblyOptions } from './change-assembly.js';
 import { CHANGE_PERIODS } from './change-runtime.js';
-import { ChangePrivateInputs, ChangeStore, purgeExpiredChangeContent } from './change-store.js';
+import { ChangePrivateInputs, ChangeStore, purgeExpiredChangeContentRounds } from './change-store.js';
 import { CHANGE_COMMANDS, EXTERNAL_TASK_COMMANDS, FOUNDATION_COMMANDS, MEMORY_COMMANDS, REVIEW_COMMANDS, TASK_COMMANDS, commandDefinitions, registerCommands } from './commands.js';
 import { ConfigError, databasePoolConfig, loadPublisherConfig } from './config.js';
 import type { PublisherConfig } from './config.js';
@@ -52,6 +52,7 @@ import { GitHubIngress, RestrictedGitHub, ReviewDisabled, ReviewPolicySchema, Re
   ReviewReconciler, ReviewRuntime, githubWebhook } from './review.js';
 import type { GitHubReader, ReviewContext, ReviewPolicy } from './review.js';
 import { HttpReviewWorker } from './review-http.js';
+import { RAW_TEXT_PURGE_EVERY_MS, purgeExpiredRawText } from './raw-text-retention.js';
 import { RecoveryScheduler } from './recovery.js';
 import { Runtime } from './runtime.js';
 import { Store } from './store.js';
@@ -600,15 +601,19 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     changeWorkers.task = task;
     changeWorkers.review = routed;
   });
-  // 원문 보존 정리(CHANGE 원문·artifact 7일, 작업 레인 질문 답 7일)는 DB만 쓴다. 레인 스위치·작업자 수락·READY 장벽과 묶으면
+  // 원문 보존 정리(CHANGE 원문·artifact·brief 7일, 작업 레인 질문 답 7일, 입력·질문·결과·게시 본문 7일)는 DB만 쓴다. 레인 스위치·작업자 수락·READY 장벽과 묶으면
   // 레인을 끈 채 재시작했을 때 이미 지울 때가 된 원문이 다시 켤 때까지 남으므로 늘 돈다.
   every('change_retention', CHANGE_PERIODS.retentionMs, async () => {
-    const purged = await purgeExpiredChangeContent(store.db, store.now());
+    const purged = await purgeExpiredChangeContentRounds(store.db, store.now());
     if (purged) log('change_content_purged', { purged });
   });
   every('task_answer_retention', TASK_ANSWER_PURGE_EVERY_MS, async () => {
     const purged = await purgeExpiredTaskAnswers(store.db, store.now());
     if (purged) log('task_answers_purged', { purged });
+  });
+  every('raw_text_retention', RAW_TEXT_PURGE_EVERY_MS, async () => {
+    const purged = await purgeExpiredRawText(store.db, store.now());
+    if (purged.events || purged.prompts || purged.results || purged.outbox) log('raw_text_purged', { ...purged });
   });
   if (external) every('external_task_purge', deps.externalPurgeMs ?? EXTERNAL_PURGE_MS, async () => {
     const purged = await external.links.purge();

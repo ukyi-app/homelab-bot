@@ -186,7 +186,8 @@ export class ChangeCommands implements ChangeCommandHandler {
       const { prNumber: _pr, ...observation } = deployment.value;
       lines.push(describeDeployment(observation));
     }
-    if ((await db.query(`SELECT 1 FROM change_artifacts WHERE change_id=$1 AND purged_at IS NOT NULL LIMIT 1`, [found.id])).rows.length) lines.push('보존 기간이 지나 artifact 바이트·리뷰 원문·요청 원문을 지웠습니다. digest와 receipt는 남아 있습니다.');
+    if ((await db.query(`SELECT 1 FROM change_artifacts WHERE change_id=$1 AND purged_at IS NOT NULL
+      UNION ALL SELECT 1 FROM change_requests WHERE id=$1 AND brief_purged_at IS NOT NULL LIMIT 1`, [found.id])).rows.length) lines.push('보존 기간이 지나 artifact 바이트·리뷰 원문·요청 원문·요약을 지웠습니다. digest와 receipt는 남아 있습니다.');
     return { content: lines.join('\n'), outcome: 'status' };
   }
 }

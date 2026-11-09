@@ -101,9 +101,14 @@ export class DiscordIngress {
       const subscription = await store.ownedConversation(event.scope, event.actor, true);
       if (recovery && (!subscription.active || subscription.recovery_token !== recovery.token
         || subscription.subscription_epoch !== recovery.epoch || Number(subscription.recovery_until) <= store.now())) return false;
-      const inbox = (await store.db.query<{ buffered: boolean; accepted: boolean; actor_id: string; scope: Scope; payload: { text: string; command?: string; target?: string; kind: EventInput['kind']; urgent?: boolean; mention?: boolean; activate?: boolean } }>(
+      const inbox = (await store.db.query<{ buffered: boolean; accepted: boolean; actor_id: string; scope: Scope; text_purged_at: string | null; payload: { text: string; command?: string; target?: string; kind: EventInput['kind']; urgent?: boolean; mention?: boolean; activate?: boolean } }>(
         'SELECT * FROM events WHERE id=$1 FOR UPDATE', [saved.id])).rows[0]!;
       if (inbox.accepted || (inbox.buffered && !recovered)) return false;
+      // 받지 못한 채 보존 기간(7일)이 지나 원문을 비운 입력이 누락 복구 등으로 다시 왔다. 저장된 빈 원문으로 처리하지 않는다.
+      if (inbox.text_purged_at !== null) {
+        await store.db.query(`UPDATE events SET buffered=false,payload=payload || '{"ignored":"text_purged"}'::jsonb WHERE id=$1`, [saved.id]);
+        return false;
+      }
       // Replay durable input, not a later delivery's content. Scope/actor must agree.
       if (inbox.actor_id !== event.actor || store.scopeId(inbox.scope) !== store.scopeId(event.scope)
         || inbox.scope.parent !== event.scope.parent) throw new Denied();
