@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import { DiscordProtocol, discordHttpApi } from '../src/discord-protocol.js';
 import type { DiscordApi } from '../src/discord-protocol.js';
 import { DEFAULTS, DiscordRejected, RateLimited } from '../src/contracts.js';
+import { DiscordIngress, DiscordPublisher } from '../src/discord.js';
 import { REACTION_ATTEMPTS } from '../src/reactions.js';
-import { event, fixture, localDatabase } from './helpers.js';
+import { Store } from '../src/store.js';
+import { MockDiscord, event, fixture, localDatabase, thread } from './helpers.js';
 
 // C04 반응 수명(AC-14): 받으면 👀, 다른 모델 일 뒤에 기다리면 ⏳, 답이 게시되면 봇 반응을 모두 지운다.
 // 실패가 확정되면 지우고 실패 한 줄을 단다. 지우기는 봇 자신의 반응(@me)만이다.
@@ -210,6 +212,68 @@ test('오류: 반응 REST 일시 오류는 게시를 막지 않고 다시 시도
   assert.equal(log.filter(line => line === 'remove failed').length, REACTION_ATTEMPTS);
   assert.deepEqual(await audits('reaction_abandoned'), [{ op: 'remove', emoji: '👀', attempts: REACTION_ATTEMPTS }]);
   assert.equal((await database.db.query<{ state: string }>('SELECT state FROM outbox')).rows[0]!.state, 'sent');
+});
+
+test('protocol 흐름: 반응 REST는 모두 @me이고 남의 반응을 지우는 호출은 0이다', async () => {
+  const { api, calls } = fakeApi();
+  const channelApi: DiscordApi = { async request(method, path, body, options) {
+    if (method === 'GET' && path.startsWith('/channels/')) { calls.push({ method, path }); return { id: thread.channel, type: 11, parent_id: thread.parent, guild_id: thread.guild }; }
+    return api.request(method, path, body, options);
+  } };
+  const protocol = new DiscordProtocol(channelApi, 'fixture-bot', f.now);
+  const ingress = new DiscordIngress(f.store, f.gate, protocol);
+  const publisher = new DiscordPublisher(f.store, f.gate, protocol);
+  const release = holdModel();
+  await ingress.receive(event('8601'));
+  f.advance(DEFAULTS.debounceMs);
+  const first = f.runtime.tick();
+  await until(() => f.requests.length === 1);
+  await ingress.receive(event('8602'));
+  f.advance(DEFAULTS.debounceMs);
+  await f.runtime.tick();
+  while (await publisher.deliver());
+  release();
+  await first;
+  while (await publisher.deliver());
+  await f.runtime.tick();
+  while (await publisher.deliver());
+  const reactionCalls = calls.filter(c => c.path.includes('/reactions/'));
+  assert.deepEqual(reactionCalls.map(c => `${c.method} ${c.path}`), [
+    `PUT /channels/fixture-thread/messages/8601/reactions/${EYES}/@me`,
+    `PUT /channels/fixture-thread/messages/8602/reactions/${EYES}/@me`,
+    `PUT /channels/fixture-thread/messages/8602/reactions/${HOURGLASS}/@me`,
+    `DELETE /channels/fixture-thread/messages/8601/reactions/${EYES}/@me`,
+    `DELETE /channels/fixture-thread/messages/8602/reactions/${EYES}/@me`,
+    `DELETE /channels/fixture-thread/messages/8602/reactions/${HOURGLASS}/@me`,
+  ]);
+  assert.equal(calls.filter(c => c.method === 'DELETE' && !c.path.endsWith('/@me')).length, 0);
+});
+
+test('재시작: 지우기 전에 게시 서버가 바뀌어도 저장된 반응 상태로 새 게시 서버가 지운다', async () => {
+  f.rest.removeOwnReaction = async () => { log.push('remove timeout'); throw Object.assign(new Error('timeout'), { name: 'TimeoutError' }); };
+  await answer('8701');
+  await drain();
+  assert.deepEqual(log, ['ack 8701', 'post fixture-thread', 'remove timeout']);
+  const fresh = new MockDiscord();
+  const restarted = new DiscordPublisher(new Store(database.db, f.now), f.gate, fresh);
+  f.advance(60_000);
+  while (await restarted.deliver());
+  assert.deepEqual(fresh.reactions, [{ op: 'remove', channel: 'fixture-thread', message: '8701', emoji: '👀' }]);
+  assert.equal(fresh.messages.length, 0, '답을 다시 게시하지 않는다');
+  while (await restarted.deliver());
+  assert.equal(fresh.reactions.length, 1);
+});
+
+test('채널 멘션: 스레드에서 답해도 반응은 채널에 있는 원문 메시지에서 지운다', async () => {
+  const channel = { kind: 'channel' as const, guild: 'fixture-guild', channel: 'fixture-chat', parent: null };
+  await f.ingress.receive(event('8801', { scope: channel }));
+  await drain();
+  f.advance(DEFAULTS.debounceMs);
+  assert.equal(await f.runtime.tick(), true);
+  await drain();
+  const replies = f.rest.messages.map(m => m.channel);
+  assert.deepEqual(replies, ['fixture-new-thread-0']);
+  assert.deepEqual(f.rest.reactions, [{ op: 'remove', channel: 'fixture-chat', message: '8801', emoji: '👀' }]);
 });
 
 // 첫 대화 작업이 모델 자리를 쥔 채로 멈춰 있게 한다. release()로 답을 낸다.
