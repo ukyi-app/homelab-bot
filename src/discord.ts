@@ -171,7 +171,7 @@ export class DiscordIngress {
                   && event.actor === current.owner });
         if (event.command !== 'revoke') await store.enqueue({ key: `control:${saved.id}`, actor: event.actor,
           scope: event.scope, revision: current.revision, payload: { kind: 'message', channel: event.scope.channel,
-            content: controlText(event.command!, result), classification: 'safe_summary' } });
+            content: controlText(event.command!, result, store.colleague), classification: 'safe_summary' } });
       } else if (event.scope.kind === 'channel') {
         await store.enqueue({ key: `thread:${saved.id}`, conversation: conversationId,
           actor: event.actor, scope: event.scope, revision: current.revision,
@@ -181,7 +181,7 @@ export class DiscordIngress {
         try { await store.accept(saved.id, event.command === 'task' ? 'task' : event.command === 'read' ? 'read' : 'chat', current.revision, event.urgent || event.command === 'urgent'); }
         catch (error) {
           if (!(error instanceof LaneClosed) || !this.tasks) throw error;
-          return refuse(taskLaneClosedText(error.reason));
+          return refuse(taskLaneClosedText(error.reason, store.colleague));
         }
         if ((!recovered || inbox.buffered) && event.kind === 'message') await store.checkpoint(conversationId, event.id, inbox.buffered);
       }
@@ -656,7 +656,7 @@ export class DiscordPublisher {
             if (!(error instanceof LaneClosed)) throw error;
             await store.db.query(`UPDATE events SET accepted=true,payload=payload || '{"ignored":"task_refused"}'::jsonb WHERE id=$1`, [row.payload.content]);
             await store.enqueue({ key: `task-refused:${row.id}`, actor: row.owner_id, scope, conversation: id, revision: row.policy_revision, services: current.service_ids,
-              payload: { kind: 'message', channel: externalId, content: taskLaneClosedText(error.reason), classification: 'safe_summary' } });
+              payload: { kind: 'message', channel: externalId, content: taskLaneClosedText(error.reason, store.colleague), classification: 'safe_summary' } });
           }
         }
         await store.ackNotice(row.payload.content);

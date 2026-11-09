@@ -185,7 +185,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   const send = deps.send ?? fetch;
   const stop = new AbortController();
   const pause = (ms: number) => sleep(ms, undefined, { signal: stop.signal }).catch(() => {});
-  const store = new Store(deps.db, now);
+  const store = new Store(deps.db, now, config.colleagueEnabled === true);
   const gate = PolicyGate.fixed(config.policy, deps.db, now);
   const health = new Health(store, async () => {
     // healthchecks.io ping. URL은 비밀(체크 UUID)이라 오류에도 남기지 않는다.
