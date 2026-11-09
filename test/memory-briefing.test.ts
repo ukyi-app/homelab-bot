@@ -4,9 +4,9 @@ import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { DEFAULTS, Denied, DiscordRejected, PolicyUnavailable, RateLimited } from '../src/contracts.js';
 import type { Scope } from '../src/contracts.js';
 import type { Database } from '../src/database.js';
-import { MemoryNotReady, MemoryRejected, MemoryService } from '../src/memory.js';
+import { DELETION_MESSAGE, MemoryNotReady, MemoryRejected, MemoryService } from '../src/memory.js';
 import type { DeletionEntry, DeletionLedger, DocumentSource, MemoryInput } from '../src/memory.js';
-import { BRIEFING, BriefingScheduler, latestSlot, nextSlot } from '../src/briefing.js';
+import { BRIEFING, BRIEFING_TEXT, BriefingScheduler, latestSlot, nextSlot } from '../src/briefing.js';
 import type { BriefingConfig, Observation, ObservationSource } from '../src/briefing.js';
 import { Store } from '../src/store.js';
 import { localDatabase, fixture, event, thread } from './helpers.js';
@@ -258,7 +258,7 @@ test('DATA-02 원장 기록 실패면 삭제 완료라 하지 않고, 조회에�
   ledger.appendFails = 'before';
   const result = await memory.delete('fixture-owner', thread, stored.id);
   assert.deepEqual([result.status, result.reason], ['pending', 'ledger_unconfirmed']);
-  assert.match(result.message, /아직 삭제하지 않았습니다/);
+  assert.equal(result.message, DELETION_MESSAGE.ledgerUnconfirmed);
   assert.equal((await rows('memories'))[0]!.statement, '원장 장애 중 삭제');
   assert.deepEqual(await memory.search('fixture-owner', thread, '원장'), []);
   assert.equal((await ledger.inner.entries()).length, 0);
@@ -359,7 +359,9 @@ test('DATA-02 삭제는 파생 브리핑에 반영: 대기 중은 막고, 이미
   await f.publisher.deliver(); assert.equal(f.rest.messages.length, 1);
   const published = await memory.delete('fixture-owner', notifications, second.id);
   assert.deepEqual([published.status, published.publishedCopies], ['deleted', 1]);
-  assert.match(published.message, /Discord에서 지우지 않았습니다/);
+  assert.equal(published.message, DELETION_MESSAGE.deletedWithCopies(1));
+  // 안전 문장: 게시된 사본은 지우지 않는다고 말한다.
+  assert.match(published.message, /Discord에서 지우지 않았어요/);
   assert.doesNotMatch((await briefings())[1]!.payload.content, /둘째 기억/);
   assert.match(f.rest.messages[0]!.body.content, /둘째 기억/);
 });
@@ -433,7 +435,7 @@ test('BRIEF-01 며칠 중단 뒤에는 밀린 회차를 몰아 보내지 않고 
   assert.equal(all.length, 1);
   assert.equal(all[0]!.idempotency_key, 'briefing:daily-briefing:2027-01-19');
   assert.match(all[0]!.payload.content, /지연 발송: 예정 08:50, 작성 01-19 09:20/);
-  assert.match(all[0]!.payload.content, /누락: 01-16, 01-17, 01-18 브리핑은 보내지 않았습니다/);
+  assert.ok(all[0]!.payload.content.includes(BRIEFING_TEXT.missed('01-16, 01-17, 01-18')), all[0]!.payload.content);
   // 보낸 회차는 누락이 아니다. 보내지 않은 채 12시간이 지나면 누락으로 바뀐다.
   await f.publisher.deliver();
   at(SLOT + 4 * DAY + BRIEFING.skipAfterMs + 1);
@@ -449,6 +451,22 @@ test('BRIEF-01 모델 비상 중지 중에도 브리핑은 정확히 한 번 나
   const [row] = await briefings();
   assert.match(row!.payload.content, /모델 호출: 중지\(비상 중지\)/);
   assert.equal((await briefings()).length, 1);
+});
+test('C10 스위치 두 판: 모델 호출 중지 줄은 꺼지면 /model-status를, 켜지면 \'/\' 이름 없이 homelab bot CLI를 안내', async () => {
+  await database.db.query("INSERT INTO controls VALUES ('scheduler','true'),('scheduler_emergency','true')");
+  const slash = scheduler();
+  await slash.ensure();
+  at(SLOT); assert.equal(await slash.tick(), 'enqueued');
+  const off = (await briefings())[0]!.payload.content;
+  assert.ok(off.includes(BRIEFING_TEXT.modelStopped.slash('비상 중지')), off);
+  assert.match(off, /\/model-status/);
+  const colleague = scheduler([], { config: { ...seoul, colleague: true } });
+  at(SLOT + DAY); assert.equal(await colleague.tick(), 'enqueued');
+  const on = (await briefings())[1]!.payload.content;
+  assert.ok(on.includes(BRIEFING_TEXT.modelStopped.colleague('비상 중지')), on);
+  assert.ok(on.includes('`homelab bot` CLI'), on);
+  // 켜짐 판 브리핑 전체에 '/' 명령 이름과 기억 명령 이름이 없다(AC-11).
+  assert.doesNotMatch(on, /(^|[\s(`'"])\/[a-z]|memory-(save|search|correct|exclude|delete)|model-status/);
 });
 test('BRIEF-01 읽기 불가·오래된 관측은 미확인, 정상은 현재 관측일 때만, 복원 검증은 백업 성공과 구분', async () => {
   let certificate: Observation | Error = new Error('read_failed');
@@ -489,7 +507,7 @@ test('BRIEF-01 전달 실패는 다음 브리핑에 알리고 실패한 회차�
   await f.publisher.deliver();
   assert.equal((await briefings())[0]!.state, 'blocked');
   at(SLOT + DAY); assert.equal(await s.tick(), 'enqueued');
-  assert.match((await briefings())[1]!.payload.content, /지난 브리핑\(01-16\) 전달 실패: 다시 보내지 않습니다/);
+  assert.ok((await briefings())[1]!.payload.content.includes(BRIEFING_TEXT.previousBlocked('01-16')));
   await f.publisher.deliver(); await f.publisher.deliver();
   assert.equal(f.rest.messages.length, 1);
   assert.deepEqual((await briefings()).map(b => b.state), ['blocked', 'sent']);

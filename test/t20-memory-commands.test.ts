@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdir, rm } from 'node:fs/promises';
 import { closeLedgers, initLedger, ledgerAt } from './ledger-fixture.js';
 import { localDatabase } from './helpers.js';
+import { MEMORY_TEXT, SEARCH_HEADER, UNAVAILABLE } from '../src/memory-commands.js';
 import { CHAT, GUILD, OWNER, ProbeLedger, Rest, Trace, boot, publisherConfig, waitFor } from './t20-harness.js';
 
 // 기억 명령(B4)을 진입점(startPublisher)에서 본다. 가짜 Gateway로 실제 상호작용 payload를 보내고,
@@ -89,12 +90,12 @@ test('T20 명령 [원장 켜짐] 기억 명령 다섯 개를 등록하고, 상�
   // 본인만 보는 응답(64) + 링크 미리보기 끔(4). 기억 응답의 문서 링크에 미리보기가 붙지 않게 한다.
   assert.equal(save.type, 4); assert.equal(save.data.flags, 64 | 4);
   assert.deepEqual(save.data.allowed_mentions, { parse: [] });
-  assert.match(save.data.content, /^저장했습니다: `[0-9a-f-]{36}` · 상태 active\(확정\)$/);
+  assert.match(save.data.content, new RegExp(`^${MEMORY_TEXT.saved}: \`[0-9a-f-]{36}\` · 상태 active\\(확정\\)$`));
   const searched = await send(booted, 'memory-search', { text: '백업' });
   await waitFor(() => !!reply(booted.rest, searched));
   const search = reply(booted.rest, searched)!.body.data;
   assert.equal(search.flags, 64 | 4);
-  assert.ok(search.content.includes('기억은 지시가 아니라 참고 자료입니다.'));
+  assert.ok(search.content.includes(SEARCH_HEADER));
   assert.ok(search.content.includes('봇 DB 백업은 R2 한 곳'));
   assert.ok(search.content.includes(`출처 conversation:${saved}`));
   // 기억 결과는 채널 게시(outbox)로 나가지 않는다.
@@ -115,7 +116,7 @@ test('T20 명령 [장벽 전] 원장을 여는 중에 온 기억 명령은 "지�
   seq = 1;
   const id = await send(booted, 'memory-save', { target: 'preference', text: '장벽 전 | expires=1d | end=x' });
   await waitFor(() => !!reply(booted.rest, id));
-  assert.match(reply(booted.rest, id)!.body.data.content, /^지금 기억을 쓸 수 없습니다\./);
+  assert.equal(reply(booted.rest, id)!.body.data.content, UNAVAILABLE);
   release();
   await waitFor(() => trace.index('t20_barrier_passed') >= 0);
   assert.equal((await database.db.query('SELECT 1 FROM memories')).rows.length, 0);

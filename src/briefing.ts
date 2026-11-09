@@ -15,7 +15,21 @@ export const BRIEFING = Object.freeze({
   skipAfterMs: 43_200_000, freshMs: 3_600_000, sourceTimeoutMs: 10_000, maxMissed: 31,
 });
 // 시각·시간대는 실제 설정에서만 온다. 비어 있으면 자동 발송하지 않는다.
-export interface BriefingConfig { time: string | null; timezone: string | null }
+// colleague는 동료 기능 스위치 값(config.colleagueEnabled === true)이다. 없으면 꺼짐 판이다.
+export interface BriefingConfig { time: string | null; timezone: string | null; colleague?: boolean }
+// 브리핑의 문장 줄. 칸 이름과 상태 표시(정상·미확인·확인 필요 등)는 명사형 그대로 두고 문장만 해요체로 쓴다.
+// '/' 이름을 안내하는 줄(모델 호출 중지)만 스위치로 두 판을 고른다(명세 §4.9). 켜짐 판의 관리 기능은 CLI다(명세 §4.8).
+// C19(미룬 리뷰 건수)·C22(토큰 만료)는 줄을 이 표와 modelLines에 더한다.
+export const BRIEFING_TEXT = Object.freeze({
+  missed: (dates: string) => `누락: ${dates} 브리핑은 보내지 않았어요(재시작한 뒤 몰아서 보내지 않아요).`,
+  previousBlocked: (date: string) => `지난 브리핑(${date})은 전달하지 못했어요. 다시 보내지 않아요.`,
+  previousUnknown: (date: string) => `지난 브리핑(${date})은 전달됐는지 확인하지 못했어요. 다시 보내지 않아요.`,
+  previousPending: (date: string) => `지난 브리핑(${date})은 아직 전달을 기다리고 있어요.`,
+  modelStopped: {
+    slash: (reasons: string) => `- 모델 호출: 중지(${reasons}) · /model-status로 확인`,
+    colleague: (reasons: string) => `- 모델 호출: 중지(${reasons}) · \`homelab bot\` CLI로 확인해 주세요`,
+  },
+});
 export interface Observation {
   observedAt: number; status: 'ok' | 'problem'; summary: string; restoreVerifiedAt?: number | null;
   // 백업 원본만 낸다. 백업 status와 따로 판정해 복원 기록 문제·오류가 백업 정상·확인 필요를 바꾸지 않는다.
@@ -338,14 +352,14 @@ export class BriefingScheduler {
       const dates = skipped.map(row => row.slot_date.slice(5));
       // 누락 기록은 중단 한 번에 최대 maxMissed회라 그 이상은 하한으로만 말한다.
       const more = dates.length > 7 ? ` 외 ${dates.length - 7}회${dates.length >= BRIEFING.maxMissed ? ' 이상' : ''}` : '';
-      lines.push(`누락: ${dates.slice(0, 7).join(', ')}${more} 브리핑은 보내지 않았습니다(재시작 뒤 몰아 보내지 않음).`);
+      lines.push(BRIEFING_TEXT.missed(`${dates.slice(0, 7).join(', ')}${more}`));
     }
     if (previous) {
       const states = (await this.db.query<{ state: string }>('SELECT state FROM outbox WHERE message_key=$1', [previous.outbox_key])).rows.map(row => row.state);
       const date = previous.slot_date.slice(5);
-      if (states.includes('blocked')) lines.push(`지난 브리핑(${date}) 전달 실패: 다시 보내지 않습니다.`);
-      else if (states.includes('unknown')) lines.push(`지난 브리핑(${date}) 전달 결과 확인 불가: 다시 보내지 않습니다.`);
-      else if (states.some(state => state === 'pending' || state === 'sending')) lines.push(`지난 브리핑(${date}) 아직 전달 대기 중입니다.`);
+      if (states.includes('blocked')) lines.push(BRIEFING_TEXT.previousBlocked(date));
+      else if (states.includes('unknown')) lines.push(BRIEFING_TEXT.previousUnknown(date));
+      else if (states.some(state => state === 'pending' || state === 'sending')) lines.push(BRIEFING_TEXT.previousPending(date));
     }
     return lines;
   }
@@ -395,7 +409,7 @@ export class BriefingScheduler {
     const label: Record<string, string> = { model_limit: '한도 대기', auth_expired: '인증 만료 대기' };
     const reasons = [...(controls.get('scheduler_emergency') ? ['비상 중지'] : []), ...waits.map(row => `${label[row.wait_reason]} ${Number(row.count)}건`)];
     const lines = [controls.get('scheduler') || reasons.length
-      ? `- 모델 호출: 중지(${reasons.join(', ') || '사유 미기록'}) · /model-status로 확인`
+      ? BRIEFING_TEXT.modelStopped[this.config.colleague === true ? 'colleague' : 'slash'](reasons.join(', ') || '사유 미기록')
       : '- 모델 호출: 중지 신호 없음'];
     if (unknown) lines.push(`- 종료를 확인하지 못한 작업: ${unknown}건(unknown, 자동 재실행 안 함)`);
     return lines;
