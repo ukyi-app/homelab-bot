@@ -22,6 +22,9 @@ const PolicyFields = z.strictObject({
   // 작업 레인 프로젝트 정책. 형식 검사는 task-policy.ts가 하고, 없으면 작업 레인만 닫힌다.
   task: z.unknown().optional(),
   change: ChangePolicySchema.optional(),
+  // 동료 기능 스위치(DECISIONS "동료 봇 전환" 9). 없으면 꺼짐. 문자열 "true" 같은 오타가 조용히 꺼짐이 되지 않게 참·거짓만 받는다.
+  // 읽는 곳은 PublisherConfig.colleagueEnabled 하나다.
+  colleagueEnabled: z.boolean().optional(),
 });
 // 이 값이 증거 묶음의 policy revision이 된다. 묶음이 받지 않는 모양이면 모델을 돌린 뒤에야 막힌다.
 const changeRevisionShape = (policy: { revision: string; change?: unknown }, ctx: z.RefinementCtx) => {

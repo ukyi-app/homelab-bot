@@ -851,3 +851,12 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 | D7 봇 지표 스크레이프 | `vmsingle/scrape.yaml`에 봇 job, `platform/bot-slot`에 vmsingle → 봇 8080 ingress | 플랫폼 PR(T16b S15) |
 | D8 Kubernetes API 경로 | 봇 파드 → Kubernetes API 길은 플랫폼 PR이 연다. 읽기 transport의 K8s 출처는 in-cluster SA 토큰(`/var/run/secrets/kubernetes.io/serviceaccount`)으로 `https://kubernetes.default.svc`를 부른다 | `src/read-transports.ts`, 주소는 env `KUBERNETES_API_URL` |
 | D9 Argo CD 앱 상태 경로 | 봇은 Argo CD 앱 상태를 Argo CD API(`argocd-server`, `ARGOCD_URL`·`ARGOCD_READER_TOKEN`)가 아니라 **Kubernetes API의 Application CR**(`GET /apis/argoproj.io/v1alpha1/namespaces/argocd/applications/{이름}`)로 읽는다. 이유: `argocd-server`는 설계상 자체 서명 TLS만 쓰고(사람용 Tailscale 프록시가 https+insecure로 붙는다) 봇이 읽는 것은 앱 객체 하나뿐이다. Kubernetes API는 SA의 클러스터 CA로 TLS를 검증하고, 자격도 SA 하나로 준다. SA `bot-reader`에 `get applications.argoproj.io -n argocd`를 준다(플랫폼, lead 확인). 앱 이름은 카탈로그 고정값만, 경로의 namespace는 `argocd` 고정, 투영은 `status.health`·`status.sync`만(D9 전과 같은 판정·관측 시각). 남는 범위: 이 권한은 `argocd` ns의 모든 Application(spec의 인라인 Helm values 포함)을 읽게 한다. Argo CD `applications, get`도 같은 범위였다. 더 줄이려면 Role에 `resourceNames`(카탈로그 앱 이름)를 둘 수 있으나 새 앱마다 플랫폼 PR이 든다(선택) | `src/read-transports.ts`(`kubernetesTransport`의 datasource `argocd`), `src/catalog.ts` `ARGOCD_APPLICATIONS`, `src/config.ts`·`src/main.ts`(env 2개 제거), [ARCHITECTURE](ARCHITECTURE.md) §5·§11, [VERIFICATION](VERIFICATION.md) "T16b D9" |
+
+## C01 동료 기능 스위치 (2026-11-09)
+
+"동료 봇 전환 (사용자 2026-11-09)" 9의 구현 위치: 런타임 정책 칸 `colleagueEnabled`(`src/policy.ts` `PolicyFields`), 읽는 곳 `PublisherConfig.colleagueEnabled`(`src/config.ts`). 뒤 티켓의 말로 실행하는 기능과 '/' 이름 없는 고정 문구는 이 값만 본다. 시험·결과는 [VERIFICATION](VERIFICATION.md) "C01 동료 기능 스위치".
+
+- **env 키가 아니라 정책 칸:** 명세 §4.9가 "런타임 정책에 둔다, 기존 스위치처럼 기동 때 읽음"으로 정했다. 그래서 차트 env 스위치(`REVIEW_ENABLED`·`CHANGE_PR_ENABLED`)와 달리 Infisical `RUNTIME_POLICIES` 값만 바꾸고 재시작하면 켜진다.
+- **참·거짓만:** 문자열 `"true"` 같은 오타가 조용히 꺼짐이 되지 않게 기동 오류로 막는다. 오류에는 필드 경로만 남긴다(기존 `runtime_policies_invalid` 규칙).
+- **설정의 선택 칸:** `PublisherConfig`를 직접 만드는 시험이 있어 `colleagueEnabled?: boolean`이고, `loadPublisherConfig`는 늘 참·거짓을 채운다. 없으면 꺼짐으로 읽는다.
+- **수명:** 시범이 끝나 '/' 명령을 정리할 때 칸·설정·예시를 같이 없앤다(명세 §4.9).

@@ -103,3 +103,17 @@ test('AUTH-02 D1 철회보다 먼저 읽은 정책은 해제 목록이 있어도
   const stale = PolicyGate.fixed(loadRuntimePolicy(policyJson({ revision: 'fixture-v2', revocationRestores: [denial] }), early), database.db, f.now);
   await assert.rejects(stale.authorize('fixture-owner', thread), Denied);
 });
+
+test('C01 동료 기능 스위치는 참·거짓만 받고, 잘못된 값은 기동 실패이며 오류에 필드 경로만 있고 값은 없음', () => {
+  const secretLike = 'fixture-secret-switch-value';
+  for (const value of ['true', 'false', secretLike, 1, 0, null, {}, [true]]) {
+    assert.throws(() => loadRuntimePolicy(policyJson({ colleagueEnabled: value }), f.now()), (error: Error) => {
+      assert.equal(error.message, 'runtime_policies_invalid: colleagueEnabled', JSON.stringify(value));
+      return true;
+    });
+  }
+  // 받은 값은 다른 정책 칸과 함께 얼린다(기동 때 한 번 읽음).
+  const policy = loadRuntimePolicy(policyJson({ colleagueEnabled: true }), f.now());
+  assert.equal(policy.colleagueEnabled, true);
+  assert.ok(Object.isFrozen(policy));
+});
