@@ -9,6 +9,7 @@ import type { ChangeCommand, ChangeCommandHandler } from './change-commands.js';
 import type { ExternalTaskCommand, ExternalTaskCommandHandler } from './external-task-commands.js';
 import type { MemoryCommand, MemoryCommandHandler } from './memory-commands.js';
 import type { PolicyGate } from './policy.js';
+import { ReactionSync, recordReceived, settleReactions } from './reactions.js';
 import { LaneClosed } from './store.js';
 import type { Delivery, Store } from './store.js';
 import type { TaskCommandHandler } from './task-commands.js';
@@ -127,10 +128,15 @@ export class DiscordIngress {
         await store.db.query(`UPDATE events SET buffered=false,payload=payload || '{"ignored":"subscription_boundary"}'::jsonb WHERE id=$1`, [saved.id]);
         return false;
       }
+      // 이 수신 뒤 👀를 달 일반 메시지. 원문의 채널은 지금 scope다(채널 멘션은 뒤에 스레드로 옮겨져도 원문은 채널에 있다).
+      // history 복구로 받은 메시지에는 표시하지 않으므로 행도 만들지 않는다.
+      const received = () => event.kind === 'message' && !recovered
+        ? recordReceived(store.db, { id: saved.id, channel: event.scope.channel, message: event.id, owner: event.actor }) : undefined;
       if (subscription.gap && !recovered && !durableControl) {
         const count = (await store.db.query<{ count: string }>('SELECT count(*) FROM events WHERE conversation_id=$1 AND buffered=true', [conversationId])).rows[0]!;
         if (Number(count.count) >= DEFAULTS.maxQueue) throw new Error('recovery_buffer_full');
         await store.db.query('UPDATE events SET buffered=true WHERE id=$1', [saved.id]);
+        await received();
         return true;
       }
       // 스레드를 만들기 전에 본다. 프로젝트가 없거나 레인이 닫혔으면 빈 스레드를 남기지 않고, 구독도 켜지 않는다.
@@ -176,6 +182,7 @@ export class DiscordIngress {
         }
         if ((!recovered || inbox.buffered) && event.kind === 'message') await store.checkpoint(conversationId, event.id, inbox.buffered);
       }
+      await received();
       if (!recovered && store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
       await store.db.query('UPDATE events SET accepted=true WHERE id=$1', [saved.id]);
       await store.db.query('UPDATE events SET buffered=false WHERE id=$1', [saved.id]);
@@ -483,7 +490,16 @@ export function hasMarker(content: string, marker: string): boolean {
   return !!body && !Array.isArray(body) && body.ref === marker && 'data' in body;
 }
 export class DiscordPublisher {
-  constructor(private readonly store: Store, private readonly gate: PolicyGate, private readonly rest: DiscordRest) {}
+  private readonly reactions: ReactionSync;
+  constructor(private readonly store: Store, private readonly gate: PolicyGate, private readonly rest: DiscordRest, private readonly log: Log = jsonLog) {
+    this.reactions = new ReactionSync(store, rest, log);
+  }
+  // 반응 상태를 Discord에 맞춘다. 게시 루프 한 바퀴마다(게시 확정 직후 포함) 부른다.
+  // 반응 오류·DB 오류는 로그만 남긴다. 게시 결과와 루프의 바쁨 판단을 바꾸지 않는다.
+  private async syncReactions(): Promise<void> {
+    try { await this.reactions.sync(); }
+    catch (error) { this.log('reaction_sync_failed', errorInfo(error)); }
+  }
   private async authorized(row: Delivery): Promise<void> {
     // Alert coalescing may have replaced the scope since this delivery was claimed.
     const current = (await this.store.db.query<{ service_ids: string[] }>('SELECT service_ids FROM outbox WHERE id=$1', [row.id])).rows[0];
@@ -511,7 +527,11 @@ export class DiscordPublisher {
   }
   async deliver(): Promise<boolean> {
     const row = await this.store.claimDelivery();
-    if (!row) return false;
+    if (!row) { await this.syncReactions(); return false; }
+    try { return await this.deliverRow(row); }
+    finally { await this.syncReactions(); }
+  }
+  private async deliverRow(row: Delivery): Promise<boolean> {
     let dispatched = false;
     let remoteId: string | null = null;
     try {
@@ -630,6 +650,11 @@ export class DiscordPublisher {
         await store.ackNotice(row.payload.content);
       }
       await store.deliveryState(row, 'sent', externalId);
+      // 대화 답의 마지막 쪽이 sent로 확정되면 그 owner 메시지의 봇 반응을 모두 지운다. unknown인 동안은 여기 오지 않는다.
+      if (row.job_id && row.message_key === `result:${row.job_id}` && !(await store.db.query(
+        'SELECT 1 FROM outbox WHERE message_key=$1 AND page_index>$2', [row.message_key, row.page_index])).rows.length) {
+        await settleReactions(store.db, row.job_id, 'cleared');
+      }
     });
   }
 }
