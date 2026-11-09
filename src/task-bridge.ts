@@ -1,4 +1,5 @@
 import type { z } from 'zod';
+import { CHAT_TASK_TEXT as T } from './chat-task-text.js';
 import { Denied, PolicyUnavailable } from './contracts.js';
 import type { Job, Scope } from './contracts.js';
 import type { Database } from './database.js';
@@ -30,12 +31,13 @@ export interface TaskBridgeText {
   prefix: string;
   question: string;
   accepted: string;
-  blocked: (job: string) => string;
+  // colleague: 동료 기능 스위치(Store.colleague). 해제 안내의 '/' 판을 고른다.
+  blocked: (colleague: boolean, job: string) => string;
 }
 export interface TaskAnswerInput { question: string; actor: string; scope: Scope; text: string; event: string }
 export interface TaskAnswerResult { ok: boolean; status: string; duplicate?: boolean }
 export interface TaskStatus { state: string; waitReason: string | null; session: boolean; question: { id: string; expiresAt: number } | null }
-export const FOREIGN_SESSION_STATUS = '다른 실행기의 세션을 가진 작업입니다. 그 실행기의 경로로만 답하거나 해제할 수 있습니다.';
+export const FOREIGN_SESSION_STATUS = T.foreignSession;
 interface Question {
   id: string; job_id: string; conversation_id: string; thread_id: string; turn: number; responder_id: string;
   state: string; expires_at: number; answer: string | null; answer_event: string | null;
@@ -116,14 +118,14 @@ export abstract class TaskBridge {
       await store.enqueue({ key: `${this.text.prefix}-question:${id}`, job: job.id, conversation: job.conversation_id, actor: job.owner_id,
         scope: job.target, revision, payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary',
           content: [`${this.text.question} (질문 ID: ${id})`, bounded(question, 500),
-            `기한: ${new Date(expires).toISOString()}. 이 스레드에서 /answer question:${id} 로 답하세요. 답으로 도구 실행을 승인하거나 권한을 바꿀 수 없습니다.`].join('\n') } });
+            T.questionFooter(store.colleague, id, new Date(expires).toISOString())].join('\n') } });
       return true;
     });
   }
   protected async blocked(job: Job, revision: string, within: Store = this.store): Promise<void> {
     await within.enqueue({ key: `${this.text.prefix}-blocked:${job.id}`, job: job.id, conversation: job.conversation_id, actor: job.owner_id,
       scope: job.target, revision, payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary',
-        content: this.text.blocked(job.id) } });
+        content: this.text.blocked(within.colleague, job.id) } });
   }
   async answer(input: TaskAnswerInput): Promise<TaskAnswerResult> {
     // 질문 답도 실행 직전과 같이 최신 정책으로 다시 인가한다(AUTH-02).
@@ -136,22 +138,22 @@ export abstract class TaskBridge {
     // 다른 대화의 질문은 아래에서 Denied라 기한이 지나 닫으며 알림을 넣는 대화는 이 대화뿐이다.
     await store.db.query('SELECT id FROM conversations WHERE id=$1 FOR UPDATE', [store.scopeId(input.scope)]);
     await this.gate.withDatabase(store.db).authorize(input.actor, input.scope);
-    if (!input.text.trim() || input.text.length > this.questions.answerChars) return { ok: false, status: '답이 비었거나 너무 깁니다.' };
+    if (!input.text.trim() || input.text.length > this.questions.answerChars) return { ok: false, status: T.answerInvalid };
     await store.lockScheduler();
     const q = (await store.db.query<Question & { job_state: string; wait_reason: string | null; owner_id: string }>(`SELECT q.*,
       j.state AS job_state,j.wait_reason,j.owner_id FROM codex_questions q JOIN jobs j ON j.id=q.job_id WHERE q.id=$1 FOR UPDATE`, [input.question])).rows[0];
-    if (!q) return { ok: false, status: '질문을 찾을 수 없습니다.' };
+    if (!q) return { ok: false, status: T.questionMissing };
     if (q.conversation_id !== store.scopeId(input.scope) || q.responder_id !== input.actor || q.owner_id !== input.actor) throw new Denied();
-    if (q.answer_event === input.event) return { ok: true, duplicate: true, status: '이미 받은 답입니다.' };
+    if (q.answer_event === input.event) return { ok: true, duplicate: true, status: T.answerDuplicate };
     if (await this.foreignSession(q.job_id, store.db)) return { ok: false, status: FOREIGN_SESSION_STATUS };
-    if (q.state !== 'open') return { ok: false, status: '이미 답했거나 닫힌 질문입니다. 지금 열린 질문의 ID를 확인하세요.' };
+    if (q.state !== 'open') return { ok: false, status: T.questionClosed };
     if (store.now() >= Number(q.expires_at)) {
       await this.close(store, q, 'expired');
-      return { ok: false, status: '기한이 지난 질문입니다. 작업을 멈췄습니다.' };
+      return { ok: false, status: T.questionExpired };
     }
     if (q.job_state !== 'waiting_user' || q.wait_reason !== 'clarification') {
       await store.db.query("UPDATE codex_questions SET state='cancelled' WHERE id=$1", [q.id]);
-      return { ok: false, status: '작업이 이 질문의 답을 기다리는 상태가 아닙니다.' };
+      return { ok: false, status: T.questionNotWaiting };
     }
     await store.db.query(`UPDATE codex_questions SET state='answered',answer=$2,answered_by=$3,answer_event=$4,answered_at=$5
       WHERE id=$1`, [q.id, input.text, input.actor, input.event, store.now()]);
@@ -171,7 +173,7 @@ export abstract class TaskBridge {
     await store.releaseScheduler();
     await store.enqueue({ key: `${this.text.prefix}-expired:${q.id}`, job: job.id, conversation: job.conversation_id, actor: job.owner_id,
       scope: job.target, revision: job.revision.policy, payload: { kind: 'message', channel: job.target.channel,
-        classification: 'safe_summary', content: `질문 ${q.id}의 답 기한이 지나 작업을 멈췄습니다(cancelled). 답 없이 진행하지 않습니다. 필요하면 새 작업으로 다시 요청하세요.` } });
+        classification: 'safe_summary', content: T.questionExpiredNotice(store.colleague, q.id) } });
   }
   // lease 만료·기록 실패 등 settle 밖에서 생긴 unknown도 알림 없이 두지 않는다. 안내의 해제 방법이 실행기마다 달라 자기 세션의 작업만 알린다.
   protected async unknownNotices(): Promise<number> {

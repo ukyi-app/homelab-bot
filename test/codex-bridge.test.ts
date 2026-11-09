@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { chmod, link, mkdir, mkdtemp, open, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
+import { CHAT_TASK_TEXT as T } from '../src/chat-task-text.js';
 import { DEFAULTS, Denied, PolicyUnavailable } from '../src/contracts.js';
 import { CODEX_CAPABILITIES, CODEX_DEFAULTS, CODEX_LIMITS, CapabilityUnavailable, CodexBridge, ExecCodexAdapter, TASK_INSTRUCTIONS,
   describeCapabilities, nodeFiles } from '../src/codex.js';
@@ -293,7 +294,8 @@ test('TASK-01 Discord 작업 요청 → codex exec 완료 → 결과 기록 → 
   assert.deepEqual(launcher.terminated, [job.id]);
   await f.publisher.deliver();
   assert.equal(f.rest.messages.length, 1);
-  assert.match(f.rest.messages[0]!.body.content, /Codex 작업 완료[\s\S]*시간대 고정[\s\S]*실제 diff 기준\): 1개/);
+  assert.ok(f.rest.messages[0]!.body.content.startsWith(T.codexCompleted(false, job.id)));
+  assert.match(f.rest.messages[0]!.body.content, /시간대 고정[\s\S]*실제 diff 기준\): 1개/);
   assert.equal(result.evidence.diff, 'workspace_snapshot'); assert.deepEqual(result.evidence.reportedChanges, ['src/a.ts']);
   // codex exec의 Git 저장소 요구: 첫 실행 전에 작업 공간을 git init·기준 커밋한다(D-15).
   assert.ok(await nodeFiles.read(join(taskPaths(root, job.id).workspace, '.git', 'HEAD')));
@@ -330,10 +332,10 @@ test('TASK-02 질문을 대화로 중계 → owner 답 → 같은 스레드 resu
   assert.equal(q.id, question); assert.equal(q.kind, 'clarification'); assert.equal(q.responder_id, 'fixture-owner');
   assert.equal(q.turn, 1); assert.equal(Number(q.expires_at), f.now() + CODEX_DEFAULTS.questionTtlMs);
   await f.publisher.deliver();
-  assert.match(f.rest.messages[0]!.body.content, new RegExp(`질문 ID: ${question}[\\s\\S]*어느 브랜치[\\s\\S]*권한을 바꿀 수 없습니다`));
+  assert.match(f.rest.messages[0]!.body.content, new RegExp(`질문 ID: ${question}[\\s\\S]*어느 브랜치[\\s\\S]*도구 실행을 승인하거나 권한을 바꿀 수는 없어요`));
   // 질문을 기다리는 동안 새 모델 실행은 없다.
   assert.equal(await runtime.tick(), false);
-  assert.deepEqual(await owner(question, 'main 기준', 'answer-1'), { ok: true, status: '답을 받았습니다. 같은 Codex 세션을 이어서 실행합니다.' });
+  assert.deepEqual(await owner(question, 'main 기준', 'answer-1'), { ok: true, status: T.codexAnswerAccepted });
   assert.equal((await jobs())[0]!.state, 'queued');
   launcher.scripts.push(finished(out('completed', 'main 기준으로 고쳤습니다.'), [], null));
   await runtime.tick();
@@ -343,7 +345,8 @@ test('TASK-02 질문을 대화로 중계 → owner 답 → 같은 스레드 resu
   assert.equal((await rows('codex_sessions'))[0]!.turn, 2);
   assert.equal((await rows('codex_questions'))[0]!.state, 'resumed');
   await f.publisher.deliver();
-  assert.match(f.rest.messages[1]!.body.content, new RegExp(`Codex 작업 완료 \\(작업 ${job.id}\\)[\\s\\S]*main 기준`));
+  assert.ok(f.rest.messages[1]!.body.content.startsWith(T.codexCompleted(false, job.id)));
+  assert.match(f.rest.messages[1]!.body.content, /main 기준/);
 });
 test('TASK-02 옛 능력표 JSON(attach_task undecided)이 저장된 세션도 상태 조회·재개가 그대로 됨', async () => {
   const { job, question } = await asked();
@@ -369,7 +372,7 @@ test('TASK-02 중복·다른 사람·다른 스레드·없는 질문·지난 질
   assert.equal((await rows('codex_questions'))[0]!.state, 'open');
   assert.equal((await owner(question, 'main', 'answer-1')).ok, true);
   // 같은 Discord 이벤트가 다시 와도 한 번만 이어 간다. 다른 두 번째 답은 닫힌 질문이다.
-  assert.deepEqual(await owner(question, 'main', 'answer-1'), { ok: true, duplicate: true, status: '이미 받은 답입니다.' });
+  assert.deepEqual(await owner(question, 'main', 'answer-1'), { ok: true, duplicate: true, status: T.answerDuplicate });
   assert.equal((await owner(question, 'develop', 'answer-2')).ok, false);
   assert.equal((await rows('audit')).filter(a => a.kind === 'codex_answer_accepted').length, 1);
   // 다음 턴이 새 질문을 내면 이전 질문 ID의 늦은 답은 거부된다.
@@ -384,7 +387,7 @@ test('TASK-02 중복·다른 사람·다른 스레드·없는 질문·지난 질
 test('TASK-02 기한 지난 질문은 답을 거부하고 작업을 멈춤, 무응답 자동 진행 없음', async () => {
   const { question } = await asked();
   f.advance(CODEX_DEFAULTS.questionTtlMs); f.policy.confirmedAt = f.now();
-  assert.deepEqual(await owner(question, 'main', 'late'), { ok: false, status: '기한이 지난 질문입니다. 작업을 멈췄습니다.' });
+  assert.deepEqual(await owner(question, 'main', 'late'), { ok: false, status: T.questionExpired });
   const job = (await jobs())[0]!;
   assert.equal(job.state, 'cancelled'); assert.equal(job.wait_reason, 'question_expired');
   assert.equal((await rows('codex_questions'))[0]!.state, 'expired');
@@ -403,12 +406,12 @@ test('TASK-02 Runtime 정리가 기한 지난 질문을 닫아 대기 슬롯을 
   assert.equal(await bridge.expireQuestions(), 0);
   assert.equal((await owner(question, 'main', 'late')).ok, false);
   await f.publisher.deliver(); await f.publisher.deliver();
-  assert.ok(f.rest.messages.some(m => m.body.content.includes(`질문 ${question}의 답 기한이 지나`)));
+  assert.ok(f.rest.messages.some(m => m.body.content.startsWith(T.questionExpiredNotice(false, question))));
   const waiting = (await jobs())[1]!;
   const next = `${waiting.id}:second-thread:1`;
   await f.store.control('fixture-owner', f.store.scopeId(thread), 'cancel', waiting.id);
   assert.equal((await jobs())[1]!.state, 'cancelled');
-  assert.deepEqual(await owner(next, 'main', 'after-cancel'), { ok: false, status: '작업이 이 질문의 답을 기다리는 상태가 아닙니다.' });
+  assert.deepEqual(await owner(next, 'main', 'after-cancel'), { ok: false, status: T.questionNotWaiting });
   assert.equal(launcher.started, 2);
 });
 test('TASK-02 migration 009 반복 적용, 작업당 열린 질문 하나, 도구 승인 종류 질문 거부', async () => {
@@ -482,7 +485,7 @@ test('TASK-03 취소·정상 종료 뒤 남은 프로세스는 unknown, 새 실�
   await running;
   assert.equal((await jobs())[0]!.state, 'unknown');
   await f.publisher.deliver();
-  assert.match(f.rest.messages[0]!.body.content, /종료를 확인하지 못했습니다\(unknown\)[\s\S]*새 모델 실행을 막았습니다/);
+  assert.ok(f.rest.messages[0]!.body.content.startsWith(T.codexBlocked(false, job.id)));
   await task('task-2');
   assert.equal(await runtime.tick(), false); assert.equal(launcher.started, 1);
   assert.equal((await bridge.release('fixture-owner', thread, job.id)).ok, false);
@@ -557,7 +560,7 @@ test('TASK-03 작업자 단절은 종료 확인에 따라 failed·unknown, 재�
   await runtime.tick();
   assert.equal((await jobs())[0]!.state, 'failed'); assert.equal(launcher.started, 2);
   assert.deepEqual(launcher.specs[1]!.args.slice(0, 2), ['exec', 'resume']);
-  assert.match((await f.store.control('fixture-owner', f.store.scopeId(thread), 'retry', job.id) as { status: string }).status, /재시도/);
+  assert.match((await f.store.control('fixture-owner', f.store.scopeId(thread), 'retry', job.id) as { status: string }).status, new RegExp(T.retryAccepted));
   launcher.scripts.push(finished(out('completed', '새로 시작해 끝냄'), [], 'fresh-thread'));
   await runtime.tick();
   assert.equal(launcher.specs[2]!.args.includes('resume'), false);
@@ -584,7 +587,7 @@ test('TASK-03 시간 초과는 정리 확인 뒤 failed 안내, 실패 결과는
   await ticking;
   t.mock.timers.reset();
   assert.equal((await jobs())[0]!.state, 'failed'); assert.equal((await jobs())[0]!.wait_reason, 'codex_timeout');
-  assert.match((await outbox())[0]!.payload.content, /작업 실패가 확인됐습니다/);
+  assert.equal((await outbox())[0]!.payload.content, T.jobFailed(false));
   launcher.scripts.push(finished(out('completed', '끝'), [], THREAD), { lines: ['broken'], exit: exit0, output: out('completed', '끝') });
   await task('task-2'); await runtime.tick();
   assert.equal((await jobs())[1]!.state, 'succeeded');
@@ -758,7 +761,7 @@ test('OPS-02 settle 밖에서 생긴 unknown(lease 만료)도 sweep이 막힘 �
   await runtime.tick();
   assert.equal((await outbox()).filter(row => row.idempotency_key === `codex-blocked:${claimed.id}`).length, 1);
   await f.publisher.deliver();
-  assert.match(f.rest.messages[0]!.body.content, new RegExp(`작업 ${claimed.id}의 Codex 프로세스 종료를 확인하지 못했습니다`));
+  assert.ok(f.rest.messages[0]!.body.content.startsWith(T.codexBlocked(false, claimed.id)));
 });
 test('AUTH-02 owner가 바뀌어 남은 unknown은 옛 owner가 못 풀고 현재 owner만 0개 확인 뒤 해제', async () => {
   launcher.left = 1;
@@ -801,7 +804,7 @@ test('TASK-03 한도 도달은 failed가 아니라 대기·스케줄러 정지·
   const waiting = (await jobs())[0]!;
   assert.equal(waiting.state, 'waiting_user'); assert.equal(waiting.wait_reason, 'model_limit');
   assert.equal((await rows('codex_questions'))[0]!.state, 'answered');
-  assert.ok((await outbox()).some(row => row.payload.content.includes('다른 계정·인증으로 바꾸지 않습니다')));
+  assert.ok((await outbox()).some(row => row.payload.content === `${T.codexLimitPaused(false, job.id)} ${T.modelPauseResume(false, job.id)}`));
   await task('task-2');
   assert.equal(await runtime.tick(), false); assert.equal(launcher.started, 2);
   const resumed = await f.store.control('fixture-owner', f.store.scopeId(thread), 'resume-model', job.id) as { ok: boolean };
@@ -909,7 +912,7 @@ test('TASK-03 질문 재개로 시도 한도에 닿은 뒤 한도 대기가 오�
     exit: { code: 1, signal: null } });
   await runtime.tick();
   assert.equal((await jobs())[0]!.attempt, 3); assert.equal((await jobs())[0]!.wait_reason, 'model_limit');
-  assert.ok((await outbox()).some(row => row.payload.content.includes('재시도 한도에 닿아 재개할 수 없습니다')));
+  assert.ok((await outbox()).some(row => row.payload.content === `${T.codexLimitPaused(false, job.id)} ${T.modelPauseFinal(false)}`));
   assert.equal((await f.store.control('fixture-owner', f.store.scopeId(thread), 'resume-model', job.id) as { ok: boolean }).ok, false);
 });
 
@@ -1084,7 +1087,7 @@ test('N3 한도 대기 뒤 재개 예산이 없어 실패하면 세션도 실패
   await runtime.tick();
   assert.equal((await jobs())[0]!.wait_reason, 'codex_tool_budget_exceeded');
   assert.equal((await rows('codex_sessions'))[0]!.state, 'failed');
-  assert.match((await f.store.control('fixture-owner', f.store.scopeId(thread), 'retry', job.id) as { status: string }).status, /재시도/);
+  assert.match((await f.store.control('fixture-owner', f.store.scopeId(thread), 'retry', job.id) as { status: string }).status, new RegExp(T.retryAccepted));
   launcher.scripts.push(finished(out('completed', '새로 끝냄'), [], 'thread-two'));
   await runtime.tick();
   assert.equal(launcher.specs[1]!.args.includes('resume'), false); assert.ok(launcher.specs[1]!.stdin.startsWith(TASK_INSTRUCTIONS));
@@ -1455,7 +1458,7 @@ test('PR9 4407855013 질문 만료 정리는 T16a 제어 경로와 같은 순서
   const second = await asked();
   f.advance(CODEX_DEFAULTS.questionTtlMs); f.policy.confirmedAt = f.now();
   assert.deepEqual(await watched.answer({ question: second.question, actor: 'fixture-owner', scope: thread, text: 'main', event: 'late' }),
-    { ok: false, status: '기한이 지난 질문입니다. 작업을 멈췄습니다.' });
+    { ok: false, status: T.questionExpired });
   assert.ok((await outbox()).some(row => row.idempotency_key === `codex-expired:${second.question}`));
   assert.deepEqual(log.inverted(), []);
 });
