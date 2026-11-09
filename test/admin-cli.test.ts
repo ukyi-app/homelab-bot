@@ -112,6 +112,27 @@ test('관리 진입점 실행: 사용법 오류는 DB를 열지 않고 64, 결�
   assert.equal(lines.some(line => line.includes('fixture-secret')), false);
 });
 
+test('관리 진입점 실행: 실패해도 stdout에는 결과 JSON 한 줄만 나가고 오류 로그는 stderr로 간다', async () => {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const out = process.stdout.write.bind(process.stdout);
+  const err = process.stderr.write.bind(process.stderr);
+  process.stdout.write = ((chunk: string | Uint8Array) => { stdout.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  process.stderr.write = ((chunk: string | Uint8Array) => { stderr.push(String(chunk)); return true; }) as typeof process.stderr.write;
+  let code: number;
+  try {
+    code = await executeAdmin(['status'], async () => { throw new Error('connect postgres://fixture-secret@db'); }, line => process.stdout.write(`${line}\n`));
+  } finally {
+    process.stdout.write = out;
+    process.stderr.write = err;
+  }
+  assert.equal(code, 1);
+  assert.equal(stdout.length, 1);
+  assert.equal(JSON.parse(stdout[0]!).result, 'failed');
+  assert.equal(stderr.some(line => JSON.parse(line).event === 'admin_failed'), true);
+  assert.equal([...stdout, ...stderr].some(line => line.includes('fixture-secret')), false);
+});
+
 test("'/' 관리 명령은 그대로 동작하고 관리 기능과 같은 상태를 본다", async () => {
   await f.ingress.receive(event('seed'));
   await f.ingress.receive(event('slash-stop', { kind: 'command', command: 'emergency-stop' }));
