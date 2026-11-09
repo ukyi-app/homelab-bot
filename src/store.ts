@@ -376,6 +376,8 @@ export class Store {
       await store.enqueue({ key: `failure:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id,
         actor: job.owner_id, scope: job.target, revision: job.revision.policy,
         payload: { kind: 'message', channel: job.target.channel, content, classification: 'safe_summary' } });
+      // 실패 확정: 위 안내가 실패 한 줄이고, 반응은 같은 트랜잭션에서 지우기로 바꾼다.
+      await settleReactions(store.db, job.id, 'failed');
       return next;
     });
   }
@@ -509,6 +511,7 @@ export class Store {
         actor: row.owner_id, scope: row.target, revision: row.revision.policy,
         payload: { kind: 'message', channel: row.target.channel, classification: 'safe_summary',
           content: `이전 작업이 멈춘 것을 확인했습니다. /retry target:${row.id}으로 다시 실행할 수 있습니다.` } }, tx);
+      await settleReactions(tx, row.id, 'failed');
       return true;
     });
   }

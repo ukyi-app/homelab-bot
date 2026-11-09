@@ -77,6 +77,33 @@ test('흐름: 받음 👀 → 답 게시 → 봇 반응 모두 지움(✅ 없음
   assert.equal(log.length, 3);
 });
 
+test('흐름: 실패가 확정되면 반응을 지우고 실패 한 줄을 단다', async () => {
+  f.setRun(async () => ({ status: 'failed', stopped: true }));
+  await f.ingress.receive(event('8201'));
+  f.advance(DEFAULTS.debounceMs);
+  assert.equal(await f.runtime.tick(), true);
+  await drain();
+  assert.deepEqual(log, ['ack 8201', 'post fixture-thread', 'remove fixture-thread/8201 👀']);
+  assert.equal(f.rest.messages.length, 1);
+  assert.equal((await database.db.query<{ state: string }>('SELECT state FROM jobs')).rows[0]!.state, 'failed');
+});
+
+test('흐름: unknown이 멈춤 확인으로 실패 확정되면 반응을 지우고 안내 한 줄을 단다', async () => {
+  f.setRun(async () => ({ status: 'unknown', stopped: false }));
+  await f.ingress.receive(event('8202'));
+  f.advance(DEFAULTS.debounceMs);
+  f.worker.cancel = async () => ({ stopped: false });
+  assert.equal(await f.runtime.tick(), true);
+  await drain();
+  assert.equal((await database.db.query<{ state: string }>('SELECT state FROM jobs')).rows[0]!.state, 'unknown');
+  assert.deepEqual(log.filter(line => line.startsWith('remove')), [], 'unknown 동안은 지우지 않는다');
+  f.worker.cancel = async () => ({ stopped: true });
+  assert.equal(await f.runtime.probeUnknown(), 1);
+  log.length = 0;
+  await drain();
+  assert.deepEqual(log, ['post fixture-thread', 'remove fixture-thread/8202 👀']);
+});
+
 // 첫 대화 작업이 모델 자리를 쥔 채로 멈춰 있게 한다. release()로 답을 낸다.
 function holdModel() {
   let release!: () => void;
