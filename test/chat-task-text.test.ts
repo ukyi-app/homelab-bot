@@ -21,6 +21,8 @@ const controls = (colleague: boolean) => [
 test("스위치 켜짐: 대화·작업·제어 고정 문구 어디에도 '/' 명령 이름이 없다", () => {
   assert.ok(registered.includes('task-release') && registered.includes('resume-model'));
   for (const [name, text] of all(true)) {
+    // 질문 답 안내는 답을 봉인하는 자연어 경로(C16 작업 질문, C28 변경 질문)가 생길 때 그 티켓이 함께 바꾼다.
+    if (name === 'questionFooter') continue;
     assert.doesNotMatch(text, slashName, name);
     for (const command of registered) assert.ok(!text.includes(`/${command}`), `${name}: /${command}`);
   }
@@ -61,6 +63,11 @@ test('고정 문구는 해요체이고 자기를 봇이라 부르지 않는다',
     assert.doesNotMatch(text, /봇/, text);
     assert.doesNotMatch(text, /습니다|십시오|입니다/, text);
   }
+});
+
+test('질문 답 안내는 켜짐 판에서도 /answer 경로다(그냥 말한 답은 봉인·label 검사를 거치지 않는다)', () => {
+  for (const colleague of [false, true])
+    assert.match(CHAT_TASK_TEXT.questionFooter(colleague, 'q-1', '2026-11-10T00:00:00.000Z'), /\/answer question:q-1 로 답해 주세요/);
 });
 
 test('질문 안내는 두 판 모두 질문 ID와 승인·권한 변경이 아니라는 문장을 남긴다', () => {
