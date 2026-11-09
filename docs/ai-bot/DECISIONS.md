@@ -488,7 +488,43 @@ T21 감사 A03: 7일 정리가 CHANGE artifact·리뷰 원문에만 걸려 작�
 | 부르는 자리 | 요청 원문은 기존 `change_retention`(1시간), 질문 답은 새 `task_answer_retention`(1시간). 둘 다 게시 서버가 뜨면 레인 스위치와 무관하게 돈다 | DB만 쓰는 정리를 레인 루프에 묶으면 레인을 끈 채 재시작했을 때 지울 때가 된 원문이 다시 켤 때까지 남는다(#94 Codex P2) |
 | 복원 | 시각 기준이라 복원된 옛 행도 다음 정리가 다시 지운다. 원문이 다시 보이는 창은 복원부터 다음 정리까지, 최대 1시간(재시작이면 게시 서버가 뜬 직후 첫 바퀴까지). 정리는 한 바퀴에 change 20건×20번, 답 200행×20번까지 지운다 | 백업 자체에 든 원문은 백업 보존 기간(14일) 동안 남는다. 이 결정의 범위 밖이다 |
 
-**정리 경로가 없는 다른 원문 칸(사용자 결정 대기).** `events.payload.text`(`/task` 요청문, CHANGE가 아닌 `/answer` 답 사본), `codex_questions.prompt`(모델 질문), `results.result`(작업 완료 요약 등 모델 출력), `outbox.payload.content`(Discord로 보낸 질문·요약 본문), `change_requests.brief`(요청 원문에서 뽑은 summary·goal·acceptance). 감사 기록(`audit.detail`)에는 원문을 넣지 않는다.
+**정리 경로가 없던 다른 원문 칸.** `events.payload.text`(`/task` 요청문, CHANGE가 아닌 `/answer` 답 사본), `codex_questions.prompt`(모델 질문), `results.result`(작업 완료 요약 등 모델 출력), `outbox.payload.content`(Discord로 보낸 질문·요약 본문), `change_requests.brief`(요청 원문에서 뽑은 summary·goal·acceptance). 아래 T31에서 정했다. 감사 기록(`audit.detail`)에는 원문을 넣지 않는다.
+
+## T31 원문 칸 보존 (사용자 2026-11-09)
+
+T27이 넘긴 다섯 칸에 정리 경로가 없어 같은 원문이나 그 사본이 남았다(homelab T31, AC-B8).
+
+**사용자 결정.** 다섯 칸을 **7일** 보존한다. 방식은 T27과 같다. 끝난 시각 기준으로 정리하고, digest·영수증은 남기고, 레인 스위치와 무관하게 게시 서버 시작 때부터 돌고, 한 바퀴에 여러 쪽을 지운다.
+
+| 칸 | 지울 때(사용자 결정) | 고르지 않는 행(사용자 결정) |
+|---|---|---|
+| `events.payload.text` | 받은 지 7일 뒤, 원문만 비운다. 행·`semantic_key`·다른 칸은 유지 | 아직 끝나지 않은 작업이 가리키는 행. 작업 시작·재개가 원문을 다시 읽는 경로를 모두 찾아 그 조건으로 지킨다 |
+| `codex_questions.prompt` | 작업이 끝난 지 7일 뒤 | 진행 중 작업(T27 질문 답과 같은 조건) |
+| `results.result` | 작업이 끝난 지 7일 뒤 | 진행 중 작업 |
+| `outbox.payload.content` | 보낸 지 7일 뒤 | 끝나지 않은 상태(`pending`·`sending`·`unknown`) |
+| `change_requests.brief` | 변경이 끝난 지 7일 뒤(T27 요청 원문과 같은 기준 시각) | 진행 중 변경 |
+
+**구현에서 정한 것(사용자 결정 아님).**
+
+| 항목 | 정한 값 | 이유 |
+|---|---|---|
+| 지운 표시 | 행은 남기고 원문만 비운다. `events`는 `payload.text=''`, 질문은 `prompt=''`, 결과는 `result='{}'`, 게시는 `payload.content=''`. 각 표에 `*_sha256`·`*_purged_at`을 더한다(migration 020, 칸 추가만). brief는 `brief_purged_at` | 세 칸이 NOT NULL이다. digest는 행을 쓰는 옛 코드가 칸을 몰라도 남도록 지울 때 DB가 계산한다(UTF-8 SHA-256, 결과는 jsonb의 text 표현) |
+| `events`가 원문을 다시 읽는 자리 | 끝나지 않은 job의 시작·재개(`codex.ts`·`claude-task-bridge.ts`·`read-runtime.ts`)와 대화 맥락, 누락 복구 버퍼(`buffered=true`), 확정 전 스레드 게시(`outbox` `kind=thread`, `pending`·`sending`·`unknown`, content가 그 event ID) | 셋 다 고르지 않는다. 스레드 게시는 확정 때 그 원문으로 job을 만들거나 경보 요약을 게시한다. job이 아직 없어 "끝나지 않은 작업" 조건으로는 잡히지 않는다 |
+| `/retry` | 요청 원문을 비운 `failed` job은 되살리지 않고 "보존 기간(7일)이 지나 요청 원문을 지워 재시도할 수 없습니다"를 돌려준다 | `/retry`는 끝난 job을 새 스레드로 다시 시작해 원문을 읽는다. 실패 job의 원문을 남기면 기간 없이 남고, 열어 두면 빈 요청으로 모델을 부른다. T27 `input_purged`와 같은 처리다 |
+| 정리와 `/retry`의 경합 | `events` 정리는 scheduler 행을 잠근 트랜잭션에서 비운다. `/retry`도 같은 행 아래에서 판정한다. 잠긴 event 행은 `SKIP LOCKED`로 건너뛴다 | 서로 다른 행을 쓰는 두 판정이 엇갈려 되살린 job의 원문을 비우는 일을 막는다. 수신 경로는 event 행 → scheduler 행 순서로 잡아, 기다리면 교착이 된다 |
+| 받지 못한 채 비운 입력 | 다시 와도(누락 복구 등) `ignored:"text_purged"`로 두고 처리하지 않는다 | 저장된 빈 원문으로 job을 만들지 않는다 |
+| 대화 맥락 | 비운 owner 메시지는 빼고, 본문을 비운 봇 페이지는 빠진 페이지로 본다 | 빈 말을 기록으로 넣지 않는다 |
+| 기준 시각 | 요청: `received_at`. 질문·결과: `COALESCE(finished_at, created_at)`. 게시: `available_at` | 게시를 `sent`로 바꾸는 유일한 자리(`deliveryState`)가 `available_at`을 그 시각으로 적는다. 따로 보낸 시각 칸은 없다 |
+| `blocked` 게시 | `sent`와 함께 지운다. 기준 시각은 막기 전 마지막 예정 시각(`available_at`) | 끝 상태이고 다시 열리는 길이 없다. 결정 표의 "보낸 지"를 끝 상태 전체로 넓혔다 |
+| `kind=thread` 게시 | 고르지 않는다 | content가 원문이 아니라 event ID이고 경보 묶음이 그 값으로 이어 붙인다 |
+| 질문·결과 예외 | T27 질문 답과 같다: job이 끝 상태가 아님, 세션이 `running`·`waiting_answer`·`waiting_model`·`unknown`이거나 `cleanup_state='pending'` | 마무리(finalize)는 `results.evidence`의 `resultDigest`만 읽어 evidence는 남긴다 |
+| brief | summary·goal·acceptanceCriteria만 비우고 경로·명령·label·`brief_digest`는 남긴다. artifact·요청 원문과 같은 질의·같은 트랜잭션 | admission CHECK·`brief_digest` 불변 트리거·짝 CHECK 때문에 NULL로 둘 수 없다. brief를 읽는 경로는 모두 진행 단계다 |
+| superseded 건의 새 generation | 막는다. T27 `input_purged`가 그대로 적용된다 | 새 generation은 brief를 요청 원문에서 다시 만든다. 요청 원문을 같은 트랜잭션에서 지우므로 따로 막을 것이 없다 |
+| 부르는 자리 | 네 칸은 새 `raw_text_retention`(1시간), brief는 기존 `change_retention`. `change_retention`은 한 바퀴에 20건×20번(`purgeExpiredChangeContentRounds`)이다 | T27의 `change_retention`은 한 쪽(20건)만 불러 결정 기록의 "20번"과 달랐다. 이번에 맞췄다 |
+| 한 바퀴 | 네 칸 각각 200행×20번 | T27 질문 답과 같다 |
+| 복원 | 시각 기준이라 복원된 옛 행도 다음 정리가 다시 비운다. 원문이 다시 보이는 창은 최대 1시간(재시작이면 게시 서버가 뜬 직후 첫 바퀴까지) | 백업 자체에 든 원문은 백업 보존 기간(14일) 동안 남는다 |
+
+**받아들인 영향.** 받은 지 7일이 지난 요청은 작업이 그 뒤에 실패해도 바로 비워져 `/retry`할 수 없다(같은 내용을 새로 요청). 끝나지 않는 작업·변경, 확정되지 않는 게시의 원문은 7일을 넘겨 남는다. 기억 삭제(T20)는 여전히 `events` 행을 지우지 않지만 원문은 7일 뒤 비워진다.
 
 ---
 
@@ -679,7 +715,7 @@ ARCHITECTURE §7은 삭제 표식을 봇 DB 복원으로 되돌아가지 않는 
 - **기억 명령 처리(T20 2단계 B4):** 원장이 켜졌을 때(`MEMORY_LEDGER_DIR`)만 등록 목록과 수신 목록에 넣는다. 원장을 끄고 재기동하면 등록 PUT이 목록에서 뺀다. 수신은 기존 검사(owner, 허용 채널·서버, 스레드 소유자)를 그대로 거치고, 제어 명령처럼 알림 채널에서도 받는다(기억 접근 채널이 대화·알림 둘이다). 구독·gap·작업 큐를 거치지 않고 받은 자리에서 처리하며, 모델을 부르지 않는다. 같은 상호작용은 `events`의 `accepted`를 `FOR UPDATE`로 먼저 잡은 쪽만 처리한다(잡은 뒤 죽으면 다시 하지 않음, 응답 토큰이 3초라 되살릴 수 없다). **진술·검색어는 `events`에 넣지 않는다.** `events`는 대화 맥락으로 모델에 들어가고(`chat-context.ts`) 기억 삭제가 지우지 못하기 때문이다. `target`(종류·ID·출처 키)과 명령 이름만 남는다. 응답은 기존 상호작용 응답(type 4, ephemeral flags 64, 멘션 없음)으로만 보내고 outbox로 채널에 게시하지 않는다. 응답을 못 보내면 기존 `ack_uncertain` 감사와 함께 내용 없는 고정 안내만 채널에 남긴다. 원장이 `closed`·`failed`·`fenced`이거나 기억이 아직 열리지 않았거나(`MemoryNotReady`) 종료 중이면 "지금 기억을 쓸 수 없음"으로 답한다(`degraded`는 받는다, 그때 삭제는 pending). 로그는 명령 이름과 결과 코드(`ok`·거부 사유)만 남긴다. 삭제 응답은 `deleted`/`pending`을 나누고 서비스 문구(백업 최대 14일)에 "이미 Discord에 게시된 사본(브리핑·이 명령들의 응답)은 지우지 않는다"를 붙인다.
 - **문서 출처 확인기(T20 2단계 B4):** 공개 저장소 `ukyi-app/homelab`·`ukyi-app/homelab-bot`의 GitHub blob 링크만 본다. 커밋 고정 링크(40자 SHA)는 `https://raw.githubusercontent.com/<저장소>/<SHA>/<경로>`를 `GET`(리다이렉트 거부, 1초 제한, 본문은 읽지 않음)해 200이면 `verified`, 404면 `inaccessible`(저장 거부), 그 밖의 응답·시간 초과는 `unverified`(근거로 세지 않음)다. 브랜치 링크는 내용이 바뀌므로 요청 없이 `unverified`, 허용 저장소 밖·모양이 다른 링크·`..`·퍼센트 인코딩·질의 문자열이 든 경로는 요청 없이 `inaccessible`이다. 이유: 게시 서버는 공유 차트 NetworkPolicy로 이미 인터넷 TCP 443(IPv4, 사설·tailnet 대역 제외)에 나가므로 새 egress·토큰·플랫폼 권한이 필요 없다. 저장소가 공개라 actor별 권한 차이가 없고(기억 명령은 owner만 씀), SHA 고정이라 같은 링크의 내용이 바뀌지 않는다. `verified`는 그 커밋에 그 파일이 있다는 뜻이지 진술이 맞다는 뜻이 아니다(EVIDENCE 규칙 그대로). 비공개 저장소·다른 문서 저장소·한글 경로는 받지 않는다(필요하면 범위를 다시 정한다).
 - **파일 원장(T20 계약 v1로 바꿈, 2026-11-02):** 프로세스 사이는 advisory lock, 프로세스 안은 원장 작업(append·읽기·내구성 확인)을 줄 세운다. 끊긴 append 조각은 다음 append 전에 잘라낸다. 재시작 때는 원장 전체를 엄격히 다시 읽는다(줄바꿈으로 끝난 손상 줄은 오류). 원장 파일과 디렉터리를 열어 둔 채 dev·ino·생성 시각을 기억하고, append·읽기·내구성 확인 전마다 경로와 대조한다. 교체·삭제·재생성이면 쓰지 않고 그 인스턴스를 `failed`로 고정한다(예전에는 디렉터리 fsync 확인 표시가 교체 뒤에도 이어졌다). **파일 fsync 실패는 이제 프로세스 수명 동안 원장을 실패로 고정한다.** 예전에는 그 인스턴스만 기존 내용을 다시 믿지 않고 새 append 성공은 새 기록으로 인정했으며, 새 인스턴스는 표시를 물려받지 않았다. 지금은 같은 파일(dev·ino·생성 시각)에 대해 새 append도, 같은 프로세스의 새 인스턴스도 거부한다. 재기동하면 다시 믿으므로 운영자가 매체를 확인해야 한다(경보는 T20 H3). 디렉터리 fsync 실패는 예전처럼 재시도할 수 있는 `degraded`로 두고 확인될 때까지 `durable()`이 false다. 쓰기·읽기·잘라내기의 ENOSPC·EIO·EROFS·EACCES 등도 `degraded`다. 상태는 `status()`(state: closed·ready·degraded·failed·fenced, 실패 단계 open·read·truncate·append·fsync·dirsync·close·lock·verify·generation, errno 코드, 시각)로 본다. 오류·상태에는 기억 내용과 경로를 넣지 않는다. `has`는 파일과 디렉터리 항목을 모두 fsync로 확인한 뒤에만 true다. 삭제 뒤 append 결과를 모르면 한 번 더 쓰고(중복 항목은 무해), 그래도 실패할 때만 원장을 다시 읽는다.
-- **DB의 삭제 표현:** 행은 남기되 진술·출처·범위·세부를 비운 `deleted` 행으로 바꾸고 검색 색인(`memory_terms`)을 지운다. 감사 기록에는 기억 내용을 넣지 않는다. 원본 Discord 메시지(`events`)는 기억 삭제로 지우지 않는다(출처 보존 기간 `retention.event_days`는 미정).
+- **DB의 삭제 표현:** 행은 남기되 진술·출처·범위·세부를 비운 `deleted` 행으로 바꾸고 검색 색인(`memory_terms`)을 지운다. 감사 기록에는 기억 내용을 넣지 않는다. 원본 Discord 메시지(`events`)는 기억 삭제로 지우지 않는다(행의 보존 기간 `retention.event_days`는 미정. 원문 `payload.text`는 T31로 받은 지 7일 뒤 비운다).
 - **파생 요약(브리핑):** 브리핑 사본마다 담은 기억을 `briefing_copies`에 남겨, 다시 작성한 회차의 이전 사본도 찾는다. 발송 차단과 본문 가리기를 나눈다. 삭제 요청(원장 기록 전 포함)과 내구성 확인 전 원장 재적용은 발송만 막고, 원장 확인 뒤 정리 때 본문을 가린다. 지운 기억이 들어간 미전송 브리핑은 `blocked`로 막고 로컬 사본을 가린다. 게시자가 잡았지만 발송을 시작하지 않은 행도 막는다(게시자의 발송 표시가 `sending` 상태를 요구한다). 이미 보냈거나 발송을 시작했거나 결과를 모르는 브리핑은 Discord에서 지우지 않고(거짓 약속 금지), 로컬 사본을 가린 뒤 그 건수를 삭제 응답에 적는다. 가린 행은 분류를 `safe_summary` 밖으로 바꿔, 429 등으로 대기열에 돌아오거나 결과 대조를 다시 해도 기존 게시자가 거부한다(결과를 모르던 행은 대조 대신 `blocked`가 된다). 브리핑 작성 중에 지우거나 대체한 기억은 큐에 넣는 transaction에서 `FOR SHARE`로 다시 확인해 빼고 다시 작성한다. 큐에 넣은 뒤의 정정·저장 제외·삭제도 같은 transaction에서 반영한다. 한 쪽도 발송을 시작하지 않은 회차는 막고 새 revision 멱등 키(`…:r<n>`)로 다시 작성하며, 막은 이전 사본은 가린다.
 - **근거와 상태:** 출처가 없으면 거부, 원본에 접근할 수 없으면 거부, 저장 제외한 출처·채널이면 거부. 종류별로 근거로 인정하는 확인된 출처가 있을 때만 `active`다(설정: 문서·성공 작업, 결정: owner 대화·문서, 장애: 성공 작업·문서, 선호: 대상 사용자 대화). PR 댓글·로그 같은 비신뢰 자료(`external`)는 근거로 세지 않는다. 같은 주제에 다른 진술이 살아 있으면 새 기억은 `candidate`, 둘 다 충돌 표시다. 같은 주제의 동시 저장·정정은 주제별 advisory lock으로 직렬화하고, 정정은 주제 잠금을 행 잠금보다 먼저 잡는다. 저장 제외로 숨긴 기억과 만료된 기억은 충돌 판정·표시에서 뺀다. 정정은 사유가 필요하고 대체된 기억은 `superseded`, 색인에서 빠진다. 기억에는 정책·권한·게시 대상 필드가 없고 어떤 권한 판단에도 쓰이지 않는다.
 - **저장 제외:** 제외한 출처·채널은 새 저장을 거부하고, 이미 저장한 기억도 다음 접근부터 검색·브리핑에서 뺀다. 대화 출처와 작업 출처 모두 그 대상 채널과 부모 채널을 제외 키로 갖는다. 010은 아직 배포 전이라 기존 행의 키를 보완하는 이전은 두지 않는다(`briefing_copies` 추가와 `briefing_runs.memory_ids` 제거도 같은 전제다. 옛 010으로 만든 DB를 살려야 하면 backfill이나 재생성이 필요하다). 저장 제외와 브리핑 큐 등록은 owner별 advisory lock으로 줄 세우고, 잠금을 얻은 뒤의 새 문장에서 제외 상태를 확인한다. 정정·삭제 요청은 기억 행 잠금이 브리핑의 `FOR SHARE`와 부딪혀 따로 잡지 않는다. 저장소·백업에서 지우는 것은 삭제다.

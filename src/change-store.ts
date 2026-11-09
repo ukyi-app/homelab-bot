@@ -748,9 +748,13 @@ export class ChangeReviewFindings {
   }
 }
 
-// 끝난 지 이만큼 지난 건의 artifact 바이트, 리뷰 원문, 요청 원문(추가 답변 포함)을 지운다.
+// 끝난 지 이만큼 지난 건의 artifact 바이트, 리뷰 원문, 요청 원문(추가 답변 포함), brief의 요청 글(summary·goal·acceptanceCriteria)을 지운다.
 export const CHANGE_RETENTION_MS = 7 * 86_400_000;
 export const CHANGE_PURGE_BATCH = 20;
+// brief는 끝 상태에서도 NULL로 둘 수 없다(observing_deploy의 admission CHECK, brief_digest 불변 트리거, 둘의 짝 CHECK).
+// 요청 글 세 칸만 비우고 경로·명령·label과 원래 brief의 digest(brief_digest)는 남긴다. brief를 읽는 경로(작성·검증·리뷰·게시)는 모두 진행 단계라
+// 비운 건에 닿지 않는다. 새 generation은 brief를 요청 원문에서 다시 만드는데, 그 원문도 같은 트랜잭션에서 지워 startNextGeneration이 input_purged로 막는다.
+const BRIEF_HELD = '(r.brief IS NOT NULL AND r.brief_purged_at IS NULL)';
 // receipt·digest·effect 기록과 요청 원문의 text_sha256은 남긴다. 진행 중이거나 미확정 effect·정리 안 끝난 세션이 있는 건은 고르지 않는다. 시각 기준은 끝 상태에 든 때다.
 // 백업에서 옛 행이 돌아와도 시각이 그대로라 다음 정리가 다시 고른다.
 export async function purgeExpiredChangeContent(database: Database, now: number, retentionMs = CHANGE_RETENTION_MS): Promise<number> {
@@ -764,7 +768,7 @@ export async function purgeExpiredChangeContent(database: Database, now: number,
     AND NOT EXISTS (SELECT 1 FROM change_child_jobs c JOIN jobs j ON j.id=c.job_id WHERE c.change_id=r.id AND j.state IN ('queued','running','verifying','cancel_requested','waiting_user','unknown'))
     AND NOT EXISTS (SELECT 1 FROM change_child_jobs c JOIN codex_sessions s ON s.job_id=c.job_id WHERE c.change_id=r.id AND (s.state IN ('running','waiting_answer','waiting_model','unknown') OR s.cleanup_state='pending'))
     AND (EXISTS (SELECT 1 FROM change_artifacts a WHERE a.change_id=r.id AND a.purged_at IS NULL) OR EXISTS (SELECT 1 FROM change_review_findings f WHERE f.change_id=r.id)
-      OR ${ChangePrivateInputs.HELD})
+      OR ${ChangePrivateInputs.HELD} OR ${BRIEF_HELD})
     ORDER BY r.updated_at LIMIT ${CHANGE_PURGE_BATCH}`, [cutoff])).rows;
   for (const row of due) {
     await database.transaction(async tx => {
@@ -775,10 +779,24 @@ export async function purgeExpiredChangeContent(database: Database, now: number,
       await tx.query(`UPDATE change_artifacts SET patch='',purged_at=$2 WHERE change_id=$1 AND purged_at IS NULL`, [row.id, now]);
       await tx.query('DELETE FROM change_review_findings WHERE change_id=$1', [row.id]);
       await ChangePrivateInputs.purgeIn(tx, row.id, now);
+      await tx.query(`UPDATE change_requests SET brief=brief || '{"summary":"","goal":"","acceptanceCriteria":[]}'::jsonb,brief_purged_at=$2
+        WHERE id=$1 AND brief IS NOT NULL AND brief_purged_at IS NULL`, [row.id, now]);
       await audit(tx, 'change_content_purged', row.id, { retentionMs }, now);
     });
   }
   return due.length;
+}
+const CHANGE_PURGE_ROUNDS = 20;
+// 주기 정리의 진입점. 한 바퀴에 여러 쪽을 고른다. 복원 직후 밀린 건이 많아도 다음 주기(1시간)마다 20건씩만 지우지 않게 한다.
+// 고른 뒤 다시 열린 건은 다시 골라지므로 횟수로 끝을 둔다.
+export async function purgeExpiredChangeContentRounds(database: Database, now: number, retentionMs = CHANGE_RETENTION_MS): Promise<number> {
+  let total = 0;
+  for (let round = 0; round < CHANGE_PURGE_ROUNDS; round++) {
+    const purged = await purgeExpiredChangeContent(database, now, retentionMs);
+    total += purged;
+    if (purged < CHANGE_PURGE_BATCH) break;
+  }
+  return total;
 }
 
 // 요청 원문을 읽는 유일한 경로다. 공개 렌더러·writer·리뷰 입력에 이 객체를 주지 않는다.

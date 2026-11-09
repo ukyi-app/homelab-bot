@@ -17,9 +17,10 @@ export async function chatContext(db: Database, conversation: string, event: str
     JOIN conversations c ON c.id=e.conversation_id WHERE e.id=$2 AND e.conversation_id=$1 AND e.actor_id=c.owner_id`,
   [conversation, event])).rows[0];
   if (!current) return [];
+  // 보존 기간(7일)이 지나 원문을 비운 owner 메시지는 빈 말로 넣지 않고 기록에서 뺀다. 현재 메시지는 끝나지 않은 job의 요청이라 비워지지 않는다.
   const owners = (await db.query<{ id: string; delivery_id: string; payload: Record<string, unknown> }>(`SELECT id,delivery_id,payload
     FROM events WHERE conversation_id=$1 AND accepted=true AND actor_id=(SELECT owner_id FROM conversations WHERE id=$1)
-    AND event_order<=$2 ORDER BY event_order DESC LIMIT $3`, [conversation, current.event_order, limits.messages])).rows.reverse();
+    AND event_order<=$2 AND (text_purged_at IS NULL OR id=$4) ORDER BY event_order DESC LIMIT $3`, [conversation, current.event_order, limits.messages, event])).rows.reverse();
   const answers = snowflake(current.delivery_id) ? await botAnswers(db, conversation, current.delivery_id, limits.messages) : [];
 
   // 봇 답은 Discord ID가 자기보다 큰 첫 owner 메시지 앞에 둔다. ID가 숫자가 아닌 owner 메시지(시험·옛 기록)는 기존 순서 자리 그대로다.
@@ -49,21 +50,22 @@ function ownerItem(payload: Record<string, unknown>): ContextItem {
 // result:<job>이 아니라서, read·task 결과는 job type으로 빠진다. 현재 입력보다 먼저 게시된 페이지만 넣고, 빠진 페이지가 있으면 일부로 표시한다.
 async function botAnswers(db: Database, conversation: string, before: string, limit: number): Promise<BotAnswer[]> {
   // AND의 평가 순서는 보장되지 않는다. 숫자가 아닌 외부 ID에 캐스트가 먼저 돌지 않게 CASE 안에서만 바꾼다.
-  const rows = (await db.query<{ message_key: string; page_index: number; state: string; external_id: string | null; content: string }>(`
+  const rows = (await db.query<{ message_key: string; page_index: number; state: string; external_id: string | null; content: string; purged: boolean }>(`
     WITH sent AS (SELECT o.message_key,CASE WHEN o.external_id ~ '^[0-9]{1,20}$' THEN o.external_id::numeric END AS posted
       FROM outbox o JOIN jobs j ON j.id=o.job_id JOIN conversations c ON c.id=j.conversation_id
       WHERE j.conversation_id=$1 AND o.conversation_id=$1 AND j.type='chat' AND o.message_key='result:' || j.id
         AND j.owner_id=c.owner_id AND o.owner_id=c.owner_id AND o.state='sent'),
     answers AS (SELECT message_key FROM sent WHERE posted<$2::numeric
       GROUP BY message_key ORDER BY min(posted) DESC LIMIT $3)
-    SELECT message_key,page_index,state,external_id,payload->>'content' AS content FROM outbox
+    SELECT message_key,page_index,state,external_id,payload->>'content' AS content,content_purged_at IS NOT NULL AS purged FROM outbox
       WHERE message_key IN (SELECT message_key FROM answers) ORDER BY message_key,page_index`,
   [conversation, before, limit])).rows;
   const grouped = new Map<string, typeof rows>();
   for (const row of rows) grouped.set(row.message_key, [...grouped.get(row.message_key) ?? [], row]);
   const result: BotAnswer[] = [];
   for (const pages of grouped.values()) {
-    const shown = pages.filter(page => page.state === 'sent' && snowflake(page.external_id) && BigInt(page.external_id!) < BigInt(before));
+    // 보존 기간이 지나 본문을 비운 페이지는 빠진 페이지로 본다. 모두 비웠으면 그 답은 넣지 않는다.
+    const shown = pages.filter(page => page.state === 'sent' && !page.purged && snowflake(page.external_id) && BigInt(page.external_id!) < BigInt(before));
     if (!shown.length) continue;
     result.push({ position: shown.reduce((min, page) => BigInt(page.external_id!) < min ? BigInt(page.external_id!) : min, BigInt(shown[0]!.external_id!)),
       pages: shown.map(page => page.content), partial: shown.length !== pages.length });

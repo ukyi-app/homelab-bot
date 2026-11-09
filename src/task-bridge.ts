@@ -46,7 +46,10 @@ export const TASK_ANSWER_PURGE_BATCH = 200;
 const TASK_ANSWER_PURGE_ROUNDS = 20;
 // 정리 주기. CHANGE 보존 정리(CHANGE_PERIODS.retentionMs)와 같은 1시간이다.
 export const TASK_ANSWER_PURGE_EVERY_MS = 3_600_000;
-const JOB_FINAL = ['succeeded', 'failed', 'cancelled', 'superseded'];
+export const JOB_FINAL = Object.freeze(['succeeded', 'failed', 'cancelled', 'superseded']);
+// 재개·마무리가 아직 그 작업의 기록을 읽을 수 있는 세션이 있다. 끝난 작업의 원문을 고르는 정리가 함께 쓴다. job ID 열 이름을 받는다.
+export const sessionHeld = (jobColumn: string) => `EXISTS (SELECT 1 FROM codex_sessions s WHERE s.job_id=${jobColumn}
+  AND (s.state IN ('running','waiting_answer','waiting_model','unknown') OR s.cleanup_state='pending'))`;
 // 끝난 작업의 질문 답 원문을 비운다. 시각 기준은 작업이 끝 상태에 든 때(finished_at, 없으면 답한 시각)다.
 // 재개는 세션이 대기(waiting_answer·waiting_model)일 때만 답을 읽으므로, 세션이 돌거나 기다리거나 unknown이거나 정리 전인 작업은 고르지 않는다.
 // /retry로 되살아날 수 있는 failed도 세션이 대기가 아니면 새 스레드로 시작해 답을 읽지 않는다.
@@ -60,10 +63,9 @@ export async function purgeExpiredTaskAnswers(db: Database, now: number, retenti
         answer_sha256=COALESCE(q.answer_sha256, encode(sha256(convert_to(q.answer,'UTF8')),'hex'))
       WHERE q.id IN (SELECT q2.id FROM codex_questions q2 JOIN jobs j ON j.id=q2.job_id
         WHERE q2.answer IS NOT NULL AND j.state=ANY($3::text[]) AND COALESCE(j.finished_at, q2.answered_at, q2.created_at)<=$1
-        AND NOT EXISTS (SELECT 1 FROM codex_sessions s WHERE s.job_id=q2.job_id
-          AND (s.state IN ('running','waiting_answer','waiting_model','unknown') OR s.cleanup_state='pending'))
+        AND NOT ${sessionHeld('q2.job_id')}
         ORDER BY q2.id LIMIT ${TASK_ANSWER_PURGE_BATCH})
-      AND q.answer IS NOT NULL RETURNING q.id`, [now - retentionMs, now, JOB_FINAL])).rows.length;
+      AND q.answer IS NOT NULL RETURNING q.id`, [now - retentionMs, now, [...JOB_FINAL]])).rows.length;
     total += purged;
     if (purged < TASK_ANSWER_PURGE_BATCH) break;
   }
