@@ -871,3 +871,7 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 ## 동료 봇 전환: 작업자 계약 v1·v2 공존 (C02, 2026-11-09)
 
 - 작업자는 대화 요청 v1·v2와 리뷰 지시문 v1·v2 literal을 함께 받는다. 게시 서버는 자동 배포라 작업자(사람 배포, C06)가 먼저 두 판을 받아야 서버가 v2로 바꿀 수 있다(C11·C12). v1 수용은 시범이 끝난 뒤 뺀다(명세 §4.2 "계약 배포 순서" 3단계). 구현과 시험은 [ARCHITECTURE](ARCHITECTURE.md) §13 "봇 답 문맥"·"대화 답 형식", [VERIFICATION](VERIFICATION.md) "C02 작업자 계약 v2".
+
+## 동료 봇 전환 7 한도 정보 구현 위치 (C03, 2026-11-10)
+
+- "동료 봇 전환 (사용자 2026-11-09)" 7의 한도 정보 읽기 자리다. 결정은 바꾸지 않았다. 작업자가 `rate_limit_event`를 읽어 응답 한도 칸(`src/contracts.ts` `RateLimitInfoSchema`)에 싣는다: 해석 `src/executor-claude.ts`, 대화 v2 `src/chat-lane.ts`, 리뷰 `src/review-lane.ts`·`src/review-http.ts`, 작업 레인 `src/executor-claude-task.ts`·`src/task-contracts.ts`. 결제 멈춤은 칸의 `stop.cause: 'billing'`으로 한도와 가른다. 재개·리뷰 미루기는 C19다. 기록은 [ARCHITECTURE](ARCHITECTURE.md) §12 "T16b 실행기 프로필"의 "한도 정보", [VERIFICATION](VERIFICATION.md) "C03 작업자 한도 정보".

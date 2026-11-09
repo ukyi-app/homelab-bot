@@ -936,6 +936,15 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - 판정: init 하나·result 최대 하나가 아니거나 깨진 줄 → `failed`. 오류 결과(`is_error`가 false가 아니거나 subtype이 success가 아님)는 assistant 메시지의 `error` 종류로 가른다: `authentication_failed`·`oauth_org_not_allowed`·`account_on_hold`·`verification_required` → `auth_expired`, `rate_limit`·`billing_error` → `limited`, 그 밖 종류(`overloaded`·`server_error` 등) → `failed`. 종류가 없거나 `unknown`일 때만 HTTP 상태(401·403 → `auth_expired`, 429·402 → `limited`)를 본다. 성공은 `is_error=false` + subtype success + 종료 코드 0 + `structured_output`이 있어야 한다. 모델 답·`result` 텍스트에 "401"·"rate limit"이 있어도 보지 않는다. 중간 `system/api_retry` 뒤 성공한 실행은 성공이다.
 - 출력 줄은 판정 필드만 남긴다(모델 본문·thinking·도구 입력·`result` 텍스트는 버림). 상한은 공통 `CHAT_LIMITS`(줄 1MiB, 전체 16MiB, 이벤트 2만 개)다.
 
+**한도 정보(C03, 2026-11-10, 명세 §4.2·§4.7).** 실행기가 stream-json의 `rate_limit_event`를 읽어 작업자 응답의 한도 칸으로 넘긴다. 게시 서버는 아직 이 칸을 읽지 않는다(C19 재개·리뷰 미루기, C21 운영 알림이 쓴다).
+
+- 이벤트 모양 `{type:'rate_limit_event', rate_limit_info:{status, resetsAt?, rateLimitType?, utilization?, …}, uuid, session_id}`는 로컬 2.1.319 바이너리의 SDK 스키마로 확인했다[확인: 정적 읽기, 모델 호출 없음]. 봇 이미지 2.1.308 `-p` 구독 모드에서 같은 칸이 오는지는 [미확인]이다(C24 실측).
+- 축약(`compactClaudeEvent`)은 `rate_limit_info`에서 네 칸만 모양을 검사해 남긴다. `status`는 `allowed`·`allowed_warning`·`rejected`, `resetsAt`은 unix 초 정수(1,000,000,000~9,999,999,999, 밀리초 값은 깨진 값), `rateLimitType`은 `five_hour`·`seven_day`·`seven_day_opus`·`seven_day_sonnet`·`seven_day_overage_included`·`overage`, `utilization`은 0~10 숫자다. 상태를 모르면 이벤트 없음, 다른 칸은 깨진 칸만 버린다. overage·창별 값·`uuid` 등 나머지는 줄·로그·응답에 남기지 않는다. 작업 레인 축약(`compactTaskEvent`)도 같은 함수를 거치고, 세션 ID가 같으면 정책 위반이 아니다. 리뷰 무도구 경계(`noToolBoundaryViolation`)도 이 이벤트를 막지 않는다.
+- 해석(`interpretClaudeStream`)은 결과가 무엇이든(답·한도·인증·실패) `EngineOutcome.rateLimit`을 싣는다: `event`는 그 실행의 마지막 이벤트, `stop`은 한도 대기(`limited`)의 원인과 같은 실행의 마지막 `rejected`가 알린 `resetsAt`이다. `allowed_warning`의 시각은 멈춤 시각으로 쓰지 않는다. 둘 다 없으면 칸이 없다.
+- 오류 분류(`classifyClaudeError`)는 그대로다. 한도 대기의 원인만 더한다: `rate_limit`·429 → `rate_limit`, `billing_error`·402 → `billing`(저절로 재개하지 않는 결제 멈춤). `rejected` 이벤트가 있어도 분류는 CLI 오류 종류·HTTP 상태가 정한다.
+- 응답 칸: 모양은 `src/contracts.ts` `RateLimitInfoSchema`(`{event?, stop?: {cause, resetsAt?}}`, strict, 빈 객체 거부) 하나다. 대화 v2는 `rateLimit`(없으면 `null`, C02 칸), 리뷰(`/v1/review`)와 작업 레인 v1(`TaskResponseSchema`)·v2(`TaskV2ResultResponseSchema`)는 선택 칸 `rateLimit`이다. 대화 v1 응답과 `unknown`에는 싣지 않는다. 미게시 후보 리뷰(`/v1/change-review`)는 같은 실행기를 쓰지만 결과 스키마에 칸이 없어 싣지 않는다(C19가 쓸 때 더한다).
+- 호환: 칸이 없는 옛 작업자 응답은 새 게시 서버가 그대로 받는다. 칸을 모르는 옛 게시 서버는 칸이 있는 리뷰·작업 응답을 거부한다(strict). 그래서 작업자를 이 판으로 둔 채 게시 서버만 이전 판으로 되돌리면 안 된다([VERIFICATION](VERIFICATION.md) "C03 작업자 한도 정보").
+
 **기동 순서.** env 확인(공통 여섯) → 프로필 선택 → 프로필 추가 env → 경로·공개 키 → 자격 디렉터리·nonce 디렉터리가 사람 홈이나 `.codex*`·`.claude*` 아래면 거부 → 어댑터·자격 조립(Codex는 CODEX_HOME 개인 경로 거부) → `<실행 파일> --version`(빈 임시 HOME·설정 디렉터리, 자격 없음, 모델 호출 없음)이 프로필 버전과 같은지(`executor_version_mismatch`·`executor_version_unavailable`) → 자격 준비(`present`·`seeded`·`kept`) → nonce 저장소 → 8080. 기동 로그는 `{"event":"worker_started","profile":…,"cli":…,"model":…,"credential":…}`이고 값(토큰·키)은 싣지 않는다.
 
 | env | 필수 | 내용 |
