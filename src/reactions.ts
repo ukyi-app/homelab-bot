@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { DiscordRejected, DiscordUnauthorized, RateLimited } from './contracts.js';
 import type { Database } from './database.js';
 import type { DiscordRest } from './discord.js';
@@ -35,6 +36,8 @@ const RETRY_MAX_MS = 60_000;
 interface Row {
   channel: string; message: string; owner: string; state: ReactionState; synced: ReactionState;
   applied: string[]; maybe?: string[]; next: number; attempt: number;
+  // 이 행을 쥔 동기화 바퀴의 표. next(lease 끝 시각)와 함께 쓰고, 맞춘 기록을 남길 때 지운다.
+  lease?: string;
 }
 
 // 수신 ACK(👀)를 보낼 일반 메시지. 수신 트랜잭션 안에서 부른다. 👀는 이 직후 dispatch 안에서 단다(protocol.acknowledge).
@@ -73,27 +76,37 @@ export class ReactionSync {
   async sync(limit = 10): Promise<boolean> {
     await this.store.refreshWaiting();
     const now = this.store.now();
+    const lease = randomUUID();
     const rows = await this.store.atomic(async store => {
       // 실행기는 WHERE 조건 순서를 보장하지 않는다. 다른 키의 값을 bigint로 바꾸지 않게 형 변환은 CASE 안에서만 한다.
       const due = (await store.db.query<{ key: string; value: Row }>(`SELECT key,value FROM controls WHERE key LIKE 'reaction:%'
         AND value->>'state'<>value->>'synced'
         AND CASE WHEN key LIKE 'reaction:%' AND jsonb_typeof(value->'next')='number' THEN (value->>'next')::bigint<=$1 ELSE false END
         ORDER BY key FOR UPDATE SKIP LOCKED LIMIT $2`, [now, limit])).rows;
-      for (const row of due) await store.db.query(`UPDATE controls SET value=jsonb_set(value,'{next}',to_jsonb($2::bigint)) WHERE key=$1`, [row.key, now + LEASE_MS]);
+      for (const row of due) await store.db.query(`UPDATE controls SET value=value || jsonb_build_object('next',$2::bigint,'lease',$3::text) WHERE key=$1`,
+        [row.key, now + LEASE_MS, lease]);
       return due;
     });
     for (const row of rows) {
-      try { await this.apply(row.key, row.value); }
-      catch (error) { this.log('reaction_sync_failed', errorInfo(error)); }
+      try {
+        // 한 바퀴의 행을 차례로 맞추는 동안 REST가 느리면 뒤 행의 lease가 끝나 다른 게시 서버가 가져갈 수 있다.
+        // 맞추기 직전에 그 행이 아직 이 바퀴 것인지 보고 lease를 늘리며, 그 사이 바뀐 상태를 다시 읽는다.
+        const fresh = (await this.store.db.query<{ value: Row }>(`UPDATE controls SET value=jsonb_set(value,'{next}',to_jsonb($3::bigint))
+          WHERE key=$1 AND value->>'lease'=$2 AND value->>'state'<>value->>'synced' RETURNING value`,
+        [row.key, lease, this.store.now() + LEASE_MS])).rows[0];
+        if (fresh) await this.apply(row.key, fresh.value, lease);
+      } catch (error) { this.log('reaction_sync_failed', errorInfo(error)); }
     }
     return rows.length > 0;
   }
-  private async apply(key: string, row: Row): Promise<void> {
+  private async apply(key: string, row: Row, lease: string): Promise<void> {
+    const finish = (have: Set<string>, maybe: Set<string>, synced: ReactionState, next: number, attempt: number) =>
+      this.finish(key, lease, have, maybe, synced, next, attempt);
     const want: readonly string[] = REACTIONS[row.state] ?? [];
     const have = new Set(row.applied);
     const maybe = new Set(row.maybe ?? []);
     const pause = await this.store.discordPauseUntil(row.channel);
-    if (pause > this.store.now()) return this.finish(key, have, maybe, row.synced, pause, row.attempt);
+    if (pause > this.store.now()) return finish(have, maybe, row.synced, pause, row.attempt);
     // 철회된 owner의 메시지에는 새 반응을 달지 않는다. 지우기는 봇 자신의 표시를 거두는 것이라 그대로 한다.
     const revoked = (await this.store.db.query('SELECT 1 FROM denied_actors WHERE actor_id=$1', [row.owner])).rows.length > 0;
     const ops: { op: 'add' | 'remove'; emoji: string }[] = [
@@ -114,27 +127,28 @@ export class ReactionSync {
         }
         if (error instanceof RateLimited) {
           await this.store.recordRateLimit(error, row.channel);
-          return this.finish(key, have, maybe, row.synced, this.store.now() + Math.max(1000, error.retryAfterMs), row.attempt);
+          return finish(have, maybe, row.synced, this.store.now() + Math.max(1000, error.retryAfterMs), row.attempt);
         }
-        if (error instanceof DiscordUnauthorized) return this.finish(key, have, maybe, row.synced, this.store.now() + RETRY_MAX_MS, row.attempt);
+        if (error instanceof DiscordUnauthorized) return finish(have, maybe, row.synced, this.store.now() + RETRY_MAX_MS, row.attempt);
         // 시간 초과·5xx·연결 오류의 더하기는 Discord가 처리했을 수 있다. 끝 상태에서 지우도록 남긴다.
         if (op === 'add') maybe.add(emoji);
         const attempt = row.attempt + 1;
         if (attempt < REACTION_ATTEMPTS) {
-          return this.finish(key, have, maybe, row.synced, this.store.now() + Math.min(RETRY_MAX_MS, 1000 * 2 ** (attempt - 1)), attempt);
+          return finish(have, maybe, row.synced, this.store.now() + Math.min(RETRY_MAX_MS, 1000 * 2 ** (attempt - 1)), attempt);
         }
         await this.store.audit('reaction_abandoned', key.slice(KEY.length), { op, emoji, attempts: attempt });
         if (op === 'remove') gone(emoji);
       }
     }
-    return this.finish(key, have, maybe, row.state, 0, 0);
+    return finish(have, maybe, row.state, 0, 0);
   }
   // 상태(state)는 건드리지 않는다. 그 사이 바뀌었으면 synced와 달라 다음 바퀴가 다시 맞춘다.
-  private async finish(key: string, have: Set<string>, maybe: Set<string>, synced: ReactionState, next: number, attempt: number): Promise<void> {
+  // 그 사이 다른 게시 서버가 lease를 가져갔으면 그쪽 기록을 덮지 않는다.
+  private async finish(key: string, lease: string, have: Set<string>, maybe: Set<string>, synced: ReactionState, next: number, attempt: number): Promise<void> {
     await this.store.atomic(async store => {
-      await store.db.query(`UPDATE controls SET value=value || jsonb_build_object('applied',$2::jsonb,'synced',$3::text,'next',$4::bigint,'attempt',$5::int,'maybe',$6::jsonb)
-        WHERE key=$1`, [key, JSON.stringify([...have]), synced, next, attempt, JSON.stringify([...maybe])]);
-      await store.db.query(`DELETE FROM controls WHERE key=$1 AND value->>'state'=value->>'synced' AND value->>'state'=ANY($2)`, [key, TERMINAL]);
+      const mine = (await store.db.query(`UPDATE controls SET value=(value - 'lease') || jsonb_build_object('applied',$2::jsonb,'synced',$3::text,'next',$4::bigint,'attempt',$5::int,'maybe',$6::jsonb)
+        WHERE key=$1 AND value->>'lease'=$7 RETURNING key`, [key, JSON.stringify([...have]), synced, next, attempt, JSON.stringify([...maybe]), lease])).rows.length > 0;
+      if (mine) await store.db.query(`DELETE FROM controls WHERE key=$1 AND value->>'state'=value->>'synced' AND value->>'state'=ANY($2)`, [key, TERMINAL]);
     });
   }
 }

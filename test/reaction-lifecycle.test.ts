@@ -4,7 +4,7 @@ import { DiscordProtocol, discordHttpApi } from '../src/discord-protocol.js';
 import type { DiscordApi } from '../src/discord-protocol.js';
 import { DEFAULTS, DiscordRejected, RateLimited } from '../src/contracts.js';
 import { DiscordIngress, DiscordPublisher } from '../src/discord.js';
-import { REACTION_ATTEMPTS } from '../src/reactions.js';
+import { moveReactions, REACTION_ATTEMPTS, ReactionSync, recordReceived } from '../src/reactions.js';
 import { Store } from '../src/store.js';
 import { MockDiscord, event, fixture, localDatabase, thread } from './helpers.js';
 
@@ -404,4 +404,28 @@ test('흐름: history gap 동안 받아 복구 버퍼에 둔 메시지를 복구
   await drain();
   assert.deepEqual(log.filter(line => line.includes('9502')), ['ack 9502', 'remove fixture-thread/9502 👀']);
   assert.equal((await database.db.query(`SELECT key FROM controls WHERE key LIKE 'reaction:%'`)).rows.length, 0, '반응 행이 남지 않는다');
+});
+
+test('동기화: 게시 서버 둘이 한 DB를 쓸 때 느린 서버는 lease를 잃은 행을 옛 상태로 다시 맞추지 않는다', async () => {
+  for (const [id, message] of [['9601', 'm1'], ['9602', 'm2']] as const) {
+    await recordReceived(database.db, { id, channel: 'fixture-thread', message, owner: f.policy.owner });
+  }
+  await moveReactions(database.db, ['9601', '9602'], 'waiting');
+  let unstick!: () => void;
+  const stuck = new Promise<void>(resolve => { unstick = resolve; });
+  const slow = new MockDiscord();
+  const add = slow.addReaction.bind(slow);
+  slow.addReaction = async (channel, message, emoji) => { await add(channel, message, emoji); if (message === 'm1') await stuck; };
+  const fast = new MockDiscord();
+  const first = new ReactionSync(new Store(database.db, f.now), slow).sync();
+  await until(() => slow.reactions.length === 1);
+  f.advance(31_000);
+  await new ReactionSync(new Store(database.db, f.now), fast).sync();
+  await moveReactions(database.db, ['9602'], 'cleared');
+  await new ReactionSync(new Store(database.db, f.now), fast).sync();
+  assert.deepEqual(fast.reactions.filter(r => r.message === 'm2').map(r => `${r.op} ${r.emoji}`), ['add ⏳', 'remove 👀', 'remove ⏳']);
+  unstick();
+  await first;
+  assert.deepEqual(slow.reactions.map(r => `${r.op} ${r.message} ${r.emoji}`), ['add m1 ⏳'], 'lease를 잃은 m2에 ⏳를 다시 더하지 않는다');
+  assert.equal((await database.db.query(`SELECT 1 FROM controls WHERE key='reaction:9602'`)).rows.length, 0);
 });
