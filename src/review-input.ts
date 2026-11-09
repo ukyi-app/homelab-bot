@@ -1,6 +1,7 @@
 import { gunzipSync } from 'node:zlib';
 import { z } from 'zod';
 import { DEFAULTS, Denied, WorkerRejected } from './contracts.js';
+import type { RateLimitInfo } from './contracts.js';
 import { archiveContract, CancelRequestSchema, ExecutionSlot, REPOSITORY_NAME } from './worker.js';
 import type { CancelRequest, WorkerVerifier } from './worker.js';
 
@@ -76,16 +77,17 @@ export interface ReviewerInput {
     omitted: { path: string; reason: typeof OMIT_REASONS[number] }[]; omittedTotal: number; limitsHit: string[] };
 }
 // unknown: 모델 프로세스가 멈췄는지 확인하지 못했다. 실패로 뭉개면 슬롯이 풀려 살아 있는 프로세스 옆에서 다음 작업이 돈다.
+// rateLimit은 그 실행에서 본 한도 정보다(없으면 칸 없음). 응답의 선택 칸으로 그대로 넘긴다.
 export type ReviewerResult =
-  | { status: 'succeeded'; output: unknown }
-  | { status: 'limited' | 'auth_expired' | 'failed'; reason?: string }
+  | { status: 'succeeded'; output: unknown; rateLimit?: RateLimitInfo }
+  | { status: 'limited' | 'auth_expired' | 'failed'; reason?: string; rateLimit?: RateLimitInfo }
   | { status: 'unknown' };
 // job은 프로세스 표식이고 timeoutMs는 이 호출에 남은 시간이다(압축본 받기·diff 계산에 쓴 만큼 뺀 값).
 export interface ReviewerRun { job: string; timeoutMs: number }
 export type ReviewerModel = (input: ReviewerInput, signal: AbortSignal, run: ReviewerRun) => Promise<ReviewerResult>;
 export type ReviewWorkerResult =
-  | { status: 'succeeded'; stopped: true; coverage: Coverage; positions: { path: string; lines: number[] }[]; output: unknown }
-  | { status: 'limited' | 'auth_expired' | 'failed'; stopped: true; reason?: string }
+  | { status: 'succeeded'; stopped: true; coverage: Coverage; positions: { path: string; lines: number[] }[]; output: unknown; rateLimit?: RateLimitInfo }
+  | { status: 'limited' | 'auth_expired' | 'failed'; stopped: true; reason?: string; rateLimit?: RateLimitInfo }
   | { status: 'unknown'; stopped: false };
 // 압축본 받기는 자격 없는 GET 하나다. init에는 인증 헤더를 넣을 자리가 없다.
 export type ArchiveFetcher = (url: string, init: { credentials: 'omit'; redirect: 'error'; maxBytes: number; signal: AbortSignal }) => Promise<Uint8Array>;
@@ -403,9 +405,10 @@ export class ReviewWorker {
           omittedTotal: coverage.omitted_files_with_reasons.length, limitsHit: [...coverage.limits_hit] } }, signal,
       { job: task.job, timeoutMs: Math.max(1, task.timeoutMs - (Date.now() - started)) });
       if (result.status === 'unknown') { stopped = false; return { status: 'unknown', stopped: false }; }
-      if (result.status !== 'succeeded') return { status: result.status, stopped: true, ...(result.reason ? { reason: result.reason } : {}) };
+      const rateLimit = result.rateLimit ? { rateLimit: result.rateLimit } : {};
+      if (result.status !== 'succeeded') return { status: result.status, stopped: true, ...(result.reason ? { reason: result.reason } : {}), ...rateLimit };
       return { status: 'succeeded', stopped: true, coverage, output: result.output,
-        positions: files.map(f => ({ path: f.path, lines: f.rightLines })) };
+        positions: files.map(f => ({ path: f.path, lines: f.rightLines })), ...rateLimit };
     } catch {
       // 깨진 응답은 모델 실행이 멈췄다는 증거가 아니다. 다음 작업을 받지 않는다(SerialWorker와 같은 규칙).
       stopped = false;

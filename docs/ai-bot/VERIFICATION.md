@@ -2191,6 +2191,34 @@ AC-14 중 👀·⏳·지움·실패를 S1(가짜 Discord REST, PGlite)에서 고
 - homelab: `bun cli/test/run.ts cli/test/commands/bot.test.ts cli/test/core/static.test.ts cli/test/core/engine.test.ts cli/test/core/adapters.test.ts` 63/63, `bun run ci --only "cli typecheck"` 통과.
 - **못 잡는 범위:** 운영 클러스터에서 owner kubeconfig의 `pods/exec` 권한, 실제 이미지 경로 `/app/dist/src/admin-main.js`와 컨테이너 `app`, 운영 DB 연결(S5 운영 1회가 본다).
 
+## C03 작업자 한도 정보 (2026-11-10)
+
+동료 봇 명세 §4.2·§4.7, AC-16(S2)의 작업자 쪽이다(homelab 계획 티켓 C03). 작업자가 Claude CLI stream-json의 `rate_limit_event`에서 상태·풀리는 시각·종류·사용률을 읽어 대화 v2·리뷰·작업 레인 응답의 한도 칸에 싣는다. 게시 서버는 아직 이 칸을 읽지 않는다(C19·C21). 병합 즉시 나가는 것은 게시 서버 쪽 리뷰·작업 응답 스키마가 선택 칸을 받게 되는 것뿐이고, 작업자는 C06 배포 뒤에야 칸을 보낸다. 모양과 규칙은 [ARCHITECTURE](ARCHITECTURE.md) §12 "T16b 실행기 프로필"의 "한도 정보".
+
+**이벤트 모양 근거.** 로컬 Claude Code 2.1.319 바이너리에 든 SDK 메시지 스키마를 정적으로 읽었다(모델 호출·로그인 없음): `rate_limit_info`는 `status`(`allowed`·`allowed_warning`·`rejected`), `resetsAt`(unix 초 정수), `rateLimitType`(6종), `utilization`(창 사용 비율, 보통 0~1, 넘겨 쓰면 1 초과)과 overage·창별 값 등이다. 시험 fixture(`test/rate-limit-fixture.ts`)는 이 모양으로 합성했고 실제 출력 녹음이 아니다.
+
+**미확인: 이미지 2.1.308 `-p` 구독 모드.** 봇 이미지의 Claude CLI 2.1.308이 `-p` 구독(장기 토큰) 모드에서 `rate_limit_event`를 내는지, `resetsAt`·`utilization`이 실제로 오는지 확인하지 않았다. 첫 실제 한도 때 S5로 본다(C24). 오지 않으면 한도 칸에 `stop`(원인)만 실리고 C19가 30분 재시도로 내려앉으며, 리뷰 미루기(`allowed_warning`)는 동작하지 않는다.
+
+**시험(경계 S2: 고정 stream-json을 내는 가짜 CLI → 작업자 응답, 모델 호출 없음).**
+
+| 완료 조건 | 시험 |
+|---|---|
+| 고정 stream-json의 `rate_limit_event`가 대화 v2·리뷰·작업 레인 응답의 한도 칸으로 나온다(AC-16 S2) | `worker-claude` `C03 대화 v2 한도 칸`(마지막 이벤트, 이벤트 없으면 `null`, 원문 칸 없음)·`C03 대화 v1 요청의 응답에는 한도 칸이 없다`, `review-lane` `C03 리뷰 한도 칸`(무도구 경계 통과, 이벤트 없으면 칸 없음), `task-stream` `C03 작업 v1 한도 칸`(완료·질문·한도·인증·실패)·`C03 작업 v2 한도 칸`(snapshot·한도·질문·실패, v2 결과 스키마 통과)·`C03 한도 이벤트 축약`(네 칸만, 다시 줄여도 같음, 같은 세션이면 위반 아님) |
+| 한도 오류 결과에 `rejected`의 풀리는 시각이 붙고, 오류 분류(한도·인증·결제)는 바뀌지 않는다 | `worker-claude` `C03 대화 v2 한도 대기`(`stop.resetsAt`, 이벤트 없으면 시각 없음, 결제 `billing`, 인증 만료 그대로)·`C03 한도 정보 읽기`(모르는 상태 → 이벤트 없음, 깨진 칸만 빠짐, 경고 시각은 멈춤 시각 아님, `rejected`가 있어도 인증·과부하 분류 그대로, HTTP 429·402만으로도 원인 구분), 기존 `CLD-05`·`stream 한도·인증`·`task-diagnostics` 분류 시험 |
+| 게시 서버 쪽 응답 스키마가 한도 칸이 있는 응답과 없는 응답을 둘 다 받는다 | `review-lane` `C03 게시 서버 리뷰 응답 스키마`(`HttpReviewWorker`), `task-contracts` `C03 작업 응답 한도 칸`(v1·v2), `worker-contract-v2` `C03 게시 서버 v2 응답 스키마`(`HttpWorker`, `null`과 한도 정보). 깨진 칸·빈 칸·원문 칸·`unknown`에 실린 칸은 거부한다 |
+| 2.1.308 실측이 미확인으로 남아 있다 | 위 "미확인" 문단 |
+
+**바뀐 기존 시험.** 한도 대기 결과에 원인이 붙어 옛 모양을 고정한 기대값 세 줄을 새 모양으로 고쳤다: `review-lane` "(e) 삭제 실패여도 한도·인증 대기", `task-stream` "stream 한도·인증", `task-diagnostics`의 `rate_limit` 판정.
+
+**롤백 주의(C06 롤백 절차에 옮긴다).**
+
+- 게시 서버만 이 판 이전으로 되돌리면 안 된다. 리뷰(`/v1/review`)·작업(`/v1/task`·`/v2/task/result`) 응답 스키마가 strict라, 칸을 모르는 옛 게시 서버가 새 작업자의 한도 칸 응답을 거부한다(리뷰는 `worker_response_uncertain`, 작업은 응답 거부). 되돌릴 때는 작업자를 먼저 C03 이전 digest로 되돌리거나 함께 되돌린다. 대화 v2는 게시 서버가 아직 v1만 보내므로(C11 전) 영향이 없다.
+- 작업자만 C03 이전으로 되돌리면 그 작업자가 저장해 둔 v2 결과 중 한도 칸이 든 것을 읽지 못한다(옛 결과 스키마). 되돌리기 전에 진행 중인 CHANGE 턴의 결과를 받아 두거나 drain한다.
+
+**검사.** `npm run check` 통과. 바뀐 모듈을 쓰는 시험 14개 파일(`worker-claude`·`worker-contract-v2`·`worker-entry`·`worker-server`·`review-lane`·`task-stream`·`task-contracts`·`task-diagnostics`·`change-review`·`change-artifact`·`task-worker`·`task-assembly`·`pr-review`·`task-bridge`) 500개 모두 통과(새 C03 시험 11개 포함). 전체 시험은 통합 단계에서 돌린다.
+
+**못 잡는 범위.** 2.1.308 `-p` 구독 모드에서 실제 이벤트가 오는지(S5, C24), 재개 스케줄과 리뷰 미루기(C19, S1 가짜 시계), 운영 알림(C21). 미게시 후보 리뷰(`/v1/change-review`)는 같은 실행기를 쓰지만 결과 스키마에 칸을 더하지 않았다. 리뷰 미루기를 이 경로에도 걸지는 C19가 정한다.
+
 ## C09 고정 문구 1 (2026-11-10, 로컬)
 
 AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 Discord REST·Gateway, PGlite)에서 고정했다. 판단은 [DECISIONS](DECISIONS.md) "C09 고정 문구 1".

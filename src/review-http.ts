@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import type { IncomingMessage } from 'node:http';
 import { z } from 'zod';
 import { Agent } from 'undici';
-import { Denied, WorkerRejected } from './contracts.js';
+import { Denied, RateLimitInfoSchema, WorkerRejected } from './contracts.js';
 import { CoverageSchema, ReviewTaskSchema } from './review-input.js';
 import type { ReviewTask, ReviewWorker, ReviewWorkerResult } from './review-input.js';
 import type { ReviewWorkerClient } from './review.js';
@@ -13,10 +13,14 @@ import type { WorkerRoute } from './worker-http.js';
 // 리뷰 레인의 작업자 HTTP(작업자 포트 8080의 별도 경로). 대화 레인 worker-http.ts와 같은 규칙:
 // capability 없으면 시작 전 거부, 깨진 응답은 멈춤의 증거가 아님.
 // 인증 없는 POST /v1/review의 401은 게시 서버가 작업자의 리뷰 준비를 판단하는 신호다. 본문을 읽기 전에 답한다.
+// rateLimit은 선택 칸이다. 칸이 없는 옛 작업자 응답도 그대로 받는다. 이 칸을 모르는 옛 게시 서버는 칸이 있는 응답을
+// 거부하므로, 작업자를 이 판으로 둔 채 게시 서버만 이전 판으로 되돌리면 안 된다(VERIFICATION "C03 작업자 한도 정보").
 const ResultSchema = z.discriminatedUnion('status', [
   z.strictObject({ status: z.literal('succeeded'), stopped: z.literal(true), coverage: CoverageSchema,
-    positions: z.array(z.strictObject({ path: z.string(), lines: z.array(z.number().int().positive()) })), output: z.unknown() }),
-  z.strictObject({ status: z.enum(['limited', 'auth_expired', 'failed']), stopped: z.literal(true), reason: z.string().max(100).optional() }),
+    positions: z.array(z.strictObject({ path: z.string(), lines: z.array(z.number().int().positive()) })), output: z.unknown(),
+    rateLimit: RateLimitInfoSchema.optional() }),
+  z.strictObject({ status: z.enum(['limited', 'auth_expired', 'failed']), stopped: z.literal(true), reason: z.string().max(100).optional(),
+    rateLimit: RateLimitInfoSchema.optional() }),
   z.strictObject({ status: z.literal('unknown'), stopped: z.literal(false) }),
 ]);
 const Denial = z.strictObject({ status: z.literal('rejected'), started: z.literal(false) });
