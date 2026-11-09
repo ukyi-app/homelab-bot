@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { ARTIFACT_LIMITS, ArtifactManifestSchema, ChangePathSchema, CommandIdSchema, EvidenceBundleSchema, GenerationSchema, GitShaSchema, ReasonCodeSchema, RepoIdSchema, Sha256Schema,
   VerificationReceiptSchema } from './change-contracts.js';
 import { CODEX_DEFAULTS, CODEX_LIMITS, EVIDENCE_PATHS } from './codex.js';
-import { DEFAULTS, Denied } from './contracts.js';
+import { DEFAULTS, Denied, RateLimitInfoSchema } from './contracts.js';
 import type { Clock } from './contracts.js';
 import { MAX_TASK_BYTES } from './review-http.js';
 import { CAPABILITY_TTL_MS, REPOSITORY_NAME, capabilityDigest, capabilityLive, openCapability, sealCapability } from './worker.js';
@@ -174,16 +174,20 @@ const responseShape = {
   version: z.literal(1), job: uuid, lease: uuid, generation, sessionId: uuid, turn,
   worker: TaskWorkerIdentitySchema, usage: TaskUsageSchema,
 };
+// 그 턴에서 본 한도 정보(contracts RateLimitInfoSchema). 소멸을 확인해 실행기 결과를 읽은 응답에만 붙는 선택 칸이다.
+// 칸이 없는 옛 작업자 응답도 그대로 받는다. 이 칸을 모르는 옛 게시 서버는 칸이 있는 응답을 거부하므로, 작업자를 이 판으로 둔 채
+// 게시 서버만 이전 판으로 되돌리면 안 된다(VERIFICATION "C03 작업자 한도 정보").
+const rateLimitSlot = { rateLimit: RateLimitInfoSchema.optional() };
 // stopped: 이 턴의 프로세스가 0개임을 확인했다. 세션 삭제 여부는 sessionRetained가 따로 말한다.
 // completed·needs_input은 정리가 남아 있으면 내보내지 않는다(실행 뒤 기록 제거 계약). 그 경우는 failed의 cleanup_pending이다.
 export const TaskResponseSchema = z.discriminatedUnion('status', [
   z.strictObject({ ...responseShape, status: z.literal('completed'), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.literal(false),
-    summary: z.string().max(TASK_LIMITS.summaryChars), ...TaskEvidenceShape }),
+    summary: z.string().max(TASK_LIMITS.summaryChars), ...TaskEvidenceShape, ...rateLimitSlot }),
   z.strictObject({ ...responseShape, status: z.literal('needs_input'), stopped: z.literal(true), sessionRetained: z.literal(true), cleanupPending: z.literal(false),
-    question: z.string().max(TASK_LIMITS.questionChars).refine(text => text.trim().length > 0, 'empty_text') }),
-  z.strictObject({ ...responseShape, status: z.enum(['limited', 'auth_expired']), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.boolean() }),
+    question: z.string().max(TASK_LIMITS.questionChars).refine(text => text.trim().length > 0, 'empty_text'), ...rateLimitSlot }),
+  z.strictObject({ ...responseShape, status: z.enum(['limited', 'auth_expired']), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.boolean(), ...rateLimitSlot }),
   z.strictObject({ ...responseShape, status: z.literal('failed'), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.boolean(),
-    reason: z.enum(TASK_FAILURE_REASONS) }),
+    reason: z.enum(TASK_FAILURE_REASONS), ...rateLimitSlot }),
   // 소멸을 확인하지 못했다. 살아 있는 프로세스가 쓸 수 있어 결과·diff를 담지 않고 공간을 지웠다고 말하지 않는다.
   z.strictObject({ ...responseShape, status: z.literal('unknown'), stopped: z.literal(false), sessionRetained: z.literal(true), cleanupPending: z.boolean() }),
 ]);
@@ -297,14 +301,14 @@ export const TaskV2ResultResponseSchema = z.discriminatedUnion('status', [
   // 이 저장소가 이 세대를 모른다(finalized:false). 옛 파드의 소멸 증명이 아니고 접수를 잃었다는 증명도 아니다.
   z.strictObject({ ...v2Response, status: z.literal('absent'), finalized: z.boolean(), stopped: z.boolean() }),
   z.strictObject({ ...turnedResponse, status: z.literal('needs_input'), stopped: z.literal(true), sessionRetained: z.literal(true), cleanupPending: z.literal(false),
-    question: z.string().max(TASK_LIMITS.questionChars).refine(text => text.trim().length > 0, 'empty_text') }),
-  z.strictObject({ ...turnedResponse, status: z.enum(['limited', 'auth_expired']), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.boolean() }),
-  z.strictObject({ ...turnedResponse, status: z.literal('failed'), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.boolean(), reason: z.enum(TASK_V2_FAILURE_REASONS) }),
+    question: z.string().max(TASK_LIMITS.questionChars).refine(text => text.trim().length > 0, 'empty_text'), ...rateLimitSlot }),
+  z.strictObject({ ...turnedResponse, status: z.enum(['limited', 'auth_expired']), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.boolean(), ...rateLimitSlot }),
+  z.strictObject({ ...turnedResponse, status: z.literal('failed'), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.boolean(), reason: z.enum(TASK_V2_FAILURE_REASONS), ...rateLimitSlot }),
   // 소멸을 확인하지 못했거나 그 턴의 결과를 잃었다. 다시 돌리지 않는다.
   z.strictObject({ ...turnedResponse, status: z.literal('unknown'), stopped: z.boolean(), sessionRetained: z.literal(true), cleanupPending: z.boolean() }),
   // 프로세스 소멸을 확인한 뒤 실제 파일로 계산한 결과다. 모델의 요약은 싣지 않는다.
   z.strictObject({ ...turnedResponse, status: z.literal('snapshot'), stopped: z.literal(true), sessionRetained: z.literal(true), cleanupPending: z.literal(false),
-    artifactDigest: Sha256Schema, artifact: WireArtifactSchema }),
+    artifactDigest: Sha256Schema, artifact: WireArtifactSchema, ...rateLimitSlot }),
 ]);
 export type TaskV2ResultResponse = z.infer<typeof TaskV2ResultResponseSchema>;
 // 저장해 두는 결과. identity는 읽을 때 지금 작업자로 다시 채운다. 파드가 바뀌어도 같은 저장소면 같은 결과다.
