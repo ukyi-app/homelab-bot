@@ -392,16 +392,32 @@ export type DeploymentObservation = z.infer<typeof DeploymentObservationSchema>;
 
 export interface ChangeTarget { key: ChangeKey; repoId: number }
 
+// 저장소 안 위치. 줄을 모르면 null이다. 경로는 ChangePathSchema를 지난 값이다.
+export interface ChangeLocation { path: string; line: number | null }
+// 확인할 것·남은 위험 한 항목. 작성 모델이 쓴 글이라 증거(승인 digest 재료)가 아니고, 공개 경로로 내기 전에 공개 검사를 거친다.
+export interface ChangeNote { text: string; location?: ChangeLocation }
+// 수정 차례의 자료 블록 한 항목. PR 리뷰·리뷰 댓글·대화 댓글이고, 작성 모델에는 자료로만 들어간다. 탈퇴한 계정이면 authorId가 null이다.
+export const REVIEW_MATERIAL_KINDS = ['review', 'review_comment', 'comment'] as const;
+export const AUTHOR_ASSOCIATIONS = ['COLLABORATOR', 'CONTRIBUTOR', 'FIRST_TIMER', 'FIRST_TIME_CONTRIBUTOR', 'MANNEQUIN', 'MEMBER', 'NONE', 'OWNER'] as const;
+export interface ReviewMaterial {
+  kind: typeof REVIEW_MATERIAL_KINDS[number]; authorId: number | null; association: typeof AUTHOR_ASSOCIATIONS[number];
+  location: ChangeLocation | null; body: string;
+}
+// 수정 차례 입력. owner의 Discord 말이 지시이고, 그 PR의 리뷰·댓글은 자료다. head는 PR 브랜치 head이고 작성의 base가 된다.
+// 자료는 오래된 것부터 적는다. 상한을 넘으면 앞에서부터 빠진다(task-contracts boundAmendmentMaterials).
+export interface ChangeAmendmentInput { pullNumber: number; head: string; instruction: string; materials: readonly ReviewMaterial[] }
+
 // B1. 작업자 v2 계약. 응답을 잃으면 같은 receipt로 fetchResult만 한다. 모델을 다시 돌리지 않는다.
+// options·checks·risks는 변경 작성 판(task-contracts CHANGE_INSTRUCTIONS_REVISION) 요청에만 있다.
 export type AuthorResult =
   | { kind: 'running' }
-  | { kind: 'needs_input'; question: string }
-  | { kind: 'snapshot'; artifact: ArtifactBundle; transportBytes: number }
+  | { kind: 'needs_input'; question: string; options?: readonly string[] }
+  | { kind: 'snapshot'; artifact: ArtifactBundle; transportBytes: number; checks?: readonly ChangeNote[]; risks?: readonly ChangeNote[] }
   | { kind: 'unknown' | 'failed' | 'cancelled'; code: string };
 export interface ChangeAuthorPort {
   // 옛 작업자면 false다. CHANGE만 닫히고 기존 /task는 그대로 돈다.
   supportsV2(): Promise<boolean>;
-  start(input: { target: ChangeTarget; baseCommit: string; baseTree: string; policyRevision: string; brief: ChangeBrief }): Promise<{ receiptId: string }>;
+  start(input: { target: ChangeTarget; baseCommit: string; baseTree: string; policyRevision: string; brief: ChangeBrief; amendment?: ChangeAmendmentInput }): Promise<{ receiptId: string }>;
   // 호출 전에 ChangePrivateInputs.record로 답변의 label을 기록한다. label_blocked면 부르지 않는다. 입력 label은 작업자 쪽 재확인용이다.
   resume(input: { receiptId: string; answer: string; label: ProvenanceLabel }): Promise<void>;
   cancel(receiptId: string): Promise<void>;

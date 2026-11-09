@@ -1,15 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, randomUUID } from 'node:crypto';
+import type { ReviewMaterial } from '../src/change-contracts.js';
 import { CODEX_DEFAULTS, CODEX_LIMITS, EVIDENCE_PATHS } from '../src/codex.js';
 import { DEFAULTS, Denied } from '../src/contracts.js';
 import type { Job } from '../src/contracts.js';
 import { CLAUDE_CHAT_CAPABILITIES } from '../src/executor-claude.js';
 import { MAX_TASK_BYTES } from '../src/review-http.js';
-import { EXECUTION_LANES, TASK_CAPABILITY, TASK_CAPABILITY_AUDIENCE, TASK_ENDPOINTS, TASK_INSTRUCTIONS_REVISION, TASK_LIMITS, TASK_OPERATIONS,
+import { AMENDMENT_LIMITS, CHANGE_INSTRUCTIONS_REVISION, CHANGE_NOTE_LIMITS, EXECUTION_LANES, TASK_CAPABILITY, TASK_CAPABILITY_AUDIENCE, TASK_ENDPOINTS, TASK_INSTRUCTIONS_REVISION, TASK_INSTRUCTIONS_REVISIONS, TASK_LIMITS, TASK_OPERATIONS,
   TASK_RETENTION, TaskCancelRequestSchema, TaskCancelResponseSchema, TaskCapabilitySchema, TaskFinalizeRequestSchema, TaskFinalizeResponseSchema,
-  TaskRejectionSchema, TaskRequestSchema, TaskResponseSchema, TaskStatusRequestSchema, TaskStatusResponseSchema, TaskV2ResultResponseSchema, TaskWorkerSigner, TaskWorkerVerifier,
-  executionLaneOf, taskQuestionId } from '../src/task-contracts.js';
+  TaskRejectionSchema, TaskRequestSchema, TaskResponseSchema, TaskStatusRequestSchema, TaskStatusResponseSchema, TaskV2RequestSchema, TaskV2ResultResponseSchema, TaskWorkerSigner, TaskWorkerVerifier,
+  boundAmendmentMaterials, executionLaneOf, taskQuestionId } from '../src/task-contracts.js';
 import { CAPABILITY_TTL_MS, WorkerSigner, WorkerVerifier, sealCapability, capabilityDigest } from '../src/worker.js';
 import { NONCE_RETENTION_MS } from '../src/worker-state.js';
 
@@ -358,4 +359,76 @@ test('T18 B1 capability: 타입도 교차 사용을 막는다', () => {
   typeOnly(() => signer().issue(
     // @ts-expect-error 작업 발급은 기존 operation을 받지 않는다.
     'cancel', body()));
+});
+
+// ---- C25 변경 작성 v2 판 ----
+const v2Start = (overrides: Record<string, unknown> = {}) => ({ ...start(), version: 2,
+  baseline: { repoId: 4242, changeGeneration: 1, baseTree: SHA, leaves: [{ path: 'src/app.txt', mode: '100644', blobSha: SHA }] }, ...overrides }) as Record<string, unknown>;
+const material = (body: string, overrides: Record<string, unknown> = {}) =>
+  ({ kind: 'review_comment', authorId: 7, association: 'OWNER', location: { path: 'src/app.txt', line: 3 }, body, ...overrides }) as ReviewMaterial;
+const amendment = (overrides: Record<string, unknown> = {}) => ({ pullNumber: 12, head: SHA, instruction: '리뷰 댓글대로 고쳐 줘',
+  materials: { label: 'public', items: [material('여기 이름이 틀렸어요')], omitted: 0 }, ...overrides });
+
+test('C25 지시문 판: v1 요청은 지금 판만, v2 요청은 지금 판과 변경 작성 판을 받는다', () => {
+  assert.equal(TASK_INSTRUCTIONS_REVISION, 'task-v1', '게시 서버가 지금 보내는 판은 그대로다');
+  assert.deepEqual([...TASK_INSTRUCTIONS_REVISIONS], ['task-v1', CHANGE_INSTRUCTIONS_REVISION]);
+  rejects(TaskRequestSchema, { ...start(), instructions: CHANGE_INSTRUCTIONS_REVISION }, 'v1은 새 판을 받지 않는다');
+  assert.equal(TaskV2RequestSchema.parse(v2Start()).instructions, 'task-v1');
+  assert.equal(TaskV2RequestSchema.parse(v2Start({ instructions: CHANGE_INSTRUCTIONS_REVISION })).instructions, CHANGE_INSTRUCTIONS_REVISION);
+  rejects(TaskV2RequestSchema, v2Start({ instructions: 'change-v9' }), '모르는 판');
+});
+
+test('C25 수정 차례 입력: 변경 작성 판에서만, head는 base와 같고, 자료 블록 label은 public뿐이다', () => {
+  const amend = (value: unknown, instructions: string = CHANGE_INSTRUCTIONS_REVISION) => v2Start({ instructions, amendment: value });
+  const parsed = TaskV2RequestSchema.parse(amend(amendment())) as { amendment?: { materials: { items: unknown[] } } };
+  assert.equal(parsed.amendment?.materials.items.length, 1);
+  TaskV2RequestSchema.parse(amend(amendment({ materials: { label: 'public', items: [material('대화 댓글', { kind: 'comment', authorId: null, association: 'NONE', location: null })], omitted: 3 } })));
+  rejects(TaskV2RequestSchema, amend(amendment(), 'task-v1'), '옛 판에는 수정 차례가 없다');
+  rejects(TaskV2RequestSchema, amend(amendment({ head: 'c'.repeat(40) })), 'head가 base와 다름');
+  for (const label of ['approved_public_summary', 'private', 'unknown']) {
+    rejects(TaskV2RequestSchema, amend(amendment({ materials: { label, items: [material('x')], omitted: 0 } })), `label ${label}`);
+  }
+  rejects(TaskV2RequestSchema, amend(amendment({ materials: { label: 'public', items: [material('x', { kind: 'push' })], omitted: 0 } })), '모르는 자료 종류');
+  rejects(TaskV2RequestSchema, amend(amendment({ materials: { label: 'public', items: [material('x', { login: 'someone' })], omitted: 0 } })), '작성자 ID·association·위치·본문 밖 칸');
+  rejects(TaskV2RequestSchema, amend(amendment({ materials: { label: 'public', items: [material('x', { location: { path: '../etc/passwd', line: 1 } })], omitted: 0 } })), '경로 규칙');
+  rejects(TaskV2RequestSchema, amend(amendment({ instruction: ' ' })), '빈 지시');
+  const many = Array.from({ length: AMENDMENT_LIMITS.materials + 1 }, (_, index) => material(`댓글 ${index}`));
+  rejects(TaskV2RequestSchema, amend(amendment({ materials: { label: 'public', items: many, omitted: 0 } })), '개수 상한');
+  const long = [material('가'.repeat(AMENDMENT_LIMITS.materialChars)), material('나'.repeat(AMENDMENT_LIMITS.materialChars))];
+  if (2 * AMENDMENT_LIMITS.materialChars > AMENDMENT_LIMITS.totalChars) rejects(TaskV2RequestSchema, amend(amendment({ materials: { label: 'public', items: long, omitted: 0 } })), '글자 상한');
+});
+
+test('C25 자료 블록 상한: 넘치면 오래된 것부터 빼고 뺀 수를 남긴다. 긴 본문은 자른다', () => {
+  const items = Array.from({ length: AMENDMENT_LIMITS.materials + 5 }, (_, index) => material(`댓글 ${index}`));
+  const bounded = boundAmendmentMaterials(items);
+  assert.equal(bounded.items.length, AMENDMENT_LIMITS.materials);
+  assert.equal(bounded.omitted, 5);
+  assert.equal(bounded.items[0]!.body, '댓글 5', '앞(오래된) 다섯 개가 빠진다');
+  assert.equal(bounded.items.at(-1)!.body, `댓글 ${AMENDMENT_LIMITS.materials + 4}`);
+  const heavy = Array.from({ length: 30 }, (_, index) => material(`${index}:${'가'.repeat(AMENDMENT_LIMITS.materialChars * 2)}`));
+  const cut = boundAmendmentMaterials(heavy);
+  assert.ok(cut.items.every(item => item.body.length <= AMENDMENT_LIMITS.materialChars));
+  assert.ok(cut.items.reduce((sum, item) => sum + item.body.length, 0) <= AMENDMENT_LIMITS.totalChars);
+  assert.equal(cut.omitted + cut.items.length, 30);
+  assert.ok(cut.items.at(-1)!.body.startsWith('29:'), '가장 새 자료는 남는다');
+  TaskV2RequestSchema.parse(v2Start({ instructions: CHANGE_INSTRUCTIONS_REVISION, amendment: amendment({ materials: { label: 'public', ...cut } }) }));
+});
+
+test('C25 결과 칸: needs_input의 선택지는 2~4개, snapshot의 확인할 것·남은 위험은 선택 칸이다', () => {
+  const turned = { version: 2, job: JOB, lease: LEASE, generation: 1, sessionId: SESSION, worker: WORKER, turn: 1, usage: { toolCalls: null, model: null } };
+  const asked = { ...turned, status: 'needs_input', stopped: true, sessionRetained: true, cleanupPending: false, question: '어느 쪽으로 할까요?' };
+  for (const options of [['A', 'B'], ['A', 'B', 'C', 'D']]) TaskV2ResultResponseSchema.parse({ ...asked, options });
+  TaskV2ResultResponseSchema.parse(asked);
+  for (const options of [[], ['A'], ['A', 'B', 'C', 'D', 'E'], ['A', ' ']]) rejects(TaskV2ResultResponseSchema, { ...asked, options }, `선택지 ${JSON.stringify(options)}`);
+  const snapshot = { ...turned, status: 'snapshot', stopped: true, sessionRetained: true, cleanupPending: false, artifactDigest: DIGEST,
+    artifact: { manifest: { version: 1, baseCommit: SHA, baseTree: SHA, resultTree: SHA, patchSha256: DIGEST,
+      entries: [{ path: 'src/app.txt', mode: '100644', changeKind: 'modified', blobSha: SHA, sha256: DIGEST, size: 4 }] }, files: [], patch: '' } };
+  TaskV2ResultResponseSchema.parse(snapshot);
+  const checks = [{ text: '함수 이름을 run으로 가정했어요', location: { path: 'src/app.txt', line: 3 } }, { text: '설정은 기본값', location: { path: 'README.md', line: null } }, { text: '위치 없음' }];
+  TaskV2ResultResponseSchema.parse({ ...snapshot, checks, risks: [] });
+  rejects(TaskV2ResultResponseSchema, { ...snapshot, checks: [{ text: 'x', location: { path: '/abs', line: 1 } }] }, '절대 경로');
+  rejects(TaskV2ResultResponseSchema, { ...snapshot, risks: [{ text: 'x', location: { path: 'a', line: 0 } }] }, '줄 0');
+  rejects(TaskV2ResultResponseSchema, { ...snapshot, risks: [{ text: '' }] }, '빈 글');
+  rejects(TaskV2ResultResponseSchema, { ...snapshot, checks: Array.from({ length: CHANGE_NOTE_LIMITS.items + 1 }, () => ({ text: 'x' })) }, '개수 상한');
+  rejects(TaskV2ResultResponseSchema, { ...asked, checks: [] }, 'needs_input에는 확인할 것이 없다');
 });

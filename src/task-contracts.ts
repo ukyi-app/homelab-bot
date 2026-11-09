@@ -1,7 +1,8 @@
 import type { KeyObject } from 'node:crypto';
 import { z } from 'zod';
-import { ARTIFACT_LIMITS, ArtifactManifestSchema, ChangePathSchema, CommandIdSchema, EvidenceBundleSchema, GenerationSchema, GitShaSchema, ReasonCodeSchema, RepoIdSchema, Sha256Schema,
-  VerificationReceiptSchema } from './change-contracts.js';
+import { ARTIFACT_LIMITS, AUTHOR_ASSOCIATIONS, ArtifactManifestSchema, ChangePathSchema, CommandIdSchema, EvidenceBundleSchema, GenerationSchema, GitShaSchema, REVIEW_MATERIAL_KINDS,
+  ReasonCodeSchema, RepoIdSchema, Sha256Schema, VerificationReceiptSchema } from './change-contracts.js';
+import type { ChangeLocation, ChangeNote, ReviewMaterial } from './change-contracts.js';
 import { CODEX_DEFAULTS, CODEX_LIMITS, EVIDENCE_PATHS } from './codex.js';
 import { DEFAULTS, Denied, RateLimitInfoSchema } from './contracts.js';
 import type { Clock } from './contracts.js';
@@ -62,7 +63,12 @@ export const TASK_CLEANUP_STATES = ['none', 'pending', 'cleaned'] as const;
 export type TaskCleanupState = typeof TASK_CLEANUP_STATES[number];
 
 // 고정 지시문의 판. 게시 서버와 작업자의 판이 다르면 시작하지 않는다. 글은 작업자가 이 판으로 고른다.
+// TASK_INSTRUCTIONS_REVISION은 v1 요청이 받는 유일한 판이자 게시 서버가 지금 보내는 판이다.
+// 작업자는 v2(변경 작성) 요청에 TASK_INSTRUCTIONS_REVISIONS를 모두 받는다. 게시 서버가 새 판을 보내려면 intake의 change.instructions에 그 판이 있어야 한다.
 export const TASK_INSTRUCTIONS_REVISION = 'task-v1';
+export const CHANGE_INSTRUCTIONS_REVISION = 'change-v2';
+export const TASK_INSTRUCTIONS_REVISIONS = Object.freeze([TASK_INSTRUCTIONS_REVISION, CHANGE_INSTRUCTIONS_REVISION] as const);
+export type TaskInstructionsRevision = typeof TASK_INSTRUCTIONS_REVISIONS[number];
 
 const uuid = z.string().uuid();
 const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
@@ -260,11 +266,37 @@ const TaskV2BaselineSchema = z.strictObject({ repoId: RepoIdSchema, changeGenera
 // 공개 brief 전체가 들어가는 자리라 v1의 사용자 입력 상한보다 넓다. brief 최대 길이에 맞춘 값이다.
 export const TASK_V2_REQUEST_CHARS = 48_000;
 const v2Text = z.string().max(TASK_V2_REQUEST_CHARS).refine(text => text.trim().length > 0, 'empty_text');
+// 변경 작성 판의 선택지·확인할 것·남은 위험 상한. 모델 출력은 작업자가 이 값으로 자르고 세며, 선택지 개수만은 틀리면 출력 전체를 받지 않는다. 글자·항목 수는 [제안]이다.
+export const CHANGE_NOTE_LIMITS = Object.freeze({ minOptions: 2, maxOptions: 4, optionChars: 100, items: 10, textChars: 300 });
+// 수정 차례 자료 블록 상한. 요청 본문 상한(TASK_LIMITS.bodyBytes) 안에 brief(TASK_V2_REQUEST_CHARS)·T0 잎과 함께 들어가야 한다. 값은 [제안]이다.
+export const AMENDMENT_LIMITS = Object.freeze({ materials: 50, materialChars: 4000, totalChars: 40_000 });
+const filled = (max: number) => z.string().max(max).refine(text => text.trim().length > 0, 'empty_text');
+export const ChangeLocationSchema = z.strictObject({ path: ChangePathSchema, line: z.number().int().positive().max(2_147_483_647).nullable() }) satisfies z.ZodType<ChangeLocation>;
+export const ChangeNoteSchema = z.strictObject({ text: filled(CHANGE_NOTE_LIMITS.textChars), location: ChangeLocationSchema.optional() }) satisfies z.ZodType<ChangeNote>;
+const ChangeNotesSchema = z.array(ChangeNoteSchema).max(CHANGE_NOTE_LIMITS.items);
+const ChangeOptionsSchema = z.array(filled(CHANGE_NOTE_LIMITS.optionChars)).min(CHANGE_NOTE_LIMITS.minOptions).max(CHANGE_NOTE_LIMITS.maxOptions);
+export const ReviewMaterialSchema = z.strictObject({ kind: z.enum(REVIEW_MATERIAL_KINDS), authorId: z.number().int().positive().nullable(),
+  association: z.enum(AUTHOR_ASSOCIATIONS), location: ChangeLocationSchema.nullable(), body: z.string().max(AMENDMENT_LIMITS.materialChars) }) satisfies z.ZodType<ReviewMaterial>;
+const materialChars = (items: readonly ReviewMaterial[]) => items.reduce((sum, item) => sum + item.body.length, 0);
+// 자료 블록은 공개 저장소 PR의 글이라 label이 public뿐이다. omitted는 상한 때문에 뺀 오래된 자료 수다.
+const AmendmentSchema = z.strictObject({ pullNumber: z.number().int().positive().max(2_147_483_647), head: z.string().regex(/^[a-f0-9]{40}$/),
+  instruction: untrustedText,
+  materials: z.strictObject({ label: z.literal('public'), items: z.array(ReviewMaterialSchema).max(AMENDMENT_LIMITS.materials), omitted: z.number().int().nonnegative() })
+    .refine(materials => materialChars(materials.items) <= AMENDMENT_LIMITS.totalChars, 'materials_too_long') });
+// 자료를 상한 안으로 줄인다. items는 오래된 것부터다. 긴 본문은 자르고, 그래도 넘치면 앞(오래된 것)부터 뺀다.
+export function boundAmendmentMaterials(items: readonly ReviewMaterial[]): { items: ReviewMaterial[]; omitted: number } {
+  const cut = items.map(item => item.body.length <= AMENDMENT_LIMITS.materialChars ? item : { ...item, body: `${item.body.slice(0, AMENDMENT_LIMITS.materialChars - 1)}…` });
+  let from = Math.max(0, cut.length - AMENDMENT_LIMITS.materials);
+  while (materialChars(cut.slice(from)) > AMENDMENT_LIMITS.totalChars) from++;
+  return { items: cut.slice(from), omitted: from };
+}
 const v2Identity = { version: z.literal(TASK_V2_CONTRACT), job: uuid, lease: uuid, generation, sessionId: uuid };
 const { version: _v1Version, ...sharedExecution } = executionShape;
-const v2Execution = { ...sharedExecution, ...v2Identity };
+// instructions는 executionShape의 같은 자리를 덮는다. 칸 순서가 그대로여야 옛 게시 서버의 서명 digest와 맞는다.
+const v2Execution = { ...sharedExecution, ...v2Identity, instructions: z.enum(TASK_INSTRUCTIONS_REVISIONS) };
+// amendment는 수정 차례에만 있는 선택 칸이고 끝에 둔다. 칸이 없으면 직렬화가 옛 요청과 같다.
 const TaskV2StartSchema = z.strictObject({ ...v2Execution, operation: z.literal('start'), turn: z.literal(1),
-  baseline: TaskV2BaselineSchema, untrusted: z.strictObject({ request: v2Text }) });
+  baseline: TaskV2BaselineSchema, untrusted: z.strictObject({ request: v2Text }), amendment: AmendmentSchema.optional() });
 // 답의 출처를 다시 확인한다. private·unknown은 모양부터 받지 않는다.
 const TaskV2ResumeSchema = z.strictObject({ ...v2Execution, operation: z.literal('resume'), turn: turn.min(2),
   expectedWorker: TaskWorkerIdentitySchema, resumeReason: z.enum(['clarification', 'model_limit', 'auth_expired']),
@@ -272,6 +304,11 @@ const TaskV2ResumeSchema = z.strictObject({ ...v2Execution, operation: z.literal
   untrusted: z.strictObject({ answer: untrustedText, label: z.enum(['public', 'approved_public_summary']) }).optional() });
 export const TaskV2RequestSchema = z.discriminatedUnion('operation', [TaskV2StartSchema, TaskV2ResumeSchema]).superRefine((request, ctx) => {
   if (request.timeoutMs > request.runBudgetRemainingMs) ctx.addIssue({ code: 'custom', path: ['timeoutMs'], message: 'over_run_budget' });
+  if (request.operation === 'start' && request.amendment) {
+    if (request.instructions !== CHANGE_INSTRUCTIONS_REVISION) ctx.addIssue({ code: 'custom', path: ['amendment'], message: 'amendment_revision' });
+    // 수정 차례는 PR 브랜치 head 위에서 작성한다. baseline은 그 head의 tree이고 T0 대조 규칙은 같다.
+    if (request.amendment.head !== request.base) ctx.addIssue({ code: 'custom', path: ['amendment', 'head'], message: 'amendment_head_mismatch' });
+  }
   if (request.operation !== 'resume') return;
   if (request.resumeReason === 'clarification' && !request.questionId) ctx.addIssue({ code: 'custom', path: ['questionId'], message: 'question_required' });
   if ((request.questionId === undefined) !== (request.untrusted === undefined)) ctx.addIssue({ code: 'custom', path: ['untrusted'], message: 'answer_question_mismatch' });
@@ -300,15 +337,17 @@ export const TaskV2ResultResponseSchema = z.discriminatedUnion('status', [
   z.strictObject({ ...v2Response, status: z.literal('running'), turn: turn.nullable(), stopped: z.literal(false) }),
   // 이 저장소가 이 세대를 모른다(finalized:false). 옛 파드의 소멸 증명이 아니고 접수를 잃었다는 증명도 아니다.
   z.strictObject({ ...v2Response, status: z.literal('absent'), finalized: z.boolean(), stopped: z.boolean() }),
+  // options·checks·risks는 변경 작성 판 요청의 결과에만 있다. 이 칸을 모르는 옛 게시 서버는 칸이 있는 결과를 거부하지만, 옛 서버는 옛 판만 보내므로 받을 일이 없다.
   z.strictObject({ ...turnedResponse, status: z.literal('needs_input'), stopped: z.literal(true), sessionRetained: z.literal(true), cleanupPending: z.literal(false),
-    question: z.string().max(TASK_LIMITS.questionChars).refine(text => text.trim().length > 0, 'empty_text'), ...rateLimitSlot }),
+    question: z.string().max(TASK_LIMITS.questionChars).refine(text => text.trim().length > 0, 'empty_text'), ...rateLimitSlot, options: ChangeOptionsSchema.optional() }),
   z.strictObject({ ...turnedResponse, status: z.enum(['limited', 'auth_expired']), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.boolean(), ...rateLimitSlot }),
   z.strictObject({ ...turnedResponse, status: z.literal('failed'), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.boolean(), reason: z.enum(TASK_V2_FAILURE_REASONS), ...rateLimitSlot }),
   // 소멸을 확인하지 못했거나 그 턴의 결과를 잃었다. 다시 돌리지 않는다.
   z.strictObject({ ...turnedResponse, status: z.literal('unknown'), stopped: z.boolean(), sessionRetained: z.literal(true), cleanupPending: z.boolean() }),
   // 프로세스 소멸을 확인한 뒤 실제 파일로 계산한 결과다. 모델의 요약은 싣지 않는다.
+  // checks·risks는 작성 모델이 쓴 확인할 것·남은 위험이다. 증거(승인 digest 재료)가 아니고, 공개 경로로 내기 전에 게시 서버가 공개 검사를 거친다.
   z.strictObject({ ...turnedResponse, status: z.literal('snapshot'), stopped: z.literal(true), sessionRetained: z.literal(true), cleanupPending: z.literal(false),
-    artifactDigest: Sha256Schema, artifact: WireArtifactSchema, ...rateLimitSlot }),
+    artifactDigest: Sha256Schema, artifact: WireArtifactSchema, ...rateLimitSlot, checks: ChangeNotesSchema.optional(), risks: ChangeNotesSchema.optional() }),
 ]);
 export type TaskV2ResultResponse = z.infer<typeof TaskV2ResultResponseSchema>;
 // 저장해 두는 결과. identity는 읽을 때 지금 작업자로 다시 채운다. 파드가 바뀌어도 같은 저장소면 같은 결과다.

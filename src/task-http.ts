@@ -7,8 +7,8 @@ import { TaskWorkerBusy, TaskWorkerRejected } from './task-bridge.js';
 import type { TaskEndpointRequest, TaskEndpointResponse, TaskWorkerPort } from './task-bridge.js';
 import { ARTIFACT_LIMITS } from './change-contracts.js';
 import { VERIFIER_REVISION } from './change-verifier.js';
-import { TASK_ENDPOINTS, TASK_LIMITS, TASK_V2_CONTRACT, TASK_V2_ENDPOINTS, TaskRejectionSchema } from './task-contracts.js';
-import type { TaskEndpoint, TaskRequest, TaskSignedBody, TaskV2Endpoint, TaskWorkerSigner } from './task-contracts.js';
+import { TASK_ENDPOINTS, TASK_INSTRUCTIONS_REVISION, TASK_INSTRUCTIONS_REVISIONS, TASK_LIMITS, TASK_V2_CONTRACT, TASK_V2_ENDPOINTS, TaskRejectionSchema } from './task-contracts.js';
+import type { TaskEndpoint, TaskInstructionsRevision, TaskRequest, TaskSignedBody, TaskV2Endpoint, TaskWorkerSigner } from './task-contracts.js';
 import { TaskRouteError } from './task-worker.js';
 import type { TaskWorkerService } from './task-worker.js';
 import { beforeConnection } from './worker-http.js';
@@ -24,8 +24,9 @@ const CONTROL_TIMEOUT_MS = 8000;
 // 옛 이미지와 대화·리뷰 작업자는 404라, 거기에 실행을 보내 응답 불명으로 레인을 닫는 일을 미리 막는다.
 export const TaskIntakeSchema = z.object({ version: z.literal(1), open: z.boolean(), reasons: z.array(z.string().max(64)).max(32),
   capabilities: z.object({ lanes: z.object({ task: z.literal(true) }) }).loose(),
-  // v2 계약을 받는 작업자에만 있다.
-  change: z.object({ contract: z.number().int(), verifierRevision: z.string().max(128) }).optional() });
+  // v2 계약을 받는 작업자에만 있다. instructions는 v2 요청에 받는 지시문 판 목록이고, 칸이 없는 옛 작업자는 옛 판(TASK_INSTRUCTIONS_REVISION)만 받는다.
+  // z.object라 이 칸을 모르는 옛 게시 서버도 칸을 버리고 받는다.
+  change: z.object({ contract: z.number().int(), verifierRevision: z.string().max(128), instructions: z.array(z.string().max(64)).max(16).optional() }).optional() });
 export type TaskIntakeStatus = { routed: boolean; open: boolean; reasons: readonly string[] };
 export const TASK_INTAKE_UNREACHED: TaskIntakeStatus = Object.freeze({ routed: false, open: false, reasons: [] });
 export async function taskWorkerIntake(workerUrl: string, send: typeof fetch, signal: AbortSignal): Promise<TaskIntakeStatus> {
@@ -45,6 +46,18 @@ export async function taskWorkerChangeContract(workerUrl: string, send: typeof f
     const parsed = TaskIntakeSchema.safeParse(await response.json());
     return parsed.success && parsed.data.change?.contract === TASK_V2_CONTRACT;
   } catch { return false; }
+}
+// 이 작업자가 v2 요청에 받는 지시문 판. 게시 서버는 여기 있는 판만 보낸다. v2를 받지 않거나 확인하지 못하면 빈 목록이고,
+// 판 목록 칸이 없는 옛 작업자는 옛 판만이다. 이 게시 서버가 모르는 판 이름은 뺀다.
+export async function taskWorkerChangeInstructions(workerUrl: string, send: typeof fetch, signal: AbortSignal): Promise<readonly TaskInstructionsRevision[]> {
+  try {
+    const response = await send(new URL(TASK_INTAKE_PATH, workerUrl).href, { method: 'GET', redirect: 'error', signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]) });
+    if (!response.ok) { await response.body?.cancel().catch(() => {}); return []; }
+    const parsed = TaskIntakeSchema.safeParse(await response.json());
+    if (!parsed.success || parsed.data.change?.contract !== TASK_V2_CONTRACT) return [];
+    const listed = parsed.data.change.instructions ?? [TASK_INSTRUCTIONS_REVISION];
+    return TASK_INSTRUCTIONS_REVISIONS.filter(revision => listed.includes(revision));
+  } catch { return []; }
 }
 
 // 응답 본문을 상한까지만 읽는다. 잘라서 쓰지 않고 넘으면 실패다. 읽은 바이트 수는 저장 상한 대조에 그대로 쓴다.
@@ -68,6 +81,8 @@ export interface TaskV2WorkerPort {
   // bytes는 실제로 받은 본문 크기다.
   callV2<E extends TaskV2Endpoint>(endpoint: E, input: TaskV2EndpointRequest<E>, signal?: AbortSignal): Promise<{ response: unknown; bytes: number }>;
   supportsChange(signal?: AbortSignal): Promise<boolean>;
+  // 받는 지시문 판(taskWorkerChangeInstructions). 선택 메서드라 이 port를 흉내 내는 기존 구현이 그대로 맞는다. 없으면 옛 판만 보낸다.
+  changeInstructions?(signal?: AbortSignal): Promise<readonly TaskInstructionsRevision[]>;
 }
 // v2는 긴 턴을 기다리지 않는다. 모든 호출이 제어 호출 기한 안에 끝난다. 거부 판별은 v1과 같다. 응답 검증은 호출자가 계약 schema로 한다.
 export class HttpTaskV2Worker implements TaskV2WorkerPort {
@@ -79,6 +94,9 @@ export class HttpTaskV2Worker implements TaskV2WorkerPort {
   }
   supportsChange(signal: AbortSignal = AbortSignal.timeout(CONTROL_TIMEOUT_MS)): Promise<boolean> {
     return taskWorkerChangeContract(this.origin, this.send, signal);
+  }
+  changeInstructions(signal: AbortSignal = AbortSignal.timeout(CONTROL_TIMEOUT_MS)): Promise<readonly TaskInstructionsRevision[]> {
+    return taskWorkerChangeInstructions(this.origin, this.send, signal);
   }
   async callV2<E extends TaskV2Endpoint>(endpoint: E, input: TaskV2EndpointRequest<E>, signal?: AbortSignal): Promise<{ response: unknown; bytes: number }> {
     const spec = TASK_V2_ENDPOINTS[endpoint];
@@ -216,7 +234,7 @@ export function taskRoutes(service: TaskWorkerService, capabilities: object, log
   const intake: WorkerRoute = async (req, res) => {
     if (req.method !== 'GET') { res.writeHead(404).end(); return; }
     res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ version: 1, open: service.intake.open, reasons: service.intake.reasons, capabilities,
-      ...(service.changeEnabled ? { change: { contract: TASK_V2_CONTRACT, verifierRevision: VERIFIER_REVISION } } : {}) }));
+      ...(service.changeEnabled ? { change: { contract: TASK_V2_CONTRACT, verifierRevision: VERIFIER_REVISION, instructions: TASK_INSTRUCTIONS_REVISIONS } } : {}) }));
   };
   return new Map<string, WorkerRoute>([...(Object.keys(TASK_ENDPOINTS) as TaskEndpoint[]).map(endpoint => [endpoint, route(endpoint)] as const),
     ...(service.changeEnabled ? (Object.keys(TASK_V2_ENDPOINTS) as TaskV2Endpoint[]).map(endpoint => [endpoint, routeV2(endpoint)] as const) : []),
