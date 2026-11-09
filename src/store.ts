@@ -180,6 +180,16 @@ export class Store {
       AND c.active=true AND c.gap=false AND j.available_at<=$1`, [this.now()])).rows;
     await moveReactions(tx, ready.map(row => row.event_id), 'waiting');
   }
+  // 대화 루프는 실행을 끝까지 기다린 뒤에야 claim을 다시 부르므로, 실행 중에 디바운스가 끝난 메시지는 claim이 보지 못한다.
+  // 게시 루프의 반응 동기화가 이것을 불러 그 메시지도 ⏳로 옮긴다. 대화 자리(interactive 레인)가 차 있을 때만이다.
+  // 작업 루프를 끈 배치에서 작업이 대화를 막는 경우는 레인 설정을 몰라 여기서 보지 않는다(claim이 볼 때 붙는다).
+  async refreshWaiting(): Promise<void> {
+    await this.db.transaction(async tx => {
+      const stopped = (await tx.query<{ value: boolean }>(`SELECT value FROM controls WHERE key='scheduler'`)).rows[0]?.value;
+      if (stopped || !await this.laneBusy('interactive', tx)) return;
+      await this.markWaiting(tx);
+    });
+  }
   // CHANGE 작성 job 하나를 claim과 같은 잠금 순서·같은 슬롯 규칙으로 집는다. 슬롯이 차 있으면 undefined이고 부모는 다음 바퀴에 다시 본다.
   async claimChangeAuthor(jobId: string): Promise<Job | undefined> {
     return this.db.transaction(async tx => {
@@ -394,7 +404,8 @@ export class Store {
   // 권한 철회로 멈춘 대화에는 안내하지 않는다(게시도 막힌다). 대화·조회의 취소는 지금처럼 알리지 않는다.
   // 모든 cancelled 확정이 여기를 지나므로 봇 반응 지우기도 여기서 한다(대화 메시지만 반응 행이 있다).
   private async cancelledNotice(job: Job, reason: string | null, tx: Database): Promise<void> {
-    await moveReactions(tx, [job.event_id], 'cleared');
+    // 디바운스 안에서 밀려난 앞 메시지도 이 작업이 맡던 것이라, 처리 중인 작업이 없으면 함께 지운다.
+    await settleReactions(tx, job.id, 'cleared');
     if (job.type !== 'task' || reason === 'authorization_revoked') return;
     await this.notice(job, `task-cancelled:${job.id}`, `작업 ${job.id} 취소를 완료했습니다(cancelled). 실행 중인 프로세스가 없음을 확인했고 다시 실행하지 않습니다. 필요하면 새 작업으로 요청하세요.`, tx);
   }

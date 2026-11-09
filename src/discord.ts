@@ -489,16 +489,24 @@ export function hasMarker(content: string, marker: string): boolean {
   const body = jsonBody(content) as { ref?: unknown; data?: unknown } | undefined;
   return !!body && !Array.isArray(body) && body.ref === marker && 'data' in body;
 }
+// 게시 루프 한 바퀴가 반응 동기화를 기다리는 상한. 반응 REST가 멈춰도 다음 답 게시는 이만큼만 늦는다.
+export const REACTION_WAIT_MS = 1000;
 export class DiscordPublisher {
   private readonly reactions: ReactionSync;
   constructor(private readonly store: Store, private readonly gate: PolicyGate, private readonly rest: DiscordRest, private readonly log: Log = jsonLog) {
     this.reactions = new ReactionSync(store, rest, log);
   }
+  private reactionRound: Promise<void> | undefined;
   // 반응 상태를 Discord에 맞춘다. 게시 루프 한 바퀴마다(게시 확정 직후 포함) 부른다.
+  // 반응 REST는 호출마다 수 초까지 걸릴 수 있어, 게시 루프는 REACTION_WAIT_MS까지만 기다리고 남은 동기화는 뒤에서 끝나게 둔다.
+  // 동기화는 한 번에 하나만 돈다. 앞 바퀴가 아직 돌면 새로 시작하지 않고 그것을 다시 같은 상한만큼 기다린다.
   // 반응 오류·DB 오류는 로그만 남긴다. 게시 결과와 루프의 바쁨 판단을 바꾸지 않는다.
   private async syncReactions(): Promise<void> {
-    try { await this.reactions.sync(); }
-    catch (error) { this.log('reaction_sync_failed', errorInfo(error)); }
+    this.reactionRound ??= this.reactions.sync().then(() => undefined, error => { this.log('reaction_sync_failed', errorInfo(error)); })
+      .finally(() => { this.reactionRound = undefined; });
+    let timer: NodeJS.Timeout | undefined;
+    const wait = new Promise<void>(resolve => { timer = setTimeout(resolve, REACTION_WAIT_MS); timer.unref?.(); });
+    try { await Promise.race([this.reactionRound, wait]); } finally { clearTimeout(timer); }
   }
   private async authorized(row: Delivery): Promise<void> {
     // Alert coalescing may have replaced the scope since this delivery was claimed.

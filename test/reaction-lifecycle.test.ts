@@ -176,7 +176,6 @@ test('오류: ⏳ 더하기 403은 감사만 남기고 대체 글이 없다', as
   await until(() => f.requests.length === 1);
   await f.ingress.receive(event('8503'));
   f.advance(DEFAULTS.debounceMs);
-  await f.runtime.tick();
   await drain();
   await drain();
   assert.deepEqual(log, ['ack 8502', 'ack 8503', 'add rejected']);
@@ -230,7 +229,6 @@ test('protocol 흐름: 반응 REST는 모두 @me이고 남의 반응을 지우�
   await until(() => f.requests.length === 1);
   await ingress.receive(event('8602'));
   f.advance(DEFAULTS.debounceMs);
-  await f.runtime.tick();
   while (await publisher.deliver());
   release();
   await first;
@@ -288,6 +286,8 @@ async function until(check: () => boolean) {
   assert.ok(check());
 }
 
+// 운영의 대화 루프는 tick()이 실행을 끝까지 기다린 뒤에야 다음 바퀴를 돈다. 그래서 실행 중에는 tick을 다시 부르지 않고
+// 게시 루프(deliver)만 돌게 둔다. ⏳는 그 게시 루프에서 붙어야 한다.
 test('흐름: 다른 모델 일 뒤에 기다리면 ⏳를 더하고, 답하면 👀·⏳를 모두 지움', async () => {
   const release = holdModel();
   await f.ingress.receive(event('8101'));
@@ -298,7 +298,6 @@ test('흐름: 다른 모델 일 뒤에 기다리면 ⏳를 더하고, 답하면 
   await drain();
   assert.deepEqual(log, ['ack 8101', 'ack 8102'], '디바운스 전에는 아직 대기가 아니다');
   f.advance(DEFAULTS.debounceMs);
-  assert.equal(await f.runtime.tick(), false);
   await drain();
   assert.deepEqual(log.slice(2), ['add fixture-thread/8102 ⏳']);
   release();
@@ -309,4 +308,72 @@ test('흐름: 다른 모델 일 뒤에 기다리면 ⏳를 더하고, 답하면 
   await drain();
   assert.deepEqual(log.slice(5).sort(), ['post fixture-thread', 'remove fixture-thread/8102 ⏳', 'remove fixture-thread/8102 👀'].sort());
   assert.equal(log[5], 'post fixture-thread');
+});
+
+test('흐름: 디바운스 안에 온 뒤 메시지를 /cancel하면 밀려난 앞 메시지의 반응까지 지운다', async () => {
+  await f.ingress.receive(event('9301'));
+  await f.ingress.receive(event('9302', { text: '덧붙임' }));
+  const states = (await database.db.query<{ state: string }>('SELECT state FROM jobs ORDER BY created_at, id')).rows.map(row => row.state).sort();
+  assert.deepEqual(states, ['queued', 'superseded']);
+  const job = (await database.db.query<{ id: string }>(`SELECT id FROM jobs WHERE state='queued'`)).rows[0]!.id;
+  await f.ingress.receive(event('9303', { kind: 'command', command: 'cancel', target: job, mention: undefined, text: '' }));
+  await drain();
+  assert.deepEqual(log.filter(line => line.startsWith('remove')).sort(), ['remove fixture-thread/9301 👀', 'remove fixture-thread/9302 👀']);
+  assert.equal((await database.db.query(`SELECT key FROM controls WHERE key LIKE 'reaction:%'`)).rows.length, 0, '반응 행이 남지 않는다');
+});
+
+test('오류: ⏳ 더하기가 실제로는 붙었는데 응답을 잃어도, 끝 상태에서 ⏳까지 지운다', async () => {
+  const add = f.rest.addReaction;
+  f.rest.addReaction = async (channel, message, emoji) => {
+    await add(channel, message, emoji);
+    throw Object.assign(new Error('timeout'), { name: 'TimeoutError' });
+  };
+  const release = holdModel();
+  await f.ingress.receive(event('9201'));
+  f.advance(DEFAULTS.debounceMs);
+  const first = f.runtime.tick();
+  await until(() => f.requests.length === 1);
+  await f.ingress.receive(event('9202'));
+  f.advance(DEFAULTS.debounceMs);
+  await drain();
+  assert.deepEqual(log, ['ack 9201', 'ack 9202', 'add fixture-thread/9202 ⏳']);
+  release();
+  await first;
+  await drain();
+  assert.equal(await f.runtime.tick(), true);
+  f.advance(60_000);
+  await drain();
+  assert.deepEqual(log.filter(line => line.startsWith('remove')).sort(),
+    ['remove fixture-thread/9201 👀', 'remove fixture-thread/9202 ⏳', 'remove fixture-thread/9202 👀']);
+});
+
+// 실제 시계로 기다린다. 게시 루프가 반응 동기화를 기다리는 상한은 실제 시간이다.
+async function within<T>(work: Promise<T>, ms: number): Promise<T | 'timeout'> {
+  let timer!: NodeJS.Timeout;
+  const timeout = new Promise<'timeout'>(resolve => { timer = setTimeout(() => resolve('timeout'), ms); });
+  try { return await Promise.race([work, timeout]); } finally { clearTimeout(timer); }
+}
+async function eventually(check: () => boolean, ms = 3000) {
+  const end = Date.now() + ms;
+  while (!check() && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.ok(check());
+}
+
+test('게시: 반응 REST가 멈춰도 게시 루프는 짧은 상한 뒤 돌아와 다음 답을 게시한다', async () => {
+  let unstick!: () => void;
+  const stuck = new Promise<void>(resolve => { unstick = resolve; });
+  const remove = f.rest.removeOwnReaction;
+  f.rest.removeOwnReaction = async (channel, message, emoji) => {
+    if (message === '9101') await stuck;
+    return remove(channel, message, emoji);
+  };
+  await answer('9101');
+  assert.equal(await within(f.publisher.deliver(), 3000), true, '반응 지우기를 기다리느라 게시 루프가 멈추지 않는다');
+  await answer('9102');
+  assert.notEqual(await within(drain(), 6000), 'timeout');
+  assert.deepEqual(log, ['ack 9101', 'post fixture-thread', 'ack 9102', 'post fixture-thread'], '앞 반응이 끝나기 전에 다음 답이 게시된다');
+  unstick();
+  await eventually(() => log.includes('remove fixture-thread/9101 👀'));
+  await drain();
+  assert.deepEqual(log.filter(line => line.startsWith('remove')).sort(), ['remove fixture-thread/9101 👀', 'remove fixture-thread/9102 👀']);
 });
