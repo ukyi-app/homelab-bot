@@ -546,7 +546,7 @@ feature-plan 합의로 정했다. 질문마다 사용자가 에이전트 추천�
 
 1. **호출:** **멘션 요청**이 기본이다. 허용 채널(대화·알림) 어디서든 받고, 봇이 만들지 않은 스레드와 오래 쉰 스레드도 받는다. 봇 글에 답장하면 그 봇 글을 자료로 넣는다(봇 자신의 글만). '/' 명령은 시범 동안 안내 없는 예비로만 남고, 없앨지는 시범 뒤에 정한다. 말로 하는 구독 끄기는 두지 않는다.
 2. **모델은 제안만 한다:** 대화 호출 한 번이 답과 제안 하나를 낸다. 실행 요청은 봇이 한 줄로 되묻고 owner가 버튼으로 확정해야 실행된다. 읽기 요청은 바로 답한다. 작업 질문은 열린 질문이 하나면 다음 말이 답이다. 변경 게시는 미리보기 digest에 묶인 버튼으로 승인하고 digest 입력은 예비로 남는다. 세션 연결 키는 버튼 뒤 본인만 보이는 응답으로 준다. 이 결정은 "대화 모델 출력은 글만 쓴다"는 이전 방어를 "실행은 owner의 버튼 상호작용으로만 일어난다"로 바꾼다.
-3. **관리 기능은 CLI로:** 비상 정지·해제·차단·상태 보기·unknown 해제는 `homelab bot` CLI(클러스터 접근)로 한다. 말로 하지 않는다. 관리자 페이지는 두지 않는다. 차단 해제는 지금의 Infisical 절차 그대로다. ARCHITECTURE §6의 "즉시 철회 명령의 경계"('/' 명령 계약)는 구현 티켓이 "클러스터 접근 권한으로 도는 CLI 관리 명령, 모델을 거치지 않고 거부를 더할 수만 있다"로 고치고 T21 영향 항목을 다시 검증한다.
+3. **관리 기능은 CLI로:** 비상 정지·해제·차단·상태 보기·unknown 해제는 `homelab bot` CLI(클러스터 접근)로 한다. 말로 하지 않는다. 관리자 페이지는 두지 않는다. 차단 해제는 지금의 Infisical 절차 그대로다. ARCHITECTURE §6의 "즉시 철회 명령의 경계"('/' 명령 계약)는 구현 티켓이 "클러스터 접근 권한으로 도는 CLI 관리 명령, 모델을 거치지 않고 거부를 더할 수만 있다"로 고치고 T21 영향 항목을 다시 검증한다. 구현 위치: 봇 `src/admin.ts`·`src/admin-main.ts`, homelab `cli/src/commands/bot.ts`(아래 "C05 관리 CLI").
 4. **말투:** Discord와 GitHub PR 리뷰 모두 해요체 **동료 말투**다. **고정 문구**는 사람이 다듬는다. 리뷰는 심각도를 두고 조건·영향·근거·개선을 한 문단으로 쓴다. **대조 표식**은 작게, 스레드 제목은 사람이 읽게 한다. **owner 호출**은 owner 손이 필요할 때만 하고 답장은 알림 없이 단다.
 5. **반응:** 👀 받음, ⏳ 대기, 💤 모델 멈춤 중 대기, 답하면 지움(✅ 없음), 실패면 지우고 한 줄, 답이 필요 없는 말은 👍(모델이 판단).
    구현(C04): 👀·⏳·지움·실패는 `src/reactions.ts`(상태 표·`ReactionSync`), `Store.claim`(⏳ 판단), 게시 확정·실패·취소 확정의 정리다. 👍·💤는 같은 상태 표에 이름을 더한다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §13 "수신·진행 신호", 검증은 [VERIFICATION](VERIFICATION.md) "C04 반응 수명".
@@ -873,6 +873,7 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 
 - 작업자는 대화 요청 v1·v2와 리뷰 지시문 v1·v2 literal을 함께 받는다. 게시 서버는 자동 배포라 작업자(사람 배포, C06)가 먼저 두 판을 받아야 서버가 v2로 바꿀 수 있다(C11·C12). v1 수용은 시범이 끝난 뒤 뺀다(명세 §4.2 "계약 배포 순서" 3단계). 구현과 시험은 [ARCHITECTURE](ARCHITECTURE.md) §13 "봇 답 문맥"·"대화 답 형식", [VERIFICATION](VERIFICATION.md) "C02 작업자 계약 v2".
 
+<<<<<<< HEAD
 ## C09 고정 문구 1: 대화·작업·제어 (2026-11-10)
 
 "동료 봇 전환 (사용자 2026-11-09)" 4(말투)·9(스위치)의 대화·작업·제어 문구 자리다. 사용자 결정이 아니라 구현 선택이고, 말의 자연스러움은 owner 검토(C24 말투 표본)로 다시 본다. 시험·결과는 [VERIFICATION](VERIFICATION.md) "C09 고정 문구 1".
@@ -883,3 +884,16 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 - **말로 하는 안내:** 켜짐 판은 "작업 목록을 보여 달라고", "다시 해 달라고", "취소해 달라고", "리뷰를 재개하거나 취소해 달라고"처럼 할 일을 말로 적는다. 대화 모델이 그 말을 제안으로 바꾸는 것은 C11·C13 몫이다. 작업 질문 답은 C16 전까지 질문 ID를 함께 적어 달라고 안내한다.
 - **사유 코드 풀기:** owner가 읽는 문장에 괄호로 붙던 `unknown`·`cancelled`·`failed`·`cleanup_pending`·`retention_full`을 뜻으로 바꿨다. `/list`·리뷰 목록·`/task-status`의 상태·대기 사유는 표(`jobStateText`·`waitReasonText`)로 풀고, 표에 없는 코드는 그대로 보인다. DB·감사·로그·멱등 키의 코드는 그대로다. 작업자 접수 닫힘 사유(`intake.reasons`)와 공개 검사 사유는 코드 그대로 싣는다.
 - **그대로 둔 것:** `/stop`의 켜짐 판은 "구독을 다시 켜 주세요"로만 적었다. 말로 하는 구독 켜기가 없어서(명세 §4.1) 더 구체적으로 적을 수 없다.
+
+## C05 관리 CLI (2026-11-10)
+
+"동료 봇 전환 (사용자 2026-11-09)" 3의 구현. 봇 `src/admin.ts`(명령 처리)·`src/admin-main.ts`(진입점), homelab `cli/src/commands/bot.ts`와 core `podops.ts`의 `bot` 어댑터. 시험·결과는 [VERIFICATION](VERIFICATION.md) "C05 관리 CLI".
+
+- **권한의 근거는 클러스터 접근:** 진입점은 DATABASE_URL만 읽는다. 정책(`RUNTIME_POLICIES`)·Discord·작업자·모델 자격을 읽지 않아 정책을 읽지 못하는 때에도 비상 정지가 된다. 감사 행위자는 `cli`다(`admin_command` 행, subject는 동작, detail에 `actor`·`result`. 비상 정지 해제는 기존 `model_emergency_released` 행도 subject `cli`로 남는다).
+- **`Store.control`을 시그니처 그대로 부른다:** 대화 자리에 실제 대화 ID(`종류:guild:채널`)와 겹치지 않는 `admin:cli`를 넘긴다. 그 대화 행이 없어 owner 대조를 거치지 않는다. `model-status`의 대기 작업 목록은 대화에 묶여 비어 나오므로 상태 보기에서 뺐다(비상 정지·일시 중지·실행 중 여부·작업 레인 닫힘만).
+- **재실행 안전:** 비상 정지가 없을 때의 해제는 아무것도 바꾸지 않는다(`not_stopped`). 같은 경우의 `/resume-model target:emergency-stop`은 다른 대기가 없으면 전역 일시 중지도 푼다. 상태 확인과 바꾸기는 한 트랜잭션이다.
+- **`kubectl exec`는 쓰기(주 진행자 결정, 2026-11-10):** 상태 보기도 `homelab bot status --apply`에서만 실행하고 plan은 대상 파드와 argv만 보인다. 읽기 허용 exec 종류는 만들지 않았다(homelab 설계 C.7 표).
+- **받지 않은 동작(시그니처 불변 규칙):** 차단·unknown 해제·멈춘 작업 재개는 진입점이 미지원(종료 4)으로 답한다. 기존 함수가 Discord owner 행위자와 대화를 요구해 CLI 행위자로 부를 수 없다. 그동안 '/' 예비(`/revoke`·`/task-release`·`/resume-model`)로 한다.
+  - 차단: `PolicyGate.revoke(actor, scope, target)`가 먼저 `authorize(actor, scope)`로 actor = 정책 owner와 허용 범위를 요구한다. 필요한 변경: 정책 revision만 읽어(실패 시 닫힘) 같은 거부 행(새 `denial_id`)을 더하는 관리용 메서드. 정책 owner로 대신 부르면 owner가 이미 거부된 뒤의 재실행이 `Denied`로 실패한다.
+  - unknown 해제: `ClaudeTaskBridge.release`·`CodexBridge.release(actor, scope, job)`이 `TaskBridge.releasable`에서 `authorize`와 작업 소유·대화 대조(또는 정책 owner의 후계 규칙)를 거친다. 필요한 변경: 작업 ID만으로 같은 소멸 확인을 거쳐 풀고 감사 행위자를 받는 관리용 경로.
+  - 멈춘 작업 재개: `Store.control`의 `resume-model <job>`이 `owner_id = actor`, `conversation_id`, 대화 구독 활성을 요구한다. 필요한 변경: 작업 ID만으로 같은 상태·시도 한도 조건을 보고 재개하는 관리용 동작(리뷰 작업은 `review-resume`이 이미 actor를 감사에만 쓴다).
