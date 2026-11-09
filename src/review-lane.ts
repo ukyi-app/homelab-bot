@@ -47,15 +47,17 @@ export function interpretReview(report: RunReport, schema: z.ZodType = ReviewOut
   if (report.credentialRecheckFailed) return failed('credential_recheck_failed');
   if (!report.outcome) return failed(report.cleanupFailed ? 'cleanup_failed' : 'no_outcome');
   const outcome = report.outcome;
-  if (outcome.kind === 'limited' || outcome.kind === 'auth_expired') return { status: outcome.kind === 'limited' ? 'limited' : 'auth_expired' };
-  if (outcome.kind === 'failed') return failed(outcome.reason);
+  // 실행기가 본 한도 정보는 결과가 무엇이든 싣는다(출력이 계약 밖이라 실패여도).
+  const rateLimit = outcome.rateLimit ? { rateLimit: outcome.rateLimit } : {};
+  if (outcome.kind === 'limited' || outcome.kind === 'auth_expired') return { status: outcome.kind === 'limited' ? 'limited' : 'auth_expired', ...rateLimit };
+  if (outcome.kind === 'failed') return { ...failed(outcome.reason), ...rateLimit };
   const parsed = schema.safeParse(outcome.value);
-  if (!parsed.success) return failed('output_invalid');
+  if (!parsed.success) return { ...failed('output_invalid'), ...rateLimit };
   // 비밀을 모른 채 통과시키지 않는다.
-  if (!report.secrets?.length) return failed('credential_secrets_missing');
+  if (!report.secrets?.length) return { ...failed('credential_secrets_missing'), ...rateLimit };
   // 게시될 수 있는 출력 전체를 본다. 필드를 고르면 새 필드가 생길 때 검사에서 샌다. best-effort다(SEC-02 근거 아님).
-  if (echoesSecret(texts(parsed.data).join('\n'), report.secrets)) return failed('credential_echo');
-  return { status: 'succeeded', output: parsed.data };
+  if (echoesSecret(texts(parsed.data).join('\n'), report.secrets)) return { ...failed('credential_echo'), ...rateLimit };
+  return { status: 'succeeded', output: parsed.data, ...rateLimit };
 }
 
 // 무도구 경계 (d): 모델 CLI의 egress가 플랫폼 프록시로만 나가는지를 env로 보이는 범위에서 묶는다. 실제 차단은 프록시 허용 목록과 NetworkPolicy다.
