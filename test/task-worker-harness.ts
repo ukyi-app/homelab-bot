@@ -44,7 +44,8 @@ process.stdin.on('end', () => {
     usage: { input_tokens: 1, output_tokens: 1 } }) + '\\n', () => process.exit(0));
 });
 `;
-export type Step = { kind?: 'hang'; output?: { status: string; summary: string; question: string }; write?: Record<string, string> };
+// output은 가짜 CLI가 structured_output으로 그대로 낸다. 변경 작성 판의 칸(options·checks·risks)이나 깨진 모양도 담을 수 있다.
+export type Step = { kind?: 'hang'; output?: { status: string; summary: string; question: string } & Record<string, unknown>; write?: Record<string, string> };
 export const COMPLETED: Step = { output: { status: 'completed', summary: '끝냈습니다.', question: '' } };
 export const QUESTION: Step = { output: { status: 'needs_input', summary: '', question: '어느 파일을 고칠까요?' } };
 

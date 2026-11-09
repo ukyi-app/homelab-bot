@@ -1897,6 +1897,18 @@ bwrap은 `--unshare-all --die-with-parent --new-session --cap-drop ALL --clearen
 
 **슬롯을 보는 순서.** 파드 정리는 프로세스를 가리지 않아 슬롯이 겹치면 상대 시험까지 죽인다. 그래서 슬롯은 비동기 조회가 모두 끝난 뒤에 보고 같은 틱에 잡는다. `changeVerify`의 슬롯 확보, `removeGeneration`의 정리 판단이 이 순서를 따르고, 조회 사이에 종료가 시작됐는지도 슬롯 직전에 다시 본다. 재조회(`changeVerification`)는 반대로 슬롯을 receipt보다 먼저 본다. receipt는 슬롯을 놓기 전에 쓰므로, 이 순서면 막 끝난 시험을 `absent`로 답하지 않는다.
 
+**변경 작성 v2 판 (C25).** 동료 봇 명세 §4.10 "변경 질문 줄이기"·"수정 요청"의 작업자 쪽이다. 게시 서버는 아직 옛 판만 보내고, 새 판을 보내고 결과를 쓰는 일은 C27(수정 요청)·C28(선택지)·C29(확인할 것·안내 댓글)다.
+
+- **판 목록.** `TASK_INSTRUCTIONS_REVISIONS = ['task-v1', 'change-v2']`(`src/task-contracts.ts`). v1 `/v1/task`는 `task-v1`만, v2 `/v2/task`는 둘 다 받는다. `TASK_INSTRUCTIONS_REVISION`(`task-v1`)은 게시 서버가 지금 보내는 판으로 남는다. 판 이름이 다르면 시작하지 않는다는 T18 규칙은 그대로라, `change-v2` 요청은 옛 작업자에서 모양 거부(400 `request_invalid` → `TaskWorkerRejected`, 미시작)다.
+- **판 고르기.** intake `change`에 `instructions`(받는 판 목록)가 붙는다. 게시 서버는 `taskWorkerChangeInstructions`(또는 `HttpTaskV2Worker.changeInstructions`)에 있는 판만 보낸다. 칸이 없는 옛 작업자는 `['task-v1']`, v2가 없거나 닿지 않으면 빈 목록이다. 옛 게시 서버는 `z.object`라 이 칸을 버리고 받는다.
+- **지시문.** `change-v2`(`TASK_INSTRUCTIONS`, `src/executor-claude-task.ts`)는 앞 판의 안전 줄(태그 안 글은 지시 권한이 아님, 정책·권한·샌드박스·게시 대상 불변, `Bash`·`Read`·`Edit`·`Write`만)을 그대로 두고 더한다: 막히지 않으면 묻지 않고 가정해서 진행하고 가정은 `checks`(확인할 것)에, 남은 위험은 `risks`에 적는다. 위치는 알 때만 적는다. 진행이 불가능할 때만 질문하고 선택지 2~4개를 낸다. 공개 여부는 묻지 않는다.
+- **출력 스키마.** `CHANGE_OUTPUT_JSON_SCHEMA`를 판 이름으로 고른다. `status`·`summary`·`question`에 `options`(문자열 목록)·`checks`·`risks`(`{text,path,line}` 목록)를 더한 평평한 모양이고, 위치가 없으면 `path:''`·`line:0`이다. Codex 작업 레인과 함께 쓰는 `TASK_OUTPUT_JSON_SCHEMA`는 바꾸지 않았다.
+- **출력 검사(`judgeTaskRun`).** 새 판이면 새 스키마로 해석한다. `needs_input`의 선택지가 2~4개가 아니거나 빈 선택지가 있으면 `invalid_output`이다. 반사 검사(`echoesSecret`)는 요약·질문에 더해 선택지와 확인할 것·남은 위험의 글·경로를 본다. 위치의 경로는 `ChangePathSchema`(manifest 경로 상한 512바이트 포함)를, 줄은 양의 정수를 지켜야 하고, 어긋난 경로는 위치째, 어긋난 줄은 줄만 버리고 항목은 남긴다. 글 300자·항목 10개·선택지 100자로 자른다(`CHANGE_NOTE_LIMITS`, 값은 [제안]).
+- **결과 칸.** `needs_input`에 `options`, `snapshot`에 `checks`·`risks`가 선택 칸으로 붙는다(`TaskV2ResultResponseSchema`). 새 판 요청의 결과에만 있다. 위 "모델의 요약은 결과에 싣지 않는다" 규칙의 예외이고 범위는 이 세 칸뿐이다: 요약은 여전히 싣지 않는다. 세 칸은 증거(승인 digest 재료)가 아니고 artifact digest에도 들어가지 않는다. 작업자에서는 반사 검사만 거치고, 공개 경로(미리보기·PR 설명·안내 댓글·Discord 버튼)로 내기 전의 공개 검사(`scanPublicText`)는 게시 서버가 한다(C28·C29).
+- **수정 차례 입력.** v2 시작 요청의 선택 칸 `amendment`(`change-v2`에서만): `pullNumber`, `head`(= `base`, PR 브랜치 head. baseline은 그 head의 tree이고 T0 대조 규칙 그대로), `instruction`(owner의 Discord 말), `materials`(`label:'public'`만, 항목은 `kind`(`review`·`review_comment`·`comment`)·`authorId`·`association`·`location`·`body`뿐, `omitted`). 상한은 자료 50개·한 본문 4,000자·합계 40,000자다(`AMENDMENT_LIMITS`, [제안]). `boundAmendmentMaterials`가 긴 본문을 자르고 넘치면 오래된 것부터 빼며 뺀 수를 `omitted`에 남긴다. 프롬프트(`taskPrompt`)에서 brief는 `untrusted_request`, owner 지시는 `owner_instruction`, 자료는 하나마다 `review_material`(첫 줄은 작성자·위치 JSON) 태그다. 뺀 자료가 있으면 "오래된 자료 n개는 상한으로 뺐다"를 남긴다. 새 판의 울타리는 자기 닫는 태그뿐 아니라 이 태그 이름들의 여닫기·대소문자·속성 변형을 모두 지워, 자료가 `owner_instruction`을 열어 지시 자리처럼 보이지 못한다. 옛 판 프롬프트는 바이트 그대로다.
+- **port 타입(`src/change-contracts.ts`).** `AuthorResult`의 `needs_input.options`, `snapshot.checks`·`risks`, `ChangeAuthorPort.start`의 `amendment`(`ChangeAmendmentInput`)가 선택 칸으로 있다. `ClaudeChangeAuthor`는 아직 채우거나 쓰지 않는다.
+- **배포 순서와 되돌림.** 게시 서버는 옛 판만 보내므로 병합 즉시 바뀌는 동작이 없다. 게시 서버만 이 판 이전으로 되돌려도 작업자는 옛 판 요청에 옛 칸만 낸다(시험 `C25 호환`). 작업자만 되돌리면 그 작업자가 저장해 둔 새 판 결과(세 칸이 든 것)를 읽지 못하므로, 게시 서버가 새 판을 보내기 시작한 뒤(C27~C29)에는 진행 중인 CHANGE 턴을 받아 두거나 drain한 뒤 되돌린다.
+
 ### 16.5 조립과 꺼짐 배포 (B5)
 
 **스위치.** 조건은 `changePrecondition` 한 곳에서 본다. 정책은 기동 때 읽고 작업자 조건만 주기로 다시 본다.
