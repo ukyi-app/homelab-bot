@@ -9,7 +9,7 @@ import type { ChangeCommand, ChangeCommandHandler } from './change-commands.js';
 import type { ExternalTaskCommand, ExternalTaskCommandHandler } from './external-task-commands.js';
 import type { MemoryCommand, MemoryCommandHandler } from './memory-commands.js';
 import type { PolicyGate } from './policy.js';
-import { ReactionSync, recordReceived, settleReactions } from './reactions.js';
+import { moveReactions, ReactionSync, recordReceived, settleReactions } from './reactions.js';
 import { LaneClosed } from './store.js';
 import type { Delivery, Store } from './store.js';
 import type { TaskCommandHandler } from './task-commands.js';
@@ -111,6 +111,7 @@ export class DiscordIngress {
       // 받지 못한 채 보존 기간(7일)이 지나 원문을 비운 입력이 누락 복구 등으로 다시 왔다. 저장된 빈 원문으로 처리하지 않는다.
       if (inbox.text_purged_at !== null) {
         await store.db.query(`UPDATE events SET buffered=false,payload=payload || '{"ignored":"text_purged"}'::jsonb WHERE id=$1`, [saved.id]);
+        await moveReactions(store.db, [saved.id], 'cleared');
         return false;
       }
       // Replay durable input, not a later delivery's content. Scope/actor must agree.
@@ -126,6 +127,8 @@ export class DiscordIngress {
         && BigInt(event.id) <= BigInt(subscription.activation_after);
       if (oldMessage || (!subscription.active && !inbox.payload.activate && !durableControl)) {
         await store.db.query(`UPDATE events SET buffered=false,payload=payload || '{"ignored":"subscription_boundary"}'::jsonb WHERE id=$1`, [saved.id]);
+        // 복구 버퍼에서 버려지는 입력이면 gap 동안 단 👀가 남지 않게 지운다(반응 행이 없으면 아무것도 안 한다).
+        await moveReactions(store.db, [saved.id], 'cleared');
         return false;
       }
       // 이 수신 뒤 👀를 달 일반 메시지. 원문의 채널은 지금 scope다(채널 멘션은 뒤에 스레드로 옮겨져도 원문은 채널에 있다).
@@ -439,7 +442,8 @@ export class DiscordIngress {
               kind: buffered.payload.kind, command: buffered.payload.command, target: buffered.payload.target, mention: buffered.payload.mention, urgent: buffered.payload.urgent }, true, { token, epoch: conversation.subscription_epoch }); }
             catch (error) {
               if (!(error instanceof Denied)) throw error;
-              await this.store.db.query("UPDATE events SET buffered=false WHERE delivery_id=$1 AND provider='discord'", [buffered.delivery_id]);
+              const dropped = (await this.store.db.query<{ id: string }>("UPDATE events SET buffered=false WHERE delivery_id=$1 AND provider='discord' RETURNING id", [buffered.delivery_id])).rows;
+              await moveReactions(this.store.db, dropped.map(row => row.id), 'cleared');
             }
           }
           break;

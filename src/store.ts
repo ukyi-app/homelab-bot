@@ -720,8 +720,10 @@ export class Store {
       else {
         await this.db.query(`UPDATE conversations SET active=false,gap=false,subscription_epoch=subscription_epoch+1,
           recovery_token=NULL,recovery_until=NULL WHERE id=$1`, [conversation]);
-        await this.db.query(`UPDATE events SET buffered=false,payload=payload || '{"ignored":"subscription_stopped"}'::jsonb
-          WHERE conversation_id=$1 AND buffered=true`, [conversation]);
+        const dropped = (await this.db.query<{ id: string }>(`UPDATE events SET buffered=false,payload=payload || '{"ignored":"subscription_stopped"}'::jsonb
+          WHERE conversation_id=$1 AND buffered=true RETURNING id`, [conversation])).rows;
+        // gap 동안 버퍼에 둔 메시지는 👀만 달렸고 job이 없어 작업 정리(settleReactions)가 보지 못한다. 버리는 여기서 지운다.
+        await moveReactions(this.db, dropped.map(row => row.id), 'cleared');
       }
       return { active: action === 'resume' };
     }

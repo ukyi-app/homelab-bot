@@ -393,3 +393,15 @@ test('흐름: 앞 답이 아직 unknown인데 뒤 메시지를 /cancel해도 앞
   await drain();
   assert.deepEqual(log.filter(line => line.startsWith('remove')), ['remove fixture-thread/9402 👀', 'remove fixture-thread/9401 👀']);
 });
+
+test('흐름: history gap 동안 받아 복구 버퍼에 둔 메시지를 복구 전에 /stop으로 버리면 👀와 반응 행도 정리한다', async () => {
+  await answer('9501');
+  await drain();
+  await database.db.query('UPDATE conversations SET gap=true');
+  await f.ingress.receive(event('9502', { text: 'gap 중' }));
+  assert.equal((await database.db.query(`SELECT 1 FROM events WHERE buffered=true`)).rows.length, 1);
+  await f.store.control(f.policy.owner, f.store.scopeId(thread), 'stop');
+  await drain();
+  assert.deepEqual(log.filter(line => line.includes('9502')), ['ack 9502', 'remove fixture-thread/9502 👀']);
+  assert.equal((await database.db.query(`SELECT key FROM controls WHERE key LIKE 'reaction:%'`)).rows.length, 0, '반응 행이 남지 않는다');
+});
