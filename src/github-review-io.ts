@@ -1,8 +1,9 @@
 import { z } from 'zod';
-import { Denied, PolicyUnavailable } from './contracts.js';
+import type { WriterOutcome } from './change-contracts.js';
+import { DEFAULTS, Denied, PolicyUnavailable } from './contracts.js';
 import { GitHubApi, GitHubAppAuth, GitHubTokenError, assertAllowed } from './github-app.js';
 import type { BoundRepository, GitHubAppCredentials } from './github-app.js';
-import { GitHubError, restrictGitHubWrite } from './review.js';
+import { GitHubError, pullRequest, restrictGitHubWrite } from './review.js';
 import type { GitHubReader, GitHubTransport, ReviewPolicySource } from './review.js';
 import type { Change } from './review-input.js';
 
@@ -118,9 +119,29 @@ const RemoteReviewComment = z.object({ id: z.number().int().positive(), pull_req
 const RemoteIssueComment = z.object({ id: z.number().int().positive(), user: Author, author_association: Association, created_at: z.string(),
   body: z.string().optional(), issue_url: z.string() });
 
-export const guidanceMarker = (key: string) => `<!-- homelab-bot-guidance:${key} -->`;
+// ---- 안내 리뷰 게시 ----
 
-export interface GitHubReviewIO { reader: GitHubReader; transport: GitHubTransport; discussion: PullDiscussionReader }
+// 자동 참고 리뷰(reviewMarker)와 접두가 달라 서로의 회수에 걸리지 않는다.
+export const guidanceMarker = (key: string) => `<!-- homelab-bot-guidance:${key} -->`;
+export interface GuidanceReview {
+  repository: string; pr: number; head: string; key: string; body: string;
+  comments: readonly { path: string; line: number; body: string }[];
+}
+// 봇 PR에 COMMENT 리뷰를 단다. 게시 상태(outbox·재시도)는 부르는 쪽이 맡는다.
+export interface GuidanceReviewPort {
+  // 다시 보내지 않는다. unknown이면 find로 회수하고, 못 찾아도 자동으로 다시 게시하지 않는다.
+  post(input: GuidanceReview): Promise<WriterOutcome<{ id: number }>>;
+  find(input: Pick<GuidanceReview, 'repository' | 'pr' | 'head' | 'key'>): Promise<{ id: number } | null>;
+}
+const GuidanceKey = z.string().regex(/^[A-Za-z0-9_.:-]{1,128}$/);
+const GuidanceTarget = { repository: z.string(), pr: z.number().int().positive(), head: Sha, key: GuidanceKey };
+// 인라인 개수(50)·본문 길이·event·side는 restrictGitHubWrite가 본다. 여기서는 그 밖의 필드가 끼지 못하게만 한다.
+const GuidanceInput = z.strictObject({ ...GuidanceTarget, body: z.string().min(1),
+  comments: z.array(z.strictObject({ path: z.string().min(1), line: z.number().int().positive(), body: z.string().min(1) })) });
+const GuidanceLookup = z.strictObject(GuidanceTarget);
+const RecoveredReview = z.object({ id: z.number().int().positive(), commit_id: z.string().nullable(), body: z.string().nullable(), pull_request_url: z.string() });
+
+export interface GitHubReviewIO { reader: GitHubReader; transport: GitHubTransport; discussion: PullDiscussionReader; guidance: GuidanceReviewPort }
 export function githubReviewIO(options: { app: GitHubAppCredentials; repositories: RepositoryLookup; send?: typeof fetch; now?: () => number }): GitHubReviewIO {
   const now = options.now ?? Date.now;
   const api = new GitHubApi(options.send ?? fetch, now);
@@ -241,5 +262,64 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
       return result;
     },
   };
-  return { reader, transport, discussion };
+  const notSent = (code: string) => ({ kind: 'not_sent', code }) as const;
+  const guidance: GuidanceReviewPort = {
+    async post(raw) {
+      const parsed = GuidanceInput.safeParse(raw);
+      // 호출자 본문이 표식을 흉내 내면 다른 글의 회수에 걸릴 수 있다.
+      if (!parsed.success || parsed.data.body.includes('<!-- homelab-bot-')) return notSent('input_invalid');
+      const { repository, pr, head, key, body, comments } = parsed.data;
+      const request = { method: 'POST', path: `/repos/${repository}/pulls/${pr}/reviews`,
+        body: { commit_id: head, event: 'COMMENT', body: `${guidanceMarker(key)}\n${body}`, comments: comments.map(c => ({ path: c.path, line: c.line, side: 'RIGHT', body: c.body })) } };
+      let write: ReturnType<typeof restrictGitHubWrite>;
+      try {
+        write = restrictGitHubWrite(request, { repository, pr, head });
+        assertAllowed('POST', write.path);
+      } catch { return notSent('input_invalid'); }
+      let repo: BoundRepository;
+      try { repo = await repositories(repository); }
+      catch (error) {
+        if (error instanceof Denied) return notSent('repository_denied');
+        if (error instanceof PolicyUnavailable) return notSent('policy_unavailable');
+        throw error;
+      }
+      // 사람이 브랜치를 옮겼으면 옛 head에 안내를 달지 않는다. 읽기 실패는 아무것도 보내기 전이다.
+      try {
+        const pull = pullRequest(await auth.withToken(repo, 'read', token => api.call('GET', `/repos/${repository}/pulls/${pr}`, token)));
+        if (!pull.open) return notSent('pull_closed');
+        if (pull.head.sha !== head) return notSent('head_changed');
+        if (pull.head.repoId !== repo.id || pull.base.repoId !== repo.id) return notSent('pull_mismatch');
+      } catch (error) {
+        return notSent(error instanceof GitHubError && error.status === 429 ? 'rate_limited' : error instanceof GitHubError ? `read_http_${error.status}` : 'read_failed');
+      }
+      let created: unknown;
+      try { created = await auth.withToken(repo, 'write', token => api.call('POST', write.path, token, write.body)); }
+      catch (error) {
+        if (error instanceof GitHubTokenError) return notSent(error.status >= 500 || error.status === 408 || error.status === 429 ? 'token_unavailable' : error.message);
+        // 연결 실패도 GitHubApi가 503으로 올려 보냈는지 알 수 없다. 그래서 unknown이다.
+        if (error instanceof GitHubError && error.status === 429) return notSent('rate_limited');
+        if (error instanceof GitHubError && (error.status >= 500 || error.status === 408)) return { kind: 'unknown', code: error.status === 503 ? 'response_lost' : 'http_5xx' };
+        if (error instanceof GitHubError) return { kind: 'rejected', status: error.status, code: `http_${error.status}` };
+        return { kind: 'unknown', code: 'response_invalid' };
+      }
+      const confirmed = ReviewCreated.safeParse(created);
+      return confirmed.success ? { kind: 'confirmed', value: { id: confirmed.data.id } } : { kind: 'unknown', code: 'response_invalid' };
+    },
+    // review.ts의 ReviewPublisher.existing과 같은 규칙: 리뷰 목록에서 표식과 head SHA가 모두 맞는 글을 찾는다.
+    async find(raw) {
+      const parsed = GuidanceLookup.safeParse(raw);
+      if (!parsed.success) throw new Denied();
+      const { repository, pr, head, key } = parsed.data;
+      const pullUrl = `https://api.github.com/repos/${repository}/pulls/${pr}`;
+      for (let page = 1; page <= DEFAULTS.recoveryPages; page++) {
+        const rows = parse(z.array(RecoveredReview), await read(repository, `/pulls/${pr}/reviews?per_page=${PAGE_SIZE}&page=${page}`));
+        if (!rows.every(row => row.pull_request_url === pullUrl)) throw new Error('github_pull_mismatch');
+        const found = rows.find(row => row.commit_id === head && row.body?.includes(guidanceMarker(key)));
+        if (found) return { id: found.id };
+        if (rows.length < PAGE_SIZE) break;
+      }
+      return null;
+    },
+  };
+  return { reader, transport, discussion, guidance };
 }

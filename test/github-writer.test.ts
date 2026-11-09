@@ -137,7 +137,7 @@ test('T19 B3 writer: gitlink 행을 버리지 않고 돌려줘 호출자가 닫�
   assert.deepEqual(walked?.leaves.find(leaf => leaf.path === 'vendor')?.mode, '160000');
 });
 
-test('T19 B3 writer: 코드 구조. fetch는 closure 한 곳이고 범용 API가 없으며 리뷰 allowlist가 늘지 않았다', async () => {
+test('T19 B3 writer: 코드 구조. fetch는 closure 한 곳이고 범용 API가 없으며 리뷰 allowlist에 writer API가 없다', async () => {
   const source = await readFile(new URL('../../src/github-writer.ts', import.meta.url), 'utf8');
   assert.equal((source.match(/\bsend\(/g) ?? []).length, 1, 'send 호출 지점은 하나다');
   assert.equal((source.match(/\bfetch\(/g) ?? []).length, 0);

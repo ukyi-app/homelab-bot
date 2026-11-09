@@ -738,3 +738,99 @@ test('PR 자료 읽기: 리뷰 정책 목록 밖 저장소와 잘못된 번호�
   for (const pr of [0, -1, 1.5]) await assert.rejects(discussion.read({ repository: REPO.fullName, pr, selfAuthors: SELF }), Denied, String(pr));
   assert.deepEqual(fake.sent, []);
 });
+
+const KEY = 'change-guidance:fixture-1';
+const GUIDANCE = { repository: REPO.fullName, pr: 5, head: HEAD, key: KEY, body: '확인할 곳 두 군데예요.', comments: [{ path: 'src/a.ts', line: 3, body: '여기는 가정했어요.' }] };
+const pullRow = (overrides: Record<string, unknown> = {}) => ({ number: 5, state: 'open', draft: false, title: 't', body: 'b', user: WRITER_BOT, author_association: 'NONE',
+  updated_at: '2026-11-09T00:00:00Z', head: { sha: HEAD, ref: 'bot/change/x/g1', repo: { id: REPO.id, full_name: REPO.fullName } },
+  base: { sha: BASE, ref: 'main', repo: { id: REPO.id, full_name: REPO.fullName } }, ...overrides });
+// PR 조회와 리뷰 게시·목록을 흉내 낸다. 게시한 리뷰는 목록에 남는다.
+class GuidanceFake extends Fake {
+  posted: { id: number; commit_id: string; body: string; user: object; state: string; author_association: string; pull_request_url: string }[] = [];
+  pull = pullRow();
+  post: (sent: Sent) => Response | null = () => null;
+  constructor() {
+    super(sent => {
+      if (sent.method === 'GET' && sent.path === `/repos/${REPO.fullName}/pulls/5`) return json(this.pull);
+      if (sent.method === 'GET' && sent.path.startsWith(`/repos/${REPO.fullName}/pulls/5/reviews?`)) return json(this.posted);
+      if (sent.method === 'POST' && sent.path === `/repos/${REPO.fullName}/pulls/5/reviews`) {
+        const body = sent.body as { commit_id: string; body: string };
+        const row = { id: 9000 + this.posted.length, commit_id: body.commit_id, body: body.body, user: REVIEW_BOT, state: 'COMMENTED', author_association: 'NONE', pull_request_url: `${API_REPO}/pulls/5` };
+        this.posted.push(row);
+        return this.post(sent) ?? json(row, 200);
+      }
+      return json({}, 404);
+    });
+  }
+  get posts() { return this.requests.filter(s => s.method === 'POST'); }
+}
+
+test('안내 리뷰 게시: 봇 PR의 현재 head에 COMMENT 리뷰 하나(인라인 RIGHT)를 쓰기 토큰으로 달고 본문 앞에 대조 표식을 둔다', async () => {
+  const fake = new GuidanceFake();
+  assert.deepEqual(await fake.io().guidance.post(GUIDANCE), { kind: 'confirmed', value: { id: 9000 } });
+  const [post, ...more] = fake.posts;
+  assert.equal(more.length, 0);
+  assert.deepEqual(post!.body, { commit_id: HEAD, event: 'COMMENT', body: `<!-- homelab-bot-guidance:${KEY} -->\n확인할 곳 두 군데예요.`,
+    comments: [{ path: 'src/a.ts', line: 3, side: 'RIGHT', body: '여기는 가정했어요.' }] });
+  const tokens = fake.sent.filter(s => s.path.endsWith('/access_tokens')).map(s => (s.body as { permissions: object }).permissions);
+  assert.deepEqual(tokens, [{ contents: 'read', pull_requests: 'read' }, { pull_requests: 'write' }]);
+  assert.equal(post!.authorization, `Bearer ${TOKEN}-2`);
+});
+
+test('안내 리뷰 게시: APPROVE·REQUEST_CHANGES·다른 head·인라인 51개·표식 흉내는 보내지 않는다', async () => {
+  const many = Array.from({ length: 51 }, (_, i) => ({ path: 'src/a.ts', line: i + 1, body: '줄' }));
+  const refusedCases: [string, unknown, string, (fake: GuidanceFake) => void][] = [
+    ['APPROVE', { ...GUIDANCE, event: 'APPROVE' }, 'input_invalid', () => {}],
+    ['REQUEST_CHANGES', { ...GUIDANCE, event: 'REQUEST_CHANGES' }, 'input_invalid', () => {}],
+    ['LEFT 인라인', { ...GUIDANCE, comments: [{ ...GUIDANCE.comments[0], side: 'LEFT' }] }, 'input_invalid', () => {}],
+    ['인라인 51개', { ...GUIDANCE, comments: many }, 'input_invalid', () => {}],
+    ['표식 흉내', { ...GUIDANCE, body: '<!-- homelab-bot-review:x -->' }, 'input_invalid', () => {}],
+    ['표식 키 모양', { ...GUIDANCE, key: 'x --> <!--' }, 'input_invalid', () => {}],
+    ['저장소 점 세그먼트', { ...GUIDANCE, repository: 'fixture-org/..' }, 'input_invalid', () => {}],
+    ['정책 밖 저장소', { ...GUIDANCE, repository: 'fixture-org/not-allowed' }, 'repository_denied', () => {}],
+    ['다른 head', { ...GUIDANCE, head: BASE }, 'head_changed', () => {}],
+    ['닫힌 PR', GUIDANCE, 'pull_closed', fake => { fake.pull = pullRow({ state: 'closed' }); }],
+    ['fork PR', GUIDANCE, 'pull_mismatch', fake => { fake.pull = pullRow({ head: { sha: HEAD, ref: 'x', repo: { id: 999, full_name: 'someone/fork' } } }); }],
+  ];
+  for (const [name, input, code, arrange] of refusedCases) {
+    const fake = new GuidanceFake();
+    arrange(fake);
+    assert.deepEqual(await fake.io().guidance.post(input as typeof GUIDANCE), { kind: 'not_sent', code }, name);
+    assert.equal(fake.posts.length, 0, name);
+    assert.ok(!fake.sent.some(s => (s.body as { permissions?: { pull_requests?: string } } | undefined)?.permissions?.pull_requests === 'write'), `${name}: 쓰기 토큰 없음`);
+  }
+});
+
+test('안내 리뷰 게시: 응답을 잃으면 다시 보내지 않고 표식과 head로 회수한다', async () => {
+  const lost = new GuidanceFake();
+  lost.post = () => { throw new TypeError('reset'); };
+  const io = lost.io();
+  assert.deepEqual(await io.guidance.post(GUIDANCE), { kind: 'unknown', code: 'response_lost' });
+  assert.equal(lost.posts.length, 1);
+  assert.deepEqual(await io.guidance.find({ repository: REPO.fullName, pr: 5, head: HEAD, key: KEY }), { id: 9000 });
+  assert.equal(lost.posts.length, 1, '회수는 다시 보내지 않는다');
+  assert.equal(await io.guidance.find({ repository: REPO.fullName, pr: 5, head: BASE, key: KEY }), null, 'head가 다르면 내 글이 아니다');
+  assert.equal(await io.guidance.find({ repository: REPO.fullName, pr: 5, head: HEAD, key: 'change-guidance:fixture-2' }), null);
+  // 같은 키의 자동 참고 리뷰 표식은 안내 리뷰로 치지 않는다.
+  lost.posted = [{ ...lost.posted[0]!, body: `<!-- homelab-bot-review:${KEY} -->` }];
+  assert.equal(await io.guidance.find({ repository: REPO.fullName, pr: 5, head: HEAD, key: KEY }), null);
+  const outcomes: [string, (sent: Sent) => Response, object][] = [
+    ['5xx', () => json({}, 502), { kind: 'unknown', code: 'http_5xx' }],
+    ['깨진 응답', () => json({ nope: true }), { kind: 'unknown', code: 'response_invalid' }],
+    ['422', () => json({}, 422), { kind: 'rejected', status: 422, code: 'http_422' }],
+    ['403', () => json({}, 403), { kind: 'rejected', status: 403, code: 'http_403' }],
+    ['429', () => json({}, 429), { kind: 'not_sent', code: 'rate_limited' }],
+  ];
+  for (const [name, response, expected] of outcomes) {
+    const fake = new GuidanceFake();
+    fake.post = response;
+    assert.deepEqual(await fake.io().guidance.post(GUIDANCE), expected, name);
+    assert.equal(fake.posts.length, 1, `${name}: 재전송하지 않는다`);
+  }
+  // 쓰기 토큰 단계 실패는 POST 전이다.
+  const token = new GuidanceFake();
+  token.token = sent => (sent.body as { permissions: { pull_requests: string } }).permissions.pull_requests === 'write' ? json({}, 502)
+    : issued(REPO, (sent.body as { permissions: Record<string, string> }).permissions, token.clock, `${TOKEN}-read`);
+  assert.deepEqual(await token.io().guidance.post(GUIDANCE), { kind: 'not_sent', code: 'token_unavailable' });
+  assert.equal(token.posts.length, 0);
+});
