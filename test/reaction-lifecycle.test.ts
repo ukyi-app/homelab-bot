@@ -76,3 +76,38 @@ test('흐름: 받음 👀 → 답 게시 → 봇 반응 모두 지움(✅ 없음
   await drain();
   assert.equal(log.length, 3);
 });
+
+// 첫 대화 작업이 모델 자리를 쥔 채로 멈춰 있게 한다. release()로 답을 낸다.
+function holdModel() {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  f.setRun(async () => { await gate; return { status: 'succeeded', stopped: true, answer: { facts: [], hypotheses: [], unknowns: ['조회 전'], checks: [] } }; });
+  return release;
+}
+async function until(check: () => boolean) {
+  for (let i = 0; i < 200 && !check(); i++) await new Promise(resolve => setImmediate(resolve));
+  assert.ok(check());
+}
+
+test('흐름: 다른 모델 일 뒤에 기다리면 ⏳를 더하고, 답하면 👀·⏳를 모두 지움', async () => {
+  const release = holdModel();
+  await f.ingress.receive(event('8101'));
+  f.advance(DEFAULTS.debounceMs);
+  const first = f.runtime.tick();
+  await until(() => f.requests.length === 1);
+  await f.ingress.receive(event('8102', { text: '두 번째' }));
+  await drain();
+  assert.deepEqual(log, ['ack 8101', 'ack 8102'], '디바운스 전에는 아직 대기가 아니다');
+  f.advance(DEFAULTS.debounceMs);
+  assert.equal(await f.runtime.tick(), false);
+  await drain();
+  assert.deepEqual(log.slice(2), ['add fixture-thread/8102 ⏳']);
+  release();
+  await first;
+  await drain();
+  assert.deepEqual(log.slice(3), ['post fixture-thread', 'remove fixture-thread/8101 👀'], '앞 메시지의 답은 뒤 메시지 반응을 건드리지 않는다');
+  assert.equal(await f.runtime.tick(), true);
+  await drain();
+  assert.deepEqual(log.slice(5).sort(), ['post fixture-thread', 'remove fixture-thread/8102 ⏳', 'remove fixture-thread/8102 👀'].sort());
+  assert.equal(log[5], 'post fixture-thread');
+});
