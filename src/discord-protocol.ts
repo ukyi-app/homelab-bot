@@ -16,7 +16,7 @@ export const DISCORD_DISPATCH_REST_TIMEOUT_MS = 1000;
 // timeoutMs: 기한 없는 요청의 짧은 제한. 둘 다 없으면 DISCORD_REST_TIMEOUT_MS.
 export interface DiscordRequestOptions { expiresAt?: number; timeoutMs?: number }
 export interface DiscordApi {
-  request(method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown, options?: DiscordRequestOptions): Promise<unknown>;
+  request(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, options?: DiscordRequestOptions): Promise<unknown>;
 }
 const ChannelSchema = z.object({ id: z.string(), type: z.number(), parent_id: z.string().nullable().optional(), guild_id: z.string().optional() });
 const MessageSchema = z.object({ id: z.string(), channel_id: z.string(), guild_id: z.string().optional(),
@@ -30,6 +30,8 @@ const InteractionSchema = z.object({ id: z.string(), token: z.string(), type: z.
     options: z.array(z.object({ name: z.string(), value: z.string() })).optional() }),
 });
 const part = encodeURIComponent;
+const ownReaction = (channel: string, message: string, emoji: string) =>
+  `/channels/${part(channel)}/messages/${part(message)}/reactions/${part(emoji)}/@me`;
 const RECEIVED = '👀';
 const DISPATCH = { timeoutMs: DISCORD_DISPATCH_REST_TIMEOUT_MS };
 export class DiscordProtocol implements DiscordRest {
@@ -75,7 +77,7 @@ export class DiscordProtocol implements DiscordRest {
     }
     // 일반 메시지는 원문에 👀만 단다. 텍스트 ACK는 대화를 덮는다. 같은 봇·메시지·emoji의 PUT은 다시 해도 하나다.
     try {
-      await this.api.request('PUT', `/channels/${part(event.scope.channel)}/messages/${part(event.id)}/reactions/${part(RECEIVED)}/@me`, undefined, DISPATCH);
+      await this.api.request('PUT', ownReaction(event.scope.channel, event.id, RECEIVED), undefined, DISPATCH);
       return;
     } catch (error) {
       // 403/404는 채널에 Add Reactions·Read Message History가 없거나 원문이 지워진 경우다. 수신 신호가 아예 없지 않게
@@ -85,6 +87,14 @@ export class DiscordProtocol implements DiscordRest {
         { content, nonce: event.id, enforce_nonce: true, ...options }, DISPATCH);
       return { fallback: error.status };
     }
+  }
+  // 반응 상태 동기화(게시 루프)에서 부른다. dispatch 밖이라 기본 제한이다. 같은 봇·메시지·emoji의 PUT·DELETE는 다시 해도 결과가 같다.
+  async addReaction(channel: string, message: string, emoji: string): Promise<void> {
+    await this.api.request('PUT', ownReaction(channel, message, emoji));
+  }
+  // 경로가 늘 @me라 다른 사람의 반응은 지울 수 없다. 남의 반응을 지우는 경로(.../reactions/{emoji}/{user})는 두지 않는다.
+  async removeOwnReaction(channel: string, message: string, emoji: string): Promise<void> {
+    await this.api.request('DELETE', ownReaction(channel, message, emoji));
   }
   async createThread(channel: string, body: Parameters<DiscordRest['createThread']>[1]) {
     return IdSchema.parse(await this.api.request('POST', `/channels/${part(channel)}/threads`, body));

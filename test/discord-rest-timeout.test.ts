@@ -58,7 +58,10 @@ test('protocol: Gateway dispatch 안의 채널 조회·리액션은 짧은 제�
   assert.deepEqual(dispatch.map(s => s.options), [{ timeoutMs: DISCORD_DISPATCH_REST_TIMEOUT_MS }, { timeoutMs: DISCORD_DISPATCH_REST_TIMEOUT_MS }]);
   await protocol.history(thread.channel, null, 100);
   await protocol.sendMessage(thread.channel, { content: 'x', nonce: 'n', enforce_nonce: true, allowed_mentions: { parse: [] } });
-  assert.deepEqual(seen.map(s => s.options), [undefined, undefined, undefined]);
+  // 반응 상태 동기화(⏳·지우기)는 게시 루프에서 돈다. dispatch 밖이라 기본 제한이다.
+  await protocol.addReaction(thread.channel, '7001', '⏳');
+  await protocol.removeOwnReaction(thread.channel, '7001', '👀');
+  assert.deepEqual(seen.map(s => s.options), [undefined, undefined, undefined, undefined, undefined]);
 });
 
 test('ackFailureReason: 원문 없이 원인만 분류한다', () => {
