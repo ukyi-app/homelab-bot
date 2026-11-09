@@ -40,10 +40,19 @@ export async function chatContext(db: Database, conversation: string, event: str
 // 모델이 구독 스레드의 멘션 없는 후속을 "봇에게 한 말이 아닐 수 있다"로 읽는다(S16). 기록에 든 owner 메시지는 모두
 // 봇이 받아들인 요청이고, 그 설명은 작업자 프롬프트의 신뢰 문맥(bot-facts.ts)에 있다.
 function ownerItem(payload: Record<string, unknown>): ContextItem {
-  const item: ContextItem = { from: 'owner', text: typeof payload.text === 'string' ? payload.text : '', kind: payload.kind };
+  const item: ContextItem = { from: 'owner', text: ownerText(payload), kind: payload.kind };
   if (typeof payload.command === 'string') item.command = payload.command;
   if (typeof payload.target === 'string') item.target = payload.target;
   return item;
+}
+
+// 모델 맥락으로 가는 owner 원문. 저장된 events 원문은 그대로 두고 여기서만 봇 멘션 표기(<@봇ID>·<@!봇ID>)를 뺀다.
+// 봇 ID는 받을 때 payload.bot_user에 남는다. 그 칸이 없는 옛 이벤트는 원문 그대로다.
+export function ownerText(payload: Record<string, unknown>): string {
+  const text = typeof payload.text === 'string' ? payload.text : '';
+  const bot = payload.bot_user;
+  if (typeof bot !== 'string' || !snowflake(bot)) return text;
+  return text.replace(new RegExp(`<@!?${bot}>[ \\t]*`, 'g'), '').trim();
 }
 
 // 같은 대화·같은 owner의 chat 결과 중 게시가 확정된(sent) 페이지만. 실패 안내·제어 ACK·스레드·경보는 message_key가

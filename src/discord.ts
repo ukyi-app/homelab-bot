@@ -59,6 +59,7 @@ const EventSchema = z.strictObject({
   text: z.string().max(DEFAULTS.maxInputChars), kind: z.enum(['message', 'command', 'button']),
   bot: z.boolean().optional(), webhook: z.boolean().optional(), mention: z.boolean().optional(),
   command: z.string().optional(), target: z.string().optional(), urgent: z.boolean().optional(),
+  botUser: z.string().regex(/^\d{1,20}$/).optional(), replyTo: z.string().regex(/^\d{1,20}$/).optional(),
 });
 export class DiscordIngress {
   constructor(private readonly store: Store, private readonly gate: PolicyGate,
@@ -719,6 +720,8 @@ export class DiscordPublisher {
 export interface GatewayFrame {
   id: string; author: { id: string; bot?: boolean }; webhook_id?: string;
   channel_id: string; guild_id?: string; content?: string; mentions?: { id: string }[];
+  // 답장의 참조 글. 참조 글이 지워졌으면 null이고, Discord가 싣지 않으면 없다. 둘 다 답장 참조 없음으로 본다.
+  referenced_message?: { id: string; author: { id: string } } | null;
 }
 export async function gatewayMessage(frame: GatewayFrame, botId: string,
   lookup: (channel: string) => Promise<{ type: number; parent_id?: string; guild_id?: string }>): Promise<EventInput> {
@@ -728,5 +731,8 @@ export async function gatewayMessage(frame: GatewayFrame, botId: string,
   return { id: frame.id, actor: frame.author.id, bot: frame.author.bot, webhook: !!frame.webhook_id,
     // 일반 채널(type 0)의 parent_id는 카테고리다. scope.parent는 스레드의 부모 채널만 뜻한다.
     scope: { kind, guild: frame.guild_id ?? null, channel: frame.channel_id, parent: kind === 'thread' ? channel.parent_id ?? null : null },
-    text: frame.content ?? '', kind: 'message', mention: frame.mentions?.some(m => m.id === botId) };
+    text: frame.content ?? '', kind: 'message', mention: frame.mentions?.some(m => m.id === botId),
+    ...(snowflake(botId) ? { botUser: botId } : {}),
+    ...(frame.referenced_message?.author.id === botId && snowflake(frame.referenced_message.id) ? { replyTo: frame.referenced_message.id } : {}) };
 }
+const snowflake = (value: string) => /^\d{1,20}$/.test(value);

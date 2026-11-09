@@ -21,7 +21,9 @@ export interface DiscordApi {
 const ChannelSchema = z.object({ id: z.string(), type: z.number(), parent_id: z.string().nullable().optional(), guild_id: z.string().optional() });
 const MessageSchema = z.object({ id: z.string(), channel_id: z.string(), guild_id: z.string().optional(),
   author: z.object({ id: z.string(), bot: z.boolean().optional() }), webhook_id: z.string().optional(),
-  content: z.string().optional(), mentions: z.array(z.object({ id: z.string() })).optional() });
+  content: z.string().optional(), mentions: z.array(z.object({ id: z.string() })).optional(),
+  // 답장 참조는 ID와 작성자만 읽는다. 본문은 Discord가 준 사본이 아니라 outbox의 게시 확정 본문을 쓴다(ARCHITECTURE §13).
+  referenced_message: z.object({ id: z.string(), author: z.object({ id: z.string() }) }).nullable().optional() });
 const IdSchema = z.object({ id: z.string() });
 const SourceSchema = z.object({ id: z.string(), thread: z.object({ id: z.string() }).nullable().optional() });
 const InteractionSchema = z.object({ id: z.string(), token: z.string(), type: z.union([z.literal(2), z.literal(3)]),

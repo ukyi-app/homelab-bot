@@ -34,6 +34,10 @@ export interface EventInput {
   id: string; actor: string; scope: Scope; text: string;
   kind: 'message' | 'command' | 'button'; bot?: boolean; webhook?: boolean;
   mention?: boolean; command?: string; target?: string; urgent?: boolean;
+  // 이 메시지를 받은 봇 사용자 ID. 모델 맥락으로 보낼 때 owner 원문에서 봇 멘션 표기를 빼는 데만 쓴다(chat-context ownerText).
+  botUser?: string;
+  // owner가 답장한 봇 자신의 글 ID. 참조 글 작성자가 봇일 때만 채운다. 본문은 outbox의 게시 확정 본문에서 읽는다.
+  replyTo?: string;
 }
 export interface Job {
   id: string; event_id: string; conversation_id: string; type: 'chat' | 'task' | 'read';
