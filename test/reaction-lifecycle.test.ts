@@ -2,7 +2,8 @@ import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DiscordProtocol, discordHttpApi } from '../src/discord-protocol.js';
 import type { DiscordApi } from '../src/discord-protocol.js';
-import { DEFAULTS } from '../src/contracts.js';
+import { DEFAULTS, DiscordRejected, RateLimited } from '../src/contracts.js';
+import { REACTION_ATTEMPTS } from '../src/reactions.js';
 import { event, fixture, localDatabase } from './helpers.js';
 
 // C04 반응 수명(AC-14): 받으면 👀, 다른 모델 일 뒤에 기다리면 ⏳, 답이 게시되면 봇 반응을 모두 지운다.
@@ -111,6 +112,104 @@ test('흐름: owner가 대기 중 작업을 /cancel하면 반응을 지운다', 
   assert.equal((await database.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job])).rows[0]!.state, 'cancelled');
   await drain();
   assert.deepEqual(log.filter(line => !line.startsWith('post') && !line.startsWith('ack')), ['remove fixture-thread/8301 👀']);
+});
+
+test('게시: 답이 unknown인 동안은 지우지 않고, 대조로 sent가 확정되면 지운다', async () => {
+  await f.ingress.receive(event('8401'));
+  f.advance(DEFAULTS.debounceMs);
+  await f.runtime.tick();
+  f.rest.loseResponse = true;
+  await drain();
+  assert.equal((await database.db.query<{ state: string }>('SELECT state FROM outbox')).rows[0]!.state, 'unknown');
+  assert.deepEqual(log, ['ack 8401', 'post fixture-thread']);
+  await f.publisher.reconcile();
+  assert.equal((await database.db.query<{ state: string }>('SELECT state FROM outbox')).rows[0]!.state, 'sent');
+  await drain();
+  assert.deepEqual(log.slice(2), ['remove fixture-thread/8401 👀']);
+});
+
+test('게시: 여러 쪽 답은 마지막 쪽이 sent로 확정된 뒤에 지운다', async () => {
+  await f.ingress.receive(event('8402'));
+  f.advance(DEFAULTS.debounceMs);
+  const job = (await database.db.query<{ id: string }>('SELECT id FROM jobs')).rows[0]!.id;
+  const claimed = (await f.store.claim())!;
+  assert.equal(claimed.id, job);
+  await f.store.finish(claimed, {}, {}, '가'.repeat(3000), claimed.target);
+  const pages = (await database.db.query('SELECT id FROM outbox')).rows.length;
+  assert.ok(pages >= 2);
+  for (let page = 1; page < pages; page++) {
+    assert.equal(await f.publisher.deliver(), true);
+    assert.equal(log.filter(line => line.startsWith('remove')).length, 0, `${page}쪽 뒤에는 아직 지우지 않는다`);
+  }
+  await drain();
+  assert.deepEqual(log.slice(-1), ['remove fixture-thread/8402 👀']);
+});
+
+async function audits(kind: string) {
+  return (await database.db.query<{ detail: unknown }>('SELECT detail FROM audit WHERE kind=$1 ORDER BY id', [kind])).rows.map(row => row.detail);
+}
+async function answer(id: string) {
+  await f.ingress.receive(event(id));
+  f.advance(DEFAULTS.debounceMs);
+  assert.equal(await f.runtime.tick(), true);
+}
+
+for (const status of [403, 404] as const) test(`오류: 지우기 ${status}는 감사만 남기고 대체 글을 달지 않으며 다시 시도하지 않는다`, async () => {
+  f.rest.removeOwnReaction = async () => { log.push('remove rejected'); throw new DiscordRejected(status); };
+  await answer('8501');
+  await drain();
+  await drain();
+  assert.deepEqual(log, ['ack 8501', 'post fixture-thread', 'remove rejected']);
+  assert.deepEqual(await audits('reaction_rejected'), [{ op: 'remove', emoji: '👀', status }]);
+  assert.deepEqual(await audits('ack_reaction_fallback'), []);
+  assert.equal((await database.db.query<{ state: string }>('SELECT state FROM outbox')).rows[0]!.state, 'sent');
+});
+
+test('오류: ⏳ 더하기 403은 감사만 남기고 대체 글이 없다', async () => {
+  f.rest.addReaction = async () => { log.push('add rejected'); throw new DiscordRejected(403); };
+  const release = holdModel();
+  await f.ingress.receive(event('8502'));
+  f.advance(DEFAULTS.debounceMs);
+  const first = f.runtime.tick();
+  await until(() => f.requests.length === 1);
+  await f.ingress.receive(event('8503'));
+  f.advance(DEFAULTS.debounceMs);
+  await f.runtime.tick();
+  await drain();
+  await drain();
+  assert.deepEqual(log, ['ack 8502', 'ack 8503', 'add rejected']);
+  assert.deepEqual(await audits('reaction_rejected'), [{ op: 'add', emoji: '⏳', status: 403 }]);
+  release();
+  await first;
+});
+
+test('오류: 지우기 429는 채널 rate limit만 기록하고, 풀린 뒤 다시 지운다. 게시 상태는 그대로다', async () => {
+  let limited = true;
+  const remove = f.rest.removeOwnReaction;
+  f.rest.removeOwnReaction = async (channel, message, emoji) => {
+    if (limited) { limited = false; log.push('remove limited'); throw new RateLimited(2000); }
+    return remove(channel, message, emoji);
+  };
+  await answer('8504');
+  await drain();
+  assert.deepEqual(log, ['ack 8504', 'post fixture-thread', 'remove limited']);
+  assert.ok(await f.store.discordPauseUntil('fixture-thread') > f.now());
+  assert.equal((await database.db.query<{ state: string }>('SELECT state FROM outbox')).rows[0]!.state, 'sent');
+  await drain();
+  assert.equal(log.length, 3, 'rate limit이 풀리기 전에는 다시 부르지 않는다');
+  f.advance(2000);
+  await drain();
+  assert.deepEqual(log.slice(3), ['remove fixture-thread/8504 👀']);
+  assert.deepEqual(await audits('reaction_rejected'), []);
+});
+
+test('오류: 반응 REST 일시 오류는 게시를 막지 않고 다시 시도하며, 한도를 넘으면 감사만 남기고 놓는다', async () => {
+  f.rest.removeOwnReaction = async () => { log.push('remove failed'); throw new Error('discord_request_failed'); };
+  await answer('8505');
+  for (let i = 0; i < 10; i++) { await drain(); f.advance(60_000); }
+  assert.equal(log.filter(line => line === 'remove failed').length, REACTION_ATTEMPTS);
+  assert.deepEqual(await audits('reaction_abandoned'), [{ op: 'remove', emoji: '👀', attempts: REACTION_ATTEMPTS }]);
+  assert.equal((await database.db.query<{ state: string }>('SELECT state FROM outbox')).rows[0]!.state, 'sent');
 });
 
 // 첫 대화 작업이 모델 자리를 쥔 채로 멈춰 있게 한다. release()로 답을 낸다.
