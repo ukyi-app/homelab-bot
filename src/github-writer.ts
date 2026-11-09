@@ -132,7 +132,7 @@ const snapshot = (row: PullRow): WriterPullSnapshot => ({
 // ChangeWriterPort(소유 C25)에 올리기 전까지 fast-forward 갱신은 이 타입에만 있다.
 export interface GitHubWriterPort extends ChangeWriterPort {
   // 자기 change·generation 브랜치를 expectedHead에서 sha로만 옮긴다. sha의 부모가 expectedHead 하나여야 하고, 브랜치가 다른 SHA면 보내지 않는다(head_changed).
-  // 응답 유실·422는 브랜치를 다시 읽어 sha면 confirmed, 다른 SHA·없음이면 rejected(head_changed), 그대로면 원래 결과다.
+  // 응답 유실·409·422는 브랜치를 다시 읽어 sha면 confirmed, 다른 SHA·없음이면 rejected(head_changed), 그대로면 원래 결과다.
   fastForwardBranch(input: { target: ChangeTarget; branch: string; expectedHead: string; sha: string }): Promise<WriterOutcome<{ ref: string; sha: string }>>;
 }
 export interface GitHubWriterIO { writer: GitHubWriterPort; preflight: ChangePreflightPort }
@@ -469,7 +469,7 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
       if (error instanceof WriterReadError) return notSent(error.message);
       throw error;
     }
-    // 응답을 잃었거나 422면 정확한 ref를 다시 읽는다. 읽기가 실패하면 처음 결과를 그대로 둔다.
+    // 응답을 잃었거나 갱신이 거부되면 정확한 ref를 다시 읽는다. 읽기가 실패하면 처음 결과를 그대로 둔다.
     const settle = async (sent: WriterOutcome<{ ref: string; sha: string }>): Promise<WriterOutcome<{ ref: string; sha: string }>> => {
       let head: { sha: string } | null;
       try { head = await signed.readBranchHead({ target, branch }); }
@@ -487,7 +487,8 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
         const updated = CreatedRef.safeParse(json);
         return updated.success && updated.data.ref === ref && updated.data.object.type === 'commit' && updated.data.object.sha === sha ? { kind: 'confirmed', value: { ref, sha } } : invalid;
       });
-      return sent.kind === 'unknown' || (sent.kind === 'rejected' && sent.status === 422) ? settle(sent) : sent;
+      // GitHub 문서는 갱신 거부로 409·422를 적는다. 어느 쪽이든 브랜치가 그대로인지 다시 본다.
+      return sent.kind === 'unknown' || (sent.kind === 'rejected' && (sent.status === 422 || sent.status === 409)) ? settle(sent) : sent;
     });
   };
 

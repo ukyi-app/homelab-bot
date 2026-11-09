@@ -562,6 +562,8 @@ test('C26 writer: 응답 유실·422는 정확한 ref를 다시 읽어 대조하
     ['5xx·그대로', { status: 502 }, null, { kind: 'unknown', code: 'http_5xx' }],
     ['422·그대로', { status: 422 }, null, { kind: 'rejected', status: 422, code: 'http_422' }],
     ['422·사람이 옮김', { status: 422 }, human, { kind: 'rejected', status: 422, code: 'head_changed' }],
+    ['409·사람이 옮김', { status: 409 }, human, { kind: 'rejected', status: 409, code: 'head_changed' }],
+    ['403', { status: 403 }, human, { kind: 'rejected', status: 403, code: 'http_403' }],
     ['유실·사람이 옮김', 'reset_before_apply', human, { kind: 'rejected', status: 0, code: 'head_changed' }],
   ];
   for (const [name, mode, interfere, expected] of cases) {

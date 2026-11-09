@@ -821,3 +821,13 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 | D7 봇 지표 스크레이프 | `vmsingle/scrape.yaml`에 봇 job, `platform/bot-slot`에 vmsingle → 봇 8080 ingress | 플랫폼 PR(T16b S15) |
 | D8 Kubernetes API 경로 | 봇 파드 → Kubernetes API 길은 플랫폼 PR이 연다. 읽기 transport의 K8s 출처는 in-cluster SA 토큰(`/var/run/secrets/kubernetes.io/serviceaccount`)으로 `https://kubernetes.default.svc`를 부른다 | `src/read-transports.ts`, 주소는 env `KUBERNETES_API_URL` |
 | D9 Argo CD 앱 상태 경로 | 봇은 Argo CD 앱 상태를 Argo CD API(`argocd-server`, `ARGOCD_URL`·`ARGOCD_READER_TOKEN`)가 아니라 **Kubernetes API의 Application CR**(`GET /apis/argoproj.io/v1alpha1/namespaces/argocd/applications/{이름}`)로 읽는다. 이유: `argocd-server`는 설계상 자체 서명 TLS만 쓰고(사람용 Tailscale 프록시가 https+insecure로 붙는다) 봇이 읽는 것은 앱 객체 하나뿐이다. Kubernetes API는 SA의 클러스터 CA로 TLS를 검증하고, 자격도 SA 하나로 준다. SA `bot-reader`에 `get applications.argoproj.io -n argocd`를 준다(플랫폼, lead 확인). 앱 이름은 카탈로그 고정값만, 경로의 namespace는 `argocd` 고정, 투영은 `status.health`·`status.sync`만(D9 전과 같은 판정·관측 시각). 남는 범위: 이 권한은 `argocd` ns의 모든 Application(spec의 인라인 Helm values 포함)을 읽게 한다. Argo CD `applications, get`도 같은 범위였다. 더 줄이려면 Role에 `resourceNames`(카탈로그 앱 이름)를 둘 수 있으나 새 앱마다 플랫폼 PR이 든다(선택) | `src/read-transports.ts`(`kubernetesTransport`의 datasource `argocd`), `src/catalog.ts` `ARGOCD_APPLICATIONS`, `src/config.ts`·`src/main.ts`(env 2개 제거), [ARCHITECTURE](ARCHITECTURE.md) §5·§11, [VERIFICATION](VERIFICATION.md) "T16b D9" |
+
+---
+
+## 동료 봇 전환 16·17 구현 위치 (C26, 2026-11-09)
+
+"동료 봇 전환 (사용자 2026-11-09)" 16(PR 수정 반복)·17(안내 댓글)의 GitHub 포트 자리다. 결정은 바꾸지 않았다.
+
+- 16 수정 커밋의 fast-forward 갱신: `src/github-writer.ts` `GitHubWriterPort.fastForwardBranch`(자기 변경 브랜치만, `force:false`, 기대 head·부모 확인 뒤 전송). PR의 리뷰·댓글 자료 읽기: `src/github-review-io.ts` `discussion.read`(리뷰 App 읽기 토큰, 허용 경로 `src/github-app.ts` GET 두 줄). 부르는 곳은 C27.
+- 17 안내 댓글 게시: `src/github-review-io.ts` `guidance.post`·`guidance.find`(`restrictGitHubWrite`를 지나는 `COMMENT` 리뷰, 안내 표식으로 회수). 부르는 곳은 C29.
+- 기록: [ARCHITECTURE](ARCHITECTURE.md) §6 리뷰 행·§16.3, [VERIFICATION](VERIFICATION.md) "C26 GitHub 쓰기·읽기 확장".

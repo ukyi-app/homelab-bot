@@ -2117,3 +2117,17 @@ T21 1회차 감사의 blocked 7건(homelab 티켓 T30)을 항목마다 사용자
 | INT-04 | CHANGE-01, CHANGE-03 | **pass**(2026-11-09). **A(운영, 실제 모델):** 사용자 스레드에서 `/change`(smoke `README.md` 한 줄, 문구 선택을 질문하라고 요구) → 작성 1턴 도구 0·`needs_input` 질문 → `/answer label=public \| (나)…` → 같은 세션 resume 턴 도구 2 → `smoke-unit` passed(T28 `payload-start` 표식의 운영 Localhost 프로필 첫 실측) → 독립 사전 리뷰 `pass_with_warnings`(P2 2건, 범위 complete) → 미리보기 digest = `/change-status` digest → `/change-publish` → 10초 뒤 smoke PR #22(head tree = 결과 tree, 부모 = 고정 base, README.md 하나) → T17 지적 없음 → 사람이 닫은 뒤 약 4분에 `cancelled(closed_unmerged)`. **B·C·D(격리 시험 게시자, 실제 smoke GitHub, 운영 게시 판정 코드, 작성·검증·리뷰 receipt는 fixture):** B 승인 확인 뒤 preflight 전 barrier에서 사람 PR(smoke #21, 문서 한 줄)을 병합하자 `superseded(base_moved)`·승인 무효·effect 0. C 새 generation이 새 base·digest를 받고 옛 digest 4가지 경로가 모두 거부. D 승인 전 예정 `bot/change/<id>/g2`에 writer 시험 토큰으로 사람 commit을 두고 승인하자 첫 쓰기 전 `blocked(head_changed)`, ref·main 불변, 게시자 쓰기 0. 25개 검사 true. 모델 5회(A 4, 사람 PR T17 1). **제약:** 작성 도구 상한은 job 합계 8회(`DEFAULTS.maxToolCalls`). D는 gate(ref가 승인 전부터 있음)만 실측했고 gate 뒤 ref가 생기는 경우는 로컬 증거다. 사람 commit은 ruleset이 사람의 `bot/**` 쓰기를 막아 writer 토큰으로 넣은 동등 시험이다. 운영 게시 서버에는 barrier를 넣지 않았다 | A `authorized_external`, B·C·D `authorized_external`(receipt `mock`) |
 
 **T30 7항목 끝(2026-11-09).** INT-02·03·04·05·06·07 pass, INT-01은 기존 증거 수용. 판정은 T21 재감사가 한다.
+
+## C26 GitHub 쓰기·읽기 확장 (2026-11-09)
+
+동료 봇 전환 16·17(수정 요청·안내 댓글)이 쓸 GitHub 포트 셋을 더했다. 부르는 곳이 없어 병합해도 GitHub에 나가는 요청과 owner가 보는 동작은 그대로다. 경계는 명세 §6 S1(가짜 GitHub)이고 네트워크·실제 GitHub은 쓰지 않았다. 설계는 [ARCHITECTURE](ARCHITECTURE.md) §6 리뷰 행과 §16.3 표.
+
+| 포트 | 시험(`test/github-writer.test.ts`, `test/github-review-app.test.ts`) | 잡는 실패 |
+|---|---|---|
+| writer `fastForwardBranch` | "C26 writer:" 6건, route 표 허용·거부 사례 | 강제 갱신(`force` 입력·`force:true` body), 남의 change·generation·base·임의 브랜치 갱신, 기대 head 불일치·부모 불일치 전송(쓰기 토큰도 받지 않음), 응답 유실·422 뒤 재전송, 응답 ref·SHA 불일치 확정 |
+| 리뷰 App `discussion.read` | "리뷰 App 허용 경로", "PR 자료 읽기:" 4건 | 허용 경로가 GET 두 줄 밖으로 늘어남, 다른 PR·저장소 글 혼입, 모르는 association, 쪽·항목·글자 상한 무시, 정책 목록 밖 저장소에 토큰 발급 |
+| 리뷰 App `guidance.post`·`find` | "안내 리뷰 게시:" 3건 | APPROVE·REQUEST_CHANGES·LEFT 인라인·인라인 51개, 옛 head·닫힌 PR·fork PR 게시, 표식 흉내 본문, 유실 뒤 재게시, 다른 head·다른 표식 종류(`homelab-bot-review:`)로 잘못 회수 |
+
+- 실행: `npm run check`, `npm run build && node --test dist/test/github-writer.test.js dist/test/github-review-app.test.js` → 83 pass, 0 fail, 0 skip.
+- **못 잡는 범위(S5):** 실제 GitHub의 fast-forward 거부 응답 모양(문서는 `force` 거짓이면 fast-forward만이라고 하고 실패 상태로 409·422를 적는다. 둘 다 ref를 다시 읽어 대조한다)과 ruleset E 동작, 인라인 위치 표시.
+- **[미확인] issue 댓글 읽기 권한:** 리뷰 App 읽기 토큰은 `contents:read`·`pull_requests:read`다. GitHub "Permissions required for GitHub Apps" 표에서 `GET /repos/{owner}/{repo}/issues/{issue_number}/comments`가 Issues(read)와 Pull requests(read) 양쪽에 "Additional permissions" 표시로 실린 것으로 읽혔다(그 표시는 "any one permission from a set"이라는 뜻). 문서 원문을 끝까지 받지 못해 확인은 요약 수준이다(확인 2026-11-09, docs.github.com). 권한을 더하지 않았고, live 첫 수정 요청에서 403이 나면 App 권한 `issues:read` 추가가 사람 작업이다.
