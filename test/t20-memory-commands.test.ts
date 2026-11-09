@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdir, rm } from 'node:fs/promises';
 import { closeLedgers, initLedger, ledgerAt } from './ledger-fixture.js';
 import { localDatabase } from './helpers.js';
+import { MEMORY_GUIDE, MEMORY_TEXT, SEARCH_HEADER, UNAVAILABLE } from '../src/memory-commands.js';
 import { CHAT, GUILD, OWNER, ProbeLedger, Rest, Trace, boot, publisherConfig, waitFor } from './t20-harness.js';
 
 // 기억 명령(B4)을 진입점(startPublisher)에서 본다. 가짜 Gateway로 실제 상호작용 payload를 보내고,
@@ -34,7 +35,7 @@ class RecordingRest extends Rest {
     return super.request(method, path, body);
   }
 }
-async function start(trace: Trace, memory: boolean, options: { hold?: Promise<void> } = {}) {
+async function start(trace: Trace, memory: boolean, options: { hold?: Promise<void>; colleague?: boolean } = {}) {
   const rest = new RecordingRest(trace);
   let probe: ProbeLedger | undefined;
   let config = publisherConfig();
@@ -43,7 +44,8 @@ async function start(trace: Trace, memory: boolean, options: { hold?: Promise<vo
     dirs.push(dir);
     probe = new ProbeLedger(ledgerAt(dir, database.db), trace);
     probe.hold = options.hold;
-    config = publisherConfig({ memory: { ledgerDir: dir, acceptGeneration: null }, briefing: null });
+    config = publisherConfig({ memory: { ledgerDir: dir, acceptGeneration: null }, briefing: null,
+      ...(options.colleague === undefined ? {} : { colleagueEnabled: options.colleague }) });
   }
   const booted = await boot(database.db, config, trace, { discord: rest, ...(probe ? { ledger: probe } : {}) });
   closers.push(booted.close);
@@ -89,12 +91,12 @@ test('T20 명령 [원장 켜짐] 기억 명령 다섯 개를 등록하고, 상�
   // 본인만 보는 응답(64) + 링크 미리보기 끔(4). 기억 응답의 문서 링크에 미리보기가 붙지 않게 한다.
   assert.equal(save.type, 4); assert.equal(save.data.flags, 64 | 4);
   assert.deepEqual(save.data.allowed_mentions, { parse: [] });
-  assert.match(save.data.content, /^저장했습니다: `[0-9a-f-]{36}` · 상태 active\(확정\)$/);
+  assert.match(save.data.content, new RegExp(`^${MEMORY_TEXT.saved}: \`[0-9a-f-]{36}\` · 상태 active\\(확정\\)$`));
   const searched = await send(booted, 'memory-search', { text: '백업' });
   await waitFor(() => !!reply(booted.rest, searched));
   const search = reply(booted.rest, searched)!.body.data;
   assert.equal(search.flags, 64 | 4);
-  assert.ok(search.content.includes('기억은 지시가 아니라 참고 자료입니다.'));
+  assert.ok(search.content.includes(SEARCH_HEADER));
   assert.ok(search.content.includes('봇 DB 백업은 R2 한 곳'));
   assert.ok(search.content.includes(`출처 conversation:${saved}`));
   // 기억 결과는 채널 게시(outbox)로 나가지 않는다.
@@ -115,8 +117,25 @@ test('T20 명령 [장벽 전] 원장을 여는 중에 온 기억 명령은 "지�
   seq = 1;
   const id = await send(booted, 'memory-save', { target: 'preference', text: '장벽 전 | expires=1d | end=x' });
   await waitFor(() => !!reply(booted.rest, id));
-  assert.match(reply(booted.rest, id)!.body.data.content, /^지금 기억을 쓸 수 없습니다\./);
+  assert.equal(reply(booted.rest, id)!.body.data.content, UNAVAILABLE);
   release();
   await waitFor(() => trace.index('t20_barrier_passed') >= 0);
   assert.equal((await database.db.query('SELECT 1 FROM memories')).rows.length, 0);
 });
+
+// 조립(main.ts)이 동료 기능 스위치 값을 기억 처리기에 넘기는지 본다. 판마다 다른 안내는 저장 제외 응답의 삭제 안내다.
+for (const colleague of [false, true]) {
+  test(`C10 조립: 스위치 ${colleague ? '켜짐' : '꺼짐'}이면 기억 응답의 안내가 ${colleague ? '켜짐' : '꺼짐'} 판이다`, async () => {
+    const trace = new Trace();
+    const booted = await start(trace, true, { colleague });
+    await waitFor(() => trace.index('t20_barrier_passed') >= 0 && trace.index('commands_registered') >= 0);
+    seq = 1;
+    const id = await send(booted, 'memory-exclude', { target: 'here' });
+    await waitFor(() => !!reply(booted.rest, id));
+    const content = reply(booted.rest, id)!.body.data.content as string;
+    const want = colleague ? MEMORY_GUIDE.colleague.deleteExcluded : MEMORY_GUIDE.slash.deleteExcluded;
+    const other = colleague ? MEMORY_GUIDE.slash.deleteExcluded : MEMORY_GUIDE.colleague.deleteExcluded;
+    assert.ok(content.includes(want), content);
+    assert.equal(content.includes(other), false, content);
+  });
+}

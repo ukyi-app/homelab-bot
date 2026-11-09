@@ -2,15 +2,17 @@ import { randomUUID } from 'node:crypto';
 import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, rm } from 'node:fs/promises';
+import { BRIEFING_TEXT } from '../src/briefing.js';
 import { COMMAND_DEFINITIONS, MEMORY_COMMANDS, MEMORY_COMMAND_DEFINITIONS, commandDefinitions } from '../src/commands.js';
 import { Denied } from '../src/contracts.js';
 import type { EventInput, Scope } from '../src/contracts.js';
 import type { LedgerState } from '../src/deletion-ledger.js';
-import { ALL_COMMANDS, DiscordIngress, MEMORY_ACK_NOTICE } from '../src/discord.js';
+import { ALL_COMMANDS, DiscordIngress } from '../src/discord.js';
 import { DOCUMENT_REPOSITORIES, githubDocuments } from '../src/document-source.js';
-import { MemoryService } from '../src/memory.js';
+import { DELETION_MESSAGE, MemoryService } from '../src/memory.js';
 import type { DeletionEntry, DeletionLedger, DocumentSource } from '../src/memory.js';
-import { DELETE_SCOPE, MemoryCommands, REPLY_LIMIT, SEARCH_HEADER, UNAVAILABLE, savedText } from '../src/memory-commands.js';
+import { DELETE_PENDING_SCOPE, DELETE_SCOPE, INPUT_ERROR, MEMORY_GUIDE, MEMORY_TEXT, MemoryCommands, RAW_TEXT_NOTICE, REJECTED, REPLY_LIMIT,
+  SEARCH_HEADER, UNAVAILABLE, savedText } from '../src/memory-commands.js';
 import { MockDiscord, event, fixture, localDatabase, thread } from './helpers.js';
 import { closeLedgers, initLedger, ledgerAt } from './ledger-fixture.js';
 
@@ -103,7 +105,7 @@ test('MEM-CMD 흐름: 저장 → 검색 → 정정 → 삭제 → 저장 제외,
   const saved = await run('memory-save', { target: 'preference', text: '답은 짧게 | expires=30d | end=해제 요청 | topic=답 길이' });
   const first = idOf(saved);
   assert.ok(first);
-  assert.match(saved!, /저장했습니다: `[0-9a-f-]{36}` · 상태 active\(확정\)/);
+  assert.ok(saved!.startsWith(`${MEMORY_TEXT.saved}: \`${first}\` · 상태 active(확정)`), saved);
 
   const found = await run('memory-search', { text: '짧게' });
   assert.ok(found!.includes(SEARCH_HEADER));
@@ -114,7 +116,7 @@ test('MEM-CMD 흐름: 저장 → 검색 → 정정 → 삭제 → 저장 제외,
   const corrected = await run('memory-correct', { target: first, text: '답은 세 줄 이내 | kind=preference | reason=더 구체적으로 | expires=30d | end=해제 요청 | topic=답 길이' });
   const second = idOf(corrected);
   assert.ok(second && second !== first);
-  assert.match(corrected!, /정정했습니다\. 새 기억: `[0-9a-f-]{36}` · 상태 active/);
+  assert.ok(corrected!.startsWith(`${MEMORY_TEXT.corrected}: \`${second}\` · 상태 active`), corrected);
   assert.ok(corrected!.includes(`\`${first}\`은 superseded`));
   const afterCorrect = await run('memory-search', { text: '답은' });
   assert.ok(afterCorrect!.includes(second!)); assert.equal(afterCorrect!.includes(first!), false);
@@ -126,11 +128,11 @@ test('MEM-CMD 흐름: 저장 → 검색 → 정정 → 삭제 → 저장 제외,
   assert.ok(deleted!.includes(DELETE_SCOPE));
   assert.equal((await run('memory-search', { text: '백업' }))!.includes(decision!), false);
   // 같은 ID를 다시 지우면 멱등으로 완료를 알린다.
-  assert.ok((await run('memory-delete', { target: decision }))!.includes('이미 삭제가 끝난 기억입니다.'));
+  assert.ok((await run('memory-delete', { target: decision }))!.includes(DELETION_MESSAGE.already));
 
   const excluded = await run('memory-exclude', { target: 'here' });
-  assert.ok(excluded!.startsWith(`저장 제외했습니다: \`channel:${thread.channel}\`. 이 출처의 기억 1건을`));
-  assert.ok((await run('memory-search', { text: '답은' }))!.startsWith('이 채널에서 볼 수 있는 기억 중 맞는 것이 없습니다.'));
+  assert.ok(excluded!.startsWith(MEMORY_TEXT.excluded(`channel:${thread.channel}`, 1)), excluded);
+  assert.ok((await run('memory-search', { text: '답은' }))!.startsWith(MEMORY_TEXT.noMatch));
   // 저장 제외한 채널에서는 새로 저장하지 않는다.
   assert.ok((await run('memory-save', { target: 'preference', text: '다시 | expires=1d | end=해제' }))!.includes('저장 제외한 출처'));
 });
@@ -144,39 +146,40 @@ test('MEM-CMD 근거: 대화만으로는 설정·장애가 candidate, 커밋 고
   assert.deepEqual((stored.source_refs as { type: string }[]).map(s => s.type), ['conversation', 'document']);
   assert.equal((stored.source_refs as { revision?: string }[])[1]!.revision, 'a'.repeat(40));
   const outside = await run('memory-save', { target: 'configuration', text: 'X | recheck=1d | doc=https://example.com/a.md' });
-  assert.ok(outside!.startsWith('출처를 확인할 수 없어 저장하지 않았습니다.'));
+  assert.equal(outside, REJECTED.memory_source_inaccessible);
   // 다른 사람의 결정은 대화만으로 확정하지 않는다.
   assert.match((await run('memory-save', { target: 'decision', text: '배포는 금요일 금지 | applies=homelab | by=팀장' }))!, /candidate/);
   assert.equal(await count('memories'), 3);
 });
 
 test('MEM-CMD 잘못된 입력: 서식·필수 값·시각·ID 오류는 저장하지 않고 이유를 짧게 답함(입력값은 되풀이하지 않음)', async () => {
-  const cases: [string, { text?: string; target?: string }, RegExp][] = [
-    ['memory-save', { target: 'opinion', text: 'x' }, /^종류는 configuration·decision·incident·preference 중 하나입니다\.$/],
-    ['memory-save', { target: 'preference', text: '   | expires=1d' }, /^진술이 비어 있습니다\./],
-    ['memory-save', { target: 'preference', text: '비밀문구 | expires=1d' }, /^preference는 `expires=`\(만료\)와 `end=`/],
-    ['memory-save', { target: 'preference', text: '비밀문구 | expires=내일 | end=x' }, /^`expires=` 값을 읽지 못했습니다\./],
-    ['memory-save', { target: 'preference', text: '비밀문구 | expires=2026-12-31 | end=x' }, /^`expires=` 값을 읽지 못했습니다\./],
-    ['memory-save', { target: 'preference', text: '비밀문구 | applies=x' }, /^`applies=`는 이 명령·종류에서 쓰지 않습니다\./],
-    ['memory-save', { target: 'preference', text: '비밀문구 | 그냥 문장' }, /^`키=값` 모양이 아닌 조각이 있습니다\./],
-    ['memory-save', { target: 'preference', text: '비밀문구 | topic=a | topic=b' }, /^`topic=`는 한 번만 씁니다\.$/],
-    ['memory-save', { target: 'configuration', text: '비밀문구' }, /^configuration은 `recheck=` 또는 `expires=`가 필요합니다/],
-    ['memory-save', { target: 'decision', text: '비밀문구' }, /^decision은 `applies=`/],
-    ['memory-save', { target: 'incident', text: '비밀문구 | briefing=maybe' }, /^`briefing=`은 yes 또는 no입니다\.$/],
-    ['memory-save', { target: 'preference', text: `${'가'.repeat(1001)} | expires=1d | end=x` }, /^입력이 기억 형식에 맞지 않습니다/],
-    ['memory-save', { target: 'preference', text: '비밀문구 | expires=1d | end=x | service=unknown-service' }, /^허용되지 않은 서비스 범위입니다\.$/],
-    ['memory-correct', { target: 'not-an-id', text: '비밀문구 | kind=preference | reason=x' }, /^기억 ID/],
-    ['memory-correct', { target: '00000000-0000-4000-8000-000000000000', text: '비밀문구 | kind=preference | expires=1d | end=x' }, /^정정에는 `reason=`/],
-    ['memory-correct', { target: '00000000-0000-4000-8000-000000000000', text: '비밀문구 | reason=x' }, /^종류는/],
-    ['memory-correct', { target: '00000000-0000-4000-8000-000000000000', text: '비밀문구 | kind=preference | reason=x | expires=1d | end=x' }, /^기억을 찾을 수 없거나/],
-    ['memory-delete', { target: 'a,b' }, /^기억 ID/],
-    ['memory-delete', { target: '00000000-0000-4000-8000-000000000000,00000000-0000-4000-8000-000000000001' }, /^삭제할 기억 ID 하나를 적습니다\.$/],
-    ['memory-delete', { target: '00000000-0000-4000-8000-000000000000' }, /^기억을 찾을 수 없거나/],
-    ['memory-exclude', { target: 'whatever' }, /^출처 키 모양이 아닙니다\./],
+  const id = '00000000-0000-4000-8000-000000000000';
+  const cases: [string, { text?: string; target?: string }, string][] = [
+    ['memory-save', { target: 'opinion', text: 'x' }, INPUT_ERROR.kind],
+    ['memory-save', { target: 'preference', text: '   | expires=1d' }, INPUT_ERROR.statement],
+    ['memory-save', { target: 'preference', text: '비밀문구 | expires=1d' }, INPUT_ERROR.required.preference],
+    ['memory-save', { target: 'preference', text: '비밀문구 | expires=내일 | end=x' }, INPUT_ERROR.time('expires')],
+    ['memory-save', { target: 'preference', text: '비밀문구 | expires=2026-12-31 | end=x' }, INPUT_ERROR.time('expires')],
+    ['memory-save', { target: 'preference', text: '비밀문구 | applies=x' }, INPUT_ERROR.key('applies', ['topic', 'service', 'recheck', 'expires', 'doc', 'briefing', 'end'])],
+    ['memory-save', { target: 'preference', text: '비밀문구 | 그냥 문장' }, INPUT_ERROR.format],
+    ['memory-save', { target: 'preference', text: '비밀문구 | topic=a | topic=b' }, INPUT_ERROR.repeat('topic')],
+    ['memory-save', { target: 'configuration', text: '비밀문구' }, INPUT_ERROR.required.configuration],
+    ['memory-save', { target: 'decision', text: '비밀문구' }, INPUT_ERROR.required.decision],
+    ['memory-save', { target: 'incident', text: '비밀문구 | briefing=maybe' }, INPUT_ERROR.briefing],
+    ['memory-save', { target: 'preference', text: `${'가'.repeat(1001)} | expires=1d | end=x` }, REJECTED.memory_invalid!],
+    ['memory-save', { target: 'preference', text: '비밀문구 | expires=1d | end=x | service=unknown-service' }, REJECTED.memory_service_scope!],
+    ['memory-correct', { target: 'not-an-id', text: '비밀문구 | kind=preference | reason=x' }, INPUT_ERROR.ids],
+    ['memory-correct', { target: id, text: '비밀문구 | kind=preference | expires=1d | end=x' }, REJECTED.memory_correction_reason_required!],
+    ['memory-correct', { target: id, text: '비밀문구 | reason=x' }, INPUT_ERROR.kind],
+    ['memory-correct', { target: id, text: '비밀문구 | kind=preference | reason=x | expires=1d | end=x' }, MEMORY_TEXT.denied],
+    ['memory-delete', { target: 'a,b' }, INPUT_ERROR.ids],
+    ['memory-delete', { target: `${id},00000000-0000-4000-8000-000000000001` }, INPUT_ERROR.deleteOne],
+    ['memory-delete', { target: id }, MEMORY_TEXT.denied],
+    ['memory-exclude', { target: 'whatever' }, REJECTED.memory_exclusion_invalid!],
   ];
   for (const [command, options, expected] of cases) {
     const reply = await run(command, options);
-    assert.match(reply ?? '(응답 없음)', expected, `${command} ${options.target}`);
+    assert.equal(reply ?? '(응답 없음)', expected, `${command} ${options.target}`);
     assert.equal(reply!.includes('비밀문구'), false);
   }
   assert.equal(await count('memories'), 0);
@@ -238,7 +241,7 @@ test('MEM-CMD 삭제 pending/deleted: 원장 기록을 확인하지 못하면 �
   const id = idOf(await run('memory-save', { target: 'preference', text: '지울 것 | expires=1d | end=x' }));
   ledger.appendFails = true;
   const pending = await run('memory-delete', { target: id });
-  assert.ok(pending!.startsWith(`상태: 삭제 대기(pending) \`${id}\`\n삭제 원장 기록을 확인하지 못해 아직 삭제하지 않았습니다.`));
+  assert.ok(pending!.startsWith(`상태: 삭제 대기(pending) \`${id}\`\n${DELETION_MESSAGE.ledgerUnconfirmed}`));
   assert.ok(pending!.includes('백업에는 최대 14일')); assert.ok(pending!.includes(DELETE_SCOPE));
   assert.equal((await run('memory-search', { text: '지울' }))!.includes(id!), false);
   ledger.appendFails = false;
@@ -262,9 +265,73 @@ test('MEM-CMD 기록: 진술·검색어는 events·감사·로그·outbox에 남
   // 기억 명령은 작업(job)을 만들지 않는다(모델을 부르지 않음).
   assert.equal(await count('jobs'), 0);
   const notice = (await database.db.query<{ payload: { content: string; channel: string } }>("SELECT payload FROM outbox WHERE message_key='ack-notice:' || (SELECT id FROM events WHERE delivery_id='lost-ack')")).rows;
-  assert.deepEqual(notice.map(r => r.payload.content), [MEMORY_ACK_NOTICE]);
+  assert.deepEqual(notice.map(r => r.payload.content), [MEMORY_GUIDE.slash.ackLost]);
   const audit = (await database.db.query<{ kind: string }>("SELECT kind FROM audit WHERE kind='ack_uncertain'")).rows;
   assert.equal(audit.length, 1);
+});
+
+// 명세 §4.3 "기억 원문"의 안내 문장. 구현 상수가 아니라 명세에서 옮긴 리터럴이다.
+const RAW_TEXT_LIFETIME = '이 스레드의 원래 메시지는 7일 뒤에 지워져요';
+// '/' 명령 이름과 기억 명령 이름(명세 §4.9, AC-11).
+const SLASH_NAMES = /(^|[\s(`'"])\/[a-z]|memory-(save|search|correct|exclude|delete)|model-status/;
+
+test('C10 기억 삭제: 완료·대기 응답 모두 원래 메시지가 7일 뒤 지워진다고 알림(지금 지운다고 하지 않음)', async () => {
+  const id = idOf(await run('memory-save', { target: 'preference', text: '지울 것 | expires=1d | end=x' }));
+  ledger.appendFails = true;
+  const pending = await run('memory-delete', { target: id });
+  assert.ok(pending!.startsWith(`상태: 삭제 대기(pending) \`${id}\``));
+  assert.ok(pending!.includes(RAW_TEXT_LIFETIME), pending);
+  ledger.appendFails = false;
+  const done = await run('memory-delete', { target: id });
+  assert.ok(done!.startsWith(`상태: 삭제 완료(deleted) \`${id}\``));
+  assert.ok(done!.includes(RAW_TEXT_LIFETIME), done);
+  assert.ok(done!.includes(DELETE_SCOPE));
+});
+
+test('C10 스위치 두 판: 꺼지면 기억 명령 이름·\'/\'를 안내하고, 켜지면 응답·안내 문구에 \'/\' 이름과 기억 명령 이름이 없음', async () => {
+  const handler = (colleague: boolean) => new MemoryCommands(memory, () => ledger.inner.status().state, () => false, f.now, colleague);
+  const slash = handler(false);
+  const colleague = handler(true);
+  // 수신(discord.ts)이 쓰는 응답 유실·일시 오류 안내.
+  assert.deepEqual(slash.guide, MEMORY_GUIDE.slash);
+  assert.deepEqual(colleague.guide, MEMORY_GUIDE.colleague);
+  for (const text of Object.values(MEMORY_GUIDE.slash)) assert.match(text, SLASH_NAMES, text);
+  for (const text of Object.values(MEMORY_GUIDE.colleague)) assert.doesNotMatch(text, SLASH_NAMES, text);
+  // 처리기 응답: 저장 제외의 삭제 안내와 충돌 안내가 판마다 다르다.
+  const exclude = (h: MemoryCommands, id: string) => h.handle({ id, actor: 'fixture-owner', scope: thread, command: 'memory-exclude', text: '', target: 'here' });
+  assert.match((await exclude(slash, 'exclude-slash')).content, SLASH_NAMES);
+  const excluded = (await exclude(colleague, 'exclude-colleague')).content;
+  assert.ok(excluded.includes(MEMORY_GUIDE.colleague.deleteExcluded), excluded);
+  assert.doesNotMatch(excluded, SLASH_NAMES);
+  const ids = Array.from({ length: 50 }, () => randomUUID());
+  const conflict = { id: randomUUID(), status: 'candidate' as const, conflictsWith: ids };
+  assert.match(savedText(MEMORY_TEXT.saved, conflict, REPLY_LIMIT, 'slash'), SLASH_NAMES);
+  const spoken = savedText(MEMORY_TEXT.saved, conflict, REPLY_LIMIT, 'colleague');
+  assert.ok(spoken.includes(MEMORY_GUIDE.colleague.resolveConflict) && spoken.includes(MEMORY_GUIDE.colleague.moreConflicts), spoken);
+  assert.doesNotMatch(spoken, SLASH_NAMES);
+  // 스위치와 무관한 문구는 두 판이 같고 '/' 이름이 없다.
+  for (const text of [UNAVAILABLE, SEARCH_HEADER, DELETE_SCOPE, DELETE_PENDING_SCOPE, RAW_TEXT_NOTICE]) assert.doesNotMatch(text, SLASH_NAMES, text);
+});
+
+test('C10 말투: 기억 명령·삭제·브리핑 문장 문구는 해요체이고 "봇" 자기 지칭이 없음', () => {
+  const sample = (value: unknown): string[] => typeof value === 'string' ? [value]
+    : typeof value === 'function' ? [String(value('x', ['k']))]
+    : value && typeof value === 'object' ? Object.values(value).flatMap(sample) : [];
+  const texts = [MEMORY_TEXT, INPUT_ERROR, REJECTED, MEMORY_GUIDE, DELETION_MESSAGE, BRIEFING_TEXT,
+    SEARCH_HEADER, DELETE_SCOPE, DELETE_PENDING_SCOPE, RAW_TEXT_NOTICE, UNAVAILABLE].flatMap(sample);
+  assert.ok(texts.length > 40, String(texts.length));
+  for (const text of texts) {
+    assert.doesNotMatch(text, /습니다|합니다|입니다|하세요|봇/, text);
+  }
+});
+
+test('C10 수신 안내 판: 켜진 처리기면 응답 유실 안내도 \'/\' 이름 없는 판으로 남김', async () => {
+  const handler = new MemoryCommands(memory, () => ledger.inner.status().state, () => false, f.now, true);
+  ingress = new DiscordIngress(f.store, f.gate, rest, true, ALL_COMMANDS, () => {}, handler);
+  rest.failAck = true;
+  await run('memory-search', { id: 'lost-ack-colleague', text: 'x' });
+  const notice = (await database.db.query<{ payload: { content: string } }>("SELECT payload FROM outbox WHERE message_key='ack-notice:' || (SELECT id FROM events WHERE delivery_id='lost-ack-colleague')")).rows;
+  assert.deepEqual(notice.map(r => r.payload.content), [MEMORY_GUIDE.colleague.ackLost]);
 });
 
 test('MEM-CMD 원장 꺼짐: 수신 목록에 없으면(지금 운영 목록) 기억 명령은 저장·응답 없이 닫힘, 처리기가 없어도 닫힘', async () => {
@@ -307,18 +374,20 @@ test('DOC-SRC 문서 출처 확인기: 허용 저장소의 커밋 고정 링크�
 
 test('MEM-CMD 응답 길이: 충돌이 많아도 저장·정정 응답은 Discord 한도 안이고 남은 충돌은 개수로 적음(PR #28 리뷰)', () => {
   const ids = Array.from({ length: 50 }, () => randomUUID());
-  const saved = savedText('저장했습니다', { id: randomUUID(), status: 'candidate', conflictsWith: ids });
+  const saved = savedText(MEMORY_TEXT.saved, { id: randomUUID(), status: 'candidate', conflictsWith: ids });
   assert.ok(saved.length <= REPLY_LIMIT, `저장 응답 ${saved.length}자`);
-  assert.match(saved, /충돌 50건: .* 외 \d+건\(memory-search로 확인\)\. memory-correct의 target에 이 ID와 충돌 ID를 쉼표로 함께\(최대 5개\) 넣어 정정하면 그 충돌이 풀립니다\./);
+  assert.match(saved, /충돌 50건: .* 외 \d+건\(/);
+  assert.ok(saved.includes(`(${MEMORY_GUIDE.slash.moreConflicts}). ${MEMORY_GUIDE.slash.resolveConflict}`), saved);
   const shown = (saved.match(/`[0-9a-f-]{36}`/g) ?? []).length - 1;
   assert.ok(shown > 0 && shown < 50);
   assert.ok(saved.includes(`외 ${50 - shown}건`));
   // 정정은 뒤에 바꾼 기억 줄이 붙는다. 그 몫을 빼고 자른다.
-  const tail = `바꾼 기억 ${ids.slice(0, 5).map(id => `\`${id}\``).join(', ')}은 superseded로 검색에서 빠집니다.`;
-  const corrected = `${savedText('정정했습니다. 새 기억', { id: randomUUID(), status: 'candidate', conflictsWith: ids }, REPLY_LIMIT - tail.length - 1)}\n${tail}`;
+  const tail = MEMORY_TEXT.superseded(ids.slice(0, 5).map(id => `\`${id}\``).join(', '));
+  const corrected = `${savedText(MEMORY_TEXT.corrected, { id: randomUUID(), status: 'candidate', conflictsWith: ids }, REPLY_LIMIT - tail.length - 1)}\n${tail}`;
   assert.ok(corrected.length <= REPLY_LIMIT, `정정 응답 ${corrected.length}자`);
   // 충돌이 적으면 전부 적는다.
-  const few = savedText('저장했습니다', { id: randomUUID(), status: 'candidate', conflictsWith: ids.slice(0, 3) });
-  assert.match(few, /충돌 3건: `[^`]+`, `[^`]+`, `[^`]+`\. memory-correct의 target에 이 ID와 충돌 ID를 쉼표로 함께\(최대 5개\) 넣어 정정하면 그 충돌이 풀립니다\./);
+  const few = savedText(MEMORY_TEXT.saved, { id: randomUUID(), status: 'candidate', conflictsWith: ids.slice(0, 3) });
+  assert.match(few, /충돌 3건: `[^`]+`, `[^`]+`, `[^`]+`\. /);
+  assert.ok(few.endsWith(`. ${MEMORY_GUIDE.slash.resolveConflict}`), few);
   assert.doesNotMatch(few, /외 \d+건/);
 });
