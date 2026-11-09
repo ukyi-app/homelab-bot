@@ -2117,3 +2117,11 @@ T21 1회차 감사의 blocked 7건(homelab 티켓 T30)을 항목마다 사용자
 | INT-04 | CHANGE-01, CHANGE-03 | **pass**(2026-11-09). **A(운영, 실제 모델):** 사용자 스레드에서 `/change`(smoke `README.md` 한 줄, 문구 선택을 질문하라고 요구) → 작성 1턴 도구 0·`needs_input` 질문 → `/answer label=public \| (나)…` → 같은 세션 resume 턴 도구 2 → `smoke-unit` passed(T28 `payload-start` 표식의 운영 Localhost 프로필 첫 실측) → 독립 사전 리뷰 `pass_with_warnings`(P2 2건, 범위 complete) → 미리보기 digest = `/change-status` digest → `/change-publish` → 10초 뒤 smoke PR #22(head tree = 결과 tree, 부모 = 고정 base, README.md 하나) → T17 지적 없음 → 사람이 닫은 뒤 약 4분에 `cancelled(closed_unmerged)`. **B·C·D(격리 시험 게시자, 실제 smoke GitHub, 운영 게시 판정 코드, 작성·검증·리뷰 receipt는 fixture):** B 승인 확인 뒤 preflight 전 barrier에서 사람 PR(smoke #21, 문서 한 줄)을 병합하자 `superseded(base_moved)`·승인 무효·effect 0. C 새 generation이 새 base·digest를 받고 옛 digest 4가지 경로가 모두 거부. D 승인 전 예정 `bot/change/<id>/g2`에 writer 시험 토큰으로 사람 commit을 두고 승인하자 첫 쓰기 전 `blocked(head_changed)`, ref·main 불변, 게시자 쓰기 0. 25개 검사 true. 모델 5회(A 4, 사람 PR T17 1). **제약:** 작성 도구 상한은 job 합계 8회(`DEFAULTS.maxToolCalls`). D는 gate(ref가 승인 전부터 있음)만 실측했고 gate 뒤 ref가 생기는 경우는 로컬 증거다. 사람 commit은 ruleset이 사람의 `bot/**` 쓰기를 막아 writer 토큰으로 넣은 동등 시험이다. 운영 게시 서버에는 barrier를 넣지 않았다 | A `authorized_external`, B·C·D `authorized_external`(receipt `mock`) |
 
 **T30 7항목 끝(2026-11-09).** INT-02·03·04·05·06·07 pass, INT-01은 기존 증거 수용. 판정은 T21 재감사가 한다.
+
+## C01 동료 기능 스위치 (2026-11-09)
+
+동료 봇 전환의 기반 티켓(homelab 계획 C01, 명세 [COLLEAGUE_SPEC](COLLEAGUE_SPEC.md) §4.9·AC-23 배선). 런타임 정책(`RUNTIME_POLICIES`)에 `colleagueEnabled`를 두고 게시 서버 설정 `PublisherConfig.colleagueEnabled`로 노출한다. 이 칸을 읽는 기능은 아직 없어 Discord·작업자 동작은 그대로다(prefactor). 이유는 [DECISIONS](DECISIONS.md) "C01 동료 기능 스위치".
+
+**동작.** 칸이 없거나 `false`면 꺼짐, `true`면 켜짐. 참·거짓 밖의 값(문자열 `"true"`, 숫자, `null`, 객체·배열)은 기동 실패이고 오류는 `RUNTIME_POLICIES(invalid: colleagueEnabled)`처럼 필드 경로만 남긴다. 다른 정책 칸처럼 기동 때 한 번 읽고 얼린다(D1). 예시 [config/runtime-policy.example.json](config/runtime-policy.example.json)은 꺼진 값이다.
+
+**검사(경계 S1 게시 서버 설정 로드).** `publisher-config` 12/12(새 2: 칸 없음·꺼짐·켜짐, 잘못된 값의 기동 오류와 값 비노출), `publisher-policy` 7/7(새 1: 잘못된 값 8가지가 정확히 `runtime_policies_invalid: colleagueEnabled`, 받은 값은 얼림). 설정을 쓰는 `publisher-main`·`github-review-app`까지 함께 65/65, `npm run check` 통과. 두 상태의 실제 동작 차이(AC-23의 버튼·문구)는 그 기능을 만드는 뒤 티켓의 두 상태 시험이 본다.

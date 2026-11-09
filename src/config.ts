@@ -49,6 +49,9 @@ export interface PublisherConfig {
   externalTask?: { environment: string; restoreEpoch?: string } | null;
   // null(또는 없음)이면 스위치가 꺼진 것이다. writer 객체·명령·루프를 만들지 않는다. writerApp이 null이면 켰는데 키가 부족한 것이고 CHANGE만 닫힌다.
   changePr?: { writerApp: { appId: string; privateKey: KeyObject } | null } | null;
+  // 동료 기능 스위치. 런타임 정책 colleagueEnabled에서 기동 때 한 번 읽는다. 말로 실행하는 기능과 '/' 이름 없는 고정 문구는 이 값만 본다.
+  // 시험이 PublisherConfig를 직접 만드는 곳이 있어 선택 칸이고, 없으면 꺼짐이다.
+  colleagueEnabled?: boolean;
 }
 type Env = Readonly<Record<string, string | undefined>>;
 const token = (value: string) => value.length > 0 && !/\s/.test(value);
@@ -103,7 +106,8 @@ export function loadPublisherConfig(env: Env, loadedAt: number): PublisherConfig
   if (problems.length || !policy || !workerKey) throw new ConfigError(problems.length ? problems : ['unknown']);
   return { databaseUrl, discordToken, policy, grafana: { url: grafanaUrl, token: grafanaToken },
     kubernetes: { url: kubernetesUrl }, workerUrl, healthchecksUrl,
-    workerKey, githubWebhookSecret, memory, briefing, githubReviewApp, reviewEnabled, taskLane, externalTask, changePr };
+    workerKey, githubWebhookSecret, memory, briefing, githubReviewApp, reviewEnabled, taskLane, externalTask, changePr,
+    colleagueEnabled: policy.colleagueEnabled === true };
 }
 function changePrConfig(env: Env, problems: string[]): PublisherConfig['changePr'] {
   const raw = env.CHANGE_PR_ENABLED;
