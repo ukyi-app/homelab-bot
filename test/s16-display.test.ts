@@ -35,7 +35,7 @@ test('S16 문맥: owner 항목에 수집 경로 플래그(mention·activate·urg
   const items = f.requests.at(-1)!.untrusted as Record<string, unknown>[];
   assert.equal(items.at(-1)!.text, '멘션 없는 후속');
   for (const item of items) {
-    for (const key of ['mention', 'activate', 'urgent', 'revision']) assert.ok(!(key in item), `${key} 포함: ${JSON.stringify(item)}`);
+    for (const key of ['mention', 'activate', 'urgent', 'revision', 'bot_user', 'reply_to']) assert.ok(!(key in item), `${key} 포함: ${JSON.stringify(item)}`);
     assert.equal(item.from, 'owner'); assert.equal(item.kind, 'message');
   }
 });
