@@ -2174,6 +2174,23 @@ AC-14 중 👀·⏳·지움·실패를 S1(가짜 Discord REST, PGlite)에서 고
 
 **못 잡는 범위.** Discord 반응 rate limit의 실제 영향(S5, C24), 👍(C11)·💤(C20)의 실제 사용. 반응 상태는 마이그레이션 없이 `controls` 행에 두었다(`src/database.ts` 목록이 이 티켓의 파일 밖이라). 전용 표로 옮기려면 마이그레이션 티켓이 필요하다.
 
+## C05 관리 CLI (2026-11-10)
+
+명세 COLLEAGUE_SPEC §4.8·AC-20. 봇 관리 진입점(`src/admin.ts`·`src/admin-main.ts`)과 homelab `homelab bot`(별도 PR). 결정·받지 않은 동작은 [DECISIONS](DECISIONS.md) "C05 관리 CLI".
+
+| 항목 | 상태 | 근거 | 남는 것 |
+|---|---|---|---|
+| AC-20 비상 정지·해제·상태 보기(S1) | local_integration / pass | `test/admin-cli.test.ts` 9건: 비상 정지 뒤 새 모델 호출 0, 해제 뒤 대기한 대화가 모델로 감, 비상 정지가 없을 때 해제는 상태·감사 불변, 종료 미확인 대화 작업이 있으면 해제 거부(종료 3)와 비상 정지 유지, 상태 보기는 값만 내고 감사 없음, 입력은 고정 동작 단어와 형식이 맞는 ID만(셸 꼴·다른 형식은 사용법 64), 사용법 오류는 DB를 열지 않음, 실패 출력에 오류 원문 없음 | 차단·unknown 해제·멈춘 작업 재개는 미지원(종료 4, 바뀌는 것 0) |
+| AC-20 감사 행위자 `cli` | local_integration / pass | 같은 시험: `admin_command` 행의 detail.actor `cli`, 해제의 기존 `model_emergency_released` 행 subject `cli`. 모델 요청 0건 | 차단 감사는 차단을 받는 뒤 작업에서 |
+| AC-20 '/' 관리 명령 유지 | local_integration / pass | 같은 시험: '/emergency-stop'을 CLI 상태 보기가 보고, CLI 비상 정지를 '/resume-model target:emergency-stop'이 풀고, '/revoke'가 거부 행을 더함. 기존 OPS-01·AUTH-02 시험(`foundation`) 그대로 통과 | 없음 |
+| AC-20 CLI(S3) | local_integration / pass | homelab `cli/test/commands/bot.test.ts` 8건: plan은 상태 보기까지 exec 0건이고 동작마다 정해진 argv(위치 인자)를 보임, apply는 같은 파드에 한 번만 exec, 봇 거부(3)·미지원(4)은 exit 1, 잘못된 파드 대상 8가지(없음·둘·다른 ns·다른 앱 라벨·마이그레이션 Job 파드·Ready 아님·지우는 중·이름 형식)는 exec 전에 멈춤, 형식이 틀린 동작·ID는 kubectl 0건으로 64, 꼴이 다른 봇 출력은 원문 없이 실패 | 운영 클러스터 권한과 실제 파드 exec는 S5(운영 1회, 사람 승인 뒤) |
+| AUTH-02 재검증: 차단의 ESO 전 효력 | local_integration / pass('/' 경로) | `revoke-dispatch` 16건·`revoke-dispatch-pg` 5건(실제 PostgreSQL 두 연결): 인가 뒤 발송 전에 커밋된 `/revoke`가 Discord REST 0건으로 막음. 거부 목록은 DB라 ESO 동기화와 무관 | CLI 차단은 아직 없음. 그동안 즉시 철회는 `/revoke`(ARCHITECTURE §6 "즉시 철회 명령의 경계") |
+| AUTH-02 재검증: 해제는 `revocationRestores` 규칙대로만 | local_integration / pass | `publisher-policy` "AUTH-02 D1 /revoke 즉시 차단은 재시작에도 남고, 새 revision + revocationRestores + 철회 뒤 기동일 때만 풀림"·"철회보다 먼저 읽은 정책은 해제 목록이 있어도 풀지 않음". 관리 진입점에는 해제 동작이 없다(파서가 받는 동작 단어에 없음) | 없음 |
+
+- 실행(병합 결과 e484354, 머신 잠금 도우미, node 24.22.0): `npm run check`, `npm run build`, `node --test dist/test/admin-cli.test.js dist/test/publisher-policy.test.js dist/test/foundation.test.js dist/test/revoke-dispatch.test.js dist/test/revoke-dispatch-pg.test.js`(실제 PostgreSQL) → 89/89 통과, skip 0.
+- homelab: `bun cli/test/run.ts cli/test/commands/bot.test.ts cli/test/core/static.test.ts cli/test/core/engine.test.ts cli/test/core/adapters.test.ts` 63/63, `bun run ci --only "cli typecheck"` 통과.
+- **못 잡는 범위:** 운영 클러스터에서 owner kubeconfig의 `pods/exec` 권한, 실제 이미지 경로 `/app/dist/src/admin-main.js`와 컨테이너 `app`, 운영 DB 연결(S5 운영 1회가 본다).
+
 ## C03 작업자 한도 정보 (2026-11-10)
 
 동료 봇 명세 §4.2·§4.7, AC-16(S2)의 작업자 쪽이다(homelab 계획 티켓 C03). 작업자가 Claude CLI stream-json의 `rate_limit_event`에서 상태·풀리는 시각·종류·사용률을 읽어 대화 v2·리뷰·작업 레인 응답의 한도 칸에 싣는다. 게시 서버는 아직 이 칸을 읽지 않는다(C19·C21). 병합 즉시 나가는 것은 게시 서버 쪽 리뷰·작업 응답 스키마가 선택 칸을 받게 되는 것뿐이고, 작업자는 C06 배포 뒤에야 칸을 보낸다. 모양과 규칙은 [ARCHITECTURE](ARCHITECTURE.md) §12 "T16b 실행기 프로필"의 "한도 정보".
