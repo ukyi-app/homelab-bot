@@ -7,6 +7,7 @@ import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
 import type { ChangeCommand, ChangeCommandHandler } from './change-commands.js';
 import type { ExternalTaskCommand, ExternalTaskCommandHandler } from './external-task-commands.js';
+import { MEMORY_GUIDE } from './memory-commands.js';
 import type { MemoryCommand, MemoryCommandHandler } from './memory-commands.js';
 import type { PolicyGate } from './policy.js';
 import { moveReactions, ReactionSync, recordReceived, settleReactions } from './reactions.js';
@@ -45,8 +46,7 @@ const externalCommands = new Set<string>(['attach', 'detach', 'attach-list']);
 const changeCommands = new Set<string>(['change', 'change-status', 'change-cancel', 'change-publish']);
 export const ALL_COMMANDS: ReadonlySet<string> = new Set(['chat', 'urgent', 'task', 'read', ...controls, ...memoryCommands, ...externalCommands, ...changeCommands]);
 export const CHANGE_ACK_NOTICE = '변경 명령의 응답을 전하지 못했습니다(상호작용 만료·전송 실패). 결과는 이 스레드의 알림과 /change-status로 확인하세요.';
-// 기억 명령 응답을 전하지 못했을 때 그 채널에 남기는 안내. 결과(기억 내용)는 싣지 않는다.
-export const MEMORY_ACK_NOTICE = '기억 명령의 응답을 전하지 못했습니다(상호작용 만료·전송 실패). 처리됐는지는 /memory-search로 확인하세요.';
+// 기억 명령 응답을 전하지 못했을 때 그 채널에 남기는 안내는 처리기의 guide(스위치 판)를 쓴다. 결과(기억 내용)는 싣지 않는다.
 export const EXTERNAL_ACK_NOTICE = '세션 연결 명령의 응답을 전하지 못했습니다(상호작용 만료·전송 실패). 결과는 /attach-list로 확인하세요.';
 const EventSchema = z.strictObject({
   id: z.string().min(1), actor: z.string().min(1), scope: ScopeSchema,
@@ -237,6 +237,7 @@ export class DiscordIngress {
     const saved = await this.store.save({ ...event, text: '' }, revision, false);
     if (this.store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
     if (!await this.claimOnce(event, saved.id, started)) return saved.id;
+    const guide = this.memory.guide ?? MEMORY_GUIDE.slash;
     let reply;
     try {
       reply = await this.memory.handle({ id: event.id, actor: event.actor, scope: event.scope,
@@ -244,11 +245,11 @@ export class DiscordIngress {
     } catch (error) {
       // DB·원장 일시 오류 등. 처리됐는지 모를 수 있어 확인 방법을 알린다. 오류 원문은 남기지 않는다(errorInfo가 코드만 싣는다).
       this.log('memory_command_failed', { command: event.command!, ...errorInfo(error) });
-      reply = { content: '처리하지 못했습니다(일시 오류). /memory-search로 결과를 확인한 뒤 다시 시도하세요.', outcome: 'error' };
+      reply = { content: guide.failed, outcome: 'error' };
     }
     // 로그에는 명령과 결과 코드만 남긴다(진술·검색어·기억 내용 없음).
     this.log('memory_command', { command: event.command!, outcome: reply.outcome });
-    await this.acknowledge(event, saved.id, reply.content, { revision, notice: MEMORY_ACK_NOTICE });
+    await this.acknowledge(event, saved.id, reply.content, { revision, notice: guide.ackLost });
     return saved.id;
   }
   // 연결 명령. 처리 방식은 기억 명령과 같다(같은 상호작용은 한 번만 처리하고 상호작용 응답으로만 답한다).

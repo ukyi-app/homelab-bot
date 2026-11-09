@@ -267,7 +267,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     const observations: ObservationSource[] = deps.observations
       ?? briefingSources({ kubernetes, certificates }, now, config.briefing?.timezone);
     const briefing = new BriefingScheduler(store, gate, memory, observations,
-      { time: config.briefing?.time ?? null, timezone: config.briefing?.timezone ?? null },
+      { time: config.briefing?.time ?? null, timezone: config.briefing?.timezone ?? null, colleague: config.colleagueEnabled === true },
       { gate: () => taskGate.open ? { open: true, routed: taskIntake.routed, intakeOpen: taskIntake.open } : taskGate,
         ...(external ? { externalConnections: () => external.links.activeCount() } : {}) });
     return { ledger, memory, briefing };
@@ -535,7 +535,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       if (!discord) {
         protocol = new DiscordProtocol(api, ready.userId, now);
         // 기억 명령은 원장이 켜졌을 때만 받는다. 장벽 전·기억이 닫힌 동안은 MemoryNotReady로, 종료 중이면 바로 "쓸 수 없음"으로 답한다.
-        const memoryCommands = t20 && new MemoryCommands(t20.memory, () => t20.ledger.status().state, () => stop.signal.aborted, now);
+        const memoryCommands = t20 && new MemoryCommands(t20.memory, () => t20.ledger.status().state, () => stop.signal.aborted, now, config.colleagueEnabled === true);
         const plainTaskCommands = taskBridge && new TaskCommands(store, gate, taskBridge, () => taskIntake, track, log);
         // 답 봉인은 스위치와 무관하다. 켰다가 끈 뒤에도 남은 CHANGE 질문의 답이 events로 들어가면 대화 모델에 샌다.
         const taskCommands = plainTaskCommands && guardedTaskCommands(plainTaskCommands, change?.inputs ?? new ChangePrivateInputs(deps.db, now), gate);

@@ -2219,6 +2219,24 @@ AC-14 중 👀·⏳·지움·실패를 S1(가짜 Discord REST, PGlite)에서 고
 
 **못 잡는 범위.** 2.1.308 `-p` 구독 모드에서 실제 이벤트가 오는지(S5, C24), 재개 스케줄과 리뷰 미루기(C19, S1 가짜 시계), 운영 알림(C21). 미게시 후보 리뷰(`/v1/change-review`)는 같은 실행기를 쓰지만 결과 스키마에 칸을 더하지 않았다. 리뷰 미루기를 이 경로에도 걸지는 C19가 정한다.
 
+## C10 고정 문구 2 (2026-11-10, 로컬)
+
+동료 봇 명세 §4.3 "기억 원문"·§4.4·§4.9의 기억·브리핑 문구(homelab 계획 C10, AC-11·AC-23의 이 범위). 기억 명령 응답·오류·충돌·삭제 안내와 브리핑 문장 줄을 해요체로 바꾸고, 기억 삭제 응답에 원래 메시지 7일 정리 안내를 더했다. '/'·명령 이름을 안내하는 줄은 동료 기능 스위치로 두 판을 고른다. 구현 선택은 [DECISIONS](DECISIONS.md) "C10 고정 문구: 기억·브리핑".
+
+**시험(경계 S1: 수신 `DiscordIngress` → 기억 명령 처리기 → `MemoryService`(PGlite·실제 원장 파일), 브리핑 예약 → outbox).**
+
+| 완료 조건 | 시험 |
+|---|---|
+| 해요체, "봇" 자기 지칭 없음 | `memory-commands` "C10 말투: …"(문구 표 전체를 훑어 `습니다·합니다·입니다·하세요·봇` 없음) |
+| 삭제하면 7일 안내 | `memory-commands` "C10 기억 삭제: 완료·대기 응답 모두 …"(명세 문장 리터럴로 확인) |
+| 꺼짐은 '/' 안내, 켜짐은 '/'·명령 이름 없음 | `memory-commands` "C10 스위치 두 판: …", "C10 수신 안내 판: …"(응답 유실 안내), `memory-briefing` "C10 스위치 두 판: 모델 호출 중지 줄 …"(켜짐 브리핑 전체 검사) |
+| 입력값 비반복·완료/대기·게시 사본 비삭제·정상/미확인 | 기존 `memory-commands` "잘못된 입력"(상수 일치 + `비밀문구` 없음), "삭제 pending/deleted", `memory-briefing` "DATA-02 삭제는 파생 브리핑에 반영"(`Discord에서 지우지 않았어요`), "BRIEF-01 읽기 불가·오래된 관측은 미확인 …" |
+
+- 실행: 잠금 도우미(`npm run check`·`npm run build`, 실제 PostgreSQL 포함) → `node --test dist/test/{memory-commands,memory-commands-pg,t20-memory-commands,memory-briefing,memory-briefing-pg,briefing-observations,briefing-task-lane}.test.js` 139 pass, 0 fail, 0 skip.
+- 리터럴로 비교하던 기억 문구 시험은 `MEMORY_TEXT`·`INPUT_ERROR`·`REJECTED`·`MEMORY_GUIDE`·`DELETION_MESSAGE`·`BRIEFING_TEXT` 상수 참조로 옮겼다. 리터럴은 안전 문장(7일 안내, 게시 사본 비삭제, 백업 14일, 입력 비반복)에만 남겼다.
+- **운영 배선 없음:** `src/main.ts`가 `config.colleagueEnabled`를 `MemoryCommands`·`BriefingConfig`에 넘기지 않아, 운영은 스위치를 켜도 꺼짐 판이다. `main.ts`는 이 티켓의 파일 밖이다.
+- **못 잡는 범위.** 문구의 자연스러움(owner 검토, C24 말투 표본), 실제 Discord 표시(S5).
+
 ## C09 고정 문구 1 (2026-11-10, 로컬)
 
 AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 Discord REST·Gateway, PGlite)에서 고정했다. 판단은 [DECISIONS](DECISIONS.md) "C09 고정 문구 1".
