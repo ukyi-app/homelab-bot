@@ -2086,6 +2086,18 @@ T21 2회차 감사의 유일한 출시 차단 A09(medium)를 고친다(homelab �
 
 **CI 경합 하나.** 문서만 바꾼 #103 병합(`1079cb4`)의 main 빌드가 `codex-bridge` "SEC-02 실제 프로세스: 작업자 환경 미상속…" 한 건으로 실패했다(`Unexpected end of JSON input`). 가짜 Codex가 `thread.started`를 낸 뒤 `env.json`을 쓰는데 `hang` 시험이 그 줄에서 중단하므로, 파일을 연 뒤 쓰기 전에 끝나면 빈 파일이 남는다. 제품 코드가 아니라 시험의 순서 문제이고, 같은 코드의 `f17f4be`·`4a10f3c` 빌드는 통과했다. #105(`1835f11`)로 `env.json`을 `thread.started`보다 먼저 쓰게 고쳤다(시험만).
 
+## T33 V1 정비: 승인 digest와 명령 재등록 (#108, 2026-11-09)
+
+T21 4회차 low 발견 A05·A08을 고친다(homelab 티켓 T33). 구현은 Claude 작업자, 대조·전체 시험은 lead, 리뷰는 PR의 Codex 코드·보안 리뷰다. 이유는 [DECISIONS](DECISIONS.md) "T33 V1 정비".
+
+**A05.** `messagePages()`가 1,800자 안의 마지막 줄바꿈에서 자른다. 줄바꿈이 없거나 앞쪽이 공백 줄뿐일 때만 글자 수로 자른다. 1,800자보다 짧은 줄은 두 메시지로 갈리지 않아, 승인 명령 `/change-publish … text:<digest>`가 한 메시지에 남는다. 같은 함수를 지나는 다른 명령 안내(`/review-resume`, `/task-release`, `/retry`, `/answer` 등)도 한 줄이라 같이 지켜진다. 이미 outbox에 쌓인 페이지는 다시 나뉘지 않는다.
+
+**A08.** guild 명령 등록 비교에서 `contexts`·`integration_types`를 뺀다. Discord 문서(Application Commands)는 두 필드를 전역 명령 전용으로 적고 guild GET은 생략한다. PUT 본문에는 그대로 둔다.
+
+**검사.** 새 `change-preview-pages` 8/8(실제 `ChangeRuntime.preview`, 경계가 digest 앞·첫 글자 뒤·중간·끝 앞·뒤·둘째 경계), `commands-register` 4/4(생략 모양 연속 등록 PUT 0, 정의 변경 PUT 1). 새 시험은 수정 전 코드에서 A05 7건·A08 2건 실패. lead 전체 시험(PG, concurrency 6) `8e00cf6` 2,159 중 통과 2,137·실패 0·건너뜀 22. Codex 코드·보안 리뷰 지적 없음, `build / test` 통과.
+
+**배포.** homelab #1207(`af9dd3e`) 자동 병합(2026-11-09 11:15:39Z). 파드 1/1 Ready, imageID가 `image.yaml`과 같음, error·warn 로그 0. 재시작 로그 `commands_registered` `"guild":"unchanged"`(배포 전 재시작은 늘 `updated`). A05는 운영에서 긴 CHANGE 안내가 아직 나오지 않아 시험으로만 확인했다.
+
 ## T30 승인·연동 시험 진행 (2026-11-07~)
 
 T21 1회차 감사의 blocked 7건(homelab 티켓 T30)을 항목마다 사용자 승인으로 실행하거나 사람이 대체 증거를 정한다. 실행안·원본 기록은 private `homelab-bot-ops`의 `evidence/t30/`.
