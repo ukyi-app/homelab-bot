@@ -356,6 +356,8 @@ export class ChangeStore {
   // 자식 job을 부모에 묶는다. 다시 불러도 멱등이다. 작성 job과 리뷰 job을 role로 구분한다.
   async linkChildJob(input: ChangeKey & { jobId: string; role: 'author' | 'review' }): Promise<StoreResult<{ created: boolean }>> {
     return attempt<{ created: boolean }>(this.database, async tx => {
+      // 부모 행을 잡는다. 보존 정리가 부모를 잠그고 재검사한 뒤 커밋하기 전에 새 자식이 끼어들지 못한다.
+      if (!(await tx.query('SELECT 1 FROM change_requests WHERE id=$1 FOR SHARE', [input.changeId])).rows.length) return fail('not_found');
       if (!(await tx.query('SELECT 1 FROM jobs WHERE id=$1', [input.jobId])).rows.length) return fail('job_not_found');
       if (!(await tx.query('SELECT 1 FROM change_generations WHERE change_id=$1 AND generation=$2', [input.changeId, input.generation])).rows.length) return fail('not_found');
       const inserted = await tx.query(`INSERT INTO change_child_jobs(job_id,change_id,generation,role,created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (job_id) DO NOTHING RETURNING job_id`,
@@ -757,9 +759,8 @@ export const CHANGE_PURGE_BATCH = 20;
 const BRIEF_HELD = '(r.brief IS NOT NULL AND r.brief_purged_at IS NULL)';
 // receipt·digest·effect 기록과 요청 원문의 text_sha256은 남긴다. 진행 중이거나 미확정 effect·정리 안 끝난 세션이 있는 건은 고르지 않는다. 시각 기준은 끝 상태에 든 때다.
 // 백업에서 옛 행이 돌아와도 시각이 그대로라 다음 정리가 다시 고른다.
-export async function purgeExpiredChangeContent(database: Database, now: number, retentionMs = CHANGE_RETENTION_MS): Promise<number> {
-  const cutoff = now - retentionMs;
-  const due = (await database.query<{ id: string }>(`SELECT r.id FROM change_requests r
+// $1은 cutoff. 고를 때와 지우기 직전에 같은 조건을 쓴다. 아래에 선언된 ChangePrivateInputs를 읽으므로 모듈 로드 때가 아니라 부를 때 만든다.
+const changePurgeDue = () => `FROM change_requests r
     LEFT JOIN change_deployments d ON d.change_id=r.id AND d.generation=r.generation
     LEFT JOIN change_deployment_windows w ON w.change_id=r.id AND w.generation=r.generation
     WHERE ((r.phase IN ('superseded','blocked','cancelled','failed') AND r.updated_at<=$1)
@@ -768,13 +769,22 @@ export async function purgeExpiredChangeContent(database: Database, now: number,
     AND NOT EXISTS (SELECT 1 FROM change_child_jobs c JOIN jobs j ON j.id=c.job_id WHERE c.change_id=r.id AND j.state IN ('queued','running','verifying','cancel_requested','waiting_user','unknown'))
     AND NOT EXISTS (SELECT 1 FROM change_child_jobs c JOIN codex_sessions s ON s.job_id=c.job_id WHERE c.change_id=r.id AND (s.state IN ('running','waiting_answer','waiting_model','unknown') OR s.cleanup_state='pending'))
     AND (EXISTS (SELECT 1 FROM change_artifacts a WHERE a.change_id=r.id AND a.purged_at IS NULL) OR EXISTS (SELECT 1 FROM change_review_findings f WHERE f.change_id=r.id)
-      OR ${ChangePrivateInputs.HELD} OR ${BRIEF_HELD})
-    ORDER BY r.updated_at LIMIT ${CHANGE_PURGE_BATCH}`, [cutoff])).rows;
+      OR ${ChangePrivateInputs.HELD} OR ${BRIEF_HELD})`;
+// 지운 건수를 돌려준다. 고른 뒤 조건이 깨져 건너뛴 건은 세지 않는다.
+export async function purgeExpiredChangeContent(database: Database, now: number, retentionMs = CHANGE_RETENTION_MS): Promise<number> {
+  const cutoff = now - retentionMs;
+  const due = (await database.query<{ id: string }>(`SELECT r.id ${changePurgeDue()} ORDER BY r.updated_at LIMIT ${CHANGE_PURGE_BATCH}`, [cutoff])).rows;
+  let purged = 0;
   for (const row of due) {
     await database.transaction(async tx => {
-      // 고른 뒤 사람이 새 generation을 열었으면 진행 중인 건이다. 부모 행을 잠그고 다시 본다.
-      const current = (await tx.query<{ phase: string }>('SELECT phase FROM change_requests WHERE id=$1 FOR UPDATE', [row.id])).rows[0];
-      if (!current || !['superseded', 'blocked', 'cancelled', 'failed', 'observing_deploy'].includes(current.phase)) return;
+      // 위 선정은 잠금 밖이라 그사이 새 generation이 열렸다 다시 끝났을 수 있다. phase만 보면 종료 직후의 새 generation까지 지운다.
+      // 부모 행을 잠근 뒤 선정 조건 전체를 새로 읽는다. 잠금과 재검사를 한 문장에 두지 않는 이유: FOR UPDATE의 재평가는
+      // 잠근 행만 새로 읽고 조인·하위 질의는 옛 스냅숏으로 봐서, 그사이 생긴 자식 job·effect·배포 관측을 놓친다.
+      // phase·generation, effect 기록, 배포 관측, 자식 job 연결은 모두 부모 행 잠금(FOR SHARE/UPDATE) 아래에서 바뀌어 재검사와 커밋 사이에 끼어들지 못한다.
+      // 잠금 없이 바뀌는 자식 job·세션 상태와 늦음 표시는 진행 중에서 끝 쪽으로만 가서 재검사를 뒤집지 않는다.
+      if (!(await tx.query('SELECT 1 FROM change_requests WHERE id=$1 FOR UPDATE', [row.id])).rows.length) return;
+      if (!(await tx.query(`SELECT r.id ${changePurgeDue()} AND r.id=$2`, [cutoff, row.id])).rows.length) return;
+      purged++;
       await tx.query('DELETE FROM change_artifact_files WHERE change_id=$1', [row.id]);
       await tx.query(`UPDATE change_artifacts SET patch='',purged_at=$2 WHERE change_id=$1 AND purged_at IS NULL`, [row.id, now]);
       await tx.query('DELETE FROM change_review_findings WHERE change_id=$1', [row.id]);
@@ -784,11 +794,11 @@ export async function purgeExpiredChangeContent(database: Database, now: number,
       await audit(tx, 'change_content_purged', row.id, { retentionMs }, now);
     });
   }
-  return due.length;
+  return purged;
 }
 const CHANGE_PURGE_ROUNDS = 20;
 // 주기 정리의 진입점. 한 바퀴에 여러 쪽을 고른다. 복원 직후 밀린 건이 많아도 다음 주기(1시간)마다 20건씩만 지우지 않게 한다.
-// 고른 뒤 다시 열린 건은 다시 골라지므로 횟수로 끝을 둔다.
+// 쪽이 덜 차면(건너뛴 건 포함) 멈춘다. 남은 건은 다음 주기가 고른다. 끝없는 반복은 횟수로 막는다.
 export async function purgeExpiredChangeContentRounds(database: Database, now: number, retentionMs = CHANGE_RETENTION_MS): Promise<number> {
   let total = 0;
   for (let round = 0; round < CHANGE_PURGE_ROUNDS; round++) {
