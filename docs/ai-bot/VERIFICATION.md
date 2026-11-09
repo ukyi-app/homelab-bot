@@ -2051,6 +2051,23 @@ T21 1회차 감사의 현 버전 필수 수정 세 건이다. homelab 티켓 T27
 
 **배포.** 게시 서버는 homelab #1179(`630c48d`, T25~T29 모두 포함) 자동 병합. 파드 1/1 Ready, imageID 일치, migration 019 성공, 게이트 open, 로그 오류 0. 정리 기록(`change_content_purged`, `task_answers_purged`)은 지운 행이 있을 때만 남는데 첫 바퀴에 없었다. 작업 레인 작업자(`task.image`)는 homelab #1180으로 같은 빌드(`sha256:ff5d453e…`, `gh attestation verify` 통과)로 올렸다. `worker-task` 파드 Ready, 기동 기록 `worker_started`(CLI 2.1.308, 자격 present, 수락 막힘 사유 없음), 게시 서버의 30초 작업자 확인에 상태 변화 기록 없음(수락이 계속 열림). 대화·리뷰 작업자(`worker.image`)는 bwrap을 쓰지 않아 그대로 `d4c8bda`다. 운영 작업자 파드의 AppArmor·seccomp Localhost 프로필 아래에서 표식 셸을 실측하지는 않았다(프로필은 `file,`로 실행을 막지 않음). 막히면 CHANGE 검증이 `not_run`으로 닫혀 게시로 가지 않는다. 첫 CHANGE 실행이 실제 확인이 된다.
 
+## T31 원문 칸 7일 보존 (#101, 2026-11-09)
+
+T27이 남긴 정리 경로 없는 원문 칸 다섯 개를 사용자 결정(2026-11-09, homelab 티켓 T31)대로 7일 보존한다. 구현은 Claude 작업자, 대조·전체 시험은 lead, 리뷰는 PR의 Codex 코드·보안 리뷰다. 칸별 규칙은 [DECISIONS](DECISIONS.md) "T31".
+
+| 칸 | 기준 시각 | 고르지 않는 행 | 남기는 것 |
+|---|---|---|---|
+| `events.payload.text` | 받은 때 | 끝나지 않은 job, 누락 복구 버퍼, 확정 전 스레드 게시 | 행, `semantic_key`, `text_sha256` |
+| `codex_questions.prompt`, `results.result` | job이 끝난 때 | 끝나지 않은 job, 대기·unknown·정리 전 세션 | `*_sha256`, `evidence` |
+| `outbox.payload.content` | 보낸(또는 막힌) 때 | `pending`·`sending`·`unknown`, `kind=thread`(본문이 event ID) | 상태·`external_id`, `content_sha256` |
+| `change_requests.brief` | 변경이 끝난 때(T27 요청 원문과 같은 트랜잭션) | 진행 중 변경 | 경로·명령·label, `brief_digest`. CHECK·digest 트리거 때문에 요청 글 세 칸만 비운다 |
+
+**경계.** 원문을 지운 실패 작업의 `/retry`는 빈 요청이 되므로 받지 않고 새 요청을 안내한다. 정리와 `/retry`는 같은 scheduler 행 잠금 아래에서 판정한다(lead 대조: `store.ts` `controlLocked`가 `retry`에 `lockScheduler`). 수신 경로와 잠금 순서가 반대라 정리는 잠긴 event 행을 기다리지 않고 건너뛴다(`SKIP LOCKED`). 받지 못한 채 비운 입력이 다시 오면 `ignored:"text_purged"`로 둔다. 대화 맥락은 비운 owner 메시지와 비운 봇 페이지를 뺀다. T27 `change_retention`이 한 쪽(20건)만 돌던 것을 20건×20번으로 맞췄다.
+
+**검사.** 새 `raw-text-retention` 13/13(실제 PG 1개: 칸별 7일 경계·진행 중 예외·멱등·복원 뒤 재정리·`/retry` 차단·중복 판정·재수신·대화 맥락·여러 쪽). PG 소켓 12개 파일 112건 실패 0(작업자). lead 전체 시험(PG, concurrency 6) `7b34bdb` 2,136 중 통과 2,114·실패 0·건너뜀 22. Codex 코드·보안 리뷰 지적 없음, `build / test` 통과.
+
+**배포.** homelab #1196(`9a84772`) 자동 병합. 파드 1/1 Ready, migration 020 성공, 게이트 open, 로그 오류 0. 2026-11-09 02:09:17Z 첫 정리 `raw_text_purged` events 26·prompts 0·results 24·outbox 26. 백업 속 원문은 백업 보존 기간(14일) 동안 남는다.
+
 ## T30 승인·연동 시험 진행 (2026-11-07~)
 
 T21 1회차 감사의 blocked 7건(homelab 티켓 T30)을 항목마다 사용자 승인으로 실행하거나 사람이 대체 증거를 정한다. 실행안·원본 기록은 private `homelab-bot-ops`의 `evidence/t30/`.
