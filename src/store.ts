@@ -21,9 +21,16 @@ export interface Delivery {
   id: string; job_id: string | null; conversation_id: string | null;
   owner_id: string; scope: Scope; policy_revision: string; idempotency_key: string;
   service_ids: string[]; message_key: string; page_index: number;
-  payload: { kind: 'message' | 'thread'; channel: string; content: string; classification: 'safe_summary' };
+  payload: { kind: 'message' | 'thread'; channel: string; content: string; classification: 'safe_summary';
+    // 답장 대상 owner 메시지 ID(같은 채널). 게시자는 첫 쪽에만 건다.
+    replyTo?: string;
+    // owner 호출. 작업 질문, 작업 완료·실패, 변경 미리보기, 변경 실패 넷만 켠다. 게시자는 첫 쪽에서 owner 한 사람만 부른다.
+    ownerCall?: true;
+    // kind=thread: 이 owner 메시지에서 스레드를 연다. 없으면 표식 이름의 독립 스레드다('/' 명령·경보).
+    fromMessage?: string };
   state: string; external_id: string | null; lease_token: string; attempt: number;
 }
+export interface DeliveryNotice { ownerCall?: boolean }
 // dispatched: 발송을 시작해도 된다. blocked: 철회·대화 거부로 막았다(행은 blocked). gap: 대화가 history gap이라 미룬다.
 // lost: lease를 잃었다(행을 건드리지 않았다).
 export type DispatchOutcome = 'dispatched' | 'blocked' | 'gap' | 'lost';
@@ -377,7 +384,8 @@ export class Store {
     [job.id, job.lease_token, this.now()])).rows[0]?.state;
   }
   // 도달한 상태를 돌려준다. lease가 끝났거나 이미 다른 상태라 바꾸지 못했으면 undefined다.
-  async fail(job: Job, reason: string): Promise<State | undefined> {
+  // notify.ownerCall: 작업 실패처럼 owner 손이 필요한 실패 안내면 owner를 부른다(작업 브리지가 넘긴다).
+  async fail(job: Job, reason: string, notify: DeliveryNotice = {}): Promise<State | undefined> {
     return this.atomic(async store => {
       await store.lockConversation(job);
       const next = await store.complete(job, 'failed', reason);
@@ -385,9 +393,11 @@ export class Store {
       // CHANGE 자식은 /retry가 받지 않으므로 부모 안내와 같은 복구 행동을 말한다.
       const change = (await store.db.query<{ change_id: string }>('SELECT change_id FROM change_child_jobs WHERE job_id=$1', [job.id])).rows[0]?.change_id;
       const content = change ? changeChildFailed(job.id, change) : T.jobFailed(store.colleague);
+      // CHANGE 자식의 실패는 변경 실패 알림(change-runtime)이 owner를 부른다. 여기서도 부르면 한 실패에 알림이 둘이다.
       await store.enqueue({ key: `failure:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id,
         actor: job.owner_id, scope: job.target, revision: job.revision.policy,
-        payload: { kind: 'message', channel: job.target.channel, content, classification: 'safe_summary' } });
+        payload: { kind: 'message', channel: job.target.channel, content, classification: 'safe_summary',
+          ...await store.addressing(job, job.target.channel, { ownerCall: notify.ownerCall === true && !change }) } });
       // 실패 확정: 위 안내가 실패 한 줄이고, 반응은 같은 트랜잭션에서 지우기로 바꾼다.
       await settleReactions(store.db, job.id, 'failed');
       return next;
@@ -460,7 +470,7 @@ export class Store {
     await this.enqueue({ key, job: job.id, conversation: job.conversation_id, actor: job.owner_id, scope: job.target,
       revision: job.revision.policy, payload: { kind: 'message', channel: job.target.channel, content, classification: 'safe_summary' } }, tx);
   }
-  async finish(job: Job, result: unknown, evidence: unknown, content: string, scope: Scope, services: string[] = []): Promise<void> {
+  async finish(job: Job, result: unknown, evidence: unknown, content: string, scope: Scope, services: string[] = [], notify: DeliveryNotice = {}): Promise<void> {
     await this.db.transaction(async tx => {
       const conversation = (await tx.query<Conversation>('SELECT * FROM conversations WHERE id=$1 FOR UPDATE', [job.conversation_id])).rows[0];
       if (!conversation || conversation.owner_id !== job.owner_id) throw new Denied();
@@ -471,8 +481,18 @@ export class Store {
       await tx.query('INSERT INTO results VALUES ($1,$2,$3,$4,$5)', [job.id, json(result), json(evidence), 'internal', this.now()]);
       await this.enqueue({ key: `result:${job.id}`, job: job.id, conversation: job.conversation_id,
         actor: job.owner_id, scope, revision: job.revision.policy, services,
-        payload: { kind: 'message', channel: scope.channel, content, classification: 'safe_summary' } }, tx);
+        payload: { kind: 'message', channel: scope.channel, content, classification: 'safe_summary',
+          ...await this.addressing(job, scope.channel, notify, tx) } }, tx);
     });
+  }
+  // 대화 답·실패 안내의 답장 대상과 owner 호출 칸. 답장은 그 job을 만든 owner 메시지가 같은 채널에 있을 때만 단다.
+  // 명령(상호작용)은 답할 메시지가 없다. 채널 멘션은 그 메시지에서 스레드를 열었으므로(스레드 행이 있다) 따로 답장하지 않는다.
+  private async addressing(job: Job, channel: string, notify: DeliveryNotice, tx = this.db): Promise<Pick<Delivery['payload'], 'replyTo' | 'ownerCall'>> {
+    const event = (await tx.query<{ delivery_id: string; kind: string | null; scope: Scope }>(`SELECT e.delivery_id,e.payload->>'kind' AS kind,e.scope FROM events e
+      WHERE e.id=$1 AND e.provider='discord'
+      AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.payload->>'kind'='thread' AND o.payload->>'content'=e.id)`, [job.event_id])).rows[0];
+    const reply = event?.kind === 'message' && event.scope.channel === channel ? event.delivery_id : undefined;
+    return { ...(reply ? { replyTo: reply } : {}), ...(notify.ownerCall ? { ownerCall: true as const } : {}) };
   }
   // chat·review unknown 조사 예약. 다음 조사 시각은 마이그레이션 없이 controls 행(unknown_probe:<job>)에 둔다.
   // 같은 행을 잠그고 시각이 된 것만 다음 시각으로 미뤄 돌려주므로 게시 서버 둘이 같은 job을 동시에 조사하지 않는다.

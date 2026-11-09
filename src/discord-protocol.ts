@@ -23,6 +23,7 @@ const MessageSchema = z.object({ id: z.string(), channel_id: z.string(), guild_i
   author: z.object({ id: z.string(), bot: z.boolean().optional() }), webhook_id: z.string().optional(),
   content: z.string().optional(), mentions: z.array(z.object({ id: z.string() })).optional() });
 const IdSchema = z.object({ id: z.string() });
+const SourceSchema = z.object({ id: z.string(), thread: z.object({ id: z.string() }).nullable().optional() });
 const InteractionSchema = z.object({ id: z.string(), token: z.string(), type: z.union([z.literal(2), z.literal(3)]),
   channel_id: z.string(), guild_id: z.string().optional(),
   user: z.object({ id: z.string() }).optional(), member: z.object({ user: z.object({ id: z.string() }) }).optional(),
@@ -96,13 +97,22 @@ export class DiscordProtocol implements DiscordRest {
   async removeOwnReaction(channel: string, message: string, emoji: string): Promise<void> {
     await this.api.request('DELETE', ownReaction(channel, message, emoji));
   }
-  async createThread(channel: string, body: Parameters<DiscordRest['createThread']>[1]) {
-    return IdSchema.parse(await this.api.request('POST', `/channels/${part(channel)}/threads`, body));
+  // 메시지에서 연 스레드의 ID는 그 메시지 ID와 같고, 한 메시지에는 스레드를 하나만 열 수 있다
+  // (Discord 문서 "Start Thread from Message", ARCHITECTURE §11 확인 기록). 이 경로의 본문에는 type이 없다.
+  async createThread(channel: string, body: Parameters<DiscordRest['createThread']>[1], from?: string) {
+    if (from === undefined) return IdSchema.parse(await this.api.request('POST', `/channels/${part(channel)}/threads`, body));
+    return IdSchema.parse(await this.api.request('POST', `/channels/${part(channel)}/messages/${part(from)}/threads`,
+      { name: body.name, auto_archive_duration: body.auto_archive_duration }));
   }
   async sendMessage(channel: string, body: Parameters<DiscordRest['sendMessage']>[1]) {
     return IdSchema.parse(await this.api.request('POST', `/channels/${part(channel)}/messages`, body));
   }
-  async findDelivery(channel: string, marker: string, kind: 'message' | 'thread'): Promise<{ id: string } | undefined> {
+  async findDelivery(channel: string, marker: string, kind: 'message' | 'thread', from?: string): Promise<{ id: string } | undefined> {
+    // 메시지에서 여는 스레드는 그 메시지에 이미 스레드가 달렸는지(message.thread)로 대조한다. 원문이 지워졌으면 404가 그대로 올라간다.
+    if (kind === 'thread' && from !== undefined) {
+      const message = SourceSchema.parse(await this.api.request('GET', `/channels/${part(channel)}/messages/${part(from)}`));
+      return message.id === from && message.thread ? { id: message.thread.id } : undefined;
+    }
     if (kind === 'thread') {
       const c = await this.channel(channel);
       if (!c.guild_id) throw new Denied();

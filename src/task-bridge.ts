@@ -93,7 +93,7 @@ export abstract class TaskBridge {
   protected async abandon(job: Job, reason: string, within: Store = this.store): Promise<boolean> {
     return within.atomic(async store => {
       await store.db.query('SELECT id FROM conversations WHERE id=$1 FOR UPDATE', [job.conversation_id]);
-      if (!await store.fail(job, reason)) return false;
+      if (!await store.fail(job, reason, { ownerCall: true })) return false;
       await store.db.query("UPDATE codex_sessions SET state='failed',updated_at=$2 WHERE job_id=$1", [job.id, store.now()]);
       await store.db.query("UPDATE codex_questions SET state='cancelled' WHERE job_id=$1 AND state IN ('open','answered')", [job.id]);
       return true;
@@ -116,7 +116,7 @@ export abstract class TaskBridge {
         VALUES ($1,$2,$3,$4,$5,'clarification',$6,$7,'open',$8,$9)`,
       [id, job.id, job.conversation_id, threadId, turn, job.owner_id, question, store.now(), expires]);
       await store.enqueue({ key: `${this.text.prefix}-question:${id}`, job: job.id, conversation: job.conversation_id, actor: job.owner_id,
-        scope: job.target, revision, payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary',
+        scope: job.target, revision, payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary', ownerCall: true,
           content: [`${this.text.question} (질문 ID: ${id})`, bounded(question, 500),
             T.questionFooter(store.colleague, id, new Date(expires).toISOString())].join('\n') } });
       return true;

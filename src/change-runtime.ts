@@ -716,7 +716,8 @@ export class ChangeRuntime {
   }
   private async notifyPhase(request: ChangeRequest): Promise<void> {
     const key = `change-phase:${request.id}:${request.generation}:${request.phase}`;
-    if (request.phase === 'awaiting_publish_approval') { await this.send(request, key, await this.preview(request)); return; }
+    // owner 호출은 게시 승인 요청(미리보기)과 변경 실패 둘만이다. 게시 완료·막힘·취소·대체는 부르지 않는다.
+    if (request.phase === 'awaiting_publish_approval') { await this.send(request, key, await this.preview(request), true); return; }
     if (request.phase === 'proposed') {
       const pull = await this.pullOf(request);
       const policy = await this.deps.policy(request.repoId);
@@ -729,12 +730,12 @@ export class ChangeRuntime {
     const tail = request.phase === 'superseded' ? changeNextGeneration(request.id) : CHANGE_RESTART;
     const untracked = pull ? ` PR #${pull.number}은 그대로 있고, 이 뒤로 병합돼도 배포를 추적하지 않습니다.` : '';
     const withheld = reason === 'task_question_sensitive' ? ' 모델 질문에서 공개하면 안 되는 값을 찾아 질문을 이 스레드에 내보내지 않았습니다.' : '';
-    await this.send(request, key, `변경 ${request.id} g${request.generation}: ${request.phase}(${reason}).${withheld}${untracked} ${tail}`);
+    await this.send(request, key, `변경 ${request.id} g${request.generation}: ${request.phase}(${reason}).${withheld}${untracked} ${tail}`, request.phase === 'failed');
   }
-  private async send(request: ChangeRequest, key: string, content: string): Promise<void> {
+  private async send(request: ChangeRequest, key: string, content: string, ownerCall = false): Promise<void> {
     const policy = await this.deps.gate.current();
     await this.deps.store.enqueue({ key, conversation: request.conversationId, actor: request.ownerId, scope: request.scope, revision: policy.revision,
-      payload: { kind: 'message', channel: request.scope.channel, content, classification: 'safe_summary' } });
+      payload: { kind: 'message', channel: request.scope.channel, content, classification: 'safe_summary', ...(ownerCall ? { ownerCall: true as const } : {}) } });
   }
   // 요청 스레드에만 보낸다. 고정 코드·SHA·경로만 싣고 리뷰 자유문·시험 로그·요청 원문을 싣지 않는다.
   private async preview(request: ChangeRequest): Promise<string> {

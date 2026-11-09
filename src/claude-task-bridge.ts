@@ -182,7 +182,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
   private async prepare(job: Job, policy: Policy, session: SessionRow | undefined): Promise<TaskRequest | undefined> {
     // 다른 실행기의 세션은 잇지도 덮지도 않는다. 행은 그 실행기의 경로가 닫게 둔다.
     if (session && session.executor !== 'claude') {
-      await this.giveUp(job, session, 'task_session_mismatch', store => store.fail(job, 'task_session_mismatch'));
+      await this.giveUp(job, session, 'task_session_mismatch', store => store.fail(job, 'task_session_mismatch', { ownerCall: true }));
       return;
     }
     // CHANGE 작성 세션을 v1로 이으면 artifact 없는 "완료"가 된다. 그 job은 ClaudeChangeAuthor로만 잇는다.
@@ -463,7 +463,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
         await end('unknown');
         return { terminal: false, end: await this.endOf(store, job.id, intended) };
       };
-      const fail = async (reason: string) => await store.fail(job, reason) ? applied('failed', true) : skipped('failed');
+      const fail = async (reason: string) => await store.fail(job, reason, { ownerCall: true }) ? applied('failed', true) : skipped('failed');
       const stopWith = async (reason: string, notify: boolean): Promise<Settled> => {
         const state = facts.stopped ? 'cancelled' : 'unknown';
         if (!await store.transition(job, state, reason)) return skipped(state);
@@ -531,7 +531,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       [T.taskCompleted(store.colleague, job.id),
         risk ? T.summaryBlocked(store.colleague, risk) : bounded(response.summary || '요약 없음', TASK_LIMITS.summaryChars),
         `변경 파일(작업자 diff 기준): ${response.changes.total}개`,
-        `검증: 통과 ${verified.passed} · 실패 ${verified.failed} · 미실행 ${verified.not_run}`].join('\n'), job.target);
+        `검증: 통과 ${verified.passed} · 실패 ${verified.failed} · 미실행 ${verified.not_run}`].join('\n'), job.target, [], { ownerCall: true });
       // 구독이 멈춘 대화에서 finish는 막혀도 던지지 않는다.
       const after = (await store.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0]!;
       if (SETTLEABLE.has(after.state)) return skipped('succeeded');

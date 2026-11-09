@@ -36,17 +36,17 @@ test('4316750293 긴 /list는 사람이 읽는 한 메시지, 끝 줄 marker 유
   assert.equal(f.rest.messages.length, 1);
   const message = f.rest.messages[0]!;
   assert.ok(message.body.content.length <= 2000); assert.ok(message.body.content.startsWith('작업 45건'));
-  assert.ok(message.body.content.endsWith(`\n[ref:${message.body.nonce}]`));
+  assert.ok(message.body.content.endsWith(`\n-# ref:${message.body.nonce}`));
 });
 test('4316750293 제어 결과·일반 문장 모두 끝 줄 marker 유지', async () => {
   await queue(); await f.ingress.receive(event('status', { kind: 'command', command: 'model-status', text: '' }));
   await f.runtime.tick();
   while (await f.publisher.deliver()) { /* 제어 결과와 모델 결과를 모두 보낸다 */ }
   const control = f.rest.messages.find(message => message.body.content.startsWith('모델 호출: 정상\n'))!;
-  assert.ok(control.body.content.endsWith(`\n[ref:${control.body.nonce}]`));
+  assert.ok(control.body.content.endsWith(`\n-# ref:${control.body.nonce}`));
   // 대화 답은 빈 섹션을 생략한다(개선안 v2 C1). fixture 답은 미확인 한 항목뿐이다.
   const answer = f.rest.messages.find(message => message.body.content.startsWith('미확인:'))!;
-  assert.ok(answer.body.content.endsWith(`\n[ref:${answer.body.nonce}]`));
+  assert.ok(answer.body.content.endsWith(`\n-# ref:${answer.body.nonce}`));
 });
 test('4316750293 실제 Protocol 대조는 JSON 본문의 marker 필드로 찾고 다른 작성자·다른 marker는 무시', async () => {
   await f.store.enqueue({ key: 'json-page', actor: f.policy.owner, scope: thread, revision: f.policy.revision,
