@@ -4,10 +4,17 @@ import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { CHANGE_RETENTION_MS, ChangeStore, purgeExpiredChangeContent } from '../src/change-store.js';
 import type { ChangeRequest } from '../src/change-store.js';
+import { ClaudeChangeAuthor, ClaudeTaskBridge } from '../src/claude-task-bridge.js';
+import type { ChangeAuthorDeps, TaskPlanSource } from '../src/claude-task-bridge.js';
+import type { Job } from '../src/contracts.js';
 import type { Database, QueryResult } from '../src/database.js';
 import { Postgres } from '../src/database.js';
 import { runMigrations } from '../src/migrate-main.js';
-import { driveTo, failure, git, hex, insertChildJob, ok, seedConversation } from './change-store-fixture.js';
+import type { PolicyGate } from '../src/policy.js';
+import { Store } from '../src/store.js';
+import type { TaskWorkerPort } from '../src/task-bridge.js';
+import type { TaskV2Request } from '../src/task-contracts.js';
+import { CONVERSATION, driveTo, failure, fixtureManifest, fixtureManifestFiles, fixturePatch, git, hex, insertChildJob, ok, seedConversation } from './change-store-fixture.js';
 import { localDatabase } from './helpers.js';
 
 // CHANGE 보존 정리의 선정과 삭제 사이 경합(A09, DECISIONS T31). 선정은 잠금 밖이라 그사이 합법적인 상태 전이를 끼워 넣고,
@@ -143,10 +150,75 @@ async function childJobAppeared(e: Env) {
   await assertPurged(e.ownerDb, r.id);
 }
 
+interface Session { state: string; cleanup_state: string; session_retained: boolean }
+const sessionOf = async (db: Database, job: string) =>
+  (await db.query<Session>('SELECT state,cleanup_state,session_retained FROM codex_sessions WHERE job_id=$1', [job])).rows[0];
+const WORKER = { instance: '11111111-1111-4111-8111-111111111111', storage: '22222222-2222-4222-8222-222222222222' };
+type WorkerAnswer = 'unavailable' | 'finalized';
+interface FinalizingAuthor { change: ChangeRequest; job: string; answer: (reply: WorkerAnswer) => Promise<void> }
+
+// 작성 자식을 실제 ClaudeChangeAuthor.finalize로 끝내되, finalizeJob이 작업자에 status를 묻는 데서 세운다.
+// 이때 세션은 completed로 커밋됐고 cleanup_state는 아직 none, 작업자 공간은 남아 session_retained=true다.
+// answer가 작업자 답을 정한다: unavailable이면 finalizeJob이 부모 잠금 없이 pending을 쓰고, finalized면 cleaned·retained false를 쓴다.
+// 부모는 T에 superseded로 끝났고 finalize는 T+8일에 돈다. 같은 흐름이 프로세스 중단으로 끊기면 세션은 이 상태로 sweep까지 남는다.
+async function finalizingAuthor(e: Env): Promise<FinalizingAuthor> {
+  e.clock.now = T;
+  const change = await driveTo(e.store, 'authoring');
+  const job = randomUUID(), lease = randomUUID(), sessionId = randomUUID();
+  await insertChildJob(e.ownerDb, job, 'task');
+  await e.ownerDb.query(`UPDATE jobs SET state='running',finished_at=NULL,conversation_id=$2,lease_token=$3,lease_until=$4,started_at=$5 WHERE id=$1`,
+    [job, CONVERSATION, lease, T + 30 * DAY, T]);
+  ok(await e.store.linkChildJob({ changeId: change.id, generation: 1, jobId: job, role: 'author' }));
+
+  let asked!: () => void, reply!: (value: WorkerAnswer) => void;
+  const statusAsked = new Promise<void>(resolve => { asked = resolve; });
+  const replied = new Promise<WorkerAnswer>(resolve => { reply = resolve; });
+  const worker = {
+    call: async (endpoint: string, body: { job: string; lease: string; generation: number; sessionId: string }) => {
+      if (endpoint !== '/v1/task/status') throw new Error(`unexpected_endpoint:${endpoint}`);
+      asked();
+      if (await replied === 'unavailable') throw new Error('fixture_worker_unavailable');
+      return { version: 1, job: body.job, lease: body.lease, generation: body.generation, sessionId: body.sessionId, worker: WORKER,
+        state: 'finalized', turn: 1, sessionExists: false, stopped: true };
+    },
+  } as unknown as TaskWorkerPort;
+  const store = new Store(e.ownerDb, () => e.clock.now);
+  const bridge = new ClaudeTaskBridge(store, {} as PolicyGate, worker, {} as TaskPlanSource, { log: () => {} });
+  const row = (await e.ownerDb.query<Job>('SELECT * FROM jobs WHERE id=$1', [job])).rows[0]!;
+  const begun = await bridge.beginChangeTurn(row, { operation: 'start', sessionId, generation: 1, lease, repository: 'ukyi-app/homelab-smoke', base: git('b'),
+    policyRevision: 'fixture-policy-1', project: { id: 'fixture-project', revision: 'fixture-project-1' }, timeoutMs: 1000, runBudgetRemainingMs: 1000 } as TaskV2Request, undefined);
+  assert.equal(begun, 'started');
+  ok(await e.store.recordSnapshot({ changeId: change.id, generation: 1, manifest: fixtureManifest(), files: fixtureManifestFiles(), patch: fixturePatch(), transportBytes: 4096 }));
+  ok(await e.store.transition({ changeId: change.id, generation: 1, from: 'snapshot_ready', to: 'superseded', reason: 'base_moved' }));
+
+  e.clock.now = T + 8 * DAY;
+  const author = new ClaudeChangeAuthor({ store, bridge, source: { keyOf: async () => ({ changeId: change.id, generation: 1 }) },
+    artifacts: { load: async (key: { changeId: string; generation: number }) => ok(await e.store.loadArtifact(key)) } } as unknown as ChangeAuthorDeps);
+  const finalizing = author.finalize(`v2:${job}:1`);
+  await statusAsked;
+  assert.deepEqual(await sessionOf(e.ownerDb, job), { state: 'completed', cleanup_state: 'none', session_retained: true });
+  assert.equal((await e.ownerDb.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job])).rows[0]!.state, 'succeeded');
+  return { change, job, answer: async value => { reply(value); await finalizing; } };
+}
+
+async function retainedSessionHeld(e: Env) {
+  const f = await finalizingAuthor(e);
+  assert.equal(await purgeExpiredChangeContent(e.purgeDb, e.clock.now), 0, '작업자 공간을 아직 안 지운 세션이 있는 건은 고르지 않는다');
+  await assertHeld(e.ownerDb, f.change.id, 1);
+
+  await f.answer('finalized');
+  assert.deepEqual(await sessionOf(e.ownerDb, f.job), { state: 'completed', cleanup_state: 'cleaned', session_retained: false });
+  assert.equal(await purgeExpiredChangeContent(e.purgeDb, T + CHANGE_RETENTION_MS - 1), 0, '종료 + 7일 1ms 전');
+  await assertHeld(e.ownerDb, f.change.id, 1);
+  assert.equal(await purgeExpiredChangeContent(e.purgeDb, T + CHANGE_RETENTION_MS), 1, '정리가 확인되면 원래 종료 시각 + 7일에 지운다');
+  await assertPurged(e.ownerDb, f.change.id);
+}
+
 const SCENARIOS: [string, (e: Env) => Promise<void>][] = [
   ['오래된 후보를 고른 뒤 새 generation이 열렸다 다시 끝나면 새 데이터가 남고, 새 종료 + 7일에 지운다', reopenedAndEndedAgain],
   ['observing_deploy 후보를 고른 뒤 배포 관측이 미확정으로 바뀌면 남고, 새 관측 + 7일에 지운다', deploymentObservedAgain],
   ['후보를 고른 뒤 끝나지 않은 자식 job이 생기면 남고, 자식이 끝나면 지운다', childJobAppeared],
+  ['작성 세션이 completed로 끝났지만 작업자 공간을 아직 안 지웠으면 남고, 정리가 확인되면 원래 종료 + 7일에 지운다', retainedSessionHeld],
 ];
 
 async function localEnv(): Promise<Env> {
@@ -210,3 +282,27 @@ test('정리 경합(실제 PostgreSQL 두 연결): 재검사 뒤 커밋 전에�
     await assertPurged(e.ownerDb, r.id);
   } finally { await e.close(); }
 });
+
+// finalizeJob의 pending 쓰기는 execution_lanes만 잠그고 부모는 잠그지 않아 정리의 부모 잠금과 직렬화되지 않는다.
+// 정리가 지우지 않는 근거는 그 전부터 세션이 session_retained로 제외돼 있다는 것이다. 후보로 고르지 않으면 재검사 지점에 닿지 않으므로,
+// after_recheck에서 끼울 자리가 오지 않으면 정리가 끝난 뒤 pending을 커밋해 같은 끝 상태를 확인한다.
+for (const at of ['before_lock', 'after_recheck'] as const) {
+  test(`정리 경합(실제 PostgreSQL 두 연결): 작성 세션의 cleanup pending이 ${at === 'before_lock' ? '부모 잠금 전' : '재검사 뒤 커밋 전'}에 커밋돼도 지우지 않는다`, { skip }, async () => {
+    const e = await pgEnv();
+    try {
+      const f = await finalizingAuthor(e);
+      let fired = false;
+      const commitPending = async () => {
+        fired = true;
+        await f.answer('unavailable');
+        assert.deepEqual(await sessionOf(e.ownerDb, f.job), { state: 'completed', cleanup_state: 'pending', session_retained: true });
+      };
+      const purgeDb = at === 'before_lock' ? pauseAfterSelect(e.purgeDb, commitPending) : pauseInsideLock(e.purgeDb, commitPending);
+      const purged = await purgeExpiredChangeContent(purgeDb, e.clock.now);
+      if (!fired) await commitPending();
+      assert.equal(purged, 0);
+      await assertHeld(e.ownerDb, f.change.id, 1);
+      assert.equal(ok(await e.store.startNextGeneration({ changeId: f.change.id, generation: 1 })).generation, 2, '다음 generation이 input_purged로 막히지 않는다');
+    } finally { await e.close(); }
+  });
+}

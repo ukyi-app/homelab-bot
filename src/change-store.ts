@@ -758,6 +758,9 @@ export const CHANGE_PURGE_BATCH = 20;
 // 비운 건에 닿지 않는다. 새 generation은 brief를 요청 원문에서 다시 만드는데, 그 원문도 같은 트랜잭션에서 지워 startNextGeneration이 input_purged로 막는다.
 const BRIEF_HELD = '(r.brief IS NOT NULL AND r.brief_purged_at IS NULL)';
 // receipt·digest·effect 기록과 요청 원문의 text_sha256은 남긴다. 진행 중이거나 미확정 effect·정리 안 끝난 세션이 있는 건은 고르지 않는다. 시각 기준은 끝 상태에 든 때다.
+// 정리 안 끝난 세션은 진행 중 상태, cleanup pending, 작업자 공간이 남은 세션(session_retained)이다. 끝 상태 커밋(ClaudeChangeAuthor.finalize)과
+// pending 표식(finalizeJob)은 서로 다른 트랜잭션이고 표식은 부모를 잠그지 않는다. 그 사이의 completed·none 세션을 retained가 덮는다.
+// retained는 작업자 정리를 확인한 뒤에만 false가 되고, true가 되는 곳은 세션 시작(job running, 이미 제외)뿐이다.
 // 백업에서 옛 행이 돌아와도 시각이 그대로라 다음 정리가 다시 고른다.
 // $1은 cutoff. 고를 때와 지우기 직전에 같은 조건을 쓴다. 아래에 선언된 ChangePrivateInputs를 읽으므로 모듈 로드 때가 아니라 부를 때 만든다.
 const changePurgeDue = () => `FROM change_requests r
@@ -767,7 +770,8 @@ const changePurgeDue = () => `FROM change_requests r
       OR (r.phase='observing_deploy' AND ((d.state IN ('observed','not_applicable','blocked') AND d.observed_at<=$1) OR w.late_reported_at<=$1)))
     AND NOT EXISTS (SELECT 1 FROM change_delivery_effects e WHERE e.change_id=r.id AND e.state<>'confirmed' AND e.resolution IS NULL)
     AND NOT EXISTS (SELECT 1 FROM change_child_jobs c JOIN jobs j ON j.id=c.job_id WHERE c.change_id=r.id AND j.state IN ('queued','running','verifying','cancel_requested','waiting_user','unknown'))
-    AND NOT EXISTS (SELECT 1 FROM change_child_jobs c JOIN codex_sessions s ON s.job_id=c.job_id WHERE c.change_id=r.id AND (s.state IN ('running','waiting_answer','waiting_model','unknown') OR s.cleanup_state='pending'))
+    AND NOT EXISTS (SELECT 1 FROM change_child_jobs c JOIN codex_sessions s ON s.job_id=c.job_id WHERE c.change_id=r.id
+      AND (s.state IN ('running','waiting_answer','waiting_model','unknown') OR s.cleanup_state='pending' OR s.session_retained))
     AND (EXISTS (SELECT 1 FROM change_artifacts a WHERE a.change_id=r.id AND a.purged_at IS NULL) OR EXISTS (SELECT 1 FROM change_review_findings f WHERE f.change_id=r.id)
       OR ${ChangePrivateInputs.HELD} OR ${BRIEF_HELD})`;
 // 지운 건수를 돌려준다. 고른 뒤 조건이 깨져 건너뛴 건은 세지 않는다.
@@ -781,7 +785,10 @@ export async function purgeExpiredChangeContent(database: Database, now: number,
       // 부모 행을 잠근 뒤 선정 조건 전체를 새로 읽는다. 잠금과 재검사를 한 문장에 두지 않는 이유: FOR UPDATE의 재평가는
       // 잠근 행만 새로 읽고 조인·하위 질의는 옛 스냅숏으로 봐서, 그사이 생긴 자식 job·effect·배포 관측을 놓친다.
       // phase·generation, effect 기록, 배포 관측, 자식 job 연결은 모두 부모 행 잠금(FOR SHARE/UPDATE) 아래에서 바뀌어 재검사와 커밋 사이에 끼어들지 못한다.
-      // 잠금 없이 바뀌는 자식 job·세션 상태와 늦음 표시는 진행 중에서 끝 쪽으로만 가서 재검사를 뒤집지 않는다.
+      // 자식 job·세션 행과 늦음 표시는 부모 잠금 없이 바뀐다. 재검사를 "고름 → 제외"로 뒤집는 전이가 없어야 한다:
+      // job은 끝 상태에서 다시 열리지 않고, 세션이 제외 쪽(진행 중·pending·retained)으로 가는 전이는 이미 제외된 상태(running job,
+      // 진행 중이거나 retained인 세션)에서만 일어난다. 늦음 표시는 NULL일 때 지금 시각으로 한 번 적혀 cutoff를 넘지 않는다.
+      // 제외 조건에 새 세션 칸을 쓰거나 세션 전이를 더하면 이 전제를 다시 확인한다.
       if (!(await tx.query('SELECT 1 FROM change_requests WHERE id=$1 FOR UPDATE', [row.id])).rows.length) return;
       if (!(await tx.query(`SELECT r.id ${changePurgeDue()} AND r.id=$2`, [cutoff, row.id])).rows.length) return;
       purged++;
