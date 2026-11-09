@@ -768,19 +768,27 @@ function migrationDatabase(pg: PGlite): Database {
   };
 }
 const OLD_TABLES = `table_schema='public' AND table_name NOT LIKE 'change\\_%' AND table_name <> 'schema_migrations'`;
-// 019(T27 원문 보존)는 옛 표 codex_questions에 NULL 허용 칸 둘과 그 CHECK만 더한다. 아래 비교에서 빼고 따로 확인한다.
-const T27_COLUMNS = `NOT (table_name='codex_questions' AND column_name IN ('answer_sha256','answer_purged_at'))`;
+// 019(T27)·020(T31) 원문 보존은 옛 표에 NULL 허용 칸과 그 digest CHECK만 더한다. 아래 비교에서 빼고 따로 확인한다.
+const RETENTION_COLUMNS: Record<string, string[]> = {
+  codex_questions: ['answer_purged_at', 'answer_sha256', 'prompt_purged_at', 'prompt_sha256'],
+  events: ['text_purged_at', 'text_sha256'],
+  outbox: ['content_purged_at', 'content_sha256'],
+  results: ['result_purged_at', 'result_sha256'],
+};
+const RETENTION_MATCH = Object.entries(RETENTION_COLUMNS).map(([table, columns]) => `(table_name='${table}' AND column_name IN (${columns.map(c => `'${c}'`).join(',')}))`).join(' OR ');
+const T27_COLUMNS = `NOT (${RETENTION_MATCH})`;
+const RETENTION_CHECKS = ['codex_questions_answer_sha256_check', 'codex_questions_prompt_sha256_check', 'events_text_sha256_check', 'outbox_content_sha256_check', 'results_result_sha256_check'];
 const schemaOf = async (db: Database) => JSON.stringify((await db.query(`SELECT table_name,column_name,data_type,is_nullable,column_default
   FROM information_schema.columns WHERE ${OLD_TABLES} AND ${T27_COLUMNS} ORDER BY table_name,ordinal_position`)).rows);
 const constraintsOf = async (db: Database) => JSON.stringify((await db.query(`SELECT conrelid::regclass::text AS t,conname,pg_get_constraintdef(oid) AS d FROM pg_constraint
-  WHERE connamespace='public'::regnamespace AND conrelid<>0 AND conrelid::regclass::text NOT LIKE 'change\\_%' AND conname<>'codex_questions_answer_sha256_check' ORDER BY t,conname`)).rows);
+  WHERE connamespace='public'::regnamespace AND conrelid<>0 AND conrelid::regclass::text NOT LIKE 'change\\_%' AND conname<>ALL($1::text[]) ORDER BY t,conname`, [RETENTION_CHECKS])).rows);
 
 test('T19 B0 migration: 016 DB에 017만 더하고 기존 표·제약·행을 바꾸지 않으며 파일을 다시 돌려도 그대로다', async () => {
   const pg = new PGlite();
   try {
     const db = migrationDatabase(pg);
     const upTo016 = MIGRATIONS.filter(file => Number.parseInt(file, 10) <= 16);
-    assert.equal(upTo016.length, MIGRATIONS.length - 3);
+    assert.equal(upTo016.length, MIGRATIONS.length - 4);
     for (const file of upTo016) await pg.exec(await readFile(`migrations/${file}`, 'utf8'));
     await seedConversation(db);
     await insertChildJob(db, 'existing-job', 'task');
@@ -788,11 +796,12 @@ test('T19 B0 migration: 016 DB에 017만 더하고 기존 표·제약·행을 �
     const constraints = await constraintsOf(db);
     const jobs = JSON.stringify((await db.query('SELECT * FROM jobs')).rows);
 
-    assert.deepEqual(await migrate(db), [17, 18, 19]);
+    assert.deepEqual(await migrate(db), [17, 18, 19, 20]);
     assert.equal(await schemaOf(db), schema);
-    const added = (await db.query<{ column_name: string; is_nullable: string; column_default: string | null }>(`SELECT column_name,is_nullable,column_default
-      FROM information_schema.columns WHERE table_name='codex_questions' AND NOT ${T27_COLUMNS} ORDER BY column_name`)).rows;
-    assert.deepEqual(added.map(c => [c.column_name, c.is_nullable, c.column_default]), [['answer_purged_at', 'YES', null], ['answer_sha256', 'YES', null]]);
+    const added = (await db.query<{ table_name: string; column_name: string; is_nullable: string; column_default: string | null }>(`SELECT table_name,column_name,is_nullable,column_default
+      FROM information_schema.columns WHERE ${OLD_TABLES} AND NOT ${T27_COLUMNS} ORDER BY table_name,column_name`)).rows;
+    assert.deepEqual(added.map(c => [c.table_name, c.column_name, c.is_nullable, c.column_default]),
+      Object.entries(RETENTION_COLUMNS).flatMap(([table, columns]) => columns.map(column => [table, column, 'YES', null])));
     assert.equal(await constraintsOf(db), constraints);
     assert.equal(JSON.stringify((await db.query('SELECT * FROM jobs')).rows), jobs);
     assert.deepEqual(await migrate(db), []);

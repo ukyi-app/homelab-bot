@@ -298,7 +298,7 @@ test('T19 B5 호환 실제 PostgreSQL: 016까지 적용된 DB를 018로 올려�
   try {
     for (const file of MIGRATIONS.filter(name => migrationVersion(name) <= 16)) await d.raw.query(await readFile(`migrations/${file}`, 'utf8'));
     await d.raw.query(`INSERT INTO conversations(id,owner_id,scope,channel_id,created_at,active) VALUES ('c','o','{}'::jsonb,'c',1,true)`);
-    assert.deepEqual(await runMigrations(d.raw), [17, 18, 19]);
+    assert.deepEqual(await runMigrations(d.raw), [17, 18, 19, 20]);
     assert.equal((await d.raw.query(`SELECT 1 FROM conversations WHERE id='c'`)).rows.length, 1);
     assert.deepEqual(await runMigrations(d.raw), []);
     const h = await changeHarness(d.db);
