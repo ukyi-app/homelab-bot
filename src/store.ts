@@ -6,6 +6,7 @@ import type { Clock, EventInput, Job, Scope, State } from './contracts.js';
 import { remaining } from './database.js';
 import type { Database, TransactionDeadline } from './database.js';
 import { messagePages } from './format.js';
+import { moveReactions, settleReactions } from './reactions.js';
 import { TASK_RETENTION } from './task-contracts.js';
 import type { ExecutionLane, ExecutionLaneClosedReason } from './task-contracts.js';
 
@@ -144,12 +145,12 @@ export class Store {
           if (closed && closed !== 'retention_full') return;
           startsClosed = closed === 'retention_full';
         }
-        if (await this.laneBusy(lane, tx)) return;
+        if (await this.laneBusy(lane, tx)) { if (lane === 'interactive') await this.markWaiting(tx); return; }
       } else {
         // Unknown hosts may still be executing; they hold the global model slot.
         // read는 모델을 부르지 않아 슬롯을 잡지도, 슬롯에 막히지도 않는다(claimRead가 따로 고른다).
         if ((await tx.query(`SELECT id FROM jobs WHERE state IN ('running','verifying','cancel_requested','unknown','waiting_user')
-          AND type<>'read' LIMIT 1`)).rows.length) return;
+          AND type<>'read' LIMIT 1`)).rows.length) { await this.markWaiting(tx); return; }
       }
       // 보존 칸이 찼어도 이미 보존 중인 세션을 잇는 일은 칸을 늘리지 않는다. 막으면 그 세션이 끝나지 못해 칸이 영영 비지 않는다.
       const retained = startsClosed ? `AND EXISTS (SELECT 1 FROM codex_sessions s WHERE s.job_id=j.id AND s.executor='claude'
@@ -162,9 +163,31 @@ export class Store {
         ${lane ? 'AND j.execution_lane=$2' : ''} ${retained}
         ORDER BY j.priority,j.created_at,e.event_order FOR UPDATE OF j SKIP LOCKED LIMIT 1`, lane ? [this.now(), lane] : [this.now()])).rows[0];
       if (!row) return;
-      return (await tx.query<Job>(`UPDATE jobs SET state='running',attempt=attempt+1,
+      const claimed = (await tx.query<Job>(`UPDATE jobs SET state='running',attempt=attempt+1,
         lease_token=$2,lease_until=$3,started_at=$4 WHERE id=$1 RETURNING *`,
       [row.id, randomUUID(), this.now() + DEFAULTS.leaseMs, this.now()])).rows[0];
+      // 방금 자리를 잡은 일 뒤에 남은 대화도 기다린다. 작업 레인은 대화 자리와 따로라 대화를 기다리게 하지 않는다.
+      if (lane !== 'task') await this.markWaiting(tx);
+      return claimed;
+    });
+  }
+  // ⏳ 판단. 모델 자리가 차 있는데 지금 집힐 수 있었던(디바운스가 끝난, 받은·활성·gap 아닌) 대화 작업의 메시지를 대기로 바꾼다.
+  // 같은 트랜잭션의 job 상태와 저장소 시각(available_at<=now)만 보므로 결정적이다. 비상 중지·한도 정지(scheduler 켜짐)는
+  // 자리 비움(💤, C20) 몫이라 여기서 바꾸지 않는다.
+  private async markWaiting(tx: Database): Promise<void> {
+    const ready = (await tx.query<{ event_id: string }>(`SELECT j.event_id FROM jobs j JOIN events e ON e.id=j.event_id
+      JOIN conversations c ON c.id=j.conversation_id WHERE j.state='queued' AND j.type='chat' AND e.accepted=true
+      AND c.active=true AND c.gap=false AND j.available_at<=$1`, [this.now()])).rows;
+    await moveReactions(tx, ready.map(row => row.event_id), 'waiting');
+  }
+  // 대화 루프는 실행을 끝까지 기다린 뒤에야 claim을 다시 부르므로, 실행 중에 디바운스가 끝난 메시지는 claim이 보지 못한다.
+  // 게시 루프의 반응 동기화가 이것을 불러 그 메시지도 ⏳로 옮긴다. 대화 자리(interactive 레인)가 차 있을 때만이다.
+  // 작업 루프를 끈 배치에서 작업이 대화를 막는 경우는 레인 설정을 몰라 여기서 보지 않는다(claim이 볼 때 붙는다).
+  async refreshWaiting(): Promise<void> {
+    await this.db.transaction(async tx => {
+      const stopped = (await tx.query<{ value: boolean }>(`SELECT value FROM controls WHERE key='scheduler'`)).rows[0]?.value;
+      if (stopped || !await this.laneBusy('interactive', tx)) return;
+      await this.markWaiting(tx);
     });
   }
   // CHANGE 작성 job 하나를 claim과 같은 잠금 순서·같은 슬롯 규칙으로 집는다. 슬롯이 차 있으면 undefined이고 부모는 다음 바퀴에 다시 본다.
@@ -363,6 +386,8 @@ export class Store {
       await store.enqueue({ key: `failure:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id,
         actor: job.owner_id, scope: job.target, revision: job.revision.policy,
         payload: { kind: 'message', channel: job.target.channel, content, classification: 'safe_summary' } });
+      // 실패 확정: 위 안내가 실패 한 줄이고, 반응은 같은 트랜잭션에서 지우기로 바꾼다.
+      await settleReactions(store.db, job.id, 'failed');
       return next;
     });
   }
@@ -377,7 +402,10 @@ export class Store {
   }
   // 작업이 cancelled로 확정되면 그 스레드에 한 번 알린다. cancelled는 끝 상태라(재시도는 failed만 받는다) job마다 키 하나다.
   // 권한 철회로 멈춘 대화에는 안내하지 않는다(게시도 막힌다). 대화·조회의 취소는 지금처럼 알리지 않는다.
+  // 모든 cancelled 확정이 여기를 지나므로 봇 반응 지우기도 여기서 한다(대화 메시지만 반응 행이 있다).
   private async cancelledNotice(job: Job, reason: string | null, tx: Database): Promise<void> {
+    // 디바운스 안에서 밀려난 앞 메시지도 이 작업이 맡던 것이라, 처리 중인 작업이 없으면 함께 지운다.
+    await settleReactions(tx, job.id, 'cleared');
     if (job.type !== 'task' || reason === 'authorization_revoked') return;
     await this.notice(job, `task-cancelled:${job.id}`, `작업 ${job.id} 취소를 완료했습니다(cancelled). 실행 중인 프로세스가 없음을 확인했고 다시 실행하지 않습니다. 필요하면 새 작업으로 요청하세요.`, tx);
   }
@@ -496,6 +524,7 @@ export class Store {
         actor: row.owner_id, scope: row.target, revision: row.revision.policy,
         payload: { kind: 'message', channel: row.target.channel, classification: 'safe_summary',
           content: `이전 작업이 멈춘 것을 확인했습니다. /retry target:${row.id}으로 다시 실행할 수 있습니다.` } }, tx);
+      await settleReactions(tx, row.id, 'failed');
       return true;
     });
   }
@@ -691,8 +720,10 @@ export class Store {
       else {
         await this.db.query(`UPDATE conversations SET active=false,gap=false,subscription_epoch=subscription_epoch+1,
           recovery_token=NULL,recovery_until=NULL WHERE id=$1`, [conversation]);
-        await this.db.query(`UPDATE events SET buffered=false,payload=payload || '{"ignored":"subscription_stopped"}'::jsonb
-          WHERE conversation_id=$1 AND buffered=true`, [conversation]);
+        const dropped = (await this.db.query<{ id: string }>(`UPDATE events SET buffered=false,payload=payload || '{"ignored":"subscription_stopped"}'::jsonb
+          WHERE conversation_id=$1 AND buffered=true RETURNING id`, [conversation])).rows;
+        // gap 동안 버퍼에 둔 메시지는 👀만 달렸고 job이 없어 작업 정리(settleReactions)가 보지 못한다. 버리는 여기서 지운다.
+        await moveReactions(this.db, dropped.map(row => row.id), 'cleared');
       }
       return { active: action === 'resume' };
     }
