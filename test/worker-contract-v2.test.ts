@@ -8,7 +8,7 @@ import { CHAT_OUTPUT_JSON_SCHEMA, CHAT_REPLY_JSON_SCHEMA } from '../src/chat-lan
 import { SYSTEM_INSTRUCTIONS, SYSTEM_INSTRUCTIONS_V2, WorkerRejected } from '../src/contracts.js';
 import type { Job } from '../src/contracts.js';
 import { WorkerSigner } from '../src/worker.js';
-import type { WorkerRequestV1, WorkerRequestV2 } from '../src/worker.js';
+import type { WorkerRequestV1, WorkerRequestV2, WorkerResult, WorkerResultV2 } from '../src/worker.js';
 import { HttpWorker } from '../src/worker-http.js';
 import { startWorker, workerConfig } from '../src/worker-main.js';
 import { SpawnLauncher } from './spawn-launcher.js';
@@ -78,8 +78,13 @@ const v1 = (j: Job, overrides: Partial<WorkerRequestV1> = {}): WorkerRequestV1 =
 const v2 = (j: Job, overrides: Partial<WorkerRequestV2> = {}): WorkerRequestV2 => ({ version: 2, job: j.id, lease: j.lease_token,
   lane: 'chat', policyRevision: 'fixture-v1', instructions: SYSTEM_INSTRUCTIONS_V2, surface: 'slash', earlierPurged: false,
   untrusted: [{ from: 'owner', text: '상태 알려줘' }], timeoutMs: 60_000, toolCalls: 8, ...overrides });
-const send = <R extends WorkerRequestV1 | WorkerRequestV2>(w: Booted, request: R) =>
-  w.chat.execute(request, signer.issue({ id: request.job, lease_token: request.lease } as Job, 'execute', request), new AbortController().signal);
+const capability = (request: WorkerRequestV1 | WorkerRequestV2) =>
+  signer.issue({ id: request.job, lease_token: request.lease } as Job, 'execute', request);
+function send(w: Booted, request: WorkerRequestV1): Promise<WorkerResult>;
+function send(w: Booted, request: WorkerRequestV2): Promise<WorkerResultV2>;
+function send(w: Booted, request: WorkerRequestV1 | WorkerRequestV2) {
+  return w.chat.execute(request, capability(request), new AbortController().signal);
+}
 
 test('C02 v2 요청: reply·proposal·ack_only 모양으로 성공하고 한도 칸은 비어 있다(AC-3 S2)', async () => {
   const w = await boot();
@@ -113,4 +118,95 @@ test('C02 v1 서버 + v2 작업자: v1 요청은 지시문·출력 스키마·�
   } finally { await w.worker.close(); }
 });
 
-void WorkerRejected;
+test('C02 v2 스키마: 모양이 다르면 실패로 닫히고 성공처럼 보이지 않는다(AC-3 S2)', async () => {
+  const w = await boot();
+  try {
+    const broken = [
+      V1_ANSWER,
+      { reply: '네', proposal: null },
+      { reply: '네', proposal: null, ack_only: false, extra: 'x' },
+      { reply: '네', proposal: { action: 'emergency_stop', target: null, content: null }, ack_only: false },
+      { reply: '네', proposal: { action: 'list', target: null }, ack_only: false },
+      { reply: '네', proposal: { action: 'memory_save', target: null, content: '가'.repeat(3001) }, ack_only: false },
+      { reply: '네', proposal: { action: 'cancel', target: 'x'.repeat(511), content: null }, ack_only: false },
+    ];
+    for (const output of broken) {
+      await mode(output);
+      assert.deepEqual(await send(w, v2(job())), { status: 'failed', stopped: true, rateLimit: null }, JSON.stringify(output).slice(0, 80));
+    }
+    // reply는 v1 답처럼 상한(12000자)에서 잘라 받는다.
+    await mode({ reply: '가'.repeat(12_001), proposal: null, ack_only: false });
+    const clipped = await send(w, v2(job()));
+    assert.equal(clipped.status, 'succeeded');
+    assert.ok(clipped.status === 'succeeded' && clipped.output.reply.length <= 12_000 && clipped.output.reply.startsWith('가'));
+  } finally { await w.worker.close(); }
+});
+
+test('C02 v2 반사 검사: reply나 제안 값 어디에 자격 값이 있어도 게시하지 않는다', async () => {
+  const w = await boot();
+  try {
+    const echoes = [
+      { reply: `토큰은 ${TOKEN}예요`, proposal: null, ack_only: false },
+      { reply: '기억할게요', proposal: { action: 'memory_save', target: null, content: `키 ${TOKEN}` }, ack_only: false },
+      { reply: '찾아볼게요', proposal: { action: 'task_status', target: TOKEN, content: null }, ack_only: false },
+    ];
+    for (const output of echoes) {
+      await mode(output);
+      assert.deepEqual(await send(w, v2(job())), { status: 'failed', stopped: true, rateLimit: null });
+    }
+  } finally { await w.worker.close(); }
+});
+
+// 50개이고 배열 JSON이 정확히 80KiB인 기록. 한글 3바이트 문자로 채운다.
+const history = (count: number, bytes: number) => {
+  const items = Array.from({ length: count }, (_, i) => ({ from: i % 2 ? 'bot' : 'owner', text: '' }));
+  const filler = bytes - Buffer.byteLength(JSON.stringify(items));
+  const each = Math.floor(filler / count / 3);
+  for (const item of items) item.text = '가'.repeat(each);
+  const rest = bytes - Buffer.byteLength(JSON.stringify(items));
+  items.at(-1)!.text += 'a'.repeat(rest);
+  assert.equal(Buffer.byteLength(JSON.stringify(items)), bytes, '시험 전제');
+  return items;
+};
+
+test('C02 기록 상한: v2는 50개·80KiB를 받고 51개·80KiB 초과는 시작 전에 거부, v1은 20개 그대로(AC-5 작업자)', async () => {
+  const w = await boot();
+  try {
+    await mode({ reply: '받았어요', proposal: null, ack_only: false });
+    const full = history(50, 80 * 1024);
+    const accepted = await send(w, v2(job(), { untrusted: full, earlierPurged: true }));
+    assert.equal(accepted.status, 'succeeded');
+    // 기록이 잘리지 않고 실행기까지 간다.
+    assert.ok(w.launcher.specs.at(-1)!.stdin.includes(JSON.stringify(full)));
+    const launched = w.launcher.specs.length;
+    for (const untrusted of [history(51, 60 * 1024), history(50, 80 * 1024 + 1)]) {
+      await assert.rejects(send(w, v2(job(), { untrusted })), WorkerRejected);
+    }
+    await assert.rejects(send(w, v1(job(), { untrusted: history(21, 4096) })), WorkerRejected);
+    assert.equal((await send(w, v1(job(), { untrusted: history(20, 4096) }))).status, 'failed', 'v1 요청은 v1 답 모양이 아니면 실패');
+    assert.equal(w.launcher.specs.length, launched + 1, '거부한 요청은 실행기를 띄우지 않는다');
+  } finally { await w.worker.close(); }
+});
+
+test('C02 지시문 literal: 판과 지시문이 맞지 않거나 다른 문자열이면 요청 거부로 닫힌다(AC-4)', async () => {
+  const w = await boot();
+  try {
+    const signed = (request: object) => {
+      const r = request as WorkerRequestV2;
+      return fetch(`${w.url}/v1/execute`, { method: 'POST', body: JSON.stringify(request),
+        headers: { authorization: `Capability ${signer.issue({ id: r.job, lease_token: r.lease } as Job, 'execute', request)}` } });
+    };
+    const cases = [
+      v2(job(), { instructions: SYSTEM_INSTRUCTIONS }),
+      { ...v1(job()), instructions: SYSTEM_INSTRUCTIONS_V2 },
+      v2(job(), { instructions: `${SYSTEM_INSTRUCTIONS_V2} ` }),
+      { ...v1(job()), version: 3 },
+    ];
+    for (const request of cases) {
+      const response = await signed(request);
+      assert.equal(response.status, 403);
+      assert.deepEqual(await response.json(), { status: 'rejected', started: false });
+    }
+    assert.equal(w.launcher.specs.length, 0);
+  } finally { await w.worker.close(); }
+});
