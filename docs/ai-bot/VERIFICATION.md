@@ -2186,6 +2186,6 @@ T21 1회차 감사의 blocked 7건(homelab 티켓 T30)을 항목마다 사용자
 - 게시 서버만 이 판 이전으로 되돌리면 안 된다. 리뷰(`/v1/review`)·작업(`/v1/task`·`/v2/task/result`) 응답 스키마가 strict라, 칸을 모르는 옛 게시 서버가 새 작업자의 한도 칸 응답을 거부한다(리뷰는 `worker_response_uncertain`, 작업은 응답 거부). 되돌릴 때는 작업자를 먼저 C03 이전 digest로 되돌리거나 함께 되돌린다. 대화 v2는 게시 서버가 아직 v1만 보내므로(C11 전) 영향이 없다.
 - 작업자만 C03 이전으로 되돌리면 그 작업자가 저장해 둔 v2 결과 중 한도 칸이 든 것을 읽지 못한다(옛 결과 스키마). 되돌리기 전에 진행 중인 CHANGE 턴의 결과를 받아 두거나 drain한다.
 
-**검사.** (아래 완료 검사 절 참고)
+**검사.** `npm run check` 통과. 바뀐 모듈을 쓰는 시험 14개 파일(`worker-claude`·`worker-contract-v2`·`worker-entry`·`worker-server`·`review-lane`·`task-stream`·`task-contracts`·`task-diagnostics`·`change-review`·`change-artifact`·`task-worker`·`task-assembly`·`pr-review`·`task-bridge`) 500개 모두 통과(새 C03 시험 11개 포함). 전체 시험은 통합 단계에서 돌린다.
 
 **못 잡는 범위.** 2.1.308 `-p` 구독 모드에서 실제 이벤트가 오는지(S5, C24), 재개 스케줄과 리뷰 미루기(C19, S1 가짜 시계), 운영 알림(C21). 미게시 후보 리뷰(`/v1/change-review`)는 같은 실행기를 쓰지만 결과 스키마에 칸을 더하지 않았다. 리뷰 미루기를 이 경로에도 걸지는 C19가 정한다.
