@@ -643,8 +643,10 @@ let input = '';
 process.stdin.on('data', d => { input += d; });
 process.stdin.on('end', () => {
   const emit = e => process.stdout.write(JSON.stringify(e) + '\\n');
-  emit({ type: 'thread.started', thread_id: 'local-thread-1' }); emit({ type: 'turn.started' });
+  // thread.started보다 먼저 쓴다. hang 시험은 그 줄을 보자마자 중단하므로, 뒤에 쓰면 파일을 연 뒤 내용을 쓰기 전에
+  // 끝나 빈 env.json이 남고 JSON.parse가 실패한다.
   writeFileSync('env.json', JSON.stringify({ keys: Object.keys(process.env), input }));
+  emit({ type: 'thread.started', thread_id: 'local-thread-1' }); emit({ type: 'turn.started' });
   const finish = () => {
     writeFileSync(target, JSON.stringify({ status: 'completed', summary: 'local', question: '' }));
     // 파이프 쓰기는 비동기라 바로 exit하면 앞선 출력이 잘린다. 마지막 쓰기가 비워진 뒤 끝낸다.
