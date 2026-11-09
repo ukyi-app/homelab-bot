@@ -1,105 +1,103 @@
-# V1_TRACE — T21-audit
+# V1_TRACE — T21-audit-2
 
-> 이 문서가 가리키는 `evidence/…` 파일과 `OBSERVATION-REQUESTS.md`, 감사 인계는 비공개 운영 저장소 `ukyi-app/homelab-bot-ops`의 `evidence/release-audit/`와 `handoffs/release-audit.md`에 있다(D-13). T21 1회차 감사(2026-11-07, 봇 `dda891f`)의 결과이며, 수정 뒤 재감사가 이 문서를 갈음한다.
+판정 **NOT_READY**, A09 원문 정리 경합으로 DATA-02 실패. 기준은 봇 `9da65f5558f5e816592c990048c77324aa4585c2`, homelab `c1c0e5bcf82ca7d99bcd8315109bff52c7ae775f`, ops `4563a2cf29b90907c6d4d22deaf49fe6f8e66942`. 2026-11-09 독립 감사이며 사용자·운영 수용 선언은 아니다.
 
-판정 **NOT_READY**. 감사 기준은 봇 `dda891f7fbba8aabcc83b1b03fec36836012fd36`, homelab `691b532e66e7edd802b56d8518144197e8500c55`, ops `6caf4cb4d0a89048876b18da702275e2704bd6d7`이다. 2026-11-07에 독립적으로 코드를 대조하고 로컬 시험을 실행했다. 운영 수용 선언은 하지 않는다.
+## 증거와 집계
 
-## 판정과 증거 읽는 법
+- **모든 현재 로컬 시험/구현 위치는 9da65f5 기준**이다. 표의 실행 리비전 열은 과거 실연동을 별도로 표시한다. 운영 이미지를 현재 소스로 재실행한 것으로 바꾸지 않는다.
+- **L**: evidence/full.log·full.meta, npm-ci/check/build 로그. `L: name`은 현재 실행한 `test/name.test.ts`. mock 포트와 실제 로컬 DB/코드의 등급을 구분한다.
+- **S1/S2**: evidence/change-sec02.log·sec02-boundary.log 및 meta, 새 감사 이미지. 10/10·24/24, skip0. 실제 고정 CLI/Bun이지만 합성 자격·가짜 모델 API, local seccomp/AppArmor unconfined다.
+- **H**: evidence/historical-records.json. 첫 감사가 직접 읽은 원본 5개와 ops HANDOFF 7개의 현재 SHA-256을 다시 계산해 모두 일치 확인. 기존 외부 시험을 재실행하지 않았으며 현재 회귀·변경 diff와 함께 유지한다. ops 자료는 공개 문서에서 파일명으로만 가리킨다.
+- **T30**: ops evidence/t30/INT-01~07.md, 결과 JSON, README·EQUIVALENCE. evidence/t30-records.json·t30-deployment-summary.json에 원본 해시·집계. 승인·동등성의 구체적 차이는 V1_RELEASE_REPORT의 T30 표가 기준이다.
+- **G**: evidence/github-pr-records.json, 이번 GitHub GET으로 공개 PR 상태·review commit/state·tree/parent 대조. **V:**는 현재 docs/ai-bot/VERIFICATION.md의 행이다.
+- 독립 재현은 evidence/audit-probes.json(A01~03), bwrap-probe.json(A04), format-probe.json(A05), retry-probe.json(A06), unknown-probe.json(A07), registration-probe.json(A08), retention-race-probe.json·retention-race-pg-probe.json(A09)이다.
 
-- **현재 로컬 실행 리비전은 모든 행에서 `dda891f`**다. 과거 실연동 리비전은 별도 열에 적었다. 과거 작업 ID를 소스 커밋으로 쓰지 않았다. 현재 소스로 로컬 회귀를 통과한 사실이 과거 운영 시험을 현재 리비전의 운영 재실행으로 바꾸지는 않는다.
-- `pass`는 적힌 증거와 범위에서의 통과다. `blocked`는 로컬 실패가 아니라, T21에 명시적으로 이관된 필수 실연동 하위 사례를 닫지 못했다는 뜻이다. live가 필요한 사례는 이번 읽기·로컬 시험 권한으로 실행하지 않는다. 별도 승인 없이 과거 `not_run`을 pass로 바꾸지 않는다. `fail`이 있으면 미실시보다 우선한다.
-- 등급은 `04` §3의 `mock`, `local_integration`, `authorized_external`, `production_observation`, `approved_operational_execution`만 사용한다. 과거 문서의 `live`는 승인된 시험이면 `authorized_external`로 읽는다. V4/V5 실행 증거인 `approved_operational_execution`은 이번에 없다.
-- **L** = `evidence/full.log`·`full.meta`와 check/build 로그. 아래 시험 파일 약칭은 `test/<약칭>.test.ts`이며 L에서 실제 실행했다. 모의 Discord/GitHub/모델을 쓰는 부분은 실서비스 증거가 아니다.
-- **S1/S2** = `evidence/change-sec02.log` / `sec02-boundary.log`와 각 meta. 실제 감사 이미지, 합성 자격, 가짜 모델 API. 두 파일 10/10, 24/24 통과. 전체 시험에서 건너뛴 22개는 여기서 모두 실행했다.
-- **A01/A02/A03** = `evidence/audit-probes.json`(질문·요약, 철회 경합, 원문 보존). **A04** = `evidence/bwrap-probe.json`. **A05** = `evidence/format-probe.json`. 등록 비교 보조 시험은 `evidence/registration-probe.json`(발견 A08의 근거)이다. **A06** = `evidence/retry-probe.json`(실제 자식 실패 안내와 retry 거부).
-- **V:행** = 현재 봇 `docs/ai-bot/VERIFICATION.md`의 시작 위치. **H** = `evidence/historical-records.json`의 원본 해시·선별 집계와 명시한 ops HANDOFF. **G** = `evidence/github-review-records.json`·`change-pr-tree.json` 및 공개 GitHub GET 대조. **O01~O07** = 비공개 운영 인계용 `OBSERVATION-REQUESTS.md`의 요청 번호. 공개 문서에서는 ops 자료를 파일명으로만 가리킨다.
+전체 시험 **2,136 / pass 2,114 / fail 0 / skipped 22 / cancelled 0**, 206,272ms. npm ci·check·build 통과. SEC-02 별도 34개와 전체를 단순 합산하지 않는다. 알려진 세 간헐 실패가 없어서 재시도하지 않았다.
 
-전체 시험: **2,085 tests / 2,063 pass / 0 fail / 22 skipped**, 197,990ms, PostgreSQL 18.6 Unix socket, Node 24.22.0. 알려진 간헐 실패 두 사례는 이번 전체 실행에서 발생하지 않아 단독 재시도하지 않았다. SEC-02 별도 34개는 전체와 겹치는 시험을 포함하므로 2,085+34개의 서로 다른 시험으로 세지 않는다.
-
-수용 시험 30개 집계: **pass 21 / fail 2 / blocked 7 / not_run 0 / not_applicable 0**. 행 안의 미실시·해당 없음 하위 사례는 전체 ID의 판정과 구분했다.
+수용 시험 **pass 29 / fail 1 / blocked 0 / not_run 0 / not_applicable 0**. 전체 시험의 fail0은 추가 독립 A09 반례까지 통과했다는 뜻이 아니다. A09 probe의 exit0은 결함 발생을 assert했다는 뜻이다. ID 수준 pass와 행 안 not_run 하위 사례를 구분한다. approved_operational_execution 증거는 이번 V1 감사에 없다.
 
 ## 수용 시험 30개
 
-| ID | 판정값 | 증거 등급 | 실행 리비전(현재는 모두 dda891f; 아래는 과거) | 증거 위치 | 잡는 실패 | 놓치는 범위·차단 이유 |
+| ID | 판정값 | 증거 등급 | 과거 실행 리비전·현재 보충 | 증거 위치 | 잡는 실패 | 재확인/유지·놓치는 범위 |
 |---|---|---|---|---|---|---|
-| AUTH-01 | pass | local_integration; authorized_external | T16b 2d5ad21/097c93e; T17 작업자 10f5da4~d77944e | foundation, publisher-policy, pr-review, external-task-receiver; V:725·330; ops handoffs/foundation-deploy.md·pr-review.md | owner/guild/channel/DM/설치/저장소/작성자/fork·서명 거부 | 운영 외부인 두 번째 계정은 없음. 로컬 부정 사례와 실제 허용 밖 채널·fork 거부를 구분. |
-| AUTH-02 | fail | local_integration; authorized_external | T16b 2d5ad21; T20 55555b3 | A02; publisher-policy, memory-briefing, task-bridge; V:794 | 철회 전후 명령·질문·기억 접근 검사와 철회 영속성 | 철회가 커밋된 뒤 Discord dispatch가 시작되는 경합을 재현. A02가 과거 pass를 제한. |
-| EVENT-01 | pass | local_integration; authorized_external | T17 작업자 7a4dfe6~d77944e; 게시 서버 개별 SHA 미기록 | foundation, publisher-pg, pr-review, task-lane-pg; V:371; ops handoffs/pr-review.md | inbox/의미 키·중복 GitHub 재전송·동시 질문/명령의 작업 한 건 | 실제 Discord RESUME 중복을 의도적으로 만든 증거 없음. 이 하위 사례는 not_run, O02. |
-| EVENT-02 | blocked | local_integration; authorized_external | T16b 2d5ad21→097c93e; CHANGE 현재 로컬 dda891f | review-3, review-4, github-writer, change-recovery, change-pg; V:738·2016; O02 | 로컬 REST 성공 후 응답 유실·DB 확인 실패·재시작에서 기존 외부 효과 대조와 무재전송 | Discord outbox 실제 ACK 유실, GitHub 변경 게시 중 실제 프로세스 kill/live fault는 승인 범위 밖. 상호작용 ACK 통과로 대신하지 않음. |
-| EVENT-03 | pass | local_integration; authorized_external | T16b 097c93e; T17 10f5da4 | publisher-recovery, pr-review; V:330·740; ops handoffs/foundation-deploy.md | 중단 중 메시지 backfill, 15분 PR 재조정, gap/커서·예산 | 14분 통신 차단 해제 뒤 41초 복구 기록. 무한 기간·전체 과거 PR 복구 보장 아님. |
-| EVENT-04 | pass | local_integration; authorized_external | T16b 2d5ad21; T18 작업자 88b37c4 | unknown-probe, stop-confirmation, publisher-shutdown, task-lane-pg; V:742·1026 | lease/단절은 unknown, 소멸 확인 뒤 failed/cancelled, unknown 자동 재실행 차단 | 실제 abrupt kill/OOM은 미실시(O02). 과거 정상 종료·취소와 현재 로컬 단절을 증거로 삼음. |
-| CHAT-01 | pass | local_integration; authorized_external | T16b 097c93e | chat-context, typing-debounce, read-lane, task-assembly; V:744 | 구독 후속 메시지, debounce, task 별도 레인·대화 맥락 | 실모델 응답 품질 일반화·장시간 부하 보장 없음. 공통 발송 철회 결함 A02 별도. |
-| CHAT-02 | pass | local_integration; authorized_external | T16b 2d5ad21/097c93e | foundation, chat-context, publisher-recovery; V:745 | stop/resume·비활성 수집 차단·재시작/세션 정리 | Discord 외부에서 권한·보관 상태가 바뀌는 모든 순서는 실측하지 않음. |
-| READ-01 | pass | local_integration; authorized_external | T16b 097c93e; T24 12a09c3 | publisher-read, read-lane, briefing-observations; V:746·822 | 등록/미등록/관측 불가·오래됨, 사실/가설/미확인, 현재 원본 없는 정상 주장 금지 | READ logs는 공개 답에 줄 수만 제공. 전체 로그를 읽었다고 주장하지 않음. |
-| READ-02 | pass | local_integration; authorized_external | T16b 2d5ad21/097c93e; homelab 현재 선언 691b532e | foundation, publisher-read, publisher-config; homelab platform/bot-slot/templates/rbac.yaml:23; V:747 | 엄격 스키마·템플릿·자원/namespace/시간/바이트 상한, Secret/ConfigMap/exec 차단 | Grafana 자격 자체는 넓어 게시 서버 침해까지 막지 못함. 실제 Secret 값을 읽어보는 시험은 하지 않음. |
-| SEC-01 | pass | mock; local_integration; authorized_external | T16b 097c93e; T17 10f5da4~d77944e | foundation, review-lane, pr-review, memory-briefing, change-review; V:748·337 | PR/AGENTS/로그 지시를 자료로 전달, 도구/정책 변경 스키마 거부, 기억은 정책이 되지 않음 | 실모델 보편적 인젝션 저항성은 증명 안 됨. 기억→모델 경로는 현재 없음(그 하위 사례만 not_applicable). |
-| SEC-02 | blocked | local_integration; authorized_external | 현재 감사 이미지 dda891f; 과거 운영 5fb4a20·d4c8bda | S1·S2; task-settings-boundary, task-process-containment; V:1364·1922; H; O01 | 실제 고정 CLI/Bun, 합성 자격, 파일·프로세스·소켓·네트워크·음성/양성 대조 | 현재 TaskLane 전체 조립 경로와 실모델 악성 시험 미확인. 과거 tools=0 api_error는 보안 통과 아님. 실자격 직접 Read 미실시. |
-| DATA-01 | fail | local_integration; mock; authorized_external | 현재 dda891f; T17 7a4dfe6 전후; T19 게시 29c73b8/작업자 d4c8bda | A01-question·A01-summary; change-data, change-publication, pr-review; V:361·1956; O07 | CHANGE/review 공개 provenance·내부 표식·비밀 패턴 차단, 다른 thread 접근 거부 | v1 task 질문·완료 요약은 합성 토큰을 그대로 전달. 현재 모델 자격의 정확 일치 반사 검사는 존재하며 실제 키 유출을 입증한 것은 아님. |
-| DATA-02 | pass | local_integration; authorized_external | T20 게시 55555b3; 복원 후 dab3de1 문서 관측 | deletion-ledger, deletion-ledger-pg, memory-briefing, t20-startup-pg; V:794; H | 기억 정정/삭제의 검색·파생 사본·삭제 원장·PITR 뒤 장벽 재적용 | 이미 외부로 게시된 사본/백업 모든 바이트 소거 보장 아님. A03은 기억 외 task/change 원문 보존 문제. NUC+SSD 동시 유실은 수용 위험. |
-| REVIEW-01 | pass | local_integration; authorized_external | T17 작업자 10f5da4→7a4dfe6→d77944e; PR head는 아래 품질 표 | pr-review, review-lane; V:337; G | 의도한 오류 두 PR의 유효 지적, 정상/바이너리/의존성 PR 오탐·부분 범위 평가 | 게시 8건+restricted 1건의 작은 표본. 모든 사례의 사전 정답이 있는 것은 아님. 옛 오탐 1건을 숨기지 않음. |
-| REVIEW-02 | pass | local_integration; authorized_external | T17 작업자 10f5da4~d77944e | pr-review, review-1, review-2; V:358 | head 교체·base retarget·선병합에 superseded와 검토 SHA 표시 | 마지막 GET과 POST 사이 원격 경쟁은 잔존. 기본 base 이동 재리뷰 off는 확정 결정이며 오래된 결과를 최신 인증으로 쓰지 않음. |
-| REVIEW-03 | pass | local_integration; authorized_external | T17 작업자 7a4dfe6; PR14 01c3fbf | review-input 관련 pr-review·review-diff-peak·review-lane; V:344; G | 큰/잘린 diff·바이너리 제외, partial/미확인 표시 | 로컬 diff 피크와 상한은 전체 모델 프로세스의 운영 최대 RSS 측정이 아님. |
-| REVIEW-04 | pass | local_integration; authorized_external | T17 작업자 10f5da4~d77944e | pr-review, github-review-app; src/review.ts:133; V:337; G | 허용 POST /reviews와 event COMMENT만, APPROVE/REQUEST_CHANGES/merge 거부 | App Pull requests write 권한 자체는 approve를 막지 않음. 제한 게시 코드 경계가 증거이며 프롬프트 약속과 구분. |
-| REVIEW-05 | pass | local_integration; authorized_external | T17 작업자 d77944e; PR16 c637d98 | pr-review, publisher-review; V:371; G | Bot 댓글 무시·작성자 숫자 허용 목록·자기 트리거 중복 세대 차단, Renovate PR 허용 | 운영 Bot 댓글 실례는 not_run. 실제 Renovate PR 리뷰와 로컬 Bot 댓글 부정 시험을 분리. |
-| TASK-01 | blocked | local_integration; authorized_external | T18 작업자 88b37c4; R08 게시 c39b074 | task-assembly, external-task-assembly, external-task-helper, external-task-pg; V:1415·1500; O03 | 명시 연결·서명·소유자·능력 표시·해제, Claude Stop→수신→Discord | 실제 Codex notify, 다른 member/집 밖 기기·복원 epoch 운영 실측 없음. R08은 확정된 읽기 전용 알림이며 작업 제어가 아님. |
-| TASK-02 | pass | local_integration; authorized_external | T18 작업자 88b37c4; 게시 서버 개별 SHA 미기록 | task-bridge, task-lane-pg, codex-bridge; V:1034 | 질문 ID/기한/소유자/중복·같은 세션 resume, 실제 두 턴 질문/답 | 바인딩 기능 판정이다. 질문 내용 공개 차단 결함은 DATA-01 fail/A01로 별도 반영. |
-| TASK-03 | pass | local_integration; authorized_external | T18 작업자 88b37c4; 취소 안내 수정 2ed8485 | task-stream, task-cancel-notice, task-process-containment, codex-bridge; V:1035 | idle/가짜 완료/승인 문구 불신·소멸 확인 뒤 취소, 실제 취소 stopped true | 실제 취소 때 완료 안내 누락은 기록상 있었고 이후 로컬 회귀로 수정. 현재 운영 안내 재관측은 없음. R08 완료는 외부 보고라고 표시. |
-| CHANGE-01 | blocked | local_integration; authorized_external | T19 게시 29c73b8; 작업자 d4c8bda; PR18 355af39 | change-assembly, change-pg, change-verification, change-review; V:1971; G; O04 | artifact/tree/base·시험·독립 리뷰·digest 승인→PR, 실제 한 턴 H.tree=T1/parent=B | 실제 여러 턴 질문→답→새 증거·승인 경로는 미실시. A04의 준비 실패 분류와 A05 안내 분할도 제한. |
-| CHANGE-02 | blocked | local_integration; authorized_external | T19 게시 29c73b8; 작업자 d4c8bda; AC-P8 homelab 56162bf | github-writer, change-policy, change-publication, change-pg; V:1940; H; O05 | main/보호 경로/merge/dispatch/GraphQL/force 요청 전 거부, 실제 main/deploy GH013·자동병합 제외 | 실제 writer 신원의 PUT merge와 workflow git push는 승인 밖이라 미실시. 기존 시험 App 결과로 대체 안 함. |
-| CHANGE-03 | blocked | local_integration | 현재 dda891f; 과거 실연동 해당 사례 없음 | change-freshness, change-recovery, change-pg, github-writer; V:2010; O04 | base 이동·사람 commit/ref 충돌·오래된 승인/정책·취소 뒤 쓰기 차단 | live 경합 PR 미실시. 보호 코드/PG 시험 통과를 실제 GitHub 경합 관측으로 승격하지 않음. |
-| DEPLOY-01 | blocked | mock; authorized_external; production_observation | T19 게시 29c73b8; H355af39/Mf0f5298/Ka4f1005 | change-deployment, change-assembly; V:1971; G; O06 | PR head/merge/config/image의 관계·stale/unready/unknown/기능 검증 미실시 구분 | 정상 observed 실연동은 있음. 현재 smoke 앱 제거, stale/unready 실연동 없음. 관측 불가를 배포 성공으로 세지 않음. |
-| MEM-01 | pass | local_integration; authorized_external | T20 55555b3 | memory-briefing, memory-commands, memory-commands-pg; V:790; H | 근거/ACL/시각/충돌·candidate와 active, 일시 지시로 정책 변형 금지 | 기억 내용이 모델 맥락에 자동 연결되지 않음. 실제 수집하지 않은 사실을 기억으로 검증하지 않음. |
-| BRIEF-01 | pass | local_integration; authorized_external; production_observation | T20 55555b3; T24 12a09c3; 작업 칸 c439cee | memory-briefing, briefing-observations, briefing-task-lane, t20-startup-pg; V:793·822·1447; H | 08:50 Asia/Seoul·회차 멱등·재시작·원장 장벽·미조회/오래됨 표시·모델 비의존 | T24 인증서/복원 칸은 해소됨. 전체 현재 운영 상태를 새로 관찰하지 않음. 공통 철회 경합 A02는 여전히 적용. |
-| OPS-01 | pass | local_integration; authorized_external | T16b 2d5ad21/097c93e; T17 d77944e; T18 88b37c4 | typing-debounce, read-lane-pg, worker-server, task-lane-pg, review-diff-peak; V:749 | 큐/레인/시간/도구/바이트 상한·취소/한도·대화 ACK, 승인된 10 PR+10 알림 | 원래 30+30을 시험하지 않음. 사용자 10+10 축소 승인 근거 존재. 혼합 최악 부하·장기 비용/자원은 미측정. |
-| OPS-02 | pass | local_integration; authorized_external | T16b 2d5ad21/097c93e; T13 플랫폼 실행 2026-10-29(봇 배포 전) | foundation, publisher-main, ops-metrics; V:750; approvals.md:554·555·556; H | 봇 replicas 0에서도 Telegram 경보, NUC 종료 때 독립 healthchecks down/up | NUC 정상 종료+RTC 복귀 15분 기록이며 갑작스러운 정전 복원 성공 증거는 아님. 외부 알림은 사용자 폰 수신 기록으로 갈음 승인. |
+| AUTH-01 | pass | local_integration; authorized_external | T16b 2d5ad21/097c93e; T17 10f5da4~d77944e | L: foundation, publisher-policy, pr-review, external-task-receiver; H: foundation-deploy·pr-review | owner/guild/channel/설치/저장소/작성자/fork·서명 거부 | 현재 회귀 재실행; 과거 허용 밖 채널·fork 거부 기록 유지. 운영 두 번째 계정 부정 시험은 not_run. |
+| AUTH-02 | pass | local_integration; authorized_external | T16b 2d5ad21; T20 55555b3; 현재 A02 | L: publisher-policy, task-bridge, memory-briefing; audit-probes.json; src/store.ts:546 | revoke 커밋이 dispatch보다 앞서면 REST0·blocked; 질문/기억/예약 재인가 | 1회차 fail 해소. dispatch 후 철회는 이미 시작한 전송을 취소하지 못함; ACK·typing 최종 조회를 네트워크 호출과 원자적이라고 주장하지 않음. |
+| EVENT-01 | pass | local_integration; authorized_external | T17 7a4dfe6~d77944e; T30 a25876b | L: foundation, publisher-pg, pr-review, task-lane-pg, external-task-pg; H·T30 INT-03 | inbox·의미 키·세대·동시 질문·GitHub 재전송·R08 duplicate 흡수 | 현재 전체 PG 회귀 재실행. 실제 Discord Gateway RESUME 중복 주입은 not_run. R08 duplicate를 Gateway 중복으로 대체하지 않음. |
+| EVENT-02 | pass | local_integration; authorized_external; mock | T30 a25876b(630c48d와 코드 동일) | L: review-3/4, github-writer, change-recovery, change-pg; T30 INT-02 result·EQUIVALENCE | 실제 Discord/PR 성공 후 local confirm 전 SIGKILL·동일 DB 재시작, 18/18·기존 효과 대조 | 1회차 blocked 해소. 선행 receipt/승인 fixture·draft PR·REST-only·localPG. wire 유실/운영 프로세스 전체 kill은 not_run. A/B는 같은 메시지 페이지. |
+| EVENT-03 | pass | local_integration; authorized_external | T16b 097c93e; T17 10f5da4 | L: publisher-recovery, pr-review; H: foundation-deploy·pr-review | history backfill·gap·커서·15분 PR 재조정 | 현재 회귀와 기존 원본 해시 재확인. 과거14분 차단 뒤41초 복구; 무제한 과거 복구 아님. |
+| EVENT-04 | pass | local_integration; authorized_external | T16b 2d5ad21; T18 88b37c4; T30 a25876b | L: unknown-probe, stop-confirmation, publisher-shutdown, task-lane-pg; H; INT-02 | lease·단절 unknown과 종료확인 failed 구분, 자동 재실행 방지 | 현재 회귀+실제 격리 publisher SIGKILL 대조. 작업자 운영 OOM은 not_run. A07의 51행 도달성 미확인 별도. |
+| CHAT-01 | pass | local_integration; authorized_external | T16b 097c93e | L: chat-context, typing-debounce, read-lane, task-assembly; H | 후속 맥락·debounce·대화/작업 별도 레인 | 현재 T31 purged 맥락 제외까지 재실행. 과거 실모델 상호작용 증거 유지, 일반 품질·장기 부하 보장 아님. |
+| CHAT-02 | pass | local_integration; authorized_external | T16b 2d5ad21/097c93e | L: foundation, chat-context, publisher-recovery; H | stop/resume·비활성 수집 차단·세션 정합 | 현재 회귀 재실행. Discord 외부 권한·보관 상태 변경의 모든 순서는 미실측. |
+| READ-01 | pass | local_integration; authorized_external | T16b 097c93e; T24 12a09c3 | L: publisher-read, read-lane, briefing-observations; H; V:746·822 | 등록/미등록/관측 불가·오래됨, 사실/가설/미확인 분리 | 현재 코드·회귀 재확인, 기존 실측 유지. 로그는 줄 수만 공개하며 원문을 전부 읽었다고 말하지 않음. |
+| READ-02 | pass | local_integration; authorized_external | T16b 2d5ad21/097c93e; homelab c1c0e5b 선언 | L: foundation, publisher-read, publisher-config; homelab platform/bot-slot/templates/rbac.yaml; H | 고정 질의·자원/시간/바이트 상한, Secret/ConfigMap/exec 차단 | 현재 선언과 로컬 거부 재확인. 읽기 자격 자체의 넓은 범위·publisher 침해는 별도 위험. 실제 Secret 값 접근 시험 없음. |
+| SEC-01 | pass | mock; local_integration; authorized_external | T16b 097c93e; T17 10f5da4~d77944e | L: foundation, review-lane, pr-review, memory-briefing, change-review; H | PR/AGENTS/로그 지시는 비신뢰 자료·도구/정책 변경 거부 | 현재 MemoryService 호출 경로 재검색: 자동 기억→모델 없음, 그 하위 사례만 not_applicable. 모델 보편적 인젝션 저항성 보장 아님. |
+| SEC-02 | pass | local_integration; authorized_external | 현재 감사 이미지 9da65f5; 운영 직접 exec 5fb4a20·d4c8bda | S1/S2; L: task-settings-boundary, task-process-containment; H; T30 INT-01; approvals 18:11 KST | 고정 CLI/Bun·파일/소켓/프로세스/네트워크 경계, 양성·음성 대조, 64/64·83pass 과거 직접exec | 1회차 blocked를 명시적 V1 대체 증거 수용 결정에 따라 해소. full signed TaskLane·악성 실모델·실자격 직접Read는 여전히 not_run. local unconfined≠운영 Localhost. |
+| DATA-01 | pass | local_integration; mock; authorized_external | 현재 A01; T30 a25876b/작업자630c48d; T17 7a4dfe6 | L: task-output, change-data, change-publication, pr-review; audit-probes.json; T30 INT-07 | task 질문·완료 요약 공개 검사, 정책 부재 닫힘, 실제 합성 출력 marker 미게시 | 1회차 fail 해소. 실제 비밀 유출 사고나 임의 인코딩 DLP 입증 아님. 스캐너의 prefix 대소문자/비ASCII 변형 한계 명시. |
+| DATA-02 | fail | local_integration; authorized_external | 현재 A09; T20 55555b3·dab3de1 | L: raw-input-retention, raw-text-retention, deletion-ledger(-pg), memory-briefing, t20-startup-pg; retention-race-pg-probe.json; H | 기억 삭제·원장 재적용·T27/T31 cutoff·복원 정상 경로는 pass | T31 범위 포함 재판정. 후보 선정 뒤 재개/재종료하면 새 generation 종료0ms에 원문·brief·artifact 소거와 next 거부. 백업14일·진행 중 예외와 별개인 A09. |
+| REVIEW-01 | pass | local_integration; authorized_external | T17 10f5da4→7a4dfe6→d77944e | L: pr-review, review-lane; H; G; 아래 기존 품질 평가 | 고정 PR head의 유효 지적·오탐·부분 검토 평가 | 현재 회귀와 공개PR 상태/SHA GET 대조, 과거 품질 분석 유지. 새 모델 평가0. 작은 표본·사전 정답 없는 사례는 정확도 합산 제외. |
+| REVIEW-02 | pass | local_integration; authorized_external | T17 10f5da4~d77944e | L: pr-review, review-1/2; H; G | head/base retarget·선병합 superseded와 검토SHA 표시 | 현재 회귀 재실행. 마지막GET/POST 사이 원격 경쟁 잔존. 기본 base이동 재리뷰 off는 기존 결정. |
+| REVIEW-03 | pass | local_integration; authorized_external | T17 7a4dfe6; PR14 01c3fbf | L: pr-review, review-diff-peak, review-lane; H; G | 큰/잘린 diff·binary·submodule/열거 누락 partial 표시 | 현재 상한 회귀 재실행, 과거 binary 실례 유지. 운영 전체 모델 최대RSS 실측 아님. |
+| REVIEW-04 | pass | local_integration; authorized_external | T17 10f5da4~d77944e; T30 PR22 | L: pr-review, github-review-app; src/review.ts:133; H; G | COMMENT만·commit_id 고정, approve/request_changes/merge 거부 | 현재 제한 코드 재확인·회귀 재실행. App PR-write 권한 자체는 approve를 막지 않으므로 코드 경계가 필수. |
+| REVIEW-05 | pass | local_integration; authorized_external | T17 d77944e; PR16 c637d98 | L: pr-review, publisher-review; H; G | Bot댓글 무시·허용 봇 작성자·중복 세대 차단, 실제 Renovate PR 리뷰 | 현재 회귀 재실행. 운영 Bot댓글 부정 사례 not_run. PR16 현재 head를 과거 평가head로 바꾸지 않음. |
+| TASK-01 | pass | local_integration; authorized_external | T18 88b37c4/c39b074; T30 a25876b, 실제 Codex0.166.0 | L: task-assembly, external-task-assembly/helper/pg; T30 INT-03·fence-result | 명시 연결·실제 notify·서명·소유자·능력 표시·duplicate·detach, 로컬 restore fence11/11 | 1회차 blocked 해소. R08은 읽기 전용 알림. 수동 sender once이며 LaunchAgent·30일·다른 member·집밖·절전·운영PITR는 not_run. |
+| TASK-02 | pass | local_integration; authorized_external | T18 88b37c4; T30 task630c48d | L: task-bridge, task-lane-pg, codex-bridge; H; T30 INT-04 A | 질문ID/소유자/기한/중복·동일세션 resume, 실제 두 턴 | 현재 회귀 재실행, DATA-01 질문 스캔도 수정확인. 운영 타인/늦은답 부정 사례는 로컬 증거만. |
+| TASK-03 | pass | local_integration; authorized_external | T18 88b37c4·2ed8485 | L: task-stream, task-cancel-notice, task-process-containment, codex-bridge; H | idle·완료문구 불신·실제 종료확인, 취소 stopped true·unknown 유지 | 현재 회귀 재실행. 수정된 취소 안내 운영 재관측은 없음. R08 완료는 외부 보고이며 봇이 실행종료를 증명하는 능력 아님. |
+| CHANGE-01 | pass | local_integration; authorized_external | T30 publisher2c77813(코드630c48d), task630c48d, reviewd4c8bda | L: change-assembly/pg/verification/review; T30 INT-04 A; G PR22 | 질문→답→실제검증→독립리뷰→digest 승인→PR, tree/parent 일치 | 1회차 blocked 해소. 고정 smoke 한 건, non-draft·미병합닫음. 모델 리뷰 경고2건 보존. A05 사용성·A09 장기 재개수명은 별도 추적. |
+| CHANGE-02 | pass | local_integration; authorized_external | T30 publisher a25876b(코드630c48d); 실제 writer | L: github-writer, change-policy/publication/pg; T30 INT-05; H; G PR19 | main/보호경로/merge/dispatch/force 코드거부, 실제 merge405·workflow push GH013·main불변 | 1회차 blocked 해소. workflow는 권한 부족, merge는 ruleset이 막음. 일반ref201 양성 대조와 함께 판정. 모든 설치대상으로 확대하지 않음. |
+| CHANGE-03 | pass | local_integration; authorized_external; mock | T30 a25876b(코드630c48d) | L: change-freshness/recovery/pg, github-writer; T30 INT-04 BCD·EQUIVALENCE | 실제 base이동 superseded·새세대/새digest·옛승인거부·기존ref 충돌 차단25/25 | 1회차 blocked 해소. receipt는fixture·Discord없음·publisherPOST금지guard. D는 writer신원으로 만든 사람선택내용, 승인전ref 충돌. gate후 실제경쟁은 로컬만. |
+| DEPLOY-01 | pass | mock; authorized_external; production_observation | T30 a25876b(코드630c48d); 현재 reader 변경없음 | L: change-deployment, change-assembly; T30 INT-06·driver·JSON; G | H/M/K/digest·config_stale2·sync_running·pod_unready9·observed·제거blocked 구분 | 1회차 blocked 해소. 실제 reader, 수동mapping·kubectlGET·10초driver. 운영60초loop/Discord·비교stale단독·aggregateunready는 미실시. 현재 smoke앱 없음. |
+| MEM-01 | pass | local_integration; authorized_external | T20 55555b3 | L: memory-briefing, memory-commands(-pg); H | 출처/ACL/시각·충돌·candidate/active·정책불변 | 현재 코드/회귀 재확인, 기존 실연동 기록 유지. 모델 자동기억주입 없음. |
+| BRIEF-01 | pass | local_integration; authorized_external; production_observation | T20 55555b3; T24 12a09c3; task칸 c439cee | L: memory-briefing, briefing-observations/task-lane, t20-startup-pg; H | 08:50 Asia/Seoul·회차멱등·재시작·원장장벽·미조회/오래됨·모델비의존 | 현재 회귀 재실행, T24/T18칸 확인. 현재 운영상태 재관측 없음. A02 수정으로 공통 발송철회 차단 회복. |
+| OPS-01 | pass | local_integration; authorized_external | T16b 2d5ad21/097c93e; T17 d77944e; T18 88b37c4 | L: typing-debounce, read-lane-pg, worker-server, task-lane-pg, review-diff-peak; H | 큐/레인/시간/도구/바이트 상한·취소·한도·대화ACK | 현재 상한 회귀 재실행. 실연동은 사용자승인 10PR+10알림, 원래30+30 아님. 최악혼합·장기비용/자원 미측정. |
+| OPS-02 | pass | local_integration; authorized_external | T16b 2d5ad21/097c93e; T13 2026-10-29 | L: foundation, publisher-main, ops-metrics; H; homelab approvals | replicas0 Telegram·봇독립경보, NUC 종료 외부healthchecks down/up | 현재 선언/회귀와 승인기록 재확인. 정상종료+RTC복귀15분이며 갑작스러운정전 복원 증거 아님. 수신은 승인된 사용자 폰 기록. |
 
 ## F01~F09·R01~R18 구현 추적
 
-모두 구현 위치가 존재한다. 상태는 구현 존재 여부만이 아니라 현재 결함과 필수 미완료를 반영한다. 공통 경계 결함은 F ID와 해당 기능 ID에 표시하고, 모든 기능 행에 중복해서 기능 부재로 표시하지 않았다. 파일·행은 봇 `dda891f` 기준이다.
+27개 모두 구현 위치를 현재 소스와 대조했다. **pass 25 / fail 2(F04·R13)**. 파일·행의 첫 감사 대비 매핑과 실제 현재 발췌는 evidence/source-map.json이다. 기존 외부 증거 유지와 현재 로컬 재실행을 구분해 시험30 표에 연결한다.
 
-| ID | 상태 | 구현 파일·행 | 시험 ID | 근거·제약 |
+| ID | 상태 | 구현 파일·행(9da65f5) | 시험 ID | 현재 근거·제약 |
 |---|---|---|---|---|
-| F01 | fail | src/policy.ts:78; src/discord.ts:477; src/review.ts:89; src/change-policy.ts:119 | AUTH-01, AUTH-02 | 허용 목록·즉시 철회 구현은 있으나 발송 경합 A02. |
-| F02 | blocked | src/store.ts:73; src/store.ts:278; src/discord.ts:541; src/review.ts:899; src/change-publisher.ts:57 | EVENT-01~04 | inbox/outbox·의미 키·대조 구현. 실제 게시 ACK 유실/kill O02 미완료. |
-| F03 | blocked | src/review-input.ts:33; src/run-control.ts:42; src/executor-claude-task.ts:302; src/task-containment.ts:60; src/change-verifier.ts:43 | SEC-01, SEC-02, READ-02 | 비신뢰 경계·실행 격리 존재. 운영 TaskLane 조립 실측 O01 미완료. |
-| F04 | fail | src/memory.ts:189; src/memory.ts:279; src/change-publication.ts:127; src/task-bridge.ts:70; src/change-store.ts:753 | DATA-01, DATA-02, AUTH-02 | task 공개 검사 A01·철회 A02·원문 보존 A03. |
-| F05 | pass | src/store.ts:130; src/store.ts:263; src/store.ts:744; src/worker.ts:94; src/run-control.ts:129 | OPS-01, TASK-03 | 직렬 레인·상한·우선순위·비상 중단 구현. 시범 부하 범위만 검증. |
-| F06 | fail | src/contracts.ts:8; src/store.ts:390; src/store.ts:537; src/health.ts:6; src/change-verifier.ts:97 | EVENT-04, OPS-02, CHANGE-01 | 실행/전달 상태 분리는 존재. bwrap 준비 실패를 시험 실패로 기록하는 A04. |
-| F07 | pass | src/briefing.ts:143; src/main.ts:334; src/main.ts:351; src/deletion-ledger.ts:110 | BRIEF-01, DATA-02, EVENT-03, OPS-02 | 영속 예약·기동 장벽·기억 PITR. R08 epoch 운영 실측은 TASK-01 O03에 남음. |
-| F08 | pass | src/change-contracts.ts:144; src/change-artifact.ts:121; src/change-review.ts:356; src/review.ts:156 | REVIEW-01~03, CHANGE-01, CHANGE-03 | SHA/tree/receipt/정책 바인딩 존재·현재 로컬 통과. 실연동 범위 제한은 해당 시험 blocked로 유지. |
-| F09 | fail | src/worker.ts:55; src/review.ts:133; src/github-writer.ts:37; src/github-writer.ts:176; src/discord.ts:502 | DATA-01, AUTH-02, REVIEW-04, CHANGE-02 | 게시자 분리·GitHub 함수 허용 목록은 있으나 Discord 출력/권한 집행 A01·A02. |
-| R01 | fail | src/discord.ts:79; src/store.ts:63; src/store.ts:657; src/chat-context.ts:14 | CHAT-01, CHAT-02, AUTH-02 | 구독/후속/중지 구현. 철회 뒤 미발송 답 경합 A02. |
-| R02 | pass | src/discord.ts:79; src/activity.ts:21; src/typing.ts:32; src/store.ts:97 | CHAT-01, OPS-01 | ACK·입력 중 표시·debounce·urgent 분리. |
-| R03 | pass | src/runtime.ts:42; src/runtime.ts:54; src/store.ts:617; src/claude-task-bridge.ts:106 | CHAT-02, TASK-03, EVENT-04 | 대화/작업 분리와 실제 중단 확인. CHANGE 자식 재시도 안내 A06은 사용성 결함. |
-| R04 | pass | src/catalog.ts:9; src/read.ts:33 | READ-01 | 카탈로그와 미등록/관측 불가 구분. |
-| R05 | pass | src/read.ts:55; src/read-transports.ts:57; src/read-transports.ts:151 | READ-02 | 엄격한 입력·고정 질의·응답 투영·허용 자원만 조회. |
-| R06 | pass | src/read.ts:24; src/chat-format.ts:9; src/chat-context.ts:14 | READ-01 | 사실/가설/미확인·관측 시각, 오래된 정상은 현재 증거가 아님. |
-| R07 | pass | src/alerts.ts:14; src/briefing-observations.ts:266 | READ-01, OPS-02, BRIEF-01 | 고정 경보 요약·사건 스레드·조회 가능한 백업/인증서/작업 메타데이터. |
-| R08 | blocked | src/external-task-links.ts:80; src/external-task-receiver.ts:179; src/external-task-commands.ts:51 | TASK-01 | 사용자 확정 read-only 알림. 실제 Codex notify·복원 세대 관측 O03 필요. |
-| R09 | fail | src/task-bridge.ts:70; src/task-bridge.ts:119; src/claude-task-bridge.ts:487; src/claude-task-bridge.ts:505 | TASK-02, TASK-03, DATA-01 | 질문 ID/소유자/기한·완료 판정은 구현. task 텍스트 공개 경계 A01. |
-| R10 | blocked | src/task-worker.ts:194; src/task-workspace.ts:275; src/executor-claude-task.ts:351; src/task-containment.ts:60 | TASK-01, SEC-02 | 독립 작업 공간·파드·자격 분리. TaskLane 전체 격리 관측 O01 필요. |
-| R11 | pass | src/review.ts:323; src/review.ts:467; src/review.ts:786; src/github-review-io.ts:88 | AUTH-01, REVIEW-01, REVIEW-04, REVIEW-05 | 전용 App·COMMENT·고정 Discord 요약. 사람 병합 권한을 대신하지 않음. |
-| R12 | pass | src/review.ts:156; src/review-input.ts:345; src/review.ts:957 | EVENT-01, REVIEW-02, REVIEW-03 | head/comparison/policy 세대·부분 검토·누락 재조정. |
-| R13 | blocked | src/change-runtime.ts:149; src/change-publisher.ts:57; src/change-policy.ts:155; src/github-writer.ts:125 | CHANGE-01~03 | 격리 작성·검증·승인·브랜치/PR 구현. O04·O05 미완료, A04·A05·A06 수정 후보. |
-| R14 | pass | src/change-review.ts:356; src/change-review.ts:445; src/change-review.ts:681; src/review-lane.ts:87 | CHANGE-01, CHANGE-03 | 작성자와 별도 세션·실제 diff/기준/시험 receipt를 묶어 검토. 같은 모델 계열이라도 세션 독립이며 다른 계열 의무는 없음. |
-| R15 | blocked | src/change-deployment.ts:78; src/change-deployment.ts:189; src/change-deployment.ts:240 | DEPLOY-01 | H/M/K/D·readiness와 기능 검증 구분. 현재 배포 대상 제거와 O06. |
-| R16 | pass | src/memory.ts:142; src/memory.ts:189; src/memory.ts:393; src/document-source.ts:32 | MEM-01 | 출처·시각·적용 범위·ACL 기반 저장/검색. 자동 모델 맥락 주입은 없음. |
-| R17 | pass | src/memory.ts:150; src/memory.ts:174; src/memory.ts:230; src/memory.ts:279; src/deletion-ledger.ts:110 | MEM-01, DATA-02, AUTH-02 | 기억 데이터 접근·정정·삭제·복원은 통과. 공통 Discord 발송 경합은 F01/F09/R01 결함으로 별도 추적. |
-| R18 | pass | src/briefing.ts:66; src/briefing.ts:203; src/briefing.ts:254; src/briefing.ts:403 | BRIEF-01 | 실제 예약·회차 멱등·미확인 표시·재시작. T24와 T18 작업 칸 구현 확인. |
+| F01 | pass | src/policy.ts:78; src/discord.ts:484; src/review.ts:89; src/change-policy.ts:119; src/store.ts:546 | AUTH-01, AUTH-02 | 현재 dispatch 철회 CAS까지 확인. A02 fixed. |
+| F02 | pass | src/store.ts:77; src/store.ts:282; src/discord.ts:552; src/review.ts:899; src/change-publisher.ts:57 | EVENT-01~04 | 현재 inbox/outbox·의미 키·대조 회귀와 INT-02 실제 local-confirm 유실 복구. A07 운영 도달성 미확인 별도. |
+| F03 | pass | src/review-input.ts:33; src/run-control.ts:42; src/executor-claude-task.ts:302; src/task-containment.ts:60; src/change-verifier.ts:43 | SEC-01, SEC-02, READ-02 | 현재 고정 CLI 경계·INT-01 명시적 대체증거 수용. 전체 signed 악성 경로 not_run을 유지. |
+| F04 | fail | src/memory.ts:189; src/memory.ts:279; src/change-publication.ts:127; src/task-bridge.ts:102; src/change-store.ts:760; src/task-output.ts:24; src/raw-text-retention.ts:88; src/change-store.ts:776 | DATA-01, DATA-02, AUTH-02 | task 출력/권한은 수정. T27/T31 정상 수명·기억 삭제는 통과하나 새 세대 원문 조기 소거 A09 fail. |
+| F05 | pass | src/store.ts:134; src/store.ts:267; src/store.ts:780; src/worker.ts:94; src/run-control.ts:129 | OPS-01, TASK-03 | 직렬 레인·상한·우선순위·비상 중단, 실제 승인 부하10+10. A08 비용 개선 별도. |
+| F06 | pass | src/contracts.ts:8; src/store.ts:397; src/store.ts:565; src/health.ts:6; src/change-verifier.ts:114 | EVENT-04, OPS-02, CHANGE-01 | 상태 분리와 시작 표식으로 준비 실패 분류 A04 fixed. unknown 시간만으로 성공/실패 확정하지 않음. |
+| F07 | pass | src/briefing.ts:143; src/main.ts:336; src/main.ts:353; src/deletion-ledger.ts:110 | BRIEF-01, DATA-02, EVENT-03, OPS-02 | 영속 예약·원장 기동 장벽·기억 PITR 유지, R08 restore fence는 로컬PG11/11. |
+| F08 | pass | src/change-contracts.ts:144; src/change-artifact.ts:121; src/change-review.ts:356; src/review.ts:156 | REVIEW-01~03, CHANGE-01, CHANGE-03 | SHA/tree/receipt/정책 바인딩 현재 회귀와 T30 실제PR22 대조. 모델 verdict를 정답으로 세지 않음. |
+| F09 | pass | src/worker.ts:55; src/review.ts:133; src/github-writer.ts:37; src/github-writer.ts:176; src/discord.ts:509 | DATA-01, AUTH-02, REVIEW-04, CHANGE-02 | task 출력검사·Discord dispatch·COMMENT·writer route/최종효과 제한 재확인, 실제 writer 거부. |
+| R01 | pass | src/discord.ts:79; src/store.ts:67; src/store.ts:685; src/chat-context.ts:14 | CHAT-01, CHAT-02, AUTH-02 | 구독/후속/중지·철회 dispatch·purged 맥락 제외 현재 회귀. |
+| R02 | pass | src/discord.ts:79; src/activity.ts:21; src/typing.ts:32; src/store.ts:101 | CHAT-01, OPS-01 | ACK·typing·debounce·urgent 분리, A08 재등록 개선 후보. |
+| R03 | pass | src/runtime.ts:42; src/runtime.ts:54; src/store.ts:645; src/claude-task-bridge.ts:108 | CHAT-02, TASK-03, EVENT-04 | 대화/작업 분리·소멸 확인, A06 불가능한 retry 안내 fixed. |
+| R04 | pass | src/catalog.ts:9; src/read.ts:33 | READ-01 | 카탈로그·미등록/관측불가 구분, 현재 회귀와 과거 실제읽기. |
+| R05 | pass | src/read.ts:55; src/read-transports.ts:57; src/read-transports.ts:151 | READ-02 | 엄격입력·고정질의·투영·허용리소스·RBAC 선언 재대조. |
+| R06 | pass | src/read.ts:24; src/chat-format.ts:9; src/chat-context.ts:14 | READ-01 | 사실/가설/미확인·관측시각, 오래된 정상을 현재증거로 쓰지 않음. |
+| R07 | pass | src/alerts.ts:14; src/briefing-observations.ts:266 | READ-01, OPS-02, BRIEF-01 | 고정경보·사건스레드·백업/인증서/작업 메타데이터, T24칸 포함. |
+| R08 | pass | src/external-task-links.ts:80; src/external-task-receiver.ts:179; src/external-task-commands.ts:51 | TASK-01 | INT-03 실제 Codex notify·duplicate·detach. 읽기전용 알림, 운영restore/30일/다른기기는 미실시. |
+| R09 | pass | src/task-bridge.ts:102; src/task-bridge.ts:151; src/claude-task-bridge.ts:503; src/claude-task-bridge.ts:530; src/task-output.ts:24 | TASK-02, TASK-03, DATA-01 | 질문바인딩·실제종료·task 출력검사 현재회귀, T30 두턴실연동. |
+| R10 | pass | src/task-worker.ts:194; src/task-workspace.ts:275; src/executor-claude-task.ts:351; src/task-containment.ts:60 | TASK-01, SEC-02 | 작업공간·별도파드·자격/PID경계, SEC-02는 INT-01 수용범위에 한정. |
+| R11 | pass | src/review.ts:323; src/review.ts:467; src/review.ts:786; src/github-review-io.ts:88 | AUTH-01, REVIEW-01, REVIEW-04, REVIEW-05 | 전용App·COMMENT·고정요약·허용작성자. 자동병합/필수gate 아님. |
+| R12 | pass | src/review.ts:156; src/review-input.ts:345; src/review.ts:957 | EVENT-01, REVIEW-02, REVIEW-03 | head/comparison/policy 세대·partial·누락재조정, 현재회귀 및 과거실측 유지. |
+| R13 | fail | src/change-runtime.ts:150; src/change-publisher.ts:57; src/change-policy.ts:155; src/github-writer.ts:125; src/change-store.ts:234; src/change-store.ts:776 | CHANGE-01~03, DATA-02 | 정상작성/검증/게시·실제경쟁/거부는 통과. A09 새세대 원문소거로 next 복구 fail, A05 편의 결함. |
+| R14 | pass | src/change-review.ts:356; src/change-review.ts:445; src/change-review.ts:681; src/review-lane.ts:87 | CHANGE-01, CHANGE-03 | 별도리뷰세션·실제diff/기준/receipt 바인딩, INT-04 A 실모델 검토. 모델무결성 보장 아님. |
+| R15 | pass | src/change-deployment.ts:78; src/change-deployment.ts:189; src/change-deployment.ts:240 | DEPLOY-01 | H/M/K/digest·stale/unready·기능시험 분리. INT-06 실제reader, 현재 smoke미등록. |
+| R16 | pass | src/memory.ts:142; src/memory.ts:189; src/memory.ts:393; src/document-source.ts:32 | MEM-01 | 출처·시각·범위·ACL 저장검색. 자동 모델주입 없음. |
+| R17 | pass | src/memory.ts:150; src/memory.ts:174; src/memory.ts:230; src/memory.ts:279; src/deletion-ledger.ts:110 | MEM-01, DATA-02, AUTH-02 | 기억 접근/정정/삭제/복원은 pass. T31 일반원문 경합은 F04/R13·DATA-02에서 별도 fail. |
+| R18 | pass | src/briefing.ts:66; src/briefing.ts:203; src/briefing.ts:254; src/briefing.ts:403 | BRIEF-01 | 예약·회차멱등·미확인·재시작, T24/T18칸과 철회발송 회귀 확인. |
 
-## `01` §9 end-to-end 흐름 5개
+## `01` §9 end-to-end 5개
 
-| 흐름 | 상태 | 실행 리비전·등급 | 실제 근거 | 남은 경계 |
+| 흐름 | 상태 | 실행 리비전·등급 | 증거 | 놓치는 범위 |
 |---|---|---|---|---|
-| 1. Discord → 상태·근거 → 구독/세션 정리·맥락 | fail | dda891f local_integration; T16b 097c93e authorized_external | foundation/chat-context/read-lane/publisher-recovery + 실제 조회·stop/resume 기록 | 정상 경로는 동작. A02에서 철회 완료 뒤 답이 나가 허용 범위 종료 계약 위반 |
-| 2. PR → 최신 리뷰 → COMMENT → Discord 요약 | pass | dda891f local_integration; T17 10f5da4~d77944e authorized_external | 실제 PR11/12/14/16 리뷰 SHA·COMMENTED와 HANDOFF Discord sent, 현재 publisher-review/pr-review | 일반 정확도·병합 전 리뷰 완료 보증 없음. 공통 Discord A02는 별도 출시 차단 |
-| 3. 소유/명시 연결 작업 → 질문·답 → 산출물·전달 | fail | dda891f local_integration; T18 88b37c4/c39b074 authorized_external | 실제 task 두 턴·취소와 Claude Stop 서명 알림, task-bridge/external-task 시험 | A01 출력 검사 누락. 실제 Codex notify O03, TaskLane SEC-02 O01 blocked. R08에는 질문 답/실행 제어 능력이 없음 |
-| 4. 수정 → 격리 시험·독립 검토 → PR → 배포 읽기 | blocked | dda891f local_integration; 게시29c73b8/작업자d4c8bda authorized_external | H3 PR18 H=355af39, M=f0f5298, K=a4f1005, digest ea8fc024…; tree/parent 일치 기록·GitHub GET | 한 턴은 통과했지만 여러 턴·실제 경합·writer 추가 거부·stale/unready O04~O06 미완료. 현재 smoke 배포 없음 |
-| 5. 결정 저장 → 출처 검색·정정·삭제 → 브리핑 → 재시작 | pass | dda891f local_integration; T20 55555b3/T24 12a09c3 authorized_external | 실제 삭제 전 PITR → 원장 entries1/applied1 → 삭제 후 검색 부재, 브리핑 한 회차 보존; 현재 startup/ledger/briefing 시험 | 이미 전달된 사본은 회수 보장 안 됨. 외부 SSD 동시 소실·R08 복원은 별도. 공통 Discord A02 적용 |
+| 1 Discord→상태·근거→구독/세션·맥락 | pass | 현재 local_integration; T16b097c93e authorized_external | L foundation/chat-context/read-lane/publisher-recovery + H 실제조회·stop/resume + A02 수정 | 운영 현재재실행 없음. dispatch 뒤 이미시작된 전송 회수 보장 없음 |
+| 2 PR→최신리뷰→COMMENT→Discord | pass | 현재 local_integration; T17 authorized_external | L publisher-review/pr-review + H·G 고정head/COMMENT, T30 PR22 리뷰 | 일반정확도·병합전리뷰완료 보증 아님 |
+| 3 소유/명시연결작업→질문·답→산출물·전달 | pass | 현재 local_integration; T18·T30 authorized_external | A01수정, 실제두턴작업·Codex notify·서명알림·detach | R08은 알림뿐, 질문/실행제어 없음. SEC-02 전체운영조립 미실시는 명시적수용 범위 |
+| 4 수정→격리시험·독립검토→PR→배포읽기 | fail | 현재 A09 local_integration; T19·T30 authorized_external/production_observation | 정상경로 PR18 병합·배포, PR22 두턴·실제검증·검토·승인, INT-04경쟁·05거부·06관측은 pass. 새세대 재개 수명 A09 fail | T30부분들은 서로 다른승인실행이지 한 요청의 연속전과정을 새로실행한 것 아님. 현재 smoke앱 없음 |
+| 5 결정저장→출처검색·정정·삭제→브리핑→재시작 | pass | 현재 local_integration; T20 55555b3/T24 12a09c3 authorized_external | L startup/ledger/briefing + H 실제PITR 원장entries1/applied1·검색부재·회차보존 | 외부사본회수/SSD동시유실 보장없음. 일반원문 A09는 흐름4와 DATA-02로 분리 |
 
-## 리뷰 품질 (`04` §6)
+## 리뷰 품질: 1회차 독립 분석을 유지한 범위
 
-공개 GitHub 리뷰와 PR 코드를 직접 대조했다. #11과 #12 첫 리비전의 알려진 두 결함은 실제 코드와 맞는다. #14의 제외 파일 오탐 및 수정 후 부분 검토 표시도 대조했다. 각 head를 고정하고, 현재 PR16의 새 head(7d2cef7)를 과거 c637d98 시험으로 대체하지 않았다. 아래 시간·호출 수는 과거 기록이며 이번에는 모델을 호출하지 않았다.
+이번에는 모델 평가를 추가하지 않았다. 첫 감사가 고정 head의 코드·리뷰를 직접 대조한 아래 분석을 유지한다. 이번 GitHub GET은 PR 상태·리뷰 commit/state·tree/parent를 재확인했고 해당 기존 증거의 해시를 대조했다. 과거 head의 본문 전체를 이번에 새로 재평가했다고 주장하지 않는다. 현재 PR16 head는 7d2cef7이며 아래 c637d98과 구분한다.
 
 | 평가 PR / head | 알려진 정답·근거 | 유효 지적 | 오탐 | 알려진 문제 누락 | 중복/스타일 잡음 | 미검토 범위 | 시간/호출량 |
 |---|---|---|---|---|---|---|---|
