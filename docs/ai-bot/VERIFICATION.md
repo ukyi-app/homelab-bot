@@ -2117,3 +2117,25 @@ T21 1회차 감사의 blocked 7건(homelab 티켓 T30)을 항목마다 사용자
 | INT-04 | CHANGE-01, CHANGE-03 | **pass**(2026-11-09). **A(운영, 실제 모델):** 사용자 스레드에서 `/change`(smoke `README.md` 한 줄, 문구 선택을 질문하라고 요구) → 작성 1턴 도구 0·`needs_input` 질문 → `/answer label=public \| (나)…` → 같은 세션 resume 턴 도구 2 → `smoke-unit` passed(T28 `payload-start` 표식의 운영 Localhost 프로필 첫 실측) → 독립 사전 리뷰 `pass_with_warnings`(P2 2건, 범위 complete) → 미리보기 digest = `/change-status` digest → `/change-publish` → 10초 뒤 smoke PR #22(head tree = 결과 tree, 부모 = 고정 base, README.md 하나) → T17 지적 없음 → 사람이 닫은 뒤 약 4분에 `cancelled(closed_unmerged)`. **B·C·D(격리 시험 게시자, 실제 smoke GitHub, 운영 게시 판정 코드, 작성·검증·리뷰 receipt는 fixture):** B 승인 확인 뒤 preflight 전 barrier에서 사람 PR(smoke #21, 문서 한 줄)을 병합하자 `superseded(base_moved)`·승인 무효·effect 0. C 새 generation이 새 base·digest를 받고 옛 digest 4가지 경로가 모두 거부. D 승인 전 예정 `bot/change/<id>/g2`에 writer 시험 토큰으로 사람 commit을 두고 승인하자 첫 쓰기 전 `blocked(head_changed)`, ref·main 불변, 게시자 쓰기 0. 25개 검사 true. 모델 5회(A 4, 사람 PR T17 1). **제약:** 작성 도구 상한은 job 합계 8회(`DEFAULTS.maxToolCalls`). D는 gate(ref가 승인 전부터 있음)만 실측했고 gate 뒤 ref가 생기는 경우는 로컬 증거다. 사람 commit은 ruleset이 사람의 `bot/**` 쓰기를 막아 writer 토큰으로 넣은 동등 시험이다. 운영 게시 서버에는 barrier를 넣지 않았다 | A `authorized_external`, B·C·D `authorized_external`(receipt `mock`) |
 
 **T30 7항목 끝(2026-11-09).** INT-02·03·04·05·06·07 pass, INT-01은 기존 증거 수용. 판정은 T21 재감사가 한다.
+
+## C02 작업자 계약 v2 (2026-11-09)
+
+동료 봇 명세 §4.2·§4.4의 작업자 쪽 계약이다(homelab 계획 티켓 C02). 작업자가 대화 요청 v1·v2와 리뷰 지시문 v1·v2를 함께 받는다. 게시 서버는 아직 v1만 보내므로 병합해도 운영 대화·리뷰 동작은 그대로다. 모양은 [ARCHITECTURE](ARCHITECTURE.md) §13 "봇 답 문맥"·"대화 답 형식", 공존 결정은 [DECISIONS](DECISIONS.md) "동료 봇 전환: 작업자 계약 v1·v2 공존".
+
+**시험(경계 S2: 게시 서버 `HttpWorker` → 작업자 HTTP → 가짜 Claude·Codex CLI → 응답, 모델 호출 없음).** 새 `worker-contract-v2` 10개, `worker-entry`·`review-lane`에 C02 시험 1개씩.
+
+| 완료 조건 | 시험 |
+|---|---|
+| v1 서버 + v2 작업자, v2 서버 + v2 작업자 대화 성공(AC-4) | `C02 v1 서버 + v2 작업자`, `C02 v2 요청`, `C02 배포 순서`(게시 서버는 v1만 만들고 조립 상한 20개·32KiB 그대로) |
+| v1 작업자 + v2 요청은 요청 거부(AC-4) | `C02 v2 서버 + v1 작업자`(v1 schema 작업자 403 → `WorkerRejected`, v2 요청에 v1 성공 모양이 오면 `failed`), `C02 지시문 literal`(판·지시문 불일치·공백 한 칸·모르는 판 모두 403, 실행기 0회) |
+| v2 응답 모양, 다르면 실패(AC-3 S2) | `C02 v2 요청`(reply·proposal·ack_only 세 모양, `rateLimit: null`, v2 지시문·`--json-schema`), `C02 v2 스키마`(v1 모양, 칸 빠짐·추가, 목록 밖 동작, 제안 값 상한 초과 → `failed`, reply는 12,000자에서 잘라 받음), `C02 v2 반사 검사`(reply·content·target) |
+| 50개·80KiB 기록과 정리 표시(AC-5 작업자) | `C02 기록 상한`(50개·80KiB 수용과 실행기 stdin 전달, 51개·80KiB+1 거부, v1 21개 거부), `C02 정리 표시` |
+| speech 신뢰 문맥에 '/' 이름 없음(AC-11) | `C02 신뢰 문맥`(등록 명령 이름 전부와 `/` 시작 낱말 0, 서비스·템플릿 ID 있음, slash는 v1과 같음) |
+| 리뷰 v2 literal, 출력 스키마 그대로(AC-13 S2) | `C02 리뷰 지시문`(두 literal 수용, 그 지시문이 모델 첫 줄, `--json-schema` 같음, 다른 문자열은 압축본·모델 전 거부) |
+| Codex 프로필 형식 | `C02 Codex 프로필`(v2 스키마가 `answer.schema.json`으로 감) |
+
+**발견.** v1·v2를 한 schema 정의로 합치며 키 순서가 바뀌자, 옛 순서로 서명한 v1 요청이 capability digest 불일치로 모두 거부됐다(첫 시험에서 잡음). digest가 schema를 거친 본문의 `JSON.stringify`라서다. v1 키 순서를 옛 그대로 고정했다. 옛 게시 서버 + 새 작업자 조합이 운영에서 깨질 수 있던 자리다.
+
+**검사.** `npm run check` 통과. 바뀐 모듈(`worker`·`worker-http`·`chat-lane`·`bot-facts`·`review-input`)을 직접 가져오는 시험 24개 파일 640개 중 637 통과. 실패 3: `change-review-pg` 2개는 PostgreSQL 소켓 경로가 Unix 소켓 길이 상한을 넘은 연결 오류(`EINVAL`)라 짧은 경로로 다시 돌려 2/2 통과, `foundation` R1-12는 로컬 Node 26과 `@types/node` 24 major 차이(변경과 무관).
+
+**못 잡는 범위.** 실제 사람 배포 순서(C06 절차), 모델 말투 품질과 정리 표시를 보고 실제로 "기억나지 않는다"고 말하는지(S5, C24), 게시 서버 렌더·공개 검사(C11), 한도 칸의 실제 값(C03).

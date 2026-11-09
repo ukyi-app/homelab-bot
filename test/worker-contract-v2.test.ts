@@ -270,7 +270,7 @@ test('C02 정리 표시: earlierPurged면 신뢰 문맥에 한 줄로 알리고,
   } finally { await w.worker.close(); }
 });
 
-test('C02 배포 순서: 이 판만 병합돼도 게시 서버는 v1 대화·리뷰 요청만 만들고 조립 상한(20개·32KiB)도 그대로다', () => {
+test('C02 배포 순서: 이 판만 병합돼도 게시 서버는 v1 대화 요청만 만들고 조립 상한(20개·32KiB)도 그대로다', () => {
   const request = workerRequest({ id: randomUUID(), lease_token: randomUUID(), type: 'chat', revision: { policy: 'p' },
     budget: { timeoutMs: 60_000, toolCalls: 8 } } as Job, [{ from: 'owner', text: '상태 알려줘' }]);
   assert.equal(request.version, 1);
