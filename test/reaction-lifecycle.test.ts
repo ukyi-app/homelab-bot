@@ -377,3 +377,19 @@ test('게시: 반응 REST가 멈춰도 게시 루프는 짧은 상한 뒤 돌아
   await drain();
   assert.deepEqual(log.filter(line => line.startsWith('remove')).sort(), ['remove fixture-thread/9101 👀', 'remove fixture-thread/9102 👀']);
 });
+
+test('흐름: 앞 답이 아직 unknown인데 뒤 메시지를 /cancel해도 앞 메시지 반응은 그 답이 sent로 확정될 때까지 남긴다', async () => {
+  await answer('9401');
+  f.rest.loseResponse = true;
+  await drain();
+  assert.equal((await database.db.query<{ state: string }>('SELECT state FROM outbox')).rows[0]!.state, 'unknown');
+  f.rest.loseResponse = false;
+  await f.ingress.receive(event('9402', { text: '하나 더' }));
+  const job = (await database.db.query<{ id: string }>(`SELECT id FROM jobs WHERE state='queued'`)).rows[0]!.id;
+  await f.ingress.receive(event('9403', { kind: 'command', command: 'cancel', target: job, mention: undefined, text: '' }));
+  await drain();
+  assert.deepEqual(log.filter(line => line.startsWith('remove')), ['remove fixture-thread/9402 👀'], '게시가 미확정인 앞 답의 👀는 남는다');
+  await f.publisher.reconcile();
+  await drain();
+  assert.deepEqual(log.filter(line => line.startsWith('remove')), ['remove fixture-thread/9402 👀', 'remove fixture-thread/9401 👀']);
+});

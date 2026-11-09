@@ -53,13 +53,16 @@ export async function moveReactions(db: Database, events: readonly string[], to:
 }
 
 // 작업이 끝났을 때(답 게시 확정·실패 확정) 그 메시지와, 같은 대화에서 그보다 먼저 받은 메시지 중 처리 중인 작업이 없는 것의 반응을 정리한다.
-// 밀려난(superseded) 앞 메시지는 이 답의 맥락에 들어 있어 따로 답하지 않으므로 같이 지운다.
+// 밀려난(superseded) 앞 메시지는 이 답의 맥락에 들어 있어 따로 답하지 않으므로 같이 지운다. 앞 메시지가 제 답을 냈는데
+// 그 답이 아직 게시 확정 전(pending·sending·unknown)이면 남긴다. 그 답의 마지막 쪽이 sent가 될 때 자기 정리가 지운다.
 export async function settleReactions(db: Database, job: string, to: 'cleared' | 'failed'): Promise<void> {
   const events = (await db.query<{ id: string }>(`SELECT e.id FROM jobs j JOIN events target ON target.id=j.event_id
     JOIN events e ON e.conversation_id=target.conversation_id AND e.event_order<=target.event_order
     WHERE j.id=$1 AND EXISTS (SELECT 1 FROM jobs mine WHERE mine.event_id=e.id)
     AND NOT EXISTS (SELECT 1 FROM jobs other WHERE other.event_id=e.id AND other.id<>$1
-      AND other.state IN ('queued','running','verifying','cancel_requested','waiting_user','unknown'))`, [job])).rows;
+      AND (other.state IN ('queued','running','verifying','cancel_requested','waiting_user','unknown')
+        OR (other.state='succeeded' AND EXISTS (SELECT 1 FROM outbox o WHERE o.message_key='result:'||other.id
+          AND o.state IN ('pending','sending','unknown')))))`, [job])).rows;
   await moveReactions(db, events.map(e => e.id), to);
 }
 
