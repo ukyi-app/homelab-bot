@@ -68,8 +68,11 @@ export class ReactionSync {
   async sync(limit = 10): Promise<boolean> {
     const now = this.store.now();
     const rows = await this.store.atomic(async store => {
+      // 실행기는 WHERE 조건 순서를 보장하지 않는다. 다른 키의 값을 bigint로 바꾸지 않게 형 변환은 CASE 안에서만 한다.
       const due = (await store.db.query<{ key: string; value: Row }>(`SELECT key,value FROM controls WHERE key LIKE 'reaction:%'
-        AND value->>'state'<>value->>'synced' AND (value->>'next')::bigint<=$1 ORDER BY key FOR UPDATE SKIP LOCKED LIMIT $2`, [now, limit])).rows;
+        AND value->>'state'<>value->>'synced'
+        AND CASE WHEN key LIKE 'reaction:%' AND jsonb_typeof(value->'next')='number' THEN (value->>'next')::bigint<=$1 ELSE false END
+        ORDER BY key FOR UPDATE SKIP LOCKED LIMIT $2`, [now, limit])).rows;
       for (const row of due) await store.db.query(`UPDATE controls SET value=jsonb_set(value,'{next}',to_jsonb($2::bigint)) WHERE key=$1`, [row.key, now + LEASE_MS]);
       return due;
     });
