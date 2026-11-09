@@ -83,6 +83,9 @@ export class MockDiscord implements DiscordRest {
       : this.threads.find(t => t.channel === channel && t.body.name.includes(marker));
   }
   async history() { return this.pages.shift() ?? []; }
+  reactions: { op: 'add' | 'remove'; channel: string; message: string; emoji: string }[] = [];
+  async addReaction(channel: string, message: string, emoji: string) { this.reactions.push({ op: 'add', channel, message, emoji }); }
+  async removeOwnReaction(channel: string, message: string, emoji: string) { this.reactions.push({ op: 'remove', channel, message, emoji }); }
 }
 // 제어 결과는 사람이 읽는 문장으로 게시된다(S16). 상태 값을 보는 시험은 Store.control의 구조화 반환값을
 // 수신 ID(cursor 인자)별로 모아 본다. 트랜잭션이 되돌려져도 남으므로, 게시된 outbox 행과 함께 확인한다.
