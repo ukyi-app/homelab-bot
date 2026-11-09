@@ -13,7 +13,7 @@ import { CLAUDE_FIXED_ENV, CLAUDE_FORBIDDEN_FLAGS, ClaudeChatAdapter, ClaudeRevi
 import { CodexChatAdapter } from '../src/executor-codex.js';
 import type { AdapterRun, ChatRun } from '../src/executor.js';
 import { PROFILES } from '../src/executor-profiles.js';
-import { REVIEW_INSTRUCTIONS, ReviewOutputSchema, ReviewWorker } from '../src/review-input.js';
+import { REVIEW_INSTRUCTIONS, REVIEW_INSTRUCTIONS_V2, ReviewOutputSchema, ReviewWorker } from '../src/review-input.js';
 import type { ReviewerInput, ReviewerModel, ReviewerResult, ReviewTask } from '../src/review-input.js';
 import { REVIEW_OMITTED_NOTE, REVIEW_OUTPUT_JSON_SCHEMA, assertEgressBound, createReviewerModel, interpretReview, reviewPrompt } from '../src/review-lane.js';
 import { RUN_PREFIX, RunControl } from '../src/run-control.js';
@@ -668,6 +668,28 @@ test('ReviewWorker + 리뷰 레인: 압축본 diff를 모델에 넣어 결과와
   assert.equal(payload.untrusted.files[0].path, 'src/app.ts');
   assert.ok(payload.untrusted.files[0].patch.includes('+b'));
   assert.deepEqual(await spaces(), []);
+});
+
+test('C02 리뷰 지시문: v1·v2 literal을 둘 다 받아 그 지시문을 모델에 넘기고 출력 스키마는 같다, 다른 문자열은 시작 전 거부(AC-13 S2)', async () => {
+  assert.ok(REVIEW_INSTRUCTIONS_V2.startsWith(REVIEW_INSTRUCTIONS) && REVIEW_INSTRUCTIONS_V2 !== REVIEW_INSTRUCTIONS);
+  assert.match(REVIEW_INSTRUCTIONS_V2, /해요체/);
+  const schemas: string[] = [];
+  for (const instructions of [REVIEW_INSTRUCTIONS, REVIEW_INSTRUCTIONS_V2]) {
+    const f = fixture();
+    const result = await new ReviewWorker(verifier, archives, f.reviewer, 50).review({ ...reviewTask(), instructions }, 'capability', live());
+    assert.deepEqual(result.status === 'succeeded' && result.output, OUTPUT);
+    const s = await seen();
+    assert.equal(s.input.split('\n')[0], instructions);
+    schemas.push(s.args[s.args.indexOf('--json-schema') + 1]!);
+  }
+  assert.equal(schemas[1], schemas[0]);
+  assert.equal(schemas[0], JSON.stringify(REVIEW_OUTPUT_JSON_SCHEMA));
+  for (const instructions of [`${REVIEW_INSTRUCTIONS_V2} `, SYSTEM_INSTRUCTIONS, '']) {
+    const f = fixture();
+    await assert.rejects(new ReviewWorker(verifier, archives, f.reviewer, 50).review({ ...reviewTask(), instructions }, 'capability', live()),
+      WorkerRejected);
+    assert.equal(f.launcher.specs.length, 0);
+  }
 });
 
 test('ReviewWorker 계약: 생존 불명은 unknown·stopped:false로 남고 작업자를 잠근다(failed로 뭉개지 않는다)', async () => {

@@ -11,9 +11,10 @@ import { SERVICES, TEMPLATES } from '../src/catalog.js';
 import { CHAT_OUTPUT_JSON_SCHEMA, CHAT_REPLY_JSON_SCHEMA } from '../src/chat-lane.js';
 import { CHANGE_COMMANDS, EXTERNAL_TASK_COMMANDS, FOUNDATION_COMMANDS, MEMORY_COMMANDS, REVIEW_COMMANDS,
   TASK_COMMANDS } from '../src/commands.js';
-import { SYSTEM_INSTRUCTIONS, SYSTEM_INSTRUCTIONS_V2, WorkerRejected } from '../src/contracts.js';
+import { DEFAULTS, SYSTEM_INSTRUCTIONS, SYSTEM_INSTRUCTIONS_V2, WorkerRejected } from '../src/contracts.js';
 import type { Job } from '../src/contracts.js';
-import { WorkerRequestV1Schema, WorkerSigner } from '../src/worker.js';
+import { CONTEXT_BYTES } from '../src/chat-context.js';
+import { WorkerRequestV1Schema, WorkerSigner, workerRequest } from '../src/worker.js';
 import type { WorkerRequestV1, WorkerRequestV2, WorkerResult, WorkerResultV2 } from '../src/worker.js';
 import { HttpWorker } from '../src/worker-http.js';
 import { startWorker, workerConfig } from '../src/worker-main.js';
@@ -267,6 +268,18 @@ test('C02 정리 표시: earlierPurged면 신뢰 문맥에 한 줄로 알리고,
       assert.ok(!factsOf(w.launcher.specs.at(-1)!.stdin).includes(EARLIER_PURGED_NOTE), surface);
     }
   } finally { await w.worker.close(); }
+});
+
+test('C02 배포 순서: 이 판만 병합돼도 게시 서버는 v1 대화·리뷰 요청만 만들고 조립 상한(20개·32KiB)도 그대로다', () => {
+  const request = workerRequest({ id: randomUUID(), lease_token: randomUUID(), type: 'chat', revision: { policy: 'p' },
+    budget: { timeoutMs: 60_000, toolCalls: 8 } } as Job, [{ from: 'owner', text: '상태 알려줘' }]);
+  assert.equal(request.version, 1);
+  assert.equal(request.instructions, SYSTEM_INSTRUCTIONS);
+  assert.ok(!('surface' in request) && !('earlierPurged' in request));
+  assert.throws(() => workerRequest({ id: randomUUID(), lease_token: randomUUID(), type: 'chat', revision: { policy: 'p' },
+    budget: { timeoutMs: 60_000, toolCalls: 8 } } as Job, Array.from({ length: 21 }, () => ({}))));
+  assert.equal(DEFAULTS.contextMessages, 20);
+  assert.equal(CONTEXT_BYTES, 32 * 1024);
 });
 
 test('C02 지시문 literal: 판과 지시문이 맞지 않거나 다른 문자열이면 요청 거부로 닫힌다(AC-4)', async () => {
