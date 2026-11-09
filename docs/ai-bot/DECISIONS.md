@@ -868,6 +868,10 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 - 17 안내 댓글 게시: `src/github-review-io.ts` `guidance.post`·`guidance.find`(`restrictGitHubWrite`를 지나는 `COMMENT` 리뷰, 안내 표식으로 회수). 부르는 곳은 C29.
 - 기록: [ARCHITECTURE](ARCHITECTURE.md) §6 리뷰 행·§16.3, [VERIFICATION](VERIFICATION.md) "C26 GitHub 쓰기·읽기 확장".
 
+## 동료 봇 전환: 작업자 계약 v1·v2 공존 (C02, 2026-11-09)
+
+- 작업자는 대화 요청 v1·v2와 리뷰 지시문 v1·v2 literal을 함께 받는다. 게시 서버는 자동 배포라 작업자(사람 배포, C06)가 먼저 두 판을 받아야 서버가 v2로 바꿀 수 있다(C11·C12). v1 수용은 시범이 끝난 뒤 뺀다(명세 §4.2 "계약 배포 순서" 3단계). 구현과 시험은 [ARCHITECTURE](ARCHITECTURE.md) §13 "봇 답 문맥"·"대화 답 형식", [VERIFICATION](VERIFICATION.md) "C02 작업자 계약 v2".
+
 ## C05 관리 CLI (2026-11-10)
 
 "동료 봇 전환 (사용자 2026-11-09)" 3의 구현. 봇 `src/admin.ts`(명령 처리)·`src/admin-main.ts`(진입점), homelab `cli/src/commands/bot.ts`와 core `podops.ts`의 `bot` 어댑터. 시험·결과는 [VERIFICATION](VERIFICATION.md) "C05 관리 CLI".
