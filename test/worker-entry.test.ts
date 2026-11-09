@@ -18,7 +18,7 @@ import type { CodexChatReport } from '../src/executor-codex.js';
 import { createExecutor, executorVersion, selectProfile } from '../src/executor-profiles.js';
 import type { ProcessLauncher } from '../src/process-launcher.js';
 import { SerialWorker, WorkerSigner, WorkerVerifier } from '../src/worker.js';
-import type { WorkerRequest } from '../src/worker.js';
+import type { WorkerRequestV1 } from '../src/worker.js';
 import { HttpWorker } from '../src/worker-http.js';
 import { WORKER_ENV, startWorker, workerConfig } from '../src/worker-main.js';
 import { FileNonceStore, NONCE_RETENTION_MS, WorkerStartError, seedAuth } from '../src/worker-state.js';
@@ -95,7 +95,7 @@ const mode = (value: unknown) => writeFile(join(fakeDir, 'mode.json'), JSON.stri
 const seen = async () => JSON.parse(await readFile(join(fakeDir, 'seen.json'), 'utf8')) as {
   args: string[]; cwd: string; entries: string[]; env: Record<string, string>; input: string; config: string; schema: string };
 const job = (): Job => ({ id: randomUUID(), lease_token: randomUUID() }) as Job;
-const chatRequest = (j: Job, overrides: Partial<WorkerRequest> = {}): WorkerRequest => ({ version: 1, job: j.id, lease: j.lease_token,
+const chatRequest = (j: Job, overrides: Partial<WorkerRequestV1> = {}): WorkerRequestV1 => ({ version: 1, job: j.id, lease: j.lease_token,
   lane: 'chat', policyRevision: 'fixture-v1', instructions: SYSTEM_INSTRUCTIONS, untrusted: [{ text: '상태 알려줘' }],
   timeoutMs: 60_000, toolCalls: 8, ...overrides });
 const env = (overrides: Record<string, string | undefined> = {}) => ({ WORKER_EXECUTOR: 'codex', WORKER_MODEL: 'cli-default',

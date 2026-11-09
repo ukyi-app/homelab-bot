@@ -16,7 +16,7 @@ import { CLAUDE_CHAT_CAPABILITIES, CLAUDE_FIXED_ENV, CLAUDE_FORBIDDEN_FLAGS, Cla
 import type { AdapterRun, ChatRun } from '../src/executor.js';
 import { PROFILES, executorVersion, selectProfile } from '../src/executor-profiles.js';
 import { SerialWorker, WorkerSigner, WorkerVerifier } from '../src/worker.js';
-import type { WorkerRequest } from '../src/worker.js';
+import type { WorkerRequestV1 } from '../src/worker.js';
 import { HttpWorker } from '../src/worker-http.js';
 import { WORKER_ENV, startWorker, workerConfig } from '../src/worker-main.js';
 import { WorkerStartError } from '../src/worker-state.js';
@@ -127,7 +127,7 @@ const mode = (value: unknown) => writeFile(join(fakeDir, 'mode.json'), JSON.stri
 interface Seen { args: string[]; cwd: string; entries: string[]; env: Record<string, string>; input: string; files: Record<string, string>; root: string }
 const seen = async () => JSON.parse(await readFile(join(fakeDir, 'seen.json'), 'utf8')) as Seen;
 const job = (): Job => ({ id: randomUUID(), lease_token: randomUUID() }) as Job;
-const chatRequest = (j: Job, overrides: Partial<WorkerRequest> = {}): WorkerRequest => ({ version: 1, job: j.id, lease: j.lease_token,
+const chatRequest = (j: Job, overrides: Partial<WorkerRequestV1> = {}): WorkerRequestV1 => ({ version: 1, job: j.id, lease: j.lease_token,
   lane: 'chat', policyRevision: 'fixture-v1', instructions: SYSTEM_INSTRUCTIONS, untrusted: [{ text: '상태 알려줘' }],
   timeoutMs: 60_000, toolCalls: 8, ...overrides });
 const env = (overrides: Record<string, string | undefined> = {}) => ({ WORKER_EXECUTOR: 'claude', WORKER_MODEL: MODEL,

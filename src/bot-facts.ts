@@ -9,7 +9,7 @@ const usage = (definition: typeof COMMAND_DEFINITIONS[number]) => {
   return `/${[definition.name, ...options].join(' ')}: ${definition.description}`;
 };
 
-export function botFacts(): string {
+export function botFacts(_surface: 'slash' | 'speech' = 'slash', _earlierPurged = false): string {
   const services = SERVICES.map(service => {
     const templates = TEMPLATES.filter(template => template.service === service.id).map(template => template.id);
     return `- ${service.id}: namespace ${service.namespace}, deployment ${service.deployment}`
