@@ -235,6 +235,18 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 - 삭제 쓰기 순서 [가정], 결정은 T20: 원장 append가 내구성 있게 기록됐음을 확인한 뒤에만 봇 DB에서 지우고, 그 뒤에 삭제 완료를 응답한다(원장 기록 확인 → DB 삭제 → 완료 응답). 원장 쓰기가 실패하면 지우지 않고, 실패를 알리거나 재시도할 수 있는 outbox에 둔다. 원장 쓰기 결과를 모르면 원장을 확인해 기록 여부로 사용자 안내를 정한다. 원장 기록 뒤 DB 삭제가 실패하면 재시도 작업으로 성공할 때까지 지우고, 그동안 기억 조회(검색·브리핑·답변)는 원장(또는 DB의 숨김 표식)과 대조해 그 기억을 숨긴다. 기동 때 재적용만 기다리면 다음 재시작 전까지 지운 것으로 기록된 기억이 계속 쓰이기 때문이다. 두 쓰기는 서로 다른 저장소라 한 트랜잭션으로 묶이지 않는다. DB를 먼저 지우고 원장 쓰기가 실패한 채 완료로 응답하면, 삭제 전 백업을 복원할 때 다시 적용할 표식이 없어 기억이 되살아난다. 부분 실패 사례(원장 실패, DB 삭제 실패, 응답 유실)는 DATA-02다.
 - 원장 위치는 정함(사용자 2026-11-02): NUC 두 번째 NVMe SSD의 파일(`deletions.jsonl` + 초기화 표식 `ledger.json`), 게시 서버만 PVC로 붙인다. 계약·단일 작성자 잠금·세대 묶기·받아들인 위험은 [DECISIONS](DECISIONS.md) T20. 보존 기간은 미정이고 백업 보존(14일)보다 짧으면 안 된다.
 
+**원문 칸 보존 7일.** 사람 입력과 모델 출력의 원문은 7일 뒤 정리가 비운다. 모두 행은 남기고 원문만 비운 뒤 지운 시각과 지우기 전 원문의 SHA-256(DB가 UTF-8로 계산)을 적는다. 시각 기준이라 백업에서 옛 행이 돌아와도 다음 정리가 다시 비운다. 백업 자체에 든 원문은 백업 보존 기간(14일) 동안 남는다. 결정은 [DECISIONS](DECISIONS.md) T27·T31.
+
+| 칸 | 기준 시각 | 고르지 않는 행 | 정리(1시간, 게시 서버가 뜨면 레인 스위치와 무관하게 돈다) |
+|---|---|---|---|
+| `codex_questions.answer`(T27, migration 019) | job이 끝 상태에 든 때 | 끝나지 않은 job, 세션이 `running`·`waiting_answer`·`waiting_model`·`unknown`이거나 정리 전 | `task_answer_retention` |
+| `change_request_inputs.text`(T27), `change_requests.brief`의 summary·goal·acceptanceCriteria(T31, migration 020) | change가 끝 상태에 든 때 | 진행 중 change, 미확정 effect, 살아 있는 자식 job, 정리 안 끝난 세션 | `change_retention` |
+| `events.payload.text`(T31) | 받은 때(`received_at`) | 끝나지 않은 job의 요청, 누락 복구 버퍼(`buffered`), 확정 전 스레드 게시(`pending`·`sending`·`unknown`)가 가리키는 event | `raw_text_retention` |
+| `codex_questions.prompt`, `results.result`(T31) | job이 끝 상태에 든 때 | 질문 답과 같다 | `raw_text_retention` |
+| `outbox.payload.content`(T31) | `available_at`(sent면 보낸 시각) | `pending`·`sending`·`unknown`, `kind=thread`(content가 event ID) | `raw_text_retention` |
+
+비운 원문을 다시 읽는 자리의 처리: `/retry`는 요청 원문을 비운 job을 받지 않고 사유를 알린다(정리와 scheduler 행 잠금으로 직렬화). 받지 못한 채 비운 입력이 다시 오면 `ignored:"text_purged"`로 두고 처리하지 않는다. 대화 맥락은 비운 owner 메시지와 비운 봇 답 페이지를 뺀다. 중복 판정(`semantic_key`)과 기억의 출처 확인은 행만 쓰므로 그대로다. 정리 함수는 `src/raw-text-retention.ts`, brief는 `purgeExpiredChangeContent`(`src/change-store.ts`)다.
+
 ## 8. 봇 중단 경보 연결 (`01` §3 질문 2, OPS-02)
 
 비AI 경보(Telegram)와 외부 생존 감시(healthchecks.io)는 플랫폼 몫이다(D-10). 봇 쪽에서 연결할 것:
@@ -1145,13 +1157,14 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - 권한 재확인 지점: 답 수락, 재개 dispatch 직전, 실행 중 감시, 결과 확정 전.
 - 한도·인증으로 끊긴 턴이 나르던 답은 `answered`로 되돌려 `/resume-model` 뒤 같은 답으로 잇는다. 대기 사유는 세션의 `wait_reason`(migration 015)에 남는다. `/resume-model`이 `jobs.wait_reason`을 비우기 때문이다.
 - 답 원문 보존 7일(T27, migration 019). `purgeExpiredTaskAnswers`가 1시간마다(`task_answer_retention`, 게시 서버가 뜨면 작업 레인·CHANGE 스위치와 무관하게 돈다) job이 끝 상태(`succeeded`·`failed`·`cancelled`·`superseded`)에 든 시각(`finished_at`, 없으면 답한 시각) 뒤 7일이 지난 답을 NULL로 두고 `answer_purged_at`을 적는다. 지우기 전 원문의 SHA-256을 `answer_sha256`에 남기고 `answer_event`·`answered_by`·`answered_at`은 그대로다. 재개는 세션이 `waiting_answer`·`waiting_model`일 때만 답을 읽으므로, 세션이 `running`·대기·`unknown`이거나 `cleanup_state='pending'`인 job의 답은 고르지 않는다. `/retry`로 되살아나는 `failed`도 세션이 대기가 아니면 새 스레드로 시작해 답을 읽지 않는다. 한 번에 200행씩 최대 20번이다.
+- 질문 원문(`prompt`)과 결과(`results.result`)도 같은 기준 시각·같은 예외로 7일 뒤 비운다(T31, migration 020, `raw_text_retention`). `prompt=''`·`result='{}'`로 두고 `*_sha256`·`*_purged_at`을 적는다. `results.evidence`(finalize가 `resultDigest`를 읽는다)는 남는다. 요청 원문(`events.payload.text`)은 받은 지 7일 뒤 비우고, 비운 job은 `/retry`가 받지 않는다. 답을 기다리는 job은 끝나지 않아 그동안 요청·질문이 남는다. 표는 §7 "원문 칸 보존 7일".
 
 **출력 공개 검사(T25).** v1 턴에서 모델이 쓴 글이 Discord로 나가는 자리는 질문(`needs_input.question`)과 완료 요약(`completed.summary`) 둘뿐이다. 실패 사유는 계약 enum이고, 대기·막힘·만료·확인 요청 안내는 job·질문 ID만 넣은 고정 문구다. 두 글은 결과 확정 전에 `src/task-output.ts`의 `taskOutputRisk`로 CHANGE 질문과 같은 `scanPublicText`를 거친다.
 
 - 표식: 작업 레인 정책에는 내부 표식 칸이 없어 `change.repositories[].internalMarkers` 전체와 `review.internalMarkers`를 합쳐 쓴다. 표식은 저장소와 무관하게 밖에 보이면 안 되는 값이고, 운영 정책을 새로 고치지 않고 적용된다.
 - 닫는 쪽: 결과 확정 직전 재인가에서 정책을 못 읽었거나(`PolicyUnavailable`) 리뷰 정책이 있는데 형식이 틀리면 `policy_unavailable`로 걸린 것으로 본다. v1 응답은 다시 받을 수 없어 CHANGE처럼 다음 바퀴로 미루지 않는다.
 - 질문이 걸리면 `codex_questions` 행과 질문 outbox를 만들지 않고 job을 `failed`(`task_question_sensitive`, CHANGE와 같은 코드)로 닫아 세션 공간을 지운다. 일반 실패 안내에 더해 `task-question-blocked:<job>:<attempt>` 안내 한 건에 사유 코드만 싣는다.
-- 요약이 걸리면 완료는 그대로 기록하고 Discord 메시지의 요약 줄만 고정 문구(사유 코드 포함)로 바꾼다. 변경 파일 수·검증 집계 줄은 남고, 증거에 `summaryWithheld`로 사유를 적는다. `results.result`의 요약 원문은 그대로다(보존 정책은 T27).
+- 요약이 걸리면 완료는 그대로 기록하고 Discord 메시지의 요약 줄만 고정 문구(사유 코드 포함)로 바꾼다. 변경 파일 수·검증 집계 줄은 남고, 증거에 `summaryWithheld`로 사유를 적는다. `results.result`의 요약 원문은 job이 끝난 지 7일 뒤 비운다(T31).
 - 로그는 `task_output_blocked`에 job·`question|summary`·사유 코드만 남긴다.
 - 한계: 탐지기는 패턴이 잡는 형태(비밀 형식, zero-width·따옴표 이음, 표식의 대소문자·구분자·URL·base64·hex 변형, 메타데이터 패턴)만 막는다. 공개 메타데이터 기준이라 이메일·17~20자리 숫자·`/home/` 경로·사설 IP가 든 질문·요약도 걸린다.
 
@@ -1310,7 +1323,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 - `Store.context()` → `chatContext()`(`src/chat-context.ts`). owner 항목은 이벤트 payload에서 `text`·`kind`(명령이면 `command`·`target`)만 고른 `{from:'owner', ...}`, 봇 항목은 `{from:'bot', text, partial?}`.
 - **수집 경로 표시는 넘기지 않는다(S16 수정).** 이전에는 payload 전체(`mention`·`activate`·`urgent`·`revision`)를 넣어, 모델이 구독 스레드의 멘션 없는 후속에 "mention=false라 봇에게 한 말이 아닐 수 있다, 멘션하라"고 답했다. 이 값들은 수신 라우팅에서 이미 쓰였고 모델 판단에 필요 없다. 게시 서버 쪽 변경이라 작업자 배포와 무관하게 바로 적용된다.
-- 봇 항목은 같은 대화·owner의 **chat 결과 중 Discord 게시가 확정된(sent) 본문**만이다. 현재 입력보다 먼저 게시된 것만 넣는다(owner 메시지 ID와 게시 메시지 ID, 둘 다 snowflake로 비교. 불확실하면 뺀다). 일부 페이지만 sent면 `partial`. read·task·실패 안내·제어·스레드·경보는 넣지 않는다.
+- 봇 항목은 같은 대화·owner의 **chat 결과 중 Discord 게시가 확정된(sent) 본문**만이다. 현재 입력보다 먼저 게시된 것만 넣는다(owner 메시지 ID와 게시 메시지 ID, 둘 다 snowflake로 비교. 불확실하면 뺀다). 일부 페이지만 sent면 `partial`. read·task·실패 안내·제어·스레드·경보는 넣지 않는다. 보존 기간(7일)이 지나 비운 owner 메시지는 빼고, 본문을 비운 봇 페이지는 빠진 페이지로 본다(모두 비웠으면 그 답을 뺀다, T31).
 - 전체 20개(작업자 스키마 상한)·배열 JSON 32KiB(라벨 포함). 현재 owner 메시지는 항상 마지막, 다음은 직전 봇 답, 나머지는 최신부터 채우고 처음 넘치는 곳에서 멈춘다. 넘치는 봇 답은 앞 페이지만 `partial`로 넣는다.
 - **받아들인 예외:** 현재 메시지 하나가 32KiB를 넘으면(입력 8000자 상한 안에서 제어 문자 등 JSON 이스케이프가 큰 극단 입력, 최대 약 48KB) 그것만 넣는다. 작업자 본문 상한 64KiB 안이고, 이전 코드는 이때 빈 문맥을 보냈다.
 - **작업자 프롬프트:** `chatPrompt`(`src/chat-lane.ts`, 실행기 전환이 `src/codex-chat.ts`에서 옮김)가 이 배열을 "owner(`from:'owner'`) 메시지와 봇이 이미 게시한 답(`from:'bot'`, `partial`이면 일부)"으로 설명한다. 작업자는 사람 배포라 sandbox 이미지를 바꾸기 전까지 옛 작업자는 같은 배열을 "owner 메시지 기록"이라 부른다(항목의 `from`이 스스로 설명해 받아들인 전환기). 되돌리려면 `Store.context()`만 owner 전용으로 바꾸면 된다(DB 변경 없음).
@@ -1936,6 +1949,6 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 
 **배포 관측.** 병합을 읽으면 `change_deployment_windows`에 창 시작을 먼저 남긴다. `recordDeployment`가 `observed_at`을 덮어써 그 값으로는 재시작 뒤 창을 잴 수 없다. 60초마다 관측하고, `settled`면 멈추고, 10분 창이 지나면 `late_reported_at`을 적고 멈춰 마지막 관측을 알린다. 익명 GitHub 한도(IP당 시간 60회) 때문에 `proposed`의 병합 읽기는 5분 간격이다.
 
-**비공개 저장과 보존.** migration 018은 additive다. `change_review_findings`(리뷰 원문), `change_deployment_windows`, `change_artifacts.purged_at`을 더한다. `purgeExpiredChangeContent`가 시간마다 끝 상태 뒤 7일이 지난 건의 `change_artifact_files`, `change_artifacts.patch`, 리뷰 원문을 지운다. receipt·digest·manifest·effect는 남는다. 진행 중이거나, 미확정 effect·살아 있는 자식 job·정리 안 끝난 세션이 있는 건은 고르지 않는다. 트리거는 artifact에 "아직 비우지 않은 행의 patch를 빈 값으로 만들고 시각을 적는" 변경만 받는다. 요청 원문과 추가 답변(`change_request_inputs.text`)도 같은 건·같은 기준 시각으로 같은 트랜잭션에서 빈 값으로 두고 `purged_at`을 적는다(migration 019, T27). `text_sha256`·label·event_id는 남는다. 이 SQL은 `ChangePrivateInputs`의 정적 함수(`HELD`·`purgeIn`·`purgedIn`)에 있어 원문 표를 만지는 코드가 그 클래스와 공용 INSERT뿐이다. 새 generation의 접수는 요청 원문을 다시 읽으므로, 원문을 지운 superseded 건은 `startNextGeneration`이 `input_purged`로 거절하고 `/change` 새 요청을 안내한다. `retention()`은 한 바퀴에 20건씩 최대 20번 골라 복원 직후 밀린 건도 한 주기 안에 지운다.
+**비공개 저장과 보존.** migration 018은 additive다. `change_review_findings`(리뷰 원문), `change_deployment_windows`, `change_artifacts.purged_at`을 더한다. `purgeExpiredChangeContent`가 시간마다 끝 상태 뒤 7일이 지난 건의 `change_artifact_files`, `change_artifacts.patch`, 리뷰 원문을 지운다. receipt·digest·manifest·effect는 남는다. 진행 중이거나, 미확정 effect·살아 있는 자식 job·정리 안 끝난 세션이 있는 건은 고르지 않는다. 트리거는 artifact에 "아직 비우지 않은 행의 patch를 빈 값으로 만들고 시각을 적는" 변경만 받는다. 요청 원문과 추가 답변(`change_request_inputs.text`)도 같은 건·같은 기준 시각으로 같은 트랜잭션에서 빈 값으로 두고 `purged_at`을 적는다(migration 019, T27). `text_sha256`·label·event_id는 남는다. 이 SQL은 `ChangePrivateInputs`의 정적 함수(`HELD`·`purgeIn`·`purgedIn`)에 있어 원문 표를 만지는 코드가 그 클래스와 공용 INSERT뿐이다. 새 generation의 접수는 요청 원문을 다시 읽으므로, 원문을 지운 superseded 건은 `startNextGeneration`이 `input_purged`로 거절하고 `/change` 새 요청을 안내한다. 같은 트랜잭션에서 `change_requests.brief`의 summary·goal·acceptanceCriteria도 빈 값으로 두고 `brief_purged_at`을 적는다(migration 020, T31). brief는 admission CHECK·`brief_digest` 불변 트리거·짝 CHECK 때문에 NULL로 둘 수 없어 세 칸만 비우고, 경로·명령·label과 원래 brief의 `brief_digest`는 남는다. brief를 읽는 경로는 모두 진행 단계다. `change_retention`은 `purgeExpiredChangeContentRounds`로 한 바퀴에 20건씩 최대 20번 골라 복원 직후 밀린 건도 한 주기 안에 지운다.
 
 **되돌리기.** 스위치를 끄면 새 접수와 루프만 멈춘다. 남은 작성 세션은 lease 만료 뒤 unknown으로 레인을 닫으므로 `/task-release`로 해제한다. `HttpTaskV2Worker`를 스위치와 무관하게 브리지에 넘겨 두는 이유다. 미확정 effect는 스위치를 켜야 대조가 돈다. `change` 절을 모르는 옛 게시 서버로 되돌릴 때는 정책 키를 먼저 뺀다.
