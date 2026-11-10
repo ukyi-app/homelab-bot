@@ -442,7 +442,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
   // risk는 응답의 질문·요약이 공개 검사에 걸린 사유다. 질문이면 행·게시 큐를 지나지 않고 실패로, 요약이면 그 줄만 고정 문구로 바꾼다.
   private async settle(job: Job, request: TaskRequest, revision: string, turn: Turn, facts: Facts, stop: Stop | undefined, usedMs: number,
     risk: TaskOutputRisk | null = null): Promise<Settled> {
-    return this.store.atomic(async (store): Promise<Settled> => {
+    const settled = await this.store.atomic(async (store): Promise<Settled> => {
       await store.lockTaskControl(job.conversation_id);
       const row = (await store.db.query<{ state: string; lease_token: string; lease_until: string }>(
         'SELECT state,lease_token,lease_until FROM jobs WHERE id=$1 FOR UPDATE', [job.id])).rows[0]!;
@@ -549,6 +549,13 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       if (SETTLEABLE.has(after.state)) return skipped('succeeded');
       return applied(after.state === 'succeeded' ? 'completed' : 'cancelled', true);
     });
+    // 대기가 아닌 응답(완료·질문·실패)에 실린 한도 경고도 계정 기록에 남긴다(리뷰 미루기). 대기 응답은 waitForUser가 이미 남겼다.
+    // 트랜잭션 안에서 기록이 실패하면 턴 확정 전체가 깨지므로 밖에서 부르고, 실패는 로그만 남긴다.
+    const response = turn.kind === 'response' ? turn.response : undefined;
+    if (response && 'rateLimit' in response && response.rateLimit && response.status !== 'limited' && response.status !== 'auth_expired') {
+      await this.store.observeRateLimit(response.rateLimit).catch(error => { this.options.log('task_rate_limit_record_failed', { job: job.id, ...errorInfo(error) }); });
+    }
+    return settled;
   }
   // Runtime.tickTask가 claim 전에 부른다. 작업자 호출 실패는 이 바퀴를 깨지 않고 다음 sweep이 다시 시도한다.
   async sweep(): Promise<number> {
