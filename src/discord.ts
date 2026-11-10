@@ -7,6 +7,7 @@ import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
 import { PUBLISH_TEXT } from './change-commands.js';
 import type { ChangeCommand, ChangeCommandHandler } from './change-commands.js';
+import { SESSION_KEY_TEXT } from './external-task-commands.js';
 import type { ExternalTaskCommand, ExternalTaskCommandHandler } from './external-task-commands.js';
 import { MEMORY_GUIDE } from './memory-commands.js';
 import type { MemoryCommand, MemoryCommandHandler } from './memory-commands.js';
@@ -78,6 +79,7 @@ export class DiscordIngress {
     if (event.bot || event.webhook) return;
     if (event.kind === 'button' && buttonRoute(event.command) === 'proposal') return this.proposalButton(event, recovered);
     if (event.kind === 'button' && buttonRoute(event.command) === 'publish') return this.publishButton(event, recovered);
+    if (event.kind === 'button' && buttonRoute(event.command) === 'session-key') return this.sessionKeyButton(event, recovered);
     // 이 단계에서 열지 않은 명령·버튼은 저장·권한 확인 전에 닫는다(task·review-*는 FOUNDATION 밖).
     if (event.kind !== 'message' && !this.commands.has(event.command ?? '')) throw new Denied();
     if (event.kind !== 'message' && taskControls.has(event.command ?? '') && !this.tasks) throw new Denied();
@@ -288,6 +290,29 @@ export class DiscordIngress {
     }
     this.log('change_command', { command: event.command!, outcome: reply.outcome });
     await this.acknowledge(event, saved.id, reply.content, { revision: p.revision, notice: CHANGE_ACK_NOTICE, ...('update' in reply && reply.update ? { update: true } : {}) });
+    return saved.id;
+  }
+  // 세션 연결 "키 보기". 키가 든 응답은 연결 명령과 같은 deliverPrivate(본인만 보는 새 메시지)로만 나가고, 버튼 글은 바꾸지 않는다.
+  // 동료 기능 스위치나 R08 처리기가 없으면 그 버튼을 만들지 않으므로 받지도 않는다. 버튼 이벤트에는 제안 ID만 남는다.
+  private async sessionKeyButton(event: z.infer<typeof EventSchema>, recovered: boolean): Promise<string | undefined> {
+    if (recovered || !this.store.colleague || !this.external?.showKey || !event.target) throw new Denied();
+    const p = await this.gate.authorize(event.actor, event.scope);
+    const conversation = await this.store.conversation(event.scope);
+    if (!conversation || (event.scope.kind !== 'channel' && conversation.owner_id !== event.actor)) throw new Denied();
+    const started = this.store.now();
+    const saved = await this.store.save({ ...event, text: '' }, p.revision, false);
+    if (this.store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
+    if (!await this.claimOnce(event, saved.id, started)) return saved.id;
+    let reply;
+    try {
+      reply = await this.external.showKey({ store: this.store, actor: event.actor, scope: event.scope, proposal: event.target,
+        deadline: { expiresAt: started + DEFAULTS.inboxTimeoutMs, now: this.store.now } }, content => this.deliverPrivate(event, saved.id, content));
+    } catch (error) {
+      this.log('session_key_failed', errorInfo(error));
+      reply = { content: SESSION_KEY_TEXT.failed, outcome: 'error' };
+    }
+    this.log('session_key_button', { outcome: reply.outcome });
+    if (reply.content !== undefined) await this.acknowledge(event, saved.id, reply.content, { revision: p.revision, notice: SESSION_KEY_TEXT.ackLost });
     return saved.id;
   }
   // 기억 명령. 구독·gap·작업 큐를 거치지 않고 받은 자리에서 한 번 처리한 뒤 상호작용 응답으로 답한다.

@@ -18,7 +18,8 @@ export interface TaskLane { run(job: Job): Promise<void>; sweep?(): Promise<unkn
 // cancel은 드레인 기한에 바로 나가므로 DB 지연은 cancel이 아니라 그 뒤의 상태 확정만 늦춘다.
 // taskLoop: 작업 레인을 tickTask 루프로 따로 돌린다. tick은 대화만 집어 긴 작업이 대화를 기다리게 하지 않는다.
 // 끄면(기본) tick 하나가 모든 모델 job을 슬롯 하나로 처리한다.
-export interface RuntimeOptions { shutdown?: AbortSignal; drainMs?: number; log?: Log; taskLoop?: boolean }
+// externalTask: R08 연결 명령을 조립했는가. 켜졌을 때만 세션 연결 제안을 받는다(키 보기 버튼을 받을 곳이 없다).
+export interface RuntimeOptions { shutdown?: AbortSignal; drainMs?: number; log?: Log; taskLoop?: boolean; externalTask?: boolean }
 export const DRAIN_MS = 10_000;
 // 멈춤이 확인된 뒤의 상태 쓰기 시도 횟수. 간격은 200ms, 400ms로 짧게 둔다(종료 기한 안에 들어가야 한다).
 export const STOPPED_WRITE_ATTEMPTS = 3;
@@ -39,7 +40,7 @@ export class Runtime {
     this.taskLoop = options.taskLoop ?? false;
     this.reads = new ReadRuntime(store, gate, reader, options.shutdown);
     // 작업 레인을 연결했을 때만 작업 시작 제안을 받는다(버튼을 눌러도 접수할 곳이 없다).
-    this.proposals = new ProposalDesk(store, gate, tasks !== undefined);
+    this.proposals = new ProposalDesk(store, gate, tasks !== undefined, options.externalTask === true);
   }
   // read 레인 한 바퀴. 모델 tick과 다른 루프에서 부른다.
   tickRead(): Promise<boolean> { return this.reads.tick(); }

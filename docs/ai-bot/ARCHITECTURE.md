@@ -1538,6 +1538,14 @@ Grafana/K8s/Argo CD의 실제 응답을 `ReadTransport`의 제한된 observation
 - 전달에 실패하면(상호작용 만료, 전송 실패, 일시 정지, 권한 변경) `revoke(...,'delivery_failed')`로 닫고 고정 안내만 남긴다. 키 글은 다시 보내지 않는다. 폐기까지 실패하면 `/detach`를 안내하고 `external_task_revoke_failed`를 남긴다.
 - events에는 세션 ID(`target`)만 남고 `text`는 비운다.
 - **남는 틈.** `attach` 커밋과 응답 사이에 프로세스가 죽으면 아무도 키를 모르는 활성 연결이 남는다. 쓰이지 않는 키라 위험은 없고, 다시 `/attach`하면 "이미 연결"로 답해 `/detach`를 안내한다.
+- **버튼 경로(C15, 동료 기능 스위치 켜짐).** 말로 한 세션 연결은 제안 동작 표의 `attach` 줄(`sessionAttachHandler`, `src/session-key-proposal.ts`. R08 명령 모듈은 제안 코드를 import하지 않는 경계 시험이 있어 따로 둔다)이 받는다. R08 스위치가 꺼져 있으면(`Runtime` 옵션 `externalTask`, 조립은 `!!config.externalTask`) 제안을 버린다(`target_denied`). 모델은 세션 ID(`target`)와 '/attach'의 text 꼴(`content`: `claude`·`codex`, 동의하면 뒤에 `summary=on`)만 고르고, 확인 글에 세션 ID·실행기·요약 동의가 그대로 보인다(공개 검사에 걸리면 세션 ID 없는 `SESSION_KEY_TEXT.questionWithheld`).
+  - **"할게요"는 대상만 확정한다.** 제안을 `confirmed`(사유 `key_pending`)로 끝내고 확인 글을 결과 한 줄로 바꾼 뒤, 같은 트랜잭션에서 "키 보기" 버튼 글(outbox 키 `session-key:<제안 ID>`, custom_id `session-key:<제안 ID>`)을 게시 큐에 넣는다. 이 단계에는 연결도 키도 없다. 끝 상태가 되면 제안 행의 `value`가 비워지므로 세션 ID·실행기·동의는 `target` 한 칸(JSON `[세션 ID, 실행기, 동의]`, 서버가 형식을 대조한 값)에 둔다.
+  - **키는 "키 보기" 상호작용 안에서만 태어난다.** `DiscordIngress.sessionKeyButton` → `ExternalTaskCommands.showKey`가 대화 행 → 제안 행 순서로 잠그고 이 대화의 `attach` 제안인지, 누른 사람이 owner인지, 아직 보지 않았는지(`key_pending`), 만료(24시간) 전인지, 구독이 켜져 있는지 본 뒤 사유를 `key_shown`으로 바꾸는 조건부 UPDATE 한 번으로 표시를 잡고 커밋한다. 그다음 `attach`로 연결을 만들고 `seedMessage`를 `deliverPrivate`로 보낸다. 버튼 상호작용의 응답은 새 메시지(callback type 4) + EPHEMERAL이고 버튼 글을 바꾸지 않는다(type 7 아님). 키를 상호작용 사이에 보관하지 않으므로 seed가 DB·outbox·감사·로그에 들어갈 자리가 없다.
+  - **두 번째 누름**은 표시가 이미 `key_shown`이라 `SESSION_KEY_TEXT.shown`만 본인에게 답하고 연결·키를 다시 만들지 않는다. 버튼 글의 버튼은 남는다(키 응답이 본인만 보는 새 메시지라 같은 응답으로 버튼 글을 바꿀 수 없다).
+  - **전달 실패**(상호작용 만료, 전송 실패, 일시 정지, 권한 변경)는 '/attach'와 같은 `revoke(...,'delivery_failed')`와 `external_task_revoke_failed` 규칙이고, 안내는 '/' 이름 없는 `SESSION_KEY_TEXT` 판이다. 실패한 뒤 다시 눌러도 표시가 잡혀 있어 키를 다시 만들지 않는다. 다시 연결하려면 말로 다시 부탁한다.
+  - **검사에 걸린 누름**(만료·구독 꺼짐·다른 대화)은 표시를 잡지 않는다. 원인을 고친 뒤 같은 버튼을 다시 누를 수 있다.
+  - **남는 틈.** 표시를 잡은 커밋과 `attach`·응답 사이에 프로세스가 죽거나 `attach`가 일시 오류로 실패하면 그 버튼으로는 키를 볼 수 없다(키를 다시 만들지 않는 쪽을 골랐다). 말로 다시 연결을 부탁하면 된다. `attach` 뒤에 죽으면 '/attach'의 남는 틈과 같다.
+  - **스위치 꺼짐.** 동료 기능 스위치나 R08 처리기가 없으면 수신이 `session-key` 버튼을 저장 전에 `Denied`로 닫는다. '/attach'는 그대로다.
 
 **켜는 순서.** 스위치는 **기본 꺼짐으로 병합한다.**
 
