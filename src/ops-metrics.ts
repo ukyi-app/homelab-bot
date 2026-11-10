@@ -48,18 +48,30 @@ const QUERY = `
   UNION ALL SELECT 'outbox', state, '', count(*)::text FROM outbox WHERE state = ANY($2::text[]) GROUP BY state
   UNION ALL SELECT 'gap', '', '', count(*)::text FROM conversations WHERE gap = true
   UNION ALL SELECT 'control', key, value::text, '0' FROM controls WHERE key IN ('scheduler', 'scheduler_emergency')
-  UNION ALL SELECT 'deletion', '', COALESCE(min(requested_at)::text, ''), count(*)::text FROM memory_deletions WHERE applied_at IS NULL`;
+  UNION ALL SELECT 'deletion', '', COALESCE(min(requested_at)::text, ''), count(*)::text FROM memory_deletions WHERE applied_at IS NULL
+  UNION ALL SELECT 'pause', kind, COALESCE(max(resets_at)::text, ''), count(*)::text FROM (
+    SELECT COALESCE(p.kind, CASE WHEN j.wait_reason='auth_expired' THEN 'auth_expired' ELSE 'rate_limit' END) AS kind, p.resets_at
+    FROM jobs j LEFT JOIN model_pauses p ON p.job_id=j.id WHERE j.state='waiting_user' AND j.wait_reason IN ('model_limit','auth_expired')) w GROUP BY kind
+  UNION ALL SELECT 'deferred', '', '', count(*)::text FROM jobs j WHERE j.type='review' AND j.state='queued'
+    AND EXISTS (SELECT 1 FROM model_limit_state s WHERE s.id='account' AND s.review_deferred_until > $3)
+    AND NOT EXISTS (SELECT 1 FROM change_child_jobs c WHERE c.job_id=j.id AND c.role='review')`;
+
+// 모델 멈춤(COLLEAGUE_SPEC §4.7 "운영 알림", C19 model_pauses). 종류는 model_pauses.kind의 CHECK 목록과 같다.
+export const MODEL_PAUSE_KINDS = ['rate_limit', 'auth_expired', 'billing'] as const;
 
 // 삭제 대기는 DB의 정리 안 끝난 삭제 요청(memory_deletions.applied_at IS NULL)이다. 원장 기록 전(ledger_unconfirmed)과
 // 원장 기록 뒤 DB 정리 전(db_purge_pending)을 함께 센다. 복원으로 요청 행이 사라진 원장 재적용 대기는 여기 없다(원장 상태로 본다).
 export async function opsMetrics(db: Database, now: number, memory: MemoryMetrics = MEMORY_DISABLED, task?: TaskLaneMetrics,
   gateClosed: TaskGateClosedReason | null = null): Promise<string> {
-  const rows = (await db.query<{ kind: string; a: string; b: string; n: string }>(QUERY, [OPEN_STATES, OUTBOX_STATES])).rows;
+  const rows = (await db.query<{ kind: string; a: string; b: string; n: string }>(QUERY, [OPEN_STATES, OUTBOX_STATES, now])).rows;
   const jobs = new Map<string, number>();
   const outbox = new Map<string, number>();
-  let gaps = 0, paused = 0, emergency = 0, deletions = 0, oldest = 0;
+  const pauses = new Map<string, { jobs: number; resetsAt: number }>();
+  let gaps = 0, paused = 0, emergency = 0, deletions = 0, oldest = 0, deferred = 0;
   for (const row of rows) {
     if (row.kind === 'job') jobs.set(`${row.a}/${row.b}`, Number(row.n));
+    else if (row.kind === 'pause') pauses.set(row.a, { jobs: Number(row.n), resetsAt: row.b ? Math.floor(Number(row.b) / 1000) : 0 });
+    else if (row.kind === 'deferred') deferred = Number(row.n);
     else if (row.kind === 'deletion') { deletions = Number(row.n); oldest = row.b ? Math.max(0, (now - Number(row.b)) / 1000) : 0; }
     else if (row.kind === 'outbox') outbox.set(row.a, Number(row.n));
     else if (row.kind === 'gap') gaps = Number(row.n);
@@ -78,6 +90,14 @@ export async function opsMetrics(db: Database, now: number, memory: MemoryMetric
     `homelab_bot_memory_deletion_pending_oldest_seconds ${oldest}`,
     `homelab_bot_briefing_enabled ${memory.briefingEnabled ? 1 : 0}`,
     ...TASK_GATE_CLOSED_REASONS.map(reason => `homelab_bot_task_gate_closed{reason="${reason}"} ${gateClosed === reason ? 1 : 0}`),
+    // 풀리는 시각은 그 종류의 대기 중 가장 늦은 것(Unix 초)이고, 모르면(인증 만료·결제, 시각 없는 한도) 0이다.
+    // 계열을 없애지 않고 0으로 두는 것은 경보 룰이 이 값을 경보 값으로 쓰기 때문이다(멈춤 여부는 paused_jobs로 가른다).
+    ...MODEL_PAUSE_KINDS.map(kind => `homelab_bot_model_paused_jobs{kind="${kind}"} ${pauses.get(kind)?.jobs ?? 0}`),
+    ...MODEL_PAUSE_KINDS.map(kind => `homelab_bot_model_pause_resets_at_seconds{kind="${kind}"} ${pauses.get(kind)?.resetsAt ?? 0}`),
+    // 지금 계정. 계정 기록은 C22가 만든다. 그 전에는 계정 라벨 없이 method="none"이다. C22는 이 줄에 account(CLI 이름 규칙을
+    // 통과한 짧은 이름)와 method(subscription·api)를 채운다. 라벨 값이 바뀌면 옛 계열은 수집 staleness(5분)로 사라진다.
+    'homelab_bot_model_account{method="none"} 1',
+    `homelab_bot_model_reviews_deferred ${deferred}`,
     ...(task ? await taskLaneLines(db, task) : []),
   ];
   return `${lines.join('\n')}\n`;
