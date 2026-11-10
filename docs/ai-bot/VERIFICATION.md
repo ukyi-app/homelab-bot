@@ -2317,6 +2317,6 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 | '/' 관리 명령 유지 | `admin-cli` "'/resume-model'은 그대로 owner·대화를 대조해 같은 작업을 재개한다", "'/' 관리 명령은 그대로 동작하고 관리 기능과 같은 상태를 본다"; 기존 `task-bridge`·`codex-bridge` '/task-release' 시험과 `revoke-dispatch`·`revoke-dispatch-pg` '/revoke' 시험 그대로 통과 |
 | 다른 동작은 정책·작업자 설정을 읽지 않음 | "관리 진입점 실행: 차단은 env 정책의 revision으로 거부 행을 더하고, 다른 동작은 정책·작업자 설정을 읽지 않는다" |
 
-- **실행:** 아래 "C32 실행 결과" 줄에 적는다.
+- **실행(bca04fe, origin/main a3d0a7b 반영, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 11개 파일(`admin-cli`·`task-bridge`·`codex-bridge`·`revoke-dispatch`·`revoke-dispatch-pg`·`task-lane-pg`·`publisher-policy`·`foundation`·`change-assembly`·`task-cancel-notice`·`task-settle-log`) → 436/436 통과, skip 0.
 - **시험하지 않은 것:** `queue_full`(큐 90건을 채우는 준비가 커 시험하지 않았다. 조건은 '/resume-model'과 같은 `queueFull('chat')`). 진입점 `main()`의 실제 pg 풀과 게시 서버 env 전체로 만든 HTTP 작업자는 S5.
 - **못 잡는 범위.** 운영 클러스터 권한, 실제 작업자 프로세스의 소멸 확인, homelab CLI가 새 결과 이름을 받는지(S3, homelab 쪽 `BOT_RESULTS`), 운영 1회(S5, 주 진행자).
