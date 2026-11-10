@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import { PGlite } from '@electric-sql/pglite';
 import {
-  CHANGE_PHASES, EFFECT_STAGES, EFFECT_STATES, UNKNOWN_RECONCILE_MS, approvalDigest, canTransition, canTransitionEffect, changeBranchName, gitBlobSha, sha256Hex,
+  CHANGE_PHASES, CHANGE_SELF_FIX, EFFECT_STAGES, EFFECT_STATES, UNKNOWN_RECONCILE_MS, approvalDigest, canTransition, canTransitionEffect, changeBranchName, gitBlobSha, sha256Hex,
 } from '../src/change-contracts.js';
 import type { ChangePhase, EffectExpected, EffectStage, EffectState } from '../src/change-contracts.js';
 import { ChangePrivateInputs, ChangeStore } from '../src/change-store.js';
@@ -797,7 +797,7 @@ test('T19 B0 migration: 016 DB에 017만 더하고 기존 표·제약·행을 �
   try {
     const db = migrationDatabase(pg);
     const upTo016 = MIGRATIONS.filter(file => Number.parseInt(file, 10) <= 16);
-    assert.equal(upTo016.length, MIGRATIONS.length - 6);
+    assert.equal(upTo016.length, MIGRATIONS.length - 7);
     for (const file of upTo016) await pg.exec(await readFile(`migrations/${file}`, 'utf8'));
     await seedConversation(db);
     await insertChildJob(db, 'existing-job', 'task');
@@ -805,7 +805,7 @@ test('T19 B0 migration: 016 DB에 017만 더하고 기존 표·제약·행을 �
     const constraints = await constraintsOf(db);
     const jobs = JSON.stringify((await db.query('SELECT * FROM jobs')).rows);
 
-    assert.deepEqual(await migrate(db), [17, 18, 19, 20, 21, 22]);
+    assert.deepEqual(await migrate(db), [17, 18, 19, 20, 21, 22, 23]);
     assert.equal(await schemaOf(db), schema);
     const added = (await db.query<{ table_name: string; column_name: string; is_nullable: string; column_default: string | null }>(`SELECT table_name,column_name,is_nullable,column_default
       FROM information_schema.columns WHERE ${OLD_TABLES} AND NOT (${T27_COLUMNS}) ORDER BY table_name,column_name`)).rows;
@@ -843,5 +843,117 @@ test('T19 B0 phase 표의 모든 끝 상태와 단계가 CHECK에 있어 코드�
     for (const phase of CHANGE_PHASES as readonly ChangePhase[]) assert.ok(definition.includes(`'${phase}'`), phase);
     const effect = (await s.db.query<{ d: string }>(`SELECT pg_get_constraintdef(oid) AS d FROM pg_constraint WHERE conname='change_delivery_effects_state_check'`)).rows[0]!.d;
     for (const state of EFFECT_STATES as readonly EffectState[]) assert.ok(effect.includes(`'${state}'`), state);
+  } finally { await s.close(); }
+});
+
+// ---- C31 게시 전 자체 리뷰 고치기 ----
+
+const BLOCKING = [{ priority: 'P0' as const, category: 'correctness' as const, code: 'logic_error' }];
+// 그 차례의 리뷰 job을 묶고 receipt를 남긴다. job은 묶는 때의 차례에 속한다.
+async function reviewRound(s: Awaited<ReturnType<typeof setup>>, key: { changeId: string; generation: number }, name: string, verdict: 'blocked' | 'pass') {
+  const jobId = `fixture-review-${key.changeId}-${name}`;
+  await insertChildJob(s.db, jobId);
+  ok(await s.store.linkChildJob({ ...key, jobId, role: 'review' }));
+  const bundle = ok(await s.store.evidenceBundle(key));
+  const receipt = fixtureReview({ bundle, jobId, ...(verdict === 'blocked' ? { verdict: 'blocked', risks: BLOCKING } : {}) });
+  return { jobId, receiptDigest: ok(await s.store.recordReview({ ...key, receipt })).receiptDigest };
+}
+// 고치기 차례의 작성 결과를 다시 저장하고 시험을 통과시켜 reviewing으로 돌린다.
+async function refill(s: Awaited<ReturnType<typeof setup>>, key: { changeId: string; generation: number }, runId: string) {
+  ok(await s.store.recordSnapshot({ ...key, manifest: fixtureManifest(), files: fixtureManifestFiles(), patch: fixturePatch(), transportBytes: 4096 }));
+  ok(await s.store.startVerification({ ...key, verifierRevision: 'fixture-verifier-1' }));
+  ok(await s.store.recordVerification({ ...key, receipt: fixtureVerification({ bundle: fixtureBundle(), runId }) }));
+  ok(await s.store.finishVerification(key));
+}
+
+test('C31 고치기 차례: 막힌 리뷰를 차례 기록으로 옮기고 같은 generation의 authoring으로 돌아간다. 브랜치·base는 그대로다', async () => {
+  const s = await setup();
+  try {
+    const r = await driveTo(s.store, 'reviewing');
+    const key = { changeId: r.id, generation: 1 };
+    const before = ok(await s.store.generationRecord(key));
+    const first = await reviewRound(s, key, 'r0', 'blocked');
+    assert.deepEqual(ok(await s.store.startSelfFix({ ...key, reviewJobId: first.jobId })), { round: 1 });
+    const request = ok(await s.store.get(r.id));
+    assert.deepEqual([request.phase, request.generation], ['authoring', 1]);
+    const after = ok(await s.store.generationRecord(key));
+    assert.deepEqual([after.branch, after.baseCommit, after.baseTree, after.fixRound], [before.branch, before.baseCommit, before.baseTree, 1]);
+    assert.deepEqual([after.resultTree, after.artifactDigest, after.verifierRevision], [null, null, null]);
+    // 이전 차례의 증거는 살아 있는 자리에서 빠져 승인·리뷰 입력이 될 수 없다.
+    failure(await s.store.evidenceBundle(key), 'not_found');
+    failure(await s.store.loadArtifact(key), 'not_found');
+    assert.equal(await count(s.db, 'change_verifications WHERE change_id=$1', [r.id]), 0);
+    assert.equal(await count(s.db, 'change_reviews WHERE change_id=$1', [r.id]), 0);
+    const rounds = await s.store.selfFixRounds(key);
+    assert.deepEqual(rounds.map(round => [round.round, round.reviewJobId, round.reviewReceiptDigest, round.artifactDigest]),
+      [[1, first.jobId, first.receiptDigest, fixtureBundle().artifactDigest]]);
+    assert.equal(rounds[0]!.reviewReceipt.verdict, 'blocked');
+    assert.equal(rounds[0]!.verifications.length, 1);
+    assert.equal(await count(s.db, `audit WHERE subject=$1 AND kind='change_self_fix'`, [r.id]), 1);
+  } finally { await s.close(); }
+});
+
+test('C31 고치기 차례: 승인 digest는 마지막 차례의 리뷰·시험 receipt로만 만들어진다. 앞 차례 리뷰 job은 새 차례에 쓰지 못한다', async () => {
+  const s = await setup();
+  try {
+    const r = await driveTo(s.store, 'reviewing');
+    const key = { changeId: r.id, generation: 1 };
+    const first = await reviewRound(s, key, 'r0', 'blocked');
+    const firstVerification = (await s.db.query<{ receipt_digest: string }>('SELECT receipt_digest FROM change_verifications WHERE change_id=$1', [r.id])).rows[0]!.receipt_digest;
+    ok(await s.store.startSelfFix({ ...key, reviewJobId: first.jobId }));
+    await refill(s, key, 'fixture-run-2');
+    const stale = fixtureReview({ bundle: ok(await s.store.evidenceBundle(key)), jobId: first.jobId });
+    failure(await s.store.recordReview({ ...key, receipt: stale }), 'job_not_linked');
+    const last = await reviewRound(s, key, 'r1', 'pass');
+    const { subject } = ok(await s.store.prepareApproval({ ...key, publication: fixtureMetadata(), ciFingerprint: hex('ci') }));
+    assert.equal(subject.review.receiptDigest, last.receiptDigest);
+    assert.notEqual(subject.review.receiptDigest, first.receiptDigest);
+    assert.equal(subject.verifications.length, 1);
+    assert.notEqual(subject.verifications[0]!.receiptDigest, firstVerification);
+  } finally { await s.close(); }
+});
+
+test('C31 고치기 상한: 2번 고친 뒤에는 더 열지 않고, 막히지 않은 리뷰·돌고 있는 자식·다른 단계에서는 열지 않는다', async () => {
+  const s = await setup();
+  try {
+    const r = await driveTo(s.store, 'reviewing');
+    const key = { changeId: r.id, generation: 1 };
+    const passing = await reviewRound(s, key, 'r0', 'pass');
+    failure(await s.store.startSelfFix({ ...key, reviewJobId: passing.jobId }), 'review_not_blocked');
+
+    const other = await driveTo(s.store, 'reviewing');
+    const otherKey = { changeId: other.id, generation: 1 };
+    failure(await s.store.startSelfFix({ ...otherKey, reviewJobId: 'missing' }), 'review_not_blocked');
+    const running = await reviewRound(s, otherKey, 'r0', 'blocked');
+    await s.db.query(`UPDATE jobs SET state='running' WHERE id=$1`, [running.jobId]);
+    failure(await s.store.startSelfFix({ ...otherKey, reviewJobId: running.jobId }), 'children_active');
+    await s.db.query(`UPDATE jobs SET state='succeeded' WHERE id=$1`, [running.jobId]);
+    ok(await s.store.startSelfFix({ ...otherKey, reviewJobId: running.jobId }));
+    failure(await s.store.startSelfFix({ ...otherKey, reviewJobId: running.jobId }), 'phase_conflict');
+    await refill(s, otherKey, 'fixture-run-2');
+    const second = await reviewRound(s, otherKey, 'r1', 'blocked');
+    assert.deepEqual(ok(await s.store.startSelfFix({ ...otherKey, reviewJobId: second.jobId })), { round: 2 });
+    await refill(s, otherKey, 'fixture-run-3');
+    const third = await reviewRound(s, otherKey, 'r2', 'blocked');
+    failure(await s.store.startSelfFix({ ...otherKey, reviewJobId: third.jobId }), 'self_fix_limit');
+    assert.equal(ok(await s.store.get(other.id)).phase, 'reviewing');
+    assert.deepEqual((await s.store.selfFixRounds(otherKey)).map(round => round.round), [1, 2]);
+  } finally { await s.close(); }
+});
+
+test('C31 고치기 DB 방어: 코드를 거치지 않고 되돌리거나 증거를 지우거나 차례를 건너뛰지 못한다', async () => {
+  const s = await setup();
+  try {
+    const r = await driveTo(s.store, 'reviewing');
+    await reviewRound(s, { changeId: r.id, generation: 1 }, 'r0', 'blocked');
+    await rawError(s.db.query(`UPDATE change_requests SET phase='authoring' WHERE id=$1`, [r.id]), /self_fix_required/);
+    await rawError(s.db.query('DELETE FROM change_reviews WHERE change_id=$1', [r.id]), /change_evidence_immutable/);
+    await rawError(s.db.query('DELETE FROM change_verifications WHERE change_id=$1', [r.id]), /change_evidence_immutable/);
+    await rawError(s.db.query('UPDATE change_generations SET result_tree=NULL,artifact_digest=NULL WHERE change_id=$1', [r.id]), /change_generation_immutable/);
+    await rawError(s.db.query('UPDATE change_generations SET fix_round=3 WHERE change_id=$1', [r.id]), /fix_round|change_generation_immutable/);
+    // 코드 상한과 DB 상한이 같다.
+    const definition = (await s.db.query<{ d: string }>(`SELECT pg_get_constraintdef(oid) AS d FROM pg_constraint WHERE conname='change_generations_fix_round_check'`)).rows[0]!.d;
+    assert.ok(definition.includes(`<= ${CHANGE_SELF_FIX.maxRounds}`), definition);
+    assert.equal(ok(await s.store.get(r.id)).phase, 'reviewing');
   } finally { await s.close(); }
 });

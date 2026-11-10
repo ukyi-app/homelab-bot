@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
-  ARTIFACT_LIMITS, ApprovalSubjectSchema, ArtifactManifestSchema, CHANGE_ID, ChangeBriefSchema, DeploymentObservationSchema, EFFECT_LEASE_MS, EFFECT_STAGES,
+  ARTIFACT_LIMITS, ApprovalSubjectSchema, ArtifactManifestSchema, CHANGE_ID, CHANGE_SELF_FIX, ChangeBriefSchema, DeploymentObservationSchema, EFFECT_LEASE_MS, EFFECT_STAGES,
   EffectExpectedSchema, EffectResultSchema, EvidenceBundleSchema, GENERATION_RESTART, MAX_GENERATION, ReasonCodeSchema, ReviewReceiptSchema, RevisionSchema, UNKNOWN_RECONCILE_MS,
   VerificationReceiptSchema, approvalDigest, artifactDigest, briefDigest, canTransition, changeBranchName, effectResultMatches, evidenceBundleDigest, isTerminalPhase,
   labelAllowsAuthorInput, newChangeId, previousEffectStage, propagateLabel, raiseLabel, reviewReceiptDigest, sha256Hex, validateArtifactFiles, verificationReceiptDigest,
@@ -20,7 +20,8 @@ export type StoreFailureReason =
   | 'base_mismatch' | 'artifact_invalid' | 'artifact_too_large' | 'artifact_conflict' | 'bundle_mismatch' | 'command_not_allowed' | 'receipt_conflict' | 'verification_incomplete'
   | 'review_incomplete' | 'job_not_found' | 'job_not_linked' | 'job_already_linked' | 'digest_mismatch' | 'approval_missing' | 'unresolved_effects'
   | 'effect_conflict' | 'effect_not_due' | 'predecessor_unconfirmed' | 'branch_mismatch' | 'evidence_mismatch' | 'lease_mismatch' | 'result_mismatch'
-  | 'head_mismatch' | 'pull_mismatch' | 'deployment_conflict' | 'deployment_stale' | 'generation_limit' | 'input_purged' | 'guard_rejected' | 'busy';
+  | 'head_mismatch' | 'pull_mismatch' | 'deployment_conflict' | 'deployment_stale' | 'generation_limit' | 'input_purged' | 'guard_rejected' | 'busy'
+  | 'self_fix_limit' | 'review_not_blocked' | 'children_active';
 export interface StoreFailure {
   ok: false; reason: StoreFailureReason; detail?: string;
   current?: { phase: ChangePhase; generation: number };
@@ -40,6 +41,13 @@ export interface ChangeRequest {
 export interface GenerationRecord {
   changeId: string; generation: number; repoId: number; baseBranch: string; branch: string; baseCommit: string; baseTree: string; policyRevision: string;
   resultTree: string | null; artifactDigest: string | null; verifierRevision: string | null;
+  // 게시 전 고치기 차례 번호. 0은 처음 작성이다. 결과·묶음 칸은 늘 이 차례의 것이다.
+  fixRound: number;
+}
+// n번째 고치기 차례를 연 앞 차례의 막힌 리뷰와 증거 digest. 리뷰 자유문은 없다.
+export interface SelfFixRound {
+  round: number; reviewJobId: string; reviewReceipt: ReviewReceipt; reviewReceiptDigest: string; artifactDigest: string; resultTree: string; verifierRevision: string;
+  verifications: { commandId: string; status: string; receiptDigest: string }[]; createdAt: number;
 }
 export interface EffectRecord {
   changeId: string; generation: number; stage: EffectStage; state: EffectState; requestDigest: string; expected: EffectExpected; approvalDigest: string; attempt: number;
@@ -62,6 +70,7 @@ const generationRow = (row: Record<string, unknown>): GenerationRecord => ({
   changeId: row.change_id as string, generation: num(row.generation), repoId: num(row.repo_id), baseBranch: row.base_branch as string, branch: row.branch as string,
   baseCommit: row.base_commit as string, baseTree: row.base_tree as string, policyRevision: row.policy_revision as string,
   resultTree: row.result_tree as string | null, artifactDigest: row.artifact_digest as string | null, verifierRevision: row.verifier_revision as string | null,
+  fixRound: num(row.fix_round ?? 0),
 });
 const effectRow = (row: Record<string, unknown>): EffectRecord => ({
   changeId: row.change_id as string, generation: num(row.generation), stage: row.stage as EffectStage, state: row.state as EffectState,
@@ -383,7 +392,9 @@ export class ChangeStore {
       if (request.value.phase !== 'reviewing') return this.conflict(request.value);
       const bundle = await this.currentBundle(tx, input);
       if (!bundle || evidenceBundleDigest(bundle) !== evidenceBundleDigest(receipt.bundle)) return fail('bundle_mismatch');
-      const job = await tx.query(`SELECT 1 FROM change_child_jobs WHERE job_id=$1 AND change_id=$2 AND generation=$3 AND role='review'`, [receipt.jobId, input.changeId, input.generation]);
+      // 앞 고치기 차례의 리뷰 job은 지금 차례의 receipt를 남기지 못한다.
+      const job = await tx.query(`SELECT 1 FROM change_child_jobs c JOIN change_generations g ON g.change_id=c.change_id AND g.generation=c.generation
+        WHERE c.job_id=$1 AND c.change_id=$2 AND c.generation=$3 AND c.role='review' AND c.fix_round=g.fix_round`, [receipt.jobId, input.changeId, input.generation]);
       if (!job.rows.length) return fail('job_not_linked');
       const inserted = await tx.query(`INSERT INTO change_reviews(change_id,generation,job_id,session_id,instruction_revision,coverage,verdict,bundle_digest,receipt,receipt_digest,created_at)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING RETURNING job_id`,
@@ -391,6 +402,47 @@ export class ChangeStore {
       if (!inserted.rows.length) return fail('receipt_conflict', { detail: 'concurrent_receipt' });
       return success({ created: true, receiptDigest: digest });
     });
+  }
+
+  // reviewing → authoring. 같은 generation의 게시 전 고치기 차례를 연다. 막힌 리뷰와 그 증거의 digest를 차례 기록으로 옮기고
+  // 살아 있는 artifact·시험·리뷰와 묶음 결과 칸을 비운다. 그래서 다음 차례의 승인 대상은 새 증거로만 만들어진다. B·T0·브랜치는 그대로다.
+  // 어느 리뷰가 고칠 대상인지(P0·P1)는 호출자가 receipt로 정한다. 여기서는 막힌 완전한 리뷰인지와 상한만 본다.
+  async startSelfFix(input: ChangeKey & { reviewJobId: string }): Promise<StoreResult<{ round: number }>> {
+    return attempt<{ round: number }>(this.database, async tx => {
+      const locked = await this.lock(tx, input, 'reviewing');
+      if (!locked.ok) return locked;
+      const generation = generationRow((await tx.query<Record<string, unknown>>('SELECT * FROM change_generations WHERE change_id=$1 AND generation=$2 FOR UPDATE', [input.changeId, input.generation])).rows[0]!);
+      const review = (await tx.query<{ job_id: string; receipt: unknown; receipt_digest: string; coverage: string; verdict: string; invalidated_at: unknown }>(
+        'SELECT job_id,receipt,receipt_digest,coverage,verdict,invalidated_at FROM change_reviews WHERE change_id=$1 AND generation=$2', [input.changeId, input.generation])).rows[0];
+      if (!review || review.job_id !== input.reviewJobId || review.invalidated_at !== null || review.verdict !== 'blocked' || review.coverage !== 'complete') return fail('review_not_blocked');
+      if (generation.fixRound >= CHANGE_SELF_FIX.maxRounds) return fail('self_fix_limit');
+      // 앞 차례의 작성·리뷰 실행이 끝나야 한다. 작업자에 남은 결과를 정리하기 전에 새 작성 job을 열면 같은 차례에 결과가 둘이다.
+      const active = await tx.query(`SELECT 1 FROM change_child_jobs c JOIN jobs j ON j.id=c.job_id LEFT JOIN codex_sessions s ON s.job_id=c.job_id
+        WHERE c.change_id=$1 AND c.generation=$2 AND (j.state IN ('queued','running','verifying','cancel_requested','waiting_user','unknown')
+          OR s.state IN ('running','waiting_answer','waiting_model','unknown')) LIMIT 1`, [input.changeId, input.generation]);
+      if (active.rows.length) return fail('children_active');
+      const verifications = (await tx.query<{ command_id: string; status: string; receipt_digest: string }>(
+        'SELECT command_id,status,receipt_digest FROM change_verifications WHERE change_id=$1 AND generation=$2 ORDER BY command_id', [input.changeId, input.generation])).rows;
+      const round = generation.fixRound + 1;
+      const now = this.now();
+      await tx.query(`INSERT INTO change_fix_rounds(change_id,generation,fix_round,review_job_id,review_receipt,review_receipt_digest,artifact_digest,result_tree,verifier_revision,verifications,created_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, [input.changeId, input.generation, round, review.job_id, JSON.stringify(parseJson(review.receipt)), review.receipt_digest,
+        generation.artifactDigest, generation.resultTree, generation.verifierRevision,
+        JSON.stringify(verifications.map(row => ({ commandId: row.command_id, status: row.status, receiptDigest: row.receipt_digest }))), now]);
+      for (const table of ['change_reviews', 'change_verifications', 'change_artifact_files', 'change_artifacts']) {
+        await tx.query(`DELETE FROM ${table} WHERE change_id=$1 AND generation=$2`, [input.changeId, input.generation]);
+      }
+      await tx.query('UPDATE change_generations SET fix_round=$3,result_tree=NULL,artifact_digest=NULL,verifier_revision=NULL WHERE change_id=$1 AND generation=$2', [input.changeId, input.generation, round]);
+      await this.step(tx, locked.value, 'authoring', now);
+      await audit(tx, 'change_self_fix', input.changeId, { generation: input.generation, round, review: review.receipt_digest }, now);
+      return success({ round });
+    });
+  }
+  async selfFixRounds(key: ChangeKey): Promise<SelfFixRound[]> {
+    const rows = (await this.database.query<Record<string, unknown>>('SELECT * FROM change_fix_rounds WHERE change_id=$1 AND generation=$2 ORDER BY fix_round', [key.changeId, key.generation])).rows;
+    return rows.map(row => ({ round: num(row.fix_round), reviewJobId: row.review_job_id as string, reviewReceipt: ReviewReceiptSchema.parse(parseJson(row.review_receipt)),
+      reviewReceiptDigest: row.review_receipt_digest as string, artifactDigest: row.artifact_digest as string, resultTree: row.result_tree as string,
+      verifierRevision: row.verifier_revision as string, verifications: parseJson(row.verifications), createdAt: num(row.created_at) }));
   }
 
   // reviewing → awaiting_publish_approval. 승인 대상을 DB의 증거로 직접 만들어 호출자가 다른 묶음을 끼워 넣지 못하게 한다.

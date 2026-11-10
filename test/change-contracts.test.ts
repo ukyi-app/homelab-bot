@@ -26,7 +26,7 @@ test('T19 B0 전이 표는 phase를 모두 덮고 정확히 이 모양이다', (
     authoring: ['snapshot_ready', ...stop],
     snapshot_ready: ['verifying', ...stop],
     verifying: ['reviewing', ...stop],
-    reviewing: ['awaiting_publish_approval', ...stop],
+    reviewing: ['awaiting_publish_approval', 'authoring', ...stop],
     awaiting_publish_approval: ['approved', ...stop],
     approved: ['publishing', ...stop],
     publishing: ['proposed', ...stop],
@@ -45,7 +45,11 @@ test('T19 B0 끝 상태에서는 나가지 못하고 단계를 건너뛰지 못�
   const main: ChangePhase[] = ['requested', 'admitted', 'authoring', 'snapshot_ready', 'verifying', 'reviewing',
     'awaiting_publish_approval', 'approved', 'publishing', 'proposed', 'merged', 'observing_deploy'];
   for (let i = 0; i < main.length; i++) {
-    for (let j = 0; j < main.length; j++) assert.equal(canTransition(main[i]!, main[j]!), j === i + 1, `${main[i]}->${main[j]}`);
+    for (let j = 0; j < main.length; j++) {
+      // 뒤로 가는 길은 게시 전 고치기 차례(reviewing → authoring) 하나뿐이다.
+      const selfFix = main[i] === 'reviewing' && main[j] === 'authoring';
+      assert.equal(canTransition(main[i]!, main[j]!), j === i + 1 || selfFix, `${main[i]}->${main[j]}`);
+    }
   }
   assert.deepEqual(GENERATION_RESTART, { from: 'superseded', to: 'requested' });
 });

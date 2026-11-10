@@ -1684,7 +1684,17 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 | → awaiting_publish_approval | `prepareApproval` | 승인 대상과 공개 텍스트, 승인 digest |
 | → approved | `approve` | owner의 승인. 대상 digest가 정확히 같아야 한다 |
 | → merged | `recordMerge` | H, M, PR 번호. 게시한 PR·head가 아니면 거부 |
+| reviewing → authoring | `startSelfFix` | 게시 전 고치기 차례(C31). 막힌 리뷰와 그 증거 digest를 `change_fix_rounds`로 옮기고 차례 번호를 올린다 |
 | 나머지 | `transition`(CAS) | 없음 |
+
+**게시 전 고치기 차례(C31).** 같은 generation 안의 되돌림이다. `reviewing`에서 완전한 리뷰가 P0·P1을 내면(`selfFixable`: 범위 부족·리뷰 출력 노출은 제외) `reviewing → authoring → snapshot_ready → verifying → reviewing`을 다시 돈다. 상한은 `CHANGE_SELF_FIX.maxRounds`(2, 기본값)이고 DB `change_generations.fix_round` CHECK와 같다. B·T0·브랜치는 그대로다.
+
+- **살아 있는 증거는 늘 마지막 차례다.** 차례를 여는 트랜잭션이 리뷰 receipt·시험 receipt digest·artifact digest·result tree·verifier revision을 `change_fix_rounds`(불변)로 옮기고 `change_reviews`·`change_verifications`·`change_artifacts`·`change_artifact_files`를 비우고 묶음 결과 칸 셋을 NULL로 둔다. 그래서 `prepareApproval`·게시자·리뷰 입력이 읽는 (change, generation) 자리에는 앞 차례 증거가 없고, 승인 digest는 마지막 차례 증거로만 만들어진다.
+- **자식 job은 차례로 나뉜다.** `change_child_jobs.fix_round`는 넣을 때 트리거가 그 generation의 지금 차례로 채운다. 작성·리뷰 job 조회와 `recordReview`의 job 확인은 지금 차례만 본다. 앞 차례 리뷰 job의 receipt는 받지 않는다. 작성·리뷰 이벤트의 delivery ID는 차례가 1 이상이면 `:r<n>`이 붙는다.
+- **DB가 막는 것.** `reviewing → authoring`은 지금 차례의 기록 행이 있고 결과·리뷰가 비어 있을 때만(`self_fix_required`), 묶음 칸 비우기는 차례 번호가 1 오를 때만, 살아 있는 리뷰·시험·artifact 삭제는 다음 차례 기록 행이 있을 때만 된다.
+- **작성 입력.** 고치기 작성은 `ChangeAuthorPort.start`의 `selfFix`(차례 번호, 그 차례를 연 리뷰의 P0·P1 발견)를 받는다. 발견은 비공개 표 `change_review_findings`에서 receipt의 `findingsDigest`로 읽고, 모델 지적 없는 코드 판정은 고정 설명이다(`blockingFindings`). 작업자 요청으로 옮기는 자리는 `ClaudeChangeAuthor`이고 지시는 고정 문구 `SELF_FIX_INSTRUCTION`, 발견은 자료 항목(`selfFixMaterials`)이다. **지금은 `supportsSelfFix()`가 false라 차례를 열지 않는다.** 작업자 계약의 수정 차례 칸(`amendment`)이 PR 번호를 요구하고 지시문이 PR 브랜치를 말해 게시 전 요청을 정직하게 담지 못한다. 칸이 넓어질 때까지 동작은 이전과 같다(`review_blocked`).
+- **실패.** 고치기 차례의 작성이 실패하거나 작업자가 요청을 받지 않으면 새 사유 없이 `blocked(review_blocked)`다. 취소·입력 막힘은 그 사유 그대로다. 시험 실패는 `verification_*`, base 이동은 기존 신선도 규칙(`prepareApproval`의 `superseded(base_moved)`)이다.
+- **알림.** 차례 시작은 알리지 않는다. `review_blocked`로 닫히면 남은 P0·P1의 제목을 최대 5개, 공개 검사(`scanPublicText`)를 지난 것만 싣고 걸리면 코드로 바꾼다. 조건·근거 원문은 싣지 않는다.
 
 **끝 상태와 재시작.** `superseded`, `blocked`, `cancelled`, `failed`에서는 나가지 못한다. 새 generation은 전이 표 밖의 `startNextGeneration` 하나로, `superseded`에서만 `requested`로 열고 admission부터 다시 받는다. 성공 경로에는 끝 상태가 없다. `observing_deploy`에 남고 `change_deployments.state`가 `DEPLOYMENT_SETTLED_STATES`면 조회를 멈춘다. PR이 병합 없이 닫히면 `proposed → cancelled`다.
 

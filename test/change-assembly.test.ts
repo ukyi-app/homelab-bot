@@ -1678,6 +1678,156 @@ test('C16 CHANGE 질문은 바로 답·질문 고르기 대상이 아니다: 켜
   });
 });
 
+// ---- C31 게시 전 자체 리뷰 고치기 ----
+
+const reviewed = { goal: 'met' as const, acceptance: [{ index: 0, status: 'met' as const }], reviewed_paths: ['src/a.ts', 'src/new.ts'], summary: 's' };
+const P0_FINDING = { priority: 'P0' as const, code: 'logic_error' as const, path: 'src/new.ts', line: 1, title: '빈 입력에서 예외가 난다', detail: '입력이 비면 값을 읽기 전에 멈춘다', evidence: 'src/new.ts 1행' };
+const P2_FINDING = { ...P0_FINDING, priority: 'P2' as const, title: '이름이 모호하다' };
+const replies = (...findings: (typeof P0_FINDING | typeof P2_FINDING)[][]) => {
+  let call = 0;
+  return () => ({ status: 'succeeded' as const, output: { ...reviewed, findings: findings[Math.min(call++, findings.length - 1)]! } });
+};
+const FIXED_STEP = { ...WRITE_STEP, write: { ...WRITE_STEP.write, 'src/new.ts': 'export const n = 2;\n' } };
+// 작업자 계약이 PR 없는 고치기 요청을 받기 전까지 작성 port는 고치기 차례를 열지 않는다(supportsSelfFix=false).
+// 런타임 경계를 시험하려고 그 칸만 열고, 고치기 요청은 같은 base 위의 새 작성으로 보낸다. 받은 입력은 starts에 남긴다.
+type StartInput = { selfFix?: { round: number; findings: readonly { title: string; priority: string }[] } };
+function selfFixing(h: Harness): StartInput[] {
+  const starts: StartInput[] = [];
+  h.restart({ instrument: deps => ({ ...deps, author: new Proxy(deps.author, { get(target, property, receiver) {
+    if (property === 'supportsSelfFix') return async () => true;
+    if (property === 'start') return async (input: Parameters<typeof target.start>[0]) => { starts.push(structuredClone(input)); const { selfFix: _selfFix, ...rest } = input; return target.start(rest); };
+    const value = Reflect.get(target, property, receiver) as unknown;
+    return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+  } }) }) });
+  return starts;
+}
+const reviewDigests = async (h: Harness, id: string) => ({
+  live: (await h.db.query<{ receipt_digest: string }>('SELECT receipt_digest FROM change_reviews WHERE change_id=$1', [id])).rows.map(row => row.receipt_digest),
+  archived: (await h.db.query<{ review_receipt_digest: string }>('SELECT review_receipt_digest FROM change_fix_rounds WHERE change_id=$1 ORDER BY fix_round', [id])).rows.map(row => row.review_receipt_digest),
+});
+
+test('C31 고치기 1번: 자체 리뷰의 P0를 게시 전에 고치고 시험·리뷰를 새로 돌아 미리보기로 간다. 승인 digest는 마지막 차례 증거로만 만든다', async () => {
+  await withHarness({ steps: [WRITE_STEP, FIXED_STEP], reviewReply: replies([P0_FINDING], []) }, async h => {
+    const starts = selfFixing(h);
+    const id = await toAwaiting(h);
+    assert.equal((await h.f.calls()).length, 2, '처음 작성 + 고치기 1번');
+    assert.equal(h.reviewInputs.length, 2, '리뷰도 차례마다 새로 돈다');
+    assert.equal(h.runs.verify, 2, '시험도 차례마다 새로 돈다');
+    // 고치기 작성 입력: 차례 번호와 그 리뷰의 P0 발견만 자료로 간다.
+    assert.equal(starts[0]!.selfFix, undefined);
+    assert.deepEqual(starts[1]!.selfFix!.round, 1);
+    assert.deepEqual(starts[1]!.selfFix!.findings.map(finding => [finding.priority, finding.title]), [['P0', '빈 입력에서 예외가 난다']]);
+    // 같은 generation·브랜치에서 이어 간다.
+    const generation = (await h.db.query<{ generation: number; fix_round: number; branch: string }>('SELECT generation,fix_round,branch FROM change_generations WHERE change_id=$1', [id])).rows;
+    assert.deepEqual(generation.map(row => [Number(row.generation), Number(row.fix_round)]), [[1, 1]]);
+    const { subject } = (await h.changes.approvalSubject({ changeId: id, generation: 1 }) as any).value;
+    const digests = await reviewDigests(h, id);
+    assert.equal(subject.review.receiptDigest, digests.live[0]);
+    assert.equal(digests.archived.length, 1);
+    assert.notEqual(subject.review.receiptDigest, digests.archived[0]);
+    const artifact = (await h.db.query<{ artifact_digest: string }>('SELECT artifact_digest FROM change_fix_rounds WHERE change_id=$1', [id])).rows[0]!.artifact_digest;
+    assert.notEqual(subject.bundle.artifactDigest, artifact, '앞 차례 artifact로 승인하지 않는다');
+    // 고치기 차례 시작은 알리지 않는다.
+    await h.deliver();
+    assert.ok(!h.messages().some(text => text.includes('review_blocked') || text.includes('고치')));
+  });
+});
+
+test('C31 고치기 상한: P0가 계속 남으면 2번 고친 뒤 review_blocked로 닫고 남은 문제 제목을 알린다', async () => {
+  await withHarness({ steps: [WRITE_STEP, FIXED_STEP, FIXED_STEP, FIXED_STEP], reviewReply: replies([P0_FINDING]) }, async h => {
+    selfFixing(h);
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    await h.pump(async () => await h.phase(id) === 'blocked');
+    assert.equal((await h.changes.get(id) as any).value.phaseReason, 'review_blocked');
+    assert.equal((await h.f.calls()).length, 3, '처음 작성 + 고치기 2번. 세 번째 고치기는 없다');
+    assert.equal(h.reviewInputs.length, 3);
+    assert.equal((await reviewDigests(h, id)).archived.length, 2);
+    assert.equal((await h.db.query('SELECT 1 FROM change_approval_subjects WHERE change_id=$1', [id])).rows.length, 0);
+    await h.deliver();
+    const notice = h.messages().find(text => text.includes('review_blocked'))!;
+    assert.match(notice, /게시 전에 2번 고치려고 했는데/);
+    assert.match(notice, /- P0 빈 입력에서 예외가 난다/);
+    assert.ok(!notice.includes('입력이 비면 값을 읽기 전에 멈춘다'), '조건·근거 원문은 싣지 않는다');
+    assert.equal(h.env.github.mutations().length, 0);
+  });
+});
+
+test('C31 P2·P3만: 고치지 않고 미리보기로 가며 남은 위험으로 보인다', async () => {
+  await withHarness({ reviewReply: replies([P2_FINDING]) }, async h => {
+    const starts = selfFixing(h);
+    const id = await toAwaiting(h);
+    assert.equal(starts.length, 1);
+    assert.equal((await h.f.calls()).length, 1);
+    assert.equal((await reviewDigests(h, id)).archived.length, 0);
+    await h.deliver();
+    assert.match(h.messages().find(text => text.includes('게시 미리보기'))!, /경고: P2 correctness logic_error/);
+  });
+});
+
+test('C31 작업자가 고치기 요청을 받지 못하면: 고치지 않고 지금처럼 review_blocked로 닫는다', async () => {
+  await withHarness({ reviewReply: replies([P0_FINDING]) }, async h => {
+    // 지금 작성 port는 고치기 차례를 열지 않는다(작업자 계약에 PR 없는 고치기 칸이 없다).
+    assert.equal(await h.runtime['deps'].author.supportsSelfFix(), false);
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    await h.pump(async () => await h.phase(id) === 'blocked');
+    assert.equal((await h.changes.get(id) as any).value.phaseReason, 'review_blocked');
+    assert.equal((await h.f.calls()).length, 1);
+    await h.deliver();
+    const notice = h.messages().find(text => text.includes('review_blocked'))!;
+    assert.match(notice, /자체 리뷰에서 막는 문제가 나와서 게시하지 않았어요/);
+    assert.match(notice, /- P0 빈 입력에서 예외가 난다/);
+  });
+  // 차례는 열렸는데 고치기 요청이 거부되면 새 실패 모양 없이 review_blocked다.
+  await withHarness({ reviewReply: replies([P0_FINDING]) }, async h => {
+    h.restart({ instrument: deps => ({ ...deps, author: new Proxy(deps.author, { get(target, property, receiver) {
+      if (property === 'supportsSelfFix') return async () => true;
+      const value = Reflect.get(target, property, receiver) as unknown;
+      return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+    } }) }) });
+    // 같은 시험 안이라 앞 harness의 행이 남아 있다. 다른 이벤트 ID로 새 변경을 만든다.
+    await h.command('200', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    await h.pump(async () => await h.phase(id) === 'blocked');
+    assert.equal((await h.changes.get(id) as any).value.phaseReason, 'review_blocked');
+    assert.equal((await h.f.calls()).length, 1, '고치기 요청은 작업자에 가지 않았다');
+    assert.ok(h.logs.some(entry => entry.event === 'change_self_fix_failed'));
+    await h.pump(async () => !await h.store.laneBusy('task'));
+  });
+});
+
+test('C31 차례 중 취소: 고치기 작성 중 /change-cancel이면 cancelled로 닫고 레인을 놓는다', async () => {
+  await withHarness({ steps: [WRITE_STEP, { kind: 'hang' }], reviewReply: replies([P0_FINDING], []) }, async h => {
+    selfFixing(h);
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    await h.pump(async () => (await h.f.calls()).length === 2);
+    assert.equal(await h.phase(id), 'authoring');
+    await h.command('101', 'change-cancel', { target: id });
+    assert.equal(await h.phase(id), 'cancelled');
+    for (let round = 0; round < 400 && await h.store.laneBusy('task'); round++) { await h.runtime.childrenTick(); await new Promise(resolve => setTimeout(resolve, 5)); }
+    assert.equal(await h.store.laneBusy('task'), false);
+    assert.equal(h.reviewInputs.length, 1);
+  });
+});
+
+test('C31 차례 중 base 이동: 고치기는 고정한 base 위에서 하고, 승인 대상을 만들 때 기존 신선도 규칙으로 superseded가 된다', async () => {
+  await withHarness({ steps: [WRITE_STEP, FIXED_STEP], reviewReply: replies([P0_FINDING], []) }, async h => {
+    selfFixing(h);
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    await h.pump(async () => (await h.db.query('SELECT 1 FROM change_fix_rounds WHERE change_id=$1', [id])).rows.length === 1);
+    const pinned = (await h.db.query<{ base_commit: string }>('SELECT base_commit FROM change_generations WHERE change_id=$1', [id])).rows[0]!.base_commit;
+    h.env.github.moveBase();
+    await h.pump(async () => isTerminal(await h.phase(id)));
+    assert.deepEqual([await h.phase(id), (await h.changes.get(id) as any).value.phaseReason], ['superseded', 'base_moved']);
+    assert.equal((await h.db.query<{ base_commit: string }>('SELECT base_commit FROM change_generations WHERE change_id=$1', [id])).rows[0]!.base_commit, pinned);
+    assert.equal(h.env.github.mutations().length, 0);
+  });
+});
+const isTerminal = (phase: string) => ['superseded', 'blocked', 'cancelled', 'failed', 'awaiting_publish_approval'].includes(phase);
+
 test('호환 작업자: 옛 작업자(v2 없음)면 CHANGE는 admitted에서 멈추고 부모를 닫지 않는다', async () => {
   await withHarness({ change: false }, async h => {
     assert.equal(await h.f.port.supportsChange(), false);

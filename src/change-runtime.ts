@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { CHANGE_RESTART, changeNextGeneration } from './change-advice.js';
 import { evaluateCi, readCiSnapshot } from './change-ci-policy.js';
-import { isTerminalPhase, labelAllowsAuthorInput, ReasonCodeSchema } from './change-contracts.js';
+import { CHANGE_SELF_FIX, isTerminalPhase, labelAllowsAuthorInput, ReasonCodeSchema } from './change-contracts.js';
 import { scanPublicText } from './change-publication.js';
-import { ChangeReviewFailed, ChangeReviewRejected } from './change-review.js';
+import { ChangeReviewFailed, ChangeReviewRejected, selfFixable } from './change-review.js';
 import type { ChangeArtifactPort, ChangeDeploymentPort, ChangeKey, ChangePhase, ChangeTarget, ChangeVerificationPort, DeploymentObservation, MergeReading, ProvenanceLabel, ReviewReceipt, TerminalChangePhase } from './change-contracts.js';
 import { DEPLOYMENT_POLL, DeploymentTargetError, deploymentPollStep, describeDeployment } from './change-deployment.js';
 import { compilePathPolicy, taskPathRules } from './change-policy.js';
@@ -84,8 +84,10 @@ export function changeAuthorSource(deps: { store: Store; gate: PolicyGate; prefl
     const row = (await db.query<{ change_id: string; generation: number | string }>(`SELECT change_id,generation FROM change_child_jobs WHERE job_id=$1 AND role='author'`, [jobId])).rows[0];
     return row ? { changeId: row.change_id, generation: Number(row.generation) } : null;
   };
+  // 지금 고치기 차례의 작성 job. 시험 port도 이 값으로 세션을 찾으므로 앞 차례의 세션을 가리키지 않는다.
   const authorJob = async (key: ChangeKey): Promise<string | null> =>
-    (await db.query<{ job_id: string }>(`SELECT job_id FROM change_child_jobs WHERE change_id=$1 AND generation=$2 AND role='author'`, [key.changeId, key.generation])).rows[0]?.job_id ?? null;
+    (await db.query<{ job_id: string }>(`SELECT c.job_id FROM change_child_jobs c JOIN change_generations g ON g.change_id=c.change_id AND g.generation=c.generation
+      WHERE c.change_id=$1 AND c.generation=$2 AND c.role='author' AND c.fix_round=g.fix_round`, [key.changeId, key.generation])).rows[0]?.job_id ?? null;
   const repoOf = async (changeId: string): Promise<ChangeRepositoryPolicy> => {
     const row = (await db.query<{ repo_id: number | string }>('SELECT repo_id FROM change_requests WHERE id=$1', [changeId])).rows[0];
     const policy = row ? await deps.policy(Number(row.repo_id)) : null;
@@ -126,9 +128,9 @@ export function changeAuthorSource(deps: { store: Store; gate: PolicyGate; prefl
 
 export interface ChangeRuntimeDeps {
   store: Store; changes: ChangeStore; inputs: Pick<ChangePrivateInputs, 'read'>; gate: PolicyGate;
-  author: Pick<ClaudeChangeAuthor, 'supportsV2' | 'start' | 'resume' | 'cancel' | 'fetchResult' | 'finalize' | 'workerFacts' | 'abandon' | 'closeUnstarted'>;
+  author: Pick<ClaudeChangeAuthor, 'supportsV2' | 'supportsSelfFix' | 'start' | 'resume' | 'cancel' | 'fetchResult' | 'finalize' | 'workerFacts' | 'abandon' | 'closeUnstarted'>;
   artifacts: ChangeArtifactPort; verification: ChangeVerificationPort;
-  review: Pick<ChangeReviewService, 'submit' | 'fetchReceipt'>;
+  review: Pick<ChangeReviewService, 'submit' | 'fetchReceipt' | 'selfFixFindings' | 'remainingFindings'>;
   publisher: Pick<ChangePublisher, 'prepareApproval' | 'publish' | 'reconcile'>;
   preflight: ChangePreflightPort; deployment: ChangeDeploymentPort; policy: ChangeRepositoryPolicies;
   // 작업자가 새 실행을 받는 중인지. 닫혀 있는데 claim하면 시작 불명 상태로 레인을 잡는다.
@@ -145,7 +147,8 @@ const receiptOf = (child: Pick<ChildRow, 'id' | 'session_generation'>) => `v2:${
 // 작업자가 고칠 수 없는 입력·경계 문제를 말한 경우다. 내부 실패(failed)와 구분해 owner가 사유를 읽게 둔다.
 const blockedAuthorCode = (code: string) => /^(artifact_|baseline_|label_|task_artifact_|task_baseline_|task_question_)/.test(code);
 // prepareApproval이 돌려주는 값 중 다시 해도 같은 것들. 그 밖의 읽기 실패는 다음 바퀴에 다시 본다.
-const FINAL_APPROVAL = /^(label_blocked|review_mismatch|review_incomplete|policy_revoked|policy_changed|publication_|secret_detected|internal_marker|metadata_sensitive|base_tree_incomplete|evidence_missing|ci_(?!unreadable))/;
+const SELF_FIX_UNAVAILABLE = new Set(['change_self_fix_unsupported', 'self_fix_findings_missing']);
+const FINAL_APPROVAL =/^(label_blocked|review_mismatch|review_incomplete|policy_revoked|policy_changed|publication_|secret_detected|internal_marker|metadata_sensitive|base_tree_incomplete|evidence_missing|ci_(?!unreadable))/;
 
 export class ChangeRuntime {
   private readonly periods: ChangePeriods;
@@ -284,20 +287,22 @@ export class ChangeRuntime {
   // ---- 작성 ----
 
   // job과 부모 연결을 한 트랜잭션으로 만든다. 연결 없는 job이 남으면 v1 경로가 집는다.
+  // 작성 job은 고치기 차례마다 하나다. 앞 차례의 job은 끝나 있고 이 차례의 작성이 아니다.
   private async authorChild(request: ChangeRequest): Promise<ChildRow> {
     const read = async () => (await this.db.query<ChildRow>(`SELECT j.id,j.state,j.wait_reason,j.lease_token,j.lease_until,j.conversation_id,j.owner_id,s.state AS session_state,s.generation AS session_generation,s.updated_at AS session_updated_at
-      FROM change_child_jobs c JOIN jobs j ON j.id=c.job_id LEFT JOIN codex_sessions s ON s.job_id=j.id AND s.executor='claude'
-      WHERE c.change_id=$1 AND c.generation=$2 AND c.role='author'`, [request.id, request.generation])).rows[0];
+      FROM change_child_jobs c JOIN change_generations g ON g.change_id=c.change_id AND g.generation=c.generation JOIN jobs j ON j.id=c.job_id LEFT JOIN codex_sessions s ON s.job_id=j.id AND s.executor='claude'
+      WHERE c.change_id=$1 AND c.generation=$2 AND c.role='author' AND c.fix_round=g.fix_round`, [request.id, request.generation])).rows[0];
     const existing = await read();
     if (existing) return existing;
     await this.db.transaction(async tx => {
       const parent = (await tx.query<{ phase: string; generation: number | string }>('SELECT phase,generation FROM change_requests WHERE id=$1 FOR UPDATE', [request.id])).rows[0];
       if (!parent || Number(parent.generation) !== request.generation || parent.phase !== 'authoring') throw new Error('change_parent_moved');
-      if ((await tx.query(`SELECT 1 FROM change_child_jobs WHERE change_id=$1 AND generation=$2 AND role='author'`, [request.id, request.generation])).rows.length) return;
+      const round = Number((await tx.query<{ fix_round: number }>('SELECT fix_round FROM change_generations WHERE change_id=$1 AND generation=$2', [request.id, request.generation])).rows[0]?.fix_round ?? 0);
+      if ((await tx.query(`SELECT 1 FROM change_child_jobs WHERE change_id=$1 AND generation=$2 AND role='author' AND fix_round=$3`, [request.id, request.generation, round])).rows.length) return;
       if (await this.deps.store.queueFull('task', tx)) throw new Error('queue_full');
       const now = this.now();
       const job = randomUUID(), event = randomUUID();
-      const delivery = `change-author:${request.id}:${request.generation}`;
+      const delivery = `change-author:${request.id}:${request.generation}${round ? `:r${round}` : ''}`;
       // 작성자 입력은 공개 brief뿐이다. 이 행에는 원문이 없고 행위자도 owner가 아니라 대화 맥락에 끼지 않는다.
       await tx.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,conversation_id,received_at,payload,accepted)
         VALUES ($1,'change',$2,$2,'change-author',$3,$4,$5,$6,true)`, [event, delivery, JSON.stringify(request.scope), request.conversationId, now, JSON.stringify({ command: 'change_author', text: '' })]);
@@ -316,29 +321,47 @@ export class ChangeRuntime {
       return false;
     }
     if (!child.session_state) {
-      if (JOB_ENDED.has(child.state)) { await this.close(request, 'authoring', { to: child.state === 'cancelled' ? 'cancelled' : 'failed', reason: child.wait_reason ?? `author_${child.state}` }); return true; }
+      if (JOB_ENDED.has(child.state)) { await this.authorEnded(request, { to: child.state === 'cancelled' ? 'cancelled' : 'failed', reason: child.wait_reason ?? `author_${child.state}` }); return true; }
       return this.startAuthor(request, child);
     }
     if (WAITING_SESSION.has(child.session_state) && (child.state === 'queued' || child.state === 'running')) return this.resumeAuthor(request, child);
     if (WAITING_SESSION.has(child.session_state) && child.state === 'waiting_user') return false;
     return this.pollAuthor(request, child);
   }
+  // 고치기 차례의 작성이 실패하면(작업자가 고치기 요청을 받지 않은 경우 포함) 앞 차례 리뷰의 P0·P1이 그대로 남은 것이다.
+  // 새 실패 모양 없이 review_blocked로 닫고 실제 사유는 로그에 둔다. 취소와 입력·경계 막힘(label_·task_question_ 등)은 그 사유 그대로다.
+  private async authorEnded(request: ChangeRequest, outcome: Outcome): Promise<void> {
+    const generation = await this.deps.changes.generationRecord(keyOf(request));
+    const round = generation.ok ? generation.value.fixRound : 0;
+    if (round > 0 && (outcome.to === 'failed' || SELF_FIX_UNAVAILABLE.has(outcome.reason))) {
+      this.deps.log('change_self_fix_failed', { round, reason: safeReason(outcome.reason) });
+      await this.close(request, 'authoring', { to: 'blocked', reason: 'review_blocked' });
+      return;
+    }
+    await this.close(request, 'authoring', outcome);
+  }
   private async startAuthor(request: ChangeRequest, child: ChildRow): Promise<boolean> {
     if (!request.brief || !request.policyRevision) throw new Error('brief_missing');
-    const generation = await this.deps.changes.generationRecord(keyOf(request));
+    const key = keyOf(request);
+    const generation = await this.deps.changes.generationRecord(key);
     if (!generation.ok) throw new Error('generation_missing');
+    const round = generation.value.fixRound;
+    // 고치기 차례는 그 차례를 연 리뷰의 P0·P1 발견을 자료로 넘긴다. 발견이 없으면 고칠 것을 말할 수 없어 닫는다.
+    const findings = round > 0 ? await this.deps.review.selfFixFindings(key, round) : [];
+    if (round > 0 && !findings.length) { await this.authorEnded(request, { to: 'blocked', reason: 'self_fix_findings_missing' }); return true; }
     if (child.state === 'queued') {
       if (!this.deps.intakeOpen()) return false;
       if (!await this.deps.store.claimChangeAuthor(child.id)) return false;
     } else if (child.state !== 'running') return false;
     try {
-      await this.deps.author.start({ target: this.target(request), baseCommit: generation.value.baseCommit, baseTree: generation.value.baseTree, policyRevision: request.policyRevision, brief: request.brief });
+      await this.deps.author.start({ target: this.target(request), baseCommit: generation.value.baseCommit, baseTree: generation.value.baseTree, policyRevision: request.policyRevision, brief: request.brief,
+        ...(round > 0 ? { selfFix: { round, findings } } : {}) });
       this.wait(`step:${request.id}`, this.periods.authorPollMs);
       return true;
     } catch (error) {
       const code = error instanceof Error ? error.message : '';
-      if (code === 'label_blocked' || code === 'base_tree_incomplete' || code === 'policy_revoked' || code === 'change_brief_too_long') {
-        await this.close(request, 'authoring', { to: 'blocked', reason: code });
+      if (code === 'label_blocked' || code === 'base_tree_incomplete' || code === 'policy_revoked' || code === 'change_brief_too_long' || code === 'change_self_fix_unsupported') {
+        await this.authorEnded(request, { to: 'blocked', reason: code });
         return true;
       }
       // 턴을 보내지 못했다. 슬롯을 놓고 다음 바퀴에 다시 본다. lease를 쥔 채 GitHub 장애를 기다리면 레인을 막는다.
@@ -370,7 +393,7 @@ export class ChangeRuntime {
     } catch (error) {
       const code = error instanceof Error ? error.message : '';
       if (code.startsWith('change_') && code !== 'change_turn_stale' && code !== 'change_job_not_claimed') {
-        await this.close(request, 'authoring', { to: 'failed', reason: code });
+        await this.authorEnded(request, { to: 'failed', reason: code });
         return true;
       }
       const row = (await this.db.query<Job>('SELECT * FROM jobs WHERE id=$1', [child.id])).rows[0];
@@ -412,10 +435,10 @@ export class ChangeRuntime {
       }
       case 'cancelled':
         // 해제로 끝난 턴은 사람이 취소한 것이 아니라 결과를 잃은 것이다.
-        await this.close(request, 'authoring', result.code === 'stop_confirmed_after_unknown' ? { to: 'failed', reason: 'task_worker_lost' } : { to: 'cancelled', reason: result.code });
+        await this.authorEnded(request, result.code === 'stop_confirmed_after_unknown' ? { to: 'failed', reason: 'task_worker_lost' } : { to: 'cancelled', reason: result.code });
         return true;
       case 'failed':
-        await this.close(request, 'authoring', { to: blockedAuthorCode(result.code) ? 'blocked' : 'failed', reason: result.code });
+        await this.authorEnded(request, { to: blockedAuthorCode(result.code) ? 'blocked' : 'failed', reason: result.code });
         return true;
       case 'unknown':
         // 시작 요청이 닿았는지 모른다. 다시 보내지 않는다. 기한이 지나면 늦게 닿는 시작까지 막고 닫는다.
@@ -554,12 +577,14 @@ export class ChangeRuntime {
     const key = keyOf(request);
     const stored = await this.deps.review.fetchReceipt(key);
     if (stored) return this.prepare(request, stored);
-    const job = (await this.db.query<{ state: string; wait_reason: string | null; finished_at: string | null }>(`SELECT j.state,j.wait_reason,j.finished_at FROM change_child_jobs c JOIN jobs j ON j.id=c.job_id WHERE c.change_id=$1 AND c.generation=$2 AND c.role='review'`, [request.id, request.generation])).rows[0];
+    const job = (await this.db.query<{ state: string; wait_reason: string | null; finished_at: string | null }>(`SELECT j.state,j.wait_reason,j.finished_at FROM change_child_jobs c
+      JOIN change_generations g ON g.change_id=c.change_id AND g.generation=c.generation JOIN jobs j ON j.id=c.job_id
+      WHERE c.change_id=$1 AND c.generation=$2 AND c.role='review' AND c.fix_round=g.fix_round`, [request.id, request.generation])).rows[0];
     if (job) {
       if (!JOB_ENDED.has(job.state)) return false;
       // 멈춤만 확인된 job은 작업자에 결과가 남아 있을 수 있다. fetchReceipt의 null이 작업자 일시 장애일 수 있어 잠시 더 묻는다.
       if (job.wait_reason === 'stop_confirmed_after_unknown' && this.now() - Number(job.finished_at) < 600_000) return false;
-      // 같은 generation에서 리뷰를 다시 돌리는 길은 없다. receipt 없이 끝났으면 부모를 닫는다.
+      // 같은 차례에서 리뷰를 다시 돌리는 길은 없다. receipt 없이 끝났으면 부모를 닫는다. 고치기 차례는 receipt가 막혔을 때만 연다.
       await this.close(request, 'reviewing', { to: 'failed', reason: job.wait_reason ?? `review_${job.state}` });
       return true;
     }
@@ -583,6 +608,8 @@ export class ChangeRuntime {
   private async prepare(request: ChangeRequest, receipt: ReviewReceipt): Promise<boolean> {
     const key = keyOf(request);
     if (receipt.verdict === 'blocked') {
+      const fixing = await this.selfFix(request, receipt);
+      if (fixing !== null) return fixing;
       await this.close(request, 'reviewing', { to: 'blocked', reason: receipt.coverage === 'incomplete' ? 'review_incomplete' : 'review_blocked' });
       return true;
     }
@@ -596,6 +623,24 @@ export class ChangeRuntime {
     }
     if (prepared.reason === 'phase_conflict') return true;
     throw new Error(safeReason(prepared.reason, 'approval_prepare_failed'));
+  }
+
+  // 게시 전 고치기 차례를 연다. P0·P1이 있는 완전한 리뷰이고 상한 전이며 작성 port가 고치기 요청을 보낼 수 있을 때만이다.
+  // null이면 고치지 않는다는 뜻이고 호출자가 지금처럼 닫는다. 차례 시작은 Discord에 알리지 않는다(진행은 기존 입력 중 표시).
+  private async selfFix(request: ChangeRequest, receipt: ReviewReceipt): Promise<boolean | null> {
+    if (!selfFixable(receipt)) return null;
+    const key = keyOf(request);
+    const generation = await this.deps.changes.generationRecord(key);
+    if (!generation.ok || generation.value.fixRound >= CHANGE_SELF_FIX.maxRounds) return null;
+    if (!await this.deps.author.supportsSelfFix()) return null;
+    const started = await this.deps.changes.startSelfFix({ ...key, reviewJobId: receipt.jobId });
+    if (started.ok) { this.deps.log('change_self_fix_started', { round: started.value.round }); return true; }
+    if (started.reason === 'busy') throw new Error('change_store_busy');
+    // 앞 차례 작성 결과의 정리(finalize)가 아직이면 정리 바퀴가 끝낼 때까지 기다린다.
+    if (started.reason === 'children_active') { this.wait(`step:${request.id}`, this.periods.authorPollMs); return false; }
+    if (started.reason === 'phase_conflict') return true;
+    this.deps.log('change_self_fix_refused', { reason: started.reason });
+    return null;
   }
 
   // ---- 게시·병합·배포 ----
@@ -734,7 +779,23 @@ export class ChangeRuntime {
     const tail = request.phase === 'superseded' ? changeNextGeneration(request.id) : CHANGE_RESTART;
     const untracked = pull ? ` PR #${pull.number}은 그대로 있고, 이 뒤로 병합돼도 배포를 추적하지 않습니다.` : '';
     const withheld = reason === 'task_question_sensitive' ? ' 모델 질문에서 공개하면 안 되는 값을 찾아 질문을 이 스레드에 내보내지 않았습니다.' : '';
-    await this.send(request, key, `변경 ${request.id} g${request.generation}: ${request.phase}(${reason}).${withheld}${untracked} ${tail}`, request.phase === 'failed');
+    const problems = request.phase === 'blocked' && reason === 'review_blocked' ? await this.remainingProblems(request) : [];
+    await this.send(request, key, [`변경 ${request.id} g${request.generation}: ${request.phase}(${reason}).${withheld}${untracked} ${tail}`, ...problems].join('\n'), request.phase === 'failed');
+  }
+  // 리뷰 막힘으로 닫힌 건의 남은 문제 요지. 리뷰 모델의 글이라 공개 검사를 지난 제목만 싣고, 걸리면 고정 코드로 바꾼다. 조건·근거 원문은 싣지 않는다.
+  private async remainingProblems(request: ChangeRequest): Promise<string[]> {
+    const key = keyOf(request);
+    const findings = await this.deps.review.remainingFindings(key);
+    if (!findings.length) return [];
+    const generation = await this.deps.changes.generationRecord(key);
+    const rounds = generation.ok ? generation.value.fixRound : 0;
+    const policy = await this.deps.policy(request.repoId);
+    const title = (text: string, code: string) => {
+      const line = text.replace(/\s+/g, ' ').trim();
+      return policy && scanPublicText({ title: line, body: line }, policy) === null ? line : code;
+    };
+    return [rounds ? `게시 전에 ${rounds}번 고치려고 했는데 자체 리뷰에서 막는 문제가 남아 있어요.` : '자체 리뷰에서 막는 문제가 나와서 게시하지 않았어요.',
+      ...findings.slice(0, 5).map(finding => `- ${finding.priority} ${title(finding.title, finding.code)}`), ...(findings.length > 5 ? [`- 외 ${findings.length - 5}개`] : [])];
   }
   private async send(request: ChangeRequest, key: string, content: string, ownerCall = false, buttons?: OutboxButton[]): Promise<void> {
     const policy = await this.deps.gate.current();

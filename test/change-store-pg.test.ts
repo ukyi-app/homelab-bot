@@ -8,7 +8,7 @@ import type { StoreResult } from '../src/change-store.js';
 import { MIGRATIONS, Postgres, appliedMigrations, migrationVersion } from '../src/database.js';
 import { runMigrations } from '../src/migrate-main.js';
 import {
-  CONVERSATION, OWNER, REPO_ID, driveTo, fixtureExpected, fixtureResult, hex, newEvent, ok, seedConversation,
+  CONVERSATION, OWNER, REPO_ID, driveTo, fixtureExpected, fixtureResult, fixtureReview, hex, insertChildJob, newEvent, ok, seedConversation,
 } from './change-store-fixture.js';
 
 // 실제 PostgreSQL(18) 시험. HOMELAB_TEST_PG_SOCKET(유닉스 소켓 디렉터리)이 없으면 건너뛴다. 실행 방법은 VERIFICATION T20 절과 같다.
@@ -216,6 +216,38 @@ test('T19 B0 실제 PostgreSQL: 새 generation을 동시에 열어도 한 번만
   } finally { await d.close(); }
 });
 
+test('C31 실제 PostgreSQL: 고치기 차례를 두 연결이 동시에 열어도 차례는 하나만 생기고, 취소와 겹치면 한쪽만 이긴다', { skip }, async () => {
+  const d = await database();
+  try {
+    const open = async () => {
+      const r = await driveTo(d.store, 'reviewing');
+      const key = { changeId: r.id, generation: 1 };
+      const jobId = `fixture-review-${r.id}-r0`;
+      await insertChildJob(d.db, jobId);
+      ok(await d.store.linkChildJob({ ...key, jobId, role: 'review' }));
+      const bundle = ok(await d.store.evidenceBundle(key));
+      ok(await d.store.recordReview({ ...key, receipt: fixtureReview({ bundle, jobId, verdict: 'blocked', risks: [{ priority: 'P1', category: 'correctness', code: 'logic_error' }] }) }));
+      return { key, jobId };
+    };
+    const first = await open();
+    const results = await parallel(() => d.store.startSelfFix({ ...first.key, reviewJobId: first.jobId }));
+    assert.equal(wins(results), 1);
+    onlyLost(reasons(results), ['phase_conflict']);
+    assert.equal(await number(d.raw, 'change_fix_rounds WHERE change_id=$1', [first.key.changeId]), 1);
+    assert.equal(ok(await d.store.generationRecord(first.key)).fixRound, 1);
+
+    const second = await open();
+    const raced: StoreResult<unknown>[] = await Promise.all([
+      d.store.startSelfFix({ ...second.key, reviewJobId: second.jobId }),
+      d.store.transition({ ...second.key, from: 'reviewing', to: 'cancelled', reason: 'owner_cancelled' }),
+    ]);
+    assert.equal(wins(raced), 1);
+    const phase = ok(await d.store.get(second.key.changeId)).phase;
+    const rounds = await number(d.raw, 'change_fix_rounds WHERE change_id=$1', [second.key.changeId]);
+    assert.deepEqual([phase, rounds], raced[0]!.ok ? ['authoring', 1] : ['cancelled', 0]);
+  } finally { await d.close(); }
+});
+
 test('T19 B0 실제 PostgreSQL: 같은 응답의 확정을 동시에 처리해도 한 번만 confirmed다', { skip }, async () => {
   const d = await database();
   try {
@@ -236,7 +268,7 @@ test('T19 B0 실제 PostgreSQL: 016 DB 업그레이드는 017만 적용하고 �
     const raw = d.pool(2);
     for (const file of MIGRATIONS.filter(name => migrationVersion(name) <= 16)) await raw.query(await readFile(`migrations/${file}`, 'utf8'));
     await seedConversation(new Postgres(raw));
-    assert.deepEqual(await runMigrations(raw), [17, 18, 19, 20, 21, 22]);
+    assert.deepEqual(await runMigrations(raw), [17, 18, 19, 20, 21, 22, 23]);
     assert.deepEqual(await runMigrations(raw), []);
     assert.equal((await appliedMigrations(new Postgres(raw))).size, MIGRATIONS.length);
     await raw.query(await readFile('migrations/017_change_pr.sql', 'utf8'));
