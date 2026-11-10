@@ -1,4 +1,5 @@
 import type { Database } from './database.js';
+import { ACCOUNT_METHODS, ACCOUNT_NAME } from './model-accounts.js';
 
 // 운영 지표(개선안 v2 1-3). 공유 DB의 현재 값을 그대로 내보내는 gauge다. 누적 counter·histogram이 아니다.
 // 함정: RollingUpdate 동안 구·신 게시 서버 두 파드가 같은 값을 내므로 경보 룰은 sum이 아니라 max()로 묶어야 한다.
@@ -54,7 +55,15 @@ const QUERY = `
     FROM jobs j LEFT JOIN model_pauses p ON p.job_id=j.id WHERE j.state='waiting_user' AND j.wait_reason IN ('model_limit','auth_expired')) w GROUP BY kind
   UNION ALL SELECT 'deferred', '', '', count(*)::text FROM jobs j WHERE j.type='review' AND j.state='queued'
     AND EXISTS (SELECT 1 FROM model_limit_state s WHERE s.id='account' AND s.review_deferred_until > $3)
-    AND NOT EXISTS (SELECT 1 FROM change_child_jobs c WHERE c.job_id=j.id AND c.role='review')`;
+    AND NOT EXISTS (SELECT 1 FROM change_child_jobs c WHERE c.job_id=j.id AND c.role='review')
+  UNION ALL SELECT 'account', name, method, '1' FROM model_accounts WHERE current`;
+
+// 지금 계정 한 줄. 계정 이름은 owner가 정한 짧은 이름이라 비밀이 아니다. DB CHECK와 같은 규칙을 여기서도 다시 보고,
+// 맞지 않으면 계정 라벨을 비운다(라벨 값에 따옴표·줄바꿈이 들어가면 지표 본문이 깨진다). 방식도 두 이름만 낸다.
+function accountLine(name: string, method: string): string {
+  const account = ACCOUNT_NAME.test(name) ? name : '';
+  return `homelab_bot_model_account{account="${account}",method="${(ACCOUNT_METHODS as readonly string[]).includes(method) ? method : 'none'}"} 1`;
+}
 
 // 모델 멈춤(COLLEAGUE_SPEC §4.7 "운영 알림", C19 model_pauses). 종류는 model_pauses.kind의 CHECK 목록과 같다.
 export const MODEL_PAUSE_KINDS = ['rate_limit', 'auth_expired', 'billing'] as const;
@@ -68,8 +77,10 @@ export async function opsMetrics(db: Database, now: number, memory: MemoryMetric
   const outbox = new Map<string, number>();
   const pauses = new Map<string, { jobs: number; resetsAt: number }>();
   let gaps = 0, paused = 0, emergency = 0, deletions = 0, oldest = 0, deferred = 0;
+  let account = 'homelab_bot_model_account{method="none"} 1';
   for (const row of rows) {
     if (row.kind === 'job') jobs.set(`${row.a}/${row.b}`, Number(row.n));
+    else if (row.kind === 'account') account = accountLine(row.a, row.b);
     else if (row.kind === 'pause') pauses.set(row.a, { jobs: Number(row.n), resetsAt: row.b ? Math.floor(Number(row.b) / 1000) : 0 });
     else if (row.kind === 'deferred') deferred = Number(row.n);
     else if (row.kind === 'deletion') { deletions = Number(row.n); oldest = row.b ? Math.max(0, (now - Number(row.b)) / 1000) : 0; }
@@ -94,9 +105,9 @@ export async function opsMetrics(db: Database, now: number, memory: MemoryMetric
     // 계열을 없애지 않고 0으로 두는 것은 경보 룰이 이 값을 경보 값으로 쓰기 때문이다(멈춤 여부는 paused_jobs로 가른다).
     ...MODEL_PAUSE_KINDS.map(kind => `homelab_bot_model_paused_jobs{kind="${kind}"} ${pauses.get(kind)?.jobs ?? 0}`),
     ...MODEL_PAUSE_KINDS.map(kind => `homelab_bot_model_pause_resets_at_seconds{kind="${kind}"} ${pauses.get(kind)?.resetsAt ?? 0}`),
-    // 지금 계정. 계정 기록은 C22가 만든다. 그 전에는 계정 라벨 없이 method="none"이다. C22는 이 줄에 account(CLI 이름 규칙을
-    // 통과한 짧은 이름)와 method(subscription·api)를 채운다. 라벨 값이 바뀌면 옛 계열은 수집 staleness(5분)로 사라진다.
-    'homelab_bot_model_account{method="none"} 1',
+    // 지금 계정(model_accounts.current). 고른 계정이 없으면 계정 라벨 없이 method="none"이다(경보 문구 "미등록").
+    // 라벨 값이 바뀌면 옛 계열은 수집 staleness(5분)로 사라진다.
+    account,
     `homelab_bot_model_reviews_deferred ${deferred}`,
     ...(task ? await taskLaneLines(db, task) : []),
   ];
