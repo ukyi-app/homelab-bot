@@ -978,3 +978,12 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 - **버튼 이름은 번호, 앞부분은 본문:** 티켓은 버튼에 질문 앞부분을 보이라고 했지만 7일 정리(T31)는 게시의 `payload.content`만 비운다. 버튼 이름에 모델이 쓴 질문 조각을 두면 기간 없이 남아 본문에 번호와 함께 싣고 버튼은 "1번 질문"으로 했다. 한 줄 상한 때문에 버튼은 5개까지다.
 - **질문 글의 판:** 작업 질문 글은 켜짐 판에서 질문 ID를 옮겨 적으라고 하지 않는다. 변경 질문 글은 같은 `ask`로 만들지만 `change_child_jobs`(role `author`)로 가려 지금 판(질문 ID와 `/answer`)을 켜짐에서도 둔다. 이 판은 C28이 바꾼다.
 - **결과 안내:** `/answer`와 같은 `controlText('answer', …)` 문구를 그 메시지에 답장으로 단다. 받았다는 👀는 달지 않는다. 이 글이 받은 표시이고, 대화 작업이 없어 👀를 지울 계기가 없다.
+
+## C17 게시 승인 버튼 custom_id 묶음 (2026-11-10)
+
+"동료 봇 전환 (사용자 2026-11-09)" 2(변경 게시는 미리보기 digest에 묶인 버튼, digest 입력은 예비)·9(스위치)의 구현 선택이다. 사용자 결정이 아니고 결정은 바꾸지 않았다. 시험은 [VERIFICATION](VERIFICATION.md) "C17 게시 승인 버튼".
+
+- **묶음 행 없이 custom_id에 싣는다:** `change-publish-ok:<변경 ID 32자>.<generation>.<승인 digest 앞 16자>`(g1이면 67자, Discord 상한 100자). 변경 ID와 전체 digest(64자)를 함께 담으면 100자를 넘는다. 티켓은 그 경우 묶음 행(변경 ID·generation·digest·만든 시각)을 저장하라고 했지만, 승인 대상(`change_approval_subjects`)은 generation마다 하나이고 DB가 내용 변경을 막아(ARCHITECTURE §16 "DB가 직접 막는 것") 변경 ID·generation이 이미 digest 하나를 정한다. 그래서 마이그레이션을 더하지 않았다. digest 앞 16자는 누를 때 그 generation의 승인 대상 digest와 한 번 더 대조하고, 승인은 서버가 읽은 전체 digest로 `/change-publish`와 같은 `ChangeStore.approve`를 부른다(owner·generation·phase·digest·이벤트 멱등 검사가 같다). 대상 칸은 `BUTTONS` 표의 2칸 꼴에 맞추려고 ':' 대신 '.'로 나눈다.
+- **옛 버튼:** 새 미리보기는 늘 새 generation이므로(공개 텍스트만 바뀌어도 새 generation) 옛 버튼은 generation 불일치로 거부되고 아무것도 바꾸지 않는다. 같은 generation이 무효화로 끝 상태가 되면 phase 불일치로 거부된다.
+- **처리 뒤 응답:** 승인하면 `UPDATE_MESSAGE`로 버튼을 없앤다. 이 응답은 글 본문을 바꾸므로, 미리보기 마지막 쪽 본문(outbox `change-phase:<ID>:<generation>:awaiting_publish_approval`의 마지막 쪽)을 남기고 결과 한 줄을 붙인다. 보존 기간이 지나 본문을 비웠으면 결과 한 줄만 남는다. 거부(지난 미리보기·이미 승인·writer 확인 전·볼 수 없음)는 누른 owner에게만 보이는 응답이고 버튼은 남는다.
+- **구독 꺼진 대화:** 실행 확인 버튼(C13)과 같이 버튼으로는 승인하지 않고 알린다. '/change-publish'는 지금처럼 구독과 무관하게 받는다.

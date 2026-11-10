@@ -53,7 +53,7 @@ export class SimulatedCrash extends Error { constructor(point: string) { super(`
 export interface HarnessOptions {
   script?: string | ((f: ChangeWorkerFixture) => string); sandbox?: SandboxRunner; steps?: Step[]; reviewReply?: () => Awaited<ReturnType<ChangeReviewerModel>>;
   policyPatch?: (policy: Policy) => Policy; change?: boolean; crash?: Crash;
-  // 동료 기능 스위치(Store.colleague). 기본 꺼짐.
+  // 동료 기능 스위치(Store.colleague). 기본 꺼짐이다.
   colleague?: boolean;
 }
 export interface Harness {
