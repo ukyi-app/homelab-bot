@@ -9,8 +9,8 @@ import { DRAIN_MS } from './runtime.js';
 import type { Store } from './store.js';
 import type { CancelRequest, WorkerSigner } from './worker.js';
 import { archiveContract } from './worker.js';
-import { CoverageSchema, FindingSchema, InputLimitsSchema, REVIEW_INSTRUCTIONS, ReviewOutputSchema, ReviewTaskSchema, SECRET_PATTERNS,
-  reviewOutcome } from './review-input.js';
+import { CoverageSchema, FindingSchema, InputLimitsSchema, REVIEW_INSTRUCTIONS, REVIEW_INSTRUCTIONS_V2, ReviewOutputSchema, ReviewTaskSchema,
+  SECRET_PATTERNS, reviewOutcome } from './review-input.js';
 import type { Change, Coverage, ReviewOutput, ReviewTask, ReviewWorkerResult } from './review-input.js';
 
 // PR_REVIEW 게시 서버 쪽. 모델 호출 전 작성자 확인(D-16), 세대 단위 작업, COMMENT만 게시하는 제한 게시.
@@ -37,10 +37,18 @@ export const ReviewPolicySchema = z.strictObject({
 export type ReviewPolicy = z.infer<typeof ReviewPolicySchema>;
 export interface ReviewContext { base: Policy; review: ReviewPolicy; revision: string }
 export const MODEL_CALL_ASSOCIATIONS = Object.freeze(['OWNER', 'MEMBER', 'COLLABORATOR']);
+// 게시 서버가 작업자에 보내는 리뷰 지시문. 작업자 요청의 literal이라 작업자가 이 판을 받게 먼저 배포돼 있어야 한다(명세 §4.2).
+export const SERVER_REVIEW_INSTRUCTIONS = REVIEW_INSTRUCTIONS_V2;
 // 권한 필드(허용 목록·저장소)는 매번 다시 검사하므로 세대 revision에는 리뷰 내용에 닿는 값만 넣는다.
-export function reviewRevision(review: ReviewPolicy): string {
-  return `rp-${createHash('sha256').update(JSON.stringify([REVIEW_INSTRUCTIONS, review.input, review.comparison])).digest('hex').slice(0, 16)}`;
+export function reviewRevision(review: ReviewPolicy, instructions: string = SERVER_REVIEW_INSTRUCTIONS): string {
+  return `rp-${createHash('sha256').update(JSON.stringify([instructions, review.input, review.comparison])).digest('hex').slice(0, 16)}`;
 }
+// 출력 스키마가 같고 말투만 다른 지시문 판들. 이 판끼리만 다른 revision(입력 상한·비교 기준이 같음)으로 이미 나온 결과는 버리지 않는다.
+// 게시 대기 결과는 지금 렌더로 게시하고, 같은 head에 그런 결과가 있으면 자동 이벤트로 다시 리뷰하지 않는다(DECISIONS "C12 PR 리뷰 말투").
+// 모델을 아직 부르지 않은 작업은 이 규칙과 무관하게 policy_changed로 닫고 새 지시문으로 새 세대를 만든다.
+const VOICE_ONLY_INSTRUCTIONS = Object.freeze([REVIEW_INSTRUCTIONS, REVIEW_INSTRUCTIONS_V2]);
+const sameReviewContent = (revision: string, context: ReviewContext) =>
+  revision === context.revision || VOICE_ONLY_INSTRUCTIONS.some(instructions => reviewRevision(context.review, instructions) === revision);
 // 리뷰 정책이 없거나 비교 기준을 정하지 않은 값(comparison null)이면 새 요청만 받지 않는다. 철회(Denied)가 아니라
 // 일시 상태로 다뤄, 대기 작업과 미게시 결과를 지우지 않고 다시 켜질 때까지 기다린다.
 export class ReviewDisabled extends PolicyUnavailable {}
@@ -149,7 +157,8 @@ export interface ReviewRow {
   trigger: string; pr_updated_at: string; review_outcome: string | null; result: ReviewResult | null;
   superseded_reason: string | null; superseded_at: string | null;
 }
-type Admission = { outcome: 'queued' | 'requeued' | 'resumed' | 'duplicate_generation' | 'stale_event' | 'base_moved'; key: string; job?: string };
+type Admission = { outcome: 'queued' | 'requeued' | 'resumed' | 'duplicate_generation' | 'stale_event' | 'base_moved' | 'instructions_only';
+  key: string; job?: string };
 export const generationKey = (repo: number, pr: number, head: string, comparison: string, policy: string) =>
   `github:review:${repo}:${pr}:${head}:${comparison}:${policy}`;
 const json = (value: unknown) => JSON.stringify(value);
@@ -243,6 +252,20 @@ export class ReviewQueue {
       await tx.query(`UPDATE pr_reviews SET review_outcome=NULL,result=NULL,superseded_at=NULL,superseded_reason=NULL,pr_updated_at=$2,
         trigger=$3,defer_count=0 WHERE job_id=$1`, [existing.job_id, pr.updatedAt, trigger]);
       return { outcome: 'requeued', key, job: existing.job_id };
+    }
+    // 지시문 판만 바뀌었고 같은 head·비교 기준의 결과가 게시됐거나 게시를 기다리면 자동 이벤트로는 다시 리뷰하지 않는다.
+    // 배포 순간 열린 PR마다 새 세대가 생겨 모델 호출이 몰리는 것을 막는다. 댓글 명시 요청과 base 재지정은 늘 새 세대다.
+    if (trigger !== 'comment' && trigger !== 'retarget') {
+      const kept = (await tx.query<{ job_id: string; policy_revision: string }>(`SELECT p.job_id,p.policy_revision FROM pr_reviews p
+        WHERE p.repo_id=$1 AND p.pr_number=$2 AND p.head_sha=$3 AND p.comparison_revision=$4 AND p.policy_revision<>$5
+        AND EXISTS (SELECT 1 FROM review_deliveries d WHERE d.job_id=p.job_id AND d.state IN ('pending','sending','sent','unknown'))`,
+      [repo.id, pr.number, pr.head.sha, comparison, context.revision])).rows.filter(row => sameReviewContent(row.policy_revision, context));
+      if (kept.length) {
+        // duplicate_generation과 같이 더 새 이벤트를 봤다는 시각을 남긴다. 늦게 온 옛 닫힘·draft가 이 시각과 비교되어 남긴 결과를 지우지 못한다.
+        await tx.query('UPDATE pr_reviews SET pr_updated_at=GREATEST(pr_updated_at,$2) WHERE job_id = ANY($1::text[])',
+          [kept.map(row => row.job_id), pr.updatedAt]);
+        return { outcome: 'instructions_only', key };
+      }
     }
     const baseOnly = latest && latest.head_sha === pr.head.sha && latest.comparison_revision !== comparison
       && latest.policy_revision === context.revision;
@@ -562,7 +585,7 @@ export class ReviewRuntime {
         repository: repo.fullName, base: review.comparison_revision, head: review.head_sha,
         archives: { base: contract.base, head: contract.head }, changes: compare.files, truncated: compare.truncated,
         pullRequest: { title: pr.title.slice(0, 1000), body: pr.body.slice(0, 65_536) }, limits: context.review.input,
-        policyRevision: context.revision, instructions: REVIEW_INSTRUCTIONS, timeoutMs: DEFAULTS.taskTimeoutMs });
+        policyRevision: context.revision, instructions: SERVER_REVIEW_INSTRUCTIONS, timeoutMs: DEFAULTS.taskTimeoutMs });
       // 원격 조회 동안 바뀐 권한·정책을 capability 발급 직전에 최신 정책으로 다시 본다(D-16 모델 호출 전 허용 확인).
       const fresh = await this.policy.current();
       const freshRepo = fresh.review.repositories.find(r => r.id === repo.id && r.installationId === repo.installationId && r.fullName === repo.fullName);
@@ -749,6 +772,12 @@ const inert = (value: string) => value.replace(/@(?=[A-Za-z0-9_-])/g, '@\u200b')
 // 파일 경로도 PR 작성자가 정한 자료다. 코드 칸을 깨거나 줄을 바꾸지 못하게 한다.
 const code = (value: string) => `\`${inert(value.replace(/[`\r\n]/g, '?'))}\``;
 export const reviewMarker = (key: string) => `<!-- homelab-bot-review:${key} -->`;
+// 모델 칸 하나를 문단 안의 문장 하나로 만든다. 빈 줄이 문단을 끊지 못하게 줄바꿈을 공백으로 접고,
+// 문장 끝 없이 끝난 칸(v1 지시문으로 저장된 결과의 "…일 때" 같은 조각)에는 마침표를 붙인다.
+const sentence = (value: string) => {
+  const flat = value.replace(/\s*[\r\n]+\s*/g, ' ').trim();
+  return /[\p{L}\p{N}]$/u.test(flat) ? `${flat}.` : flat;
+};
 // 게시 본문은 코드가 만든다. 모델 텍스트는 지적 칸 안의 자료로만 들어가고 event·대상은 상수다.
 export function render(result: ReviewResult, positions: { path: string; lines: number[] }[],
   limits: NonNullable<ReviewPolicy['publish']>, key: string): { body: string; comments: { path: string; line: number; side: 'RIGHT'; body: string }[] } | null {
@@ -756,23 +785,26 @@ export function render(result: ReviewResult, positions: { path: string; lines: n
   const shown = findings.slice(0, limits.maxFindings);
   const comments: { path: string; line: number; side: 'RIGHT'; body: string }[] = [];
   const valid = new Map(positions.map(p => [p.path, new Set(p.lines)]));
-  const entry = (f: ReviewResult['findings'][number]) => `**[${f.severity}] ${inert(f.title)}**\n- 조건: ${inert(f.condition)}\n- 영향: ${inert(f.impact)}\n- 근거: ${inert(f.evidence)}\n- 개선: ${inert(f.suggestion)}`;
+  const heading = (f: ReviewResult['findings'][number]) => `**[${f.severity}] ${inert(f.title.replace(/\s*[\r\n]+\s*/g, ' '))}**`;
+  const paragraph = (f: ReviewResult['findings'][number]) =>
+    [f.condition, f.impact, f.evidence, f.suggestion].map(text => inert(sentence(text))).join(' ');
   for (const f of shown) if (f.line && valid.get(f.path)?.has(f.line) && comments.length < limits.maxInlineComments) {
-    comments.push({ path: f.path, line: f.line, side: 'RIGHT', body: entry(f) });
+    comments.push({ path: f.path, line: f.line, side: 'RIGHT', body: `${heading(f)}\n\n${paragraph(f)}` });
   }
   const omitted = result.coverage.omitted_files_with_reasons;
-  const lines = [reviewMarker(key), '**자동 참고 리뷰**: 승인·병합 판단이 아니며 안전을 보증하지 않습니다.',
-    `- 검토 리비전: head \`${result.head_sha}\`, 기준 \`${result.comparison_revision}\`, 정책 \`${result.policy_revision}\``,
-    `- 결과: ${result.review_outcome === 'partial' ? '부분 검토' : '검토 완료'}. 확인 파일 ${result.coverage.checked_files.length}개, 제외 ${omitted.length}개`
-      + (result.coverage.limits_hit.length ? `, 상한: ${result.coverage.limits_hit.join(', ')}` : ''),
-    ...omitted.slice(0, 20).map(o => `  - 미검토 ${code(o.path)}: ${o.reason}`),
-    ...(omitted.length > 20 ? [`  - 미검토 ${omitted.length - 20}개 더 있음`] : []),
+  const limitsHit = result.coverage.limits_hit.length ? `(상한: ${result.coverage.limits_hit.join(', ')})` : '';
+  const lines = [reviewMarker(key), '참고용 자동 리뷰예요. 승인·병합 판단이 아니고 안전을 보증하지도 않아요.',
+    `${result.review_outcome === 'partial' ? '부분 검토예요' : '검토를 마쳤어요'}. 파일 ${result.coverage.checked_files.length}개를 봤어요`
+      + (omitted.length ? `, ${omitted.length}개는 못 봤어요` : '') + `${limitsHit}. `
+      + `리비전 head \`${result.head_sha}\` · 기준 \`${result.comparison_revision}\` · 정책 \`${result.policy_revision}\``,
+    ...omitted.slice(0, 20).map(o => `- 못 본 파일 ${code(o.path)}: ${o.reason}`),
+    ...(omitted.length > 20 ? [`- 못 본 파일이 ${omitted.length - 20}개 더 있어요`] : []),
     '', inert(result.public_summary), ''];
-  lines.push(shown.length ? '### 지적' : '### 지적 없음');
-  for (const f of shown) lines.push(`${entry(f)}\n- 위치: ${code(f.path)}${f.line ? `:${f.line}` : ''}`);
-  if (findings.length > shown.length) lines.push(`- 상한으로 ${findings.length - shown.length}건 생략`);
-  if (result.open_questions.length) lines.push('### 확인 질문', ...result.open_questions.map(q => `- ${inert(q)}`));
-  const body = lines.join('\n');
+  if (!shown.length) lines.push('따로 지적할 건 없어요.');
+  for (const f of shown) lines.push(`${heading(f)} · ${code(f.path)}${f.line ? `:${f.line}` : ''}\n${paragraph(f)}`, '');
+  if (findings.length > shown.length) lines.push(`게시 상한 때문에 ${findings.length - shown.length}건은 싣지 않았어요.`, '');
+  if (result.open_questions.length) lines.push('확인하고 싶은 점이 있어요.', ...result.open_questions.map(q => `- ${inert(q)}`));
+  const body = lines.join('\n').trimEnd();
   return body.length > limits.maxBodyChars ? null : { body, comments };
 }
 
@@ -880,7 +912,7 @@ export class ReviewPublisher {
     const repo = context.review.repositories.find(r => String(r.id) === String(row.repo_id) && r.fullName === row.repo_full_name
       && String(r.installationId) === String(saved?.installation_id));
     if (!repo) { await this.state(row, 'blocked', 'authorization_revoked'); return; }
-    if (context.revision !== row.policy_revision) { await this.state(row, 'superseded', 'policy_changed'); return; }
+    if (!sameReviewContent(row.policy_revision, context)) { await this.state(row, 'superseded', 'policy_changed'); return; }
     if (!context.review.publish) { await this.state(row, 'blocked', 'publish_limits_unset'); return; }
     // 내부 표식 목록은 결과 저장 뒤에도 바뀔 수 있어 게시 직전 현재 정책으로 다시 분류한다(DATA-01).
     const stored = saved?.result;
