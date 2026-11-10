@@ -20,7 +20,7 @@ import type { TaskOutputRisk } from './task-output.js';
 import type { TaskStatus, TaskWorkerPort } from './task-bridge.js';
 import type { TaskV2WorkerPort } from './task-http.js';
 import { CHANGE_INSTRUCTIONS_REVISION, TASK_ENDPOINTS, TASK_INSTRUCTIONS_REVISION, TASK_LIMITS, boundAmendmentMaterials, TASK_RETENTION, TASK_V2_CONTRACT, TASK_V2_ENDPOINTS, TASK_V2_REQUEST_CHARS, taskQuestionId } from './task-contracts.js';
-import type { BaselineLeaf, TaskCancelResponse, TaskRequest, TaskResponse, TaskStatusResponse, TaskV2Request, TaskV2TurnResult, TaskV2VerificationResponse, TaskWorkerIdentity } from './task-contracts.js';
+import type { BaselineLeaf, TaskInstructionsRevision, TaskCancelResponse, TaskRequest, TaskResponse, TaskStatusResponse, TaskV2Request, TaskV2TurnResult, TaskV2VerificationResponse, TaskWorkerIdentity } from './task-contracts.js';
 
 // 작업 레인(Claude)의 게시 서버 쪽 턴 조율. 한 run이 /v1/task 한 번, 곧 한 턴이다. 작업자 호출은 TaskWorkerPort로만 한다.
 // 결과는 프로세스 소멸 확인을 전제로만 확정하고, 확인을 못 하면 unknown으로 두어 작업 레인의 새 접수를 닫는다.
@@ -252,8 +252,9 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     } : { ...shape, operation: 'start', turn, generation: (session?.generation ?? 0) + 1, sessionId: randomUUID(), untrusted: { request: text } });
   }
   // v2 턴의 저장. 시작·재개의 CAS와 응답 해석을 v1과 한 벌로 쓴다. v2는 응답을 기다리지 않아 결과 확정이 다른 시점에 일어난다.
+  // 시작 턴의 지시문 판을 세션에 남긴다. 재개는 그 판을 그대로 보낸다(재개의 begin은 capabilities를 바꾸지 않는다).
   beginChangeTurn(job: Job, request: TaskV2Request, session: SessionRow | undefined): Promise<'started' | 'stale' | 'conflict'> {
-    return this.begin(job, request, session, { version: TASK_V2_CONTRACT, lane: 'task', tool_approval_relay: false });
+    return this.begin(job, request, session, { version: TASK_V2_CONTRACT, lane: 'task', tool_approval_relay: false, instructions: request.instructions });
   }
   // snapshot 외의 턴 결말을 v1과 같은 규칙으로 확정한다.
   async settleChangeTurn(job: Job, session: SessionRow, result: Exclude<TaskV2TurnResult, { status: 'snapshot' }> | null, stop?: Stop, questionBlocked = false): Promise<Settled> {
@@ -523,7 +524,9 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
           }
           return settled;
         }
-        if (await this.ask(job, revision, taskQuestionId(job.id, request.sessionId, request.turn), request.sessionId, request.turn, response.question, store)) {
+        // 선택지는 변경 작성 판(v2) 결과에만 있다. 공개 검사는 fetchResult가 질문과 함께 마쳤다(걸리면 question_blocked로 여기 오지 않는다).
+        const options = (response as { options?: readonly string[] }).options;
+        if (await this.ask(job, revision, taskQuestionId(job.id, request.sessionId, request.turn), request.sessionId, request.turn, response.question, store, options)) {
           await end('waiting_answer');
           return { terminal: false };
         }
@@ -756,11 +759,14 @@ export interface ChangeAuthorSource {
   // change generation의 작성 job.
   authorJob(key: ChangeKey): Promise<string | null>;
   keyOf(jobId: string): Promise<ChangeKey | null>;
-  // 모델 질문을 스레드에 내보내면 안 되는 사유 코드. 없으면 null이다.
-  questionRisk(jobId: string, question: string): Promise<string | null>;
+  // 모델 질문을 스레드에 내보내면 안 되는 사유 코드. 없으면 null이다. 선택지가 있으면 그 글도 함께 본다(질문 글과 버튼으로 나간다).
+  questionRisk(jobId: string, question: string, options?: readonly string[]): Promise<string | null>;
 }
 export interface ChangeAuthorDeps { bridge: ClaudeTaskBridge; store: Store; gate: PolicyGate; worker: TaskV2WorkerPort; source: ChangeAuthorSource; artifacts: ChangeArtifactPort }
 const TERMINAL_SESSION = new Set(['completed', 'failed', 'cancelled']);
+// 시작 턴이 남긴 판. 판을 남기기 전에 시작한 세션은 옛 판이었다.
+const sessionInstructions = (session: SessionRow): TaskInstructionsRevision =>
+  (session.capabilities as { instructions?: TaskInstructionsRevision } | null | undefined)?.instructions === CHANGE_INSTRUCTIONS_REVISION ? CHANGE_INSTRUCTIONS_REVISION : TASK_INSTRUCTIONS_REVISION;
 // 작업자 정리(유예 1.5초 + KILL 2초)보다 길게 기다린다. null은 마지막 시도다.
 const BUSY_RETRY_MS = [500, 1000, 2000, 4000, null] as const;
 // 작업자 v2 경로. 세션 행을 v1과 같은 표에 두어 레인 닫힘·보존 칸·소멸 확인이 같은 규칙으로 돈다. receipt는 job·세션 세대이고 나머지는 그 행에서 읽는다.
@@ -768,12 +774,16 @@ const BUSY_RETRY_MS = [500, 1000, 2000, 4000, null] as const;
 export class ClaudeChangeAuthor implements ChangeAuthorPort {
   constructor(private readonly deps: ChangeAuthorDeps) {}
   supportsV2(): Promise<boolean> { return this.deps.worker.supportsChange().catch(() => false); }
-  // 고치기 요청은 변경 작성 판(change-v2)의 수정 차례 칸에 PR 번호 없이 싣는다. 그 판을 말하지 않는 작업자에는 차례를 열지 않는다.
+  // 새 세션의 지시문 판. 작업자가 변경 작성 판을 받는다고 알릴 때만 그 판이고, 알리지 않거나(옛 작업자·옛 port) 확인하지 못하면
+  // 옛 판이다. 옛 작업자는 새 판 요청을 모양으로 거부해 턴을 띄우지 못하므로, 닫지 않고 지금 동작으로 둔다.
+  private async startInstructions(): Promise<TaskInstructionsRevision> {
+    const listed = await this.deps.worker.changeInstructions?.().catch(() => []) ?? [];
+    return listed.includes(CHANGE_INSTRUCTIONS_REVISION) ? CHANGE_INSTRUCTIONS_REVISION : TASK_INSTRUCTIONS_REVISION;
+  }
+  // 고치기 요청은 변경 작성 판(change-v2)의 수정 차례 칸에 PR 번호 없이 싣는다. 새 세션이 그 판으로 시작할 작업자에만 차례를 연다.
   // 판은 말하지만 PR 번호를 필수로 받는 옛 작업자는 요청을 거부하고(TaskWorkerRejected), 호출자가 review_blocked로 닫는다.
   async supportsSelfFix(): Promise<boolean> {
-    if (!await this.supportsV2()) return false;
-    const listed = await this.deps.worker.changeInstructions?.().catch(() => []) ?? [];
-    return listed.includes(CHANGE_INSTRUCTIONS_REVISION);
+    return await this.supportsV2() && await this.startInstructions() === CHANGE_INSTRUCTIONS_REVISION;
   }
   private async session(jobId: string, generation?: number): Promise<SessionRow | undefined> {
     const row = (await this.deps.store.db.query<SessionRow>(`SELECT * FROM codex_sessions WHERE job_id=$1 AND executor='claude'`, [jobId])).rows[0];
@@ -819,13 +829,13 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
     const generation = (prior?.generation ?? 0) + 1;
     const timeoutMs = Math.min(job.budget.timeoutMs, TASK_LIMITS.turnTimeoutMs);
     // 게시 전 고치기 차례만 변경 작성 판과 수정 차례 칸을 쓴다. head는 그 generation의 B이고 PR 번호는 없다. 발견은 자료 항목으로만 간다.
-    const selfFix = input.selfFix ? { instructions: CHANGE_INSTRUCTIONS_REVISION, amendment: { pullNumber: null, head: input.baseCommit, instruction: SELF_FIX_INSTRUCTION,
-      materials: { label: 'public' as const, ...boundAmendmentMaterials(selfFixMaterials(input.selfFix.findings)) } } } : null;
+    const amendment = input.selfFix ? { pullNumber: null, head: input.baseCommit, instruction: SELF_FIX_INSTRUCTION,
+      materials: { label: 'public' as const, ...boundAmendmentMaterials(selfFixMaterials(input.selfFix.findings)) } } : null;
     const request = TASK_V2_ENDPOINTS['/v2/task'].request.parse({ version: TASK_V2_CONTRACT, lane: 'task', job: job.id, lease: job.lease_token, generation, policyRevision: input.policyRevision,
-      instructions: selfFix?.instructions ?? TASK_INSTRUCTIONS_REVISION, sessionId: randomUUID(), repository: plan.repository, base: input.baseCommit, project: plan.project, timeoutMs,
+      instructions: amendment ? CHANGE_INSTRUCTIONS_REVISION : await this.startInstructions(), sessionId: randomUUID(), repository: plan.repository, base: input.baseCommit, project: plan.project, timeoutMs,
       runBudgetRemainingMs: TASK_LIMITS.runBudgetMs, toolCalls: Math.min(job.budget.toolCalls, TASK_LIMITS.toolCalls), limits: plan.limits, operation: 'start', turn: 1,
       baseline: { repoId: input.target.repoId, changeGeneration: input.target.key.generation, baseTree: input.baseTree, leaves: plan.baseline },
-      untrusted: { request: renderChangeBrief(input.brief) }, ...(selfFix ? { amendment: selfFix.amendment } : {}) });
+      untrusted: { request: renderChangeBrief(input.brief) }, ...(amendment ? { amendment } : {}) });
     await this.send(job, prior, request);
     return { receiptId: changeReceipt(job.id, generation) };
   }
@@ -851,7 +861,7 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
     const plan = await this.deps.source.settings(jobId);
     if (plan.project.id !== session.project_id || plan.project.revision !== session.project_revision) throw new Error('change_session_mismatch');
     const request = TASK_V2_ENDPOINTS['/v2/task'].request.parse({ version: TASK_V2_CONTRACT, lane: 'task', job: jobId, lease: job.lease_token, generation, policyRevision: session.policy_revision,
-      instructions: TASK_INSTRUCTIONS_REVISION, sessionId: session.claude_session_id, repository: session.repository, base: session.base_sha, project: plan.project,
+      instructions: sessionInstructions(session), sessionId: session.claude_session_id, repository: session.repository, base: session.base_sha, project: plan.project,
       timeoutMs: Math.min(job.budget.timeoutMs, TASK_LIMITS.turnTimeoutMs, remaining), runBudgetRemainingMs: remaining, toolCalls, limits: plan.limits,
       operation: 'resume', turn: session.turn + 1, expectedWorker: status.worker, resumeReason: session.state === 'waiting_answer' ? 'clarification' : session.wait_reason,
       ...(question ? { questionId: question.id, untrusted: { answer: input.answer, label: input.label } } : {}) });
@@ -902,15 +912,16 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
       if (!artifact) return { kind: 'unknown', code: 'artifact_response_invalid' };
       await this.deps.bridge.bindChangeWorker(jobId, session, result.worker);
       await this.deps.store.heartbeat(job).catch(() => {});
-      return { kind: 'snapshot', artifact, transportBytes: raw.bytes };
+      // 확인할 것·남은 위험은 변경 작성 판(change-v2) 결과에만 있다. 옛 판 결과면 칸 없이 넘긴다.
+      return { kind: 'snapshot', artifact, transportBytes: raw.bytes, ...(result.checks ? { checks: result.checks } : {}), ...(result.risks ? { risks: result.risks } : {}) };
     }
     const stop = result.status === 'failed' && result.reason === 'aborted' ? 'cancel' as const : undefined;
     // 질문 경로는 스레드로 바로 나간다. 질문 행을 만들기 전에 본다. 정책을 못 읽어 던지면 아무것도 나가지 않고 다음 바퀴에 같은 결과를 다시 본다.
-    const risky = result.status === 'needs_input' && await this.deps.source.questionRisk(jobId, result.question) !== null;
+    const risky = result.status === 'needs_input' && await this.deps.source.questionRisk(jobId, result.question, result.options) !== null;
     const settled = await this.settled(job, session, result, stop, risky);
     this.deps.bridge.reportChangeEnd(jobId, settled);
     if (risky) return { kind: 'failed', code: CHANGE_QUESTION_BLOCKED };
-    if (result.status === 'needs_input') return { kind: 'needs_input', question: result.question };
+    if (result.status === 'needs_input') return { kind: 'needs_input', question: result.question, ...(result.options ? { options: result.options } : {}) };
     if (result.status === 'failed') return stop ? { kind: 'cancelled', code: 'aborted' } : { kind: 'failed', code: result.reason };
     if (result.status === 'unknown') return settled.terminal ? { kind: 'failed', code: 'task_worker_lost' } : { kind: 'unknown', code: 'stop_unconfirmed' };
     return { kind: 'unknown', code: result.status === 'limited' ? 'model_limit' : 'auth_expired' };

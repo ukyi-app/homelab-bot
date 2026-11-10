@@ -1,11 +1,13 @@
 import { z } from 'zod';
 import type { WriterOutcome } from './change-contracts.js';
 import { DEFAULTS, Denied, PolicyUnavailable } from './contracts.js';
-import { GitHubApi, GitHubAppAuth, GitHubTokenError, assertAllowed } from './github-app.js';
+import { GitHubApi, GitHubAppAuth, GitHubTokenError, TokenResponse, appJwt, assertAllowed, grantedExactly } from './github-app.js';
 import type { BoundRepository, GitHubAppCredentials } from './github-app.js';
-import { GitHubError, pullRequest, restrictGitHubWrite } from './review.js';
-import type { GitHubReader, GitHubTransport, ReviewPolicySource } from './review.js';
+import { GitHubError, pullRequest, requestedRepository, restrictGitHubWrite, ReviewQueue, ReviewRequests } from './review.js';
+import type { GitHubReader, GitHubTransport, ReviewPolicySource, ReviewTarget, ReviewTargetReader } from './review.js';
 import type { Change } from './review-input.js';
+import { bindReviewRequests, REVIEW_REQUEST_ORGANIZATION } from './review-request.js';
+import type { Store } from './store.js';
 
 // src/review.ts의 GitHubReader·GitHubTransport 실제 구현. 조립은 main.ts 몫이다(C5).
 // ReviewTaskSchema.changes와 ChangeSchema.path의 상한과 같아야 한다. 넘긴 목록이 계약 밖이면 열거 실패로 닫힌다.
@@ -78,11 +80,21 @@ export function diffTrees(base: Pick<Tree, 'tree' | 'truncated'>, head: Pick<Tre
 
 export type RepositoryLookup = (fullName: string) => Promise<BoundRepository>;
 // 저장소 이름에서 토큰 범위를 현재 정책으로 정한다. 정책에 없으면 토큰을 발급하지 않는다.
-export function policyRepositories(policy: Pick<ReviewPolicySource, 'current'>): RepositoryLookup {
+// store를 주면 정책 목록 밖 저장소도 Discord 리뷰 요청(C30) 세대가 아직 살아 있는 동안(실행 전·실행 중·게시 대기·게시 불명)
+// 그 세대의 대상 기록으로 토큰 범위를 정한다. 작업이 끝나면 다시 닫힌다.
+const LIVE_REQUEST = `SELECT p.request_target,p.repo_id,p.repo_full_name,p.installation_id FROM pr_reviews p JOIN jobs j ON j.id=p.job_id
+  WHERE p.repo_full_name=$1 AND p.request_target IS NOT NULL AND (j.state IN ('queued','running','verifying','waiting_user','cancel_requested')
+    OR EXISTS (SELECT 1 FROM review_deliveries d WHERE d.job_id=p.job_id AND d.state IN ('pending','sending','unknown')))
+  ORDER BY p.created_at DESC LIMIT 1`;
+export function policyRepositories(policy: Pick<ReviewPolicySource, 'current'>, store?: Pick<Store, 'db'>): RepositoryLookup {
   return async fullName => {
     const repo = (await policy.current()).review.repositories.find(r => r.fullName === fullName);
-    if (!repo) throw new Denied();
-    return repo;
+    if (repo) return repo;
+    const row = store && (await store.db.query<{ request_target: unknown; repo_id: string; repo_full_name: string; installation_id: string }>(
+      LIVE_REQUEST, [fullName])).rows[0];
+    const requested = row ? requestedRepository(row) : undefined;
+    if (!requested) throw new Denied();
+    return requested;
   };
 }
 
@@ -141,17 +153,69 @@ const GuidanceInput = z.strictObject({ ...GuidanceTarget, body: z.string().min(1
 const GuidanceLookup = z.strictObject(GuidanceTarget);
 const RecoveredReview = z.object({ id: z.number().int().positive(), commit_id: z.string().nullable(), body: z.string().nullable(), pull_request_url: z.string() });
 
-export interface GitHubReviewIO { reader: GitHubReader; transport: GitHubTransport; discussion: PullDiscussionReader; guidance: GuidanceReviewPort }
-export function githubReviewIO(options: { app: GitHubAppCredentials; repositories: RepositoryLookup; send?: typeof fetch; now?: () => number }): GitHubReviewIO {
+// ---- 리뷰 요청 대상(C30) ----
+
+const InstallationSchema = z.object({ id: z.number().int().positive(), account: z.object({ login: z.string() }).nullable() });
+const RepositorySchema = z.object({ id: z.number().int().positive(), full_name: z.string(), private: z.boolean().optional(),
+  visibility: z.string().optional(), owner: z.object({ login: z.string(), type: z.string() }) });
+// 저장소 정보 읽기에는 메타데이터 읽기만 쓴다. App의 다른 권한을 이 토큰에 싣지 않는다.
+const METADATA = Object.freeze({ metadata: 'read' });
+
+export interface GitHubReviewIO {
+  reader: GitHubReader; transport: GitHubTransport; discussion: PullDiscussionReader; guidance: GuidanceReviewPort; targets: ReviewTargetReader;
+}
+// requests: 주면 같은 Store에 Discord 리뷰 요청 접수(ReviewRequests)를 묶는다. 대화 성공 분기의 제안 대조가 그 묶음을 읽는다.
+export function githubReviewIO(options: { app: GitHubAppCredentials; repositories: RepositoryLookup; send?: typeof fetch; now?: () => number;
+  requests?: { store: Store; policy: ReviewPolicySource } }): GitHubReviewIO {
   const now = options.now ?? Date.now;
   const api = new GitHubApi(options.send ?? fetch, now);
   const auth = new GitHubAppAuth(options.app, api, now);
   const { repositories } = options;
-  const read = async (repository: string, suffix: string): Promise<unknown> => {
-    const path = `/repos/${repository}${suffix}`;
+  const readFrom = (repo: BoundRepository, suffix: string): Promise<unknown> => {
+    const path = `/repos/${repo.fullName}${suffix}`;
     assertAllowed('GET', path);
-    const repo = await repositories(repository);
     return auth.withToken(repo, 'read', token => api.call('GET', path, token));
+  };
+  const read = async (repository: string, suffix: string): Promise<unknown> => {
+    assertAllowed('GET', `/repos/${repository}${suffix}`);
+    return readFrom(await repositories(repository), suffix);
+  };
+  const mergeBaseOf = async (get: (suffix: string) => Promise<unknown>, base: string, head: string): Promise<string> => {
+    const raw = parse(MergeBaseSchema, await get(`/compare/${base}...${head}?per_page=1`));
+    if (raw.base_commit.sha !== base) throw new Error('github_invalid_response');
+    return raw.merge_base_commit.sha;
+  };
+  // 정책 목록 밖 조직 저장소. 설치는 App JWT로 묻고(없으면 404 → null), 저장소 ID를 아직 모르므로 이름으로 좁힌 메타데이터 토큰으로
+  // 저장소 정보를 읽는다. 설치 계정·토큰 저장소·정보가 요청한 저장소와 하나라도 다르면 쓰지 않는다.
+  const targets: ReviewTargetReader = {
+    async repository(fullName) {
+      const [owner, name] = fullName.split('/') as [string, string];
+      if (owner.toLowerCase() !== REVIEW_REQUEST_ORGANIZATION || !name) throw new Denied();
+      let installation: z.infer<typeof InstallationSchema>;
+      try { installation = parse(InstallationSchema, await api.call('GET', `/repos/${fullName}/installation`, appJwt(options.app, now()))); }
+      catch (error) {
+        if (error instanceof GitHubError && error.status === 404) return null;
+        throw error;
+      }
+      if (installation.account?.login.toLowerCase() !== owner.toLowerCase()) throw new Error('github_installation_mismatch');
+      const issued = TokenResponse.safeParse(await api.call('POST', `/app/installations/${installation.id}/access_tokens`, appJwt(options.app, now()),
+        { repositories: [name], permissions: METADATA }));
+      const granted = issued.success && issued.data.repositories?.length === 1 ? issued.data.repositories[0]! : undefined;
+      if (!issued.success || !granted || granted.full_name.toLowerCase() !== fullName.toLowerCase() || !grantedExactly(issued.data.permissions, METADATA)) {
+        throw new Error('github_token_mismatch');
+      }
+      const path = `/repos/${granted.full_name}`;
+      assertAllowed('GET', path);
+      const info = parse(RepositorySchema, await api.call('GET', path, issued.data.token));
+      if (info.id !== granted.id || info.full_name !== granted.full_name || info.owner.type !== 'Organization'
+        || info.owner.login.toLowerCase() !== REVIEW_REQUEST_ORGANIZATION) throw new Error('github_repository_mismatch');
+      // 작업자는 압축본을 자격 없이 받으므로 익명으로 보이는 저장소만 public이다. visibility 칸(internal 포함)을 먼저 보고,
+      // 칸이 없으면 private 불리언으로, 둘 다 없거나 서로 어긋나면 private로 닫는다. 접수(ReviewRequests)가 private를 거절한다.
+      const open = info.private !== true && (info.visibility === undefined ? info.private === false : info.visibility === 'public');
+      return { id: info.id, fullName: info.full_name, installationId: installation.id, visibility: open ? 'public' : 'private' };
+    },
+    pullRequest: (target: ReviewTarget, number) => readFrom(target, `/pulls/${number}`),
+    mergeBase: (target: ReviewTarget, base, head) => mergeBaseOf(suffix => readFrom(target, suffix), base, head),
   };
   const list = async (repository: string, suffix: string): Promise<unknown[]> => parse(z.array(z.unknown()), await read(repository, suffix));
   const commitTree = async (repository: string, commit: string): Promise<string> => {
@@ -168,11 +232,7 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
     pullRequest: (repository, number) => read(repository, `/pulls/${number}`),
     openPullRequests: (repository, page) => list(repository, `/pulls?state=open&sort=updated&direction=desc&per_page=100&page=${page}`),
     reviews: (repository, number, page) => list(repository, `/pulls/${number}/reviews?per_page=100&page=${page}`),
-    async mergeBase(repository, base, head) {
-      const raw = parse(MergeBaseSchema, await read(repository, `/compare/${base}...${head}?per_page=1`));
-      if (raw.base_commit.sha !== base) throw new Error('github_invalid_response');
-      return raw.merge_base_commit.sha;
-    },
+    mergeBase: (repository, base, head) => mergeBaseOf(suffix => read(repository, suffix), base, head),
     // compare API 파일 목록은 300개에서 끊기고 gitlink를 놓칠 수 있어 tree로 직접 비교한다. 실패를 그 목록으로 덮지 않는다.
     async compare(repository, base, head) {
       const [baseTree, headTree] = [await commitTree(repository, base), await commitTree(repository, head)];
@@ -321,5 +381,9 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
       return null;
     },
   };
-  return { reader, transport, discussion, guidance };
+  if (options.requests) {
+    const { store, policy } = options.requests;
+    bindReviewRequests(store, new ReviewRequests(store, policy, new ReviewQueue(store, reader), reader, targets));
+  }
+  return { reader, transport, discussion, guidance, targets };
 }

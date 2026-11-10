@@ -14,7 +14,9 @@ import type { MemoryCommand, MemoryCommandHandler } from './memory-commands.js';
 import type { PolicyGate } from './policy.js';
 import { buttonAllowed, buttonRoute } from './discord-protocol.js';
 import { bindProposalHandlers, PROPOSAL_BUTTONS, PROPOSAL_TEXT, pressProposal } from './proposals.js';
-import { offerAnswer, pressQuestionPick } from './question-pick.js';
+import { chooseNextAnswer, deferInGap, offerAnswer, pressQuestionPick, sealsNextMessage } from './question-pick.js';
+import { pressChangeQuestion } from './change-question.js';
+import type { ChangeQuestionPress } from './change-question.js';
 import { moveReactions, ReactionSync, recordReceived, settleReactions } from './reactions.js';
 import { LaneClosed } from './store.js';
 import type { Delivery, Store } from './store.js';
@@ -85,6 +87,7 @@ export class DiscordIngress {
     if (event.kind === 'button' && buttonRoute(event.command) === 'question') return this.questionButton(event, recovered);
     if (event.kind === 'button' && buttonRoute(event.command) === 'publish') return this.publishButton(event, recovered);
     if (event.kind === 'button' && buttonRoute(event.command) === 'session-key') return this.sessionKeyButton(event, recovered);
+    if (event.kind === 'button' && buttonRoute(event.command) === 'change-question') return this.changeQuestionButton(event, recovered);
     // 이 단계에서 열지 않은 명령·버튼은 저장·권한 확인 전에 닫는다(task·review-*는 FOUNDATION 밖).
     if (event.kind !== 'message' && !this.commands.has(event.command ?? '')) throw new Denied();
     if (event.kind !== 'message' && taskControls.has(event.command ?? '') && !this.tasks) throw new Denied();
@@ -124,7 +127,11 @@ export class DiscordIngress {
     let answered = false;
     // 처리기가 맡은 답은 events에 원문을 남기지 않고 이 호출의 값으로만 넘긴다. /answer는 버퍼에 들어가지 않아 저장한 원문으로 되살릴 일이 없다.
     const spoken = event.text;
-    const sealed = event.kind !== 'message' && event.command === 'answer' && !!event.target && await this.tasks?.sealsAnswer?.(this.store.db, event.target) === true;
+    // 변경 질문의 답이 될 수 있는 일반 메시지(스위치 켜짐, owner, 열린 변경 질문이 있는 스레드)도 저장 전에 봉인한다. 수신 트랜잭션에서
+    // 답으로 쓰지 않게 되면 일반 대화라 원문을 되돌린다.
+    const messageSealed = event.kind === 'message' && this.store.colleague && !!this.tasks && event.scope.kind !== 'channel'
+      && conversation?.owner_id === event.actor && await sealsNextMessage(this.store, this.tasks, this.store.scopeId(event.scope), event.actor);
+    const sealed = messageSealed || event.kind !== 'message' && event.command === 'answer' && !!event.target && await this.tasks?.sealsAnswer?.(this.store.db, event.target) === true;
     const saved = await this.store.save(sealed ? { ...event, text: '' } : event, p.revision, !!explicit && (!isControl || event.command === 'resume'));
     if (!recovered && this.store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
     // Route durably before ACK: a lost response or process exit cannot orphan an acknowledged request.
@@ -163,11 +170,21 @@ export class DiscordIngress {
       // history 복구로 받은 메시지에는 표시하지 않으므로 행도 만들지 않는다.
       const received = () => event.kind === 'message' && !recovered
         ? recordReceived(store.db, { id: saved.id, channel: event.scope.channel, message: event.id, owner: event.actor }) : undefined;
-      if (subscription.gap && !recovered && !durableControl) {
+      const buffer = async () => {
         const count = (await store.db.query<{ count: string }>('SELECT count(*) FROM events WHERE conversation_id=$1 AND buffered=true', [conversationId])).rows[0]!;
         if (Number(count.count) >= DEFAULTS.maxQueue) throw new Error('recovery_buffer_full');
         await store.db.query('UPDATE events SET buffered=true WHERE id=$1', [saved.id]);
         await received();
+        return true;
+      };
+      // gap 동안에는 checkpoint가 움직이지 않아 복구가 앞선 메시지를 그대로 다시 읽는다.
+      // 봉인한 말은 버퍼 재생이 원문을 읽을 수 없어 버퍼에 두지 않는다. 누락된 앞선 말보다 먼저 답이 되지 않게 답으로도 쓰지 않고
+      // 다시 말해 달라고 한다. 누락된 말은 복구가 같은 봉인 판단(sealsNextMessage)으로 받는다.
+      if (subscription.gap && !recovered && !durableControl) {
+        if (!messageSealed) return buffer();
+        await deferInGap(store, { event: saved.id, message: event.id, actor: event.actor, scope: event.scope, conversation: conversationId,
+          text: '', revision: current.revision, sealed: true });
+        answered = true;
         return true;
       }
       // 스레드를 만들기 전에 본다. 프로젝트가 없거나 레인이 닫혔으면 빈 스레드를 남기지 않고, 구독도 켜지 않는다.
@@ -211,8 +228,9 @@ export class DiscordIngress {
         // 결과 안내 글이 받았다는 표시라 👀를 달지 않는다.
         answered = event.kind === 'message' && store.colleague && this.tasks
           ? await offerAnswer(store, this.tasks, { event: saved.id, message: event.id, actor: event.actor, scope: event.scope, conversation: conversationId,
-            text: event.text, revision: current.revision }) !== undefined
+            text: event.text, revision: current.revision, sealed: messageSealed }) !== undefined
           : false;
+        if (!answered && messageSealed) await store.db.query(`UPDATE events SET payload=jsonb_set(payload,'{text}',to_jsonb($2::text)) WHERE id=$1`, [saved.id, spoken]);
         // admit 뒤에 레인이 닫힌 경합. SQL 오류가 아니라 트랜잭션은 그대로 쓸 수 있다.
         if (!answered) {
           try { await store.accept(saved.id, event.command === 'task' ? 'task' : event.command === 'read' ? 'read' : 'chat', current.revision, event.urgent || event.command === 'urgent'); }
@@ -310,6 +328,28 @@ export class DiscordIngress {
       return pressQuestionPick(store, tasks, { button: event.target!, actor: event.actor, scope: event.scope });
     }, { expiresAt: started + DEFAULTS.inboxTimeoutMs, now: this.store.now });
     this.log('question_pick', { outcome: outcome ? (outcome.update ? 'settled' : 'refused') : 'duplicate' });
+    if (outcome) await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: outcome.content, update: outcome.update });
+    return saved.id;
+  }
+  // 변경 질문의 선택지·"직접 답하기" 버튼. 스위치가 꺼져 있으면 그 버튼을 만들지 않으므로 받지도 않는다. 처리 방식은 질문 고르기 버튼과 같다
+  // (같은 상호작용은 한 번만, 답 쓰기·accepted를 한 트랜잭션에). 버튼 이벤트에는 질문 ID와 순번만 남고 선택지 글은 질문 행에서 읽는다.
+  private async changeQuestionButton(event: z.infer<typeof EventSchema>, recovered: boolean): Promise<string | undefined> {
+    if (recovered || !this.store.colleague || !this.tasks || !event.target) throw new Denied();
+    const tasks = this.tasks;
+    const p = await this.gate.authorize(event.actor, event.scope);
+    const conversation = await this.store.conversation(event.scope);
+    if (!conversation || (event.scope.kind !== 'channel' && conversation.owner_id !== event.actor)) throw new Denied();
+    const started = this.store.now();
+    const saved = await this.store.save({ ...event, text: '' }, p.revision, false);
+    if (this.store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
+    const outcome = await this.store.atomic(async store => {
+      if (!await this.claimIn(store, event, saved.id)) return;
+      const pressed = await pressChangeQuestion(store, tasks, { button: event.command as ChangeQuestionPress['button'], target: event.target!, actor: event.actor, scope: event.scope, event: event.id });
+      // 질문 고르기로 다른 질문을 골라 두었어도 "직접 답하기"를 누른 질문이 다음 말의 대상이 된다.
+      if (pressed.next) await chooseNextAnswer(store.db, store.scopeId(event.scope), pressed.next, event.actor);
+      return pressed;
+    }, { expiresAt: started + DEFAULTS.inboxTimeoutMs, now: this.store.now });
+    this.log('change_question_button', { command: event.command!, outcome: outcome ? (outcome.update ? 'settled' : 'refused') : 'duplicate' });
     if (outcome) await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: outcome.content, update: outcome.update });
     return saved.id;
   }

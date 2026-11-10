@@ -12,6 +12,8 @@ import { join } from 'node:path';
 import { CHANGE_RESTART, changeChildFailed } from '../src/change-advice.js';
 import { changePrecondition, changeTaskPathsMatch } from '../src/change-assembly.js';
 import { parseChangeRequest } from '../src/change-commands.js';
+import { CHANGE_QUESTION_TEXT } from '../src/change-question.js';
+import { QUESTION_PICK_TEXT } from '../src/question-pick.js';
 import { ChangePublisher } from '../src/change-publisher.js';
 import type { ChangeRuntimeDeps } from '../src/change-runtime.js';
 import { CHANGE_RETENTION_MS, purgeExpiredChangeContent } from '../src/change-store.js';
@@ -25,6 +27,7 @@ import { startPublisher } from '../src/main.js';
 import type { Publisher } from '../src/main.js';
 import { loadRuntimePolicy } from '../src/policy.js';
 import { createGitHubWriter } from '../src/github-writer.js';
+import type { GuidanceReview, GuidanceReviewPort } from '../src/github-review-io.js';
 import { TaskWorkerBusy } from '../src/task-bridge.js';
 import { HttpTaskV2Worker } from '../src/task-http.js';
 import { SELF_FIX_INSTRUCTION } from '../src/claude-task-bridge.js';
@@ -413,6 +416,89 @@ test('CHANGE-01 unverifiable 경고는 pass_with_warnings로 미리보기에 남
     assert.equal(await h.phase(id), 'awaiting_publish_approval');
   });
 });
+// ---- C29 확인할 것과 안내 댓글 ----
+
+const GUIDE_NOTES = {
+  checks: [{ text: '상수 값을 2로 가정했어요', location: { path: 'src/a.ts', line: 1 } }, { text: '배포 순서를 가정했어요' }],
+  risks: [{ text: '읽어보기가 낡을 수 있어요', location: { path: 'README.md', line: 1 } }],
+};
+// 리뷰 정책 게시 상한만 쓴다. 저장소 목록·자격은 안내 포트 대역이 대신한다.
+const REVIEW_POLICY = { repositories: [{ id: REPO.id, fullName: REPO.fullName, installationId: REPO.installationId, visibility: 'public' }], allowedBotAuthorIds: [], commentCommand: null,
+  reviewDrafts: false, rereviewOnBaseMove: null, comparison: 'merge_base', reviewSince: 0, internalMarkers: ['fixture-corp-host'],
+  input: { maxFiles: 20, maxFileBytes: 100_000, maxDiffBytes: 200_000, maxArchiveBytes: 1_000_000, maxBodyChars: 4000 },
+  publish: { maxFindings: 10, maxInlineComments: 5, maxBodyChars: 20_000 }, reconcile: { maxPages: 2, maxReviewsPerRun: 3 } };
+const guidancePort = () => {
+  const reviews: GuidanceReview[] = [];
+  const port: GuidanceReviewPort = { post: async input => { reviews.push(input); return { kind: 'confirmed', value: { id: 5000 + reviews.length } }; }, find: async () => null };
+  return { reviews, port };
+};
+
+test('AC-25·AC-27 연결: 작성 결과의 확인할 것이 미리보기와 PR 설명에 있고, 게시 뒤 조립 인수로 받은 포트로 diff 안 항목만 안내 댓글이 한 번 달린다', async () => {
+  const fake = guidancePort();
+  await withHarness({ notes: GUIDE_NOTES, guidance: fake.port, policyPatch: policy => ({ ...policy, review: REVIEW_POLICY }) }, async h => {
+    const id = await toAwaiting(h);
+    await h.deliver();
+    const preview = h.messages().find(text => text.includes('게시 미리보기'))!;
+    assert.ok(preview.includes('확인할 것:\n- 상수 값을 2로 가정했어요 (`src/a.ts:1`)\n- 배포 순서를 가정했어요\n남은 위험:\n- 읽어보기가 낡을 수 있어요 (`README.md:1`)'), preview);
+    await h.command('101', 'change-publish', { target: id, text: await digestOf(h, id) });
+    await h.pump(async () => await h.phase(id) === 'proposed');
+    const body = h.env.github.pulls[0]!.body ?? '';
+    for (const note of [...GUIDE_NOTES.checks, ...GUIDE_NOTES.risks]) assert.ok(body.includes(note.text), note.text);
+    await h.pump(async () => fake.reviews.length === 1);
+    const review = fake.reviews[0]!;
+    assert.deepEqual([review.repository, review.pr, review.head], [REPO.fullName, h.env.github.pulls[0]!.number, h.env.github.pulls[0]!.head.sha]);
+    assert.deepEqual(review.comments, [{ path: 'src/a.ts', line: 1, body: '**확인할 것** 상수 값을 2로 가정했어요' }]);
+    // 병합을 기다리는 동안 다시 돌아도 같은 차례에 두 번 달지 않는다.
+    for (let round = 0; round < 3; round++) await h.runtime.publishTick();
+    assert.equal(fake.reviews.length, 1);
+    assert.equal(await h.phase(id), 'proposed');
+  });
+});
+
+test('AC-27 리뷰 경로 없음: 안내 포트가 없어도 게시와 병합 추적은 그대로다', async () => {
+  // 리뷰 App 조건이 맞지 않으면 main이 포트를 넘기지 않는다.
+  await withHarness({ notes: GUIDE_NOTES }, async h => {
+    const id = await toProposed(h);
+    assert.equal(h.env.github.pulls.length, 1);
+    assert.ok((h.env.github.pulls[0]!.body ?? '').includes(GUIDE_NOTES.checks[0]!.text), 'PR 설명에는 확인할 것이 있다');
+    for (let round = 0; round < 3; round++) await h.runtime.publishTick();
+    assert.equal((await h.db.query('SELECT 1 FROM change_guidance')).rows.length, 0);
+    h.env.github.pulls[0]!.state = 'closed';
+    await h.pump(async () => await h.phase(id) === 'cancelled');
+  });
+});
+
+test('AC-27 리뷰 경로 닫힘: 포트가 policy_unavailable로 답하면 안내만 미루고 게시와 병합 추적은 그대로다', async () => {
+  const posts: GuidanceReview[] = [];
+  const closed: GuidanceReviewPort = { post: async input => { posts.push(input); return { kind: 'not_sent', code: 'policy_unavailable' }; }, find: async () => null };
+  await withHarness({ notes: GUIDE_NOTES, guidance: closed, policyPatch: policy => ({ ...policy, review: REVIEW_POLICY }) }, async h => {
+    const id = await toProposed(h);
+    await h.pump(async () => posts.length === 1);
+    assert.equal(await h.phase(id), 'proposed');
+    assert.ok(h.logs.some(entry => entry.event === 'change_guidance' && JSON.stringify(entry.fields).includes('policy_unavailable')));
+    h.env.github.pulls[0]!.state = 'closed';
+    await h.pump(async () => await h.phase(id) === 'cancelled');
+    assert.equal(posts.length, 1, '미룬 기한 전에는 다시 보내지 않는다');
+  });
+});
+
+test('AC-25 옛 판 결과: 확인할 것이 없으면 미리보기·PR 설명이 지금과 같고 안내 댓글을 달지 않는다', async () => {
+  const fake = guidancePort();
+  await withHarness({ guidance: fake.port, policyPatch: policy => ({ ...policy, review: REVIEW_POLICY }) }, async h => {
+    const id = await toAwaiting(h);
+    await h.deliver();
+    const preview = h.messages().find(text => text.includes('게시 미리보기'))!;
+    assert.ok(!preview.includes('확인할 것') && !preview.includes('남은 위험'));
+    await h.command('101', 'change-publish', { target: id, text: await digestOf(h, id) });
+    await h.pump(async () => await h.phase(id) === 'proposed');
+    const body = h.env.github.pulls[0]!.body ?? '';
+    assert.ok(!body.includes('## 확인할 것') && !body.includes('\n## 남은 위험'));
+    for (let round = 0; round < 3; round++) await h.runtime.publishTick();
+    assert.equal(fake.reviews.length, 0);
+    assert.ok(h.logs.some(entry => entry.event === 'change_guidance' && JSON.stringify(entry.fields).includes('no_inline_items')));
+  });
+});
+
 test('CHANGE-03 연결: 승인 뒤 base가 움직이면 superseded이고 자동으로 다시 시작하지 않는다. /change text:next만 새 generation을 연다', async () => {
   await withHarness({}, async h => {
     const id = await toAwaiting(h);
@@ -1654,29 +1740,43 @@ test('호환 /answer: CHANGE에 묶이지 않은 v1 질문은 같은 처리기�
   });
 });
 
-test('C16 CHANGE 질문은 바로 답·질문 고르기 대상이 아니다: 켜짐에서도 /answer를 안내하고 그냥 한 말은 대화로 가며, 작업 질문이 함께 열려 있으면 그 하나에만 바로 답이 붙는다', async () => {
+test('C28 변경 질문과 작업 질문이 함께 열려 있으면 그 말을 봉인한 채 답으로 쓰지 않고 먼저 고르게 하며, 고른 변경 질문에 다음 말이 공개 표시로 답이 된다', async () => {
   await withHarness({ steps: [QUESTION, WRITE_STEP], colleague: true }, async h => {
-    const { question } = await toQuestion(h);
+    const { id, question } = await toQuestion(h);
     await h.deliver();
-    assert.ok(h.messages().some(text => text.includes(`질문 ID: ${question}`) && text.includes(`/answer question:${question}`)), '변경 질문 글은 켜짐에서도 질문 ID와 /answer를 안내한다');
-    const chatJobs = async () => (await h.db.query<{ delivery_id: string }>(`SELECT e.delivery_id FROM jobs j JOIN events e ON e.id=j.event_id WHERE j.type='chat' ORDER BY e.delivery_id`)).rows.map(row => row.delivery_id);
-    const changeQuestion = async () => (await h.db.query<{ state: string; answer: string | null }>('SELECT state,answer FROM codex_questions WHERE id=$1', [question])).rows[0]!;
-    // 열린 질문이 CHANGE 질문뿐이면 지금처럼 대화로 받고 질문은 그대로 열려 있다.
-    await h.ingress.receive({ id: '1700000000000000001', actor: OWNER, scope: THREAD, kind: 'message', text: '그냥 한 말이에요', mention: true });
-    assert.deepEqual(await changeQuestion(), { state: 'open', answer: null });
-    assert.deepEqual(await chatJobs(), ['1700000000000000001']);
-    // 작업 질문 하나가 함께 열리면 열린 질문을 셀 때 CHANGE 질문은 빠져 그 작업 질문에만 바로 답이 붙는다(고르기 글 없음).
+    // 옛 판 세션의 변경 질문은 선택지가 없다. 켜짐 판 글은 '/answer' 대신 "직접 답하기"와 말로 답하기를 안내한다.
+    const asked = h.rest.messages.find(message => message.body.content.includes(`질문 ID: ${question}`))!;
+    assert.doesNotMatch(asked.body.content, /\/answer/);
+    assert.deepEqual(asked.body.components![0]!.components.map(button => button.label), [CHANGE_QUESTION_TEXT.direct]);
+    const chatJobs = async () => (await h.db.query(`SELECT 1 FROM jobs WHERE type='chat'`)).rows.length;
+    const row = async (target: string) => (await h.db.query<{ state: string; answer: string | null }>('SELECT state,answer FROM codex_questions WHERE id=$1', [target])).rows[0]!;
+    const eventText = async (delivery: string) => (await h.db.query<{ text: string }>(`SELECT payload->>'text' AS text FROM events WHERE delivery_id=$1`, [delivery])).rows[0]!.text;
+    // 먼저 만든 작업 질문(1번)이 함께 열린다.
     const conversation = h.store.scopeId(THREAD);
     await insertChildJob(h.db, 'fixture-v1-job', 'task');
     await h.db.query(`UPDATE jobs SET conversation_id=$1,state='waiting_user',wait_reason='clarification' WHERE id='fixture-v1-job'`, [conversation]);
     await h.db.query(`INSERT INTO codex_questions(id,job_id,conversation_id,thread_id,turn,kind,responder_id,prompt,state,created_at,expires_at)
-      VALUES ('fixture-v1-question','fixture-v1-job',$1,'thread',1,'clarification',$2,'질문','open',1,$3)`, [conversation, OWNER, Date.now() + 3_600_000]);
-    await h.ingress.receive({ id: '1700000000000000002', actor: OWNER, scope: THREAD, kind: 'message', text: '작업 질문의 답이에요', mention: true });
-    const task = (await h.db.query<{ state: string; answer: string | null }>(`SELECT state,answer FROM codex_questions WHERE id='fixture-v1-question'`)).rows[0]!;
-    assert.deepEqual(task, { state: 'answered', answer: '작업 질문의 답이에요' });
-    assert.deepEqual(await changeQuestion(), { state: 'open', answer: null });
-    assert.deepEqual(await chatJobs(), ['1700000000000000001']);
-    assert.equal((await h.db.query(`SELECT 1 FROM outbox WHERE message_key LIKE 'question-pick:%'`)).rows.length, 0);
+      VALUES ('fixture-v1-question','fixture-v1-job',$1,'thread',1,'clarification',$2,'작업 질문','open',1,$3)`, [conversation, OWNER, Date.now() + 3_600_000]);
+    await h.ingress.receive({ id: '1700000000000000002', actor: OWNER, scope: THREAD, kind: 'message', text: `${CANARY} 어느 답인지 모를 말`, mention: true });
+    assert.equal(await eventText('1700000000000000002'), '', '고르는 동안 원문을 events에 두지 않는다');
+    assert.deepEqual(await row(question), { state: 'open', answer: null });
+    assert.deepEqual(await row('fixture-v1-question'), { state: 'open', answer: null });
+    assert.equal(await chatJobs(), 0);
+    await h.deliver();
+    const pick = h.rest.messages.filter(message => message.body.components?.length).at(-1)!;
+    assert.ok(pick.body.content.startsWith(QUESTION_PICK_TEXT.choose([])), '먼저 고르게 한다');
+    assert.ok(!pick.body.content.includes(CANARY));
+    const second = pick.body.components![0]!.components[1]!.custom_id;
+    await h.ingress.receive({ id: 'fixture-pick-1', actor: OWNER, scope: THREAD, kind: 'button', command: 'question-pick', target: second.slice(second.indexOf(':') + 1), text: '' });
+    assert.equal(h.acknowledgements().at(-1), QUESTION_PICK_TEXT.chosen(2));
+    // 고른 뒤의 말은 그 변경 질문의 답이다. 작업 질문은 그대로 열려 있다.
+    await h.ingress.receive({ id: '1700000000000000003', actor: OWNER, scope: THREAD, kind: 'message', text: 'src/a.ts를 고치세요' });
+    assert.deepEqual(await row(question), { state: 'answered', answer: 'src/a.ts를 고치세요' });
+    assert.deepEqual(await row('fixture-v1-question'), { state: 'open', answer: null });
+    assert.equal(await eventText('1700000000000000003'), '');
+    assert.ok(!(await eventsText(h)).includes(CANARY));
+    await h.pump(async () => await h.phase(id) === 'awaiting_publish_approval');
+    assert.ok((await h.f.calls())[1]!.input.includes('src/a.ts를 고치세요'));
   });
 });
 
@@ -1692,6 +1792,8 @@ const replies = (...findings: (typeof P0_FINDING | typeof P2_FINDING)[][]) => {
 // 고치기 세션은 변경 작성 판(change-v2)이라 모델 출력도 그 판의 모양(options·checks·risks)이다.
 const FIXED_STEP = { write: { ...WRITE_STEP.write, 'src/new.ts': 'export const n = 2;\n' },
   output: { status: 'completed', summary: '고쳤어요', question: '', options: [], checks: [], risks: [] } };
+// 작업자가 변경 작성 판을 알리면(changeV2) 처음 작성도 그 판이라 같은 모양을 낸다.
+const V2_WRITE_STEP = { ...WRITE_STEP, output: { ...FIXED_STEP.output, summary: '작성했어요' } };
 // 운영 이미지 9b067e9의 작업자는 변경 작성 판을 말하지만 수정 차례의 pullNumber를 필수로 받는다. PR 번호 없는 요청을 400 거부(started:false)로 돌려준다.
 // 게시 서버 포트는 그 응답을 그대로 받도록 실제 HttpTaskV2Worker를 쓰고 HTTP 응답만 바꾼다.
 function oldWorker(h: Harness): void {
@@ -1707,7 +1809,9 @@ const reviewDigests = async (h: Harness, id: string) => ({
 });
 
 test('C31 고치기 1번: 자체 리뷰의 P0를 게시 전에 고치고 시험·리뷰를 새로 돌아 미리보기로 간다. 승인 digest는 마지막 차례 증거로만 만든다', async () => {
-  await withHarness({ steps: [WRITE_STEP, FIXED_STEP], reviewReply: replies([P0_FINDING], []) }, async h => {
+  const firstChecks = { ...V2_WRITE_STEP, output: { ...V2_WRITE_STEP.output, checks: [{ text: '고치기 전 가정을 확인', path: 'src/new.ts', line: 1 }] } };
+  const fixedChecks = { ...FIXED_STEP, output: { ...FIXED_STEP.output, checks: [{ text: '빈 입력 처리를 확인', path: 'src/new.ts', line: 1 }] } };
+  await withHarness({ changeV2: true, steps: [firstChecks, fixedChecks], reviewReply: replies([P0_FINDING], []) }, async h => {
     const id = await toAwaiting(h);
     const calls = await h.f.calls();
     assert.equal(calls.length, 2, '처음 작성 + 고치기 1번');
@@ -1734,14 +1838,21 @@ test('C31 고치기 1번: 자체 리뷰의 P0를 게시 전에 고치고 시험�
     assert.notEqual(subject.review.receiptDigest, digests.archived[0]);
     const artifact = (await h.db.query<{ artifact_digest: string }>('SELECT artifact_digest FROM change_fix_rounds WHERE change_id=$1', [id])).rows[0]!.artifact_digest;
     assert.notEqual(subject.bundle.artifactDigest, artifact, '앞 차례 artifact로 승인하지 않는다');
+    // 확인할 것(C29)은 마지막 차례 결과의 목록이다. 앞 차례 목록은 차례를 열 때 지웠다.
+    const notes = (await h.db.query<{ checks: unknown }>('SELECT checks FROM change_notes WHERE change_id=$1', [id])).rows;
+    assert.deepEqual(notes.map(row => row.checks), [[{ text: '빈 입력 처리를 확인', location: { path: 'src/new.ts', line: 1 } }]]);
+    assert.ok(subject.publication.body.includes('빈 입력 처리를 확인') && !subject.publication.body.includes('고치기 전 가정'));
     // 고치기 차례 시작은 알리지 않는다.
     await h.deliver();
-    assert.ok(!h.messages().some(text => text.includes('review_blocked') || text.includes('고치')));
+    assert.ok(!h.messages().some(text => text.includes('review_blocked') || text.includes('고치기 전')));
+    const preview = h.messages().find(text => text.includes('게시 미리보기'))!;
+    assert.match(preview, /확인할 것:\n- 빈 입력 처리를 확인/);
+    assert.ok(!preview.includes('고치기 전 가정'));
   });
 });
 
 test('C31 고치기 상한: P0가 계속 남으면 2번 고친 뒤 review_blocked로 닫고 남은 문제 제목을 알린다', async () => {
-  await withHarness({ steps: [WRITE_STEP, FIXED_STEP, FIXED_STEP, FIXED_STEP], reviewReply: replies([P0_FINDING]) }, async h => {
+  await withHarness({ changeV2: true, steps: [V2_WRITE_STEP, FIXED_STEP, FIXED_STEP, FIXED_STEP], reviewReply: replies([P0_FINDING]) }, async h => {
     await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
     const id = await h.changeId();
     await h.pump(async () => await h.phase(id) === 'blocked');
@@ -1770,7 +1881,7 @@ test('C31 P2·P3만: 고치지 않고 미리보기로 가며 남은 위험으로
 });
 
 test('C31 작업자가 변경 작성 판을 말하지 않으면: 고치기 차례를 열지 않고 지금처럼 review_blocked로 닫는다', async () => {
-  await withHarness({ reviewReply: replies([P0_FINDING]) }, async h => {
+  await withHarness({ changeV2: true, reviewReply: replies([P0_FINDING]) }, async h => {
     h.f.port.changeInstructions = async () => ['task-v1'];
     await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
     const id = await h.changeId();
@@ -1785,7 +1896,7 @@ test('C31 작업자가 변경 작성 판을 말하지 않으면: 고치기 차�
 });
 
 test('C31 호환(옛 작업자 9b067e9): PR 번호 없는 고치기 요청을 거부하면 새 실패 모양 없이 review_blocked로 닫고 레인을 놓는다', async () => {
-  await withHarness({ reviewReply: replies([P0_FINDING]) }, async h => {
+  await withHarness({ changeV2: true, steps: [V2_WRITE_STEP], reviewReply: replies([P0_FINDING]) }, async h => {
     oldWorker(h);
     await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
     const id = await h.changeId();
@@ -1801,8 +1912,36 @@ test('C31 호환(옛 작업자 9b067e9): PR 번호 없는 고치기 요청을 �
   });
 });
 
+test('C31 고치기 세션 재개: 고치기 차례가 질문으로 멈췄다 답으로 이어지면 재개 턴도 변경 작성 판(change-v2)이다', async () => {
+  const question = { output: { ...FIXED_STEP.output, status: 'needs_input', summary: '', question: '빈 입력이면 무엇을 돌려줄까요?', options: ['0', '예외'] } };
+  await withHarness({ changeV2: true, steps: [WRITE_STEP, question, FIXED_STEP], reviewReply: replies([P0_FINDING], []) }, async h => {
+    // 작업자 알림은 고치기 차례를 열 때만 change-v2로 둔다. 처음 작성과 재개 때는 옛 판만 알려, 재개 판이 알림이 아니라 고치기 시작 턴의 세션 기록에서 온다는 것을 본다.
+    const sent: { operation: string; instructions: string; amendment?: unknown }[] = [];
+    const advertised = h.f.port.changeInstructions!.bind(h.f.port);
+    let fixing = false;
+    h.f.port.changeInstructions = async signal => fixing ? advertised(signal) : ['task-v1'];
+    const call = h.f.port.callV2.bind(h.f.port);
+    h.f.port.callV2 = (async (endpoint: never, body: never, signal?: AbortSignal) => {
+      if (endpoint === '/v2/task') sent.push(body);
+      return call(endpoint, body, signal);
+    }) as typeof h.f.port.callV2;
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    await h.pump(async () => sent.length === 1);
+    fixing = true;
+    await h.pump(async () => (await h.db.query(`SELECT 1 FROM codex_questions WHERE state='open'`)).rows.length > 0);
+    fixing = false;
+    const asked = (await h.db.query<{ id: string }>(`SELECT id FROM codex_questions WHERE state='open'`)).rows[0]!.id;
+    await h.command('101', 'answer', { target: asked, text: 'label=public | 0을 돌려주세요' });
+    await h.pump(async () => await h.phase(id) === 'awaiting_publish_approval');
+    assert.deepEqual(sent.map(request => [request.operation, request.instructions, request.amendment !== undefined]),
+      [['start', 'task-v1', false], ['start', 'change-v2', true], ['resume', 'change-v2', false]]);
+    assert.equal((await h.f.calls()).length, 3);
+  });
+});
+
 test('C31 차례 중 취소: 고치기 작성 중 /change-cancel이면 cancelled로 닫고 레인을 놓는다', async () => {
-  await withHarness({ steps: [WRITE_STEP, { kind: 'hang' }], reviewReply: replies([P0_FINDING], []) }, async h => {
+  await withHarness({ changeV2: true, steps: [V2_WRITE_STEP, { kind: 'hang' }], reviewReply: replies([P0_FINDING], []) }, async h => {
     await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
     const id = await h.changeId();
     await h.pump(async () => (await h.f.calls()).length === 2);
@@ -1816,7 +1955,7 @@ test('C31 차례 중 취소: 고치기 작성 중 /change-cancel이면 cancelled
 });
 
 test('C31 차례 중 base 이동: 고친 결과는 고정한 base 그대로 미리보기로 가고, 승인 뒤 게시 직전 기존 신선도 규칙으로 superseded가 된다', async () => {
-  await withHarness({ steps: [WRITE_STEP, FIXED_STEP], reviewReply: replies([P0_FINDING], []) }, async h => {
+  await withHarness({ changeV2: true, steps: [V2_WRITE_STEP, FIXED_STEP], reviewReply: replies([P0_FINDING], []) }, async h => {
     await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
     const id = await h.changeId();
     // 가짜 작업자는 작업 공간을 지금 main에서 만들어, 작성 중에 옮기면 baseline_mismatch로 먼저 막힌다. 고친 결과를 저장한 뒤 옮긴다.

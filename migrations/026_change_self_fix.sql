@@ -1,6 +1,6 @@
 BEGIN;
--- C31 게시 전 자체 리뷰 고치기(DECISIONS "동료 봇 전환" 17). 017·018의 변경 표에만 칸·표·트리거를 더한다.
--- 같은 generation 안의 고치기 차례다. 살아 있는 증거 자리(change_artifacts·change_verifications·change_reviews와 묶음 칸)는
+-- C31 게시 전 자체 리뷰 고치기(DECISIONS "동료 봇 전환" 17). 017·018·025의 변경 표에만 칸·표·트리거를 더한다.
+-- 같은 generation 안의 고치기 차례다. 살아 있는 증거 자리(change_artifacts·change_verifications·change_reviews·change_notes와 묶음 칸)는
 -- 늘 마지막 차례의 것이고, 앞 차례의 증거는 digest만 change_fix_rounds로 옮긴다. 그래서 승인·게시·리뷰 입력은 앞 차례의 증거를 볼 수 없다.
 
 -- 지금 차례 번호. 0은 처음 작성이다. 상한은 코드 CHANGE_SELF_FIX.maxRounds와 같고 시험이 대조한다.
@@ -101,6 +101,9 @@ DROP TRIGGER IF EXISTS change_verifications_delete_guard ON change_verifications
 CREATE TRIGGER change_verifications_delete_guard BEFORE DELETE ON change_verifications FOR EACH ROW EXECUTE FUNCTION change_live_evidence_delete_guard();
 DROP TRIGGER IF EXISTS change_reviews_delete_guard ON change_reviews;
 CREATE TRIGGER change_reviews_delete_guard BEFORE DELETE ON change_reviews FOR EACH ROW EXECUTE FUNCTION change_live_evidence_delete_guard();
+-- 025의 확인할 것·남은 위험 목록도 차례의 작성 결과다. 고치기 차례를 열 때 함께 지워 다음 차례 결과의 목록이 새로 기록된다(원문 정리는 UPDATE라 무관하다).
+DROP TRIGGER IF EXISTS change_notes_delete_guard ON change_notes;
+CREATE TRIGGER change_notes_delete_guard BEFORE DELETE ON change_notes FOR EACH ROW EXECUTE FUNCTION change_live_evidence_delete_guard();
 
 CREATE OR REPLACE FUNCTION change_child_jobs_round() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -109,5 +112,5 @@ BEGIN
 END $$;
 DROP TRIGGER IF EXISTS change_child_jobs_round ON change_child_jobs;
 CREATE TRIGGER change_child_jobs_round BEFORE INSERT ON change_child_jobs FOR EACH ROW EXECUTE FUNCTION change_child_jobs_round();
-INSERT INTO schema_migrations VALUES (23) ON CONFLICT DO NOTHING;
+INSERT INTO schema_migrations VALUES (26) ON CONFLICT DO NOTHING;
 COMMIT;

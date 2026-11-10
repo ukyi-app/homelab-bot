@@ -37,7 +37,7 @@ export const CHANGE_PHASE_TRANSITIONS: Readonly<Record<ChangePhase, readonly Cha
 });
 export const canTransition = (from: ChangePhase, to: ChangePhase): boolean => CHANGE_PHASE_TRANSITIONS[from].includes(to);
 export const isTerminalPhase = (phase: ChangePhase): phase is TerminalChangePhase => (TERMINAL_CHANGE_PHASES as readonly ChangePhase[]).includes(phase);
-// 게시 전 고치기 차례 상한(사용자 2026-11-09의 기본값). migrations/023의 fix_round CHECK와 같은 값이고 시험이 대조한다.
+// 게시 전 고치기 차례 상한(사용자 2026-11-09의 기본값). migrations/026의 fix_round CHECK와 같은 값이고 시험이 대조한다.
 export const CHANGE_SELF_FIX = Object.freeze({ maxRounds: 2 });
 // 전이 표 밖의 유일한 재시작이다. 새 generation은 admission부터 다시 받는다. blocked·failed는 사람이 볼 일이라 자동으로 다시 열지 않는다.
 export const GENERATION_RESTART = Object.freeze({ from: 'superseded', to: 'requested' } as const);

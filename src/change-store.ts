@@ -405,7 +405,7 @@ export class ChangeStore {
   }
 
   // reviewing → authoring. 같은 generation의 게시 전 고치기 차례를 연다. 막힌 리뷰와 그 증거의 digest를 차례 기록으로 옮기고
-  // 살아 있는 artifact·시험·리뷰와 묶음 결과 칸을 비운다. 그래서 다음 차례의 승인 대상은 새 증거로만 만들어진다. B·T0·브랜치는 그대로다.
+  // 살아 있는 artifact·시험·리뷰·확인할 것 목록과 묶음 결과 칸을 비운다. 그래서 다음 차례의 승인 대상은 새 증거로만 만들어진다. B·T0·브랜치는 그대로다.
   // 어느 리뷰가 고칠 대상인지(P0·P1)는 호출자가 receipt로 정한다. 여기서는 막힌 완전한 리뷰인지와 상한만 본다.
   async startSelfFix(input: ChangeKey & { reviewJobId: string }): Promise<StoreResult<{ round: number }>> {
     return attempt<{ round: number }>(this.database, async tx => {
@@ -429,7 +429,8 @@ export class ChangeStore {
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, [input.changeId, input.generation, round, review.job_id, JSON.stringify(parseJson(review.receipt)), review.receipt_digest,
         generation.artifactDigest, generation.resultTree, generation.verifierRevision,
         JSON.stringify(verifications.map(row => ({ commandId: row.command_id, status: row.status, receiptDigest: row.receipt_digest }))), now]);
-      for (const table of ['change_reviews', 'change_verifications', 'change_artifact_files', 'change_artifacts']) {
+      // 확인할 것·남은 위험(change_notes)도 그 차례 작성 결과라 함께 비운다. 남기면 다음 차례 결과의 목록이 기록되지 않고 고치기 전 목록이 PR 본문에 실린다.
+      for (const table of ['change_reviews', 'change_verifications', 'change_notes', 'change_artifact_files', 'change_artifacts']) {
         await tx.query(`DELETE FROM ${table} WHERE change_id=$1 AND generation=$2`, [input.changeId, input.generation]);
       }
       await tx.query('UPDATE change_generations SET fix_round=$3,result_tree=NULL,artifact_digest=NULL,verifier_revision=NULL WHERE change_id=$1 AND generation=$2', [input.changeId, input.generation, round]);
@@ -802,13 +803,16 @@ export class ChangeReviewFindings {
   }
 }
 
-// 끝난 지 이만큼 지난 건의 artifact 바이트, 리뷰 원문, 요청 원문(추가 답변 포함), brief의 요청 글(summary·goal·acceptanceCriteria)을 지운다.
+// 끝난 지 이만큼 지난 건의 artifact 바이트, 리뷰 원문, 요청 원문(추가 답변 포함), brief의 요청 글(summary·goal·acceptanceCriteria), 확인할 것·남은 위험 목록을 지운다.
 export const CHANGE_RETENTION_MS = 7 * 86_400_000;
 export const CHANGE_PURGE_BATCH = 20;
 // brief는 끝 상태에서도 NULL로 둘 수 없다(observing_deploy의 admission CHECK, brief_digest 불변 트리거, 둘의 짝 CHECK).
 // 요청 글 세 칸만 비우고 경로·명령·label과 원래 brief의 digest(brief_digest)는 남긴다. brief를 읽는 경로(작성·검증·리뷰·게시)는 모두 진행 단계라
 // 비운 건에 닿지 않는다. 새 generation은 brief를 요청 원문에서 다시 만드는데, 그 원문도 같은 트랜잭션에서 지워 startNextGeneration이 input_purged로 막는다.
 const BRIEF_HELD = '(r.brief IS NOT NULL AND r.brief_purged_at IS NULL)';
+// 확인할 것·남은 위험(C29)은 공개 검사 전에 저장된 모델 글이라 공개 검사에 걸려 막힌 건에도 남는다. 두 목록만 비우고 원래 목록의 digest를 남긴다.
+// change_notes의 UPDATE 거부 트리거가 이 모양(빈 목록, 원래 목록의 digest, 지운 시각)만 받는다. 승인 digest는 PR 본문에 묶여 있어 비워도 그대로다.
+const NOTES_HELD = 'EXISTS (SELECT 1 FROM change_notes n WHERE n.change_id=r.id AND n.purged_at IS NULL)';
 // receipt·digest·effect 기록과 요청 원문의 text_sha256은 남긴다. 진행 중이거나 미확정 effect·정리 안 끝난 세션이 있는 건은 고르지 않는다. 시각 기준은 끝 상태에 든 때다.
 // 정리 안 끝난 세션은 진행 중 상태, cleanup pending, 작업자 공간이 남은 세션(session_retained)이다. 끝 상태 커밋(ClaudeChangeAuthor.finalize)과
 // pending 표식(finalizeJob)은 서로 다른 트랜잭션이고 표식은 부모를 잠그지 않는다. 그 사이의 completed·none 세션을 retained가 덮는다.
@@ -825,7 +829,7 @@ const changePurgeDue = () => `FROM change_requests r
     AND NOT EXISTS (SELECT 1 FROM change_child_jobs c JOIN codex_sessions s ON s.job_id=c.job_id WHERE c.change_id=r.id
       AND (s.state IN ('running','waiting_answer','waiting_model','unknown') OR s.cleanup_state='pending' OR s.session_retained))
     AND (EXISTS (SELECT 1 FROM change_artifacts a WHERE a.change_id=r.id AND a.purged_at IS NULL) OR EXISTS (SELECT 1 FROM change_review_findings f WHERE f.change_id=r.id)
-      OR ${ChangePrivateInputs.HELD} OR ${BRIEF_HELD})`;
+      OR ${ChangePrivateInputs.HELD} OR ${BRIEF_HELD} OR ${NOTES_HELD})`;
 // 지운 건수를 돌려준다. 고른 뒤 조건이 깨져 건너뛴 건은 세지 않는다.
 export async function purgeExpiredChangeContent(database: Database, now: number, retentionMs = CHANGE_RETENTION_MS): Promise<number> {
   const cutoff = now - retentionMs;
@@ -850,6 +854,8 @@ export async function purgeExpiredChangeContent(database: Database, now: number,
       await ChangePrivateInputs.purgeIn(tx, row.id, now);
       await tx.query(`UPDATE change_requests SET brief=brief || '{"summary":"","goal":"","acceptanceCriteria":[]}'::jsonb,brief_purged_at=$2
         WHERE id=$1 AND brief IS NOT NULL AND brief_purged_at IS NULL`, [row.id, now]);
+      await tx.query(`UPDATE change_notes SET checks='[]'::jsonb,risks='[]'::jsonb,purged_at=$2,
+        notes_sha256=encode(sha256(convert_to(jsonb_build_object('checks',checks,'risks',risks)::text,'UTF8')),'hex') WHERE change_id=$1 AND purged_at IS NULL`, [row.id, now]);
       await audit(tx, 'change_content_purged', row.id, { retentionMs }, now);
     });
   }

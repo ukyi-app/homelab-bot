@@ -228,7 +228,7 @@ test('실제 PostgreSQL: 018까지의 DB에 남은 옛 원문도 019 적용 뒤 
     const T = clock.now;
     const answered = await seedQuestion(db, 'pg-done', { jobState: 'succeeded', finishedAt: T, answeredAt: T, session: { state: 'completed' }, text: '실제 PG 답 원문 ✓' });
     const waiting = await seedQuestion(db, 'pg-wait', { jobState: 'waiting_user', finishedAt: T, answeredAt: T, session: { state: 'waiting_answer' } });
-    assert.deepEqual(await runMigrations(d.raw), [19, 20, 21, 22]);
+    assert.deepEqual(await runMigrations(d.raw), [19, 20, 21, 22, 23, 24, 25, 26]);
 
     assert.equal(await purgeExpiredChangeContent(db, T + 8 * DAY), 1);
     assert.equal(await purgeExpiredTaskAnswers(db, T + 8 * DAY), 1);

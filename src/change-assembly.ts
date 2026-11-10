@@ -16,6 +16,7 @@ import type { ClaudeTaskBridge } from './claude-task-bridge.js';
 import type { PublisherConfig } from './config.js';
 import type { Scope } from './contracts.js';
 import type { GitHubAppCredentials } from './github-app.js';
+import type { GuidanceReviewPort } from './github-review-io.js';
 import { PublicationStopped, createGitHubWriter, policyWriterRepositories } from './github-writer.js';
 import type { Log } from './log.js';
 import type { Policy, PolicyGate } from './policy.js';
@@ -91,6 +92,8 @@ export interface ChangeAssemblyOptions {
   // 시험 주입 자리. 스위치가 꺼졌을 때 writer를 만들지 않음을 이 함수로 센다.
   createWriter?: typeof createGitHubWriter; deployTargets?: readonly DeployTarget[];
   periods?: ChangeRuntimeDeps['periods']; verificationPollMs?: number;
+  // 봇 PR 안내 리뷰(리뷰 App). 리뷰 경로가 없으면 비고, 안내 댓글만 달지 않는다.
+  guidance?: GuidanceReviewPort;
   // 시험이 port 사이에 중단을 넣는 자리.
   instrument?: (deps: ChangeRuntimeDeps) => ChangeRuntimeDeps;
 }
@@ -136,7 +139,8 @@ export function assembleChange(options: ChangeAssemblyOptions): ChangeAssembly {
   const deployment = new DeploymentReader({ github: publicGithubReader({ send }), kubernetes: deploymentKubernetesReader(options.kubernetes), now, targets,
     resolveService: repoId => services.find(item => item.repoId === repoId)?.service ?? null });
   const runtimeDeps: ChangeRuntimeDeps = { store, changes, inputs, gate, author, artifacts, verification, review: options.review, publisher, preflight: io.preflight, deployment, policy,
-    intakeOpen: options.intakeOpen, log, verifierRevision: VERIFIER_REVISION, ...(options.periods ? { periods: options.periods } : {}) };
+    intakeOpen: options.intakeOpen, log, verifierRevision: VERIFIER_REVISION, ...(options.periods ? { periods: options.periods } : {}),
+    ...(options.guidance ? { guidance: options.guidance } : {}) };
   const runtime = new ChangeRuntime(options.instrument ? options.instrument(runtimeDeps) : runtimeDeps);
   return { runtime, author, inputs, publisher };
 }

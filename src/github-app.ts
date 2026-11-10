@@ -23,6 +23,9 @@ const NUMBER = '[1-9][0-9]{0,15}';
 const SHA = '[a-f0-9]{40}';
 const ALLOWED = Object.freeze([
   `POST /app/installations/${NUMBER}/access_tokens`,
+  // 리뷰 요청(C30) 대상 확인: 그 저장소의 App 설치(App JWT)와 저장소 정보(ID·공개 범위, 이름으로 좁힌 설치 토큰).
+  `GET ${REPO}/installation`,
+  `GET ${REPO}`,
   `GET ${REPO}/pulls/${NUMBER}`,
   String.raw`GET ${REPO}/pulls\?state=open&sort=updated&direction=desc&per_page=100&page=${NUMBER}`,
   String.raw`GET ${REPO}/pulls/${NUMBER}/reviews\?per_page=100&page=${NUMBER}`,

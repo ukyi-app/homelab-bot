@@ -71,7 +71,7 @@ test('T16b 실제 PostgreSQL: 010까지 적용된 기존 DB는 011부터만 적�
     for (const file of MIGRATIONS.slice(0, 10)) await pool.query(await readFile(`migrations/${file}`, 'utf8'));
     const db = new Postgres(d.pool(2));
     await pendingAlert(db);
-    assert.deepEqual(await runMigrations(pool), [11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23]);
+    assert.deepEqual(await runMigrations(pool), [11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
     assert.equal((await db.query<{ state: string }>('SELECT state FROM outbox')).rows[0]!.state, 'pending');
   } finally { await d.close(); }
 });
