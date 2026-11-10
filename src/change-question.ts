@@ -6,8 +6,9 @@ import type { TaskAnswerInput, TaskAnswerResult } from './task-bridge.js';
 
 // 변경 질문 선택지(C28, COLLEAGUE_SPEC §4.10 "변경 질문 줄이기", 스위치 켜짐에서만). 변경 작성이 진행할 수 없어 물으면
 // 질문 글에 선택지 버튼(2~4개)과 "직접 답하기"를 단다. 버튼을 누르거나 owner가 그 스레드에 다음에 보낸 말이 답이다.
-// 답은 공개 표시(label=public)로 '/answer'와 같은 처리기(ChangeAnswerGuard.answerIn)에 넘긴다. 공개 검사·출처 기록은 그 처리기 그대로라
-// 공개 여부를 따로 묻지 않는다. 처음 게시 전 질문의 답은 뒤의 미리보기 승인 때 owner가 본다.
+// 답은 '/answer'와 같은 처리기(ChangeAnswerGuard.answerIn)에 넘긴다. 선택지와 분류를 적지 않은 말에는 공개 표시(label=public)를 붙이고,
+// owner가 말에 분류(label=...)를 적었으면 그대로 넘긴다. 공개 검사·출처 기록은 그 처리기 그대로라 공개 여부를 따로 묻지 않는다.
+// 처음 게시 전 질문의 답은 뒤의 미리보기 승인 때 owner가 본다.
 
 // 버튼 custom_id 이름. 허용 목록 표는 discord-protocol.ts BUTTONS다. 대상 칸은 질문 ID(':'를 '.'로 바꿈)와 선택지 순번(1부터)뿐이고
 // 선택지 글은 싣지 않는다. 서버가 저장된 질문 행에서 그 순번의 글을 읽는다. 질문 ID는 job·세션 UUID와 턴이라 100자 안에 든다.
@@ -19,7 +20,7 @@ export const CHANGE_DIRECT_BUTTON = 'change-direct';
 export const CHANGE_QUESTION_TEXT = Object.freeze({
   choice: (number: number) => `${number}번`,
   direct: '직접 답하기',
-  // "직접 답하기"를 누른 owner에게만 보인다. 상태는 바꾸지 않는다(버튼 없이 말해도 같다).
+  // "직접 답하기"를 누른 owner에게만 보인다. 질문 행·작업 상태는 그대로이고 이 질문을 다음 말의 답 대상으로 적는다.
   speak: '이 스레드에 답을 말해 주세요. 다음에 보내는 말이 이 질문의 답이 돼요.',
   chosen: (number: number, status: string) => `${number}번을 답으로 보냈어요. ${status}`,
   missing: '이 대화에서 찾을 수 없는 질문이에요.',
@@ -57,12 +58,17 @@ export interface ChangeAnswerHandler {
   answerIn(store: Store, input: TaskAnswerInput): Promise<TaskAnswerResult>;
   sealsAnswer?(db: Store['db'], question: string): Promise<boolean>;
 }
-// 공개 표시를 붙인 답. 처리기가 label을 떼고 같은 공개 검사를 한다. owner의 말이 'label='로 시작해도 그 뒤 글 전체가 답이다.
+// 공개 표시를 붙인 답. 처리기가 label을 떼고 같은 공개 검사를 한다. 선택지 글은 모델이 쓴 것이라 'label='로 시작해도 글 전체가 답이다.
 export const publicAnswer = (text: string) => `label=public | ${text}`;
+// owner가 말로 한 답. 'label='로 시작하면 owner가 적은 분류라 그대로 처리기에 넘긴다. 공개가 아니거나 서식이 틀리면 '/answer'와 같이
+// 막히거나 서식 안내를 받고, 공개 표시로 덮어 작성 모델에 보내지 않는다. 대소문자·공백이 달라도 분류를 적으려 한 말로 본다.
+const OWNER_LABEL = /^\s*label\s*=/i;
+export const spokenAnswer = (text: string) => OWNER_LABEL.test(text) ? text : publicAnswer(text);
 
 export interface ChangeQuestionPress { button: typeof CHANGE_CHOICE_BUTTON | typeof CHANGE_DIRECT_BUTTON; target: string; actor: string; scope: Scope; event: string }
 // update: 응답으로 그 질문 글을 바꾸고 버튼을 없앤다. false면 누른 사람만 보는 응답이고 버튼은 남는다.
-export interface ChangeQuestionOutcome { content: string; update: boolean }
+// next: owner의 다음 말을 이 질문의 답으로 받게 적을 질문("직접 답하기"). 호출자가 같은 트랜잭션에서 chooseNextAnswer로 적는다.
+export interface ChangeQuestionOutcome { content: string; update: boolean; next?: string }
 // 버튼 하나의 처리. 호출자(수신)의 트랜잭션 안에서 부른다(같은 상호작용은 호출자가 한 번만 들여보낸다).
 // 응답자·대화·기한·답 기다림 검사와 이벤트 한 번 반영은 answerIn이 질문 행을 잠근 채 한다. 여기서는 그 전에 이 경로의 버튼인지만 가린다.
 export async function pressChangeQuestion(store: Store, handler: ChangeAnswerHandler, input: ChangeQuestionPress): Promise<ChangeQuestionOutcome> {
@@ -74,7 +80,7 @@ export async function pressChangeQuestion(store: Store, handler: ChangeAnswerHan
   if (!row || row.conversation_id !== store.scopeId(input.scope) || await handler.sealsAnswer?.(store.db, target.question) !== true) return { content: CHANGE_QUESTION_TEXT.missing, update: false };
   if (row.responder_id !== input.actor) return { content: CHANGE_QUESTION_TEXT.notOwner, update: false };
   if (row.state !== 'open') return { content: CHANGE_QUESTION_TEXT.closed, update: false };
-  if (input.button === CHANGE_DIRECT_BUTTON) return { content: CHANGE_QUESTION_TEXT.speak, update: false };
+  if (input.button === CHANGE_DIRECT_BUTTON) return { content: CHANGE_QUESTION_TEXT.speak, update: false, next: target.question };
   const option = row.options?.[target.number! - 1];
   if (!option) return { content: row.prompt_purged_at !== null ? CHANGE_QUESTION_TEXT.purged : CHANGE_QUESTION_TEXT.missing, update: false };
   const result = await handler.answerIn(store, { question: target.question, actor: input.actor, scope: input.scope, text: publicAnswer(option), event: input.event });

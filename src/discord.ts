@@ -14,7 +14,7 @@ import type { MemoryCommand, MemoryCommandHandler } from './memory-commands.js';
 import type { PolicyGate } from './policy.js';
 import { buttonAllowed, buttonRoute } from './discord-protocol.js';
 import { bindProposalHandlers, PROPOSAL_BUTTONS, PROPOSAL_TEXT, pressProposal } from './proposals.js';
-import { deferInGap, offerAnswer, pressQuestionPick, sealsNextMessage } from './question-pick.js';
+import { chooseNextAnswer, deferInGap, offerAnswer, pressQuestionPick, sealsNextMessage } from './question-pick.js';
 import { pressChangeQuestion } from './change-question.js';
 import type { ChangeQuestionPress } from './change-question.js';
 import { moveReactions, ReactionSync, recordReceived, settleReactions } from './reactions.js';
@@ -344,7 +344,10 @@ export class DiscordIngress {
     if (this.store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
     const outcome = await this.store.atomic(async store => {
       if (!await this.claimIn(store, event, saved.id)) return;
-      return pressChangeQuestion(store, tasks, { button: event.command as ChangeQuestionPress['button'], target: event.target!, actor: event.actor, scope: event.scope, event: event.id });
+      const pressed = await pressChangeQuestion(store, tasks, { button: event.command as ChangeQuestionPress['button'], target: event.target!, actor: event.actor, scope: event.scope, event: event.id });
+      // 질문 고르기로 다른 질문을 골라 두었어도 "직접 답하기"를 누른 질문이 다음 말의 대상이 된다.
+      if (pressed.next) await chooseNextAnswer(store.db, store.scopeId(event.scope), pressed.next, event.actor);
+      return pressed;
     }, { expiresAt: started + DEFAULTS.inboxTimeoutMs, now: this.store.now });
     this.log('change_question_button', { command: event.command!, outcome: outcome ? (outcome.update ? 'settled' : 'refused') : 'duplicate' });
     if (outcome) await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: outcome.content, update: outcome.update });

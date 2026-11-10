@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Scope } from './contracts.js';
-import { publicAnswer } from './change-question.js';
+import { spokenAnswer } from './change-question.js';
 import { controlText } from './control-format.js';
 import type { Database } from './database.js';
 import type { OutboxButton, Store } from './store.js';
@@ -39,7 +39,7 @@ export const QUESTION_PICK_TEXT = Object.freeze({
 });
 
 // 질문 종류. 바로 답을 받는 종류만 DIRECT에 둔다. 변경(CHANGE) 질문의 답은 원문을 events에 두지 않는다(처리기의 sealsAnswer).
-// 그래서 그 답이 될 수 있는 말은 수신이 저장 전에 봉인하고(sealsNextMessage), 답에는 공개 표시를 붙인다(change-question.ts publicAnswer).
+// 그래서 그 답이 될 수 있는 말은 수신이 저장 전에 봉인하고(sealsNextMessage), 분류를 적지 않은 답에만 공개 표시를 붙인다(change-question.ts spokenAnswer).
 export type QuestionKind = 'task' | 'change';
 const DIRECT: ReadonlySet<QuestionKind> = new Set<QuestionKind>(['task', 'change']);
 async function questionKind(tasks: TaskCommandHandler, db: Database, question: string): Promise<QuestionKind> {
@@ -59,6 +59,12 @@ async function directQuestions(store: Store, tasks: TaskCommandHandler, conversa
   const picked = chosen?.owner === actor ? direct.find(question => question.id === chosen.question) : undefined;
   return picked ? [picked] : direct;
 }
+// 이 질문을 owner의 다음 말의 답 대상으로 적는다(질문 고르기의 봉인한 말, 변경 질문의 "직접 답하기"). 질문 행·작업 상태는 바꾸지 않는다.
+// 호출자가 그 질문이 이 사람에게 열려 있는지 본 뒤 트랜잭션 안에서 부른다.
+export async function chooseNextAnswer(db: Database, conversation: string, question: string, owner: string): Promise<void> {
+  await db.query(`INSERT INTO controls VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`,
+    [CHOSEN + conversation, JSON.stringify({ question, owner })]);
+}
 // 이 사람이 이 대화에 보낸 다음 말이 변경 질문의 답이 될 수 있는가(답이 되든 고르기로 가든). 수신이 저장 전에 묻고, 참이면 원문을 비워 저장한다.
 // 잠그지 않는다. 수신 트랜잭션의 offerAnswer가 같은 사실을 잠근 채 다시 보고, 그사이 바뀐 경우를 맞춘다.
 export async function sealsNextMessage(store: Store, tasks: TaskCommandHandler, conversation: string, actor: string): Promise<boolean> {
@@ -69,7 +75,8 @@ const preview = (prompt: string) => {
   return flat.length > PREVIEW_CHARS ? `${flat.slice(0, PREVIEW_CHARS).join('')}…` : flat.join('');
 };
 
-// sealed: 수신이 이 말의 원문을 비워 저장했다(sealsNextMessage). 원문은 text로만 온다.
+// sealed: 수신이 지금 이 말을 봉인 대상으로 봤다(sealsNextMessage). 원문은 text로만 온다. 같은 말이 이미 원문과 함께 저장돼 있었으면
+// (gap 버퍼에 둔 뒤 질문이 열림) save가 그 행을 덮어쓰지 않아 events에 원문이 남아 있을 수 있다.
 export interface OfferInput { event: string; message: string; actor: string; scope: Scope; conversation: string; text: string; revision: string; sealed?: boolean }
 // 수신 트랜잭션 안에서 부른다(대화 행을 잠근 뒤, 같은 이벤트는 inbox.accepted가 한 번만 들여보낸다).
 // undefined면 바로 답 대상이 아니라 호출자가 지금처럼 대화로 처리한다. 'answered'·'picking'이면 대화 작업을 만들지 않는다.
@@ -78,11 +85,12 @@ export async function offerAnswer(store: Store, tasks: TaskCommandHandler, input
   const questions = await directQuestions(store, tasks, input.conversation, input.actor);
   if (!questions.length) return;
   const change = questions.some(question => question.kind === 'change');
-  // 저장 전 판단 뒤에 변경 질문이 열렸으면(버퍼 재생 포함) 원문이 events에 있다. 답 경로로 보내기 전에 여기서 비운다.
-  if (change && !input.sealed) await store.db.query(`UPDATE events SET payload=jsonb_set(payload,'{text}','""'::jsonb) WHERE id=$1`, [input.event]);
+  // 변경 질문의 답이 될 말은 events에 원문을 두지 않는다. sealed여도 비운다: 저장 전 판단 뒤에 질문이 열렸거나, 질문이 열리기 전
+  // 원문과 함께 버퍼에 둔 말을 복구하면 행에 원문이 있다. 이미 비었으면 같은 값을 다시 쓸 뿐이다.
+  if (change) await store.db.query(`UPDATE events SET payload=jsonb_set(payload,'{text}','""'::jsonb) WHERE id=$1`, [input.event]);
   if (questions.length === 1) {
     const question = questions[0]!;
-    const text = question.kind === 'change' ? publicAnswer(input.text) : input.text;
+    const text = question.kind === 'change' ? spokenAnswer(input.text) : input.text;
     const result = await tasks.answerIn(store, { question: question.id, actor: input.actor, scope: input.scope, text, event: input.message });
     if (result.ok) await store.db.query('DELETE FROM controls WHERE key=$1', [CHOSEN + input.conversation]);
     await notify(store, input, `answer:${input.event}`, controlText('answer', result, store.colleague));
@@ -136,8 +144,7 @@ export async function pressQuestionPick(store: Store, tasks: TaskCommandHandler,
     // 봉인한 말은 원문이 없어 답으로 붙이지 않는다. 그 질문이 이 사람에게 아직 열려 있으면 다음 말의 대상으로 적는다.
     const open = await openTaskQuestions(store.db, conversation.id, input.actor, store.now());
     if (!open.some(question => question.id === row.question)) return { content: QUESTION_PICK_TEXT.missing, update: false };
-    await store.db.query(`INSERT INTO controls VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`,
-      [CHOSEN + conversation.id, JSON.stringify({ question: row.question, owner: input.actor })]);
+    await chooseNextAnswer(store.db, conversation.id, row.question, input.actor);
     await settle();
     return { content: QUESTION_PICK_TEXT.chosen(row.number), update: true };
   }
