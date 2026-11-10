@@ -2021,6 +2021,8 @@ bwrap은 `--unshare-all --die-with-parent --new-session --cap-drop ALL --clearen
 
 **시작 기록.** `changeVerify`는 시험 프로세스를 띄우기 전에 `<job>.<generation>.verification.<command>.started`를 배타적으로 만들어(`O_EXCL`) fsync한다. 이미 있으면 시험을 띄우지 않는다. 재시작 뒤 이 기록만 있고 receipt가 없으면 다시 돌리지 않고 `absent`로 답해 `WorkerChangeVerification.run`이 `unknown`으로 닫는다. 첫 실행의 실패가 재실행 통과로 가려지지 않게 하려는 것이다. 슬롯 경합은 시험 결과가 아니라서 `/v2/task/verify`만 409 `{status:'busy'}`로 따로 말하고, 게시 서버(`TaskWorkerBusy`)는 receipt를 남기지 않고 다시 부른다.
 
+**시작 거부 뒤 재조회 (C33).** `/v2/task/verify` 거부(`TaskWorkerRejected`)는 그 요청이 시작하지 않았다는 뜻일 뿐이라 `WorkerChangeVerification.run`은 바로 `not_run`으로 굳히지 않는다. `/v2/task/verification`으로 다시 물어 `running`·`done`이면 그 결과를 따르고, `absent`면 답한 작업자 신원으로 한 번만 다시 보내 그것도 거부될 때만 `not_run`이다. 재조회가 기한(`waitMs`)까지 닿지 않으면 `unknown`이다. `verificationWorker`의 `expectedWorker: null` 재시도는 재조회에만 있다. 이유는 DECISIONS "C33 시험 거부 뒤 재조회".
+
 **슬롯을 보는 순서.** 파드 정리는 프로세스를 가리지 않아 슬롯이 겹치면 상대 시험까지 죽인다. 그래서 슬롯은 비동기 조회가 모두 끝난 뒤에 보고 같은 틱에 잡는다. `changeVerify`의 슬롯 확보, `removeGeneration`의 정리 판단이 이 순서를 따르고, 조회 사이에 종료가 시작됐는지도 슬롯 직전에 다시 본다. 재조회(`changeVerification`)는 반대로 슬롯을 receipt보다 먼저 본다. receipt는 슬롯을 놓기 전에 쓰므로, 이 순서면 막 끝난 시험을 `absent`로 답하지 않는다.
 
 **변경 작성 v2 판 (C25).** 동료 봇 명세 §4.10 "변경 질문 줄이기"·"수정 요청"의 작업자 쪽이다. 새 판을 보내는 일은 C28이 했고(작업자가 `change.instructions`에 `change-v2`를 알릴 때만, 아니면 옛 판. 재개는 시작 턴의 판, 세션 `capabilities.instructions`), 결과를 쓰는 일은 C27(수정 요청)·C28(선택지, §16.5)·C29(확인할 것·안내 댓글)다.

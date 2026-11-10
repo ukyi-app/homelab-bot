@@ -271,17 +271,33 @@ export class WorkerChangeVerification implements ChangeVerificationPort {
     if (!CommandIdSchema.safeParse(input.commandId).success || !EvidenceBundleSchema.safeParse(input.bundle).success) throw new Error('verification_input_invalid');
     const control = await this.options.control(input.key);
     if (!control?.worker) return this.local(input, 'not_run');
-    const worker = control.worker;
     let reply: TaskV2VerificationResponse | null = null;
-    try { reply = await this.options.worker.verify({ ...control, worker }, input.commandId, input.bundle); }
-    // 거부는 시작하지 않았다는 증거다. 그 밖은 시작했는지 모르니 아래에서 저장된 값을 본다.
-    catch (error) {
-      // 슬롯이 잠깐 찬 것은 시험 결과가 아니다. receipt는 command당 하나라 not_run으로 굳히면 이 generation을 살릴 수 없다.
-      if (error instanceof TaskWorkerBusy) throw error;
-      if (error instanceof TaskWorkerRejected) return this.local(input, 'not_run');
-    }
+    // 거부는 이 요청이 시작하지 않았다는 증거일 뿐이다. 같은 command를 다른 게시 서버가 이미 시작했을 수 있다.
+    // capability에 무작위 값이 없어 두 게시 서버가 같은 밀리초에 서명하면 토큰이 같고, 작업자는 늦은 쪽을 재사용으로 거부한다.
+    // 그래서 거부를 바로 not_run으로 굳히지 않고 아래에서 작업자에게 그 command의 상태를 다시 묻는다. 그 밖의 실패는 시작했는지 모르는 것이다.
+    let rejected = false;
+    const start = async (worker: { instance: string; storage: string }) => {
+      try { return await this.options.worker.verify({ ...control, worker }, input.commandId, input.bundle); }
+      catch (error) {
+        // 슬롯이 잠깐 찬 것은 시험 결과가 아니다. receipt는 command당 하나라 not_run으로 굳히면 이 generation을 살릴 수 없다.
+        if (error instanceof TaskWorkerBusy) throw error;
+        rejected = error instanceof TaskWorkerRejected;
+        return null;
+      }
+    };
+    reply = await start(control.worker);
+    let resent = false;
     const deadline = Date.now() + this.waitMs;
     while (reply?.status !== 'done') {
+      if (reply?.status === 'absent' && rejected && !resent) {
+        // 거부 뒤에도 작업자가 이 command를 모른다. 이긴 쪽 요청이 아직 슬롯을 잡기 전이거나, 파드가 바뀌어 instance가 달라 거부됐을 수 있다.
+        // 답한 작업자 신원으로 한 번만 다시 보낸다. 작업자는 command마다 한 번만 돌리므로 겹쳐도 시험은 하나다. 또 거부되면 정말 시작하지 않은 것이다.
+        resent = true;
+        rejected = false;
+        reply = await start(reply.worker);
+        if (rejected) return this.local(input, 'not_run');
+        continue;
+      }
       if (reply?.status === 'absent' || Date.now() >= deadline) return this.local(input, 'unknown');
       await this.options.keepalive?.(input.key).catch(() => {});
       await this.sleep(this.pollMs);

@@ -227,6 +227,27 @@ test('T19 B5 EVENT-02 실제 PostgreSQL: 게시 서버 둘이 같은 부모를 �
     for (const stage of ['tree', 'commit', 'ref', 'pull'] as const) assert.equal(h.env.github.count(ROUTES[stage]), 1, stage);
   } finally { await h.close(); await d.close(); }
 });
+test('C33 EVENT-02 실제 PostgreSQL: 게시 서버 둘이 같은 밀리초에 verify를 서명해 한쪽이 거부돼도 승인 대기까지 가고 시험 receipt는 passed 하나다', { skip }, async () => {
+  const d = await bare();
+  await runMigrations(d.raw);
+  const h = await changeHarness(d.db, { sameMillisecondVerify: true });
+  try {
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    const first = h.runtime;
+    const firstReview = h.reviewRuntime;
+    h.restart();
+    const second = h.runtime;
+    const secondReview = h.reviewRuntime;
+    const both = async () => { await Promise.allSettled([first.childrenTick(), second.childrenTick(), first.laneTick(), second.laneTick(), first.publishTick(), second.publishTick(), firstReview.tick(), secondReview.tick()]); };
+    for (let round = 0; round < 400 && !['awaiting_publish_approval', 'blocked'].includes(await h.phase(id)); round++) { await both(); await new Promise(resolve => setTimeout(resolve, 3)); }
+    assert.equal(h.collisions.verify, 1, '두 verify가 같은 시각에 서명됐다');
+    assert.equal(await h.phase(id), 'awaiting_publish_approval');
+    assert.deepEqual((await h.db.query<{ status: string }>('SELECT status FROM change_verifications WHERE change_id=$1', [id])).rows.map(row => row.status), ['passed']);
+    assert.equal((await h.f.calls()).length, 1);
+    assert.equal(h.runs.verify, 1);
+  } finally { await h.close(); await d.close(); }
+});
 test('T19 B5 굶주림·철회 실제 PostgreSQL: 끝난 관측과 오래된 proposed가 33개씩 있어도 새 요청이 진행하고, 승인 뒤 /revoke면 대조가 쓰지 않는다', { skip }, async () => {
   const d = await bare();
   await runMigrations(d.raw);

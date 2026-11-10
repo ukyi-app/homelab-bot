@@ -67,10 +67,14 @@ export interface HarnessOptions {
   // 수정 차례(C27) 배선. 조립(change-assembly.ts)은 아직 수정 차례의 쓰기·자료 읽기를 잇지 않아(C27 반환 사항), 시험이 그 두 자리를 직접 넣는다.
   // writer의 쓰기 직전 확인은 게시 단계뿐 아니라 수정 차례(amending, 그 차례 running)도 받고, 런타임에 PR 리뷰·댓글 읽기를 준다.
   amendments?: { discussion: AmendmentDiscussionReader };
+  // 처음 오는 /v2/task/verify 두 건을 같은 밀리초에 서명한다. 게시 서버 둘의 토큰이 같아져 작업자가 늦은 쪽을 재사용으로 거부한다.
+  sameMillisecondVerify?: boolean;
 }
 export interface Harness {
   db: Database; env: PublishEnv; f: ChangeWorkerFixture; store: Store; changes: ChangeStore; gate: PolicyGate; policy: { current: Policy }; rest: MockDiscord; ingress: DiscordIngress; discord: DiscordPublisher;
-  logs: { event: string; fields: unknown }[]; reviewInputs: ChangeReviewerInput[]; runs: { verify: number }; worker: { taskOpen: boolean; unreachable: boolean };
+  logs: { event: string; fields: unknown }[]; reviewInputs: ChangeReviewerInput[]; runs: { verify: number };
+  // sameMillisecondVerify로 같은 시각에 서명한 verify 쌍의 수.
+  collisions: { verify: number }; worker: { taskOpen: boolean; unreachable: boolean };
   runtime: ChangeRuntime; reviewRuntime: ReviewRuntime; bridge: ClaudeTaskBridge;
   command(id: string, command: string, fields?: { target?: string; text?: string; scope?: Scope; actor?: string }): Promise<void>;
   pump(done: () => Promise<boolean>, rounds?: number): Promise<void>;
@@ -112,7 +116,8 @@ export async function changeHarness(db: Database, options: HarnessOptions = {}):
   const inner = options.sandbox ?? (bwrapReady ? spawnSandbox : pass);
   const env = await publishEnv(db);
   env.github.clock = Date.now();
-  const f = await changeWorkerFixture({ currentItems: items, change: options.change, verifier: { registry, sandbox: (args, limits, signal) => { runs.verify++; return inner(args, limits, signal); } } });
+  const signing = { frozen: null as number | null };
+  const f = await changeWorkerFixture({ currentItems: items, change: options.change, signerNow: () => signing.frozen ?? Date.now(), verifier: { registry, sandbox: (args, limits, signal) => { runs.verify++; return inner(args, limits, signal); } } });
   archiveUrls = f.archiveUrls;
   await f.script(options.steps ?? [WRITE_STEP]);
   if (options.script) registry['smoke-unit'].argv = ['/bin/sh', '-c', typeof options.script === 'function' ? options.script(f) : options.script];
@@ -149,8 +154,27 @@ export async function changeHarness(db: Database, options: HarnessOptions = {}):
   const worker = { taskOpen: true, unreachable: false };
   const reach = () => { if (worker.unreachable) throw new Error('task_worker_uncertain'); };
   const v1 = { call: async (endpoint: never, body: never, signal?: AbortSignal) => { reach(); return new HttpTaskWorker(f.url, f.signer, fetch).call(endpoint, body, signal); } };
+  const collisions = { verify: 0 };
+  // callV2는 첫 await 전에 서명까지 끝낸다. 두 건을 같은 동기 구간에서 부르면 시계를 묶어 둔 동안 둘 다 서명된다.
+  let armed = options.sameMillisecondVerify === true;
+  const waiting: (() => void)[] = [];
+  const collide = (call: () => Promise<{ response: unknown; bytes: number }>) => new Promise<{ response: unknown; bytes: number }>((resolve, reject) => {
+    const go = () => { call().then(resolve, reject); };
+    waiting.push(go);
+    if (waiting.length === 2) {
+      armed = false;
+      const pair = waiting.splice(0);
+      signing.frozen = Date.now();
+      try { for (const fire of pair) fire(); } finally { signing.frozen = null; }
+      collisions.verify++;
+      return;
+    }
+    // 짝이 오지 않으면 혼자 보낸다. 시험은 collisions로 충돌이 실제로 났는지 본다.
+    setTimeout(() => { const index = waiting.indexOf(go); if (index >= 0) { waiting.splice(index, 1); go(); } }, 2000);
+  });
   const v2 = { callV2: (async (endpoint: never, body: never, signal?: AbortSignal) => {
     reach();
+    if (armed && endpoint === '/v2/task/verify') return collide(() => f.port.callV2(endpoint, body, signal));
     const answered = await f.port.callV2(endpoint, body, signal);
     // 변경 작성 판 작업자처럼 결과에 확인할 것·남은 위험을 싣는다. 게시 서버가 아직 옛 판을 보내 실제 작업자는 이 칸을 내지 않는다.
     const response = answered.response as { status?: string };
@@ -199,7 +223,7 @@ export async function changeHarness(db: Database, options: HarnessOptions = {}):
   let built = build({ ...(options.crash ? { crash: options.crash } : {}) });
   const discord = new DiscordPublisher(store, gate, rest);
   const harness: Harness = {
-    db, env, f, store, changes: built.changes, gate, policy, rest, ingress: built.ingress, discord, logs, reviewInputs, runs, worker, runtime: built.runtime, reviewRuntime: built.reviewRuntime, bridge: built.bridge,
+    db, env, f, store, changes: built.changes, gate, policy, rest, ingress: built.ingress, discord, logs, reviewInputs, runs, collisions, worker, runtime: built.runtime, reviewRuntime: built.reviewRuntime, bridge: built.bridge,
     async command(id, command, fields = {}) {
       await harness.ingress.receive({ id, actor: fields.actor ?? OWNER, scope: fields.scope ?? THREAD, kind: 'command', command, text: fields.text ?? '', ...(fields.target !== undefined ? { target: fields.target } : {}) });
     },

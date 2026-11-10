@@ -1012,11 +1012,12 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
         const { response } = await this.deps.worker.callV2(endpoint, { version: TASK_V2_CONTRACT, job: control.job, lease: control.lease, generation: control.generation, sessionId: control.sessionId, expectedWorker, ...fields } as never);
         return TASK_V2_ENDPOINTS[endpoint].response.parse(response);
       };
-      // fetchResult와 같다. 파드가 바뀌면 instance가 달라 거부되므로 저장소를 대조하는 쪽으로 다시 묻는다. receipt는 볼륨에 남아 있다.
+      // 재조회는 fetchResult와 같다. 파드가 바뀌면 instance가 달라 거부되므로 저장소를 대조하는 쪽으로 다시 묻는다. receipt는 볼륨에 남아 있다.
+      // 시작 요청은 계약상 expectedWorker를 비울 수 없어 여기서 다시 보내지 않는다. 거부를 받은 WorkerChangeVerification이 재조회로 지금 신원을 얻어 다시 보낸다.
       let reply: TaskV2VerificationResponse;
       try { reply = await send(control.worker); }
       catch (error) {
-        if (!(error instanceof TaskWorkerRejected) || !control.worker) throw error;
+        if (endpoint !== '/v2/task/verification' || !(error instanceof TaskWorkerRejected) || !control.worker) throw error;
         reply = await send(null);
       }
       // 다른 저장소의 답은 이 세션의 사실이 아니다.
