@@ -899,6 +899,16 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
   - unknown 해제: `ClaudeTaskBridge.release`·`CodexBridge.release(actor, scope, job)`이 `TaskBridge.releasable`에서 `authorize`와 작업 소유·대화 대조(또는 정책 owner의 후계 규칙)를 거친다. 필요한 변경: 작업 ID만으로 같은 소멸 확인을 거쳐 풀고 감사 행위자를 받는 관리용 경로.
   - 멈춘 작업 재개: `Store.control`의 `resume-model <job>`이 `owner_id = actor`, `conversation_id`, 대화 구독 활성을 요구한다. 필요한 변경: 작업 ID만으로 같은 상태·시도 한도 조건을 보고 재개하는 관리용 동작(리뷰 작업은 `review-resume`이 이미 actor를 감사에만 쓴다).
 
+## C32 관리 CLI 나머지 동작 (2026-11-10)
+
+위 "C05 관리 CLI"의 "받지 않은 동작" 셋을 연다(사용자 2026-11-10, C05에서 나눔). 기존 '/' 경로 함수의 시그니처는 그대로 두고 CLI 행위자용 관리 메서드를 더했다. 셋 모두 owner·대화를 대조하지 않는다(권한의 근거는 클러스터 접근). 시험·결과는 [VERIFICATION](VERIFICATION.md) "C32 관리 CLI 나머지 동작".
+
+- **차단 `PolicyGate.deny(target)`(`src/policy.ts`):** 정책은 거부 행의 revision을 적으려고만 읽고, 읽지 못하면 아무것도 더하지 않는다. 거부 행만 더하고 해제 메서드는 없다. 이미 거부돼 있으면 행을 덮어쓰지 않는다(`already_blocked`). `/revoke`처럼 덮어쓰면 `denial_id`가 바뀌어 사람이 `revocationRestores`에 준비해 둔 해제 승인이 듣지 않게 되고, 재실행이 상태를 바꾼다. 예외: 해제 승인이 이미 적힌 옛 거부(다음 인가가 지울 행)는 먼저 지우고 새 거부를 더한다. 그대로 두면 차단했다고 답한 뒤 다음 이벤트에 풀린다. `authorize`의 해제 조건 SQL은 같은 private 메서드(`restoreApproved`)로 옮겨 둘이 함께 쓴다(동작 불변).
+- **unknown 해제 `TaskBridge.adminRelease(job, actor)`(`src/claude-task-bridge.ts`·`src/codex.ts`):** 두 브리지의 '/' 해제 본문을 `releaseJob`으로 떼어 '/' 경로(`release`)와 관리 경로가 같은 소멸 확인·해제 CAS를 쓴다. 결과는 `ReleaseOutcome`(`released`·`missing`·`not_unknown`·`foreign`·`worker_alive`·`state_changed`)이고 '/' 경로는 지금과 같은 안내 문구로 바꾼다. 관리 경로는 정책을 읽지 않는다(정책을 못 읽어도 소멸 확인만으로 푼다). 진입점은 브리지를 앞에서부터 묻고 `foreign`이면 다음 브리지로 넘긴다. 게시 서버가 Claude 브리지만 조립하므로 진입점도 Claude 브리지만 만들고, Codex 브리지의 관리 경로는 시험만 있다.
+- **멈춘 작업 재개 `Store.adminResumeJob(job, actor)`(`src/store.ts`):** '/resume-model <job>'의 조건 중 owner·대화·구독 활성만 뺐다. 비상 정지 중이면 `emergency_stopped`, 큐가 차면 `queue_full`, 한도·인증 대기가 아니거나 시도 한도면 `not_waiting`이다. 리뷰 작업은 고르지 않는다('/resume-model'도 닿지 않고 리뷰 재개는 따로다).
+- **진입점이 읽는 env(`src/admin-main.ts` `adminPorts`):** 비상 정지·해제·상태 보기·멈춘 작업 재개는 그대로 DATABASE_URL만 읽는다. 차단은 `RUNTIME_POLICIES`, unknown 해제는 게시 서버 설정 전체(`loadPublisherConfig`, `taskPrecondition`)를 읽는다. "C05 관리 CLI"의 "진입점은 DATABASE_URL만 읽는다"는 이 두 동작에서 바뀐다. 정책을 못 읽어도 비상 정지가 되는 성질은 남는다.
+- **결과 이름과 종료 코드:** `blocked`·`already_blocked`(0), `released`(0), 소멸 미확인·확인 사이 상태 변경 `running_jobs`(3), 없는 작업·unknown 아님·맡는 브리지 없음 `not_releasable`(3), `resumed`(0), `not_waiting`·`emergency_stopped`·`queue_full`(3). 작업 레인이 닫힌 배치의 해제와 정책·설정 읽기 실패는 `failed`(1). 새 이름 일곱(`blocked`·`already_blocked`·`not_releasable`·`resumed`·`not_waiting`·`emergency_stopped`·`queue_full`)은 homelab CLI `BOT_RESULTS`에 아직 없어, homelab 쪽 집합을 넓히기 전에는 CLI가 봇 결과를 형식 오류로 본다.
+
 ## 동료 봇 전환 7 한도 정보 구현 위치 (C03, 2026-11-10)
 
 - "동료 봇 전환 (사용자 2026-11-09)" 7의 한도 정보 읽기 자리다. 결정은 바꾸지 않았다. 작업자가 `rate_limit_event`를 읽어 응답 한도 칸(`src/contracts.ts` `RateLimitInfoSchema`)에 싣는다: 해석 `src/executor-claude.ts`, 대화 v2 `src/chat-lane.ts`, 리뷰 `src/review-lane.ts`·`src/review-http.ts`, 작업 레인 `src/executor-claude-task.ts`·`src/task-contracts.ts`. 결제 멈춤은 칸의 `stop.cause: 'billing'`으로 한도와 가른다. 재개·리뷰 미루기는 C19다. 기록은 [ARCHITECTURE](ARCHITECTURE.md) §12 "T16b 실행기 프로필"의 "한도 정보", [VERIFICATION](VERIFICATION.md) "C03 작업자 한도 정보".

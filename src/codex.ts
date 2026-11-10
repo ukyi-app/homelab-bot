@@ -5,7 +5,8 @@ import { dirname, join, resolve } from 'node:path';
 import { CHAT_TASK_TEXT as T } from './chat-task-text.js';
 import { DEFAULTS, Denied, PolicyUnavailable } from './contracts.js';
 import type { Job, Scope } from './contracts.js';
-import { FOREIGN_SESSION_STATUS, TaskBridge } from './task-bridge.js';
+import { TaskBridge, releaseStatus } from './task-bridge.js';
+import type { ReleaseOutcome } from './task-bridge.js';
 import { assertWorkerRoot, codexConfig, configToml, execArgs, launchEnvironment, taskPaths } from './codex-config.js';
 import type { CodexPaths } from './codex-config.js';
 import { TASK_OUTPUT_JSON_SCHEMA, authSecrets, compactEvent, interpretRun } from './codex-events.js';
@@ -411,16 +412,24 @@ export class CodexBridge extends TaskBridge {
     throw new CapabilityUnavailable('attach_task', 'false');
   }
   async release(actor: string, scope: Scope, jobId: string): Promise<{ ok: boolean; status: string }> {
-    const job = await this.releasable(actor, scope, jobId);
-    if (job.state !== 'unknown') return { ok: false, status: T.releaseNotUnknown };
+    const outcome = await this.releaseJob(await this.releasable(actor, scope, jobId), actor);
+    return { ok: outcome === 'released', status: releaseStatus(outcome, this.store.colleague) };
+  }
+  async adminRelease(jobId: string, actor: string): Promise<ReleaseOutcome> {
+    const job = await this.adminTarget(jobId);
+    return job ? this.releaseJob(job, actor) : 'missing';
+  }
+  private async releaseJob(job: Job, actor: string): Promise<ReleaseOutcome> {
+    const jobId = job.id;
+    if (job.state !== 'unknown') return 'not_unknown';
     // Claude 세션은 작업자가 달라 Codex 어댑터의 답이 소멸 증명이 되지 못한다.
-    if (await this.foreignSession(jobId)) return { ok: false, status: FOREIGN_SESSION_STATUS };
+    if (await this.foreignSession(jobId)) return 'foreign';
     const confirmed = await this.adapter.confirmStop(jobId).catch(() => ({ stopped: false }));
-    if (!confirmed.stopped) return { ok: false, status: T.releaseWorkerAlive };
+    if (!confirmed.stopped) return 'worker_alive';
     const changed = await this.store.db.query(`UPDATE jobs SET state='cancelled',wait_reason='stop_confirmed_after_unknown',finished_at=$2
       WHERE id=$1 AND state='unknown' AND NOT EXISTS (SELECT 1 FROM codex_sessions s WHERE s.job_id=$1 AND s.executor='claude') RETURNING id`, [jobId, this.store.now()]);
-    if (!changed.rows.length) return { ok: false, status: T.releaseStateChanged(this.store.colleague) };
+    if (!changed.rows.length) return 'state_changed';
     await this.store.audit('codex_unknown_released', jobId, { actor });
-    return { ok: true, status: T.releaseConfirmed };
+    return 'released';
   }
 }

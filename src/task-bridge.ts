@@ -73,6 +73,13 @@ export async function purgeExpiredTaskAnswers(db: Database, now: number, retenti
   }
   return total;
 }
+// unknown 해제의 결과. '/' 경로는 안내 문구로, 관리 기능은 결과 이름으로 바꾼다.
+// foreign: 다른 실행기의 세션이라 이 브리지의 작업자가 소멸을 증명할 수 없다.
+export type ReleaseOutcome = 'released' | 'missing' | 'not_unknown' | 'foreign' | 'worker_alive' | 'state_changed';
+export const releaseStatus = (outcome: ReleaseOutcome, colleague: boolean): string => ({
+  released: T.releaseConfirmed, missing: T.releaseNotUnknown, not_unknown: T.releaseNotUnknown, foreign: FOREIGN_SESSION_STATUS,
+  worker_alive: T.releaseWorkerAlive, state_changed: T.releaseStateChanged(colleague),
+})[outcome];
 export abstract class TaskBridge {
   protected constructor(protected readonly store: Store, protected readonly gate: PolicyGate,
     protected readonly text: TaskBridgeText, protected readonly questions: TaskBridgeOptions) {}
@@ -219,5 +226,12 @@ export abstract class TaskBridge {
     const successor = !!job && job.owner_id !== policy.owner && actor === policy.owner;
     if (!job || job.type !== 'task' || (!own && !successor)) throw new Denied();
     return job;
+  }
+  // 관리 기능 unknown 해제(COLLEAGUE_SPEC §4.8). 권한의 근거는 클러스터 접근이라 정책·owner·대화를 보지 않는다.
+  // 소멸 확인과 해제 CAS는 '/' 경로와 같다. actor는 감사에만 남는다.
+  abstract adminRelease(jobId: string, actor: string): Promise<ReleaseOutcome>;
+  protected async adminTarget(jobId: string): Promise<Job | undefined> {
+    const job = (await this.store.db.query<Job>('SELECT * FROM jobs WHERE id=$1', [jobId])).rows[0];
+    return job?.type === 'task' ? job : undefined;
   }
 }
