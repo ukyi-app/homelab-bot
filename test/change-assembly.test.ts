@@ -2109,3 +2109,34 @@ test('AC-28·스위치: 동료 기능 스위치가 꺼져 있으면 확정된 �
     assert.equal(await h.phase(id), 'proposed');
   });
 });
+
+test('AC-28 수정 중 병합: 차례가 도는 동안 PR이 병합되면 커밋하지 않고 merged로 나간다. 남은 작성은 정리된다', async () => {
+  const fake = discussionFake();
+  await withHarness({ changeV2: true, colleague: true, steps: [V2_WRITE_STEP, { kind: 'hang' }], amendments: { discussion: fake.read } }, async h => {
+    const id = await toProposed(h);
+    const published = branchHead(h);
+    await requestAmendment(h, id, 'amend-1', published);
+    await h.pump(async () => (await h.f.calls()).length === 2);
+    assert.equal(await h.phase(id), 'amending');
+    h.env.github.pulls[0]!.merged_at = '2026-01-01T00:00:00Z';
+    await h.pump(async () => ['merged', 'observing_deploy'].includes(await h.phase(id)));
+    assert.deepEqual((await roundsOf(h, id)).map(round => [round.state, round.reason, round.commit_sha]), [['failed', 'pr_merged', null]]);
+    assert.equal(h.env.github.mutations(/^PATCH .*git\/refs/).length, 0, '병합된 PR 브랜치를 움직이지 않는다');
+    assert.equal(branchHead(h), published);
+    const amendAuthor = async () => (await h.db.query<{ state: string }>(`SELECT j.state FROM jobs j JOIN change_child_jobs c ON c.job_id=j.id
+      WHERE c.change_id=$1 AND c.amendment_round=1 AND c.role='author'`, [id])).rows[0]!.state;
+    await h.pump(async () => !['running', 'queued'].includes(await amendAuthor()));
+  });
+});
+
+test('AC-28 ref 갱신 응답 유실: 다시 보내지 않고 브랜치를 다시 읽어 확정한다(fast-forward 한 번)', async () => {
+  const fake = discussionFake();
+  await withHarness({ changeV2: true, colleague: true, steps: [V2_WRITE_STEP, AMEND_STEP], amendments: { discussion: fake.read } }, async h => {
+    const id = await toProposed(h);
+    await requestAmendment(h, id, 'amend-1', branchHead(h));
+    h.env.github.fail(/^PATCH .*git\/refs/, 'lose_response');
+    await h.pump(async () => (await roundsOf(h, id))[0]?.state === 'committed');
+    assert.equal(h.env.github.mutations(/^PATCH .*git\/refs/).length, 1);
+    assert.equal(branchHead(h), (await roundsOf(h, id))[0]!.commit_sha);
+  });
+});

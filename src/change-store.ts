@@ -1315,6 +1315,8 @@ export class ChangePrivateInputs {
       const updated = (await tx.query<Record<string, unknown>>('UPDATE change_requests SET label=$2,updated_at=$3 WHERE id=$1 RETURNING *', [input.changeId, label, now])).rows[0]!;
       return success(requestRow(updated));
     }
+    // 수정 차례 중의 답(작성 질문)이면 그 차례와 대기열도 함께 닫는다.
+    if (request.phase === 'amending' || request.phase === 'proposed') await closeAmendments(tx, input, 'label_blocked', now);
     await tx.query(`UPDATE change_requests SET label=$2,phase='blocked',phase_reason='label_blocked',updated_at=$3 WHERE id=$1`, [input.changeId, label, now]);
     await settleTerminal(tx, input, 'label_blocked', now);
     await audit(tx, 'change_phase', input.changeId, { generation: input.generation, from: request.phase, to: 'blocked', reason: 'label_blocked' }, now);
