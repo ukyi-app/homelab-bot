@@ -240,7 +240,9 @@ export async function changeHarness(db: Database, options: HarnessOptions = {}):
       const amendments = (await db.query('SELECT round,state,reason,base_commit IS NOT NULL AS pinned,artifact_digest IS NOT NULL AS saved FROM change_amendments ORDER BY round')).rows;
       const children = (await db.query(`SELECT c.role,c.amendment_round,j.state,j.wait_reason,s.state AS session FROM change_child_jobs c JOIN jobs j ON j.id=c.job_id
         LEFT JOIN codex_sessions s ON s.job_id=j.id ORDER BY c.created_at`)).rows;
-      throw new Error(`pump_timeout phase=${row?.phase} reason=${row?.phase_reason} rounds=${JSON.stringify(amendments)} children=${JSON.stringify(children)} logs=${JSON.stringify(logs.slice(-8))}`);
+      // 집을 수 있는 대기 대화 job이 있으면 리뷰가 대화 우선(F05)으로 양보한다. pump는 대화를 돌리지 않으므로 이 수가 0이 아니면 리뷰가 멈춘 이유다.
+      const chatReady = (await db.query(`SELECT 1 FROM jobs WHERE type='chat' AND state='queued' AND available_at<=$1`, [store.now()])).rows.length;
+      throw new Error(`pump_timeout phase=${row?.phase} reason=${row?.phase_reason} chatReady=${chatReady} rounds=${JSON.stringify(amendments)} children=${JSON.stringify(children)} logs=${JSON.stringify(logs.slice(-8))}`);
     },
     phase: async id => (await db.query<{ phase: ChangePhase }>('SELECT phase FROM change_requests WHERE id=$1', [id])).rows[0]!.phase,
     changeId: async () => (await db.query<{ id: string }>('SELECT id FROM change_requests ORDER BY created_at DESC LIMIT 1')).rows[0]!.id,
