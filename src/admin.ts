@@ -2,6 +2,8 @@ import type { PolicyGate } from './policy.js';
 import type { Store } from './store.js';
 import type { ReleaseOutcome, TaskBridge } from './task-bridge.js';
 import type { ExecutionLaneClosedReason } from './task-contracts.js';
+import { ACCOUNT_NAME, listAccounts, recordAccount } from './model-accounts.js';
+import type { AccountView, PausedCounts } from './model-accounts.js';
 
 // 관리 기능 진입점의 명령 처리(명세 §4.8, DECISIONS "동료 봇 전환" 3). owner가 클러스터 접근 권한으로 `homelab bot`을 실행하면
 // CLI가 게시 서버 파드 안에서 admin-main을 부른다. 권한의 근거는 클러스터 접근이지 Discord owner ID가 아니다.
@@ -25,13 +27,20 @@ export type AdminCommand =
   | { name: 'resume'; target: 'job'; job: string }
   | { name: 'status' }
   | { name: 'block'; user: string }
-  | { name: 'release'; job: string };
+  | { name: 'release'; job: string }
+  | { name: 'account'; action: 'record' | 'use'; account: string; method: 'subscription' }
+  | { name: 'account'; action: 'list' };
 
 export type AdminState = { emergency: boolean; paused: boolean; executionPending: boolean; taskLaneClosed: ExecutionLaneClosedReason | null };
 // homelab CLI(cli/src/core/podops.ts BOT_RESULTS)가 받는 이름과 같아야 한다. 이름을 더하면 그쪽 집합도 넓힌다.
 export type AdminResult = 'stopped' | 'already_stopped' | 'released' | 'not_stopped' | 'running_jobs' | 'status' | 'unsupported' | 'usage' | 'failed'
-  | 'blocked' | 'already_blocked' | 'not_releasable' | 'resumed' | 'not_waiting' | 'emergency_stopped' | 'queue_full';
-export type AdminReport = { schema: typeof ADMIN_SCHEMA; command: string; result: AdminResult; state?: AdminState };
+  | 'blocked' | 'already_blocked' | 'not_releasable' | 'resumed' | 'not_waiting' | 'emergency_stopped' | 'queue_full'
+  | 'recorded' | 'accounts' | 'switched' | 'unknown_account';
+// 계정 전환 뒤 해제의 결과. resumed는 다시 큐에 넣은 작업 수, waiting은 아직 모델 멈춤으로 기다리는 수,
+// held는 비상 정지·큐 상한으로 해제를 못 한 이유(없으면 null).
+export type AccountSwitch = { resumed: number; waiting: number; held: 'emergency_stopped' | 'queue_full' | null };
+export type AdminReport = { schema: typeof ADMIN_SCHEMA; command: string; result: AdminResult; state?: AdminState;
+  accounts?: AccountView[]; paused?: PausedCounts; switch?: AccountSwitch };
 
 export class AdminUsage extends Error {
   constructor() { super('admin_usage'); }
@@ -40,6 +49,7 @@ export class AdminUsage extends Error {
 // 입력은 고정 명령 단어와 형식 검사를 거친 ID뿐이다. 그 밖은 사용법 오류로 아무것도 하지 않는다.
 export function parseAdminArgs(argv: readonly string[]): AdminCommand {
   const [name, a, b, ...rest] = argv;
+  if (name === 'account') return parseAccount(argv.slice(1));
   if (rest.length) throw new AdminUsage();
   if (name === 'emergency-stop' && a === undefined) return { name };
   if (name === 'status' && a === undefined) return { name };
@@ -49,8 +59,16 @@ export function parseAdminArgs(argv: readonly string[]): AdminCommand {
   if (name === 'release' && a !== undefined && b === undefined && UUID.test(a)) return { name, job: a };
   throw new AdminUsage();
 }
+// 계정 동작은 `account list`와 `account record|use <이름> subscription`뿐이다. API 크레딧(api)은 C23이 받는다.
+function parseAccount([action, account, method, ...rest]: readonly string[]): AdminCommand {
+  if (action === 'list' && account === undefined) return { name: 'account', action };
+  if ((action === 'record' || action === 'use') && account !== undefined && ACCOUNT_NAME.test(account) && method === 'subscription' && !rest.length)
+    return { name: 'account', action, account, method };
+  throw new AdminUsage();
+}
 
-const label = (command: AdminCommand) => command.name === 'resume' ? `resume ${command.target}` : command.name;
+const label = (command: AdminCommand) => command.name === 'resume' ? `resume ${command.target}`
+  : command.name === 'account' ? `account ${command.action}` : command.name;
 type ModelStatus = { paused: boolean; emergency: boolean; executionPending: boolean; taskLaneClosed: ExecutionLaneClosedReason | null };
 const stateOf = (status: ModelStatus): AdminState =>
   ({ emergency: status.emergency, paused: status.paused, executionPending: status.executionPending, taskLaneClosed: status.taskLaneClosed });
@@ -68,7 +86,8 @@ const releaseResult = (outcome: ReleaseOutcome): AdminResult =>
 
 export async function runAdmin(store: Store, command: AdminCommand, ports: AdminPorts = {}): Promise<{ code: number; report: AdminReport }> {
   const report = (result: AdminResult, state?: AdminState): AdminReport => ({ schema: ADMIN_SCHEMA, command: label(command), result, ...(state ? { state } : {}) });
-  const audit = (s: Store, result: AdminResult) => s.audit('admin_command', label(command), { actor: ADMIN_ACTOR, result });
+  const target = command.name === 'account' && command.action !== 'list' ? { account: command.account, method: command.method } : {};
+  const audit = (s: Store, result: AdminResult) => s.audit('admin_command', label(command), { actor: ADMIN_ACTOR, result, ...target });
   const status = (s: Store) => s.control(ADMIN_ACTOR, ADMIN_CONVERSATION, 'model-status') as Promise<ModelStatus>;
   if (command.name === 'release') {
     // 작업자 소멸 확인은 HTTP 호출이라 트랜잭션 밖에서 한다. 상태 확인과 바꾸기는 브리지의 해제 CAS가 한 트랜잭션에서 한다.
@@ -84,6 +103,15 @@ export async function runAdmin(store: Store, command: AdminCommand, ports: Admin
   }
   // 상태 확인과 바꾸기를 한 트랜잭션에서 한다. Store.atomic은 안쪽 control의 atomic을 같은 트랜잭션으로 합친다.
   return store.atomic(async s => {
+    if (command.name === 'account') {
+      if (command.action === 'list') return { code: ADMIN_EXIT.ok, report: { ...report('accounts'), ...await listAccounts(s.db) } };
+      if (command.action === 'record') {
+        await recordAccount(s.db, command.account, command.method, s.now());
+        await audit(s, 'recorded');
+        return { code: ADMIN_EXIT.ok, report: report('recorded') };
+      }
+      throw new AdminUsage();
+    }
     if (command.name === 'block') {
       if (!ports.gate) throw new Error('admin_policy_unavailable');
       const result = await ports.gate.withDatabase(s.db).deny(command.user) ? 'blocked' : 'already_blocked';

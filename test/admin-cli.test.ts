@@ -277,6 +277,25 @@ test('관리 기능 unknown 해제: 작업 레인을 조립하지 못했으면(�
   assert.deepEqual(await audits(), []);
 });
 
+// ---- C22 계정 등록·전환·목록(AC-21의 봇 쪽) ----
+const NO_PAUSES = { rate_limit: 0, auth_expired: 0, billing: 0 };
+test('계정 기록: 구독 계정의 이름·방식·발급일만 남기고, 목록이 만료일(발급 뒤 1년)과 지금 계정 아님을 보인다', async () => {
+  const out = await admin('account', 'record', 'main', 'subscription');
+  assert.equal(out.code, 0);
+  assert.equal(out.report.result, 'recorded');
+  assert.equal(out.report.command, 'account record');
+  const list = await admin('account', 'list');
+  assert.equal(list.code, 0);
+  assert.equal(list.report.result, 'accounts');
+  // fixture 시계는 2027-01-15T08:00:00Z다.
+  assert.deepEqual(list.report.accounts, [{ name: 'main', method: 'subscription', current: false,
+    issuedAt: '2027-01-15T08:00:00Z', expiresAt: '2028-01-15T08:00:00Z', limit: null }]);
+  assert.deepEqual(list.report.paused, NO_PAUSES);
+  assert.deepEqual((await audits()).map(row => [row.kind, row.subject, row.detail.actor]),
+    [['admin_command', 'account record', 'cli']]);
+  assert.equal(f.requests.length, 0);
+});
+
 test('관리 진입점 입력은 고정 명령 단어와 형식이 맞는 ID만 받는다', () => {
   for (const argv of [[], ['stop'], ['emergency-stop', 'now'], ['status', '--json'], ['resume'], ['resume', 'job'],
     ['resume', 'job', 'not-a-uuid'], ['block', 'fixture-owner'], ['block', '12345'], ['block', '123456789012345678', 'x'],
