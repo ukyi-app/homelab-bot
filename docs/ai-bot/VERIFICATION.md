@@ -2301,3 +2301,22 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 - **실행(머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 19개 파일(`c08-mention-scope`·`c08-reply-context`·`foundation`·`s16-display`·`chat-context`·`publisher-gateway`·`c07-reply-call-thread`·`chat-ack`·`publisher-recovery`·`discord-rest-timeout`·`reaction-lifecycle`·`memory-commands`·`revoke-dispatch`·`pr-review`·`review-1`·`raw-text-retention`·`raw-input-retention`·`publisher-pg`·`chat-format`) 377 통과, 실패·skip 0.
 - **운영 영향(스위치 밖).** 병합하면 알림 채널 부모의 owner 멘션이 스레드를 열고 답한다(이전에는 거부). 새 이벤트의 payload에 `bot_user`·`reply_to`(ID만)가 더해진다. 옛 이벤트는 멘션 표기가 남은 채로 간다.
 - **못 잡는 범위.** 실제 Discord 권한·intent·스레드 생성 응답, 알림 채널 overwrite의 스레드 생성 권한, 답장 프레임에 `referenced_message`가 실제로 실리는지와 Discord가 참조 글을 생략하는 실제 경우(삭제된 글 등)는 S5(C24)다. 작업자 프롬프트가 `replied_bot_post`를 설명하지 않는 것은 시험하지 않았다(ARCHITECTURE §13 "작업자 프롬프트(남은 것)").
+
+## C32 관리 CLI 나머지 동작 (2026-11-10, 로컬)
+
+명세 COLLEAGUE_SPEC §4.8·AC-20(C05와 함께). C05가 미지원(종료 4)으로 막아 둔 차단·unknown 해제·멈춘 작업 재개를 관리 진입점에서 연다. 경계는 S1(관리 진입점 `runAdmin`·`executeAdmin` → PGlite·실제 PostgreSQL, 작업 브리지는 가짜 작업자). 결정·결과 이름은 [DECISIONS](DECISIONS.md) "C32 관리 CLI 나머지 동작".
+
+| 완료 조건 | 시험 |
+|---|---|
+| 차단이 거부 행만 더하고 모델 0, 감사 행위자 `cli` | `admin-cli` "관리 기능 차단: 거부 목록에 행만 더하고 모델을 부르지 않으며 감사 행위자가 cli다"(작업·비상 정지 불변, `admin_command` 한 행), "정책을 읽지 못하면 아무것도 더하지 않고 실패한다(닫힘)", "관리 진입점 실행: 정책·게시 서버 설정을 읽지 못하면 차단·해제는 아무것도 바꾸지 않고 실패(1)한다" |
+| 차단 재실행 안전, owner 자신도 막음 | "이미 거부돼 있으면 같은 행을 그대로 두고 already_blocked다(재실행 안전)", "owner 자신도 막고, 막힌 뒤 재실행도 Denied 없이 already_blocked다", "해제 승인(revocationRestores)에 적힌 옛 거부만 남아 있으면 새 거부로 바꿔 다음 인가에도 유지된다" |
+| AUTH-02: 차단이 ESO 동기화 전에 효력 | "정책 재동기화(ESO) 전에도 그 사용자의 다음 이벤트가 거부된다(AUTH-02)", `revoke-dispatch-pg` "C32 실제 PostgreSQL: 인가 뒤 다른 연결의 관리 기능 차단이 dispatch보다 먼저 커밋되면 REST 0, blocked"(두 연결 차단 경합도 행 하나) |
+| unknown 해제는 소멸 확인 뒤에만, 못 하면 풀지 않음 | `admin-cli` "관리 기능 unknown 해제: 소멸 확인 뒤 풀고 레인을 열며, 모델을 부르지 않고 감사 행위자가 cli다", "작업자 소멸을 확인하지 못하면 풀지 않고 running_jobs로 거부한다", "없는 작업·unknown이 아닌 작업·어느 브리지도 맡지 않는 세션은 not_releasable이다", "Codex 세션은 Codex 브리지가 소멸 확인 뒤 푼다", "작업 레인을 조립하지 못했으면(브리지 없음) 아무것도 바꾸지 않고 실패한다"; `task-bridge` "관리 기능 unknown 해제: 작업 ID만으로 소멸 확인 뒤에만 풀고 …"(owner 교체·정책 불가에도 소멸 확인만 봄), "다른 저장소의 취소 응답은 소멸 증명이 아니고 …", "Codex 세션은 Codex 경로만 …", "Codex 경로는 Claude 세션을 foreign으로 두고 …" |
+| '/' 해제와 CLI 해제가 겹쳐도 한 번 | `task-lane-pg` "실제 PostgreSQL: 같은 unknown 작업에 '/task-release'와 관리 기능 해제가 겹쳐도 한 번만 풀린다"(6회, 순서 바꿔) |
+| 멈춘 작업 재개는 그 대기 상태일 때만 | `admin-cli` "관리 기능 멈춘 작업 재개: 작업 ID만으로 모델 멈춤 작업을 다시 큐에 넣고 감사 행위자가 cli다"(구독 꺼짐에도), "인증 대기도 같은 경로로 푼다", "그 대기 상태가 아니면 바꾸지 않고 not_waiting이다(재실행·없는 작업·질문 대기·시도 한도)", "비상 정지 중이면 바꾸지 않고 emergency_stopped다" |
+| '/' 관리 명령 유지 | `admin-cli` "'/resume-model'은 그대로 owner·대화를 대조해 같은 작업을 재개한다", "'/' 관리 명령은 그대로 동작하고 관리 기능과 같은 상태를 본다"; 기존 `task-bridge`·`codex-bridge` '/task-release' 시험과 `revoke-dispatch`·`revoke-dispatch-pg` '/revoke' 시험 그대로 통과 |
+| 다른 동작은 정책·작업자 설정을 읽지 않음 | "관리 진입점 실행: 차단은 env 정책의 revision으로 거부 행을 더하고, 다른 동작은 정책·작업자 설정을 읽지 않는다" |
+
+- **실행:** 아래 "C32 실행 결과" 줄에 적는다.
+- **시험하지 않은 것:** `queue_full`(큐 90건을 채우는 준비가 커 시험하지 않았다. 조건은 '/resume-model'과 같은 `queueFull('chat')`). 진입점 `main()`의 실제 pg 풀과 게시 서버 env 전체로 만든 HTTP 작업자는 S5.
+- **못 잡는 범위.** 운영 클러스터 권한, 실제 작업자 프로세스의 소멸 확인, homelab CLI가 새 결과 이름을 받는지(S3, homelab 쪽 `BOT_RESULTS`), 운영 1회(S5, 주 진행자).
