@@ -553,7 +553,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     // 트랜잭션 안에서 기록이 실패하면 턴 확정 전체가 깨지므로 밖에서 부르고, 실패는 로그만 남긴다.
     const response = turn.kind === 'response' ? turn.response : undefined;
     if (response && 'rateLimit' in response && response.rateLimit && response.status !== 'limited' && response.status !== 'auth_expired') {
-      await this.store.observeRateLimit(response.rateLimit).catch(error => { this.options.log('task_rate_limit_record_failed', { job: job.id, ...errorInfo(error) }); });
+      await this.store.observeRateLimit(response.rateLimit, job.id).catch(error => { this.options.log('task_rate_limit_record_failed', { job: job.id, ...errorInfo(error) }); });
     }
     return settled;
   }
