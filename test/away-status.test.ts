@@ -139,6 +139,32 @@ test('AC-14 💤: 멈춤이 시작되면 기다리던 메시지의 👀·⏳를 
   assert.equal((await database.db.query("SELECT 1 FROM controls WHERE key LIKE 'reaction:%'")).rows.length, 0);
 });
 
+test('AC-14 💤: 같은 회차 안에서 풀린 동안 받은 메시지도 다시 멈추면 💤가 되고, 안내 줄은 다시 달지 않으며, 바꿀 것이 없으면 반응 호출이 없다', async () => {
+  await receive('9201');
+  f.advance(DEFAULTS.debounceMs);
+  f.setRun(limited);
+  await f.runtime.tick();
+  await drain();
+  // 재개 예약 루프가 다시 돌리기 전, 멈춤 기록이 빈 틈(유예 안이라 회차는 그대로)에 받은 메시지는 👀다.
+  assert.equal(await resumeLater(), 1);
+  assert.equal(await f.store.syncAway(), false);
+  await receive('9202', thread2);
+  await drain();
+  assert.deepEqual(reactionsOf('9202'), []);
+  assert.equal(f.rest.acks.length, 2);
+  // 다시 한도로 멈추면 같은 회차지만 기다리는 9202도 💤가 된다.
+  await f.runtime.tick();
+  assert.equal(await f.store.syncAway(), true);
+  await drain();
+  assert.deepEqual(reactionsOf('9202').filter(r => r !== 'add ⏳' && r !== 'remove ⏳'), ['add 💤', 'remove 👀']);
+  assert.deepEqual(reactionsOf('9201'), ['add 💤', 'remove 👀']);
+  assert.deepEqual((await awayLines()).map(row => row.idempotency_key), ['away:fixture-thread:1']);
+  // 상태 루프가 계속 돌아도 이미 💤인 메시지에 반응을 다시 보내지 않는다.
+  const calls = f.rest.reactions.length;
+  for (let i = 0; i < 3; i++) { assert.equal(await f.store.syncAway(), true); await drain(); }
+  assert.equal(f.rest.reactions.length, calls);
+});
+
 test('AC-15 자리 비움 한 줄: 멈춘 동안 스레드마다 처음 부를 때 한 번, 재시도 사이에도 같은 멈춤이고 새 멈춤이면 다시 한 번', async () => {
   await receive('9101');
   f.advance(DEFAULTS.debounceMs);

@@ -56,7 +56,8 @@ export async function recordReceived(db: Database, event: { id: string; channel:
   await db.query('INSERT INTO controls VALUES ($1,$2) ON CONFLICT DO NOTHING', [KEY + event.id, JSON.stringify(row)]);
 }
 
-// 모델 멈춤이 시작될 때 이미 기다리던 메시지(👀·⏳) 전부를 💤로 바꾼다. 호출자의 트랜잭션 안에서 부른다.
+// 모델 멈춤 중이면 기다리던 메시지(👀·⏳) 전부를 💤로 바꾼다. 이미 💤인 행은 고르지 않아 되풀이해 불러도 바뀌는 것이 없다.
+// 호출자의 트랜잭션 안에서 부른다.
 export async function sleepReactions(db: Database): Promise<void> {
   await db.query(`UPDATE controls SET value=jsonb_set(value,'{state}','"away"') WHERE key LIKE 'reaction:%' AND value->>'state'=ANY($1)`, [FROM.away]);
 }

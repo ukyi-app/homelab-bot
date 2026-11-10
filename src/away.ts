@@ -24,8 +24,7 @@ export async function showAway(store: { syncAway(): Promise<boolean> }, gateway:
 }
 
 // 회차를 지금 멈춤 기록에 맞춘다. 호출자의 트랜잭션 안에서, scheduler 행을 잠근 뒤에 부른다(잠금 순서 scheduler → model_away).
-// started: 이번에 새 회차가 시작됐다(기다리던 메시지의 반응을 💤로 바꿀 때).
-export async function syncAway(db: Database, now: number): Promise<{ paused: boolean; episode: number; started: boolean }> {
+export async function syncAway(db: Database, now: number): Promise<{ paused: boolean; episode: number }> {
   await db.query(`INSERT INTO controls VALUES ($1,$2) ON CONFLICT DO NOTHING`, [KEY, JSON.stringify({ episode: 0, active: false, clearSince: null })]);
   const row = (await db.query<{ value: AwayRow }>('SELECT value FROM controls WHERE key=$1 FOR UPDATE', [KEY])).rows[0]!.value;
   const paused = await modelPaused(db);
@@ -35,7 +34,7 @@ export async function syncAway(db: Database, now: number): Promise<{ paused: boo
       : row.clearSince !== null && now - row.clearSince >= AWAY_GRACE_MS ? { ...row, active: false, clearSince: null }
         : { ...row, clearSince: row.clearSince ?? now };
   if (JSON.stringify(next) !== JSON.stringify(row)) await db.query('UPDATE controls SET value=$2 WHERE key=$1', [KEY, JSON.stringify(next)]);
-  return { paused, episode: next.episode, started: paused && !row.active };
+  return { paused, episode: next.episode };
 }
 
 // 자리 비움 한 줄의 멱등 키. 멈춤 중이면 스레드(채널)와 회차로 묶어 같은 멈춤 동안 같은 스레드에 한 번만 나간다.

@@ -467,11 +467,13 @@ export class Store {
   async syncAway(): Promise<boolean> {
     return this.db.transaction(async tx => { await this.lockScheduler(tx); return (await this.syncAwayIn(tx)).paused; });
   }
-  // 새 회차가 시작되면 이미 기다리던 메시지의 👀·⏳를 같은 트랜잭션에서 💤로 바꾼다.
+  // 멈춤이면 기다리던 메시지의 👀·⏳를 같은 트랜잭션에서 💤로 바꾼다. 새 회차가 시작될 때만이 아니라 지금 멈춤이면 매번이다:
+  // 같은 회차 안에서 잠깐 풀린 동안(재개 예약 루프의 재시도·유예) 받은 메시지도 다시 멈추면 💤가 돼야 한다.
+  // 이미 💤인 행은 건드리지 않아 바꿀 것이 없으면 반응 동기화(REST)도 일어나지 않는다.
   // 잠금 순서 scheduler 행 → 회차 행: 부르는 쪽이 scheduler 행을 먼저 잠근다.
   private async syncAwayIn(tx: Database): Promise<{ paused: boolean; episode: number }> {
     const away = await syncAway(tx, this.now());
-    if (away.started) await sleepReactions(tx);
+    if (away.paused) await sleepReactions(tx);
     return away;
   }
   // 작업 레인·리뷰가 직접 거는 대기 안내의 멱등 키. 자리 비움이면 스레드와 회차로 묶고, 아니면 호출자의 작업별 키다.
