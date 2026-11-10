@@ -16,6 +16,7 @@ import { ClaudeTaskBridge } from '../src/claude-task-bridge.js';
 import type { Scope } from '../src/contracts.js';
 import type { Database } from '../src/database.js';
 import { DiscordIngress, DiscordPublisher } from '../src/discord.js';
+import type { GuidanceReviewPort } from '../src/github-review-io.js';
 import { PolicyGate } from '../src/policy.js';
 import type { Policy } from '../src/policy.js';
 import { ReviewRuntime } from '../src/review.js';
@@ -57,6 +58,8 @@ export interface HarnessOptions {
   colleague?: boolean;
   // 작성 결과에 실을 확인할 것·남은 위험(C25 결과 칸).
   notes?: { checks: ChangeNote[]; risks: ChangeNote[] };
+  // main이 리뷰 경로에서 넘기는 안내 리뷰 포트(assembleChange 인수). 없으면 리뷰 경로가 없는 운영과 같다.
+  guidance?: GuidanceReviewPort;
 }
 export interface Harness {
   db: Database; env: PublishEnv; f: ChangeWorkerFixture; store: Store; changes: ChangeStore; gate: PolicyGate; policy: { current: Policy }; rest: MockDiscord; ingress: DiscordIngress; discord: DiscordPublisher;
@@ -151,7 +154,7 @@ export async function changeHarness(db: Database, options: HarnessOptions = {}):
     const bridge = new ClaudeTaskBridge(store, gate, v1 as never, { plan: async () => { throw new Error('v1_plan_not_used'); } }, { log: () => {} }, v2);
     const review = assembleChangeReview({ store, gate, signer, workerUrl: reviewUrl, send: fetch, now: Date.now, shutdown: shutdown.signal, log });
     const assembled = assembleChange({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, store, gate, changes: review.changes, review: review.service, bridge, worker: v2, kubernetes: { get: async () => { throw new Error('kubernetes_not_used'); } }, send, now: Date.now, log, shutdown: shutdown.signal,
-      intakeOpen: () => worker.taskOpen, verificationPollMs: 2, periods: { authorPollMs: 0, mergePollMs: 0, failureBackoffMs: 0, failureBackoffMaxMs: 0, startGraceMs: 200 },
+      intakeOpen: () => worker.taskOpen, ...(options.guidance ? { guidance: options.guidance } : {}), verificationPollMs: 2, periods: { authorPollMs: 0, mergePollMs: 0, failureBackoffMs: 0, failureBackoffMaxMs: 0, startGraceMs: 200 },
       deployTargets: [{ kind: 'app', service: 'fixture-app', repository: REPO.fullName, configRepository: 'fixture-org/config', imageFile: 'apps/fixture-app/image.yaml', imageRepository: 'ghcr.io/fixture-org/fixture-app', namespace: 'app-fixture-app', deployment: 'fixture-app', container: 'app', argoApplication: 'fixture-app', podApp: 'fixture-app' }],
       instrument: deps => {
         const wrapped: ChangeRuntimeDeps = { ...deps, author: crashing('author', deps.author, plan), artifacts: crashing('artifacts', deps.artifacts, plan), verification: crashing('verification', deps.verification, plan), review: crashing('review', deps.review, plan), publisher: crashing('publisher', deps.publisher, plan),

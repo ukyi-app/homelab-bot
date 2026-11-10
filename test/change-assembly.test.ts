@@ -429,10 +429,9 @@ const guidancePort = () => {
   return { reviews, port };
 };
 
-test('AC-25·AC-27 연결: 작성 결과의 확인할 것이 미리보기와 PR 설명에 있고, 게시 뒤 diff 안 항목만 안내 댓글로 한 번 달린다', async () => {
-  await withHarness({ notes: GUIDE_NOTES, policyPatch: policy => ({ ...policy, review: REVIEW_POLICY }) }, async h => {
-    const fake = guidancePort();
-    h.restart({ instrument: deps => ({ ...deps, guidance: fake.port }) });
+test('AC-25·AC-27 연결: 작성 결과의 확인할 것이 미리보기와 PR 설명에 있고, 게시 뒤 조립 인수로 받은 포트로 diff 안 항목만 안내 댓글이 한 번 달린다', async () => {
+  const fake = guidancePort();
+  await withHarness({ notes: GUIDE_NOTES, guidance: fake.port, policyPatch: policy => ({ ...policy, review: REVIEW_POLICY }) }, async h => {
     const id = await toAwaiting(h);
     await h.deliver();
     const preview = h.messages().find(text => text.includes('게시 미리보기'))!;
@@ -452,10 +451,34 @@ test('AC-25·AC-27 연결: 작성 결과의 확인할 것이 미리보기와 PR 
   });
 });
 
+test('AC-27 리뷰 경로 없음: 안내 포트가 없거나 리뷰 경로가 닫혀 있어도 게시와 병합 추적은 그대로다', async () => {
+  // 리뷰 App 조건이 맞지 않으면 main이 포트를 넘기지 않는다.
+  await withHarness({ notes: GUIDE_NOTES }, async h => {
+    const id = await toProposed(h);
+    assert.equal(h.env.github.pulls.length, 1);
+    assert.ok((h.env.github.pulls[0]!.body ?? '').includes(GUIDE_NOTES.checks[0]!.text), 'PR 설명에는 확인할 것이 있다');
+    for (let round = 0; round < 3; round++) await h.runtime.publishTick();
+    assert.equal((await h.db.query('SELECT 1 FROM change_guidance')).rows.length, 0);
+    h.env.github.pulls[0]!.state = 'closed';
+    await h.pump(async () => await h.phase(id) === 'cancelled');
+  });
+  // 포트는 있지만 리뷰 경로가 닫혀 있다(리뷰 정책을 읽지 못함). 안내만 미루고 게시·병합 추적은 막지 않는다.
+  const posts: GuidanceReview[] = [];
+  const closed: GuidanceReviewPort = { post: async input => { posts.push(input); return { kind: 'not_sent', code: 'policy_unavailable' }; }, find: async () => null };
+  await withHarness({ notes: GUIDE_NOTES, guidance: closed, policyPatch: policy => ({ ...policy, review: REVIEW_POLICY }) }, async h => {
+    const id = await toProposed(h);
+    await h.pump(async () => posts.length === 1);
+    assert.equal(await h.phase(id), 'proposed');
+    assert.ok(h.logs.some(entry => entry.event === 'change_guidance' && JSON.stringify(entry.fields).includes('policy_unavailable')));
+    h.env.github.pulls[0]!.state = 'closed';
+    await h.pump(async () => await h.phase(id) === 'cancelled');
+    assert.equal(posts.length, 1, '미룬 기한 전에는 다시 보내지 않는다');
+  });
+});
+
 test('AC-25 옛 판 결과: 확인할 것이 없으면 미리보기·PR 설명이 지금과 같고 안내 댓글을 달지 않는다', async () => {
-  await withHarness({ policyPatch: policy => ({ ...policy, review: REVIEW_POLICY }) }, async h => {
-    const fake = guidancePort();
-    h.restart({ instrument: deps => ({ ...deps, guidance: fake.port }) });
+  const fake = guidancePort();
+  await withHarness({ guidance: fake.port, policyPatch: policy => ({ ...policy, review: REVIEW_POLICY }) }, async h => {
     const id = await toAwaiting(h);
     await h.deliver();
     const preview = h.messages().find(text => text.includes('게시 미리보기'))!;
