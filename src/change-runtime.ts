@@ -5,14 +5,15 @@ import { CHANGE_SELF_FIX, isTerminalPhase, labelAllowsAuthorInput, ReasonCodeSch
 import { ChangeGuidance, guidanceLimit, notesApproved, readChangeNotes, recordChangeNotes } from './change-guidance.js';
 import { noteLine, scanPublicText } from './change-publication.js';
 import { ChangeReviewFailed, ChangeReviewRejected, selfFixable } from './change-review.js';
-import type { ChangeArtifactPort, ChangeDeploymentPort, ChangeKey, ChangePhase, ChangeTarget, ChangeVerificationPort, DeploymentObservation, MergeReading, ProvenanceLabel, ReviewReceipt, TerminalChangePhase } from './change-contracts.js';
+import type { AmendmentKey, ChangeArtifactPort, ChangeDeploymentPort, ChangeKey, ChangeNote, ChangePhase, EvidenceKey, ReviewMaterial, VerificationReceipt, ChangeTarget, ChangeVerificationPort, DeploymentObservation, MergeReading, ProvenanceLabel, ReviewReceipt, TerminalChangePhase } from './change-contracts.js';
 import { DEPLOYMENT_POLL, DeploymentTargetError, deploymentPollStep, describeDeployment } from './change-deployment.js';
 import { compilePathPolicy, taskPathRules } from './change-policy.js';
 import type { ChangeRepositoryPolicy } from './change-policy.js';
-import { parseChangeRequest, publishButton } from './change-commands.js';
+import { discussionMaterials, parseChangeRequest, publishButton } from './change-commands.js';
+import type { AmendmentDiscussionReader } from './change-commands.js';
 import type { ChangePublisher } from './change-publisher.js';
 import type { ChangeReviewService } from './change-review.js';
-import type { ChangePrivateInputs, ChangeRequest, ChangeStore } from './change-store.js';
+import type { AmendmentRound, ChangePrivateInputs, ChangeRequest, ChangeStore } from './change-store.js';
 import { purgeExpiredChangeContentRounds } from './change-store.js';
 import type { ChangeAuthorSource, ClaudeChangeAuthor } from './claude-task-bridge.js';
 import { DEFAULTS, Denied, PolicyUnavailable } from './contracts.js';
@@ -43,10 +44,32 @@ export const CHANGE_PERIODS = Object.freeze({
   failureBackoffMaxMs: 600_000,
 });
 export type ChangePeriods = Record<keyof typeof CHANGE_PERIODS, number>;
+// 수정 차례(C27) 결과 알림. 동료 기능 스위치를 켰을 때만 생기는 흐름이라 동료 말투다. 사유는 고정 코드를 말로 옮기고 모르는 코드는 그대로 둔다.
+const AMENDMENT_REASON: Readonly<Record<string, string>> = Object.freeze({
+  head_changed: '확인한 뒤로 PR 브랜치에 다른 커밋이 올라왔어요. 지금 브랜치를 보고 다시 요청해 주세요',
+  pr_merged: 'PR이 병합돼서 커밋하지 않았어요',
+  closed_unmerged: 'PR이 닫혀서 커밋하지 않았어요',
+  pull_not_open: 'PR이 열려 있지 않아서 커밋하지 않았어요',
+  review_blocked: '자체 리뷰에서 막는 문제가 나왔어요',
+  review_incomplete: '자체 리뷰가 변경 전체를 보지 못했어요',
+  worker_unsupported: '작업자가 아직 수정 요청을 받지 못하는 버전이에요',
+  input_purged: '보존 기간이 지나 요청 내용을 지웠어요',
+  policy_changed: '그 사이 정책이 바뀌었어요. 새로 변경을 요청해 주세요',
+  owner_cancelled: '취소했어요',
+});
+export const AMENDMENT_TEXT = Object.freeze({
+  committed: (pr: number, round: number, files: number, passed: number, total: number, checks: number) =>
+    `PR #${pr}에 수정 차례 ${round} 커밋을 올렸어요. 바뀐 파일 ${files}개, 시험 ${passed}/${total} 통과, 확인할 것 ${checks}개예요. 병합은 직접 검토한 뒤 해 주세요.`,
+  failed: (pr: number, round: number, reason: string) => `PR #${pr}의 수정 차례 ${round}은 커밋하지 않았어요. ${
+    AMENDMENT_REASON[reason] ?? (reason.startsWith('verification_') ? '시험이 통과하지 못했어요' : `사유 코드: ${reason}`)}.`,
+  checks: '확인할 것(PR 줄 댓글로 못 단 것):',
+  risks: '남은 위험(PR 줄 댓글로 못 단 것):',
+});
 // 끝난 부모에게 알리는 시효. 재시작 때 지난 건을 몰아 보내지 않는다.
 const NOTICE_WINDOW_MS = 7 * 86_400_000;
-const LANE_PHASES = ['requested', 'admitted', 'authoring', 'snapshot_ready', 'verifying'] as const;
-const PUBLISH_PHASES = ['reviewing', 'approved', 'publishing', 'proposed', 'merged', 'observing_deploy'] as const;
+// amending은 두 바퀴에 모두 있다. 작성·시험(작업자 슬롯)은 laneTick, 병합 감시·리뷰·게시는 publishTick이 맡는다.
+const LANE_PHASES = ['requested', 'admitted', 'authoring', 'snapshot_ready', 'verifying', 'amending'] as const;
+const PUBLISH_PHASES = ['reviewing', 'approved', 'publishing', 'proposed', 'amending', 'merged', 'observing_deploy'] as const;
 const NOTICE_PHASES = ['awaiting_publish_approval', 'proposed', 'superseded', 'blocked', 'cancelled', 'failed'] as const;
 const STEP_BATCH = 32;
 // 다시 할 일이 없는 관측이다. 알림은 따로 고르므로 바퀴에서 빼도 빠지지 않는다.
@@ -82,14 +105,16 @@ export function changeAuthorSource(deps: { store: Store; gate: PolicyGate; prefl
   const db = deps.store.db;
   const claimed = async (jobId: string): Promise<Job | null> =>
     (await db.query<Job>(`SELECT * FROM jobs WHERE id=$1 AND state='running' AND lease_until>$2`, [jobId, deps.store.now()])).rows[0] ?? null;
-  const keyOfJob = async (jobId: string): Promise<ChangeKey | null> => {
-    const row = (await db.query<{ change_id: string; generation: number | string }>(`SELECT change_id,generation FROM change_child_jobs WHERE job_id=$1 AND role='author'`, [jobId])).rows[0];
-    return row ? { changeId: row.change_id, generation: Number(row.generation) } : null;
+  const keyOfJob = async (jobId: string): Promise<EvidenceKey | null> => {
+    const row = (await db.query<{ change_id: string; generation: number | string; amendment_round: number | string }>(`SELECT change_id,generation,amendment_round FROM change_child_jobs WHERE job_id=$1 AND role='author'`, [jobId])).rows[0];
+    if (!row) return null;
+    const round = Number(row.amendment_round);
+    return { changeId: row.change_id, generation: Number(row.generation), ...(round ? { round } : {}) };
   };
-  // 지금 고치기 차례의 작성 job. 시험 port도 이 값으로 세션을 찾으므로 앞 차례의 세션을 가리키지 않는다.
-  const authorJob = async (key: ChangeKey): Promise<string | null> =>
+  // 지금 고치기 차례의 작성 job. 수정 차례(C27)면 그 차례의 작성 job이다. 시험 port도 이 값으로 세션을 찾으므로 앞 차례의 세션을 가리키지 않는다.
+  const authorJob = async (key: EvidenceKey): Promise<string | null> =>
     (await db.query<{ job_id: string }>(`SELECT c.job_id FROM change_child_jobs c JOIN change_generations g ON g.change_id=c.change_id AND g.generation=c.generation
-      WHERE c.change_id=$1 AND c.generation=$2 AND c.role='author' AND c.fix_round=g.fix_round`, [key.changeId, key.generation])).rows[0]?.job_id ?? null;
+      WHERE c.change_id=$1 AND c.generation=$2 AND c.role='author' AND c.fix_round=g.fix_round AND c.amendment_round=$3`, [key.changeId, key.generation, key.round ?? 0])).rows[0]?.job_id ?? null;
   const repoOf = async (changeId: string): Promise<ChangeRepositoryPolicy> => {
     const row = (await db.query<{ repo_id: number | string }>('SELECT repo_id FROM change_requests WHERE id=$1', [changeId])).rows[0];
     const policy = row ? await deps.policy(Number(row.repo_id)) : null;
@@ -113,7 +138,7 @@ export function changeAuthorSource(deps: { store: Store; gate: PolicyGate; prefl
       return scanPublicText({ title: question, body: [question, ...options].join('\n') }, policy);
     },
     async plan(input) {
-      const jobId = await authorJob(input.target.key);
+      const jobId = await authorJob({ ...input.target.key, round: input.amendment?.round ?? 0 });
       const job = jobId ? await claimed(jobId) : null;
       if (!job) throw new Error('change_job_not_claimed');
       const policy = await repoOf(input.target.key.changeId);
@@ -131,15 +156,17 @@ export function changeAuthorSource(deps: { store: Store; gate: PolicyGate; prefl
 
 export interface ChangeRuntimeDeps {
   store: Store; changes: ChangeStore; inputs: Pick<ChangePrivateInputs, 'read'>; gate: PolicyGate;
-  author: Pick<ClaudeChangeAuthor, 'supportsV2' | 'supportsSelfFix' | 'start' | 'resume' | 'cancel' | 'fetchResult' | 'finalize' | 'workerFacts' | 'abandon' | 'closeUnstarted'>;
+  author: Pick<ClaudeChangeAuthor, 'supportsV2' | 'supportsSelfFix' | 'supportsAmendment' | 'start' | 'resume' | 'cancel' | 'fetchResult' | 'finalize' | 'workerFacts' | 'abandon' | 'closeUnstarted'>;
   artifacts: ChangeArtifactPort; verification: ChangeVerificationPort;
   review: Pick<ChangeReviewService, 'submit' | 'fetchReceipt' | 'selfFixFindings' | 'remainingFindings'>;
-  publisher: Pick<ChangePublisher, 'prepareApproval' | 'publish' | 'reconcile'>;
+  publisher: Pick<ChangePublisher, 'prepareApproval' | 'publish' | 'reconcile' | 'publishAmendment' | 'reconcileAmendments'>;
   preflight: ChangePreflightPort; deployment: ChangeDeploymentPort; policy: ChangeRepositoryPolicies;
   // 작업자가 새 실행을 받는 중인지. 닫혀 있는데 claim하면 시작 불명 상태로 레인을 잡는다.
   intakeOpen: () => boolean;
   // 봇 PR 안내 리뷰(리뷰 App, C26 guidance 포트). 없으면 안내 댓글만 달지 않고 게시·병합 추적은 그대로다.
   guidance?: GuidanceReviewPort;
+  // 수정 차례(C27)의 자료 읽기(리뷰 App, C26 discussion.read). 없으면 수정 차례를 열지 않는다(확정된 요청은 대기열에 남는다).
+  discussion?: AmendmentDiscussionReader;
   log: Log; verifierRevision: string; periods?: Partial<ChangePeriods>;
 }
 interface ChildRow {
@@ -188,10 +215,15 @@ export class ChangeRuntime {
       if (await this.guarded(request, () => this.publishStep(request))) busy = true;
     }
     await this.sendNotices();
+    await this.sendAmendmentNotices();
     return busy;
   }
   // 게시 대조. 응답을 잃은 effect를 정확한 값과 맞추고 기한 넘은 unknown을 사람 해소로 넘긴다. 승인·게시 중인 건도 이어 간다.
-  reconcile() { return this.deps.publisher.reconcile(); }
+  async reconcile() {
+    const report = await this.deps.publisher.reconcile();
+    await this.deps.publisher.reconcileAmendments();
+    return report;
+  }
   retention(): Promise<number> { return purgeExpiredChangeContentRounds(this.db, this.now()); }
 
   // 사람의 병합·답을 기다리거나 일시 오류로 머무는 행은 시각이 그대로라 앞자리를 계속 차지한다. 정렬값과 ID의 커서로 한 쪽씩 돌아 뒤의 행도 차례를 받게 한다.
@@ -381,7 +413,13 @@ export class ChangeRuntime {
   private async sessionState(jobId: string): Promise<string | null> {
     return (await this.db.query<{ state: string }>(`SELECT state FROM codex_sessions WHERE job_id=$1 AND executor='claude'`, [jobId])).rows[0]?.state ?? null;
   }
-  private async resumeAuthor(request: ChangeRequest, child: ChildRow): Promise<boolean> {
+  // round가 있으면 수정 차례(C27)의 작성이다. 끝나면 부모 대신 그 차례를 닫는다.
+  private async authorEnd(request: ChangeRequest, round: AmendmentRound | undefined, outcome: Outcome): Promise<boolean> {
+    if (round) return this.failAmendment(request, round, outcome.reason);
+    await this.authorEnded(request, outcome);
+    return true;
+  }
+  private async resumeAuthor(request: ChangeRequest, child: ChildRow, round?: AmendmentRound): Promise<boolean> {
     if (child.state === 'queued') {
       if (!this.deps.intakeOpen()) return false;
       if (!await this.deps.store.claimChangeAuthor(child.id)) return false;
@@ -393,17 +431,18 @@ export class ChangeRuntime {
       // 기록이 없는 답은 출처를 모르는 것이다. 작성자에 넘기지 않는다.
       label = recorded?.label ?? 'unknown';
     }
-    if (!labelAllowsAuthorInput(label)) { await this.close(request, 'authoring', { to: 'blocked', reason: 'label_blocked' }); return true; }
+    if (!labelAllowsAuthorInput(label)) {
+      if (round) return this.failAmendment(request, round, 'label_blocked');
+      await this.close(request, 'authoring', { to: 'blocked', reason: 'label_blocked' });
+      return true;
+    }
     try {
       await this.deps.author.resume({ receiptId: receiptOf(child), answer: question?.answer ?? '', label });
       this.wait(`step:${request.id}`, this.periods.authorPollMs);
       return true;
     } catch (error) {
       const code = error instanceof Error ? error.message : '';
-      if (code.startsWith('change_') && code !== 'change_turn_stale' && code !== 'change_job_not_claimed') {
-        await this.authorEnded(request, { to: 'failed', reason: code });
-        return true;
-      }
+      if (code.startsWith('change_') && code !== 'change_turn_stale' && code !== 'change_job_not_claimed') return this.authorEnd(request, round, { to: 'failed', reason: code });
       const row = (await this.db.query<Job>('SELECT * FROM jobs WHERE id=$1', [child.id])).rows[0];
       if (row && WAITING_SESSION.has(await this.sessionState(child.id) ?? '')) await this.deps.store.defer(row, 'change_resume_deferred');
       throw error;
@@ -417,7 +456,7 @@ export class ChangeRuntime {
     if (!facts.known || (needStopped && !facts.stopped)) return false;
     return this.deps.store.reacquireChangeAuthor({ id: child.id, lease_token: child.lease_token, conversation_id: child.conversation_id });
   }
-  private async pollAuthor(request: ChangeRequest, child: ChildRow): Promise<boolean> {
+  private async pollAuthor(request: ChangeRequest, child: ChildRow, round?: AmendmentRound): Promise<boolean> {
     const slot = `step:${request.id}`;
     await this.reacquire(child, false);
     const receiptId = receiptOf(child);
@@ -431,8 +470,16 @@ export class ChangeRuntime {
       case 'snapshot': {
         if (child.state === 'cancel_requested') {
           await this.deps.author.abandon(receiptId);
+          if (round) return this.failAmendment(request, round, 'owner_cancelled');
           await this.close(request, 'authoring', { to: 'cancelled', reason: 'owner_cancelled' });
           return true;
+        }
+        // 수정 차례의 확인할 것·남은 위험은 그 차례 artifact와 함께 둔다(처음 게시의 목록은 PR 본문에 묶여 있어 덮지 않는다).
+        if (round) {
+          const saved = await this.deps.artifacts.save({ ...keyOf(request), round: round.round }, result.artifact, result.transportBytes, { checks: result.checks ?? [], risks: result.risks ?? [] });
+          if (saved.ok) return true;
+          if (saved.reason === 'busy') throw new Error('change_store_busy');
+          return saved.reason === 'phase_conflict' ? true : this.failAmendment(request, round, saved.reason);
         }
         // 저장보다 먼저 남긴다. 저장 뒤에 끊기면 phase가 넘어가 이 결과를 다시 읽지 않는다. 같은 결과를 다시 받아도 처음 기록 그대로다.
         if (result.checks?.length || result.risks?.length) await recordChangeNotes(this.db, keyOf(request), { checks: result.checks ?? [], risks: result.risks ?? [] }, this.now);
@@ -445,11 +492,9 @@ export class ChangeRuntime {
       }
       case 'cancelled':
         // 해제로 끝난 턴은 사람이 취소한 것이 아니라 결과를 잃은 것이다.
-        await this.authorEnded(request, result.code === 'stop_confirmed_after_unknown' ? { to: 'failed', reason: 'task_worker_lost' } : { to: 'cancelled', reason: result.code });
-        return true;
+        return this.authorEnd(request, round, result.code === 'stop_confirmed_after_unknown' ? { to: 'failed', reason: 'task_worker_lost' } : { to: 'cancelled', reason: result.code });
       case 'failed':
-        await this.authorEnded(request, { to: blockedAuthorCode(result.code) ? 'blocked' : 'failed', reason: result.code });
-        return true;
+        return this.authorEnd(request, round, { to: blockedAuthorCode(result.code) ? 'blocked' : 'failed', reason: result.code });
       case 'unknown':
         // 시작 요청이 닿았는지 모른다. 다시 보내지 않는다. 기한이 지나면 늦게 닿는 시작까지 막고 닫는다.
         if (result.code === 'start_unconfirmed' && this.now() - Number(child.session_updated_at) >= this.periods.startGraceMs) await this.deps.author.closeUnstarted(receiptId);
@@ -524,6 +569,7 @@ export class ChangeRuntime {
         return true;
       }
       case 'verifying': return this.verifying(request);
+      case 'amending': return this.amendLane(request);
       default: return false;
     }
   }
@@ -532,11 +578,16 @@ export class ChangeRuntime {
   // 시험을 기다리는 바퀴와 따로 돈다. 그래야 취소가 시험 시한까지 기다리지 않는다.
   async childrenTick(): Promise<boolean> {
     // 소멸을 확인하지 못한 자식은 사람이 풀 때까지 남는다. 그런 행이 뒤의 정리를 막지 않게 커서로 돈다.
+    // 수정 차례(C27)의 자식은 그 차례가 running이고 부모가 amending인 동안만 산다. 결과 저장은 그 차례의 artifact로 본다.
     const rows = await this.page('children', async after => (await this.db.query<ChildRow & { role: string; change_id: string; has_artifact: boolean; phase: string; order_at: string | number }>(`SELECT c.role,c.change_id,r.phase,c.created_at AS order_at,
-      EXISTS (SELECT 1 FROM change_artifacts a WHERE a.change_id=c.change_id AND a.generation=c.generation) AS has_artifact,
+      CASE WHEN c.amendment_round>0 THEN EXISTS (SELECT 1 FROM change_amendment_artifacts m WHERE m.change_id=c.change_id AND m.generation=c.generation AND m.round=c.amendment_round)
+        ELSE EXISTS (SELECT 1 FROM change_artifacts a WHERE a.change_id=c.change_id AND a.generation=c.generation) END AS has_artifact,
       j.id,j.state,j.wait_reason,j.lease_token,j.lease_until,j.conversation_id,j.owner_id,s.state AS session_state,s.generation AS session_generation,s.updated_at AS session_updated_at
       FROM change_child_jobs c JOIN change_requests r ON r.id=c.change_id JOIN jobs j ON j.id=c.job_id LEFT JOIN codex_sessions s ON s.job_id=j.id AND s.executor='claude'
-      WHERE (r.generation<>c.generation OR (c.role='author' AND r.phase NOT IN ('requested','admitted','authoring','snapshot_ready','verifying')) OR (c.role='review' AND r.phase<>'reviewing'))
+      WHERE (r.generation<>c.generation
+        OR (c.amendment_round=0 AND ((c.role='author' AND r.phase NOT IN ('requested','admitted','authoring','snapshot_ready','verifying')) OR (c.role='review' AND r.phase<>'reviewing')))
+        OR (c.amendment_round>0 AND NOT (r.phase='amending' AND EXISTS (SELECT 1 FROM change_amendments am WHERE am.change_id=c.change_id AND am.generation=c.generation
+          AND am.round=c.amendment_round AND am.state='running'))))
       AND (j.state IN ('queued','running','verifying','cancel_requested','waiting_user','unknown') OR (c.role='author' AND s.state IN ('running','waiting_answer','waiting_model')))
       AND (c.created_at,j.id)>($1::bigint,$2::text) ORDER BY c.created_at,j.id LIMIT $3`, [after.at, after.id, STEP_BATCH])).rows);
     let busy = false;
@@ -653,6 +704,279 @@ export class ChangeRuntime {
     return null;
   }
 
+  // ---- 게시 뒤 수정 차례 (C27) ----
+
+  // proposed에서 대기열의 다음 차례를 연다. 동료 기능 스위치가 꺼져 있거나 자료를 읽을 수 없으면 새 차례를 열지 않는다(돌고 있는 차례는 끝까지 간다).
+  private async openAmendment(request: ChangeRequest): Promise<boolean> {
+    if (!this.deps.store.colleague || !this.deps.discussion) return false;
+    if (!(await this.db.query(`SELECT 1 FROM change_amendments WHERE change_id=$1 AND generation=$2 AND state='queued' LIMIT 1`, [request.id, request.generation])).rows.length) return false;
+    const started = await this.deps.changes.startAmendment(keyOf(request));
+    if (started.ok) { this.deps.log('change_amendment_started', { round: started.value.round }); return true; }
+    if (started.reason === 'busy') throw new Error('change_store_busy');
+    return false;
+  }
+  private async runningAmendment(request: ChangeRequest): Promise<AmendmentRound | null> {
+    return (await this.deps.changes.amendments(keyOf(request))).find(round => round.state === 'running') ?? null;
+  }
+  // 차례를 커밋 없이 닫는다. 결과 알림은 sendAmendmentNotices가 owner 호출로 보낸다.
+  private async failAmendment(request: ChangeRequest, round: AmendmentRound, reason: string): Promise<boolean> {
+    const finished = await this.deps.changes.finishAmendment({ ...keyOf(request), round: round.round, outcome: { state: 'failed', reason: safeReason(reason, 'amendment_failed') } });
+    if (!finished.ok && finished.reason === 'busy') throw new Error('change_store_busy');
+    if (!finished.ok) this.deps.log('change_amendment_finish_failed', { reason: finished.reason });
+    else this.deps.log('change_amendment_failed', { round: round.round, reason: safeReason(reason, 'amendment_failed') });
+    return true;
+  }
+  // 작성·시험 쪽 한 걸음. 작업자 슬롯을 쓰는 일이라 laneTick에서 돈다.
+  private async amendLane(request: ChangeRequest): Promise<boolean> {
+    const round = await this.runningAmendment(request);
+    if (!round) return false;
+    if (round.baseCommit === null) return this.pinAmendment(request, round);
+    if (round.artifactDigest === null) return this.amendAuthor(request, round);
+    const verified = await this.deps.changes.amendmentVerifications({ ...keyOf(request), round: round.round });
+    const required = request.brief?.verificationCommandIds ?? [];
+    if (round.verifierRevision === null || required.some(command => !verified.some(item => item.commandId === command))) return this.amendVerify(request, round);
+    return false;
+  }
+  // 차례를 시작하면 PR 브랜치 head를 다시 읽는다. 확인 때의 head이거나, 확인 뒤 head까지가 모두 이 change의 앞선 수정 차례가 올린 커밋이면 그 위에서 쓴다.
+  // 차례 커밋은 늘 앞 head를 부모로 하는 fast-forward라, 지금 head가 마지막으로 확정한 수정 커밋(없으면 처음 게시의 head)과 같고 확인 때의 head가
+  // 이 change가 올린 커밋 사슬 위에 있으면 그 사이 커밋은 모두 우리 것이다. 그 밖(사람 push 등)은 커밋 없이 head_changed다.
+  private async pinAmendment(request: ChangeRequest, round: AmendmentRound): Promise<boolean> {
+    const key = keyOf(request);
+    const generation = await this.deps.changes.generationRecord(key);
+    if (!generation.ok) throw new Error('generation_missing');
+    const published = await this.deps.changes.publishedHeadOf(key);
+    const pull = await this.pullOf(request);
+    const ours = new Set([pull?.headSha, ...(await this.deps.changes.amendments(key)).filter(item => item.state === 'committed').map(item => item.commitSha)].filter(Boolean));
+    const head = await this.deps.preflight.readBranchHead({ target: this.target(request), branch: generation.value.branch });
+    if (!head || head.sha !== published || !ours.has(round.confirmedHead)) return this.failAmendment(request, round, 'head_changed');
+    const commit = await this.deps.preflight.readCommit({ target: this.target(request), sha: head.sha });
+    if (!commit) throw new Error('amendment_head_unreadable');
+    const pinned = await this.deps.changes.pinAmendmentBase({ ...key, round: round.round, baseCommit: head.sha, baseTree: commit.treeSha });
+    if (!pinned.ok && pinned.reason === 'busy') throw new Error('change_store_busy');
+    if (!pinned.ok) return this.failAmendment(request, round, pinned.reason);
+    return true;
+  }
+  private async amendmentAuthorChild(request: ChangeRequest, round: AmendmentRound): Promise<ChildRow> {
+    const read = async () => (await this.db.query<ChildRow>(`SELECT j.id,j.state,j.wait_reason,j.lease_token,j.lease_until,j.conversation_id,j.owner_id,s.state AS session_state,s.generation AS session_generation,s.updated_at AS session_updated_at
+      FROM change_child_jobs c JOIN jobs j ON j.id=c.job_id LEFT JOIN codex_sessions s ON s.job_id=j.id AND s.executor='claude'
+      WHERE c.change_id=$1 AND c.generation=$2 AND c.role='author' AND c.amendment_round=$3`, [request.id, request.generation, round.round])).rows[0];
+    const existing = await read();
+    if (existing) return existing;
+    await this.db.transaction(async tx => {
+      const parent = (await tx.query<{ phase: string; generation: number | string }>('SELECT phase,generation FROM change_requests WHERE id=$1 FOR UPDATE', [request.id])).rows[0];
+      if (!parent || Number(parent.generation) !== request.generation || parent.phase !== 'amending') throw new Error('change_parent_moved');
+      if ((await tx.query(`SELECT 1 FROM change_child_jobs WHERE change_id=$1 AND generation=$2 AND role='author' AND amendment_round=$3`, [request.id, request.generation, round.round])).rows.length) return;
+      if (await this.deps.store.queueFull('task', tx)) throw new Error('queue_full');
+      const now = this.now();
+      const job = randomUUID(), event = randomUUID();
+      const delivery = `change-author:${request.id}:${request.generation}:a${round.round}`;
+      // 작성자 입력은 공개 brief와 차례 입력뿐이다. 이 행에는 원문이 없고 행위자도 owner가 아니라 대화 맥락에 끼지 않는다.
+      await tx.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,conversation_id,received_at,payload,accepted)
+        VALUES ($1,'change',$2,$2,'change-author',$3,$4,$5,$6,true)`, [event, delivery, JSON.stringify(request.scope), request.conversationId, now, JSON.stringify({ command: 'change_author', text: '' })]);
+      await tx.query(`INSERT INTO jobs(id,event_id,conversation_id,type,owner_id,target,revision,budget,priority,available_at,created_at)
+        VALUES ($1,$2,$3,'task',$4,$5,$6,$7,30,$8,$8)`, [job, event, request.conversationId, request.ownerId, JSON.stringify(request.scope), JSON.stringify({ policy: request.policyRevision }),
+        JSON.stringify({ timeoutMs: DEFAULTS.taskTimeoutMs, toolCalls: DEFAULTS.maxToolCalls }), now]);
+      await tx.query(`INSERT INTO change_child_jobs(job_id,change_id,generation,role,created_at) VALUES ($1,$2,$3,'author',$4)`, [job, request.id, request.generation, now]);
+    });
+    return (await read())!;
+  }
+  private async amendAuthor(request: ChangeRequest, round: AmendmentRound): Promise<boolean> {
+    const child = await this.amendmentAuthorChild(request, round);
+    if (child.state === 'unknown' && (!child.session_state || WAITING_SESSION.has(child.session_state))) {
+      await this.deps.store.requeueChangeAuthor(child.id, child.conversation_id);
+      return false;
+    }
+    if (!child.session_state) {
+      if (JOB_ENDED.has(child.state)) return this.failAmendment(request, round, child.wait_reason ?? `author_${child.state}`);
+      return this.startAmendAuthor(request, round, child);
+    }
+    if (WAITING_SESSION.has(child.session_state) && (child.state === 'queued' || child.state === 'running')) return this.resumeAuthor(request, child, round);
+    if (WAITING_SESSION.has(child.session_state) && child.state === 'waiting_user') return false;
+    return this.pollAuthor(request, child, round);
+  }
+  private async startAmendAuthor(request: ChangeRequest, round: AmendmentRound, child: ChildRow): Promise<boolean> {
+    if (!request.brief || !request.policyRevision || round.baseCommit === null || round.baseTree === null) throw new Error('brief_missing');
+    // 작업자가 변경 작성 판을 받지 않으면 수정 차례 칸을 실을 수 없다. 기다려도 같은 답이라 차례를 닫는다.
+    if (!await this.deps.author.supportsAmendment()) return this.failAmendment(request, round, 'worker_unsupported');
+    const instruction = (await this.deps.inputs.read({ changeId: request.id })).find(row => row.eventId === round.eventId);
+    if (!instruction?.text.trim()) return this.failAmendment(request, round, 'input_purged');
+    const policy = await this.deps.policy(request.repoId);
+    if (!policy) return this.failAmendment(request, round, 'policy_revoked');
+    if (policy.revision !== request.policyRevision) return this.failAmendment(request, round, 'policy_changed');
+    let materials: ReviewMaterial[];
+    try {
+      const wanted = new Set(round.materials);
+      // 확인 때 센 ID 묶음의 글만 쓴다. 그 뒤에 달린 글은 다음 차례 몫이고, 그사이 지워진 글은 빠진다.
+      materials = discussionMaterials(await this.deps.discussion!({ repository: policy.fullName, pr: round.pullNumber })).filter(item => wanted.has(item.id)).map(item => item.material);
+    } catch (error) {
+      this.deps.log('change_amendment_materials_failed', errorInfo(error));
+      throw error;
+    }
+    if (child.state === 'queued') {
+      if (!this.deps.intakeOpen()) return false;
+      if (!await this.deps.store.claimChangeAuthor(child.id)) return false;
+    } else if (child.state !== 'running') return false;
+    try {
+      await this.deps.author.start({ target: this.target(request), baseCommit: round.baseCommit, baseTree: round.baseTree, policyRevision: request.policyRevision, brief: request.brief,
+        amendment: { pullNumber: round.pullNumber, head: round.baseCommit, instruction: instruction.text, materials, round: round.round } });
+      this.wait(`step:${request.id}`, this.periods.authorPollMs);
+      return true;
+    } catch (error) {
+      const code = error instanceof Error ? error.message : '';
+      if (code === 'label_blocked' || code === 'base_tree_incomplete' || code === 'policy_revoked' || code === 'change_brief_too_long') return this.failAmendment(request, round, code);
+      const row = (await this.db.query<Job>('SELECT * FROM jobs WHERE id=$1', [child.id])).rows[0];
+      if (row && !(await this.sessionState(child.id))) await this.deps.store.defer(row, 'change_start_deferred');
+      throw error;
+    }
+  }
+  private async amendVerify(request: ChangeRequest, round: AmendmentRound): Promise<boolean> {
+    const key = { ...keyOf(request), round: round.round };
+    const author = await this.amendmentAuthorChild(request, round);
+    if (author.state === 'cancel_requested') return this.failAmendment(request, round, 'owner_cancelled');
+    await this.reacquire(author, false);
+    const started = await this.deps.changes.startAmendmentVerification({ ...key, verifierRevision: this.deps.verifierRevision });
+    if (!started.ok) {
+      if (started.reason === 'busy') throw new Error('change_store_busy');
+      return started.reason === 'phase_conflict' ? true : this.failAmendment(request, round, started.reason);
+    }
+    const required = request.brief?.verificationCommandIds ?? [];
+    const statusOf = async () => new Map((await this.deps.changes.amendmentVerifications(key)).map(receipt => [receipt.commandId, receipt.status]));
+    let statuses = await statusOf();
+    for (const commandId of required) {
+      if (statuses.has(commandId)) continue;
+      let receipt;
+      try { receipt = await this.deps.verification.run({ key, bundle: started.value, commandId }); }
+      catch (error) {
+        if (error instanceof TaskWorkerBusy) { this.wait(`step:${request.id}`, this.periods.failureBackoffMs); return false; }
+        throw error;
+      }
+      const recorded = await this.deps.changes.recordAmendmentVerification({ ...key, receipt });
+      if (!recorded.ok && recorded.reason !== 'receipt_conflict') {
+        if (recorded.reason === 'phase_conflict' || recorded.reason === 'amendment_not_running') return true;
+        throw new Error(`verification_record_${recorded.reason}`);
+      }
+      statuses = await statusOf();
+      if (statuses.get(commandId) !== 'passed') break;
+    }
+    const bad = required.map(commandId => statuses.get(commandId)).find(status => status !== 'passed');
+    const child = await this.amendmentAuthorChild(request, round).catch(() => null);
+    if (child?.state === 'cancel_requested' || child?.state === 'cancelled') return this.failAmendment(request, round, 'owner_cancelled');
+    if (child?.session_generation) await this.deps.author.finalize(receiptOf(child)).catch(error => { this.deps.log('change_author_finalize_deferred', errorInfo(error)); });
+    if (bad !== undefined) return this.failAmendment(request, round, `verification_${bad ?? 'missing'}`);
+    return true;
+  }
+  // 리뷰·게시 쪽 한 걸음. 수정 중 PR이 병합·닫히면 커밋하지 않고 나간다.
+  private async amendPublish(request: ChangeRequest): Promise<boolean> {
+    const round = await this.runningAmendment(request);
+    if (!round) return false;
+    const key = { ...keyOf(request), round: round.round };
+    if (this.due(`merge:${request.id}`)) {
+      this.wait(`merge:${request.id}`, this.periods.mergePollMs);
+      const reading = await this.deps.deployment.readMerge({ target: this.target(request), prNumber: round.pullNumber });
+      if (reading.state === 'closed_unmerged') {
+        const moved = await this.deps.changes.transition({ ...keyOf(request), from: 'amending', to: 'cancelled', reason: 'closed_unmerged' });
+        if (!moved.ok) this.deps.log('change_amendment_close_failed', { reason: moved.reason });
+        return true;
+      }
+      if (reading.state === 'merged') {
+        const recorded = await this.deps.changes.recordMerge({ ...keyOf(request), prNumber: reading.prNumber, headSha: reading.headSha, mergeCommit: reading.mergeCommit });
+        if (recorded.ok) return true;
+        if (recorded.reason === 'head_mismatch') {
+          const moved = await this.deps.changes.transition({ ...keyOf(request), from: 'amending', to: 'blocked', reason: 'head_changed' });
+          if (!moved.ok) this.deps.log('change_amendment_close_failed', { reason: moved.reason });
+          return true;
+        }
+        this.deps.log('change_amendment_merge_unrecorded', { reason: recorded.reason });
+      }
+    }
+    if (round.artifactDigest === null || round.verifierRevision === null) return false;
+    const verifications = await this.deps.changes.amendmentVerifications(key);
+    const required = request.brief?.verificationCommandIds ?? [];
+    if (required.some(command => verifications.find(item => item.commandId === command)?.status !== 'passed')) return false;
+    const receipt = await this.deps.review.fetchReceipt(key);
+    if (!receipt) return this.amendReview(request, round, verifications);
+    if (receipt.verdict === 'blocked') return this.failAmendment(request, round, receipt.coverage === 'incomplete' ? 'review_incomplete' : 'review_blocked');
+    if (!await this.authorized(request)) return true;
+    const outcome = await this.deps.publisher.publishAmendment(key, {
+      pullOpen: async () => (await this.deps.deployment.readMerge({ target: this.target(request), prNumber: round.pullNumber })).state === 'open' });
+    if (outcome.kind !== 'committed' && outcome.kind !== 'failed') this.deps.log('change_amendment_publish', { kind: outcome.kind, ...('reason' in outcome ? { reason: outcome.reason } : { stage: outcome.stage }) });
+    switch (outcome.kind) {
+      case 'committed': {
+        const finished = await this.deps.changes.finishAmendment({ ...key, outcome: { state: 'committed', commitSha: outcome.commitSha } });
+        if (!finished.ok && finished.reason === 'busy') throw new Error('change_store_busy');
+        this.deps.log('change_amendment_committed', { round: round.round });
+        return true;
+      }
+      case 'failed': return this.failAmendment(request, round, outcome.reason);
+      case 'deferred': this.nextAt.set(`step:${request.id}`, outcome.retryAt); return false;
+      case 'unknown': this.wait(`step:${request.id}`, 60_000); return false;
+      case 'blocked': this.deps.log('change_amendment_blocked', { reason: outcome.reason }); return true;
+    }
+  }
+  private async amendReview(request: ChangeRequest, round: AmendmentRound, verifications: readonly VerificationReceipt[]): Promise<boolean> {
+    const key = { ...keyOf(request), round: round.round };
+    const job = (await this.db.query<{ state: string; wait_reason: string | null; finished_at: string | null }>(`SELECT j.state,j.wait_reason,j.finished_at FROM change_child_jobs c JOIN jobs j ON j.id=c.job_id
+      WHERE c.change_id=$1 AND c.generation=$2 AND c.role='review' AND c.amendment_round=$3`, [request.id, request.generation, round.round])).rows[0];
+    if (job) {
+      if (!JOB_ENDED.has(job.state)) return false;
+      if (job.wait_reason === 'stop_confirmed_after_unknown' && this.now() - Number(job.finished_at) < 600_000) return false;
+      return this.failAmendment(request, round, job.wait_reason ?? `review_${job.state}`);
+    }
+    const bundle = await this.deps.changes.amendmentBundle(key);
+    const artifact = await this.deps.changes.loadAmendmentArtifact(key);
+    if (!bundle.ok || !artifact.ok || !request.brief) throw new Error('evidence_missing');
+    try {
+      await this.deps.review.submit({ key, bundle: bundle.value, brief: request.brief, manifest: artifact.value.manifest, patch: artifact.value.patch, verifications });
+      return true;
+    } catch (error) {
+      if (error instanceof ChangeReviewRejected || error instanceof ChangeReviewFailed) {
+        if (error.code === 'queue_full') { this.wait(`step:${request.id}`, 60_000); return false; }
+        return error.code === 'phase_conflict' ? true : this.failAmendment(request, round, error.code);
+      }
+      throw error;
+    }
+  }
+  // 끝난 차례의 결과를 owner 호출로 알린다(동료 봇 전환 11의 호출 표에 더한 두 종류: 수정 결과·수정 실패). outbox 키로 한 번만 들어간다.
+  // 커밋한 차례는 안내 댓글을 먼저 단다. 안내가 아직이면(미룸·대조 중) 다음 바퀴에 다시 본다. 안내 포트가 없으면 공개 검사를 지난 항목을 모두 요약에 싣는다.
+  private async sendAmendmentNotices(): Promise<void> {
+    const rows = (await this.db.query<{ change_id: string; generation: number | string; round: number | string }>(`SELECT a.change_id,a.generation,a.round FROM change_amendments a
+      WHERE a.state IN ('committed','failed') AND a.finished_at>$1
+      AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.idempotency_key='change-amendment:'||a.change_id||':'||a.generation||':'||a.round)
+      ORDER BY a.finished_at LIMIT $2`, [this.now() - NOTICE_WINDOW_MS, STEP_BATCH])).rows;
+    for (const row of rows) {
+      try { await this.notifyAmendment({ changeId: row.change_id, generation: Number(row.generation), round: Number(row.round) }); }
+      catch (error) { this.deps.log('change_amendment_notice_failed', errorInfo(error)); }
+    }
+  }
+  private async notifyAmendment(key: AmendmentKey): Promise<void> {
+    const request = await this.deps.changes.get(key.changeId);
+    const round = await this.deps.changes.amendment(key);
+    if (!request.ok || !round.ok) return;
+    const noticeKey = `change-amendment:${key.changeId}:${key.generation}:${key.round}`;
+    if (round.value.state === 'failed') {
+      await this.send(request.value, noticeKey, AMENDMENT_TEXT.failed(round.value.pullNumber, key.round, round.value.reason ?? 'amendment_failed'), true);
+      return;
+    }
+    const policy = await this.deps.policy(request.value.repoId);
+    const artifact = await this.deps.changes.loadAmendmentArtifact(key);
+    if (!policy || !artifact.ok || round.value.commitSha === null) throw new Error('amendment_evidence_missing');
+    let outside = { checks: artifact.value.checks, risks: artifact.value.risks };
+    if (this.guidance) {
+      const posted = await this.guidance.post({ key: { changeId: key.changeId, generation: key.generation }, round: key.round, repoId: request.value.repoId, pr: round.value.pullNumber, headSha: round.value.commitSha,
+        checks: artifact.value.checks, risks: artifact.value.risks, patch: artifact.value.patch });
+      if (posted.state === 'deferred' || posted.state === 'sending' || posted.state === 'unknown') return;
+      outside = posted.outside;
+    } else {
+      const clean = (notes: readonly ChangeNote[]) => notes.filter(note => scanPublicText({ title: note.text, body: note.text }, policy) === null);
+      outside = { checks: clean(outside.checks), risks: clean(outside.risks) };
+    }
+    const verifications = await this.deps.changes.amendmentVerifications(key);
+    const changed = artifact.value.manifest.entries.filter(entry => entry.changeKind !== 'unchanged').length;
+    const passed = verifications.filter(item => item.status === 'passed').length;
+    await this.send(request.value, noticeKey, [AMENDMENT_TEXT.committed(round.value.pullNumber, key.round, changed, passed, verifications.length, artifact.value.checks.length),
+      ...(outside.checks.length ? [AMENDMENT_TEXT.checks, ...outside.checks.map(noteLine)] : []), ...(outside.risks.length ? [AMENDMENT_TEXT.risks, ...outside.risks.map(noteLine)] : [])].join('\n'), true);
+  }
+
   // ---- 게시·병합·배포 ----
 
   private async publishing(request: ChangeRequest): Promise<boolean> {
@@ -684,7 +1008,11 @@ export class ChangeRuntime {
   }
   // 조회 실패와 대상 오류는 던져진다. 미병합으로 처리하지 않고 phase를 유지한다.
   private async proposed(request: ChangeRequest): Promise<boolean> {
-    this.wait(`step:${request.id}`, this.periods.mergePollMs);
+    // 확정된 수정 요청이 기다리면 병합 읽기 주기를 기다리지 않고 차례를 연다.
+    if (await this.openAmendment(request)) return true;
+    // 병합 읽기 주기는 따로 센다. 수정 요청이 들어오면 다음 바퀴에 바로 차례를 열어야 하기 때문이다.
+    if (!this.due(`merge:${request.id}`)) return false;
+    this.wait(`merge:${request.id}`, this.periods.mergePollMs);
     const pull = await this.pullOf(request);
     if (!pull) throw new Error('pull_effect_missing');
     await this.guide(request);
@@ -698,7 +1026,7 @@ export class ChangeRuntime {
     if (reading.state === 'open') return false;
     if (reading.state === 'closed_unmerged') { await this.close(request, 'proposed', { to: 'cancelled', reason: 'closed_unmerged' }); return true; }
     const recorded = await this.deps.changes.recordMerge({ ...keyOf(request), prNumber: reading.prNumber, headSha: reading.headSha, mergeCommit: reading.mergeCommit });
-    if (recorded.ok) { this.nextAt.delete(`step:${request.id}`); return true; }
+    if (recorded.ok) { this.nextAt.delete(`step:${request.id}`); this.nextAt.delete(`merge:${request.id}`); return true; }
     if (recorded.reason === 'busy') throw new Error('change_store_busy');
     if (recorded.reason === 'head_mismatch') await this.close(request, 'proposed', { to: 'blocked', reason: 'head_changed' });
     else if (recorded.reason === 'pull_mismatch') await this.close(request, 'proposed', { to: 'blocked', reason: 'pull_mismatch' });
@@ -746,6 +1074,9 @@ export class ChangeRuntime {
         if (!await this.authorized(request)) return true;
         return this.publishing(request);
       case 'proposed': return this.proposed(request);
+      case 'amending':
+        if (!await this.authorized(request)) return true;
+        return this.amendPublish(request);
       case 'merged': return this.merged(request);
       case 'observing_deploy': return this.observing(request);
       default: return false;

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import { freezeSource, materializeSource, snapshotSource, sourceUnchanged } from './change-artifact.js';
 import { CommandIdSchema, EvidenceBundleSchema, VerificationReceiptSchema, evidenceBundleDigest } from './change-contracts.js';
-import type { ArtifactBundle, ChangeKey, ChangeVerificationPort, EvidenceBundle, VerificationReceipt, VerificationStatus } from './change-contracts.js';
+import type { ArtifactBundle, ChangeKey, ChangeVerificationPort, EvidenceKey, EvidenceBundle, VerificationReceipt, VerificationStatus } from './change-contracts.js';
 import { classify } from './review.js';
 import type { RunDirs } from './executor.js';
 import type { ProcessCleanup } from './process-launcher.js';
@@ -242,10 +242,11 @@ export interface ChangeVerificationWorker {
 }
 export interface WorkerVerificationOptions {
   worker: ChangeVerificationWorker;
-  // change generation의 작성 세션. 없으면 시험할 결과가 작업자에 없다는 뜻이다.
-  control(key: ChangeKey): Promise<ChangeVerificationControl | null>;
+  // change generation의 작성 세션. key.round가 있으면 그 수정 차례의 작성 세션이라 receipt도 그 차례 job·세션 키로 작업자에 남는다.
+  // 없으면 시험할 결과가 작업자에 없다는 뜻이다.
+  control(key: EvidenceKey): Promise<ChangeVerificationControl | null>;
   // 기다리는 동안 자식 job의 lease를 늘린다.
-  keepalive?(key: ChangeKey): Promise<void>;
+  keepalive?(key: EvidenceKey): Promise<void>;
   imageRevision: string;
   pollMs?: number; waitMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -266,7 +267,7 @@ export class WorkerChangeVerification implements ChangeVerificationPort {
     return VerificationReceiptSchema.parse({ runId: randomUUID(), commandId: input.commandId, runnerRevision: VERIFIER_REVISION, imageRevision: this.options.imageRevision,
       bundle: input.bundle, exitCode: null, timedOut: false, logDigest: null, status });
   }
-  async run(input: { key: ChangeKey; bundle: EvidenceBundle; commandId: string }): Promise<VerificationReceipt> {
+  async run(input: { key: EvidenceKey; bundle: EvidenceBundle; commandId: string }): Promise<VerificationReceipt> {
     if (!CommandIdSchema.safeParse(input.commandId).success || !EvidenceBundleSchema.safeParse(input.bundle).success) throw new Error('verification_input_invalid');
     const control = await this.options.control(input.key);
     if (!control?.worker) return this.local(input, 'not_run');
@@ -288,7 +289,7 @@ export class WorkerChangeVerification implements ChangeVerificationPort {
     }
     return reply.receipt;
   }
-  async fetchReceipt(input: { key: ChangeKey; commandId: string }): Promise<VerificationReceipt | null> {
+  async fetchReceipt(input: { key: EvidenceKey; commandId: string }): Promise<VerificationReceipt | null> {
     const control = await this.options.control(input.key);
     if (!control) return null;
     const reply = await this.options.worker.verification(control, input.commandId).catch(() => null);

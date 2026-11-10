@@ -9,7 +9,7 @@ import {
   VERIFICATION_STATUSES, artifactDigest, briefDigest, canonicalJson, evidenceBundleDigest, gitBlobSha, labelAllowsAuthorInput, sha256Hex, verificationReceiptDigest,
 } from './change-contracts.js';
 import type {
-  ArtifactBundle, ArtifactFile, ArtifactManifest, ChangeBrief, ChangeKey, ChangeReviewPort, EvidenceBundle, ReviewReceipt, SelfFixFinding, VerificationReceipt,
+  ArtifactBundle, ArtifactFile, ArtifactManifest, ChangeBrief, ChangeKey, ChangeReviewPort, EvidenceBundle, EvidenceKey, ReviewReceipt, SelfFixFinding, VerificationReceipt,
 } from './change-contracts.js';
 import type { ChangeRequest, ChangeStore } from './change-store.js';
 import { DEFAULTS, Denied, WorkerRejected } from './contracts.js';
@@ -712,7 +712,16 @@ export class ChangeReviewService implements ChangeReviewPort {
   }
   private get db() { return this.deps.changes.database; }
 
-  private async loadEvidence(key: ChangeKey): Promise<LoadedEvidence | null> {
+  // round가 1 이상이면 그 수정 차례(C27)의 증거다. 처음 게시의 증거와 섞이지 않는다.
+  private async loadEvidence(key: EvidenceKey): Promise<LoadedEvidence | null> {
+    if (key.round) {
+      const amendment = { ...key, round: key.round };
+      const request = await this.deps.changes.get(key.changeId);
+      const bundle = await this.deps.changes.amendmentBundle(amendment);
+      const artifact = await this.deps.changes.loadAmendmentArtifact(amendment);
+      if (!request.ok || !bundle.ok || !artifact.ok || !request.value.brief) return null;
+      return { request: request.value, brief: request.value.brief, bundle: bundle.value, artifact: artifact.value, verifications: await this.deps.changes.amendmentVerifications(amendment) };
+    }
     const request = await this.deps.changes.get(key.changeId);
     const bundle = await this.deps.changes.evidenceBundle(key);
     const artifact = await this.deps.changes.loadArtifact(key);
@@ -737,23 +746,29 @@ export class ChangeReviewService implements ChangeReviewPort {
     return evidence;
   }
   // 부모 행을 먼저 잠근다(ChangeStore와 같은 잠금 순서). generation마다 리뷰 job은 하나다. 다시 불러도 같은 job이라 모델 호출이 늘지 않는다.
+  // 수정 차례(key.round ≥ 1)는 차례마다 리뷰 job이 하나이고 부모가 amending일 때만 만든다. job의 차례는 넣을 때 트리거가 정한다.
   async submit(input: ReviewPortInput): Promise<string> {
     await this.validate(input);
     const { changeId, generation } = input.key;
+    const amendment = input.key.round ?? 0;
     const store = this.deps.store;
     return this.db.transaction(async tx => {
       const parent = (await tx.query<{ phase: string; generation: number; label: ChangeBrief['label'] }>('SELECT phase,generation,label FROM change_requests WHERE id=$1 FOR UPDATE', [changeId])).rows[0];
       if (!parent) throw new ChangeReviewRejected('not_found');
       // 리뷰 job은 고치기 차례마다 하나다. 앞 차례의 job은 이 차례의 리뷰가 아니다.
       const round = Number((await tx.query<{ fix_round: number }>('SELECT fix_round FROM change_generations WHERE change_id=$1 AND generation=$2', [changeId, generation])).rows[0]?.fix_round ?? 0);
-      const existing = (await tx.query<{ job_id: string }>(`SELECT job_id FROM change_child_jobs WHERE change_id=$1 AND generation=$2 AND role='review' AND fix_round=$3`, [changeId, generation, round])).rows[0];
+      const existing = (await tx.query<{ job_id: string }>(`SELECT job_id FROM change_child_jobs WHERE change_id=$1 AND generation=$2 AND role='review' AND fix_round=$3 AND amendment_round=$4`,
+        [changeId, generation, round, amendment])).rows[0];
       if (existing) return existing.job_id;
-      if (Number(parent.generation) !== generation || parent.phase !== 'reviewing') throw new ChangeReviewRejected('phase_conflict');
+      if (Number(parent.generation) !== generation || parent.phase !== (amendment ? 'amending' : 'reviewing')) throw new ChangeReviewRejected('phase_conflict');
+      if (amendment && !(await tx.query(`SELECT 1 FROM change_amendments WHERE change_id=$1 AND generation=$2 AND round=$3 AND state='running'`, [changeId, generation, amendment])).rows.length) {
+        throw new ChangeReviewRejected('phase_conflict');
+      }
       if (!labelAllowsAuthorInput(parent.label)) throw new ChangeReviewRejected('label_blocked');
       if (await store.queueFull('review', tx)) throw new ChangeReviewRejected('queue_full');
       const now = store.now();
       const job = randomUUID(), event = randomUUID();
-      const delivery = `change-review:${changeId}:${generation}${round ? `:r${round}` : ''}`;
+      const delivery = `change-review:${changeId}:${generation}${round ? `:r${round}` : ''}${amendment ? `:a${amendment}` : ''}`;
       const target = JSON.stringify({ kind: 'change', changeId, generation });
       await tx.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,conversation_id,received_at,payload,accepted)
         VALUES ($1,'change',$2,$2,'change-review',$3,NULL,$4,$5,true)`, [event, delivery, target, now, JSON.stringify({ command: 'change_review' })]);
@@ -788,14 +803,14 @@ export class ChangeReviewService implements ChangeReviewPort {
     }
   }
   // 저장된 receipt가 먼저다. 없고 실행 결과가 불명이면 작업자에 남은 결과만 받아 온다. 모델은 다시 부르지 않는다.
-  async fetchReceipt(key: ChangeKey): Promise<ReviewReceipt | null> {
+  async fetchReceipt(key: EvidenceKey): Promise<ReviewReceipt | null> {
     const stored = await this.settledReceipt(key);
     if (stored) return stored;
     const job = await this.reviewJob(key);
     return job && this.recoverable(job) ? this.recover(job, key) : null;
   }
   // receipt 기록과 job 종료 사이에서 끊겼으면 돌려주기 전에 마저 닫는다. 닫히지 않은 unknown은 대화 레인을 막고 작업자 결과도 남긴다.
-  private async settledReceipt(key: ChangeKey): Promise<ReviewReceipt | null> {
+  private async settledReceipt(key: EvidenceKey): Promise<ReviewReceipt | null> {
     const receipt = await this.storedReceipt(key);
     if (!receipt) return null;
     const job = await this.reviewJob(key);
@@ -805,14 +820,15 @@ export class ChangeReviewService implements ChangeReviewPort {
     }
     return receipt;
   }
-  private async storedReceipt(key: ChangeKey): Promise<ReviewReceipt | null> {
+  private async storedReceipt(key: EvidenceKey): Promise<ReviewReceipt | null> {
+    if (key.round) return this.deps.changes.amendmentReview({ ...key, round: key.round });
     const row = (await this.db.query<{ receipt: unknown; invalidated_at: unknown }>('SELECT receipt,invalidated_at FROM change_reviews WHERE change_id=$1 AND generation=$2', [key.changeId, key.generation])).rows[0];
     if (!row || row.invalidated_at !== null) return null;
     return ReviewReceiptSchema.parse(typeof row.receipt === 'string' ? JSON.parse(row.receipt) : row.receipt);
   }
-  private async reviewJob(key: ChangeKey): Promise<ReviewJob | null> {
+  private async reviewJob(key: EvidenceKey): Promise<ReviewJob | null> {
     return (await this.db.query<ReviewJob>(`SELECT j.* FROM jobs j JOIN change_child_jobs c ON c.job_id=j.id JOIN change_generations g ON g.change_id=c.change_id AND g.generation=c.generation
-      WHERE c.change_id=$1 AND c.generation=$2 AND c.role='review' AND c.fix_round=g.fix_round`, [key.changeId, key.generation])).rows[0] ?? null;
+      WHERE c.change_id=$1 AND c.generation=$2 AND c.role='review' AND c.fix_round=g.fix_round AND c.amendment_round=$3`, [key.changeId, key.generation, key.round ?? 0])).rows[0] ?? null;
   }
   // round번째 고치기 차례를 연 리뷰의 P0·P1 발견. 작성 모델에 자료로 넘긴다. 원문이 없으면(보존 정리) 코드 판정만 남는다.
   async selfFixFindings(key: ChangeKey, round: number): Promise<SelfFixFinding[]> {
@@ -835,7 +851,7 @@ export class ChangeReviewService implements ChangeReviewPort {
   private recoverable(job: ReviewJob): boolean {
     return !!job.lease_token && (job.state === 'unknown' || (job.state === 'failed' && job.wait_reason === 'stop_confirmed_after_unknown'));
   }
-  private async recover(job: Job, key: ChangeKey): Promise<ReviewReceipt | null> {
+  private async recover(job: Job, key: EvidenceKey): Promise<ReviewReceipt | null> {
     // 서명 digest는 키 순서를 탄다. 작업자가 파싱한 모양과 같도록 스키마를 거친 값에 서명한다.
     const lookup = ResultLookupSchema.parse({ version: 1, kind: 'result', job: job.id, lease: job.lease_token });
     let found: ChangeReviewLookupResponse;
@@ -886,7 +902,7 @@ export class ChangeReviewService implements ChangeReviewPort {
     return new Set(rows.flatMap(row => [row.claude_session_id, row.thread_id]).filter((value): value is string => !!value));
   }
   // 멈춤이 확인된 결과로 receipt를 만든다. 비공개 저장 → receipt 기록 → job 종료 → ack 순서라 어느 단계에서 끊겨도 작업자 결과로 다시 올 수 있다.
-  private async settle(job: Job, key: ChangeKey, result: Extract<ChangeReviewWorkerResult, { status: 'succeeded' }>): Promise<ReviewReceipt | null> {
+  private async settle(job: Job, key: EvidenceKey, result: Extract<ChangeReviewWorkerResult, { status: 'succeeded' }>): Promise<ReviewReceipt | null> {
     if ((await this.authorSessions(key.changeId)).has(result.sessionId)) { await this.closeJob(job, 'failed', 'author_session_reused'); return null; }
     let output: ChangeReviewOutput | null = null;
     if (result.output !== null) {
@@ -903,8 +919,9 @@ export class ChangeReviewService implements ChangeReviewPort {
       criteria: evidence.brief.acceptanceCriteria.length, required: evidence.brief.verificationCommandIds, verifications: evidence.verifications,
       problems: result.problems, output, internalMarkers: context.internalMarkers });
     const { receipt } = decision;
-    await this.deps.findings.save({ key, jobId: job.id, sessionId: result.sessionId, instructionRevision: receipt.instructionRevision, findingsDigest: receipt.findingsDigest, ...decision.findings });
-    const recorded = await this.deps.changes.recordReview({ ...key, receipt });
+    await this.deps.findings.save({ key: { changeId: key.changeId, generation: key.generation }, jobId: job.id, sessionId: result.sessionId, instructionRevision: receipt.instructionRevision, findingsDigest: receipt.findingsDigest, ...decision.findings });
+    const recorded = key.round ? await this.deps.changes.recordAmendmentReview({ ...key, round: key.round, receipt })
+      : await this.deps.changes.recordReview({ changeId: key.changeId, generation: key.generation, receipt });
     if (!recorded.ok) {
       await this.closeJob(job, recorded.reason === 'phase_conflict' ? 'superseded' : 'failed', recorded.reason);
       return null;
@@ -941,12 +958,13 @@ export class ChangeReviewService implements ChangeReviewPort {
     let stopped = false;
     const keepalive = setInterval(() => { void store.heartbeat(job).catch(() => {}); }, this.pollMs);
     try {
-      const link = (await this.db.query<{ change_id: string; generation: number; role: string }>('SELECT change_id,generation,role FROM change_child_jobs WHERE job_id=$1', [job.id])).rows[0];
+      const link = (await this.db.query<{ change_id: string; generation: number; role: string; amendment_round: number | string }>('SELECT change_id,generation,role,amendment_round FROM change_child_jobs WHERE job_id=$1', [job.id])).rows[0];
       if (link?.role !== 'review') { await this.closeJob(job, 'failed', 'review_source_unknown'); return; }
-      const key: ChangeKey = { changeId: link.change_id, generation: Number(link.generation) };
+      const amendment = Number(link.amendment_round);
+      const key: EvidenceKey = { changeId: link.change_id, generation: Number(link.generation), ...(amendment ? { round: amendment } : {}) };
       const evidence = await this.loadEvidence(key);
       if (!evidence) { await this.closeJob(job, 'failed', 'evidence_missing'); return; }
-      if (evidence.request.generation !== key.generation || evidence.request.phase !== 'reviewing') { await this.closeJob(job, 'superseded', 'parent_left_reviewing'); return; }
+      if (evidence.request.generation !== key.generation || evidence.request.phase !== (amendment ? 'amending' : 'reviewing')) { await this.closeJob(job, 'superseded', 'parent_left_reviewing'); return; }
       let context: ChangeReviewContext;
       try { context = await this.deps.context(); }
       catch { await store.defer(job, 'policy_unavailable'); return; }

@@ -6,7 +6,7 @@ import {
   labelAllowsAuthorInput, newChangeId, previousEffectStage, propagateLabel, raiseLabel, reviewReceiptDigest, sha256Hex, validateArtifactFiles, verificationReceiptDigest,
 } from './change-contracts.js';
 import type {
-  AmendmentKey, ApprovalSubject, ArtifactBundle, ArtifactFile, ArtifactManifest, ChangeBrief, ChangeKey, ChangePhase, DeploymentObservation, EffectExpected, EffectResolution, EffectResult,
+  AmendmentKey, ApprovalSubject, ArtifactBundle, ArtifactFile, ArtifactManifest, ChangeBrief, ChangeKey, ChangeNote, ChangePhase, DeploymentObservation, EffectExpected, EffectResolution, EffectResult,
   EffectStage, EffectState, EvidenceBundle, ProvenanceLabel, PublicMetadata, ReviewReceipt, TerminalChangePhase, VerificationReceipt,
 } from './change-contracts.js';
 import type { Clock, Scope } from './contracts.js';
@@ -787,7 +787,8 @@ export class ChangeStore {
     });
   }
   // 차례 결과 저장. recordSnapshot과 같은 검사(바이트·patch·상한)에 base가 그 차례의 base인지를 본다. 같은 결과의 재저장은 멱등이다.
-  async recordAmendmentSnapshot(input: AmendmentKey & { manifest: ArtifactManifest; files: readonly ArtifactFile[]; patch: string; transportBytes: number }): Promise<StoreResult<{ artifactDigest: string; created: boolean }>> {
+  async recordAmendmentSnapshot(input: AmendmentKey & { manifest: ArtifactManifest; files: readonly ArtifactFile[]; patch: string; transportBytes: number;
+    checks?: readonly ChangeNote[]; risks?: readonly ChangeNote[]; }): Promise<StoreResult<{ artifactDigest: string; created: boolean }>> {
     const parsed = ArtifactManifestSchema.safeParse(input.manifest);
     if (!parsed.success) return fail('invalid_input', { detail: parsed.error.issues[0]?.message });
     const manifest = parsed.data;
@@ -803,9 +804,9 @@ export class ChangeStore {
       if (round.artifactDigest !== null) return round.artifactDigest === digest ? success({ artifactDigest: digest, created: false }) : fail('artifact_conflict');
       if (round.baseCommit !== manifest.baseCommit || round.baseTree !== manifest.baseTree) return fail('base_mismatch');
       const now = this.now();
-      await tx.query(`INSERT INTO change_amendment_artifacts(change_id,generation,round,artifact_digest,result_tree,manifest,patch,label,changed_bytes,transport_bytes,created_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, [input.changeId, input.generation, input.round, digest, manifest.resultTree, JSON.stringify(manifest), input.patch, round.label,
-        files.changedBytes, input.transportBytes, now]);
+      await tx.query(`INSERT INTO change_amendment_artifacts(change_id,generation,round,artifact_digest,result_tree,manifest,patch,label,changed_bytes,transport_bytes,checks,risks,created_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, [input.changeId, input.generation, input.round, digest, manifest.resultTree, JSON.stringify(manifest), input.patch, round.label,
+        files.changedBytes, input.transportBytes, JSON.stringify(input.checks ?? []), JSON.stringify(input.risks ?? []), now]);
       for (const file of input.files) {
         await tx.query('INSERT INTO change_amendment_artifact_files(change_id,generation,round,path,content) VALUES ($1,$2,$3,$4,$5)',
           [input.changeId, input.generation, input.round, file.path, Buffer.from(file.content)]);
@@ -815,14 +816,14 @@ export class ChangeStore {
       return success({ artifactDigest: digest, created: true });
     });
   }
-  async loadAmendmentArtifact(key: AmendmentKey): Promise<StoreResult<ArtifactBundle & { artifactDigest: string }>> {
+  async loadAmendmentArtifact(key: AmendmentKey): Promise<StoreResult<ArtifactBundle & { artifactDigest: string; label: ProvenanceLabel; checks: ChangeNote[]; risks: ChangeNote[] }>> {
     const row = (await this.database.query<Record<string, unknown>>('SELECT * FROM change_amendment_artifacts WHERE change_id=$1 AND generation=$2 AND round=$3',
       [key.changeId, key.generation, key.round])).rows[0];
     if (!row) return fail('not_found');
     const files = (await this.database.query<{ path: string; content: Uint8Array }>('SELECT path,content FROM change_amendment_artifact_files WHERE change_id=$1 AND generation=$2 AND round=$3 ORDER BY path',
       [key.changeId, key.generation, key.round])).rows;
-    return success({ manifest: parseJson<ArtifactManifest>(row.manifest), patch: row.patch as string, artifactDigest: row.artifact_digest as string,
-      files: files.map(file => ({ path: file.path, content: Buffer.from(file.content) })) });
+    return success({ manifest: parseJson<ArtifactManifest>(row.manifest), patch: row.patch as string, artifactDigest: row.artifact_digest as string, label: row.label as ProvenanceLabel,
+      checks: parseJson<ChangeNote[]>(row.checks), risks: parseJson<ChangeNote[]>(row.risks), files: files.map(file => ({ path: file.path, content: Buffer.from(file.content) })) });
   }
   // 차례 시험을 시작한다. 이 뒤에 차례의 증거 묶음이 완성된다.
   async startAmendmentVerification(input: AmendmentKey & { verifierRevision: string }): Promise<StoreResult<EvidenceBundle>> {
@@ -1219,6 +1220,8 @@ const BRIEF_HELD = '(r.brief IS NOT NULL AND r.brief_purged_at IS NULL)';
 // 확인할 것·남은 위험(C29)은 공개 검사 전에 저장된 모델 글이라 공개 검사에 걸려 막힌 건에도 남는다. 두 목록만 비우고 원래 목록의 digest를 남긴다.
 // change_notes의 UPDATE 거부 트리거가 이 모양(빈 목록, 원래 목록의 digest, 지운 시각)만 받는다. 승인 digest는 PR 본문에 묶여 있어 비워도 그대로다.
 const NOTES_HELD = 'EXISTS (SELECT 1 FROM change_notes n WHERE n.change_id=r.id AND n.purged_at IS NULL)';
+// 수정 차례(C27)의 artifact 바이트·patch·확인할 것·남은 위험도 같은 기한에 지운다. 지시 원문은 요청 원문과 같은 입력 표라 ChangePrivateInputs.purgeIn이 지운다.
+const AMENDMENT_HELD = 'EXISTS (SELECT 1 FROM change_amendment_artifacts m WHERE m.change_id=r.id AND m.purged_at IS NULL)';
 // receipt·digest·effect 기록과 요청 원문의 text_sha256은 남긴다. 진행 중이거나 미확정 effect·정리 안 끝난 세션이 있는 건은 고르지 않는다. 시각 기준은 끝 상태에 든 때다.
 // 정리 안 끝난 세션은 진행 중 상태, cleanup pending, 작업자 공간이 남은 세션(session_retained)이다. 끝 상태 커밋(ClaudeChangeAuthor.finalize)과
 // pending 표식(finalizeJob)은 서로 다른 트랜잭션이고 표식은 부모를 잠그지 않는다. 그 사이의 completed·none 세션을 retained가 덮는다.
@@ -1231,11 +1234,12 @@ const changePurgeDue = () => `FROM change_requests r
     WHERE ((r.phase IN ('superseded','blocked','cancelled','failed') AND r.updated_at<=$1)
       OR (r.phase='observing_deploy' AND ((d.state IN ('observed','not_applicable','blocked') AND d.observed_at<=$1) OR w.late_reported_at<=$1)))
     AND NOT EXISTS (SELECT 1 FROM change_delivery_effects e WHERE e.change_id=r.id AND e.state<>'confirmed' AND e.resolution IS NULL)
+    AND NOT EXISTS (SELECT 1 FROM change_amendment_effects e WHERE e.change_id=r.id AND e.state<>'confirmed' AND e.resolution IS NULL)
     AND NOT EXISTS (SELECT 1 FROM change_child_jobs c JOIN jobs j ON j.id=c.job_id WHERE c.change_id=r.id AND j.state IN ('queued','running','verifying','cancel_requested','waiting_user','unknown'))
     AND NOT EXISTS (SELECT 1 FROM change_child_jobs c JOIN codex_sessions s ON s.job_id=c.job_id WHERE c.change_id=r.id
       AND (s.state IN ('running','waiting_answer','waiting_model','unknown') OR s.cleanup_state='pending' OR s.session_retained))
     AND (EXISTS (SELECT 1 FROM change_artifacts a WHERE a.change_id=r.id AND a.purged_at IS NULL) OR EXISTS (SELECT 1 FROM change_review_findings f WHERE f.change_id=r.id)
-      OR ${ChangePrivateInputs.HELD} OR ${BRIEF_HELD} OR ${NOTES_HELD})`;
+      OR ${ChangePrivateInputs.HELD} OR ${BRIEF_HELD} OR ${NOTES_HELD} OR ${AMENDMENT_HELD})`;
 // 지운 건수를 돌려준다. 고른 뒤 조건이 깨져 건너뛴 건은 세지 않는다.
 export async function purgeExpiredChangeContent(database: Database, now: number, retentionMs = CHANGE_RETENTION_MS): Promise<number> {
   const cutoff = now - retentionMs;
@@ -1257,6 +1261,8 @@ export async function purgeExpiredChangeContent(database: Database, now: number,
       await tx.query('DELETE FROM change_artifact_files WHERE change_id=$1', [row.id]);
       await tx.query(`UPDATE change_artifacts SET patch='',purged_at=$2 WHERE change_id=$1 AND purged_at IS NULL`, [row.id, now]);
       await tx.query('DELETE FROM change_review_findings WHERE change_id=$1', [row.id]);
+      await tx.query('DELETE FROM change_amendment_artifact_files WHERE change_id=$1', [row.id]);
+      await tx.query(`UPDATE change_amendment_artifacts SET patch='',checks='[]'::jsonb,risks='[]'::jsonb,purged_at=$2 WHERE change_id=$1 AND purged_at IS NULL`, [row.id, now]);
       await ChangePrivateInputs.purgeIn(tx, row.id, now);
       await tx.query(`UPDATE change_requests SET brief=brief || '{"summary":"","goal":"","acceptanceCriteria":[]}'::jsonb,brief_purged_at=$2
         WHERE id=$1 AND brief IS NOT NULL AND brief_purged_at IS NULL`, [row.id, now]);

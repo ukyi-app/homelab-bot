@@ -120,6 +120,9 @@ CREATE TABLE IF NOT EXISTS change_amendment_artifacts (
   label text NOT NULL CHECK (label IN ('public','approved_public_summary')),
   changed_bytes integer NOT NULL CHECK (changed_bytes BETWEEN 0 AND 1048576),
   transport_bytes integer NOT NULL CHECK (transport_bytes BETWEEN 0 AND 2097152),
+  -- 작성 모델이 낸 확인할 것·남은 위험(C29 모양). 공개 검사 전 글이라 안내 댓글·Discord 결과 요약으로 낼 때 다시 검사한다.
+  checks jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(checks) = 'array'),
+  risks jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(risks) = 'array'),
   created_at bigint NOT NULL,
   purged_at bigint,
   PRIMARY KEY (change_id, generation, round),
@@ -135,11 +138,11 @@ CREATE TABLE IF NOT EXISTS change_amendment_artifact_files (
   FOREIGN KEY (change_id, generation, round) REFERENCES change_amendment_artifacts(change_id, generation, round),
   CONSTRAINT change_amendment_artifact_files_size CHECK (octet_length(content) <= 1048576)
 );
--- 018의 change_artifacts_guard와 같다. 허용하는 UPDATE는 보존 정리(patch 비우기) 하나다.
+-- 018의 change_artifacts_guard와 같다. 허용하는 UPDATE는 보존 정리(patch·확인할 것·남은 위험 비우기) 하나다.
 CREATE OR REPLACE FUNCTION change_amendment_artifacts_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-  IF TG_OP = 'UPDATE' AND OLD.purged_at IS NULL AND NEW.purged_at IS NOT NULL AND NEW.patch = ''
-    AND (to_jsonb(NEW) - 'patch' - 'purged_at') = (to_jsonb(OLD) - 'patch' - 'purged_at') THEN
+  IF TG_OP = 'UPDATE' AND OLD.purged_at IS NULL AND NEW.purged_at IS NOT NULL AND NEW.patch = '' AND NEW.checks = '[]'::jsonb AND NEW.risks = '[]'::jsonb
+    AND (to_jsonb(NEW) - 'patch' - 'purged_at' - 'checks' - 'risks') = (to_jsonb(OLD) - 'patch' - 'purged_at' - 'checks' - 'risks') THEN
     RETURN NEW;
   END IF;
   RAISE EXCEPTION 'change_evidence_immutable' USING ERRCODE = 'CH001';

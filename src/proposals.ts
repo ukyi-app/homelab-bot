@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { TEMPLATES } from './catalog.js';
-import { parseChangeRequest } from './change-commands.js';
+import { AMENDMENT_REQUEST_TEXT, parseChangeRequest } from './change-commands.js';
+import { CHANGE_AMENDMENT } from './change-contracts.js';
 import type { ChangeCommandHandler } from './change-commands.js';
 import { ownerText } from './chat-context.js';
 import { chatReplyRisk } from './chat-format.js';
@@ -76,6 +77,8 @@ interface ReadSkip { skip: 'queued' | 'not_connected' | 'target_denied' }
 interface ReadHandler { kind: 'read'; run(context: ReadContext): Promise<string | ReadSkip> }
 // digest 재료. 버튼을 누를 때 저장된 참조로 다시 만들어 제안 때의 digest와 대조한다.
 interface Values { target: string | null; content: string | null }
+// 확인 글 대신 거절 한 줄로 답하는 경우(C27 수정 요청: 병합·닫힌 PR, 상한). 대상이 보이지 않으면 거절하지 않고 버린다.
+interface Refusal { refusal: string }
 interface Prepared extends Values {
   // 모델이 고른 값(C14 기억 진술)만 value에 둔다. owner 원문은 sourceEvent 참조로만 둔다.
   value: string | null; sourceEvent: string | null;
@@ -98,8 +101,8 @@ export interface ExecuteContext extends ProposalHandlers { revision: string; pol
 interface Executed { state: 'confirmed' | 'refused'; content: string; reason?: string; job?: string; later?: () => Promise<string> }
 interface RunHandler {
   kind: 'run';
-  // 제안 때 허용 대상 대조와 값 준비. undefined면 그 제안을 버린다(대화 답만 나간다).
-  prepare(context: PrepareContext): Promise<Prepared | undefined>;
+  // 제안 때 허용 대상 대조와 값 준비. undefined면 그 제안을 버린다(대화 답만 나간다). Refusal이면 확인 글 없이 그 한 줄을 일반 답으로 단다.
+  prepare(context: PrepareContext): Promise<Prepared | Refusal | undefined>;
   // 버튼 때 저장된 값·참조로 지금 값을 다시 만든다. 원문이 비었으면 undefined.
   current(store: Store, row: ProposalRow): Promise<Values | undefined>;
   // '/' 처리기와 같은 경로로 실행한다. 호출자의 트랜잭션 안이다.
@@ -417,6 +420,46 @@ const changeCancelHandler: RunHandler = {
   },
 };
 
+// 변경 PR 수정(C27, DECISIONS "동료 봇 전환" 16). 대상은 이 스레드에서 owner가 낸 변경(변경 ID나 PR 번호)이고 그 PR이 열려 있어야 한다.
+// 지시는 owner 원문(멘션 표기 제거)이고, 확인 때 읽은 PR 리뷰·댓글 ID 묶음과 PR head를 값으로 묶는다. 버튼 때 원문이 바뀌거나 지워졌으면 실행하지 않는다.
+// 병합·닫힌 PR과 상한에 닿은 변경은 확인 글 없이 거절 한 줄로 답한다. 남의 변경은 존재를 알리지 않고 버린다.
+interface AmendValue { changeId: string; generation: number; pullNumber: number; head: string; materials: string[] }
+const amendContent = (instruction: string, value: AmendValue) => JSON.stringify([instruction, value.changeId, value.generation, value.pullNumber, value.head, [...value.materials].sort()]);
+const parseAmendValue = (raw: string | null): AmendValue | undefined => {
+  try { return raw ? JSON.parse(raw) as AmendValue : undefined; } catch { return undefined; }
+};
+const changeAmendHandler: RunHandler = {
+  kind: 'run',
+  async prepare({ store, job, proposal, policy, handlers }) {
+    const amendment = handlers.changes?.amendment;
+    // '/change'와 같은 장소(대화 채널의 스레드)다.
+    if (!amendment || !proposal.target || job.target.kind !== 'thread' || job.target.parent !== policy.conversationChannel) return;
+    const instruction = await sourceText(store, job.event_id);
+    if (!instruction) return;
+    const found = await amendment.prepare({ actor: job.owner_id, scope: job.target, target: proposal.target, instruction });
+    if (!found.ok) {
+      if (found.reason === 'not_visible' || found.reason === 'unavailable') return;
+      return { refusal: found.reason === 'limit' ? AMENDMENT_REQUEST_TEXT.limit(CHANGE_AMENDMENT.maxRounds) : AMENDMENT_REQUEST_TEXT[found.reason] };
+    }
+    const value: AmendValue = { changeId: found.changeId, generation: found.generation, pullNumber: found.pullNumber, head: found.head, materials: found.materials };
+    const question = AMENDMENT_REQUEST_TEXT.question(found.pullNumber, found.materials.length);
+    return { target: found.changeId, content: amendContent(instruction, value), value: JSON.stringify(value), sourceEvent: job.event_id, question, plainQuestion: question };
+  },
+  async current(store, row) {
+    const instruction = await sourceText(store, row.source_event);
+    const value = parseAmendValue(row.value);
+    return instruction === undefined || !value ? undefined : { target: row.target, content: amendContent(instruction, value) };
+  },
+  async execute(_store, row, values, { changes }) {
+    const value = parseAmendValue(row.value);
+    const instruction = values.content ? (JSON.parse(values.content) as [string])[0] : undefined;
+    if (!changes?.amendment || !value || !instruction) return { state: 'refused', reason: 'change_unavailable', content: PROPOSAL_TEXT.unavailable };
+    const amendment = changes.amendment;
+    // 확인 이벤트는 제안 ID로 정한다. 같은 제안은 한 번만 눌리므로 같은 요청이 두 번 들어가지 않는다.
+    return later(async () => (await amendment.request({ id: `proposal:${row.id}`, actor: row.owner_id, scope: row.scope, ...value, instruction })).content);
+  },
+};
+
 // PR 리뷰 요청(C30, DECISIONS "동료 봇 전환" 18). 확인 버튼이 없으므로 모델이 고른 대상(저장소·PR 번호)은 owner 원문에 그 PR이
 // 링크나 <소유자>/<저장소>#<번호>로 적혀 있을 때만 쓴다. 맥락 자료(이전 대화·봇 글)가 대상을 바꾸지 못하게 한다.
 // 원문에 없으면 리뷰하지 않고 그 이유를 답한다(모델 답이 "리뷰할게요"라고 했어도 아무 일이 없는 것처럼 보이지 않게).
@@ -471,6 +514,8 @@ export const ACTIONS: Readonly<Record<string, ActionRow>> = Object.freeze({
   urgent: { kind: 'none', command: 'urgent' },
   // '/'가 없는 실행. PR 댓글 리뷰 명령과 같은 명시 트리거로 바로 접수한다(명세 §4.3 "리뷰 요청", 확인 없음).
   review_request: { kind: 'run', command: 'review-request', confirm: false, handler: reviewRequestHandler },
+  // '/'가 없는 실행. 실행 확인 버튼을 거친다(명세 §4.3 "수정 요청").
+  change_amend: { kind: 'run', command: 'change-amend', handler: changeAmendHandler },
 });
 // 확인 없이 바로 처리하는 처리기는 읽기 줄이거나 confirm: false인 실행 줄에만 붙는다. 어긋난 줄은 연결 안 된 것으로 본다.
 const connected = (action: string): ReadHandler | RunHandler | undefined => {
@@ -512,6 +557,12 @@ export class ProposalDesk {
     const prepared = await handler.prepare({ store: this.store, job, proposal, policy, tasksConnected: this.tasksConnected,
       externalConnected: this.externalConnected, handlers });
     if (!prepared) return drop('target_denied');
+    if ('refusal' in prepared) {
+      await this.store.audit('proposal_dropped', job.id, { action: proposal.action, reason: 'refused' });
+      await this.store.enqueue({ key: `result:${job.id}:read`, job: job.id, conversation: job.conversation_id, actor: job.owner_id, scope: job.target, revision: job.revision.policy,
+        payload: { kind: 'message', channel: job.target.channel, content: prepared.refusal, classification: 'safe_summary', after: `result:${job.id}` } });
+      return 'read';
+    }
     // 확인 글은 owner 원문을 싣고 모델 답의 공개 검사(chatReplyRisk)를 거치지 않으므로 같은 정책으로 따로 본다.
     // 걸리면 원문 없는 고정 문구로 되묻고, 그것도 걸리면(정책을 못 읽음 등) 버린다. 사유 코드만 남기고 값은 남기지 않는다.
     const question = chatReplyRisk(prepared.question, policy) === null ? prepared.question

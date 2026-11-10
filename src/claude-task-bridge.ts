@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { decodeArtifact } from './change-artifact.js';
 import { CHAT_TASK_TEXT as T } from './chat-task-text.js';
 import { ChangePathSchema, labelAllowsAuthorInput } from './change-contracts.js';
-import type { AuthorResult, ChangeArtifactPort, ChangeAuthorPort, ChangeBrief, ChangeKey, ProvenanceLabel, ReviewMaterial, SelfFixFinding } from './change-contracts.js';
+import type { AuthorResult, ChangeArtifactPort, ChangeAuthorPort, ChangeBrief, ChangeKey, EvidenceKey, ProvenanceLabel, ReviewMaterial, SelfFixFinding } from './change-contracts.js';
 import type { ChangeVerificationControl, ChangeVerificationWorker } from './change-verifier.js';
 import { Denied, PolicyUnavailable, DEFAULTS } from './contracts.js';
 import type { Job, Scope } from './contracts.js';
@@ -756,9 +756,10 @@ export interface ChangeAuthorSource {
   settings(jobId: string): Promise<Pick<ChangeAuthorPlan, 'project' | 'limits'>>;
   // 재개 때 claim된 자식 job. 없으면 슬롯을 잡지 않은 것이라 띄우지 않는다.
   claimed(jobId: string): Promise<Job | null>;
-  // change generation의 작성 job.
-  authorJob(key: ChangeKey): Promise<string | null>;
-  keyOf(jobId: string): Promise<ChangeKey | null>;
+  // change generation의 작성 job. key.round가 있으면 그 수정 차례의 작성 job이다.
+  authorJob(key: EvidenceKey): Promise<string | null>;
+  // 수정 차례의 job이면 round가 붙는다.
+  keyOf(jobId: string): Promise<EvidenceKey | null>;
   // 모델 질문을 스레드에 내보내면 안 되는 사유 코드. 없으면 null이다. 선택지가 있으면 그 글도 함께 본다(질문 글과 버튼으로 나간다).
   questionRisk(jobId: string, question: string, options?: readonly string[]): Promise<string | null>;
 }
@@ -785,6 +786,8 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
   async supportsSelfFix(): Promise<boolean> {
     return await this.supportsV2() && await this.startInstructions() === CHANGE_INSTRUCTIONS_REVISION;
   }
+  // 게시 뒤 수정 차례(C27)도 같은 판의 수정 차례 칸(PR 번호 있음)을 쓴다. 운영 작업자(9b067e9)는 이 모양을 받는다(C25).
+  supportsAmendment(): Promise<boolean> { return this.supportsSelfFix(); }
   private async session(jobId: string, generation?: number): Promise<SessionRow | undefined> {
     const row = (await this.deps.store.db.query<SessionRow>(`SELECT * FROM codex_sessions WHERE job_id=$1 AND executor='claude'`, [jobId])).rows[0];
     return row && (generation === undefined || row.generation === generation) ? row : undefined;
@@ -828,9 +831,12 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
     if (prior && !TERMINAL_SESSION.has(prior.state)) throw new Error('change_session_active');
     const generation = (prior?.generation ?? 0) + 1;
     const timeoutMs = Math.min(job.budget.timeoutMs, TASK_LIMITS.turnTimeoutMs);
-    // 게시 전 고치기 차례만 변경 작성 판과 수정 차례 칸을 쓴다. head는 그 generation의 B이고 PR 번호는 없다. 발견은 자료 항목으로만 간다.
-    const amendment = input.selfFix ? { pullNumber: null, head: input.baseCommit, instruction: SELF_FIX_INSTRUCTION,
-      materials: { label: 'public' as const, ...boundAmendmentMaterials(selfFixMaterials(input.selfFix.findings)) } } : null;
+    // 수정 차례 칸은 두 경우에만 쓴다. 게시 뒤 수정 차례(C27)는 PR 번호와 그 PR head, owner의 Discord 말(지시), PR 리뷰·댓글(자료)이다.
+    // 게시 전 고치기 차례는 head가 그 generation의 B이고 PR 번호가 없으며 지시는 고정 문구, 발견은 자료다. 어느 쪽이든 자료는 지시 자리에 들어가지 않는다.
+    const amendment = input.amendment ? { pullNumber: input.amendment.pullNumber, head: input.amendment.head, instruction: input.amendment.instruction,
+      materials: { label: 'public' as const, ...boundAmendmentMaterials(input.amendment.materials) } }
+      : input.selfFix ? { pullNumber: null, head: input.baseCommit, instruction: SELF_FIX_INSTRUCTION,
+        materials: { label: 'public' as const, ...boundAmendmentMaterials(selfFixMaterials(input.selfFix.findings)) } } : null;
     const request = TASK_V2_ENDPOINTS['/v2/task'].request.parse({ version: TASK_V2_CONTRACT, lane: 'task', job: job.id, lease: job.lease_token, generation, policyRevision: input.policyRevision,
       instructions: amendment ? CHANGE_INSTRUCTIONS_REVISION : await this.startInstructions(), sessionId: randomUUID(), repository: plan.repository, base: input.baseCommit, project: plan.project, timeoutMs,
       runBudgetRemainingMs: TASK_LIMITS.runBudgetMs, toolCalls: Math.min(job.budget.toolCalls, TASK_LIMITS.toolCalls), limits: plan.limits, operation: 'start', turn: 1,
@@ -982,14 +988,14 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
     return settled.terminal;
   }
   // 검증 port가 같은 세션을 가리키게 한다.
-  async verificationControl(key: ChangeKey): Promise<ChangeVerificationControl | null> {
+  async verificationControl(key: EvidenceKey): Promise<ChangeVerificationControl | null> {
     const jobId = await this.deps.source.authorJob(key);
     const session = jobId ? await this.session(jobId) : undefined;
     if (!jobId || !session?.worker_lease || !session.claude_session_id || !session.generation) return null;
     return { job: jobId, lease: session.worker_lease, generation: session.generation, sessionId: session.claude_session_id,
       worker: session.worker_instance && session.worker_storage ? { instance: session.worker_instance, storage: session.worker_storage } : null };
   }
-  async verificationKeepalive(key: ChangeKey): Promise<void> {
+  async verificationKeepalive(key: EvidenceKey): Promise<void> {
     const jobId = await this.deps.source.authorJob(key);
     if (!jobId) return;
     const job = await this.jobRow(jobId);

@@ -1,13 +1,13 @@
 import {
   EFFECT_LEASE_MS, EFFECT_STAGES, artifactDigest, effectRequestDigest, evidenceBundleDigest, labelAllowsAuthorInput, propagateLabel, reviewReceiptDigest, sha256Hex,
 } from './change-contracts.js';
-import type { ApprovalSubject, ChangeKey, ChangeTarget, ChangeWriterPort, EffectExpected, EffectResult, EffectStage, EvidenceBundle, PublicMetadata, ReviewReceipt, WriterCommitMetadata, WriterOutcome, WriterPullSnapshot } from './change-contracts.js';
+import type { AmendmentKey, ApprovalSubject, ChangeKey, ChangeTarget, ChangeWriterPort, EffectExpected, EffectResult, EffectStage, EvidenceBundle, PublicMetadata, ReviewReceipt, WriterCommitMetadata, WriterOutcome, WriterPullSnapshot } from './change-contracts.js';
 import { evaluateCi, readCiSnapshot } from './change-ci-policy.js';
 import { readChangeNotes } from './change-guidance.js';
 import { compilePathPolicy, gitCommitSha, inspectCandidate } from './change-policy.js';
 import type { BaseLeaf, ChangeRepositoryPolicy, PublishPlan } from './change-policy.js';
-import { publicationMarker, renderPublication, scanPublicPayload } from './change-publication.js';
-import type { ChangeRequest, ChangeStore, EffectKey, EffectRecord, GenerationRecord } from './change-store.js';
+import { publicationMarker, renderAmendmentCommit, renderPublication, scanPublicPayload } from './change-publication.js';
+import type { AmendmentEffect, AmendmentRound, ChangeRequest, ChangeStore, EffectKey, EffectRecord, GenerationRecord } from './change-store.js';
 import { Denied, PolicyUnavailable } from './contracts.js';
 import type { ChangePreflightPort } from './github-writer.js';
 import type { Log } from './log.js';
@@ -49,6 +49,17 @@ const MAX_SEND_ATTEMPTS = 8;
 // 나중에 다시 하면 풀릴 수 있는 미전송만 재시도한다. 입력·권한·저장소 불일치는 다시 해도 같아서 사람에게 넘긴다.
 const TRANSIENT_NOT_SENT = new Set(['connection_refused', 'connection_failed', 'rate_limited', 'policy_unavailable', 'authorization_check_failed', 'token_unavailable', 'token_response_invalid']);
 const isTransientNotSent = (code: string) => TRANSIENT_NOT_SENT.has(code) || /^token_http_5\d\d$/.test(code);
+
+// 수정 차례 커밋의 결과. failed는 커밋을 올리지 않았다(차례를 실패로 닫는다), blocked는 effect를 해소하지 못해 부모가 막혔다.
+export type AmendmentPublishOutcome =
+  | { kind: 'committed'; commitSha: string }
+  | { kind: 'failed'; reason: string }
+  | { kind: 'deferred'; reason: string; retryAt: number }
+  | { kind: 'unknown'; stage: EffectStage }
+  | { kind: 'blocked'; reason: string };
+interface AmendmentPlan {
+  key: AmendmentKey; target: ChangeTarget; generation: GenerationRecord; round: AmendmentRound; publish: PublishPlan; metadata: PublicMetadata; headSha: string;
+}
 
 interface Plan {
   target: ChangeTarget; key: ChangeKey; generation: GenerationRecord; subject: ApprovalSubject; bundle: EvidenceBundle; policy: ChangeRepositoryPolicy;
@@ -590,6 +601,232 @@ export class ChangePublisher {
     return pull.repoId === generation.repoId && pull.authorId === policy.writerBotUserId && pull.headBranch === generation.branch && pull.baseBranch === generation.baseBranch
       && pull.headSha === headSha && pull.title === publication.title && pull.body === publication.body && pull.body.includes(`<!-- ${marker} -->`);
   }
+
+  // ---- 수정 차례 커밋 (C27) ----
+
+  // 수정 차례의 커밋을 같은 PR 브랜치에 fast-forward로 올린다. 미리보기·승인이 없는 대신 처음 게시와 같은 검사(정책·시험·리뷰·보호 경로·허용 경로·
+  // 공개 검사·CI)를 모두 지나야 첫 쓰기를 부른다. PR 생성·PR 설명 수정·강제 갱신이 없다. 같은 차례를 몇 번 불러도 안전하다.
+  // failed는 커밋을 올리지 않았다는 뜻이다(보낸 effect가 있으면 안 나간 것으로 해소된 뒤에만 나온다). 호출자가 차례를 실패로 닫는다.
+  async publishAmendment(key: AmendmentKey, options: { pullOpen: () => Promise<boolean> }): Promise<AmendmentPublishOutcome> {
+    await this.store.expireSendingAmendmentEffects();
+    const effects = (await this.store.amendmentEffects({ changeId: key.changeId })).filter(effect => effect.generation === key.generation && effect.round === key.round);
+    const ref = effects.find(effect => effect.stage === 'ref');
+    if (ref?.state === 'confirmed' && ref.result?.stage === 'ref') return { kind: 'committed', commitSha: ref.result.sha };
+    const plan = await this.amendmentPlan(key, effects);
+    if ('kind' in plan) return plan;
+    for (const stage of ['blob', 'tree', 'commit', 'ref'] as const) {
+      const outcome = await this.amendmentStage(plan, stage, options);
+      if (outcome) return outcome;
+    }
+    return { kind: 'committed', commitSha: plan.headSha };
+  }
+  private async amendmentPlan(key: AmendmentKey, effects: readonly AmendmentEffect[]): Promise<AmendmentPlan | AmendmentPublishOutcome> {
+    const failed = (reason: string): AmendmentPublishOutcome => ({ kind: 'failed', reason });
+    const request = await this.store.get(key.changeId);
+    const generation = await this.store.generationRecord(key);
+    const round = await this.store.amendment(key);
+    const bundle = await this.store.amendmentBundle(key);
+    const artifact = await this.store.loadAmendmentArtifact(key);
+    const approval = await this.store.approvalSubject(key);
+    if (!request.ok || !generation.ok || !round.ok || !approval.ok) return failed('evidence_missing');
+    if (round.value.state !== 'running' || request.value.phase !== 'amending') return failed('amendment_not_running');
+    if (!bundle.ok || !artifact.ok || round.value.baseCommit === null || round.value.baseTree === null) return failed('evidence_missing');
+    const brief = request.value.brief;
+    if (!brief) return failed('brief_missing');
+    const label = propagateLabel([request.value.label, artifact.value.label, brief.label, round.value.label]);
+    if (!labelAllowsAuthorInput(label)) return failed('label_blocked');
+    const policy = await this.policy(generation.value.repoId);
+    if (!policy || policy.repoId !== generation.value.repoId) return failed('policy_revoked');
+    if (policy.revision !== bundle.value.policyRevision) return failed('policy_changed');
+    if (!policy.writerAccepted) return failed('writer_acceptance_missing');
+    // 필수 시험 전부가 이 차례의 묶음에서 통과했고, 새 세션의 리뷰가 통과(경고 포함)이며 범위가 완전해야 한다.
+    const verifications = await this.store.amendmentVerifications(key);
+    const bundleDigest = evidenceBundleDigest(bundle.value);
+    for (const command of new Set([...policy.requiredCommands, ...brief.verificationCommandIds])) {
+      const receipt = verifications.find(item => item.commandId === command);
+      if (!receipt || evidenceBundleDigest(receipt.bundle) !== bundleDigest) return failed('required_command_missing');
+      if (receipt.status !== 'passed') return failed(`verification_${receipt.status}`);
+    }
+    const review = await this.store.amendmentReview(key);
+    if (!review || evidenceBundleDigest(review.bundle) !== bundleDigest) return failed('review_missing');
+    if (review.verdict === 'blocked' || review.coverage !== 'complete') return failed(review.coverage === 'complete' ? 'review_blocked' : 'review_incomplete');
+    const manifest = artifact.value.manifest;
+    if (artifactDigest(manifest) !== bundle.value.artifactDigest || manifest.baseCommit !== round.value.baseCommit || manifest.baseTree !== round.value.baseTree
+      || sha256Hex(Buffer.from(artifact.value.patch)) !== manifest.patchSha256) return failed('artifact_mismatch');
+    const repoRules = compilePathPolicy(policy.allowedPaths, policy.deniedPaths);
+    const briefRules = compilePathPolicy(brief.allowedPaths, brief.deniedPaths);
+    if (!repoRules.ok || !briefRules.ok) return failed('policy_missing');
+
+    // 여기부터 GitHub을 읽는다(자격 없는 읽기). 일시 실패는 공개 효과 없이 미룬다.
+    // writer·읽기 입력은 차례 번호 없는 ChangeKey만 받는다(모양을 엄격히 본다).
+    const target: ChangeTarget = { key: { changeId: key.changeId, generation: key.generation }, repoId: generation.value.repoId };
+    let leaves: { complete: boolean; leaves: BaseLeaf[] } | null;
+    let base: { treeSha: string; parents: string[] } | null;
+    let branchHead: { sha: string } | null;
+    try {
+      branchHead = await this.preflight.readBranchHead({ target, branch: generation.value.branch });
+      base = await this.preflight.readCommit({ target, sha: round.value.baseCommit });
+      leaves = await this.preflight.readTreeLeaves({ target, sha: round.value.baseTree });
+    } catch (error) { return this.deferredAmendment(this.code(error)); }
+    if (!base || base.treeSha !== round.value.baseTree) return failed('base_tree_mismatch');
+    if (!leaves) return failed('base_tree_incomplete');
+    const inspected = inspectCandidate({ base: { sha: round.value.baseTree, complete: leaves.complete, leaves: leaves.leaves }, manifest, files: artifact.value.files,
+      policies: [repoRules.policy, briefRules.policy] });
+    if (!inspected.ok) return failed(inspected.reason);
+    const marker = publicationMarker(key);
+    const metadata = renderAmendmentCommit({ key, pullNumber: round.value.pullNumber, identity: policy.identity, at: round.value.startedAt ?? round.value.createdAt, bundle: bundle.value });
+    const scanned = scanPublicPayload({ paths: inspected.plan.changedPaths, files: artifact.value.files, publication: metadata, branch: generation.value.branch, marker },
+      { internalMarkers: policy.internalMarkers });
+    if (!scanned.ok) return failed(scanned.reason);
+    let snapshot: Awaited<ReturnType<typeof readCiSnapshot>>;
+    try { snapshot = await readCiSnapshot(this.preflight, target, leaves.leaves, policy.ci); }
+    catch (error) {
+      if (error instanceof Error && error.message === 'ci_workflow_mode') return failed('ci_workflow_mode');
+      return this.deferredAmendment(this.code(error));
+    }
+    if (!snapshot) return failed('ci_unreadable');
+    const ci = evaluateCi(snapshot, policy.ci);
+    if (!ci.ok) return failed(ci.reason);
+    // 처음 게시 때 승인한 CI 형태와 같아야 한다. 수정 차례는 미리보기가 없어 바뀐 형태를 사람이 볼 곳이 없다.
+    if (ci.fingerprint !== approval.value.subject.ciFingerprint) return failed('ci_fingerprint_changed');
+    const headSha = gitCommitSha({ treeSha: inspected.plan.resultTree, parents: [round.value.baseCommit], message: metadata.commitMessage, author: metadata.author, committer: metadata.committer });
+    // 브랜치는 차례 base 그대로여야 한다. 내 커밋이면 ref 단계가 회수한다. 그 밖이면 사람 push라 덮지 않는다(아직 아무것도 올리지 않았을 때만 여기서 멈춘다).
+    if (branchHead?.sha !== round.value.baseCommit && branchHead?.sha !== headSha && !effects.some(effect => effect.stage === 'ref')) return failed('head_changed');
+    return { key, target, generation: generation.value, round: round.value, publish: inspected.plan, metadata, headSha };
+  }
+  private async amendmentStage(plan: AmendmentPlan, stage: Exclude<EffectStage, 'pull'>, options: { pullOpen: () => Promise<boolean> }): Promise<AmendmentPublishOutcome | null> {
+    const key = { ...plan.key, stage };
+    const current = (await this.store.amendmentEffects({ changeId: plan.key.changeId })).find(effect => effect.generation === plan.key.generation && effect.round === plan.key.round && effect.stage === stage);
+    if (current?.state === 'confirmed') return null;
+    if (current?.state === 'sending') return { kind: 'deferred', reason: 'busy', retryAt: this.now() + this.retryMs };
+    if (current?.state === 'blocked') return current.resolution ? { kind: 'failed', reason: current.blockedReason ?? 'effect_blocked' } : { kind: 'blocked', reason: current.blockedReason ?? 'effect_blocked' };
+    if (current?.state === 'unknown') return (await this.reconcileAmendmentEffect(plan, current)) === 'confirmed' ? null : { kind: 'unknown', stage };
+    const { requestDigest, expected } = this.amendmentIntent(plan, stage);
+    if (!current) {
+      const intent = await this.store.recordAmendmentEffectIntent({ ...key, requestDigest, expected });
+      if (!intent.ok) return intent.reason === 'busy' || intent.reason === 'unresolved_effects' ? { kind: 'deferred', reason: intent.reason, retryAt: this.now() + this.retryMs } : { kind: 'failed', reason: intent.reason };
+    }
+    // 보내기 직전에 PR이 열려 있는지 다시 본다. 닫혔거나 병합됐으면 브랜치를 움직이지 않는다.
+    if (stage === 'ref' && !await options.pullOpen()) {
+      await this.store.abandonUnsentAmendmentEffect({ ...key, leaseId: null });
+      return { kind: 'failed', reason: 'pull_not_open' };
+    }
+    const claim = await this.store.claimAmendmentEffect(key);
+    if (!claim.ok) return { kind: 'deferred', reason: claim.reason, retryAt: this.now() + this.retryMs };
+    const leaseId = claim.value.leaseId;
+    if (stage === 'blob' && plan.publish.blobs.length === 0) {
+      const confirmed = await this.store.confirmAmendmentEffect({ ...key, leaseId, result: { stage: 'blob', shas: [] } });
+      return confirmed.ok ? null : { kind: 'deferred', reason: confirmed.reason, retryAt: this.now() + this.retryMs };
+    }
+    const outcome = await this.sendAmendment(plan, stage);
+    switch (outcome.kind) {
+      case 'confirmed': {
+        const confirmed = await this.store.confirmAmendmentEffect({ ...key, leaseId, result: outcome.value });
+        if (confirmed.ok) return null;
+        if (confirmed.reason === 'result_mismatch') {
+          await this.store.blockAmendmentEffect({ ...key, reason: 'result_mismatch' });
+          return { kind: 'blocked', reason: 'result_mismatch' };
+        }
+        return { kind: 'deferred', reason: confirmed.reason, retryAt: this.now() + this.retryMs };
+      }
+      // 확실히 안 나갔거나 GitHub이 거부했다(브랜치가 다른 SHA, fast-forward 아님 등). 다시 보내지 않고 이 차례를 커밋 없이 닫는다.
+      case 'not_sent': case 'rejected':
+        await this.store.abandonUnsentAmendmentEffect({ ...key, leaseId });
+        return { kind: 'failed', reason: outcome.code };
+      case 'unknown': {
+        await this.store.markAmendmentEffectUnknown({ ...key, leaseId, code: /^[a-z][a-z0-9_]{0,63}$/.test(outcome.code) ? outcome.code : 'response_lost' });
+        const effect = (await this.store.amendmentEffects({ changeId: plan.key.changeId, unresolved: true })).find(item => item.round === plan.key.round && item.stage === stage);
+        return effect && (await this.reconcileAmendmentEffect(plan, effect)) === 'confirmed' ? null : { kind: 'unknown', stage };
+      }
+    }
+  }
+  private amendmentIntent(plan: AmendmentPlan, stage: Exclude<EffectStage, 'pull'>): { requestDigest: string; expected: EffectExpected } {
+    const { round, publish, metadata, headSha, generation } = plan;
+    const base = round.baseCommit!;
+    switch (stage) {
+      case 'blob': {
+        const shas = [...new Set(publish.blobs.map(blob => blob.blobSha))].sort();
+        return { requestDigest: effectRequestDigest(stage, { round: round.round, shas }), expected: { stage, shas } };
+      }
+      case 'tree':
+        return { requestDigest: effectRequestDigest(stage, { round: round.round, baseTree: round.baseTree, entries: publish.treeEntries }), expected: { stage, baseTree: round.baseTree!, treeSha: publish.resultTree } };
+      case 'commit':
+        return { requestDigest: effectRequestDigest(stage, { round: round.round, treeSha: publish.resultTree, parent: base, metadata: { message: metadata.commitMessage, author: metadata.author, committer: metadata.committer } }),
+          expected: { stage, treeSha: publish.resultTree, parent: base, commitSha: headSha } };
+      case 'ref':
+        return { requestDigest: effectRequestDigest(stage, { round: round.round, branch: generation.branch, expectedHead: base, sha: headSha, force: false }), expected: { stage, ref: `refs/heads/${generation.branch}`, sha: headSha } };
+    }
+  }
+  private async sendAmendment(plan: AmendmentPlan, stage: Exclude<EffectStage, 'pull'>): Promise<WriterOutcome<EffectResult>> {
+    const { target, round, publish, metadata, headSha, generation } = plan;
+    const wrap = <T>(outcome: WriterOutcome<T>, map: (value: T) => EffectResult): WriterOutcome<EffectResult> => outcome.kind === 'confirmed' ? { kind: 'confirmed', value: map(outcome.value) } : outcome;
+    switch (stage) {
+      case 'blob': return wrap(await this.writer.createBlobs({ target, files: publish.blobs }), value => ({ stage: 'blob', shas: value.shas }));
+      case 'tree': return wrap(await this.writer.createTree({ target, baseTree: round.baseTree!, entries: publish.treeEntries }), value => ({ stage: 'tree', treeSha: value.treeSha }));
+      case 'commit':
+        return wrap(await this.writer.createCommit({ target, treeSha: publish.resultTree, parent: round.baseCommit!, metadata: { message: metadata.commitMessage, author: metadata.author, committer: metadata.committer } }),
+          value => ({ stage: 'commit', commitSha: value.commitSha, treeSha: value.treeSha, parents: value.parents }));
+      // 강제 갱신 경로는 없다. writer가 브랜치 head가 차례 base이고 새 커밋의 부모가 그 하나인지 본 뒤에만 보낸다.
+      case 'ref': return wrap(await this.writer.fastForwardBranch({ target, branch: generation.branch, expectedHead: round.baseCommit!, sha: headSha }), value => ({ stage: 'ref', ref: value.ref, sha: value.sha }));
+    }
+  }
+  // 보냈는지 모르는 차례 effect를 정확한 값과 대조한다. 다시 보내지 않는다. ref는 브랜치가 내 커밋이면 확정, 다른 SHA로 갔으면 막는다.
+  private async reconcileAmendmentEffect(plan: Pick<AmendmentPlan, 'key' | 'target' | 'generation'>, effect: AmendmentEffect): Promise<'confirmed' | 'unresolved' | 'blocked'> {
+    const expected = effect.expected;
+    const { target } = plan;
+    let result: EffectResult | null = null;
+    try {
+      switch (expected.stage) {
+        case 'blob': {
+          let all = true;
+          for (const sha of expected.shas) if (!await this.writer.readBlobExists({ target, sha })) { all = false; break; }
+          if (all) result = { stage: 'blob', shas: expected.shas };
+          break;
+        }
+        case 'tree':
+          if (await this.writer.readTreeLeaves({ target, sha: expected.treeSha })) result = { stage: 'tree', treeSha: expected.treeSha };
+          break;
+        case 'commit': {
+          const commit = await this.writer.readCommit({ target, sha: expected.commitSha });
+          if (commit) result = { stage: 'commit', commitSha: expected.commitSha, treeSha: commit.treeSha, parents: commit.parents };
+          break;
+        }
+        case 'ref': {
+          const head = await this.writer.readBranchHead({ target, branch: plan.generation.branch });
+          const round = await this.store.amendment({ ...plan.key, round: effect.round });
+          if (head?.sha === expected.sha) result = { stage: 'ref', ref: expected.ref, sha: expected.sha };
+          else if (head && round.ok && head.sha !== round.value.baseCommit) {
+            await this.store.blockAmendmentEffect({ ...plan.key, round: effect.round, stage: 'ref', reason: 'head_changed' });
+            return 'blocked';
+          }
+          break;
+        }
+        case 'pull': return 'unresolved';
+      }
+    } catch (error) {
+      this.log('change_amendment_reconcile_failed', { stage: effect.stage, reason: this.code(error) });
+      return 'unresolved';
+    }
+    if (!result) return 'unresolved';
+    const confirmed = await this.store.confirmAmendmentEffect({ ...plan.key, round: effect.round, stage: effect.stage, leaseId: null, result });
+    return confirmed.ok ? 'confirmed' : 'unresolved';
+  }
+  // 대조 주기. 응답을 잃은 차례 effect를 맞추고 기한이 지난 unknown은 사람 해소로 넘긴다(부모 blocked).
+  async reconcileAmendments(): Promise<void> {
+    await this.store.expireSendingAmendmentEffects();
+    for (const effect of await this.store.amendmentEffects({ unresolved: true })) {
+      if (effect.state !== 'unknown') continue;
+      const key = { changeId: effect.changeId, generation: effect.generation, round: effect.round };
+      const generation = await this.store.generationRecord(key);
+      if (!generation.ok) continue;
+      const target = { key: { changeId: key.changeId, generation: key.generation }, repoId: generation.value.repoId };
+      const verdict = await this.reconcileAmendmentEffect({ key, target, generation: generation.value }, effect);
+      if (verdict === 'unresolved' && effect.reconcileDeadline !== null && effect.reconcileDeadline <= this.now()) {
+        await this.store.blockAmendmentEffect({ ...key, stage: effect.stage, reason: 'unknown_deadline' });
+      }
+    }
+  }
+  private deferredAmendment(reason: string): AmendmentPublishOutcome { return { kind: 'deferred', reason, retryAt: this.now() + this.retryMs }; }
 
   // ---- 공통 ----
 

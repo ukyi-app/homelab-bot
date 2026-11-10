@@ -8,6 +8,7 @@ import { sha256Hex } from '../src/change-contracts.js';
 import type { ChangeNote, ChangePhase } from '../src/change-contracts.js';
 import { ChangeReviewResults, ChangeReviewWorker, changeReviewRoutes } from '../src/change-review.js';
 import type { ChangeReviewOutput, ChangeReviewerInput, ChangeReviewerModel } from '../src/change-review.js';
+import type { AmendmentDiscussionReader } from '../src/change-commands.js';
 import type { ChangeRuntime, ChangeRuntimeDeps } from '../src/change-runtime.js';
 import type { ChangeStore } from '../src/change-store.js';
 import { spawnSandbox } from '../src/change-verifier.js';
@@ -17,6 +18,7 @@ import type { Scope } from '../src/contracts.js';
 import type { Database } from '../src/database.js';
 import { DiscordIngress, DiscordPublisher } from '../src/discord.js';
 import type { GuidanceReviewPort } from '../src/github-review-io.js';
+import { createGitHubWriter } from '../src/github-writer.js';
 import { PolicyGate } from '../src/policy.js';
 import type { Policy } from '../src/policy.js';
 import { ReviewRuntime } from '../src/review.js';
@@ -62,6 +64,9 @@ export interface HarnessOptions {
   guidance?: GuidanceReviewPort;
   // 작업자 v2 port가 받는 지시문 판 목록을 알리는지. 기본은 알리지 않아(옛 port 모양) 게시 서버가 옛 판을 보낸다.
   changeV2?: boolean;
+  // 수정 차례(C27) 배선. 조립(change-assembly.ts)은 아직 수정 차례의 쓰기·자료 읽기를 잇지 않아(C27 반환 사항), 시험이 그 두 자리를 직접 넣는다.
+  // writer의 쓰기 직전 확인은 게시 단계뿐 아니라 수정 차례(amending, 그 차례 running)도 받고, 런타임에 PR 리뷰·댓글 읽기를 준다.
+  amendments?: { discussion: AmendmentDiscussionReader };
 }
 export interface Harness {
   db: Database; env: PublishEnv; f: ChangeWorkerFixture; store: Store; changes: ChangeStore; gate: PolicyGate; policy: { current: Policy }; rest: MockDiscord; ingress: DiscordIngress; discord: DiscordPublisher;
@@ -94,8 +99,11 @@ function crashing<T extends object>(name: string, port: T, plan: { crash?: Crash
 }
 
 export async function changeHarness(db: Database, options: HarnessOptions = {}): Promise<Harness> {
+  // 작업자가 받는 압축본은 요청한 commit의 tree다(수정 차례는 PR head). 처음 게시는 main head와 같다.
+  let archiveUrls: string[] = [];
   const items = () => {
-    const head = env.github.refs.get('heads/main')!;
+    const asked = /([0-9a-f]{40})/.exec(archiveUrls.at(-1) ?? '')?.[1];
+    const head = asked && env.github.commits.has(asked) ? asked : env.github.refs.get('heads/main')!;
     return env.github.leaves(env.github.commits.get(head)!.tree).map(leaf => ({ name: leaf.path, data: env.github.blobs.get(leaf.blobSha)!.toString() }));
   };
   const runs = { verify: 0 };
@@ -105,6 +113,7 @@ export async function changeHarness(db: Database, options: HarnessOptions = {}):
   const env = await publishEnv(db);
   env.github.clock = Date.now();
   const f = await changeWorkerFixture({ currentItems: items, change: options.change, verifier: { registry, sandbox: (args, limits, signal) => { runs.verify++; return inner(args, limits, signal); } } });
+  archiveUrls = f.archiveUrls;
   await f.script(options.steps ?? [WRITE_STEP]);
   if (options.script) registry['smoke-unit'].argv = ['/bin/sh', '-c', typeof options.script === 'function' ? options.script(f) : options.script];
   const logs: Harness['logs'] = [];
@@ -157,7 +166,13 @@ export async function changeHarness(db: Database, options: HarnessOptions = {}):
     const bridge = new ClaudeTaskBridge(store, gate, v1 as never, { plan: async () => { throw new Error('v1_plan_not_used'); } }, { log: () => {} }, v2);
     const review = assembleChangeReview({ store, gate, signer, workerUrl: reviewUrl, send: fetch, now: Date.now, shutdown: shutdown.signal, log });
     const assembled = assembleChange({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, store, gate, changes: review.changes, review: review.service, bridge, worker: v2, kubernetes: { get: async () => { throw new Error('kubernetes_not_used'); } }, send, now: Date.now, log, shutdown: shutdown.signal,
-      intakeOpen: () => worker.taskOpen, ...(options.guidance ? { guidance: options.guidance } : {}), verificationPollMs: 2, periods: { authorPollMs: 0, mergePollMs: 0, failureBackoffMs: 0, failureBackoffMaxMs: 0, startGraceMs: 200 },
+      intakeOpen: () => worker.taskOpen, ...(options.guidance ? { guidance: options.guidance } : {}),
+      ...(options.amendments ? { createWriter: writerOptions => createGitHubWriter({ ...writerOptions, authorizeWrite: async target => {
+        const row = (await db.query<{ phase: string; generation: number }>(`SELECT r.phase,r.generation FROM change_requests r WHERE r.id=$1
+          AND EXISTS (SELECT 1 FROM change_amendments a WHERE a.change_id=r.id AND a.generation=r.generation AND a.state='running')`, [target.key.changeId])).rows[0];
+        if (row?.phase === 'amending' && Number(row.generation) === target.key.generation) return;
+        return writerOptions.authorizeWrite(target);
+      } }) } : {}), verificationPollMs: 2, periods: { authorPollMs: 0, mergePollMs: 0, failureBackoffMs: 0, failureBackoffMaxMs: 0, startGraceMs: 200 },
       deployTargets: [{ kind: 'app', service: 'fixture-app', repository: REPO.fullName, configRepository: 'fixture-org/config', imageFile: 'apps/fixture-app/image.yaml', imageRepository: 'ghcr.io/fixture-org/fixture-app', namespace: 'app-fixture-app', deployment: 'fixture-app', container: 'app', argoApplication: 'fixture-app', podApp: 'fixture-app' }],
       instrument: deps => {
         const wrapped: ChangeRuntimeDeps = { ...deps, author: crashing('author', deps.author, plan), artifacts: crashing('artifacts', deps.artifacts, plan), verification: crashing('verification', deps.verification, plan), review: crashing('review', deps.review, plan), publisher: crashing('publisher', deps.publisher, plan),
@@ -172,7 +187,8 @@ export async function changeHarness(db: Database, options: HarnessOptions = {}):
               return result;
             };
           } }) };
-        return runtimeOptions.instrument ? runtimeOptions.instrument(wrapped) : wrapped;
+        const amended = options.amendments ? { ...wrapped, discussion: options.amendments.discussion } : wrapped;
+        return runtimeOptions.instrument ? runtimeOptions.instrument(amended) : amended;
       } });
     const reviewRuntime = new ReviewRuntime(store, null as never, null as never, null as never, null as never, signer, 5, { changeReview: review.service, lanes: true });
     const commands = changeCommandHandler({ store, gate, changes: review.changes, log, closedReason: () => null, runtime: assembled.runtime });
@@ -197,7 +213,10 @@ export async function changeHarness(db: Database, options: HarnessOptions = {}):
         await new Promise(resolve => setTimeout(resolve, 3));
       }
       const row = (await db.query<{ phase: string; phase_reason: string | null }>('SELECT phase,phase_reason FROM change_requests ORDER BY created_at DESC LIMIT 1')).rows[0];
-      throw new Error(`pump_timeout phase=${row?.phase} reason=${row?.phase_reason} logs=${JSON.stringify(logs.slice(-8))}`);
+      const amendments = (await db.query('SELECT round,state,reason,base_commit IS NOT NULL AS pinned,artifact_digest IS NOT NULL AS saved FROM change_amendments ORDER BY round')).rows;
+      const children = (await db.query(`SELECT c.role,c.amendment_round,j.state,j.wait_reason,s.state AS session FROM change_child_jobs c JOIN jobs j ON j.id=c.job_id
+        LEFT JOIN codex_sessions s ON s.job_id=j.id ORDER BY c.created_at`)).rows;
+      throw new Error(`pump_timeout phase=${row?.phase} reason=${row?.phase_reason} rounds=${JSON.stringify(amendments)} children=${JSON.stringify(children)} logs=${JSON.stringify(logs.slice(-8))}`);
     },
     phase: async id => (await db.query<{ phase: ChangePhase }>('SELECT phase FROM change_requests WHERE id=$1', [id])).rows[0]!.phase,
     changeId: async () => (await db.query<{ id: string }>('SELECT id FROM change_requests ORDER BY created_at DESC LIMIT 1')).rows[0]!.id,
