@@ -2568,23 +2568,6 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 - **못 잡는 범위:** 모델이 언제 가정하고 언제 묻는지, 선택지가 좋은지는 S5(C24 표본)다. 실제 Discord의 버튼·`UPDATE_MESSAGE` 모양은 S5다. 저장 전 판단과 수신 트랜잭션 사이에 질문이 닫히거나 열리는 경합(원문 되돌리기·그 자리 비우기)은 시험하지 않았다. 공개 검사에 걸린 답의 안내 말투는 처리기 문구(합니다체) 그대로다.
 - **운영 영향:** 스위치 꺼짐이면 질문 글·다음 말·버튼이 지금 그대로다. 스위치 밖으로 바로 바뀌는 것은 변경 작성 요청의 지시문 판(`CHANGE_PR_ENABLED`가 켜져 있고 작업자가 `change-v2`를 알릴 때)과 선택지 저장 칸이다. 되돌림은 DECISIONS "C28 …"의 "되돌림".
 
-## C33 시험 거부 뒤 재조회 (2026-11-10, 로컬)
-
-T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·PR이 하나)의 결함 수정을 S1(변경 런타임·시험 receipt, PGlite와 실제 PostgreSQL)과 검증 port에서 고정했다. 원인과 방법은 DECISIONS "C33 시험 거부 뒤 재조회". 같은 밀리초 충돌은 시험 하네스 옵션 `sameMillisecondVerify`(`test/change-assembly-harness.ts`)가 만든다. 처음 오는 `/v2/task/verify` 두 건을 같은 동기 구간에서 고정 시각으로 서명시켜 토큰을 같게 하고, 실제로 짝지어 서명했는지 `collisions.verify`로 센다.
-
-| 완료 조건 | 시험 |
-|---|---|
-| 같은 밀리초에 두 게시 서버가 verify를 보내도 `awaiting_publish_approval`까지 가고 모델·시험·PR이 하나 | `change-verify-recheck` "C33 같은 밀리초: …"(PGlite, 충돌 1건, 사유 없음, receipt `passed` 하나, 게시까지 가서 모델 1·시험 1·리뷰 1·PR 1), `change-pg` "C33 EVENT-02 실제 PostgreSQL: 게시 서버 둘이 같은 밀리초에 …"(충돌 1건, receipt `passed` 하나, 모델 1·시험 1) |
-| 시험이 정말 시작되지 않았으면 `verification_not_run` | `change-verification` "검증 port: 세션이 없거나 거부되면 not_run, …"(거부되고 재조회도 `absent`, 재전송도 거부 → `not_run`. 재조회가 끝내 닿지 않으면 `unknown`), "검증 port C33: 거부 뒤 작업자가 모르면 … 또 거부되면 not_run이다"(재전송은 한 번뿐) |
-| 기존 EVENT-02 실제 PostgreSQL 시험이 반복에서 실패하지 않음 | `change-pg` "T19 B5 EVENT-02 실제 PostgreSQL: 게시 서버 둘이 같은 부모를 동시에 …"를 조사 패치의 반복 계측(커밋하지 않음)으로 30번씩 세 번, 90번 중 0번 실패. 고치기 전 main `9377c33`은 55번 중 5번 |
-| 파드 교체(`worker_mismatch`) 동작 | `change-verify-recheck` "C33 파드 교체: …"(시험 요청 직전 작업자 재시작 → 재조회가 새 신원을 알려 같은 저장소의 새 파드에서 시험 1회, `passed`), `change-verification` "검증 port C33: 거부 뒤 작업자가 모르면 답한 작업자 신원으로 …"(두 번째 verify가 새 instance로 간다) |
-| 다른 쪽 시험을 따름 | `change-verification` "검증 port C33: 시작 요청이 거부돼도 작업자가 그 command를 돌리는 중이거나 끝냈으면 그 결과를 따른다"(running 뒤 done, 바로 done, 둘 다 verify 1회) |
-
-- **실행(origin/main 병합 뒤 2ed0ee3, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 바뀐 파일을 참조하는 9개 파일(`change-verify-recheck`, `change-verification`, `change-verify-start`, `change-pg`, `change-assembly`, `c28-change-question`, `task-stream`, `change-artifact`, `c17-publish-button`) 274개 모두 통과, skip 0.
-- **시험이 실패할 수 있는지 확인:** 새 시험 다섯(같은 밀리초, 파드 교체, port 셋)을 고치기 전 `src`로 돌려 모두 실패를 봤다. 같은 밀리초 시험은 충돌 1건에서 `blocked`·`verification_not_run`, 파드 교체 시험도 `not_run`으로 닫혔다.
-- **바뀐 기존 시험:** `change-verification` "검증 port: 세션이 없거나 거부되면 not_run, …"의 거부 경우는 재조회가 `absent`인 경우로 좁혔다(이 티켓이 바꾼 동작). 재조회가 닿지 않으면 `unknown`인 단언을 더했다.
-- **못 잡는 범위:** 토큰이 같아지는 것 자체(근본 수정, 작업자 배포 뒤), 실제 배포 교체 순간(C24 S5). 이긴 쪽이 슬롯을 잡기 전에 재조회가 `absent`를 받는 좁은 틈은 재전송으로 덮지만 결정적 시험으로 만들지 않았다.
-
 ## C29 안내 댓글과 확인할 것 (2026-11-10, 로컬)
 
 동료 봇 명세 §4.10 "변경 질문 줄이기"(확인할 것을 미리보기와 PR 설명에)·"안내 댓글"과 AC-27, AC-25의 미리보기·PR 설명 줄을 S1에서 고정했다. 게시는 가짜 GitHub(`test/change-github-fake.ts`)와 PGlite, 안내 리뷰는 C26 `GuidanceReviewPort` 모양의 대역(표식·head 회수 규칙 같음), 조립 시험은 결과에 두 칸을 싣는 가짜 작업자(`change-assembly-harness` `notes` 옵션)다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §16.3 "확인할 것·남은 위험 (C29)"·"안내 댓글 (C29)", 구현 선택은 [DECISIONS](DECISIONS.md) "동료 봇 전환 14·17 확인할 것과 안내 댓글 구현 선택". 시험 파일은 새 `test/change-guidance.test.ts`와 `change-publication`·`change-assembly`의 C29 줄이다.
@@ -2605,3 +2588,20 @@ T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·
 - **못 잡는 범위:** 실제 GitHub의 줄 댓글 표시, 리뷰 App 설치 상태, GitHub hunk와 artifact patch의 문맥 줄 차이(C24 S5). 모델이 언제 가정하고 무엇을 확인할 것으로 쓰는지의 품질(S5).
 - **운영 영향:** 스위치 밖이다. 병합하면 변경 PR을 새로 게시할 때부터 PR 설명·미리보기에 확인할 것 절이 생긴다. 다만 지금 게시 서버는 옛 판(`task-v1`)을 보내 결과에 목록이 없으므로 C28의 판 전환 전에는 공개 문구가 그대로다. 안내 댓글은 리뷰 경로가 있을 때 `main`이 넘긴 포트로 나가고, 리뷰 정책 저장소 목록 밖 저장소는 `repository_denied`로 건너뛴다(지금 목록은 `homelab-smoke`뿐).
 - **조립 배선(주 진행자 허용, 2026-11-10):** `src/main.ts`가 리뷰 경로의 `guidance` 포트를 `assembleChange` 인수로 넘기고 `src/change-assembly.ts`가 `ChangeRuntimeDeps.guidance`로 전달한다. 시험은 `change-assembly` "AC-25·AC-27 연결: … 조립 인수로 받은 포트로 …"(harness가 `assembleChange`의 `guidance` 인수로 넘김)와 "AC-27 리뷰 경로 없음: 안내 포트가 없어도 게시와 병합 추적은 그대로다"(안내 기록 0건, 닫힌 PR은 `cancelled`), "AC-27 리뷰 경로 닫힘: 포트가 policy_unavailable로 답하면 …"(한 번 보내고 미룸, `proposed` 유지, 병합 추적 계속). `main`의 두 줄은 타입 검사로만 확인했고 기동 시험(`startPublisher`)으로 포트 전달을 따로 보지 않았다. 배선 뒤 실행(5f064be, origin/main 9d5621a 그대로, `--pg`): 위 17개 파일에서 `ops-metrics`를 빼고 `publisher-main`·`publisher-review`를 더한 18개 파일 469개 모두 통과, skip 0. 그 전 실행에서 "리뷰 경로 없음" 시험이 한 시험 안에서 하네스를 두 번 만들다 DB를 비우지 않아 앞 변경을 집어 실패했고, 시험을 둘로 나눴다.
+
+## C33 시험 거부 뒤 재조회 (2026-11-10, 로컬)
+
+T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·PR이 하나)의 결함 수정을 S1(변경 런타임·시험 receipt, PGlite와 실제 PostgreSQL)과 검증 port에서 고정했다. 원인과 방법은 DECISIONS "C33 시험 거부 뒤 재조회". 같은 밀리초 충돌은 시험 하네스 옵션 `sameMillisecondVerify`(`test/change-assembly-harness.ts`)가 만든다. 처음 오는 `/v2/task/verify` 두 건을 같은 동기 구간에서 고정 시각으로 서명시켜 토큰을 같게 하고, 실제로 짝지어 서명했는지 `collisions.verify`로 센다.
+
+| 완료 조건 | 시험 |
+|---|---|
+| 같은 밀리초에 두 게시 서버가 verify를 보내도 `awaiting_publish_approval`까지 가고 모델·시험·PR이 하나 | `change-verify-recheck` "C33 같은 밀리초: …"(PGlite, 충돌 1건, 사유 없음, receipt `passed` 하나, 게시까지 가서 모델 1·시험 1·리뷰 1·PR 1), `change-pg` "C33 EVENT-02 실제 PostgreSQL: 게시 서버 둘이 같은 밀리초에 …"(충돌 1건, receipt `passed` 하나, 모델 1·시험 1) |
+| 시험이 정말 시작되지 않았으면 `verification_not_run` | `change-verification` "검증 port: 세션이 없거나 거부되면 not_run, …"(거부되고 재조회도 `absent`, 재전송도 거부 → `not_run`. 재조회가 끝내 닿지 않으면 `unknown`), "검증 port C33: 거부 뒤 작업자가 모르면 … 또 거부되면 not_run이다"(재전송은 한 번뿐) |
+| 기존 EVENT-02 실제 PostgreSQL 시험이 반복에서 실패하지 않음 | `change-pg` "T19 B5 EVENT-02 실제 PostgreSQL: 게시 서버 둘이 같은 부모를 동시에 …"를 조사 패치의 반복 계측(커밋하지 않음)으로 30번씩 세 번, 90번 중 0번 실패. 고치기 전 main `9377c33`은 55번 중 5번 |
+| 파드 교체(`worker_mismatch`) 동작 | `change-verify-recheck` "C33 파드 교체: …"(시험 요청 직전 작업자 재시작 → 재조회가 새 신원을 알려 같은 저장소의 새 파드에서 시험 1회, `passed`), `change-verification` "검증 port C33: 거부 뒤 작업자가 모르면 답한 작업자 신원으로 …"(두 번째 verify가 새 instance로 간다) |
+| 다른 쪽 시험을 따름 | `change-verification` "검증 port C33: 시작 요청이 거부돼도 작업자가 그 command를 돌리는 중이거나 끝냈으면 그 결과를 따른다"(running 뒤 done, 바로 done, 둘 다 verify 1회) |
+
+- **실행(origin/main 병합 뒤 2ed0ee3, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 바뀐 파일을 참조하는 9개 파일(`change-verify-recheck`, `change-verification`, `change-verify-start`, `change-pg`, `change-assembly`, `c28-change-question`, `task-stream`, `change-artifact`, `c17-publish-button`) 274개 모두 통과, skip 0.
+- **시험이 실패할 수 있는지 확인:** 새 시험 다섯(같은 밀리초, 파드 교체, port 셋)을 고치기 전 `src`로 돌려 모두 실패를 봤다. 같은 밀리초 시험은 충돌 1건에서 `blocked`·`verification_not_run`, 파드 교체 시험도 `not_run`으로 닫혔다.
+- **바뀐 기존 시험:** `change-verification` "검증 port: 세션이 없거나 거부되면 not_run, …"의 거부 경우는 재조회가 `absent`인 경우로 좁혔다(이 티켓이 바꾼 동작). 재조회가 닿지 않으면 `unknown`인 단언을 더했다.
+- **못 잡는 범위:** 토큰이 같아지는 것 자체(근본 수정, 작업자 배포 뒤), 실제 배포 교체 순간(C24 S5). 이긴 쪽이 슬롯을 잡기 전에 재조회가 `absent`를 받는 좁은 틈은 재전송으로 덮지만 결정적 시험으로 만들지 않았다.

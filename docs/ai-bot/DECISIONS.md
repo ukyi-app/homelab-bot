@@ -1074,17 +1074,6 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 - **선택지 없는 변경 질문(옛 판 세션):** 켜짐 판에서도 "직접 답하기"와 말로 답하기만 둔다. 배포 순간 진행 중이던 옛 판 세션의 질문이 여기에 해당한다.
 - **선택지 저장과 7일 정리:** `codex_questions.options`(jsonb, 없으면 NULL)에 질문 행과 같은 트랜잭션으로 둔다. 질문 원문과 같은 기준·예외(`purgeExpiredQuestionPrompts`)로 NULL로 비우고 jsonb text 표현의 SHA-256을 `options_sha256`에 남긴다. 지운 시각은 같은 행의 `prompt_purged_at`이다.
 
-## C33 시험 거부 뒤 재조회 (2026-11-10)
-
-T19 B5 EVENT-02 "게시 서버 둘이 같은 부모를 동시에 밀어도 모델·시험·PR이 하나다"의 결함 수정이다(사용자 2026-11-10 "그래 그렇게 진행해"). 동료 봇 명세의 AC가 아니고 봇 #85부터 있던 결함이다. 코드는 `src/change-verifier.ts`(`WorkerChangeVerification.run`)와 `src/claude-task-bridge.ts`(`verificationWorker`)다.
-
-- **원인:** 작업자 capability claims에는 무작위 값이 없다(`TaskWorkerSigner.issue`: operation·job·lease·generation·본문 digest·`issued`(ms)·`expires`). nonce는 payload의 sha256이고 Ed25519 서명도 결정적이라, 게시 서버 둘이 같은 밀리초에 같은 `/v2/task/verify`를 서명하면 토큰이 같다. 작업자는 늦게 온 쪽을 재사용으로 보고 403으로 거부한다. 진 쪽은 거부를 로컬 `not_run` receipt로 굳혔고, 이긴 쪽 시험이 끝나기 전에 그 기록이 먼저 들어가 부모가 `verifying → blocked (verification_not_run)`으로 닫혔다. receipt가 command마다 하나라 이긴 쪽 `passed`는 `receipt_conflict`가 되어 같은 generation을 살릴 수 없었다. `verificationWorker`의 `expectedWorker: null` 재시도는 verify 요청 schema가 null을 받지 않아 보내기 전에 실패하는 죽은 경로였다. 재현율: main `9377c33`에서 기존 실제 PostgreSQL 시험 반복 55번 중 5번.
-- **고른 방법(게시 서버만):** 거부는 "이 요청이 시작하지 않았다"는 증거일 뿐 "이 command가 시작하지 않았다"는 증거가 아니다. 그래서 `run`은 거부를 받으면 `/v2/task/verification`으로 그 command를 다시 묻는다. `running`·`done`이면 그 결과를 따른다(다른 게시 서버가 낸 시험). `absent`면 재조회가 답한 작업자 신원으로 verify를 **한 번만** 다시 보내고, 그것도 거부될 때만 `not_run`이다. 다시 보내는 이유는 둘이다. 이긴 쪽 요청이 아직 슬롯을 잡기 전이면 재조회가 `absent`로 답할 수 있고, 파드 교체로 instance가 바뀌어 `worker_mismatch`로 거부됐으면 새 신원이 있어야 시작할 수 있다. 작업자는 시작 기록(`O_EXCL`)과 슬롯으로 command마다 한 번만 돌리므로 다시 보내도 시험은 하나다. 재조회가 기한(`waitMs`, 표의 가장 긴 시한 + 60초)까지 닿지 않으면 시작 여부를 모르므로 기존 기한 규칙대로 `unknown`이다.
-- **티켓 문구와 다른 점:** 티켓은 "물어도 모르면 확정하지 않고 다음 바퀴에 다시 본다"였다. 다음 바퀴로 던지면 레인 재시도(`guarded`)에 시도 상한이 없어 작업자가 닿지 않는 동안 변경을 끝없이 붙잡는다. 그래서 같은 호출 안에서 `pollMs`마다 다시 묻고 기존 기한에서 `unknown`으로 닫는다. 그 결과 작업자가 연결 전에 닿지 않는 경우(`TaskWorkerRejected`)도 예전처럼 즉시 `not_run`이 아니라 기한까지 다시 묻고 `unknown`이다.
-- **`verificationWorker`:** `expectedWorker: null` 재시도를 `/v2/task/verification`에만 둔다. verify는 다시 보내지 않고 거부를 그대로 올려, 위 재조회가 지금 신원을 얻어 다시 보낸다(파드 교체 동작을 S1 시험으로 고정).
-- **근본 수정을 미룬 이유:** 근본 수정은 capability claims에 무작위 nonce(jti)를 넣어 같은 요청이라도 서버마다 토큰이 다르게 하는 것이다. 그런데 `TaskCapabilitySchema`가 `strictObject`라 작업자가 새 칸을 먼저 받아들이도록 배포된 뒤에야 게시 서버가 보낼 수 있다. 순서가 바뀌면 모든 작업자 호출이 403이 된다. 작업자 배포 순서를 묶는 변경이라 이 티켓(게시 서버만) 밖에 둔다. 이 수정 뒤에도 같은 밀리초 충돌 자체는 남고(진 쪽이 재조회 한 번과 재전송 한 번을 더 쓴다), 같은 ms의 `/v2/task/verification` 폴링 충돌은 원래도 null 재시도로 통한다.
-- **운영 영향:** 스위치 밖이다. 병합·배포 즉시 운영 변경 흐름(`CHANGE_PR_ENABLED`가 켜져 있을 때)의 시험 단계에 적용된다. 바뀌는 것은 verify가 거부됐을 때뿐이다. 작업자 계약·이미지는 그대로라 작업자를 함께 배포할 필요가 없다. 되돌리면 같은 밀리초 충돌과 파드 교체 때 다시 `verification_not_run`으로 닫힌다.
-
 ## 동료 봇 전환 14·17 확인할 것과 안내 댓글 구현 선택 (C29, 2026-11-10)
 
 "동료 봇 전환 (사용자 2026-11-09)" 14(가정은 미리보기와 PR 설명의 확인할 것에)·17(안내 댓글, 자체 리뷰 전체 비게시)의 게시 쪽 구현이다. 사용자 결정이 아니라 구현 선택이고 결정은 바꾸지 않았다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §16.3 "확인할 것·남은 위험 (C29)"·"안내 댓글 (C29)", 시험은 [VERIFICATION](VERIFICATION.md) "C29 안내 댓글과 확인할 것". 스위치 밖이라 병합하면 변경 PR을 새로 게시할 때부터 운영에 나간다.
@@ -1097,3 +1086,14 @@ T19 B5 EVENT-02 "게시 서버 둘이 같은 부모를 동시에 밀어도 모�
 - **상한은 PR 리뷰와 같은 값:** 리뷰 정책 `publish.maxInlineComments`(운영 5)를 쓴다. 리뷰 정책이 없거나 게시가 닫혔으면(`publish: null`) 안내 댓글도 달지 않는다(`review_publish_closed`).
 - **PR 설명의 경로 표시는 끝 100자:** C25 상한(경로 512바이트)대로 20개 항목이 모두 최대이면 본문 16,000자를 넘어 승인 준비가 막힌다. 줄 댓글은 실제 경로를 그대로 쓴다.
 - **안내 댓글 글은 짧은 고정 머리말 + 항목 글:** 리뷰 본문은 "확인할 것과 남은 위험 중 바뀐 줄에 있는 것만 줄 댓글로 달았어요. 전체 목록은 PR 설명에 있어요."(수정 차례는 "나머지는 Discord 결과 요약에 있어요"), 줄 댓글은 `**확인할 것**`·`**남은 위험**` 머리에 항목 글이다. 말투는 owner 검토(C24 말투 표본)로 다시 본다.
+
+## C33 시험 거부 뒤 재조회 (2026-11-10)
+
+T19 B5 EVENT-02 "게시 서버 둘이 같은 부모를 동시에 밀어도 모델·시험·PR이 하나다"의 결함 수정이다(사용자 2026-11-10 "그래 그렇게 진행해"). 동료 봇 명세의 AC가 아니고 봇 #85부터 있던 결함이다. 코드는 `src/change-verifier.ts`(`WorkerChangeVerification.run`)와 `src/claude-task-bridge.ts`(`verificationWorker`)다.
+
+- **원인:** 작업자 capability claims에는 무작위 값이 없다(`TaskWorkerSigner.issue`: operation·job·lease·generation·본문 digest·`issued`(ms)·`expires`). nonce는 payload의 sha256이고 Ed25519 서명도 결정적이라, 게시 서버 둘이 같은 밀리초에 같은 `/v2/task/verify`를 서명하면 토큰이 같다. 작업자는 늦게 온 쪽을 재사용으로 보고 403으로 거부한다. 진 쪽은 거부를 로컬 `not_run` receipt로 굳혔고, 이긴 쪽 시험이 끝나기 전에 그 기록이 먼저 들어가 부모가 `verifying → blocked (verification_not_run)`으로 닫혔다. receipt가 command마다 하나라 이긴 쪽 `passed`는 `receipt_conflict`가 되어 같은 generation을 살릴 수 없었다. `verificationWorker`의 `expectedWorker: null` 재시도는 verify 요청 schema가 null을 받지 않아 보내기 전에 실패하는 죽은 경로였다. 재현율: main `9377c33`에서 기존 실제 PostgreSQL 시험 반복 55번 중 5번.
+- **고른 방법(게시 서버만):** 거부는 "이 요청이 시작하지 않았다"는 증거일 뿐 "이 command가 시작하지 않았다"는 증거가 아니다. 그래서 `run`은 거부를 받으면 `/v2/task/verification`으로 그 command를 다시 묻는다. `running`·`done`이면 그 결과를 따른다(다른 게시 서버가 낸 시험). `absent`면 재조회가 답한 작업자 신원으로 verify를 **한 번만** 다시 보내고, 그것도 거부될 때만 `not_run`이다. 다시 보내는 이유는 둘이다. 이긴 쪽 요청이 아직 슬롯을 잡기 전이면 재조회가 `absent`로 답할 수 있고, 파드 교체로 instance가 바뀌어 `worker_mismatch`로 거부됐으면 새 신원이 있어야 시작할 수 있다. 작업자는 시작 기록(`O_EXCL`)과 슬롯으로 command마다 한 번만 돌리므로 다시 보내도 시험은 하나다. 재조회가 기한(`waitMs`, 표의 가장 긴 시한 + 60초)까지 닿지 않으면 시작 여부를 모르므로 기존 기한 규칙대로 `unknown`이다.
+- **티켓 문구와 다른 점:** 티켓은 "물어도 모르면 확정하지 않고 다음 바퀴에 다시 본다"였다. 다음 바퀴로 던지면 레인 재시도(`guarded`)에 시도 상한이 없어 작업자가 닿지 않는 동안 변경을 끝없이 붙잡는다. 그래서 같은 호출 안에서 `pollMs`마다 다시 묻고 기존 기한에서 `unknown`으로 닫는다. 그 결과 작업자가 연결 전에 닿지 않는 경우(`TaskWorkerRejected`)도 예전처럼 즉시 `not_run`이 아니라 기한까지 다시 묻고 `unknown`이다.
+- **`verificationWorker`:** `expectedWorker: null` 재시도를 `/v2/task/verification`에만 둔다. verify는 다시 보내지 않고 거부를 그대로 올려, 위 재조회가 지금 신원을 얻어 다시 보낸다(파드 교체 동작을 S1 시험으로 고정).
+- **근본 수정을 미룬 이유:** 근본 수정은 capability claims에 무작위 nonce(jti)를 넣어 같은 요청이라도 서버마다 토큰이 다르게 하는 것이다. 그런데 `TaskCapabilitySchema`가 `strictObject`라 작업자가 새 칸을 먼저 받아들이도록 배포된 뒤에야 게시 서버가 보낼 수 있다. 순서가 바뀌면 모든 작업자 호출이 403이 된다. 작업자 배포 순서를 묶는 변경이라 이 티켓(게시 서버만) 밖에 둔다. 이 수정 뒤에도 같은 밀리초 충돌 자체는 남고(진 쪽이 재조회 한 번과 재전송 한 번을 더 쓴다), 같은 ms의 `/v2/task/verification` 폴링 충돌은 원래도 null 재시도로 통한다.
+- **운영 영향:** 스위치 밖이다. 병합·배포 즉시 운영 변경 흐름(`CHANGE_PR_ENABLED`가 켜져 있을 때)의 시험 단계에 적용된다. 바뀌는 것은 verify가 거부됐을 때뿐이다. 작업자 계약·이미지는 그대로라 작업자를 함께 배포할 필요가 없다. 되돌리면 같은 밀리초 충돌과 파드 교체 때 다시 `verification_not_run`으로 닫힌다.
