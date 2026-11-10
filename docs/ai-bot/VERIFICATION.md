@@ -2301,3 +2301,20 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 - **실행(머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 19개 파일(`c08-mention-scope`·`c08-reply-context`·`foundation`·`s16-display`·`chat-context`·`publisher-gateway`·`c07-reply-call-thread`·`chat-ack`·`publisher-recovery`·`discord-rest-timeout`·`reaction-lifecycle`·`memory-commands`·`revoke-dispatch`·`pr-review`·`review-1`·`raw-text-retention`·`raw-input-retention`·`publisher-pg`·`chat-format`) 377 통과, 실패·skip 0.
 - **운영 영향(스위치 밖).** 병합하면 알림 채널 부모의 owner 멘션이 스레드를 열고 답한다(이전에는 거부). 새 이벤트의 payload에 `bot_user`·`reply_to`(ID만)가 더해진다. 옛 이벤트는 멘션 표기가 남은 채로 간다.
 - **못 잡는 범위.** 실제 Discord 권한·intent·스레드 생성 응답, 알림 채널 overwrite의 스레드 생성 권한, 답장 프레임에 `referenced_message`가 실제로 실리는지와 Discord가 참조 글을 생략하는 실제 경우(삭제된 글 등)는 S5(C24)다. 작업자 프롬프트가 `replied_bot_post`를 설명하지 않는 것은 시험하지 않았다(ARCHITECTURE §13 "작업자 프롬프트(남은 것)").
+
+## C12 PR 리뷰 말투 (2026-11-10, 로컬)
+
+동료 봇 명세 §4.4 "PR 리뷰(GitHub)"·"리뷰 지시문 변경의 대가"와 AC-13을 S1(GitHub webhook → PGlite → 가짜 작업자 → 가짜 GitHub 게시, 조립 서버 `publisher-review`)과 S2(리뷰 레인 프롬프트, 가짜 CLI)에서 고정했다. 렌더 형식과 재리뷰 몰림 판단은 [DECISIONS](DECISIONS.md) "C12 PR 리뷰 말투".
+
+| 완료 조건 | 시험 |
+|---|---|
+| 본문·인라인 댓글에 심각도, 지적마다 한 문단 | `pr-review` "AC-13 PR 리뷰 말투: 심각도·한 문단 지적·…"(P1·P3 순서, `**[P1] 0으로 나누기** · \`src/app.ts\`:2` 줄 아래 네 칸이 한 문단, 칸 안 빈 줄도 접힘, `- 조건:` 같은 줄 없음, 인라인 댓글 본문 리터럴), `publisher-review` "T17 열림 조립"(조립 서버에서 같은 심각도 줄) |
+| "승인·병합 판단이 아니다"와 대조 marker 유지 | 같은 시험의 둘째 줄 리터럴과 첫 줄 marker 정규식, `pr-review` "REVIEW-04 전체 경로", "DATA-01 …HTML 주석을 무력화"(`<!--`가 marker 하나뿐), "EVENT-02 재시도 전 기존 게시를 먼저 대조…"(marker로 대조) |
+| Discord 리뷰 요약에 모델 문장 없음 | "AC-13 PR 리뷰 말투…"(요약에 제목·조건·영향·개선·확인 질문·공개 요약이 없고 "승인·병합 판단이 아닙니다"는 있음) |
+| 게시 상한 동작 그대로 | "REVIEW-04 게시 상한이 정해지지 않았거나 넘으면 자동 게시를 거부", "r2 P2-06 REVIEW-04 게시 대기 중 낮아진 지적 수·인라인 수·본문 길이 상한을 게시 시점 정책으로 적용"(문구만 새 렌더로) |
+| 지시문 literal과 서버 v2 사용 | `pr-review` "SEC-01 PR 본문·…"(작업자 입력의 지시문이 `REVIEW_INSTRUCTIONS_V2`), `publisher-review` "T17 열림 조립"(작업자 요청의 `instructions`), `review-lane` "리뷰 레인 입력: …"(프롬프트 첫 줄이 받은 v2 그대로) |
+| 재리뷰 몰림 확인과 대응 | `pr-review` "AC-13 리뷰 지시문 v1→v2 배포: …"(배포 전 서버로 PR 7 게시·PR 8 게시 대기·PR 9 대기 → 배포 뒤 PR 8은 새 렌더로 게시, 재조정은 PR 9만 넣음(`admitted: 1`), PR 9 옛 작업은 `policy_changed`, `ready_for_review`는 `instructions_only`, 댓글 명령은 `queued`) |
+
+- **고치기 전 실패 확인:** 새 렌더 시험은 옛 렌더에서, 서버 v2 시험 2개(SEC-01·T17 열림 조립)는 서버가 v1을 보낼 때, 배포 시험은 게시 대기 결과가 `policy_changed`로 버려져 실패했다.
+- **바뀐 기존 시험:** 머리말 정규식(`승인·병합 판단이 아니며`)을 둘째 줄 리터럴로, `미검토 …`를 `- 못 본 파일 …`로, `상한으로 1건 생략`을 `게시 상한 때문에 1건은 싣지 않았어요`로 바꿨다. `review-lane`의 입력 지시문은 서버가 보내는 v2로 바꿨다.
+- **못 잡는 범위.** 리뷰 글의 말투 품질과 GitHub에서 보이는 모양은 S5(C24 `homelab-smoke` PR)다. 운영의 실제 재리뷰 건수는 배포 뒤 관찰이다(DECISIONS의 예상 0건).
