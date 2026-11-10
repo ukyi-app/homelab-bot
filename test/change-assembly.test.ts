@@ -1011,6 +1011,24 @@ test('A06 자식 실패 안내: 작성 모델이 실패하면 자식·부모 안
     assert.ok(h.acknowledgements().at(-1)!.endsWith(CHANGE_TEXT.accepted(false, '').slice('변경 '.length)));
   });
 });
+for (const colleague of [true, false]) {
+  test(`C18 자식 실패 안내(스위치 ${colleague ? '켜짐' : '꺼짐'}): 자식·부모 안내가 ${colleague ? "'/' 이름 없는 켜짐 판" : "지금의 '/' 안내 판"}이다`, async () => {
+    await withHarness({ colleague, steps: [{ output: { status: 'cannot_complete', summary: '', question: '' } }] }, async h => {
+      await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+      const id = await h.changeId();
+      await h.pump(async () => await h.phase(id) === 'failed');
+      const child = (await childOf(h.db, id))!;
+      for (let round = 0; round < 5; round++) await h.runtime.publishTick();
+      await h.deliver();
+      const childNotice = bodies(h).find(text => text.startsWith(`작업 ${child.id}`));
+      assert.equal(childNotice, changeChildFailed(child.id, id, colleague));
+      const parentNotice = bodies(h).find(text => text.startsWith(`변경 ${id} g1: failed`))!;
+      assert.ok(parentNotice.endsWith(changeRestart(colleague)));
+      if (colleague) for (const text of [childNotice!, parentNotice]) assert.doesNotMatch(text, /(^|[^\p{L}\p{N}])\/[a-z][a-z-]*/u, text);
+      else assert.match(childNotice!, new RegExp(`/change-status target:${id}`));
+    });
+  });
+}
 test('호환 슬롯: 리뷰는 대화 레인이고 작업 레인과 겹치지 않는다. 승인 대기 중인 부모는 어느 슬롯도 잡지 않는다', async () => {
   await withHarness({}, async h => {
     const id = await toAwaiting(h);

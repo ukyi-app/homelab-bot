@@ -408,7 +408,7 @@ export class Store {
       if (next !== 'failed') return next;
       // CHANGE 자식은 /retry가 받지 않으므로 부모 안내와 같은 복구 행동을 말한다.
       const change = (await store.db.query<{ change_id: string }>('SELECT change_id FROM change_child_jobs WHERE job_id=$1', [job.id])).rows[0]?.change_id;
-      const content = change ? changeChildFailed(job.id, change) : T.jobFailed(store.colleague);
+      const content = change ? changeChildFailed(job.id, change, store.colleague) : T.jobFailed(store.colleague);
       // CHANGE 자식의 실패는 변경 실패 알림(change-runtime)이 owner를 부른다. 여기서도 부르면 한 실패에 알림이 둘이다.
       await store.enqueue({ key: `failure:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id,
         actor: job.owner_id, scope: job.target, revision: job.revision.policy,
