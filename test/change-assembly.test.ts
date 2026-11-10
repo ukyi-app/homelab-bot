@@ -1689,7 +1689,9 @@ const replies = (...findings: (typeof P0_FINDING | typeof P2_FINDING)[][]) => {
   let call = 0;
   return () => ({ status: 'succeeded' as const, output: { ...reviewed, findings: findings[Math.min(call++, findings.length - 1)]! } });
 };
-const FIXED_STEP = { ...WRITE_STEP, write: { ...WRITE_STEP.write, 'src/new.ts': 'export const n = 2;\n' } };
+// 고치기 세션은 변경 작성 판(change-v2)이라 모델 출력도 그 판의 모양(options·checks·risks)이다.
+const FIXED_STEP = { write: { ...WRITE_STEP.write, 'src/new.ts': 'export const n = 2;\n' },
+  output: { status: 'completed', summary: '고쳤어요', question: '', options: [], checks: [], risks: [] } };
 // 운영 이미지 9b067e9의 작업자는 변경 작성 판을 말하지만 수정 차례의 pullNumber를 필수로 받는다. PR 번호 없는 요청을 400 거부(started:false)로 돌려준다.
 // 게시 서버 포트는 그 응답을 그대로 받도록 실제 HttpTaskV2Worker를 쓰고 HTTP 응답만 바꾼다.
 function oldWorker(h: Harness): void {
