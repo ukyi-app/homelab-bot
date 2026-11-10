@@ -8,6 +8,7 @@ import { LaneClosed } from './store.js';
 import type { OutboxButton, Store } from './store.js';
 import type { TaskCommandHandler } from './task-commands.js';
 import { taskProject } from './task-policy.js';
+import { sessionAttachHandler } from './session-key-proposal.js';
 
 // 제안과 실행 확인(COLLEAGUE_SPEC §4.3). 모델은 제안만 하고, 서버가 동작 표에 대조한다. 읽기 요청은 바로 '/'와 같은 경로로 답하고,
 // 실행 요청은 제안을 저장한 뒤 owner가 "할게요"를 눌러야 '/'와 같은 경로로 실행한다. 동료 기능 스위치가 꺼져 있으면 부르지 않는다.
@@ -44,7 +45,8 @@ interface Prepared extends Values {
   // question은 원문 미리보기를 싣고, plainQuestion은 서버가 대조한 값(저장소 등)만 싣는다. question이 공개 검사에 걸리면 plainQuestion을 쓴다.
   question: string; plainQuestion: string;
 }
-interface PrepareContext { store: Store; job: Job; proposal: Proposal; policy: Policy; tasksConnected: boolean }
+// externalConnected: R08 연결 명령을 조립했는가(EXTERNAL_TASK_EVENTS_ENABLED). 꺼져 있으면 세션 연결 제안을 버린다.
+interface PrepareContext { store: Store; job: Job; proposal: Proposal; policy: Policy; tasksConnected: boolean; externalConnected: boolean }
 export interface ProposalRow {
   id: string; conversation_id: string; owner_id: string; scope: Scope; action: string; target: string | null;
   value: string | null; source_event: string | null; digest: string; source_job: string; state: string;
@@ -138,7 +140,7 @@ export const ACTIONS: Readonly<Record<string, ActionRow>> = Object.freeze({
   memory_correct: { kind: 'run', command: 'memory-correct' },
   memory_exclude: { kind: 'run', command: 'memory-exclude' },
   memory_delete: { kind: 'run', command: 'memory-delete' },
-  attach: { kind: 'run', command: 'attach' },
+  attach: { kind: 'run', command: 'attach', handler: sessionAttachHandler },
   detach: { kind: 'run', command: 'detach' },
   change: { kind: 'run', command: 'change' },
   change_cancel: { kind: 'run', command: 'change-cancel' },
@@ -170,7 +172,8 @@ export const proposalButtons = (id: string): OutboxButton[] => [
 
 // 대화 성공 분기(runtime.ts)가 결과를 확정한 뒤 부른다. 제안을 버려도 대화 답은 이미 나가 있다.
 export class ProposalDesk {
-  constructor(private readonly store: Store, private readonly gate: PolicyGate, private readonly tasksConnected: boolean) {}
+  constructor(private readonly store: Store, private readonly gate: PolicyGate, private readonly tasksConnected: boolean,
+    private readonly externalConnected = false) {}
   async consider(job: Job, proposal: Proposal, policy: Policy): Promise<'read' | 'proposed' | 'dropped'> {
     // 버린 제안은 동작과 사유만 남긴다(값은 남기지 않는다).
     const drop = async (reason: string) => { await this.store.audit('proposal_dropped', job.id, { action: proposal.action, reason }); return 'dropped' as const; };
@@ -186,7 +189,8 @@ export class ProposalDesk {
         payload: { kind: 'message', channel: job.target.channel, content, classification: 'safe_summary' } });
       return 'read';
     }
-    const prepared = await handler.prepare({ store: this.store, job, proposal, policy, tasksConnected: this.tasksConnected });
+    const prepared = await handler.prepare({ store: this.store, job, proposal, policy, tasksConnected: this.tasksConnected,
+      externalConnected: this.externalConnected });
     if (!prepared) return drop('target_denied');
     // 확인 글은 owner 원문을 싣고 모델 답의 공개 검사(chatReplyRisk)를 거치지 않으므로 같은 정책으로 따로 본다.
     // 걸리면 원문 없는 고정 문구로 되묻고, 그것도 걸리면(정책을 못 읽음 등) 버린다. 사유 코드만 남기고 값은 남기지 않는다.

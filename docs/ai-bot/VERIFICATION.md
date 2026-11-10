@@ -2408,6 +2408,35 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 - **운영 영향:** 스위치가 꺼져 있으면 미리보기 글에 버튼이 없고 게시 버튼 상호작용은 저장 전에 `Denied`라 지금 동작 그대로다. 마이그레이션은 더하지 않았다.
 - **못 잡는 범위.** 실제 Discord 클라이언트의 버튼 표시와 `UPDATE_MESSAGE`가 2,000자 안에서 마지막 쪽 본문을 바꾸는 모양은 S5다. 실제 GitHub 게시는 기존 T19 경로와 S5(C24)다. digest 앞 16자 충돌은 같은 변경·같은 세대 안에서만 의미가 있고 그 세대의 승인 주제는 하나라 생기지 않는다.
 
+## C15 세션 연결 키 버튼 (2026-11-10, 로컬)
+
+동료 봇 명세 §4.3 "세션 연결 키"·§4.9(스위치)와 AC-9를 S1에서 고정했다: 수신은 실제 `DiscordProtocol`에 Gateway 프레임(owner 멘션 메시지, 버튼 상호작용 type 3)을 넣고, 저장은 PGlite, 연결은 실제 `ExternalTaskLinks`, 게시는 가짜 REST(`MockDiscord`), 버튼 응답은 가짜 API가 받은 callback 본문이다. 키 값은 찾기 쉬운 가짜 값(`OneTimeSeed`로 감싼 고정 문자열)으로 바꿔 응답 밖 어디에도 없는지 본다(기존 R08 seed 비노출 시험과 같은 방식: DB 전체 덤프, 게시 글, 로그 수집기). 계약은 [ARCHITECTURE](ARCHITECTURE.md) §15 "seed 경계"의 "버튼 경로(C15)", 구현 선택은 [DECISIONS](DECISIONS.md) "C15 세션 연결 키 버튼 구현 선택". 시험 파일은 새 `test/c15-session-key.test.ts`다.
+
+| 완료 조건 | 시험 |
+|---|---|
+| 확인 글에 세션 ID·실행기·요약 동의가 그대로 보이고, "할게요" 전에는 연결 없음 | "C15 세션 연결 제안은 세션 ID·실행기·요약 동의를 그대로 보여 되묻고, \"할게요\" 전에는 연결이 없다" |
+| "할게요"로 확정하면 "키 보기" 버튼 글, 키는 아직 없음 | "C15 \"할게요\"로 확정하면 \"키 보기\" 버튼 글이 붙고, 키는 아직 만들지 않는다(상호작용 사이에 키를 보관하지 않음)"(callback type 7·`components: []`, 버튼 이름 "키 보기", custom_id 100자 안 2칸, `attach` 0회·연결 0건) |
+| 누른 owner에게만 보이는 응답으로 키 한 번, 공개 글·이벤트·outbox·감사·로그에 키 없음 | "C15 \"키 보기\"를 누른 owner에게만 보이는 응답으로 키가 한 번 나오고, 공개 글·이벤트·outbox·감사·로그에는 키가 없다"(callback type 4·EPHEMERAL 64, 연결 행의 실행기·세션 ID·동의, DB 전체·게시 글·다른 callback·로그에 가짜 키 없음) |
+| 두 번째 누름 거부, 키 다시 안 만듦 | "C15 두 번째 \"키 보기\"는 거부되고 이미 보여 줬다고만 답한다(키를 다시 만들거나 보여 주지 않음)" |
+| 응답 실패면 폐기(전송 실패·상호작용 만료·일시 정지), 다시 눌러도 재발급 없음 | "C15 키 응답에 실패(전송 실패)하면 …", "C15 키 응답에 실패(상호작용 만료)하면 …"(연결 `delivery_failed`, `ack_uncertain` 기록, 덤프·로그·게시 글에 가짜 키 없음, 다시 누르면 `SESSION_KEY_TEXT.shown`), "C15 일시 정지 중이면 키를 보내지 않고 그 연결을 폐기한다" |
+| 폐기까지 실패하면 기존 안내·감사 | "C15 키 응답 실패 뒤 폐기까지 실패하면 seed 없이 해제 방법을 안내하고 기존 감사를 남긴다"(`external_task_revoke_failed`) |
+| 비 owner의 키 보기 거부 | "C15 owner가 아닌 사람의 \"키 보기\"는 저장 전에 거부되고 키를 만들지 않는다" |
+| 만료(24시간) 뒤 키 없음 | "C15 24시간이 지나면 \"키 보기\"로 키를 만들지 않는다" |
+| R08 스위치 꺼짐이면 제안 버림 | "C15 R08 스위치가 꺼져 있으면 세션 연결 제안을 버리고 버튼 글이 없다"(감사 `proposal_dropped` `target_denied`) |
+| 허용 밖 대상은 버림 | "C15 실행기를 알 수 없거나 세션 ID 형식이 틀린 제안은 버린다"(실행기 없음·`gemini`·경로 꼴 세션 ID·세션 ID 없음) |
+| 동료 기능 스위치 꺼짐이면 버튼 없음, '/attach' 그대로 | "C15 동료 기능 스위치가 꺼져 있으면 \"키 보기\" 버튼을 받지 않고 /attach는 지금처럼 본인만 보는 응답으로 키를 준다". 기존 '/attach' 경로 시험(`external-task-assembly`·`external-task-pg`·`external-task-helper`)도 그대로 통과 |
+
+실행 결과(2026-11-10, 잠금 도우미, `npm run check` 포함):
+
+- `test.sh <worktree> c15 -- dist/test/c15-session-key.test.js dist/test/c13-proposal.test.js`: 27개 통과, 실패 0, 건너뜀 0.
+- `test.sh <worktree> c15 --pg -- dist/test/{c15-session-key,c13-proposal,c13-proposal-pg,external-task-assembly,external-task-helper,external-task-links,external-task-receiver,external-task-pg,foundation,stop-confirmation,publisher-main,discord-rest-timeout}.test.js`: 212개 통과, 실패 0, 건너뜀 0.
+- R08 경계 시험(`external-task-receiver.test.ts`, 명령 모듈은 제안 코드를 import하지 않음)에 맞춰 제안 처리기는 `src/session-key-proposal.ts`에 둔다.
+
+- **운영 영향:** 동료 기능 스위치가 꺼져 있으면 세션 연결 제안을 볼 일이 없고(제안 자체를 보지 않음) "키 보기" 버튼도 받지 않는다. R08 스위치가 꺼져 있으면 동료 기능이 켜져도 세션 연결 제안을 버린다. '/attach' 경로는 문구·동작 그대로다(처리 함수를 키 발급 공통 함수로 나눴을 뿐이다). 마이그레이션은 없다.
+- **남은 위험.** 대화 출력 스키마(`CHAT_REPLY_JSON_SCHEMA`, 소유 C02)의 `content` 설명이 세션 연결의 실행기 꼴(`claude`·`codex`, `summary=on`)을 말하지 않아, 모델이 `content`를 null로 내면 제안이 버려진다. 스키마 설명이나 봇 정보에 그 꼴을 더하기 전에는 운영에서 말로 하는 세션 연결이 거의 나오지 않을 수 있다.
+- **못 잡는 범위.** Discord 클라이언트에서 실제로 본인에게만 보이는지(EPHEMERAL 표시)는 S5(C24)다. 두 연결에서 "키 보기"를 겹쳐 누르는 경합은 실제 PostgreSQL로 돌리지 않았다(표시는 C13의 "할게요"와 같은 행 잠금 + 조건부 UPDATE이고, 겹쳐도 활성 연결 유일 인덱스가 둘째 `attach`를 막는다).
+- **확정 글의 세션 ID(PR #128 Codex P1 수정).** "할게요" 응답은 확인 글을 공개 글로 바꾸고 공개 검사를 거치지 않는다. 그래서 확정 문구 `SESSION_KEY_TEXT.confirmed`는 실행기 이름만 싣고 세션 ID를 싣지 않는다. 시험 "C15 공개 검사에 걸리는 세션 ID는 확인 글에서 숨기고, \"할게요\" 뒤 바뀐 글과 버튼 글에도 다시 싣지 않는다"(사설 IP 꼴 ID `10.20.30.40`, 상호작용 응답·게시 글 어디에도 없음).
+
 ## C16 작업 질문 바로 답 (2026-11-10, 로컬)
 
 동료 봇 명세 §4.3 "작업 질문 바로 답"·§4.9(스위치)와 AC-8을 S1에서 고정했다: 수신은 실제 `DiscordProtocol`에 Gateway 프레임(owner 일반 메시지 `MESSAGE_CREATE`, 버튼 `INTERACTION_CREATE` type 3)을 넣고, 저장은 PGlite, 게시는 가짜 REST(`MockDiscord`), 버튼 응답은 가짜 API가 받은 callback 본문이다. 작업은 '/task'와 같은 `TaskCommands`를 운영처럼 CHANGE 답 봉인 처리기(`guardedTaskCommands`)로 감싸고 작업 레인(`ClaudeTaskBridge` + 가짜 작업자)으로 돈다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §12 "질문 계약"의 "작업 질문 바로 답", 구현 선택은 [DECISIONS](DECISIONS.md) "C16 작업 질문 바로 답 구현 선택". 시험 파일은 새 `test/c16-task-question.test.ts`와 `chat-task-text`·`codex-bridge`·`change-assembly`(하네스에 스위치 옵션)의 C16 줄이다.

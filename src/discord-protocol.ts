@@ -6,6 +6,7 @@ import type { AckOutcome, DiscordIngress, DiscordRest, GatewayFrame } from './di
 import { PROPOSAL_BUTTONS } from './proposals.js';
 import { QUESTION_PICK_BUTTON } from './question-pick.js';
 import { PUBLISH_BUTTON } from './change-commands.js';
+import { SESSION_KEY_BUTTON } from './external-task-commands.js';
 
 // 기한 없는 REST(게시·대조·history 복구·명령 등록·gateway URL·typing)의 전송 제한. 1초 일괄 제한은 재시작 직후
 // 복구 GET을 시간 초과로 실패시킨다(S16). 이 호출들은 게시 lease·복구 lease(각 30초)나 별도 루프 안에서 돌아 몇 초를 기다려도
@@ -37,7 +38,8 @@ const InteractionSchema = z.object({ id: z.string(), token: z.string(), type: z.
 });
 // 버튼 custom_id 허용 목록. custom_id는 `이름` 또는 `이름:대상`이고 parts는 ':'로 나눈 칸 수다(정확히 그 수만 받는다).
 // route는 수신(DiscordIngress.receive)의 처리 분기다: control은 '/' 제어와 같은 경로, proposal은 실행 확인(src/proposals.ts),
-// publish는 변경 게시 승인(src/change-commands.ts, '/change-publish'와 같은 승인 경로).
+// publish는 변경 게시 승인(src/change-commands.ts, '/change-publish'와 같은 승인 경로),
+// session-key는 세션 연결 "키 보기"(src/external-task-commands.ts).
 // 뒤 티켓은 줄만 더한다. 게시자도 이 표로 보낼 버튼을 대조한다. Discord custom_id 상한은 100자다.
 export const BUTTONS = Object.freeze([
   { name: 'list', parts: 1, route: 'control' },
@@ -48,6 +50,7 @@ export const BUTTONS = Object.freeze([
   { name: PROPOSAL_BUTTONS.no, parts: 2, route: 'proposal' },
   { name: QUESTION_PICK_BUTTON, parts: 2, route: 'question' },
   { name: PUBLISH_BUTTON, parts: 2, route: 'publish' },
+  { name: SESSION_KEY_BUTTON, parts: 2, route: 'session-key' },
 ] as const);
 export type ButtonRoute = typeof BUTTONS[number]['route'];
 export const CUSTOM_ID_MAX = 100;
