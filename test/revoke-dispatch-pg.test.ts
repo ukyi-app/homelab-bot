@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
+import { parseAdminArgs, runAdmin } from '../src/admin.js';
 import { Postgres, migrate } from '../src/database.js';
 import type { Database } from '../src/database.js';
 import type { Scope } from '../src/contracts.js';
@@ -95,6 +96,29 @@ for (const kind of ['message', 'thread', 'scheduled'] as const) {
     } finally { await close(); }
   });
 }
+
+test('C32 실제 PostgreSQL: 인가 뒤 다른 연결의 관리 기능 차단이 dispatch보다 먼저 커밋되면 REST 0, blocked', { skip }, async () => {
+  const { db, f, kinds, publisherOn, state, close } = await setup();
+  try {
+    // 관리 기능 차단은 Discord 사용자 ID 형식만 받는다. owner 자신도 막을 수 있다.
+    f.policy.owner = '123456789012345678';
+    await kinds.message();
+    const held = pausing(db, sql => /SELECT actor_id FROM denied_actors WHERE actor_id=\$1/.test(sql));
+    const delivering = publisherOn(held.db).deliver();
+    await held.paused;
+    const out = await runAdmin(new Store(db, f.now), parseAdminArgs(['block', f.policy.owner]), { gate: f.gate });
+    assert.equal(out.report.result, 'blocked');
+    held.release();
+    assert.equal(await delivering, true);
+    assert.equal(f.rest.messages.length, 0);
+    assert.equal(await state(), 'blocked');
+    // 두 연결의 차단이 겹쳐도 거부 행은 하나이고 한쪽만 새로 더했다고 답한다.
+    const block = () => runAdmin(new Store(db, f.now), parseAdminArgs(['block', '223456789012345678']), { gate: f.gate });
+    const both = await Promise.all([block(), block()]);
+    assert.deepEqual(both.map(item => item.report.result).sort(), ['already_blocked', 'blocked']);
+    assert.equal((await db.query("SELECT 1 FROM denied_actors WHERE actor_id='223456789012345678'")).rows.length, 1);
+  } finally { await close(); }
+});
 
 test('T26 실제 PostgreSQL 한계: dispatch가 먼저면 보낸 뒤 철회돼도 되돌리지 못하고 confirm이 unknown으로 남긴다', { skip }, async () => {
   const { db, f, kinds, publisherOn, state, revoke, close } = await setup();

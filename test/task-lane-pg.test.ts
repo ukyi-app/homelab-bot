@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
+import { parseAdminArgs, runAdmin } from '../src/admin.js';
 import { ClaudeTaskBridge } from '../src/claude-task-bridge.js';
 import { taskLaneClosedText } from '../src/control-format.js';
 import { Postgres, migrate } from '../src/database.js';
@@ -380,6 +381,27 @@ test('실제 PostgreSQL: 해제와 늦은 응답이 어떤 순서로 겹쳐도 �
       assert.equal((await allRows(db, 'results')).length, 0);
       await local.bridge.sweep();
       assert.equal((await laneRow(db)).closed_reason, null);
+    } finally { await close(); }
+  }
+});
+test("실제 PostgreSQL: 같은 unknown 작업에 '/task-release'와 관리 기능 해제가 겹쳐도 한 번만 풀린다", { skip }, async () => {
+  for (let round = 0; round < 6; round++) {
+    const { db, f, close } = await setup();
+    try {
+      const local = lane(f);
+      local.worker.scripts.push(reply.unknown());
+      const job = await task(f, db);
+      await local.runtime.tickTask();
+      assert.equal((await jobs(db))[0]!.state, 'unknown');
+      const other = new ClaudeTaskBridge(instance(db, f), f.gate, local.worker, { plan: async () => PLAN }, { monitorMs: 5, stopWaitMs: 50, log: () => {} });
+      const slash = () => local.bridge.release('fixture-owner', thread, job.id).then(result => result.ok);
+      const cli = () => runAdmin(instance(db, f), parseAdminArgs(['release', job.id]), { releasers: [other] }).then(out => out.report.result === 'released');
+      const results = settled(await Promise.allSettled(round % 2 ? [slash(), cli()] : [cli(), slash()]));
+      assert.equal(results.filter(Boolean).length, 1, `round ${round}`);
+      assert.equal((await jobs(db))[0]!.state, 'cancelled');
+      assert.equal((await laneRow(db)).closed_reason, null);
+      assert.equal((await allRows(db, 'audit')).filter(row => row.kind === 'task_unknown_released').length, 1);
+      assert.equal(local.worker.executes.length, 1);
     } finally { await close(); }
   }
 });
