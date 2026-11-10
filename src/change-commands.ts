@@ -341,9 +341,12 @@ export class ChangeCommands implements ChangeCommandHandler {
     const pullNumber = (typeof pull.result === 'string' ? JSON.parse(pull.result) : pull.result as { number: number }).number as number;
     const head = await this.deps.changes.publishedHeadOf(key);
     if (!head) return { ok: false, reason: 'unavailable' };
-    let items: AmendmentMaterialItem[];
-    try { items = discussionMaterials(await this.deps.discussion({ repository: repository.fullName, pr: pullNumber })); }
+    let read: PullDiscussion;
+    try { read = await this.deps.discussion({ repository: repository.fullName, pr: pullNumber }); }
     catch (error) { this.deps.log('change_amendment_discussion_failed', errorInfo(error)); return { ok: false, reason: 'unavailable' }; }
+    // DB phase는 마지막 병합 읽기(5분 주기)에 머물러 있다. 그 사이 GitHub에서 병합·닫힌 PR에 확인 버튼을 내면 누른 뒤 차례·횟수가 생긴다.
+    if (!read.open) return { ok: false, reason: 'not_open' };
+    const items = discussionMaterials(read);
     return { ok: true, changeId: found.id, generation: found.generation, repository: repository.fullName, pullNumber, head,
       materials: items.map(item => item.id), materialsDigest: amendmentMaterialsDigest(items) };
   }
