@@ -148,3 +148,84 @@ test('C30 정책 목록 밖이지만 리뷰 App이 설치된 조직 저장소 PR
   // 정책 목록은 그대로다(자동 리뷰 대상을 넓히지 않는다).
   assert.deepEqual((w.h.f.policy.review as ReviewPolicy).repositories, [LISTED]);
 });
+
+test('C30 리뷰 App이 없는 조직 저장소와 조직 밖 PR은 못 한다고 답하고 리뷰 작업을 만들지 않는다. 조직 밖은 GitHub에 묻지 않는다', async () => {
+  const w = await wired();
+  await w.ask('https://github.com/ukyi-app/no-app-repo/pull/3 리뷰해 줘', 'ukyi-app/no-app-repo#3');
+  assert.equal(lastPosted(w), REVIEW_REQUEST_TEXT.refused.not_installed);
+  assert.deepEqual(w.gh.calls, ['installation ukyi-app/no-app-repo']);
+  await w.ask('https://github.com/someone-else/tool/pull/4 리뷰해 줘', 'someone-else/tool#4');
+  assert.equal(lastPosted(w), REVIEW_REQUEST_TEXT.refused.outside_organization);
+  assert.deepEqual(w.gh.calls, ['installation ukyi-app/no-app-repo'], '조직 밖 PR은 설치·PR 조회를 하지 않는다');
+  assert.deepEqual(await w.reviews(), []);
+  noButtons(w.h);
+});
+
+test('C30 owner 원문에 없는 PR을 모델이 대상으로 고르면(맥락 자료가 고른 대상) 리뷰하지 않고 이유를 답한다', async () => {
+  const w = await wired();
+  w.gh.installed.set(OUTSIDE.fullName, OUTSIDE);
+  w.gh.pulls.set(`${OUTSIDE.fullName}#12`, pull(OUTSIDE, { number: 12 }));
+  // 원문에는 다른 PR 링크가 있다. 대상은 원문 밖이다.
+  await w.ask(`이 PR 리뷰해 줘 https://github.com/${LISTED.fullName}/pull/7`, `${OUTSIDE.fullName}#12`);
+  assert.equal(lastPosted(w), REVIEW_REQUEST_TEXT.notInText);
+  // 원문에 PR이 없고 "그거 리뷰해 줘"만 있다.
+  await w.ask('아까 그거 리뷰해 줘', `${LISTED.fullName}#7`);
+  assert.equal(lastPosted(w), REVIEW_REQUEST_TEXT.notInText);
+  assert.deepEqual(await w.reviews(), []);
+  assert.deepEqual(w.gh.calls, []);
+});
+
+test('C30 동료 기능 스위치가 꺼져 있으면 리뷰 요청 제안을 버리고 리뷰 작업이 생기지 않는다', async () => {
+  const w = await wired({ colleague: false });
+  await w.ask(`이 PR 리뷰해 줘 https://github.com/${LISTED.fullName}/pull/7`, `${LISTED.fullName}#7`);
+  assert.deepEqual(await w.reviews(), []);
+  assert.deepEqual(w.gh.calls, []);
+  assert.ok(!w.posted().includes(REVIEW_REQUEST_TEXT.started(LISTED.fullName, 7)));
+});
+
+test('C30 리뷰 경로가 없는 게시 서버(묶인 리뷰 요청 없음)에서는 제안을 연결 안 됨으로 버린다', async () => {
+  const w = await wired({ bind: false });
+  await w.ask(`이 PR 리뷰해 줘 https://github.com/${LISTED.fullName}/pull/7`, `${LISTED.fullName}#7`);
+  assert.deepEqual(await w.reviews(), []);
+  const dropped = (await database.db.query<{ detail: unknown }>("SELECT detail FROM audit WHERE kind='proposal_dropped'")).rows
+    .map(row => typeof row.detail === 'string' ? JSON.parse(row.detail) : row.detail);
+  assert.deepEqual(dropped, [{ action: 'review_request', reason: 'not_connected' }]);
+});
+
+test('C30 fork PR·작성자 조건 밖·닫힌 PR은 자동 리뷰와 같은 판단으로 거절하고, draft는 명시 요청이라 리뷰한다', async () => {
+  const w = await wired();
+  const fork = { id: 999, full_name: 'someone/fork' };
+  const cases: [Record<string, unknown>, string][] = [
+    [{ head: { sha: HEAD, ref: 'f', repo: fork } }, REVIEW_REQUEST_TEXT.refused.fork],
+    [{ head: { sha: HEAD, ref: 'f', repo: null } }, REVIEW_REQUEST_TEXT.refused.fork],
+    [{ author_association: 'CONTRIBUTOR' }, REVIEW_REQUEST_TEXT.refused.author],
+    [{ user: { id: 77, login: 'fixture-bot[bot]', type: 'Bot' }, author_association: 'NONE' }, REVIEW_REQUEST_TEXT.refused.author],
+    [{ state: 'closed' }, REVIEW_REQUEST_TEXT.refused.closed],
+    [{ state: 'closed', merged: true }, REVIEW_REQUEST_TEXT.refused.closed],
+  ];
+  for (const [override, expected] of cases) {
+    w.gh.pulls.set(`${LISTED.fullName}#7`, pull(LISTED, override));
+    await w.ask(`https://github.com/${LISTED.fullName}/pull/7 리뷰해 줘`, `${LISTED.fullName}#7`);
+    assert.equal(lastPosted(w), expected, JSON.stringify(override));
+  }
+  assert.deepEqual(await w.reviews(), []);
+  w.gh.pulls.set(`${LISTED.fullName}#7`, pull(LISTED, { draft: true }));
+  await w.ask(`https://github.com/${LISTED.fullName}/pull/7 리뷰해 줘`, `https://github.com/${LISTED.fullName}/pull/7`);
+  assert.equal(lastPosted(w), REVIEW_REQUEST_TEXT.started(LISTED.fullName, 7));
+  // 같은 커밋으로 다시 부탁하면 새 작업을 만들지 않는다.
+  await w.ask(`https://github.com/${LISTED.fullName}/pull/7 리뷰해 줘`, `${LISTED.fullName}#7`);
+  assert.equal(lastPosted(w), REVIEW_REQUEST_TEXT.already(LISTED.fullName, 7));
+  assert.equal((await w.reviews()).length, 1);
+});
+
+test('C30 목록 밖 저장소의 리뷰 요청 세대는 실행 전 head가 바뀌면 닫기만 하고 새 세대를 자동으로 만들지 않는다', async () => {
+  const w = await wired();
+  w.gh.installed.set(OUTSIDE.fullName, OUTSIDE);
+  w.gh.pulls.set(`${OUTSIDE.fullName}#12`, pull(OUTSIDE, { number: 12 }));
+  await w.ask(`${OUTSIDE.fullName}#12 리뷰 부탁해요`, `${OUTSIDE.fullName}#12`);
+  w.gh.pulls.set(`${OUTSIDE.fullName}#12`, pull(OUTSIDE, { number: 12, head: { sha: 'c'.repeat(40), ref: 'feature', repo: { id: OUTSIDE.id, full_name: OUTSIDE.fullName } },
+    updated_at: '2026-11-10T01:00:00Z' }));
+  assert.equal(await w.runtime.tick(), true);
+  assert.deepEqual((await w.reviews()).map(r => r.state), ['superseded']);
+  assert.equal(w.gh.writes.length, 0);
+});

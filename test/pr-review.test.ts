@@ -11,7 +11,7 @@ import { DEFAULTS, Denied, WorkerRejected } from '../src/contracts.js';
 import type { Scope } from '../src/contracts.js';
 import { ArchiveError, MODEL_OMITTED_MAX, readArchive, REVIEW_INSTRUCTIONS, REVIEW_INSTRUCTIONS_V2, ReviewWorker, unifiedDiff } from '../src/review-input.js';
 import type { ArchiveFetcher, ReviewerInput, ReviewerModel, ReviewTask } from '../src/review-input.js';
-import { GitHubError, GitHubIngress, githubWebhook, RestrictedGitHub, restrictGitHubWrite, ReviewPolicySource,
+import { GitHubError, GitHubIngress, githubWebhook, pullRequest, RestrictedGitHub, restrictGitHubWrite, ReviewPolicySource,
   ReviewPublisher, ReviewQueue, ReviewReconciler, ReviewRuntime, reviewMarker, reviewRevision } from '../src/review.js';
 import type { GitHubReader, GitHubTransport, GitHubWrite, ReviewPolicy, ReviewResult } from '../src/review.js';
 import { archiveContract } from '../src/worker.js';
@@ -211,6 +211,23 @@ test('AUTH-01 fork PR·삭제된 head 저장소·미허용 설치·미허용 저
   for (const [payload, reason] of cases) assert.equal((await hook('pull_request', payload)).reason, reason);
   assert.equal((await rows('jobs')).length, 0);
   assert.equal((await rows('events')).length, 0);
+});
+test('C30 리뷰 App이 조직 전체에 설치돼도 정책 목록 밖 저장소의 PR 이벤트·댓글 명령은 자동 리뷰를 만들지 않는다(Discord 리뷰 요청 세대가 있어도)', async () => {
+  // 같은 설치(조직 전체)에 든 목록 밖 저장소. Discord 리뷰 요청으로 그 저장소 세대 하나가 이미 있다.
+  const other = { id: 202, fullName: 'ukyi-app/other', installationId: REPO.installationId, visibility: 'private' as const };
+  const side = { id: other.id, full_name: other.fullName };
+  const otherPull = pull({ number: 9, head: { sha: HEAD, ref: 'f', repo: side }, base: { sha: BASE, ref: 'main', repo: side } });
+  const context = await r.source.current();
+  await database.db.transaction(tx => r.queue.admit(pullRequest(otherPull), other, context, BASE, 'comment', 'discord:fixture', tx, { outside: true }));
+  const before = (await rows('jobs')).length;
+  const event = (action: string, pr: Record<string, unknown> = otherPull) => ({ action, number: 9, pull_request: pr, repository: side,
+    installation: { id: other.installationId }, sender: pr.user });
+  const newHead = pull({ number: 9, head: { sha: HEAD2, ref: 'f', repo: side }, base: { sha: BASE, ref: 'main', repo: side }, updated_at: '2026-10-30T00:00:00Z' });
+  for (const action of ['opened', 'reopened', 'ready_for_review']) assert.equal((await hook('pull_request', event(action))).reason, 'installation_or_repository', action);
+  assert.equal((await hook('pull_request', event('synchronize', newHead))).reason, 'installation_or_repository');
+  const comment = { ...commentEvent(), repository: side, issue: { number: 9, author_association: 'MEMBER', pull_request: { url: 'fixture' } } };
+  assert.equal((await hook('issue_comment', comment)).reason, 'installation_or_repository');
+  assert.equal((await rows('jobs')).length, before);
 });
 test('AUTH-01 댓글 트리거: Bot 댓글 무시, comment.author_association 사용, 대상 PR의 fork·작성자 재확인', async () => {
   assert.equal((await hook('issue_comment', commentEvent({ type: 'Bot', association: 'MEMBER' }))).reason, 'bot_comment');
@@ -1506,6 +1523,8 @@ COMMIT;
 test('r3 R2-03 r1 시점 008로 만든 리뷰 표에 현재 008을 다시 적용하면 새 열이 생기고 기존 작업을 저장·게시한다', async () => {
   await database.pg.exec('DROP TABLE review_deliveries; DROP TABLE pr_reviews; DROP TABLE github_deliveries; DELETE FROM schema_migrations WHERE version=8;');
   await database.pg.exec(R1_MIGRATION_008);
+  // 뒤 번호 마이그레이션(023 리뷰 요청 대상 칸)은 새 코드보다 먼저 돈다. 이 시험이 다시 만든 표에도 같이 적용한다.
+  await database.pg.exec(await readFile('migrations/023_review_request.sql', 'utf8'));
   await opened();
   const sql = await readFile('migrations/008_pr_review.sql', 'utf8');
   await database.pg.exec(sql); await database.pg.exec(sql);
