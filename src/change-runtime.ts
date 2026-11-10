@@ -752,9 +752,10 @@ export class ChangeRuntime {
     if (!round) return false;
     if (round.baseCommit === null) return this.pinAmendment(request, round);
     if (round.artifactDigest === null) return this.amendAuthor(request, round);
-    const verified = await this.deps.changes.amendmentVerifications({ ...keyOf(request), round: round.round });
+    const verified = new Map((await this.deps.changes.amendmentVerifications({ ...keyOf(request), round: round.round })).map(item => [item.commandId, item.status]));
     const required = request.brief?.verificationCommandIds ?? [];
-    if (round.verifierRevision === null || required.some(command => !verified.some(item => item.commandId === command))) return this.amendVerify(request, round);
+    // receipt가 다 있어도 하나라도 통과가 아니면 시험 쪽에서 끝맺는다. 실패 receipt 저장 직후 끊기면 차례를 닫는 일이 여기서만 이어진다.
+    if (round.verifierRevision === null || required.some(command => verified.get(command) !== 'passed')) return this.amendVerify(request, round);
     return false;
   }
   // 차례를 시작하면 PR 브랜치 head를 다시 읽는다. 확인 때의 head이거나, 확인 뒤 head까지가 모두 이 change의 앞선 수정 차례가 올린 커밋이면 그 위에서 쓴다.
@@ -863,7 +864,8 @@ export class ChangeRuntime {
     const statusOf = async () => new Map((await this.deps.changes.amendmentVerifications(key)).map(receipt => [receipt.commandId, receipt.status]));
     let statuses = await statusOf();
     for (const commandId of required) {
-      if (statuses.has(commandId)) continue;
+      // 저장된 실패가 있으면 뒤 시험을 돌리지 않는다. 재시작 뒤에도 끊기기 전과 같은 결과로 닫는다.
+      if (statuses.has(commandId)) { if (statuses.get(commandId) !== 'passed') break; continue; }
       let receipt;
       try { receipt = await this.deps.verification.run({ key, bundle: started.value, commandId }); }
       catch (error) {

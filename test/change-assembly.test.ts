@@ -2174,3 +2174,29 @@ test('AC-28 쓰기 직전 확인(실제 조립): 처음 게시가 끝난 propose
     assert.equal(h.env.github.mutations(/^PATCH/).length, 0, '브랜치 갱신이 없다');
   });
 });
+
+test('AC-28 시험 실패 receipt 저장 직후 끊김: 재시작한 프로세스가 저장된 결과로 차례를 커밋 없이 닫고 작성 세션을 정리한다', async () => {
+  const fake = discussionFake();
+  let sandboxRuns = 0;
+  // 처음 게시의 시험은 통과하고 수정 차례의 시험만 실패한다.
+  const sandbox: SandboxRunner = async () => ({ started: true, exitCode: ++sandboxRuns === 1 ? 0 : 3, timedOut: false, overflow: false, aborted: false,
+    log: Buffer.from('x\n'), logBytes: 2, logDigest: 'b'.repeat(64) });
+  await withHarness({ changeV2: true, colleague: true, steps: [V2_WRITE_STEP, AMEND_STEP], amendments: { discussion: fake.read }, sandbox }, async h => {
+    const id = await toProposed(h);
+    const before = h.env.github.mutations().length;
+    h.restart({ crash: { point: 'changes.recordAmendmentVerification', when: 'after' } });
+    await requestAmendment(h, id, 'amend-1', branchHead(h));
+    await h.pump(async () => (await h.db.query(`SELECT 1 FROM change_amendment_verifications WHERE change_id=$1`, [id])).rows.length > 0
+      && h.logs.some(entry => entry.event === 'change_step_failed'));
+    assert.deepEqual((await roundsOf(h, id)).map(round => round.state), ['running'], '끊긴 순간에는 차례가 아직 돈다');
+    h.restart();
+    await h.pump(async () => (await roundsOf(h, id))[0]?.state === 'failed' && await h.phase(id) === 'proposed');
+    assert.equal((await roundsOf(h, id))[0]!.reason, 'verification_failed');
+    assert.equal(sandboxRuns, 2, '저장된 시험을 다시 돌리지 않는다');
+    assert.equal(h.env.github.mutations().length, before, 'GitHub 쓰기가 없다');
+    const amendAuthor = async () => (await h.db.query<{ state: string; session: string | null }>(`SELECT j.state,s.state AS session FROM jobs j JOIN change_child_jobs c ON c.job_id=j.id
+      LEFT JOIN codex_sessions s ON s.job_id=j.id WHERE c.change_id=$1 AND c.amendment_round=1 AND c.role='author'`, [id])).rows[0]!;
+    await h.pump(async () => { const row = await amendAuthor(); return !['running', 'queued', 'unknown'].includes(row.state) && row.session !== 'running'; });
+    assert.equal(await h.store.laneBusy('task'), false);
+  });
+});
