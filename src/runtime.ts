@@ -1,4 +1,4 @@
-import { chatReplyContent, chatReplyRisk, WITHHELD_REPLY_NOTICE } from './chat-format.js';
+import { ACK_ONLY_NOTICE, chatReplyContent, chatReplyRisk, WITHHELD_REPLY_NOTICE } from './chat-format.js';
 import { ChatReplySchema, DEFAULTS, Denied, PolicyUnavailable, WorkerRejected } from './contracts.js';
 import type { Job } from './contracts.js';
 import type { Policy, PolicyGate } from './policy.js';
@@ -174,7 +174,7 @@ export class Runtime {
         // Completed results remain durable while the publisher waits for fresh policy.
         if (!await this.store.active(job.conversation_id)) { await this.store.transition(job, 'superseded'); return true; }
         const evidence = { source: 'worker', policyRevision: job.revision.policy };
-        if (ackOnly) await this.store.finish(job, { reply: '', ack_only: true }, evidence, null, job.target);
+        if (ackOnly) await this.store.finish(job, { reply: '', ack_only: true }, evidence, { ackOnly: ACK_ONLY_NOTICE }, job.target);
         else {
           // 공개 검사는 게시 직전의 정책으로 한다. 끝난 뒤 재인가가 정책을 못 읽었으면 보내기 전 인가의 정책을 쓴다.
           const risk = chatReplyRisk(reply, latestPolicy ?? policy);

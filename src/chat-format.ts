@@ -7,6 +7,8 @@ import type { TaskOutputRisk } from './task-output.js';
 export const EMPTY_REPLY_NOTICE = '드릴 답을 만들지 못했어요. 조금 더 자세히 다시 물어봐 주세요.';
 // 공개 검사에 걸린 답 대신 나가는 글. 모델 글은 한 글자도 싣지 않는다(사유 코드는 결과 기록에만 남긴다).
 export const WITHHELD_REPLY_NOTICE = '밖에 보이면 안 되는 내용이 섞여 있어 이 답은 올리지 않았어요. 질문을 바꿔 다시 물어봐 주세요.';
+// ack_only 답인데 👍를 달 owner 메시지가 없는 요청(명령 등)에 끝을 알리는 글. 모델 글은 싣지 않는다.
+export const ACK_ONLY_NOTICE = '알겠어요.';
 // 게시 표식은 JSON으로 읽히는 본문을 {ref,data}로 다시 감싼다(markedContent). 그러면 owner가 받는 글이 모델 문장과 달라지므로,
 // 그런 답은 코드 블록으로 보낸다.
 const FENCE = '```';

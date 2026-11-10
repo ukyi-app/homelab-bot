@@ -224,6 +224,25 @@ test('ack_only: 디바운스로 밀려난 앞 메시지는 👍 없이 반응만
   assert.ok(writes(calls).includes('DELETE /channels/fixture-thread/messages/6201/reactions/%F0%9F%91%80/@me'));
 });
 
+// 반응을 달 owner 메시지가 없는 요청(/chat 명령)은 👍 대신 짧은 고정 완료 글 하나로 끝을 알린다. 모델 글은 싣지 않는다.
+test('ack_only: 반응을 달 수 없는 /chat 명령은 고정 완료 글 하나만 게시한다', async () => {
+  // 상호작용 ACK는 MockDiscord 그대로 두고(가짜 상호작용에는 콜백 토큰이 없다) 반응 REST만 실제 protocol로 본다.
+  const acknowledge = f.rest.acknowledge;
+  const calls = wireReactions();
+  (f.rest as DiscordRest).acknowledge = acknowledge;
+  f.setRun(async () => ({ status: 'succeeded', stopped: true, output: { reply: '모델 글', proposal: null, ack_only: true }, rateLimit: null }));
+  await f.ingress.receive(event('6401', { kind: 'command', command: 'chat', mention: undefined, text: '고마워' }));
+  f.advance(DEFAULTS.debounceMs);
+  assert.equal(await f.runtime.tick(), true);
+  await drain();
+  assert.equal(writes(calls).filter(line => line.includes(THUMBS)).length, 0);
+  // 게시 글 끝의 대조 표식 줄(-# ref:)은 빼고 본문만 본다.
+  assert.deepEqual(f.rest.messages.map(m => m.body.content.split('\n')[0]), ['알겠어요.']);
+  assert.equal(f.rest.messages[0]!.body.message_reference, undefined);
+  assert.equal((await rows('jobs')).find(j => j.type === 'chat')!.state, 'succeeded');
+  assert.deepEqual((await rows('results'))[0]!.result, { reply: '', ack_only: true });
+});
+
 // C04에서 넘어온 정리(봇 PR #114 Codex 3차 P2): 실행 중 /stop으로 구독이 꺼진 뒤 성공이 오면 답 없이 superseded로 끝나고,
 // 게시 확정 쪽 정리가 오지 않으므로 그 종료와 함께 반응을 지운다.
 test('실행 중 /stop → 성공 → 답 없이 superseded, 👀와 반응 행도 정리', async () => {
