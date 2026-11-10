@@ -3,8 +3,12 @@ import test from 'node:test';
 import { ChangeRuntime } from '../src/change-runtime.js';
 import type { ChangeRuntimeDeps } from '../src/change-runtime.js';
 import type { ChangeRequest } from '../src/change-store.js';
+import { PUBLISH_TEXT } from '../src/change-commands.js';
+import { buttonAllowed } from '../src/discord-protocol.js';
 import { messagePages } from '../src/format.js';
-import { fixtureApprovalSubject, fixtureReview } from './change-store-fixture.js';
+import { Store } from '../src/store.js';
+import { CONVERSATION, OWNER, fixtureApprovalSubject, fixtureReview, seedConversation } from './change-store-fixture.js';
+import { localDatabase } from './helpers.js';
 
 // A05: CHANGE 게시 미리보기의 승인 명령이 페이지 경계에 걸려도 한 메시지 안에 통째로 있어야 복사해 승인할 수 있다.
 // 미리보기는 실제 ChangeRuntime.preview로 만들고, 변경 파일 경로 길이로 digest 위치를 경계 주변에 맞춘다.
@@ -66,4 +70,44 @@ test('A05: 앞쪽이 공백 줄뿐이면 빈 페이지를 만들지 않는다', 
   const pages = messagePages(text);
   assert.equal(pages.join(''), text);
   for (const page of pages) assert.match(page, /\S/);
+});
+
+// C17: 여러 쪽 미리보기의 게시 승인 버튼. 실제 ChangeRuntime 알림과 실제 Store.enqueue(outbox 쪽 나눔)를 거친다.
+async function previewRows(colleague: boolean, approval: string) {
+  const { db, pg } = await localDatabase();
+  try {
+    await seedConversation(db);
+    const entries = Array.from({ length: 60 }, (_, index) => ({ changeKind: 'added', path: `src/${'deep/'.repeat(8)}file${index}.ts` }));
+    const deps = {
+      store: new Store(db, () => 0, colleague),
+      gate: { current: async () => ({ revision: 'fixture-v1' }) },
+      changes: { approvalSubject: async () => ({ ok: true, value: { subject: fixtureApprovalSubject(request.id), digest: approval } }),
+        loadArtifact: async () => ({ ok: true, value: { manifest: { entries } } }) },
+    } as unknown as ChangeRuntimeDeps;
+    const runtime = new ChangeRuntime(deps) as unknown as { notifyPhase(request: ChangeRequest): Promise<void> };
+    await runtime.notifyPhase({ ...request, phase: 'awaiting_publish_approval', conversationId: CONVERSATION, ownerId: OWNER,
+      scope: { guild: 'fixture-guild', channel: 'fixture-thread', parent: 'fixture-chat', kind: 'thread' } } as ChangeRequest);
+    return (await db.query<{ page_index: number; payload: { content: string; buttons?: { id: string; label: string }[] } }>(
+      'SELECT page_index,payload FROM outbox ORDER BY page_index')).rows;
+  } finally { await pg.close(); }
+}
+const APPROVAL = '0123456789abcdef'.repeat(4);
+
+test('C17: 스위치가 켜져 있으면 여러 쪽 미리보기의 마지막 쪽에만 게시 버튼이 붙고, 그 버튼은 미리보기 전체의 승인 digest를 가리킨다', async () => {
+  const rows = await previewRows(true, APPROVAL);
+  assert.ok(rows.length > 1, `미리보기가 여러 쪽이다(${rows.length})`);
+  const preview = rows.map(row => row.payload.content).join('');
+  assert.ok(preview.includes(`/change-publish target:${request.id} text:${APPROVAL}`));
+  for (const row of rows.slice(0, -1)) assert.equal(row.payload.buttons, undefined);
+  const buttons = rows.at(-1)!.payload.buttons!;
+  assert.equal(buttons.length, 1);
+  assert.equal(buttons[0]!.id, `change-publish-ok:${request.id}.1.0123456789abcdef`);
+  assert.equal(buttons[0]!.label, PUBLISH_TEXT.label);
+  assert.ok(buttonAllowed(buttons[0]!.id), 'custom_id 허용 목록과 100자 상한 안이다');
+});
+
+test('C17: 스위치가 꺼져 있으면 미리보기 글에 버튼이 없다', async () => {
+  const rows = await previewRows(false, APPROVAL);
+  assert.ok(rows.length > 1);
+  assert.ok(rows.every(row => row.payload.buttons === undefined));
 });

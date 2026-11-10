@@ -8,7 +8,7 @@ import type { ChangeArtifactPort, ChangeDeploymentPort, ChangeKey, ChangePhase, 
 import { DEPLOYMENT_POLL, DeploymentTargetError, deploymentPollStep, describeDeployment } from './change-deployment.js';
 import { compilePathPolicy, taskPathRules } from './change-policy.js';
 import type { ChangeRepositoryPolicy } from './change-policy.js';
-import { parseChangeRequest } from './change-commands.js';
+import { parseChangeRequest, publishButton } from './change-commands.js';
 import type { ChangePublisher } from './change-publisher.js';
 import type { ChangeReviewService } from './change-review.js';
 import type { ChangePrivateInputs, ChangeRequest, ChangeStore } from './change-store.js';
@@ -20,7 +20,7 @@ import type { ChangePreflightPort } from './github-writer.js';
 import { errorInfo } from './log.js';
 import type { Log } from './log.js';
 import type { PolicyGate } from './policy.js';
-import type { Store } from './store.js';
+import type { OutboxButton, Store } from './store.js';
 import { TaskWorkerBusy } from './task-bridge.js';
 import { DEFAULT_LIMITS } from './task-policy.js';
 
@@ -717,7 +717,11 @@ export class ChangeRuntime {
   private async notifyPhase(request: ChangeRequest): Promise<void> {
     const key = `change-phase:${request.id}:${request.generation}:${request.phase}`;
     // owner 호출은 게시 승인 요청(미리보기)과 변경 실패 둘만이다. 게시 완료·막힘·취소·대체는 부르지 않는다.
-    if (request.phase === 'awaiting_publish_approval') { await this.send(request, key, await this.preview(request), true); return; }
+    if (request.phase === 'awaiting_publish_approval') {
+      // 게시 승인 버튼은 동료 기능 스위치를 켰을 때만 단다. outbox가 여러 쪽 글의 마지막 쪽에만 버튼을 남긴다.
+      await this.send(request, key, await this.preview(request), true, this.deps.store.colleague ? await this.publishButtons(request) : undefined);
+      return;
+    }
     if (request.phase === 'proposed') {
       const pull = await this.pullOf(request);
       const policy = await this.deps.policy(request.repoId);
@@ -732,10 +736,16 @@ export class ChangeRuntime {
     const withheld = reason === 'task_question_sensitive' ? ' 모델 질문에서 공개하면 안 되는 값을 찾아 질문을 이 스레드에 내보내지 않았습니다.' : '';
     await this.send(request, key, `변경 ${request.id} g${request.generation}: ${request.phase}(${reason}).${withheld}${untracked} ${tail}`, request.phase === 'failed');
   }
-  private async send(request: ChangeRequest, key: string, content: string, ownerCall = false): Promise<void> {
+  private async send(request: ChangeRequest, key: string, content: string, ownerCall = false, buttons?: OutboxButton[]): Promise<void> {
     const policy = await this.deps.gate.current();
     await this.deps.store.enqueue({ key, conversation: request.conversationId, actor: request.ownerId, scope: request.scope, revision: policy.revision,
-      payload: { kind: 'message', channel: request.scope.channel, content, classification: 'safe_summary', ...(ownerCall ? { ownerCall: true as const } : {}) } });
+      payload: { kind: 'message', channel: request.scope.channel, content, classification: 'safe_summary', ...(ownerCall ? { ownerCall: true as const } : {}),
+        ...(buttons?.length ? { buttons } : {}) } });
+  }
+  private async publishButtons(request: ChangeRequest): Promise<OutboxButton[]> {
+    const approval = await this.deps.changes.approvalSubject(keyOf(request));
+    if (!approval.ok) throw new Error('preview_evidence_missing');
+    return [publishButton(request.id, request.generation, approval.value.digest)];
   }
   // 요청 스레드에만 보낸다. 고정 코드·SHA·경로만 싣고 리뷰 자유문·시험 로그·요청 원문을 싣지 않는다.
   private async preview(request: ChangeRequest): Promise<string> {
