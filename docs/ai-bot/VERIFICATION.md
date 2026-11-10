@@ -2518,7 +2518,8 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 | C27이 수정 차례 뒤 같은 함수로 달 수 있고 같은 차례에 두 번 달리지 않음 | `change-guidance` "AC-27 수정 차례 진입점: …"(차례 1, 새 head·patch, 밖 목록 반환, 다른 head는 `head_mismatch`), "AC-27 한 번만: …" 3개(두 번 호출, 응답 유실 회수·미발견 unknown·24시간 뒤 `unknown_expired`, 보내다 끊긴 기록), "AC-27 실패: …" 2개(설치·정책 밖 `repository_denied`는 건너뜀·로그는 사유 코드만, 일시 실패 미룸·거부 실패, PR·변경 상태 그대로), `change-assembly` "AC-25·AC-27 연결: …"(병합 대기 바퀴를 더 돌아도 1건) |
 | 옛 판 결과(두 칸 없음, C28 병합 전 운영)는 지금과 같음 | `change-assembly` "AC-25 옛 판 결과: …"(미리보기·PR 본문에 절 없음, 안내 0건), `change-publication` "AC-25 PR 설명: 항목이 없으면 …"(빈 목록과 칸 없음이 같은 공개 문구) |
 
-- **실행:** (아래 결과 칸)
+- **실행(origin/main 9d5621a를 병합한 0f2967e, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 바뀐 파일과 마이그레이션 개수를 보는 17개 파일(새 `change-guidance`, `change-publication`, `change-assembly`, `change-artifact`, `change-freshness`, `change-preview-pages`, `change-review`, `change-data`, `change-recovery`, `change-store`, `change-store-pg`, `change-pg`, `publisher-migrate`, `publisher-pg`, `raw-text-retention`, `raw-input-retention`, `ops-metrics`) 441개 모두 통과, skip 0. 첫 실행에서 기존 시험 둘이 걸렸다: `change-preview-pages`의 가짜 DB가 모든 조회에 리뷰 행을 돌려줘 새 `change_notes` 조회가 깨졌고(조회 대상별로 답하게 고침), `change-store` "T19 B0 migration: 016 DB에 …"가 마이그레이션 수(-6)로 실패한 뒤 PGlite 정리에서 멈춰 파일 시한(25분)까지 돌았다(-7로 고침).
+- **시험이 실패할 수 있는지 확인:** 새 시험은 구현 전에 타입 단계에서 실패했고(입력 칸·함수 없음), 자체 리뷰 시험은 첫 실행에서 준비(외래 키) 실패로 걸렸다. 구현을 되돌려 보는 변이 확인은 하지 않았다.
 - **못 잡는 범위:** 실제 GitHub의 줄 댓글 표시, 리뷰 App 설치 상태, GitHub hunk와 artifact patch의 문맥 줄 차이(C24 S5). 모델이 언제 가정하고 무엇을 확인할 것으로 쓰는지의 품질(S5).
 - **운영 영향:** 스위치 밖이다. 병합하면 변경 PR을 새로 게시할 때부터 PR 설명·미리보기에 확인할 것 절이 생긴다. 다만 지금 게시 서버는 옛 판(`task-v1`)을 보내 결과에 목록이 없으므로 C28의 판 전환 전에는 공개 문구가 그대로다. 안내 댓글은 `ChangeRuntimeDeps.guidance`가 연결될 때만 나간다.
 
