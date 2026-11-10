@@ -11,10 +11,10 @@ import { Denied } from '../src/contracts.js';
 import type { Scope } from '../src/contracts.js';
 import type { Database } from '../src/database.js';
 import { ALL_COMMANDS, DiscordIngress, EXTERNAL_ACK_NOTICE } from '../src/discord.js';
-import { ExternalTaskCommands } from '../src/external-task-commands.js';
+import { ATTACH_COMMAND_TEXT, ExternalTaskCommands } from '../src/external-task-commands.js';
 import type { ExternalTaskCommandHandler } from '../src/external-task-commands.js';
 import { EXTERNAL_LINK_TTL_MS, ExternalTaskLinks, OneTimeSeed } from '../src/external-task-links.js';
-import { EXTERNAL_TASK_PATH, ExternalTaskReceiver, FIXED_SUMMARY } from '../src/external-task-receiver.js';
+import { EXTERNAL_NOTICE_TEXT, EXTERNAL_TASK_PATH, ExternalTaskReceiver, FIXED_SUMMARY } from '../src/external-task-receiver.js';
 import { PORTS } from '../src/http.js';
 import { startPublisher } from '../src/main.js';
 import type { Publisher, PublisherDeps } from '../src/main.js';
@@ -74,7 +74,7 @@ test('R08 연결 목록: 최장 세션 ID 10건과 더 있음 표시도 Discord 
   for (let n = 0; n < 10; n++) assert.ok(content.includes(`\`${connectionId(n)}\``));
   assert.ok(content.includes(`\`${'a'.repeat(40)}…\``));
   assert.ok(!content.includes('a'.repeat(41)));
-  assert.match(content, /더 있음/);
+  assert.ok(content.endsWith(ATTACH_COMMAND_TEXT.listMore));
 });
 
 test('R08 조립 명령: 켰을 때만 세 명령, 작업 레인과 독립, Discord 한도 안, 옵션은 수신이 읽는 이름', () => {
@@ -218,9 +218,9 @@ test('R08 조립 켜짐: /attach → 8082 수신 → Discord 게시 → 해제 �
   assert.equal(accepted.status, 202);
   await waitFor(() => rest.sent.some(m => m.channel === THREAD));
   const posted = rest.sent.find(m => m.channel === THREAD)!.content;
-  assert.match(posted, /사람 세션이 턴을 끝냈다고 알림/);
+  assert.ok(posted.startsWith(EXTERNAL_NOTICE_TEXT.head('claude', `\`${SESSION}\``)));
   assert.match(posted, new RegExp(FIXED_SUMMARY));
-  assert.match(posted, /봇이 결과를 확인한 것은 아닙니다/);
+  assert.ok(posted.includes(EXTERNAL_NOTICE_TEXT.unverified));
 
   const metrics = () => fetch(`http://127.0.0.1:${p.ports.app}/metrics`).then(response => response.text());
   assert.match(await metrics(), /homelab_bot_external_task_requests\{outcome="accepted"\} 1/);
@@ -232,7 +232,7 @@ test('R08 조립 켜짐: /attach → 8082 수신 → Discord 게시 → 해제 �
   assert.match(listed, /활성/);
 
   const detached = (await reply(command('detach', THREAD, { target: who.connectionId }))).body.data.content;
-  assert.match(detached, /해제했습니다/);
+  assert.ok(detached.startsWith(ATTACH_COMMAND_TEXT.detached(false, 0).split('.')[0]!));
   assert.equal((await post(port, who)).status, 401);
 
   await p.stop();
@@ -438,7 +438,7 @@ test('R08 전달 실패: 폐기까지 실패해도 seed는 남지 않고 해제 
     const seen: string[] = [];
     ctx.f.rest.acknowledge = async (_e, content) => { seen.push(content); if (content.includes(FAKE_SEED)) throw new Error(content); };
     await ctx.ingress.receive(event('a1', { kind: 'command', command: 'attach', target: SESSION, text: 'claude' }));
-    assert.match(seen.at(-1)!, /폐기도 확인하지 못했습니다.*\/detach/);
+    assert.equal(seen.at(-1)!, ATTACH_COMMAND_TEXT.revokeUnconfirmed(false));
     assert.ok(ctx.logged.join('\n').includes('external_task_revoke_failed'));
     assert.equal(ctx.logged.join('\n').includes(FAKE_SEED), false);
     assert.equal((await dumpTables(ctx.db)).includes(FAKE_SEED), false);
@@ -463,13 +463,13 @@ test('R08 명령 권한: owner만, 자기 활성 스레드에서만, 스위치�
     await assert.rejects(ctx.ingress.receive(event('b1', { kind: 'button', command: 'attach', target: SESSION })), Denied);
     // 채널에서는 안내만, 키를 만들지 않는다.
     await attach('c1', { scope: CHANNEL });
-    assert.match(ctx.acks.find(a => a.id === 'c1')!.content, /스레드에서만/);
+    assert.equal(ctx.acks.find(a => a.id === 'c1')!.content, ATTACH_COMMAND_TEXT.threadOnly(false));
     await ctx.ingress.receive(event('c2', { kind: 'command', command: 'attach-list', scope: CHANNEL }));
-    assert.match(ctx.acks.find(a => a.id === 'c2')!.content, /스레드에서만/);
+    assert.equal(ctx.acks.find(a => a.id === 'c2')!.content, ATTACH_COMMAND_TEXT.threadOnly(false));
     // 비활성 스레드.
     await ctx.db.query('UPDATE conversations SET active=false WHERE id=$1', [ctx.f.store.scopeId(thread)]);
     await attach('i1');
-    assert.match(ctx.acks.find(a => a.id === 'i1')!.content, /연결할 수 없습니다/);
+    assert.equal(ctx.acks.find(a => a.id === 'i1')!.content, ATTACH_COMMAND_TEXT.notAttachable(false));
     await ctx.db.query('UPDATE conversations SET active=true WHERE id=$1', [ctx.f.store.scopeId(thread)]);
     assert.equal(await connections(), 0);
     // 잘못된 입력은 서식 안내뿐이다.
@@ -500,7 +500,7 @@ test('R08 명령 권한: owner만, 자기 활성 스레드에서만, 스위치�
     const other: Scope = { ...thread, channel: 'fixture-other-owned' };
     await seedConversation(ctx.db, ctx.f.store, ctx.f.now(), other);
     await ctx.ingress.receive(event('l1', { kind: 'command', command: 'attach-list', scope: other }));
-    assert.match(ctx.acks.find(a => a.id === 'l1')!.content, /연결한 세션이 없습니다/);
+    assert.equal(ctx.acks.find(a => a.id === 'l1')!.content, ATTACH_COMMAND_TEXT.listEmpty);
     await ctx.ingress.receive(event('l2', { kind: 'command', command: 'attach-list' }));
     const list = ctx.acks.find(a => a.id === 'l2')!.content;
     assert.ok(list.includes(who.connectionId) && list.includes(SESSION));
@@ -509,7 +509,7 @@ test('R08 명령 권한: owner만, 자기 활성 스레드에서만, 스위치�
     // 잘라낸 목록임을 알린다.
     for (let i = 0; i < 10; i++) await ctx.issue(`m${i}`, 'codex', `session-${i}`);
     await ctx.ingress.receive(event('l3', { kind: 'command', command: 'attach-list' }));
-    assert.match(ctx.acks.find(a => a.id === 'l3')!.content, /더 있음/);
+    assert.ok(ctx.acks.find(a => a.id === 'l3')!.content.endsWith(ATTACH_COMMAND_TEXT.listMore));
   } finally { await ctx.close(); }
 });
 
@@ -519,7 +519,7 @@ test('R08 연결 수명: 해제하면 수신과 미게시 행을 막음', async 
     const who = await ctx.issue('a1');
     assert.equal((await ctx.send(who)).outcome, 'accepted');
     await ctx.ingress.receive(event('d1', { kind: 'command', command: 'detach', target: who.connectionId }));
-    assert.match(ctx.acks.find(a => a.id === 'd1')!.content, /미게시 알림 1건을 막았습니다/);
+    assert.equal(ctx.acks.find(a => a.id === 'd1')!.content, ATTACH_COMMAND_TEXT.detached(false, 1));
     assert.equal((await ctx.send(who)).status, 401);
     assert.equal(await ctx.f.publisher.deliver(), false);
     assert.equal(ctx.f.rest.messages.length, 0);

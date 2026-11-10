@@ -12,7 +12,7 @@ import { workerRequest } from '../src/worker.js';
 import type { WorkerResult } from '../src/worker.js';
 import { Runtime } from '../src/runtime.js';
 import { DiscordPublisher } from '../src/discord.js';
-import { AlertIngress } from '../src/alerts.js';
+import { ALERT_TEXT, AlertIngress } from '../src/alerts.js';
 import { event, fixture, localDatabase, service, thread } from './helpers.js';
 
 let database: Awaited<ReturnType<typeof localDatabase>>;
@@ -127,7 +127,7 @@ test('R2-05 혼합 경보 그룹은 지원 항목만 게시하고 제외 건수 
   assert.equal((await rows('outbox')).length, 1);
   assert.equal((await rows('audit'))[0]!.detail.count, 1);
   await f.publisher.deliver(); await f.publisher.deliver();
-  assert.match(f.rest.messages[0]!.body.content, /경보 firing: 1건/);
+  assert.ok(f.rest.messages[0]!.body.content.startsWith(ALERT_TEXT.relayed('firing', 1)));
   await ingress.receive({ groupKey: 'mixed', status: 'firing', alerts: [supported, { ...unsupported, fingerprint: 'changed' }] });
   await f.publisher.deliver(); assert.equal(f.rest.messages.length, 1); assert.equal(f.requests.length, 0);
 });

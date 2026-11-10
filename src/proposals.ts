@@ -4,6 +4,7 @@ import { AMENDMENT_REQUEST_TEXT, parseChangeRequest } from './change-commands.js
 import { CHANGE_AMENDMENT } from './change-contracts.js';
 import type { ChangeCommandHandler } from './change-commands.js';
 import { ownerText } from './chat-context.js';
+import { ChatSuperseded, chatJobCurrent } from './chat-currency.js';
 import { chatReplyRisk } from './chat-format.js';
 import { Denied } from './contracts.js';
 import type { Job, Proposal, Scope } from './contracts.js';
@@ -73,7 +74,7 @@ const boundHandlers = new WeakMap<Store, ProposalHandlers>();
 export function bindProposalHandlers(store: Store, handlers: ProposalHandlers): void { boundHandlers.set(store, handlers); }
 interface ReadContext { store: Store; job: Job; proposal: Proposal; policy: Policy; handlers: ProposalHandlers }
 // 결과를 일반 답으로 싣지 않는 경우. queued는 다른 레인(read)이 결과를 게시한다. 나머지는 제안을 버린다.
-interface ReadSkip { skip: 'queued' | 'not_connected' | 'target_denied' }
+interface ReadSkip { skip: 'queued' | 'not_connected' | 'target_denied' | 'superseded' }
 interface ReadHandler { kind: 'read'; run(context: ReadContext): Promise<string | ReadSkip> }
 // digest 재료. 버튼을 누를 때 저장된 참조로 다시 만들어 제안 때의 digest와 대조한다.
 interface Values { target: string | null; content: string | null }
@@ -471,7 +472,12 @@ const reviewRequestHandler: ReadHandler = {
     const target = proposal.target ? pullTarget(proposal.target) : undefined;
     const text = await sourceText(store, job.event_id);
     if (!target || !text || !pullReferences(text).some(ref => samePull(ref, target))) return REVIEW_REQUEST_TEXT.notInText;
-    const result = await port.request({ repository: `${target.owner}/${target.repo}`, pr: target.number, key: job.id });
+    // 대상 조회(GitHub) 동안 같은 대화에 새 말이 오면 접수 트랜잭션이 대화 행을 잠그고 다시 봐서 리뷰를 만들지 않는다.
+    let result: Awaited<ReturnType<typeof port.request>>;
+    try { result = await port.request({ repository: `${target.owner}/${target.repo}`, pr: target.number, key: job.id }); } catch (error) {
+      if (error instanceof ChatSuperseded) return skip('superseded');
+      throw error;
+    }
     if (result.outcome === 'refused') return REVIEW_REQUEST_TEXT.refused[result.reason];
     return REVIEW_REQUEST_TEXT[result.outcome](result.repository, result.pr);
   },
@@ -595,12 +601,7 @@ export class ProposalDesk {
 
 // 결과가 succeeded로 확정됐고, 그 뒤 같은 대화에 새 대화 요청이 오지 않았다. 새 메시지가 대화를 대체했으면 제안을 만들지 않는다
 // (다음 대화 차례가 같은 기록을 보고 다시 판단한다).
-async function current(store: Store, job: Job): Promise<boolean> {
-  const row = (await store.db.query<{ current: boolean }>(`SELECT j.state='succeeded' AND NOT EXISTS (SELECT 1 FROM jobs n
-    JOIN events ne ON ne.id=n.event_id WHERE n.conversation_id=j.conversation_id AND n.type='chat' AND n.id<>j.id
-      AND ne.event_order>(SELECT event_order FROM events WHERE id=j.event_id)) AS current FROM jobs j WHERE j.id=$1`, [job.id])).rows[0];
-  return row?.current === true;
-}
+const current = (store: Store, job: Job): Promise<boolean> => chatJobCurrent(store.db, job.id);
 
 // 만료된 대기 제안을 끝내고 값을 비운다. 버튼을 누르지 않은 제안의 값이 24시간 넘게 남지 않게 새 제안을 만들 때마다 부른다.
 async function expirePending(store: Store): Promise<void> {

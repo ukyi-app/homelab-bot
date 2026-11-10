@@ -222,6 +222,24 @@ test('C28 "직접 답하기": 누른 owner에게만 말로 답하라고 알리�
   });
 });
 
+test('C28 "직접 답하기" 거부: 기한이 지났지만 아직 열린 질문, 답을 기다리지 않는 작업의 질문이면 다음 말을 답 대상으로 적지 않는다', async () => {
+  await withHarness({ changeV2: true, colleague: true, steps: [CHOICE_QUESTION, V2_WRITE] }, async h => {
+    const { question } = await toQuestion(h);
+    const direct = buttonsOf(await questionPost(h)).at(-1)!;
+    const chosen = async () => (await h.db.query(`SELECT 1 FROM controls WHERE key LIKE 'question-chosen:%'`)).rows.length;
+    // 만료 정리 전이라 state='open'인 질문. 시계 대신 저장된 기한을 앞당긴다.
+    await h.db.query('UPDATE codex_questions SET expires_at=$2 WHERE id=$1', [question, Date.now() - 1]);
+    await press(h, direct.custom_id);
+    assert.deepEqual(lastAck(h), { content: CHANGE_QUESTION_TEXT.expired, update: false });
+    assert.equal(await chosen(), 0, '기한이 지난 질문을 다음 말의 답 대상으로 적지 않는다');
+    await h.db.query('UPDATE codex_questions SET expires_at=$2 WHERE id=$1', [question, Date.now() + 60_000]);
+    await h.db.query(`UPDATE jobs SET state='queued',wait_reason=NULL WHERE id=(SELECT job_id FROM codex_questions WHERE id=$1)`, [question]);
+    await press(h, direct.custom_id);
+    assert.deepEqual(lastAck(h), { content: CHANGE_QUESTION_TEXT.closed, update: false });
+    assert.equal(await chosen(), 0, '답을 기다리지 않는 작업의 질문도 적지 않는다');
+  });
+});
+
 // ---- 다음 말 ----
 
 let sequence = 1_800_000_000_000_000_000n;

@@ -39,7 +39,7 @@ export async function actions(db: Database, options: { colleague?: boolean; disc
   await memoryService.open();
   const memory = new MemoryCommands(memoryService, () => ledger.status().state, () => false, h.f.now, options.colleague ?? true);
   const links = new ExternalTaskLinks(h.f.store);
-  const external = new ExternalTaskCommands(links, 'fixture-environment', () => {});
+  const external = new ExternalTaskCommands(links, 'fixture-environment', () => {}, options.colleague ?? true);
   const changeStore = new ChangeStore(db, h.f.now);
   const changes = new ChangeCommands({ store: h.f.store, changes: changeStore, gate: h.f.gate, log: () => {}, closedReason: () => null,
     ...(options.discussion ? { discussion: options.discussion } : {}) });

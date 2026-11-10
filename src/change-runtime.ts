@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { CHANGE_RESTART, changeNextGeneration } from './change-advice.js';
+import { changeNextGeneration, changeRestart } from './change-advice.js';
 import { evaluateCi, readCiSnapshot } from './change-ci-policy.js';
 import { CHANGE_SELF_FIX, isTerminalPhase, labelAllowsAuthorInput, ReasonCodeSchema } from './change-contracts.js';
 import { ChangeGuidance, guidanceLimit, notesApproved, readChangeNotes, recordChangeNotes } from './change-guidance.js';
@@ -9,7 +9,7 @@ import type { AmendmentKey, ChangeArtifactPort, ChangeDeploymentPort, ChangeKey,
 import { DEPLOYMENT_POLL, DeploymentTargetError, deploymentPollStep, describeDeployment } from './change-deployment.js';
 import { compilePathPolicy, taskPathRules } from './change-policy.js';
 import type { ChangeRepositoryPolicy } from './change-policy.js';
-import { discussionMaterials, parseChangeRequest, publishButton } from './change-commands.js';
+import { discussionMaterials, parseChangeRequest, PUBLISH_TEXT, publishButton } from './change-commands.js';
 import type { AmendmentDiscussionReader } from './change-commands.js';
 import type { ChangePublisher } from './change-publisher.js';
 import type { ChangeReviewService } from './change-review.js';
@@ -26,6 +26,26 @@ import type { PolicyGate } from './policy.js';
 import type { OutboxButton, Store } from './store.js';
 import { TaskWorkerBusy } from './task-bridge.js';
 import { DEFAULT_LIMITS } from './task-policy.js';
+
+// 변경 알림의 고정 문구. 동료 말투(해요체, 자기를 "봇"이라 부르지 않음)다. 첫 인자 colleague는 동료 기능 스위치(Store.colleague)이고
+// 켜지면 '/' 이름 대신 말로 하는 안내(미리보기는 게시 승인 버튼)를 낸다. 분기는 colleague 하나뿐이어야 시험이 '/' 이름을 검사할 수 있다.
+// phase·사유 코드, SHA·경로는 코드 그대로 싣는다.
+export const CHANGE_NOTICE_TEXT = Object.freeze({
+  mergeUnreadable: (_c: boolean, id: string, pr: number, code: string) =>
+    `변경 ${id}: PR #${pr}의 병합 여부를 읽지 못했어요(${code}). 병합돼도 배포를 추적하지 못할 수 있어요. 상태는 proposed로 둬요.`,
+  published: (c: boolean, id: string, pr: number | string, repository: string | null) => [
+    `변경 ${id}: PR #${pr}을 게시했어요${repository ? ` (${repository})` : ''}. 병합은 사람이 검토해서 해요. 저는 병합하지 않아요.`,
+    `이 알림이 전달되지 않아도 게시를 다시 하지 않아요. ${c ? '상태는 물어보면 알려 드릴게요.' : '상태는 /change-status로 볼 수 있어요.'}`].join('\n'),
+  untracked: (_c: boolean, pr: number) => ` PR #${pr}은 그대로 있고, 이 뒤로 병합돼도 배포를 추적하지 않아요.`,
+  withheld: ' 모델 질문에서 공개하면 안 되는 값을 찾아 질문을 이 스레드에 내보내지 않았어요.',
+  selfFixRemaining: (_c: boolean, rounds: number) => `게시 전에 ${rounds}번 고치려고 했는데 자체 리뷰에서 막는 문제가 남아 있어요.`,
+  selfReviewBlocked: '자체 리뷰에서 막는 문제가 나와서 게시하지 않았어요.',
+  previewHead: (_c: boolean, id: string, generation: number) => `변경 ${id} g${generation} 게시 미리보기예요. 아직 아무것도 공개하지 않았어요.`,
+  // 켜짐 판은 같은 글에 단 게시 승인 버튼을 가리킨다(버튼은 여러 쪽 글의 마지막 쪽에 붙는다).
+  previewApprove: (c: boolean, id: string, digest: string) => c ? `게시하려면 이 글의 "${PUBLISH_TEXT.label}" 버튼을 눌러 주세요.`
+    : `승인하려면 이 스레드에서: /change-publish target:${id} text:${digest}`,
+  previewBinding: (c: boolean) => `${c ? '버튼 승인은' : 'digest는'} 위 내용 전체에 묶여 있어요. 승인 전에 base가 움직이면 게시하지 않아요.`,
+});
 
 // 부모 change의 phase를 port 호출로 한 걸음씩 밀어 준다. 부모는 슬롯을 잡지 않고 모델 실행만 자식 job이다.
 // 프로세스 상태가 없다. 시각·재시도 간격만 메모리에 두고, 재시작하면 DB의 phase에서 이어 간다. 그래서 응답을 잃어도 모델을 다시 돌리는 길이 없다.
@@ -1020,7 +1040,8 @@ export class ChangeRuntime {
     try { reading = await this.deps.deployment.readMerge({ target: this.target(request), prNumber: pull.number }); }
     catch (error) {
       // 기다려도 풀리지 않는 대상 오류다. phase는 유지하되 말없이 멈춰 있지 않게 한 번 알린다.
-      if (error instanceof DeploymentTargetError) await this.send(request, `change-merge-unreadable:${request.id}:${request.generation}`, `변경 ${request.id}: PR #${pull.number}의 병합 여부를 읽지 못합니다(${error.code}). 병합해도 배포를 추적하지 못할 수 있습니다. 상태는 proposed로 둡니다.`);
+      if (error instanceof DeploymentTargetError) await this.send(request, `change-merge-unreadable:${request.id}:${request.generation}`,
+        CHANGE_NOTICE_TEXT.mergeUnreadable(this.deps.store.colleague, request.id, pull.number, error.code));
       throw error;
     }
     if (reading.state === 'open') return false;
@@ -1111,25 +1132,25 @@ export class ChangeRuntime {
     }
   }
   private async notifyPhase(request: ChangeRequest): Promise<void> {
+    const c = this.deps.store.colleague;
     const key = `change-phase:${request.id}:${request.generation}:${request.phase}`;
     // owner 호출은 게시 승인 요청(미리보기)과 변경 실패 둘만이다. 게시 완료·막힘·취소·대체는 부르지 않는다.
     if (request.phase === 'awaiting_publish_approval') {
       // 게시 승인 버튼은 동료 기능 스위치를 켰을 때만 단다. outbox가 여러 쪽 글의 마지막 쪽에만 버튼을 남긴다.
-      await this.send(request, key, await this.preview(request), true, this.deps.store.colleague ? await this.publishButtons(request) : undefined);
+      await this.send(request, key, await this.preview(request), true, c ? await this.publishButtons(request) : undefined);
       return;
     }
     if (request.phase === 'proposed') {
       const pull = await this.pullOf(request);
       const policy = await this.deps.policy(request.repoId);
-      await this.send(request, key, [`변경 ${request.id}: PR #${pull?.number ?? '?'}을 게시했습니다${policy ? ` (${policy.fullName})` : ''}. 사람이 검토해 병합합니다. 봇은 병합하지 않습니다.`,
-        '이 알림의 전달 실패는 게시를 되풀이하지 않습니다. /change-status로 상태를 볼 수 있습니다.'].join('\n'));
+      await this.send(request, key, CHANGE_NOTICE_TEXT.published(c, request.id, pull?.number ?? '?', policy?.fullName ?? null));
       return;
     }
     const reason = request.phaseReason ?? request.phase;
     const pull = await this.pullOf(request);
-    const tail = request.phase === 'superseded' ? changeNextGeneration(request.id) : CHANGE_RESTART;
-    const untracked = pull ? ` PR #${pull.number}은 그대로 있고, 이 뒤로 병합돼도 배포를 추적하지 않습니다.` : '';
-    const withheld = reason === 'task_question_sensitive' ? ' 모델 질문에서 공개하면 안 되는 값을 찾아 질문을 이 스레드에 내보내지 않았습니다.' : '';
+    const tail = request.phase === 'superseded' ? changeNextGeneration(c, request.id) : changeRestart(c);
+    const untracked = pull ? CHANGE_NOTICE_TEXT.untracked(c, pull.number) : '';
+    const withheld = reason === 'task_question_sensitive' ? CHANGE_NOTICE_TEXT.withheld : '';
     const problems = request.phase === 'blocked' && reason === 'review_blocked' ? await this.remainingProblems(request) : [];
     await this.send(request, key, [`변경 ${request.id} g${request.generation}: ${request.phase}(${reason}).${withheld}${untracked} ${tail}`, ...problems].join('\n'), request.phase === 'failed');
   }
@@ -1145,7 +1166,7 @@ export class ChangeRuntime {
       const line = text.replace(/\s+/g, ' ').trim();
       return policy && scanPublicText({ title: line, body: line }, policy) === null ? line : code;
     };
-    return [rounds ? `게시 전에 ${rounds}번 고치려고 했는데 자체 리뷰에서 막는 문제가 남아 있어요.` : '자체 리뷰에서 막는 문제가 나와서 게시하지 않았어요.',
+    return [rounds ? CHANGE_NOTICE_TEXT.selfFixRemaining(this.deps.store.colleague, rounds) : CHANGE_NOTICE_TEXT.selfReviewBlocked,
       ...findings.slice(0, 5).map(finding => `- ${finding.priority} ${title(finding.title, finding.code)}`), ...(findings.length > 5 ? [`- 외 ${findings.length - 5}개`] : [])];
   }
   private async send(request: ChangeRequest, key: string, content: string, ownerCall = false, buttons?: OutboxButton[]): Promise<void> {
@@ -1173,10 +1194,11 @@ export class ChangeRuntime {
     const notes = await readChangeNotes(this.db, key);
     if (!notesApproved(subject.publication.body, notes)) throw new Error('preview_evidence_missing');
     const noted = [...(notes.checks.length ? ['확인할 것:', ...notes.checks.map(noteLine)] : []), ...(notes.risks.length ? ['남은 위험:', ...notes.risks.map(noteLine)] : [])];
-    return [`변경 ${request.id} g${request.generation} 게시 미리보기. 아직 아무것도 공개하지 않았습니다.`,
+    const c = this.deps.store.colleague;
+    return [CHANGE_NOTICE_TEXT.previewHead(c, request.id, request.generation),
       `제목: ${subject.publication.title}`, `base: ${subject.baseBranch} @ ${subject.bundle.baseCommit}`, `브랜치: ${subject.branch}`, `결과 tree: ${subject.bundle.resultTree}`, `artifact: ${subject.bundle.artifactDigest}`,
       `시험: ${subject.verifications.map(item => `${item.commandId} ${item.status}`).join(', ')}`, `리뷰: ${subject.review.verdict}, 범위 ${subject.review.coverage}`, ...warnings, ...noted,
       `변경 파일 ${changed.length}개:`, ...changed.slice(0, 40).map(entry => `- ${entry.changeKind} ${entry.path}`), ...(changed.length > 40 ? [`- 외 ${changed.length - 40}개`] : []),
-      '', `승인하려면 이 스레드에서: /change-publish target:${request.id} text:${digest}`, 'digest는 위 내용 전체에 묶여 있습니다. 승인 전에 base가 움직이면 게시하지 않습니다.'].join('\n');
+      '', CHANGE_NOTICE_TEXT.previewApprove(c, request.id, digest), CHANGE_NOTICE_TEXT.previewBinding(c)].join('\n');
   }
 }
