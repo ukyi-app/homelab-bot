@@ -117,7 +117,7 @@ afterEach(async () => { await publisher?.stop(); publisher = undefined; await gw
 
 const SECRET = 'fixture-webhook-secret-value';
 async function boot(options: { heartbeatEveryMs?: number; gateway?: boolean; ports?: { app: number; alerts: number }; db?: Database;
-  now?: () => number } = {}) {
+  now?: () => number; modelResumeTickMs?: number } = {}) {
   const config: PublisherConfig = {
     databaseUrl: 'postgresql://unused', discordToken: 'fixture-discord-token',
     policy: loadRuntimePolicy(JSON.stringify({ revision: 'fixture-v1', owner: OWNER, guild: GUILD, conversationChannel: CHAT,
@@ -127,7 +127,8 @@ async function boot(options: { heartbeatEveryMs?: number; gateway?: boolean; por
   };
   publisher = await startPublisher(config, { db: options.db ?? database.db, now: options.now, discord: rest, gatewayUrl: options.gateway === false ? () => new Promise(() => {}) : async () => ({ url: gw.url }),
     allowGatewayUrl: url => url.hostname === '127.0.0.1', serviceAccount: { tokenFile: join(serviceAccountDir, 'token'), caFile: null },
-    ports: options.ports ?? { app: 0, alerts: 0 }, idleMs: 20, identifySpacingMs: 250, recoveryBackoff: () => 200, registerDelaysMs: [0, 20, 20], heartbeatEveryMs: options.heartbeatEveryMs ?? 60_000, stopTimeoutMs: 3000, log: () => {} });
+    ports: options.ports ?? { app: 0, alerts: 0 }, idleMs: 20, identifySpacingMs: 250, recoveryBackoff: () => 200, registerDelaysMs: [0, 20, 20], heartbeatEveryMs: options.heartbeatEveryMs ?? 60_000, stopTimeoutMs: 3000, log: () => {},
+    ...(options.modelResumeTickMs !== undefined ? { modelResumeTickMs: options.modelResumeTickMs } : {}) });
   return publisher;
 }
 const app = (p: Publisher, path: string, init?: RequestInit) => fetch(`http://127.0.0.1:${p.ports.app}${path}`, init);
@@ -478,6 +479,21 @@ test('P2-5 8081 listen이 실패하면 먼저 연 8080도 닫고 오류를 다�
     publisher = undefined;
     await assert.rejects(fetch(`http://127.0.0.1:${appPort}/readyz`));
   } finally { blocker.close(); }
+});
+
+test('AC-15 진입점: 모델 멈춤 기록이 있으면 연결 뒤 봇 상태가 idle이고, 멈춤이 풀리면 상태 루프가 online으로 바꾼다', async () => {
+  const job = 'fixture-paused-review';
+  await database.db.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,received_at,payload,accepted)
+    VALUES ($1,'github',$1,$1,'github-review','{}',$2,'{}',true)`, [`e-${job}`, Date.now()]);
+  await database.db.query(`INSERT INTO jobs(id,event_id,conversation_id,type,owner_id,target,revision,budget,priority,available_at,created_at,state,wait_reason)
+    VALUES ($1,$2,NULL,'review','github-review','{}','{"policy":"p"}','{"timeoutMs":1,"toolCalls":0}',40,$3,$3,'waiting_user','model_limit')`, [job, `e-${job}`, Date.now()]);
+  await database.db.query(`INSERT INTO model_pauses(job_id,kind,retry_at,paused_at) VALUES ($1,'rate_limit',$2,$3)`, [job, Date.now() + 3_600_000, Date.now()]);
+  await boot({ modelResumeTickMs: 30 });
+  const statuses = () => gw.connections.flatMap(c => c.received.filter(p => p.op === 3).map(p => (p.d as { status: string }).status));
+  await until(() => statuses().includes('idle'));
+  await database.db.query("UPDATE jobs SET state='cancelled',wait_reason=NULL WHERE id=$1", [job]);
+  await until(() => statuses().at(-1) === 'online', 6000);
+  assert.deepEqual(statuses(), ['idle', 'online']);
 });
 
 test('OPS-02 진입점: Gateway 연결·루프가 돌면 healthchecks ping, stop()은 수신기를 닫고 다시 연결하지 않음', async () => {
