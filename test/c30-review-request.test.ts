@@ -218,6 +218,31 @@ test('C30 fork PR·작성자 조건 밖·닫힌 PR은 자동 리뷰와 같은 �
   assert.equal((await w.reviews()).length, 1);
 });
 
+test('C30 목록 밖 세대의 대상 기록이 그 행의 설치·저장소와 다르거나 조직 밖이면 실행하지 않고, 게시 직전에도 막는다', async () => {
+  for (const tamper of [{ installationId: 999 }, { fullName: 'someone/other-repo' }]) {
+    await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,outbox,results,conversations,proposals,audit RESTART IDENTITY CASCADE');
+    const w = await wired();
+    w.gh.installed.set(OUTSIDE.fullName, OUTSIDE);
+    w.gh.pulls.set(`${OUTSIDE.fullName}#12`, pull(OUTSIDE, { number: 12 }));
+    await w.ask(`${OUTSIDE.fullName}#12 리뷰 부탁해요`, `${OUTSIDE.fullName}#12`);
+    await database.db.query('UPDATE pr_reviews SET request_target=$1', [JSON.stringify({ ...OUTSIDE, ...tamper })]);
+    assert.equal(await w.runtime.tick(), true);
+    assert.deepEqual((await w.reviews()).map(r => r.state), ['cancelled'], JSON.stringify(tamper));
+  }
+  // 실행이 끝난 뒤 게시 직전에 기록이 어긋나도 보내지 않는다.
+  await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,outbox,results,conversations,proposals,audit RESTART IDENTITY CASCADE');
+  const w = await wired();
+  w.gh.installed.set(OUTSIDE.fullName, OUTSIDE);
+  w.gh.pulls.set(`${OUTSIDE.fullName}#12`, pull(OUTSIDE, { number: 12 }));
+  await w.ask(`${OUTSIDE.fullName}#12 리뷰 부탁해요`, `${OUTSIDE.fullName}#12`);
+  assert.equal(await w.runtime.tick(), true);
+  await database.db.query('UPDATE pr_reviews SET request_target=NULL');
+  await w.publisher.deliver();
+  assert.equal(w.gh.writes.length, 0);
+  const delivery = (await database.db.query<{ state: string; reason: string }>('SELECT state,reason FROM review_deliveries')).rows;
+  assert.deepEqual(delivery, [{ state: 'blocked', reason: 'authorization_revoked' }]);
+});
+
 test('C30 목록 밖 저장소의 리뷰 요청 세대는 실행 전 head가 바뀌면 닫기만 하고 새 세대를 자동으로 만들지 않는다', async () => {
   const w = await wired();
   w.gh.installed.set(OUTSIDE.fullName, OUTSIDE);

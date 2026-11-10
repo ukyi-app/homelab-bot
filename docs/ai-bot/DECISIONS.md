@@ -251,6 +251,8 @@ PR #3 리뷰에서 공개 저장소 문구를 남는 위험으로만 두면 지�
 
 **변경(사용자 2026-11-09, 아래 "동료 봇 전환" 16·18).** 댓글 내용은 owner가 Discord에서 봇 변경 PR의 수정을 요청했을 때만 그 PR에서 자료로 읽는다. 댓글·리뷰만으로는 봇이 움직이지 않고, `/homelab-review` 명령 규칙은 그대로다. 리뷰 App 설치는 조직의 모든 저장소로 넓히되 자동 리뷰 대상은 정책 목록 그대로다.
 
+**리뷰 App 설치 범위 수행(C30):** 2026-11-10 기준 `ukyi-review`는 조직에 `repository_selection: selected`로 설치돼 있고 All repositories로 넓히는 사람 작업은 아직이다(owner 승인과 homelab `approvals.md` 기록은 C30 할 일 7, 주 진행자). 넓히기 전에는 선택되지 않은 저장소의 리뷰 요청이 "리뷰 App 없음"으로 거절된다 [가정: 선택 밖 저장소의 설치 조회는 404, 실측은 C24 S5]. 코드 쪽은 "C30 리뷰 요청 구현 선택"(아래).
+
 **상태:** 확정(사용자 2026-10-18, T15). **선택지 1(기본안): 전용 리뷰 App + 격리 리뷰어 + 제한 게시 서버(`01` §5).** 봇이 리뷰하는 저장소는 저장소별 Codex 설정에서 Codex 자동 리뷰를 끈다(사람 작업. 수동 `@codex review`는 남긴다). Codex Connector 설치 범위는 선택 저장소로 줄이고 private 운영 저장소 `homelab-bot-ops`는 뺀다(사람 작업, D-26의 설치 범위 축소. 완료(사람 2026-10-18 17:45). 시점과 결과는 아래 "Codex Connector 설치 범위"). 작성자 확인의 App 예외는 새 결정 ID 없이 D-16 안의 하위 결정으로 정했다(아래). 모두 에이전트 추천을 받아들였다.
 
 **질문:** V1 기능 7(전용 GitHub App 중심의 PR 자동 리뷰)을 무엇으로 채우는가. Codex Connector는 유지로 확정됐고(D-26) 설치 범위 축소는 여기서 함께 봤다.
@@ -1030,3 +1032,16 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 - **질문 글의 판:** 작업 질문 글은 켜짐 판에서 질문 ID를 옮겨 적으라고 하지 않는다. 변경 질문 글은 같은 `ask`로 만들지만 `change_child_jobs`(role `author`)로 가려 지금 판(질문 ID와 `/answer`)을 켜짐에서도 둔다. 이 판은 C28이 바꾼다.
 - **결과 안내:** `/answer`와 같은 `controlText('answer', …)` 문구를 그 메시지에 답장으로 단다. 받았다는 👀는 달지 않는다. 이 글이 받은 표시이고, 대화 작업이 없어 👀를 지울 계기가 없다. history gap 동안 받아 버퍼에 둘 때 이미 단 👀는 복구 때 바로 답·고르기로 보내면서 그 반응 행을 `cleared`로 옮겨 지운다.
 - **고르기 글의 버튼은 실제로 답을 붙였을 때만 없앤다:** 새 고르기는 닫힌 질문의 행만 지우므로, 행 하나가 없거나 그 질문을 바로 답할 수 없는 것은 그 질문만의 끝이다. 그 버튼을 누르면 본인에게만 안내하고 같은 글의 다른 버튼은 남긴다. 버튼을 없애는 것은 답을 붙였을 때와 그 말 자체를 쓸 수 없을 때(원문 정리, 다른 사람·다른 대화의 말)뿐이다.
+
+## C30 리뷰 요청 구현 선택 (2026-11-10)
+
+"동료 봇 전환 (사용자 2026-11-09)" 9(스위치)·18(리뷰 요청, 설치 범위, 자동 리뷰 대상은 정책 목록 그대로)의 구현이다. 사용자 결정이 아니라 구현 선택이고 결정은 바꾸지 않았다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §13 "제안과 실행 확인 (C13)"의 "리뷰 요청(C30)", 시험은 [VERIFICATION](VERIFICATION.md) "C30 리뷰 요청".
+
+- **제안 동작 ID:** 작업자 계약의 제안 동작 목록(`PROPOSAL_RUN_ACTIONS`) 끝에 `review_request` 하나를 더했다(주 진행자 2026-11-10 허용). 목록은 작업자 요청 본문이 아니라 작업자 안의 출력 스키마에만 들어가 capability digest와 요청 `z.literal`은 그대로다. 그래서 새 게시 서버 + 옛 작업자(운영 이미지 `9b067e9`)는 대화가 깨지지 않지만 모델이 이 제안을 낼 수 없다(작업자 출력 스키마 enum에 없음). 작업자 이미지를 바꿔야 리뷰 요청이 동작한다. 반대(옛 게시 서버 + 새 작업자)는 모델이 `review_request`를 내면 게시 서버의 응답 검사(`ChatReplySchema`)에 걸려 그 대화가 실패하므로, 게시 서버가 먼저 배포돼야 한다(지금 배포 순서: 게시 서버 자동, 작업자는 사람 PR).
+- **"확인 없는 실행" 줄:** 동작 표(`ACTIONS`)에 종류 `run`이고 `confirm: false`인 줄을 하나 더했다. 이 칸이 있는 실행 줄만 읽기 줄처럼 확인 글·버튼 없이 처리기 결과를 일반 답(`result:<job>:read`)으로 단다. 기존 줄은 이 칸이 없어 그대로다.
+- **대상은 owner 원문에 있어야 한다:** 확인 버튼이 없으므로 모델이 고른 대상(`<소유자>/<저장소>#<번호>`, 링크 등)은 그 owner 메시지 원문(멘션 표기 제거)에 같은 PR이 링크(`github.com/<소유자>/<저장소>/pull/<번호>`)나 짧은 꼴(`<소유자>/<저장소>#<번호>`, 소유자를 빼면 조직 저장소)로 있을 때만 쓴다. 원문에 없으면 리뷰하지 않고 그 이유를 답한다(버리면 모델 답만 "리뷰할게요"로 남아 아무 일 없는 것처럼 보인다). "12번 PR"처럼 저장소가 없는 말은 받지 않는다.
+- **조직 이름은 코드 상수:** `REVIEW_REQUEST_ORGANIZATION = 'ukyi-app'`(`src/review-request.ts`). 리뷰 정책(`ReviewPolicySchema`)에 칸을 더하면 운영 정책 JSON이 그 칸 없이 검사에 걸려 리뷰 경로가 닫히므로 정책을 바꾸지 않았다. 조직 이름은 공개 정보다.
+- **명시 트리거는 `comment` 그대로:** Discord 요청도 PR 댓글 명령과 같은 trigger 값(`comment`)으로 접수해 draft 예외·늘 새 세대·대체에서 보호가 코드 한 곳도 바뀌지 않고 같다. 출처는 리뷰 입력 이벤트의 `delivery_id`(`discord:<대화 job>`)와 payload `source: 'discord'`, 감사 `review_requested`(저장소·번호·결과·거절 사유)로 구분한다.
+- **목록 밖 저장소의 범위는 그 세대의 작업 하나:** 대상 기록(저장소 ID·이름·설치 ID·visibility)은 `pr_reviews.request_target`(마이그레이션 023)에만 둔다. 실행 직전·게시 직전 저장소 대조와 설치 토큰 범위(`policyRepositories`)는 정책 목록에 없을 때 이 기록을 쓰되, 토큰은 그 세대가 아직 살아 있을 때(작업 `queued`·`running`·`verifying`·`waiting_user`·`cancel_requested`, 게시 `pending`·`sending`·`unknown`)만 받는다. 실행 전 head가 바뀌거나 정책 revision이 바뀌어 그 세대가 닫혀도 새 세대를 자동으로 만들지 않는다(정책 목록 저장소는 지금처럼 `live_check`로 다시 넣는다). owner가 다시 부탁하면 된다. 정책 목록·폴링 대조·webhook 저장소 검사(`GitHubIngress`)에는 더하지 않는다.
+- **대상 조회:** 조직 밖이면 GitHub에 묻지 않는다. 조직 안이고 정책 목록 밖이면 App JWT로 `GET /repos/{owner}/{repo}/installation`(없으면 404 → "리뷰 App 없음"), 저장소 ID를 아직 모르므로 이름으로 좁힌 메타데이터 읽기 토큰(`repositories: [이름]`, `permissions: { metadata: read }`)으로 `GET /repos/{owner}/{repo}`를 읽는다. 설치 계정·토큰 저장소·저장소 정보(ID·이름·소유자 `Organization`)가 하나라도 요청과 다르면 쓰지 않는다. visibility는 문서상 필수 칸이 아니라 필수 칸 `private`로 정한다 [확인: https://docs.github.com/en/rest/apps/apps#get-a-repository-installation-for-the-authenticated-app , https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app , https://docs.github.com/en/rest/repos/repos#get-a-repository]. PR과 merge base는 그 뒤 저장소 ID 하나·읽기 권한 토큰으로 읽는다.
+- **배선:** 리뷰 요청 접수(`ReviewRequests`)는 App 자격이 있는 리뷰 입출력 조립(`githubReviewIO`의 `requests` 인수)이 같은 `Store`에 묶는다(`bindReviewRequests`, C14 `bindProposalHandlers`와 같은 WeakMap 방식). `main.ts`는 그 조립 줄의 인수만 바뀌었다. 리뷰 경로를 열지 않은 게시 서버에서는 묶이지 않아 제안을 "연결 안 됨"으로 버린다.
