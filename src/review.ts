@@ -528,7 +528,11 @@ export class ReviewRuntime {
         AND e.actor_id=j.owner_id AND j.available_at<=$1 ${this.lanes ? "AND j.execution_lane='interactive'" : ''} LIMIT 1`, [this.store.now()])).rows.length) return;
       // type='review'에는 게시 PR 리뷰와 미게시 후보(change_child_jobs)가 함께 있다. 맡을 실행기가 없으면 미게시 후보를 집지 않고 대기열에 둔다.
       const unassigned = this.changeReview ? '' : `AND NOT EXISTS (SELECT 1 FROM change_child_jobs c WHERE c.job_id=jobs.id AND c.role='review')`;
-      const row = (await tx.query<{ id: string }>(`SELECT id FROM jobs WHERE type='review' AND state='queued' AND available_at<=$1 ${unassigned}
+      // 리뷰 미루기(COLLEAGUE_SPEC §4.7): 한도 경고의 풀리는 시각까지 새 PR 리뷰를 집지 않는다. 미룬 리뷰는 queued로 남아 기한 뒤에 집힌다.
+      // 미게시 후보 리뷰는 owner가 시킨 변경 작업의 한 단계라 작업처럼 계속한다.
+      const deferred = await this.store.reviewDeferredUntil(tx) === null ? ''
+        : `AND EXISTS (SELECT 1 FROM change_child_jobs c WHERE c.job_id=jobs.id AND c.role='review')`;
+      const row = (await tx.query<{ id: string }>(`SELECT id FROM jobs WHERE type='review' AND state='queued' AND available_at<=$1 ${unassigned} ${deferred}
         ORDER BY priority,created_at FOR UPDATE SKIP LOCKED LIMIT 1`, [this.store.now()])).rows[0];
       if (!row) return;
       return (await tx.query<Job & Record<string, unknown>>(`UPDATE jobs SET state='running',attempt=attempt+1,lease_token=$2,
@@ -654,7 +658,7 @@ export class ReviewRuntime {
       if (!result.stopped) { await this.store.transition(asJob(job), 'unknown', 'worker_disconnected'); return true; }
       stopped = true;
       if (result.status === 'limited' || result.status === 'auth_expired') {
-        await this.store.waitForUser(asJob(job), result.status === 'limited' ? 'model_limit' : 'auth_expired');
+        await this.store.waitForUser(asJob(job), result.status === 'limited' ? 'model_limit' : 'auth_expired', { rateLimit: result.rateLimit ?? null });
         // 전역 모델 대기를 owner가 알림 채널에서 풀 수 있게 job ID와 명령을 알린다(원문 없음).
         const scope = notificationScope(context.base);
         await this.store.enqueue({ key: `review-waiting:${job.id}`, actor: context.base.owner, scope, revision: context.base.revision,
@@ -664,6 +668,8 @@ export class ReviewRuntime {
               + `포기는 /review-cancel target:${job.id}.` } });
         return true;
       }
+      // 대기가 아닌 결과의 한도 경고도 계정 기록에 남긴다(리뷰 미루기). 기록 실패가 결과 처리를 막지 않는다.
+      await this.store.observeRateLimit(result.rateLimit).catch(() => {});
       if (result.status !== 'succeeded') { await this.close(job, review, 'failed', result.reason ?? 'model_failed'); return true; }
       await this.finish(job, review, context, task, result);
     } catch (error) {

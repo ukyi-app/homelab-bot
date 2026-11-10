@@ -490,7 +490,8 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       if (response.status === 'limited' || response.status === 'auth_expired') {
         const reason = response.status === 'limited' ? 'model_limit' : 'auth_expired';
         // 계정 한도는 대화·리뷰도 같은 계정이라 양쪽을 막고, 인증 만료는 레인 토큰의 일이라 작업 레인만 막는다.
-        await store.waitForUser(job, reason, { laneOnly: reason === 'auth_expired' });
+        // 한도 정보가 없으면(옛 작업자) 멈춤 기록은 시각을 모르는 한도로 남아 30분마다 다시 시도한다.
+        await store.waitForUser(job, reason, { laneOnly: reason === 'auth_expired', rateLimit: response.rateLimit ?? null });
         const now = (await store.db.query<{ state: string; attempt: number }>('SELECT state,attempt FROM jobs WHERE id=$1', [job.id])).rows[0]!;
         if (now.state !== 'waiting_user') return skipped('waiting_user');
         await session('waiting_model', { reason });

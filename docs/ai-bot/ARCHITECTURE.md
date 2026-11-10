@@ -332,6 +332,10 @@ live 메시지 하나가 일시 장애(DB·REST·429 등)로 처리되지 못하
 긴 작업 중 수신·저장 ACK·조회 없이 가능한 제어 명령은 계속 처리한다. 실행 중 작업을 대화가 선점하지 않는다.
 실제 모델 답변은 직렬 대기하므로 대화의 즉시 답변을 보장하지 않는다. 파드 분리는 T18의 판단이다.
 
+**자동 재개(C19, COLLEAGUE_SPEC §4.7, AC-16).** 대기를 기록하는 같은 트랜잭션(`Store.waitForUser`)이 작업자 응답의 한도 칸(C03)으로 멈춤 기록 `model_pauses`를 쓴다: 종류(한도·인증 만료·결제, 결제는 `stop.cause='billing'`), 풀리는 시각, 한도 종류, 사용률, 다음 재시도 시각(한도 + 시각 → 시각 + 1분, 시각 없음·인증 만료 → 30분 뒤, 결제 → 없음). 대화·리뷰(`Runtime`·`ReviewRuntime`)와 Claude 작업 레인(`ClaudeTaskBridge.settle`)이 칸을 넘기고, 칸이 없는 응답(옛 작업자, Codex 작업 레인)은 30분 재시도로 내려앉는다. 게시 서버의 재개 예약 루프(`src/main.ts` `model_resume`, 15초)가 `Store.resumeDue()`로 시각이 지난 대기를 '/resume-model'과 같은 전이(`Store.resumeWaiting`: `waiting_user` → `queued`, 시도 한도 검사, 전역 정지 해제)로 되돌린다. 비상 정지 중이면 아무것도 하지 않는다. 작업 행만 바꾸므로 같은 계정·모델·실행기로 이어서 하고, 자동 인증 전환은 여전히 없다(D-14 조건 2). 한도·인증 멈춤은 시도로 세지 않아(대기에 들어갈 때 `attempt`를 되돌림) 반복 재시도가 시도 한도에 막혀 전역 정지를 영영 잡지 않는다. 결정과 이유는 [DECISIONS](DECISIONS.md) "C19 한도 재개와 리뷰 미루기".
+
+**리뷰 미루기(C19, AC-17).** 대화·리뷰 결과의 마지막 `rate_limit_event`가 `allowed_warning`이고 풀리는 시각이 있으면 `model_limit_state.review_deferred_until`에 남기고(늘리기만 함), `ReviewRuntime.claim`은 그 시각까지 PR 리뷰를 집지 않는다. 미게시 후보 리뷰와 대화·작업 claim은 그대로 돈다. 미룬 리뷰는 `queued`로 남아 기한 뒤 claim이 집는다.
+
 `audit.kind=model_timing`에 `queueWaitMs=started_at-created_at`, `executionMs=종료-started_at`을 남긴다.
 로컬 시험은 모의 작업이 실행 중인 동안 두 번째 대화의 ACK가 도착하고 두 번째 모델 호출이 없음을 확인한 뒤,
 가상 시계 5초를 전진하고 첫 작업을 끝낸다. 두 번째 호출의 기록된 대기가 **5초 이상**인지 검증한다.
@@ -1309,6 +1313,8 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 | chat `unknown`(runtime 경로·lease 만료) | `unknown:<job>:<attempt>` | 종료 미확인으로 새 모델 실행 정지, 봇이 확인을 계속 시도, `/model-status` |
 | chat unknown 해소 | `unknown-resolved:<job>:<attempt>` | 멈춤 확인, `/retry target:<job>` |
 | read lease 만료 | `read-expired:<job>:<attempt>` | `/read`로 다시 요청 |
+
+한도·인증 대기 안내의 '/resume-model' 재개는 예비다. C19부터 한도는 풀리는 시각 1분 뒤(모르면 30분마다), 인증 만료는 30분마다 저절로 이어서 하고(§11 "호출 경로·직렬 대기·측정"의 자동 재개), 결제 멈춤만 사람이 풀어야 한다. 그래서 안내의 "원인을 해결한 뒤 재개해 주세요"는 틀린 말은 아니지만 저절로 이어서 한다는 말이 없다. 문구를 자리 비움으로 바꾸는 일은 C20이다. 같은 시도 번호로 다시 멈추면 멱등 키가 같아 안내가 되풀이되지 않는다(한도·인증 멈춤은 시도로 세지 않는다).
 
 권한 철회로 생긴 unknown은 안내하지 않는다(게시도 막힌다). 모두 `safe_summary`, `allowed_mentions.parse=[]`다. 이 표의 안내는 owner를 부르지 않는다. owner를 부르는 글은 **owner 호출** 넷(작업 질문, 작업 완료·실패, 변경 미리보기, 변경 실패)뿐이다(C07, §11 "표식·답장·스레드").
 

@@ -543,6 +543,31 @@ test('계정 한도 대기는 양쪽을 막는다: 작업 쪽 한도가 대화�
   await control(f, 'cancel', chatJob!.id);
   assert.equal((await f.store.claim('task'))?.type, 'task');
 });
+test('AC-16 작업 레인 응답의 풀리는 시각 1분 뒤 같은 세션으로 저절로 잇고, 한도 정보가 없는 응답은 30분 뒤 다시 시도한다', async () => {
+  const resetsAt = Math.floor((f.now() + 3_600_000) / 1000);
+  const limited = reply.limited('limited');
+  setup.worker.scripts.push((r, w) => ({ ...limited(r, w), rateLimit: { stop: { cause: 'rate_limit', resetsAt } } }));
+  const job = await newTask();
+  await setup.runtime.tickTask();
+  f.advance(resetsAt * 1000 + 59_999 - f.now()); f.policy.confirmedAt = f.now();
+  assert.equal(await f.store.resumeDue(), 0);
+  f.advance(1);
+  assert.equal(await f.store.resumeDue(), 1);
+  // 옛 작업자처럼 한도 칸 없이 다시 한도로 멈춘다.
+  setup.worker.scripts.push(reply.limited('limited'));
+  assert.equal(await setup.runtime.tickTask(), true);
+  assert.equal((await jobs(db()))[0]!.state, 'waiting_user');
+  f.advance(30 * 60_000 - 1); f.policy.confirmedAt = f.now();
+  assert.equal(await f.store.resumeDue(), 0);
+  f.advance(1);
+  assert.equal(await f.store.resumeDue(), 1);
+  setup.worker.scripts.push(reply.completed());
+  assert.equal(await setup.runtime.tickTask(), true);
+  assert.equal((await jobs(db()))[0]!.state, 'succeeded');
+  const turns = setup.worker.executes.slice(1);
+  assert.deepEqual(turns.map(t => [t.operation, t.job, t.operation === 'resume' ? t.resumeReason : null]),
+    [['resume', job.id, 'model_limit'], ['resume', job.id, 'model_limit']]);
+});
 test('대화 레인 인증 대기는 작업 레인을 막지 않는다(토큰이 다르다). scheduler 표시는 지금 그대로', async () => {
   await chat('chat-1');
   const chatJob = await f.store.claim('interactive');
