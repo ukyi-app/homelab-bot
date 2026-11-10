@@ -1,8 +1,8 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ADMIN_ACTOR, AdminUsage, parseAdminArgs, runAdmin } from '../src/admin.js';
-import type { AdminPorts } from '../src/admin.js';
-import { executeAdmin } from '../src/admin-main.js';
+import type { AdminCommand, AdminPorts } from '../src/admin.js';
+import { adminPorts, executeAdmin } from '../src/admin-main.js';
 import { DEFAULTS, Denied } from '../src/contracts.js';
 import { localDatabase, fixture, event, thread } from './helpers.js';
 import { codexBridge, codexSession, lane, reply, task } from './task-lane-fixture.js';
@@ -294,6 +294,30 @@ test('관리 진입점 실행: 사용법 오류는 DB를 열지 않고 64, 결�
   assert.equal(await executeAdmin(['status'], async () => { throw new Error('connect postgres://fixture-secret@db'); }, line => lines.push(line)), 1);
   assert.deepEqual(lines.map(line => JSON.parse(line).result), ['usage', 'status', 'failed']);
   assert.equal(lines.some(line => line.includes('fixture-secret')), false);
+});
+
+const runtimePolicies = JSON.stringify({ revision: 'fixture-env-v1', owner: 'fixture-owner', guild: 'fixture-guild',
+  conversationChannel: 'fixture-chat', notificationChannel: 'fixture-notifications', dmEnabled: null, services: [] });
+
+test('관리 진입점 실행: 차단은 env 정책의 revision으로 거부 행을 더하고, 다른 동작은 정책·작업자 설정을 읽지 않는다', async () => {
+  const lines: string[] = [];
+  const open = async (command: AdminCommand) => ({ store: f.store, close: async () => {}, ports: adminPorts(command, { RUNTIME_POLICIES: runtimePolicies }, f.store, f.now) });
+  assert.equal(await executeAdmin(['block', TARGET], open, line => lines.push(line)), 0);
+  assert.deepEqual((await denials()).map(row => [row.actor_id, row.policy_revision]), [[TARGET, 'fixture-env-v1']]);
+  // 정책·작업자 설정이 없어도 비상 정지·상태 보기·멈춘 작업 재개는 연다.
+  for (const argv of [['status'], ['emergency-stop'], ['resume', 'job', MISSING]]) assert.deepEqual(adminPorts(parseAdminArgs(argv), {}, f.store, f.now), {});
+  assert.deepEqual(lines.map(line => JSON.parse(line).result), ['blocked']);
+});
+
+test('관리 진입점 실행: 정책·게시 서버 설정을 읽지 못하면 차단·해제는 아무것도 바꾸지 않고 실패(1)한다', async () => {
+  const lines: string[] = [];
+  const open = (env: Record<string, string>) => async (command: AdminCommand) => ({ store: f.store, close: async () => {}, ports: adminPorts(command, env, f.store, f.now) });
+  assert.equal(await executeAdmin(['block', TARGET], open({}), line => lines.push(line)), 1);
+  assert.equal(await executeAdmin(['block', TARGET], open({ RUNTIME_POLICIES: '{"revision":1}' }), line => lines.push(line)), 1);
+  assert.equal(await executeAdmin(['release', MISSING], open({ RUNTIME_POLICIES: runtimePolicies }), line => lines.push(line)), 1);
+  assert.deepEqual(lines.map(line => JSON.parse(line).result), ['failed', 'failed', 'failed']);
+  assert.deepEqual(await denials(), []);
+  assert.deepEqual(await audits(), []);
 });
 
 test('관리 진입점 실행: 실패해도 stdout에는 결과 JSON 한 줄만 나가고 오류 로그는 stderr로 간다', async () => {
