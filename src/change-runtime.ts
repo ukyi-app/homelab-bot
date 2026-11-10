@@ -727,13 +727,19 @@ export class ChangeRuntime {
 
   // ---- 게시 뒤 수정 차례 (C27) ----
 
-  // proposed에서 대기열의 다음 차례를 연다. 동료 기능 스위치가 꺼져 있거나 자료를 읽을 수 없으면 새 차례를 열지 않는다(돌고 있는 차례는 끝까지 간다).
-  private async openAmendment(request: ChangeRequest): Promise<boolean> {
+  // proposed에서 열 차례가 기다리는지. 동료 기능 스위치가 꺼져 있거나 자료를 읽을 수 없으면 새 차례를 열지 않는다(돌고 있는 차례는 끝까지 간다).
+  private async amendmentWaiting(request: ChangeRequest): Promise<boolean> {
     if (!this.deps.store.colleague || !this.deps.discussion) return false;
-    if (!(await this.db.query(`SELECT 1 FROM change_amendments WHERE change_id=$1 AND generation=$2 AND state='queued' LIMIT 1`, [request.id, request.generation])).rows.length) return false;
+    return (await this.db.query(`SELECT 1 FROM change_amendments WHERE change_id=$1 AND generation=$2 AND state='queued' LIMIT 1`, [request.id, request.generation])).rows.length > 0;
+  }
+  // 부르는 쪽(proposed)이 방금 PR이 열려 있음을 읽은 뒤에만 부른다.
+  private async openAmendment(request: ChangeRequest): Promise<boolean> {
     const started = await this.deps.changes.startAmendment(keyOf(request));
     if (started.ok) { this.deps.log('change_amendment_started', { round: started.value.round }); return true; }
     if (started.reason === 'busy') throw new Error('change_store_busy');
+    // 기다리는 차례가 있으면 proposed가 바퀴마다 병합 읽기(익명 GitHub, 시간 60회)를 하므로, 열지 못한 채 남으면 읽기 주기로 늦춘다.
+    this.deps.log('change_amendment_start_refused', { reason: started.reason });
+    this.wait(`step:${request.id}`, this.periods.mergePollMs);
     return false;
   }
   private async runningAmendment(request: ChangeRequest): Promise<AmendmentRound | null> {
@@ -1049,10 +1055,10 @@ export class ChangeRuntime {
   }
   // 조회 실패와 대상 오류는 던져진다. 미병합으로 처리하지 않고 phase를 유지한다.
   private async proposed(request: ChangeRequest): Promise<boolean> {
-    // 확정된 수정 요청이 기다리면 병합 읽기 주기를 기다리지 않고 차례를 연다.
-    if (await this.openAmendment(request)) return true;
-    // 병합 읽기 주기는 따로 센다. 수정 요청이 들어오면 다음 바퀴에 바로 차례를 열어야 하기 때문이다.
-    if (!this.due(`merge:${request.id}`)) return false;
+    // 확정된 수정 요청이 기다리면 병합 읽기 주기를 기다리지 않고 지금 읽은 뒤 차례를 연다. 마지막 읽기 뒤 병합·닫힌 PR에 작성 모델·시험을 돌리지 않기 위해서다.
+    // 병합 읽기 주기는 따로 센다(merge 슬롯). 읽기에 실패하면 던져 차례를 열지 않고 실패 간격으로 다시 본다.
+    const amend = await this.amendmentWaiting(request);
+    if (!amend && !this.due(`merge:${request.id}`)) return false;
     this.wait(`merge:${request.id}`, this.periods.mergePollMs);
     const pull = await this.pullOf(request);
     if (!pull) throw new Error('pull_effect_missing');
@@ -1065,7 +1071,7 @@ export class ChangeRuntime {
         CHANGE_NOTICE_TEXT.mergeUnreadable(this.deps.store.colleague, request.id, pull.number, error.code));
       throw error;
     }
-    if (reading.state === 'open') return false;
+    if (reading.state === 'open') return amend ? this.openAmendment(request) : false;
     if (reading.state === 'closed_unmerged') { await this.close(request, 'proposed', { to: 'cancelled', reason: 'closed_unmerged' }); return true; }
     const recorded = await this.deps.changes.recordMerge({ ...keyOf(request), prNumber: reading.prNumber, headSha: reading.headSha, mergeCommit: reading.mergeCommit });
     if (recorded.ok) { this.nextAt.delete(`step:${request.id}`); this.nextAt.delete(`merge:${request.id}`); return true; }

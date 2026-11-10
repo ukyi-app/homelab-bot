@@ -2196,6 +2196,41 @@ test('AC-28 수정 중 병합: 차례가 도는 동안 PR이 병합되면 커밋
   });
 });
 
+test('AC-28 차례 열기 직전 병합(C34): 확정된 요청이 기다려도 병합 읽기를 먼저 해, 마지막 읽기 뒤 병합된 PR이면 차례를 열지 않고 작성 0으로 merged로 나간다', async () => {
+  const fake = discussionFake();
+  await withHarness({ changeV2: true, colleague: true, steps: [V2_WRITE_STEP, AMEND_STEP], amendments: { discussion: fake.read } }, async h => {
+    const id = await toProposed(h);
+    const published = branchHead(h);
+    // 이 런타임의 병합 읽기 주기가 막 돌아 다음 읽기는 한참 뒤다. 그 사이 PR이 병합되고 수정 요청이 확정된다.
+    h.restart({ instrument: deps => ({ ...deps, periods: { ...deps.periods, mergePollMs: 3_600_000 } }) });
+    await h.runtime.publishTick();
+    h.env.github.pulls[0]!.merged_at = '2026-01-01T00:00:00Z';
+    await requestAmendment(h, id, 'amend-1', published);
+    await h.pump(async () => ['merged', 'observing_deploy'].includes(await h.phase(id)), 50);
+    assert.deepEqual((await roundsOf(h, id)).map(round => [round.state, round.reason]), [['failed', 'pr_merged']]);
+    assert.equal((await h.f.calls()).length, 1, '수정 차례 작성 모델을 부르지 않는다');
+    assert.equal((await h.db.query(`SELECT 1 FROM change_child_jobs WHERE change_id=$1 AND amendment_round>0`, [id])).rows.length, 0, '작성 job이 없다');
+    assert.equal(h.env.github.mutations(/^PATCH .*git\/refs/).length, 0);
+  });
+});
+
+test('AC-28 차례 열기 전 병합 읽기(C34): 열린 PR이면 차례를 열고, 수정 요청이 없을 때 병합 읽기 주기는 그대로다', async () => {
+  const fake = discussionFake();
+  await withHarness({ changeV2: true, colleague: true, steps: [V2_WRITE_STEP, AMEND_STEP], amendments: { discussion: fake.read } }, async h => {
+    const id = await toProposed(h);
+    let reads = 0;
+    h.restart({ instrument: deps => ({ ...deps, periods: { ...deps.periods, mergePollMs: 3_600_000 },
+      deployment: { observe: input => deps.deployment.observe(input), readMerge: async input => { reads++; return deps.deployment.readMerge(input); } } }) });
+    for (let tick = 0; tick < 5; tick++) await h.runtime.publishTick();
+    assert.equal(reads, 1, '요청이 없으면 주기마다 한 번 읽는다');
+    await requestAmendment(h, id, 'amend-1', branchHead(h));
+    await h.runtime.publishTick();
+    assert.equal(reads, 2, '차례를 열기 전에 한 번 더 읽는다');
+    assert.equal(await h.phase(id), 'amending');
+    await h.pump(async () => (await roundsOf(h, id))[0]?.state === 'committed' && await h.phase(id) === 'proposed');
+  });
+});
+
 test('AC-28 ref 갱신 응답 유실: 다시 보내지 않고 브랜치를 다시 읽어 확정한다(fast-forward 한 번)', async () => {
   const fake = discussionFake();
   await withHarness({ changeV2: true, colleague: true, steps: [V2_WRITE_STEP, AMEND_STEP], amendments: { discussion: fake.read } }, async h => {
