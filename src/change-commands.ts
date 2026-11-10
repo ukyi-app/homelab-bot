@@ -10,7 +10,7 @@ import type { Database } from './database.js';
 import { errorInfo } from './log.js';
 import type { Log } from './log.js';
 import type { PolicyGate } from './policy.js';
-import type { Store } from './store.js';
+import type { OutboxButton, Store } from './store.js';
 import type { TaskAnswerInput, TaskAnswerResult } from './task-bridge.js';
 import type { TaskCommandHandler } from './task-commands.js';
 
@@ -20,7 +20,14 @@ import type { TaskCommandHandler } from './task-commands.js';
 export type ChangeCommand = 'change' | 'change-status' | 'change-cancel' | 'change-publish';
 export interface ChangeCommandRequest { id: string; actor: string; scope: Scope; command: ChangeCommand; text: string; target?: string }
 export interface ChangeCommandReply { content: string; outcome: string }
-export interface ChangeCommandHandler { handle(request: ChangeCommandRequest): Promise<ChangeCommandReply> }
+// 게시 승인 버튼 누름. target은 버튼 custom_id의 대상 칸(`<변경 ID>.<generation>.<digest 앞 16자>`)이다.
+export interface PublishPress { id: string; actor: string; scope: Scope; target: string }
+// update: 응답으로 그 글을 content로 바꾸고 버튼을 없앤다. 아니면 누른 owner에게만 보이는 응답이고 버튼은 남는다.
+export interface PublishPressReply extends ChangeCommandReply { update?: true }
+export interface ChangeCommandHandler {
+  handle(request: ChangeCommandRequest): Promise<ChangeCommandReply>;
+  pressPublish?(request: PublishPress): Promise<PublishPressReply>;
+}
 
 const USAGE = '서식: /change project:<저장소> text:<요약> | goal=<목표> | accept=<인수 조건> | label=public. accept는 여러 번 쓸 수 있고 base=<브랜치>는 선택입니다. label은 이 글을 공개해도 되는지에 대한 owner의 판단입니다(public, approved_public_summary, private, unknown).';
 const THREAD_ONLY = '변경 요청은 대화 채널의 스레드에서만 받습니다. /chat으로 스레드를 연 뒤 그 스레드에서 실행하세요.';
@@ -63,6 +70,31 @@ export interface ChangeCommandDeps {
 }
 const closedText = (reason: string) => `지금 변경 요청을 받지 않습니다(${reason}). 대화·작업·리뷰는 그대로 동작합니다.`;
 
+// 게시 승인 버튼(COLLEAGUE_SPEC §4.3 "게시 승인"). custom_id는 `change-publish-ok:<변경 ID>.<generation>.<승인 digest 앞 16자>`다.
+// 전체 digest(64자)는 변경 ID(32자)와 함께 100자 상한에 들지 않는다. 승인 대상은 generation마다 하나이고 DB가 바꾸지 못하게 막으므로
+// (ARCHITECTURE §16) 변경 ID·generation이 digest 하나를 정한다. 앞자리는 누를 때 지금 승인 대상의 digest와 한 번 더 대조한다.
+export const PUBLISH_BUTTON = 'change-publish-ok';
+const PUBLISH_DIGEST_CHARS = 16;
+const PUBLISH_TARGET = /^([0-9a-f]{32})\.([1-9][0-9]{0,8})\.([0-9a-f]{16})$/;
+// 버튼 응답 문구. 동료 기능 스위치를 켰을 때만 보이므로 동료 말투다.
+export const PUBLISH_TEXT = Object.freeze({
+  label: '게시해 주세요',
+  approved: (id: string) => `변경 ${id} 게시를 승인했어요. 게시 직전에 base·정책·CI를 다시 확인하고 결과는 이 스레드에 알려 드릴게요.`,
+  stale: '지난 미리보기의 버튼이라 승인하지 않았어요. 가장 최근 미리보기를 확인해 주세요.',
+  settled: '이미 승인한 미리보기예요.',
+  notVisible: '이 스레드에서 볼 수 있는 변경이 아니에요.',
+  writerUnaccepted: '아직 게시할 수 없어서 승인하지 않았어요(writer 확인 전). 승인 대기는 그대로예요.',
+  stopped: '이 대화는 구독이 꺼져 있어서 승인하지 않았어요.',
+  closed: '지금은 변경 게시를 받지 않아요. 승인 대기는 그대로예요.',
+  failed: '처리하지 못했어요(일시 오류). 잠시 뒤 다시 눌러 주세요.',
+});
+// 미리보기 글의 outbox 키. change-runtime의 단계 알림 키(`change-phase:<ID>:<generation>:<phase>`)와 같은 꼴이어야 한다.
+export const changePreviewKey = (changeId: string, generation: number) => `change-phase:${changeId}:${generation}:awaiting_publish_approval`;
+// 승인이 이미 들어간 뒤의 단계. 같은 generation의 버튼을 다시 누르면 "이미 승인"으로 답한다.
+const SETTLED_PHASES: ReadonlySet<string> = new Set(['approved', 'publishing', 'proposed', 'merged', 'observing_deploy']);
+export const publishButton = (changeId: string, generation: number, digest: string): OutboxButton =>
+  ({ id: `${PUBLISH_BUTTON}:${changeId}.${generation}.${digest.slice(0, PUBLISH_DIGEST_CHARS)}`, label: PUBLISH_TEXT.label, style: 'primary' });
+
 export class ChangeCommands implements ChangeCommandHandler {
   constructor(private readonly deps: ChangeCommandDeps) {}
   async handle(request: ChangeCommandRequest): Promise<ChangeCommandReply> {
@@ -74,7 +106,7 @@ export class ChangeCommands implements ChangeCommandHandler {
     }
   }
   // 요청한 스레드의 owner에게만 존재를 알린다.
-  private async own(request: ChangeCommandRequest): Promise<ChangeRequest | null> {
+  private async own(request: Pick<ChangeCommandRequest, 'actor' | 'scope' | 'target'>): Promise<ChangeRequest | null> {
     if (!request.target || !CHANGE_ID.test(request.target)) return null;
     const found = await this.deps.changes.get(request.target);
     if (!found.ok || found.value.ownerId !== request.actor || found.value.conversationId !== this.deps.store.scopeId(request.scope)) return null;
@@ -137,15 +169,48 @@ export class ChangeCommands implements ChangeCommandHandler {
     if (closed) return { content: closedText(closed), outcome: 'closed' };
     const found = await this.own(request);
     if (!found) return { content: NOT_VISIBLE, outcome: 'not_visible' };
+    const approved = await this.approve(found, found.generation, request.text.trim(), request);
+    if (approved.ok) return { content: `변경 ${found.id} 게시를 승인했습니다. 게시 직전 base·정책·CI를 다시 확인하고, 결과는 이 스레드에 알립니다.`, outcome: 'approved' };
+    if (approved.reason === 'writer_unaccepted') return { content: '실제 writer의 AC-P8이 확인되지 않아 게시를 받지 않습니다. 승인 대기는 그대로입니다.', outcome: 'writer_unaccepted' };
+    const text: Partial<Record<string, string>> = { digest_mismatch: '미리보기의 승인 digest와 다릅니다. 승인하지 않았습니다.', duplicate_event: '이미 처리한 승인입니다.',
+      owner_mismatch: NOT_VISIBLE, phase_conflict: `승인 대기 상태가 아닙니다(지금 ${approved.phase ?? found.phase}).` };
+    return { content: text[approved.reason] ?? TRANSIENT, outcome: approved.reason };
+  }
+  // '/change-publish'와 게시 승인 버튼이 함께 쓰는 승인. 저장 계층의 approve가 owner·generation·phase·digest·이벤트 멱등을 본다.
+  private async approve(found: ChangeRequest, generation: number, digest: string, request: { id: string; actor: string }): Promise<{ ok: true } | { ok: false; reason: string; phase?: string }> {
     const policy = await this.deps.gate.current();
     const repository = policy.change?.repositories.find(item => item.repoId === found.repoId);
     // 승인한 뒤에 막히면 되돌릴 수 없다. 확인 전이면 승인을 받지 않고 대기에 둔다.
-    if (repository && !repository.writerAccepted) return { content: '실제 writer의 AC-P8이 확인되지 않아 게시를 받지 않습니다. 승인 대기는 그대로입니다.', outcome: 'writer_unaccepted' };
-    const approved = await this.deps.changes.approve({ changeId: found.id, generation: found.generation, approvalDigest: request.text.trim(), eventId: request.id, actor: request.actor });
-    if (approved.ok) return { content: `변경 ${found.id} 게시를 승인했습니다. 게시 직전 base·정책·CI를 다시 확인하고, 결과는 이 스레드에 알립니다.`, outcome: 'approved' };
-    const text: Partial<Record<string, string>> = { digest_mismatch: '미리보기의 승인 digest와 다릅니다. 승인하지 않았습니다.', duplicate_event: '이미 처리한 승인입니다.',
-      owner_mismatch: NOT_VISIBLE, phase_conflict: `승인 대기 상태가 아닙니다(지금 ${approved.current?.phase ?? found.phase}).` };
-    return { content: text[approved.reason] ?? TRANSIENT, outcome: approved.reason };
+    if (repository && !repository.writerAccepted) return { ok: false, reason: 'writer_unaccepted' };
+    const approved = await this.deps.changes.approve({ changeId: found.id, generation, approvalDigest: digest, eventId: request.id, actor: request.actor });
+    return approved.ok ? { ok: true } : { ok: false, reason: approved.reason, ...(approved.current ? { phase: approved.current.phase } : {}) };
+  }
+  // 게시 승인 버튼. 버튼이 가리키는 generation의 승인 대상 digest로 '/change-publish'와 같은 승인을 한다.
+  async pressPublish(request: PublishPress): Promise<PublishPressReply> {
+    if (this.deps.closedReason()) return { content: PUBLISH_TEXT.closed, outcome: 'closed' };
+    const pressed = PUBLISH_TARGET.exec(request.target);
+    const found = pressed ? await this.own({ ...request, target: pressed[1] }) : null;
+    if (!pressed || !found) return { content: PUBLISH_TEXT.notVisible, outcome: 'not_visible' };
+    const generation = Number(pressed[2]);
+    const stale = { content: PUBLISH_TEXT.stale, outcome: 'stale' };
+    // 새 generation이 열렸으면 그 버튼이 본 미리보기는 지난 것이다.
+    if (generation !== found.generation) return stale;
+    const subject = await this.deps.changes.approvalSubject({ changeId: found.id, generation });
+    if (!subject.ok || !subject.value.digest.startsWith(pressed[3]!)) return stale;
+    const approved = await this.approve(found, generation, subject.value.digest, request);
+    if (approved.ok) {
+      // 갱신 응답은 그 글 본문을 바꾸므로 미리보기 마지막 쪽을 남기고 결과를 붙인다. 보존 기간이 지나 본문을 비웠으면 결과만 남는다.
+      const page = (await this.deps.store.db.query<{ content: string | null }>(`SELECT payload->>'content' AS content FROM outbox WHERE message_key=$1
+        ORDER BY page_index DESC LIMIT 1`, [changePreviewKey(found.id, generation)])).rows[0]?.content;
+      return { content: page ? `${page}\n\n${PUBLISH_TEXT.approved(found.id)}` : PUBLISH_TEXT.approved(found.id), outcome: 'approved', update: true };
+    }
+    if (approved.reason === 'writer_unaccepted') return { content: PUBLISH_TEXT.writerUnaccepted, outcome: approved.reason };
+    if (approved.reason === 'duplicate_event' || approved.reason === 'phase_conflict' && approved.phase !== undefined && SETTLED_PHASES.has(approved.phase)) {
+      return { content: PUBLISH_TEXT.settled, outcome: 'settled' };
+    }
+    if (approved.reason === 'owner_mismatch') return { content: PUBLISH_TEXT.notVisible, outcome: approved.reason };
+    if (approved.reason === 'phase_conflict' || approved.reason === 'digest_mismatch') return { ...stale, outcome: approved.reason };
+    return { content: PUBLISH_TEXT.failed, outcome: approved.reason };
   }
   private async cancel(request: ChangeCommandRequest): Promise<ChangeCommandReply> {
     const found = await this.own(request);
