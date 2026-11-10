@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { z } from 'zod';
 import { DEFAULTS, Denied, PolicyUnavailable, WorkerRejected } from './contracts.js';
 import type { Job, Scope } from './contracts.js';
+import { ChatSuperseded, lockedChatJobCurrent } from './chat-currency.js';
 import type { Database } from './database.js';
 import type { Policy, PolicyGate } from './policy.js';
 import { DRAIN_MS } from './runtime.js';
@@ -378,7 +379,11 @@ export class ReviewRequests implements ReviewRequestPort {
   constructor(private readonly store: Store, private readonly policy: ReviewPolicySource, private readonly queue: ReviewQueue,
     private readonly reader: GitHubReader, private readonly targets: ReviewTargetReader) {}
   async request(input: { repository: string; pr: number; key: string }): Promise<ReviewRequestResult> {
-    const result = await this.resolve(input.repository, input.pr, input.key);
+    let result: ReviewRequestResult;
+    try { result = await this.resolve(input.repository, input.pr, input.key); } catch (error) {
+      if (error instanceof ChatSuperseded) await this.store.audit('review_requested', input.key, { repository: input.repository, pr: input.pr, outcome: 'superseded' });
+      throw error;
+    }
     await this.store.audit('review_requested', input.key, { repository: input.repository, pr: input.pr, outcome: result.outcome,
       ...(result.outcome === 'refused' ? { reason: result.reason } : {}) });
     return result;
@@ -412,8 +417,13 @@ export class ReviewRequests implements ReviewRequestPort {
     }
     let admitted: Admission | Decision;
     try {
-      admitted = await this.store.db.transaction(tx => this.queue.admit(pr, repo, context, comparison, 'comment', `discord:${key}`, tx,
-        { outside: !listed }));
+      admitted = await this.store.db.transaction(async tx => {
+        // 위 GitHub 조회 동안 owner가 같은 대화에서 요청을 고치거나 거뒀으면 옛 요청으로 리뷰를 만들지 않는다.
+        // key가 대화 job일 때(제안 처리에서 온 요청)만 대화가 있다.
+        const chat = (await tx.query("SELECT 1 FROM jobs WHERE id=$1 AND type='chat'", [key])).rows.length > 0;
+        if (chat && !await lockedChatJobCurrent(tx, key)) throw new ChatSuperseded();
+        return this.queue.admit(pr, repo, context, comparison, 'comment', `discord:${key}`, tx, { outside: !listed });
+      });
     } catch (error) {
       if (error instanceof Error && error.message === 'queue_full') return refused('unavailable');
       throw error;
