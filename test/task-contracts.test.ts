@@ -406,6 +406,24 @@ test('C25 수정 차례 입력: 변경 작성 판에서만, head는 base와 같�
   if (2 * AMENDMENT_LIMITS.materialChars > AMENDMENT_LIMITS.totalChars) rejects(TaskV2RequestSchema, amend(amendment({ materials: { label: 'public', items: long, omitted: 0 } })), '글자 상한');
 });
 
+test('C31 게시 전 고치기 입력: PR 번호 없는(null) 수정 차례 칸을 받고, 판·head 규칙은 같다', () => {
+  const amend = (value: unknown, instructions: string = CHANGE_INSTRUCTIONS_REVISION) => v2Start({ instructions, amendment: value });
+  const parsed = TaskV2RequestSchema.parse(amend(amendment({ pullNumber: null }))) as { amendment?: { pullNumber: unknown } };
+  assert.equal(parsed.amendment?.pullNumber, null);
+  rejects(TaskV2RequestSchema, amend(amendment({ pullNumber: null }), 'task-v1'), '옛 판에는 고치기 차례도 없다');
+  rejects(TaskV2RequestSchema, amend(amendment({ pullNumber: null, head: 'c'.repeat(40) })), 'head가 base와 다름');
+  for (const pullNumber of [0, -1, 1.5, '12', undefined]) rejects(TaskV2RequestSchema, amend(amendment({ pullNumber })), `pullNumber ${String(pullNumber)}`);
+});
+
+test('C31 호환: 기존 요청의 칸 순서와 직렬화(서명 digest의 재료)가 그대로다', () => {
+  const plain = TaskV2RequestSchema.parse(v2Start({ instructions: CHANGE_INSTRUCTIONS_REVISION })) as Record<string, unknown>;
+  const amended = TaskV2RequestSchema.parse(v2Start({ instructions: CHANGE_INSTRUCTIONS_REVISION, amendment: amendment() })) as Record<string, unknown>;
+  assert.equal('amendment' in plain, false, '칸이 없으면 직렬화에 나타나지 않는다');
+  assert.deepEqual(Object.keys(amended), [...Object.keys(plain), 'amendment'], '수정 차례 칸은 맨 끝이다');
+  assert.equal(JSON.stringify(amended.amendment), `{"pullNumber":12,"head":"${SHA}","instruction":"리뷰 댓글대로 고쳐 줘","materials":{"label":"public","items":[{"kind":"review_comment","authorId":7,"association":"OWNER","location":{"path":"src/app.txt","line":3},"body":"여기 이름이 틀렸어요"}],"omitted":0}}`);
+  assert.equal(JSON.stringify(TaskV2RequestSchema.parse(JSON.parse(JSON.stringify(amended)))), JSON.stringify(amended), '다시 파싱해도 같은 바이트');
+});
+
 test('C25 자료 블록 상한: 넘치면 오래된 것부터 빼고 뺀 수를 남긴다. 긴 본문은 자른다', () => {
   const items = Array.from({ length: AMENDMENT_LIMITS.materials + 5 }, (_, index) => material(`댓글 ${index}`));
   const bounded = boundAmendmentMaterials(items);

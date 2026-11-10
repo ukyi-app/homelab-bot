@@ -280,7 +280,9 @@ export const ReviewMaterialSchema = z.strictObject({ kind: z.enum(REVIEW_MATERIA
   association: z.enum(AUTHOR_ASSOCIATIONS), location: ChangeLocationSchema.nullable(), body: z.string().max(AMENDMENT_LIMITS.materialChars) }) satisfies z.ZodType<ReviewMaterial>;
 const materialChars = (items: readonly ReviewMaterial[]) => items.reduce((sum, item) => sum + item.body.length, 0);
 // 자료 블록은 공개 저장소 PR의 글이라 label이 public뿐이다. omitted는 상한 때문에 뺀 오래된 자료 수다.
-const AmendmentSchema = z.strictObject({ pullNumber: z.number().int().positive().max(2_147_483_647), head: z.string().regex(/^[a-f0-9]{40}$/),
+// pullNumber가 null이면 게시 전 고치기 차례(PR 없음, head는 그 generation의 B)이고 자료는 자체 리뷰의 발견이다. 게시 뒤 수정 차례는 PR 번호가 있다.
+// 칸 순서는 그대로라 PR 번호가 있는 요청의 직렬화·서명 digest가 바뀌지 않는다.
+const AmendmentSchema = z.strictObject({ pullNumber: z.number().int().positive().max(2_147_483_647).nullable(), head: z.string().regex(/^[a-f0-9]{40}$/),
   instruction: untrustedText,
   materials: z.strictObject({ label: z.literal('public'), items: z.array(ReviewMaterialSchema).max(AMENDMENT_LIMITS.materials), omitted: z.number().int().nonnegative() })
     .refine(materials => materialChars(materials.items) <= AMENDMENT_LIMITS.totalChars, 'materials_too_long') });

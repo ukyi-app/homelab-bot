@@ -265,8 +265,12 @@ test('AC-25 승인 묶음: 승인 digest가 확인할 것 목록에 묶인다. �
     // 기록은 고쳐 쓸 수 없다.
     await assert.rejects(env.db.query(`UPDATE change_notes SET checks='[]'::jsonb WHERE change_id=$1`, [key.changeId]));
     ok(await env.store.approve({ ...key, approvalDigest: prepared.digest, eventId: newEvent(), actor: OWNER }));
-    // 지우고 다시 넣어 바꿔치기해도 승인한 본문에 없는 글은 공개하지 않는다.
+    // 지우기도 DB가 막는다(026: 고치기 차례를 여는 트랜잭션만 지운다).
+    await assert.rejects(env.db.query('DELETE FROM change_notes WHERE change_id=$1', [key.changeId]), /change_evidence_immutable/);
+    // 트리거를 끄고 지운 뒤 다시 넣어 바꿔치기해도 승인한 본문에 없는 글은 공개하지 않는다.
+    await env.db.query('ALTER TABLE change_notes DISABLE TRIGGER change_notes_delete_guard');
     await env.db.query('DELETE FROM change_notes WHERE change_id=$1', [key.changeId]);
+    await env.db.query('ALTER TABLE change_notes ENABLE TRIGGER change_notes_delete_guard');
     await recordChangeNotes(env.db, key, { checks: [{ text: '승인 뒤 끼운 가정', location: { path: 'src/a.ts', line: 1 } }], risks: [] });
     assert.equal((await env.publisher.publish(key)).kind, 'proposed');
     assert.equal(env.github.pulls[0]!.body, subject.publication.body);

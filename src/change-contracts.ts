@@ -25,7 +25,8 @@ export const CHANGE_PHASE_TRANSITIONS: Readonly<Record<ChangePhase, readonly Cha
   authoring: ['snapshot_ready', ...STOP],
   snapshot_ready: ['verifying', ...STOP],
   verifying: ['reviewing', ...STOP],
-  reviewing: ['awaiting_publish_approval', ...STOP],
+  // reviewing → authoring은 같은 generation의 게시 전 고치기 차례다. 전용 메서드(ChangeStore.startSelfFix)로만 간다.
+  reviewing: ['awaiting_publish_approval', 'authoring', ...STOP],
   awaiting_publish_approval: ['approved', ...STOP],
   approved: ['publishing', ...STOP],
   publishing: ['proposed', ...STOP],
@@ -36,6 +37,8 @@ export const CHANGE_PHASE_TRANSITIONS: Readonly<Record<ChangePhase, readonly Cha
 });
 export const canTransition = (from: ChangePhase, to: ChangePhase): boolean => CHANGE_PHASE_TRANSITIONS[from].includes(to);
 export const isTerminalPhase = (phase: ChangePhase): phase is TerminalChangePhase => (TERMINAL_CHANGE_PHASES as readonly ChangePhase[]).includes(phase);
+// 게시 전 고치기 차례 상한(사용자 2026-11-09의 기본값). migrations/026의 fix_round CHECK와 같은 값이고 시험이 대조한다.
+export const CHANGE_SELF_FIX = Object.freeze({ maxRounds: 2 });
 // 전이 표 밖의 유일한 재시작이다. 새 generation은 admission부터 다시 받는다. blocked·failed는 사람이 볼 일이라 자동으로 다시 열지 않는다.
 export const GENERATION_RESTART = Object.freeze({ from: 'superseded', to: 'requested' } as const);
 export const MAX_GENERATION = 999;
@@ -406,6 +409,9 @@ export interface ReviewMaterial {
 // 수정 차례 입력. owner의 Discord 말이 지시이고, 그 PR의 리뷰·댓글은 자료다. head는 PR 브랜치 head이고 작성의 base가 된다.
 // 자료는 오래된 것부터 적는다. 상한을 넘으면 앞에서부터 빠진다(task-contracts boundAmendmentMaterials).
 export interface ChangeAmendmentInput { pullNumber: number; head: string; instruction: string; materials: readonly ReviewMaterial[] }
+// 게시 전 고치기 차례의 자료 한 항목. 앞 차례 자체 리뷰의 P0·P1 발견이고 작성 모델에는 자료로만 들어간다. 지시는 고정 문구다.
+// 모델이 쓴 리뷰 문장이라 비공개 표(change_review_findings)에서 오고 공개 경로로 내지 않는다. 위치를 모르면 location이 null이다.
+export interface SelfFixFinding { priority: 'P0' | 'P1'; code: string; title: string; detail: string; evidence: string; location: ChangeLocation | null }
 
 // B1. 작업자 v2 계약. 응답을 잃으면 같은 receipt로 fetchResult만 한다. 모델을 다시 돌리지 않는다.
 // options·checks·risks는 변경 작성 판(task-contracts CHANGE_INSTRUCTIONS_REVISION) 요청에만 있다.
@@ -417,7 +423,11 @@ export type AuthorResult =
 export interface ChangeAuthorPort {
   // 옛 작업자면 false다. CHANGE만 닫히고 기존 /task는 그대로 돈다.
   supportsV2(): Promise<boolean>;
-  start(input: { target: ChangeTarget; baseCommit: string; baseTree: string; policyRevision: string; brief: ChangeBrief; amendment?: ChangeAmendmentInput }): Promise<{ receiptId: string }>;
+  // 게시 전 고치기 차례의 작성 요청을 보낼 수 있는지. false면 호출자는 고치지 않고 지금처럼 review_blocked로 닫는다.
+  supportsSelfFix(): Promise<boolean>;
+  // selfFix는 게시 전 고치기 차례에만 있다. base는 그 generation의 B·T0 그대로다.
+  start(input: { target: ChangeTarget; baseCommit: string; baseTree: string; policyRevision: string; brief: ChangeBrief; amendment?: ChangeAmendmentInput;
+    selfFix?: { round: number; findings: readonly SelfFixFinding[] } }): Promise<{ receiptId: string }>;
   // 호출 전에 ChangePrivateInputs.record로 답변의 label을 기록한다. label_blocked면 부르지 않는다. 입력 label은 작업자 쪽 재확인용이다.
   resume(input: { receiptId: string; answer: string; label: ProvenanceLabel }): Promise<void>;
   cancel(receiptId: string): Promise<void>;
