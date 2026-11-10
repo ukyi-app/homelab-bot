@@ -1,8 +1,15 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { TEMPLATES } from './catalog.js';
+import { parseChangeRequest } from './change-commands.js';
+import type { ChangeCommandHandler } from './change-commands.js';
 import { ownerText } from './chat-context.js';
 import { chatReplyRisk } from './chat-format.js';
+import { Denied } from './contracts.js';
 import type { Job, Proposal, Scope } from './contracts.js';
 import { controlText, taskLaneClosedText } from './control-format.js';
+import type { ExternalTaskCommandHandler } from './external-task-commands.js';
+import { CommandInputError, parseIds, parseKind } from './memory-commands.js';
+import type { MemoryCommandHandler } from './memory-commands.js';
 import type { Policy, PolicyGate } from './policy.js';
 import { LaneClosed } from './store.js';
 import type { OutboxButton, Store } from './store.js';
@@ -30,12 +37,41 @@ export const PROPOSAL_TEXT = Object.freeze({
   stopped: '이 대화는 구독이 꺼져 있어서 실행하지 않았어요. 구독을 다시 켠 뒤 다시 말해 주세요.',
   notOwner: '제안을 받은 사람만 누를 수 있어요.',
   unavailable: '지금은 이 일을 할 수 없어요. 잠시 뒤 다시 말해 주세요.',
+  // 말로 한 변경 요청의 실행 확인(DECISIONS "동료 봇 전환" 15). 저장소는 변경 정책 대조를 지난 이름이다.
+  changeQuestion: (repository: string) => `${repository}에 이 변경 PR을 준비할까요?`,
+  changeCancelQuestion: (change: string) => `변경 \`${change}\`을 취소할까요?`,
+  cancelQuestion: (job: string) => `작업 \`${job}\`을 취소할까요?`,
+  taskCancelQuestion: (job: string) => `작업 \`${job}\`을 취소할까요?`,
+  retryQuestion: (job: string) => `작업 \`${job}\`을 다시 시도할까요?`,
+  reviewResumeQuestion: (job: string) => `리뷰 작업 \`${job}\`을 이어서 할까요?`,
+  reviewCancelQuestion: (job: string) => `리뷰 작업 \`${job}\`을 취소할까요?`,
+  // 기억 저장·정정은 저장될 글을 한 글자도 줄이지 않고 그대로 싣는다. owner가 본 값만 저장된다.
+  memorySaveQuestion: (kind: string, statement: string) => `이 내용을 ${kind} 기억으로 저장할까요?\n${quoted(statement)}`,
+  memoryCorrectQuestion: (ids: string, statement: string) => `기억 ${ids}을 이 내용으로 정정할까요?\n${quoted(statement)}`,
+  memoryExcludeQuestion: (key: string) => `출처 \`${key}\`을 기억에서 제외할까요? 이 출처의 기억은 검색·브리핑에서 빠지고 새로 저장하지 않아요.`,
+  memoryDeleteQuestion: (id: string) => `기억 \`${id}\`을 지울까요?`,
+  detachQuestion: (connection: string) => `세션 연결 \`${connection}\`을 해제할까요?`,
+  // 커밋 뒤 처리기가 실패했을 때. 처리됐는지 모를 수 있어 확인을 권한다.
+  failed: '처리하지 못했어요(일시 오류). 상태를 확인해 달라고 한 뒤 필요하면 다시 말해 주세요.',
 });
+// 저장될 글을 줄마다 인용 표시로 싣는다. 내용은 바꾸지 않는다.
+function quoted(text: string): string {
+  return text.split('\n').map(line => `> ${line}`).join('\n');
+}
 
 // 명세 §4.3 동작 표의 종류. admin(관리 기능)·none(구독 끄기·켜기, 급한 질문)은 말로 하지 않으므로 처리기를 달지 않고 늘 버린다.
 export type ActionKind = 'read' | 'run' | 'question' | 'publish' | 'admin' | 'none';
-interface ReadContext { store: Store; job: Job }
-interface ReadHandler { kind: 'read'; run(context: ReadContext): Promise<string> }
+// 수신(DiscordIngress)이 가진 '/' 처리기. 대화 성공 분기(Runtime)는 이 처리기를 받지 않으므로 수신이 같은 Store에 묶어 둔다.
+// 묶이지 않은 처리기의 동작은 "연결 안 됨"으로 버린다('/' 명령도 처리기가 없으면 닫힌다).
+export interface ProposalHandlers {
+  tasks?: TaskCommandHandler; memory?: MemoryCommandHandler; external?: ExternalTaskCommandHandler; changes?: ChangeCommandHandler;
+}
+const boundHandlers = new WeakMap<Store, ProposalHandlers>();
+export function bindProposalHandlers(store: Store, handlers: ProposalHandlers): void { boundHandlers.set(store, handlers); }
+interface ReadContext { store: Store; job: Job; proposal: Proposal; policy: Policy; handlers: ProposalHandlers }
+// 결과를 일반 답으로 싣지 않는 경우. queued는 다른 레인(read)이 결과를 게시한다. 나머지는 제안을 버린다.
+interface ReadSkip { skip: 'queued' | 'not_connected' | 'target_denied' }
+interface ReadHandler { kind: 'read'; run(context: ReadContext): Promise<string | ReadSkip> }
 // digest 재료. 버튼을 누를 때 저장된 참조로 다시 만들어 제안 때의 digest와 대조한다.
 interface Values { target: string | null; content: string | null }
 interface Prepared extends Values {
@@ -44,14 +80,17 @@ interface Prepared extends Values {
   // question은 원문 미리보기를 싣고, plainQuestion은 서버가 대조한 값(저장소 등)만 싣는다. question이 공개 검사에 걸리면 plainQuestion을 쓴다.
   question: string; plainQuestion: string;
 }
-interface PrepareContext { store: Store; job: Job; proposal: Proposal; policy: Policy; tasksConnected: boolean }
+interface PrepareContext { store: Store; job: Job; proposal: Proposal; policy: Policy; tasksConnected: boolean; handlers: ProposalHandlers }
 export interface ProposalRow {
   id: string; conversation_id: string; owner_id: string; scope: Scope; action: string; target: string | null;
   value: string | null; source_event: string | null; digest: string; source_job: string; state: string;
   expires_at: string; message_key: string;
 }
-export interface ExecuteContext { tasks?: TaskCommandHandler; revision: string }
-interface Executed { state: 'confirmed' | 'refused'; content: string; reason?: string; job?: string }
+// policy: 버튼을 누른 때 수신이 인가한 정책(말로 하는 리뷰 제어의 장소 판단에 쓴다).
+export interface ExecuteContext extends ProposalHandlers { revision: string; policy?: Policy }
+// later: 자기 DB 연결을 쓰는 처리기(기억·변경·세션 연결)는 버튼 트랜잭션이 커밋된 뒤에 부른다. 그 트랜잭션은 대화·제안 행을
+// 잠그고 있고, 처리기가 읽는 행(원 메시지 등)도 다른 연결에서 봐야 한다. '/' 기억·변경 명령처럼 한 번 잡은 뒤 실행하고 다시 하지 않는다.
+interface Executed { state: 'confirmed' | 'refused'; content: string; reason?: string; job?: string; later?: () => Promise<string> }
 interface RunHandler {
   kind: 'run';
   // 제안 때 허용 대상 대조와 값 준비. undefined면 그 제안을 버린다(대화 답만 나간다).
@@ -119,31 +158,283 @@ const taskHandler: RunHandler = {
   },
 };
 
+// ---- C14 나머지 동작. 읽기는 '/'와 같은 처리기의 결과를 일반 답으로 싣고, 실행은 '/'와 같은 처리기를 버튼 뒤에 부른다. ----
+const skip = (why: ReadSkip['skip']): ReadSkip => ({ skip: why });
+// 처리기 응답 문구가 아니라 대상 ID 자리에 쓰는 모양만 본다(SQL·custom_id 밖 값이 확인 글에 실리지 않게).
+const ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+// 이 대화에서 owner가 볼 수 있는 job. '/cancel'·'/retry'·'/task-cancel'이 대조하는 owner·대화와 같다.
+async function visibleJob(store: Store, job: Job, target: string, type?: string): Promise<boolean> {
+  if (!ID.test(target)) return false;
+  return (await store.db.query('SELECT 1 FROM jobs WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND ($4::text IS NULL OR type=$4)',
+    [target, job.owner_id, job.conversation_id, type ?? null])).rows.length > 0;
+}
+// 말로 하는 리뷰 재개·취소·상태의 장소(DECISIONS "동료 봇 전환" 13): owner가 허용 채널(대화·알림)이나 그 아래 스레드에서 말했다.
+// '/' 리뷰 제어는 이 판단을 쓰지 않고 지금처럼 알림 채널 본문만 받는다(discord.ts 수신).
+export function spokenReviewAllowed(scope: Scope, actor: string, policy: Policy): boolean {
+  const allowed = [policy.conversationChannel, policy.notificationChannel];
+  if (actor !== policy.owner) return false;
+  if (scope.kind === 'channel') return scope.parent === null && allowed.includes(scope.channel);
+  return scope.kind === 'thread' && scope.parent !== null && allowed.includes(scope.parent);
+}
+// 원 메시지의 Discord ID. 기억의 대화 출처(memory.ts)와 변경 요청의 입력 이벤트 키가 이 값이라, 근거 판정이 '/'와 같이 "owner 대화"가 된다.
+async function deliveryOf(store: Store, event: string | null): Promise<string | undefined> {
+  if (!event) return;
+  return (await store.db.query<{ delivery_id: string }>("SELECT delivery_id FROM events WHERE id=$1 AND provider='discord'", [event])).rows[0]?.delivery_id;
+}
+
+const taskStatusHandler: ReadHandler = {
+  kind: 'read',
+  async run({ job, proposal, handlers }) {
+    if (!handlers.tasks) return skip('not_connected');
+    if (!proposal.target || !ID.test(proposal.target)) return skip('target_denied');
+    // '/task-status'와 같은 처리기다. 타인 작업·다른 대화의 작업은 Denied라 제안을 버린다.
+    try { return await handlers.tasks.status(job.owner_id, job.target, proposal.target); } catch (error) {
+      if (error instanceof Denied) return skip('target_denied');
+      throw error;
+    }
+  },
+};
+const changeStatusHandler: ReadHandler = {
+  kind: 'read',
+  async run({ job, proposal, handlers }) {
+    if (!handlers.changes) return skip('not_connected');
+    if (!proposal.target) return skip('target_denied');
+    const reply = await handlers.changes.handle({ id: job.event_id, actor: job.owner_id, scope: job.target, command: 'change-status', text: '', target: proposal.target });
+    return reply.outcome === 'not_visible' ? skip('target_denied') : reply.content;
+  },
+};
+const reviewStatusHandler: ReadHandler = {
+  kind: 'read',
+  run: async ({ store, job, policy }) => controlText('review-status', await store.control(job.owner_id, job.conversation_id, 'review-status', undefined, undefined,
+    { review: spokenReviewAllowed(job.target, job.owner_id, policy) }), store.colleague),
+};
+// 읽기 템플릿: 모델은 템플릿 ID만 고르고 서버가 카탈로그에 대조한다. '/read'와 같은 모양의 입력(대상 서비스, 본문 템플릿 ID)으로
+// read 레인에 접수하므로 정책 인가·5초 예산·결과 게시가 '/read'와 같다. 결과는 read 레인이 이 대화에 일반 글로 게시한다.
+const readHandler: ReadHandler = {
+  kind: 'read',
+  async run({ store, job, proposal }) {
+    const template = TEMPLATES.find(item => item.id === proposal.target);
+    if (!template) return skip('target_denied');
+    await store.atomic(async tx => {
+      const id = randomUUID();
+      const inserted = await tx.db.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,conversation_id,received_at,payload)
+        VALUES ($1,'proposal',$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (semantic_key) DO NOTHING RETURNING id`, [id, job.id, `proposal-read:${job.id}`, job.owner_id,
+        JSON.stringify(job.target), job.conversation_id, tx.now(), JSON.stringify({ text: template.id, command: 'read', target: template.service, kind: 'command',
+          revision: job.revision.policy })]);
+      if (!inserted.rows.length) return;
+      await tx.accept(id, 'read', job.revision.policy);
+    });
+    return skip('queued');
+  },
+};
+const memorySearchHandler: ReadHandler = {
+  kind: 'read',
+  async run({ store, job, proposal, handlers }) {
+    if (!handlers.memory) return skip('not_connected');
+    if (!proposal.content?.trim()) return skip('target_denied');
+    const id = await deliveryOf(store, job.event_id);
+    if (!id) return skip('target_denied');
+    return (await handlers.memory.handle({ id, actor: job.owner_id, scope: job.target, command: 'memory-search', text: proposal.content })).content;
+  },
+};
+const attachListHandler: ReadHandler = {
+  kind: 'read',
+  async run({ job, handlers }) {
+    if (!handlers.external) return skip('not_connected');
+    // 목록은 키를 싣지 않아 본인 전용 응답(deliver)을 쓰지 않는다.
+    const reply = await handlers.external.handle({ actor: job.owner_id, scope: job.target, command: 'attach-list', text: '' }, async () => false);
+    return reply.content ?? skip('target_denied');
+  },
+};
+
+const fixedQuestion = (target: string, question: string, extra: Partial<Prepared> = {}): Prepared =>
+  ({ target, content: null, value: null, sourceEvent: null, question, plainQuestion: question, ...extra });
+const targetOnly = async (_store: Store, row: ProposalRow): Promise<Values> => ({ target: row.target, content: null });
+// 대화 작업 제어('/cancel'·'/retry'). '/'처럼 버튼 트랜잭션 안에서 Store.control을 부른다(같은 잠금 순서: 대화 행 → 스케줄러 행).
+const controlHandler = (command: 'cancel' | 'retry', question: (job: string) => string): RunHandler => ({
+  kind: 'run',
+  async prepare({ store, job, proposal }) {
+    if (!proposal.target || !await visibleJob(store, job, proposal.target)) return;
+    return fixedQuestion(proposal.target, question(proposal.target));
+  },
+  current: targetOnly,
+  async execute(store, row, values) {
+    const result = await store.control(row.owner_id, row.conversation_id, command, values.target!, row.id);
+    return controlled(command, result, store.colleague);
+  },
+});
+const controlled = (command: string, result: unknown, colleague: boolean): Executed => ({
+  state: (result as { ok?: boolean } | null)?.ok === false ? 'refused' : 'confirmed',
+  ...((result as { ok?: boolean } | null)?.ok === false ? { reason: 'control_refused' } : {}),
+  content: controlText(command, result, colleague),
+});
+const taskCancelHandler: RunHandler = {
+  kind: 'run',
+  async prepare({ store, job, proposal, handlers }) {
+    if (!handlers.tasks || !proposal.target || !await visibleJob(store, job, proposal.target, 'task')) return;
+    return fixedQuestion(proposal.target, PROPOSAL_TEXT.taskCancelQuestion(proposal.target));
+  },
+  current: targetOnly,
+  async execute(store, row, values, { tasks }) {
+    if (!tasks) return { state: 'refused', reason: 'task_unavailable', content: PROPOSAL_TEXT.unavailable };
+    return controlled('task-cancel', await tasks.cancelIn(store, row.owner_id, row.conversation_id, values.target!, row.id), store.colleague);
+  },
+};
+// 리뷰 재개·취소. 리뷰 작업은 대화가 없어 대상은 리뷰 job이면 되고, 권한은 '/'의 별도 리뷰 권한 자리에 말로 하는 장소 판단을 넣는다.
+const reviewHandler = (command: 'review-resume' | 'review-cancel', question: (job: string) => string): RunHandler => ({
+  kind: 'run',
+  async prepare({ store, job, proposal, policy }) {
+    if (!proposal.target || !ID.test(proposal.target) || !spokenReviewAllowed(job.target, job.owner_id, policy)) return;
+    if (!(await store.db.query("SELECT 1 FROM jobs WHERE id=$1 AND type='review'", [proposal.target])).rows.length) return;
+    return fixedQuestion(proposal.target, question(proposal.target));
+  },
+  current: targetOnly,
+  async execute(store, row, values, { policy }) {
+    const allowed = !!policy && spokenReviewAllowed(row.scope, row.owner_id, policy);
+    return controlled(command, await store.control(row.owner_id, row.conversation_id, command, values.target!, row.id, { review: allowed }), store.colleague);
+  },
+});
+// 커밋 뒤에 부를 처리기 실행. 실패는 고정 문구로 바꾸고 오류 원문은 싣지 않는다(호출자가 사유 코드로 남긴다).
+const later = (run: () => Promise<string>): Executed => ({ state: 'confirmed', content: '', later: run });
+const memoryKind = (target: string | null): string | undefined => {
+  try { return parseKind(target ?? undefined); } catch (error) { if (error instanceof CommandInputError) return; throw error; }
+};
+const memoryIds = (target: string | null): string[] | undefined => {
+  try { return parseIds(target ?? undefined); } catch (error) { if (error instanceof CommandInputError) return; throw error; }
+};
+// 기억 저장·정정: 내용은 모델이 골라낸 글이라 value에 두고 확인 글에 그대로 싣는다. 버튼 때 digest가 같은 그 글만 '/'와 같은 처리기로 저장한다.
+// 확인 글이 공개 검사에 걸리면 내용을 숨긴 채 저장을 물을 수 없으므로 버린다(plainQuestion도 같은 글).
+const memoryWriteHandler = (command: 'memory-save' | 'memory-correct'): RunHandler => ({
+  kind: 'run',
+  async prepare({ job, proposal, handlers }) {
+    const statement = proposal.content;
+    if (!handlers.memory || !statement?.trim()) return;
+    let question: string;
+    if (command === 'memory-save') {
+      const kind = memoryKind(proposal.target);
+      if (!kind) return;
+      question = PROPOSAL_TEXT.memorySaveQuestion(kind, statement);
+    } else {
+      const ids = memoryIds(proposal.target);
+      if (!ids) return;
+      question = PROPOSAL_TEXT.memoryCorrectQuestion(ids.map(id => `\`${id}\``).join(', '), statement);
+    }
+    return { target: proposal.target, content: statement, value: statement, sourceEvent: job.event_id, question, plainQuestion: question };
+  },
+  current: async (_store, row) => ({ target: row.target, content: row.value }),
+  async execute(store, row, values, { memory }) {
+    const id = await deliveryOf(store, row.source_event);
+    if (!memory || !id) return { state: 'refused', reason: 'memory_unavailable', content: PROPOSAL_TEXT.unavailable };
+    return later(async () => (await memory.handle({ id, actor: row.owner_id, scope: row.scope, command, text: values.content!, target: values.target ?? undefined })).content);
+  },
+});
+const memoryTargetHandler = (command: 'memory-exclude' | 'memory-delete'): RunHandler => ({
+  kind: 'run',
+  async prepare({ job, proposal, handlers }) {
+    const target = proposal.target?.trim();
+    if (!handlers.memory || !target) return;
+    if (command === 'memory-delete') {
+      if (memoryIds(target)?.length !== 1) return;
+      return fixedQuestion(target, PROPOSAL_TEXT.memoryDeleteQuestion(target), { sourceEvent: job.event_id });
+    }
+    // memory.ts exclude가 받는 출처 키 모양만 받는다(here는 이 스레드).
+    if (target !== 'here' && !/^(conversation|job|document|external|channel):.{1,200}$/s.test(target)) return;
+    return fixedQuestion(target, PROPOSAL_TEXT.memoryExcludeQuestion(target), { sourceEvent: job.event_id });
+  },
+  current: targetOnly,
+  async execute(store, row, values, { memory }) {
+    const id = await deliveryOf(store, row.source_event);
+    if (!memory || !id) return { state: 'refused', reason: 'memory_unavailable', content: PROPOSAL_TEXT.unavailable };
+    return later(async () => (await memory.handle({ id, actor: row.owner_id, scope: row.scope, command, text: '', target: values.target! })).content);
+  },
+});
+const detachHandler: RunHandler = {
+  kind: 'run',
+  async prepare({ store, job, proposal, handlers }) {
+    // '/detach'는 owner의 연결이면 받는다. 말로 할 때는 이 대화에서 볼 수 있는(이 스레드에 연결한) 열린 연결만 받는다.
+    if (!handlers.external || !proposal.target || !ID.test(proposal.target)) return;
+    if (!(await store.db.query(`SELECT 1 FROM external_task_connections WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND revoked_at IS NULL`,
+      [proposal.target, job.owner_id, job.conversation_id])).rows.length) return;
+    return fixedQuestion(proposal.target, PROPOSAL_TEXT.detachQuestion(proposal.target));
+  },
+  current: targetOnly,
+  async execute(_store, row, values, { external }) {
+    if (!external) return { state: 'refused', reason: 'external_unavailable', content: PROPOSAL_TEXT.unavailable };
+    return later(async () => (await external.handle({ actor: row.owner_id, scope: row.scope, command: 'detach', text: '', target: values.target! }, async () => false)).content ?? '');
+  },
+};
+// 말로 한 변경 요청을 '/change'의 text 서식으로 옮긴다. 요약은 owner 원문 그대로이고, 인수 조건은 서버 고정 문구, 출처는
+// DECISIONS "동료 봇 전환" 15의 공개 표시(label=public)다. 접수 때 공개 검사(scanBrief)와 출처 label 규칙은 '/change' 그대로다.
+export const SPOKEN_CHANGE_ACCEPTANCE = '요약에 적힌 owner의 요청이 반영돼 있다';
+export const spokenChangeText = (text: string) => `${text} | accept=${SPOKEN_CHANGE_ACCEPTANCE} | label=public`;
+const changeHandler: RunHandler = {
+  kind: 'run',
+  async prepare({ store, job, proposal, policy, handlers }) {
+    // '/change'와 같은 장소(대화 채널의 스레드)와 같은 저장소 정책 대조다.
+    if (!handlers.changes || job.target.kind !== 'thread' || job.target.parent !== policy.conversationChannel) return;
+    const repository = policy.change?.repositories.find(item => item.fullName === proposal.target || String(item.repoId) === proposal.target);
+    if (!repository) return;
+    const content = await sourceText(store, job.event_id);
+    if (!content || !spokenAsIs(content)) return;
+    const question = PROPOSAL_TEXT.changeQuestion(repository.fullName);
+    return { target: repository.fullName, content, value: null, sourceEvent: job.event_id, question, plainQuestion: question };
+  },
+  async current(store, row) {
+    const content = await sourceText(store, row.source_event);
+    return content === undefined ? undefined : { target: row.target, content };
+  },
+  async execute(store, row, values, { changes }) {
+    const id = await deliveryOf(store, row.source_event);
+    if (!changes || !id || !values.content) return { state: 'refused', reason: 'change_unavailable', content: PROPOSAL_TEXT.unavailable };
+    return later(async () => (await changes.handle({ id, actor: row.owner_id, scope: row.scope, command: 'change', text: spokenChangeText(values.content!), target: values.target! })).content);
+  },
+};
+// '/change' 서식으로 옮겨도 요약이 owner 원문과 같아야 받는다(" | "·"goal=" 같은 서식 글자, 길이·제어 문자에 걸리면 버린다).
+function spokenAsIs(text: string): boolean {
+  const parsed = parseChangeRequest(spokenChangeText(text));
+  return parsed.ok && parsed.value.summary === text && parsed.value.label === 'public';
+}
+const changeCancelHandler: RunHandler = {
+  kind: 'run',
+  async prepare({ job, proposal, handlers }) {
+    if (!handlers.changes || !proposal.target) return;
+    // 볼 수 있는지는 '/change-status'와 같은 처리기로 본다(읽기만 한다). 요청한 스레드의 owner에게만 보인다.
+    const seen = await handlers.changes.handle({ id: job.event_id, actor: job.owner_id, scope: job.target, command: 'change-status', text: '', target: proposal.target });
+    if (seen.outcome === 'not_visible') return;
+    return fixedQuestion(proposal.target, PROPOSAL_TEXT.changeCancelQuestion(proposal.target));
+  },
+  current: targetOnly,
+  async execute(_store, row, values, { changes }) {
+    if (!changes) return { state: 'refused', reason: 'change_unavailable', content: PROPOSAL_TEXT.unavailable };
+    return later(async () => (await changes.handle({ id: row.id, actor: row.owner_id, scope: row.scope, command: 'change-cancel', text: '', target: values.target! })).content);
+  },
+};
+
 // 동작 표. 키는 작업자 계약의 제안 동작 ID(contracts.ts PROPOSAL_ACTIONS, '/' 이름의 하이픈을 밑줄로)이고,
 // 계약에 없는 줄(작업 질문·게시 승인·관리 기능·없음)은 종류를 적어 두기만 한다. 처리기가 없는 줄은 "연결 안 됨"이라 버린다.
 // 뒤 티켓(C14~C17)은 줄에 처리기를 달거나 줄을 더한다.
 export const ACTIONS: Readonly<Record<string, ActionRow>> = Object.freeze({
   list: { kind: 'read', command: 'list', handler: listHandler },
-  task_status: { kind: 'read', command: 'task-status' },
-  change_status: { kind: 'read', command: 'change-status' },
-  review_status: { kind: 'read', command: 'review-status' },
-  read: { kind: 'read', command: 'read' },
-  memory_search: { kind: 'read', command: 'memory-search' },
-  attach_list: { kind: 'read', command: 'attach-list' },
+  task_status: { kind: 'read', command: 'task-status', handler: taskStatusHandler },
+  change_status: { kind: 'read', command: 'change-status', handler: changeStatusHandler },
+  review_status: { kind: 'read', command: 'review-status', handler: reviewStatusHandler },
+  read: { kind: 'read', command: 'read', handler: readHandler },
+  memory_search: { kind: 'read', command: 'memory-search', handler: memorySearchHandler },
+  attach_list: { kind: 'read', command: 'attach-list', handler: attachListHandler },
   task: { kind: 'run', command: 'task', handler: taskHandler },
-  cancel: { kind: 'run', command: 'cancel' },
-  task_cancel: { kind: 'run', command: 'task-cancel' },
-  retry: { kind: 'run', command: 'retry' },
-  memory_save: { kind: 'run', command: 'memory-save' },
-  memory_correct: { kind: 'run', command: 'memory-correct' },
-  memory_exclude: { kind: 'run', command: 'memory-exclude' },
-  memory_delete: { kind: 'run', command: 'memory-delete' },
+  cancel: { kind: 'run', command: 'cancel', handler: controlHandler('cancel', PROPOSAL_TEXT.cancelQuestion) },
+  task_cancel: { kind: 'run', command: 'task-cancel', handler: taskCancelHandler },
+  retry: { kind: 'run', command: 'retry', handler: controlHandler('retry', PROPOSAL_TEXT.retryQuestion) },
+  memory_save: { kind: 'run', command: 'memory-save', handler: memoryWriteHandler('memory-save') },
+  memory_correct: { kind: 'run', command: 'memory-correct', handler: memoryWriteHandler('memory-correct') },
+  memory_exclude: { kind: 'run', command: 'memory-exclude', handler: memoryTargetHandler('memory-exclude') },
+  memory_delete: { kind: 'run', command: 'memory-delete', handler: memoryTargetHandler('memory-delete') },
   attach: { kind: 'run', command: 'attach' },
-  detach: { kind: 'run', command: 'detach' },
-  change: { kind: 'run', command: 'change' },
-  change_cancel: { kind: 'run', command: 'change-cancel' },
-  review_resume: { kind: 'run', command: 'review-resume' },
-  review_cancel: { kind: 'run', command: 'review-cancel' },
+  detach: { kind: 'run', command: 'detach', handler: detachHandler },
+  change: { kind: 'run', command: 'change', handler: changeHandler },
+  change_cancel: { kind: 'run', command: 'change-cancel', handler: changeCancelHandler },
+  review_resume: { kind: 'run', command: 'review-resume', handler: reviewHandler('review-resume', PROPOSAL_TEXT.reviewResumeQuestion) },
+  review_cancel: { kind: 'run', command: 'review-cancel', handler: reviewHandler('review-cancel', PROPOSAL_TEXT.reviewCancelQuestion) },
   answer: { kind: 'question', command: 'answer' },
   change_publish: { kind: 'publish', command: 'change-publish' },
   emergency_stop: { kind: 'admin', command: 'emergency-stop' },
@@ -177,16 +468,18 @@ export class ProposalDesk {
     const handler = connected(proposal.action);
     if (!handler) return drop('not_connected');
     if (!await current(this.store, job)) return drop('superseded');
+    const handlers = boundHandlers.get(this.store) ?? {};
     if (handler.kind === 'read') {
       // '/' 읽기 명령의 수신과 같은 인가(현재 정책 owner·허용 채널·거부 목록) 뒤 같은 처리기를 부른다.
       await this.gate.authorize(job.owner_id, job.target);
-      const content = await handler.run({ store: this.store, job });
+      const content = await handler.run({ store: this.store, job, proposal, policy, handlers });
+      if (typeof content !== 'string') return content.skip === 'queued' ? 'read' : drop(content.skip);
       await this.store.enqueue({ key: `result:${job.id}:read`, job: job.id, conversation: job.conversation_id, actor: job.owner_id,
         scope: job.target, revision: job.revision.policy,
-        payload: { kind: 'message', channel: job.target.channel, content, classification: 'safe_summary' } });
+        payload: { kind: 'message', channel: job.target.channel, content, classification: 'safe_summary', after: `result:${job.id}` } });
       return 'read';
     }
-    const prepared = await handler.prepare({ store: this.store, job, proposal, policy, tasksConnected: this.tasksConnected });
+    const prepared = await handler.prepare({ store: this.store, job, proposal, policy, tasksConnected: this.tasksConnected, handlers });
     if (!prepared) return drop('target_denied');
     // 확인 글은 owner 원문을 싣고 모델 답의 공개 검사(chatReplyRisk)를 거치지 않으므로 같은 정책으로 따로 본다.
     // 걸리면 원문 없는 고정 문구로 되묻고, 그것도 걸리면(정책을 못 읽음 등) 버린다. 사유 코드만 남기고 값은 남기지 않는다.
@@ -210,7 +503,7 @@ export class ProposalDesk {
       if (!inserted.rows.length) return 'duplicate';
       await store.enqueue({ key, job: job.id, conversation: job.conversation_id, actor: job.owner_id, scope: job.target,
         revision: job.revision.policy, payload: { kind: 'message', channel: job.target.channel, content: question,
-          classification: 'safe_summary', buttons: proposalButtons(id) } });
+          classification: 'safe_summary', buttons: proposalButtons(id), after: `result:${job.id}` } });
       return 'proposed';
     });
     if (made === 'superseded') return drop('superseded');
@@ -235,7 +528,8 @@ async function expirePending(store: Store): Promise<void> {
 
 export interface PressInput { proposal: string; answer: 'yes' | 'no'; actor: string; scope: Scope; event: string; context: ExecuteContext }
 // update: 응답으로 그 글의 버튼을 없앤다(처리·거절·만료·이미 처리됨). false면 본인만 보는 응답이고 버튼은 남는다.
-export interface PressOutcome { content: string; update: boolean }
+// later: 있으면 호출자가 트랜잭션 커밋 뒤에 부르고, 그 결과 문장이 content 대신 응답이 된다(제안은 이미 confirmed다).
+export interface PressOutcome { content: string; update: boolean; later?: () => Promise<string> }
 // 버튼 하나의 처리. 호출자(수신)의 트랜잭션 안에서 부른다. 대화 행 → 제안 행 순서로 잠그고, 상태 전이는 state='pending' 조건부라
 // 같은 제안을 두 번 눌러도 한 번만 실행된다. 실행은 '/' 처리기와 같은 경로라 권한·정책 검사가 같다.
 export async function pressProposal(store: Store, input: PressInput): Promise<PressOutcome> {
@@ -263,5 +557,5 @@ export async function pressProposal(store: Store, input: PressInput): Promise<Pr
   }
   const executed = await handler.execute(store, row, values, input.context);
   await settle(executed.state, executed.reason ?? null, executed.job ?? null);
-  return { content: executed.content, update: true };
+  return { content: executed.content, update: true, ...(executed.later ? { later: executed.later } : {}) };
 }

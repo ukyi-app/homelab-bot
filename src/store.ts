@@ -29,7 +29,10 @@ export interface Delivery {
     // kind=thread: 이 owner 메시지에서 스레드를 연다. 없으면 표식 이름의 독립 스레드다('/' 명령·경보).
     fromMessage?: string;
     // 버튼 한 줄. 여러 쪽으로 나뉘는 글이면 마지막 쪽에만 남는다. id는 discord-protocol BUTTONS 표의 custom_id 모양이어야 한다.
-    buttons?: OutboxButton[] };
+    buttons?: OutboxButton[];
+    // 선행 글의 message_key. 그 글의 모든 쪽이 끝(sent·blocked·failed)나기 전에는 이 글을 집지 않는다(claimDelivery).
+    // 같은 message_key의 쪽 순서만으로는 다른 글 사이의 순서가 지켜지지 않는다(앞 글의 뒤 쪽이 늦어지면 뒤 글이 먼저 나간다).
+    after?: string };
   state: string; external_id: string | null; lease_token: string; attempt: number;
 }
 export interface DeliveryNotice { ownerCall?: boolean }
@@ -600,6 +603,8 @@ export class Store {
           AND predecessor.page_index=o.page_index-1 AND predecessor.state='sent'))
         AND NOT EXISTS (SELECT 1 FROM outbox previous WHERE previous.message_key=o.message_key
           AND previous.page_index<o.page_index AND previous.state<>'sent')
+        AND NOT EXISTS (SELECT 1 FROM outbox dep WHERE dep.message_key=o.payload->>'after'
+          AND dep.state IN ('pending','sending','unknown'))
         ORDER BY o.created_at,o.message_key,o.page_index FOR UPDATE OF o SKIP LOCKED LIMIT 1`, [this.now()])).rows[0];
       if (!row) return;
       return (await tx.query<Delivery>(`UPDATE outbox SET state='sending',attempt=attempt+1,dispatch_started=false,
