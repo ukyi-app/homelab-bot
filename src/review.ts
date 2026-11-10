@@ -9,8 +9,8 @@ import { DRAIN_MS } from './runtime.js';
 import type { Store } from './store.js';
 import type { CancelRequest, WorkerSigner } from './worker.js';
 import { archiveContract } from './worker.js';
-import { CoverageSchema, FindingSchema, InputLimitsSchema, REVIEW_INSTRUCTIONS, ReviewOutputSchema, ReviewTaskSchema, SECRET_PATTERNS,
-  reviewOutcome } from './review-input.js';
+import { CoverageSchema, FindingSchema, InputLimitsSchema, REVIEW_INSTRUCTIONS_V2, ReviewOutputSchema, ReviewTaskSchema,
+  SECRET_PATTERNS, reviewOutcome } from './review-input.js';
 import type { Change, Coverage, ReviewOutput, ReviewTask, ReviewWorkerResult } from './review-input.js';
 
 // PR_REVIEW 게시 서버 쪽. 모델 호출 전 작성자 확인(D-16), 세대 단위 작업, COMMENT만 게시하는 제한 게시.
@@ -37,9 +37,11 @@ export const ReviewPolicySchema = z.strictObject({
 export type ReviewPolicy = z.infer<typeof ReviewPolicySchema>;
 export interface ReviewContext { base: Policy; review: ReviewPolicy; revision: string }
 export const MODEL_CALL_ASSOCIATIONS = Object.freeze(['OWNER', 'MEMBER', 'COLLABORATOR']);
+// 게시 서버가 작업자에 보내는 리뷰 지시문. 작업자 요청의 literal이라 작업자가 이 판을 받게 먼저 배포돼 있어야 한다(명세 §4.2).
+export const SERVER_REVIEW_INSTRUCTIONS = REVIEW_INSTRUCTIONS_V2;
 // 권한 필드(허용 목록·저장소)는 매번 다시 검사하므로 세대 revision에는 리뷰 내용에 닿는 값만 넣는다.
-export function reviewRevision(review: ReviewPolicy): string {
-  return `rp-${createHash('sha256').update(JSON.stringify([REVIEW_INSTRUCTIONS, review.input, review.comparison])).digest('hex').slice(0, 16)}`;
+export function reviewRevision(review: ReviewPolicy, instructions: string = SERVER_REVIEW_INSTRUCTIONS): string {
+  return `rp-${createHash('sha256').update(JSON.stringify([instructions, review.input, review.comparison])).digest('hex').slice(0, 16)}`;
 }
 // 리뷰 정책이 없거나 비교 기준을 정하지 않은 값(comparison null)이면 새 요청만 받지 않는다. 철회(Denied)가 아니라
 // 일시 상태로 다뤄, 대기 작업과 미게시 결과를 지우지 않고 다시 켜질 때까지 기다린다.
@@ -562,7 +564,7 @@ export class ReviewRuntime {
         repository: repo.fullName, base: review.comparison_revision, head: review.head_sha,
         archives: { base: contract.base, head: contract.head }, changes: compare.files, truncated: compare.truncated,
         pullRequest: { title: pr.title.slice(0, 1000), body: pr.body.slice(0, 65_536) }, limits: context.review.input,
-        policyRevision: context.revision, instructions: REVIEW_INSTRUCTIONS, timeoutMs: DEFAULTS.taskTimeoutMs });
+        policyRevision: context.revision, instructions: SERVER_REVIEW_INSTRUCTIONS, timeoutMs: DEFAULTS.taskTimeoutMs });
       // 원격 조회 동안 바뀐 권한·정책을 capability 발급 직전에 최신 정책으로 다시 본다(D-16 모델 호출 전 허용 확인).
       const fresh = await this.policy.current();
       const freshRepo = fresh.review.repositories.find(r => r.id === repo.id && r.installationId === repo.installationId && r.fullName === repo.fullName);

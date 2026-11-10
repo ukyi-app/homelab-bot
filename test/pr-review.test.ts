@@ -9,7 +9,7 @@ import { readFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { DEFAULTS, Denied, WorkerRejected } from '../src/contracts.js';
 import type { Scope } from '../src/contracts.js';
-import { ArchiveError, MODEL_OMITTED_MAX, readArchive, REVIEW_INSTRUCTIONS, ReviewWorker, unifiedDiff } from '../src/review-input.js';
+import { ArchiveError, MODEL_OMITTED_MAX, readArchive, REVIEW_INSTRUCTIONS, REVIEW_INSTRUCTIONS_V2, ReviewWorker, unifiedDiff } from '../src/review-input.js';
 import type { ArchiveFetcher, ReviewerInput, ReviewerModel, ReviewTask } from '../src/review-input.js';
 import { GitHubError, GitHubIngress, githubWebhook, RestrictedGitHub, restrictGitHubWrite, ReviewPolicySource,
   ReviewPublisher, ReviewQueue, ReviewReconciler, ReviewRuntime, reviewMarker } from '../src/review.js';
@@ -376,7 +376,7 @@ test('SEC-01 PR 본문·변경된 AGENTS.md·Renovate 릴리스 노트의 지시
     { path: 'src/app.ts', previousPath: null, status: 'modified', baseType: 'blob', headType: 'blob' }], truncated: false };
   await fullReview(pull({ ...bot(RENOVATE), title: 'chore(deps): update fixture-lib to v2', body: `## Release notes\n${injection}` }));
   const input = r.inputs[0]!;
-  assert.equal(input.instructions, REVIEW_INSTRUCTIONS);
+  assert.equal(input.instructions, REVIEW_INSTRUCTIONS_V2);
   assert.equal(input.guidelines, '기준 지침: 한국어로 리뷰한다.\n');
   assert.ok(input.untrusted.pullRequest.body.includes(injection));
   assert.ok(!JSON.stringify([input.instructions, input.guidelines]).includes('APPROVE'));

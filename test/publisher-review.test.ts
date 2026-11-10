@@ -7,6 +7,7 @@ import { reviewPrecondition, reviewWorkerRouted, startPublisher } from '../src/m
 import type { Publisher, PublisherDeps } from '../src/main.js';
 import { loadRuntimePolicy } from '../src/policy.js';
 import { ReviewPublisher, ReviewReconciler, ReviewRuntime } from '../src/review.js';
+import { REVIEW_INSTRUCTIONS_V2 } from '../src/review-input.js';
 import { Store } from '../src/store.js';
 import { FakeGateway } from './fake-gateway.js';
 import { localDatabase } from './helpers.js';
@@ -29,7 +30,7 @@ const pull = (o: Record<string, unknown> = {}) => ({ number: 7, state: 'open', d
   user: { id: 42, login: 'fixture-member', type: 'User' }, author_association: 'MEMBER', updated_at: '2026-11-04T00:00:00Z',
   head: { sha: HEAD, ref: 'feature', repo: REPO }, base: { sha: BASE, ref: 'main', repo: REPO }, ...o });
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
-type Task = { job: string; base: string; head: string; changes: { path: string }[] };
+type Task = { job: string; base: string; head: string; changes: { path: string }[]; instructions: string };
 
 // GitHub와 작업자 흉내. 서비스별 호출을 따로 센다.
 class World {
@@ -247,7 +248,10 @@ test('T17 열림 조립: opened → 작업 생성 → 작업자 → COMMENT 게�
   // 비교 기준은 결정대로 merge base, 게시는 COMMENT와 검토한 head뿐이다.
   assert.deepEqual([world.tasks[0]!.base, world.tasks[0]!.head, world.tasks[0]!.changes.map(c => c.path)], [MERGE_BASE, HEAD, ['src/app.ts']]);
   assert.deepEqual([world.posted[0]!.event, world.posted[0]!.commit_id], ['COMMENT', HEAD]);
-  assert.match(world.posted[0]!.body, /0으로 나누기/);
+  // 조립된 서버는 리뷰 지시문 v2를 보내고, 게시 본문은 심각도 줄과 승인·병합 아님 안내를 남긴다(AC-13).
+  assert.equal(world.tasks[0]!.instructions, REVIEW_INSTRUCTIONS_V2);
+  assert.match(world.posted[0]!.body, /^\*\*\[P1\] 0으로 나누기\*\* · `src\/app\.ts`:2$/m);
+  assert.equal(world.posted[0]!.body.split('\n')[1], '참고용 자동 리뷰예요. 승인·병합 판단이 아니고 안전을 보증하지도 않아요.');
   await waitFor(() => rest.sent.some(m => m.channel === NOTIFY && m.content.includes('PR 리뷰 게시: fixture-org/fixture-repo#7')));
   assert.deepEqual((await reviewJobs()).map(j => [j.state, j.trigger]), [['succeeded', 'opened']]);
   assert.deepEqual((await deliveries()).map(d => d.state), ['sent']);
