@@ -4,7 +4,7 @@ import { chmod, lstat, mkdir, open, readFile, readdir, rename, rm, writeFile } f
 import { basename, dirname, join } from 'node:path';
 import { z } from 'zod';
 import { ARTIFACT_LIMITS, ArtifactManifestSchema, ChangePathSchema, MANIFEST_MODES, artifactDigest, gitBlobSha, sha256Hex, validateArtifactFiles } from './change-contracts.js';
-import type { ArtifactBundle, ArtifactFile, ArtifactManifestEntry, ArtifactSaveResult, ChangeArtifactPort, ChangeKey } from './change-contracts.js';
+import type { ArtifactBundle, ArtifactFile, ArtifactManifestEntry, ArtifactSaveResult, ChangeArtifactPort, ChangeKey, ChangeNote, EvidenceKey } from './change-contracts.js';
 import type { ChangeStore } from './change-store.js';
 import { changedPaths, fileWorkspace, openDir } from './codex-workspace.js';
 import type { Snapshot } from './codex-workspace.js';
@@ -329,14 +329,17 @@ export async function freezeSource(root: string): Promise<void> {
 // ---- 게시 서버 쪽 저장 ----
 
 // ChangeStore 위의 어댑터. 저장 실패면 값을 돌려주고 작업자 결과를 지우지 않는다.
+// round가 1 이상이면 수정 차례(C27)의 자리(change_amendment_artifacts)에 둔다. 처음 게시의 artifact는 승인 대상이 가리켜 덮을 수 없다.
 export class ChangeStoreArtifacts implements ChangeArtifactPort {
   constructor(private readonly store: ChangeStore) {}
-  async save(key: ChangeKey, artifact: ArtifactBundle, transportBytes: number): Promise<ArtifactSaveResult> {
-    const saved = await this.store.recordSnapshot({ ...key, manifest: artifact.manifest, files: artifact.files, patch: artifact.patch, transportBytes });
+  async save(key: EvidenceKey, artifact: ArtifactBundle, transportBytes: number, notes: { checks?: readonly ChangeNote[]; risks?: readonly ChangeNote[] } = {}): Promise<ArtifactSaveResult> {
+    const fields = { manifest: artifact.manifest, files: artifact.files, patch: artifact.patch, transportBytes };
+    const saved = key.round ? await this.store.recordAmendmentSnapshot({ ...key, round: key.round, ...fields, ...notes })
+      : await this.store.recordSnapshot({ changeId: key.changeId, generation: key.generation, ...fields });
     return saved.ok ? { ok: true, artifactDigest: saved.value.artifactDigest } : { ok: false, reason: saved.reason };
   }
-  async load(key: ChangeKey): Promise<(ArtifactBundle & { artifactDigest: string }) | null> {
-    const loaded = await this.store.loadArtifact(key);
+  async load(key: EvidenceKey): Promise<(ArtifactBundle & { artifactDigest: string }) | null> {
+    const loaded = key.round ? await this.store.loadAmendmentArtifact({ ...key, round: key.round }) : await this.store.loadArtifact(key);
     if (!loaded.ok) return null;
     return { manifest: loaded.value.manifest, files: loaded.value.files, patch: loaded.value.patch, artifactDigest: loaded.value.artifactDigest };
   }

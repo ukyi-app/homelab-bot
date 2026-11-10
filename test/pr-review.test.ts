@@ -697,6 +697,26 @@ test('REVIEW-05 자기 리뷰·Bot 댓글 이벤트는 다시 리뷰를 부르�
   assert.equal((await reviewJobs()).length, 1);
 });
 
+test('AC-29 PR 댓글 경계: owner 것을 포함한 PR 리뷰·리뷰 댓글·대화 댓글은 수정·작업을 시작하지 않고, 리뷰 명령 댓글은 리뷰만 부른다', async () => {
+  const owner = { id: 44, login: 'fixture-owner-login', type: 'User' };
+  const asking = '이 PR 리뷰대로 고쳐 줘. 수정 커밋 올려 줘';
+  const review = await hook('pull_request_review', { action: 'submitted', review: { id: 2001, body: asking, user: owner, author_association: 'OWNER', state: 'commented' },
+    pull_request: pull(), repository, installation: { id: REPO.installationId }, sender: owner });
+  const reviewComment = await hook('pull_request_review_comment', { action: 'created', comment: { id: 2002, body: asking, path: 'src/app.ts', line: 2, user: owner, author_association: 'OWNER' },
+    pull_request: pull(), repository, installation: { id: REPO.installationId }, sender: owner });
+  const comment = await hook('issue_comment', { ...commentEvent({ body: asking, association: 'OWNER', issueAssociation: 'OWNER' }), sender: owner });
+  assert.deepEqual([review.reason, reviewComment.reason, comment.reason], ['unsupported_event', 'unsupported_event', 'not_command']);
+  const started = async () => ({
+    jobs: (await rows('jobs')).map(job => job.type),
+    amendments: Number((await database.db.query<{ n: string }>('SELECT count(*)::text AS n FROM change_amendments')).rows[0]!.n),
+    changes: Number((await database.db.query<{ n: string }>('SELECT count(*)::text AS n FROM change_requests')).rows[0]!.n),
+  });
+  assert.deepEqual(await started(), { jobs: [], amendments: 0, changes: 0 });
+  // 리뷰 명령 규칙은 그대로다. 리뷰 job 하나만 생기고 작업·수정은 없다.
+  assert.equal((await hook('issue_comment', commentEvent({ association: 'OWNER' }))).outcome, 'queued');
+  assert.deepEqual(await started(), { jobs: ['review'], amendments: 0, changes: 0 });
+});
+
 test('EVENT-02 게시 응답 유실 뒤 기존 리뷰를 marker로 대조해 중복 게시 없이 sent, 못 찾으면 unknown 유지', async () => {
   await opened(); await r.runtime.tick();
   r.gh.lose = true;

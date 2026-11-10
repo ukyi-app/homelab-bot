@@ -250,7 +250,13 @@ const say = (h: Harness, text: string, fields: { mention?: boolean; actor?: stri
 const eventText = async (h: Harness, delivery: string) => (await h.db.query<{ text: string }>(`SELECT payload->>'text' AS text FROM events WHERE delivery_id=$1`, [delivery])).rows[0]?.text;
 const chatJobs = async (h: Harness) => (await h.db.query(`SELECT 1 FROM jobs WHERE type='chat'`)).rows.length;
 // 멘션으로 대화를 연 스레드에서 변경을 요청한 것과 같게 구독을 켠다. 이 대화 작업은 시험이 돌리지 않는다.
-const opened = async (h: Harness) => { await say(h, '변경 부탁할게요', { mention: true }); return chatJobs(h); };
+const opened = async (h: Harness) => {
+  await say(h, '변경 부탁할게요', { mention: true });
+  // 시험은 대화를 돌리지 않는다. 남겨 두면 디바운스(2초) 뒤 집을 수 있게 되어 리뷰가 대화 우선(F05)으로 매 tick 양보하고 pump_timeout이 난다.
+  // 행은 남기므로 chatJobs로 세는 "대화 작업을 만들지 않는다" 단언은 그대로다.
+  await h.db.query(`UPDATE jobs SET available_at=available_at+3600000 WHERE type='chat' AND state='queued'`);
+  return chatJobs(h);
+};
 
 test('C28 다음 말: 열린 변경 질문이 하나면 owner의 다음 말이 저장 전에 봉인되고 공개 표시로 답이 되어 이어진다. 대화 작업·모델 호출은 없다', async () => {
   await withHarness({ changeV2: true, colleague: true, steps: [CHOICE_QUESTION, V2_WRITE] }, async h => {

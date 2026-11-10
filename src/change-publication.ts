@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { ChangeBriefSchema, CommandIdSchema, EvidenceBundleSchema, GenerationSchema, PublicMetadataSchema, ProvenanceLabelSchema, REVIEW_RISK_CATEGORIES, ChangeIdSchema, labelAllowsAuthorInput, propagateLabel } from './change-contracts.js';
-import type { ArtifactFile, ChangeBrief, ChangeKey, ChangeNote, EvidenceBundle, ProvenanceLabel, PublicMetadata } from './change-contracts.js';
+import type { AmendmentKey, ArtifactFile, ChangeBrief, ChangeKey, ChangeNote, EvidenceBundle, ProvenanceLabel, PublicMetadata } from './change-contracts.js';
 import { CHANGE_NOTE_LIMITS, ChangeNoteSchema } from './task-contracts.js';
 
 // 공개 제목·본문·commit 메시지와 봇 PR 안내 리뷰 글을 만드는 유일한 곳이다. 승인 brief, 구조화된 수치·SHA·시험 상태,
@@ -21,6 +21,16 @@ export function neutralizePublicText(text: string): string {
 
 // 대조용 표식이다. 제목·Discord ID를 넣지 않는다. change ID는 무작위 값이다.
 export const publicationMarker = (key: ChangeKey): string => `homelab-bot-change:${key.changeId}:g${key.generation}`;
+// 수정 차례(C27)의 커밋 메타데이터. 모델 글 없이 코드가 만든 고정 문구와 차례 번호만 싣는다. 시각은 차례 시작 시각(초)이라 재시도해도 같은 커밋 SHA다.
+// PR 제목·본문은 처음 게시 때만 쓰고 수정 차례는 고치지 않는다(AC-27). title·body 칸은 공개 검사(scanPublicPayload)에 넣으려고 커밋 메시지로 채운다.
+export const AMENDMENT_COMMIT_TITLE = (round: number) => `수정 차례 ${round}: owner 요청과 PR 리뷰 반영`;
+export function renderAmendmentCommit(input: { key: AmendmentKey; pullNumber: number; identity: { name: string; email: string }; at: number; bundle: Pick<EvidenceBundle, 'baseCommit' | 'resultTree' | 'artifactDigest'> }): PublicMetadata {
+  const date = new Date(Math.floor(input.at / 1000) * 1000).toISOString().replace('.000Z', 'Z');
+  const identity = { name: input.identity.name, email: input.identity.email, date };
+  const title = AMENDMENT_COMMIT_TITLE(input.key.round);
+  const commitMessage = `${title}\n\nChange: ${input.key.changeId}/g${input.key.generation}\nPull: #${input.pullNumber}\nRound: ${input.key.round}\nBase: ${input.bundle.baseCommit}\nTree: ${input.bundle.resultTree}\nArtifact: ${input.bundle.artifactDigest}\n`;
+  return PublicMetadataSchema.parse({ title, body: commitMessage, commitMessage, author: identity, committer: identity, draft: false });
+}
 
 export const PublicationInputSchema = z.strictObject({
   key: z.strictObject({ changeId: ChangeIdSchema, generation: GenerationSchema }),

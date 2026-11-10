@@ -83,8 +83,10 @@ test('R08 실제 PostgreSQL: 같은 event_id를 동시에 보내도 한 번만 �
     assert.equal(await ctx.count('outbox'), 1);
     assert.equal(await ctx.count('external_task_events'), 1);
     // 같은 ID의 다른 내용이 동시에 들어와도 먼저 들어온 내용 하나만 남는다.
-    const event = JSON.parse(eventBody(who, ctx.store.now())) as Record<string, unknown>;
-    const variants = Array.from({ length: 8 }, (_, i) => JSON.stringify({ ...event, occurred_at: ctx.store.now() - i }));
+    // 시각은 한 번만 읽는다. 변형마다 다시 읽으면 그 사이 1ms가 흘러 두 변형의 내용이 같아지고, 충돌이 아니라 중복으로 답한다.
+    const at = ctx.store.now();
+    const event = JSON.parse(eventBody(who, at)) as Record<string, unknown>;
+    const variants = Array.from({ length: 8 }, (_, i) => JSON.stringify({ ...event, occurred_at: at - i }));
     const mixed = await Promise.all(variants.map(variant => post(ctx, who, variant)));
     assert.equal(mixed.filter(reply => reply.outcome === 'accepted').length, 1);
     assert.equal(mixed.filter(reply => reply.outcome === 'event_conflict').length, 7);

@@ -1,5 +1,5 @@
-import { CHANGE_ID, labelAllowsAuthorInput, PROVENANCE_LABELS, propagateLabel } from './change-contracts.js';
-import type { ChangeKey, ProvenanceLabel } from './change-contracts.js';
+import { AMENDMENT_MATERIAL_ID, AUTHOR_ASSOCIATIONS, amendmentMaterialsDigest, CHANGE_AMENDMENT, CHANGE_ID, ChangePathSchema, labelAllowsAuthorInput, PROVENANCE_LABELS, propagateLabel } from './change-contracts.js';
+import type { ChangeKey, ProvenanceLabel, ReviewMaterial } from './change-contracts.js';
 import type { ChangeRepositoryPolicy } from './change-policy.js';
 import { scanPublicText } from './change-publication.js';
 import type { ChangePrivateInputs, ChangeRequest, ChangeStore } from './change-store.js';
@@ -7,6 +7,7 @@ import { describeDeployment } from './change-deployment.js';
 import { Denied } from './contracts.js';
 import type { Scope } from './contracts.js';
 import type { Database } from './database.js';
+import type { PullDiscussion } from './github-review-io.js';
 import { errorInfo } from './log.js';
 import type { Log } from './log.js';
 import type { PolicyGate } from './policy.js';
@@ -27,7 +28,35 @@ export interface PublishPressReply extends ChangeCommandReply { update?: true }
 export interface ChangeCommandHandler {
   handle(request: ChangeCommandRequest): Promise<ChangeCommandReply>;
   pressPublish?(request: PublishPress): Promise<PublishPressReply>;
+  // 말로 하는 수정 요청(C27). PR 리뷰·댓글을 읽을 수 있게 조립됐을 때만 있다. 없으면 제안 동작이 "연결 안 됨"이다.
+  amendment?: AmendmentRequests;
 }
+// 수정 요청의 대상 대조와 접수. 대상은 이 스레드에서 owner가 낸 변경이고, 그 변경의 PR이 열려 있어야(proposed·amending) 한다.
+export type AmendmentRefusal = 'no_pull' | 'not_open' | 'limit' | 'sensitive' | 'unavailable';
+export type AmendmentTarget =
+  | { ok: true; changeId: string; generation: number; repository: string; pullNumber: number; head: string; materials: string[]; materialsDigest: string }
+  | { ok: false; reason: 'not_visible' | AmendmentRefusal };
+export interface AmendmentRequests {
+  // 확인 글을 만들 때 부른다. PR 리뷰·댓글을 읽어 ID 묶음과 그 글의 digest를 정한다(이 묶음까지가 이번 차례의 자료다). target은 변경 ID나 PR 번호(#n·n·PR 링크)다.
+  prepare(input: { actor: string; scope: Scope; target: string; instruction: string }): Promise<AmendmentTarget>;
+  // 버튼을 누른 뒤 부른다. 확인 때 정한 값 그대로 대기열에 넣는다. 차례 시작은 런타임이 한다.
+  request(input: { id: string; actor: string; scope: Scope; changeId: string; generation: number; pullNumber: number; head: string; materials: readonly string[]; materialsDigest: string; instruction: string }): Promise<ChangeCommandReply>;
+}
+// 수정 요청 문구. 동료 기능 스위치를 켰을 때만 보이므로 동료 말투다.
+export const AMENDMENT_REQUEST_TEXT = Object.freeze({
+  question: (repository: string, pr: number, comments: number) => `${repository} PR #${pr}에 리뷰 댓글 ${comments}개를 반영해서 수정 커밋을 올릴까요?`,
+  no_pull: '아직 PR을 올리지 않은 변경이라 수정 요청을 받을 수 없어요. 게시를 먼저 마쳐 주세요.',
+  not_open: '이미 병합됐거나 닫힌 PR이라 고칠 수 없어요.',
+  limit: (max: number) => `이 PR은 수정을 ${max}번 받아서 더 받을 수 없어요. 필요하면 새 변경으로 요청해 주세요.`,
+  sensitive: '말한 내용에 밖에 보이면 안 되는 값이 섞여 있어서 수정 요청으로 받지 않았어요. 그 값을 빼고 다시 말해 주세요.',
+  queued: (round: number) => `수정 요청을 받았어요. 지금 돌고 있는 수정이 끝나면 차례 ${round}로 이어서 할게요. 결과는 이 스레드에서 알려 드릴게요.`,
+  accepted: (round: number) => `수정 요청을 받았어요. 차례 ${round}로 시작할게요. 결과는 이 스레드에서 알려 드릴게요.`,
+  closed: '지금은 수정 요청을 받지 않아요. 잠시 뒤 다시 말해 주세요.',
+  failed: '수정 요청을 받지 못했어요(일시 오류). 변경 상태를 확인한 뒤 다시 말해 주세요.',
+  stale: 'PR 상태가 바뀌어서 이 요청은 받지 않았어요. 다시 말해 주세요.',
+  // PR 리뷰·댓글을 읽을 길이 없거나(리뷰 경로 꺼짐) 지금 읽지 못했다. 대상 변경이 이 스레드에서 보일 때만 이렇게 답한다.
+  unavailable: '지금은 PR 리뷰·댓글을 읽을 수 없어서 수정 요청을 받지 못해요. 잠시 뒤 다시 말해 주세요.',
+});
 
 // 변경 명령·답 처리기의 고정 문구. 동료 말투(해요체, 결론부터, 자기를 "봇"이라 부르지 않음)다.
 // 첫 인자 colleague는 동료 기능 스위치(Store.colleague)다. 켜지면 '/' 이름 대신 말로 하는 안내를, 꺼지면 지금의 '/' 안내를 낸다.
@@ -124,6 +153,8 @@ export interface ChangeCommandDeps {
   // 받지 못하는 사유. null이면 받는다. 조회·취소는 닫혀 있어도 된다. 끝내는 경로를 닫으면 진행 중인 건을 멈출 수 없다.
   closedReason: () => string | null;
   admit?: (request: ChangeRequest) => Promise<{ ok: true } | { ok: false; reason: string }>;
+  // 수정 요청 자료 읽기(리뷰 App, C26 discussion.read). 있으면 말로 하는 수정 요청을 받는다.
+  discussion?: AmendmentDiscussionReader;
 }
 
 // 게시 승인 버튼(COLLEAGUE_SPEC §4.3 "게시 승인"). custom_id는 `change-publish-ok:<변경 ID>.<generation>.<승인 digest 앞 16자>`다.
@@ -152,6 +183,8 @@ export const publishButton = (changeId: string, generation: number, digest: stri
   ({ id: `${PUBLISH_BUTTON}:${changeId}.${generation}.${digest.slice(0, PUBLISH_DIGEST_CHARS)}`, label: PUBLISH_TEXT.label, style: 'primary' });
 
 export class ChangeCommands implements ChangeCommandHandler {
+  // 리뷰 경로가 없어도 둔다. 그때는 보이는 변경에 거절 한 줄(unavailable)로 답해 말한 요청이 조용히 사라지지 않게 한다.
+  readonly amendment: AmendmentRequests = { prepare: input => this.prepareAmendment(input), request: input => this.requestAmendment(input) };
   constructor(private readonly deps: ChangeCommandDeps) {}
   private get colleague(): boolean { return this.deps.store.colleague; }
   async handle(request: ChangeCommandRequest): Promise<ChangeCommandReply> {
@@ -282,6 +315,54 @@ export class ChangeCommands implements ChangeCommandHandler {
     const published = found.phase === 'publishing' || found.phase === 'proposed';
     return { content: CHANGE_TEXT.cancelled(c, found.id, published), outcome: 'cancelled' };
   }
+  // 수정 요청 대상. 남의 변경·다른 스레드의 변경은 존재도 알리지 않는다(not_visible). 병합·닫힘·상한·민감한 말은 거절 사유를 돌려준다.
+  private async prepareAmendment(input: { actor: string; scope: Scope; target: string; instruction: string }): Promise<AmendmentTarget> {
+    const target = input.target.trim();
+    const pr = /^(?:#?(\d{1,9})|https:\/\/github\.com\/([^/\s]+\/[^/\s]+)\/pull\/(\d{1,9})\/?)$/.exec(target);
+    const conversation = this.deps.store.scopeId(input.scope);
+    const policy = await this.deps.gate.current();
+    // 링크로 지정하면 저장소까지 대상이다. 번호만 맞추면 같은 스레드의 다른 저장소 PR이 골라져 엉뚱한 브랜치에 커밋이 올라간다.
+    const linked = pr?.[2] === undefined ? null : policy.change?.repositories.find(item => item.fullName.toLowerCase() === pr[2]!.toLowerCase())?.repoId ?? -1;
+    const id = CHANGE_ID.test(target) ? target : pr && linked !== -1 ? (await this.deps.store.db.query<{ id: string }>(`SELECT r.id FROM change_requests r JOIN change_delivery_effects e
+      ON e.change_id=r.id AND e.generation=r.generation AND e.stage='pull' AND e.state='confirmed' WHERE r.owner_id=$1 AND r.conversation_id=$2 AND e.result->>'number'=$3
+      AND ($4::bigint IS NULL OR r.repo_id=$4) ORDER BY r.updated_at DESC LIMIT 1`, [input.actor, conversation, String(Number(pr[1] ?? pr[3])), linked])).rows[0]?.id : undefined;
+    const found = id ? await this.own({ actor: input.actor, scope: input.scope, target: id }) : null;
+    if (!found) return { ok: false, reason: 'not_visible' };
+    const key = { changeId: found.id, generation: found.generation };
+    const pull = (await this.deps.store.db.query<{ result: unknown }>(`SELECT result FROM change_delivery_effects WHERE change_id=$1 AND generation=$2 AND stage='pull' AND state='confirmed'`,
+      [found.id, found.generation])).rows[0];
+    if (found.phase !== 'proposed' && found.phase !== 'amending') return { ok: false, reason: pull || found.phase === 'merged' || found.phase === 'observing_deploy' ? 'not_open' : 'no_pull' };
+    if (!pull) return { ok: false, reason: 'no_pull' };
+    if ((await this.deps.changes.amendments(key)).length >= CHANGE_AMENDMENT.maxRounds) return { ok: false, reason: 'limit' };
+    const repository = policy.change?.repositories.find(item => item.repoId === found.repoId);
+    if (!repository || !this.deps.discussion) return { ok: false, reason: 'unavailable' };
+    // 지시는 작성 모델에만 가지만, 공개하면 안 되는 값이 섞인 말은 첫 요청(scanBrief)처럼 받지 않는다.
+    if (scanPublicText({ title: input.instruction, body: input.instruction }, repository)) return { ok: false, reason: 'sensitive' };
+    const pullNumber = (typeof pull.result === 'string' ? JSON.parse(pull.result) : pull.result as { number: number }).number as number;
+    const head = await this.deps.changes.publishedHeadOf(key);
+    if (!head) return { ok: false, reason: 'unavailable' };
+    let items: AmendmentMaterialItem[];
+    try { items = discussionMaterials(await this.deps.discussion({ repository: repository.fullName, pr: pullNumber })); }
+    catch (error) { this.deps.log('change_amendment_discussion_failed', errorInfo(error)); return { ok: false, reason: 'unavailable' }; }
+    return { ok: true, changeId: found.id, generation: found.generation, repository: repository.fullName, pullNumber, head,
+      materials: items.map(item => item.id), materialsDigest: amendmentMaterialsDigest(items) };
+  }
+  private async requestAmendment(input: Parameters<AmendmentRequests['request']>[0]): Promise<ChangeCommandReply> {
+    if (this.deps.closedReason()) return { content: AMENDMENT_REQUEST_TEXT.closed, outcome: 'closed' };
+    const found = await this.own({ actor: input.actor, scope: input.scope, target: input.changeId });
+    if (!found) return { content: CHANGE_TEXT.notVisible, outcome: 'not_visible' };
+    // 수정 요청 출처는 변경 요청과 같은 공개 표시다(DECISIONS "동료 봇 전환" 15·16, C27 판단).
+    const queued = await this.deps.changes.requestAmendment({ changeId: input.changeId, generation: input.generation, eventId: input.id, actor: input.actor,
+      pullNumber: input.pullNumber, head: input.head, materials: input.materials, materialsDigest: input.materialsDigest, instruction: input.instruction, label: 'public' });
+    if (queued.ok) {
+      return found.phase === 'amending' ? { content: AMENDMENT_REQUEST_TEXT.queued(queued.value.round), outcome: 'queued' } : { content: AMENDMENT_REQUEST_TEXT.accepted(queued.value.round), outcome: 'accepted' };
+    }
+    if (queued.reason === 'amendment_limit') return { content: AMENDMENT_REQUEST_TEXT.limit(CHANGE_AMENDMENT.maxRounds), outcome: queued.reason };
+    if (queued.reason === 'phase_conflict') return { content: AMENDMENT_REQUEST_TEXT.not_open, outcome: queued.reason };
+    if (queued.reason === 'pull_mismatch' || queued.reason === 'duplicate_event') return { content: AMENDMENT_REQUEST_TEXT.stale, outcome: queued.reason };
+    this.deps.log('change_amendment_request_failed', { reason: queued.reason });
+    return { content: AMENDMENT_REQUEST_TEXT.failed, outcome: queued.reason };
+  }
   private async status(request: ChangeCommandRequest): Promise<ChangeCommandReply> {
     const c = this.colleague;
     const found = await this.own(request);
@@ -308,6 +389,12 @@ export class ChangeCommands implements ChangeCommandHandler {
       const number = (typeof pull.result === 'string' ? JSON.parse(pull.result) : pull.result as { number: number }).number;
       lines.push(`PR #${number}${found.phase === 'superseded' || found.phase === 'blocked' ? `: ${CHANGE_TEXT.statusUntracked}` : ''}`);
     }
+    // 수정 차례(C27). 차례마다 한 줄이고 사유는 고정 코드다.
+    const rounds = await this.deps.changes.amendments(key);
+    if (rounds.length) lines.push(`수정 차례 ${rounds.length}/${CHANGE_AMENDMENT.maxRounds}: ${rounds.map(round => `${round.round} ${round.state}${round.reason ? `(${round.reason})` : ''}${round.commitSha ? ` ${round.commitSha.slice(0, 12)}` : ''}`).join(', ')}`);
+    for (const effect of await this.deps.changes.amendmentEffects({ changeId: found.id, unresolved: true })) {
+      lines.push(`미확정 수정 커밋 기록: 차례 ${effect.round} ${effect.stage} ${effect.state}${effect.blockedReason ? `(${effect.blockedReason})` : ''}.`);
+    }
     const deployment = await this.deps.changes.deployment(key);
     if (deployment.ok) {
       const { prNumber: _pr, ...observation } = deployment.value;
@@ -318,6 +405,27 @@ export class ChangeCommands implements ChangeCommandHandler {
     return { content: lines.join('\n'), outcome: 'status' };
   }
 }
+// ---- 수정 요청 자료 (C27) ----
+
+// PR 리뷰·리뷰 댓글·대화 댓글을 수정 차례의 자료 항목으로 옮긴다. 확인 글의 k와 ID 묶음, 실행 때의 자료 블록이 같은 함수를 쓴다.
+// 본문이 빈 리뷰(승인만 누른 리뷰 등)는 반영할 내용이 없어 빼고 세지 않는다. 오래된 것부터 둔다(상한이 넘치면 앞에서부터 빠진다).
+// 다른 PR의 글이 섞인 응답은 읽는 쪽(github-review-io discussion.read)이 통째로 거부한다.
+export interface AmendmentMaterialItem { id: string; material: ReviewMaterial }
+export type AmendmentDiscussionReader = (input: { repository: string; pr: number }) => Promise<PullDiscussion>;
+const ASSOCIATIONS: ReadonlySet<string> = new Set(AUTHOR_ASSOCIATIONS);
+export function discussionMaterials(discussion: PullDiscussion): AmendmentMaterialItem[] {
+  const association = (value: string) => (ASSOCIATIONS.has(value) ? value : 'NONE') as ReviewMaterial['association'];
+  const at = (value: string | null) => value ? Date.parse(value) || 0 : 0;
+  const items: (AmendmentMaterialItem & { at: number })[] = [
+    ...discussion.reviews.map(row => ({ id: `review:${row.id}`, at: at(row.createdAt), material: { kind: 'review' as const, authorId: row.author?.id ?? null, association: association(row.association), location: null, body: row.body } })),
+    ...discussion.reviewComments.map(row => ({ id: `review_comment:${row.id}`, at: at(row.createdAt), material: { kind: 'review_comment' as const, authorId: row.author?.id ?? null, association: association(row.association),
+      location: ChangePathSchema.safeParse(row.path).success ? { path: row.path, line: row.line } : null, body: row.body } })),
+    ...discussion.comments.map(row => ({ id: `comment:${row.id}`, at: at(row.createdAt), material: { kind: 'comment' as const, authorId: row.author?.id ?? null, association: association(row.association), location: null, body: row.body } })),
+  ];
+  return items.filter(item => item.material.body.trim() && AMENDMENT_MATERIAL_ID.test(item.id))
+    .sort((a, b) => a.at - b.at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)).map(({ id, material }) => ({ id, material }));
+}
+
 // 추가 방어다. 탐지기는 완전성 증거가 아니고 owner의 label이 우선이다. 찾으면 모델을 부르기 전에 막아 값을 작성자에 넘기지 않는다.
 function scanBrief(parsed: ParsedChangeRequest, policy: ChangeRepositoryPolicy): string | null {
   return scanPublicText({ title: parsed.summary, body: [parsed.goal, ...parsed.acceptance, parsed.summary].join('\n') }, policy);

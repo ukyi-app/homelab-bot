@@ -7,7 +7,7 @@ import { z } from 'zod';
 // ---- 단계와 전이 ----
 
 export const CHANGE_PHASES = ['requested', 'admitted', 'authoring', 'snapshot_ready', 'verifying', 'reviewing',
-  'awaiting_publish_approval', 'approved', 'publishing', 'proposed', 'merged', 'observing_deploy',
+  'awaiting_publish_approval', 'approved', 'publishing', 'proposed', 'amending', 'merged', 'observing_deploy',
   'superseded', 'blocked', 'cancelled', 'failed'] as const;
 export type ChangePhase = typeof CHANGE_PHASES[number];
 export const TERMINAL_CHANGE_PHASES = ['superseded', 'blocked', 'cancelled', 'failed'] as const;
@@ -30,7 +30,10 @@ export const CHANGE_PHASE_TRANSITIONS: Readonly<Record<ChangePhase, readonly Cha
   awaiting_publish_approval: ['approved', ...STOP],
   approved: ['publishing', ...STOP],
   publishing: ['proposed', ...STOP],
-  proposed: ['merged', 'superseded', 'blocked', 'cancelled'],
+  // proposed ↔ amending은 게시 뒤 수정 차례(C27)다. 전용 메서드(ChangeStore.startAmendment·finishAmendment)로만 간다.
+  // amending에서도 failed가 없다. 차례가 실패하면 커밋 없이 proposed로 돌아오고, 차례 effect를 해소하지 못하면 blocked다.
+  proposed: ['merged', 'amending', 'superseded', 'blocked', 'cancelled'],
+  amending: ['proposed', 'merged', 'blocked', 'cancelled'],
   merged: ['observing_deploy', 'blocked', 'failed'],
   observing_deploy: ['blocked', 'failed'],
   superseded: [], blocked: [], cancelled: [], failed: [],
@@ -39,6 +42,9 @@ export const canTransition = (from: ChangePhase, to: ChangePhase): boolean => CH
 export const isTerminalPhase = (phase: ChangePhase): phase is TerminalChangePhase => (TERMINAL_CHANGE_PHASES as readonly ChangePhase[]).includes(phase);
 // 게시 전 고치기 차례 상한(사용자 2026-11-09의 기본값). migrations/026의 fix_round CHECK와 같은 값이고 시험이 대조한다.
 export const CHANGE_SELF_FIX = Object.freeze({ maxRounds: 2 });
+// 게시 뒤 수정 차례 상한(사용자 2026-11-09 "한 PR에 수정은 최대 10번"). 대기열에 든 요청과 실패한 차례도 센다.
+// migrations/027의 change_amendments.round CHECK와 같은 값이고 시험이 대조한다.
+export const CHANGE_AMENDMENT = Object.freeze({ maxRounds: 10 });
 // 전이 표 밖의 유일한 재시작이다. 새 generation은 admission부터 다시 받는다. blocked·failed는 사람이 볼 일이라 자동으로 다시 열지 않는다.
 export const GENERATION_RESTART = Object.freeze({ from: 'superseded', to: 'requested' } as const);
 export const MAX_GENERATION = 999;
@@ -81,6 +87,10 @@ export const BranchNameSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._/-]{0,
 const MILLIS = z.number().int().nonnegative();
 
 export interface ChangeKey { changeId: string; generation: number }
+// 게시 뒤 수정 차례의 키(C27). generation을 올리지 않고 차례 번호를 하나 더 둔다. 브랜치·승인 대상은 그 generation의 것 그대로다.
+export interface AmendmentKey extends ChangeKey { round: number }
+// 증거 port의 키. round가 없거나 0이면 처음 게시(와 그 고치기 차례)이고, 1 이상이면 그 수정 차례의 증거다.
+export type EvidenceKey = ChangeKey & { round?: number };
 
 // ---- 고정 직렬화와 digest ----
 
@@ -151,6 +161,16 @@ export const EvidenceBundleSchema = z.strictObject({
 });
 export type EvidenceBundle = z.infer<typeof EvidenceBundleSchema>;
 export const evidenceBundleDigest = (bundle: EvidenceBundle): string => domainDigest('change-evidence/v1', bundle);
+// 수정 차례의 증거 묶음. 묶음 8개 필드는 처음 게시와 같은 모양이고(baseCommit은 차례를 시작할 때 읽은 PR head) 차례 번호를 함께 묶는다.
+// domain이 달라 처음 게시의 묶음 digest·승인 digest 재료로 쓰이지 못한다.
+export const amendmentEvidenceDigest = (round: number, bundle: EvidenceBundle): string => domainDigest('change-amendment-evidence/v1', { round, bundle });
+// 수정 요청 확인 때 센 PR 리뷰·리뷰 댓글·대화 댓글 ID 묶음(`review:<id>`·`review_comment:<id>`·`comment:<id>`).
+export const AMENDMENT_MATERIAL_ID = /^(review|review_comment|comment):[1-9][0-9]{0,15}$/;
+// owner가 확인한 자료의 digest. ID만 묶으면 확인 뒤 작성자가 같은 글을 고쳐 owner가 보지 않은 피드백을 실을 수 있어
+// 작성 모델이 받는 칸(종류·작성자·관계·위치·본문)을 모두 넣는다. 원문은 저장하지 않고 이 값만 둔다. 순서와 무관하다.
+export const amendmentMaterialsDigest = (items: readonly { id: string; material: ReviewMaterial }[]): string => domainDigest('change-amendment-materials/v1',
+  [...items].sort((a, b) => compareText(a.id, b.id)).map(({ id, material }) => [id, material.kind, material.authorId, material.association,
+    material.location ? [material.location.path, material.location.line ?? null] : null, material.body]));
 
 // ---- artifact ----
 
@@ -408,7 +428,8 @@ export interface ReviewMaterial {
 }
 // 수정 차례 입력. owner의 Discord 말이 지시이고, 그 PR의 리뷰·댓글은 자료다. head는 PR 브랜치 head이고 작성의 base가 된다.
 // 자료는 오래된 것부터 적는다. 상한을 넘으면 앞에서부터 빠진다(task-contracts boundAmendmentMaterials).
-export interface ChangeAmendmentInput { pullNumber: number; head: string; instruction: string; materials: readonly ReviewMaterial[] }
+// round는 수정 차례 번호(C27)이고 작업자 요청에는 싣지 않는다. 게시 서버가 차례 키로 쓴다.
+export interface ChangeAmendmentInput { pullNumber: number; head: string; instruction: string; materials: readonly ReviewMaterial[]; round: number }
 // 게시 전 고치기 차례의 자료 한 항목. 앞 차례 자체 리뷰의 P0·P1 발견이고 작성 모델에는 자료로만 들어간다. 지시는 고정 문구다.
 // 모델이 쓴 리뷰 문장이라 비공개 표(change_review_findings)에서 오고 공개 경로로 내지 않는다. 위치를 모르면 location이 null이다.
 export interface SelfFixFinding { priority: 'P0' | 'P1'; code: string; title: string; detail: string; evidence: string; location: ChangeLocation | null }
@@ -425,7 +446,10 @@ export interface ChangeAuthorPort {
   supportsV2(): Promise<boolean>;
   // 게시 전 고치기 차례의 작성 요청을 보낼 수 있는지. false면 호출자는 고치지 않고 지금처럼 review_blocked로 닫는다.
   supportsSelfFix(): Promise<boolean>;
+  // 게시 뒤 수정 차례(C27)의 작성 요청을 보낼 수 있는지. 작업자 intake가 변경 작성 판(change-v2)을 알릴 때만 참이다. false면 그 차례를 실패로 닫는다.
+  supportsAmendment(): Promise<boolean>;
   // selfFix는 게시 전 고치기 차례에만 있다. base는 그 generation의 B·T0 그대로다.
+  // amendment는 게시 뒤 수정 차례에만 있다. base는 차례를 시작할 때 읽은 PR head와 그 tree다.
   start(input: { target: ChangeTarget; baseCommit: string; baseTree: string; policyRevision: string; brief: ChangeBrief; amendment?: ChangeAmendmentInput;
     selfFix?: { round: number; findings: readonly SelfFixFinding[] } }): Promise<{ receiptId: string }>;
   // 호출 전에 ChangePrivateInputs.record로 답변의 label을 기록한다. label_blocked면 부르지 않는다. 입력 label은 작업자 쪽 재확인용이다.
@@ -438,18 +462,21 @@ export interface ChangeAuthorPort {
 // B1. 게시 서버 쪽 영속 저장이다. 구현은 ChangeStore 위의 어댑터로 충분하다. 저장 실패면 작업자 결과를 지우지 않는다.
 export type ArtifactSaveResult = { ok: true; artifactDigest: string } | { ok: false; reason: string };
 export interface ChangeArtifactPort {
-  save(key: ChangeKey, artifact: ArtifactBundle, transportBytes: number): Promise<ArtifactSaveResult>;
-  load(key: ChangeKey): Promise<(ArtifactBundle & { artifactDigest: string }) | null>;
+  // 수정 차례의 결과는 차례 키(round ≥ 1)의 자리에 둔다. 처음 게시의 artifact를 덮지 않는다.
+  save(key: EvidenceKey, artifact: ArtifactBundle, transportBytes: number, notes?: { checks?: readonly ChangeNote[]; risks?: readonly ChangeNote[] }): Promise<ArtifactSaveResult>;
+  load(key: EvidenceKey): Promise<(ArtifactBundle & { artifactDigest: string }) | null>;
 }
 // B1. 무자격 시험 실행기. commandId는 registry 키이고 argv를 받지 않는다. 실행하지 못한 경우도 status='not_run' receipt로 돌려준다.
 export interface ChangeVerificationPort {
-  run(input: { key: ChangeKey; bundle: EvidenceBundle; commandId: string }): Promise<VerificationReceipt>;
-  fetchReceipt(input: { key: ChangeKey; commandId: string }): Promise<VerificationReceipt | null>;
+  // key.round가 있으면 그 수정 차례의 작성 세션 결과를 시험한다.
+  run(input: { key: EvidenceKey; bundle: EvidenceBundle; commandId: string }): Promise<VerificationReceipt>;
+  fetchReceipt(input: { key: EvidenceKey; commandId: string }): Promise<VerificationReceipt | null>;
 }
 // B2. 작성 세션과 다른 새 세션의 미게시 리뷰. author 세션 ID·대화·설명은 입력에 없다.
 export interface ChangeReviewPort {
-  review(input: { key: ChangeKey; bundle: EvidenceBundle; brief: ChangeBrief; manifest: ArtifactManifest; patch: string; verifications: readonly VerificationReceipt[] }): Promise<ReviewReceipt>;
-  fetchReceipt(key: ChangeKey): Promise<ReviewReceipt | null>;
+  // key.round가 있으면 그 수정 차례의 증거를 리뷰하고 receipt를 차례 키로 남긴다.
+  review(input: { key: EvidenceKey; bundle: EvidenceBundle; brief: ChangeBrief; manifest: ArtifactManifest; patch: string; verifications: readonly VerificationReceipt[] }): Promise<ReviewReceipt>;
+  fetchReceipt(key: EvidenceKey): Promise<ReviewReceipt | null>;
 }
 // B3. 호출 결과를 넷으로 나눈다. unknown은 대조로만 끝낸다. 토큰·URL·method는 입출력에 없고 writer 안에서만 산다.
 export type WriterOutcome<T> =
@@ -466,6 +493,8 @@ export interface ChangeWriterPort {
   createCommit(input: { target: ChangeTarget; treeSha: string; parent: string; metadata: WriterCommitMetadata }): Promise<WriterOutcome<{ commitSha: string; treeSha: string; parents: string[] }>>;
   createRef(input: { target: ChangeTarget; branch: string; sha: string }): Promise<WriterOutcome<{ ref: string; sha: string }>>;
   createPull(input: { target: ChangeTarget; branch: string; baseBranch: string; title: string; body: string; draft: boolean }): Promise<WriterOutcome<WriterPullSnapshot>>;
+  // 수정 차례(C27)의 커밋을 자기 브랜치에 fast-forward로만 올린다(C26 구현, 강제 갱신 없음). 브랜치가 expectedHead가 아니면 보내지 않는다.
+  fastForwardBranch(input: { target: ChangeTarget; branch: string; expectedHead: string; sha: string }): Promise<WriterOutcome<{ ref: string; sha: string }>>;
   // 대조와 신선도 검사. 정확한 이름·SHA만 받는다. prefix 검색은 없다.
   readBranchHead(input: { target: ChangeTarget; branch: string }): Promise<{ sha: string } | null>;
   readCommit(input: { target: ChangeTarget; sha: string }): Promise<{ treeSha: string; parents: string[] } | null>;

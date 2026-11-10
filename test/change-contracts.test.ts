@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
-  ARTIFACT_LIMITS, ApprovalSubjectSchema, ArtifactManifestSchema, CHANGE_PHASES, CHANGE_PHASE_TRANSITIONS, ChangeBriefSchema, DEPLOYMENT_STATES,
+  ARTIFACT_LIMITS, ApprovalSubjectSchema, ArtifactManifestSchema, CHANGE_AMENDMENT, CHANGE_PHASES, CHANGE_PHASE_TRANSITIONS, ChangeBriefSchema, DEPLOYMENT_STATES,
   DeploymentObservationSchema, EFFECT_STAGES, EFFECT_STATES, EFFECT_TRANSITIONS, EffectExpectedSchema, EffectResultSchema, EvidenceBundleSchema, GENERATION_RESTART,
   PROVENANCE_LABELS, PublicMetadataSchema, ReviewReceiptSchema, TERMINAL_CHANGE_PHASES, UNKNOWN_RECONCILE_MS, VerificationReceiptSchema,
   approvalDigest, artifactDigest, canTransition, canTransitionEffect, canonicalJson, changeBranchName, changeBranchRef, effectResultMatches,
@@ -18,7 +18,7 @@ test('T19 B0 전이 표는 phase를 모두 덮고 정확히 이 모양이다', (
   const terminal = ['superseded', 'blocked', 'cancelled', 'failed'];
   const stop = ['superseded', 'blocked', 'cancelled', 'failed'];
   assert.deepEqual([...CHANGE_PHASES], ['requested', 'admitted', 'authoring', 'snapshot_ready', 'verifying', 'reviewing',
-    'awaiting_publish_approval', 'approved', 'publishing', 'proposed', 'merged', 'observing_deploy', ...terminal]);
+    'awaiting_publish_approval', 'approved', 'publishing', 'proposed', 'amending', 'merged', 'observing_deploy', ...terminal]);
   assert.deepEqual([...TERMINAL_CHANGE_PHASES], terminal);
   assert.deepEqual(CHANGE_PHASE_TRANSITIONS, {
     requested: ['admitted', 'blocked', 'cancelled', 'failed'],
@@ -30,7 +30,9 @@ test('T19 B0 전이 표는 phase를 모두 덮고 정확히 이 모양이다', (
     awaiting_publish_approval: ['approved', ...stop],
     approved: ['publishing', ...stop],
     publishing: ['proposed', ...stop],
-    proposed: ['merged', 'superseded', 'blocked', 'cancelled'],
+    proposed: ['merged', 'amending', 'superseded', 'blocked', 'cancelled'],
+    // C27 수정 차례. 실패해도 failed로 가지 않고 proposed로 돌아온다(공개된 PR은 그대로다).
+    amending: ['proposed', 'merged', 'blocked', 'cancelled'],
     merged: ['observing_deploy', 'blocked', 'failed'],
     observing_deploy: ['blocked', 'failed'],
     superseded: [], blocked: [], cancelled: [], failed: [],
@@ -52,6 +54,12 @@ test('T19 B0 끝 상태에서는 나가지 못하고 단계를 건너뛰지 못�
     }
   }
   assert.deepEqual(GENERATION_RESTART, { from: 'superseded', to: 'requested' });
+  // 수정 차례는 proposed와 amending 사이만 오가고 게시 전 단계로 돌아가지 못한다.
+  for (const phase of main) {
+    assert.equal(canTransition('amending', phase), phase === 'proposed' || phase === 'merged', `amending->${phase}`);
+    assert.equal(canTransition(phase, 'amending'), phase === 'proposed', `${phase}->amending`);
+  }
+  assert.equal(CHANGE_AMENDMENT.maxRounds, 10);
 });
 
 test('T19 B0 label 전파는 가장 제한적인 값이고 어떤 입력으로도 낮출 수 없다', () => {

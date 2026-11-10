@@ -78,7 +78,8 @@ export const PROPOSAL_READ_ACTIONS = Object.freeze(['list', 'task_status', 'chan
 export const PROPOSAL_RUN_ACTIONS = Object.freeze(['task', 'cancel', 'task_cancel', 'retry', 'memory_save', 'memory_correct',
   'memory_exclude', 'memory_delete', 'attach', 'detach', 'change', 'change_cancel', 'review_resume', 'review_cancel',
   // 리뷰 요청(C30)은 '/'가 없는 실행이고 확인 없이 바로 접수한다. 이름 끝에만 더해 앞 줄의 뜻·순서는 그대로다.
-  'review_request'] as const);
+  // 변경 PR 수정(C27)도 '/'가 없는 실행이고 확인 버튼을 거친다. 작업자 출력 스키마 enum에만 들어가 요청 본문·capability digest는 그대로다.
+  'review_request', 'change_amend'] as const);
 export const PROPOSAL_ACTIONS = Object.freeze([...PROPOSAL_READ_ACTIONS, ...PROPOSAL_RUN_ACTIONS] as const);
 // reply는 v1 답 전체 상한(8+4+8+4개 × 500자)과 같다. target은 가장 긴 대상(기억 출처 키 510자), content는 기억 진술(3000자)에 맞춘다.
 export const CHAT_REPLY_LIMITS = Object.freeze({ reply: 12_000, target: 510, content: 3000 });

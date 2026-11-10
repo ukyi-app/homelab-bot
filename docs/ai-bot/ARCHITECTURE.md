@@ -190,7 +190,7 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 
 **외부인 입력:** 봇 저장소와 앱 저장소가 public이라(D-29) 모델 호출 전 게이트를 둔다. 설치·저장소 허용, fork 제외, `author_association` 또는 허용 봇 작성자 ID(D-16 하위 결정). `CONTRIBUTOR`는 허용하지 않는다. 댓글 트리거는 `comment.author_association`을 보고 Bot 댓글은 무시한다. 댓글 트리거도 대상 PR을 조회해, 같은 저장소 PR이고 PR 작성자가 자동 리뷰와 같은 조건일 때만 모델을 호출한다(DECISIONS D-16 규칙 스케치).
 
-**Discord 입력:** 매 이벤트마다 사용자 ID(문자열 snowflake)·guild·채널(스레드는 `parent_id`) 허용 검사. 봇·webhook 메시지 무시. 버튼은 누른 사람 ID를 질문 대상·작업 소유자와 대조. 봇 메시지의 멘션은 기본 `allowed_mentions: {"parse": []}`(D-17)이고, **owner 호출** 넷(작업 질문, 작업 완료·실패, 변경 미리보기, 변경 실패)만 `users`에 owner 사용자 ID 하나를 허용한다. everyone·역할·다른 사용자는 늘 막는다. 답장은 `replied_user: false`로 알림을 끈다(C07, §11 "표식·답장·스레드"). **멘션 요청을 받는 자리(C08):** 대화 채널과 알림 채널 부모의 `@` 멘션을 둘 다 받아 그 메시지에서 스레드를 연다(`DiscordIngress.receive`, 채널 부모의 일반 메시지는 멘션만 남는다). '/' 대화 명령은 지금처럼 대화 채널만이다. 허용 채널 아래 공개 스레드는 봇이 만들지 않았거나 오래 쉬어 보관됐어도 멘션을 받고, 구독 중이면 이어 말하기도 받는다(시간으로 닫는 검사 없음). 비공개 스레드(type 12)는 `gatewayMessage`가, owner·서버·채널·거부 목록은 `PolicyGate.authorize`가 지금처럼 먼저 막는다.
+**Discord 입력:** 매 이벤트마다 사용자 ID(문자열 snowflake)·guild·채널(스레드는 `parent_id`) 허용 검사. 봇·webhook 메시지 무시. 버튼은 누른 사람 ID를 질문 대상·작업 소유자와 대조. 봇 메시지의 멘션은 기본 `allowed_mentions: {"parse": []}`(D-17)이고, **owner 호출** 넷(작업 질문, 작업 완료·실패, 변경 미리보기, 변경 실패)과 수정 차례 결과·실패 둘(C27)만 `users`에 owner 사용자 ID 하나를 허용한다. everyone·역할·다른 사용자는 늘 막는다. 답장은 `replied_user: false`로 알림을 끈다(C07, §11 "표식·답장·스레드"). **멘션 요청을 받는 자리(C08):** 대화 채널과 알림 채널 부모의 `@` 멘션을 둘 다 받아 그 메시지에서 스레드를 연다(`DiscordIngress.receive`, 채널 부모의 일반 메시지는 멘션만 남는다). '/' 대화 명령은 지금처럼 대화 채널만이다. 허용 채널 아래 공개 스레드는 봇이 만들지 않았거나 오래 쉬어 보관됐어도 멘션을 받고, 구독 중이면 이어 말하기도 받는다(시간으로 닫는 검사 없음). 비공개 스레드(type 12)는 `gatewayMessage`가, owner·서버·채널·거부 목록은 `PolicyGate.authorize`가 지금처럼 먼저 막는다.
 
 **허용 목록 반영(F01, AUTH-02):** T16b D1(사용자 2026-10-30)로 아래 제안 중 파일 마운트·최대 나이는 채택하지 않았다. 지금 계약은 §11이다(env를 기동 때 읽기, 즉시 차단은 `/revoke`). 아래는 당시 기록이다. Infisical에서 허용 목록을 바꾸면 ESO 동기화를 거쳐야 봇에 닿는다. 정책을 확인할 수 없거나 오래됐으면 거부하도록 **실패 시 닫힘**으로 설계한다. 다만 이것이 철회의 즉시 효력을 보장하지는 않는다(아래 "남는 창"). 아래는 제안이고 값은 T16a에서 정한다 [가정]:
 
@@ -1681,6 +1681,7 @@ POST
 ```
 requested → admitted → authoring → snapshot_ready → verifying → reviewing
   → awaiting_publish_approval → approved → publishing → proposed → merged → observing_deploy
+                                                         proposed ⇄ amending → merged (C27 수정 차례)
 ```
 
 | 전이 | 전용 저장 메서드 | 그때 고정되는 것 |
@@ -1694,6 +1695,9 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 | → approved | `approve` | owner의 승인. 대상 digest가 정확히 같아야 한다 |
 | → merged | `recordMerge` | H, M, PR 번호. 게시한 PR·head가 아니면 거부 |
 | reviewing → authoring | `startSelfFix` | 게시 전 고치기 차례(C31). 막힌 리뷰와 그 증거 digest를 `change_fix_rounds`로 옮기고 차례 번호를 올린다 |
+| proposed → amending | `startAmendment` | 게시 뒤 수정 차례(C27). 대기열의 가장 앞 차례를 running으로 바꾼다 |
+| amending → proposed | `finishAmendment` | 차례 결과(커밋 SHA 또는 실패 사유). 커밋은 그 차례의 ref effect가 그 SHA로 확정됐을 때만 |
+| proposed·amending → merged | `recordMerge` | 게시한 head는 마지막으로 ref가 확정된 수정 커밋(없으면 처음 게시의 head)이다. 남은 차례는 커밋 없이 `pr_merged`로 닫는다 |
 | 나머지 | `transition`(CAS) | 없음 |
 
 **게시 전 고치기 차례(C31).** 같은 generation 안의 되돌림이다. `reviewing`에서 완전한 리뷰가 P0·P1을 내면(`selfFixable`: 범위 부족·리뷰 출력 노출은 제외) `reviewing → authoring → snapshot_ready → verifying → reviewing`을 다시 돈다. 상한은 `CHANGE_SELF_FIX.maxRounds`(2, 기본값)이고 DB `change_generations.fix_round` CHECK와 같다. B·T0·브랜치는 그대로다.
@@ -1706,6 +1710,18 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 - **이어 묻기.** 고치기 세션이 질문을 내면 지금의 변경 질문 경로를 그대로 쓴다. 재개 요청은 C28 규칙대로 시작 턴이 세션 `capabilities.instructions`에 남긴 판(고치기면 `change-v2`)을 보낸다.
 - **실패.** 고치기 차례의 작성이 실패하거나 작업자가 요청을 받지 않으면 새 사유 없이 `blocked(review_blocked)`다. 취소·입력 막힘은 그 사유 그대로다. 시험 실패는 `verification_*`, base 이동은 기존 신선도 규칙이다. 고친 결과는 고정한 B 위에서 미리보기로 가고, 승인 뒤 게시 직전 검사(`ChangePublisher` gate)가 `superseded(base_moved)`로 닫는다.
 - **알림.** 차례 시작은 알리지 않는다. `review_blocked`로 닫히면 남은 P0·P1의 제목을 최대 5개, 공개 검사(`scanPublicText`)를 지난 것만 싣고 걸리면 코드로 바꾼다. 조건·근거 원문은 싣지 않는다.
+
+**게시 뒤 수정 차례(C27).** owner가 Discord에서 봇 PR 수정을 확정하면 차례 하나가 생긴다. generation을 올리지 않는다. 지금 계약은 브랜치·artifact·시험·리뷰·승인·effect가 (change, generation)에 묶이고 새 generation은 새 브랜치에서 처음부터라 같은 PR 브랜치를 쓸 수 없기 때문이다. 그래서 차례는 (change, generation, round) 키를 하나 더 두고, 브랜치·승인 대상은 그 generation의 것 그대로다. 처음 게시의 승인 digest 규칙(generation마다 승인 대상 하나)과 표는 바꾸지 않는다.
+
+- **대기열과 상한.** 확정된 요청은 `change_amendments`에 queued로 들어간다(`requestAmendment`, 부모가 proposed·amending일 때만). 한 generation의 차례는 대기열·실패한 차례까지 `CHANGE_AMENDMENT.maxRounds`(10)번이고 11번째는 `amendment_limit`이다. DB `round` CHECK(1~10)가 같은 값이다. running은 change당 하나(부분 unique 인덱스)이고 부모를 잠가 동시 확정에도 차례 번호가 겹치지 않는다. 지시 원문은 `change_request_inputs`(label `public`, 7일 정리 대상)이고 차례 행에는 확인 때 센 PR 리뷰·리뷰 댓글·대화 댓글 ID 묶음, 그 글들의 digest(`materials_digest`, 원문 없음), PR head만 있다. 차례를 시작할 때 그 ID의 글을 다시 읽어 digest가 다르면(고쳐짐·지워짐) 작성 claim·모델 호출 전에 `materials_changed`로 닫는다. 확인 뒤 달린 글은 자료에도 대조에도 들지 않는다.
+- **대상.** 모델 대상은 변경 ID나 PR 번호(`#n`·`n`·PR 링크)다. PR 링크면 링크의 저장소(정책 저장소 목록과 대소문자 무시 대조)와 번호를 함께 맞추고, 정책에 없는 저장소의 링크는 고르지 않는다. 확인 글은 "<저장소> PR #n에 …"로 저장소를 보인다.
+- **시작.** 런타임은 proposed 바퀴마다 대기열을 보고 `startAmendment`로 연다. 동료 기능 스위치가 꺼져 있거나 자료 읽기 포트가 없으면 열지 않는다(돌고 있는 차례는 끝까지 간다).
+- **base.** 차례를 시작하면 PR 브랜치 head를 다시 읽는다. head가 마지막으로 확정한 수정 커밋(없으면 처음 게시의 head)과 같고 확인 때의 head가 이 change가 올린 커밋 사슬(처음 게시 head와 확정된 수정 커밋들) 위에 있으면 그 head와 tree를 차례 base로 고정한다(`pinAmendmentBase`). 그래서 대기열의 요청은 앞 차례 커밋 위에서 `head_changed` 없이 이어지고, 사람 push 뒤에는 커밋 없이 `head_changed`로 닫힌다.
+- **작성·시험·리뷰.** 작성은 새 자식 job(`change_child_jobs.amendment_round`, 넣을 때 트리거가 running 차례로 채운다)과 새 세션이다. `ClaudeChangeAuthor.start`가 C25 수정 차례 칸 `amendment`(PR 번호, head=차례 base, 지시=owner 원문, 자료=확인 때 ID 묶음의 글만)를 판 `change-v2`로 보낸다. 작업자가 그 판을 말하지 않으면(`supportsAmendment`) 차례를 `worker_unsupported`로 닫는다. 작성 질문은 지금의 변경 질문 경로 그대로다. 시험·리뷰는 port에 차례 키(`EvidenceKey.round`)를 넘겨 차례마다 새로 만들고 `change_amendment_*` 표에 둔다. 앞 차례·처음 게시의 증거와 리뷰 job은 받지 않는다. 묶음 digest는 `change-amendment-evidence/v1` domain이다. 시험은 하나가 실패하면 뒤를 돌리지 않는다. 필수 시험 receipt가 다 있어도 하나라도 통과가 아니면 작성·시험 바퀴가 그 저장된 결과로 작성 세션을 정리하고 차례를 닫는다(실패 receipt 저장 직후 끊겨도 재시작 뒤 이어진다).
+- **게시.** 시험 전부 통과, 새 세션 리뷰 `pass`·`pass_with_warnings`이고 범위 완전, 보호·허용 경로(`inspectCandidate`), `scanPublicPayload`, CI 판정(처음 게시 때 승인한 fingerprint와 같아야 함)을 모두 지나야 `ChangePublisher.publishAmendment`가 blob → tree → commit(부모는 차례 base 하나, 고정 신원·시각, 커밋 메시지는 고정 문구와 차례 번호) → `fastForwardBranch`로 올린다. PR 생성·PR 설명 수정·강제 갱신은 없다. ref 직전에 PR이 열려 있는지 다시 본다. 실패는 커밋 없이 차례를 닫고 proposed로 돌아간다. 실패 전이(`finishAmendment` failed)는 그 차례의 claim 전(`pending`) effect를 같은 트랜잭션에서 안 나간 것(`not_sent`)으로 해소한다. 보냈을 수 있는 `sending`·`unknown`은 그대로 두어 DB가 복귀를 막고 대조로만 풀린다.
+- **수정 중 병합·닫힘.** amending 바퀴도 병합을 읽는다. 병합이면 `recordMerge`(남은 차례 `pr_merged`), 병합 없이 닫히면 `cancelled(closed_unmerged)`다. 차례 effect가 해소되지 않으면 DB가 proposed·merged·cancelled로 나가지 못하게 막고 `blocked`만 된다.
+- **알림.** 커밋한 차례는 C29 안내 댓글(`ChangeGuidance.post`, 그 커밋 기준)을 먼저 달고, Discord 결과 요약(차례 번호, 바뀐 파일 수, 시험 결과, 확인할 것 건수, 줄 댓글로 못 단 확인할 것·남은 위험)을 owner 호출로 보낸다. 안내 리뷰가 실제로 달렸을(`posted`) 때만 줄 댓글 항목을 빼고, 거부·재시도 소진(`failed`)·건너뜀(`skipped`)이면 공개 검사를 지난 항목 전부(`GuidanceOutcome.cleared`)를 싣는다. 실패한 차례는 사유를 동료 말투로 owner 호출해 알린다. outbox 키 `change-amendment:<id>:<gen>:<round>`로 한 번만 간다. 알림을 아직 못 만든 행(안내 대조 대기, 정책 조회 실패)은 outbox가 없어 남으므로 조회는 끝난 시각·키 커서로 32개씩 돈다(뒤 차례 알림을 막지 않는다).
+- **조립.** writer의 쓰기 직전 확인(`change-assembly.ts` `authorizeWrite`)은 두 경우만 받는다. 처음 게시(부모 `publishing` + 살아 있는 승인, 그대로)와 수정 차례(부모 `amending`이고 running 차례가 지금 `change_amendment_may_send` 조건을 만족, `ChangeStore.amendmentWritable`이 그 DB 함수를 직접 부른다). 브랜치가 그 변경·generation의 것인지는 writer가 따로 본다. PR 리뷰·댓글 읽기(`discussion`)는 `main.ts`가 리뷰 경로의 `discussion.read`를 `assembleChange`·`changeCommandHandler`의 선택 인수로 넘긴다. 리뷰 경로가 없으면 런타임은 수정 차례를 열지 않고, 이 스레드에서 보이는 변경의 수정 요청은 확인 글 없이 거절 한 줄(`AMENDMENT_REQUEST_TEXT.unavailable`)로 끝난다.
 
 **끝 상태와 재시작.** `superseded`, `blocked`, `cancelled`, `failed`에서는 나가지 못한다. 새 generation은 전이 표 밖의 `startNextGeneration` 하나로, `superseded`에서만 `requested`로 열고 admission부터 다시 받는다. 성공 경로에는 끝 상태가 없다. `observing_deploy`에 남고 `change_deployments.state`가 `DEPLOYMENT_SETTLED_STATES`면 조회를 멈춘다. PR이 병합 없이 닫히면 `proposed → cancelled`다.
 
@@ -1724,6 +1740,10 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 | `change_approvals` | `event_id` unique, 살아 있는 승인 generation당 하나 | 승인과 무효화 |
 | `change_delivery_effects` | `(change_id, generation, stage)` | 게시 effect |
 | `change_deployments` | 위 키 | H, M, K, D, 관측 시각, 상태 |
+| `change_amendments` | `(change_id, generation, round)`, `event_id` unique | 수정 차례(C27). 상태, 지시 event·label, PR 번호, 확인 때 head·ID 묶음·자료 digest, 차례 base·묶음 칸, 커밋 SHA, 실패 사유 |
+| `change_amendment_artifacts`, `change_amendment_artifact_files` | 위 키, 위 키+`path` | 차례 manifest·patch·바이트, 확인할 것·남은 위험 |
+| `change_amendment_verifications`, `change_amendment_reviews` | 위 키+`command_id`, 위 키 | 차례 시험·리뷰 receipt. 리뷰는 그 차례 자식 job만 |
+| `change_amendment_effects` | 위 키+`stage` | 차례 게시 effect(blob·tree·commit·ref). 승인 digest 대신 차례 조건 |
 
 **DB가 직접 막는 것.** 코드를 거치지 않은 쓰기도 막는다. 위반은 `CH001`과 사유 코드로 나오고 저장 계층이 값으로 바꾼다.
 
@@ -1732,6 +1752,7 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 - label은 내려가지 않고, private·unknown이면 진행 단계에 있을 수 없다.
 - 묶음·artifact·승인 대상·receipt 내용·effect intent는 바뀌지 않는다. receipt·승인은 무효 표시만 더한다.
 - 토큰·키·자격 열이 없다. 시험이 열 이름을 확인한다.
+- 수정 차례(C27, 027): `amending`은 그 generation에 running 차례가 있을 때만 들어가고, proposed로 돌아갈 때는 running 차례가 끝나 있어야 한다. 차례 effect가 미해소면 proposed·merged·cancelled로 못 나가고(blocked만) 새 generation도 열지 못한다. 차례 effect의 intent·`pending→sending`은 부모가 `amending`이고 그 차례가 running이며 그 차례의 필수 시험이 모두 통과하고 완전한 통과 리뷰가 있을 때만이다(`change_amendment_may_send`, 처음 게시의 `change_effect_may_send`는 그대로). 차례는 queued→running→committed|failed로만 가고 committed는 그 차례의 ref effect가 그 SHA로 확정됐을 때만이다. 요청 칸·증거 칸은 바뀌지 않는다.
 
 **effect 상태.** `blob → tree → commit → ref → pull` 순서이고 앞 stage가 `confirmed`여야 다음 intent를 받는다. blob은 stage당 행 하나이고 파일별 SHA를 `expected`에 담는다. 같은 내용은 같은 SHA라 재전송해도 중복이 없다.
 
@@ -1919,6 +1940,7 @@ writer의 `PATCH git/refs`는 위의 변경 브랜치 fast-forward 한 줄뿐이
 | 쓰기 직전 권한 확인 실패 | `not_sent(policy_unavailable·authorization_check_failed)`. 보내지 않고 위 연결 전 실패처럼 재시도 |
 | blob·tree·commit 응답 유실 | `unknown`, 예상 SHA를 GET해 있으면 확정, 없으면 unknown 유지 |
 | ref 응답 유실·422 | 정확한 ref를 GET. 예상 H면 회수, 다른 SHA면 `head_changed`로 막힘, 없으면 unknown(422는 막힘) |
+| 수정 차례 ref 갱신(C27, `fastForwardBranch`) | 보내기 전 브랜치가 차례 base가 아니거나 부모가 다르면 `not_sent`(보내지 않음, 차례 실패). 응답 유실·409·422는 writer가 정확한 ref를 다시 읽어 새 SHA면 확정, 다른 SHA면 `rejected(head_changed)`(차례 실패). 그래도 모르면 `unknown`이고 다시 보내지 않고 대조만 한다. 대조에서 브랜치가 차례 base도 새 SHA도 아니면 막힘(부모 blocked), 24시간 뒤 사람 해소 |
 | PR 응답 유실 | `state=all` 정확 조회. 한 건이고 저장소·작성자 숫자 ID·head·base·제목·본문·marker가 모두 맞으면 회수. 어긋나면 `pull_mismatch`, 여러 건·미발견이면 unknown |
 | PR 422 | 위와 같은 대조. 없으면 `http_422`로 막힘. 다시 보내지 않음 |
 | 응답 뒤 DB 기록 실패 | `sending`으로 남고 임대 만료 뒤 대조로 회수 |

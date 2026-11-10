@@ -108,6 +108,8 @@ export interface GuidanceOutcome {
   reason: string | null; reviewId: number | null;
   // 줄 댓글로 달지 않은 항목(diff 밖·위치 없음·상한 초과). 수정 차례면 C27이 Discord 결과 요약에 싣는다. 공개 검사에 걸렸으면 비어 있다.
   outside: ChangeNotes;
+  // 공개 검사를 지난 모든 항목(줄 댓글로 보내려던 것 포함). 줄 댓글이 실제로 달리지 않고 끝나면(failed·skipped) C27이 이것을 요약에 싣는다. 검사에 걸렸으면 없다.
+  cleared?: ChangeNotes;
 }
 export interface GuidanceRound {
   key: ChangeKey; round: number; repoId: number; pr: number; headSha: string;
@@ -163,12 +165,17 @@ export class ChangeGuidance {
 
   // 수정 차례(C27)도 이 함수를 부른다. 같은 차례를 몇 번 불러도 한 번만 보낸다.
   async post(round: GuidanceRound): Promise<GuidanceOutcome> {
-    const { key } = round;
     if (!/^[0-9a-f]{40}$/.test(round.headSha)) return this.result('failed', 'guidance_input_invalid');
     const policy = await this.options.policy(round.repoId);
     const limit = await this.options.limit();
     const rendered = policy ? renderGuidance({ checks: round.checks, risks: round.risks, positions: guidanceDiffLines(round.patch), limit: limit ?? 0, round: round.round },
       { internalMarkers: policy.internalMarkers, identity: policy.identity }) : null;
+    const outcome = await this.place(round, policy, limit, rendered);
+    return rendered?.ok ? { ...outcome, cleared: { checks: [...round.checks], risks: [...round.risks] } } : outcome;
+  }
+  private async place(round: GuidanceRound, policy: Awaited<ReturnType<ChangeGuidanceOptions['policy']>>, limit: number | null,
+    rendered: ReturnType<typeof renderGuidance> | null): Promise<GuidanceOutcome> {
+    const { key } = round;
     const outside = rendered?.ok ? rendered.outside : { checks: [], risks: [] };
     const existing = await this.row(key, round.round);
     if (existing && existing.head_sha !== round.headSha) return this.result('failed', 'head_mismatch', null, outside);
