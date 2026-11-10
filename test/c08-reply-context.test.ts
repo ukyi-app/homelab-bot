@@ -1,6 +1,6 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULTS, SYSTEM_INSTRUCTIONS } from '../src/contracts.js';
+import { DEFAULTS, SYSTEM_INSTRUCTIONS_V2 } from '../src/contracts.js';
 import { chatContext, CONTEXT_BYTES } from '../src/chat-context.js';
 import { chatPrompt } from '../src/chat-lane.js';
 import { purgeExpiredOutboxContent } from '../src/raw-text-retention.js';
@@ -101,7 +101,7 @@ test('AC-2 참조 글은 지시 자리가 아니라 untrusted 자료 배열 안�
   await botPost('7993', injection);
   await untrustedFor(frame(`<@${BOT}> 이 말 뭐예요?`, referenced('7993', BOT, injection)));
   const request = f.requests.at(-1)!;
-  assert.equal(request.instructions, SYSTEM_INSTRUCTIONS);
+  assert.equal(request.instructions, SYSTEM_INSTRUCTIONS_V2);
   const prompt = chatPrompt(request);
   const data = prompt.lastIndexOf(JSON.stringify(request.untrusted));
   assert.ok(data > 0);

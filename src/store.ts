@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { changeChildFailed } from './change-advice.js';
-import { chatContext } from './chat-context.js';
+import { chatContext, earlierPurged } from './chat-context.js';
 import { CHAT_TASK_TEXT as T } from './chat-task-text.js';
 import { DEFAULTS, Denied, RateLimited } from './contracts.js';
 import type { Clock, EventInput, Job, Scope, State } from './contracts.js';
@@ -35,6 +35,10 @@ export interface DeliveryNotice { ownerCall?: boolean }
 // lost: lease를 잃었다(행을 건드리지 않았다).
 export type DispatchOutcome = 'dispatched' | 'blocked' | 'gap' | 'lost';
 const json = (value: unknown) => JSON.stringify(value);
+// 👀를 달아 둔 일반 메시지에만 반응 행(reactions.ts의 controls `reaction:<event id>`)이 있다. 명령·history 복구에는 없다.
+async function hasReaction(tx: Database, event: string): Promise<boolean> {
+  return (await tx.query('SELECT 1 FROM controls WHERE key=$1', [`reaction:${event}`])).rows.length > 0;
+}
 // 전역 상한 중 read 몫. contracts.ts의 DEFAULTS는 공용 계약이라 여기 둔다.
 export const READ_QUEUE_RESERVE = 10;
 export const MODEL_QUEUE_LIMIT = DEFAULTS.maxQueue - READ_QUEUE_RESERVE;
@@ -410,6 +414,8 @@ export class Store {
       WHERE id=$1 AND lease_token=$2 AND lease_until>$5 AND state IN ('running','verifying','cancel_requested') RETURNING state`,
     [job.id, job.lease_token, state, reason, this.now()])).rows[0]?.state;
     if (next === 'cancelled') await this.cancelledNotice(job, reason, tx);
+    // 구독이 꺼져(/stop) 답 없이 끝난 작업. 게시할 답이 없으니 게시 확정 쪽 정리가 오지 않는다. 여기서 지운다.
+    if (next === 'superseded') await settleReactions(tx, job.id, 'cleared');
     return next;
   }
   // 작업이 cancelled로 확정되면 그 스레드에 한 번 알린다. cancelled는 끝 상태라(재시도는 failed만 받는다) job마다 키 하나다.
@@ -470,7 +476,10 @@ export class Store {
     await this.enqueue({ key, job: job.id, conversation: job.conversation_id, actor: job.owner_id, scope: job.target,
       revision: job.revision.policy, payload: { kind: 'message', channel: job.target.channel, content, classification: 'safe_summary' } }, tx);
   }
-  async finish(job: Job, result: unknown, evidence: unknown, content: string, scope: Scope, services: string[] = [], notify: DeliveryNotice = {}): Promise<void> {
+  // content가 { ackOnly }면 게시할 글이 없는 대화 답(ack_only)이다. 결과는 같게 저장하고, 글 대신 그 메시지에 👍만 남긴다.
+  // 결과 outbox가 없으므로 다음 대화 기록의 봇 항목에도 들어가지 않는다. 👍를 달 반응 행이 없는 요청(명령, history 복구)은
+  // 끝을 알릴 길이 없으므로 ackOnly 고정 글을 일반 답처럼 게시한다.
+  async finish(job: Job, result: unknown, evidence: unknown, content: string | { ackOnly: string }, scope: Scope, services: string[] = [], notify: DeliveryNotice = {}): Promise<void> {
     await this.db.transaction(async tx => {
       const conversation = (await tx.query<Conversation>('SELECT * FROM conversations WHERE id=$1 FOR UPDATE', [job.conversation_id])).rows[0];
       if (!conversation || conversation.owner_id !== job.owner_id) throw new Denied();
@@ -479,9 +488,15 @@ export class Store {
       if (!state) throw new Error('stale_result');
       if (state === 'cancelled') return;
       await tx.query('INSERT INTO results VALUES ($1,$2,$3,$4,$5)', [job.id, json(result), json(evidence), 'internal', this.now()]);
+      if (typeof content !== 'string' && await hasReaction(tx, job.event_id)) {
+        // 👍를 먼저 정한다. 끝 상태라 뒤의 정리(밀려난 앞 메시지 지우기)가 이 메시지를 다시 바꾸지 않는다.
+        await moveReactions(tx, [job.event_id], 'acked');
+        await settleReactions(tx, job.id, 'cleared');
+        return;
+      }
       await this.enqueue({ key: `result:${job.id}`, job: job.id, conversation: job.conversation_id,
         actor: job.owner_id, scope, revision: job.revision.policy, services,
-        payload: { kind: 'message', channel: scope.channel, content, classification: 'safe_summary',
+        payload: { kind: 'message', channel: scope.channel, content: typeof content === 'string' ? content : content.ackOnly, classification: 'safe_summary',
           ...await this.addressing(job, scope.channel, notify, tx) } }, tx);
     });
   }
@@ -666,6 +681,9 @@ export class Store {
   }
   async context(conversation: string, event: string): Promise<unknown[]> {
     return chatContext(this.db, conversation, event);
+  }
+  async earlierPurged(conversation: string, event: string): Promise<boolean> {
+    return earlierPurged(this.db, conversation, event);
   }
   async checkpoint(conversation: string, message: string, recovering = false): Promise<void> {
     if (!/^\d+$/.test(message)) return;

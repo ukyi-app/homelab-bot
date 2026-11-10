@@ -7,12 +7,14 @@ import type { Log } from './log.js';
 import type { Store } from './store.js';
 
 // owner 메시지 하나에 봇이 달아 두는 반응. 상태마다 붙어 있어야 할 봇 반응 전체를 적는다.
-// 상태를 더할 때(👍 C11, 💤 C20)는 이 표와 아래 FROM에 이름만 더한다. 동기화는 지금 붙은 것과 비교해 필요한 것만 더하고 지운다.
+// 상태를 더할 때(💤 C20)는 이 표와 아래 FROM에 이름만 더한다. 동기화는 지금 붙은 것과 비교해 필요한 것만 더하고 지운다.
 export const REACTIONS = {
   received: ['👀'],
   waiting: ['👀', '⏳'],
   cleared: [],
   failed: [],
+  // 답할 필요가 없는 말(ack_only)이라 글 없이 남기는 표시. 이 반응만은 끝 상태에서도 붙어 있다.
+  acked: ['👍'],
 } as const satisfies Record<string, readonly string[]>;
 export type ReactionState = keyof typeof REACTIONS;
 // 이 상태로 옮길 수 있는 앞 상태. 끝 상태(답 게시·실패 확정)에서는 다시 바뀌지 않는다.
@@ -21,8 +23,9 @@ const FROM: Record<ReactionState, readonly ReactionState[]> = {
   waiting: ['received'],
   cleared: ['received', 'waiting'],
   failed: ['received', 'waiting'],
+  acked: ['received', 'waiting'],
 };
-const TERMINAL: readonly ReactionState[] = ['cleared', 'failed'];
+const TERMINAL: readonly ReactionState[] = ['cleared', 'failed', 'acked'];
 // 반응 행은 마이그레이션 없이 controls(`reaction:<event id>`)에 둔다. 끝 상태까지 동기화하면 지운다.
 const KEY = 'reaction:';
 // 동기화 한 바퀴가 행을 쥐는 시간. 다른 게시 서버가 같은 행을 동시에 바꾸지 않게 한다.

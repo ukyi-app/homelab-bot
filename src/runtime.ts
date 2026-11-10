@@ -1,12 +1,12 @@
-import { chatAnswerContent } from './chat-format.js';
-import { AnswerSchema, DEFAULTS, Denied, PolicyUnavailable, WorkerRejected } from './contracts.js';
+import { ACK_ONLY_NOTICE, chatReplyContent, chatReplyRisk, WITHHELD_REPLY_NOTICE } from './chat-format.js';
+import { ChatReplySchema, DEFAULTS, Denied, PolicyUnavailable, WorkerRejected } from './contracts.js';
 import type { Job } from './contracts.js';
-import type { PolicyGate } from './policy.js';
+import type { Policy, PolicyGate } from './policy.js';
 import type { ReadAdapter } from './read.js';
 import { ReadRuntime, dispatchable } from './read-runtime.js';
 import type { Store } from './store.js';
 import { workerRequest } from './worker.js';
-import type { WorkerClient, WorkerResult, WorkerSigner } from './worker.js';
+import type { WorkerClient, WorkerResultV2, WorkerSigner } from './worker.js';
 import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
 
@@ -72,6 +72,7 @@ export class Runtime {
     // 작업자 cancel이 멈춤을 확인했는지(result.stopped와 구분한다). 확인 결과는 상태 쓰기 전에 남겨,
     // 쓰기가 실패해도 catch가 cancel을 다시 묻지 않게 한다.
     let confirmed = false;
+    let latestPolicy: Policy | undefined;
     try {
       // 종료 신호 전에 시작한 claim이 늦게 돌아온 경우. 작업자에 보내기 전이라 시도 횟수를 쓰지 않고 되돌린다.
       if (await this.deferOnShutdown(job)) return true;
@@ -91,7 +92,10 @@ export class Runtime {
         await this.tasks.run(job);
         return true;
       }
-      const request = workerRequest(job, await this.store.context(job.conversation_id, job.event_id));
+      // surface는 동료 기능 스위치를 따른다(켜짐이면 '/' 명령 이름이 없는 speech).
+      const request = workerRequest(job, await this.store.context(job.conversation_id, job.event_id), {
+        surface: this.store.colleague ? 'speech' : 'slash',
+        earlierPurged: await this.store.earlierPurged(job.conversation_id, job.event_id) });
       await this.gate.authorize(job.owner_id, job.target);
       if (!await this.dispatchable(job)) return true;
       // 여기부터 dispatch까지는 await가 없어 신호가 끼어들 틈이 없다. 이후의 신호는 드레인 타이머가 받는다.
@@ -99,7 +103,7 @@ export class Runtime {
       const abort = new AbortController();
       let timeout: ReturnType<typeof setTimeout> | undefined;
       let monitorTask: Promise<void> | undefined;
-      const interrupted = new Promise<WorkerResult>(resolve => {
+      const interrupted = new Promise<WorkerResultV2>(resolve => {
         abort.signal.addEventListener('abort', () => resolve({ status: 'unknown', stopped: false }), { once: true });
       });
       const monitor = setInterval(() => {
@@ -118,7 +122,7 @@ export class Runtime {
         drain = setTimeout(() => { drained = true; void stopRequest(); abort.abort(); }, this.drainMs);
       };
       this.shutdown?.addEventListener('abort', onShutdown, { once: true });
-      let result: WorkerResult | undefined;
+      let result: WorkerResultV2 | undefined;
       let rejected = false;
       try {
         const capability = this.signer.issue(job, 'execute', request);
@@ -126,7 +130,7 @@ export class Runtime {
         result = await Promise.race([
           this.worker.execute(request, capability, abort.signal),
           interrupted,
-          new Promise<WorkerResult>(resolve => {
+          new Promise<WorkerResultV2>(resolve => {
             timeout = setTimeout(() => { abort.abort(); resolve({ status: 'unknown', stopped: false }); }, job.budget.timeoutMs);
           }),
         ]);
@@ -146,7 +150,7 @@ export class Runtime {
       }
       stopped = result.stopped;
       waiting = result.stopped && (result.status === 'limited' || result.status === 'auth_expired');
-      try { await this.gate.authorize(job.owner_id, job.target); }
+      try { latestPolicy = await this.gate.authorize(job.owner_id, job.target); }
       catch (error) {
         if (error instanceof Denied) { authorizationRevoked = true; abort.abort(); }
         else if (!(error instanceof PolicyUnavailable)) throw error;
@@ -165,11 +169,19 @@ export class Runtime {
         await this.stopOutcome(job, stopped, { revoked: false, ownerCancel: false, drained, unknownReason: 'worker_disconnected' });
       } else if (result.status === 'failed') await this.store.fail(job, 'model_failed');
       else if (result.status === 'succeeded') {
-        const answer = AnswerSchema.parse(result.answer);
+        // proposal은 받기만 하고 버린다(저장·게시하지 않음). 제안 처리는 이 분기에 C13이 더한다.
+        const { reply, ack_only: ackOnly } = ChatReplySchema.parse(result.output);
         // Completed results remain durable while the publisher waits for fresh policy.
         if (!await this.store.active(job.conversation_id)) { await this.store.transition(job, 'superseded'); return true; }
-        const content = chatAnswerContent(answer);
-        await this.store.finish(job, answer, { source: 'worker', policyRevision: job.revision.policy }, content, job.target);
+        const evidence = { source: 'worker', policyRevision: job.revision.policy };
+        if (ackOnly) await this.store.finish(job, { reply: '', ack_only: true }, evidence, { ackOnly: ACK_ONLY_NOTICE }, job.target);
+        else {
+          // 공개 검사는 게시 직전의 정책으로 한다. 끝난 뒤 재인가가 정책을 못 읽었으면 보내기 전 인가의 정책을 쓴다.
+          const risk = chatReplyRisk(reply, latestPolicy ?? policy);
+          // 걸린 답은 모델 글을 결과·감사·로그 어디에도 남기지 않고 사유 코드만 둔다.
+          if (risk) await this.store.finish(job, { withheld: risk, ack_only: false }, evidence, WITHHELD_REPLY_NOTICE, job.target);
+          else await this.store.finish(job, { reply, ack_only: false }, evidence, chatReplyContent(reply), job.target);
+        }
       }
       await this.store.audit('model_timing', job.id, { queueWaitMs: Number(job.started_at) - Number(job.created_at),
         executionMs: this.store.now() - Number(job.started_at) });

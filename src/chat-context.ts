@@ -1,10 +1,11 @@
-import { DEFAULTS } from './contracts.js';
+import { WORKER_ACCEPT } from './contracts.js';
 import type { Database } from './database.js';
 
 // 작업자에게 넘기는 untrusted 대화 기록. owner 메시지와, 봇이 owner에게 실제로 게시한 자기 답을 시간 순서로 섞는다.
-// 작업자 스키마가 20개를 넘으면 요청을 거부하므로 전체 항목 수를 함께 센다.
+// 작업자 v2 스키마가 50개·80KiB를 넘으면 요청을 거부하므로 전체 항목 수와 배열 JSON 바이트를 같은 방식으로 센다.
 // owner가 봇 자신의 글에 답장한 메시지는 그 봇 글을 'replied_bot_post' 자료 항목으로 바로 앞에 둔다. 이 항목도 상한에 든다.
-export const CONTEXT_BYTES = 32768;
+export const CONTEXT_MESSAGES = WORKER_ACCEPT.contextMessagesV2;
+export const CONTEXT_BYTES = WORKER_ACCEPT.contextBytesV2;
 export type ContextItem = ({ from: 'owner' } & Record<string, unknown>) | { from: 'bot'; text: string; partial?: true }
   | { from: 'replied_bot_post'; text: string };
 interface BotAnswer { position: bigint; pages: string[]; partial: boolean }
@@ -15,7 +16,7 @@ const snowflake = (value: string | null | undefined) => typeof value === 'string
 const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
 
 export async function chatContext(db: Database, conversation: string, event: string,
-  limits: { messages: number; bytes: number } = { messages: DEFAULTS.contextMessages, bytes: CONTEXT_BYTES }): Promise<ContextItem[]> {
+  limits: { messages: number; bytes: number } = { messages: CONTEXT_MESSAGES, bytes: CONTEXT_BYTES }): Promise<ContextItem[]> {
   const current = (await db.query<{ delivery_id: string; event_order: string }>(`SELECT e.delivery_id,e.event_order FROM events e
     JOIN conversations c ON c.id=e.conversation_id WHERE e.id=$2 AND e.conversation_id=$1 AND e.actor_id=c.owner_id`,
   [conversation, event])).rows[0];
@@ -40,6 +41,18 @@ export async function chatContext(db: Database, conversation: string, event: str
   }
   while (next < answers.length) timeline.push({ from: 'bot', answer: answers[next++]! });
   return select(timeline, limits);
+}
+
+// 이 대화에서 현재 메시지보다 앞의 원문이 7일 정리로 비워져 기록에서 빠졌는지. 받아들인 owner 메시지나, 이 대화 chat 답의
+// 게시 확정 페이지 중 하나라도 비워졌으면 참이다. 상한에 밀려 어차피 빠질 오래된 것도 센다: 모델은 그 부분을 기억하지 못한다.
+export async function earlierPurged(db: Database, conversation: string, event: string): Promise<boolean> {
+  const row = (await db.query<{ purged: boolean }>(`SELECT EXISTS (SELECT 1 FROM events e WHERE e.conversation_id=$1 AND e.accepted=true
+      AND e.actor_id=(SELECT owner_id FROM conversations WHERE id=$1) AND e.text_purged_at IS NOT NULL AND e.id<>$2
+      AND e.event_order<(SELECT event_order FROM events WHERE id=$2 AND conversation_id=$1))
+    OR EXISTS (SELECT 1 FROM outbox o JOIN jobs j ON j.id=o.job_id WHERE j.conversation_id=$1 AND o.conversation_id=$1 AND j.type='chat'
+      AND o.message_key='result:' || j.id AND o.state='sent' AND o.content_purged_at IS NOT NULL AND j.event_id<>$2) AS purged`,
+  [conversation, event])).rows[0];
+  return row?.purged === true;
 }
 
 // owner 항목은 모델에 필요한 필드만 고른다. 저장된 수집 경로 표시(mention·activate·urgent)와 정책 revision을 넘기면

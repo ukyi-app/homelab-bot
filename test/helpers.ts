@@ -11,7 +11,7 @@ import type { DiscordRest } from '../src/discord.js';
 import { DiscordRejected } from '../src/contracts.js';
 import type { EventInput, Scope } from '../src/contracts.js';
 import { SerialWorker, WorkerSigner, WorkerVerifier } from '../src/worker.js';
-import type { WorkerRequest, WorkerResult } from '../src/worker.js';
+import type { WorkerRequest, WorkerResult, WorkerResultV2 } from '../src/worker.js';
 import { ReadAdapter } from '../src/read.js';
 import type { QueryTemplate, Service } from '../src/read.js';
 import { Runtime } from '../src/runtime.js';
@@ -107,7 +107,19 @@ export const service: Service = { id: 'fixture-service', repository: 'fixture/se
   deployment: 'fixture', internalDomain: null, externalDomain: null, documentation: [] };
 export const template: QueryTemplate = { id: 'fixture-status', service: service.id, datasource: 'fixture-metrics',
   namespace: service.namespace, kind: 'status', query: 'up{namespace="app-fixture"}', maxWindowSeconds: 300, maxRows: 20, maxBytes: 8192 };
-export async function fixture(db: Database) {
+// 대화 작업자 가짜가 돌려줄 수 있는 결과. 게시 서버는 v2 요청만 보낸다. 대화 답 모양을 보지 않는 기존 시험은
+// v1 답(네 배열)을 주므로, v2 요청에는 그 항목을 한 줄씩 이은 reply로 옮긴다. 답 모양 자체를 보는 시험은 v2를 직접 준다.
+type FixtureResult = WorkerResult | WorkerResultV2;
+function asRequested(request: WorkerRequest, result: FixtureResult): FixtureResult {
+  if (request.version !== 2 || !('answer' in result)) return result;
+  const answer = result.answer as Record<string, unknown>;
+  const items = [answer.facts, answer.hypotheses, answer.unknowns, answer.checks].flatMap(value => Array.isArray(value) ? value : []);
+  // 네 배열 밖의 칸(모델이 정책·도구를 지정하려는 답)은 v2에서도 계약 밖 칸으로 옮겨 작업자가 실패로 닫게 둔다.
+  const extra = Object.fromEntries(Object.entries(answer).filter(([key]) => !['facts', 'hypotheses', 'unknowns', 'checks'].includes(key)));
+  return { status: 'succeeded', stopped: true, rateLimit: null,
+    output: { reply: items.join('\n'), proposal: null, ack_only: false, ...extra } };
+}
+export async function fixture(db: Database, options: { colleague?: boolean } = {}) {
   let time = 1_800_000_000_000;
   const now = () => time;
   const policy: Policy = { revision: 'fixture-v1', confirmedAt: time, owner: 'fixture-owner', guild: 'fixture-guild',
@@ -118,7 +130,7 @@ export async function fixture(db: Database) {
     if (policyUnavailable) throw new Error('policy_source_unavailable');
     return policy;
   }, db, now);
-  const store = new Store(db, now);
+  const store = new Store(db, now, options.colleague === true);
   const rest = new MockDiscord();
   const ingress = new DiscordIngress(store, gate, rest);
   const publisher = new DiscordPublisher(store, gate, rest);
@@ -129,9 +141,10 @@ export async function fixture(db: Database) {
   }, now);
   const signer = new WorkerSigner(keys.privateKey, now);
   const requests: WorkerRequest[] = [];
-  let run: (request: WorkerRequest) => Promise<WorkerResult> = async () => ({ status: 'succeeded', stopped: true,
-    answer: { facts: [], hypotheses: [], unknowns: ['조회 전'], checks: [] } });
-  const worker = new SerialWorker(verifier, async request => { requests.push(request); return run(request); }, async () => true);
+  let run: (request: WorkerRequest) => Promise<FixtureResult> = async () => ({ status: 'succeeded', stopped: true,
+    output: { reply: '조회 전이에요.', proposal: null, ack_only: false }, rateLimit: null });
+  const worker = new SerialWorker(verifier, async request => { requests.push(request); return asRequested(request, await run(request)); },
+    async () => true);
   const queries: unknown[] = [];
   let observation: unknown = { observedAt: time, rows: [{ status: 'healthy' }] };
   const reader = new ReadAdapter([service], [template], gate, { query: async request => {

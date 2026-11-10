@@ -23,6 +23,7 @@ let database: Awaited<ReturnType<typeof localDatabase>>;
 let f: Awaited<ReturnType<typeof fixture>>;
 const channel: Scope = { ...thread, kind: 'channel', channel: 'fixture-chat', parent: null };
 const answer = { facts: [], hypotheses: [], unknowns: [], checks: [] };
+const output = { reply: '네.', proposal: null, ack_only: false };
 before(async () => { database = await localDatabase(); });
 beforeEach(async () => {
   await database.pg.exec('TRUNCATE events,conversations,jobs,results,outbox,schedules,denied_actors,controls,audit,incidents RESTART IDENTITY CASCADE');
@@ -69,9 +70,9 @@ test('R1-02 dispatch 전 DB 오류는 failed, 슬롯과 실패 안내 유지', a
   await queue('second'); await f.runtime.tick(); assert.equal(f.requests.length, 1);
 });
 test('R1-02 stopped:true 무효 출력은 failed, mutex 해제 뒤 다음 작업 실행', async () => {
-  for (const invalid of [{ ...answer, facts: ['x'.repeat(501)] }, { ...answer, tool: 'shell' }]) {
+  for (const invalid of [{ ...output, reply: 'x'.repeat(12_001) }, { ...output, tool: 'shell' }]) {
     await queue(`bad-${(await rows('jobs')).length}`);
-    f.setRun(async () => ({ status: 'succeeded', stopped: true, answer: invalid }));
+    f.setRun(async () => ({ status: 'succeeded', stopped: true, output: invalid as typeof output, rateLimit: null }));
     await f.runtime.tick(); assert.equal((await rows('jobs')).at(-1)!.state, 'failed');
     f.setRun(async () => ({ status: 'succeeded', stopped: true, answer }));
     await queue(`good-${(await rows('jobs')).length}`); await f.runtime.tick();
@@ -92,8 +93,8 @@ test('R1-02 HTTP 실행 전 거부와 실행 후 예외를 구분', async () => 
 });
 test('R1-02 HttpWorker의 중단 확인된 무효 JSON 출력도 failed', async () => {
   await queue(); const job = (await f.store.claim())!;
-  const client = new HttpWorker('http://worker:8080', async () => new Response(JSON.stringify({ status: 'succeeded', stopped: true, answer: { tool: 'shell' } })));
-  assert.deepEqual(await client.execute(workerRequest(job, []), 'fixture', new AbortController().signal), { status: 'failed', stopped: true });
+  const client = new HttpWorker('http://worker:8080', async () => new Response(JSON.stringify({ status: 'succeeded', stopped: true, output: { tool: 'shell' }, rateLimit: null })));
+  assert.deepEqual(await client.execute(workerRequest(job, []), 'fixture', new AbortController().signal), { status: 'failed', stopped: true, rateLimit: null });
 });
 test('R1-02 실행 전 작업자 거부는 Runtime failed, 다음 모델 작업 허용', async () => {
   await queue();
@@ -187,7 +188,7 @@ test('R1-06 느린 HTTP 작업도 예산에 맞춘 dispatcher로 완료', async 
   const delay = Number(process.env.HOMELAB_WORKER_SLOW_MS ?? 1100);
   assert.ok(Number.isInteger(delay) && delay >= 1100 && delay <= 1_790_000);
   await queue(); const job = (await f.store.claim())!; job.budget.timeoutMs = delay + 5000;
-  const server = createServer((_req, res) => { setTimeout(() => res.end(JSON.stringify({ status: 'succeeded', stopped: true, answer })), delay); });
+  const server = createServer((_req, res) => { setTimeout(() => res.end(JSON.stringify({ status: 'succeeded', stopped: true, output, rateLimit: null })), delay); });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   try {
     let dispatcherSeen = false;

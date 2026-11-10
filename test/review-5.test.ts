@@ -123,14 +123,14 @@ test('4314491292 chat claim 뒤 맥락 조회 전에 들어온 이벤트도 제�
   assert.deepEqual(texts(f.requests[0]!.untrusted), ['응답 A']);
   assert.deepEqual(texts(f.requests[1]!.untrusted), ['응답 A', '응답 B']);
 });
-test('4314491292 causal boundary 안에서도 20건/32KiB·accepted·대화 격리 유지', async () => {
+test('4314491292 causal boundary 안에서도 50건/80KiB·accepted·대화 격리 유지', async () => {
   const ids: string[] = [];
-  for (let i = 0; i < 35; i++) {
+  for (let i = 0; i < 65; i++) {
     const saved = await f.store.save(event(`item-${i}`, { text: `내용 ${i}` }), f.policy.revision, true); ids.push(saved.id);
     await database.db.query('UPDATE events SET accepted=true WHERE id=$1', [saved.id]);
   }
   const conversation = f.store.scopeId(thread);
-  assert.deepEqual(texts(await f.store.context(conversation, ids[24]!)), Array.from({ length: 20 }, (_, i) => `내용 ${i + 5}`));
+  assert.deepEqual(texts(await f.store.context(conversation, ids[54]!)), Array.from({ length: 50 }, (_, i) => `내용 ${i + 5}`));
   const unaccepted = await f.store.save(event('unaccepted', { text: '미수락' }), f.policy.revision, true);
   assert.equal(texts(await f.store.context(conversation, unaccepted.id)).includes('미수락'), false);
   const foreign = await f.store.save(event('foreign', { scope: { ...thread, channel: 'other-thread' } }), f.policy.revision, true);
@@ -140,8 +140,9 @@ test('4314491292 causal boundary 안에서도 20건/32KiB·accepted·대화 격�
     last = (await f.store.save(event(`large-${i}`, { text: '가'.repeat(8000) }), f.policy.revision, true)).id;
     await database.db.query('UPDATE events SET accepted=true WHERE id=$1', [last]);
   }
+  // 8000자 한글 하나가 약 24KB라 80KiB에는 셋까지 든다.
   const bounded = await f.store.context(conversation, last);
-  assert.equal(bounded.length, 1); assert.ok(Buffer.byteLength(JSON.stringify(bounded)) <= 32768);
+  assert.equal(bounded.length, 3); assert.ok(Buffer.byteLength(JSON.stringify(bounded)) <= 80 * 1024);
 });
 
 // The source-backed model selects the nearest newer N, then returns that page newest first.

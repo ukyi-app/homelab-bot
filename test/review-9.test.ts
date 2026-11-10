@@ -44,8 +44,8 @@ test('4316750293 제어 결과·일반 문장 모두 끝 줄 marker 유지', asy
   while (await f.publisher.deliver()) { /* 제어 결과와 모델 결과를 모두 보낸다 */ }
   const control = f.rest.messages.find(message => message.body.content.startsWith('모델 호출: 정상\n'))!;
   assert.ok(control.body.content.endsWith(`\n-# ref:${control.body.nonce}`));
-  // 대화 답은 빈 섹션을 생략한다(개선안 v2 C1). fixture 답은 미확인 한 항목뿐이다.
-  const answer = f.rest.messages.find(message => message.body.content.startsWith('미확인:'))!;
+  // 대화 답은 라벨 없는 reply 문장이다(C11). fixture 기본 답은 '조회 전이에요.'다.
+  const answer = f.rest.messages.find(message => message.body.content.startsWith('조회 전이에요.'))!;
   assert.ok(answer.body.content.endsWith(`\n-# ref:${answer.body.nonce}`));
 });
 test('4316750293 실제 Protocol 대조는 JSON 본문의 marker 필드로 찾고 다른 작성자·다른 marker는 무시', async () => {
@@ -114,15 +114,15 @@ test('4316750315 검색 오류도 backoff, 간격은 상한에서 멈추고 unkn
 });
 
 // 개선안 v2 C1: 섹션 예산으로 항목을 버리지 않고 모든 항목을 완결 그대로 실으며 빈 섹션은 생략한다.
-test('4316750301 모델 응답 섹션은 완결 항목을 모두 싣고 빈 섹션은 생략', async () => {
-  const unknowns = Array.from({ length: 8 }, (_, i) => `미확인 항목 ${i} ${'가'.repeat(80)}`);
-  f.setRun(async () => ({ status: 'succeeded', stopped: true, answer: { facts: [], hypotheses: [], unknowns, checks: ['짧은 확인'] } }));
+test('4316750301 모델 응답(reply)은 모든 줄을 라벨·생략 없이 싣는다(C11)', async () => {
+  const lines = Array.from({ length: 8 }, (_, i) => `확인 못 한 것 ${i} ${'가'.repeat(80)}`);
+  const reply = lines.join('\n');
+  f.setRun(async () => ({ status: 'succeeded', stopped: true, output: { reply, proposal: null, ack_only: false }, rateLimit: null }));
   await queue(); await f.runtime.tick(); await f.publisher.deliver();
   const content = f.rest.messages[0]!.body.content;
-  const lines = content.split('\n');
-  assert.deepEqual(lines.slice(lines.indexOf('미확인:') + 1, lines.indexOf('미확인:') + 1 + unknowns.length), unknowns.map(u => `- ${u}`));
-  assert.doesNotMatch(content, /생략|^사실:|없음/m); assert.match(content, /^권장 확인:\n- 짧은 확인$/m);
-  assert.deepEqual((await rows('results'))[0]!.result.unknowns, unknowns);
+  assert.ok(content.startsWith(`${reply}\n-# ref:`), content);
+  assert.doesNotMatch(content, /생략|^사실:|^미확인:|없음/m);
+  assert.equal((await rows('results'))[0]!.result.reply, reply);
 });
 
 test('4316750328 read 5초 시간 초과는 전송에 AbortSignal을 넘겨 실제 요청을 중단', async t => {

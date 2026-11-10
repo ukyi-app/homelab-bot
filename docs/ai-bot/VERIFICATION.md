@@ -2338,3 +2338,26 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 - **고치기 전 실패 확인:** 새 렌더 시험은 옛 렌더에서, 서버 v2 시험 2개(SEC-01·T17 열림 조립)는 서버가 v1을 보낼 때, 배포 시험은 게시 대기 결과가 `policy_changed`로 버려져 실패했다.
 - **바뀐 기존 시험:** 머리말 정규식(`승인·병합 판단이 아니며`)을 둘째 줄 리터럴로, `미검토 …`를 `- 못 본 파일 …`로, `상한으로 1건 생략`을 `게시 상한 때문에 1건은 싣지 않았어요`로 바꿨다. `review-lane`의 입력 지시문은 서버가 보내는 v2로 바꿨다.
 - **못 잡는 범위.** 리뷰 글의 말투 품질과 GitHub에서 보이는 모양은 S5(C24 `homelab-smoke` PR)다. 운영의 실제 재리뷰 건수는 배포 뒤 관찰이다(DECISIONS의 예상 0건).
+
+## C11 대화 v2 전환 (2026-11-10, 로컬)
+
+동료 봇 명세 §4.2(대화 답과 작업자 계약 v2)·§4.5(`ack_only`의 👍)와 AC-3·AC-4(서버)·AC-5·AC-14(👍)를 S1(수신 `DiscordIngress` → PGlite·실제 PostgreSQL → `Runtime` → 게시 `DiscordPublisher`, 반응은 실제 `DiscordProtocol`에 가짜 API)과 S2(작업자 v2 계약: `SerialWorker`·`HttpWorker`·로컬 HTTP 작업자)에서 고정했다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §13 "대화 답 형식 (v2 `reply`, C11)"과 "봇 답 문맥"이다. 시작 전 확인: C06 운영 확인(v1 게시 서버 + v2 작업자로 대화·작업·리뷰 각 1회)이 homelab `approvals.md` 2026-11-10 10:1x~10:3x 줄에 있다.
+
+| 완료 조건 | 시험 |
+|---|---|
+| 대화 답이 라벨 없이 `reply` 문장으로 게시(스위치 두 상태) | `chat-format` "게시 경로(스위치 꺼짐)·(스위치 켜짐): 대화 답은 라벨 없이 reply 문장 그대로", "reply는 앞뒤 공백만 다듬고 라벨 없이 그대로", "게시 경로: 빈 reply는 빈 답 문구로 게시된다", "12,000자 reply·한글·대리쌍도 …1800자 페이지로 나뉜다", `review-9` "4316750301 모델 응답(reply)은 모든 줄을 라벨·생략 없이 싣는다(C11)" |
+| `ack_only`면 글 없이 👍, 👀 지움 | `chat-ack` "ack_only: 글 없이 👀를 지우고 👍만 단다. 결과는 저장되고 다음 대화 기록의 봇 항목에는 들지 않는다"(REST 순서 👀 `PUT` → 👍 `PUT` → 👀 `DELETE`), "ack_only: 디바운스로 밀려난 앞 메시지는 👍 없이 반응만 지운다", "ack_only: 반응을 달 수 없는 /chat 명령은 고정 완료 글 하나만 게시한다"(반응 행이 없는 요청은 👍 대신 `ACK_ONLY_NOTICE` 한 줄, 봇 PR #124 Codex P2 4520406570) |
+| 공개 검사에 걸린 답은 고정 문구만 | `chat-format` "게시 경로: 공개 검사에 걸린 reply는 모델 글 없이 고정 문구만, 결과·감사에는 사유 코드만 남는다"(결과·감사·outbox 어디에도 모델 글 없음), "게시 경로: 내부 표식을 알 수 없으면(리뷰 정책 형식 오류) …고정 문구로 닫는다" |
+| 기록 50개·80KiB, 현재 메시지 마지막, 오래된 것부터 | `chat-context` "전체 50개 상한, 현재 메시지가 마지막이고 오래된 것부터 빠진다"(실제 요청이 v2 스키마 통과), "80KiB 상한은 한글·이모지 바이트와 라벨까지 센다", "직전 봇 답은 owner 메시지보다 먼저 자리를 받는다", "80KiB에 통째로 안 들어가는 봇 답은 앞 페이지만 일부로 넣는다", `review-5` "4314491292 causal boundary 안에서도 50건/80KiB …" |
+| 정리돼 빠진 앞부분 → 신뢰 문맥 표시 칸 | `chat-context` "정리 표시: 원문을 비운 owner 메시지가 앞에 있으면 기록에서 빠지고 표시 칸이 채워진다"(표시가 `untrusted` 앞 신뢰 문맥에), "…본문을 비운 봇 답 페이지가 …", "…지워진 앞부분이 없으면 …거짓", "…다른 대화의 정리는 …들지 않는다" |
+| v2 서버 + v2 작업자 성공, v2 서버 + v1 작업자는 요청 거부 | `foundation` "C11 v2 게시 서버 + v1 작업자: 요청 거부(worker_rejected)로 닫히고 답 대신 실패 안내만 나간다"(v1 스키마만 받는 로컬 HTTP 작업자), "작업자 HTTP 계약은 로컬 서버에서 서명 검증 …"(v2 요청 성공), `worker-contract-v2` "C11 배포 순서 (2): 게시 서버는 v2 대화 요청만 만들고 …50개·80KiB" |
+| surface는 스위치를 따름 | `s16-display` "C11 대화 요청: 스위치 꺼짐이면 v2 요청의 surface는 slash", "…켜짐이면 …speech"(speech 신뢰 문맥에 '/' 명령 이름 없음) |
+| `proposal` 버림 | `chat-format` "게시 경로: 제안(proposal)은 저장·게시하지 않는다" |
+| (8a) 실행 중 `/stop` → 성공 → 반응 정리 | `chat-ack` "실행 중 /stop → 성공 → 답 없이 superseded, 👀와 반응 행도 정리" |
+| (8b) v2 프롬프트의 `replied_bot_post` 설명 | `s16-display` "C11 대화 프롬프트(v2): 기록의 replied_bot_post 항목을 …설명한다", `worker-contract-v2` "C02 신뢰 문맥: speech …"(v2 slash와 v1의 차이가 그 한 줄뿐) |
+
+- **실행(dd4a133, origin/main d353fc0 반영, 머신 잠금 도우미, node 24.22.0):** `npm run check`, `npm run build`, `node --test` 바뀐 파일을 참조하는 42개 파일(대화 작업자 가짜·`Runtime`·`workerRequest`·`chat-context`·`chat-lane`·반응·`chat-format`을 쓰는 시험) 1,201개 중 통과 1,175, 실패 0, skip 26(실제 PostgreSQL 전용). 이어 `--pg`로 PG 경로 12개 파일(`task-lane-pg`·`publisher-pg`·`status-notice-pg`·`read-lane-pg`·`task-cancel-notice`·`raw-text-retention`·`review-9`·`revoke-dispatch-pg`·`typing-pg`·`chat-ack`·`chat-context`·`chat-format`) 122개 모두 통과.
+- **바뀐 기존 시험:** 시험 fixture(`test/helpers.ts`)의 대화 작업자 가짜는 기본 답을 v2로 주고, v1 답(네 배열)을 주는 기존 시험은 v2 요청에 대해 항목을 한 줄씩 이은 `reply`로 옮긴다(네 배열 밖 칸은 계약 밖 칸으로 남겨 실패로 닫힌다). v1 요청·라벨·20개·32KiB를 기대하던 줄(`chat-format`·`chat-context`·`foundation` 외 `review-1`·`review-2`·`review-5`·`review-6`·`review-9`·`c08-reply-context`·`worker-contract-v2`)을 v2 모양으로 고쳤다.
+- **운영 영향(스위치와 무관하게 병합 즉시).** 대화 답이 라벨 목록에서 `reply` 문장으로 바뀌고, 답할 필요 없는 말에는 글 없이 👍만 남는다. 동료 말투 지시문(`SYSTEM_INSTRUCTIONS_V2`)이 모든 대화에 쓰인다. 공개 검사의 metadata 패턴(17~20자리 숫자, 이메일, `/home/` 같은 경로, 사설 IP `10.*`·`192.168.*`·`172.16~31.*`)에 걸리는 답은 고정 문구로 바뀐다. 홈랩 대화에서 파드·노드의 사설 IP를 그대로 말하는 답이 막힐 수 있다. 스위치를 켰을 때만 다른 것은 `surface`(speech)다. 롤백은 게시 서버 이미지를 되돌리면 된다(작업자는 v1·v2를 모두 받는다).
+- **작업자 배포가 필요한 것:** `replied_bot_post` 설명 줄은 작업자 이미지(`chat-lane.ts`)에 있어 작업자를 다시 배포해야 모델에 닿는다. 그 전에는 지금 작업자(C06 `9b067e9`)의 v2 프롬프트가 그 항목을 설명 없이 받는다. 게시 서버 쪽 동작은 이 줄과 무관하다.
+- **못 잡는 범위.** 모델 말투의 실제 품질, 모델이 정리 표시를 보고 "기억나지 않는다"고 말하는지, 실제 Discord 👍 표시는 S5(C24 표본)다. 실제 사람 배포 순서 준수는 티켓 절차(C06 확인)가 맡는다.
