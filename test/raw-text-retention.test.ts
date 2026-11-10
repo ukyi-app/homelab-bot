@@ -442,7 +442,7 @@ test('실제 PostgreSQL: 019까지의 DB에 남은 옛 원문도 020 적용 뒤 
     const waiting = await seed(db, 'pg-wait', { job: { state: 'waiting_user', finishedAt: null, session: { state: 'waiting_answer' } } });
     await outbox(db, 'pg-sent', { state: 'sent', at: T, content: '실제 PG 본문 ✓' });
     await outbox(db, 'pg-unknown', { state: 'unknown', at: T });
-    assert.deepEqual(await runMigrations(d.raw), [20, 21, 22, 23]);
+    assert.deepEqual(await runMigrations(d.raw), [20, 21, 22, 23, 24]);
 
     assert.equal(await purgeExpiredChangeContentRounds(db, T + 8 * DAY), 1);
     assert.deepEqual(await purgeExpiredRawText(db, T + 8 * DAY), { events: 1, prompts: 1, results: 1, outbox: 1 });

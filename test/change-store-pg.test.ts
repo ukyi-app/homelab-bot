@@ -236,7 +236,7 @@ test('T19 B0 실제 PostgreSQL: 016 DB 업그레이드는 017만 적용하고 �
     const raw = d.pool(2);
     for (const file of MIGRATIONS.filter(name => migrationVersion(name) <= 16)) await raw.query(await readFile(`migrations/${file}`, 'utf8'));
     await seedConversation(new Postgres(raw));
-    assert.deepEqual(await runMigrations(raw), [17, 18, 19, 20, 21, 22, 23]);
+    assert.deepEqual(await runMigrations(raw), [17, 18, 19, 20, 21, 22, 23, 24]);
     assert.deepEqual(await runMigrations(raw), []);
     assert.equal((await appliedMigrations(new Postgres(raw))).size, MIGRATIONS.length);
     await raw.query(await readFile('migrations/017_change_pr.sql', 'utf8'));
