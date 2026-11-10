@@ -34,7 +34,7 @@ export interface ChangeCommandHandler {
 // 수정 요청의 대상 대조와 접수. 대상은 이 스레드에서 owner가 낸 변경이고, 그 변경의 PR이 열려 있어야(proposed·amending) 한다.
 export type AmendmentRefusal = 'no_pull' | 'not_open' | 'limit' | 'sensitive' | 'unavailable';
 export type AmendmentTarget =
-  | { ok: true; changeId: string; generation: number; pullNumber: number; head: string; materials: string[] }
+  | { ok: true; changeId: string; generation: number; repository: string; pullNumber: number; head: string; materials: string[] }
   | { ok: false; reason: 'not_visible' | AmendmentRefusal };
 export interface AmendmentRequests {
   // 확인 글을 만들 때 부른다. PR 리뷰·댓글을 읽어 ID 묶음을 정한다(이 묶음까지가 이번 차례의 자료다). target은 변경 ID나 PR 번호(#n·n·PR 링크)다.
@@ -44,7 +44,7 @@ export interface AmendmentRequests {
 }
 // 수정 요청 문구. 동료 기능 스위치를 켰을 때만 보이므로 동료 말투다.
 export const AMENDMENT_REQUEST_TEXT = Object.freeze({
-  question: (pr: number, comments: number) => `PR #${pr}에 리뷰 댓글 ${comments}개를 반영해서 수정 커밋을 올릴까요?`,
+  question: (repository: string, pr: number, comments: number) => `${repository} PR #${pr}에 리뷰 댓글 ${comments}개를 반영해서 수정 커밋을 올릴까요?`,
   no_pull: '아직 PR을 올리지 않은 변경이라 수정 요청을 받을 수 없어요. 게시를 먼저 마쳐 주세요.',
   not_open: '이미 병합됐거나 닫힌 PR이라 고칠 수 없어요.',
   limit: (max: number) => `이 PR은 수정을 ${max}번 받아서 더 받을 수 없어요. 필요하면 새 변경으로 요청해 주세요.`,
@@ -318,11 +318,14 @@ export class ChangeCommands implements ChangeCommandHandler {
   // 수정 요청 대상. 남의 변경·다른 스레드의 변경은 존재도 알리지 않는다(not_visible). 병합·닫힘·상한·민감한 말은 거절 사유를 돌려준다.
   private async prepareAmendment(input: { actor: string; scope: Scope; target: string; instruction: string }): Promise<AmendmentTarget> {
     const target = input.target.trim();
-    const pr = /^(?:#?(\d{1,9})|https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/(\d{1,9})\/?)$/.exec(target);
+    const pr = /^(?:#?(\d{1,9})|https:\/\/github\.com\/([^/\s]+\/[^/\s]+)\/pull\/(\d{1,9})\/?)$/.exec(target);
     const conversation = this.deps.store.scopeId(input.scope);
-    const id = CHANGE_ID.test(target) ? target : pr ? (await this.deps.store.db.query<{ id: string }>(`SELECT r.id FROM change_requests r JOIN change_delivery_effects e
+    const policy = await this.deps.gate.current();
+    // 링크로 지정하면 저장소까지 대상이다. 번호만 맞추면 같은 스레드의 다른 저장소 PR이 골라져 엉뚱한 브랜치에 커밋이 올라간다.
+    const linked = pr?.[2] === undefined ? null : policy.change?.repositories.find(item => item.fullName.toLowerCase() === pr[2]!.toLowerCase())?.repoId ?? -1;
+    const id = CHANGE_ID.test(target) ? target : pr && linked !== -1 ? (await this.deps.store.db.query<{ id: string }>(`SELECT r.id FROM change_requests r JOIN change_delivery_effects e
       ON e.change_id=r.id AND e.generation=r.generation AND e.stage='pull' AND e.state='confirmed' WHERE r.owner_id=$1 AND r.conversation_id=$2 AND e.result->>'number'=$3
-      ORDER BY r.updated_at DESC LIMIT 1`, [input.actor, conversation, String(Number(pr[1] ?? pr[2]))])).rows[0]?.id : undefined;
+      AND ($4::bigint IS NULL OR r.repo_id=$4) ORDER BY r.updated_at DESC LIMIT 1`, [input.actor, conversation, String(Number(pr[1] ?? pr[3])), linked])).rows[0]?.id : undefined;
     const found = id ? await this.own({ actor: input.actor, scope: input.scope, target: id }) : null;
     if (!found) return { ok: false, reason: 'not_visible' };
     const key = { changeId: found.id, generation: found.generation };
@@ -331,7 +334,6 @@ export class ChangeCommands implements ChangeCommandHandler {
     if (found.phase !== 'proposed' && found.phase !== 'amending') return { ok: false, reason: pull || found.phase === 'merged' || found.phase === 'observing_deploy' ? 'not_open' : 'no_pull' };
     if (!pull) return { ok: false, reason: 'no_pull' };
     if ((await this.deps.changes.amendments(key)).length >= CHANGE_AMENDMENT.maxRounds) return { ok: false, reason: 'limit' };
-    const policy = await this.deps.gate.current();
     const repository = policy.change?.repositories.find(item => item.repoId === found.repoId);
     if (!repository || !this.deps.discussion) return { ok: false, reason: 'unavailable' };
     // 지시는 작성 모델에만 가지만, 공개하면 안 되는 값이 섞인 말은 첫 요청(scanBrief)처럼 받지 않는다.
@@ -342,7 +344,7 @@ export class ChangeCommands implements ChangeCommandHandler {
     let materials: string[];
     try { materials = discussionMaterials(await this.deps.discussion({ repository: repository.fullName, pr: pullNumber })).map(item => item.id); }
     catch (error) { this.deps.log('change_amendment_discussion_failed', errorInfo(error)); return { ok: false, reason: 'unavailable' }; }
-    return { ok: true, changeId: found.id, generation: found.generation, pullNumber, head, materials };
+    return { ok: true, changeId: found.id, generation: found.generation, repository: repository.fullName, pullNumber, head, materials };
   }
   private async requestAmendment(input: Parameters<AmendmentRequests['request']>[0]): Promise<ChangeCommandReply> {
     if (this.deps.closedReason()) return { content: AMENDMENT_REQUEST_TEXT.closed, outcome: 'closed' };

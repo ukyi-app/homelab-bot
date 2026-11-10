@@ -6,7 +6,8 @@ import { ChatReplySchema, PROPOSAL_RUN_ACTIONS } from '../src/contracts.js';
 import type { PullDiscussion } from '../src/github-review-io.js';
 import { actions, notifyThread, TRUNCATE } from './c14-actions-fixture.js';
 import type { Actions } from './c14-actions-fixture.js';
-import { REPO } from './change-github-fake.js';
+import type { ChangeRepositoryPolicy } from '../src/change-policy.js';
+import { REPO, repositoryPolicy } from './change-github-fake.js';
 import { driveTo, git, ok } from './change-store-fixture.js';
 import { localDatabase } from './helpers.js';
 
@@ -35,9 +36,9 @@ function discussion(): PullDiscussion {
       path: 'src/a.ts', line: 1, side: 'RIGHT', commitId: 'a'.repeat(40) }],
     comments: [{ id: 34, author: null, association: 'NONE', createdAt: '2026-01-02T03:07:00Z', body: '탈퇴한 계정의 댓글' }] };
 }
-async function wired(options: { colleague?: boolean; fail?: boolean; reader?: false } = {}) {
+async function wired(options: { colleague?: boolean; fail?: boolean; reader?: false; repositories?: ChangeRepositoryPolicy[] } = {}) {
   const reads: { repository: string; pr: number }[] = [];
-  open = await actions(database.db, { colleague: options.colleague ?? true, ...(options.reader === false ? {} : { discussion: async (input: { repository: string; pr: number }) => {
+  open = await actions(database.db, { colleague: options.colleague ?? true, ...(options.repositories ? { repositories: options.repositories } : {}), ...(options.reader === false ? {} : { discussion: async (input: { repository: string; pr: number }) => {
     reads.push(input);
     if (options.fail) throw new Error('read_failed');
     return discussion();
@@ -58,7 +59,7 @@ test('C27 수정 요청 확인: "PR #n에 리뷰 댓글 k개를 반영해서 수
   const { a, reads } = await wired();
   const id = await published(a);
   await a.speak(message(), 'PR 7에 리뷰 반영해 줘', { action: 'change_amend', target: '#7', content: '모델이 다시 쓴 지시' });
-  assert.equal(body(a.buttons().content), AMENDMENT_REQUEST_TEXT.question(7, 3));
+  assert.equal(body(a.buttons().content), AMENDMENT_REQUEST_TEXT.question(REPO.fullName, 7, 3));
   assert.deepEqual(reads, [{ repository: REPO.fullName, pr: 7 }]);
   assert.equal((await rounds(id)).length, 0, '누르기 전에는 접수하지 않는다');
   await a.press(a.buttons().ids[0]!);
@@ -78,6 +79,31 @@ test('C27 수정 요청 확인: "PR #n에 리뷰 댓글 k개를 반영해서 수
   await a.press(a.buttons().ids[0]!);
   assert.deepEqual((await rounds(id)).map(item => [item.round, item.state]), [[1, 'running'], [2, 'queued']]);
   assert.equal(String(a.lastCallback()!.data.content), AMENDMENT_REQUEST_TEXT.queued(2));
+});
+
+test('C27 수정 요청 PR 링크: 링크의 저장소와 번호를 함께 대조해 같은 스레드의 다른 저장소 #7을 고르지 않고, 확인 글에 저장소를 보인다', async () => {
+  const OTHER = 'fixture-org/fixture-other';
+  const { a } = await wired({ repositories: [repositoryPolicy(), repositoryPolicy({ repoId: 4343, fullName: OTHER })] });
+  const mine = await published(a);
+  // 같은 스레드에서 더 최근에 다른 저장소의 PR #7이 올라온 변경. 저장소는 바꿀 수 없는 칸이라 트리거를 끄고 옮긴다.
+  await a.slash('change', { target: REPO.fullName, text: '다른 요약 | accept=시험 통과 | label=public' });
+  const other = (await database.db.query<{ id: string }>('SELECT id FROM change_requests WHERE id<>$1', [mine])).rows[0]!.id;
+  await driveTo(a.changeStore, 'proposed', ok(await a.changeStore.get(other)));
+  await database.pg.exec(`SET session_replication_role=replica;
+    UPDATE change_requests SET repo_id=4343,updated_at=updated_at+60000 WHERE id='${other}'; UPDATE change_generations SET repo_id=4343 WHERE change_id='${other}';
+    SET session_replication_role=origin;`);
+  await a.speak(message(), '이 PR 리뷰 반영해 줘', { action: 'change_amend', target: `https://github.com/${REPO.fullName}/pull/7`, content: null });
+  assert.equal(body(a.buttons().content), AMENDMENT_REQUEST_TEXT.question(REPO.fullName, 7, 3));
+  await a.press(a.buttons().ids[0]!);
+  assert.deepEqual([(await rounds(mine)).length, (await rounds(other)).length], [1, 0], '링크의 저장소 변경에 들어간다');
+
+  await a.speak(message(), '저 PR 리뷰 반영해 줘', { action: 'change_amend', target: `https://github.com/${OTHER}/pull/7`, content: null });
+  assert.equal(body(a.buttons().content), AMENDMENT_REQUEST_TEXT.question(OTHER, 7, 3));
+  // 정책에 없는 저장소의 링크는 번호가 같아도 고르지 않는다.
+  const before = a.buttons().posted.length;
+  await a.speak(message(), '그 PR 반영해 줘', { action: 'change_amend', target: 'https://github.com/fixture-org/unknown/pull/7', content: null });
+  assert.equal((await a.dropped()).at(-1)!.reason, 'target_denied');
+  assert.equal(a.buttons().posted.length, before);
 });
 
 test('C27 수정 요청 거절: 병합·닫힌 PR과 상한에 닿은 변경은 확인 글 없이 거절 한 줄로 답하고, 남의 스레드·없는 PR은 버린다', async () => {

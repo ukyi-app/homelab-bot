@@ -14,6 +14,7 @@ import type { DocumentSource } from '../src/memory.js';
 import { MemoryCommands } from '../src/memory-commands.js';
 import { TaskCommands } from '../src/task-commands.js';
 import { BOT, harness } from './c13-proposal-fixture.js';
+import type { ChangeRepositoryPolicy } from '../src/change-policy.js';
 import { repositoryPolicy } from './change-github-fake.js';
 import { thread } from './helpers.js';
 import { closeLedgers, initLedger, ledgerAt } from './ledger-fixture.js';
@@ -28,10 +29,10 @@ export const outsideThread: Scope = { guild: thread.guild, channel: 'fixture-out
 export const notifyChannel: Scope = { guild: thread.guild, channel: 'fixture-notifications', parent: null, kind: 'channel' };
 const documents: DocumentSource = { check: async () => 'inaccessible' };
 export type Actions = Awaited<ReturnType<typeof actions>>;
-// discussion: 수정 요청(C27)의 PR 리뷰·댓글 읽기. 주면 변경 명령이 말로 하는 수정 요청을 받는다.
-export async function actions(db: Database, options: { colleague?: boolean; discussion?: AmendmentDiscussionReader } = {}) {
+// discussion: 수정 요청(C27)의 PR 리뷰·댓글 읽기. 주면 변경 명령이 말로 하는 수정 요청을 받는다. repositories: 변경 정책의 저장소 목록(기본 하나).
+export async function actions(db: Database, options: { colleague?: boolean; discussion?: AmendmentDiscussionReader; repositories?: ChangeRepositoryPolicy[] } = {}) {
   const h = await harness(db, options);
-  (h.f.policy as { change?: unknown }).change = { repositories: [repositoryPolicy()] };
+  (h.f.policy as { change?: unknown }).change = { repositories: options.repositories ?? [repositoryPolicy()] };
   await mkdir('.local', { recursive: true });
   const { dir } = await initLedger('c14-actions');
   const ledger = ledgerAt(dir, db);
