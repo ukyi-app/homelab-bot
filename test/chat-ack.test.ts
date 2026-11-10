@@ -176,3 +176,71 @@ test('수신: 명령/버튼 모드 문구는 그대로 텍스트 ACK 대상이 �
   await ingress.receive(event('6050') as EventInput);
   assert.equal(calls.length, 0);
 });
+
+// C11 ack_only(AC-14 👍): 답할 필요가 없는 말에는 글 없이 👀를 거두고 👍만 남긴다. 반응 REST는 실제 protocol 경로로 본다.
+const THUMBS = '%F0%9F%91%8D';
+function wireReactions() {
+  const wired = wire();
+  const rest = f.rest as DiscordRest;
+  rest.addReaction = (channel, message, emoji) => wired.protocol.addReaction(channel, message, emoji);
+  rest.removeOwnReaction = (channel, message, emoji) => wired.protocol.removeOwnReaction(channel, message, emoji);
+  return wired.calls;
+}
+const writes = (calls: Call[]) => calls.filter(c => c.method !== 'GET').map(c => `${c.method} ${c.path}`);
+async function drain() { while (await f.publisher.deliver()); }
+
+test('ack_only: 글 없이 👀를 지우고 👍만 단다. 결과는 저장되고 다음 대화 기록의 봇 항목에는 들지 않는다', async () => {
+  const calls = wireReactions();
+  f.setRun(async () => ({ status: 'succeeded', stopped: true, output: { reply: '', proposal: null, ack_only: true }, rateLimit: null }));
+  await f.ingress.receive(event('6101', { text: '고마워' }));
+  f.advance(DEFAULTS.debounceMs);
+  assert.equal(await f.runtime.tick(), true);
+  await drain();
+  const base = '/channels/fixture-thread/messages/6101/reactions';
+  assert.deepEqual(writes(calls), [`PUT ${base}/%F0%9F%91%80/@me`, `PUT ${base}/${THUMBS}/@me`, `DELETE ${base}/%F0%9F%91%80/@me`]);
+  assert.equal(f.rest.messages.length, 0);
+  assert.equal((await rows('outbox')).length, 0);
+  assert.equal((await rows('jobs'))[0]!.state, 'succeeded');
+  assert.deepEqual((await rows('results'))[0]!.result, { reply: '', ack_only: true });
+  // 끝 상태라 반응 행을 지우고, 다시 돌아도 더 부르지 않는다.
+  assert.equal((await rows('controls')).filter(c => c.key.startsWith('reaction:')).length, 0);
+  await drain();
+  assert.equal(writes(calls).length, 3);
+  f.setRun(async () => ({ status: 'succeeded', stopped: true, output: { reply: '네.', proposal: null, ack_only: false }, rateLimit: null }));
+  await f.ingress.receive(event('6102', { text: '다음 질문' }));
+  f.advance(DEFAULTS.debounceMs); await f.runtime.tick();
+  assert.deepEqual((f.requests.at(-1)!.untrusted as { from: string }[]).map(item => item.from), ['owner', 'owner']);
+});
+
+test('ack_only: 디바운스로 밀려난 앞 메시지는 👍 없이 반응만 지운다', async () => {
+  const calls = wireReactions();
+  f.setRun(async () => ({ status: 'succeeded', stopped: true, output: { reply: '', proposal: null, ack_only: true }, rateLimit: null }));
+  await f.ingress.receive(event('6201', { text: '아' }));
+  await f.ingress.receive(event('6202', { text: '고마워' }));
+  f.advance(DEFAULTS.debounceMs);
+  await f.runtime.tick(); await drain();
+  const thumbs = writes(calls).filter(line => line.includes(THUMBS));
+  assert.deepEqual(thumbs, [`PUT /channels/fixture-thread/messages/6202/reactions/${THUMBS}/@me`]);
+  assert.ok(writes(calls).includes('DELETE /channels/fixture-thread/messages/6201/reactions/%F0%9F%91%80/@me'));
+});
+
+// C04에서 넘어온 정리(봇 PR #114 Codex 3차 P2): 실행 중 /stop으로 구독이 꺼진 뒤 성공이 오면 답 없이 superseded로 끝나고,
+// 게시 확정 쪽 정리가 오지 않으므로 그 종료와 함께 반응을 지운다.
+test('실행 중 /stop → 성공 → 답 없이 superseded, 👀와 반응 행도 정리', async () => {
+  const calls = wireReactions();
+  let finish!: (value: { status: 'succeeded'; stopped: true; output: { reply: string; proposal: null; ack_only: false }; rateLimit: null }) => void;
+  f.setRun(() => new Promise(resolve => { finish = resolve; }));
+  await f.ingress.receive(event('6301'));
+  f.advance(DEFAULTS.debounceMs);
+  const running = f.runtime.tick();
+  while (!finish) await new Promise(resolve => setImmediate(resolve));
+  await f.ingress.receive(event('6302', { kind: 'command', command: 'stop', mention: undefined, text: '' }));
+  finish({ status: 'succeeded', stopped: true, output: { reply: '늦은 답', proposal: null, ack_only: false }, rateLimit: null });
+  await running;
+  await drain();
+  const job = (await rows('jobs')).find(j => j.type === 'chat')!;
+  assert.equal(job.state, 'superseded');
+  assert.ok(!f.rest.messages.some(m => m.body.content.includes('늦은 답')));
+  assert.ok(writes(calls).includes('DELETE /channels/fixture-thread/messages/6301/reactions/%F0%9F%91%80/@me'), writes(calls).join('\n'));
+  assert.equal((await rows('controls')).filter(c => c.key.startsWith('reaction:')).length, 0);
+});

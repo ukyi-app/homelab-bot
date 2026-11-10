@@ -310,12 +310,12 @@ test('R6-AUDIT thread 생성 중 owner 교체는 후속 대화·job 없이 unkno
 test('R6-AUDIT HttpWorker transport 구성 실패는 미시작, 정리 실패는 확인된 결과 보존', async () => {
   await f.ingress.receive(event('100')); f.advance(DEFAULTS.debounceMs + 50); const job = (await f.store.claim())!;
   const request = workerRequest(job, []); let calls = 0;
-  const send: typeof fetch = async () => { calls++; return Response.json({ status: 'failed', stopped: true }); };
+  const send: typeof fetch = async () => { calls++; return Response.json({ status: 'failed', stopped: true, rateLimit: null }); };
   const broken = new HttpWorker('http://fixture-worker', send, () => { throw new Error('setup_failed'); });
   await assert.rejects(broken.execute(request, '', new AbortController().signal), WorkerRejected); assert.equal(calls, 0);
   const dispatcher = { destroy: async () => { throw new Error('cleanup_failed'); } } as unknown as Agent;
   const worker = new HttpWorker('http://fixture-worker', send, () => dispatcher);
-  assert.deepEqual(await worker.execute(request, '', new AbortController().signal), { status: 'failed', stopped: true }); assert.equal(calls, 1);
+  assert.deepEqual(await worker.execute(request, '', new AbortController().signal), { status: 'failed', stopped: true, rateLimit: null }); assert.equal(calls, 1);
 });
 test('R6-AUDIT 중첩 heartbeat는 ping 하나만, 실패 후 재시도 가능', async () => {
   let release!: () => void; let calls = 0;

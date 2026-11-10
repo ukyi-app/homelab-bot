@@ -42,9 +42,9 @@ export type WorkerResultV2 =
   | { status: 'succeeded'; output: ChatReply; stopped: true; rateLimit: RateLimitInfo | null }
   | { status: 'limited' | 'auth_expired' | 'failed'; stopped: true; rateLimit: RateLimitInfo | null }
   | { status: 'unknown'; stopped: false };
-// 게시 서버가 쓰는 작업자 꼴. 게시 서버는 아직 v1만 보낸다(v2 사용은 C11).
+// 게시 서버가 쓰는 작업자 꼴. 게시 서버는 v2만 보낸다.
 export interface WorkerClient {
-  execute(request: WorkerRequestV1, capability: string, signal: AbortSignal): Promise<WorkerResult>;
+  execute(request: WorkerRequestV2, capability: string, signal: AbortSignal): Promise<WorkerResultV2>;
   cancel(request: CancelRequest, capability: string): Promise<{ stopped: boolean }>;
 }
 // 작업자 서버가 받는 꼴. 두 판을 모두 받고 요청 판에 맞는 응답 판을 돌려준다(v1 요청에는 v1 모양만).
@@ -102,9 +102,14 @@ export class WorkerVerifier {
     } catch { throw new Denied(); }
   }
 }
-export function workerRequest(job: Job, context: unknown[]): WorkerRequestV1 {
-  return WorkerRequestV1Schema.parse({ version: 1, job: job.id, lease: job.lease_token, lane: job.type,
-    policyRevision: job.revision.policy, instructions: SYSTEM_INSTRUCTIONS, untrusted: context,
+// 게시 서버가 보내는 대화 요청은 v2뿐이다. 작업자 쪽 v1 수용은 시범이 끝난 뒤 뺀다(명세 §4.2 계약 배포 순서).
+// v1만 받는 옛 작업자는 이 요청을 시작 전에 거부하고(WorkerRejected), 대화는 worker_rejected 실패로 닫힌다.
+export interface ChatRequestOptions { surface: 'slash' | 'speech'; earlierPurged: boolean }
+export function workerRequest(job: Job, context: unknown[],
+  options: ChatRequestOptions = { surface: 'slash', earlierPurged: false }): WorkerRequestV2 {
+  return WorkerRequestV2Schema.parse({ version: 2, job: job.id, lease: job.lease_token, lane: job.type,
+    policyRevision: job.revision.policy, instructions: SYSTEM_INSTRUCTIONS_V2,
+    surface: options.surface, earlierPurged: options.earlierPurged, untrusted: context,
     timeoutMs: job.budget.timeoutMs, toolCalls: job.budget.toolCalls });
 }
 

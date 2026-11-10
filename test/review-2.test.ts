@@ -169,7 +169,7 @@ for (const parent of [true, false]) test(`R2-07 interaction ACK 만료는 처리
 test('R2-08 작은 transport 기본 timeout을 예산 설정으로 덮어 느린 headers/body 수집', async () => {
   await queue(); const job = (await f.store.claim())!; job.budget.timeoutMs = 5000;
   for (const phase of ['headers', 'body']) {
-    const payload = JSON.stringify(success);
+    const payload = JSON.stringify({ status: 'succeeded', stopped: true, output: { reply: '네.', proposal: null, ack_only: false }, rateLimit: null });
     const server = createServer((_req, res) => {
       if (phase === 'body') { res.writeHead(200, { 'content-type': 'application/json' }); res.write(payload.slice(0, 1)); }
       setTimeout(() => res.end(phase === 'body' ? payload.slice(1) : payload), 1600);

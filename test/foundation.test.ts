@@ -9,7 +9,9 @@ import type { Job } from '../src/contracts.js';
 import { DiscordIngress, gatewayMessage } from '../src/discord.js';
 import { PolicyGate } from '../src/policy.js';
 import { ReadAdapter } from '../src/read.js';
-import { archiveContract, workerRequest } from '../src/worker.js';
+import { archiveContract, workerRequest, WorkerRequestV1Schema } from '../src/worker.js';
+import { Runtime } from '../src/runtime.js';
+import { createServer } from 'node:http';
 import { GatewayBudget, Health } from '../src/health.js';
 import { AlertIngress } from '../src/alerts.js';
 import { receivers } from '../src/http.js';
@@ -417,6 +419,31 @@ test('작업자 HTTP 계약은 로컬 서버에서 서명 검증하고 잘못된
     assert.equal(result.status, 'succeeded');
     await assert.rejects(client.execute(request, 'forged', new AbortController().signal));
     assert.equal(f.requests.length, 1);
+  } finally { server.close(); await once(server, 'close'); }
+});
+// AC-4: v2 게시 서버 + v1만 받는 옛 작업자. 옛 작업자는 모르는 판을 시작 전 403 rejected로 닫았다(작업자 HTTP v1 계약).
+// 이 조합은 배포 순서상 생기지 않지만, 생기면 요청 거부로 닫히고 성공처럼 보이지 않아야 한다.
+test('C11 v2 게시 서버 + v1 작업자: 요청 거부(worker_rejected)로 닫히고 답 대신 실패 안내만 나간다', async () => {
+  const seen: unknown[] = [];
+  const server = createServer(async (request, response) => {
+    let raw = ''; for await (const chunk of request) raw += chunk;
+    const parsed = WorkerRequestV1Schema.safeParse(JSON.parse(raw));
+    seen.push(JSON.parse(raw).version);
+    response.writeHead(parsed.success ? 500 : 403, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ status: 'rejected', started: false }));
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  try {
+    const runtime = new Runtime(f.store, f.gate, new HttpWorker(`http://127.0.0.1:${(server.address() as AddressInfo).port}`, fetch), f.signer, f.reader);
+    await queued('old-worker');
+    assert.equal(await runtime.tick(), true);
+    assert.deepEqual(seen, [2]);
+    const job = (await rows('jobs'))[0]!;
+    assert.equal(job.state, 'failed'); assert.equal(job.wait_reason, 'worker_rejected');
+    assert.equal((await rows('results')).length, 0);
+    while (await f.publisher.deliver());
+    assert.equal(f.rest.messages.length, 1);
+    assert.ok((await rows('outbox')).every(o => !String(o.idempotency_key).startsWith('result:')));
   } finally { server.close(); await once(server, 'close'); }
 });
 // 같은 payload·서명 바이트로 디코드되는 다른 base64url 표기. Node 디코더는 패딩, 허용 밖 문자,
