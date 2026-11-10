@@ -1157,6 +1157,39 @@ test('C27 차례 증거: 차례마다 새 artifact·시험·리뷰를 만들고 
   } finally { await s.close(); }
 });
 
+test('C27 차례 실패 전이: claim 전에 끊겨 남은 pending effect는 같은 트랜잭션에서 안 나간 것으로 해소하고 proposed로 돌아온다. 보냈을 수 있는 effect는 그대로 막는다', async () => {
+  const s = await setup();
+  try {
+    const r = await driveTo(s.store, 'proposed');
+    const key = { changeId: r.id, generation: 1, round: 1 };
+    ok(await amend(s, r.id));
+    ok(await amend(s, r.id));
+    ok(await s.store.startAmendment(key));
+    await roundEvidence(s, key);
+    // blob은 나갔고 tree intent만 저장한 채 끊겼다. 재시작 전에 정책이 바뀌어 차례를 실패로 닫는다.
+    ok(await s.store.recordAmendmentEffectIntent({ ...key, stage: 'blob', requestDigest: hex('blob'), expected: roundExpected('blob', r.id) }));
+    const blob = ok(await s.store.claimAmendmentEffect({ ...key, stage: 'blob' }));
+    ok(await s.store.confirmAmendmentEffect({ ...key, stage: 'blob', leaseId: blob.leaseId, result: roundResult('blob', r.id) }));
+    ok(await s.store.recordAmendmentEffectIntent({ ...key, stage: 'tree', requestDigest: hex('tree'), expected: roundExpected('tree', r.id) }));
+    const failed = ok(await s.store.finishAmendment({ ...key, outcome: { state: 'failed', reason: 'policy_changed' } }));
+    assert.deepEqual([failed.state, failed.reason], ['failed', 'policy_changed']);
+    assert.equal(await phaseOf(s.store, r.id), 'proposed');
+    assert.deepEqual((await s.store.amendmentEffects({ changeId: r.id })).map(effect => [effect.stage, effect.state, effect.resolution]),
+      [['blob', 'confirmed', null], ['tree', 'blocked', 'not_sent']]);
+    // 뒤 대기열이 이어서 열린다.
+    assert.equal(ok(await s.store.startAmendment({ changeId: r.id, generation: 1 })).round, 2);
+
+    // 전송 중(claim 뒤)인 effect는 나갔을 수 있어 실패 전이로 해소하지 않는다.
+    const key2 = { ...key, round: 2 };
+    await roundEvidence(s, key2);
+    ok(await s.store.recordAmendmentEffectIntent({ ...key2, stage: 'blob', requestDigest: hex('blob2'), expected: roundExpected('blob', r.id) }));
+    ok(await s.store.claimAmendmentEffect({ ...key2, stage: 'blob' }));
+    failure(await s.store.finishAmendment({ ...key2, outcome: { state: 'failed', reason: 'policy_changed' } }), 'unresolved_effects');
+    assert.equal(await phaseOf(s.store, r.id), 'amending');
+    assert.deepEqual((await s.store.amendmentEffects({ changeId: r.id, unresolved: true })).map(effect => [effect.round, effect.stage, effect.state]), [[2, 'blob', 'sending']]);
+  } finally { await s.close(); }
+});
+
 test('C27 차례 effect 유실: unknown이면 다시 보내지 않고 대조로만 확정하며, 해소 전에는 proposed로 못 돌아가고 막히면 부모가 blocked다', async () => {
   const s = await setup();
   try {

@@ -765,6 +765,12 @@ export class ChangeStore {
         WHERE change_id=$1 AND generation=$2 AND round=$3 AND state='running' RETURNING *`, [input.changeId, input.generation, input.round, outcome.state,
         outcome.state === 'committed' ? outcome.commitSha : null, outcome.state === 'failed' ? outcome.reason : null, now])).rows[0];
       if (!row) return fail('amendment_not_running');
+      // claim 전(pending)의 effect는 확실히 안 나갔다. 해소하지 않으면 트리거가 proposed 복귀를 막아 같은 실패만 되풀이하고 뒤 대기열이 멈춘다.
+      // 보냈을 수 있는 sending·unknown은 그대로 두어 대조로만 풀린다.
+      if (outcome.state === 'failed') {
+        await tx.query(`UPDATE change_amendment_effects SET state='blocked',blocked_reason='abandoned_unsent',resolution='not_sent',resolved_by='system',resolved_at=$4,updated_at=$4
+          WHERE change_id=$1 AND generation=$2 AND round=$3 AND state='pending'`, [input.changeId, input.generation, input.round, now]);
+      }
       await this.step(tx, locked.value, 'proposed', now);
       await audit(tx, 'change_amendment_finished', input.changeId, { generation: input.generation, round: input.round, state: outcome.state,
         reason: outcome.state === 'failed' ? outcome.reason : null }, now);
