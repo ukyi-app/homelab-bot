@@ -218,7 +218,9 @@ export class DiscordIngress {
         }
         if ((!recovered || inbox.buffered) && event.kind === 'message') await store.checkpoint(conversationId, event.id, inbox.buffered);
       }
-      if (!answered) await received();
+      // gap 버퍼에 둘 때 단 👀는 대화 작업이 없어 작업 정리(settleReactions)가 보지 못한다. 답·고르기로 보낸 여기서 지운다.
+      if (answered) await moveReactions(store.db, [saved.id], 'cleared');
+      else await received();
       if (!recovered && store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
       await store.db.query('UPDATE events SET accepted=true WHERE id=$1', [saved.id]);
       await store.db.query('UPDATE events SET buffered=false WHERE id=$1', [saved.id]);

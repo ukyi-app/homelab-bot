@@ -88,7 +88,9 @@ export interface PickOutcome { content: string; update: boolean }
 export async function pressQuestionPick(store: Store, tasks: TaskCommandHandler, input: PickInput): Promise<PickOutcome> {
   const conversation = await store.ownedConversation(input.scope, input.actor, true);
   const row = (await store.db.query<{ value: PickRow }>('SELECT value FROM controls WHERE key=$1 FOR UPDATE', [KEY + input.button])).rows[0]?.value;
-  if (!row || row.conversation !== conversation.id) return { content: QUESTION_PICK_TEXT.missing, update: true };
+  // 행 하나가 없는 것은 그 질문만 닫혔다는 뜻일 수 있다(새 고르기가 닫힌 질문의 행만 지운다). 같은 글의 다른 질문은 아직
+  // 고를 수 있으니 버튼을 남기고, 글의 버튼은 실제로 답을 붙였거나 그 말 자체를 쓸 수 없을 때만 없앤다.
+  if (!row || row.conversation !== conversation.id) return { content: QUESTION_PICK_TEXT.missing, update: false };
   if (row.owner !== input.actor) return { content: QUESTION_PICK_TEXT.notOwner, update: false };
   const settle = () => store.db.query(`DELETE FROM controls WHERE key LIKE '${KEY}%' AND value->>'pick'=$1`, [row.pick]);
   // 그 말이 같은 스레드에서 같은 owner가 보낸 것인지 저장된 이벤트로 다시 본다.
@@ -96,7 +98,7 @@ export async function pressQuestionPick(store: Store, tasks: TaskCommandHandler,
     `SELECT actor_id,conversation_id,payload->>'text' AS text,text_purged_at FROM events WHERE id=$1`, [row.pick])).rows[0];
   if (!message || message.actor_id !== input.actor || message.conversation_id !== conversation.id) return { content: QUESTION_PICK_TEXT.missing, update: true };
   if (message.text_purged_at !== null || !message.text) { await settle(); return { content: QUESTION_PICK_TEXT.purged, update: true }; }
-  if (!DIRECT.has(await questionKind(tasks, store.db, row.question))) return { content: QUESTION_PICK_TEXT.missing, update: true };
+  if (!DIRECT.has(await questionKind(tasks, store.db, row.question))) return { content: QUESTION_PICK_TEXT.missing, update: false };
   const result: TaskAnswerResult = await tasks.answerIn(store, { question: row.question, actor: input.actor, scope: input.scope, text: message.text, event: row.message });
   const status = controlText('answer', result, store.colleague);
   if (!result.ok) return { content: status, update: false };

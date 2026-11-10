@@ -41,6 +41,8 @@ async function harness(db: Database, options: { colleague?: boolean } = {}) {
   const protocol = new DiscordProtocol({ request: async (method, path, body) => {
     if (method === 'GET' && path === `/channels/${thread.channel}`) return { id: thread.channel, type: 11, parent_id: thread.parent, guild_id: thread.guild };
     if (method === 'GET' && path === '/channels/fixture-other-thread') return { id: 'fixture-other-thread', type: 11, parent_id: thread.parent, guild_id: thread.guild };
+    // history 복구가 읽는 기록. gap 동안 받은 메시지는 이미 버퍼에 있어 새로 읽을 것이 없다.
+    if (method === 'GET' && path.startsWith(`/channels/${thread.channel}/messages?`)) return [];
     if (method === 'PUT') return undefined;
     if (method === 'POST' && path.endsWith('/callback')) { callbacks.push({ body: body as never }); return undefined; }
     throw new Error(`unexpected_route ${method} ${path}`);
@@ -146,8 +148,74 @@ test('C16 열린 작업 질문이 둘이면 질문마다 버튼을 단 글로 �
   // 같은 말을 다른 질문에 다시 붙이지 못한다.
   await h.press(buttons[0]!.custom_id);
   assert.equal((await h.question(first.question)).state, 'open');
-  assert.equal(h.callbacks.at(-1)!.body.type, 7);
   assert.doesNotMatch(String(h.callbacks.at(-1)!.body.data.content), new RegExp(T.taskAnswerAccepted));
+});
+
+// history gap 동안 받은 owner 메시지를 버퍼에 두고(👀와 반응 행), 복구가 그 메시지를 다시 받게 한다.
+async function bufferedThenRecovered(h: Harness, text: string) {
+  await h.deliver();
+  await database.db.query('UPDATE conversations SET gap=true');
+  const id = messageId();
+  await h.say(text, { id });
+  assert.equal((await database.db.query('SELECT 1 FROM events WHERE buffered=true')).rows.length, 1);
+  assert.equal(await h.ingress.recover(thread, h.f.policy.owner), 'done');
+  return id;
+}
+const reactionState = async (message: string) => (await database.db.query<{ state: string }>(
+  `SELECT c.value->>'state' AS state FROM controls c JOIN events e ON c.key='reaction:'||e.id WHERE e.delivery_id=$1`, [message])).rows[0]?.state;
+
+test('C16 history gap 동안 받아 복구 때 바로 답으로 처리한 메시지는 👀를 지운다', async () => {
+  const h = await harness(database.db);
+  const { question } = await h.asked();
+  const said = await bufferedThenRecovered(h, 'main 기준이요');
+  assert.equal((await h.question(question)).answer_event, said);
+  assert.deepEqual(await h.chatJobs(), []);
+  assert.equal(await reactionState(said), 'cleared');
+  await h.deliver();
+  assert.deepEqual(h.f.rest.reactions.filter(r => r.message === said), [{ op: 'remove', channel: thread.channel, message: said, emoji: '👀' }]);
+  assert.equal(await reactionState(said), undefined, '반응 행이 남지 않는다');
+});
+
+test('C16 history gap 동안 받아 복구 때 질문 고르기 글로 보낸 메시지도 👀를 지운다', async () => {
+  const h = await harness(database.db);
+  await h.asked('어느 브랜치 기준으로 고칠까요?');
+  await h.asked('시험 이름을 바꿔도 될까요?');
+  const said = await bufferedThenRecovered(h, '네, 바꿔도 돼요');
+  assert.deepEqual(await h.chatJobs(), []);
+  assert.equal(await reactionState(said), 'cleared');
+  await h.deliver();
+  assert.ok(h.f.rest.messages.some(m => m.body.components?.length && m.body.message_reference?.message_id === said));
+  assert.deepEqual(h.f.rest.reactions.filter(r => r.message === said), [{ op: 'remove', channel: thread.channel, message: said, emoji: '👀' }]);
+});
+
+test('C16 옛 고르기 글의 닫힌 질문 버튼을 눌러도 그 글의 다른 버튼은 남아 아직 열린 질문에 답을 붙일 수 있다', async () => {
+  const h = await harness(database.db);
+  const first = await h.asked('어느 브랜치 기준으로 고칠까요?');
+  h.f.advance(1000);
+  const second = await h.asked('시험 이름을 바꿔도 될까요?');
+  h.f.advance(1000);
+  await h.asked('로그를 더 남길까요?');
+  const said = messageId();
+  await h.say('네, 바꿔도 돼요', { id: said });
+  await h.deliver();
+  const old = h.f.rest.messages.filter(m => m.body.components?.length).at(-1)!.body.components![0]!.components;
+  assert.equal(old.length, 3);
+  // 1번 질문을 '/answer'로 닫고, 다음 말로 남은 두 질문의 새 고르기 글을 만든다.
+  await h.ingress.receive({ id: 'fixture-answer-1', actor: h.f.policy.owner, scope: thread, kind: 'command', command: 'answer', target: first.question, text: 'main 기준이요' });
+  assert.equal((await h.question(first.question)).state, 'answered');
+  await h.say('로그는 그대로 둬요');
+  await h.deliver();
+  assert.equal(h.f.rest.messages.filter(m => m.body.components?.length).at(-1)!.body.components![0]!.components.length, 2);
+
+  // 옛 글의 닫힌 질문 버튼: 본인에게만 안내하고 그 글의 버튼은 그대로 둔다.
+  await h.press(old[0]!.custom_id);
+  assert.equal(h.callbacks.at(-1)!.body.type, 4);
+  assert.equal(h.callbacks.at(-1)!.body.data.components, undefined);
+  // 같은 글의 2번 질문 버튼으로 처음 말을 답으로 붙인다.
+  await h.press(old[1]!.custom_id);
+  assert.deepEqual(await h.question(second.question), { state: 'answered', answer: '네, 바꿔도 돼요', answer_event: said });
+  assert.equal(h.callbacks.at(-1)!.body.type, 7);
+  assert.deepEqual(h.callbacks.at(-1)!.body.data.components, []);
 });
 
 test('C16 고르는 사이 질문의 기한이 지나면 답을 붙이지 않고 이유만 본인에게 답하며 버튼은 그대로 둔다', async () => {
