@@ -12,6 +12,8 @@ import { archiveContract } from './worker.js';
 import { CoverageSchema, FindingSchema, InputLimitsSchema, REVIEW_INSTRUCTIONS, REVIEW_INSTRUCTIONS_V2, ReviewOutputSchema, ReviewTaskSchema,
   SECRET_PATTERNS, reviewOutcome } from './review-input.js';
 import type { Change, Coverage, ReviewOutput, ReviewTask, ReviewWorkerResult } from './review-input.js';
+import { REVIEW_REQUEST_ORGANIZATION } from './review-request.js';
+import type { ReviewRequestPort, ReviewRequestRefusal, ReviewRequestResult } from './review-request.js';
 
 // PR_REVIEW 게시 서버 쪽. 모델 호출 전 작성자 확인(D-16), 세대 단위 작업, COMMENT만 게시하는 제한 게시.
 const Sha = z.string().regex(/^[a-f0-9]{40}$/);
@@ -155,7 +157,22 @@ export interface ReviewRow {
   job_id: string; generation_key: string; installation_id: string; repo_id: string; repo_full_name: string;
   pr_number: number; head_sha: string; comparison_revision: string; base_ref: string; policy_revision: string;
   trigger: string; pr_updated_at: string; review_outcome: string | null; result: ReviewResult | null;
-  superseded_reason: string | null; superseded_at: string | null;
+  superseded_reason: string | null; superseded_at: string | null; request_target: unknown;
+}
+export type ReviewTarget = ReviewPolicy['repositories'][number];
+const ReviewTargetSchema = ReviewPolicySchema.shape.repositories.element;
+const requestTarget = (repo: ReviewTarget): ReviewTarget =>
+  ({ id: repo.id, fullName: repo.fullName, installationId: repo.installationId, visibility: repo.visibility });
+// 정책 목록 밖 저장소의 리뷰 요청 대상(C30). 그 세대 행의 저장소·설치와 같고 조직 저장소일 때만 쓴다.
+// 이 기록은 그 세대의 작업 하나에만 범위를 준다. 정책 목록·폴링 대조·webhook 저장소 검사에는 쓰지 않는다.
+export function requestedRepository(row: { request_target: unknown; repo_id: string | number; repo_full_name: string;
+  installation_id: string | number }): ReviewTarget | undefined {
+  const parsed = ReviewTargetSchema.safeParse(typeof row.request_target === 'string' ? JSON.parse(row.request_target) : row.request_target);
+  if (!parsed.success) return;
+  const target = parsed.data;
+  if (target.fullName.split('/')[0]!.toLowerCase() !== REVIEW_REQUEST_ORGANIZATION) return;
+  return String(target.id) === String(row.repo_id) && target.fullName === row.repo_full_name
+    && String(target.installationId) === String(row.installation_id) ? target : undefined;
 }
 type Admission = { outcome: 'queued' | 'requeued' | 'resumed' | 'duplicate_generation' | 'stale_event' | 'base_moved' | 'instructions_only';
   key: string; job?: string };
@@ -180,8 +197,9 @@ export class ReviewQueue {
     return this.store.db.transaction(tx => this.admit(pr, repo, context, comparison, trigger, deliveryId, tx));
   }
   // 세대 키 (repo_id, pr, head_sha, comparison_revision, policy_revision)로 작업 한 건만 만든다(EVENT-01).
+  // request: Discord 리뷰 요청(C30). 입력 이벤트에 출처를 남기고, outside면 정책 목록 밖 저장소라 그 세대에 대상 기록을 둔다.
   async admit(pr: PullRequest, repo: ReviewPolicy['repositories'][number], context: ReviewContext, comparison: string,
-    trigger: string, deliveryId: string, tx: Database): Promise<Admission | Decision> {
+    trigger: string, deliveryId: string, tx: Database, request?: { outside: boolean }): Promise<Admission | Decision> {
     const decision = pullRequestDecision(pr, repo, context.review, trigger === 'comment');
     if (decision) return decision;
     const now = this.store.now();
@@ -198,6 +216,9 @@ export class ReviewQueue {
         EXISTS (SELECT 1 FROM review_deliveries d WHERE d.job_id=p.job_id AND d.state='superseded') AS held,
         EXISTS (SELECT 1 FROM review_deliveries d WHERE d.job_id=p.job_id AND d.state='blocked') AS blocked
       FROM pr_reviews p JOIN jobs j ON j.id=p.job_id WHERE p.generation_key=$1`, [key])).rows[0];
+    // 정책에서 빠진 저장소의 옛 세대를 리뷰 요청이 되살리면, 실행·게시가 그 세대를 쓸 수 있게 대상 기록을 채운다.
+    if (existing && request?.outside) await tx.query('UPDATE pr_reviews SET request_target=COALESCE(request_target,$2) WHERE job_id=$1',
+      [existing.job_id, json(requestTarget(repo))]);
     // 같은 세대의 공개 가능한 결과가 이미 있는데 닫힘·draft·게시 직전 상태 변화로 게시만 못 했으면, 모델을 다시 부르지 않고
     // 그 결과의 게시를 이어간다(세대가 같으면 head·base·정책이 같아 결과가 유효하다).
     const resume = !!existing && existing.state === 'succeeded' && existing.result?.output_classification === 'public'
@@ -304,15 +325,15 @@ export class ReviewQueue {
     const event = randomUUID(), job = randomUUID();
     await tx.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,conversation_id,received_at,payload,accepted)
       VALUES ($1,'github',$2,$3,$4,$5,NULL,$6,$7,true)`, [event, deliveryId, key, `github:${pr.author.id}`,
-      json({ kind: 'github', repo: repo.id, pr: pr.number }), now, json({ command: 'review', trigger })]);
+      json({ kind: 'github', repo: repo.id, pr: pr.number }), now, json({ command: 'review', trigger, ...(request ? { source: 'discord' } : {}) })]);
     await tx.query(`INSERT INTO jobs(id,event_id,conversation_id,type,owner_id,target,revision,budget,priority,available_at,created_at)
       VALUES ($1,$2,NULL,'review','github-review',$3,$4,$5,40,$6,$6)`, [job, event, json({ kind: 'github', repo: repo.id, pr: pr.number }),
       json({ policy: context.revision, head: pr.head.sha, comparison }),
       json({ timeoutMs: DEFAULTS.taskTimeoutMs, toolCalls: 0 }), now]);
     await tx.query(`INSERT INTO pr_reviews(job_id,generation_key,installation_id,repo_id,repo_full_name,pr_number,head_sha,
-      comparison_revision,base_ref,policy_revision,trigger,pr_updated_at,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      comparison_revision,base_ref,policy_revision,trigger,pr_updated_at,created_at,request_target) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
     [job, key, repo.installationId, repo.id, repo.fullName, pr.number, pr.head.sha, comparison, pr.base.ref, context.revision,
-      trigger, pr.updatedAt, now]);
+      trigger, pr.updatedAt, now, request?.outside ? json(requestTarget(repo)) : null]);
     return { outcome: 'queued', key, job };
   }
   // 닫힘·draft 이벤트도 admission과 같은 잠금·시각 검사를 거친다. 기록보다 오래된 이벤트는 최신 세대를 지우지 못한다.
@@ -338,6 +359,66 @@ export class ReviewQueue {
       review_outcome=CASE WHEN review_outcome IS NULL OR review_outcome IN ('completed','partial') THEN 'superseded' ELSE review_outcome END
       WHERE repo_id=$1 AND pr_number=$2 AND generation_key<>$3 AND superseded_at IS NULL AND NOT ($6::boolean AND trigger='comment')`,
     [repo, pr, except, now, reason, keepExplicit]);
+  }
+}
+
+// 정책 목록 밖 조직 저장소를 리뷰 App으로 찾는 자리(github-review-io.ts). 설치가 없으면 null이다.
+export interface ReviewTargetReader {
+  repository(fullName: string): Promise<ReviewTarget | null>;
+  pullRequest(target: ReviewTarget, number: number): Promise<unknown>;
+  mergeBase(target: ReviewTarget, base: string, head: string): Promise<unknown>;
+}
+const REQUEST_REFUSALS: Readonly<Record<string, ReviewRequestRefusal>> = Object.freeze({
+  fork: 'fork', author_denied: 'author', pr_closed: 'closed', pr_merged: 'closed', repository_mismatch: 'not_found',
+});
+// Discord 리뷰 요청(COLLEAGUE_SPEC §4.10)을 PR 댓글 리뷰 명령과 같은 명시 트리거('comment': draft 예외, 늘 새 세대, 대체에서 보호)로
+// 접수한다. 조직 밖이면 GitHub에 묻지 않는다. 정책 목록의 저장소는 정책 기록을, 목록 밖이면 리뷰 App 설치 조회 기록을 쓴다.
+// fork·작성자 association·닫힘 판단(pullRequestDecision)은 자동 리뷰와 같다.
+export class ReviewRequests implements ReviewRequestPort {
+  constructor(private readonly store: Store, private readonly policy: ReviewPolicySource, private readonly queue: ReviewQueue,
+    private readonly reader: GitHubReader, private readonly targets: ReviewTargetReader) {}
+  async request(input: { repository: string; pr: number; key: string }): Promise<ReviewRequestResult> {
+    const result = await this.resolve(input.repository, input.pr, input.key);
+    await this.store.audit('review_requested', input.key, { repository: input.repository, pr: input.pr, outcome: result.outcome,
+      ...(result.outcome === 'refused' ? { reason: result.reason } : {}) });
+    return result;
+  }
+  private async resolve(repository: string, number: number, key: string): Promise<ReviewRequestResult> {
+    const refused = (reason: ReviewRequestRefusal) => ({ outcome: 'refused', reason }) as const;
+    if (repository.split('/')[0]!.toLowerCase() !== REVIEW_REQUEST_ORGANIZATION) return refused('outside_organization');
+    if (!REPO_NAME.test(repository)) return refused('not_found');
+    let context: ReviewContext;
+    try { context = await this.policy.current(); } catch (error) {
+      if (error instanceof PolicyUnavailable) return refused('unavailable');
+      throw error;
+    }
+    const listed = context.review.repositories.find(r => r.fullName.toLowerCase() === repository.toLowerCase());
+    let repo: ReviewTarget, pr: PullRequest, comparison: string;
+    try {
+      const found = listed ?? await this.targets.repository(repository);
+      if (!found) return refused('not_installed');
+      repo = found;
+      pr = pullRequest(listed ? await this.reader.pullRequest(repo.fullName, number) : await this.targets.pullRequest(repo, number));
+      const decision = pullRequestDecision(pr, repo, context.review, true);
+      if (decision) return refused(REQUEST_REFUSALS[decision.reason] ?? 'unavailable');
+      comparison = context.review.comparison === 'base_head' ? pr.base.sha : Sha.parse(listed
+        ? await this.reader.mergeBase(repo.fullName, pr.base.sha, pr.head.sha) : await this.targets.mergeBase(repo, pr.base.sha, pr.head.sha));
+    } catch (error) {
+      // 조회 실패면 모델 작업을 만들지 않는다. 원인은 답에 싣지 않는다.
+      return refused(error instanceof GitHubError && error.status === 404 ? 'not_found' : 'unavailable');
+    }
+    let admitted: Admission | Decision;
+    try {
+      admitted = await this.store.db.transaction(tx => this.queue.admit(pr, repo, context, comparison, 'comment', `discord:${key}`, tx,
+        { outside: !listed }));
+    } catch (error) {
+      if (error instanceof Error && error.message === 'queue_full') return refused('unavailable');
+      throw error;
+    }
+    if (admitted.outcome === 'denied' || admitted.outcome === 'ignored') return refused(REQUEST_REFUSALS[admitted.reason] ?? 'unavailable');
+    if (admitted.outcome === 'stale_event') return refused('unavailable');
+    const started = ['queued', 'requeued', 'resumed'].includes(admitted.outcome);
+    return { outcome: started ? 'started' : 'already', repository: repo.fullName, pr: pr.number };
   }
 }
 
