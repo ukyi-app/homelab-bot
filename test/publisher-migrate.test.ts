@@ -32,14 +32,14 @@ test('T16b 위험 5 migrate() 재실행은 적용된 버전을 건너뛰어 006�
   try {
     const db = migrationDatabase(pg);
     await migrate(db);
-    assert.deepEqual(await versions(db), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23]);
+    assert.deepEqual(await versions(db), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
     await pendingAlert(db);
     await migrate(db);
     await migrate(db);
     const row = (await db.query<{ state: string }>('SELECT state FROM outbox')).rows[0]!;
     assert.equal(row.state, 'pending');
     assert.equal((await db.query("SELECT 1 FROM audit WHERE kind='legacy_alert_scope_missing'")).rows.length, 0);
-    assert.deepEqual(await versions(db), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23]);
+    assert.deepEqual(await versions(db), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
   } finally { await pg.close(); }
 });
 
@@ -56,7 +56,7 @@ test('T16b migrate() 반환값은 이번에 적용한 버전, 다시 돌리면 �
   const pg = new PGlite();
   try {
     const db = migrationDatabase(pg);
-    assert.deepEqual(await migrate(db), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23]);
+    assert.deepEqual(await migrate(db), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
     assert.deepEqual(await migrate(db), []);
   } finally { await pg.close(); }
 });
@@ -72,7 +72,7 @@ test('T16b 기존 DB 업그레이드: 010까지 적용된 DB에 migrate()는 011
     const db = migrationDatabase(pg);
     await pendingAlert(db);
     await migrate(db);
-    assert.deepEqual(await versions(db), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23]);
+    assert.deepEqual(await versions(db), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
     assert.equal((await db.query("SELECT 1 FROM information_schema.columns WHERE table_name='outbox' AND column_name='reconcile_after'")).rows.length, 1);
     assert.equal((await db.query<{ t: string | null }>("SELECT to_regclass('deletion_ledger_generation')::text AS t")).rows[0]!.t, 'deletion_ledger_generation');
     assert.equal((await db.query<{ state: string }>('SELECT state FROM outbox')).rows[0]!.state, 'pending');

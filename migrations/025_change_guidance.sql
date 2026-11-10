@@ -53,5 +53,5 @@ CREATE TABLE IF NOT EXISTS change_guidance (
   CHECK ((state = 'posted') = (review_id IS NOT NULL))
 );
 
-INSERT INTO schema_migrations VALUES (23) ON CONFLICT DO NOTHING;
+INSERT INTO schema_migrations VALUES (25) ON CONFLICT DO NOTHING;
 COMMIT;

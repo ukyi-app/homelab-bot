@@ -60,6 +60,8 @@ export interface HarnessOptions {
   notes?: { checks: ChangeNote[]; risks: ChangeNote[] };
   // main이 리뷰 경로에서 넘기는 안내 리뷰 포트(assembleChange 인수). 없으면 리뷰 경로가 없는 운영과 같다.
   guidance?: GuidanceReviewPort;
+  // 작업자 v2 port가 받는 지시문 판 목록을 알리는지. 기본은 알리지 않아(옛 port 모양) 게시 서버가 옛 판을 보낸다.
+  changeV2?: boolean;
 }
 export interface Harness {
   db: Database; env: PublishEnv; f: ChangeWorkerFixture; store: Store; changes: ChangeStore; gate: PolicyGate; policy: { current: Policy }; rest: MockDiscord; ingress: DiscordIngress; discord: DiscordPublisher;
@@ -145,7 +147,8 @@ export async function changeHarness(db: Database, options: HarnessOptions = {}):
     const response = answered.response as { status?: string };
     if (options.notes && endpoint === '/v2/task/result' && response.status === 'snapshot') return { ...answered, response: { ...response, ...options.notes } };
     return answered;
-  }) as typeof f.port.callV2, supportsChange: (signal?: AbortSignal) => f.port.supportsChange(signal) };
+  }) as typeof f.port.callV2, supportsChange: (signal?: AbortSignal) => f.port.supportsChange(signal),
+    ...(options.changeV2 ? { changeInstructions: (signal?: AbortSignal) => f.port.changeInstructions(signal) } : {}) };
   let shutdown = new AbortController();
   const rest = new MockDiscord();
   const build = (runtimeOptions: { crash?: Crash; instrument?: (deps: ChangeRuntimeDeps) => ChangeRuntimeDeps } = {}) => {

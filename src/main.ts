@@ -230,7 +230,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   let reviewOpened = false;
   const reviewPolicy = new GatedReviewPolicy(gate, () => reviewOpened);
   const review = precondition.open ? (() => {
-    const io = githubReviewIO({ app: precondition.app, repositories: policyRepositories(reviewPolicy), send, now });
+    const io = githubReviewIO({ app: precondition.app, repositories: policyRepositories(reviewPolicy, store), send, now, requests: { store, policy: reviewPolicy } });
     const queue = new ReviewQueue(store, io.reader);
     return { queue, reader: io.reader, guidance: io.guidance,
       runtime: new ReviewRuntime(store, reviewPolicy, queue, io.reader, new HttpReviewWorker(config.workerUrl, send), signer, undefined,

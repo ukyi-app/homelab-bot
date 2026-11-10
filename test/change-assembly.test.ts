@@ -12,6 +12,8 @@ import { join } from 'node:path';
 import { CHANGE_RESTART, changeChildFailed } from '../src/change-advice.js';
 import { changePrecondition, changeTaskPathsMatch } from '../src/change-assembly.js';
 import { parseChangeRequest } from '../src/change-commands.js';
+import { CHANGE_QUESTION_TEXT } from '../src/change-question.js';
+import { QUESTION_PICK_TEXT } from '../src/question-pick.js';
 import { ChangePublisher } from '../src/change-publisher.js';
 import type { ChangeRuntimeDeps } from '../src/change-runtime.js';
 import { CHANGE_RETENTION_MS, purgeExpiredChangeContent } from '../src/change-store.js';
@@ -1736,29 +1738,43 @@ test('호환 /answer: CHANGE에 묶이지 않은 v1 질문은 같은 처리기�
   });
 });
 
-test('C16 CHANGE 질문은 바로 답·질문 고르기 대상이 아니다: 켜짐에서도 /answer를 안내하고 그냥 한 말은 대화로 가며, 작업 질문이 함께 열려 있으면 그 하나에만 바로 답이 붙는다', async () => {
+test('C28 변경 질문과 작업 질문이 함께 열려 있으면 그 말을 봉인한 채 답으로 쓰지 않고 먼저 고르게 하며, 고른 변경 질문에 다음 말이 공개 표시로 답이 된다', async () => {
   await withHarness({ steps: [QUESTION, WRITE_STEP], colleague: true }, async h => {
-    const { question } = await toQuestion(h);
+    const { id, question } = await toQuestion(h);
     await h.deliver();
-    assert.ok(h.messages().some(text => text.includes(`질문 ID: ${question}`) && text.includes(`/answer question:${question}`)), '변경 질문 글은 켜짐에서도 질문 ID와 /answer를 안내한다');
-    const chatJobs = async () => (await h.db.query<{ delivery_id: string }>(`SELECT e.delivery_id FROM jobs j JOIN events e ON e.id=j.event_id WHERE j.type='chat' ORDER BY e.delivery_id`)).rows.map(row => row.delivery_id);
-    const changeQuestion = async () => (await h.db.query<{ state: string; answer: string | null }>('SELECT state,answer FROM codex_questions WHERE id=$1', [question])).rows[0]!;
-    // 열린 질문이 CHANGE 질문뿐이면 지금처럼 대화로 받고 질문은 그대로 열려 있다.
-    await h.ingress.receive({ id: '1700000000000000001', actor: OWNER, scope: THREAD, kind: 'message', text: '그냥 한 말이에요', mention: true });
-    assert.deepEqual(await changeQuestion(), { state: 'open', answer: null });
-    assert.deepEqual(await chatJobs(), ['1700000000000000001']);
-    // 작업 질문 하나가 함께 열리면 열린 질문을 셀 때 CHANGE 질문은 빠져 그 작업 질문에만 바로 답이 붙는다(고르기 글 없음).
+    // 옛 판 세션의 변경 질문은 선택지가 없다. 켜짐 판 글은 '/answer' 대신 "직접 답하기"와 말로 답하기를 안내한다.
+    const asked = h.rest.messages.find(message => message.body.content.includes(`질문 ID: ${question}`))!;
+    assert.doesNotMatch(asked.body.content, /\/answer/);
+    assert.deepEqual(asked.body.components![0]!.components.map(button => button.label), [CHANGE_QUESTION_TEXT.direct]);
+    const chatJobs = async () => (await h.db.query(`SELECT 1 FROM jobs WHERE type='chat'`)).rows.length;
+    const row = async (target: string) => (await h.db.query<{ state: string; answer: string | null }>('SELECT state,answer FROM codex_questions WHERE id=$1', [target])).rows[0]!;
+    const eventText = async (delivery: string) => (await h.db.query<{ text: string }>(`SELECT payload->>'text' AS text FROM events WHERE delivery_id=$1`, [delivery])).rows[0]!.text;
+    // 먼저 만든 작업 질문(1번)이 함께 열린다.
     const conversation = h.store.scopeId(THREAD);
     await insertChildJob(h.db, 'fixture-v1-job', 'task');
     await h.db.query(`UPDATE jobs SET conversation_id=$1,state='waiting_user',wait_reason='clarification' WHERE id='fixture-v1-job'`, [conversation]);
     await h.db.query(`INSERT INTO codex_questions(id,job_id,conversation_id,thread_id,turn,kind,responder_id,prompt,state,created_at,expires_at)
-      VALUES ('fixture-v1-question','fixture-v1-job',$1,'thread',1,'clarification',$2,'질문','open',1,$3)`, [conversation, OWNER, Date.now() + 3_600_000]);
-    await h.ingress.receive({ id: '1700000000000000002', actor: OWNER, scope: THREAD, kind: 'message', text: '작업 질문의 답이에요', mention: true });
-    const task = (await h.db.query<{ state: string; answer: string | null }>(`SELECT state,answer FROM codex_questions WHERE id='fixture-v1-question'`)).rows[0]!;
-    assert.deepEqual(task, { state: 'answered', answer: '작업 질문의 답이에요' });
-    assert.deepEqual(await changeQuestion(), { state: 'open', answer: null });
-    assert.deepEqual(await chatJobs(), ['1700000000000000001']);
-    assert.equal((await h.db.query(`SELECT 1 FROM outbox WHERE message_key LIKE 'question-pick:%'`)).rows.length, 0);
+      VALUES ('fixture-v1-question','fixture-v1-job',$1,'thread',1,'clarification',$2,'작업 질문','open',1,$3)`, [conversation, OWNER, Date.now() + 3_600_000]);
+    await h.ingress.receive({ id: '1700000000000000002', actor: OWNER, scope: THREAD, kind: 'message', text: `${CANARY} 어느 답인지 모를 말`, mention: true });
+    assert.equal(await eventText('1700000000000000002'), '', '고르는 동안 원문을 events에 두지 않는다');
+    assert.deepEqual(await row(question), { state: 'open', answer: null });
+    assert.deepEqual(await row('fixture-v1-question'), { state: 'open', answer: null });
+    assert.equal(await chatJobs(), 0);
+    await h.deliver();
+    const pick = h.rest.messages.filter(message => message.body.components?.length).at(-1)!;
+    assert.ok(pick.body.content.startsWith(QUESTION_PICK_TEXT.choose([])), '먼저 고르게 한다');
+    assert.ok(!pick.body.content.includes(CANARY));
+    const second = pick.body.components![0]!.components[1]!.custom_id;
+    await h.ingress.receive({ id: 'fixture-pick-1', actor: OWNER, scope: THREAD, kind: 'button', command: 'question-pick', target: second.slice(second.indexOf(':') + 1), text: '' });
+    assert.equal(h.acknowledgements().at(-1), QUESTION_PICK_TEXT.chosen(2));
+    // 고른 뒤의 말은 그 변경 질문의 답이다. 작업 질문은 그대로 열려 있다.
+    await h.ingress.receive({ id: '1700000000000000003', actor: OWNER, scope: THREAD, kind: 'message', text: 'src/a.ts를 고치세요' });
+    assert.deepEqual(await row(question), { state: 'answered', answer: 'src/a.ts를 고치세요' });
+    assert.deepEqual(await row('fixture-v1-question'), { state: 'open', answer: null });
+    assert.equal(await eventText('1700000000000000003'), '');
+    assert.ok(!(await eventsText(h)).includes(CANARY));
+    await h.pump(async () => await h.phase(id) === 'awaiting_publish_approval');
+    assert.ok((await h.f.calls())[1]!.input.includes('src/a.ts를 고치세요'));
   });
 });
 

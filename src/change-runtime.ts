@@ -101,13 +101,14 @@ export function changeAuthorSource(deps: { store: Store; gate: PolicyGate; prefl
   };
   return {
     claimed, authorJob, keyOf: keyOfJob,
-    async questionRisk(jobId, question) {
+    async questionRisk(jobId, question, options = []) {
       const key = await keyOfJob(jobId);
       const row = key ? (await db.query<{ repo_id: number | string }>('SELECT repo_id FROM change_requests WHERE id=$1', [key.changeId])).rows[0] : undefined;
       const policy = row ? await deps.policy(Number(row.repo_id)) : null;
       // 내부 표식을 볼 수 없으면 공개해도 되는 글이라고 말할 수 없다. 정책을 잠시 못 읽는 예외는 그대로 올라가 다음 바퀴에 다시 본다.
       if (!policy) return 'policy_revoked';
-      return scanPublicText({ title: question, body: question }, policy);
+      // 선택지는 질문 글 본문과 버튼으로 함께 나가므로 질문과 같은 검사를 받는다.
+      return scanPublicText({ title: question, body: [question, ...options].join('\n') }, policy);
     },
     async plan(input) {
       const jobId = await authorJob(input.target.key);

@@ -11,6 +11,7 @@ import type { ExternalTaskCommandHandler } from './external-task-commands.js';
 import { CommandInputError, parseIds, parseKind } from './memory-commands.js';
 import type { MemoryCommandHandler } from './memory-commands.js';
 import type { Policy, PolicyGate } from './policy.js';
+import { pullReferences, pullTarget, REVIEW_REQUEST_TEXT, reviewRequestsOf, samePull } from './review-request.js';
 import { LaneClosed } from './store.js';
 import type { OutboxButton, Store } from './store.js';
 import type { TaskCommandHandler } from './task-commands.js';
@@ -104,7 +105,9 @@ interface RunHandler {
   // '/' 처리기와 같은 경로로 실행한다. 호출자의 트랜잭션 안이다.
   execute(store: Store, row: ProposalRow, values: Values, context: ExecuteContext): Promise<Executed>;
 }
-export interface ActionRow { kind: ActionKind; command: string; handler?: ReadHandler | RunHandler }
+// confirm: false인 실행 줄은 확인 글·버튼 없이 읽기 요청과 같은 경로(인가 → 처리기 → 결과를 일반 답으로)로 바로 처리한다.
+// 그런 줄의 처리기는 ReadHandler 모양이다. 나머지 줄은 이 칸을 두지 않는다.
+export interface ActionRow { kind: ActionKind; command: string; confirm?: false; handler?: ReadHandler | RunHandler }
 
 // owner 원문(멘션 표기 제거). 7일 정리로 비웠으면 없다.
 async function sourceText(store: Store, event: string | null): Promise<string | undefined> {
@@ -414,6 +417,23 @@ const changeCancelHandler: RunHandler = {
   },
 };
 
+// PR 리뷰 요청(C30, DECISIONS "동료 봇 전환" 18). 확인 버튼이 없으므로 모델이 고른 대상(저장소·PR 번호)은 owner 원문에 그 PR이
+// 링크나 <소유자>/<저장소>#<번호>로 적혀 있을 때만 쓴다. 맥락 자료(이전 대화·봇 글)가 대상을 바꾸지 못하게 한다.
+// 원문에 없으면 리뷰하지 않고 그 이유를 답한다(모델 답이 "리뷰할게요"라고 했어도 아무 일이 없는 것처럼 보이지 않게).
+const reviewRequestHandler: ReadHandler = {
+  kind: 'read',
+  async run({ store, job, proposal }) {
+    const port = reviewRequestsOf(store);
+    if (!port) return skip('not_connected');
+    const target = proposal.target ? pullTarget(proposal.target) : undefined;
+    const text = await sourceText(store, job.event_id);
+    if (!target || !text || !pullReferences(text).some(ref => samePull(ref, target))) return REVIEW_REQUEST_TEXT.notInText;
+    const result = await port.request({ repository: `${target.owner}/${target.repo}`, pr: target.number, key: job.id });
+    if (result.outcome === 'refused') return REVIEW_REQUEST_TEXT.refused[result.reason];
+    return REVIEW_REQUEST_TEXT[result.outcome](result.repository, result.pr);
+  },
+};
+
 // 동작 표. 키는 작업자 계약의 제안 동작 ID(contracts.ts PROPOSAL_ACTIONS, '/' 이름의 하이픈을 밑줄로)이고,
 // 계약에 없는 줄(작업 질문·게시 승인·관리 기능·없음)은 종류를 적어 두기만 한다. 처리기가 없는 줄은 "연결 안 됨"이라 버린다.
 // 뒤 티켓(C14~C17)은 줄에 처리기를 달거나 줄을 더한다.
@@ -449,10 +469,15 @@ export const ACTIONS: Readonly<Record<string, ActionRow>> = Object.freeze({
   stop: { kind: 'none', command: 'stop' },
   resume: { kind: 'none', command: 'resume' },
   urgent: { kind: 'none', command: 'urgent' },
+  // '/'가 없는 실행. PR 댓글 리뷰 명령과 같은 명시 트리거로 바로 접수한다(명세 §4.3 "리뷰 요청", 확인 없음).
+  review_request: { kind: 'run', command: 'review-request', confirm: false, handler: reviewRequestHandler },
 });
+// 확인 없이 바로 처리하는 처리기는 읽기 줄이거나 confirm: false인 실행 줄에만 붙는다. 어긋난 줄은 연결 안 된 것으로 본다.
 const connected = (action: string): ReadHandler | RunHandler | undefined => {
   const row = Object.hasOwn(ACTIONS, action) ? ACTIONS[action] : undefined;
-  return row && row.kind !== 'admin' && row.kind !== 'none' ? row.handler : undefined;
+  if (!row || row.kind === 'admin' || row.kind === 'none' || !row.handler) return;
+  const immediate = row.handler.kind === 'read';
+  return immediate === (row.kind === 'read' || (row.kind === 'run' && row.confirm === false)) ? row.handler : undefined;
 };
 
 export function proposalDigest(action: string, values: Values): string {
