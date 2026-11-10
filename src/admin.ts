@@ -56,7 +56,7 @@ const stateOf = (status: ModelStatus): AdminState =>
   ({ emergency: status.emergency, paused: status.paused, executionPending: status.executionPending, taskLaneClosed: status.taskLaneClosed });
 
 // 차단·unknown 해제에만 쓰는 의존. 진입점은 이 동작일 때만 정책·작업자 설정을 읽어 만든다.
-// 그래서 정책을 읽지 못해도 비상 정지·해제·상태 보기는 DATABASE_URL만으로 된다.
+// 그래서 정책을 읽지 못해도 비상 정지·해제·상태 보기·멈춘 작업 재개는 DATABASE_URL만으로 된다.
 export interface AdminPorts {
   gate?: Pick<PolicyGate, 'withDatabase'>;
   // 게시 서버가 조립하는 작업 브리지. 앞에서부터 묻고, 다른 실행기의 세션(foreign)이면 다음 브리지에 넘긴다.
