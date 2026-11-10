@@ -2200,3 +2200,20 @@ test('AC-28 시험 실패 receipt 저장 직후 끊김: 재시작한 프로세�
     assert.equal(await h.store.laneBusy('task'), false);
   });
 });
+
+test('AC-28 안내 댓글 전송 실패: 줄 댓글이 거부되면 줄 댓글로 보내려던 항목도 diff 밖 항목과 함께 owner 호출 결과 요약에 싣는다', async () => {
+  const fake = discussionFake();
+  const reviews: GuidanceReview[] = [];
+  const port: GuidanceReviewPort = { post: async input => { reviews.push(input); return { kind: 'rejected', status: 422, code: 'validation_failed' }; }, find: async () => null };
+  await withHarness({ changeV2: true, colleague: true, steps: [V2_WRITE_STEP, AMEND_STEP], amendments: { discussion: fake.read }, guidance: port,
+    policyPatch: policy => ({ ...policy, review: REVIEW_POLICY }) }, async h => {
+    const id = await toProposed(h);
+    await requestAmendment(h, id, 'amend-1', branchHead(h));
+    await h.pump(async () => (await roundsOf(h, id))[0]?.state === 'committed');
+    await h.pump(async () => { await h.deliver(); return h.messages().some(text => text.includes('수정 차례 1 커밋을 올렸어요')); });
+    assert.equal(reviews.length, 1, '한 번 보냈고 거부됐다');
+    const notice = h.rest.messages.find(message => message.body.content.includes('수정 차례 1 커밋을 올렸어요'))!.body.content;
+    assert.ok(notice.includes('- 리뷰대로 상수를 3으로 바꿨어요'), notice);
+    assert.ok(notice.includes('- 다른 모듈의 기대값을 확인하세요'), notice);
+  });
+});

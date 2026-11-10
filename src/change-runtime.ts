@@ -987,7 +987,8 @@ export class ChangeRuntime {
       const posted = await this.guidance.post({ key: { changeId: key.changeId, generation: key.generation }, round: key.round, repoId: request.value.repoId, pr: round.value.pullNumber, headSha: round.value.commitSha,
         checks: artifact.value.checks, risks: artifact.value.risks, patch: artifact.value.patch });
       if (posted.state === 'deferred' || posted.state === 'sending' || posted.state === 'unknown') return;
-      outside = posted.outside;
+      // outside는 위치·상한으로 나눈 목록이라 실제 게시 여부가 아니다. 줄 댓글이 달리지 않고 끝나면 보내려던 항목도 요약에 실어야 어디에도 안 보이는 일이 없다.
+      outside = posted.state === 'posted' ? posted.outside : posted.cleared ?? posted.outside;
     } else {
       const clean = (notes: readonly ChangeNote[]) => notes.filter(note => scanPublicText({ title: note.text, body: note.text }, policy) === null);
       outside = { checks: clean(outside.checks), risks: clean(outside.risks) };
