@@ -465,11 +465,11 @@ export class Store {
   }
   // 자리 비움 회차를 멈춤 기록에 맞추고 지금 멈춤인지 돌려준다. 게시 서버의 상태 루프가 부르고, 그 값으로 Gateway 상태를 바꾼다.
   async syncAway(): Promise<boolean> {
-    return this.db.transaction(async tx => (await this.syncAwayIn(tx)).paused);
+    return this.db.transaction(async tx => { await this.lockScheduler(tx); return (await this.syncAwayIn(tx)).paused; });
   }
-  // 새 회차가 시작되면 이미 기다리던 메시지의 👀·⏳를 같은 트랜잭션에서 💤로 바꾼다. 잠금 순서: scheduler 행 → 회차 행.
+  // 새 회차가 시작되면 이미 기다리던 메시지의 👀·⏳를 같은 트랜잭션에서 💤로 바꾼다.
+  // 잠금 순서 scheduler 행 → 회차 행: 부르는 쪽이 scheduler 행을 먼저 잠근다.
   private async syncAwayIn(tx: Database): Promise<{ paused: boolean; episode: number }> {
-    await this.lockScheduler(tx);
     const away = await syncAway(tx, this.now());
     if (away.started) await sleepReactions(tx);
     return away;
