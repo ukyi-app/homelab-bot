@@ -1,3 +1,4 @@
+import type { PolicyGate } from './policy.js';
 import type { Store } from './store.js';
 import type { ExecutionLaneClosedReason } from './task-contracts.js';
 
@@ -24,7 +25,9 @@ export type AdminCommand =
   | { name: 'release'; job: string };
 
 export type AdminState = { emergency: boolean; paused: boolean; executionPending: boolean; taskLaneClosed: ExecutionLaneClosedReason | null };
-export type AdminResult = 'stopped' | 'already_stopped' | 'released' | 'not_stopped' | 'running_jobs' | 'status' | 'unsupported' | 'usage' | 'failed';
+// homelab CLI(cli/src/core/podops.ts BOT_RESULTS)가 받는 이름과 같아야 한다. 이름을 더하면 그쪽 집합도 넓힌다.
+export type AdminResult = 'stopped' | 'already_stopped' | 'released' | 'not_stopped' | 'running_jobs' | 'status' | 'unsupported' | 'usage' | 'failed'
+  | 'blocked' | 'already_blocked';
 export type AdminReport = { schema: typeof ADMIN_SCHEMA; command: string; result: AdminResult; state?: AdminState };
 
 export class AdminUsage extends Error {
@@ -49,17 +52,27 @@ type ModelStatus = { paused: boolean; emergency: boolean; executionPending: bool
 const stateOf = (status: ModelStatus): AdminState =>
   ({ emergency: status.emergency, paused: status.paused, executionPending: status.executionPending, taskLaneClosed: status.taskLaneClosed });
 
-export async function runAdmin(store: Store, command: AdminCommand): Promise<{ code: number; report: AdminReport }> {
+// 차단·unknown 해제에만 쓰는 의존. 진입점은 이 동작일 때만 정책·작업자 설정을 읽어 만든다.
+// 그래서 정책을 읽지 못해도 비상 정지·해제·상태 보기는 DATABASE_URL만으로 된다.
+export interface AdminPorts {
+  gate?: Pick<PolicyGate, 'withDatabase'>;
+}
+
+export async function runAdmin(store: Store, command: AdminCommand, ports: AdminPorts = {}): Promise<{ code: number; report: AdminReport }> {
   const report = (result: AdminResult, state?: AdminState): AdminReport => ({ schema: ADMIN_SCHEMA, command: label(command), result, ...(state ? { state } : {}) });
-  // 차단·unknown 해제·멈춘 작업 재개는 기존 함수가 Discord owner 행위자와 대화를 요구해 CLI 행위자로 부를 수 없다.
-  // 시그니처를 바꾸지 않고 막아 둔다(DECISIONS "C05 관리 CLI"). 그동안 '/revoke'·'/task-release'·'/resume-model'이 예비다.
-  if (command.name === 'block' || command.name === 'release' || (command.name === 'resume' && command.target === 'job'))
+  if (command.name === 'release' || (command.name === 'resume' && command.target === 'job'))
     return { code: ADMIN_EXIT.unsupported, report: report('unsupported') };
   // 상태 확인과 바꾸기를 한 트랜잭션에서 한다. Store.atomic은 안쪽 control의 atomic을 같은 트랜잭션으로 합친다.
   return store.atomic(async s => {
+    const audit = (result: AdminResult) => s.audit('admin_command', label(command), { actor: ADMIN_ACTOR, result });
+    if (command.name === 'block') {
+      if (!ports.gate) throw new Error('admin_policy_unavailable');
+      const result = await ports.gate.withDatabase(s.db).deny(command.user) ? 'blocked' : 'already_blocked';
+      await audit(result);
+      return { code: ADMIN_EXIT.ok, report: report(result) };
+    }
     const status = () => s.control(ADMIN_ACTOR, ADMIN_CONVERSATION, 'model-status') as Promise<ModelStatus>;
     const before = await status();
-    const audit = (result: AdminResult) => s.audit('admin_command', label(command), { actor: ADMIN_ACTOR, result });
     if (command.name === 'status') return { code: ADMIN_EXIT.ok, report: report('status', stateOf(before)) };
     if (command.name === 'emergency-stop') {
       await s.control(ADMIN_ACTOR, ADMIN_CONVERSATION, 'emergency-stop');

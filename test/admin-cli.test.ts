@@ -2,7 +2,7 @@ import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ADMIN_ACTOR, AdminUsage, parseAdminArgs, runAdmin } from '../src/admin.js';
 import { executeAdmin } from '../src/admin-main.js';
-import { DEFAULTS } from '../src/contracts.js';
+import { DEFAULTS, Denied } from '../src/contracts.js';
 import { localDatabase, fixture, event, thread } from './helpers.js';
 
 // C05 관리 기능(AC-20) S1: 관리 진입점이 모델을 거치지 않고 기존 저장소 경로로 비상 정지·해제·상태 보기를 하고,
@@ -82,15 +82,71 @@ test('관리 기능 상태 보기: 비상 정지·일시 중지·작업 레인 �
   assert.equal(f.requests.length, 0);
 });
 
-test('관리 기능 차단·unknown 해제·멈춘 작업 재개는 이 진입점에서 아직 받지 않고 아무것도 바꾸지 않는다', async () => {
-  for (const argv of [['block', '123456789012345678'], ['release', '0f8b5a8e-3c1d-4e2f-9a7b-1c2d3e4f5a6b'],
-    ['resume', 'job', '0f8b5a8e-3c1d-4e2f-9a7b-1c2d3e4f5a6b']]) {
-    const out = await admin(...argv);
-    assert.equal(out.code, 4, argv.join(' '));
-    assert.equal(out.report.result, 'unsupported');
-  }
-  assert.equal((await database.db.query('SELECT 1 FROM denied_actors')).rows.length, 0);
+// ---- C32 차단 ----
+const TARGET = '123456789012345678';
+const block = (user = TARGET) => runAdmin(f.store, parseAdminArgs(['block', user]), { gate: f.gate });
+const denials = async () => (await database.db.query<{ actor_id: string; policy_revision: string | null; denial_id: string; created_at: string }>(
+  'SELECT actor_id,policy_revision,denial_id,created_at FROM denied_actors ORDER BY actor_id')).rows;
+
+test('관리 기능 차단: 거부 목록에 행만 더하고 모델을 부르지 않으며 감사 행위자가 cli다', async () => {
+  await queued();
+  const jobsBefore = (await database.db.query('SELECT id,state FROM jobs ORDER BY id')).rows;
+  const out = await block();
+  assert.equal(out.code, 0);
+  assert.equal(out.report.result, 'blocked');
+  assert.equal(out.report.command, 'block');
+  const rows = await denials();
+  assert.deepEqual(rows.map(row => [row.actor_id, row.policy_revision]), [[TARGET, 'fixture-v1']]);
+  assert.deepEqual((await database.db.query('SELECT id,state FROM jobs ORDER BY id')).rows, jobsBefore);
+  assert.equal(await flag('scheduler_emergency'), undefined);
+  assert.deepEqual((await audits()).map(row => [row.kind, row.subject, row.detail.actor]), [['admin_command', 'block', 'cli']]);
+  assert.equal(f.requests.length, 0);
+});
+
+test('관리 기능 차단: 이미 거부돼 있으면 같은 행을 그대로 두고 already_blocked다(재실행 안전)', async () => {
+  await block();
+  const first = await denials();
+  f.advance(1000);
+  const again = await block();
+  assert.equal(again.code, 0);
+  assert.equal(again.report.result, 'already_blocked');
+  assert.deepEqual(await denials(), first);
+});
+
+test('관리 기능 차단: owner 자신도 막고, 막힌 뒤 재실행도 Denied 없이 already_blocked다', async () => {
+  f.policy.owner = TARGET;
+  assert.equal((await block()).report.result, 'blocked');
+  assert.equal((await block()).report.result, 'already_blocked');
+});
+
+test('관리 기능 차단: 정책 재동기화(ESO) 전에도 그 사용자의 다음 이벤트가 거부된다(AUTH-02)', async () => {
+  f.policy.owner = TARGET;
+  await f.ingress.receive(event('before', { actor: TARGET }));
+  assert.equal((await database.db.query('SELECT 1 FROM jobs')).rows.length, 1);
+  await block();
+  await assert.rejects(f.ingress.receive(event('after', { actor: TARGET })), Denied);
+  assert.equal((await database.db.query('SELECT 1 FROM jobs')).rows.length, 1);
+  assert.equal(f.policy.revision, 'fixture-v1');
+});
+
+test('관리 기능 차단: 정책을 읽지 못하면 아무것도 더하지 않고 실패한다(닫힘)', async () => {
+  f.setPolicyUnavailable(true);
+  await assert.rejects(block());
+  assert.deepEqual(await denials(), []);
   assert.deepEqual(await audits(), []);
+});
+
+test('관리 기능 차단: 해제 승인(revocationRestores)에 적힌 옛 거부만 남아 있으면 새 거부로 바꿔 다음 인가에도 유지된다', async () => {
+  await database.db.query(`INSERT INTO denied_actors(actor_id,created_at,policy_revision,denial_id)
+    VALUES ($1,$2,'fixture-v0','0f8b5a8e-3c1d-4e2f-9a7b-1c2d3e4f5a6b')`, [TARGET, f.now() - 1000]);
+  f.policy.revocationRestores = ['0f8b5a8e-3c1d-4e2f-9a7b-1c2d3e4f5a6b'];
+  f.policy.owner = TARGET;
+  const out = await block();
+  assert.equal(out.report.result, 'blocked');
+  const [row] = await denials();
+  assert.equal(row!.policy_revision, 'fixture-v1');
+  assert.notEqual(row!.denial_id, '0f8b5a8e-3c1d-4e2f-9a7b-1c2d3e4f5a6b');
+  await assert.rejects(f.gate.authorize(TARGET, thread));
 });
 
 test('관리 진입점 입력은 고정 명령 단어와 형식이 맞는 ID만 받는다', () => {

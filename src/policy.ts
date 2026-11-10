@@ -90,11 +90,25 @@ export class PolicyGate {
       if (scope.guild !== p.guild || !parent || ![p.conversationChannel, p.notificationChannel].includes(parent)) throw new Denied();
       if (scope.kind === 'channel' && scope.parent !== null) throw new Denied();
     }
+    await this.restoreApproved(actor, p);
+    if ((await this.db.query('SELECT actor_id FROM denied_actors WHERE actor_id=$1', [actor])).rows.length) throw new Denied();
+    return p;
+  }
+  // 사람이 revocationRestores에 적은, 철회 뒤 확인한 정책보다 앞선 거부만 지운다.
+  private async restoreApproved(actor: string, p: Policy): Promise<void> {
     await this.db.query(`DELETE FROM denied_actors WHERE actor_id=$1 AND policy_revision IS NOT NULL
       AND policy_revision<>$2 AND created_at<$3 AND denial_id=ANY($4::text[])`,
     [actor, p.revision, p.confirmedAt, p.revocationRestores ?? []]);
-    if ((await this.db.query('SELECT actor_id FROM denied_actors WHERE actor_id=$1', [actor])).rows.length) throw new Denied();
-    return p;
+  }
+  // 관리 기능 차단(COLLEAGUE_SPEC §4.8). 권한의 근거는 클러스터 접근이라 actor·범위를 대조하지 않는다. owner 자신도 막을 수 있다.
+  // 정책은 거부 행의 revision을 적으려고만 읽고, 읽지 못하면 PolicyUnavailable로 아무것도 더하지 않는다. 해제 경로는 없다.
+  // 이미 거부돼 있으면 행을 그대로 둔다(새 거부면 true). 덮어쓰면 denial_id가 바뀌어 사람이 준비해 둔 해제 승인이 듣지 않는다.
+  // 다만 해제 승인이 이미 적힌 옛 거부는 다음 인가가 지울 행이라 먼저 지우고 새 거부를 더한다.
+  async deny(target: string): Promise<boolean> {
+    const p = await this.current();
+    await this.restoreApproved(target, p);
+    return (await this.db.query(`INSERT INTO denied_actors(actor_id,created_at,policy_revision,denial_id) VALUES ($1,$2,$3,$4)
+      ON CONFLICT (actor_id) DO NOTHING RETURNING actor_id`, [target, this.now(), p.revision, randomUUID()])).rows.length > 0;
   }
   async revoke(actor: string, scope: Scope, target: string): Promise<void> {
     const p = await this.authorize(actor, scope);
