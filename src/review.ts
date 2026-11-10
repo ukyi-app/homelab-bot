@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { z } from 'zod';
 import { DEFAULTS, Denied, PolicyUnavailable, WorkerRejected } from './contracts.js';
 import type { Job, Scope } from './contracts.js';
+import { CHAT_TASK_TEXT as T } from './chat-task-text.js';
 import { ChatSuperseded, lockedChatJobCurrent } from './chat-currency.js';
 import type { Database } from './database.js';
 import type { Policy, PolicyGate } from './policy.js';
@@ -767,13 +768,10 @@ export class ReviewRuntime {
       stopped = true;
       if (result.status === 'limited' || result.status === 'auth_expired') {
         await this.store.waitForUser(asJob(job), result.status === 'limited' ? 'model_limit' : 'auth_expired', { rateLimit: result.rateLimit ?? null });
-        // 전역 모델 대기를 owner가 알림 채널에서 풀 수 있게 job ID와 명령을 알린다(원문 없음).
+        // 알림 채널에 자리 비움 한 줄만 단다. 원인·풀리는 시각·할 일은 운영 알림(Telegram)이 보내고 재개는 저절로 한다.
         const scope = notificationScope(context.base);
-        await this.store.enqueue({ key: `review-waiting:${job.id}`, actor: context.base.owner, scope, revision: context.base.revision,
-          payload: { kind: 'message', channel: scope.channel, classification: 'safe_summary',
-            content: `PR 리뷰가 모델 ${result.status === 'limited' ? '한도' : '인증 만료'}로 대기 중이고 새 모델 호출이 멈췄습니다: `
-              + `${review.repo_full_name}#${review.pr_number}, job ${job.id}. 원인 해소 뒤 이 채널에서 /review-resume target:${job.id}, `
-              + `포기는 /review-cancel target:${job.id}.` } });
+        await this.store.enqueue({ key: await this.store.awayKey(scope.channel, `review-waiting:${job.id}`), actor: context.base.owner, scope, revision: context.base.revision,
+          payload: { kind: 'message', channel: scope.channel, classification: 'safe_summary', content: T.away } });
         return true;
       }
       // 대기가 아닌 결과의 한도 경고도 계정 기록에 남긴다(리뷰 미루기). 기록 실패가 결과 처리를 막지 않는다.

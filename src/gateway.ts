@@ -13,6 +13,9 @@ const FATAL_CLOSE = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
 const SESSION_LOST_CLOSE = new Set([4007, 4009]);
 // 우리가 끊고 RESUME할 때 쓰는 코드. 1000·1001로 닫으면 Discord가 세션을 무효로 만든다.
 const RECONNECT_CODE = 4900;
+// 상태 바꾸기 rate limit(Discord 문서 Activity Object: "5 times per 20 seconds"). 전체 전송 한도는 연결당 60초 120개다.
+const PRESENCE_PER_WINDOW = 5;
+const PRESENCE_WINDOW_MS = 20_000;
 
 export interface GatewaySocket {
   send(data: string): void;
@@ -37,7 +40,11 @@ export interface GatewayOptions {
   random?: () => number;
   helloTimeoutMs?: number;
   now?: () => number;
+  // 봇 상태(자리 비움). READY·RESUMED마다 불러 그때의 멈춤 기록에서 상태를 다시 읽는다. 실패하면 보내지 않고 다음 setPresence를 기다린다.
+  presence?: () => Promise<PresenceStatus>;
 }
+// 모델 멈춤이면 자리 비움(idle), 아니면 온라인. Discord 문서 Update Presence(op 3)의 status 값이다.
+export type PresenceStatus = 'idle' | 'online';
 const Payload = z.object({ op: z.number().int(), d: z.unknown().optional(), s: z.number().int().nullable().optional(),
   t: z.string().nullable().optional() });
 const Hello = z.object({ heartbeat_interval: z.number().positive().max(600_000) });
@@ -62,7 +69,45 @@ export class GatewaySession {
     return { connected: this.connected, halted: this.halted, resumable: !!this.session && this.seq !== null };
   }
   private connected = false;
+  // wanted: 보여야 할 상태. shown: 지금 연결에 보낸 상태. RESUME 뒤 Discord가 상태를 지키는지 문서에 없어 연결마다 다시 보낸다.
+  private wanted: PresenceStatus | undefined;
+  private shown: PresenceStatus | undefined;
+  private presenceVersion = 0;
+  private presenceSent: number[] = [];
   start(): void { void this.open(); }
+  // 바뀐 상태만 보낸다. 연결이 없으면 기억만 하고, 다음 READY·RESUMED가 멈춤 기록을 다시 읽어 맞춘다.
+  setPresence(status: PresenceStatus): void {
+    this.presenceVersion++;
+    this.wanted = status;
+    this.pushPresence();
+  }
+  private pushPresence(): void {
+    const socket = this.socket;
+    if (!socket || !this.connected || this.wanted === undefined || this.wanted === this.shown) return;
+    // 문서(Activity Object): 상태 바꾸기는 20초에 5번까지다. 넘으면 가장 오래된 전송이 창을 벗어날 때 다시 본다.
+    const now = this.now();
+    this.presenceSent = this.presenceSent.filter(at => now - at < PRESENCE_WINDOW_MS);
+    if (this.presenceSent.length >= PRESENCE_PER_WINDOW) {
+      this.later(PRESENCE_WINDOW_MS - (now - this.presenceSent[0]!), () => { if (this.socket === socket) this.pushPresence(); });
+      return;
+    }
+    const status = this.wanted;
+    this.presenceSent.push(now);
+    this.shown = status;
+    this.send(socket, { op: 3, d: { since: status === 'idle' ? now : null, activities: [], status, afk: false } });
+  }
+  private restorePresence(socket: GatewaySocket): void {
+    this.shown = undefined;
+    const read = this.options.presence;
+    if (!read) { this.pushPresence(); return; }
+    const version = this.presenceVersion;
+    void read().then(status => {
+      if (this.socket !== socket) return;
+      // 읽는 사이 setPresence가 더 새 값을 넣었으면 그 값을 둔다.
+      if (this.presenceVersion === version) this.wanted = status;
+      this.pushPresence();
+    }, error => { this.log('gateway_presence_failed', errorInfo(error)); });
+  }
   async stop(timeoutMs = 2000): Promise<void> {
     this.stopped = true;
     this.clearTimers();
@@ -225,12 +270,13 @@ export class GatewaySession {
       this.attempt = 0;
       this.setConnected(true);
       this.log('gateway_ready');
+      this.restorePresence(socket);
       const info = { applicationId: ready.data.application.id, userId: ready.data.user.id };
       this.events = this.events.then(async () => { await this.options.onReady?.(info); })
         .catch(() => { this.log('gateway_ready_handler_failed'); });
       return;
     }
-    if (payload.t === 'RESUMED') { this.attempt = 0; this.setConnected(true); this.log('gateway_resumed'); return; }
+    if (payload.t === 'RESUMED') { this.attempt = 0; this.setConnected(true); this.log('gateway_resumed'); this.restorePresence(socket); return; }
     if (!payload.t) return;
     const type = payload.t, data = payload.d;
     // 이벤트는 받은 순서대로 하나씩 처리한다(메시지 checkpoint가 순서에 기댄다). heartbeat는 타이머라 막히지 않는다.

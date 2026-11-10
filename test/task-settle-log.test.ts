@@ -49,7 +49,7 @@ const jobRow = async (id: string) => (await db().query<{ state: string; wait_rea
 const sessionRow = async () => (await allRows(db(), 'codex_sessions'))[0]!;
 const outboxKeys = async (prefix: string) => (await db().query<{ idempotency_key: string }>('SELECT idempotency_key FROM outbox')).rows
   .map(row => row.idempotency_key).filter(key => key.startsWith(prefix));
-const notices = { cancelled: () => outboxKeys('task-cancelled:'), blocked: () => outboxKeys('task-blocked:'), failure: () => outboxKeys('failure:'), result: () => outboxKeys('result:'), wait: () => outboxKeys('task-wait:'), question: () => outboxKeys('task-question:') };
+const notices = { cancelled: () => outboxKeys('task-cancelled:'), blocked: () => outboxKeys('task-blocked:'), failure: () => outboxKeys('failure:'), result: () => outboxKeys('result:'), wait: async () => [...await outboxKeys('task-wait:'), ...await outboxKeys('away:')], question: () => outboxKeys('task-question:') };
 const finished = (job: string, state: string, reason: string | null): Logged => [FINISHED, { job, state, reason }];
 const skipped = (job: string, intended: string, state: string | null, reason: string | null): Logged => [SKIPPED, { job, intended, actual_state: state, actual_reason: reason }];
 // 불변식: settle 한 번에 끝 기록 하나이고, 그 값은 settle 직후의 DB와 같다. 호출자는 lease·expire를 더 건드리기 전에 부른다.

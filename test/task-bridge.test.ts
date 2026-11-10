@@ -21,7 +21,7 @@ let database: Awaited<ReturnType<typeof localDatabase>>;
 let f: Fixture;
 let setup: ReturnType<typeof lane>;
 before(async () => { database = await localDatabase(); });
-const RESET = `TRUNCATE events,conversations,jobs,results,outbox,schedules,denied_actors,controls,audit,incidents,codex_sessions,codex_questions RESTART IDENTITY CASCADE;
+const RESET = `TRUNCATE events,conversations,jobs,results,outbox,schedules,denied_actors,controls,audit,incidents,codex_sessions,codex_questions,model_limit_state RESTART IDENTITY CASCADE;
   UPDATE execution_lanes SET closed_reason=NULL,closed_at=NULL`;
 beforeEach(async () => {
   await database.pg.exec(RESET);
@@ -567,6 +567,36 @@ test('AC-16 작업 레인 응답의 풀리는 시각 1분 뒤 같은 세션으�
   const turns = setup.worker.executes.slice(1);
   assert.deepEqual(turns.map(t => [t.operation, t.job, t.operation === 'resume' ? t.resumeReason : null]),
     [['resume', job.id, 'model_limit'], ['resume', job.id, 'model_limit']]);
+});
+test('AC-17 작업 레인의 완료 응답에 실린 한도 경고(allowed_warning)도 계정 기록에 남아, 그 풀리는 시각까지 리뷰를 미룬다', async () => {
+  const resetsAt = Math.floor((f.now() + 3_600_000) / 1000);
+  const completed = reply.completed();
+  setup.worker.scripts.push((r, w) => ({ ...completed(r, w) as object,
+    rateLimit: { event: { status: 'allowed_warning', resetsAt, rateLimitType: 'five_hour', utilization: 0.9 } } }));
+  await newTask();
+  assert.equal(await setup.runtime.tickTask(), true);
+  assert.equal((await jobs(db()))[0]!.state, 'succeeded');
+  assert.equal(await f.store.reviewDeferredUntil(), resetsAt * 1000);
+});
+test('AC-15 작업 레인 대기 안내: 계정 한도는 자리 비움 한 줄(스레드·회차 키)이고, 작업 레인 인증 만료는 대화가 계속되므로 자리 비움이 아니다', async () => {
+  setup.worker.scripts.push(reply.limited('limited'));
+  const job = await newTask();
+  await setup.runtime.tickTask();
+  assert.equal(await f.store.syncAway(), true);
+  const limitedLines = (await outbox()).filter(row => row.job_id === job.id);
+  assert.deepEqual(limitedLines.map(row => [row.idempotency_key, row.payload.content]), [[`away:${job.target.channel}:1`, T.away]]);
+  await control(f, 'cancel', job.id);
+
+  await database.pg.exec(RESET);
+  f = await fixture(database.db); setup = lane(f);
+  setup.worker.scripts.push(reply.limited('auth_expired'));
+  const authJob = await newTask();
+  await setup.runtime.tickTask();
+  assert.equal(await f.store.syncAway(), false);
+  const authLines = (await outbox()).filter(row => row.job_id === authJob.id);
+  assert.deepEqual(authLines.map(row => [row.idempotency_key, row.payload.content]), [[`task-wait:${authJob.id}:1`, T.away]]);
+  await chat('chat-1');
+  assert.equal((await outbox()).filter(row => row.idempotency_key.startsWith('away:')).length, 0);
 });
 // 도구를 쓰지 않은 턴으로 둔다. 작업당 도구 예산(8)이 턴 예산보다 먼저 닿지 않게 한다.
 const idle = (script: Script): Script => (r, w) => ({ ...script(r, w) as object, usage: { toolCalls: 0, model: null } });

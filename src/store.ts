@@ -7,7 +7,8 @@ import type { Clock, EventInput, Job, RateLimitInfo, Scope, State } from './cont
 import { remaining } from './database.js';
 import type { Database, TransactionDeadline } from './database.js';
 import { messagePages } from './format.js';
-import { moveReactions, settleReactions } from './reactions.js';
+import { awayKey, syncAway } from './away.js';
+import { moveReactions, settleReactions, sleepReactions } from './reactions.js';
 import { TASK_RETENTION } from './task-contracts.js';
 import type { ExecutionLane, ExecutionLaneClosedReason } from './task-contracts.js';
 
@@ -152,6 +153,15 @@ export class Store {
       if (!inserted.rows.length) return (await tx.query<{ id: string }>('SELECT id FROM jobs WHERE event_id=$1', [id])).rows[0]!.id;
       if (type === 'chat') await tx.query(`UPDATE jobs SET state='superseded' WHERE conversation_id=$1 AND type='chat'
         AND state='queued' AND priority<>0 AND id<>$2`, [event.conversation_id, jobId]);
+      // 모델 멈춤 중에 부르면 그 스레드에 자리 비움 한 줄을 단다. 같은 멈춤 동안 같은 스레드에는 멱등 키가 같아 한 번뿐이다.
+      // 조회(read)는 모델을 쓰지 않아 멈춤과 상관없이 답한다.
+      if (type !== 'read') {
+        const away = await this.syncAwayIn(tx);
+        const channel = event.scope.channel;
+        if (away.paused) await this.enqueue({ key: `away:${channel}:${away.episode}`, job: jobId, conversation: event.conversation_id,
+          actor: event.actor_id, scope: event.scope, revision, payload: { kind: 'message', channel, content: T.away, classification: 'safe_summary',
+            ...await this.addressing({ event_id: id }, channel, {}, tx) } }, tx);
+      }
       return jobId;
     });
   }
@@ -448,11 +458,26 @@ export class Store {
       if (await this.complete(job, 'waiting_user', reason, tx) !== 'waiting_user') return;
       await this.recordPause(job.id, reason, options.rateLimit ?? null, tx);
       if (!options.laneOnly) await tx.query(`UPDATE controls SET value='true' WHERE key='scheduler'`);
-      // task는 작업 레인(codex.ts)이 따로 알린다. 여기서는 chat만.
-      if (job.type === 'chat') await this.notice(job, `waiting:${job.id}:${job.attempt}`,
-        reason === 'auth_expired' ? T.modelWaitAuth(this.colleague, job.id) : T.modelWaitLimit(this.colleague, job.id), tx);
+      const away = await this.syncAwayIn(tx);
+      // task는 작업 레인(codex.ts)이 따로 알린다. 여기서는 chat만. 자리 비움 한 줄이라 원인·시각·'/' 명령이 없다.
+      if (job.type === 'chat') await this.notice(job, away.paused ? `away:${job.target.channel}:${away.episode}` : `waiting:${job.id}:${job.attempt}`, T.away, tx);
     });
   }
+  // 자리 비움 회차를 멈춤 기록에 맞추고 지금 멈춤인지 돌려준다. 게시 서버의 상태 루프가 부르고, 그 값으로 Gateway 상태를 바꾼다.
+  async syncAway(): Promise<boolean> {
+    return this.db.transaction(async tx => { await this.lockScheduler(tx); return (await this.syncAwayIn(tx)).paused; });
+  }
+  // 멈춤이면 기다리던 메시지의 👀·⏳를 같은 트랜잭션에서 💤로 바꾼다. 새 회차가 시작될 때만이 아니라 지금 멈춤이면 매번이다:
+  // 같은 회차 안에서 잠깐 풀린 동안(재개 예약 루프의 재시도·유예) 받은 메시지도 다시 멈추면 💤가 돼야 한다.
+  // 이미 💤인 행은 건드리지 않아 바꿀 것이 없으면 반응 동기화(REST)도 일어나지 않는다.
+  // 잠금 순서 scheduler 행 → 회차 행: 부르는 쪽이 scheduler 행을 먼저 잠근다.
+  private async syncAwayIn(tx: Database): Promise<{ paused: boolean; episode: number }> {
+    const away = await syncAway(tx, this.now());
+    if (away.paused) await sleepReactions(tx);
+    return away;
+  }
+  // 작업 레인·리뷰가 직접 거는 대기 안내의 멱등 키. 자리 비움이면 스레드와 회차로 묶고, 아니면 호출자의 작업별 키다.
+  awayKey(channel: string, fallback: string, tx = this.db): Promise<string> { return awayKey(tx, channel, fallback); }
   // 멈춤 기록. 결제는 저절로 재개하지 않아 다음 재시도 시각이 없다.
   // 한도·인증으로 멈춘 실행은 시도로 세지 않는다(attempt를 되돌린다). 세면 30분 재시도가 두 번 만에 시도 한도에 닿아
   // 그 작업이 재개될 수 없는 채 scheduler를 영영 막는다. 결제는 owner가 풀어야 하므로 지금처럼 센다.
@@ -550,7 +575,7 @@ export class Store {
   }
   // 대화 답·실패 안내의 답장 대상과 owner 호출 칸. 답장은 그 job을 만든 owner 메시지가 같은 채널에 있을 때만 단다.
   // 명령(상호작용)은 답할 메시지가 없다. 채널 멘션은 그 메시지에서 스레드를 열었으므로(스레드 행이 있다) 따로 답장하지 않는다.
-  private async addressing(job: Job, channel: string, notify: DeliveryNotice, tx = this.db): Promise<Pick<Delivery['payload'], 'replyTo' | 'ownerCall'>> {
+  private async addressing(job: Pick<Job, 'event_id'>, channel: string, notify: DeliveryNotice, tx = this.db): Promise<Pick<Delivery['payload'], 'replyTo' | 'ownerCall'>> {
     const event = (await tx.query<{ delivery_id: string; kind: string | null; scope: Scope }>(`SELECT e.delivery_id,e.payload->>'kind' AS kind,e.scope FROM events e
       WHERE e.id=$1 AND e.provider='discord'
       AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.payload->>'kind'='thread' AND o.payload->>'content'=e.id)`, [job.event_id])).rows[0];

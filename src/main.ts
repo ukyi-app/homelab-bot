@@ -3,6 +3,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import type { Server } from 'node:http';
 import pg from 'pg';
 import { AlertIngress } from './alerts.js';
+import { presenceOf, showAway } from './away.js';
 import { BriefingScheduler } from './briefing.js';
 import type { ObservationSource } from './briefing.js';
 import { briefingSources } from './briefing-observations.js';
@@ -525,6 +526,8 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     log,
     connect: deps.connect,
     allowUrl: deps.allowGatewayUrl,
+    // 자리 비움(C20). 연결·재연결마다 그때의 멈춤 기록에서 봇 상태를 다시 읽는다.
+    presence: async () => presenceOf(await store.syncAway()),
     dispatch: async (type, data) => {
       // 입력 중 힌트. 기다리지 않고(뒤 이벤트를 막지 않게) 백그라운드로 돌린다. 오류를 스스로 삼키므로 guard로 가지 않는다.
       if (type === 'TYPING_START') { typingHint(data); return; }
@@ -585,6 +588,8 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
           const resumed = await store.resumeDue();
           if (resumed) log('model_resumed', { jobs: resumed });
         });
+        // 자리 비움: 멈춤 회차를 맞추고 Gateway 상태를 멈춤이면 idle, 풀리면 online으로 둔다(바뀐 때만 보낸다).
+        every('model_away', deps.modelResumeTickMs ?? MODEL_RESUME_TICK_MS, () => showAway(store, gateway));
         startReviewLoops();
         startTaskLoop();
         startChangeLoops();

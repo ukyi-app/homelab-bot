@@ -828,7 +828,7 @@ test('TASK-03 한도 도달은 failed가 아니라 대기·스케줄러 정지·
   const waiting = (await jobs())[0]!;
   assert.equal(waiting.state, 'waiting_user'); assert.equal(waiting.wait_reason, 'model_limit');
   assert.equal((await rows('codex_questions'))[0]!.state, 'answered');
-  assert.ok((await outbox()).some(row => row.payload.content === `${T.codexLimitPaused(false, job.id)} ${T.modelPauseResume(false, job.id)}`));
+  assert.ok((await outbox()).some(row => row.payload.content === T.away));
   await task('task-2');
   assert.equal(await runtime.tick(), false); assert.equal(launcher.started, 2);
   const resumed = await f.store.control('fixture-owner', f.store.scopeId(thread), 'resume-model', job.id) as { ok: boolean };
@@ -938,7 +938,7 @@ test('TASK-03 질문 재개로 시도 한도에 닿은 뒤 한도 대기가 와�
     exit: { code: 1, signal: null } });
   await runtime.tick();
   assert.equal((await jobs())[0]!.attempt, 2); assert.equal((await jobs())[0]!.wait_reason, 'model_limit');
-  assert.ok((await outbox()).some(row => row.payload.content === `${T.codexLimitPaused(false, job.id)} ${T.modelPauseResume(false, job.id)}`));
+  assert.ok((await outbox()).some(row => row.payload.content === T.away));
   assert.equal((await f.store.control('fixture-owner', f.store.scopeId(thread), 'resume-model', job.id) as { ok: boolean }).ok, true);
 });
 
