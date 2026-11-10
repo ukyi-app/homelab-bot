@@ -26,6 +26,7 @@ export const CHANGE_QUESTION_TEXT = Object.freeze({
   missing: '이 대화에서 찾을 수 없는 질문이에요.',
   notOwner: '질문을 받은 사람만 답할 수 있어요.',
   closed: '이미 답했거나 닫힌 질문이에요.',
+  expired: '답할 기한이 지난 질문이라 답을 받지 않아요.',
   purged: '보존 기간이 지나 선택지를 지웠어요. 이 스레드에서 답을 말해 주세요.',
 });
 
@@ -74,13 +75,20 @@ export interface ChangeQuestionOutcome { content: string; update: boolean; next?
 export async function pressChangeQuestion(store: Store, handler: ChangeAnswerHandler, input: ChangeQuestionPress): Promise<ChangeQuestionOutcome> {
   const target = decode(input.target, input.button === CHANGE_CHOICE_BUTTON);
   if (!target) return { content: CHANGE_QUESTION_TEXT.missing, update: false };
-  const row = (await store.db.query<{ conversation_id: string; responder_id: string; state: string; prompt: string; options: string[] | null; prompt_purged_at: string | null }>(
-    'SELECT conversation_id,responder_id,state,prompt,options,prompt_purged_at FROM codex_questions WHERE id=$1', [target.question])).rows[0];
+  const row = (await store.db.query<{ conversation_id: string; responder_id: string; state: string; prompt: string; options: string[] | null; prompt_purged_at: string | null;
+    expires_at: string | number; waiting: boolean }>(`SELECT q.conversation_id,q.responder_id,q.state,q.prompt,q.options,q.prompt_purged_at,q.expires_at,
+      j.state='waiting_user' AND j.wait_reason='clarification' AS waiting FROM codex_questions q JOIN jobs j ON j.id=q.job_id WHERE q.id=$1`, [target.question])).rows[0];
   // 다른 스레드의 질문은 있는지도 알리지 않는다.
   if (!row || row.conversation_id !== store.scopeId(input.scope) || await handler.sealsAnswer?.(store.db, target.question) !== true) return { content: CHANGE_QUESTION_TEXT.missing, update: false };
   if (row.responder_id !== input.actor) return { content: CHANGE_QUESTION_TEXT.notOwner, update: false };
   if (row.state !== 'open') return { content: CHANGE_QUESTION_TEXT.closed, update: false };
-  if (input.button === CHANGE_DIRECT_BUTTON) return { content: CHANGE_QUESTION_TEXT.speak, update: false, next: target.question };
+  if (input.button === CHANGE_DIRECT_BUTTON) {
+    // 선택지 버튼은 answerIn이 기한·답 대기를 본다. 여기서는 답을 쓰지 않으므로 같은 검사를 먼저 해야 한다. 다음 말 경로(openTaskQuestions)는
+    // 기한 전·답 대기 질문만 보므로, 걸린 질문을 답 대상으로 적으면 "다음 말이 답"이라던 말이 봉인 없이 일반 대화로 들어간다.
+    if (store.now() >= Number(row.expires_at)) return { content: CHANGE_QUESTION_TEXT.expired, update: false };
+    if (!row.waiting) return { content: CHANGE_QUESTION_TEXT.closed, update: false };
+    return { content: CHANGE_QUESTION_TEXT.speak, update: false, next: target.question };
+  }
   const option = row.options?.[target.number! - 1];
   if (!option) return { content: row.prompt_purged_at !== null ? CHANGE_QUESTION_TEXT.purged : CHANGE_QUESTION_TEXT.missing, update: false };
   const result = await handler.answerIn(store, { question: target.question, actor: input.actor, scope: input.scope, text: publicAnswer(option), event: input.event });
