@@ -7,7 +7,7 @@ import { z } from 'zod';
 // ---- 단계와 전이 ----
 
 export const CHANGE_PHASES = ['requested', 'admitted', 'authoring', 'snapshot_ready', 'verifying', 'reviewing',
-  'awaiting_publish_approval', 'approved', 'publishing', 'proposed', 'merged', 'observing_deploy',
+  'awaiting_publish_approval', 'approved', 'publishing', 'proposed', 'amending', 'merged', 'observing_deploy',
   'superseded', 'blocked', 'cancelled', 'failed'] as const;
 export type ChangePhase = typeof CHANGE_PHASES[number];
 export const TERMINAL_CHANGE_PHASES = ['superseded', 'blocked', 'cancelled', 'failed'] as const;
@@ -30,7 +30,10 @@ export const CHANGE_PHASE_TRANSITIONS: Readonly<Record<ChangePhase, readonly Cha
   awaiting_publish_approval: ['approved', ...STOP],
   approved: ['publishing', ...STOP],
   publishing: ['proposed', ...STOP],
-  proposed: ['merged', 'superseded', 'blocked', 'cancelled'],
+  // proposed ↔ amending은 게시 뒤 수정 차례(C27)다. 전용 메서드(ChangeStore.startAmendment·finishAmendment)로만 간다.
+  // amending에서도 failed가 없다. 차례가 실패하면 커밋 없이 proposed로 돌아오고, 차례 effect를 해소하지 못하면 blocked다.
+  proposed: ['merged', 'amending', 'superseded', 'blocked', 'cancelled'],
+  amending: ['proposed', 'merged', 'blocked', 'cancelled'],
   merged: ['observing_deploy', 'blocked', 'failed'],
   observing_deploy: ['blocked', 'failed'],
   superseded: [], blocked: [], cancelled: [], failed: [],
@@ -39,6 +42,9 @@ export const canTransition = (from: ChangePhase, to: ChangePhase): boolean => CH
 export const isTerminalPhase = (phase: ChangePhase): phase is TerminalChangePhase => (TERMINAL_CHANGE_PHASES as readonly ChangePhase[]).includes(phase);
 // 게시 전 고치기 차례 상한(사용자 2026-11-09의 기본값). migrations/026의 fix_round CHECK와 같은 값이고 시험이 대조한다.
 export const CHANGE_SELF_FIX = Object.freeze({ maxRounds: 2 });
+// 게시 뒤 수정 차례 상한(사용자 2026-11-09 "한 PR에 수정은 최대 10번"). 대기열에 든 요청과 실패한 차례도 센다.
+// migrations/027의 change_amendments.round CHECK와 같은 값이고 시험이 대조한다.
+export const CHANGE_AMENDMENT = Object.freeze({ maxRounds: 10 });
 // 전이 표 밖의 유일한 재시작이다. 새 generation은 admission부터 다시 받는다. blocked·failed는 사람이 볼 일이라 자동으로 다시 열지 않는다.
 export const GENERATION_RESTART = Object.freeze({ from: 'superseded', to: 'requested' } as const);
 export const MAX_GENERATION = 999;
@@ -81,6 +87,8 @@ export const BranchNameSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._/-]{0,
 const MILLIS = z.number().int().nonnegative();
 
 export interface ChangeKey { changeId: string; generation: number }
+// 게시 뒤 수정 차례의 키(C27). generation을 올리지 않고 차례 번호를 하나 더 둔다. 브랜치·승인 대상은 그 generation의 것 그대로다.
+export interface AmendmentKey extends ChangeKey { round: number }
 
 // ---- 고정 직렬화와 digest ----
 
@@ -151,6 +159,12 @@ export const EvidenceBundleSchema = z.strictObject({
 });
 export type EvidenceBundle = z.infer<typeof EvidenceBundleSchema>;
 export const evidenceBundleDigest = (bundle: EvidenceBundle): string => domainDigest('change-evidence/v1', bundle);
+// 수정 차례의 증거 묶음. 묶음 8개 필드는 처음 게시와 같은 모양이고(baseCommit은 차례를 시작할 때 읽은 PR head) 차례 번호를 함께 묶는다.
+// domain이 달라 처음 게시의 묶음 digest·승인 digest 재료로 쓰이지 못한다.
+export const amendmentEvidenceDigest = (round: number, bundle: EvidenceBundle): string => domainDigest('change-amendment-evidence/v1', { round, bundle });
+// 수정 요청 확인 때 센 PR 리뷰·리뷰 댓글·대화 댓글 ID 묶음(`review:<id>`·`review_comment:<id>`·`comment:<id>`). 순서와 무관하다.
+export const AMENDMENT_MATERIAL_ID = /^(review|review_comment|comment):[1-9][0-9]{0,15}$/;
+export const amendmentMaterialsDigest = (ids: readonly string[]): string => domainDigest('change-amendment-materials/v1', [...new Set(ids)].sort(compareText));
 
 // ---- artifact ----
 

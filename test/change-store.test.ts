@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import { PGlite } from '@electric-sql/pglite';
 import {
-  CHANGE_PHASES, CHANGE_SELF_FIX, EFFECT_STAGES, EFFECT_STATES, UNKNOWN_RECONCILE_MS, approvalDigest, canTransition, canTransitionEffect, changeBranchName, gitBlobSha, sha256Hex,
+  CHANGE_AMENDMENT, CHANGE_PHASES, CHANGE_SELF_FIX, EFFECT_STAGES, EFFECT_STATES, UNKNOWN_RECONCILE_MS, approvalDigest, canTransition, canTransitionEffect, changeBranchName, gitBlobSha, sha256Hex,
 } from '../src/change-contracts.js';
 import type { ChangePhase, EffectExpected, EffectStage, EffectState } from '../src/change-contracts.js';
 import { ChangePrivateInputs, ChangeStore } from '../src/change-store.js';
@@ -802,7 +802,7 @@ test('T19 B0 migration: 016 DB에 017만 더하고 기존 표·제약·행을 �
   try {
     const db = migrationDatabase(pg);
     const upTo016 = MIGRATIONS.filter(file => Number.parseInt(file, 10) <= 16);
-    assert.equal(upTo016.length, MIGRATIONS.length - 10);
+    assert.equal(upTo016.length, MIGRATIONS.length - 11);
     for (const file of upTo016) await pg.exec(await readFile(`migrations/${file}`, 'utf8'));
     await seedConversation(db);
     await insertChildJob(db, 'existing-job', 'task');
@@ -810,7 +810,7 @@ test('T19 B0 migration: 016 DB에 017만 더하고 기존 표·제약·행을 �
     const constraints = await constraintsOf(db);
     const jobs = JSON.stringify((await db.query('SELECT * FROM jobs')).rows);
 
-    assert.deepEqual(await migrate(db), [17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
+    assert.deepEqual(await migrate(db), [17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]);
     assert.equal(await schemaOf(db), schema);
     const added = (await db.query<{ table_name: string; column_name: string; is_nullable: string; column_default: string | null }>(`SELECT table_name,column_name,is_nullable,column_default
       FROM information_schema.columns WHERE ${OLD_TABLES} AND NOT (${T27_COLUMNS}) ORDER BY table_name,column_name`)).rows;
@@ -962,5 +962,115 @@ test('C31 고치기 DB 방어: 코드를 거치지 않고 되돌리거나 증거
     const definition = (await s.db.query<{ d: string }>(`SELECT pg_get_constraintdef(oid) AS d FROM pg_constraint WHERE conname='change_generations_fix_round_check'`)).rows[0]!.d;
     assert.ok(definition.includes(`<= ${CHANGE_SELF_FIX.maxRounds}`), definition);
     assert.equal(ok(await s.store.get(r.id)).phase, 'reviewing');
+  } finally { await s.close(); }
+});
+
+// ---- C27 게시 뒤 수정 차례 ----
+
+const HEAD = git('h');
+const amend = (s: Awaited<ReturnType<typeof setup>>, changeId: string, overrides: Partial<Parameters<ChangeStore['requestAmendment']>[0]> = {}) => s.store.requestAmendment({
+  changeId, generation: 1, eventId: newEvent(), actor: OWNER, pullNumber: 7, head: HEAD, materials: ['review:11', 'comment:12'], instruction: '리뷰 반영해 줘',
+  label: 'public', ...overrides });
+
+test('C27 수정 차례: 확정된 요청은 대기열에 들고 proposed에서 하나씩 열린다. 끝나면 proposed로 돌아오고 다음 차례가 열린다', async () => {
+  const s = await setup();
+  try {
+    const r = await driveTo(s.store, 'proposed');
+    const key = { changeId: r.id, generation: 1 };
+    const first = ok(await amend(s, r.id));
+    assert.deepEqual([first.round, first.state, first.pullNumber, first.confirmedHead, first.materials], [1, 'queued', 7, HEAD, ['review:11', 'comment:12']]);
+    assert.equal(await phaseOf(s.store, r.id), 'proposed');
+    // 지시 원문은 공개 경로가 읽지 않는 입력 표에 둔다.
+    assert.deepEqual((await new ChangePrivateInputs(s.db).read({ changeId: r.id })).filter(row => row.eventId === first.eventId).map(row => [row.text, row.label]), [['리뷰 반영해 줘', 'public']]);
+    ok(await amend(s, r.id));
+    const started = ok(await s.store.startAmendment(key));
+    assert.deepEqual([started.round, started.state], [1, 'running']);
+    assert.equal(await phaseOf(s.store, r.id), 'amending');
+    // 수정 중에 온 요청은 다음 차례다. 돌고 있는 차례가 있으면 새 차례를 열지 않는다.
+    assert.equal(ok(await amend(s, r.id)).round, 3);
+    failure(await s.store.startAmendment(key), 'phase_conflict');
+    failure(await s.store.transition({ ...key, from: 'amending', to: 'proposed', reason: null }), 'dedicated_operation');
+    failure(await s.store.transition({ ...key, from: 'proposed', to: 'amending', reason: null }), 'dedicated_operation');
+    const done = ok(await s.store.finishAmendment({ ...key, round: 1, outcome: { state: 'failed', reason: 'head_changed' } }));
+    assert.deepEqual([done.state, done.reason, done.commitSha], ['failed', 'head_changed', null]);
+    assert.equal(await phaseOf(s.store, r.id), 'proposed');
+    failure(await s.store.finishAmendment({ ...key, round: 1, outcome: { state: 'failed', reason: 'head_changed' } }), 'phase_conflict');
+    assert.equal(ok(await s.store.startAmendment(key)).round, 2);
+    assert.deepEqual((await s.store.amendments(key)).map(round => [round.round, round.state]), [[1, 'failed'], [2, 'running'], [3, 'queued']]);
+  } finally { await s.close(); }
+});
+
+test('C27 수정 요청 거부: 11번째·병합·닫힌·남의 change·다른 PR·같은 확인 이벤트는 대기열에 들지 않는다', async () => {
+  const s = await setup();
+  try {
+    const r = await driveTo(s.store, 'proposed');
+    for (let i = 0; i < CHANGE_AMENDMENT.maxRounds; i++) ok(await amend(s, r.id));
+    failure(await amend(s, r.id), 'amendment_limit');
+    // 상한은 DB도 막는다. 코드 상수와 같은 값이다.
+    const definition = (await s.db.query<{ d: string }>(`SELECT pg_get_constraintdef(oid) AS d FROM pg_constraint WHERE conname='change_amendments_round_check'`)).rows[0]!.d;
+    assert.ok(definition.includes(`<= ${CHANGE_AMENDMENT.maxRounds}`), definition);
+
+    const other = await driveTo(s.store, 'proposed');
+    failure(await amend(s, other.id, { actor: 'someone-else' }), 'owner_mismatch');
+    failure(await amend(s, other.id, { pullNumber: 8 }), 'pull_mismatch');
+    failure(await amend(s, other.id, { materials: ['issue:1'] }), 'invalid_input');
+    failure(await amend(s, other.id, { label: 'unknown' }), 'label_blocked');
+    const once = newEvent();
+    ok(await amend(s, other.id, { eventId: once }));
+    failure(await amend(s, other.id, { eventId: once }), 'duplicate_event');
+
+    const merged = await driveTo(s.store, 'observing_deploy');
+    failure(await amend(s, merged.id), 'phase_conflict');
+    const closed = await driveTo(s.store, 'proposed');
+    ok(await s.store.transition({ changeId: closed.id, generation: 1, from: 'proposed', to: 'cancelled', reason: 'closed_unmerged' }));
+    failure(await amend(s, closed.id), 'phase_conflict');
+    const reviewing = await driveTo(s.store, 'reviewing');
+    failure(await amend(s, reviewing.id), 'phase_conflict');
+    assert.equal(await count(s.db, 'change_amendments WHERE change_id=ANY($1)', [[merged.id, closed.id, reviewing.id]]), 0);
+  } finally { await s.close(); }
+});
+
+test('C27 수정 중 병합·닫힘: 커밋 없이 차례를 닫고 merged·cancelled로 나간다. 대기열도 함께 닫힌다', async () => {
+  const s = await setup();
+  try {
+    const r = await driveTo(s.store, 'proposed');
+    const key = { changeId: r.id, generation: 1 };
+    ok(await amend(s, r.id));
+    ok(await amend(s, r.id));
+    ok(await s.store.startAmendment(key));
+    ok(await s.store.recordMerge({ ...key, prNumber: 7, headSha: HEAD, mergeCommit: git('m') }));
+    assert.equal(await phaseOf(s.store, r.id), 'merged');
+    assert.deepEqual((await s.store.amendments(key)).map(round => [round.state, round.reason, round.commitSha]), [['failed', 'pr_merged', null], ['failed', 'pr_merged', null]]);
+
+    const closed = await driveTo(s.store, 'proposed');
+    const closedKey = { changeId: closed.id, generation: 1 };
+    ok(await amend(s, closed.id));
+    ok(await s.store.startAmendment(closedKey));
+    ok(await s.store.transition({ ...closedKey, from: 'amending', to: 'cancelled', reason: 'closed_unmerged' }));
+    assert.deepEqual((await s.store.amendments(closedKey)).map(round => [round.state, round.reason]), [['failed', 'closed_unmerged']]);
+    // 사람이 head를 바꾼 뒤의 병합은 게시한 head가 아니라 받지 않는다.
+    const pushed = await driveTo(s.store, 'proposed');
+    failure(await s.store.recordMerge({ changeId: pushed.id, generation: 1, prNumber: 7, headSha: git('human'), mergeCommit: git('m') }), 'head_mismatch');
+  } finally { await s.close(); }
+});
+
+test('C27 수정 차례 DB 방어: 코드를 거치지 않고 차례 없이 amending으로 가거나 돌고 있는 차례를 두고 돌아오거나 상한을 넘지 못한다', async () => {
+  const s = await setup();
+  try {
+    const r = await driveTo(s.store, 'proposed');
+    const key = { changeId: r.id, generation: 1 };
+    await rawError(s.db.query(`UPDATE change_requests SET phase='amending' WHERE id=$1`, [r.id]), /amendment_required/);
+    const queued = ok(await amend(s, r.id));
+    await rawError(s.db.query(`UPDATE change_amendments SET state='committed',commit_sha=$2,finished_at=1 WHERE change_id=$1`, [r.id, git('x')]), /change_amendment_transition_not_allowed/);
+    await rawError(s.db.query(`UPDATE change_amendments SET materials='[]'::jsonb WHERE change_id=$1`, [r.id]), /change_amendment_immutable/);
+    await rawError(s.db.query(`DELETE FROM change_amendments WHERE change_id=$1`, [r.id]), /change_amendment_immutable/);
+    await rawError(s.db.query(`INSERT INTO change_amendments(change_id,generation,round,state,event_id,label,pull_number,confirmed_head,materials,materials_digest,created_at,started_at)
+      VALUES ($1,1,11,'queued',$2,'public',7,$3,'[]'::jsonb,$4,1,NULL)`, [r.id, queued.eventId, HEAD, hex('m')]), /change_amendments_round_check|duplicate key/);
+    ok(await s.store.startAmendment(key));
+    await rawError(s.db.query(`UPDATE change_requests SET phase='proposed' WHERE id=$1`, [r.id]), /amendment_running/);
+    // ref가 확정되지 않은 차례는 committed로 적지 못한다.
+    await rawError(s.db.query(`UPDATE change_amendments SET state='committed',commit_sha=$2,finished_at=1 WHERE change_id=$1`, [r.id, git('x')]), /amendment_ref_required/);
+    failure(await s.store.finishAmendment({ ...key, round: 1, outcome: { state: 'committed', commitSha: git('x') } }), 'guard_rejected');
+    assert.equal(await phaseOf(s.store, r.id), 'amending');
   } finally { await s.close(); }
 });

@@ -3,12 +3,13 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import pg from 'pg';
+import { CHANGE_AMENDMENT } from '../src/change-contracts.js';
 import { ChangePrivateInputs, ChangeStore } from '../src/change-store.js';
 import type { StoreResult } from '../src/change-store.js';
 import { MIGRATIONS, Postgres, appliedMigrations, migrationVersion } from '../src/database.js';
 import { runMigrations } from '../src/migrate-main.js';
 import {
-  CONVERSATION, OWNER, REPO_ID, driveTo, fixtureExpected, fixtureResult, fixtureReview, hex, insertChildJob, newEvent, ok, seedConversation,
+  CONVERSATION, OWNER, REPO_ID, driveTo, fixtureExpected, fixtureResult, fixtureReview, git, hex, insertChildJob, newEvent, ok, seedConversation,
 } from './change-store-fixture.js';
 
 // 실제 PostgreSQL(18) 시험. HOMELAB_TEST_PG_SOCKET(유닉스 소켓 디렉터리)이 없으면 건너뛴다. 실행 방법은 VERIFICATION T20 절과 같다.
@@ -248,6 +249,28 @@ test('C31 실제 PostgreSQL: 고치기 차례를 두 연결이 동시에 열어�
   } finally { await d.close(); }
 });
 
+test('C27 실제 PostgreSQL: 수정 요청이 동시에 확정돼도 차례 번호가 겹치지 않고 상한을 넘지 않으며, 동시에 열어도 차례는 하나만 돈다', { skip }, async () => {
+  const d = await database();
+  try {
+    const r = await driveTo(d.store, 'proposed');
+    const key = { changeId: r.id, generation: 1 };
+    const request = () => d.store.requestAmendment({ ...key, eventId: newEvent(), actor: OWNER, pullNumber: 7, head: git('h'), materials: ['comment:1'],
+      instruction: '리뷰 반영', label: 'public' });
+    const first = await parallel(request, 2);
+    assert.equal(wins(first), 2);
+    const started = await parallel(() => d.store.startAmendment(key));
+    assert.equal(wins(started), 1);
+    onlyLost(reasons(started), ['phase_conflict']);
+    assert.equal(ok(await d.store.get(r.id)).phase, 'amending');
+    assert.equal(await number(d.raw, `change_amendments WHERE change_id=$1 AND state='running'`, [r.id]), 1);
+    // 상한 근처에서 동시에 와도 11번째는 생기지 않는다.
+    const rest = await parallel(request, CHANGE_AMENDMENT.maxRounds);
+    assert.equal(wins(rest), CHANGE_AMENDMENT.maxRounds - 2);
+    onlyLost(reasons(rest), ['amendment_limit']);
+    assert.deepEqual((await d.store.amendments(key)).map(round => round.round), Array.from({ length: CHANGE_AMENDMENT.maxRounds }, (_, i) => i + 1));
+  } finally { await d.close(); }
+});
+
 test('T19 B0 실제 PostgreSQL: 같은 응답의 확정을 동시에 처리해도 한 번만 confirmed다', { skip }, async () => {
   const d = await database();
   try {
@@ -268,7 +291,7 @@ test('T19 B0 실제 PostgreSQL: 016 DB 업그레이드는 017만 적용하고 �
     const raw = d.pool(2);
     for (const file of MIGRATIONS.filter(name => migrationVersion(name) <= 16)) await raw.query(await readFile(`migrations/${file}`, 'utf8'));
     await seedConversation(new Postgres(raw));
-    assert.deepEqual(await runMigrations(raw), [17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
+    assert.deepEqual(await runMigrations(raw), [17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]);
     assert.deepEqual(await runMigrations(raw), []);
     assert.equal((await appliedMigrations(new Postgres(raw))).size, MIGRATIONS.length);
     await raw.query(await readFile('migrations/017_change_pr.sql', 'utf8'));
