@@ -961,10 +961,13 @@ export class ChangeRuntime {
   // 끝난 차례의 결과를 owner 호출로 알린다(동료 봇 전환 11의 호출 표에 더한 두 종류: 수정 결과·수정 실패). outbox 키로 한 번만 들어간다.
   // 커밋한 차례는 안내 댓글을 먼저 단다. 안내가 아직이면(미룸·대조 중) 다음 바퀴에 다시 본다. 안내 포트가 없으면 공개 검사를 지난 항목을 모두 요약에 싣는다.
   private async sendAmendmentNotices(): Promise<void> {
-    const rows = (await this.db.query<{ change_id: string; generation: number | string; round: number | string }>(`SELECT a.change_id,a.generation,a.round FROM change_amendments a
+    // 안내 댓글 대조(최대 하루)나 정책 조회 실패로 알림을 못 만든 행은 outbox가 없어 계속 앞자리에 남는다. 커서로 돌아 뒤 차례의 알림을 막지 않는다.
+    const rows = await this.page('amendment-notices', async after => (await this.db.query<PageRow & { change_id: string; generation: number | string; round: number | string }>(
+      `SELECT a.change_id,a.generation,a.round,a.finished_at AS order_at,a.change_id||':'||a.generation||':'||a.round AS id FROM change_amendments a
       WHERE a.state IN ('committed','failed') AND a.finished_at>$1
       AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.idempotency_key='change-amendment:'||a.change_id||':'||a.generation||':'||a.round)
-      ORDER BY a.finished_at LIMIT $2`, [this.now() - NOTICE_WINDOW_MS, STEP_BATCH])).rows;
+      AND (a.finished_at,a.change_id||':'||a.generation||':'||a.round)>($2::bigint,$3::text)
+      ORDER BY a.finished_at,a.change_id||':'||a.generation||':'||a.round LIMIT $4`, [this.now() - NOTICE_WINDOW_MS, after.at, after.id, STEP_BATCH])).rows);
     for (const row of rows) {
       try { await this.notifyAmendment({ changeId: row.change_id, generation: Number(row.generation), round: Number(row.round) }); }
       catch (error) { this.deps.log('change_amendment_notice_failed', errorInfo(error)); }

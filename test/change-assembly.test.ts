@@ -2217,3 +2217,22 @@ test('AC-28 안내 댓글 전송 실패: 줄 댓글이 거부되면 줄 댓글�
     assert.ok(notice.includes('- 다른 모듈의 기대값을 확인하세요'), notice);
   });
 });
+
+test('AC-28 수정 결과 알림 조회: 알림을 만들지 못하고 남은 오래된 차례 32개가 앞자리를 차지해도 뒤 차례의 실패 알림이 나간다', async () => {
+  await withHarness({ changeV2: true, colleague: true, steps: [V2_WRITE_STEP] }, async h => {
+    const id = await toProposed(h);
+    // 알림을 만들 수 없는 끝난 차례(부모 행이 읽히지 않아 outbox가 생기지 않는다). 대조 대기·정책 조회 실패와 같은 자리를 차지한다.
+    const now = Date.now();
+    const stuck = Array.from({ length: 32 }, (_, i) => `('fixture-stuck-${i}',1,1,'failed','fixture-stuck-event-${i}','public',7,'${'a'.repeat(40)}','[]'::jsonb,'${'b'.repeat(64)}',
+      'policy_changed',${now - 3_600_000},${now - 3_600_000},${now - 3_600_000 + i})`).join(',');
+    await h.db.transaction(async tx => {
+      await tx.query(`SET LOCAL session_replication_role=replica`);
+      await tx.query(`INSERT INTO change_amendments(change_id,generation,round,state,event_id,label,pull_number,confirmed_head,materials,materials_digest,reason,created_at,started_at,finished_at)
+        VALUES ${stuck}`);
+    });
+    await requestAmendment(h, id, 'amend-1', branchHead(h));
+    ok(await h.changes.startAmendment({ changeId: id, generation: 1 }));
+    ok(await h.changes.finishAmendment({ changeId: id, generation: 1, round: 1, outcome: { state: 'failed', reason: 'policy_changed' } }));
+    await h.pump(async () => { await h.deliver(); return h.messages().some(text => text.includes('수정 차례 1은 커밋하지 않았어요')); }, 20);
+  });
+});
