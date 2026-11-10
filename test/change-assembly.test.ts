@@ -25,6 +25,7 @@ import { startPublisher } from '../src/main.js';
 import type { Publisher } from '../src/main.js';
 import { loadRuntimePolicy } from '../src/policy.js';
 import { createGitHubWriter } from '../src/github-writer.js';
+import type { GuidanceReview, GuidanceReviewPort } from '../src/github-review-io.js';
 import { TaskWorkerBusy } from '../src/task-bridge.js';
 import { spawnSandbox } from '../src/change-verifier.js';
 import type { SandboxRunner } from '../src/change-verifier.js';
@@ -411,6 +412,64 @@ test('CHANGE-01 unverifiable 경고는 pass_with_warnings로 미리보기에 남
     assert.equal(await h.phase(id), 'awaiting_publish_approval');
   });
 });
+// ---- C29 확인할 것과 안내 댓글 ----
+
+const GUIDE_NOTES = {
+  checks: [{ text: '상수 값을 2로 가정했어요', location: { path: 'src/a.ts', line: 1 } }, { text: '배포 순서를 가정했어요' }],
+  risks: [{ text: '읽어보기가 낡을 수 있어요', location: { path: 'README.md', line: 1 } }],
+};
+// 리뷰 정책 게시 상한만 쓴다. 저장소 목록·자격은 안내 포트 대역이 대신한다.
+const REVIEW_POLICY = { repositories: [{ id: REPO.id, fullName: REPO.fullName, installationId: REPO.installationId, visibility: 'public' }], allowedBotAuthorIds: [], commentCommand: null,
+  reviewDrafts: false, rereviewOnBaseMove: null, comparison: 'merge_base', reviewSince: 0, internalMarkers: ['fixture-corp-host'],
+  input: { maxFiles: 20, maxFileBytes: 100_000, maxDiffBytes: 200_000, maxArchiveBytes: 1_000_000, maxBodyChars: 4000 },
+  publish: { maxFindings: 10, maxInlineComments: 5, maxBodyChars: 20_000 }, reconcile: { maxPages: 2, maxReviewsPerRun: 3 } };
+const guidancePort = () => {
+  const reviews: GuidanceReview[] = [];
+  const port: GuidanceReviewPort = { post: async input => { reviews.push(input); return { kind: 'confirmed', value: { id: 5000 + reviews.length } }; }, find: async () => null };
+  return { reviews, port };
+};
+
+test('AC-25·AC-27 연결: 작성 결과의 확인할 것이 미리보기와 PR 설명에 있고, 게시 뒤 diff 안 항목만 안내 댓글로 한 번 달린다', async () => {
+  await withHarness({ notes: GUIDE_NOTES, policyPatch: policy => ({ ...policy, review: REVIEW_POLICY }) }, async h => {
+    const fake = guidancePort();
+    h.restart({ instrument: deps => ({ ...deps, guidance: fake.port }) });
+    const id = await toAwaiting(h);
+    await h.deliver();
+    const preview = h.messages().find(text => text.includes('게시 미리보기'))!;
+    assert.ok(preview.includes('확인할 것:\n- 상수 값을 2로 가정했어요 (`src/a.ts:1`)\n- 배포 순서를 가정했어요\n남은 위험:\n- 읽어보기가 낡을 수 있어요 (`README.md:1`)'), preview);
+    await h.command('101', 'change-publish', { target: id, text: await digestOf(h, id) });
+    await h.pump(async () => await h.phase(id) === 'proposed');
+    const body = h.env.github.pulls[0]!.body ?? '';
+    for (const note of [...GUIDE_NOTES.checks, ...GUIDE_NOTES.risks]) assert.ok(body.includes(note.text), note.text);
+    await h.pump(async () => fake.reviews.length === 1);
+    const review = fake.reviews[0]!;
+    assert.deepEqual([review.repository, review.pr, review.head], [REPO.fullName, h.env.github.pulls[0]!.number, h.env.github.pulls[0]!.head.sha]);
+    assert.deepEqual(review.comments, [{ path: 'src/a.ts', line: 1, body: '**확인할 것** 상수 값을 2로 가정했어요' }]);
+    // 병합을 기다리는 동안 다시 돌아도 같은 차례에 두 번 달지 않는다.
+    for (let round = 0; round < 3; round++) await h.runtime.publishTick();
+    assert.equal(fake.reviews.length, 1);
+    assert.equal(await h.phase(id), 'proposed');
+  });
+});
+
+test('AC-25 옛 판 결과: 확인할 것이 없으면 미리보기·PR 설명이 지금과 같고 안내 댓글을 달지 않는다', async () => {
+  await withHarness({ policyPatch: policy => ({ ...policy, review: REVIEW_POLICY }) }, async h => {
+    const fake = guidancePort();
+    h.restart({ instrument: deps => ({ ...deps, guidance: fake.port }) });
+    const id = await toAwaiting(h);
+    await h.deliver();
+    const preview = h.messages().find(text => text.includes('게시 미리보기'))!;
+    assert.ok(!preview.includes('확인할 것') && !preview.includes('남은 위험'));
+    await h.command('101', 'change-publish', { target: id, text: await digestOf(h, id) });
+    await h.pump(async () => await h.phase(id) === 'proposed');
+    const body = h.env.github.pulls[0]!.body ?? '';
+    assert.ok(!body.includes('## 확인할 것') && !body.includes('\n## 남은 위험'));
+    for (let round = 0; round < 3; round++) await h.runtime.publishTick();
+    assert.equal(fake.reviews.length, 0);
+    assert.ok(h.logs.some(entry => entry.event === 'change_guidance' && JSON.stringify(entry.fields).includes('no_inline_items')));
+  });
+});
+
 test('CHANGE-03 연결: 승인 뒤 base가 움직이면 superseded이고 자동으로 다시 시작하지 않는다. /change text:next만 새 generation을 연다', async () => {
   await withHarness({}, async h => {
     const id = await toAwaiting(h);

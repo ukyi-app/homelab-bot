@@ -5,7 +5,7 @@ import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { assembleChange, assembleChangeReview, changeCommandHandler, guardedTaskCommands } from '../src/change-assembly.js';
 import { sha256Hex } from '../src/change-contracts.js';
-import type { ChangePhase } from '../src/change-contracts.js';
+import type { ChangeNote, ChangePhase } from '../src/change-contracts.js';
 import { ChangeReviewResults, ChangeReviewWorker, changeReviewRoutes } from '../src/change-review.js';
 import type { ChangeReviewOutput, ChangeReviewerInput, ChangeReviewerModel } from '../src/change-review.js';
 import type { ChangeRuntime, ChangeRuntimeDeps } from '../src/change-runtime.js';
@@ -55,6 +55,8 @@ export interface HarnessOptions {
   policyPatch?: (policy: Policy) => Policy; change?: boolean; crash?: Crash;
   // 동료 기능 스위치(Store.colleague). 기본 꺼짐이다.
   colleague?: boolean;
+  // 작성 결과에 실을 확인할 것·남은 위험(C25 결과 칸).
+  notes?: { checks: ChangeNote[]; risks: ChangeNote[] };
 }
 export interface Harness {
   db: Database; env: PublishEnv; f: ChangeWorkerFixture; store: Store; changes: ChangeStore; gate: PolicyGate; policy: { current: Policy }; rest: MockDiscord; ingress: DiscordIngress; discord: DiscordPublisher;
@@ -133,7 +135,14 @@ export async function changeHarness(db: Database, options: HarnessOptions = {}):
   const worker = { taskOpen: true, unreachable: false };
   const reach = () => { if (worker.unreachable) throw new Error('task_worker_uncertain'); };
   const v1 = { call: async (endpoint: never, body: never, signal?: AbortSignal) => { reach(); return new HttpTaskWorker(f.url, f.signer, fetch).call(endpoint, body, signal); } };
-  const v2 = { callV2: (async (endpoint: never, body: never, signal?: AbortSignal) => { reach(); return f.port.callV2(endpoint, body, signal); }) as typeof f.port.callV2, supportsChange: (signal?: AbortSignal) => f.port.supportsChange(signal) };
+  const v2 = { callV2: (async (endpoint: never, body: never, signal?: AbortSignal) => {
+    reach();
+    const answered = await f.port.callV2(endpoint, body, signal);
+    // 변경 작성 판 작업자처럼 결과에 확인할 것·남은 위험을 싣는다. 게시 서버가 아직 옛 판을 보내 실제 작업자는 이 칸을 내지 않는다.
+    const response = answered.response as { status?: string };
+    if (options.notes && endpoint === '/v2/task/result' && response.status === 'snapshot') return { ...answered, response: { ...response, ...options.notes } };
+    return answered;
+  }) as typeof f.port.callV2, supportsChange: (signal?: AbortSignal) => f.port.supportsChange(signal) };
   let shutdown = new AbortController();
   const rest = new MockDiscord();
   const build = (runtimeOptions: { crash?: Crash; instrument?: (deps: ChangeRuntimeDeps) => ChangeRuntimeDeps } = {}) => {

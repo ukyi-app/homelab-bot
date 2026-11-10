@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { CHANGE_RESTART, changeNextGeneration } from './change-advice.js';
 import { evaluateCi, readCiSnapshot } from './change-ci-policy.js';
 import { isTerminalPhase, labelAllowsAuthorInput, ReasonCodeSchema } from './change-contracts.js';
-import { scanPublicText } from './change-publication.js';
+import { ChangeGuidance, guidanceLimit, notesApproved, readChangeNotes, recordChangeNotes } from './change-guidance.js';
+import { noteLine, scanPublicText } from './change-publication.js';
 import { ChangeReviewFailed, ChangeReviewRejected } from './change-review.js';
 import type { ChangeArtifactPort, ChangeDeploymentPort, ChangeKey, ChangePhase, ChangeTarget, ChangeVerificationPort, DeploymentObservation, MergeReading, ProvenanceLabel, ReviewReceipt, TerminalChangePhase } from './change-contracts.js';
 import { DEPLOYMENT_POLL, DeploymentTargetError, deploymentPollStep, describeDeployment } from './change-deployment.js';
@@ -16,6 +17,7 @@ import { purgeExpiredChangeContentRounds } from './change-store.js';
 import type { ChangeAuthorSource, ClaudeChangeAuthor } from './claude-task-bridge.js';
 import { DEFAULTS, Denied, PolicyUnavailable } from './contracts.js';
 import type { Job } from './contracts.js';
+import type { GuidanceReviewPort } from './github-review-io.js';
 import type { ChangePreflightPort } from './github-writer.js';
 import { errorInfo } from './log.js';
 import type { Log } from './log.js';
@@ -133,6 +135,8 @@ export interface ChangeRuntimeDeps {
   preflight: ChangePreflightPort; deployment: ChangeDeploymentPort; policy: ChangeRepositoryPolicies;
   // 작업자가 새 실행을 받는 중인지. 닫혀 있는데 claim하면 시작 불명 상태로 레인을 잡는다.
   intakeOpen: () => boolean;
+  // 봇 PR 안내 리뷰(리뷰 App, C26 guidance 포트). 없으면 안내 댓글만 달지 않고 게시·병합 추적은 그대로다.
+  guidance?: GuidanceReviewPort;
   log: Log; verifierRevision: string; periods?: Partial<ChangePeriods>;
 }
 interface ChildRow {
@@ -154,9 +158,12 @@ export class ChangeRuntime {
   private readonly failures = new Map<string, number>();
   private readonly cursors = new Map<string, Cursor>();
   private readonly now: () => number;
+  private readonly guidance: ChangeGuidance | null;
   constructor(private readonly deps: ChangeRuntimeDeps) {
     this.periods = { ...CHANGE_PERIODS, ...deps.periods };
     this.now = deps.store.now;
+    this.guidance = deps.guidance ? new ChangeGuidance({ db: deps.store.db, changes: deps.changes, port: deps.guidance, policy: deps.policy,
+      limit: async () => guidanceLimit(await deps.gate.current()), now: deps.store.now, log: deps.log }) : null;
   }
   private get db() { return this.deps.store.db; }
   private due(slot: string): boolean { return (this.nextAt.get(slot) ?? 0) <= this.now(); }
@@ -403,6 +410,8 @@ export class ChangeRuntime {
           await this.close(request, 'authoring', { to: 'cancelled', reason: 'owner_cancelled' });
           return true;
         }
+        // 저장보다 먼저 남긴다. 저장 뒤에 끊기면 phase가 넘어가 이 결과를 다시 읽지 않는다. 같은 결과를 다시 받아도 처음 기록 그대로다.
+        if (result.checks?.length || result.risks?.length) await recordChangeNotes(this.db, keyOf(request), { checks: result.checks ?? [], risks: result.risks ?? [] }, this.now);
         const saved = await this.deps.artifacts.save(keyOf(request), result.artifact, result.transportBytes);
         if (saved.ok) return true;
         if (saved.reason === 'busy') throw new Error('change_store_busy');
@@ -632,6 +641,7 @@ export class ChangeRuntime {
     this.wait(`step:${request.id}`, this.periods.mergePollMs);
     const pull = await this.pullOf(request);
     if (!pull) throw new Error('pull_effect_missing');
+    await this.guide(request);
     let reading: MergeReading;
     try { reading = await this.deps.deployment.readMerge({ target: this.target(request), prNumber: pull.number }); }
     catch (error) {
@@ -647,6 +657,15 @@ export class ChangeRuntime {
     if (recorded.reason === 'head_mismatch') await this.close(request, 'proposed', { to: 'blocked', reason: 'head_changed' });
     else if (recorded.reason === 'pull_mismatch') await this.close(request, 'proposed', { to: 'blocked', reason: 'pull_mismatch' });
     return true;
+  }
+  // 처음 게시의 안내 댓글. 차례가 끝날 때까지 병합 읽기 주기마다 이어 본다(미룸·응답 유실 대조). 실패는 로그 사유 코드만 남기고 병합 추적을 막지 않는다.
+  private async guide(request: ChangeRequest): Promise<void> {
+    if (!this.guidance) return;
+    const key = keyOf(request);
+    try {
+      if (await this.guidance.settled(key, 0)) return;
+      await this.guidance.afterPublish(key);
+    } catch (error) { this.deps.log('change_guidance_failed', errorInfo(error)); }
   }
   private async merged(request: ChangeRequest): Promise<boolean> {
     // 창 시작을 먼저 남긴다. recordDeployment가 observed_at을 덮어써 그 값으로는 재시작 뒤 창을 잴 수 없다.
@@ -747,7 +766,7 @@ export class ChangeRuntime {
     if (!approval.ok) throw new Error('preview_evidence_missing');
     return [publishButton(request.id, request.generation, approval.value.digest)];
   }
-  // 요청 스레드에만 보낸다. 고정 코드·SHA·경로만 싣고 리뷰 자유문·시험 로그·요청 원문을 싣지 않는다.
+  // 요청 스레드에만 보낸다. 고정 코드·SHA·경로와, 승인 본문에 그대로 있는(공개 검사를 지난) 확인할 것·남은 위험 줄만 싣는다. 리뷰 자유문·시험 로그·요청 원문을 싣지 않는다.
   private async preview(request: ChangeRequest): Promise<string> {
     const key = keyOf(request);
     const approval = await this.deps.changes.approvalSubject(key);
@@ -758,9 +777,12 @@ export class ChangeRuntime {
     const { subject, digest } = approval.value;
     const changed = artifact.value.manifest.entries.filter(entry => entry.changeKind !== 'unchanged');
     const warnings = receipt?.risks.map(risk => `- 경고: ${risk.priority} ${risk.category} ${risk.code}`) ?? [];
+    const notes = await readChangeNotes(this.db, key);
+    if (!notesApproved(subject.publication.body, notes)) throw new Error('preview_evidence_missing');
+    const noted = [...(notes.checks.length ? ['확인할 것:', ...notes.checks.map(noteLine)] : []), ...(notes.risks.length ? ['남은 위험:', ...notes.risks.map(noteLine)] : [])];
     return [`변경 ${request.id} g${request.generation} 게시 미리보기. 아직 아무것도 공개하지 않았습니다.`,
       `제목: ${subject.publication.title}`, `base: ${subject.baseBranch} @ ${subject.bundle.baseCommit}`, `브랜치: ${subject.branch}`, `결과 tree: ${subject.bundle.resultTree}`, `artifact: ${subject.bundle.artifactDigest}`,
-      `시험: ${subject.verifications.map(item => `${item.commandId} ${item.status}`).join(', ')}`, `리뷰: ${subject.review.verdict}, 범위 ${subject.review.coverage}`, ...warnings,
+      `시험: ${subject.verifications.map(item => `${item.commandId} ${item.status}`).join(', ')}`, `리뷰: ${subject.review.verdict}, 범위 ${subject.review.coverage}`, ...warnings, ...noted,
       `변경 파일 ${changed.length}개:`, ...changed.slice(0, 40).map(entry => `- ${entry.changeKind} ${entry.path}`), ...(changed.length > 40 ? [`- 외 ${changed.length - 40}개`] : []),
       '', `승인하려면 이 스레드에서: /change-publish target:${request.id} text:${digest}`, 'digest는 위 내용 전체에 묶여 있습니다. 승인 전에 base가 움직이면 게시하지 않습니다.'].join('\n');
   }

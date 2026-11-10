@@ -882,7 +882,8 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
       if (!artifact) return { kind: 'unknown', code: 'artifact_response_invalid' };
       await this.deps.bridge.bindChangeWorker(jobId, session, result.worker);
       await this.deps.store.heartbeat(job).catch(() => {});
-      return { kind: 'snapshot', artifact, transportBytes: raw.bytes };
+      // 확인할 것·남은 위험은 변경 작성 판(change-v2) 결과에만 있다. 옛 판 결과면 칸 없이 넘긴다.
+      return { kind: 'snapshot', artifact, transportBytes: raw.bytes, ...(result.checks ? { checks: result.checks } : {}), ...(result.risks ? { risks: result.risks } : {}) };
     }
     const stop = result.status === 'failed' && result.reason === 'aborted' ? 'cancel' as const : undefined;
     // 질문 경로는 스레드로 바로 나간다. 질문 행을 만들기 전에 본다. 정책을 못 읽어 던지면 아무것도 나가지 않고 다음 바퀴에 같은 결과를 다시 본다.

@@ -2504,3 +2504,20 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 - **운영 영향:** 스위치가 꺼져 있으면 수신 분기를 타지 않고 고르기 버튼도 받지 않아 지금 동작 그대로다. 스위치와 무관하게 바뀌는 것은 없다(질문 글의 꺼짐 판·변경 질문 글 문구는 그대로).
 - **못 잡는 범위.** owner가 질문과 무관한 말을 스레드에 보내면 그 말이 답이 된다(명세 그대로의 결과). 실제 Discord의 답장 표시와 `UPDATE_MESSAGE` 모양은 S5다. 한 스레드에 열린 작업 질문이 6개 이상이면 버튼은 오래된 5개만 달린다.
 - **PR #129 리뷰 수정(2건, 빨강→초록):** history gap 동안 받아 복구 때 바로 답·고르기로 보낸 메시지의 👀를 지운다(`c16-task-question` "C16 history gap 동안 받아 복구 때 바로 답으로 처리한 메시지는 👀를 지운다", "… 질문 고르기 글로 보낸 메시지도 👀를 지운다", 수정 전 반응 행 `received`로 실패). 옛 고르기 글의 닫힌 질문 버튼은 본인에게만 안내하고 그 글의 버튼을 남긴다("C16 옛 고르기 글의 닫힌 질문 버튼을 눌러도 그 글의 다른 버튼은 남아 아직 열린 질문에 답을 붙일 수 있다", 수정 전 callback type 7로 실패). `c16-task-question`·`change-assembly`·`reaction-lifecycle` 154개 모두 통과, skip 0.
+
+## C29 안내 댓글과 확인할 것 (2026-11-10, 로컬)
+
+동료 봇 명세 §4.10 "변경 질문 줄이기"(확인할 것을 미리보기와 PR 설명에)·"안내 댓글"과 AC-27, AC-25의 미리보기·PR 설명 줄을 S1에서 고정했다. 게시는 가짜 GitHub(`test/change-github-fake.ts`)와 PGlite, 안내 리뷰는 C26 `GuidanceReviewPort` 모양의 대역(표식·head 회수 규칙 같음), 조립 시험은 결과에 두 칸을 싣는 가짜 작업자(`change-assembly-harness` `notes` 옵션)다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §16.3 "확인할 것·남은 위험 (C29)"·"안내 댓글 (C29)", 구현 선택은 [DECISIONS](DECISIONS.md) "동료 봇 전환 14·17 확인할 것과 안내 댓글 구현 선택". 시험 파일은 새 `test/change-guidance.test.ts`와 `change-publication`·`change-assembly`의 C29 줄이다.
+
+| 완료 조건 | 시험 |
+|---|---|
+| 가정해서 진행하면 미리보기·PR 설명에 확인할 것, 승인 digest가 목록을 묶음 | `change-assembly` "AC-25·AC-27 연결: …"(미리보기 줄·PR 본문), `change-publication` "AC-25 PR 설명: 확인할 것·남은 위험 절에 …", `change-guidance` "AC-25 승인 묶음: 승인 digest가 확인할 것 목록에 묶인다. 승인 뒤 기록을 바꿔치기하면 …"(목록만 다른 본문은 다른 digest, 기록 UPDATE 거부, 지우고 다시 넣으면 `notes_unapproved`·PR 본문은 승인한 그대로) |
+| 처음 게시 뒤 diff 안 위치만 `COMMENT` 줄 댓글, diff 밖은 PR 설명에만 | `change-guidance` "AC-27 처음 게시: …"(`commit_id`=확정 head, 줄 댓글 2건, 밖 목록 3건), "AC-27 diff 안 위치가 없으면 리뷰를 달지 않는다(댓글 0건)…", "AC-27 상한: …"(상한 1이면 1건, 정책이 게시를 닫았으면 0건), "AC-27 diff 위치: hunk 안 오른쪽 줄만 센다…", `change-publication` "AC-27 안내 리뷰 글: …" 4개, `change-assembly` "AC-25·AC-27 연결: …"(실제 작업자 patch로 diff 안 1건) |
+| 자체 리뷰 전체(`findings` 글)는 PR 설명·댓글 어디에도 없음 | `change-guidance` "AC-27 자체 리뷰 findings 글은 PR 설명과 안내 댓글 어디에도 없다"(비공개 표의 지적 글이 PR·GitHub 요청 본문·안내 리뷰에 없음), `change-publication` "T19 B3 공개 문구: 입력 스키마가 raw 로그·대화·리뷰 자유문 자리를 거부한다"(그대로) |
+| 확인할 것·남은 위험 글은 공개 검사를 지나고, 걸리면 게시하지 않음 | `change-publication` "AC-25 공개 검사: …"(`internal_marker`·`secret_detected`·`metadata_sensitive`), "AC-25 PR 설명: 항목 글도 mention·자동 연결을 끊는다", "AC-27 안내 리뷰 글: 댓글 글도 무력화하고 …", `change-guidance` "AC-27 수정 차례 진입점: …"(걸린 수정 차례 글은 보내지 않음) |
+| C27이 수정 차례 뒤 같은 함수로 달 수 있고 같은 차례에 두 번 달리지 않음 | `change-guidance` "AC-27 수정 차례 진입점: …"(차례 1, 새 head·patch, 밖 목록 반환, 다른 head는 `head_mismatch`), "AC-27 한 번만: …" 3개(두 번 호출, 응답 유실 회수·미발견 unknown·24시간 뒤 `unknown_expired`, 보내다 끊긴 기록), "AC-27 실패: …" 2개(설치·정책 밖 `repository_denied`는 건너뜀·로그는 사유 코드만, 일시 실패 미룸·거부 실패, PR·변경 상태 그대로), `change-assembly` "AC-25·AC-27 연결: …"(병합 대기 바퀴를 더 돌아도 1건) |
+| 옛 판 결과(두 칸 없음, C28 병합 전 운영)는 지금과 같음 | `change-assembly` "AC-25 옛 판 결과: …"(미리보기·PR 본문에 절 없음, 안내 0건), `change-publication` "AC-25 PR 설명: 항목이 없으면 …"(빈 목록과 칸 없음이 같은 공개 문구) |
+
+- **실행:** (아래 결과 칸)
+- **못 잡는 범위:** 실제 GitHub의 줄 댓글 표시, 리뷰 App 설치 상태, GitHub hunk와 artifact patch의 문맥 줄 차이(C24 S5). 모델이 언제 가정하고 무엇을 확인할 것으로 쓰는지의 품질(S5).
+- **운영 영향:** 스위치 밖이다. 병합하면 변경 PR을 새로 게시할 때부터 PR 설명·미리보기에 확인할 것 절이 생긴다. 다만 지금 게시 서버는 옛 판(`task-v1`)을 보내 결과에 목록이 없으므로 C28의 판 전환 전에는 공개 문구가 그대로다. 안내 댓글은 `ChangeRuntimeDeps.guidance`가 연결될 때만 나간다.
