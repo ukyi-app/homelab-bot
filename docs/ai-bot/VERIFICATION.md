@@ -2505,6 +2505,23 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 - **못 잡는 범위.** owner가 질문과 무관한 말을 스레드에 보내면 그 말이 답이 된다(명세 그대로의 결과). 실제 Discord의 답장 표시와 `UPDATE_MESSAGE` 모양은 S5다. 한 스레드에 열린 작업 질문이 6개 이상이면 버튼은 오래된 5개만 달린다.
 - **PR #129 리뷰 수정(2건, 빨강→초록):** history gap 동안 받아 복구 때 바로 답·고르기로 보낸 메시지의 👀를 지운다(`c16-task-question` "C16 history gap 동안 받아 복구 때 바로 답으로 처리한 메시지는 👀를 지운다", "… 질문 고르기 글로 보낸 메시지도 👀를 지운다", 수정 전 반응 행 `received`로 실패). 옛 고르기 글의 닫힌 질문 버튼은 본인에게만 안내하고 그 글의 버튼을 남긴다("C16 옛 고르기 글의 닫힌 질문 버튼을 눌러도 그 글의 다른 버튼은 남아 아직 열린 질문에 답을 붙일 수 있다", 수정 전 callback type 7로 실패). `c16-task-question`·`change-assembly`·`reaction-lifecycle` 154개 모두 통과, skip 0.
 
+## C21 운영 알림 (2026-11-10, 로컬)
+
+동료 봇 명세 §4.7 "운영 알림"과 AC-18을 S1(봇 지표 출력)과 S4(homelab vmalert 규칙 단위 시험, Alertmanager route 시험)에서 고정했다. 지표는 [ARCHITECTURE](ARCHITECTURE.md) §13 "지표", 구현 선택은 [DECISIONS](DECISIONS.md) "C21 운영 알림". 봇 시험은 `test/ops-metrics.test.ts`의 C21 줄, homelab 시험은 `platform/observability/stack/vmalert/tests/bot.test.yaml`의 `HomelabBotModelPaused` 다섯 개와 `tools/ci/alerting.ts` `ROUTES`의 경보 이름 줄이다.
+
+| 완료 조건 | 시험 |
+|---|---|
+| `/metrics`에 멈춤 종류·풀리는 시각·지금 계정·미룬 리뷰 수, 라벨에 ID·본문 없음 | `ops-metrics` "C21 운영 알림 지표: 모델 멈춤이 없으면 종류마다 0, …", "… 종류별 대기 작업 수와 가장 늦게 풀리는 시각(Unix 초, 모르면 0), 대기에서 나간 작업의 남은 기록은 세지 않음"(작업 ID `fixture-…`가 출력에 없음), "… 멈춤 기록 전의 판이 남긴 대기도 wait_reason으로 종류를 정해 센다", "… 리뷰 미루기 기한 안이면 대기열의 PR 리뷰 수, 기한이 지나면 0", "OPS-M8 라벨은 화이트리스트뿐"(`kind`·`method` 허용 목록), "OPS-M1 빈 DB"(계열 수) |
+| 멈춤이면 2분 안에 Telegram에 원인 종류·풀리는 시각(KST)·할 일·지금 계정 | `bot.test.yaml` "HomelabBotModelPaused는 사용 한도 멈춤 다음 평가에 풀리는 시각(KST)과 할 일을 담아 발화한다"(`for` 없음, 두 파드 → 경보 하나, 946720800 → "2000-01-01 19:00 KST"), "… 풀리는 시각을 모르는 사용 한도에 모름과 30분 재시도를 적는다", "… 인증 만료·결제 멈춤을 종류별로 알리고 지금 계정 이름과 방식을 적는다"(C22 뒤 모양 `account="main",method="api"` → "main(API 크레딧)"), "… 모델 멈춤이 없으면 울리지 않는다". 2분 = 수집 30초 + 평가 30초 + `group_wait` 30초 |
+| Discord에는 가지 않음 | 경보에 `service` 라벨 없음(위 시험의 `exp_labels`가 `severity`·`kind`뿐). 봇 수신기가 버리는 것은 기존 `review-1` "R1-13 서비스 없는 플랫폼 경보는 감사 후 202, 잘못된 형식은 400"(outbox 0). route는 `alerting.ts` `alertname=HomelabBotModelPaused severity=warning kind=billing` → `bot,telegram` |
+| 멈춘 동안 4시간마다, 풀리면 해소 | Alertmanager `repeat_interval: 4h`·`send_resolved: true`(바꾸지 않음). 재시도 틈에 해소가 나가지 않는 것과 풀린 뒤 해소는 `bot.test.yaml` "HomelabBotModelPaused는 재시도·수집 공백에 해소되지 않고 풀리면 5분 뒤 해소된다" |
+| 운영 발화 시험 1회 | 미실행(S5, 주 진행자·사람 승인 뒤). 결과는 이 절과 homelab approvals.md에 적는다 |
+
+- **실행(머신 잠금 도우미, node 24.22.0):** 봇 `npm run check`, `npm run build`, `node --test dist/test/ops-metrics.test.js` 15개 모두 통과, skip 0. homelab `bun run ci --only alerting`(vmalert-tool 1.154.1 unittest 다섯 파일, `amtool check-config`, route 시험) 통과, `pre-commit run --files`(바뀐 세 파일) 통과.
+- **시험이 실패할 수 있는지 확인:** 봇 시험은 구현 전에 5개가 실패했다(새 계열 없음). 규칙 시험은 규칙 전에 실패했고, 사본에서 `max`를 `sum`으로 바꾸면 두 파드 시험이(풀리는 시각이 두 배), `keep_firing_for`를 빼면 재시도 틈(5분)과 해소 지연(17분) 기대가 실패했다.
+- **이름·라벨 대조:** 규칙이 쓰는 이름은 `homelab_bot_model_paused_jobs`·`homelab_bot_model_pause_resets_at_seconds`·`homelab_bot_model_account`, 라벨은 `kind`(`rate_limit`·`auth_expired`·`billing`)·`account`·`method`(`none`·`api`·`subscription`)이고 `src/ops-metrics.ts`의 출력과 글자 그대로 같다.
+- **못 잡는 범위:** 실제 Telegram 전송과 도착 시간, 운영 vmsingle에 새 계열이 생겼는지(배포 뒤 주 진행자가 본다). 경보 문구의 CLI 명령(`homelab bot account use`, `--by api`, `homelab bot account list`)은 명세 §4.8의 이름이고 아직 CLI에 없다(C22·C23). `homelab bot resume <작업 ID> --apply`는 지금 CLI에 있지만, 결제로 멈춘 작업의 ID를 CLI로 볼 길이 아직 없다(`homelab bot status`는 멈춤 여부만 보인다). 그 전까지 결제 멈춤은 계정 전환(C22)이나 ID를 아는 경우의 해제로 푼다.
+
 ## C31 게시 전 자체 리뷰 고치기 (2026-11-10, 로컬)
 
 명세 §4.10 "게시 전 자체 리뷰 고치기", AC-31. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §16 "게시 전 고치기 차례(C31)", 구현 선택은 [DECISIONS](DECISIONS.md) "C31 게시 전 자체 리뷰 고치기 구현 선택". 경계는 S1(변경 상태 전이·런타임, PostgreSQL 두 연결)과 S2(작성 입력의 자료 블록)다.
@@ -2526,20 +2543,3 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 - **실행(고치기 켬, origin/main 9d5621a 그대로, `--pg`):** `task-contracts`·`change-artifact`·`change-self-fix`·`change-assembly`·`change-contracts`·`change-store`·`change-store-pg`·`change-review`·`change-pg`·`publisher-migrate`·`publisher-pg`·`task-stream`·`task-settings-boundary`·`task-diagnostics`·`change-recovery`·`change-verify-start` 469개 중 466 통과·3 실패. 실패 셋은 C31 조립 시험의 가짜 모델 출력이 옛 판 모양이라 고치기 세션(`change-v2`)이 `invalid_output`으로 끝난 것이었고, 출력을 그 판 모양으로 고친 뒤 `change-assembly` 125개 모두 통과, skip 0.
 - **시험 경계의 한계:** 옛 작업자는 HTTP 응답(400 `rejected`)만 흉내 낸다. 9b067e9 이미지 자체를 띄우지 않는다. 실제로 고치는 품질과 실제 작업자 이미지 위의 고치기는 S5(C24)다.
 - **운영 영향:** 병합하면 migration 023(변경 표에 칸·표·트리거 추가, 옛 표 불변)이 돈다. `CHANGE_PR_ENABLED`가 꺼져 있으면 동작이 없다. 켜져 있고 작업자가 9b067e9인 동안은 P0·P1 건이 차례를 하나 연 뒤 지금과 같은 `review_blocked`로 닫히고(모델 호출 없음), 알림에 남은 P0·P1 제목 줄(공개 검사를 지난 것만)이 붙는다. 이 변경이 든 작업자 이미지가 배포되면 실제로 최대 2번 고친다.
-
-## C21 운영 알림 (2026-11-10, 로컬)
-
-동료 봇 명세 §4.7 "운영 알림"과 AC-18을 S1(봇 지표 출력)과 S4(homelab vmalert 규칙 단위 시험, Alertmanager route 시험)에서 고정했다. 지표는 [ARCHITECTURE](ARCHITECTURE.md) §13 "지표", 구현 선택은 [DECISIONS](DECISIONS.md) "C21 운영 알림". 봇 시험은 `test/ops-metrics.test.ts`의 C21 줄, homelab 시험은 `platform/observability/stack/vmalert/tests/bot.test.yaml`의 `HomelabBotModelPaused` 다섯 개와 `tools/ci/alerting.ts` `ROUTES`의 경보 이름 줄이다.
-
-| 완료 조건 | 시험 |
-|---|---|
-| `/metrics`에 멈춤 종류·풀리는 시각·지금 계정·미룬 리뷰 수, 라벨에 ID·본문 없음 | `ops-metrics` "C21 운영 알림 지표: 모델 멈춤이 없으면 종류마다 0, …", "… 종류별 대기 작업 수와 가장 늦게 풀리는 시각(Unix 초, 모르면 0), 대기에서 나간 작업의 남은 기록은 세지 않음"(작업 ID `fixture-…`가 출력에 없음), "… 멈춤 기록 전의 판이 남긴 대기도 wait_reason으로 종류를 정해 센다", "… 리뷰 미루기 기한 안이면 대기열의 PR 리뷰 수, 기한이 지나면 0", "OPS-M8 라벨은 화이트리스트뿐"(`kind`·`method` 허용 목록), "OPS-M1 빈 DB"(계열 수) |
-| 멈춤이면 2분 안에 Telegram에 원인 종류·풀리는 시각(KST)·할 일·지금 계정 | `bot.test.yaml` "HomelabBotModelPaused는 사용 한도 멈춤 다음 평가에 풀리는 시각(KST)과 할 일을 담아 발화한다"(`for` 없음, 두 파드 → 경보 하나, 946720800 → "2000-01-01 19:00 KST"), "… 풀리는 시각을 모르는 사용 한도에 모름과 30분 재시도를 적는다", "… 인증 만료·결제 멈춤을 종류별로 알리고 지금 계정 이름과 방식을 적는다"(C22 뒤 모양 `account="main",method="api"` → "main(API 크레딧)"), "… 모델 멈춤이 없으면 울리지 않는다". 2분 = 수집 30초 + 평가 30초 + `group_wait` 30초 |
-| Discord에는 가지 않음 | 경보에 `service` 라벨 없음(위 시험의 `exp_labels`가 `severity`·`kind`뿐). 봇 수신기가 버리는 것은 기존 `review-1` "R1-13 서비스 없는 플랫폼 경보는 감사 후 202, 잘못된 형식은 400"(outbox 0). route는 `alerting.ts` `alertname=HomelabBotModelPaused severity=warning kind=billing` → `bot,telegram` |
-| 멈춘 동안 4시간마다, 풀리면 해소 | Alertmanager `repeat_interval: 4h`·`send_resolved: true`(바꾸지 않음). 재시도 틈에 해소가 나가지 않는 것과 풀린 뒤 해소는 `bot.test.yaml` "HomelabBotModelPaused는 재시도·수집 공백에 해소되지 않고 풀리면 5분 뒤 해소된다" |
-| 운영 발화 시험 1회 | 미실행(S5, 주 진행자·사람 승인 뒤). 결과는 이 절과 homelab approvals.md에 적는다 |
-
-- **실행(머신 잠금 도우미, node 24.22.0):** 봇 `npm run check`, `npm run build`, `node --test dist/test/ops-metrics.test.js` 15개 모두 통과, skip 0. homelab `bun run ci --only alerting`(vmalert-tool 1.154.1 unittest 다섯 파일, `amtool check-config`, route 시험) 통과, `pre-commit run --files`(바뀐 세 파일) 통과.
-- **시험이 실패할 수 있는지 확인:** 봇 시험은 구현 전에 5개가 실패했다(새 계열 없음). 규칙 시험은 규칙 전에 실패했고, 사본에서 `max`를 `sum`으로 바꾸면 두 파드 시험이(풀리는 시각이 두 배), `keep_firing_for`를 빼면 재시도 틈(5분)과 해소 지연(17분) 기대가 실패했다.
-- **이름·라벨 대조:** 규칙이 쓰는 이름은 `homelab_bot_model_paused_jobs`·`homelab_bot_model_pause_resets_at_seconds`·`homelab_bot_model_account`, 라벨은 `kind`(`rate_limit`·`auth_expired`·`billing`)·`account`·`method`(`none`·`api`·`subscription`)이고 `src/ops-metrics.ts`의 출력과 글자 그대로 같다.
-- **못 잡는 범위:** 실제 Telegram 전송과 도착 시간, 운영 vmsingle에 새 계열이 생겼는지(배포 뒤 주 진행자가 본다). 경보 문구의 CLI 명령(`homelab bot account use`, `--by api`, `homelab bot account list`)은 명세 §4.8의 이름이고 아직 CLI에 없다(C22·C23). `homelab bot resume <작업 ID> --apply`는 지금 CLI에 있지만, 결제로 멈춘 작업의 ID를 CLI로 볼 길이 아직 없다(`homelab bot status`는 멈춤 여부만 보인다). 그 전까지 결제 멈춤은 계정 전환(C22)이나 ID를 아는 경우의 해제로 푼다.

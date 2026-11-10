@@ -1031,6 +1031,17 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 - **결과 안내:** `/answer`와 같은 `controlText('answer', …)` 문구를 그 메시지에 답장으로 단다. 받았다는 👀는 달지 않는다. 이 글이 받은 표시이고, 대화 작업이 없어 👀를 지울 계기가 없다. history gap 동안 받아 버퍼에 둘 때 이미 단 👀는 복구 때 바로 답·고르기로 보내면서 그 반응 행을 `cleared`로 옮겨 지운다.
 - **고르기 글의 버튼은 실제로 답을 붙였을 때만 없앤다:** 새 고르기는 닫힌 질문의 행만 지우므로, 행 하나가 없거나 그 질문을 바로 답할 수 없는 것은 그 질문만의 끝이다. 그 버튼을 누르면 본인에게만 안내하고 같은 글의 다른 버튼은 남긴다. 버튼을 없애는 것은 답을 붙였을 때와 그 말 자체를 쓸 수 없을 때(원문 정리, 다른 사람·다른 대화의 말)뿐이다.
 
+## C21 운영 알림 (2026-11-10)
+
+"동료 봇 전환 (사용자 2026-11-09)" 7의 "원인·풀리는 시각·할 일은 Telegram 운영 알림으로"의 구현이다. 결정은 바꾸지 않았고, 아래는 구현 선택이다(사용자 결정 아님). 지표는 [ARCHITECTURE](ARCHITECTURE.md) §13 "지표", 경보는 homelab `platform/observability/stack/vmalert/rules/bot.yaml` `HomelabBotModelPaused`, 시험은 [VERIFICATION](VERIFICATION.md) "C21 운영 알림".
+
+- **멈춤은 종류별 작업 수 + 풀리는 시각 두 계열:** 종류(`rate_limit`·`auth_expired`·`billing`)는 `model_pauses.kind`의 CHECK 목록 그대로 코드에 고정하고, 멈춤이 없어도 0으로 낸다. 풀리는 시각은 그 종류의 대기 중 가장 늦은 것(Unix 초)이고 모르면 **0**이다(계열을 없애지 않는다). 경보가 이 값을 경보 값으로 쓰고 멈춤 여부는 작업 수로 가르기 때문이다. 0이면 경보 문구가 "모름"(한도)·"없음"(인증 만료·결제)으로 적는다.
+- **지금 계정은 라벨:** 운영 알림에 계정 이름이 나와야 하고 Telegram 문구는 vmalert 템플릿이 만들므로, 이름을 라벨 값으로 둔다. 비밀이 아니고(owner가 CLI로 정한 짧은 이름) 계정은 한 번에 하나라 계열도 하나다. 계정 기록은 C22가 만든다. **그 전 모양은 `homelab_bot_model_account{method="none"} 1`**(계정 라벨 없음)이고 경보 문구는 "미등록"이다. C22가 이 줄에 `account`(CLI 이름 규칙을 통과한 이름만, 그 밖이면 라벨을 비운다)와 `method`(`subscription`·`api`)를 채운다. 계정을 바꾸면 옛 계열은 수집 staleness로 사라진다.
+- **미룬 리뷰 수:** 브리핑(C19)과 같은 대상, 리뷰 미루기 기한 안의 대기열 PR 리뷰(미게시 후보 리뷰 제외)다. 기한 밖이면 0이다. 경보는 걸지 않았다(멈춤이 아니라 대화·작업은 계속된다).
+- **KST 표기:** vmalert 템플릿에 시간대 함수가 없어 `toTime`의 UTC에 9시간을 더해 "YYYY-MM-DD HH:MM KST"로 적는다. 한국은 서머타임이 없어 이 계산이 늘 맞다. 봇 지표는 Unix 초 그대로다.
+- **경보 지속:** `for` 없이 첫 평가에 울리고(도착 예산 2분), `keep_firing_for: 5m`로 재시도 틈을 잇는다. 시각 모르는 한도·인증 만료는 30분마다, 한도는 풀리는 시각 1분 뒤 작업을 다시 돌려 그동안 작업 수가 0이 된다. 그 틈에 해소·새 발생이 가지 않는 대신 진짜 해소도 5분 늦게 온다.
+- **Discord에는 안 간다:** 경보에 `service` 라벨이 없어 봇 수신기가 감사(`alert_ignored`)만 남기고 버린다. Alertmanager 설정은 바꾸지 않았다(warning → 봇 route `continue` + Telegram 형제 route, 4시간 반복, 해소 전송).
+
 ## C31 게시 전 자체 리뷰 고치기 구현 선택 (2026-11-10)
 
 "동료 봇 전환 (사용자 2026-11-09)" 17(자체 리뷰에서 찾은 문제는 게시 전에 고친다, 최대 2번)의 구현이다. 사용자 결정이 아니라 구현 선택이고 결정은 바꾸지 않았다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §16 "게시 전 고치기 차례(C31)", 시험은 [VERIFICATION](VERIFICATION.md) "C31 게시 전 자체 리뷰 고치기". `CHANGE_PR_ENABLED` 안의 흐름이고 동료 기능 스위치와는 별개다.
@@ -1043,14 +1054,3 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 - **고치기 요청은 수정 차례 칸에 PR 번호 없이 싣는다(주 진행자 2026-11-10, 분해 불일치 수용):** C25의 수정 차례 칸 `amendment`는 `pullNumber`가 필수였고 지시문이 "PR #n의 브랜치 head 위에서", 자료를 "PR 리뷰·댓글"이라고 말해 게시 전 요청을 담지 못했다. 주 진행자가 이 티켓에 두 자리를 열었다: `src/task-contracts.ts` `AmendmentSchema.pullNumber`를 null도 받게 넓히고(칸 순서·숫자 값의 직렬화 그대로, 게시 뒤 수정 차례(C27)는 PR 번호 필수 의미 유지: `ChangeAmendmentInput.pullNumber`는 숫자), `src/executor-claude-task.ts`가 null일 때 게시 전 고치기 문장을 쓴다. 게시 서버는 고치기 차례에만 판 `change-v2`와 `amendment`(`pullNumber: null`, head=B, 지시 `SELF_FIX_INSTRUCTION`, 자료 `selfFixMaterials`)를 보낸다. 보통 작성 요청의 판 전환은 C28 몫이라 고치지 않았다.
 - **배포 순서와 옛 작업자:** `supportsSelfFix()`는 작업자 intake가 `change-v2`를 말할 때만 참이다. 운영 작업자(이미지 9b067e9)는 그 판을 말하지만 PR 번호 없는 요청을 400으로 거부하므로, 게시 서버만 먼저 배포되면 P0·P1 건은 차례를 하나 연 뒤 지금과 같은 `review_blocked`로 닫힌다(새 실패 모양 없음, 고치기 없음). 실제 고치기는 이 변경이 든 작업자 이미지가 배포된 뒤에 돈다. 순서는 게시 서버 → 작업자 이미지이고, 거꾸로 해도 옛 게시 서버는 null을 보내지 않아 새 작업자에서 지금과 같다.
 - **알림:** 차례 시작은 알리지 않는다. `review_blocked`로 닫히면 남은 P0·P1 제목을 최대 5개 싣는다. 리뷰 모델의 글이라 공개 검사를 지난 제목만 싣고 걸리면 코드로 바꾸며 조건·근거 원문은 싣지 않는다.
-
-## C21 운영 알림 (2026-11-10)
-
-"동료 봇 전환 (사용자 2026-11-09)" 7의 "원인·풀리는 시각·할 일은 Telegram 운영 알림으로"의 구현이다. 결정은 바꾸지 않았고, 아래는 구현 선택이다(사용자 결정 아님). 지표는 [ARCHITECTURE](ARCHITECTURE.md) §13 "지표", 경보는 homelab `platform/observability/stack/vmalert/rules/bot.yaml` `HomelabBotModelPaused`, 시험은 [VERIFICATION](VERIFICATION.md) "C21 운영 알림".
-
-- **멈춤은 종류별 작업 수 + 풀리는 시각 두 계열:** 종류(`rate_limit`·`auth_expired`·`billing`)는 `model_pauses.kind`의 CHECK 목록 그대로 코드에 고정하고, 멈춤이 없어도 0으로 낸다. 풀리는 시각은 그 종류의 대기 중 가장 늦은 것(Unix 초)이고 모르면 **0**이다(계열을 없애지 않는다). 경보가 이 값을 경보 값으로 쓰고 멈춤 여부는 작업 수로 가르기 때문이다. 0이면 경보 문구가 "모름"(한도)·"없음"(인증 만료·결제)으로 적는다.
-- **지금 계정은 라벨:** 운영 알림에 계정 이름이 나와야 하고 Telegram 문구는 vmalert 템플릿이 만들므로, 이름을 라벨 값으로 둔다. 비밀이 아니고(owner가 CLI로 정한 짧은 이름) 계정은 한 번에 하나라 계열도 하나다. 계정 기록은 C22가 만든다. **그 전 모양은 `homelab_bot_model_account{method="none"} 1`**(계정 라벨 없음)이고 경보 문구는 "미등록"이다. C22가 이 줄에 `account`(CLI 이름 규칙을 통과한 이름만, 그 밖이면 라벨을 비운다)와 `method`(`subscription`·`api`)를 채운다. 계정을 바꾸면 옛 계열은 수집 staleness로 사라진다.
-- **미룬 리뷰 수:** 브리핑(C19)과 같은 대상, 리뷰 미루기 기한 안의 대기열 PR 리뷰(미게시 후보 리뷰 제외)다. 기한 밖이면 0이다. 경보는 걸지 않았다(멈춤이 아니라 대화·작업은 계속된다).
-- **KST 표기:** vmalert 템플릿에 시간대 함수가 없어 `toTime`의 UTC에 9시간을 더해 "YYYY-MM-DD HH:MM KST"로 적는다. 한국은 서머타임이 없어 이 계산이 늘 맞다. 봇 지표는 Unix 초 그대로다.
-- **경보 지속:** `for` 없이 첫 평가에 울리고(도착 예산 2분), `keep_firing_for: 5m`로 재시도 틈을 잇는다. 시각 모르는 한도·인증 만료는 30분마다, 한도는 풀리는 시각 1분 뒤 작업을 다시 돌려 그동안 작업 수가 0이 된다. 그 틈에 해소·새 발생이 가지 않는 대신 진짜 해소도 5분 늦게 온다.
-- **Discord에는 안 간다:** 경보에 `service` 라벨이 없어 봇 수신기가 감사(`alert_ignored`)만 남기고 버린다. Alertmanager 설정은 바꾸지 않았다(warning → 봇 route `continue` + Telegram 형제 route, 4시간 반복, 해소 전송).
