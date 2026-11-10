@@ -317,7 +317,7 @@ test('REVIEW-04 전체 경로: 게시 서버는 event=COMMENT와 검토 head를 
   assert.equal(write.body.commit_id, HEAD);
   assert.equal(write.path, `/repos/${REPO.fullName}/pulls/7/reviews`);
   assert.deepEqual(write.body.comments.map(c => [c.path, c.line, c.side]), [['src/app.ts', 2, 'RIGHT']]);
-  assert.match(write.body.body, /승인·병합 판단이 아니며/);
+  assert.equal(write.body.body.split('\n')[1], '참고용 자동 리뷰예요. 승인·병합 판단이 아니고 안전을 보증하지도 않아요.');
   const [job] = await reviewJobs();
   assert.equal(job!.state, 'succeeded');
   assert.equal(job!.review_outcome, 'completed');
@@ -328,6 +328,31 @@ test('REVIEW-04 전체 경로: 게시 서버는 event=COMMENT와 검토 head를 
   await f.publisher.deliver();
   assert.equal(f.rest.messages.length, 1);
   assert.match(f.rest.messages[0]!.body.content, /PR 리뷰 게시: fixture-org\/fixture-repo#7/);
+});
+test('AC-13 PR 리뷰 말투: 심각도·한 문단 지적·승인·병합 아님 안내·첫 줄 대조 표식, Discord 요약에는 모델 문장 없음', async () => {
+  const second = { severity: 'P3', title: '경계 시험 없음', path: 'src/app.ts', line: null, condition: 'count가 0인 경우를 시험하지 않아요.',
+    impact: '같은 버그가\n\n다시 들어와도 못 잡아요.', evidence: '바뀐 파일에 시험이 없어요.', suggestion: 'count 0 시험을 하나 더해 주세요.' };
+  const question = 'count 0이 실제로 들어오나요?';
+  r.reply({ status: 'succeeded', output: { findings: [second, FINDING], open_questions: [question], public_summary: '나눗셈 경계만 보면 될 것 같아요.' } });
+  await fullReview();
+  const write = r.gh.writes[0]!;
+  const body = write.body.body;
+  const lines = body.split('\n');
+  assert.match(lines[0]!, /^<!-- homelab-bot-review:github-review:[0-9a-f-]+:1 -->$/);
+  assert.equal(lines[1], '참고용 자동 리뷰예요. 승인·병합 판단이 아니고 안전을 보증하지도 않아요.');
+  assert.match(lines[2]!, new RegExp(`^검토를 마쳤어요\\. 파일 1개를 봤어요\\. 리비전 head \`${HEAD}\` · 기준 \`${BASE}\` · 정책 \`rp-[0-9a-f]{16}\`$`));
+  // 조건·영향·근거·개선이 네 줄 양식이 아니라 심각도 줄 아래 한 문단으로 이어진다. 심각도 순서(P1 먼저)는 그대로다.
+  const p1 = 'count가 0일 때. NaN·Infinity가 호출자로 전파된다. return total / count; count 0을 먼저 거부한다.';
+  const p3 = 'count가 0인 경우를 시험하지 않아요. 같은 버그가 다시 들어와도 못 잡아요. 바뀐 파일에 시험이 없어요. count 0 시험을 하나 더해 주세요.';
+  assert.ok(body.includes(`**[P1] 0으로 나누기** · \`src/app.ts\`:2\n${p1}\n\n**[P3] 경계 시험 없음** · \`src/app.ts\`\n${p3}`));
+  assert.ok(!/^- (조건|영향|근거|개선): /m.test(body));
+  assert.ok(body.includes(`\n- ${question}`));
+  assert.deepEqual(write.body.comments.map(c => c.body), [`**[P1] 0으로 나누기**\n\n${p1}`]);
+  const summary = (await rows('outbox')).find(o => o.idempotency_key.startsWith('review-summary:'))!.payload.content as string;
+  assert.ok(summary.includes('승인·병합 판단이 아닙니다'));
+  for (const text of [FINDING.title, FINDING.condition, FINDING.impact, second.title, second.suggestion, question, '나눗셈 경계만']) {
+    assert.ok(!summary.includes(text), text);
+  }
 });
 test('REVIEW-04 게시 상한이 정해지지 않았거나 넘으면 자동 게시를 거부', async () => {
   r.policy().publish = null;
@@ -534,7 +559,7 @@ test('REVIEW-03 파일 수·diff 상한·바이너리·큰 잠금 파일·submod
   assert.equal(result.coverage.omitted_files_with_reasons.filter(o => o.reason === 'file_limit').length, 3);
   assert.ok(result.coverage.limits_hit.includes('file_limit'));
   assert.match(r.gh.writes[0]!.body.body, /부분 검토/);
-  assert.match(r.gh.writes[0]!.body.body, /미검토 `vendor\/lib`: submodule_pointer/);
+  assert.match(r.gh.writes[0]!.body.body, /^- 못 본 파일 `vendor\/lib`: submodule_pointer$/m);
   // 모델도 제외 파일과 이유를 받는다. 없으면 참조된 파일을 "PR에 없다"고 오판한다.
   const sent = r.inputs.at(-1)!.untrusted;
   assert.deepEqual(sent.omitted, result.coverage.omitted_files_with_reasons);
@@ -795,7 +820,7 @@ test('DATA-01 게시 직전 현재 내부 표식으로 다시 분류하고, 모�
   r.reply({ status: 'succeeded', output: OUTPUT });
   await fullReview(pull({ updated_at: '2026-10-29T00:07:00Z' }));
   const hostileBody = r.gh.writes[0]!.body.body;
-  assert.ok(hostileBody.includes('- 미검토 `x?@\u200bfixture-org/admins?&lt;!--.bin`: binary'));
+  assert.ok(hostileBody.includes('- 못 본 파일 `x?@\u200bfixture-org/admins?&lt;!--.bin`: binary'));
   assert.equal(hostileBody.match(/<!--/g)!.length, 1);
 });
 
@@ -1372,7 +1397,7 @@ test('r2 P2-06 REVIEW-04 게시 대기 중 낮아진 지적 수·인라인 수·
   const body = r.gh.writes[0]!.body.body;
   assert.equal(body.match(/^\*\*\[P[0-3]\]/gm)!.length, 1);
   assert.ok(!body.includes('두 번째 지적'));
-  assert.match(body, /상한으로 1건 생략/);
+  assert.match(body, /게시 상한 때문에 1건은 싣지 않았어요/);
   assert.deepEqual(r.gh.writes[0]!.body.comments, []);
   await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,outbox CASCADE');
   r.policy().publish = POLICY.publish;
