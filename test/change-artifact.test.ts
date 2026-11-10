@@ -402,6 +402,8 @@ async function authorHarness(options: { items?: TarItem[] } = {}): Promise<Autho
     const send = () => f.port.callV2(endpoint, body, signal);
     return calls.intercept ? calls.intercept(endpoint, send) : send();
   }) as HttpTaskV2Worker['callV2'];
+  // 이 묶음은 판과 무관한 작성 port 동작을 옛 판 출력으로 본다. 받는 판을 알리지 않는 옛 port 모양이라 게시 서버가 옛 판을 보낸다(새 판은 c28 시험).
+  Object.defineProperty(counted, 'changeInstructions', { value: undefined });
   const v1 = new FakeTaskWorker();
   v1.call = (async (endpoint: string, body: unknown) => {
     const spec = TASK_ENDPOINTS[endpoint as '/v1/task/status'];

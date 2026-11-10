@@ -112,10 +112,11 @@ export const CHAT_TASK_TEXT = Object.freeze({
   taskQuestionFooter: (c: boolean, id: string, expires: string) => c
     ? `기한: ${expires}. 이 스레드에서 답을 말해 주세요. 답으로 도구 실행을 승인하거나 권한을 바꿀 수는 없어요.`
     : `기한: ${expires}. 이 스레드에서 /answer question:${id} 로 답해 주세요. 답으로 도구 실행을 승인하거나 권한을 바꿀 수는 없어요.`,
-  // 변경 질문. 켜짐 판도 /answer를 안내한다. 스레드에 그냥 말한 답은 답 경로(봉인·label 검사)를 거치지 않고 대화 기록으로 들어가
-  // private 답이 대화 모델에 샌다. 변경 질문의 자연어 답 경로를 만드는 C28이 이 줄을 바꾼다.
-  changeQuestionFooter: (_c: boolean, id: string, expires: string) =>
-    `기한: ${expires}. 이 스레드에서 /answer question:${id} 로 답해 주세요. 답으로 도구 실행을 승인하거나 권한을 바꿀 수는 없어요.`,
+  // 변경 질문. 켜짐 판은 선택지 버튼·"직접 답하기"와 함께 나가고, 수신이 owner의 다음 말을 저장 전에 봉인해 답 경로로 보낸다
+  // (change-question.ts, question-pick.ts). 꺼짐 판은 그 경로가 없어 그냥 말한 답이 봉인·label 검사 없이 대화 기록에 들어가므로 /answer를 안내한다.
+  changeQuestionFooter: (c: boolean, id: string, expires: string) => c
+    ? `기한: ${expires}. 버튼을 누르거나, 이 스레드에서 답을 말해도 돼요. 답으로 도구 실행을 승인하거나 권한을 바꿀 수는 없어요.`
+    : `기한: ${expires}. 이 스레드에서 /answer question:${id} 로 답해 주세요. 답으로 도구 실행을 승인하거나 권한을 바꿀 수는 없어요.`,
   answerInvalid: '답이 비었거나 너무 길어요.',
   questionMissing: '질문을 찾지 못했어요.',
   answerDuplicate: '이미 받은 답이에요.',

@@ -1,4 +1,5 @@
 import type { z } from 'zod';
+import { changeQuestionPost } from './change-question.js';
 import { CHAT_TASK_TEXT as T } from './chat-task-text.js';
 import { Denied, PolicyUnavailable } from './contracts.js';
 import type { Job, Scope } from './contracts.js';
@@ -120,8 +121,9 @@ export abstract class TaskBridge {
     });
   }
   // 질문을 만들고 job을 대기로 둔다. 구독이 멈췄거나 취소 요청이 먼저면 질문 없이 끝낸다. 대기에 들어갔으면 true.
-  // within: 호출자의 트랜잭션에 묶을 때 그 Store를 넘긴다.
-  protected async ask(job: Job, revision: string, id: string, threadId: string, turn: number, question: string, within: Store = this.store): Promise<boolean> {
+  // within: 호출자의 트랜잭션에 묶을 때 그 Store를 넘긴다. options: 변경 작성 판 질문의 선택지(2~4개, 공개 검사를 지난 것). 질문 행에 함께 둔다.
+  protected async ask(job: Job, revision: string, id: string, threadId: string, turn: number, question: string, within: Store = this.store,
+    options?: readonly string[]): Promise<boolean> {
     const expires = within.now() + this.questions.questionTtlMs;
     return within.atomic(async store => {
       const conversation = (await store.db.query<{ active: boolean }>('SELECT active FROM conversations WHERE id=$1 FOR UPDATE', [job.conversation_id])).rows[0];
@@ -132,15 +134,18 @@ export abstract class TaskBridge {
         WHERE id=$1 AND lease_token=$2 AND lease_until>$3 AND state IN ('running','verifying','cancel_requested') RETURNING state`,
       [job.id, job.lease_token, store.now(), store.now(), !!conversation?.active])).rows[0]?.state;
       if (state !== 'waiting_user') return false;
-      await store.db.query(`INSERT INTO codex_questions(id,job_id,conversation_id,thread_id,turn,kind,responder_id,prompt,state,created_at,expires_at)
-        VALUES ($1,$2,$3,$4,$5,'clarification',$6,$7,'open',$8,$9)`,
-      [id, job.id, job.conversation_id, threadId, turn, job.owner_id, question, store.now(), expires]);
-      // 변경 작성 job의 질문도 이 경로로 만든다. 그 답은 '/' answer와 label 서식으로만 받으므로 안내를 따로 둔다.
-      const footer = await changeAuthorJob(store.db, job.id) ? T.changeQuestionFooter : T.taskQuestionFooter;
+      await store.db.query(`INSERT INTO codex_questions(id,job_id,conversation_id,thread_id,turn,kind,responder_id,prompt,state,created_at,expires_at,options)
+        VALUES ($1,$2,$3,$4,$5,'clarification',$6,$7,'open',$8,$9,$10)`,
+      [id, job.id, job.conversation_id, threadId, turn, job.owner_id, question, store.now(), expires, options?.length ? JSON.stringify(options) : null]);
+      // 변경 작성 job의 질문도 이 경로로 만든다. 켜짐 판은 선택지 버튼과 "직접 답하기"를 달고(change-question.ts),
+      // 꺼짐 판은 '/' answer와 label 서식 안내만 둔다. 선택지는 판과 무관하게 질문 행에 저장한다.
+      const change = await changeAuthorJob(store.db, job.id);
+      const footer = change ? T.changeQuestionFooter : T.taskQuestionFooter;
+      const post = change && store.colleague ? changeQuestionPost(id, question, options) : { lines: [bounded(question, 500)], buttons: [] };
       await store.enqueue({ key: `${this.text.prefix}-question:${id}`, job: job.id, conversation: job.conversation_id, actor: job.owner_id,
         scope: job.target, revision, payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary', ownerCall: true,
-          content: [`${this.text.question} (질문 ID: ${id})`, bounded(question, 500),
-            footer(store.colleague, id, new Date(expires).toISOString())].join('\n') } });
+          content: [`${this.text.question} (질문 ID: ${id})`, ...post.lines,
+            footer(store.colleague, id, new Date(expires).toISOString())].join('\n'), ...(post.buttons.length ? { buttons: post.buttons } : {}) } });
       return true;
     });
   }

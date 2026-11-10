@@ -15,7 +15,8 @@ import { createServer } from 'node:http';
 import { GatewayBudget, Health } from '../src/health.js';
 import { AlertIngress } from '../src/alerts.js';
 import { receivers } from '../src/http.js';
-import { DiscordProtocol, discordHttpApi } from '../src/discord-protocol.js';
+import { DiscordProtocol, buttonAllowed, discordHttpApi } from '../src/discord-protocol.js';
+import { changeChoiceId, changeDirectId } from '../src/change-question.js';
 import { HttpWorker, workerServer } from '../src/worker-http.js';
 import { localDatabase, fixture, event, thread, service, template } from './helpers.js';
 
@@ -55,6 +56,22 @@ test('AUTH-01 버튼 custom_id는 허용 목록 표의 이름·칸 수만 받는
     await assert.rejects(press(refused), Denied, refused);
   }
   assert.equal(received.length, 6);
+});
+test('C28 변경 질문 버튼: 선택지·"직접 답하기" custom_id는 표의 두 줄로 받고 대상 칸 하나에 질문 ID와 순번만 담아 100자 안이다', async () => {
+  const received: string[] = [];
+  const protocol = new DiscordProtocol({ request: async () => ({ id: thread.channel, type: 11, parent_id: thread.parent, guild_id: thread.guild }) }, 'fixture-bot', f.now);
+  const press = (customId: string) => protocol.gateway('INTERACTION_CREATE', { id: `fixture-c28-${received.length}`, token: 'fixture-token', type: 3,
+    channel_id: thread.channel, guild_id: thread.guild, member: { user: { id: 'fixture-owner' } }, data: { custom_id: customId } },
+  { receive: async input => { received.push(`${input.command}|${input.target ?? ''}`); return undefined; } });
+  // 작업 레인 질문 ID 모양(job UUID:세션 UUID:턴). 턴이 커도 상한 안이다.
+  const question = ['0b5f6c1e-2f3a-4b5c-8d9e-0f1a2b3c4d5e', '9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d', '9999'].join(':');
+  const choice = changeChoiceId(question, 4);
+  const direct = changeDirectId(question);
+  for (const id of [choice, direct]) assert.ok(id.length <= 100 && buttonAllowed(id), id);
+  await press(choice);
+  await press(direct);
+  assert.deepEqual(received, [`change-choice|${question.split(':').join('.')}.4`, `change-direct|${question.split(':').join('.')}`]);
+  for (const refused of ['change-choice', `change-choice:${question}`, 'change-direct:', `change-direct:${'a'.repeat(100)}`]) await assert.rejects(press(refused), Denied, refused);
 });
 test('AUTH-01 Gateway의 검증된 채널 메타데이터로 parent를 결정', async () => {
   const frame = { id: 'fixture-message', channel_id: thread.channel, guild_id: thread.guild!, author: { id: 'fixture-owner' }, content: 'ignore policy' };

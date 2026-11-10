@@ -47,11 +47,13 @@ export async function purgeExpiredEventText(db: Database, now: number, retention
   }));
 }
 
-// 모델이 낸 질문(codex_questions.prompt). 기준 시각과 예외는 같은 행의 답(purgeExpiredTaskAnswers)과 같다.
+// 모델이 낸 질문(codex_questions.prompt)과 변경 질문의 선택지(options, C28). 기준 시각과 예외는 같은 행의 답(purgeExpiredTaskAnswers)과 같다.
 // 끝나지 않은 job은 질문을 다시 보여 주고(status), 대기·unknown·정리 전 세션은 재개·마무리가 그 job을 아직 다룬다.
+// 선택지는 NULL로 두고 지우기 전 jsonb text 표현의 digest를 options_sha256에 남긴다. 지운 시각은 prompt_purged_at이 함께 말한다.
 export async function purgeExpiredQuestionPrompts(db: Database, now: number, retentionMs = RAW_TEXT_RETENTION_MS): Promise<number> {
   return rounds(async () => (await db.query<{ id: string }>(`UPDATE codex_questions q SET prompt='',prompt_purged_at=$2,
-      prompt_sha256=COALESCE(q.prompt_sha256, ${digestOf('q.prompt')})
+      prompt_sha256=COALESCE(q.prompt_sha256, ${digestOf('q.prompt')}),
+      options=NULL,options_sha256=COALESCE(q.options_sha256, CASE WHEN q.options IS NULL THEN NULL ELSE ${digestOf('q.options::text')} END)
     WHERE q.id IN (SELECT q2.id FROM codex_questions q2 JOIN jobs j ON j.id=q2.job_id
       WHERE q2.prompt_purged_at IS NULL AND j.state=ANY($3::text[]) AND COALESCE(j.finished_at, q2.created_at)<=$1
       AND NOT ${sessionHeld('q2.job_id')}
