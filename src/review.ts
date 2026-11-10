@@ -638,8 +638,11 @@ export class ReviewRuntime {
     const keepalive = setInterval(() => { void this.store.heartbeat(asJob(job)).catch(() => {}); }, this.pollMs);
     try {
       const context = await this.policy.current();
-      const repo = context.review.repositories.find(r => String(r.id) === String(review.repo_id)
+      // 정책 목록 밖이면 Discord 리뷰 요청의 대상 기록으로만 통과한다. 그 세대는 다시 넣지 않는다(범위는 이 작업 하나).
+      const listed = context.review.repositories.find(r => String(r.id) === String(review.repo_id)
         && String(r.installationId) === String(review.installation_id) && r.fullName === review.repo_full_name);
+      const outside = listed ? undefined : requestedRepository(review);
+      const repo = listed ?? outside;
       if (!repo) { await this.close(job, review, 'cancelled', 'authorization_revoked'); return true; }
       if (context.revision !== review.policy_revision) { await this.close(job, review, 'superseded', 'policy_changed'); return true; }
       // 실행 직전 live PR로 head·base·닫힘·작성자를 다시 본다. webhook 내용만 믿지 않는다.
@@ -650,8 +653,8 @@ export class ReviewRuntime {
       if (stale) {
         await this.close(job, review, 'superseded', stale);
         // 늦게 온 옛 이벤트나 base 이동이면 live 세대를 같은 규칙으로 넣는다. 닫혔으면 남은 대기 작업도 정리한다.
-        if (pr.open) await this.queue.admitLive(pr, repo, context, 'live_check');
-        else await this.store.db.transaction(tx => this.queue.supersede(tx, repo.id, pr.number, stale));
+        if (pr.open && !outside) await this.queue.admitLive(pr, repo, context, 'live_check');
+        else if (!pr.open) await this.store.db.transaction(tx => this.queue.supersede(tx, repo.id, pr.number, stale));
         return true;
       }
       // trigger는 조회 중 댓글 명시 요청으로 승격될 수 있어 작업 시작 때 읽은 값을 쓰지 않는다.
@@ -673,11 +676,12 @@ export class ReviewRuntime {
         policyRevision: context.revision, instructions: SERVER_REVIEW_INSTRUCTIONS, timeoutMs: DEFAULTS.taskTimeoutMs });
       // 원격 조회 동안 바뀐 권한·정책을 capability 발급 직전에 최신 정책으로 다시 본다(D-16 모델 호출 전 허용 확인).
       const fresh = await this.policy.current();
-      const freshRepo = fresh.review.repositories.find(r => r.id === repo.id && r.installationId === repo.installationId && r.fullName === repo.fullName);
+      const freshRepo = fresh.review.repositories.find(r => r.id === repo.id && r.installationId === repo.installationId && r.fullName === repo.fullName)
+        ?? outside;
       if (!freshRepo) { await this.close(job, review, 'cancelled', 'authorization_revoked'); return true; }
       if (fresh.revision !== review.policy_revision) {
         await this.close(job, review, 'superseded', 'policy_changed');
-        await this.queue.admitLive(pr, freshRepo, fresh, 'live_check');
+        if (!outside) await this.queue.admitLive(pr, freshRepo, fresh, 'live_check');
         return true;
       }
       const revoked = pullRequestDecision(pr, freshRepo, fresh.review, await this.explicit(job.id));
@@ -948,7 +952,7 @@ export class ReviewPublisher {
       if (stale) {
         await this.state(row, 'superseded', stale);
         // 게시하지 못한 채 밀려났으므로 live 세대를 같은 규칙으로 넣는다(아직 게시된 리뷰가 없으면 base 이동도 재리뷰).
-        if (pr.open) await this.queue.admitLive(pr, repo, context, 'live_check');
+        if (pr.open && context.review.repositories.includes(repo)) await this.queue.admitLive(pr, repo, context, 'live_check');
         return true;
       }
       if (pr.head.repoId !== pr.base.repoId || !authorAllowed(pr.author, context.review)) { await this.state(row, 'blocked', 'author_denied'); return true; }
@@ -994,10 +998,12 @@ export class ReviewPublisher {
   // 이 정책으로 게시해도 되는지 본다. 되면 row.body·comments를 이 정책으로 다시 렌더링해 허용 저장소를 돌려주고,
   // 안 되면 게시 행 상태를 바꾸고 undefined를 돌려준다.
   private async publishable(row: DeliveryRow, context: ReviewContext): Promise<ReviewPolicy['repositories'][number] | undefined> {
-    const saved = (await this.store.db.query<{ result: ReviewResult | null; positions: { path: string; lines: number[] }[] | null; installation_id: string }>(
-      'SELECT result,positions,installation_id FROM pr_reviews WHERE job_id=$1', [row.job_id])).rows[0];
+    const saved = (await this.store.db.query<{ result: ReviewResult | null; positions: { path: string; lines: number[] }[] | null; installation_id: string;
+      request_target: unknown }>('SELECT result,positions,installation_id,request_target FROM pr_reviews WHERE job_id=$1', [row.job_id])).rows[0];
+    // 정책 목록 밖이면 Discord 리뷰 요청의 대상 기록으로만 통과한다(실행 직전 판단과 같은 규칙).
     const repo = context.review.repositories.find(r => String(r.id) === String(row.repo_id) && r.fullName === row.repo_full_name
-      && String(r.installationId) === String(saved?.installation_id));
+      && String(r.installationId) === String(saved?.installation_id))
+      ?? (saved ? requestedRepository({ ...saved, repo_id: row.repo_id, repo_full_name: row.repo_full_name }) : undefined);
     if (!repo) { await this.state(row, 'blocked', 'authorization_revoked'); return; }
     if (!sameReviewContent(row.policy_revision, context)) { await this.state(row, 'superseded', 'policy_changed'); return; }
     if (!context.review.publish) { await this.state(row, 'blocked', 'publish_limits_unset'); return; }

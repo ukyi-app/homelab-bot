@@ -130,3 +130,21 @@ test('C30 정책 목록의 조직 저장소 PR 리뷰 부탁은 확인 버튼 �
   assert.equal(w.gh.writes[0]!.body.event, 'COMMENT');
   assert.equal(w.gh.writes[0]!.path, `/repos/${LISTED.fullName}/pulls/7/reviews`);
 });
+
+test('C30 정책 목록 밖이지만 리뷰 App이 설치된 조직 저장소 PR도 그 작업 하나로 리뷰하고 COMMENT를 게시한다(짧은 꼴 owner/repo#번호)', async () => {
+  const w = await wired();
+  w.gh.installed.set(OUTSIDE.fullName, OUTSIDE);
+  w.gh.pulls.set(`${OUTSIDE.fullName}#12`, pull(OUTSIDE, { number: 12 }));
+  await w.ask(`${OUTSIDE.fullName}#12 리뷰 부탁해요`, `${OUTSIDE.fullName}#12`);
+  noButtons(w.h);
+  assert.equal(lastPosted(w), REVIEW_REQUEST_TEXT.started(OUTSIDE.fullName, 12));
+  assert.deepEqual((await w.reviews()).map(r => [r.repo_full_name, r.state]), [[OUTSIDE.fullName, 'queued']]);
+  assert.equal(await w.runtime.tick(), true);
+  assert.deepEqual((await w.reviews()).map(r => r.state), ['succeeded']);
+  await w.publisher.deliver();
+  assert.equal(w.gh.writes.length, 1);
+  assert.deepEqual([w.gh.writes[0]!.path, w.gh.writes[0]!.body.event, w.gh.writes[0]!.body.commit_id],
+    [`/repos/${OUTSIDE.fullName}/pulls/12/reviews`, 'COMMENT', HEAD]);
+  // 정책 목록은 그대로다(자동 리뷰 대상을 넓히지 않는다).
+  assert.deepEqual((w.h.f.policy.review as ReviewPolicy).repositories, [LISTED]);
+});
