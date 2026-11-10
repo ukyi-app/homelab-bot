@@ -7,7 +7,7 @@ import type { Log } from './log.js';
 import type { Store } from './store.js';
 
 // owner 메시지 하나에 봇이 달아 두는 반응. 상태마다 붙어 있어야 할 봇 반응 전체를 적는다.
-// 상태를 더할 때(👍 C11, 💤 C20)는 이 표와 아래 FROM에 이름만 더한다. 동기화는 지금 붙은 것과 비교해 필요한 것만 더하고 지운다.
+// 상태를 더할 때(💤 C20)는 이 표와 아래 FROM에 이름만 더한다. 동기화는 지금 붙은 것과 비교해 필요한 것만 더하고 지운다.
 export const REACTIONS = {
   received: ['👀'],
   waiting: ['👀', '⏳'],
