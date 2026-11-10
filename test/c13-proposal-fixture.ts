@@ -3,6 +3,7 @@ import type { Proposal } from '../src/contracts.js';
 import type { Database } from '../src/database.js';
 import { ALL_COMMANDS, DiscordIngress } from '../src/discord.js';
 import { DiscordProtocol } from '../src/discord-protocol.js';
+import type { Store } from '../src/store.js';
 import { TaskCommands } from '../src/task-commands.js';
 import { fixture, thread } from './helpers.js';
 import { lane } from './task-lane-fixture.js';
@@ -42,9 +43,11 @@ export async function harness(db: Database, options: { colleague?: boolean } = {
       while (await f.publisher.deliver()) { /* 쌓인 게시를 비운다 */ }
     },
     // 버튼 상호작용(Gateway INTERACTION_CREATE type 3). 누를 때마다 새 상호작용 ID다.
-    press: (customId: string, actor = f.policy.owner) => protocol.gateway('INTERACTION_CREATE', { id: `fixture-interaction-${++interactions}`,
+    press: (customId: string, actor = f.policy.owner, via: DiscordIngress = ingress) => protocol.gateway('INTERACTION_CREATE', { id: `fixture-interaction-${++interactions}`,
       token: 'fixture-interaction-token', type: 3, channel_id: thread.channel, guild_id: thread.guild, member: { user: { id: actor } },
-      data: { custom_id: customId } }, ingress),
+      data: { custom_id: customId } }, via),
+    // 같은 처리기를 쓰는 다른 수신(다른 게시 서버 인스턴스·다른 DB 연결).
+    ingressOn: (store: Store) => new DiscordIngress(store, f.gate, protocol, true, ALL_COMMANDS, () => {}, undefined, handler),
     // 마지막으로 게시된 버튼 글과 그 버튼들.
     buttons: () => {
       const posted = f.rest.messages.filter(m => m.body.components?.length);

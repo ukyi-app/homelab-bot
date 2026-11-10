@@ -42,6 +42,20 @@ test('AUTH-01 미허용 사용자·guild·채널·스레드·DM·버튼을 저�
   await f.ingress.receive(event('webhook', { webhook: true }));
   assert.equal((await rows('events')).length, 0);
 });
+// 버튼 custom_id 허용 목록(discord-protocol BUTTONS). 표에 없는 이름, 칸 수가 다른 값, 빈 칸, 100자 초과는 수신 전에 닫는다.
+test('AUTH-01 버튼 custom_id는 허용 목록 표의 이름·칸 수만 받는다', async () => {
+  const received: string[] = [];
+  const protocol = new DiscordProtocol({ request: async () => ({ id: thread.channel, type: 11, parent_id: thread.parent, guild_id: thread.guild }) }, 'fixture-bot', f.now);
+  const press = (customId: string) => protocol.gateway('INTERACTION_CREATE', { id: `fixture-${received.length}-${customId.length}`, token: 'fixture-token', type: 3,
+    channel_id: thread.channel, guild_id: thread.guild, member: { user: { id: 'fixture-owner' } }, data: { custom_id: customId } },
+  { receive: async input => { received.push(`${input.command}|${input.target ?? ''}`); return undefined; } });
+  for (const accepted of ['list', 'stop', 'resume', 'cancel:fixture-job', 'proposal-yes:fixture-proposal', 'proposal-no:fixture-proposal']) await press(accepted);
+  assert.deepEqual(received, ['list|', 'stop|', 'resume|', 'cancel|fixture-job', 'proposal-yes|fixture-proposal', 'proposal-no|fixture-proposal']);
+  for (const refused of ['retry:fixture-job', 'cancel', 'list:extra', 'proposal-yes', 'proposal-yes:a:b', 'cancel:', `proposal-yes:${'a'.repeat(100)}`]) {
+    await assert.rejects(press(refused), Denied, refused);
+  }
+  assert.equal(received.length, 6);
+});
 test('AUTH-01 Gateway의 검증된 채널 메타데이터로 parent를 결정', async () => {
   const frame = { id: 'fixture-message', channel_id: thread.channel, guild_id: thread.guild!, author: { id: 'fixture-owner' }, content: 'ignore policy' };
   await assert.rejects(gatewayMessage(frame, 'fixture-bot', async () => ({ type: 11, parent_id: 'fixture-chat', guild_id: 'other' })), Denied);
