@@ -43,7 +43,9 @@ export interface ChangeWorkerFixture {
   raw(endpoint: string, body: unknown, token?: string): Promise<{ status: number; json: any }>;
   signed(endpoint: TaskV2Endpoint, body: unknown): Promise<{ status: number; json: any }>;
 }
-export async function changeWorkerFixture(options: { items?: TarItem[]; currentItems?: () => TarItem[]; verifier?: Partial<VerifierOptions>; change?: boolean } = {}): Promise<ChangeWorkerFixture> {
+export async function changeWorkerFixture(options: { items?: TarItem[]; currentItems?: () => TarItem[]; verifier?: Partial<VerifierOptions>; change?: boolean;
+  // 게시 서버 서명 시계. 두 요청을 같은 밀리초에 서명시키는 시험이 쓴다.
+  signerNow?: () => number; } = {}): Promise<ChangeWorkerFixture> {
   const base = await realpath(await mkdtemp(join(tmpdir(), 't19-b1-')));
   const fake = join(base, 'fake');
   const credential = join(base, 'credential');
@@ -58,7 +60,7 @@ export async function changeWorkerFixture(options: { items?: TarItem[]; currentI
   await writeFile(join(fake, 'version.txt'), '2.1.308 (Claude Code)\n');
   await writeFile(join(fake, 'script.json'), JSON.stringify([COMPLETED]));
   const keys = generateKeyPairSync('ed25519');
-  const signer = new TaskWorkerSigner(keys.privateKey);
+  const signer = new TaskWorkerSigner(keys.privateKey, options.signerNow);
   const cleanup = new FakeCleanup(join(fake, 'pids'));
   const items = options.items ?? BASE_ITEMS;
   const archiveUrls: string[] = [];

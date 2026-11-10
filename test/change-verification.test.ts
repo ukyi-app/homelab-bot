@@ -419,12 +419,42 @@ test('검증 port: 세션이 없거나 거부되면 not_run, 기다림이 끝나
   assert.equal((await noSession.run(portInput)).status, 'not_run');
   assert.equal(await noSession.fetchReceipt({ key: portInput.key, commandId: 'smoke-unit' }), null);
   assert.equal((await portWith({}, { control: async () => ({ ...control, worker: null }) }).run(portInput)).status, 'not_run', '작업자를 모른다');
-  assert.equal((await portWith({ verify: async () => { throw new TaskWorkerRejected(); } }).run(portInput)).status, 'not_run');
+  const neverStarted = { verify: async () => { throw new TaskWorkerRejected(); }, verification: async () => fakeReply('absent') };
+  assert.equal((await portWith(neverStarted).run(portInput)).status, 'not_run', '거부되고 작업자도 모른다');
   assert.equal((await portWith({ verify: async () => fakeReply('absent') }).run(portInput)).status, 'unknown');
   assert.equal((await portWith({}).run(portInput)).status, 'unknown', '시한');
-  const receipt = await portWith({ verify: async () => { throw new TaskWorkerRejected(); } }).run(portInput);
+  assert.equal((await portWith({ verify: async () => { throw new TaskWorkerRejected(); }, verification: async () => { throw new Error('connection reset'); } }).run(portInput)).status, 'unknown', '거부 뒤 재조회가 끝내 닿지 않으면 시작 여부를 모른다');
+  const receipt = await portWith(neverStarted).run(portInput);
   assert.deepEqual([receipt.exitCode, receipt.logDigest, receipt.timedOut], [null, null, false]);
   await assert.rejects(portWith({}).run({ ...portInput, commandId: 'Bad Id; rm -rf' }), /verification_input_invalid/, '셸 문자열은 ID가 아니다');
+});
+
+test('검증 port C33: 시작 요청이 거부돼도 작업자가 그 command를 돌리는 중이거나 끝냈으면 그 결과를 따른다', async () => {
+  for (const [name, replies] of [['running 뒤 done', ['running', 'done']], ['바로 done', ['done']]] as const) {
+    let starts = 0;
+    let polls = 0;
+    const port = portWith({ verify: async () => { starts++; throw new TaskWorkerRejected(); },
+      verification: async () => { const status = replies[Math.min(polls++, replies.length - 1)]!; return status === 'done' ? fakeReply('done', passedReceipt) : fakeReply(status); } });
+    assert.deepEqual(await port.run(portInput), passedReceipt, name);
+    assert.equal(starts, 1, `${name}: 다시 보내지 않는다`);
+  }
+});
+
+test('검증 port C33: 거부 뒤 작업자가 모르면 답한 작업자 신원으로 한 번만 다시 보낸다. 받아들이면 그 시험을 기다리고, 또 거부되면 not_run이다', async () => {
+  const moved = { instance: 'i-new', storage: 's' };
+  const absentAt = (worker: { instance: string; storage: string }) => ({ ...fakeReply('absent'), worker }) as TaskV2VerificationResponse;
+  const sent: string[] = [];
+  let polls = 0;
+  const accepted = portWith({
+    verify: async target => { sent.push(target.worker.instance); if (sent.length === 1) throw new TaskWorkerRejected(); return fakeReply('running'); },
+    verification: async () => (++polls === 1 ? absentAt(moved) : fakeReply('done', passedReceipt)) });
+  assert.deepEqual(await accepted.run(portInput), passedReceipt);
+  assert.deepEqual(sent, ['i', 'i-new'], '두 번째는 재조회가 알려 준 신원으로 보낸다');
+
+  const refused: string[] = [];
+  const port = portWith({ verify: async target => { refused.push(target.worker.instance); throw new TaskWorkerRejected(); }, verification: async () => absentAt(moved) });
+  assert.equal((await port.run(portInput)).status, 'not_run');
+  assert.deepEqual(refused, ['i', 'i-new'], '다시 보내는 것은 한 번뿐이다');
 });
 
 test('검증 port: 작업 중 keepalive를 부른다', async () => {
