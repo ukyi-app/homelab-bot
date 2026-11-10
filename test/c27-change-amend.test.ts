@@ -2,6 +2,7 @@ import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AMENDMENT_REQUEST_TEXT, discussionMaterials } from '../src/change-commands.js';
 import { CHANGE_AMENDMENT } from '../src/change-contracts.js';
+import { AMENDMENT_TEXT } from '../src/change-runtime.js';
 import { ChatReplySchema, PROPOSAL_RUN_ACTIONS } from '../src/contracts.js';
 import type { PullDiscussion } from '../src/github-review-io.js';
 import { actions, notifyThread, TRUNCATE } from './c14-actions-fixture.js';
@@ -196,4 +197,17 @@ test('C27 리뷰 경로 없음: PR 리뷰·댓글 읽기가 없으면 수정 요
   assert.equal(body(a.buttons().content), `${REPO.fullName}에 이 변경 PR을 준비할까요?`);
   await a.press(a.buttons().ids[0]!);
   assert.equal((await database.db.query('SELECT id FROM change_requests')).rows.length, 2);
+});
+
+test("C27 문구: 수정 요청·결과 문구는 동료 말투(해요체)이고 '/' 명령 이름이 없다(C18 검사 방식)", () => {
+  const slashName = /(^|[^\p{L}\p{N}])\/[a-z][a-z-]*/u;
+  const texts = [...Object.values(AMENDMENT_REQUEST_TEXT).map(text => typeof text === 'string' ? text : (text as (...values: unknown[]) => string)(REPO.fullName, 7, 3)),
+    AMENDMENT_TEXT.committed(7, 1, 2, 1, 1, 3), AMENDMENT_TEXT.checks, AMENDMENT_TEXT.risks,
+    ...['head_changed', 'verification_failed', 'review_blocked', 'policy_changed', 'fixture_unknown_reason'].map(reason => AMENDMENT_TEXT.failed(7, 1, reason))];
+  for (const text of texts) {
+    assert.doesNotMatch(text, slashName, text);
+    assert.doesNotMatch(text, /니다|봇/, text);
+  }
+  // 문장으로 끝나는 안내는 해요체다(목록 머리 두 줄은 문장이 아니다).
+  for (const text of texts.filter(text => !text.endsWith(':'))) assert.match(text, /요[.?]?$|사유 코드: [a-z_]+\.$/, text);
 });
