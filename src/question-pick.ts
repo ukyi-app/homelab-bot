@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Scope } from './contracts.js';
+import { publicAnswer } from './change-question.js';
 import { controlText } from './control-format.js';
 import type { Database } from './database.js';
 import type { OutboxButton, Store } from './store.js';
@@ -26,40 +27,68 @@ export const QUESTION_PICK_TEXT = Object.freeze({
     ...previews.map((preview, index) => `${index + 1}. ${preview}`)].join('\n'),
   button: (index: number) => `${index + 1}번 질문`,
   answered: (status: string, number: number) => `${status} (${number}번 질문)`,
+  // 변경 질문이 함께 열려 있어 방금 말을 봉인한 경우. 말은 답으로 쓰지 않았고, 고른 뒤 다시 말하면 그 질문의 답이 된다.
+  choose: (previews: readonly string[]) => ['열린 질문이 여러 개라 방금 말은 답으로 쓰지 않았어요. 어느 질문에 답할지 먼저 골라 주세요.',
+    ...previews.map((preview, index) => `${index + 1}. ${preview}`)].join('\n'),
+  chosen: (number: number) => `${number}번 질문을 골랐어요. 이 스레드에 답을 말해 주세요.`,
   missing: '이미 처리했거나 이 대화에서 찾을 수 없는 선택이에요.',
   notOwner: '질문을 받은 사람만 고를 수 있어요.',
   purged: '보존 기간이 지나 답으로 쓸 말을 지웠어요. 이 스레드에서 다시 말해 주세요.',
 });
 
-// 질문 종류. 바로 답을 받는 종류만 DIRECT에 둔다. 변경(CHANGE) 질문은 '/' answer와 label 서식으로만 받는다(선택지와 다음 말 답은 C28).
+// 질문 종류. 바로 답을 받는 종류만 DIRECT에 둔다. 변경(CHANGE) 질문의 답은 원문을 events에 두지 않는다(처리기의 sealsAnswer).
+// 그래서 그 답이 될 수 있는 말은 수신이 저장 전에 봉인하고(sealsNextMessage), 답에는 공개 표시를 붙인다(change-question.ts publicAnswer).
 export type QuestionKind = 'task' | 'change';
-const DIRECT: ReadonlySet<QuestionKind> = new Set<QuestionKind>(['task']);
+const DIRECT: ReadonlySet<QuestionKind> = new Set<QuestionKind>(['task', 'change']);
 async function questionKind(tasks: TaskCommandHandler, db: Database, question: string): Promise<QuestionKind> {
   return await tasks.sealsAnswer?.(db, question) === true ? 'change' : 'task';
 }
-async function directQuestions(store: Store, tasks: TaskCommandHandler, conversation: string, actor: string): Promise<OpenQuestion[]> {
+// 봉인한 말로 고르기를 연 뒤 owner가 고른 질문. 대화마다 하나이고 값에는 ID만 둔다. 그 질문이 열려 있는 동안 다음 말의 대상이다.
+const CHOSEN = 'question-chosen:';
+interface DirectQuestion extends OpenQuestion { kind: QuestionKind }
+async function directQuestions(store: Store, tasks: TaskCommandHandler, conversation: string, actor: string): Promise<DirectQuestion[]> {
   const open = await openTaskQuestions(store.db, conversation, actor, store.now());
-  const direct: OpenQuestion[] = [];
-  for (const question of open) if (DIRECT.has(await questionKind(tasks, store.db, question.id))) direct.push(question);
-  return direct;
+  const direct: DirectQuestion[] = [];
+  for (const question of open) {
+    const kind = await questionKind(tasks, store.db, question.id);
+    if (DIRECT.has(kind)) direct.push({ ...question, kind });
+  }
+  const chosen = (await store.db.query<{ value: { question: string; owner: string } }>('SELECT value FROM controls WHERE key=$1', [CHOSEN + conversation])).rows[0]?.value;
+  const picked = chosen?.owner === actor ? direct.find(question => question.id === chosen.question) : undefined;
+  return picked ? [picked] : direct;
+}
+// 이 사람이 이 대화에 보낸 다음 말이 변경 질문의 답이 될 수 있는가(답이 되든 고르기로 가든). 수신이 저장 전에 묻고, 참이면 원문을 비워 저장한다.
+// 잠그지 않는다. 수신 트랜잭션의 offerAnswer가 같은 사실을 잠근 채 다시 보고, 그사이 바뀐 경우를 맞춘다.
+export async function sealsNextMessage(store: Store, tasks: TaskCommandHandler, conversation: string, actor: string): Promise<boolean> {
+  return (await directQuestions(store, tasks, conversation, actor)).some(question => question.kind === 'change');
 }
 const preview = (prompt: string) => {
   const flat = Array.from(prompt.replace(/\s+/g, ' ').trim());
   return flat.length > PREVIEW_CHARS ? `${flat.slice(0, PREVIEW_CHARS).join('')}…` : flat.join('');
 };
 
-export interface OfferInput { event: string; message: string; actor: string; scope: Scope; conversation: string; text: string; revision: string }
+// sealed: 수신이 이 말의 원문을 비워 저장했다(sealsNextMessage). 원문은 text로만 온다.
+export interface OfferInput { event: string; message: string; actor: string; scope: Scope; conversation: string; text: string; revision: string; sealed?: boolean }
 // 수신 트랜잭션 안에서 부른다(대화 행을 잠근 뒤, 같은 이벤트는 inbox.accepted가 한 번만 들여보낸다).
 // undefined면 바로 답 대상이 아니라 호출자가 지금처럼 대화로 처리한다. 'answered'·'picking'이면 대화 작업을 만들지 않는다.
 export async function offerAnswer(store: Store, tasks: TaskCommandHandler, input: OfferInput): Promise<'answered' | 'picking' | undefined> {
   if (!input.text.trim()) return;
   const questions = await directQuestions(store, tasks, input.conversation, input.actor);
   if (!questions.length) return;
+  const change = questions.some(question => question.kind === 'change');
+  // 저장 전 판단 뒤에 변경 질문이 열렸으면(버퍼 재생 포함) 원문이 events에 있다. 답 경로로 보내기 전에 여기서 비운다.
+  if (change && !input.sealed) await store.db.query(`UPDATE events SET payload=jsonb_set(payload,'{text}','""'::jsonb) WHERE id=$1`, [input.event]);
   if (questions.length === 1) {
-    const result = await tasks.answerIn(store, { question: questions[0]!.id, actor: input.actor, scope: input.scope, text: input.text, event: input.message });
+    const question = questions[0]!;
+    const text = question.kind === 'change' ? publicAnswer(input.text) : input.text;
+    const result = await tasks.answerIn(store, { question: question.id, actor: input.actor, scope: input.scope, text, event: input.message });
+    if (result.ok) await store.db.query('DELETE FROM controls WHERE key=$1', [CHOSEN + input.conversation]);
     await notify(store, input, `answer:${input.event}`, controlText('answer', result, store.colleague));
     return 'answered';
   }
+  // 봉인한 말은 고르기 동안 들고 있을 자리가 없다(events에 두지 않고, 고르기 행에는 ID만 둔다). 그래서 이 말은 답으로 쓰지 않고
+  // 어느 질문에 답할지 먼저 고르게 한다. 고르면 그 질문이 다음 말의 대상이 된다(CHOSEN).
+  const sealed = change || input.sealed === true;
   // 닫힌 질문을 가리키는 옛 고르기 행은 새 고르기를 만들 때 지운다(누르지 않은 채 질문이 닫힌 경우).
   await store.db.query(`DELETE FROM controls WHERE key LIKE '${KEY}%' AND value->>'conversation'=$1
     AND NOT EXISTS (SELECT 1 FROM codex_questions q WHERE q.id=controls.value->>'question' AND q.state='open')`, [input.conversation]);
@@ -68,10 +97,11 @@ export async function offerAnswer(store: Store, tasks: TaskCommandHandler, input
   for (const [index, question] of shown.entries()) {
     const id = randomUUID();
     await store.db.query('INSERT INTO controls VALUES ($1,$2)', [KEY + id, JSON.stringify({ pick: input.event, message: input.message,
-      question: question.id, conversation: input.conversation, owner: input.actor, number: index + 1 })]);
+      question: question.id, conversation: input.conversation, owner: input.actor, number: index + 1, ...(sealed ? { sealed: true } : {}) })]);
     buttons.push({ id: KEY + id, label: QUESTION_PICK_TEXT.button(index), style: 'secondary' });
   }
-  await notify(store, input, `question-pick:${input.event}`, QUESTION_PICK_TEXT.prompt(shown.map(question => preview(question.prompt))), buttons);
+  const previews = shown.map(question => preview(question.prompt));
+  await notify(store, input, `question-pick:${input.event}`, sealed ? QUESTION_PICK_TEXT.choose(previews) : QUESTION_PICK_TEXT.prompt(previews), buttons);
   return 'picking';
 }
 async function notify(store: Store, input: OfferInput, key: string, content: string, buttons?: OutboxButton[]): Promise<void> {
@@ -79,7 +109,7 @@ async function notify(store: Store, input: OfferInput, key: string, content: str
     payload: { kind: 'message', channel: input.scope.channel, content, classification: 'safe_summary', replyTo: input.message, ...(buttons ? { buttons } : {}) } });
 }
 
-interface PickRow { pick: string; message: string; question: string; conversation: string; owner: string; number: number }
+interface PickRow { pick: string; message: string; question: string; conversation: string; owner: string; number: number; sealed?: boolean }
 export interface PickInput { button: string; actor: string; scope: Scope }
 // update: 응답으로 그 글을 바꾸고 버튼을 없앤다. false면 본인만 보는 응답이고 버튼은 남는다(다른 질문을 고를 수 있다).
 export interface PickOutcome { content: string; update: boolean }
@@ -93,6 +123,15 @@ export async function pressQuestionPick(store: Store, tasks: TaskCommandHandler,
   if (!row || row.conversation !== conversation.id) return { content: QUESTION_PICK_TEXT.missing, update: false };
   if (row.owner !== input.actor) return { content: QUESTION_PICK_TEXT.notOwner, update: false };
   const settle = () => store.db.query(`DELETE FROM controls WHERE key LIKE '${KEY}%' AND value->>'pick'=$1`, [row.pick]);
+  if (row.sealed) {
+    // 봉인한 말은 원문이 없어 답으로 붙이지 않는다. 그 질문이 이 사람에게 아직 열려 있으면 다음 말의 대상으로 적는다.
+    const open = await openTaskQuestions(store.db, conversation.id, input.actor, store.now());
+    if (!open.some(question => question.id === row.question)) return { content: QUESTION_PICK_TEXT.missing, update: false };
+    await store.db.query(`INSERT INTO controls VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`,
+      [CHOSEN + conversation.id, JSON.stringify({ question: row.question, owner: input.actor })]);
+    await settle();
+    return { content: QUESTION_PICK_TEXT.chosen(row.number), update: true };
+  }
   // 그 말이 같은 스레드에서 같은 owner가 보낸 것인지 저장된 이벤트로 다시 본다.
   const message = (await store.db.query<{ actor_id: string; conversation_id: string; text: string | null; text_purged_at: string | null }>(
     `SELECT actor_id,conversation_id,payload->>'text' AS text,text_purged_at FROM events WHERE id=$1`, [row.pick])).rows[0];

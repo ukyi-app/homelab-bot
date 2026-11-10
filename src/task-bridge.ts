@@ -1,4 +1,5 @@
 import type { z } from 'zod';
+import { changeQuestionPost } from './change-question.js';
 import { CHAT_TASK_TEXT as T } from './chat-task-text.js';
 import { Denied, PolicyUnavailable } from './contracts.js';
 import type { Job, Scope } from './contracts.js';
@@ -136,12 +137,15 @@ export abstract class TaskBridge {
       await store.db.query(`INSERT INTO codex_questions(id,job_id,conversation_id,thread_id,turn,kind,responder_id,prompt,state,created_at,expires_at,options)
         VALUES ($1,$2,$3,$4,$5,'clarification',$6,$7,'open',$8,$9,$10)`,
       [id, job.id, job.conversation_id, threadId, turn, job.owner_id, question, store.now(), expires, options?.length ? JSON.stringify(options) : null]);
-      // 변경 작성 job의 질문도 이 경로로 만든다. 그 답은 '/' answer와 label 서식으로만 받으므로 안내를 따로 둔다.
-      const footer = await changeAuthorJob(store.db, job.id) ? T.changeQuestionFooter : T.taskQuestionFooter;
+      // 변경 작성 job의 질문도 이 경로로 만든다. 켜짐 판은 선택지 버튼과 "직접 답하기"를 달고(change-question.ts),
+      // 꺼짐 판은 '/' answer와 label 서식 안내만 둔다. 선택지는 판과 무관하게 질문 행에 저장한다.
+      const change = await changeAuthorJob(store.db, job.id);
+      const footer = change ? T.changeQuestionFooter : T.taskQuestionFooter;
+      const post = change && store.colleague ? changeQuestionPost(id, question, options) : { lines: [bounded(question, 500)], buttons: [] };
       await store.enqueue({ key: `${this.text.prefix}-question:${id}`, job: job.id, conversation: job.conversation_id, actor: job.owner_id,
         scope: job.target, revision, payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary', ownerCall: true,
-          content: [`${this.text.question} (질문 ID: ${id})`, bounded(question, 500),
-            footer(store.colleague, id, new Date(expires).toISOString())].join('\n') } });
+          content: [`${this.text.question} (질문 ID: ${id})`, ...post.lines,
+            footer(store.colleague, id, new Date(expires).toISOString())].join('\n'), ...(post.buttons.length ? { buttons: post.buttons } : {}) } });
       return true;
     });
   }

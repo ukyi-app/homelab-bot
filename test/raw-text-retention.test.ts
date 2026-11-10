@@ -270,6 +270,26 @@ test('모델 질문·결과: 작업이 끝난 뒤 7일 cutoff 직전에는 남�
   } finally { await s.close(); }
 });
 
+test('C28 변경 질문 선택지: 질문과 같은 7일 기준으로 선택지를 비우고 digest를 남긴다. 끝나지 않은 작업의 선택지와 선택지 없는 질문은 그대로다', async () => {
+  const s = await setup();
+  try {
+    const options = ['src 설정을 고친다 ✓', 'README만 고친다'];
+    const done = await seed(s.db, 'done', { job: { state: 'succeeded', session: { state: 'completed', cleanup: 'cleaned' } } });
+    const waiting = await seed(s.db, 'waiting', { job: { state: 'waiting_user', finishedAt: null, session: { state: 'waiting_answer' } } });
+    const plain = await seed(s.db, 'plain', { job: { state: 'succeeded', session: { state: 'completed', cleanup: 'cleaned' } } });
+    for (const row of [done, waiting]) await s.db.query('UPDATE codex_questions SET options=$2::jsonb WHERE id=$1', [row.question, JSON.stringify(options)]);
+    const optionsRow = async (question: string) => (await s.db.query<{ options: string[] | null; options_sha256: string | null }>(
+      'SELECT options,options_sha256 FROM codex_questions WHERE id=$1', [question])).rows[0]!;
+    assert.equal(await purgeExpiredQuestionPrompts(s.db, T + RAW_TEXT_RETENTION_MS - 1), 0, 'cutoff 1ms 전');
+    assert.deepEqual((await optionsRow(done.question!)).options, options);
+    assert.equal(await purgeExpiredQuestionPrompts(s.db, T + 30 * DAY), 2);
+    // digest는 지울 때 DB가 jsonb의 text 표현에서 계산한다.
+    assert.deepEqual(await optionsRow(done.question!), { options: null, options_sha256: sha('["src 설정을 고친다 ✓", "README만 고친다"]') });
+    assert.deepEqual(await optionsRow(plain.question!), { options: null, options_sha256: null }, '선택지 없는 질문은 digest도 없다');
+    assert.deepEqual(await optionsRow(waiting.question!), { options, options_sha256: null }, '답을 기다리는 작업의 선택지는 남는다');
+  } finally { await s.close(); }
+});
+
 test('모델 질문·결과: 끝나지 않은 작업과 재개·마무리가 아직 다루는 세션의 행은 오래돼도 남는다(T27 질문 답과 같은 조건)', async () => {
   const s = await setup();
   try {
