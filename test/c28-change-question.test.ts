@@ -8,6 +8,7 @@ import { OTHER_THREAD, REQUEST_TEXT, THREAD, WRITE_STEP, changeHarness } from '.
 import type { Harness } from './change-assembly-harness.js';
 import { OWNER } from './change-store-fixture.js';
 import { CHANGE_QUESTION_TEXT, changeChoiceId, changeDirectId } from '../src/change-question.js';
+import { QUESTION_PICK_TEXT } from '../src/question-pick.js';
 import { localDatabase } from './helpers.js';
 import type { Step } from './task-worker-harness.js';
 
@@ -279,15 +280,47 @@ test('C28 꺼짐: 변경 질문이 열려 있어도 다음 말은 답이 아니�
   });
 });
 
-test('C28 다음 말(history gap 중): 봉인한 말은 복구 버퍼에 두지 않고 바로 답 경로로 보내 원문 없이 답이 된다', async () => {
+test('C28 다음 말(history gap 중): 봉인한 말은 복구 버퍼에 두지 않고 원문 없이 받은 것으로 닫으며, 복구 뒤 다시 말하면 답이 된다', async () => {
   await withHarness({ changeV2: true, colleague: true, steps: [CHOICE_QUESTION, V2_WRITE] }, async h => {
     await opened(h);
     const { question } = await toQuestion(h);
     // 재연결 뒤 누락 복구 전이다. 시계 대신 저장된 대화 상태를 바꾼다.
     await h.db.query('UPDATE conversations SET gap=true WHERE id=$1', [h.store.scopeId(THREAD)]);
     const message = await say(h, OPTIONS[0]!);
+    assert.deepEqual(await questionRow(h, question), { state: 'open', answer: null });
+    const row = (await h.db.query<{ text: string; buffered: boolean; accepted: boolean }>(`SELECT payload->>'text' AS text,buffered,accepted FROM events WHERE delivery_id=$1`, [message])).rows[0]!;
+    assert.deepEqual(row, { text: '', buffered: false, accepted: true });
+    // 누락된 말이 없으면 복구는 이 말을 다시 처리하지 않는다(받은 것으로 닫았다).
+    h.rest.pages = [[{ id: message, actor: OWNER, scope: THREAD, kind: 'message', text: OPTIONS[0]!, mention: false }]];
+    assert.equal(await h.ingress.recover(THREAD, OWNER), 'done');
+    assert.deepEqual(await questionRow(h, question), { state: 'open', answer: null });
+    await say(h, OPTIONS[0]!);
     assert.deepEqual(await questionRow(h, question), { state: 'answered', answer: OPTIONS[0] });
-    const row = (await h.db.query<{ text: string; buffered: boolean }>(`SELECT payload->>'text' AS text,buffered FROM events WHERE delivery_id=$1`, [message])).rows[0]!;
-    assert.deepEqual(row, { text: '', buffered: false });
+  });
+});
+
+test('C28 다음 말(history gap 중, 누락 복구 전): 실시간 말은 답으로 확정하지 않고 다시 말해 달라고 하며, 복구한 앞선 말이 원문 없이 답이 된다', async () => {
+  await withHarness({ changeV2: true, colleague: true, steps: [CHOICE_QUESTION, V2_WRITE] }, async h => {
+    const before = await opened(h);
+    const { id, question } = await toQuestion(h);
+    await h.db.query('UPDATE conversations SET gap=true WHERE id=$1', [h.store.scopeId(THREAD)]);
+    // A는 끊긴 동안 보내 누락됐고, B는 재연결 뒤 실시간으로 먼저 받는다. history에는 둘 다 있다.
+    const missed = { id: String(++sequence), actor: OWNER, scope: THREAD, kind: 'message' as const, text: OPTIONS[1]!, mention: false };
+    const live = await say(h, `${OPTIONS[0]} 쪽이 낫겠어요`);
+    assert.deepEqual(await questionRow(h, question), { state: 'open', answer: null }, '누락 복구 전에는 답으로 확정하지 않는다');
+    assert.equal(await eventText(h, live), '');
+    h.rest.pages = [[missed, { id: live, actor: OWNER, scope: THREAD, kind: 'message', text: `${OPTIONS[0]} 쪽이 낫겠어요`, mention: false }]];
+    assert.equal(await h.ingress.recover(THREAD, OWNER), 'done');
+    assert.deepEqual(await questionRow(h, question), { state: 'answered', answer: OPTIONS[1] }, '앞선 말이 답이다');
+    assert.equal(await eventText(h, missed.id), '', 'A의 원문이 events에 없다');
+    assert.equal(await eventText(h, live), '', 'B의 원문이 events에 없다');
+    assert.deepEqual(await publicInputs(h, id), [OPTIONS[1]]);
+    assert.equal(await chatJobs(h), before, '대화 작업을 만들지 않는다');
+    await h.deliver();
+    assert.ok(h.rest.messages.some(post => post.body.message_reference?.message_id === live && post.body.content.startsWith(QUESTION_PICK_TEXT.gap)), 'B에 다시 말해 달라고 답한다');
+    await h.pump(async () => await h.phase(id) === 'awaiting_publish_approval');
+    const calls = await h.f.calls();
+    assert.equal(calls.length, 2, '작성 모델만 두 번이고 대화 모델 호출은 없다');
+    assert.ok(calls[1]!.input.includes(OPTIONS[1]!));
   });
 });

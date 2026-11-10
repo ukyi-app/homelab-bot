@@ -30,6 +30,8 @@ export const QUESTION_PICK_TEXT = Object.freeze({
   // 변경 질문이 함께 열려 있어 방금 말을 봉인한 경우. 말은 답으로 쓰지 않았고, 고른 뒤 다시 말하면 그 질문의 답이 된다.
   choose: (previews: readonly string[]) => ['열린 질문이 여러 개라 방금 말은 답으로 쓰지 않았어요. 어느 질문에 답할지 먼저 골라 주세요.',
     ...previews.map((preview, index) => `${index + 1}. ${preview}`)].join('\n'),
+  // history gap 중 봉인한 말. 누락 복구가 끝나기 전이라 답으로 쓰지 않았다.
+  gap: '연결이 잠깐 끊겨 놓친 말을 확인하는 중이라 방금 말은 답으로 쓰지 않았어요. 잠시 뒤에도 답이 필요하면 다시 말해 주세요.',
   chosen: (number: number) => `${number}번 질문을 골랐어요. 이 스레드에 답을 말해 주세요.`,
   missing: '이미 처리했거나 이 대화에서 찾을 수 없는 선택이에요.',
   notOwner: '질문을 받은 사람만 고를 수 있어요.',
@@ -103,6 +105,13 @@ export async function offerAnswer(store: Store, tasks: TaskCommandHandler, input
   const previews = shown.map(question => preview(question.prompt));
   await notify(store, input, `question-pick:${input.event}`, sealed ? QUESTION_PICK_TEXT.choose(previews) : QUESTION_PICK_TEXT.prompt(previews), buttons);
   return 'picking';
+}
+// history gap 중에 실시간으로 받은 봉인한 말. 누락 복구가 아직 넣지 않은 앞선 말이 그 질문의 진짜 첫 답일 수 있어 답으로 확정하지 않는다.
+// 원문은 이미 비워 저장했고 메모리에도 들지 않는다(재시작해도 잃을 것이 없다). 받은 것으로 닫아 복구의 history 대조가 이 말을
+// 다시 처리하지 않게 하고, 다시 말해 달라고 답한다. 수신 트랜잭션 안에서 부른다.
+export async function deferInGap(store: Store, input: OfferInput): Promise<void> {
+  await store.db.query(`UPDATE events SET accepted=true,buffered=false,payload=payload || '{"ignored":"sealed_in_gap"}'::jsonb WHERE id=$1`, [input.event]);
+  await notify(store, input, `answer-gap:${input.event}`, QUESTION_PICK_TEXT.gap);
 }
 async function notify(store: Store, input: OfferInput, key: string, content: string, buttons?: OutboxButton[]): Promise<void> {
   await store.enqueue({ key, conversation: input.conversation, actor: input.actor, scope: input.scope, revision: input.revision,

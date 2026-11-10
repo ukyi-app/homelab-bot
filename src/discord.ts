@@ -14,7 +14,7 @@ import type { MemoryCommand, MemoryCommandHandler } from './memory-commands.js';
 import type { PolicyGate } from './policy.js';
 import { buttonAllowed, buttonRoute } from './discord-protocol.js';
 import { bindProposalHandlers, PROPOSAL_BUTTONS, PROPOSAL_TEXT, pressProposal } from './proposals.js';
-import { offerAnswer, pressQuestionPick, sealsNextMessage } from './question-pick.js';
+import { deferInGap, offerAnswer, pressQuestionPick, sealsNextMessage } from './question-pick.js';
 import { pressChangeQuestion } from './change-question.js';
 import type { ChangeQuestionPress } from './change-question.js';
 import { moveReactions, ReactionSync, recordReceived, settleReactions } from './reactions.js';
@@ -177,9 +177,16 @@ export class DiscordIngress {
         await received();
         return true;
       };
-      // 봉인한 말은 버퍼 재생이 원문을 읽을 수 없어 버퍼에 두지 않고 지금 답 경로로 보낸다. 답이 되지 않으면 원문을 되돌린 뒤 버퍼에 둔다.
       // gap 동안에는 checkpoint가 움직이지 않아 복구가 앞선 메시지를 그대로 다시 읽는다.
-      if (subscription.gap && !recovered && !durableControl && !messageSealed) return buffer();
+      // 봉인한 말은 버퍼 재생이 원문을 읽을 수 없어 버퍼에 두지 않는다. 누락된 앞선 말보다 먼저 답이 되지 않게 답으로도 쓰지 않고
+      // 다시 말해 달라고 한다. 누락된 말은 복구가 같은 봉인 판단(sealsNextMessage)으로 받는다.
+      if (subscription.gap && !recovered && !durableControl) {
+        if (!messageSealed) return buffer();
+        await deferInGap(store, { event: saved.id, message: event.id, actor: event.actor, scope: event.scope, conversation: conversationId,
+          text: '', revision: current.revision, sealed: true });
+        answered = true;
+        return true;
+      }
       // 스레드를 만들기 전에 본다. 프로젝트가 없거나 레인이 닫혔으면 빈 스레드를 남기지 않고, 구독도 켜지 않는다.
       const refuse = async (text: string) => {
         await store.db.query(`UPDATE events SET accepted=true,buffered=false,payload=payload || '{"ignored":"task_refused"}'::jsonb WHERE id=$1`, [saved.id]);
@@ -223,10 +230,7 @@ export class DiscordIngress {
           ? await offerAnswer(store, this.tasks, { event: saved.id, message: event.id, actor: event.actor, scope: event.scope, conversation: conversationId,
             text: event.text, revision: current.revision, sealed: messageSealed }) !== undefined
           : false;
-        if (!answered && messageSealed) {
-          await store.db.query(`UPDATE events SET payload=jsonb_set(payload,'{text}',to_jsonb($2::text)) WHERE id=$1`, [saved.id, spoken]);
-          if (subscription.gap && !recovered) return buffer();
-        }
+        if (!answered && messageSealed) await store.db.query(`UPDATE events SET payload=jsonb_set(payload,'{text}',to_jsonb($2::text)) WHERE id=$1`, [saved.id, spoken]);
         // admit 뒤에 레인이 닫힌 경합. SQL 오류가 아니라 트랜잭션은 그대로 쓸 수 있다.
         if (!answered) {
           try { await store.accept(saved.id, event.command === 'task' ? 'task' : event.command === 'read' ? 'read' : 'chat', current.revision, event.urgent || event.command === 'urgent'); }
