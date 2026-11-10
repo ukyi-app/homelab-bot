@@ -26,7 +26,8 @@ export async function recordChangeNotes(db: Pick<Database, 'query'>, key: Change
     [key.changeId, key.generation, JSON.stringify(parsed.checks), JSON.stringify(parsed.risks), now()]);
   return inserted.rows.length === 1;
 }
-// 기록이 없으면(옛 판 결과) 빈 목록이다.
+// 기록이 없거나(옛 판 결과) 7일 원문 정리(purgeExpiredChangeContent)가 비웠으면 빈 목록이다.
+// 비우는 건은 끝난 변경뿐이라 승인 준비·미리보기·처음 게시 안내는 비운 목록을 읽지 않는다.
 export async function readChangeNotes(db: Pick<Database, 'query'>, key: ChangeKey): Promise<ChangeNotes> {
   const row = (await db.query<{ checks: unknown; risks: unknown }>('SELECT checks,risks FROM change_notes WHERE change_id=$1 AND generation=$2', [key.changeId, key.generation])).rows[0];
   if (!row) return { checks: [], risks: [] };

@@ -5,11 +5,12 @@ import type { ChangeKey, ChangeNote, WriterOutcome } from '../src/change-contrac
 import { ChangeGuidance, guidanceDiffLines, readChangeNotes, recordChangeNotes } from '../src/change-guidance.js';
 import type { GuidanceOutcome } from '../src/change-guidance.js';
 import { renderPublication } from '../src/change-publication.js';
-import { ChangeReviewFindings } from '../src/change-store.js';
+import { CHANGE_RETENTION_MS, ChangeReviewFindings, purgeExpiredChangeContent } from '../src/change-store.js';
 import { guidanceMarker } from '../src/github-review-io.js';
 import type { GuidanceReview, GuidanceReviewPort } from '../src/github-review-io.js';
 import { DEFAULT_CHANGES, REPO, publishEnv } from './change-github-fake.js';
 import type { PublishEnv } from './change-github-fake.js';
+import type { Database } from '../src/database.js';
 import { OWNER, newEvent, ok } from './change-store-fixture.js';
 import { localDatabase } from './helpers.js';
 
@@ -301,5 +302,96 @@ test('AC-27 수정 차례 진입점: 같은 함수가 그 차례의 head·diff·
     const blocked = await guidance.post({ ...round, round: 2, checks: [{ text: 'fixture-corp-host로 붙어요', location: { path: 'src/a.ts', line: 2 } }] });
     assert.deepEqual([blocked.state, blocked.reason], ['skipped', 'internal_marker']);
     assert.equal(port.posts, 2);
+  } finally { await close(); }
+});
+
+// ---- 7일 원문 정리(T27·T31과 같은 기준) ----
+
+interface NotesRow { checks: unknown; risks: unknown; notes_sha256: string | null; purged_at: string | number | null }
+const notesRow = async (db: Database, key: ChangeKey) => (await db.query<NotesRow>('SELECT checks,risks,notes_sha256,purged_at FROM change_notes WHERE change_id=$1 AND generation=$2',
+  [key.changeId, key.generation])).rows[0]!;
+const parsedRow = (value: unknown) => typeof value === 'string' ? JSON.parse(value) as unknown : value;
+// 원래 목록의 digest. 정리가 남겨야 하는 값을 행과 무관하게 DB에서 계산한다.
+const notesDigest = async (db: Database, notes: { checks: ChangeNote[]; risks: ChangeNote[] }) => (await db.query<{ digest: string }>(
+  `SELECT encode(sha256(convert_to(jsonb_build_object('checks',$1::jsonb,'risks',$2::jsonb)::text,'UTF8')),'hex') AS digest`, [JSON.stringify(notes.checks), JSON.stringify(notes.risks)])).rows[0]!.digest;
+
+test('C29 보존: 끝난 변경의 확인할 것·남은 위험은 끝난 지 7일 뒤 비우고 digest를 남긴다. 기간 전·살아 있는 변경의 목록은 그대로고 승인 digest도 그대로다', async () => {
+  const { env, port, guidance, close } = await setup();
+  try {
+    const done = await publishWith(env, NOTES);
+    posted(await guidance.afterPublish(done.key));
+    ok(await env.store.transition({ ...done.key, from: 'proposed', to: 'cancelled', reason: 'closed_unmerged' }));
+    const endedAt = env.clock.now;
+    const live = await env.newRequest();
+    await env.driveToReview(live, DEFAULT_CHANGES, { patch: PATCH });
+    await recordChangeNotes(env.db, live, NOTES);
+
+    assert.equal(await purgeExpiredChangeContent(env.db, endedAt + CHANGE_RETENTION_MS - 1), 0, '종료 + 7일 1ms 전');
+    assert.deepEqual(await readChangeNotes(env.db, done.key), NOTES);
+    assert.equal((await notesRow(env.db, done.key)).purged_at, null);
+
+    assert.equal(await purgeExpiredChangeContent(env.db, endedAt + CHANGE_RETENTION_MS), 1, '종료 + 7일');
+    const row = await notesRow(env.db, done.key);
+    assert.deepEqual([parsedRow(row.checks), parsedRow(row.risks), Number(row.purged_at)], [[], [], endedAt + CHANGE_RETENTION_MS]);
+    assert.equal(row.notes_sha256, await notesDigest(env.db, NOTES));
+    assert.deepEqual(await readChangeNotes(env.db, done.key), { checks: [], risks: [] });
+    assert.equal(ok(await env.store.approvalSubject(done.key)).digest, done.digest, '승인 digest는 PR 본문에 묶여 정리와 무관하다');
+    // 전송 기록에는 모델 글이 없다(사유 코드·리뷰 ID뿐).
+    const sent = (await env.db.query<Record<string, unknown>>('SELECT * FROM change_guidance WHERE change_id=$1', [done.key.changeId])).rows;
+    assert.deepEqual(sent.map(item => item.state), ['posted']);
+    assert.ok(!JSON.stringify(sent).includes(INSIDE.text));
+
+    assert.deepEqual(await readChangeNotes(env.db, live), NOTES, '진행 중 변경의 목록은 그대로다');
+    assert.equal(await purgeExpiredChangeContent(env.db, endedAt + 30 * 86_400_000), 0, '멱등, 진행 중 건은 고르지 않는다');
+    assert.deepEqual(await readChangeNotes(env.db, live), NOTES);
+    assert.equal(port.posts, 1);
+  } finally { await close(); }
+});
+
+test('C29 보존: 공개 검사에 걸려 막힌 변경의 목록(내부 표식이 든 모델 글)도 7일 뒤 비운다', async () => {
+  const { env, close } = await setup();
+  try {
+    const key = await env.newRequest();
+    const review = await env.driveToReview(key, DEFAULT_CHANGES, { patch: PATCH });
+    const leaked = { checks: [{ text: `fixture-corp-host 에 붙는다고 가정했어요`, location: { path: 'src/a.ts', line: 1 } }], risks: [] };
+    await recordChangeNotes(env.db, key, leaked);
+    const prepared = await env.publisher.prepareApproval(key, { review, at: env.clock.now });
+    assert.equal(prepared.ok, false, JSON.stringify(prepared));
+    ok(await env.store.transition({ ...key, from: 'reviewing', to: 'blocked', reason: 'publication_blocked' }));
+    const endedAt = env.clock.now;
+    assert.equal(await purgeExpiredChangeContent(env.db, endedAt + CHANGE_RETENTION_MS), 1);
+    const row = await notesRow(env.db, key);
+    assert.ok(!JSON.stringify(row).includes('fixture-corp-host'));
+    assert.equal(row.notes_sha256, await notesDigest(env.db, leaked));
+  } finally { await close(); }
+});
+
+test('C29 보존: 다른 원문을 이미 비우고 목록만 남은 변경도 고른다. 기록은 정리 모양 말고는 고쳐 쓸 수 없다', async () => {
+  const { env, close } = await setup();
+  try {
+    const key = await env.newRequest();
+    await env.driveToReview(key, DEFAULT_CHANGES, { patch: PATCH });
+    await recordChangeNotes(env.db, key, NOTES);
+    ok(await env.store.transition({ ...key, from: 'reviewing', to: 'cancelled', reason: 'user_cancelled' }));
+    const endedAt = env.clock.now;
+    // C29 이전 정리가 목록만 남긴 상태.
+    await env.db.query('DELETE FROM change_artifact_files WHERE change_id=$1', [key.changeId]);
+    await env.db.query(`UPDATE change_artifacts SET patch='',purged_at=$2 WHERE change_id=$1`, [key.changeId, endedAt]);
+    await env.db.query('DELETE FROM change_review_findings WHERE change_id=$1', [key.changeId]);
+    await env.db.query(`UPDATE change_request_inputs SET text='',purged_at=$2 WHERE change_id=$1`, [key.changeId, endedAt]);
+    await env.db.query(`UPDATE change_requests SET brief=brief || '{"summary":"","goal":"","acceptanceCriteria":[]}'::jsonb,brief_purged_at=$2 WHERE id=$1`, [key.changeId, endedAt]);
+
+    const where = [key.changeId, key.generation];
+    // 정리 모양이 아닌 UPDATE는 거부한다: digest 위조, 목록을 남긴 채 지운 표시.
+    await assert.rejects(env.db.query(`UPDATE change_notes SET checks='[]'::jsonb,risks='[]'::jsonb,purged_at=1,notes_sha256=$3 WHERE change_id=$1 AND generation=$2`, [...where, 'a'.repeat(64)]));
+    await assert.rejects(env.db.query(`UPDATE change_notes SET purged_at=1,notes_sha256=encode(sha256(convert_to(jsonb_build_object('checks',checks,'risks',risks)::text,'UTF8')),'hex') WHERE change_id=$1 AND generation=$2`, where));
+
+    assert.equal(await purgeExpiredChangeContent(env.db, endedAt + CHANGE_RETENTION_MS), 1);
+    assert.deepEqual(await readChangeNotes(env.db, key), { checks: [], risks: [] });
+    assert.equal((await notesRow(env.db, key)).notes_sha256, await notesDigest(env.db, NOTES));
+    // 지운 행을 되살리거나 다시 지울 수 없다.
+    await assert.rejects(env.db.query(`UPDATE change_notes SET checks=$3::jsonb WHERE change_id=$1 AND generation=$2`, [...where, JSON.stringify(NOTES.checks)]));
+    await assert.rejects(env.db.query(`UPDATE change_notes SET purged_at=purged_at+1 WHERE change_id=$1 AND generation=$2`, where));
+    assert.equal(await purgeExpiredChangeContent(env.db, endedAt + 30 * 86_400_000), 0, '다 비운 건은 다시 고르지 않는다');
   } finally { await close(); }
 });
