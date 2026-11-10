@@ -55,6 +55,8 @@ export interface HarnessOptions {
   policyPatch?: (policy: Policy) => Policy; change?: boolean; crash?: Crash;
   // 동료 기능 스위치(Store.colleague). 기본 꺼짐이다.
   colleague?: boolean;
+  // 작업자 v2 port가 받는 지시문 판 목록을 알리는지. 기본은 알리지 않아(옛 port 모양) 게시 서버가 옛 판을 보낸다.
+  changeV2?: boolean;
 }
 export interface Harness {
   db: Database; env: PublishEnv; f: ChangeWorkerFixture; store: Store; changes: ChangeStore; gate: PolicyGate; policy: { current: Policy }; rest: MockDiscord; ingress: DiscordIngress; discord: DiscordPublisher;
@@ -133,7 +135,8 @@ export async function changeHarness(db: Database, options: HarnessOptions = {}):
   const worker = { taskOpen: true, unreachable: false };
   const reach = () => { if (worker.unreachable) throw new Error('task_worker_uncertain'); };
   const v1 = { call: async (endpoint: never, body: never, signal?: AbortSignal) => { reach(); return new HttpTaskWorker(f.url, f.signer, fetch).call(endpoint, body, signal); } };
-  const v2 = { callV2: (async (endpoint: never, body: never, signal?: AbortSignal) => { reach(); return f.port.callV2(endpoint, body, signal); }) as typeof f.port.callV2, supportsChange: (signal?: AbortSignal) => f.port.supportsChange(signal) };
+  const v2 = { callV2: (async (endpoint: never, body: never, signal?: AbortSignal) => { reach(); return f.port.callV2(endpoint, body, signal); }) as typeof f.port.callV2, supportsChange: (signal?: AbortSignal) => f.port.supportsChange(signal),
+    ...(options.changeV2 ? { changeInstructions: (signal?: AbortSignal) => f.port.changeInstructions(signal) } : {}) };
   let shutdown = new AbortController();
   const rest = new MockDiscord();
   const build = (runtimeOptions: { crash?: Crash; instrument?: (deps: ChangeRuntimeDeps) => ChangeRuntimeDeps } = {}) => {
