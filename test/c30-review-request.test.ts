@@ -14,7 +14,7 @@ import { localDatabase } from './helpers.js';
 // 리뷰 실행(가짜 작업자 모델) → 게시(가짜 GitHub). 리뷰 App 설치 조회와 토큰 범위는 github-review-app 시험이 본다.
 const BASE = 'a'.repeat(40), HEAD = 'b'.repeat(40);
 const LISTED = { id: 301, fullName: 'ukyi-app/listed-repo', installationId: 701, visibility: 'public' as const };
-const OUTSIDE: ReviewTarget = { id: 302, fullName: 'ukyi-app/other-repo', installationId: 701, visibility: 'private' };
+const OUTSIDE: ReviewTarget = { id: 302, fullName: 'ukyi-app/other-repo', installationId: 701, visibility: 'public' };
 const POLICY: ReviewPolicy = { repositories: [LISTED], allowedBotAuthorIds: [], commentCommand: '/fixture-review',
   reviewDrafts: false, rereviewOnBaseMove: false, comparison: 'merge_base', reviewSince: 0, internalMarkers: ['fixture-internal-host'],
   input: { maxFiles: 20, maxFileBytes: 100_000, maxDiffBytes: 200_000, maxArchiveBytes: 1_000_000, maxBodyChars: 4000 },
@@ -159,6 +159,23 @@ test('C30 리뷰 App이 없는 조직 저장소와 조직 밖 PR은 못 한다�
   assert.deepEqual(w.gh.calls, ['installation ukyi-app/no-app-repo'], '조직 밖 PR은 설치·PR 조회를 하지 않는다');
   assert.deepEqual(await w.reviews(), []);
   noButtons(w.h);
+});
+
+test('C30 정책 목록 밖 비공개 저장소 PR은 작업자가 압축본을 받을 수 없어 거절하고 리뷰 작업을 만들지 않는다. 목록의 비공개 저장소는 그대로 받는다', async () => {
+  const w = await wired();
+  const hidden: ReviewTarget = { ...OUTSIDE, fullName: 'ukyi-app/hidden-repo', visibility: 'private' };
+  w.gh.installed.set(hidden.fullName, hidden);
+  w.gh.pulls.set(`${hidden.fullName}#12`, pull(hidden, { number: 12 }));
+  await w.ask(`https://github.com/${hidden.fullName}/pull/12 리뷰해 줘`, `${hidden.fullName}#12`);
+  assert.equal(lastPosted(w), REVIEW_REQUEST_TEXT.refused.not_public);
+  assert.deepEqual(w.gh.calls, [`installation ${hidden.fullName}`], '거절이 정해지면 PR을 읽지 않는다');
+  assert.deepEqual(await w.reviews(), []);
+  noButtons(w.h);
+  // 정책 목록 저장소는 visibility와 상관없이 지금처럼 접수한다.
+  (w.h.f.policy.review as ReviewPolicy).repositories = [{ ...LISTED, visibility: 'private' }];
+  await w.ask(`이 PR 리뷰해 줘 https://github.com/${LISTED.fullName}/pull/7`, `${LISTED.fullName}#7`);
+  assert.equal(lastPosted(w), REVIEW_REQUEST_TEXT.started(LISTED.fullName, 7));
+  assert.deepEqual((await w.reviews()).map(r => r.repo_full_name), [LISTED.fullName]);
 });
 
 test('C30 owner 원문에 없는 PR을 모델이 대상으로 고르면(맥락 자료가 고른 대상) 리뷰하지 않고 이유를 답한다', async () => {

@@ -372,7 +372,7 @@ const REQUEST_REFUSALS: Readonly<Record<string, ReviewRequestRefusal>> = Object.
   fork: 'fork', author_denied: 'author', pr_closed: 'closed', pr_merged: 'closed', repository_mismatch: 'not_found',
 });
 // Discord 리뷰 요청(COLLEAGUE_SPEC §4.10)을 PR 댓글 리뷰 명령과 같은 명시 트리거('comment': draft 예외, 늘 새 세대, 대체에서 보호)로
-// 접수한다. 조직 밖이면 GitHub에 묻지 않는다. 정책 목록의 저장소는 정책 기록을, 목록 밖이면 리뷰 App 설치 조회 기록을 쓴다.
+// 접수한다. 조직 밖이면 GitHub에 묻지 않는다. 정책 목록의 저장소는 정책 기록을, 목록 밖이면 리뷰 App 설치 조회 기록을 쓰고 공개 저장소만 받는다.
 // fork·작성자 association·닫힘 판단(pullRequestDecision)은 자동 리뷰와 같다.
 export class ReviewRequests implements ReviewRequestPort {
   constructor(private readonly store: Store, private readonly policy: ReviewPolicySource, private readonly queue: ReviewQueue,
@@ -397,6 +397,9 @@ export class ReviewRequests implements ReviewRequestPort {
     try {
       const found = listed ?? await this.targets.repository(repository);
       if (!found) return refused('not_installed');
+      // 작업자가 압축본을 자격 없이 받아(archiveContract·createArchiveFetcher) 비공개 목록 밖 저장소는 실행에서 반드시 실패한다.
+      // 작업자에 GitHub 자격을 넘기지 않으므로 받아 두지 않고 여기서 거절한다. 정책 목록 저장소는 운영자가 고른 대상이라 그대로 둔다.
+      if (!listed && found.visibility !== 'public') return refused('not_public');
       repo = found;
       pr = pullRequest(listed ? await this.reader.pullRequest(repo.fullName, number) : await this.targets.pullRequest(repo, number));
       const decision = pullRequestDecision(pr, repo, context.review, true);

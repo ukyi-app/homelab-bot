@@ -33,7 +33,7 @@ export function pullTarget(target: string): PullReference | undefined {
 export const samePull = (left: PullReference, right: PullReference) => left.number === right.number
   && left.owner.toLowerCase() === right.owner.toLowerCase() && left.repo.toLowerCase() === right.repo.toLowerCase();
 
-export type ReviewRequestRefusal = 'outside_organization' | 'not_installed' | 'not_found' | 'fork' | 'author' | 'closed' | 'unavailable';
+export type ReviewRequestRefusal = 'outside_organization' | 'not_installed' | 'not_public' | 'not_found' | 'fork' | 'author' | 'closed' | 'unavailable';
 export type ReviewRequestResult =
   | { outcome: 'started' | 'already'; repository: string; pr: number }
   | { outcome: 'refused'; reason: ReviewRequestRefusal };
@@ -55,6 +55,7 @@ export const REVIEW_REQUEST_TEXT = Object.freeze({
   refused: Object.freeze({
     outside_organization: `${REVIEW_REQUEST_ORGANIZATION} 조직 저장소의 PR만 리뷰할 수 있어요.`,
     not_installed: '그 저장소에는 리뷰 App이 설치돼 있지 않아서 리뷰할 수 없어요.',
+    not_public: '비공개 저장소의 PR은 아직 리뷰할 수 없어요.',
     not_found: '그 PR을 찾지 못했어요. 링크를 다시 확인해 주세요.',
     fork: 'fork에서 온 PR은 리뷰하지 않아요.',
     author: 'PR 작성자가 리뷰 조건(조직 멤버·협업자나 허용된 봇)에 맞지 않아서 리뷰하지 않아요.',

@@ -156,8 +156,8 @@ const RecoveredReview = z.object({ id: z.number().int().positive(), commit_id: z
 // ---- 리뷰 요청 대상(C30) ----
 
 const InstallationSchema = z.object({ id: z.number().int().positive(), account: z.object({ login: z.string() }).nullable() });
-const RepositorySchema = z.object({ id: z.number().int().positive(), full_name: z.string(), private: z.boolean(),
-  owner: z.object({ login: z.string(), type: z.string() }) });
+const RepositorySchema = z.object({ id: z.number().int().positive(), full_name: z.string(), private: z.boolean().optional(),
+  visibility: z.string().optional(), owner: z.object({ login: z.string(), type: z.string() }) });
 // 저장소 정보 읽기에는 메타데이터 읽기만 쓴다. App의 다른 권한을 이 토큰에 싣지 않는다.
 const METADATA = Object.freeze({ metadata: 'read' });
 
@@ -209,8 +209,10 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
       const info = parse(RepositorySchema, await api.call('GET', path, issued.data.token));
       if (info.id !== granted.id || info.full_name !== granted.full_name || info.owner.type !== 'Organization'
         || info.owner.login.toLowerCase() !== REVIEW_REQUEST_ORGANIZATION) throw new Error('github_repository_mismatch');
-      // visibility 칸은 문서상 필수가 아니라 필수 칸인 private로 정한다(internal 저장소도 private로 다룬다).
-      return { id: info.id, fullName: info.full_name, installationId: installation.id, visibility: info.private ? 'private' : 'public' };
+      // 작업자는 압축본을 자격 없이 받으므로 익명으로 보이는 저장소만 public이다. visibility 칸(internal 포함)을 먼저 보고,
+      // 칸이 없으면 private 불리언으로, 둘 다 없거나 서로 어긋나면 private로 닫는다. 접수(ReviewRequests)가 private를 거절한다.
+      const open = info.private !== true && (info.visibility === undefined ? info.private === false : info.visibility === 'public');
+      return { id: info.id, fullName: info.full_name, installationId: installation.id, visibility: open ? 'public' : 'private' };
     },
     pullRequest: (target: ReviewTarget, number) => readFrom(target, `/pulls/${number}`),
     mergeBase: (target: ReviewTarget, base, head) => mergeBaseOf(suffix => readFrom(target, suffix), base, head),

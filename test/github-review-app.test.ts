@@ -839,7 +839,7 @@ test('안내 리뷰 게시: 응답을 잃으면 다시 보내지 않고 표식�
 
 // ---- C30 리뷰 요청 대상(정책 목록 밖 조직 저장소) ----
 const SIDE: BoundRepository = { id: 79, fullName: 'ukyi-app/side-repo', installationId: 900 };
-const SIDE_INFO = { id: SIDE.id, full_name: SIDE.fullName, private: true, owner: { login: 'ukyi-app', type: 'Organization' } };
+const SIDE_INFO = { id: SIDE.id, full_name: SIDE.fullName, private: false, visibility: 'public', owner: { login: 'ukyi-app', type: 'Organization' } };
 // 이름으로 좁힌 토큰(대상 조회)과 ID로 좁힌 토큰(그 뒤 읽기)을 모두 흉내 낸다. 요청받은 저장소 하나만 돌려준다.
 const scopedToken = (fake: Fake, repos: BoundRepository[] = [SIDE]): Route => sent => {
   const request = sent.body as { repository_ids?: number[]; repositories?: string[]; permissions: Record<string, string> };
@@ -860,7 +860,7 @@ test('C30 리뷰 요청 대상 조회: App JWT로 설치를 묻고, 이름으로
   const fake = new Fake(sideRoutes());
   fake.token = scopedToken(fake);
   const { targets } = fake.io();
-  assert.deepEqual(await targets.repository(SIDE.fullName), { id: SIDE.id, fullName: SIDE.fullName, installationId: SIDE.installationId, visibility: 'private' });
+  assert.deepEqual(await targets.repository(SIDE.fullName), { id: SIDE.id, fullName: SIDE.fullName, installationId: SIDE.installationId, visibility: 'public' });
   const [installation, token, info] = fake.sent as [Sent, Sent, Sent];
   assert.deepEqual([installation.method, installation.path], ['GET', `/repos/${SIDE.fullName}/installation`]);
   assert.equal(decode(installation.authorization.replace(/^Bearer /, '').split('.')[1]!).iss, '12345', '설치 조회는 App JWT로 한다');
@@ -875,6 +875,20 @@ test('C30 리뷰 요청 대상 조회: App JWT로 설치를 묻고, 이름으로
   none.token = scopedToken(none);
   assert.equal(await none.io().targets.repository('ukyi-app/no-app'), null);
   assert.equal(none.issues, 0);
+});
+
+test('C30 리뷰 요청 대상 조회: 공개 범위는 visibility 칸, 없으면 private 불리언으로 정하고 모르거나 어긋나면 private로 닫는다', async () => {
+  const cases: [Record<string, unknown>, 'public' | 'private'][] = [
+    [{ private: false, visibility: 'public' }, 'public'], [{ private: false }, 'public'], [{ visibility: 'public' }, 'public'],
+    [{ private: true, visibility: 'private' }, 'private'], [{ private: true, visibility: 'internal' }, 'private'], [{ visibility: 'internal' }, 'private'],
+    [{ private: true }, 'private'], [{}, 'private'], [{ private: true, visibility: 'public' }, 'private'], [{ private: false, visibility: 'internal' }, 'private'],
+  ];
+  for (const [fields, expected] of cases) {
+    const { private: _private, visibility: _visibility, ...rest } = SIDE_INFO;
+    const fake = new Fake(sideRoutes({ [`GET /repos/${SIDE.fullName}`]: () => json({ ...rest, ...fields }) }));
+    fake.token = scopedToken(fake);
+    assert.equal((await fake.io().targets.repository(SIDE.fullName))?.visibility, expected, JSON.stringify(fields));
+  }
 });
 
 test('C30 리뷰 요청 대상 조회: 설치 계정·토큰 저장소·저장소 정보가 요청한 저장소와 다르면 쓰지 않는다', async () => {
@@ -931,11 +945,33 @@ test('C30 토큰 범위: 정책 목록 밖 저장소는 Discord 리뷰 요청 �
     assert.ok(requests);
     assert.deepEqual(await requests.request({ repository: SIDE.fullName, pr: 5, key: 'fixture-chat-job' }),
       { outcome: 'started', repository: SIDE.fullName, pr: 5 });
-    assert.deepEqual(await lookup(SIDE.fullName), { id: SIDE.id, fullName: SIDE.fullName, installationId: SIDE.installationId, visibility: 'private' });
+    assert.deepEqual(await lookup(SIDE.fullName), { id: SIDE.id, fullName: SIDE.fullName, installationId: SIDE.installationId, visibility: 'public' });
     assert.deepEqual(await io.reader.pullRequest(SIDE.fullName, 5), sidePull);
     await assert.rejects(lookup('ukyi-app/never-requested'), Denied);
     // 작업이 끝나고 게시할 것도 없으면 범위가 닫힌다.
     await database.db.query("UPDATE jobs SET state='succeeded' WHERE type='review'");
     await assert.rejects(lookup(SIDE.fullName), Denied);
+  } finally { await database.pg.close(); }
+});
+
+test('C30 접수 조립: 정책 목록 밖 비공개·internal 저장소 요청은 PR을 읽지 않고 not_public으로 거절하며 리뷰 작업을 만들지 않는다', async () => {
+  const database = await localDatabase();
+  try {
+    const f = await fixture(database.db);
+    f.policy.review = { repositories: [{ ...REPO, visibility: 'public' }], allowedBotAuthorIds: [], commentCommand: null, reviewDrafts: false,
+      rereviewOnBaseMove: false, comparison: 'base_head', reviewSince: 0, internalMarkers: [],
+      input: { maxFiles: 20, maxFileBytes: 100_000, maxDiffBytes: 200_000, maxArchiveBytes: 1_000_000, maxBodyChars: 4000 },
+      publish: { maxFindings: 10, maxInlineComments: 5, maxBodyChars: 20_000 }, reconcile: { maxPages: 1, maxReviewsPerRun: 1 } } satisfies ReviewPolicy;
+    const source = new ReviewPolicySource(f.gate);
+    for (const fields of [{ private: true, visibility: 'private' }, { private: true, visibility: 'internal' }]) {
+      const fake = new Fake(sideRoutes({ [`GET /repos/${SIDE.fullName}`]: () => json({ ...SIDE_INFO, ...fields }) }));
+      fake.token = scopedToken(fake);
+      githubReviewIO({ app: APP, repositories: policyRepositories(source, f.store), send: fake.send, now: () => fake.clock,
+        requests: { store: f.store, policy: source } });
+      assert.deepEqual(await reviewRequestsOf(f.store)!.request({ repository: SIDE.fullName, pr: 5, key: `fixture-${fields.visibility}` }),
+        { outcome: 'refused', reason: 'not_public' }, fields.visibility);
+      assert.ok(!fake.sent.some(s => s.path.includes('/pulls/')), 'PR을 읽지 않는다');
+    }
+    assert.deepEqual((await database.db.query('SELECT job_id FROM pr_reviews')).rows, []);
   } finally { await database.pg.close(); }
 });
