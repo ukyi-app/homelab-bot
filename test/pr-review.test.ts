@@ -1531,6 +1531,22 @@ test('r3 R2-01 EVENT-01 같은 세대의 reopened·ready_for_review 뒤 늦게 �
   assert.equal(r.gh.writes.length, 1);
   assert.equal(r.inputs.length, 1);
 });
+test('AC-13 지시문 판만 바뀌어 재리뷰를 건너뛴 이벤트도 최신 시각을 남겨, 늦게 온 옛 closed·draft가 v1 게시 대기 결과를 지우지 않는다', async () => {
+  const current = r.source.current.bind(r.source);
+  r.source.current = async () => { const context = await current(); return { ...context, revision: reviewRevision(context.review, REVIEW_INSTRUCTIONS) }; };
+  await opened(pull({ updated_at: '2026-10-29T00:00:00Z' }));
+  await r.runtime.tick();
+  r.source.current = current;
+  r.gh.pulls.set(7, pull({ updated_at: '2026-10-29T02:00:00Z' }));
+  assert.equal((await hook('pull_request', prEvent('reopened', pull({ updated_at: '2026-10-29T02:00:00Z' })))).outcome, 'instructions_only');
+  assert.equal((await hook('pull_request', prEvent('closed', pull({ state: 'closed', updated_at: '2026-10-29T01:00:00Z' })))).outcome, 'stale_event');
+  assert.equal((await hook('pull_request', prEvent('ready_for_review', pull({ updated_at: '2026-10-29T03:00:00Z' })))).outcome, 'instructions_only');
+  assert.equal((await hook('pull_request', prEvent('converted_to_draft', pull({ draft: true, updated_at: '2026-10-29T02:30:00Z' })))).outcome, 'stale_event');
+  assert.deepEqual((await deliveries()).map(d => d.state), ['pending']);
+  await r.publisher.deliver();
+  assert.equal(r.gh.writes.length, 1);
+  assert.equal(r.inputs.length, 1);
+});
 test('r3 R2-02 REVIEW-02 게시 직전 draft로 보류한 세대는 ready_for_review·재조정·댓글로 저장 결과를 모델 재호출 없이 게시', async () => {
   const held = async (base: number) => {
     const at = (m: number) => `2026-10-29T${String(base).padStart(2, '0')}:${String(m).padStart(2, '0')}:00Z`;

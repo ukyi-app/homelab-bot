@@ -256,11 +256,16 @@ export class ReviewQueue {
     // 지시문 판만 바뀌었고 같은 head·비교 기준의 결과가 게시됐거나 게시를 기다리면 자동 이벤트로는 다시 리뷰하지 않는다.
     // 배포 순간 열린 PR마다 새 세대가 생겨 모델 호출이 몰리는 것을 막는다. 댓글 명시 요청과 base 재지정은 늘 새 세대다.
     if (trigger !== 'comment' && trigger !== 'retarget') {
-      const kept = (await tx.query<{ policy_revision: string }>(`SELECT DISTINCT p.policy_revision FROM pr_reviews p
+      const kept = (await tx.query<{ job_id: string; policy_revision: string }>(`SELECT p.job_id,p.policy_revision FROM pr_reviews p
         WHERE p.repo_id=$1 AND p.pr_number=$2 AND p.head_sha=$3 AND p.comparison_revision=$4 AND p.policy_revision<>$5
         AND EXISTS (SELECT 1 FROM review_deliveries d WHERE d.job_id=p.job_id AND d.state IN ('pending','sending','sent','unknown'))`,
-      [repo.id, pr.number, pr.head.sha, comparison, context.revision])).rows;
-      if (kept.some(row => sameReviewContent(row.policy_revision, context))) return { outcome: 'instructions_only', key };
+      [repo.id, pr.number, pr.head.sha, comparison, context.revision])).rows.filter(row => sameReviewContent(row.policy_revision, context));
+      if (kept.length) {
+        // duplicate_generation과 같이 더 새 이벤트를 봤다는 시각을 남긴다. 늦게 온 옛 닫힘·draft가 이 시각과 비교되어 남긴 결과를 지우지 못한다.
+        await tx.query('UPDATE pr_reviews SET pr_updated_at=GREATEST(pr_updated_at,$2) WHERE job_id = ANY($1::text[])',
+          [kept.map(row => row.job_id), pr.updatedAt]);
+        return { outcome: 'instructions_only', key };
+      }
     }
     const baseOnly = latest && latest.head_sha === pr.head.sha && latest.comparison_revision !== comparison
       && latest.policy_revision === context.revision;
