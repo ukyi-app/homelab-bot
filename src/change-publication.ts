@@ -1,9 +1,11 @@
 import { z } from 'zod';
 import { ChangeBriefSchema, CommandIdSchema, EvidenceBundleSchema, GenerationSchema, PublicMetadataSchema, ProvenanceLabelSchema, REVIEW_RISK_CATEGORIES, ChangeIdSchema, labelAllowsAuthorInput, propagateLabel } from './change-contracts.js';
-import type { ArtifactFile, ChangeBrief, ChangeKey, EvidenceBundle, ProvenanceLabel, PublicMetadata } from './change-contracts.js';
+import type { ArtifactFile, ChangeBrief, ChangeKey, ChangeNote, EvidenceBundle, ProvenanceLabel, PublicMetadata } from './change-contracts.js';
+import { CHANGE_NOTE_LIMITS, ChangeNoteSchema } from './task-contracts.js';
 
-// 공개 제목·본문·commit 메시지를 만드는 유일한 곳이다. 승인 brief와 구조화된 수치·SHA·시험 상태만 받는다.
-// raw 로그·대화·리뷰 자유문을 받을 자리가 스키마에 없다. 값이 위험하면 고쳐서 내보내지 않고 전체 공개를 막는다.
+// 공개 제목·본문·commit 메시지와 봇 PR 안내 리뷰 글을 만드는 유일한 곳이다. 승인 brief, 구조화된 수치·SHA·시험 상태,
+// 작성 모델의 확인할 것·남은 위험(항목 글과 위치)만 받는다. raw 로그·대화·리뷰 자유문(자체 리뷰 findings 포함)을 받을 자리가 스키마에 없다.
+// 값이 위험하면 고쳐서 내보내지 않고 전체 공개를 막는다.
 
 const ZWSP = String.fromCodePoint(0x200b);
 // 공개 PR에서 알림·역참조·자동 닫기·외부 요청을 일으키는 표기를 끊는다. 내용을 지우지 않고 링크만 되지 않게 한다.
@@ -29,9 +31,25 @@ export const PublicationInputSchema = z.strictObject({
   review: z.strictObject({ verdict: z.enum(['pass', 'pass_with_warnings']), risks: z.array(z.strictObject({ priority: z.enum(['P2', 'P3']), category: z.enum(REVIEW_RISK_CATEGORIES) })).max(64) }),
   identity: z.strictObject({ name: z.string(), email: z.string() }),
   at: z.number().int().nonnegative(),
+  // 작성 모델이 쓴 확인할 것·남은 위험(C25 결과 칸). 공개 경로의 유일한 모델 글이라 무력화한 뒤 본문 전체 검사를 지난다.
+  // 칸이 없는 것(옛 판 결과)과 빈 목록은 같은 공개 문구다.
+  checks: z.array(ChangeNoteSchema).max(CHANGE_NOTE_LIMITS.items).optional(),
+  risks: z.array(ChangeNoteSchema).max(CHANGE_NOTE_LIMITS.items).optional(),
 });
 export type PublicationInput = z.infer<typeof PublicationInputSchema>;
 export type PublicationResult = { ok: true; publication: PublicMetadata; marker: string } | { ok: false; reason: string };
+
+// 모델 글 한 줄. 줄바꿈이 목록 밖으로 나가 머리줄을 만들지 못하게 접는다.
+const noteText = (text: string) => neutralizePublicText(text.replace(/\s*[\r\n]+\s*/g, ' ').trim());
+// 경로가 코드 칸을 깨거나 줄을 바꾸지 못하게 한다.
+const noteCode = (value: string) => `\`${neutralizePublicText(value.replace(/[`\r\n]/g, '?'))}\``;
+// 경로는 512바이트까지 올 수 있다. 20개 항목이 모두 최대여도 본문 상한(16,000자) 안에 들도록 표시는 끝 100자만 남긴다(파일 이름 쪽이 남는다).
+const NOTE_PATH_SHOWN = 100;
+const shownPath = (path: string) => path.length > NOTE_PATH_SHOWN ? `…${path.slice(-NOTE_PATH_SHOWN)}` : path;
+const noteWhere = (note: ChangeNote) => note.location ? ` (${noteCode(`${shownPath(note.location.path)}${note.location.line ? `:${note.location.line}` : ''}`)})` : '';
+// PR 설명과 미리보기가 같은 줄을 쓴다. 미리보기는 승인 본문에 이 줄이 그대로 있는지로 공개 검사를 지난 글인지 확인한다.
+export const noteLine = (note: ChangeNote): string => `- ${noteText(note.text)}${noteWhere(note)}`;
+const noteSection = (heading: string, notes: readonly ChangeNote[] | undefined) => notes?.length ? [`## ${heading}`, ...notes.map(noteLine), ''] : [];
 
 const riskLines = (risks: PublicationInput['review']['risks']) => {
   if (!risks.length) return ['- 남은 위험: 없음'];
@@ -45,6 +63,7 @@ function renderBody(input: PublicationInput, brief: ChangeBrief, bundle: Evidenc
     '## 목표', neutralizePublicText(brief.goal), '',
     '## 인수 조건', ...brief.acceptanceCriteria.map(item => `- ${neutralizePublicText(item)}`), '',
     '## 검증', ...input.verifications.map(item => `- \`${item.commandId}\`: ${item.status}`), '',
+    ...noteSection('확인할 것', input.checks), ...noteSection('남은 위험', input.risks),
     '## 사전 리뷰', `- 판정: ${input.review.verdict}, 범위 complete`, ...riskLines(input.review.risks), '',
     '## 고정 리비전', `- base commit: ${bundle.baseCommit}`, `- base tree: ${bundle.baseTree}`, `- result tree: ${bundle.resultTree}`, `- artifact: ${bundle.artifactDigest}`,
     `- policy: ${bundle.policyRevision}`, `- verifier: ${bundle.verifierRevision}`, `- 출처 label: ${label}`, '',
@@ -74,6 +93,47 @@ export function renderPublication(raw: PublicationInput, scan: ScanPolicy): Publ
   const scanned = scanPublicPayload({ paths: [], files: [], publication: publication.data, branch: input.branch, marker }, scan);
   if (!scanned.ok) return { ok: false, reason: scanned.reason };
   return { ok: true, publication: publication.data, marker };
+}
+
+// ---- 봇 PR 안내 리뷰 글 ----
+
+const GuidanceNotesSchema = z.array(ChangeNoteSchema).max(CHANGE_NOTE_LIMITS.items);
+export interface GuidanceInput {
+  checks: readonly ChangeNote[]; risks: readonly ChangeNote[];
+  // 파일마다 diff 안 오른쪽 줄. 게시한 artifact patch에서 읽은 값이다(guidanceDiffLines).
+  positions: ReadonlyMap<string, ReadonlySet<number>>;
+  // 리뷰 정책 publish.maxInlineComments와 같은 값.
+  limit: number;
+  // 0은 처음 게시, 1부터는 수정 차례.
+  round: number;
+}
+export interface GuidanceComment { path: string; line: number; body: string }
+export type GuidanceRender =
+  | { ok: true; body: string; comments: GuidanceComment[]; outside: { checks: ChangeNote[]; risks: ChangeNote[] } }
+  | { ok: false; reason: 'guidance_input_invalid' | Exclude<ScanResult, { ok: true }>['reason'] };
+// 확인할 것·남은 위험 중 위치가 diff 안인 것만 줄 댓글로 만든다. 자체 리뷰 findings는 받을 자리가 없다.
+// 밖 목록(diff 밖·위치 없음·상한 초과)은 처음 게시면 PR 설명에, 수정 차례면 C27의 Discord 결과 요약에 있다. 그래서 밖 목록까지 함께 공개 검사를 한다.
+export function renderGuidance(input: GuidanceInput, scan: ScanPolicy & { identity: { name: string; email: string } }): GuidanceRender {
+  const checks = GuidanceNotesSchema.safeParse(input.checks);
+  const risks = GuidanceNotesSchema.safeParse(input.risks);
+  if (!checks.success || !risks.success || !Number.isSafeInteger(input.limit) || input.limit < 0 || !Number.isSafeInteger(input.round) || input.round < 0) return { ok: false, reason: 'guidance_input_invalid' };
+  const comments: GuidanceComment[] = [];
+  const outside = { checks: [] as ChangeNote[], risks: [] as ChangeNote[] };
+  for (const [kind, heading, notes] of [['checks', '확인할 것', checks.data], ['risks', '남은 위험', risks.data]] as const) {
+    for (const note of notes) {
+      const line = note.location?.line;
+      if (note.location && line && input.positions.get(note.location.path)?.has(line) && comments.length < input.limit) comments.push({ path: note.location.path, line, body: `**${heading}** ${noteText(note.text)}` });
+      else outside[kind].push(note);
+    }
+  }
+  const body = input.round === 0
+    ? '확인할 것과 남은 위험 중 바뀐 줄에 있는 것만 줄 댓글로 달았어요. 전체 목록은 PR 설명에 있어요.'
+    : `수정 ${input.round}번째의 확인할 것과 남은 위험 중 바뀐 줄에 있는 것만 줄 댓글로 달았어요. 나머지는 Discord 결과 요약에 있어요.`;
+  // 경로도 공개된다. 파일 경로 검사는 게시 때 했지만 위치는 모델이 쓴 값이라 다시 본다.
+  const everything = [...comments.flatMap(comment => [comment.path, comment.body]), ...[...outside.checks, ...outside.risks].flatMap(note => [noteLine(note), note.location?.path ?? ''])];
+  const reason = scanPublicText({ title: 'guidance', body: [body, ...everything].join('\n') }, scan);
+  if (reason) return { ok: false, reason };
+  return { ok: true, body, comments, outside };
 }
 
 // ---- 공개 payload 검사 ----
