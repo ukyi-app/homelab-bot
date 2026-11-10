@@ -19,7 +19,7 @@ import { taskOutputRisk } from './task-output.js';
 import type { TaskOutputRisk } from './task-output.js';
 import type { TaskStatus, TaskWorkerPort } from './task-bridge.js';
 import type { TaskV2WorkerPort } from './task-http.js';
-import { TASK_ENDPOINTS, TASK_INSTRUCTIONS_REVISION, TASK_LIMITS, TASK_RETENTION, TASK_V2_CONTRACT, TASK_V2_ENDPOINTS, TASK_V2_REQUEST_CHARS, taskQuestionId } from './task-contracts.js';
+import { CHANGE_INSTRUCTIONS_REVISION, TASK_ENDPOINTS, TASK_INSTRUCTIONS_REVISION, TASK_LIMITS, boundAmendmentMaterials, TASK_RETENTION, TASK_V2_CONTRACT, TASK_V2_ENDPOINTS, TASK_V2_REQUEST_CHARS, taskQuestionId } from './task-contracts.js';
 import type { BaselineLeaf, TaskCancelResponse, TaskRequest, TaskResponse, TaskStatusResponse, TaskV2Request, TaskV2TurnResult, TaskV2VerificationResponse, TaskWorkerIdentity } from './task-contracts.js';
 
 // 작업 레인(Claude)의 게시 서버 쪽 턴 조율. 한 run이 /v1/task 한 번, 곧 한 턴이다. 작업자 호출은 TaskWorkerPort로만 한다.
@@ -768,9 +768,13 @@ const BUSY_RETRY_MS = [500, 1000, 2000, 4000, null] as const;
 export class ClaudeChangeAuthor implements ChangeAuthorPort {
   constructor(private readonly deps: ChangeAuthorDeps) {}
   supportsV2(): Promise<boolean> { return this.deps.worker.supportsChange().catch(() => false); }
-  // 작업자 계약의 수정 차례 칸(amendment)은 PR 번호가 필수이고 지시문이 "PR 브랜치 head 위에서"라고 말한다. 게시 전에는 PR이 없어
-  // 그 칸으로 고치기 요청을 정직하게 만들 수 없다. 칸이 PR 없는 고치기를 받을 때까지 고치기 차례를 열지 않는다(호출자가 review_blocked로 닫는다).
-  async supportsSelfFix(): Promise<boolean> { return false; }
+  // 고치기 요청은 변경 작성 판(change-v2)의 수정 차례 칸에 PR 번호 없이 싣는다. 그 판을 말하지 않는 작업자에는 차례를 열지 않는다.
+  // 판은 말하지만 PR 번호를 필수로 받는 옛 작업자는 요청을 거부하고(TaskWorkerRejected), 호출자가 review_blocked로 닫는다.
+  async supportsSelfFix(): Promise<boolean> {
+    if (!await this.supportsV2()) return false;
+    const listed = await this.deps.worker.changeInstructions?.().catch(() => []) ?? [];
+    return listed.includes(CHANGE_INSTRUCTIONS_REVISION);
+  }
   private async session(jobId: string, generation?: number): Promise<SessionRow | undefined> {
     const row = (await this.deps.store.db.query<SessionRow>(`SELECT * FROM codex_sessions WHERE job_id=$1 AND executor='claude'`, [jobId])).rows[0];
     return row && (generation === undefined || row.generation === generation) ? row : undefined;
@@ -807,8 +811,6 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
   }
   async start(input: Parameters<ChangeAuthorPort['start']>[0]): Promise<{ receiptId: string }> {
     if (!labelAllowsAuthorInput(input.brief.label)) throw new Error('label_blocked');
-    // supportsSelfFix가 false인 동안 작업자에 아무것도 보내지 않는다. 고치기 자료를 원래 요청 칸에 섞어 보내지 않기 위해서다.
-    if (input.selfFix) throw new Error('change_self_fix_unsupported');
     const plan = await this.deps.source.plan(input);
     const { job } = plan;
     await this.deps.gate.authorize(job.owner_id, job.target);
@@ -816,11 +818,14 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
     if (prior && !TERMINAL_SESSION.has(prior.state)) throw new Error('change_session_active');
     const generation = (prior?.generation ?? 0) + 1;
     const timeoutMs = Math.min(job.budget.timeoutMs, TASK_LIMITS.turnTimeoutMs);
+    // 게시 전 고치기 차례만 변경 작성 판과 수정 차례 칸을 쓴다. head는 그 generation의 B이고 PR 번호는 없다. 발견은 자료 항목으로만 간다.
+    const selfFix = input.selfFix ? { instructions: CHANGE_INSTRUCTIONS_REVISION, amendment: { pullNumber: null, head: input.baseCommit, instruction: SELF_FIX_INSTRUCTION,
+      materials: { label: 'public' as const, ...boundAmendmentMaterials(selfFixMaterials(input.selfFix.findings)) } } } : null;
     const request = TASK_V2_ENDPOINTS['/v2/task'].request.parse({ version: TASK_V2_CONTRACT, lane: 'task', job: job.id, lease: job.lease_token, generation, policyRevision: input.policyRevision,
-      instructions: TASK_INSTRUCTIONS_REVISION, sessionId: randomUUID(), repository: plan.repository, base: input.baseCommit, project: plan.project, timeoutMs,
+      instructions: selfFix?.instructions ?? TASK_INSTRUCTIONS_REVISION, sessionId: randomUUID(), repository: plan.repository, base: input.baseCommit, project: plan.project, timeoutMs,
       runBudgetRemainingMs: TASK_LIMITS.runBudgetMs, toolCalls: Math.min(job.budget.toolCalls, TASK_LIMITS.toolCalls), limits: plan.limits, operation: 'start', turn: 1,
       baseline: { repoId: input.target.repoId, changeGeneration: input.target.key.generation, baseTree: input.baseTree, leaves: plan.baseline },
-      untrusted: { request: renderChangeBrief(input.brief) } });
+      untrusted: { request: renderChangeBrief(input.brief) }, ...(selfFix ? { amendment: selfFix.amendment } : {}) });
     await this.send(job, prior, request);
     return { receiptId: changeReceipt(job.id, generation) };
   }

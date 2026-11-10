@@ -26,6 +26,8 @@ import type { Publisher } from '../src/main.js';
 import { loadRuntimePolicy } from '../src/policy.js';
 import { createGitHubWriter } from '../src/github-writer.js';
 import { TaskWorkerBusy } from '../src/task-bridge.js';
+import { HttpTaskV2Worker } from '../src/task-http.js';
+import { SELF_FIX_INSTRUCTION } from '../src/claude-task-bridge.js';
 import { spawnSandbox } from '../src/change-verifier.js';
 import type { SandboxRunner } from '../src/change-verifier.js';
 import { FakeGateway, until } from './fake-gateway.js';
@@ -1688,18 +1690,14 @@ const replies = (...findings: (typeof P0_FINDING | typeof P2_FINDING)[][]) => {
   return () => ({ status: 'succeeded' as const, output: { ...reviewed, findings: findings[Math.min(call++, findings.length - 1)]! } });
 };
 const FIXED_STEP = { ...WRITE_STEP, write: { ...WRITE_STEP.write, 'src/new.ts': 'export const n = 2;\n' } };
-// 작업자 계약이 PR 없는 고치기 요청을 받기 전까지 작성 port는 고치기 차례를 열지 않는다(supportsSelfFix=false).
-// 런타임 경계를 시험하려고 그 칸만 열고, 고치기 요청은 같은 base 위의 새 작성으로 보낸다. 받은 입력은 starts에 남긴다.
-type StartInput = { selfFix?: { round: number; findings: readonly { title: string; priority: string }[] } };
-function selfFixing(h: Harness): StartInput[] {
-  const starts: StartInput[] = [];
-  h.restart({ instrument: deps => ({ ...deps, author: new Proxy(deps.author, { get(target, property, receiver) {
-    if (property === 'supportsSelfFix') return async () => true;
-    if (property === 'start') return async (input: Parameters<typeof target.start>[0]) => { starts.push(structuredClone(input)); const { selfFix: _selfFix, ...rest } = input; return target.start(rest); };
-    const value = Reflect.get(target, property, receiver) as unknown;
-    return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
-  } }) }) });
-  return starts;
+// 운영 이미지 9b067e9의 작업자는 변경 작성 판을 말하지만 수정 차례의 pullNumber를 필수로 받는다. PR 번호 없는 요청을 400 거부(started:false)로 돌려준다.
+// 게시 서버 포트는 그 응답을 그대로 받도록 실제 HttpTaskV2Worker를 쓰고 HTTP 응답만 바꾼다.
+function oldWorker(h: Harness): void {
+  h.f.port = new HttpTaskV2Worker(h.f.url, h.f.signer, async (input, init) => {
+    const body = typeof init?.body === 'string' ? JSON.parse(init.body) as { amendment?: { pullNumber: unknown } } : {};
+    if (String(input).endsWith('/v2/task') && body.amendment && body.amendment.pullNumber === null) return Response.json({ status: 'rejected', started: false }, { status: 400 });
+    return fetch(input, init);
+  });
 }
 const reviewDigests = async (h: Harness, id: string) => ({
   live: (await h.db.query<{ receipt_digest: string }>('SELECT receipt_digest FROM change_reviews WHERE change_id=$1', [id])).rows.map(row => row.receipt_digest),
@@ -1708,15 +1706,22 @@ const reviewDigests = async (h: Harness, id: string) => ({
 
 test('C31 고치기 1번: 자체 리뷰의 P0를 게시 전에 고치고 시험·리뷰를 새로 돌아 미리보기로 간다. 승인 digest는 마지막 차례 증거로만 만든다', async () => {
   await withHarness({ steps: [WRITE_STEP, FIXED_STEP], reviewReply: replies([P0_FINDING], []) }, async h => {
-    const starts = selfFixing(h);
     const id = await toAwaiting(h);
-    assert.equal((await h.f.calls()).length, 2, '처음 작성 + 고치기 1번');
+    const calls = await h.f.calls();
+    assert.equal(calls.length, 2, '처음 작성 + 고치기 1번');
     assert.equal(h.reviewInputs.length, 2, '리뷰도 차례마다 새로 돈다');
     assert.equal(h.runs.verify, 2, '시험도 차례마다 새로 돈다');
-    // 고치기 작성 입력: 차례 번호와 그 리뷰의 P0 발견만 자료로 간다.
-    assert.equal(starts[0]!.selfFix, undefined);
-    assert.deepEqual(starts[1]!.selfFix!.round, 1);
-    assert.deepEqual(starts[1]!.selfFix!.findings.map(finding => [finding.priority, finding.title]), [['P0', '빈 입력에서 예외가 난다']]);
+    // 고치기 작성 입력(S2): 지시 자리는 고정 지시 하나이고, 그 리뷰의 P0 발견은 자료 태그 안에만 있다. 원래 요청은 그대로 함께 간다.
+    assert.ok(!calls[0]!.input.includes('<owner_instruction>'), '처음 작성은 수정 차례 입력이 없다');
+    const prompt = calls[1]!.input;
+    assert.match(prompt, /게시 전 고치기 차례다\. 아직 PR이 없다/);
+    assert.ok(!/PR #/.test(prompt));
+    assert.deepEqual([...prompt.matchAll(/<owner_instruction>\n([\s\S]*?)\n<\/owner_instruction>/g)].map(match => match[1]), [SELF_FIX_INSTRUCTION]);
+    const materials = [...prompt.matchAll(/<review_material>\n([\s\S]*?)\n<\/review_material>/g)].map(match => match[1]!);
+    assert.equal(materials.length, 1);
+    assert.ok(materials[0]!.includes('[P0] 빈 입력에서 예외가 난다') && materials[0]!.includes('"path":"src/new.ts"'));
+    assert.ok(!prompt.replace(/<review_material>\n[\s\S]*?\n<\/review_material>/g, '').includes('빈 입력에서 예외가 난다'), '발견은 자료 밖에 없다');
+    assert.match(prompt, /공개 목표/);
     // 같은 generation·브랜치에서 이어 간다.
     const generation = (await h.db.query<{ generation: number; fix_round: number; branch: string }>('SELECT generation,fix_round,branch FROM change_generations WHERE change_id=$1', [id])).rows;
     assert.deepEqual(generation.map(row => [Number(row.generation), Number(row.fix_round)]), [[1, 1]]);
@@ -1735,7 +1740,6 @@ test('C31 고치기 1번: 자체 리뷰의 P0를 게시 전에 고치고 시험�
 
 test('C31 고치기 상한: P0가 계속 남으면 2번 고친 뒤 review_blocked로 닫고 남은 문제 제목을 알린다', async () => {
   await withHarness({ steps: [WRITE_STEP, FIXED_STEP, FIXED_STEP, FIXED_STEP], reviewReply: replies([P0_FINDING]) }, async h => {
-    selfFixing(h);
     await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
     const id = await h.changeId();
     await h.pump(async () => await h.phase(id) === 'blocked');
@@ -1755,9 +1759,7 @@ test('C31 고치기 상한: P0가 계속 남으면 2번 고친 뒤 review_blocke
 
 test('C31 P2·P3만: 고치지 않고 미리보기로 가며 남은 위험으로 보인다', async () => {
   await withHarness({ reviewReply: replies([P2_FINDING]) }, async h => {
-    const starts = selfFixing(h);
     const id = await toAwaiting(h);
-    assert.equal(starts.length, 1);
     assert.equal((await h.f.calls()).length, 1);
     assert.equal((await reviewDigests(h, id)).archived.length, 0);
     await h.deliver();
@@ -1765,10 +1767,9 @@ test('C31 P2·P3만: 고치지 않고 미리보기로 가며 남은 위험으로
   });
 });
 
-test('C31 작업자가 고치기 요청을 받지 못하면: 고치지 않고 지금처럼 review_blocked로 닫는다', async () => {
+test('C31 작업자가 변경 작성 판을 말하지 않으면: 고치기 차례를 열지 않고 지금처럼 review_blocked로 닫는다', async () => {
   await withHarness({ reviewReply: replies([P0_FINDING]) }, async h => {
-    // 지금 작성 port는 고치기 차례를 열지 않는다(작업자 계약에 PR 없는 고치기 칸이 없다).
-    assert.equal(await h.runtime['deps'].author.supportsSelfFix(), false);
+    h.f.port.changeInstructions = async () => ['task-v1'];
     await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
     const id = await h.changeId();
     await h.pump(async () => await h.phase(id) === 'blocked');
@@ -1779,27 +1780,27 @@ test('C31 작업자가 고치기 요청을 받지 못하면: 고치지 않고 �
     assert.match(notice, /자체 리뷰에서 막는 문제가 나와서 게시하지 않았어요/);
     assert.match(notice, /- P0 빈 입력에서 예외가 난다/);
   });
-  // 차례는 열렸는데 고치기 요청이 거부되면 새 실패 모양 없이 review_blocked다.
+});
+
+test('C31 호환(옛 작업자 9b067e9): PR 번호 없는 고치기 요청을 거부하면 새 실패 모양 없이 review_blocked로 닫고 레인을 놓는다', async () => {
   await withHarness({ reviewReply: replies([P0_FINDING]) }, async h => {
-    h.restart({ instrument: deps => ({ ...deps, author: new Proxy(deps.author, { get(target, property, receiver) {
-      if (property === 'supportsSelfFix') return async () => true;
-      const value = Reflect.get(target, property, receiver) as unknown;
-      return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
-    } }) }) });
-    // 같은 시험 안이라 앞 harness의 행이 남아 있다. 다른 이벤트 ID로 새 변경을 만든다.
-    await h.command('200', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    oldWorker(h);
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
     const id = await h.changeId();
     await h.pump(async () => await h.phase(id) === 'blocked');
     assert.equal((await h.changes.get(id) as any).value.phaseReason, 'review_blocked');
-    assert.equal((await h.f.calls()).length, 1, '고치기 요청은 작업자에 가지 않았다');
+    assert.equal((await h.f.calls()).length, 1, '고치기 요청은 모델까지 가지 않았다');
+    assert.equal((await reviewDigests(h, id)).archived.length, 1, '차례는 열렸다');
     assert.ok(h.logs.some(entry => entry.event === 'change_self_fix_failed'));
     await h.pump(async () => !await h.store.laneBusy('task'));
+    await h.deliver();
+    assert.match(h.messages().find(text => text.includes('review_blocked'))!, /- P0 빈 입력에서 예외가 난다/);
+    assert.equal(h.env.github.mutations().length, 0);
   });
 });
 
 test('C31 차례 중 취소: 고치기 작성 중 /change-cancel이면 cancelled로 닫고 레인을 놓는다', async () => {
   await withHarness({ steps: [WRITE_STEP, { kind: 'hang' }], reviewReply: replies([P0_FINDING], []) }, async h => {
-    selfFixing(h);
     await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
     const id = await h.changeId();
     await h.pump(async () => (await h.f.calls()).length === 2);
@@ -1814,7 +1815,6 @@ test('C31 차례 중 취소: 고치기 작성 중 /change-cancel이면 cancelled
 
 test('C31 차례 중 base 이동: 고친 결과는 고정한 base 그대로 미리보기로 가고, 승인 뒤 게시 직전 기존 신선도 규칙으로 superseded가 된다', async () => {
   await withHarness({ steps: [WRITE_STEP, FIXED_STEP], reviewReply: replies([P0_FINDING], []) }, async h => {
-    selfFixing(h);
     await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
     const id = await h.changeId();
     // 가짜 작업자는 작업 공간을 지금 main에서 만들어, 작성 중에 옮기면 baseline_mismatch로 먼저 막힌다. 고친 결과를 저장한 뒤 옮긴다.

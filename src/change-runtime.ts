@@ -147,7 +147,7 @@ const receiptOf = (child: Pick<ChildRow, 'id' | 'session_generation'>) => `v2:${
 // 작업자가 고칠 수 없는 입력·경계 문제를 말한 경우다. 내부 실패(failed)와 구분해 owner가 사유를 읽게 둔다.
 const blockedAuthorCode = (code: string) => /^(artifact_|baseline_|label_|task_artifact_|task_baseline_|task_question_)/.test(code);
 // prepareApproval이 돌려주는 값 중 다시 해도 같은 것들. 그 밖의 읽기 실패는 다음 바퀴에 다시 본다.
-const SELF_FIX_UNAVAILABLE = new Set(['change_self_fix_unsupported', 'self_fix_findings_missing']);
+const SELF_FIX_UNAVAILABLE = new Set(['self_fix_findings_missing']);
 const FINAL_APPROVAL =/^(label_blocked|review_mismatch|review_incomplete|policy_revoked|policy_changed|publication_|secret_detected|internal_marker|metadata_sensitive|base_tree_incomplete|evidence_missing|ci_(?!unreadable))/;
 
 export class ChangeRuntime {
@@ -360,7 +360,7 @@ export class ChangeRuntime {
       return true;
     } catch (error) {
       const code = error instanceof Error ? error.message : '';
-      if (code === 'label_blocked' || code === 'base_tree_incomplete' || code === 'policy_revoked' || code === 'change_brief_too_long' || code === 'change_self_fix_unsupported') {
+      if (code === 'label_blocked' || code === 'base_tree_incomplete' || code === 'policy_revoked' || code === 'change_brief_too_long') {
         await this.authorEnded(request, { to: 'blocked', reason: code });
         return true;
       }

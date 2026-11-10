@@ -133,7 +133,8 @@ export async function changeHarness(db: Database, options: HarnessOptions = {}):
   const worker = { taskOpen: true, unreachable: false };
   const reach = () => { if (worker.unreachable) throw new Error('task_worker_uncertain'); };
   const v1 = { call: async (endpoint: never, body: never, signal?: AbortSignal) => { reach(); return new HttpTaskWorker(f.url, f.signer, fetch).call(endpoint, body, signal); } };
-  const v2 = { callV2: (async (endpoint: never, body: never, signal?: AbortSignal) => { reach(); return f.port.callV2(endpoint, body, signal); }) as typeof f.port.callV2, supportsChange: (signal?: AbortSignal) => f.port.supportsChange(signal) };
+  const v2 = { callV2: (async (endpoint: never, body: never, signal?: AbortSignal) => { reach(); return f.port.callV2(endpoint, body, signal); }) as typeof f.port.callV2, supportsChange: (signal?: AbortSignal) => f.port.supportsChange(signal),
+    changeInstructions: (signal?: AbortSignal) => f.port.changeInstructions(signal) };
   let shutdown = new AbortController();
   const rest = new MockDiscord();
   const build = (runtimeOptions: { crash?: Crash; instrument?: (deps: ChangeRuntimeDeps) => ChangeRuntimeDeps } = {}) => {
