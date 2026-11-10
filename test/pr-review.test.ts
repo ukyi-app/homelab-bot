@@ -9,10 +9,10 @@ import { readFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { DEFAULTS, Denied, WorkerRejected } from '../src/contracts.js';
 import type { Scope } from '../src/contracts.js';
-import { ArchiveError, MODEL_OMITTED_MAX, readArchive, REVIEW_INSTRUCTIONS, ReviewWorker, unifiedDiff } from '../src/review-input.js';
+import { ArchiveError, MODEL_OMITTED_MAX, readArchive, REVIEW_INSTRUCTIONS, REVIEW_INSTRUCTIONS_V2, ReviewWorker, unifiedDiff } from '../src/review-input.js';
 import type { ArchiveFetcher, ReviewerInput, ReviewerModel, ReviewTask } from '../src/review-input.js';
 import { GitHubError, GitHubIngress, githubWebhook, RestrictedGitHub, restrictGitHubWrite, ReviewPolicySource,
-  ReviewPublisher, ReviewQueue, ReviewReconciler, ReviewRuntime, reviewMarker } from '../src/review.js';
+  ReviewPublisher, ReviewQueue, ReviewReconciler, ReviewRuntime, reviewMarker, reviewRevision } from '../src/review.js';
 import type { GitHubReader, GitHubTransport, GitHubWrite, ReviewPolicy, ReviewResult } from '../src/review.js';
 import { archiveContract } from '../src/worker.js';
 import { HttpReviewWorker, reviewWorkerServer } from '../src/review-http.js';
@@ -317,7 +317,7 @@ test('REVIEW-04 전체 경로: 게시 서버는 event=COMMENT와 검토 head를 
   assert.equal(write.body.commit_id, HEAD);
   assert.equal(write.path, `/repos/${REPO.fullName}/pulls/7/reviews`);
   assert.deepEqual(write.body.comments.map(c => [c.path, c.line, c.side]), [['src/app.ts', 2, 'RIGHT']]);
-  assert.match(write.body.body, /승인·병합 판단이 아니며/);
+  assert.equal(write.body.body.split('\n')[1], '참고용 자동 리뷰예요. 승인·병합 판단이 아니고 안전을 보증하지도 않아요.');
   const [job] = await reviewJobs();
   assert.equal(job!.state, 'succeeded');
   assert.equal(job!.review_outcome, 'completed');
@@ -328,6 +328,65 @@ test('REVIEW-04 전체 경로: 게시 서버는 event=COMMENT와 검토 head를 
   await f.publisher.deliver();
   assert.equal(f.rest.messages.length, 1);
   assert.match(f.rest.messages[0]!.body.content, /PR 리뷰 게시: fixture-org\/fixture-repo#7/);
+});
+test('AC-13 PR 리뷰 말투: 심각도·한 문단 지적·승인·병합 아님 안내·첫 줄 대조 표식, Discord 요약에는 모델 문장 없음', async () => {
+  const second = { severity: 'P3', title: '경계 시험 없음', path: 'src/app.ts', line: null, condition: 'count가 0인 경우를 시험하지 않아요.',
+    impact: '같은 버그가\n\n다시 들어와도 못 잡아요.', evidence: '바뀐 파일에 시험이 없어요.', suggestion: 'count 0 시험을 하나 더해 주세요.' };
+  const question = 'count 0이 실제로 들어오나요?';
+  r.reply({ status: 'succeeded', output: { findings: [second, FINDING], open_questions: [question], public_summary: '나눗셈 경계만 보면 될 것 같아요.' } });
+  await fullReview();
+  const write = r.gh.writes[0]!;
+  const body = write.body.body;
+  const lines = body.split('\n');
+  assert.match(lines[0]!, /^<!-- homelab-bot-review:github-review:[0-9a-f-]+:1 -->$/);
+  assert.equal(lines[1], '참고용 자동 리뷰예요. 승인·병합 판단이 아니고 안전을 보증하지도 않아요.');
+  assert.match(lines[2]!, new RegExp(`^검토를 마쳤어요\\. 파일 1개를 봤어요\\. 리비전 head \`${HEAD}\` · 기준 \`${BASE}\` · 정책 \`rp-[0-9a-f]{16}\`$`));
+  // 조건·영향·근거·개선이 네 줄 양식이 아니라 심각도 줄 아래 한 문단으로 이어진다. 심각도 순서(P1 먼저)는 그대로다.
+  const p1 = 'count가 0일 때. NaN·Infinity가 호출자로 전파된다. return total / count; count 0을 먼저 거부한다.';
+  const p3 = 'count가 0인 경우를 시험하지 않아요. 같은 버그가 다시 들어와도 못 잡아요. 바뀐 파일에 시험이 없어요. count 0 시험을 하나 더해 주세요.';
+  assert.ok(body.includes(`**[P1] 0으로 나누기** · \`src/app.ts\`:2\n${p1}\n\n**[P3] 경계 시험 없음** · \`src/app.ts\`\n${p3}`));
+  assert.ok(!/^- (조건|영향|근거|개선): /m.test(body));
+  assert.ok(body.includes(`\n- ${question}`));
+  assert.deepEqual(write.body.comments.map(c => c.body), [`**[P1] 0으로 나누기**\n\n${p1}`]);
+  const summary = (await rows('outbox')).find(o => o.idempotency_key.startsWith('review-summary:'))!.payload.content as string;
+  assert.ok(summary.includes('승인·병합 판단이 아닙니다'));
+  for (const text of [FINDING.title, FINDING.condition, FINDING.impact, second.title, second.suggestion, question, '나눗셈 경계만']) {
+    assert.ok(!summary.includes(text), text);
+  }
+});
+test('AC-13 리뷰 지시문 v1→v2 배포: 게시 대기 결과는 새 렌더로 게시, 같은 head에 결과가 있는 PR은 자동 재리뷰 없음, 모델 전 작업만 새 세대', async () => {
+  const current = r.source.current.bind(r.source);
+  // 배포 전 서버: 같은 정책에 v1 지시문으로 만든 세대 revision을 쓴다.
+  r.source.current = async () => { const context = await current(); return { ...context, revision: reviewRevision(context.review, REVIEW_INSTRUCTIONS) }; };
+  const legacy = reviewRevision(r.policy(), REVIEW_INSTRUCTIONS);
+  const prN = (n: number) => pull({ number: n });
+  for (const n of [7, 8, 9]) r.gh.pulls.set(n, prN(n));
+  await hook('pull_request', prEvent('opened', prN(7))); await r.runtime.tick(); await r.publisher.deliver();
+  await hook('pull_request', prEvent('opened', prN(8))); await r.runtime.tick();
+  await hook('pull_request', prEvent('opened', prN(9)));
+  assert.deepEqual((await deliveries()).map(d => [d.pr_number, d.state, d.policy_revision]), [[7, 'sent', legacy], [8, 'pending', legacy]]);
+  const generations = async () => (await database.db.query<{ pr_number: number; state: string; wait_reason: string | null; policy_revision: string }>(
+    'SELECT p.pr_number,j.state,j.wait_reason,p.policy_revision FROM pr_reviews p JOIN jobs j ON j.id=p.job_id ORDER BY j.created_at,p.pr_number')).rows
+    .map(g => [g.pr_number, g.state, g.wait_reason, g.policy_revision === legacy ? 'v1' : 'v2']);
+
+  r.source.current = current;
+  // 배포 전에 저장돼 게시를 기다리던 결과는 버리지 않고 새 렌더로 나간다.
+  await r.publisher.deliver();
+  assert.deepEqual(r.gh.writes.map(w => w.path), [7, 8].map(n => `/repos/${REPO.fullName}/pulls/${n}/reviews`));
+  assert.equal(r.gh.writes[1]!.body.body.split('\n')[1], '참고용 자동 리뷰예요. 승인·병합 판단이 아니고 안전을 보증하지도 않아요.');
+  assert.match(r.gh.writes[1]!.body.body, /^\*\*\[P1\] 0으로 나누기\*\* · `src\/app\.ts`:2$/m);
+  // 재조정은 같은 head에 결과가 이미 있는 PR(7·8)을 지시문 변경만으로 다시 리뷰하지 않는다. 모델을 아직 부르지 않은 PR 9만 새 세대다.
+  r.gh.open = [7, 8, 9].map(prN);
+  assert.deepEqual(await r.reconciler.run(), { admitted: 1, limited: false });
+  assert.deepEqual(await generations(), [[7, 'succeeded', null, 'v1'], [8, 'succeeded', null, 'v1'], [9, 'superseded', 'policy_changed', 'v1'],
+    [9, 'queued', null, 'v2']]);
+  assert.equal((await hook('pull_request', prEvent('ready_for_review', prN(8)))).outcome, 'instructions_only');
+  await r.runtime.tick(); await r.publisher.deliver();
+  assert.equal(r.inputs.at(-1)!.instructions, REVIEW_INSTRUCTIONS_V2);
+  assert.equal(r.gh.writes.length, 3);
+  assert.deepEqual(await r.reconciler.run(), { admitted: 0, limited: false });
+  // 명시 요청(댓글 리뷰 명령)은 새 지시문으로 다시 리뷰한다.
+  assert.equal((await hook('issue_comment', commentEvent())).outcome, 'queued');
 });
 test('REVIEW-04 게시 상한이 정해지지 않았거나 넘으면 자동 게시를 거부', async () => {
   r.policy().publish = null;
@@ -351,7 +410,7 @@ test('SEC-01 PR 본문·변경된 AGENTS.md·Renovate 릴리스 노트의 지시
     { path: 'src/app.ts', previousPath: null, status: 'modified', baseType: 'blob', headType: 'blob' }], truncated: false };
   await fullReview(pull({ ...bot(RENOVATE), title: 'chore(deps): update fixture-lib to v2', body: `## Release notes\n${injection}` }));
   const input = r.inputs[0]!;
-  assert.equal(input.instructions, REVIEW_INSTRUCTIONS);
+  assert.equal(input.instructions, REVIEW_INSTRUCTIONS_V2);
   assert.equal(input.guidelines, '기준 지침: 한국어로 리뷰한다.\n');
   assert.ok(input.untrusted.pullRequest.body.includes(injection));
   assert.ok(!JSON.stringify([input.instructions, input.guidelines]).includes('APPROVE'));
@@ -534,7 +593,7 @@ test('REVIEW-03 파일 수·diff 상한·바이너리·큰 잠금 파일·submod
   assert.equal(result.coverage.omitted_files_with_reasons.filter(o => o.reason === 'file_limit').length, 3);
   assert.ok(result.coverage.limits_hit.includes('file_limit'));
   assert.match(r.gh.writes[0]!.body.body, /부분 검토/);
-  assert.match(r.gh.writes[0]!.body.body, /미검토 `vendor\/lib`: submodule_pointer/);
+  assert.match(r.gh.writes[0]!.body.body, /^- 못 본 파일 `vendor\/lib`: submodule_pointer$/m);
   // 모델도 제외 파일과 이유를 받는다. 없으면 참조된 파일을 "PR에 없다"고 오판한다.
   const sent = r.inputs.at(-1)!.untrusted;
   assert.deepEqual(sent.omitted, result.coverage.omitted_files_with_reasons);
@@ -795,7 +854,7 @@ test('DATA-01 게시 직전 현재 내부 표식으로 다시 분류하고, 모�
   r.reply({ status: 'succeeded', output: OUTPUT });
   await fullReview(pull({ updated_at: '2026-10-29T00:07:00Z' }));
   const hostileBody = r.gh.writes[0]!.body.body;
-  assert.ok(hostileBody.includes('- 미검토 `x?@\u200bfixture-org/admins?&lt;!--.bin`: binary'));
+  assert.ok(hostileBody.includes('- 못 본 파일 `x?@\u200bfixture-org/admins?&lt;!--.bin`: binary'));
   assert.equal(hostileBody.match(/<!--/g)!.length, 1);
 });
 
@@ -1372,7 +1431,7 @@ test('r2 P2-06 REVIEW-04 게시 대기 중 낮아진 지적 수·인라인 수·
   const body = r.gh.writes[0]!.body.body;
   assert.equal(body.match(/^\*\*\[P[0-3]\]/gm)!.length, 1);
   assert.ok(!body.includes('두 번째 지적'));
-  assert.match(body, /상한으로 1건 생략/);
+  assert.match(body, /게시 상한 때문에 1건은 싣지 않았어요/);
   assert.deepEqual(r.gh.writes[0]!.body.comments, []);
   await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,outbox CASCADE');
   r.policy().publish = POLICY.publish;
@@ -1466,6 +1525,22 @@ test('r3 R2-01 EVENT-01 같은 세대의 reopened·ready_for_review 뒤 늦게 �
   assert.equal((await hook('pull_request', prEvent('reopened', pull({ updated_at: '2026-10-29T02:00:00Z' })))).outcome, 'duplicate_generation');
   assert.equal((await hook('pull_request', prEvent('closed', pull({ state: 'closed', updated_at: '2026-10-29T01:00:00Z' })))).outcome, 'stale_event');
   assert.equal((await hook('pull_request', prEvent('ready_for_review', pull({ updated_at: '2026-10-29T03:00:00Z' })))).outcome, 'duplicate_generation');
+  assert.equal((await hook('pull_request', prEvent('converted_to_draft', pull({ draft: true, updated_at: '2026-10-29T02:30:00Z' })))).outcome, 'stale_event');
+  assert.deepEqual((await deliveries()).map(d => d.state), ['pending']);
+  await r.publisher.deliver();
+  assert.equal(r.gh.writes.length, 1);
+  assert.equal(r.inputs.length, 1);
+});
+test('AC-13 지시문 판만 바뀌어 재리뷰를 건너뛴 이벤트도 최신 시각을 남겨, 늦게 온 옛 closed·draft가 v1 게시 대기 결과를 지우지 않는다', async () => {
+  const current = r.source.current.bind(r.source);
+  r.source.current = async () => { const context = await current(); return { ...context, revision: reviewRevision(context.review, REVIEW_INSTRUCTIONS) }; };
+  await opened(pull({ updated_at: '2026-10-29T00:00:00Z' }));
+  await r.runtime.tick();
+  r.source.current = current;
+  r.gh.pulls.set(7, pull({ updated_at: '2026-10-29T02:00:00Z' }));
+  assert.equal((await hook('pull_request', prEvent('reopened', pull({ updated_at: '2026-10-29T02:00:00Z' })))).outcome, 'instructions_only');
+  assert.equal((await hook('pull_request', prEvent('closed', pull({ state: 'closed', updated_at: '2026-10-29T01:00:00Z' })))).outcome, 'stale_event');
+  assert.equal((await hook('pull_request', prEvent('ready_for_review', pull({ updated_at: '2026-10-29T03:00:00Z' })))).outcome, 'instructions_only');
   assert.equal((await hook('pull_request', prEvent('converted_to_draft', pull({ draft: true, updated_at: '2026-10-29T02:30:00Z' })))).outcome, 'stale_event');
   assert.deepEqual((await deliveries()).map(d => d.state), ['pending']);
   await r.publisher.deliver();

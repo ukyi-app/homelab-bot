@@ -2321,6 +2321,24 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 - **시험하지 않은 것:** `queue_full`(큐 90건을 채우는 준비가 커 시험하지 않았다. 조건은 '/resume-model'과 같은 `queueFull('chat')`). 진입점 `main()`의 실제 pg 풀과 게시 서버 env 전체로 만든 HTTP 작업자는 S5.
 - **못 잡는 범위.** 운영 클러스터 권한, 실제 작업자 프로세스의 소멸 확인, homelab CLI가 새 결과 이름을 받는지(S3, homelab 쪽 `BOT_RESULTS`), 운영 1회(S5, 주 진행자).
 
+## C12 PR 리뷰 말투 (2026-11-10, 로컬)
+
+동료 봇 명세 §4.4 "PR 리뷰(GitHub)"·"리뷰 지시문 변경의 대가"와 AC-13을 S1(GitHub webhook → PGlite → 가짜 작업자 → 가짜 GitHub 게시, 조립 서버 `publisher-review`)과 S2(리뷰 레인 프롬프트, 가짜 CLI)에서 고정했다. 렌더 형식과 재리뷰 몰림 판단은 [DECISIONS](DECISIONS.md) "C12 PR 리뷰 말투".
+
+| 완료 조건 | 시험 |
+|---|---|
+| 본문·인라인 댓글에 심각도, 지적마다 한 문단 | `pr-review` "AC-13 PR 리뷰 말투: 심각도·한 문단 지적·…"(P1·P3 순서, `**[P1] 0으로 나누기** · \`src/app.ts\`:2` 줄 아래 네 칸이 한 문단, 칸 안 빈 줄도 접힘, `- 조건:` 같은 줄 없음, 인라인 댓글 본문 리터럴), `publisher-review` "T17 열림 조립"(조립 서버에서 같은 심각도 줄) |
+| "승인·병합 판단이 아니다"와 대조 marker 유지 | 같은 시험의 둘째 줄 리터럴과 첫 줄 marker 정규식, `pr-review` "REVIEW-04 전체 경로", "DATA-01 …HTML 주석을 무력화"(`<!--`가 marker 하나뿐), "EVENT-02 재시도 전 기존 게시를 먼저 대조…"(marker로 대조) |
+| Discord 리뷰 요약에 모델 문장 없음 | "AC-13 PR 리뷰 말투…"(요약에 제목·조건·영향·개선·확인 질문·공개 요약이 없고 "승인·병합 판단이 아닙니다"는 있음) |
+| 게시 상한 동작 그대로 | "REVIEW-04 게시 상한이 정해지지 않았거나 넘으면 자동 게시를 거부", "r2 P2-06 REVIEW-04 게시 대기 중 낮아진 지적 수·인라인 수·본문 길이 상한을 게시 시점 정책으로 적용"(문구만 새 렌더로) |
+| 지시문 literal과 서버 v2 사용 | `pr-review` "SEC-01 PR 본문·…"(작업자 입력의 지시문이 `REVIEW_INSTRUCTIONS_V2`), `publisher-review` "T17 열림 조립"(작업자 요청의 `instructions`), `review-lane` "리뷰 레인 입력: …"(프롬프트 첫 줄이 받은 v2 그대로) |
+| 재리뷰 몰림 확인과 대응 | `pr-review` "AC-13 리뷰 지시문 v1→v2 배포: …"(배포 전 서버로 PR 7 게시·PR 8 게시 대기·PR 9 대기 → 배포 뒤 PR 8은 새 렌더로 게시, 재조정은 PR 9만 넣음(`admitted: 1`), PR 9 옛 작업은 `policy_changed`, `ready_for_review`는 `instructions_only`, 댓글 명령은 `queued`) |
+
+- **실행(병합 결과 d257572, origin/main d353fc0 반영, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 11개 파일(`pr-review`·`publisher-review`·`review-lane`·`change-review-dispatch`·`change-review-pg`·`change-review`·`github-review-app`·`review-repo-name`·`task-bridge`·`worker-server`·`unknown-probe`) 388개 통과, 실패·skip 0.
+- **고치기 전 실패 확인:** 새 렌더 시험은 옛 렌더에서, 서버 v2 시험 2개(SEC-01·T17 열림 조립)는 서버가 v1을 보낼 때, 배포 시험은 게시 대기 결과가 `policy_changed`로 버려져 실패했다.
+- **바뀐 기존 시험:** 머리말 정규식(`승인·병합 판단이 아니며`)을 둘째 줄 리터럴로, `미검토 …`를 `- 못 본 파일 …`로, `상한으로 1건 생략`을 `게시 상한 때문에 1건은 싣지 않았어요`로 바꿨다. `review-lane`의 입력 지시문은 서버가 보내는 v2로 바꿨다.
+- **못 잡는 범위.** 리뷰 글의 말투 품질과 GitHub에서 보이는 모양은 S5(C24 `homelab-smoke` PR)다. 운영의 실제 재리뷰 건수는 배포 뒤 관찰이다(DECISIONS의 예상 0건).
+
 ## C11 대화 v2 전환 (2026-11-10, 로컬)
 
 동료 봇 명세 §4.2(대화 답과 작업자 계약 v2)·§4.5(`ack_only`의 👍)와 AC-3·AC-4(서버)·AC-5·AC-14(👍)를 S1(수신 `DiscordIngress` → PGlite·실제 PostgreSQL → `Runtime` → 게시 `DiscordPublisher`, 반응은 실제 `DiscordProtocol`에 가짜 API)과 S2(작업자 v2 계약: `SerialWorker`·`HttpWorker`·로컬 HTTP 작업자)에서 고정했다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §13 "대화 답 형식 (v2 `reply`, C11)"과 "봇 답 문맥"이다. 시작 전 확인: C06 운영 확인(v1 게시 서버 + v2 작업자로 대화·작업·리뷰 각 1회)이 homelab `approvals.md` 2026-11-10 10:1x~10:3x 줄에 있다.
