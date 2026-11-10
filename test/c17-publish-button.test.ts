@@ -38,8 +38,10 @@ const protocol = new DiscordProtocol({ request: async (method, path) => {
 const press = (h: Harness, id: string, customId: string, actor = OWNER) => protocol.gateway('INTERACTION_CREATE', { id, token: 'fixture-interaction-token', type: 3,
   channel_id: THREAD.channel, guild_id: THREAD.guild, member: { user: { id: actor } }, data: { custom_id: customId } }, h.ingress);
 // 게시된 미리보기 중 버튼이 달린 글(마지막 쪽)과 미리보기 본문에 적힌 승인 digest.
+// 앞 세대 버튼 글이 섞이면 그 세대 digest를 잘못 집으므로 버튼 글도 custom_id의 세대 칸으로 거른다.
 const previewButton = (h: Harness, generation = 1) => {
-  const posted = h.rest.messages.filter(message => message.body.content.includes(`g${generation} 게시 미리보기`) || message.body.components?.length);
+  const posted = h.rest.messages.filter(message => message.body.content.includes(`g${generation} 게시 미리보기`)
+    || message.body.components?.[0]?.components[0]?.custom_id.includes(`.${generation}.`));
   const withButton = posted.filter(message => message.body.components?.length);
   const digest = /text:([0-9a-f]{64})/.exec(posted.map(message => message.body.content).join(''))?.[1];
   return { withButton, digest, customId: withButton.at(-1)?.body.components?.[0]?.components[0]?.custom_id };
