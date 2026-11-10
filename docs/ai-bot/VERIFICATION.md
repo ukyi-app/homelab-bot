@@ -2677,3 +2677,17 @@ T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·
 - **Codex 1차 리뷰 반영(origin/main edd9a4a(C18) 병합 뒤, `--pg`):** 지적마다 수정을 잠시 되돌려 빨강을 본 뒤 초록이다. (1) `change-assembly` "AC-28 시험 실패 receipt 저장 직후 끊김: …"(되돌리면 차례가 `running`에서 `pump_timeout`, 고치면 `verification_failed`로 닫히고 시험 다시 안 돌림·GitHub 쓰기 0·작성 job 정리·레인 풀림). (2) `c27-change-amend` "C27 수정 요청 PR 링크: …"(되돌리면 다른 저장소 #7을 고름, 고치면 링크 저장소의 변경·확인 글에 저장소, 정책 밖 저장소 링크는 버림). (3) `change-store` "C27 차례 실패 전이: claim 전에 …"(되돌리면 `unresolved_effects`, 고치면 pending만 `not_sent`로 해소·proposed 복귀·다음 차례 열림, `sending`은 그대로 막음). (4) `change-assembly` "AC-28 안내 댓글 전송 실패: …"(되돌리면 줄 댓글 항목이 요약에서 빠짐). (5) `change-assembly` "AC-28 수정 결과 알림 조회: …"(알림을 못 만드는 끝난 차례 32개를 앞에 두면 되돌린 판은 뒤 실패 알림을 못 보냄). 관련 9개 파일(`c18-fixed-text`·`c27-change-amend`·`change-assembly`·`change-store`·`change-store-pg`·`change-guidance`·`change-publication`·`change-contracts`·`pr-review`) 385개 모두 통과. C27 문구 표(`AMENDMENT_TEXT`·`AMENDMENT_REQUEST_TEXT`)는 C18 검사 방식으로 '/' 이름이 없고 해요체인지 `c27-change-amend` "C27 문구: …"가 본다.
 - **확인한 자료만 반영(Codex 보안 리뷰 P2, `--pg`):** 런타임 대조 줄을 잠시 끄면 "AC-28 확인 뒤 자료 변경·삭제" 두 시험만 실패하고(고친 본문이 작성 입력에 들어가거나 지워진 글을 빼고 커밋), 되살리면 통과한다.
 - **못 잡는 범위:** 실제 GitHub push·CI, ruleset E 아래 fast-forward(S5, C24 "수정 요청 한 차례"), 자료 안 프롬프트 주입이 작성 모델을 속이는 경우(실행 확인·검사·owner의 병합 전 리뷰가 방어), 실제 작업자 이미지 위의 수정 차례(S5).
+
+## C34 수정 요청 후속 (2026-11-10, 로컬)
+
+명세 §4.10 "수정 요청", AC-28(재시작 복구, 닫힌 PR 거절). 봇 #138(C27) Codex 3차 리뷰 P2 둘이다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §16 "재시작과 닫힌 PR(C34)", 구현 선택은 [DECISIONS](DECISIONS.md) "C34 수정 요청 후속". 경계는 S1(변경 런타임·수정 요청, 가짜 GitHub, PGlite)이다.
+
+| 완료 조건 | 근거 |
+|---|---|
+| 시험이 모두 통과한 뒤 재시작해도 수정 차례의 작성 job이 끝 상태가 되고 작업 레인이 풀린다 | `change-assembly` "AC-28 시험 통과 receipt 저장 직후 끊김(C34): …"(통과 receipt 저장 직후 끊김 → 재시작한 런타임이 리뷰·게시 바퀴 없이 작성·정리 바퀴만으로 job `succeeded`·세션 `completed`, `laneBusy('task')` false, 차례는 아직 running, 이어서 커밋, 시험 다시 안 돌림). 고치기 전에는 job·세션이 `running`에 남아 실패했다 |
+| 이미 병합되거나 닫힌 PR의 수정 요청은 확인 버튼 없이 거절되고 수정 횟수를 쓰지 않는다 | `c27-change-amend` "C34 수정 요청 닫힌 PR: …"(DB는 proposed인데 GitHub PR이 닫힘 → 버튼·제안 0, `not_open` 한 줄, 차례 0, 다시 열리면 확인 글). 고치기 전에는 확인 버튼이 나와 실패했다. `github-review-app` "PR 자료 읽기(C34): …"(병합·병합 없이 닫힘은 `open: false`, 다른 번호 응답 거부), "PR 자료 읽기: 리뷰·리뷰 댓글·…"(PR 읽기가 먼저 한 번, 읽기 토큰). `change-assembly` "AC-28 차례 열기 직전 병합(C34): …"(병합 읽기 주기가 1시간 남았어도 차례 열기 전 읽어 merged, 차례 `pr_merged`, 작성 job·모델 호출 0, ref 갱신 0). 고치기 전에는 작성이 돌고 게시에서야 `pull_not_open`으로 닫혀 실패했다 |
+| 기존 병합 읽기 흐름 그대로 | `change-assembly` "AC-28 차례 열기 전 병합 읽기(C34): …"(기다리는 차례가 없으면 5바퀴에 병합 읽기 1번, 차례가 생기면 열기 전 1번 더 읽고 연다), 그리고 같은 파일의 T19·C17·C29·C31 처음 게시·병합·배포 시험 |
+
+- **실행(origin/main 07fd6d0 위, 병합할 새 커밋 없음, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 바뀐 모듈을 참조하는 16개 파일(`change-assembly`·`change-pg`·`change-guidance`·`change-preview-pages`·`change-verify-recheck`·`c13-proposal`·`c14-remaining-actions`·`c16-task-question`·`c17-publish-button`·`c18-fixed-text`·`c27-change-amend`·`c28-change-question`·`c30-review-request`·`github-review-app`·`publisher-main`·`pr-review`) 459개 모두 통과, skip 0.
+- **운영 영향:** 동료 기능 스위치가 꺼져 있으면 수정 차례가 열리지 않고 수정 요청 처리기도 동작하지 않으므로 바뀐 동작이 없다. 스위치 밖에서 닿는 곳은 둘이다. (1) `proposed` 바퀴는 기다리는 수정 차례가 없으면 병합 읽기 주기·순서가 C27과 같다(위 시험). (2) 리뷰 App `discussion.read`가 `GET pulls/{n}`을 한 번 더 읽는다. 지금 이 읽기를 부르는 곳은 수정 요청(스위치 뒤)뿐이다. 마이그레이션 없음.
+- **못 잡는 범위:** 실제 GitHub의 상태 지연(병합 직후 `GET pulls`가 아직 open을 주는 경우, C24 S5). 확인 글을 낸 뒤 누르기 전에 닫힌 PR은 누를 때 다시 읽지 않는다. 그 차례는 열기 전 병합 읽기에서 `pr_merged`나 `closed_unmerged`로 닫히고 작성은 돌지 않는다.
