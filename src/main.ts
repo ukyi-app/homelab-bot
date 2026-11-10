@@ -219,7 +219,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   // taskLoop와 lanes는 함께 켠다. 하나만 켜면 해제 문구와 실제 슬롯이 어긋난다.
   const taskLoop = !!taskBridge;
   const runtime = new Runtime(store, gate, new HttpWorker(config.workerUrl, send), signer, reader,
-    taskBridge, { shutdown: stop.signal, drainMs: deps.drainMs, taskLoop });
+    taskBridge, { shutdown: stop.signal, drainMs: deps.drainMs, taskLoop, externalTask: !!config.externalTask });
   const changeReview = changeGate.open ? assembleChangeReview({ store, gate, signer, workerUrl: config.workerUrl, send, now, shutdown: stop.signal, log, ...(deps.drainMs !== undefined ? { drainMs: deps.drainMs } : {}) }) : undefined;
   // 객체는 만들기만 한다(I/O 없음). 조건 (d)를 확인하기 전에는 reviewOpened가 false라 webhook·명령이 닫힌 그대로다.
   const precondition = reviewGate;
