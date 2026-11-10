@@ -5,7 +5,7 @@ import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { assembleChange, assembleChangeReview, changeCommandHandler, guardedTaskCommands } from '../src/change-assembly.js';
 import { sha256Hex } from '../src/change-contracts.js';
-import type { ChangePhase } from '../src/change-contracts.js';
+import type { ChangeNote, ChangePhase } from '../src/change-contracts.js';
 import { ChangeReviewResults, ChangeReviewWorker, changeReviewRoutes } from '../src/change-review.js';
 import type { ChangeReviewOutput, ChangeReviewerInput, ChangeReviewerModel } from '../src/change-review.js';
 import type { ChangeRuntime, ChangeRuntimeDeps } from '../src/change-runtime.js';
@@ -16,6 +16,7 @@ import { ClaudeTaskBridge } from '../src/claude-task-bridge.js';
 import type { Scope } from '../src/contracts.js';
 import type { Database } from '../src/database.js';
 import { DiscordIngress, DiscordPublisher } from '../src/discord.js';
+import type { GuidanceReviewPort } from '../src/github-review-io.js';
 import { PolicyGate } from '../src/policy.js';
 import type { Policy } from '../src/policy.js';
 import { ReviewRuntime } from '../src/review.js';
@@ -55,6 +56,10 @@ export interface HarnessOptions {
   policyPatch?: (policy: Policy) => Policy; change?: boolean; crash?: Crash;
   // 동료 기능 스위치(Store.colleague). 기본 꺼짐이다.
   colleague?: boolean;
+  // 작성 결과에 실을 확인할 것·남은 위험(C25 결과 칸).
+  notes?: { checks: ChangeNote[]; risks: ChangeNote[] };
+  // main이 리뷰 경로에서 넘기는 안내 리뷰 포트(assembleChange 인수). 없으면 리뷰 경로가 없는 운영과 같다.
+  guidance?: GuidanceReviewPort;
   // 작업자 v2 port가 받는 지시문 판 목록을 알리는지. 기본은 알리지 않아(옛 port 모양) 게시 서버가 옛 판을 보낸다.
   changeV2?: boolean;
   // 처음 오는 /v2/task/verify 두 건을 같은 밀리초에 서명한다. 게시 서버 둘의 토큰이 같아져 작업자가 늦은 쪽을 재사용으로 거부한다.
@@ -161,7 +166,11 @@ export async function changeHarness(db: Database, options: HarnessOptions = {}):
   const v2 = { callV2: (async (endpoint: never, body: never, signal?: AbortSignal) => {
     reach();
     if (armed && endpoint === '/v2/task/verify') return collide(() => f.port.callV2(endpoint, body, signal));
-    return f.port.callV2(endpoint, body, signal);
+    const answered = await f.port.callV2(endpoint, body, signal);
+    // 변경 작성 판 작업자처럼 결과에 확인할 것·남은 위험을 싣는다. 게시 서버가 아직 옛 판을 보내 실제 작업자는 이 칸을 내지 않는다.
+    const response = answered.response as { status?: string };
+    if (options.notes && endpoint === '/v2/task/result' && response.status === 'snapshot') return { ...answered, response: { ...response, ...options.notes } };
+    return answered;
   }) as typeof f.port.callV2, supportsChange: (signal?: AbortSignal) => f.port.supportsChange(signal),
     ...(options.changeV2 ? { changeInstructions: (signal?: AbortSignal) => f.port.changeInstructions(signal) } : {}) };
   let shutdown = new AbortController();
@@ -172,7 +181,7 @@ export async function changeHarness(db: Database, options: HarnessOptions = {}):
     const bridge = new ClaudeTaskBridge(store, gate, v1 as never, { plan: async () => { throw new Error('v1_plan_not_used'); } }, { log: () => {} }, v2);
     const review = assembleChangeReview({ store, gate, signer, workerUrl: reviewUrl, send: fetch, now: Date.now, shutdown: shutdown.signal, log });
     const assembled = assembleChange({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, store, gate, changes: review.changes, review: review.service, bridge, worker: v2, kubernetes: { get: async () => { throw new Error('kubernetes_not_used'); } }, send, now: Date.now, log, shutdown: shutdown.signal,
-      intakeOpen: () => worker.taskOpen, verificationPollMs: 2, periods: { authorPollMs: 0, mergePollMs: 0, failureBackoffMs: 0, failureBackoffMaxMs: 0, startGraceMs: 200 },
+      intakeOpen: () => worker.taskOpen, ...(options.guidance ? { guidance: options.guidance } : {}), verificationPollMs: 2, periods: { authorPollMs: 0, mergePollMs: 0, failureBackoffMs: 0, failureBackoffMaxMs: 0, startGraceMs: 200 },
       deployTargets: [{ kind: 'app', service: 'fixture-app', repository: REPO.fullName, configRepository: 'fixture-org/config', imageFile: 'apps/fixture-app/image.yaml', imageRepository: 'ghcr.io/fixture-org/fixture-app', namespace: 'app-fixture-app', deployment: 'fixture-app', container: 'app', argoApplication: 'fixture-app', podApp: 'fixture-app' }],
       instrument: deps => {
         const wrapped: ChangeRuntimeDeps = { ...deps, author: crashing('author', deps.author, plan), artifacts: crashing('artifacts', deps.artifacts, plan), verification: crashing('verification', deps.verification, plan), review: crashing('review', deps.review, plan), publisher: crashing('publisher', deps.publisher, plan),

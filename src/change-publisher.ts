@@ -3,6 +3,7 @@ import {
 } from './change-contracts.js';
 import type { ApprovalSubject, ChangeKey, ChangeTarget, ChangeWriterPort, EffectExpected, EffectResult, EffectStage, EvidenceBundle, PublicMetadata, ReviewReceipt, WriterCommitMetadata, WriterOutcome, WriterPullSnapshot } from './change-contracts.js';
 import { evaluateCi, readCiSnapshot } from './change-ci-policy.js';
+import { readChangeNotes } from './change-guidance.js';
 import { compilePathPolicy, gitCommitSha, inspectCandidate } from './change-policy.js';
 import type { BaseLeaf, ChangeRepositoryPolicy, PublishPlan } from './change-policy.js';
 import { publicationMarker, renderPublication, scanPublicPayload } from './change-publication.js';
@@ -153,11 +154,13 @@ export class ChangePublisher {
     const stored = (await this.store.database.query<{ receipt_digest: string }>('SELECT receipt_digest FROM change_reviews WHERE change_id=$1 AND generation=$2', [key.changeId, key.generation])).rows[0];
     if (!stored || stored.receipt_digest !== reviewReceiptDigest(input.review)) return { ok: false, reason: 'review_mismatch' };
     if (input.review.verdict === 'blocked') return { ok: false, reason: 'review_incomplete' };
+    // 확인할 것·남은 위험은 본문에 들어가 승인 digest에 묶인다. 자체 리뷰 findings는 여기로 오지 않는다(위험은 고정 enum 건수만).
+    const notes = await readChangeNotes(this.store.database, key);
     const rendered = renderPublication({
       key, label: request.value.label, brief, bundle: bundle.value, branch: generation.value.branch,
       verifications: brief.verificationCommandIds.map(commandId => ({ commandId, status: 'passed' as const })),
       review: { verdict: input.review.verdict, risks: input.review.risks.map(risk => ({ priority: risk.priority as 'P2' | 'P3', category: risk.category })) },
-      identity: policy.identity, at: input.at,
+      identity: policy.identity, at: input.at, checks: notes.checks, risks: notes.risks,
     }, { internalMarkers: policy.internalMarkers });
     if (!rendered.ok) return rendered;
     const target: ChangeTarget = { key, repoId: generation.value.repoId };

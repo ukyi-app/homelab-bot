@@ -263,8 +263,7 @@ export const FIXTURE_BASE_FILES: Record<string, string> = {
 export interface FileChange { path: string; content?: string; kind: Extract<ManifestChangeKind, 'added' | 'modified' | 'deleted' | 'mode_changed'>; mode?: '100644' | '100755' }
 export const DEFAULT_CHANGES: FileChange[] = [{ path: 'src/a.ts', kind: 'modified', content: 'export const a = 2;\n' }, { path: 'src/new.ts', kind: 'added', content: 'export const n = 1;\n' }];
 
-export function buildCandidate(leaves: BaseLeaf[], baseCommit: string, baseTree: string, changes: FileChange[]): { manifest: ArtifactManifest; files: ArtifactFile[]; patch: string } {
-  const patch = '--- 합성 표시용 patch\n';
+export function buildCandidate(leaves: BaseLeaf[], baseCommit: string, baseTree: string, changes: FileChange[], patch = '--- 합성 표시용 patch\n'): { manifest: ArtifactManifest; files: ArtifactFile[]; patch: string } {
   const byPath = new Map(changes.map(change => [change.path, change]));
   const entries: ArtifactManifest['entries'] = [];
   const files: ArtifactFile[] = [];
@@ -294,7 +293,8 @@ export interface PublishEnv {
   writeGuard: { check: (target: ChangeTarget) => Promise<void> };
   approve: (changes?: FileChange[], overrides?: { brief?: Partial<ChangeBrief> }) => Promise<ChangeKey>;
   // 현재 generation을 admit부터 approve 직전(reviewing)까지 민다.
-  driveToReview: (key: ChangeKey, changes: FileChange[], overrides?: { brief?: Partial<ChangeBrief> }) => Promise<ReviewReceipt>;
+  // patch를 주면 합성 patch 대신 그 글을 artifact patch로 둔다(안내 댓글의 diff 안 판단).
+  driveToReview: (key: ChangeKey, changes: FileChange[], overrides?: { brief?: Partial<ChangeBrief>; patch?: string }) => Promise<ReviewReceipt>;
   newRequest: () => Promise<ChangeKey>;
 }
 // db는 호출자가 만든다(PGlite·실제 PostgreSQL). 시드 base와 승인 직전까지 가는 도구를 돌려준다.
@@ -332,7 +332,7 @@ export async function publishEnv(db: Database, options: { files?: Record<string,
     const brief: ChangeBrief = { summary: '공개 제목', goal: '공개 목표', acceptanceCriteria: ['시험 통과'], repoId: REPO.id, baseBranch: 'main', allowedPaths: ['src/**', 'tests/**', 'docs/**', 'README.md'], deniedPaths: [], verificationCommandIds: ['smoke-unit'], label: 'public', ...overrides.brief };
     ok(await store.admit({ ...key, brief, policyRevision: current.revision }));
     ok(await store.pinBase({ ...key, baseCommit: head, baseTree: tree }));
-    const { manifest, files, patch } = buildCandidate(github.leaves(tree), head, tree, changes);
+    const { manifest, files, patch } = buildCandidate(github.leaves(tree), head, tree, changes, overrides.patch);
     ok(await store.recordSnapshot({ ...key, manifest, files, patch, transportBytes: 4096 }));
     const bundle = ok(await store.startVerification({ ...key, verifierRevision: 'fixture-verifier-1' }));
     ok(await store.recordVerification({ ...key, receipt: fixtureVerification({ bundle }) }));

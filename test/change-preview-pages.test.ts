@@ -20,7 +20,8 @@ const command = `/change-publish target:${request.id} text:${digest}`;
 async function previewWithDigestAt(target: number, files: number): Promise<string> {
   const entries = Array.from({ length: files }, (_, index) => ({ changeKind: 'added', path: `src/file${index}.ts` }));
   const deps = {
-    store: { now: () => 0, db: { query: async () => ({ rows: [{ receipt: fixtureReview() }] }) } },
+    // 리뷰 receipt만 답한다. 확인할 것 기록(change_notes)은 없는 옛 판 결과다.
+    store: { now: () => 0, db: { query: async (sql: string) => ({ rows: sql.includes('change_reviews') ? [{ receipt: fixtureReview() }] : [] }) } },
     changes: { approvalSubject: async () => ({ ok: true, value: { subject: fixtureApprovalSubject(request.id), digest } }),
       loadArtifact: async () => ({ ok: true, value: { manifest: { entries } } }) },
   } as unknown as ChangeRuntimeDeps;
