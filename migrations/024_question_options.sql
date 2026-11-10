@@ -5,5 +5,5 @@ BEGIN;
 ALTER TABLE codex_questions ADD COLUMN IF NOT EXISTS options jsonb CHECK (options IS NULL OR jsonb_typeof(options)='array');
 ALTER TABLE codex_questions ADD COLUMN IF NOT EXISTS options_sha256 text CHECK (options_sha256 ~ '^[0-9a-f]{64}$');
 
-INSERT INTO schema_migrations VALUES (23) ON CONFLICT DO NOTHING;
+INSERT INTO schema_migrations VALUES (24) ON CONFLICT DO NOTHING;
 COMMIT;
