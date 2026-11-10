@@ -451,7 +451,7 @@ test('AC-25·AC-27 연결: 작성 결과의 확인할 것이 미리보기와 PR 
   });
 });
 
-test('AC-27 리뷰 경로 없음: 안내 포트가 없거나 리뷰 경로가 닫혀 있어도 게시와 병합 추적은 그대로다', async () => {
+test('AC-27 리뷰 경로 없음: 안내 포트가 없어도 게시와 병합 추적은 그대로다', async () => {
   // 리뷰 App 조건이 맞지 않으면 main이 포트를 넘기지 않는다.
   await withHarness({ notes: GUIDE_NOTES }, async h => {
     const id = await toProposed(h);
@@ -462,7 +462,9 @@ test('AC-27 리뷰 경로 없음: 안내 포트가 없거나 리뷰 경로가 �
     h.env.github.pulls[0]!.state = 'closed';
     await h.pump(async () => await h.phase(id) === 'cancelled');
   });
-  // 포트는 있지만 리뷰 경로가 닫혀 있다(리뷰 정책을 읽지 못함). 안내만 미루고 게시·병합 추적은 막지 않는다.
+});
+
+test('AC-27 리뷰 경로 닫힘: 포트가 policy_unavailable로 답하면 안내만 미루고 게시와 병합 추적은 그대로다', async () => {
   const posts: GuidanceReview[] = [];
   const closed: GuidanceReviewPort = { post: async input => { posts.push(input); return { kind: 'not_sent', code: 'policy_unavailable' }; }, find: async () => null };
   await withHarness({ notes: GUIDE_NOTES, guidance: closed, policyPatch: policy => ({ ...policy, review: REVIEW_POLICY }) }, async h => {
