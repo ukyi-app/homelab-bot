@@ -13,7 +13,7 @@ import { MEMORY_GUIDE } from './memory-commands.js';
 import type { MemoryCommand, MemoryCommandHandler } from './memory-commands.js';
 import type { PolicyGate } from './policy.js';
 import { buttonAllowed, buttonRoute } from './discord-protocol.js';
-import { PROPOSAL_BUTTONS, pressProposal } from './proposals.js';
+import { bindProposalHandlers, PROPOSAL_BUTTONS, PROPOSAL_TEXT, pressProposal } from './proposals.js';
 import { moveReactions, ReactionSync, recordReceived, settleReactions } from './reactions.js';
 import { LaneClosed } from './store.js';
 import type { Delivery, Store } from './store.js';
@@ -73,7 +73,10 @@ export class DiscordIngress {
     private readonly rest: DiscordRest, public readonly messageContent = true,
     private readonly commands: ReadonlySet<string> = ALL_COMMANDS, private readonly log: Log = jsonLog,
     private readonly memory?: MemoryCommandHandler, private readonly tasks?: TaskCommandHandler,
-    private readonly external?: ExternalTaskCommandHandler, private readonly changes?: ChangeCommandHandler) {}
+    private readonly external?: ExternalTaskCommandHandler, private readonly changes?: ChangeCommandHandler) {
+    // 말로 한 읽기 요청과 실행 확인 제안 준비(Runtime의 ProposalDesk)가 '/'와 같은 처리기를 쓰게 같은 Store에 묶는다.
+    bindProposalHandlers(store, { tasks, memory, external, changes });
+  }
   async receive(input: EventInput, recovered = false, recovery?: { token: string; epoch: number }): Promise<string | undefined> {
     const event = EventSchema.parse(input);
     if (event.bot || event.webhook) return;
@@ -261,9 +264,17 @@ export class DiscordIngress {
     const outcome = await this.store.atomic(async store => {
       if (!await this.claimIn(store, event, saved.id)) return;
       return pressProposal(store, { proposal: event.target!, answer: event.command === PROPOSAL_BUTTONS.yes ? 'yes' : 'no', actor: event.actor,
-        scope: event.scope, event: saved.id, context: { tasks: this.tasks, revision: p.revision } });
+        scope: event.scope, event: saved.id, context: { tasks: this.tasks, memory: this.memory, external: this.external, changes: this.changes,
+          revision: p.revision, policy: p } });
     }, { expiresAt: started + DEFAULTS.inboxTimeoutMs, now: this.store.now });
     this.log('proposal_button', { command: event.command!, outcome: outcome ? (outcome.update ? 'settled' : 'refused') : 'duplicate' });
+    // 기억·변경·세션 연결 처리기는 커밋 뒤 '/' 명령과 같은 호출로 한 번 부른다. 실패하면 다시 하지 않고 확인을 권한다.
+    if (outcome?.later) {
+      outcome.content = await outcome.later().catch(error => {
+        this.log('proposal_execute_failed', { command: event.command!, ...errorInfo(error) });
+        return PROPOSAL_TEXT.failed;
+      });
+    }
     // 응답을 전하지 못하면 결과 문장(공개해도 되는 고정 문구)을 그 스레드에 남긴다. 버튼은 남지만 다시 누르면 "이미 처리"로 답한다.
     if (outcome) await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: outcome.content, update: outcome.update });
     return saved.id;
