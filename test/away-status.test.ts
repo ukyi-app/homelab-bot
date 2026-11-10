@@ -1,10 +1,13 @@
 import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { AWAY_GRACE_MS, presenceOf, showAway } from '../src/away.js';
+import { DEFAULTS } from '../src/contracts.js';
+import type { Scope } from '../src/contracts.js';
 import { GatewaySession } from '../src/gateway.js';
 import type { GatewayOptions, PresenceStatus } from '../src/gateway.js';
 import { FakeGateway, until } from './fake-gateway.js';
 import type { GatewayPayload } from './fake-gateway.js';
-import { localDatabase } from './helpers.js';
+import { event, fixture, localDatabase, thread } from './helpers.js';
 
 // C20 자리 비움(AC-15, AC-14의 💤). 경계 S1: 가짜 Gateway·가짜 Discord REST와 저장소(PGlite).
 // 실제 Discord에는 연결하지 않는다.
@@ -13,7 +16,12 @@ let session: GatewaySession | undefined;
 let database: Awaited<ReturnType<typeof localDatabase>>;
 before(async () => { database = await localDatabase(); });
 after(async () => { await database.pg.close(); });
-beforeEach(async () => { gw = new FakeGateway(); gw.options.identifyIntervalMs = 200; await gw.start(); });
+let f: Awaited<ReturnType<typeof fixture>>;
+beforeEach(async () => {
+  gw = new FakeGateway(); gw.options.identifyIntervalMs = 200; await gw.start();
+  await database.pg.exec('TRUNCATE events,conversations,jobs,results,outbox,schedules,denied_actors,controls,audit,incidents,model_pauses,model_limit_state RESTART IDENTITY CASCADE');
+  f = await fixture(database.db);
+});
 afterEach(async () => { await session?.stop(200); session = undefined; await gw.close(); });
 
 function startGateway(presence: () => Promise<PresenceStatus>, overrides: Partial<GatewayOptions> = {}) {
@@ -88,4 +96,116 @@ test('AC-15 Gateway 상태: 연결이 없을 때 바꾼 상태는 버리지 않�
   gateway.setPresence('idle');
   await until(() => statuses().length === 1);
   assert.deepEqual(statuses(), ['idle']);
+});
+
+// ---- 저장소·게시(가짜 Discord REST) ----
+const MINUTE = 60_000;
+// 명세 §4.5의 문장 그대로다. 원인·시각·'/' 명령이 없어야 한다.
+const AWAY_LINE = '지금은 잠깐 자리를 비웠어요. 돌아오면 이어서 할게요.';
+const thread2: Scope = { ...thread, channel: 'fixture-thread-2' };
+const limited = async () => ({ status: 'limited' as const, stopped: true as const, rateLimit: null });
+const answered = async () => ({ status: 'succeeded' as const, stopped: true as const, rateLimit: null,
+  output: { reply: '이어서 답했어요.', proposal: null, ack_only: false } });
+async function drain() { while (await f.publisher.deliver()); }
+async function receive(id: string, scope: Scope = thread) { await f.ingress.receive(event(id, { scope })); }
+// 메시지마다 봇이 Discord에 보낸 반응 호출(더하기·지우기)을 순서대로. 👀는 수신 ACK가 달고(acknowledge) 그 뒤는 동기화가 맞춘다.
+const reactionsOf = (message: string) => f.rest.reactions.filter(r => r.message === message).map(r => `${r.op} ${r.emoji}`);
+const awayLines = async () => (await database.db.query<{ idempotency_key: string; payload: { channel: string; content: string } }>(
+  "SELECT idempotency_key,payload FROM outbox WHERE payload->>'content' LIKE '%자리를 비웠어요%' ORDER BY created_at,idempotency_key")).rows;
+// 재개 예약 루프가 멈춘 작업을 다시 돌리는 시각까지 간다(시각 모르는 한도는 30분 뒤).
+async function resumeLater() { f.advance(30 * MINUTE); f.policy.confirmedAt = f.now(); return f.store.resumeDue(); }
+
+test('AC-14 💤: 멈춤이 시작되면 기다리던 메시지의 👀·⏳를 💤로 바꾸고, 멈춘 동안 받은 메시지도 💤, 답한 뒤 봇 반응만 지운다', async () => {
+  await receive('9001');
+  await receive('9002', thread2);
+  f.advance(DEFAULTS.debounceMs);
+  f.setRun(limited);
+  // 9001을 집는 순간 9002는 ⏳가 더해지고, 9001이 한도로 멈추면 두 메시지 모두 💤가 된다.
+  assert.equal(await f.runtime.tick(), true);
+  await receive('9003', thread2);
+  await drain();
+  assert.deepEqual(reactionsOf('9001'), ['add 💤', 'remove 👀']);
+  assert.deepEqual(reactionsOf('9002').filter(r => r !== 'add ⏳' && r !== 'remove ⏳'), ['add 💤', 'remove 👀']);
+  assert.deepEqual(reactionsOf('9003'), ['add 💤', 'remove 👀']);
+  assert.equal(f.rest.acks.length, 3);
+
+  assert.equal(await resumeLater(), 1);
+  f.setRun(answered);
+  while (await f.runtime.tick());
+  await drain();
+  for (const message of ['9001', '9002', '9003']) assert.equal(reactionsOf(message).at(-1), 'remove 💤', message);
+  // 지우기는 봇이 단 반응(👀·⏳·💤)뿐이고, 가짜 Discord의 지우기는 봇 자신(@me) 경로 하나뿐이다.
+  assert.deepEqual(f.rest.reactions.filter(r => r.op === 'remove' && !['👀', '⏳', '💤'].includes(r.emoji)), []);
+  assert.equal((await database.db.query("SELECT 1 FROM controls WHERE key LIKE 'reaction:%'")).rows.length, 0);
+});
+
+test('AC-15 자리 비움 한 줄: 멈춘 동안 스레드마다 처음 부를 때 한 번, 재시도 사이에도 같은 멈춤이고 새 멈춤이면 다시 한 번', async () => {
+  await receive('9101');
+  f.advance(DEFAULTS.debounceMs);
+  f.setRun(limited);
+  await f.runtime.tick();
+  // 멈춘 스레드에는 그 자리에서 한 줄. 같은 스레드에서 다시 불러도 더 달지 않는다.
+  await receive('9102');
+  // 다른 스레드는 처음 부를 때 한 번.
+  await receive('9103', thread2);
+  await receive('9104', thread2);
+  assert.deepEqual((await awayLines()).map(row => [row.idempotency_key, row.payload.channel]).sort(),
+    [['away:fixture-thread-2:1', 'fixture-thread-2'], ['away:fixture-thread:1', 'fixture-thread']]);
+  // 재개 예약 루프가 다시 돌렸는데 또 한도면 같은 멈춤이다. 그 사이 상태 루프가 멈춤 기록이 빈 틈을 봐도 회차는 그대로다.
+  assert.equal(await resumeLater(), 1);
+  assert.equal(await f.store.syncAway(), false);
+  await f.runtime.tick();
+  await receive('9105', thread2);
+  assert.equal((await awayLines()).length, 2);
+
+  // 풀리고 유예가 지나면 회차가 닫힌다. 그 뒤 다시 멈추면 새 회차라 다시 한 번 단다.
+  assert.equal(await resumeLater(), 1);
+  f.setRun(answered);
+  while (await f.runtime.tick());
+  assert.equal(await f.store.syncAway(), false);
+  f.advance(AWAY_GRACE_MS);
+  assert.equal(await f.store.syncAway(), false);
+  await receive('9106');
+  f.advance(DEFAULTS.debounceMs);
+  f.setRun(limited);
+  await f.runtime.tick();
+  await receive('9107', thread2);
+  const lines = await awayLines();
+  assert.deepEqual(lines.map(row => row.idempotency_key).sort(),
+    ['away:fixture-thread-2:1', 'away:fixture-thread-2:2', 'away:fixture-thread:1', 'away:fixture-thread:2']);
+  // 원인(한도·인증·결제), 시각, '/' 재개 명령이 없다.
+  for (const row of lines) {
+    assert.equal(row.payload.content, AWAY_LINE);
+    assert.doesNotMatch(row.payload.content, /한도|인증|결제|\d|KST|\/[a-z]/);
+  }
+  await drain();
+  assert.ok(f.rest.messages.filter(m => m.body.content.includes(AWAY_LINE)).every(m => m.body.allowed_mentions.parse.length === 0));
+});
+
+test('AC-15 Gateway 상태(저장소 연결): 멈춤 시작 → idle, 재연결 뒤 복원, 풀리면 online, 비상 정지는 자리 비움이 아니다', async () => {
+  const gateway = startGateway(async () => presenceOf(await f.store.syncAway()));
+  await until(() => statuses().length === 1);
+  assert.deepEqual(statuses(), ['online']);
+  await receive('9201');
+  f.advance(DEFAULTS.debounceMs);
+  f.setRun(limited);
+  await f.runtime.tick();
+  await showAway(f.store, gateway);
+  await until(() => statuses().length === 2);
+  assert.deepEqual(statuses(), ['online', 'idle']);
+  gw.latest.close(4000);
+  await until(() => gw.connections.length === 2 && statuses(gw.connections[1]).length === 1);
+  assert.deepEqual(statuses(gw.connections[1]), ['idle']);
+
+  assert.equal(await resumeLater(), 1);
+  f.setRun(answered);
+  await f.runtime.tick();
+  await showAway(f.store, gateway);
+  await until(() => statuses().length === 2);
+  assert.deepEqual(statuses(), ['idle', 'online']);
+
+  await f.store.control(f.policy.owner, f.store.scopeId(thread), 'emergency-stop');
+  await showAway(f.store, gateway);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.deepEqual(statuses(), ['idle', 'online']);
 });

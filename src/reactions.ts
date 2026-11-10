@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { modelPaused } from './away.js';
 import { DiscordRejected, DiscordUnauthorized, RateLimited } from './contracts.js';
 import type { Database } from './database.js';
 import type { DiscordRest } from './discord.js';
@@ -7,10 +8,12 @@ import type { Log } from './log.js';
 import type { Store } from './store.js';
 
 // owner 메시지 하나에 봇이 달아 두는 반응. 상태마다 붙어 있어야 할 봇 반응 전체를 적는다.
-// 상태를 더할 때(💤 C20)는 이 표와 아래 FROM에 이름만 더한다. 동기화는 지금 붙은 것과 비교해 필요한 것만 더하고 지운다.
+// 상태를 더할 때는 이 표와 아래 FROM에 이름만 더한다. 동기화는 지금 붙은 것과 비교해 필요한 것만 더하고 지운다.
 export const REACTIONS = {
   received: ['👀'],
   waiting: ['👀', '⏳'],
+  // 모델 멈춤 중 기다리는 메시지(자리 비움, C20). 멈춤이 풀려도 답할 때까지 남는다.
+  away: ['💤'],
   cleared: [],
   failed: [],
   // 답할 필요가 없는 말(ack_only)이라 글 없이 남기는 표시. 이 반응만은 끝 상태에서도 붙어 있다.
@@ -21,9 +24,10 @@ export type ReactionState = keyof typeof REACTIONS;
 const FROM: Record<ReactionState, readonly ReactionState[]> = {
   received: [],
   waiting: ['received'],
-  cleared: ['received', 'waiting'],
-  failed: ['received', 'waiting'],
-  acked: ['received', 'waiting'],
+  away: ['received', 'waiting'],
+  cleared: ['received', 'waiting', 'away'],
+  failed: ['received', 'waiting', 'away'],
+  acked: ['received', 'waiting', 'away'],
 };
 const TERMINAL: readonly ReactionState[] = ['cleared', 'failed', 'acked'];
 // 반응 행은 마이그레이션 없이 controls(`reaction:<event id>`)에 둔다. 끝 상태까지 동기화하면 지운다.
@@ -45,10 +49,16 @@ interface Row {
 
 // 수신 ACK(👀)를 보낼 일반 메시지. 수신 트랜잭션 안에서 부른다. 👀는 이 직후 dispatch 안에서 단다(protocol.acknowledge).
 // 붙었다고 보고 적는다. 실패했어도 나중에 지우는 DELETE는 결과가 같다.
+// 모델 멈춤 중에 받은 메시지는 처음부터 💤 상태로 적는다. 동기화가 👀를 💤로 바꾼다.
 export async function recordReceived(db: Database, event: { id: string; channel: string; message: string; owner: string }): Promise<void> {
-  const row: Row = { channel: event.channel, message: event.message, owner: event.owner, state: 'received', synced: 'received',
-    applied: [...REACTIONS.received], next: 0, attempt: 0 };
+  const row: Row = { channel: event.channel, message: event.message, owner: event.owner, state: await modelPaused(db) ? 'away' : 'received',
+    synced: 'received', applied: [...REACTIONS.received], next: 0, attempt: 0 };
   await db.query('INSERT INTO controls VALUES ($1,$2) ON CONFLICT DO NOTHING', [KEY + event.id, JSON.stringify(row)]);
+}
+
+// 모델 멈춤이 시작될 때 이미 기다리던 메시지(👀·⏳) 전부를 💤로 바꾼다. 호출자의 트랜잭션 안에서 부른다.
+export async function sleepReactions(db: Database): Promise<void> {
+  await db.query(`UPDATE controls SET value=jsonb_set(value,'{state}','"away"') WHERE key LIKE 'reaction:%' AND value->>'state'=ANY($1)`, [FROM.away]);
 }
 
 // 반응 상태를 바꾼다(저장만, REST는 동기화가 한다). 호출자의 트랜잭션 안에서 상태 전이와 함께 쓴다.

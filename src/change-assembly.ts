@@ -14,6 +14,7 @@ import { ChangePrivateInputs, ChangeReviewFindings, ChangeStore } from './change
 import { VERIFIER_REVISION, WorkerChangeVerification } from './change-verifier.js';
 import { ClaudeChangeAuthor } from './claude-task-bridge.js';
 import type { ClaudeTaskBridge } from './claude-task-bridge.js';
+import { CHAT_TASK_TEXT } from './chat-task-text.js';
 import type { PublisherConfig } from './config.js';
 import type { Scope } from './contracts.js';
 import type { GitHubAppCredentials } from './github-app.js';
@@ -80,9 +81,10 @@ export function assembleChangeReview(deps: { store: Store; gate: PolicyGate; sig
       const parent = link ? await changes.get(link.change_id) : null;
       if (!parent?.ok) { deps.log('change_review_wait_unnotified', { reason }); return; }
       const policy = await deps.gate.current();
-      await deps.store.enqueue({ key: `change-review-wait:${job.id}:${job.attempt}`, conversation: parent.value.conversationId, actor: parent.value.ownerId, scope: parent.value.scope, revision: policy.revision,
-        payload: { kind: 'message', channel: parent.value.scope.channel, classification: 'safe_summary',
-          content: `변경 ${parent.value.id}의 리뷰가 ${reason === 'model_limit' ? '모델 사용 한도' : '인증 만료'}로 멈췄습니다. 대화·리뷰 모델 호출도 함께 멈춥니다. 원인을 해소한 뒤 알림 채널에서 /review-resume target:${job.id} 로 재개하세요.` } });
+      // 자리 비움 한 줄(원인·'/' 명령 없음). 같은 멈춤 동안 그 스레드에 한 번만 나간다.
+      const channel = parent.value.scope.channel;
+      await deps.store.enqueue({ key: await deps.store.awayKey(channel, `change-review-wait:${job.id}:${job.attempt}`), conversation: parent.value.conversationId, actor: parent.value.ownerId, scope: parent.value.scope, revision: policy.revision,
+        payload: { kind: 'message', channel, classification: 'safe_summary', content: CHAT_TASK_TEXT.away } });
     } });
   return { service, changes, findings };
 }

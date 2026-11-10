@@ -66,8 +66,8 @@ test('AC-16 풀리는 시각을 모르는 한도는 30분마다 다시 시도하
     await f.runtime.tick();
   }
   assert.equal((await job()).state, 'waiting_user');
-  // 같은 시도 번호의 대기라 대기 안내는 처음 한 번뿐이다.
-  assert.equal((await rows('outbox')).filter(row => row.idempotency_key.startsWith('waiting:')).length, 1);
+  // 같은 멈춤이라 대기 안내(자리 비움, C20)는 처음 한 번뿐이다.
+  assert.equal((await rows('outbox')).filter(row => row.idempotency_key.startsWith('away:')).length, 1);
   f.setRun(answered);
   f.advance(30 * MINUTE);
   assert.equal(await f.store.resumeDue(), 1);

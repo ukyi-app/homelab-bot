@@ -506,11 +506,11 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
         await store.syncTaskLane();
         // 그 턴이 나르던 답은 처리되지 않았다. /resume-model 뒤 같은 답으로 잇는다.
         if (request.operation === 'resume' && request.questionId) await store.db.query("UPDATE codex_questions SET state='answered' WHERE id=$1 AND state='resumed'", [request.questionId]);
+        // 자리 비움 한 줄(원인·시각·'/' 명령 없음). 이어서 할 수 있으면 같은 멈춤 동안 이 스레드에 한 번만 나간다.
         const resumable = Number(now.attempt) < DEFAULTS.maxRetries + 1;
-        await store.enqueue({ key: `task-wait:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id, actor: job.owner_id, scope: job.target, revision,
-          payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary',
-            content: `${reason === 'model_limit' ? T.taskLimitPaused(store.colleague, job.id) : T.taskAuthPaused(store.colleague, job.id)} `
-              + (resumable ? T.modelPauseResume(store.colleague, job.id) : T.modelPauseFinal(store.colleague)) } });
+        const fallback = `task-wait:${job.id}:${job.attempt}`;
+        await store.enqueue({ key: resumable ? await store.awayKey(job.target.channel, fallback) : fallback, job: job.id, conversation: job.conversation_id, actor: job.owner_id, scope: job.target, revision,
+          payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary', content: resumable ? T.away : T.awayFinal } });
         return { terminal: false };
       }
       if (response.status === 'needs_input') {

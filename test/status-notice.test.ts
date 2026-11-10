@@ -32,21 +32,32 @@ test('S4 runtime이 unknown을 기록하면 안내 1개(종료 확인을 계속 
 });
 
 // 명세 §4.9: 스위치가 켜진 Store의 안내는 '/' 이름 없이 관리 기능을 CLI로 안내하고, 멱등 키·분류·멘션 막음은 그대로다.
-for (const kind of ['waiting', 'unknown'] as const) test(`동료 스위치 켜짐: ${kind} 안내에 '/' 명령 이름이 없고 멱등 키·분류·멘션 막음은 그대로`, async () => {
+test("동료 스위치 켜짐: unknown 안내에 '/' 명령 이름이 없고 멱등 키·분류·멘션 막음은 그대로", async () => {
   const on = new Store(database.db, f.now, true);
   await queued();
   const job = (await on.claim())!;
-  if (kind === 'waiting') await on.waitForUser(job, 'model_limit');
-  else await on.transition(job, 'unknown');
-  const sent = await notices(`${kind}:`);
-  assert.deepEqual(sent.map(o => o.idempotency_key), [`${kind}:${job.id}:1`]);
-  assert.equal(sent[0]!.payload.content, kind === 'waiting' ? CHAT_TASK_TEXT.modelWaitLimit(true, job.id) : CHAT_TASK_TEXT.unknownWait(true));
+  await on.transition(job, 'unknown');
+  const sent = await notices('unknown:');
+  assert.deepEqual(sent.map(o => o.idempotency_key), [`unknown:${job.id}:1`]);
+  assert.equal(sent[0]!.payload.content, CHAT_TASK_TEXT.unknownWait(true));
   assert.equal(sent[0]!.payload.classification, 'safe_summary');
   assert.doesNotMatch(sent[0]!.payload.content, /(^|\s)\/[a-z]/);
   assert.match(sent[0]!.payload.content, /`homelab bot` CLI/);
   while (await f.publisher.deliver()) { /* drain */ }
   assert.ok(f.rest.messages.length);
   for (const message of f.rest.messages) assert.deepEqual(message.body.allowed_mentions, { parse: [] });
+});
+
+// C20: 한도·인증 대기 안내는 자리 비움 한 줄이고 스위치 밖이라 켜짐·꺼짐이 같다.
+for (const colleague of [false, true]) test(`AC-15 자리 비움: 대화 대기 안내는 스위치 ${colleague ? '켜짐' : '꺼짐'}에서도 같은 한 줄이고 멱등 키는 스레드·멈춤 회차다`, async () => {
+  const store = new Store(database.db, f.now, colleague);
+  await queued();
+  const job = (await store.claim())!;
+  await store.waitForUser(job, 'model_limit');
+  const sent = await notices('away:');
+  assert.deepEqual(sent.map(o => [o.idempotency_key, o.payload.content, o.payload.classification]),
+    [[`away:${job.target.channel}:1`, '지금은 잠깐 자리를 비웠어요. 돌아오면 이어서 할게요.', 'safe_summary']]);
+  assert.equal((await notices('waiting:')).length, 0);
 });
 
 test('S4 권한 철회로 인한 unknown은 안내하지 않음(철회된 대화에 게시하지 않는다)', async () => {
@@ -77,7 +88,7 @@ test('S4 task의 unknown·waiting_user는 store가 안내하지 않음(작업 �
   assert.equal((await notices('unknown:')).length, 0);
 });
 
-for (const status of ['limited', 'auth_expired'] as const) test(`S4 ${status} waiting_user 안내 1개(같은 attempt 두 번이어도), 멘션 없음`, async () => {
+for (const status of ['limited', 'auth_expired'] as const) test(`S4 ${status} waiting_user 안내는 자리 비움 1개(같은 attempt 두 번이어도), 원인·'/' 명령·멘션 없음`, async () => {
   await queued();
   f.setRun(async () => ({ status, stopped: true }));
   await f.runtime.tick();
@@ -87,13 +98,12 @@ for (const status of ['limited', 'auth_expired'] as const) test(`S4 ${status} wa
   // 되돌려져 있으므로, 처음 대기에 들어간 실행의 attempt(1)로 다시 넣는다.
   await database.db.query(`UPDATE jobs SET state='running',lease_until=$2 WHERE id=$1`, [job.id, f.now() + 1000]);
   await f.store.waitForUser({ ...job, attempt: 1, target: job.target, revision: job.revision } as never, status === 'limited' ? 'model_limit' : 'auth_expired');
-  const sent = await notices('waiting:');
-  assert.deepEqual(sent.map(o => o.idempotency_key), [`waiting:${job.id}:1`]);
-  assert.match(sent[0]!.payload.content, new RegExp(`/resume-model target:${job.id}`));
-  assert.match(sent[0]!.payload.content, /\/model-status/);
-  assert.equal(sent[0]!.payload.content, status === 'limited' ? CHAT_TASK_TEXT.modelWaitLimit(false, job.id) : CHAT_TASK_TEXT.modelWaitAuth(false, job.id));
+  const sent = await notices('away:');
+  assert.deepEqual(sent.map(o => o.idempotency_key), [`away:${job.target.channel}:1`]);
+  assert.equal(sent[0]!.payload.content, CHAT_TASK_TEXT.away);
+  assert.doesNotMatch(sent[0]!.payload.content, /한도|인증|결제|\/|\d/);
   while (await f.publisher.deliver()) { /* drain */ }
-  const message = f.rest.messages.find(m => m.body.content.includes('/resume-model'))!;
+  const message = f.rest.messages.find(m => m.body.content.includes(CHAT_TASK_TEXT.away))!;
   assert.deepEqual(message.body.allowed_mentions, { parse: [] });
   assert.ok(!message.body.content.includes('<@'));
 });
