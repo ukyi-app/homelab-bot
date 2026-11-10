@@ -1042,3 +1042,14 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 - **고치기가 실패하면 `review_blocked`:** 고치기 작성의 실패와 작업자가 요청을 받지 않은 경우는 새 사유를 만들지 않는다. 남은 문제는 앞 차례 리뷰의 것이라 그 사유가 맞다. 실제 사유는 `change_self_fix_failed` 로그에 남는다.
 - **고치기 요청은 아직 작업자에 보내지 않는다(분해 불일치, 주 진행자 결정 대기):** 작업자 계약의 수정 차례 칸 `amendment`(C25)는 `pullNumber`가 필수이고 지시문이 "PR #n의 브랜치 head 위에서 고친다", 자료를 "PR 리뷰·댓글"이라고 말한다. 게시 전에는 PR이 없어 이 칸으로는 정직한 요청을 만들 수 없고, 칸 모양(`src/task-contracts.ts`·`src/executor-claude-task.ts`)은 이 티켓의 자리 밖이다. 그래서 `ClaudeChangeAuthor.supportsSelfFix()`가 false이고 런타임은 차례를 열지 않아 운영 동작은 이전과 같다. 칸이 PR 없는 고치기를 받으면(예: `pullNumber` nullable과 그때의 지시 문장) `supportsSelfFix`를 작업자 판 지원으로 바꾸고 `start`가 `selfFix`를 `amendment`(지시 `SELF_FIX_INSTRUCTION`, 자료 `selfFixMaterials`, head=B, 판 `change-v2`)로 옮기면 된다.
 - **알림:** 차례 시작은 알리지 않는다. `review_blocked`로 닫히면 남은 P0·P1 제목을 최대 5개 싣는다. 리뷰 모델의 글이라 공개 검사를 지난 제목만 싣고 걸리면 코드로 바꾸며 조건·근거 원문은 싣지 않는다.
+
+## C21 운영 알림 (2026-11-10)
+
+"동료 봇 전환 (사용자 2026-11-09)" 7의 "원인·풀리는 시각·할 일은 Telegram 운영 알림으로"의 구현이다. 결정은 바꾸지 않았고, 아래는 구현 선택이다(사용자 결정 아님). 지표는 [ARCHITECTURE](ARCHITECTURE.md) §13 "지표", 경보는 homelab `platform/observability/stack/vmalert/rules/bot.yaml` `HomelabBotModelPaused`, 시험은 [VERIFICATION](VERIFICATION.md) "C21 운영 알림".
+
+- **멈춤은 종류별 작업 수 + 풀리는 시각 두 계열:** 종류(`rate_limit`·`auth_expired`·`billing`)는 `model_pauses.kind`의 CHECK 목록 그대로 코드에 고정하고, 멈춤이 없어도 0으로 낸다. 풀리는 시각은 그 종류의 대기 중 가장 늦은 것(Unix 초)이고 모르면 **0**이다(계열을 없애지 않는다). 경보가 이 값을 경보 값으로 쓰고 멈춤 여부는 작업 수로 가르기 때문이다. 0이면 경보 문구가 "모름"(한도)·"없음"(인증 만료·결제)으로 적는다.
+- **지금 계정은 라벨:** 운영 알림에 계정 이름이 나와야 하고 Telegram 문구는 vmalert 템플릿이 만들므로, 이름을 라벨 값으로 둔다. 비밀이 아니고(owner가 CLI로 정한 짧은 이름) 계정은 한 번에 하나라 계열도 하나다. 계정 기록은 C22가 만든다. **그 전 모양은 `homelab_bot_model_account{method="none"} 1`**(계정 라벨 없음)이고 경보 문구는 "미등록"이다. C22가 이 줄에 `account`(CLI 이름 규칙을 통과한 이름만, 그 밖이면 라벨을 비운다)와 `method`(`subscription`·`api`)를 채운다. 계정을 바꾸면 옛 계열은 수집 staleness로 사라진다.
+- **미룬 리뷰 수:** 브리핑(C19)과 같은 대상, 리뷰 미루기 기한 안의 대기열 PR 리뷰(미게시 후보 리뷰 제외)다. 기한 밖이면 0이다. 경보는 걸지 않았다(멈춤이 아니라 대화·작업은 계속된다).
+- **KST 표기:** vmalert 템플릿에 시간대 함수가 없어 `toTime`의 UTC에 9시간을 더해 "YYYY-MM-DD HH:MM KST"로 적는다. 한국은 서머타임이 없어 이 계산이 늘 맞다. 봇 지표는 Unix 초 그대로다.
+- **경보 지속:** `for` 없이 첫 평가에 울리고(도착 예산 2분), `keep_firing_for: 5m`로 재시도 틈을 잇는다. 시각 모르는 한도·인증 만료는 30분마다, 한도는 풀리는 시각 1분 뒤 작업을 다시 돌려 그동안 작업 수가 0이 된다. 그 틈에 해소·새 발생이 가지 않는 대신 진짜 해소도 5분 늦게 온다.
+- **Discord에는 안 간다:** 경보에 `service` 라벨이 없어 봇 수신기가 감사(`alert_ignored`)만 남기고 버린다. Alertmanager 설정은 바꾸지 않았다(warning → 봇 route `continue` + Telegram 형제 route, 4시간 반복, 해소 전송).
