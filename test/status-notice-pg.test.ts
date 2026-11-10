@@ -82,7 +82,7 @@ test('S4 실제 PostgreSQL: /model-status가 대화 행을 쥔 사이 waiting_us
     held.release();
     const results = await Promise.allSettled([status, waiting]);
     for (const result of results) assert.equal(result.status, 'fulfilled', result.status === 'rejected' ? String(result.reason) : '');
-    assert.equal((await db.query<{ count: string }>("SELECT count(*) FROM outbox WHERE idempotency_key LIKE 'waiting:%'")).rows[0]!.count, '1');
+    assert.equal((await db.query<{ count: string }>("SELECT count(*) FROM outbox WHERE idempotency_key LIKE 'away:%'")).rows[0]!.count, '1');
   } finally { await close(); }
 });
 

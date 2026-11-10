@@ -1342,9 +1342,11 @@ for (const reason of ['limited', 'auth_expired'] as const) {
     const [job] = await reviewJobs();
     assert.deepEqual([job!.state, job!.wait_reason], ['waiting_user', reason === 'limited' ? 'model_limit' : 'auth_expired']);
     assert.equal(await schedulerPaused(), true);
-    const notice = (await rows('outbox')).find(o => o.idempotency_key === `review-waiting:${job!.id}`)!;
+    // 알림 채널에는 자리 비움 한 줄만(C20). 원인·job·'/' 재개 명령은 Discord에 적지 않는다(원인은 운영 알림).
+    const notice = (await rows('outbox')).find(o => o.idempotency_key === 'away:fixture-notifications:1')!;
     assert.equal(notice.scope.channel, 'fixture-notifications');
-    assert.ok(notice.payload.content.includes(job!.id) && notice.payload.content.includes('review-resume'));
+    assert.equal(notice.payload.content, '지금은 잠깐 자리를 비웠어요. 돌아오면 이어서 할게요.');
+    assert.ok(!notice.payload.content.includes(job!.id) && !notice.payload.content.includes('review-resume'));
     await f.ingress.receive(event('chat-waiting')); f.advance(DEFAULTS.debounceMs);
     assert.equal(await f.store.claim(), undefined);
     const status = await command('review-status');

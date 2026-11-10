@@ -1321,12 +1321,15 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 
 | 상황 | 멱등 키 | 내용 |
 |---|---|---|
-| chat `waiting_user` | `waiting:<job>:<attempt>` | 모델 사용 한도/인증 만료, `/resume-model target:<job>`, `/model-status` |
+| 모델 멈춤(한도·인증·결제) 대기: chat `waiting_user`, 작업 레인(Claude·Codex), PR 리뷰(알림 채널), 변경 리뷰 자식(부모 스레드) | `away:<채널>:<멈춤 회차>` | 자리 비움 한 줄 `CHAT_TASK_TEXT.away`(원인·시각·'/' 명령 없음, 스위치 밖이라 두 판이 같음) |
+| 모델 멈춤 중 owner가 부름(대화·작업 접수, 조회 제외) | `away:<채널>:<멈춤 회차>` | 같은 한 줄. owner 메시지에 답장(알림 없음) |
+| 작업 레인 토큰의 인증 만료(작업 레인만 막음, 자리 비움 아님) | `task-wait:<job>:<attempt>` | 같은 한 줄 |
+| 멈춘 작업이 시도 한도에 닿아 이어서 할 수 없음(결제 멈춤) | `task-wait:`·`codex-wait:<job>:<attempt>` | `CHAT_TASK_TEXT.awayFinal`(취소하고 새로 요청) |
 | chat `unknown`(runtime 경로·lease 만료) | `unknown:<job>:<attempt>` | 종료 미확인으로 새 모델 실행 정지, 봇이 확인을 계속 시도, `/model-status` |
 | chat unknown 해소 | `unknown-resolved:<job>:<attempt>` | 멈춤 확인, `/retry target:<job>` |
 | read lease 만료 | `read-expired:<job>:<attempt>` | `/read`로 다시 요청 |
 
-한도·인증 대기 안내의 '/resume-model' 재개는 예비다. C19부터 한도는 풀리는 시각 1분 뒤(모르면 30분마다), 인증 만료는 30분마다 저절로 이어서 하고(§11 "호출 경로·직렬 대기·측정"의 자동 재개), 결제 멈춤만 사람이 풀어야 한다. 그래서 안내의 "원인을 해결한 뒤 재개해 주세요"는 틀린 말은 아니지만 저절로 이어서 한다는 말이 없다. 문구를 자리 비움으로 바꾸는 일은 C20이다. 같은 시도 번호로 다시 멈추면 멱등 키가 같아 안내가 되풀이되지 않는다(한도·인증 멈춤은 시도로 세지 않는다).
+모델 멈춤 안내는 C20부터 자리 비움 한 줄이다. 원인·풀리는 시각·할 일은 운영 알림(C21, Telegram)이 보내고, 재개는 C19 재개 예약 루프가 저절로 한다. '/resume-model'·'/review-resume'은 예비로 남지만 안내하지 않는다. 멱등 키가 스레드(채널)와 멈춤 회차라, 같은 멈춤 동안 같은 스레드에는 대기 진입·owner 호출·재시도 어느 경로로도 한 번만 나가고 새 멈춤이면 다시 한 번 나간다(아래 "자리 비움과 Gateway 상태").
 
 권한 철회로 생긴 unknown은 안내하지 않는다(게시도 막힌다). 모두 `safe_summary`, `allowed_mentions.parse=[]`다. 이 표의 안내는 owner를 부르지 않는다. owner를 부르는 글은 **owner 호출** 넷(작업 질문, 작업 완료·실패, 변경 미리보기, 변경 실패)뿐이다(C07, §11 "표식·답장·스레드").
 
@@ -1335,7 +1338,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - 일반 메시지의 수신 ACK는 텍스트 메시지 대신 원문에 👀 리액션(`PUT .../reactions/%F0%9F%91%80/@me`)이다. 이전에는 메시지마다 "수신·처리 기록 저장됨…"을 게시해 대화가 덮였다.
 - 리액션이 403/404(채널에 Add Reactions·Read Message History 없음 등)면 기존 텍스트 ACK로 한 번 대체하고 감사 `ack_reaction_fallback`을 남긴다. 429는 rate limit만 기록하고 대체하지 않는다. 상호작용(slash·버튼)은 ephemeral 응답 그대로다.
 - ACK 단계의 오류(실패를 기록하는 DB 쓰기 포함)는 `receive()` 밖으로 나가지 않는다(`ack_failure_unrecorded` 로그). 나가면 `guard()`가 그 대화에 history gap 장벽을 세운다.
-- **반응 수명(C04, AC-14).** owner 메시지 하나의 봇 반응 상태를 `src/reactions.ts`의 표 하나(`REACTIONS`: 상태 → 붙어 있어야 할 봇 반응)가 정한다. `received`(👀) → `waiting`(👀⏳) → 끝 상태 `cleared`·`failed`(반응 없음)·`acked`(👍, C11 `ack_only`). 끝 상태는 다시 바뀌지 않는다. 뒤 티켓은 표와 `FROM`에 상태 이름만 더한다(💤 C20).
+- **반응 수명(C04, AC-14).** owner 메시지 하나의 봇 반응 상태를 `src/reactions.ts`의 표 하나(`REACTIONS`: 상태 → 붙어 있어야 할 봇 반응)가 정한다. `received`(👀) → `waiting`(👀⏳) → 끝 상태 `cleared`·`failed`(반응 없음)·`acked`(👍, C11 `ack_only`). 모델 멈춤 중이면 `received`·`waiting`에서 `away`(💤, C20)로 가고, `away`는 끝 상태로만 간다(멈춤이 풀려도 답할 때까지 💤). 끝 상태는 다시 바뀌지 않는다. 뒤 티켓은 표와 `FROM`에 상태 이름만 더한다.
   - 상태는 저장소에 둔다. 마이그레이션 없이 `controls`의 `reaction:<event id>` 행(원문 채널·메시지 ID·owner·상태·마지막으로 맞춘 상태·붙인 반응)이다. 원문 채널은 받을 때의 채널이라 채널 멘션이 스레드로 옮겨져도 원문(부모 채널)에서 지운다. history 복구로 받은 메시지는 👀를 달지 않으므로 행도 없다.
   - 받음: 수신 트랜잭션이 행을 만들고 👀는 지금처럼 dispatch 안에서 단다(1초, 403/404 텍스트 대체 한 번).
   - ⏳: `Store.claim`이 모델 자리가 차 있다고 판단할 때(앞 job이 있어 못 집음, 또는 방금 다른 job을 집음) 같은 트랜잭션에서, 디바운스가 끝나(`available_at<=now`) 지금 집힐 수 있었던 queued chat의 메시지를 `waiting`으로 바꾼다. 같은 트랜잭션의 job 상태와 저장소 시각만 본다. 작업 레인(`claim('task')`)은 대화 자리와 따로라 바꾸지 않는다. 비상 중지·한도 정지(scheduler 켜짐)는 자리 비움(💤) 몫이라 바꾸지 않는다. 운영의 대화 루프는 `tick()`이 실행을 끝까지 기다린 뒤에야 `claim`을 다시 부르므로, 실행 중에 디바운스가 끝난 메시지는 게시 루프가 맡는다: 반응 동기화 한 바퀴마다 `Store.refreshWaiting`이 scheduler가 꺼져 있고 대화 자리(interactive 레인)가 차 있으면 같은 판단으로 `waiting`으로 바꾼다. 작업 루프를 끈 배치에서 실행 중인 task가 대화를 막는 경우는 이 경로가 레인 설정을 몰라 보지 않고, `claim`이 볼 때만 ⏳가 붙는다.
@@ -1344,6 +1347,19 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
   - 오류: 403/404는 감사 `reaction_rejected`만 남기고 그 반응을 놓는다(대체 글은 👀 수신에만). 429는 채널 rate limit만 기록하고 풀린 뒤 다시 한다. 401은 60초 뒤, 일시 오류(시간 초과·5xx)는 1초부터 두 배(최대 60초)로 5번까지 하고 넘으면 감사 `reaction_abandoned`로 놓는다. 일시 오류로 끝난 더하기는 Discord가 처리했을 수 있어 행의 `maybe`("붙었을 수 있음")에 적고, 원하는 상태에서 빠지면(끝 상태 포함) 붙인 반응과 함께 지운다. 없는 봇 반응을 지우면 404라 감사만 남고 무해하다. 반응 오류·동기화의 DB 오류는 로그 `reaction_sync_failed`만 남기고 게시 결과·작업 상태·루프의 바쁨 판단을 바꾸지 않는다.
   - 재시작: 상태 전이는 job·outbox 전이와 같은 트랜잭션에 저장되므로 게시 서버가 지우기 전에 죽어도 새 게시 서버의 게시 루프가 남은 행을 이어서 맞춘다. 👀는 dispatch에서 달기 전에 "붙음"으로 적으므로 실제로 못 달았으면 나중의 DELETE가 없는 반응을 지우게 되고 결과는 같다. 잃을 수 있는 것은 5번 넘게 일시 실패한 반응과 403/404 반응뿐이다.
 - 모델이 running인 chat의 채널(구독 켜짐·gap 아님·owner 일치)에 8초마다 `POST /channels/{id}/typing`(Discord 표시 10초)을 보낸다(`src/activity.ts`, 루프 `typing`, 생존 근거 아님). rate limit pause·정책 거부면 건너뛰고, 429는 채널 pause로 기록하며, 실패는 다음 주기에 다시 본다. 종료 신호를 받으면 진행 중인 바퀴도 대기 뒤·전송 직전에 멈추고, 전송 직전에 그 채널의 running chat이 아직 있는지 다시 확인한다.
+
+### 자리 비움과 Gateway 상태 (C20)
+
+모델 멈춤 동안 Discord에는 자리 비움(봇 상태 idle, 💤, 원인 없는 한 줄)만 보인다(COLLEAGUE_SPEC §4.5·§4.7, AC-14·AC-15). 코드는 `src/away.ts`(멈춤 판단·회차·`showAway`), `src/gateway.ts`(상태 보내기), `src/reactions.ts`(`away` 상태), `src/store.ts`(`accept`·`waitForUser`·`syncAway`·`awayKey`). 스위치 밖이라 배포하면 바로 적용된다.
+
+- **멈춤 판단:** C19 멈춤 기록(`model_pauses`)이 있고 그 작업이 `waiting_user`(`model_limit`·`auth_expired`)이면 멈춤이다. 결제 멈춤도 같다. 작업 레인 토큰의 인증 만료(Claude 작업 레인 `laneOnly`)는 대화가 계속 답하므로 자리 비움이 아니다(`Store.releaseScheduler`와 같은 구분). 비상 정지는 모델 멈춤이 아니라 보지 않고 지금 모습 그대로다.
+- **회차:** 마이그레이션 없이 `controls`의 `model_away` 행(`episode`·`active`·`clearSince`)이다. 멈춤 기록이 생기면 회차를 하나 올리고, 멈춤 기록이 5분(`AWAY_GRACE_MS`) 비어 있어야 닫는다. 재개 예약 루프가 작업을 다시 돌리는 몇 초 동안 멈춤 기록이 비었다가 또 한도로 멈춰도 같은 회차라 한 줄이 다시 나가지 않는다. 회차를 맞추는 트랜잭션(`waitForUser`, 접수, 상태 루프)에서 지금 멈춤이면 기다리던 메시지의 반응 행(`received`·`waiting`) 전부를 `away`로 바꾼다. 새 회차가 시작될 때만이 아니라 매번이라, 같은 회차 안에서 잠깐 풀린 동안(재시도·유예) 받아 👀인 메시지도 다시 멈추면 💤가 된다. 이미 `away`인 행은 고르지 않아 바꿀 것이 없는 바퀴에는 반응 REST가 없다. 잠금 순서는 scheduler 행 → `model_away` 행이다.
+- **💤:** 멈춤 중에 받은 메시지는 반응 행을 처음부터 `away`로 적는다(👀는 지금처럼 dispatch가 달고, 동기화가 💤를 더하고 👀를 지운다. 403/404 대체 글은 👀 수신 그대로). 답·실패·취소·`ack_only` 확정이 지운다. 지우기는 봇 자신(`@me`)뿐이다.
+- **한 줄:** 위 "상태 안내" 표. 접수(`Store.accept`, 조회 제외)와 대기 진입이 같은 키(`away:<채널>:<회차>`)를 쓰고 outbox 멱등 키가 중복을 막는다. 멈춤 판단은 지금 기록을 보므로, 회차 유예 중(풀린 뒤 5분)에 부르면 한 줄도 💤도 없다.
+- **Gateway 상태:** `GatewaySession`이 READY·RESUMED마다 `presence()`(게시 서버는 `Store.syncAway()`)로 멈춤 기록을 다시 읽어 op 3을 보낸다. 게시 서버의 `model_away` 루프가 15초(`MODEL_RESUME_TICK_MS`)마다 회차를 맞추고 상태를 `setPresence`로 넘기며, 세션은 바뀐 상태만 보낸다. 상태는 지금 멈춤 기록을 따르고 회차 유예를 기다리지 않는다(재시도 틈을 15초 루프가 보면 잠깐 online이 될 수 있다). 페이로드는 `{ since: idle이면 지금 시각(ms) 아니면 null, activities: [], status: 'idle'|'online', afk: false }`다.
+- **Discord 문서 확인(2026-11-11, https://docs.discord.com/developers/events/gateway-events#update-presence , discord.com/developers/docs가 이 주소로 넘어간다):** Update Presence(op 3)는 `since`(?integer, idle이 된 Unix ms, 아니면 null)·`activities`·`status`(`online`·`dnd`·`idle`·`invisible`·`offline`)·`afk` 네 칸이다. Identify에도 같은 모양의 `presence?`가 있지만 쓰지 않는다(IDENTIFY는 예약 창 안에서 보내야 해 DB를 읽지 않는다). RESUME 뒤 상태가 유지되는지는 문서에 없다(https://docs.discord.com/developers/events/gateway#resuming), 그래서 RESUMED 뒤에도 다시 보낸다. 전송 한도는 연결당 60초 120개, 넘으면 바로 끊긴다(https://docs.discord.com/developers/events/gateway#rate-limiting). 상태 바꾸기는 "5 times per 20 seconds"다(https://docs.discord.com/developers/events/gateway-events#activity-object). 세션은 20초 창에 5번을 넘기지 않게 넘으면 미뤘다 보낸다.
+- **입력 중 표시:** 그대로다(명세 §4.5).
+- **못 잡는 범위:** 실제 Discord 클라이언트의 idle 표시와 반응 rate limit 영향(S5, C24).
 
 ### 입력 중 디바운스
 

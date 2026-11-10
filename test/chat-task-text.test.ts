@@ -31,7 +31,6 @@ test("스위치 꺼짐: '/' 안내 줄은 지금처럼 '/' 명령 이름을 안�
   const off = Object.fromEntries(all(false));
   assert.match(off.readTimeout!, /\/read/);
   assert.match(off.jobFailed!, /\/list[\s\S]*\/retry/);
-  assert.match(off.modelWaitAuth!, /\/resume-model target:job-1[\s\S]*\/model-status/);
   assert.match(off.unknownWait!, /\/model-status/);
   assert.match(off.staleRetry!, /\/retry target:job-1/);
   assert.match(off.interactionExpired!, /\/list/);
@@ -41,16 +40,25 @@ test("스위치 꺼짐: '/' 안내 줄은 지금처럼 '/' 명령 이름을 안�
   assert.match(off.codexBlocked!, /\/codex-release target:job-1/);
   assert.match(off.taskQuestionFooter!, /\/answer question:job-1/);
   assert.match(off.changeQuestionFooter!, /\/answer question:job-1/);
-  assert.match(off.modelPauseResume!, /\/resume-model target:job-1[\s\S]*\/cancel/);
   assert.match(off.modelWaitLong!, /\/resume-model target:job-1[\s\S]*\/cancel target:job-1/);
   assert.match(taskLaneClosedText('unknown'), /\/task-release target:<job-id>/);
   assert.match(taskLaneClosedText('retention_full'), /\/answer[\s\S]*\/resume-model[\s\S]*\/task-cancel/);
   assert.match(controlText('stop', { active: false }), /\/resume/);
 });
 
+// 명세 §4.5·§4.7: 자리 비움은 스위치 밖이라 두 판이 같고, 원인(한도·인증·결제)·시각·'/' 명령을 적지 않는다.
+test("AC-15 자리 비움 문장은 스위치와 상관없이 같고 원인·시각·'/' 명령이 없다", () => {
+  const on = Object.fromEntries(all(true)), off = Object.fromEntries(all(false));
+  assert.equal(on.away, '지금은 잠깐 자리를 비웠어요. 돌아오면 이어서 할게요.');
+  for (const name of ['away', 'awayFinal'] as const) {
+    assert.equal(on[name], off[name], name);
+    assert.doesNotMatch(on[name]!, /한도|인증|결제|요금|토큰|\d|KST|\//, name);
+  }
+});
+
 test('관리 기능 안내의 켜짐 판은 homelab bot CLI로 한다고 말한다', () => {
   const on = Object.fromEntries(all(true));
-  for (const name of ['modelWaitAuth', 'modelWaitLimit', 'unknownWait', 'modelStatus', 'taskBlocked', 'codexBlocked', 'laneUnknownNote', 'releaseUnknownNote'] as const) {
+  for (const name of ['unknownWait', 'modelStatus', 'taskBlocked', 'codexBlocked', 'laneUnknownNote', 'releaseUnknownNote'] as const) {
     assert.match(on[name]!, /`homelab bot` CLI/, name);
   }
   assert.match(taskLaneClosedText('unknown', true), /`homelab bot` CLI/);

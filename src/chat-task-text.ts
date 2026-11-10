@@ -29,12 +29,11 @@ export const CHAT_TASK_TEXT = Object.freeze({
     : '작업이 실패했어요. /list로 상태를 보고 /retry로 다시 시도할 수 있어요.',
   taskCancelled: (_c: boolean, job: string) =>
     `작업 ${job} 취소를 마쳤어요. 실행 중인 프로세스가 없는 걸 확인했고 다시 실행하지 않아요. 필요하면 새 작업으로 요청해 주세요.`,
-  modelWaitAuth: (c: boolean, job: string) => `모델 인증이 만료돼 작업이 멈췄어요. ${c
-    ? `원인을 해결한 뒤 ${CLI}로 재개하거나 상태를 볼 수 있어요.`
-    : `원인을 해결한 뒤 /resume-model target:${job}로 재개해 주세요. 상태는 /model-status로 볼 수 있어요.`}`,
-  modelWaitLimit: (c: boolean, job: string) => `모델 사용 한도에 걸려 작업이 멈췄어요. ${c
-    ? `원인을 해결한 뒤 ${CLI}로 재개하거나 상태를 볼 수 있어요.`
-    : `원인을 해결한 뒤 /resume-model target:${job}로 재개해 주세요. 상태는 /model-status로 볼 수 있어요.`}`,
+  // 자리 비움(C20). 모델 멈춤(한도·인증·결제) 동안 Discord에 나가는 말은 이것뿐이다. 원인·시각·'/' 명령은 적지 않는다
+  // (원인은 운영 알림이 Telegram으로 보낸다). 스위치와 상관없이 같다.
+  away: '지금은 잠깐 자리를 비웠어요. 돌아오면 이어서 할게요.',
+  // 멈춘 작업이 시도 한도에 닿아 돌아와도 이어서 할 수 없을 때(결제 멈춤은 시도로 센다).
+  awayFinal: '지금은 잠깐 자리를 비웠어요. 이 작업은 돌아와도 이어서 할 수 없어서, 취소하고 새로 요청해 주세요.',
   unknownWait: (c: boolean) => `작업이 끝났는지 확인하지 못해 새 모델 실행을 멈췄어요. 작업자에게 계속 확인하고 있어요. ${c
     ? `상태는 ${CLI}로 볼 수 있어요.` : '상태는 /model-status로 볼 수 있어요.'}`,
   staleRetry: (c: boolean, job: string) => c ? `이전 작업이 멈춘 걸 확인했어요(작업 ${job}). 다시 해 달라고 하면 다시 실행해요.`
@@ -131,15 +130,7 @@ export const CHAT_TASK_TEXT = Object.freeze({
   codexBlocked: (c: boolean, job: string) => `작업 ${job}의 Codex 프로세스가 끝났는지 확인하지 못해서, 다시 실행하지 않고 새 모델 실행을 막았어요. 작업자 프로세스가 0개인지 확인한 뒤 ${c
     ? `${CLI}로 해제해 주세요.` : `/codex-release target:${job} 로 해제해 주세요.`}`,
 
-  // 모델 멈춤·완료·해제(ClaudeTaskBridge·CodexBridge). 한도·인증 안내는 말투만 바꾼다(자리 비움은 뒤 티켓).
-  taskLimitPaused: (_c: boolean, job: string) => `모델 사용 한도가 차서 작업 ${job}의 실행이 멈췄어요. 같은 계정을 쓰는 대화와 리뷰도 함께 멈춰요.`,
-  taskAuthPaused: (_c: boolean, job: string) => `작업 레인 인증이 만료돼 작업 ${job}의 실행이 멈췄어요. 대화와 리뷰는 계속돼요.`,
-  codexLimitPaused: (_c: boolean, job: string) => `모델 사용 한도가 차서 작업 ${job}의 실행이 멈췄어요.`,
-  codexAuthPaused: (_c: boolean, job: string) => `모델 인증이 만료돼 작업 ${job}의 실행이 멈췄어요.`,
-  modelPauseResume: (c: boolean, job: string) => `다른 계정이나 인증으로 바꾸지 않아요. ${c
-    ? `원인을 해결한 뒤 ${CLI}로 재개하거나, 작업을 취소해 달라고 말해 주세요.` : `원인을 해결한 뒤 /resume-model target:${job} 로 재개하거나 /cancel 해 주세요.`}`,
-  modelPauseFinal: (c: boolean) => `다른 계정이나 인증으로 바꾸지 않아요. 재시도 한도에 닿아 재개할 수 없어요. ${c
-    ? '작업을 취소하고 새로 요청해 주세요.' : '/cancel 뒤 새 작업으로 요청해 주세요.'}`,
+  // 완료·해제(ClaudeTaskBridge·CodexBridge). 모델 멈춤 안내는 위의 자리 비움이다.
   questionBlocked: (c: boolean, job: string, risk: string) => `작업 ${job}의 질문이 공개 검사에 걸려서(사유: ${risk}) 질문을 올리지 않고 작업을 멈췄어요. ${c
     ? '요청을 고쳐 새로 요청하거나, 다시 해 달라고 말해 주세요.' : `요청을 고쳐 새 작업으로 요청하거나 /retry target:${job} 로 다시 실행해 주세요.`}`,
   taskCompleted: (_c: boolean, job: string) => `작업을 마쳤어요 (작업 ${job})`,

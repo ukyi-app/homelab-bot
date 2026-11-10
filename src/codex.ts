@@ -381,11 +381,12 @@ export class CodexBridge extends TaskBridge {
       if (now?.state !== 'waiting_user' || now.wait_reason !== outcome.reason) return;
       if (answered) await this.store.db.query("UPDATE codex_questions SET state='answered' WHERE id=$1 AND state='resumed'", [answered]);
       // clarification 재개도 claim마다 attempt를 올린다. /resume-model의 시도 한도에 닿았으면 재개를 안내하지 않는다.
+      // 자리 비움 한 줄(원인·시각·'/' 명령 없음). 이어서 할 수 있으면 같은 멈춤 동안 이 스레드에 한 번만 나간다.
       const resumable = Number(now.attempt) < DEFAULTS.maxRetries + 1;
-      await this.store.enqueue({ key: `codex-wait:${job.id}:${job.attempt}`, job: job.id, conversation: job.conversation_id,
+      const fallback = `codex-wait:${job.id}:${job.attempt}`;
+      await this.store.enqueue({ key: resumable ? await this.store.awayKey(job.target.channel, fallback) : fallback, job: job.id, conversation: job.conversation_id,
         actor: job.owner_id, scope: job.target, revision, payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary',
-          content: `${outcome.reason === 'model_limit' ? T.codexLimitPaused(this.store.colleague, job.id) : T.codexAuthPaused(this.store.colleague, job.id)} `
-            + (resumable ? T.modelPauseResume(this.store.colleague, job.id) : T.modelPauseFinal(this.store.colleague)) } });
+          content: resumable ? T.away : T.awayFinal } });
       return;
     }
     if (outcome.kind === 'question') {
