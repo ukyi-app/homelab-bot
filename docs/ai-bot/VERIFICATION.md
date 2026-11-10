@@ -2580,6 +2580,7 @@ T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·
 | 파드 교체(`worker_mismatch`) 동작 | `change-verify-recheck` "C33 파드 교체: …"(시험 요청 직전 작업자 재시작 → 재조회가 새 신원을 알려 같은 저장소의 새 파드에서 시험 1회, `passed`), `change-verification` "검증 port C33: 거부 뒤 작업자가 모르면 답한 작업자 신원으로 …"(두 번째 verify가 새 instance로 간다) |
 | 다른 쪽 시험을 따름 | `change-verification` "검증 port C33: 시작 요청이 거부돼도 작업자가 그 command를 돌리는 중이거나 끝냈으면 그 결과를 따른다"(running 뒤 done, 바로 done, 둘 다 verify 1회) |
 
+- **실행(origin/main 병합 뒤 2ed0ee3, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 바뀐 파일을 참조하는 9개 파일(`change-verify-recheck`, `change-verification`, `change-verify-start`, `change-pg`, `change-assembly`, `c28-change-question`, `task-stream`, `change-artifact`, `c17-publish-button`) 274개 모두 통과, skip 0.
 - **시험이 실패할 수 있는지 확인:** 새 시험 다섯(같은 밀리초, 파드 교체, port 셋)을 고치기 전 `src`로 돌려 모두 실패를 봤다. 같은 밀리초 시험은 충돌 1건에서 `blocked`·`verification_not_run`, 파드 교체 시험도 `not_run`으로 닫혔다.
 - **바뀐 기존 시험:** `change-verification` "검증 port: 세션이 없거나 거부되면 not_run, …"의 거부 경우는 재조회가 `absent`인 경우로 좁혔다(이 티켓이 바꾼 동작). 재조회가 닿지 않으면 `unknown`인 단언을 더했다.
 - **못 잡는 범위:** 토큰이 같아지는 것 자체(근본 수정, 작업자 배포 뒤), 실제 배포 교체 순간(C24 S5). 이긴 쪽이 슬롯을 잡기 전에 재조회가 `absent`를 받는 좁은 틈은 재전송으로 덮지만 결정적 시험으로 만들지 않았다.
