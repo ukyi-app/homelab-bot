@@ -2334,6 +2334,7 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 | 지시문 literal과 서버 v2 사용 | `pr-review` "SEC-01 PR 본문·…"(작업자 입력의 지시문이 `REVIEW_INSTRUCTIONS_V2`), `publisher-review` "T17 열림 조립"(작업자 요청의 `instructions`), `review-lane` "리뷰 레인 입력: …"(프롬프트 첫 줄이 받은 v2 그대로) |
 | 재리뷰 몰림 확인과 대응 | `pr-review` "AC-13 리뷰 지시문 v1→v2 배포: …"(배포 전 서버로 PR 7 게시·PR 8 게시 대기·PR 9 대기 → 배포 뒤 PR 8은 새 렌더로 게시, 재조정은 PR 9만 넣음(`admitted: 1`), PR 9 옛 작업은 `policy_changed`, `ready_for_review`는 `instructions_only`, 댓글 명령은 `queued`) |
 
+- **실행(병합 결과 d257572, origin/main d353fc0 반영, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 11개 파일(`pr-review`·`publisher-review`·`review-lane`·`change-review-dispatch`·`change-review-pg`·`change-review`·`github-review-app`·`review-repo-name`·`task-bridge`·`worker-server`·`unknown-probe`) 388개 통과, 실패·skip 0.
 - **고치기 전 실패 확인:** 새 렌더 시험은 옛 렌더에서, 서버 v2 시험 2개(SEC-01·T17 열림 조립)는 서버가 v1을 보낼 때, 배포 시험은 게시 대기 결과가 `policy_changed`로 버려져 실패했다.
 - **바뀐 기존 시험:** 머리말 정규식(`승인·병합 판단이 아니며`)을 둘째 줄 리터럴로, `미검토 …`를 `- 못 본 파일 …`로, `상한으로 1건 생략`을 `게시 상한 때문에 1건은 싣지 않았어요`로 바꿨다. `review-lane`의 입력 지시문은 서버가 보내는 v2로 바꿨다.
 - **못 잡는 범위.** 리뷰 글의 말투 품질과 GitHub에서 보이는 모양은 S5(C24 `homelab-smoke` PR)다. 운영의 실제 재리뷰 건수는 배포 뒤 관찰이다(DECISIONS의 예상 0건).
