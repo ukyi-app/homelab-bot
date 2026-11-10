@@ -1,9 +1,11 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ADMIN_ACTOR, AdminUsage, parseAdminArgs, runAdmin } from '../src/admin.js';
+import type { AdminPorts } from '../src/admin.js';
 import { executeAdmin } from '../src/admin-main.js';
 import { DEFAULTS, Denied } from '../src/contracts.js';
 import { localDatabase, fixture, event, thread } from './helpers.js';
+import { codexBridge, codexSession, lane, reply, task } from './task-lane-fixture.js';
 
 // C05 관리 기능(AC-20) S1: 관리 진입점이 모델을 거치지 않고 기존 저장소 경로로 비상 정지·해제·상태 보기를 하고,
 // 감사에 행위자 cli를 남긴다. '/' 관리 명령은 그대로 동작한다.
@@ -13,7 +15,8 @@ before(async () => { database = await localDatabase(); });
 beforeEach(async () => {
   const tables = (await database.pg.query<{ tablename: string }>(
     "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename<>'schema_migrations'")).rows.map(r => r.tablename);
-  await database.pg.exec(`TRUNCATE ${tables.join(',')} RESTART IDENTITY CASCADE`);
+  await database.pg.exec(`TRUNCATE ${tables.join(',')} RESTART IDENTITY CASCADE;
+    INSERT INTO execution_lanes(lane) VALUES ('interactive'), ('task') ON CONFLICT DO NOTHING`);
   f = await fixture(database.db);
 });
 after(async () => { await database.pg.close(); });
@@ -212,6 +215,66 @@ test("관리 기능 멈춘 작업 재개: '/resume-model'은 그대로 owner·�
   await f.ingress.receive(event('slash-resume-job', { kind: 'command', command: 'resume-model', target: id }));
   assert.equal((await job(id))?.state, 'queued');
   assert.equal((await admin('resume', 'job', id)).report.result, 'not_waiting');
+});
+
+// ---- C32 unknown 해제 ----
+const unknownTask = async () => {
+  const local = lane(f);
+  local.worker.scripts.push(reply.unknown());
+  const created = await task(f, database.db);
+  await local.runtime.tickTask();
+  assert.equal((await job(created.id))?.state, 'unknown');
+  return { ...local, id: created.id as string };
+};
+const release = (id: string, releasers: AdminPorts['releasers']) => runAdmin(f.store, parseAdminArgs(['release', id]), { releasers });
+
+test('관리 기능 unknown 해제: 소멸 확인 뒤 풀고 레인을 열며, 모델을 부르지 않고 감사 행위자가 cli다', async () => {
+  const { bridge, worker, id } = await unknownTask();
+  const out = await release(id, [bridge, codexBridge(f).bridge]);
+  assert.equal(out.code, 0);
+  assert.equal(out.report.result, 'released');
+  assert.equal(out.report.command, 'release');
+  assert.equal(out.report.state?.taskLaneClosed, null);
+  assert.deepEqual(await job(id), { state: 'cancelled', wait_reason: 'stop_confirmed_after_unknown' });
+  assert.deepEqual((await audits()).filter(row => row.detail.actor === ADMIN_ACTOR).map(row => [row.kind, row.subject]),
+    [['task_unknown_released', id], ['admin_command', 'release']]);
+  assert.equal(worker.executes.length, 1, '다시 실행하지 않는다');
+  assert.equal(f.requests.length, 0);
+});
+
+test('관리 기능 unknown 해제: 작업자 소멸을 확인하지 못하면 풀지 않고 running_jobs로 거부한다', async () => {
+  const { bridge, worker, id } = await unknownTask();
+  worker.stopped = false;
+  const out = await release(id, [bridge]);
+  assert.equal(out.code, 3);
+  assert.equal(out.report.result, 'running_jobs');
+  assert.equal(out.report.state?.taskLaneClosed, 'unknown');
+  assert.equal((await job(id))?.state, 'unknown');
+});
+
+test('관리 기능 unknown 해제: 없는 작업·unknown이 아닌 작업·어느 브리지도 맡지 않는 세션은 not_releasable이다', async () => {
+  const { bridge, id } = await unknownTask();
+  assert.equal((await release(MISSING, [bridge])).report.result, 'not_releasable');
+  assert.equal((await release(id, [bridge])).report.result, 'released');
+  const rerun = await release(id, [bridge]);
+  assert.equal(rerun.code, 3);
+  assert.equal(rerun.report.result, 'not_releasable');
+  const { job: codexJob } = await codexSession(f, database.db);
+  assert.equal((await release(codexJob.id, [bridge])).report.result, 'not_releasable');
+  assert.equal((await job(codexJob.id))?.state, 'unknown');
+});
+
+test('관리 기능 unknown 해제: Codex 세션은 Codex 브리지가 소멸 확인 뒤 푼다', async () => {
+  const { job: codexJob } = await codexSession(f, database.db);
+  const codex = codexBridge(f);
+  const out = await release(codexJob.id, [lane(f).bridge, codex.bridge]);
+  assert.equal(out.report.result, 'released');
+  assert.deepEqual(codex.confirms, [codexJob.id]);
+});
+
+test('관리 기능 unknown 해제: 작업 레인을 조립하지 못했으면(브리지 없음) 아무것도 바꾸지 않고 실패한다', async () => {
+  await assert.rejects(release(MISSING, []));
+  assert.deepEqual(await audits(), []);
 });
 
 test('관리 진입점 입력은 고정 명령 단어와 형식이 맞는 ID만 받는다', () => {
