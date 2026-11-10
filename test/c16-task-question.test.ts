@@ -196,7 +196,10 @@ test('C16 같은 메시지가 다시 전달돼도 답은 한 번만 반영되고
 test('C16 다른 실행기 세션의 질문은 지금처럼 거부를 안내하고, 그 말로 대화 작업을 만들지 않는다', async () => {
   const h = await harness(database.db);
   const { job, question } = await h.asked();
-  await database.db.query(`UPDATE codex_sessions SET executor='codex' WHERE job_id=$1`, [job]);
+  // 같은 질문을 Codex 세션의 작업 것으로 바꾼다(세션 행의 executor 기본값이 codex다, task-lane-fixture의 codexSession과 같은 모양).
+  await database.db.query('DELETE FROM codex_sessions WHERE job_id=$1', [job]);
+  await database.db.query(`INSERT INTO codex_sessions(job_id,thread_id,turn,tool_calls,host,capabilities,state,created_at,updated_at)
+    VALUES ($1,'codex-thread',1,0,'worker','{}','waiting_answer',$2,$2)`, [job, h.f.now()]);
   await h.say('main 기준이요');
   assert.equal((await h.question(question)).state, 'open');
   assert.deepEqual(await h.chatJobs(), []);

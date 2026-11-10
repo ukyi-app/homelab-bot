@@ -2407,7 +2407,8 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 | Codex 질문 같은 규칙, 다른 실행기 세션은 기존 거부 | `codex-bridge` "C16 Codex 작업 질문도 같은 규칙: …"(같은 스레드 `exec resume`, stdin이 답), `c16-task-question` "C16 다른 실행기 세션의 질문은 지금처럼 거부를 안내하고, 그 말로 대화 작업을 만들지 않는다" |
 | 답 원문 7일 정리 그대로 | `c16-task-question` "C16 바로 답한 원문도 지금처럼 작업이 끝난 지 7일 뒤 지워진다"(`purgeExpiredTaskAnswers`) |
 
-- **실행:** C16 작업자 보고 시점(2026-11-10 14:40)에 미실행. 머신 시험 잠금을 다른 실행이 멈춘 채 쥐고 있었다. 타입 검사(`tsc --noEmit -p .`)만 통과했다. 통합 때 아래 결과로 채운다.
+- **실행(origin/main dd0a53f 그대로라 병합할 것 없음, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 바뀐 파일을 참조하는 16개 파일(`c16-task-question`, `chat-task-text`, `codex-bridge`, `change-assembly`, `task-bridge`, `task-assembly`, `raw-input-retention`, `c13-proposal`, `c13-proposal-pg`, `foundation`, `chat-task-text-assembly`, `task-lane-pg`, `reaction-lifecycle`, `c08-mention-scope`, `c08-reply-context`, `chat-ack`) 471개 중 통과 470, 실패 1, skip 0. 실패 1은 이 티켓의 "다른 실행기 세션" 시험 준비가 Claude 세션 행의 `executor`만 바꾸다 CHECK 제약(`codex_sessions_executor_identity_check`)에 걸린 것이고, Codex 세션 행으로 바꿔 넣게 고친 뒤 `c16-task-question` 10개 모두 통과했다.
+- **시험이 실패할 수 있는지 확인:** 구현이 시험보다 먼저 들어가 변이로 봤다. CHANGE 질문도 바로 답 대상으로 넣으면(`DIRECT`에 `change`) `change-assembly`의 C16 시험이 실패하고, 바로 답을 끄면 `c16-task-question` 6개와 `codex-bridge` C16 1개가 실패한다.
 
 - **운영 영향:** 스위치가 꺼져 있으면 수신 분기를 타지 않고 고르기 버튼도 받지 않아 지금 동작 그대로다. 스위치와 무관하게 바뀌는 것은 없다(질문 글의 꺼짐 판·변경 질문 글 문구는 그대로).
 - **못 잡는 범위.** owner가 질문과 무관한 말을 스레드에 보내면 그 말이 답이 된다(명세 그대로의 결과). 실제 Discord의 답장 표시와 `UPDATE_MESSAGE` 모양은 S5다. 한 스레드에 열린 작업 질문이 6개 이상이면 버튼은 오래된 5개만 달린다.
