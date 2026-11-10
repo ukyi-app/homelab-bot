@@ -73,6 +73,19 @@ export async function purgeExpiredTaskAnswers(db: Database, now: number, retenti
   }
   return total;
 }
+// 변경 작성 job인지. 질문 글의 답 안내를 고를 때 쓴다(수신의 봉인 판단은 처리기의 sealsAnswer가 같은 사실을 본다).
+async function changeAuthorJob(db: Database, job: string): Promise<boolean> {
+  return (await db.query(`SELECT 1 FROM change_child_jobs WHERE job_id=$1 AND role='author'`, [job])).rows.length > 0;
+}
+// 그 대화에서 이 사람이 지금 답할 수 있는 열린 질문. 조건은 answerIn과 같다(같은 대화, 응답자와 작업 owner가 이 사람,
+// 기한 전, 그 답을 기다리는 작업). 실행기와 질문 종류는 가리지 않는다. 다른 실행기 세션은 answerIn이 거부하고, 종류는 호출자가 가린다.
+// 잠그지 않는다. 호출자의 트랜잭션에서 answerIn이 같은 조건을 잠근 채 다시 본다.
+export interface OpenQuestion { id: string; prompt: string }
+export async function openTaskQuestions(db: Database, conversation: string, actor: string, now: number): Promise<OpenQuestion[]> {
+  return (await db.query<OpenQuestion>(`SELECT q.id,q.prompt FROM codex_questions q JOIN jobs j ON j.id=q.job_id
+    WHERE q.conversation_id=$1 AND q.responder_id=$2 AND j.owner_id=$2 AND q.state='open' AND q.expires_at>$3
+      AND j.state='waiting_user' AND j.wait_reason='clarification' ORDER BY q.created_at,q.id`, [conversation, actor, now])).rows;
+}
 // unknown 해제의 결과. '/' 경로는 안내 문구로, 관리 기능은 결과 이름으로 바꾼다.
 // foreign: 다른 실행기의 세션이라 이 브리지의 작업자가 소멸을 증명할 수 없다.
 export type ReleaseOutcome = 'released' | 'missing' | 'not_unknown' | 'foreign' | 'worker_alive' | 'state_changed';
@@ -122,10 +135,12 @@ export abstract class TaskBridge {
       await store.db.query(`INSERT INTO codex_questions(id,job_id,conversation_id,thread_id,turn,kind,responder_id,prompt,state,created_at,expires_at)
         VALUES ($1,$2,$3,$4,$5,'clarification',$6,$7,'open',$8,$9)`,
       [id, job.id, job.conversation_id, threadId, turn, job.owner_id, question, store.now(), expires]);
+      // 변경 작성 job의 질문도 이 경로로 만든다. 그 답은 '/' answer와 label 서식으로만 받으므로 안내를 따로 둔다.
+      const footer = await changeAuthorJob(store.db, job.id) ? T.changeQuestionFooter : T.taskQuestionFooter;
       await store.enqueue({ key: `${this.text.prefix}-question:${id}`, job: job.id, conversation: job.conversation_id, actor: job.owner_id,
         scope: job.target, revision, payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary', ownerCall: true,
           content: [`${this.text.question} (질문 ID: ${id})`, bounded(question, 500),
-            T.questionFooter(store.colleague, id, new Date(expires).toISOString())].join('\n') } });
+            footer(store.colleague, id, new Date(expires).toISOString())].join('\n') } });
       return true;
     });
   }

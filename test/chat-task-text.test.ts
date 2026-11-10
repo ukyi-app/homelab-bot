@@ -21,8 +21,8 @@ const controls = (colleague: boolean) => [
 test("스위치 켜짐: 대화·작업·제어 고정 문구 어디에도 '/' 명령 이름이 없다", () => {
   assert.ok(registered.includes('task-release') && registered.includes('resume-model'));
   for (const [name, text] of all(true)) {
-    // 질문 답 안내는 답을 봉인하는 자연어 경로(C16 작업 질문, C28 변경 질문)가 생길 때 그 티켓이 함께 바꾼다.
-    if (name === 'questionFooter') continue;
+    // 변경 질문의 답 안내는 답을 봉인하는 자연어 경로(C28)가 생길 때 그 티켓이 함께 바꾼다.
+    if (name === 'changeQuestionFooter') continue;
     assert.doesNotMatch(text, slashName, name);
     for (const command of registered) assert.ok(!text.includes(`/${command}`), `${name}: /${command}`);
   }
@@ -41,7 +41,8 @@ test("스위치 꺼짐: '/' 안내 줄은 지금처럼 '/' 명령 이름을 안�
   assert.match(off.reviewStatus!, /\/review-resume target:<job-id>[\s\S]*\/review-cancel target:<job-id>/);
   assert.match(off.taskBlocked!, /\/task-release target:job-1/);
   assert.match(off.codexBlocked!, /\/codex-release target:job-1/);
-  assert.match(off.questionFooter!, /\/answer question:job-1/);
+  assert.match(off.taskQuestionFooter!, /\/answer question:job-1/);
+  assert.match(off.changeQuestionFooter!, /\/answer question:job-1/);
   assert.match(off.modelPauseResume!, /\/resume-model target:job-1[\s\S]*\/cancel/);
   assert.match(off.modelWaitLong!, /\/resume-model target:job-1[\s\S]*\/cancel target:job-1/);
   assert.match(taskLaneClosedText('unknown'), /\/task-release target:<job-id>/);
@@ -65,17 +66,26 @@ test('고정 문구는 해요체이고 자기를 봇이라 부르지 않는다',
   }
 });
 
-test('질문 답 안내는 켜짐 판에서도 /answer 경로다(그냥 말한 답은 봉인·label 검사를 거치지 않는다)', () => {
+test('변경 질문 답 안내는 켜짐 판에서도 /answer 경로다(그냥 말한 답은 봉인·label 검사를 거치지 않는다)', () => {
   for (const colleague of [false, true])
-    assert.match(CHAT_TASK_TEXT.questionFooter(colleague, 'q-1', '2026-11-10T00:00:00.000Z'), /\/answer question:q-1 로 답해 주세요/);
+    assert.match(CHAT_TASK_TEXT.changeQuestionFooter(colleague, 'q-1', '2026-11-10T00:00:00.000Z'), /\/answer question:q-1 로 답해 주세요/);
 });
 
-test('질문 안내는 두 판 모두 질문 ID와 승인·권한 변경이 아니라는 문장을 남긴다', () => {
+test('C16 작업 질문 답 안내: 켜짐 판은 질문 ID를 옮겨 적으라고 하지 않고 이 스레드에서 답을 말해 달라고 한다, 꺼짐 판은 /answer 그대로', () => {
+  const on = CHAT_TASK_TEXT.taskQuestionFooter(true, 'q-1', '2026-11-10T00:00:00.000Z');
+  assert.match(on, /이 스레드에서 답을 말해 주세요/);
+  assert.doesNotMatch(on, /q-1/);
+  assert.doesNotMatch(on, slashName);
+  assert.match(CHAT_TASK_TEXT.taskQuestionFooter(false, 'q-1', '2026-11-10T00:00:00.000Z'), /\/answer question:q-1 로 답해 주세요/);
+});
+
+test('질문 안내는 모든 판에서 승인·권한 변경이 아니라는 문장을 남기고, 꺼짐 판과 변경 질문은 질문 ID를 안내한다', () => {
   for (const colleague of [false, true]) {
-    const footer = CHAT_TASK_TEXT.questionFooter(colleague, 'q-1', '2026-11-10T00:00:00.000Z');
-    assert.match(footer, /q-1/);
-    assert.match(footer, /도구 실행을 승인하거나 권한을 바꿀 수는 없어요/);
+    for (const footer of [CHAT_TASK_TEXT.taskQuestionFooter, CHAT_TASK_TEXT.changeQuestionFooter])
+      assert.match(footer(colleague, 'q-1', '2026-11-10T00:00:00.000Z'), /도구 실행을 승인하거나 권한을 바꿀 수는 없어요/);
+    assert.match(CHAT_TASK_TEXT.changeQuestionFooter(colleague, 'q-1', '2026-11-10T00:00:00.000Z'), /q-1/);
   }
+  assert.match(CHAT_TASK_TEXT.taskQuestionFooter(false, 'q-1', '2026-11-10T00:00:00.000Z'), /q-1/);
 });
 
 test('상태·사유 코드는 owner가 읽는 말로 풀고 모르는 코드는 그대로 둔다', () => {

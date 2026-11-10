@@ -4,6 +4,7 @@ import type { Clock, EventInput } from './contracts.js';
 import { gatewayMessage, hasMarker } from './discord.js';
 import type { AckOutcome, DiscordIngress, DiscordRest, GatewayFrame } from './discord.js';
 import { PROPOSAL_BUTTONS } from './proposals.js';
+import { QUESTION_PICK_BUTTON } from './question-pick.js';
 
 // 기한 없는 REST(게시·대조·history 복구·명령 등록·gateway URL·typing)의 전송 제한. 1초 일괄 제한은 재시작 직후
 // 복구 GET을 시간 초과로 실패시킨다(S16). 이 호출들은 게시 lease·복구 lease(각 30초)나 별도 루프 안에서 돌아 몇 초를 기다려도
@@ -43,6 +44,7 @@ export const BUTTONS = Object.freeze([
   { name: 'cancel', parts: 2, route: 'control' },
   { name: PROPOSAL_BUTTONS.yes, parts: 2, route: 'proposal' },
   { name: PROPOSAL_BUTTONS.no, parts: 2, route: 'proposal' },
+  { name: QUESTION_PICK_BUTTON, parts: 2, route: 'question' },
 ] as const);
 export type ButtonRoute = typeof BUTTONS[number]['route'];
 export const CUSTOM_ID_MAX = 100;

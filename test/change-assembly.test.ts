@@ -1652,6 +1652,32 @@ test('호환 /answer: CHANGE에 묶이지 않은 v1 질문은 같은 처리기�
   });
 });
 
+test('C16 CHANGE 질문은 바로 답·질문 고르기 대상이 아니다: 켜짐에서도 /answer를 안내하고 그냥 한 말은 대화로 가며, 작업 질문이 함께 열려 있으면 그 하나에만 바로 답이 붙는다', async () => {
+  await withHarness({ steps: [QUESTION, WRITE_STEP], colleague: true }, async h => {
+    const { question } = await toQuestion(h);
+    await h.deliver();
+    assert.ok(h.messages().some(text => text.includes(`질문 ID: ${question}`) && text.includes(`/answer question:${question}`)), '변경 질문 글은 켜짐에서도 질문 ID와 /answer를 안내한다');
+    const chatJobs = async () => (await h.db.query<{ delivery_id: string }>(`SELECT e.delivery_id FROM jobs j JOIN events e ON e.id=j.event_id WHERE j.type='chat' ORDER BY e.delivery_id`)).rows.map(row => row.delivery_id);
+    const changeQuestion = async () => (await h.db.query<{ state: string; answer: string | null }>('SELECT state,answer FROM codex_questions WHERE id=$1', [question])).rows[0]!;
+    // 열린 질문이 CHANGE 질문뿐이면 지금처럼 대화로 받고 질문은 그대로 열려 있다.
+    await h.ingress.receive({ id: '1700000000000000001', actor: OWNER, scope: THREAD, kind: 'message', text: '그냥 한 말이에요', mention: true });
+    assert.deepEqual(await changeQuestion(), { state: 'open', answer: null });
+    assert.deepEqual(await chatJobs(), ['1700000000000000001']);
+    // 작업 질문 하나가 함께 열리면 열린 질문을 셀 때 CHANGE 질문은 빠져 그 작업 질문에만 바로 답이 붙는다(고르기 글 없음).
+    const conversation = h.store.scopeId(THREAD);
+    await insertChildJob(h.db, 'fixture-v1-job', 'task');
+    await h.db.query(`UPDATE jobs SET conversation_id=$1,state='waiting_user',wait_reason='clarification' WHERE id='fixture-v1-job'`, [conversation]);
+    await h.db.query(`INSERT INTO codex_questions(id,job_id,conversation_id,thread_id,turn,kind,responder_id,prompt,state,created_at,expires_at)
+      VALUES ('fixture-v1-question','fixture-v1-job',$1,'thread',1,'clarification',$2,'질문','open',1,$3)`, [conversation, OWNER, Date.now() + 3_600_000]);
+    await h.ingress.receive({ id: '1700000000000000002', actor: OWNER, scope: THREAD, kind: 'message', text: '작업 질문의 답이에요', mention: true });
+    const task = (await h.db.query<{ state: string; answer: string | null }>(`SELECT state,answer FROM codex_questions WHERE id='fixture-v1-question'`)).rows[0]!;
+    assert.deepEqual(task, { state: 'answered', answer: '작업 질문의 답이에요' });
+    assert.deepEqual(await changeQuestion(), { state: 'open', answer: null });
+    assert.deepEqual(await chatJobs(), ['1700000000000000001']);
+    assert.equal((await h.db.query(`SELECT 1 FROM outbox WHERE message_key LIKE 'question-pick:%'`)).rows.length, 0);
+  });
+});
+
 test('호환 작업자: 옛 작업자(v2 없음)면 CHANGE는 admitted에서 멈추고 부모를 닫지 않는다', async () => {
   await withHarness({ change: false }, async h => {
     assert.equal(await h.f.port.supportsChange(), false);
