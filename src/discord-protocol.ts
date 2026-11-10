@@ -3,6 +3,7 @@ import { Denied, DiscordRejected, DiscordUnauthorized, RateLimited } from './con
 import type { Clock, EventInput } from './contracts.js';
 import { gatewayMessage, hasMarker } from './discord.js';
 import type { AckOutcome, DiscordIngress, DiscordRest, GatewayFrame } from './discord.js';
+import { PROPOSAL_BUTTONS } from './proposals.js';
 
 // 기한 없는 REST(게시·대조·history 복구·명령 등록·gateway URL·typing)의 전송 제한. 1초 일괄 제한은 재시작 직후
 // 복구 GET을 시간 초과로 실패시킨다(S16). 이 호출들은 게시 lease·복구 lease(각 30초)나 별도 루프 안에서 돌아 몇 초를 기다려도
@@ -32,6 +33,29 @@ const InteractionSchema = z.object({ id: z.string(), token: z.string(), type: z.
   data: z.object({ name: z.string().optional(), custom_id: z.string().optional(),
     options: z.array(z.object({ name: z.string(), value: z.string() })).optional() }),
 });
+// 버튼 custom_id 허용 목록. custom_id는 `이름` 또는 `이름:대상`이고 parts는 ':'로 나눈 칸 수다(정확히 그 수만 받는다).
+// route는 수신(DiscordIngress.receive)의 처리 분기다: control은 '/' 제어와 같은 경로, proposal은 실행 확인(src/proposals.ts).
+// 뒤 티켓은 줄만 더한다. 게시자도 이 표로 보낼 버튼을 대조한다. Discord custom_id 상한은 100자다.
+export const BUTTONS = Object.freeze([
+  { name: 'list', parts: 1, route: 'control' },
+  { name: 'stop', parts: 1, route: 'control' },
+  { name: 'resume', parts: 1, route: 'control' },
+  { name: 'cancel', parts: 2, route: 'control' },
+  { name: PROPOSAL_BUTTONS.yes, parts: 2, route: 'proposal' },
+  { name: PROPOSAL_BUTTONS.no, parts: 2, route: 'proposal' },
+] as const);
+export type ButtonRoute = typeof BUTTONS[number]['route'];
+export const CUSTOM_ID_MAX = 100;
+// 표에 있는 버튼이면 그 줄과 나눈 칸을 돌려준다. 빈 칸·상한 초과·칸 수 불일치는 받지 않는다.
+export function parseButton(customId: string | undefined): { route: ButtonRoute; parts: string[] } | undefined {
+  if (customId === undefined || customId.length > CUSTOM_ID_MAX) return;
+  const parts = customId.split(':');
+  const row = BUTTONS.find(button => button.name === parts[0]);
+  if (!row || parts.length !== row.parts || parts.some(value => !value)) return;
+  return { route: row.route, parts };
+}
+export const buttonAllowed = (customId: string) => parseButton(customId) !== undefined;
+export const buttonRoute = (name: string | undefined): ButtonRoute | undefined => BUTTONS.find(button => button.name === name)?.route;
 const part = encodeURIComponent;
 const ownReaction = (channel: string, message: string, emoji: string) =>
   `/channels/${part(channel)}/messages/${part(message)}/reactions/${part(emoji)}/@me`;
@@ -60,8 +84,9 @@ export class DiscordProtocol implements DiscordRest {
       guild_id: interaction.guild_id, author: { id: actor } };
     const normalized = await gatewayMessage(frame, this.botId, id => this.channel(id, DISPATCH));
     const options = new Map(interaction.data.options?.map(o => [o.name, o.value]));
-    const custom = interaction.data.custom_id?.split(':');
-    if (interaction.type === 3 && (!custom || custom.length > 2 || !['list', 'stop', 'resume', 'cancel'].includes(custom[0]!))) throw new Denied();
+    const button = interaction.type === 3 ? parseButton(interaction.data.custom_id) : undefined;
+    if (interaction.type === 3 && !button) throw new Denied();
+    const custom = button?.parts;
     const input: EventInput = { ...normalized, kind: interaction.type === 2 ? 'command' : 'button',
       command: interaction.type === 2 ? interaction.data.name : custom![0],
       urgent: interaction.type === 2 && interaction.data.name === 'urgent',
@@ -73,9 +98,12 @@ export class DiscordProtocol implements DiscordRest {
     if (event.kind !== 'message') {
       const interaction = this.interactions.get(event.id);
       if (!interaction || this.now() >= interaction.expires) throw new Error('interaction_expired');
-      await this.api.request('POST', `/interactions/${part(event.id)}/${part(interaction.token)}/callback`,
-        // 상호작용 응답은 늘 본인만 보는 메시지(EPHEMERAL 64)다. 호출자가 준 플래그(미리보기 끄기)는 더하기만 한다.
-        { type: 4, data: { content, ...options, flags: 64 | (options.flags ?? 0) } }, { expiresAt: interaction.expires });
+      const { update, ...rest } = options;
+      // update는 버튼이 달린 글 자체를 바꾸고 버튼을 없앤다(UPDATE_MESSAGE 7). 글은 공개 그대로라 EPHEMERAL을 붙이지 않는다.
+      const body = update && event.kind === 'button' ? { type: 7, data: { content, allowed_mentions: rest.allowed_mentions, components: [] } }
+        // 그 밖의 상호작용 응답은 늘 본인만 보는 메시지(EPHEMERAL 64)다. 호출자가 준 플래그(미리보기 끄기)는 더하기만 한다.
+        : { type: 4, data: { content, ...rest, flags: 64 | (rest.flags ?? 0) } };
+      await this.api.request('POST', `/interactions/${part(event.id)}/${part(interaction.token)}/callback`, body, { expiresAt: interaction.expires });
       return;
     }
     // 일반 메시지는 원문에 👀만 단다. 텍스트 ACK는 대화를 덮는다. 같은 봇·메시지·emoji의 PUT은 다시 해도 하나다.

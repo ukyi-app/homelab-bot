@@ -27,10 +27,13 @@ export interface Delivery {
     // owner 호출. 작업 질문, 작업 완료·실패, 변경 미리보기, 변경 실패 넷만 켠다. 게시자는 첫 쪽에서 owner 한 사람만 부른다.
     ownerCall?: true;
     // kind=thread: 이 owner 메시지에서 스레드를 연다. 없으면 표식 이름의 독립 스레드다('/' 명령·경보).
-    fromMessage?: string };
+    fromMessage?: string;
+    // 버튼 한 줄. 여러 쪽으로 나뉘는 글이면 마지막 쪽에만 남는다. id는 discord-protocol BUTTONS 표의 custom_id 모양이어야 한다.
+    buttons?: OutboxButton[] };
   state: string; external_id: string | null; lease_token: string; attempt: number;
 }
 export interface DeliveryNotice { ownerCall?: boolean }
+export interface OutboxButton { id: string; label: string; style: 'primary' | 'secondary' }
 // dispatched: 발송을 시작해도 된다. blocked: 철회·대화 거부로 막았다(행은 blocked). gap: 대화가 history gap이라 미룬다.
 // lost: lease를 잃었다(행을 건드리지 않았다).
 export type DispatchOutcome = 'dispatched' | 'blocked' | 'gap' | 'lost';
@@ -608,10 +611,12 @@ export class Store {
   async enqueue(input: { key: string; job?: string; conversation?: string; actor: string; scope: Scope; revision: string; services?: string[]; payload: Delivery['payload'] }, tx?: Database): Promise<void> {
     if (!tx) return this.db.transaction(inner => this.enqueue(input, inner));
     const pages = input.payload.kind === 'message' ? messagePages(input.payload.content) : [input.payload.content];
+    const { buttons, ...payload } = input.payload;
     for (const [index, content] of pages.entries()) await tx.query(`INSERT INTO outbox(id,job_id,conversation_id,owner_id,scope,policy_revision,idempotency_key,payload,available_at,created_at,service_ids,message_key,page_index)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$10,$11,$12) ON CONFLICT (idempotency_key) DO NOTHING`,
     [randomUUID(), input.job ?? null, input.conversation ?? null, input.actor, json(input.scope), input.revision,
-      index ? `${input.key}:page:${index + 1}` : input.key, json({ ...input.payload, content }), this.now(), json(input.services ?? []), input.key, index]);
+      index ? `${input.key}:page:${index + 1}` : input.key,
+      json({ ...payload, content, ...(buttons?.length && index === pages.length - 1 ? { buttons } : {}) }), this.now(), json(input.services ?? []), input.key, index]);
   }
   async discordPauseUntil(channel?: string): Promise<number> {
     const rows = (await this.db.query<{ value: number }>("SELECT value FROM controls WHERE key='discord_global_after' OR key=$1", [`discord_channel_after:${channel ?? ''}`])).rows;

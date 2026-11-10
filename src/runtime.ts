@@ -2,6 +2,7 @@ import { ACK_ONLY_NOTICE, chatReplyContent, chatReplyRisk, WITHHELD_REPLY_NOTICE
 import { ChatReplySchema, DEFAULTS, Denied, PolicyUnavailable, WorkerRejected } from './contracts.js';
 import type { Job } from './contracts.js';
 import type { Policy, PolicyGate } from './policy.js';
+import { ProposalDesk } from './proposals.js';
 import type { ReadAdapter } from './read.js';
 import { ReadRuntime, dispatchable } from './read-runtime.js';
 import type { Store } from './store.js';
@@ -24,6 +25,7 @@ export const STOPPED_WRITE_ATTEMPTS = 3;
 const STOPPED_WRITE_DELAY_MS = 200;
 export class Runtime {
   private readonly reads: ReadRuntime;
+  private readonly proposals: ProposalDesk;
   private readonly shutdown?: AbortSignal;
   private readonly drainMs: number;
   private readonly log: Log;
@@ -36,6 +38,8 @@ export class Runtime {
     this.log = options.log ?? jsonLog;
     this.taskLoop = options.taskLoop ?? false;
     this.reads = new ReadRuntime(store, gate, reader, options.shutdown);
+    // 작업 레인을 연결했을 때만 작업 시작 제안을 받는다(버튼을 눌러도 접수할 곳이 없다).
+    this.proposals = new ProposalDesk(store, gate, tasks !== undefined);
   }
   // read 레인 한 바퀴. 모델 tick과 다른 루프에서 부른다.
   tickRead(): Promise<boolean> { return this.reads.tick(); }
@@ -173,18 +177,26 @@ export class Runtime {
         await this.stopOutcome(job, stopped, { revoked: false, ownerCancel: false, drained, unknownReason: 'worker_disconnected' });
       } else if (result.status === 'failed') await this.store.fail(job, 'model_failed');
       else if (result.status === 'succeeded') {
-        // proposal은 받기만 하고 버린다(저장·게시하지 않음). 제안 처리는 이 분기에 C13이 더한다.
-        const { reply, ack_only: ackOnly } = ChatReplySchema.parse(result.output);
+        // 제안(proposal)은 결과에 저장하지 않는다. 결과를 확정한 뒤 동작 표에 대조한다(아래 consider).
+        const { reply, proposal, ack_only: ackOnly } = ChatReplySchema.parse(result.output);
         // Completed results remain durable while the publisher waits for fresh policy.
         if (!await this.store.active(job.conversation_id)) { await this.store.transition(job, 'superseded'); return true; }
         const evidence = { source: 'worker', policyRevision: job.revision.policy };
+        let withheld = false;
         if (ackOnly) await this.store.finish(job, { reply: '', ack_only: true }, evidence, { ackOnly: ACK_ONLY_NOTICE }, job.target);
         else {
           // 공개 검사는 게시 직전의 정책으로 한다. 끝난 뒤 재인가가 정책을 못 읽었으면 보내기 전 인가의 정책을 쓴다.
           const risk = chatReplyRisk(reply, latestPolicy ?? policy);
+          withheld = risk !== null;
           // 걸린 답은 모델 글을 결과·감사·로그 어디에도 남기지 않고 사유 코드만 둔다.
           if (risk) await this.store.finish(job, { withheld: risk, ack_only: false }, evidence, WITHHELD_REPLY_NOTICE, job.target);
           else await this.store.finish(job, { reply, ack_only: false }, evidence, chatReplyContent(reply), job.target);
+        }
+        // 스위치가 꺼져 있으면 제안을 보지 않는다. 답이 필요 없는 말(👍)과 공개 검사에 걸린 답의 제안도 버린다.
+        // 제안 처리의 실패는 이미 확정한 답을 바꾸지 않는다(작업자 판정·cancel 경로로 가지 않게 여기서 끊는다).
+        if (proposal && this.store.colleague && !ackOnly && !withheld) {
+          await this.proposals.consider(job, proposal, latestPolicy ?? policy)
+            .catch(error => { this.log('proposal_failed', { job: job.id, ...errorInfo(error) }); });
         }
       }
       await this.store.audit('model_timing', job.id, { queueWaitMs: Number(job.started_at) - Number(job.created_at),

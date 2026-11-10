@@ -767,8 +767,8 @@ function migrationDatabase(pg: PGlite): Database {
     transaction: fn => pg.transaction(tx => fn({ query: (sql, params = []) => tx.query(sql, params), transaction: () => { throw new Error('nested'); } })),
   };
 }
-// 022(C19)는 새 표 model_pauses·model_limit_state만 더해 옛 표를 바꾸지 않는다. 새 표는 이 비교 대상이 아니다.
-const NEW_TABLES = ['model_pauses', 'model_limit_state'];
+// 016 뒤에 새로 생긴 표(변경 PR 표, C13 proposals, C19 model_pauses·model_limit_state)는 비교에서 뺀다. 기존 표가 바뀌지 않았는지만 본다.
+const NEW_TABLES = ['proposals', 'model_pauses', 'model_limit_state'];
 const OLD_TABLES = `table_schema='public' AND table_name NOT LIKE 'change\\_%' AND table_name <> 'schema_migrations'
   AND table_name NOT IN (${NEW_TABLES.map(t => `'${t}'`).join(',')})`;
 // 019(T27)·020(T31) 원문 보존은 옛 표에 NULL 허용 칸과 그 digest CHECK만 더한다. 아래 비교에서 빼고 따로 확인한다.
@@ -800,7 +800,7 @@ test('T19 B0 migration: 016 DB에 017만 더하고 기존 표·제약·행을 �
     const constraints = await constraintsOf(db);
     const jobs = JSON.stringify((await db.query('SELECT * FROM jobs')).rows);
 
-    assert.deepEqual(await migrate(db), [17, 18, 19, 20, 22]);
+    assert.deepEqual(await migrate(db), [17, 18, 19, 20, 21, 22]);
     assert.equal(await schemaOf(db), schema);
     const added = (await db.query<{ table_name: string; column_name: string; is_nullable: string; column_default: string | null }>(`SELECT table_name,column_name,is_nullable,column_default
       FROM information_schema.columns WHERE ${OLD_TABLES} AND NOT ${T27_COLUMNS} ORDER BY table_name,column_name`)).rows;

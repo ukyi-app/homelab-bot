@@ -10,6 +10,8 @@ import type { ExternalTaskCommand, ExternalTaskCommandHandler } from './external
 import { MEMORY_GUIDE } from './memory-commands.js';
 import type { MemoryCommand, MemoryCommandHandler } from './memory-commands.js';
 import type { PolicyGate } from './policy.js';
+import { buttonAllowed, buttonRoute } from './discord-protocol.js';
+import { PROPOSAL_BUTTONS, pressProposal } from './proposals.js';
 import { moveReactions, ReactionSync, recordReceived, settleReactions } from './reactions.js';
 import { LaneClosed } from './store.js';
 import type { Delivery, Store } from './store.js';
@@ -20,12 +22,15 @@ export interface AckOutcome { fallback: 403 | 404 }
 // parse는 늘 비운다(everyone·역할·이름 파싱 없음). users는 owner 호출 글에서 owner 한 사람만, replied_user는 답장 알림을 끈다.
 // Discord는 parse와 users를 함께 받지만 parse에 'users'가 있으면 거부한다(parse가 비어 있으면 괜찮다).
 export interface AllowedMentions { parse: never[]; users?: [string]; replied_user?: false }
+// 버튼 한 줄(Discord action row type 1, button type 2). style 1 primary, 2 secondary.
+export interface ButtonRow { type: 1; components: { type: 2; style: 1 | 2; label: string; custom_id: string }[] }
 export interface DiscordRest {
-  acknowledge(event: EventInput, content: string, options: { allowed_mentions: { parse: never[] }; flags?: typeof SUPPRESS_EMBEDS }): Promise<AckOutcome | void>;
+  // update: 버튼 상호작용에 답하며 그 버튼이 달린 글을 content로 바꾸고 버튼을 모두 없앤다(callback type 7). 버튼에만 쓴다.
+  acknowledge(event: EventInput, content: string, options: { allowed_mentions: { parse: never[] }; flags?: typeof SUPPRESS_EMBEDS; update?: true }): Promise<AckOutcome | void>;
   // from이 있으면 그 메시지에서 스레드를 연다(스레드 ID = 메시지 ID). 없으면 채널에 독립 스레드를 만든다.
   createThread(channel: string, body: { name: string; type: 11; auto_archive_duration: 1440 }, from?: string): Promise<{ id: string }>;
   sendMessage(channel: string, body: { content: string; nonce: string; enforce_nonce: true; allowed_mentions: AllowedMentions;
-    message_reference?: { message_id: string; fail_if_not_exists: false } }): Promise<{ id: string }>;
+    message_reference?: { message_id: string; fail_if_not_exists: false }; components?: ButtonRow[] }): Promise<{ id: string }>;
   // kind=thread이고 from이 있으면 그 메시지에 이미 달린 스레드로 대조한다. 없으면 표식 이름으로 찾는다.
   findDelivery(channel: string, marker: string, kind: 'message' | 'thread', from?: string): Promise<{ id: string } | undefined>;
   history(channel: string, after: string | null, limit: 100): Promise<EventInput[]>;
@@ -70,6 +75,7 @@ export class DiscordIngress {
   async receive(input: EventInput, recovered = false, recovery?: { token: string; epoch: number }): Promise<string | undefined> {
     const event = EventSchema.parse(input);
     if (event.bot || event.webhook) return;
+    if (event.kind === 'button' && buttonRoute(event.command) === 'proposal') return this.proposalButton(event, recovered);
     // 이 단계에서 열지 않은 명령·버튼은 저장·권한 확인 전에 닫는다(task·review-*는 FOUNDATION 밖).
     if (event.kind !== 'message' && !this.commands.has(event.command ?? '')) throw new Denied();
     if (event.kind !== 'message' && taskControls.has(event.command ?? '') && !this.tasks) throw new Denied();
@@ -226,16 +232,37 @@ export class DiscordIngress {
   }
   // 같은 상호작용 ID는 events의 accepted를 먼저 잡은 쪽만 처리한다.
   private claimOnce(event: z.infer<typeof EventSchema>, id: string, started: number): Promise<boolean> {
-    return this.store.atomic(async store => {
-      const inbox = (await store.db.query<{ accepted: boolean; actor_id: string; scope: Scope; payload: { command?: string; target?: string } }>(
-        'SELECT accepted,actor_id,scope,payload FROM events WHERE id=$1 FOR UPDATE', [id])).rows[0]!;
-      if (inbox.accepted) return false;
-      if (inbox.actor_id !== event.actor || store.scopeId(inbox.scope) !== store.scopeId(event.scope) || inbox.scope.parent !== event.scope.parent
-        || inbox.payload.command !== event.command || inbox.payload.target !== event.target) throw new Denied();
-      await this.gate.withDatabase(store.db).authorize(event.actor, event.scope);
-      await store.db.query('UPDATE events SET accepted=true WHERE id=$1', [id]);
-      return true;
+    return this.store.atomic(store => this.claimIn(store, event, id), { expiresAt: started + DEFAULTS.inboxTimeoutMs, now: this.store.now });
+  }
+  private async claimIn(store: Store, event: z.infer<typeof EventSchema>, id: string): Promise<boolean> {
+    const inbox = (await store.db.query<{ accepted: boolean; actor_id: string; scope: Scope; payload: { command?: string; target?: string } }>(
+      'SELECT accepted,actor_id,scope,payload FROM events WHERE id=$1 FOR UPDATE', [id])).rows[0]!;
+    if (inbox.accepted) return false;
+    if (inbox.actor_id !== event.actor || store.scopeId(inbox.scope) !== store.scopeId(event.scope) || inbox.scope.parent !== event.scope.parent
+      || inbox.payload.command !== event.command || inbox.payload.target !== event.target) throw new Denied();
+    await this.gate.withDatabase(store.db).authorize(event.actor, event.scope);
+    await store.db.query('UPDATE events SET accepted=true WHERE id=$1', [id]);
+    return true;
+  }
+  // 실행 확인 버튼("할게요"·"아니에요"). 스위치가 꺼져 있으면 그 버튼을 만들지 않으므로 받지도 않는다. 상호작용은 history 복구로
+  // 들어오지 않아(재생 없음) 늦은 실행이 생기지 않는다. 같은 상호작용은 한 번만 처리하고, 제안 상태 전이·실행·accepted를 한 트랜잭션에 둔다.
+  private async proposalButton(event: z.infer<typeof EventSchema>, recovered: boolean): Promise<string | undefined> {
+    if (recovered || !this.store.colleague || !event.target) throw new Denied();
+    const p = await this.gate.authorize(event.actor, event.scope);
+    const conversation = await this.store.conversation(event.scope);
+    if (!conversation || (event.scope.kind !== 'channel' && conversation.owner_id !== event.actor)) throw new Denied();
+    const started = this.store.now();
+    const saved = await this.store.save({ ...event, text: '' }, p.revision, false);
+    if (this.store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
+    const outcome = await this.store.atomic(async store => {
+      if (!await this.claimIn(store, event, saved.id)) return;
+      return pressProposal(store, { proposal: event.target!, answer: event.command === PROPOSAL_BUTTONS.yes ? 'yes' : 'no', actor: event.actor,
+        scope: event.scope, event: saved.id, context: { tasks: this.tasks, revision: p.revision } });
     }, { expiresAt: started + DEFAULTS.inboxTimeoutMs, now: this.store.now });
+    this.log('proposal_button', { command: event.command!, outcome: outcome ? (outcome.update ? 'settled' : 'refused') : 'duplicate' });
+    // 응답을 전하지 못하면 결과 문장(공개해도 되는 고정 문구)을 그 스레드에 남긴다. 버튼은 남지만 다시 누르면 "이미 처리"로 답한다.
+    if (outcome) await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: outcome.content, update: outcome.update });
+    return saved.id;
   }
   // 기억 명령. 구독·gap·작업 큐를 거치지 않고 받은 자리에서 한 번 처리한 뒤 상호작용 응답으로 답한다.
   // 중복 전달(같은 상호작용 ID)은 events의 accepted를 먼저 잡은 쪽만 처리한다. 잡은 뒤 처리 중에 죽으면 다시 하지 않는다
@@ -332,7 +359,8 @@ export class DiscordIngress {
   // 처리는 이미 영속됐다. 여기서 나는 오류(ACK 실패를 기록하는 DB 쓰기 포함)는 수신 결과를 바꾸지 않는다.
   // 메시지 이벤트에서 던지면 main의 guard()가 그 대화에 history gap 장벽을 세운다.
   // content: 상호작용 응답 본문(기억·연결 명령은 처리 결과). direct가 있으면 응답 실패 때 결과 대신 그 고정 안내를 채널에 남긴다.
-  private async acknowledge(event: EventInput, id: string, content?: string, direct?: { revision: string; notice: string }): Promise<void> {
+  // direct.update: 버튼 응답으로 그 글을 content로 바꾸고 버튼을 없앤다(실행 확인).
+  private async acknowledge(event: EventInput, id: string, content?: string, direct?: { revision: string; notice: string; update?: boolean }): Promise<void> {
     let outcome: AckOutcome | void;
     try {
       try {
@@ -340,7 +368,7 @@ export class DiscordIngress {
         // 일반 메시지는 👀 리액션이고 이 문구는 권한 거부 때의 대체 텍스트로만 쓰인다.
         outcome = await this.rest.acknowledge(event, content
           ?? (this.messageContent ? '받아서 기록해 뒀어요. 처리 상태는 따로 알려 드릴게요.' : '받아서 기록해 뒀어요. 지금은 명령과 버튼으로만 받아요.'),
-        direct ? { ...noMentions, flags: SUPPRESS_EMBEDS } : noMentions);
+        direct?.update ? { ...noMentions, update: true } : direct ? { ...noMentions, flags: SUPPRESS_EMBEDS } : noMentions);
       } catch (error) {
         if (error instanceof RateLimited) await this.store.recordRateLimit(error, event.scope.channel);
         await this.store.atomic(async store => {
@@ -619,8 +647,12 @@ export class DiscordPublisher {
     const reply = first ? row.payload.replyTo : undefined;
     const content = call ? `<@${row.owner_id}> ${row.payload.content}` : row.payload.content;
     const allowed: AllowedMentions = { parse: [], ...(call ? { users: [row.owner_id] as [string] } : {}), ...(reply ? { replied_user: false as const } : {}) };
+    const buttons = row.payload.buttons;
+    if (buttons?.some(button => !buttonAllowed(button.id))) throw new Denied();
     return { content: markedContent(content, marker), nonce: marker, enforce_nonce: true, allowed_mentions: allowed,
-      ...(reply ? { message_reference: { message_id: reply, fail_if_not_exists: false as const } } : {}) };
+      ...(reply ? { message_reference: { message_id: reply, fail_if_not_exists: false as const } } : {}),
+      ...(buttons?.length ? { components: [{ type: 1 as const, components: buttons.map(button => ({ type: 2 as const,
+        style: button.style === 'primary' ? 1 as const : 2 as const, label: button.label, custom_id: button.id })) }] } : {}) };
   }
   // 메시지에서 여는 스레드는 owner 원문으로 제목을 짓는다. 원문은 outbox에 두지 않고 게시 때 events에서 읽는다
   // (outbox 본문 보존 정리가 이 칸을 모른다). 경보·'/' 스레드는 표식 이름이고 대조도 그 이름으로 한다.
