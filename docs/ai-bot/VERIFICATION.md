@@ -2389,3 +2389,23 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 - **바뀐 기존 시험:** 마이그레이션 021이 더해져 적용 버전 목록을 그대로 비교하던 줄(`publisher-migrate` 4줄, `publisher-pg`, `change-store`, `change-pg`, `change-store-pg`, `raw-input-retention`, `raw-text-retention`)에 21을 더했다. `change-store`의 "016 DB에 017만 더하고 기존 표·제약을 바꾸지 않는다" 비교는 새 표 `proposals`를 변경 PR 표처럼 비교에서 뺐다. 시험 도우미 `test/helpers.ts`의 PGlite 마이그레이션 목록에 021을 더했다.
 - **운영 영향:** 스위치가 꺼져 있으면 제안을 보지 않고 확인 버튼도 받지 않아 지금 동작 그대로다. 스위치와 무관하게 바뀌는 것은 마이그레이션 021(새 표만 더함)과, 기존 제어 버튼이 칸 수를 정확히 보게 된 것(`list:x`처럼 게시 서버가 만든 적 없는 꼴을 받지 않음)이다.
 - **못 잡는 범위.** 모델이 요청을 잘못 읽는 비율과 읽기·실행을 헷갈리는 비율은 S5(C24 표본)다. 프롬프트 주입이 그럴듯한 제안을 만드는 경우는 되묻기 글을 owner가 읽는 것이 방어다. 실제 Discord에서 `UPDATE_MESSAGE`가 버튼을 없애는 모양은 S5다.
+
+## C14 나머지 동작 연결 (2026-11-10, 로컬)
+
+동료 봇 명세 §4.3(동작 목록, 제안 값의 출처, 리뷰 제어 장소, 변경 요청 확인 문구, 기억 원문)과 AC-6·AC-7·AC-26을 S1에서 고정했다. 경계는 C13과 같다: 실제 `DiscordProtocol`에 Gateway 프레임(owner 멘션 `MESSAGE_CREATE`, '/' 명령 `INTERACTION_CREATE` type 2, 버튼 type 3)을 넣고, 저장은 PGlite, 게시는 가짜 REST, 상호작용 응답은 가짜 API가 받은 callback 본문이다. 처리기는 '/'와 같은 것을 잇는다: 작업 명령(`TaskCommands` + 작업 레인), 기억(`MemoryCommands` + `MemoryService` + 실제 파일 원장), 세션 연결(`ExternalTaskCommands` + `ExternalTaskLinks`), 변경(`ChangeCommands` + `ChangeStore`, 작업자·GitHub 없이 접수까지). 비교 기준은 같은 대화에서 같은 '/' 명령을 보낸 결과다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §13 "제안과 실행 확인 (C13)"의 "나머지 동작 줄(C14)"·"게시 순서(선행 키)", 구현 선택은 [DECISIONS](DECISIONS.md) "C14 나머지 동작 연결: 값의 출처와 구현 선택". 시험 파일은 `test/c14-remaining-actions.test.ts`(경계 도우미 `test/c14-actions-fixture.ts`).
+
+| 완료 조건 | 시험 |
+|---|---|
+| 읽기 여섯 동작이 확인 없이 일반 답, 상태 안 바뀜 | `c14-remaining-actions` "C14 작업 상태 제안은 확인 없이 /task-status와 같은 결과를 일반 답으로 달고, 상태를 바꾸지 않으며, 이 대화에서 볼 수 없는 작업이면 버려진다", "C14 변경 상태·세션 연결 목록·기억 검색 제안은 확인 없이 같은 /명령 결과를 일반 답으로 단다", "C14 읽기 템플릿 제안은 카탈로그의 템플릿이면 /read와 같은 read 레인 결과를 달고, 카탈로그 밖이면 버려진다", "C14 리뷰 상태 제안은 스레드에서 말해도 알림 채널의 /review-status와 같은 결과를 단다"(버튼 글·제안 행 0, 작업 상태 그대로) |
+| 실행 요청은 버튼 전 실행 0건, 누르면 같은 '/' 처리기로 한 번 | "C14 작업 취소 제안은 버튼 전 실행 0건이고, 누르면 /cancel·/task-cancel과 같은 결과로 한 번 실행되며, 이 대화에서 볼 수 없는 작업이면 버려진다", "C14 기억 저장 제안은 …", "C14 기억 삭제 제안은 …", "C14 세션 연결 해제 제안은 이 스레드의 연결만 받고, 누르면 /detach와 같은 처리로 한 번 해제한다", "C14 말로 한 변경 요청은 …", "C14 변경 취소 제안은 이 스레드의 변경만 받고, 누르면 /change-cancel과 같은 처리로 취소한다", "C14 말로 하는 리뷰 재개·취소는 …"(누르기 전 상태 그대로, 누른 뒤 바뀜) |
+| 권한·장소 결과가 '/'와 같음 | 비 owner·허용 채널 밖은 수신에서 `Denied`(리뷰 시험), 이 대화에서 볼 수 없는 작업·변경·연결과 카탈로그 밖 템플릿은 버림(감사 `proposal_dropped`·`target_denied`), "C14 말로 한 변경 요청도 /change와 같은 장소·저장소 규칙이라 알림 채널 스레드·정책 밖 저장소면 버려진다"(같은 자리의 '/change'는 "대화 채널의 스레드에서만") |
+| 기억 저장은 확인 글에 보인 내용만, 변경 요청은 owner 원문 | "C14 기억 저장 제안은 저장될 내용이 확인 글에 그대로 보이고, 누르면 그 내용만 출처를 owner 대화로 저장하며, 값은 처리·거절·만료 뒤 비워진다"(출처 `conversation:<원 메시지 ID>`, 상태 active), "C14 기억 저장 제안의 값이 확인 글과 달라지면 버튼은 저장하지 않는다(owner가 본 값만 저장된다)", "C14 말로 한 변경 요청은 …"(입력 요약 = owner 원문, 모델 `content` 없음, 입력 이벤트 = 원 메시지 ID) |
+| 말로 하는 리뷰 재개·취소 장소, '/'는 알림 채널 본문만 | "C14 말로 하는 리뷰 재개·취소는 대화 채널·알림 채널 아래 스레드에서 owner면 받고, 허용 채널 밖·비 owner는 거부하며, / 리뷰 제어는 지금처럼 알림 채널 본문에서만 받는다" |
+| 변경 요청 확인 글, 누르면 공개 표시로 접수, '/' 규칙 그대로 | "C14 말로 한 변경 요청은 \"<저장소>에 이 변경 PR을 준비할까요?\"로 묻고, 누르기 전 접수 0건이며, 누르면 owner 원문을 공개 표시로 접수한다"(확인 글 리터럴 비교, 공개 여부를 묻는 글 0, `label=public`), "C14 / 변경 요청은 지금처럼 owner가 적은 label을 쓴다(적지 않으면 unknown으로 막힌다)" |
+| 기억 삭제 7일 안내가 버튼 응답에도 | "C14 기억 삭제 제안은 누르면 /memory-delete와 같은 처리로 지우고 원문 7일 안내가 버튼 응답에도 나온다"(`RAW_TEXT_NOTICE`) |
+| 확인 글 게시 순서(PR #125 Codex 2차 P2) | "C14 실행 확인 글은 대화 답의 모든 쪽이 게시된 뒤에만 나간다(긴 답의 남은 쪽이 늦어져도 버튼이 먼저 보이지 않는다)"(둘째 쪽 응답 유실로 `unknown`, 대조로 `sent`가 된 뒤에야 버튼 글) |
+
+- **실행(a6b119f, origin/main dd0a53f 그대로라 병합할 것 없음, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 바뀐 파일(`proposals.ts`·`discord.ts`·`store.ts`)과 티켓이 비교 대상으로 든 시험 19개 파일(새 `c14-remaining-actions`, `c13-proposal`·`c13-proposal-pg`, `foundation`, `memory-commands`·`memory-commands-pg`, `change-assembly`, `external-task-assembly`, `read-lane`·`read-lane-pg`, `review-9`·`review-9-pg`, `chat-ack`, `s16-display`, `chat-format`, `discord-rest-timeout`, `publisher-review`, `publisher-pg`, `publisher-recovery`) 362개 모두 통과, skip 0.
+- **시험이 실패할 수 있는지 확인:** 게시 순서 시험은 고치기 전 코드(dd0a53f)에서 돌려 실패를 봤다("답의 남은 쪽보다 확인 글이 먼저 나가면 안 된다", 버튼 글 1건). 나머지 시험은 동작 줄이 "연결 안 됨"이던 코드에서는 제안이 버려져 버튼·답이 없으므로 처음부터 성립하지 않는다(구현과 함께 들어갔다).
+- **못 잡는 범위:** 모델이 읽기와 실행을 헷갈리거나 요청을 잘못 읽는 비율은 S5(C24 표본)다. 실제 Discord에서 버튼 응답 모양은 S5다. `retry`·`memory_correct`·`memory_exclude`는 같은 처리기 묶음(`controlHandler`·`memoryWriteHandler`·`memoryTargetHandler`)의 다른 줄이라 따로 시험하지 않았다. 커밋 뒤 처리기 실행이 죽음으로 끊기는 경우(제안은 `confirmed`, 실행 없음)는 시험하지 않았다.
+- **운영 영향:** 스위치가 꺼져 있으면 제안을 보지 않고 확인 버튼도 받지 않아 지금 동작 그대로다. 스위치와 무관하게 바뀌는 것은 outbox 집기 조건 하나다(선행 키 `payload.after`가 있는 글만 기다리고, 지금 그 키를 두는 글은 확인 글·읽기 결과뿐이다).
