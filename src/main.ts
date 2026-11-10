@@ -115,6 +115,8 @@ const T20_PERIODS = { briefingTickMs: 30_000, memoryResumeMs: 60_000, ledgerReop
 // 재조정 주기. PR 재조정은 열린 PR마다 compare를 한 번 부르므로 길게 두고(webhook이 주 경로), 게시 대조는 응답 유실 행만 본다.
 const REVIEW_PERIODS = { workerProbeMs: 30_000, deliveryReconcileMs: 60_000, pullRequestReconcileMs: 900_000 };
 const TASK_WORKER_PROBE_MS = 30_000;
+// 재개 예약 루프(Store.resumeDue) 주기. 재개 시각은 분 단위라 15초 늦어도 "풀리는 시각 1분 뒤"·"30분 안에"를 지킨다.
+const MODEL_RESUME_TICK_MS = 15_000;
 // 중복 방지 ID의 보관 기한은 7일이라 정리는 드물어도 된다.
 const EXTERNAL_PURGE_MS = 3_600_000;
 const closedReader: GitHubReader = {
@@ -158,6 +160,8 @@ export interface PublisherDeps {
   reviewPullRequestReconcileMs?: number;
   // 작업 레인 작업자 확인 주기. 시험만 바꾼다.
   taskWorkerProbeMs?: number;
+  // 재개 예약 루프 주기. 시험만 바꾼다.
+  modelResumeTickMs?: number;
   // R08 보관 정리 주기. 시험만 바꾼다.
   externalPurgeMs?: number;
   // 변경 PR 조립의 시험 주입 자리. 켜져 있을 때만 쓴다.
@@ -571,6 +575,11 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
         runtimeStarted = true;
         loop('runtime', () => runtime.tick());
         loop('read', () => runtime.tickRead());
+        // 모델 멈춤의 저절로 재개. 같은 작업 행을 대기열로 돌릴 뿐이라 계정·모델·실행기는 그대로다(D-14 조건 2).
+        every('model_resume', deps.modelResumeTickMs ?? MODEL_RESUME_TICK_MS, async () => {
+          const resumed = await store.resumeDue();
+          if (resumed) log('model_resumed', { jobs: resumed });
+        });
         startReviewLoops();
         startTaskLoop();
         startChangeLoops();

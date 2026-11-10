@@ -64,6 +64,8 @@ interface SessionRow {
   repository: string | null; base_sha: string | null; policy_revision: string | null; project_id: string | null; project_revision: string | null;
   run_budget_ms: string | number | null; run_used_ms: string | number; session_retained: boolean; cleanup_state: 'none' | 'pending' | 'cleaned';
   state: string; updated_at: string | number; wait_reason: 'model_limit' | 'auth_expired' | null;
+  // 한도·인증 대기로 끝난 턴 수(결제 멈춤 제외). 턴 예산에서 뺀다.
+  model_wait_turns: number;
   waiting_since: string | number | null; owner_confirm_requested_at: string | number | null;
   capabilities?: unknown;
   // 턴을 시작할 때만 함께 읽는다. 답했지만 아직 이어 가지 않은 질문이다.
@@ -101,6 +103,9 @@ const echoed = <T extends ControlTarget>(asked: ControlTarget, response: T): T =
   return response;
 };
 // 실행이 끝났을 수 있는 job. release는 lease를 바꾸지 않고 /retry도 다음 claim까지 같은 lease를 남겨 lease만으로는 늦은 응답을 가려내지 못한다.
+// 턴 번호는 세션 프로토콜의 순번이고 예산은 진행한 턴만 센다. 한도·인증 대기 턴이 예산을 다 쓰면 30분 재시도만으로 작업이 끝나 버린다.
+// 작업자가 턴 번호 상한 16인 옛 스키마면 17 이상의 재개를 400으로 거부하고 작업은 task_worker_rejected로 실패한다.
+const overTurnBudget = (prior: Pick<SessionRow, 'turn' | 'model_wait_turns'>) => prior.turn + 1 - Number(prior.model_wait_turns ?? 0) > TASK_LIMITS.turns;
 const HELD = new Set(['running', 'verifying', 'cancel_requested']);
 const SETTLEABLE = new Set([...HELD, 'unknown']);
 const sameSession = (a: SessionRow | undefined, b: SessionRow | undefined) => a?.executor === b?.executor && a?.generation === b?.generation
@@ -230,7 +235,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     text: string): Promise<TaskRequest | undefined> {
     const prior = worker ? session : undefined;
     const turn = prior ? prior.turn + 1 : 1;
-    if (turn > TASK_LIMITS.turns) { await this.giveUp(job, session, 'task_turn_limit'); return; }
+    if (prior && overTurnBudget(prior)) { await this.giveUp(job, session, 'task_turn_limit'); return; }
     const toolCalls = Math.min(job.budget.toolCalls - (prior?.tool_calls ?? 0), TASK_LIMITS.toolCalls);
     if (toolCalls <= 0) { await this.giveUp(job, session, 'task_tool_budget_exceeded'); return; }
     const remaining = prior ? Number(prior.run_budget_ms) - Number(prior.run_used_ms) : TASK_LIMITS.runBudgetMs;
@@ -294,7 +299,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
           ON CONFLICT (job_id) DO UPDATE SET thread_id=$2,turn=1,tool_calls=0,host='worker-task',repository=$3,capabilities=$4,state='running',updated_at=$5,
           executor='claude',claude_session_id=$2,generation=$6,worker_lease=$7,base_sha=$8,policy_revision=$9,project_id=$10,project_revision=$11,
           turn_timeout_ms=$12,run_budget_ms=$13,run_used_ms=0,stopped=NULL,session_retained=true,cleanup_state='none',waiting_since=NULL,
-          owner_confirm_requested_at=NULL,wait_reason=NULL,worker_instance=NULL,worker_storage=NULL
+          owner_confirm_requested_at=NULL,wait_reason=NULL,worker_instance=NULL,worker_storage=NULL,model_wait_turns=0
           WHERE codex_sessions.executor='claude' AND codex_sessions.state NOT IN ('running','waiting_answer','waiting_model','unknown')
           AND NOT codex_sessions.session_retained AND codex_sessions.cleanup_state<>'pending' RETURNING job_id`,
         [job.id, request.sessionId, request.repository, JSON.stringify(capabilities), now,
@@ -442,15 +447,16 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
         'SELECT state,lease_token,lease_until FROM jobs WHERE id=$1 FOR UPDATE', [job.id])).rows[0]!;
       // 다른 실행이 넘겨받았거나 이미 확정됐으면 이 응답은 어떤 행도 바꾸지 못한다. 해제까지 끝난 세션을 unknown으로 덮으면 레인이 다시 닫힌다.
       if (row.lease_token !== job.lease_token || !SETTLEABLE.has(row.state)) { await store.audit('task_stale_response', job.id, { generation: request.generation, turn: request.turn }); return { terminal: false }; }
-      const session = async (state: string, wait: { reason: 'model_limit' | 'auth_expired' } | null = null) => {
+      const session = async (state: string, wait: { reason: 'model_limit' | 'auth_expired'; budgeted: boolean } | null = null) => {
         await store.db.query(`UPDATE codex_sessions SET state=$2,updated_at=$3,run_used_ms=run_used_ms+$4,
           tool_calls=CASE WHEN $5::integer IS NULL OR tool_calls IS NULL THEN NULL ELSE tool_calls+$5::integer END,
           ${bindWorker('$6', '$7')},stopped=$8,
           session_retained=COALESCE($9,session_retained),cleanup_state=CASE WHEN $10::boolean THEN 'pending' ELSE cleanup_state END,
-          wait_reason=$11,waiting_since=$12,owner_confirm_requested_at=NULL
+          wait_reason=$11,waiting_since=$12,owner_confirm_requested_at=NULL,model_wait_turns=model_wait_turns+CASE WHEN $16::boolean THEN 1 ELSE 0 END
           WHERE job_id=$1 AND state='running' AND worker_lease=$13 AND generation=$14 AND claude_session_id=$15`,
         [job.id, state, store.now(), Math.max(0, usedMs), facts.tools, facts.worker?.instance ?? null, facts.worker?.storage ?? null, facts.stopped ? true : null,
-          facts.retained, facts.cleanupPending, wait?.reason ?? null, wait ? store.now() : null, request.lease, request.generation, request.sessionId]);
+          facts.retained, facts.cleanupPending, wait?.reason ?? null, wait ? store.now() : null, request.lease, request.generation, request.sessionId,
+          wait ? !wait.budgeted : false]);
       };
       const end = async (state: string) => { await session(state); await store.syncTaskLane(); };
       // job이 전이했다. 세션도 끝내고 DB 값을 끝으로 적는다.
@@ -490,10 +496,12 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       if (response.status === 'limited' || response.status === 'auth_expired') {
         const reason = response.status === 'limited' ? 'model_limit' : 'auth_expired';
         // 계정 한도는 대화·리뷰도 같은 계정이라 양쪽을 막고, 인증 만료는 레인 토큰의 일이라 작업 레인만 막는다.
-        await store.waitForUser(job, reason, { laneOnly: reason === 'auth_expired' });
+        // 한도 정보가 없으면(옛 작업자) 멈춤 기록은 시각을 모르는 한도로 남아 30분마다 다시 시도한다.
+        await store.waitForUser(job, reason, { laneOnly: reason === 'auth_expired', rateLimit: response.rateLimit ?? null });
         const now = (await store.db.query<{ state: string; attempt: number }>('SELECT state,attempt FROM jobs WHERE id=$1', [job.id])).rows[0]!;
         if (now.state !== 'waiting_user') return skipped('waiting_user');
-        await session('waiting_model', { reason });
+        // 한도·인증 대기 턴은 진행이 없어 턴 예산에서 뺀다. 결제는 저절로 재개하지 않고 owner가 풀 때마다 한 턴을 써서 센다.
+        await session('waiting_model', { reason, budgeted: reason === 'model_limit' && response.rateLimit?.stop?.cause === 'billing' });
         await store.syncTaskLane();
         // 그 턴이 나르던 답은 처리되지 않았다. /resume-model 뒤 같은 답으로 잇는다.
         if (request.operation === 'resume' && request.questionId) await store.db.query("UPDATE codex_questions SET state='answered' WHERE id=$1 AND state='resumed'", [request.questionId]);
@@ -814,6 +822,8 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
     if (status.worker.storage !== session.worker_storage || status.state !== 'waiting' || !status.sessionExists || !status.stopped) throw new Error('change_session_missing');
     const question = (await this.deps.store.db.query<{ id: string }>(`SELECT id FROM codex_questions WHERE job_id=$1 AND thread_id=$2 AND state='answered'`, [jobId, session.claude_session_id])).rows[0];
     if (session.state === 'waiting_answer' && !question) throw new Error('change_question_not_answered');
+    // change-runtime은 change_로 시작하는 사유만 요청 실패로 닫는다.
+    if (overTurnBudget(session)) throw new Error('change_turn_limit');
     const remaining = Number(session.run_budget_ms) - Number(session.run_used_ms);
     if (remaining <= 0) throw new Error('change_run_budget_exhausted');
     const toolCalls = Math.min(job.budget.toolCalls - (session.tool_calls ?? 0), TASK_LIMITS.toolCalls);
