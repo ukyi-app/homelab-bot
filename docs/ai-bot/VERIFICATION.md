@@ -2389,3 +2389,21 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 - **바뀐 기존 시험:** 마이그레이션 021이 더해져 적용 버전 목록을 그대로 비교하던 줄(`publisher-migrate` 4줄, `publisher-pg`, `change-store`, `change-pg`, `change-store-pg`, `raw-input-retention`, `raw-text-retention`)에 21을 더했다. `change-store`의 "016 DB에 017만 더하고 기존 표·제약을 바꾸지 않는다" 비교는 새 표 `proposals`를 변경 PR 표처럼 비교에서 뺐다. 시험 도우미 `test/helpers.ts`의 PGlite 마이그레이션 목록에 021을 더했다.
 - **운영 영향:** 스위치가 꺼져 있으면 제안을 보지 않고 확인 버튼도 받지 않아 지금 동작 그대로다. 스위치와 무관하게 바뀌는 것은 마이그레이션 021(새 표만 더함)과, 기존 제어 버튼이 칸 수를 정확히 보게 된 것(`list:x`처럼 게시 서버가 만든 적 없는 꼴을 받지 않음)이다.
 - **못 잡는 범위.** 모델이 요청을 잘못 읽는 비율과 읽기·실행을 헷갈리는 비율은 S5(C24 표본)다. 프롬프트 주입이 그럴듯한 제안을 만드는 경우는 되묻기 글을 owner가 읽는 것이 방어다. 실제 Discord에서 `UPDATE_MESSAGE`가 버튼을 없애는 모양은 S5다.
+
+## C17 게시 승인 버튼 (2026-11-10, 로컬)
+
+동료 봇 명세 §4.3 "게시 승인"·§4.9(스위치)와 AC-10을 S1에서 고정했다. 미리보기 게시는 실제 `ChangeRuntime.notifyPhase`가 실제 `Store.enqueue`(PGlite)에 넣은 outbox 행을, 버튼 누름은 실제 `DiscordProtocol`에 Gateway `INTERACTION_CREATE`(type 3) 프레임을 넣어 수신 → `ChangeCommands.pressPublish` → `ChangeStore.approve` → 기존 게시 경로(가짜 Discord REST, 가짜 GitHub)까지 지나게 했다. custom_id 묶음 방식은 [DECISIONS](DECISIONS.md) "C17 게시 승인 버튼 custom_id 묶음". 시험 파일은 `test/c17-publish-button.test.ts`(새 파일, 경계 도우미 `test/change-assembly-harness.ts`에 `colleague` 옵션)와 `test/change-preview-pages.test.ts`의 C17 두 줄이다.
+
+| 완료 조건 | 시험 |
+|---|---|
+| 스위치 켜짐: 미리보기 마지막 쪽에만 digest에 묶인 버튼, 꺼짐: 버튼 없음 | `change-preview-pages` "C17: 스위치가 켜져 있으면 여러 쪽 미리보기의 마지막 쪽에만 게시 버튼이 붙고, 그 버튼은 미리보기 전체의 승인 digest를 가리킨다"(60개 파일로 여러 쪽, 앞쪽은 버튼 없음, custom_id `change-publish-ok:<변경>.1.<digest 앞 16자>`, `buttonAllowed` 통과), "C17: 스위치가 꺼져 있으면 미리보기 글에 버튼이 없다"(모든 쪽), `c17-publish-button` 스위치 꺼짐 줄 |
+| 누르면 그 digest로 승인·기록, 게시는 기존 재확인 경로 | `c17-publish-button` "C17 AC-10 …"(승인 행 `generation 1`·전체 digest·`event_id`=상호작용 ID·`approved_by` owner, callback type 7로 버튼 없앰·미리보기 마지막 쪽 본문 유지, 이어서 `proposed`·PR 1건), "C17: 버튼 승인도 게시 직전 재확인을 거친다 …"(누른 뒤 base가 움직이면 `superseded`, GitHub 쓰기 0) |
+| 새 미리보기 뒤 옛 버튼 거부, 상태 그대로 | `c17-publish-button` 같은 줄 후반(g2 미리보기 뒤 g1 버튼: `PUBLISH_TEXT.stale`, 누른 사람에게만 보이는 응답, g2 승인 행 없음, 상태 `awaiting_publish_approval`, g2 버튼은 승인) |
+| owner 아닌 사람 거부, 두 번 눌러도 승인 한 번 | `c17-publish-button` "C17: owner가 아닌 사람은 승인하지 못하고 …"(침입자 `Denied`·승인 0, 같은 상호작용 재전달은 응답 없음, 새 상호작용은 `PUBLISH_TEXT.settled`, 승인 행 1개) |
+| digest 입력 '/' 승인 계속 | `c17-publish-button` "C17: 구독이 꺼진 대화에서는 버튼으로 승인하지 않는다. 스위치가 켜져도 digest 입력 /change-publish 승인은 그대로 된다"(스위치 켜짐에서 `/change-publish` 승인 행 1개), 기존 `change-assembly`·`change-pg` 승인 시험 |
+| 스위치 꺼짐에서 게시 버튼 상호작용 거부 | `c17-publish-button` "C17: 스위치가 꺼져 있으면 …"(만든 custom_id로 눌러도 `Denied`, 승인 0) |
+
+- **실행(origin/main dd0a53f 그대로라 병합할 것 없음, 머신 잠금 도우미, node 24.22.0):** `npm run check`·`npm run build` 뒤 `node --test` `change-preview-pages` 10개 모두 통과. 이어서 `--pg`로 `c17-publish-button`·`change-preview-pages`·`change-assembly`·`change-pg`·`c13-proposal`·`c13-proposal-pg`·`foundation`·`c07-reply-call-thread`·`chat-ack`·`commands-register`·`change-publication` 258개 중 통과 257, 실패 1, skip 0. 실패 1은 시험 도우미가 g2 미리보기를 찾을 때 g1 버튼 글까지 섞어 g1 digest를 기대값으로 잡은 것이었고(실제 버튼은 g2 digest), 버튼 글을 custom_id의 세대 칸으로 거르게 고친 뒤 `c17-publish-button` 5개 모두 통과, skip 0.
+- **시험이 실패할 수 있는지:** 시험을 먼저 써서 구현 전에는 `PUBLISH_TEXT`·`pressPublish`가 없어 빌드부터 실패했다. 행동 단위 변이 실행(검사 하나씩 끈 채 돌리기)은 하지 않았다.
+- **운영 영향:** 스위치가 꺼져 있으면 미리보기 글에 버튼이 없고 게시 버튼 상호작용은 저장 전에 `Denied`라 지금 동작 그대로다. 마이그레이션은 더하지 않았다.
+- **못 잡는 범위.** 실제 Discord 클라이언트의 버튼 표시와 `UPDATE_MESSAGE`가 2,000자 안에서 마지막 쪽 본문을 바꾸는 모양은 S5다. 실제 GitHub 게시는 기존 T19 경로와 S5(C24)다. digest 앞 16자 충돌은 같은 변경·같은 세대 안에서만 의미가 있고 그 세대의 승인 주제는 하나라 생기지 않는다.
