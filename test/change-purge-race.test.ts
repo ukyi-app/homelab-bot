@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
+import { readChangeNotes, recordChangeNotes } from '../src/change-guidance.js';
 import { CHANGE_RETENTION_MS, ChangeStore, purgeExpiredChangeContent } from '../src/change-store.js';
 import type { ChangeRequest } from '../src/change-store.js';
 import { ClaudeChangeAuthor, ClaudeTaskBridge } from '../src/claude-task-bridge.js';
@@ -214,7 +215,29 @@ async function retainedSessionHeld(e: Env) {
   await assertPurged(e.ownerDb, f.change.id);
 }
 
+// 확인할 것·남은 위험(C29): change_notes의 UPDATE 거부 트리거가 정리 모양만 받는지 두 DB에서 본다.
+async function notesPurged(e: Env) {
+  e.clock.now = T;
+  const notes = { checks: [{ text: '합성 가정', location: { path: 'src/a.ts', line: 1 } }], risks: [{ text: '합성 위험' }] };
+  const done = await driveTo(e.store, 'snapshot_ready');
+  await recordChangeNotes(e.ownerDb, { changeId: done.id, generation: 1 }, notes, () => e.clock.now);
+  ok(await e.store.transition({ changeId: done.id, generation: 1, from: 'snapshot_ready', to: 'superseded', reason: 'base_moved' }));
+  const live = await driveTo(e.store, 'snapshot_ready');
+  await recordChangeNotes(e.ownerDb, { changeId: live.id, generation: 1 }, notes, () => e.clock.now);
+  await assert.rejects(e.ownerDb.query(`UPDATE change_notes SET checks='[]'::jsonb,risks='[]'::jsonb,purged_at=1,notes_sha256=$2 WHERE change_id=$1`, [done.id, 'a'.repeat(64)]), 'digest 위조');
+  assert.equal(await purgeExpiredChangeContent(e.purgeDb, T + CHANGE_RETENTION_MS - 1), 0);
+  assert.equal(await purgeExpiredChangeContent(e.purgeDb, T + CHANGE_RETENTION_MS), 1);
+  assert.deepEqual(await readChangeNotes(e.ownerDb, { changeId: done.id, generation: 1 }), { checks: [], risks: [] });
+  const expected = (await e.ownerDb.query<{ digest: string }>(`SELECT encode(sha256(convert_to(jsonb_build_object('checks',$1::jsonb,'risks',$2::jsonb)::text,'UTF8')),'hex') AS digest`,
+    [JSON.stringify(notes.checks), JSON.stringify(notes.risks)])).rows[0]!.digest;
+  const row = (await e.ownerDb.query<{ notes_sha256: string; purged_at: string }>('SELECT notes_sha256,purged_at FROM change_notes WHERE change_id=$1', [done.id])).rows[0]!;
+  assert.deepEqual([row.notes_sha256, Number(row.purged_at)], [expected, T + CHANGE_RETENTION_MS]);
+  await assert.rejects(e.ownerDb.query(`UPDATE change_notes SET checks=$2::jsonb WHERE change_id=$1`, [done.id, JSON.stringify(notes.checks)]), '되살리기');
+  assert.deepEqual(await readChangeNotes(e.ownerDb, { changeId: live.id, generation: 1 }), notes, '진행 중 변경의 목록은 그대로다');
+}
+
 const SCENARIOS: [string, (e: Env) => Promise<void>][] = [
+  ['끝난 변경의 확인할 것·남은 위험은 종료 + 7일에 비우고 digest를 남긴다. 정리 모양이 아닌 UPDATE는 거부한다', notesPurged],
   ['오래된 후보를 고른 뒤 새 generation이 열렸다 다시 끝나면 새 데이터가 남고, 새 종료 + 7일에 지운다', reopenedAndEndedAgain],
   ['observing_deploy 후보를 고른 뒤 배포 관측이 미확정으로 바뀌면 남고, 새 관측 + 7일에 지운다', deploymentObservedAgain],
   ['후보를 고른 뒤 끝나지 않은 자식 job이 생기면 남고, 자식이 끝나면 지운다', childJobAppeared],

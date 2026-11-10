@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PublicMetadataSchema } from '../src/change-contracts.js';
-import { neutralizePublicText, publicationMarker, renderPublication } from '../src/change-publication.js';
+import { neutralizePublicText, publicationMarker, renderGuidance, renderPublication } from '../src/change-publication.js';
 import type { PublicationInput } from '../src/change-publication.js';
 import { fixtureBrief, fixtureBundle } from './change-store-fixture.js';
 
@@ -88,4 +88,104 @@ test('T19 B3 공개 문구: private·unknown label은 렌더링부터 막고 bri
     assert.deepEqual(renderPublication(input({ label, brief: fixtureBrief({ label: 'public' }) }), SCAN), { ok: false, reason: 'label_blocked' });
   }
   assert.ok(rendered(input({ label: 'approved_public_summary' })).body.includes('approved_public_summary'));
+});
+
+// ---- C29 확인할 것·남은 위험 ----
+
+const NOTES = {
+  checks: [{ text: '기본 포트를 8080으로 가정했어요', location: { path: 'src/a.ts', line: 1 } }, { text: '설정 파일이 없으면 기본값을 써요' }],
+  risks: [{ text: '동시 요청에서 캐시가 오래될 수 있어요', location: { path: 'src/new.ts', line: null } }],
+};
+
+test('AC-25 PR 설명: 확인할 것·남은 위험 절에 항목 글과 위치가 있고, 기존 사전 리뷰 절은 그대로다', () => {
+  const body = rendered(input(NOTES)).body;
+  assert.ok(body.includes('## 확인할 것\n- 기본 포트를 8080으로 가정했어요 (`src/a.ts:1`)\n- 설정 파일이 없으면 기본값을 써요\n'), body);
+  assert.ok(body.includes('## 남은 위험\n- 동시 요청에서 캐시가 오래될 수 있어요 (`src/new.ts`)\n'), body);
+  assert.ok(body.includes('## 사전 리뷰\n- 판정: pass_with_warnings, 범위 complete\n- 남은 위험: P2 correctness 1건'), body);
+  assert.ok(body.indexOf('## 확인할 것') < body.indexOf('## 사전 리뷰'));
+});
+
+test('AC-25 PR 설명: 항목이 없으면 확인할 것·남은 위험 절이 없다(C28 병합 전 옛 판 결과)', () => {
+  const body = rendered(input()).body;
+  assert.ok(!body.includes('## 확인할 것'));
+  assert.ok(!body.includes('\n## 남은 위험'));
+  assert.deepEqual(rendered(input({ checks: [], risks: [] })), rendered(input()), '빈 목록과 칸 없음은 같은 공개 문구다');
+});
+
+test('AC-25 PR 설명: 항목 글도 mention·자동 연결을 끊는다', () => {
+  const body = rendered(input({ checks: [{ text: '@octocat fixes #12 <!-- 숨김 -->' }] })).body;
+  assert.ok(!/(^|[^\w])@[A-Za-z]/.test(body));
+  assert.ok(!/#\d/.test(body));
+  assert.equal(body.split('<!--').length, 2, 'marker 주석은 서버가 넣은 하나뿐이다');
+});
+
+test('AC-25 공개 검사: 항목 글에 비밀·내부 표식이 있으면 고치지 않고 게시를 막는다', () => {
+  assert.deepEqual(renderPublication(input({ checks: [{ text: 'fixture-internal-host에 붙어요' }] }), SCAN), { ok: false, reason: 'internal_marker' });
+  assert.deepEqual(renderPublication(input({ risks: [{ text: `토큰 ghp_${'a'.repeat(30)} 노출` }] }), SCAN), { ok: false, reason: 'secret_detected' });
+  assert.deepEqual(renderPublication(input({ risks: [{ text: '/home/owner/x 경로를 읽어요' }] }), SCAN), { ok: false, reason: 'metadata_sensitive' });
+});
+
+test('AC-25 입력 스키마: 항목 수·글 길이가 C25 상한(10개·300자)을 넘거나 위치가 틀리면 받지 않는다', () => {
+  const many = Array.from({ length: 11 }, (_, index) => ({ text: `항목 ${index}` }));
+  assert.deepEqual(renderPublication(input({ checks: many }), SCAN), { ok: false, reason: 'publication_input_invalid' });
+  assert.deepEqual(renderPublication(input({ risks: [{ text: '가'.repeat(301) }] }), SCAN), { ok: false, reason: 'publication_input_invalid' });
+  assert.deepEqual(renderPublication(input({ checks: [{ text: '위치', location: { path: '../x', line: 1 } }] }), SCAN), { ok: false, reason: 'publication_input_invalid' });
+  // 최대 개수·길이·경로라도 본문 상한 안에 든다.
+  const longest = (prefix: string) => Array.from({ length: 10 }, (_, index) => ({ text: '나'.repeat(300), location: { path: `${prefix}${index}/${'p'.repeat(500)}`, line: 2_147_483_647 } }));
+  assert.equal(renderPublication(input({ checks: longest('c'), risks: longest('r') }), SCAN).ok, true);
+});
+
+// ---- C29 안내 리뷰 글 ----
+
+const IDENTITY = { name: 'fixture-writer[bot]', email: 'fixture-writer[bot]@users.noreply.github.com' };
+const GUIDE_SCAN = { ...SCAN, identity: IDENTITY };
+// src/a.ts는 오른쪽 1~4줄, src/new.ts는 1~2줄이 diff 안이다.
+const POSITIONS = new Map([['src/a.ts', new Set([1, 2, 3, 4])], ['src/new.ts', new Set([1, 2])]]);
+const guide = (overrides: Partial<Parameters<typeof renderGuidance>[0]> = {}) => renderGuidance({ checks: [], risks: [], positions: POSITIONS, limit: 5, round: 0, ...overrides }, GUIDE_SCAN);
+
+test('AC-27 안내 리뷰 글: diff 안 위치의 항목만 줄 댓글이 되고, diff 밖·줄 없음·위치 없음은 밖 목록에 남는다', () => {
+  const inside = { text: '포트를 가정했어요', location: { path: 'src/a.ts', line: 2 } };
+  const otherLine = { text: '바뀌지 않은 줄', location: { path: 'src/a.ts', line: 40 } };
+  const otherFile = { text: '바뀌지 않은 파일', location: { path: 'README.md', line: 1 } };
+  const noLine = { text: '줄을 모름', location: { path: 'src/new.ts', line: null } };
+  const nowhere = { text: '위치 없음' };
+  const risk = { text: '캐시가 오래될 수 있어요', location: { path: 'src/new.ts', line: 1 } };
+  const result = guide({ checks: [inside, otherLine, otherFile, noLine, nowhere], risks: [risk] });
+  assert.ok(result.ok, JSON.stringify(result));
+  assert.deepEqual(result.comments, [
+    { path: 'src/a.ts', line: 2, body: '**확인할 것** 포트를 가정했어요' },
+    { path: 'src/new.ts', line: 1, body: '**남은 위험** 캐시가 오래될 수 있어요' },
+  ]);
+  assert.deepEqual(result.outside, { checks: [otherLine, otherFile, noLine, nowhere], risks: [] });
+  assert.equal(result.body, '확인할 것과 남은 위험 중 바뀐 줄에 있는 것만 줄 댓글로 달았어요. 전체 목록은 PR 설명에 있어요.');
+});
+
+test('AC-27 안내 리뷰 글: 수정 차례는 diff 밖 항목이 Discord 결과 요약에 있다고 말한다', () => {
+  const result = guide({ round: 2, checks: [{ text: '가정', location: { path: 'src/a.ts', line: 1 } }] });
+  assert.ok(result.ok);
+  assert.equal(result.body, '수정 2번째의 확인할 것과 남은 위험 중 바뀐 줄에 있는 것만 줄 댓글로 달았어요. 나머지는 Discord 결과 요약에 있어요.');
+});
+
+test('AC-27 안내 리뷰 글: 상한을 넘는 항목은 댓글로 달지 않고 밖 목록에 남는다. 확인할 것이 먼저다', () => {
+  const at = (line: number) => ({ text: `항목 ${line}`, location: { path: 'src/a.ts', line } });
+  const result = guide({ limit: 2, checks: [at(1), at(2), at(3)], risks: [at(4)] });
+  assert.ok(result.ok);
+  assert.deepEqual(result.comments.map(comment => comment.line), [1, 2]);
+  assert.deepEqual(result.outside, { checks: [at(3)], risks: [at(4)] });
+  const none = guide({ limit: 0, checks: [at(1)] });
+  assert.ok(none.ok);
+  assert.deepEqual([none.comments.length, none.outside.checks.length], [0, 1]);
+});
+
+test('AC-27 안내 리뷰 글: 댓글 글도 무력화하고, 비밀·내부 표식이 있으면 아무것도 내보내지 않는다', () => {
+  const neutral = guide({ checks: [{ text: '@octocat fixes #12\n## 머리줄', location: { path: 'src/a.ts', line: 1 } }] });
+  assert.ok(neutral.ok);
+  assert.ok(!/(^|[^\w])@[A-Za-z]/.test(neutral.comments[0]!.body));
+  assert.ok(!/#\d/.test(neutral.comments[0]!.body));
+  assert.ok(!neutral.comments[0]!.body.includes('\n'), '줄바꿈으로 머리줄을 만들지 못한다');
+  assert.deepEqual(guide({ risks: [{ text: 'fixture-internal-host 접속', location: { path: 'src/a.ts', line: 1 } }] }), { ok: false, reason: 'internal_marker' });
+  assert.deepEqual(guide({ checks: [{ text: `ghp_${'b'.repeat(30)}`, location: { path: 'src/a.ts', line: 1 } }] }), { ok: false, reason: 'secret_detected' });
+  // diff 밖 항목도 C27이 Discord에 실을 수 있어 함께 검사한다.
+  assert.deepEqual(guide({ checks: [{ text: 'fixture-internal-host', location: { path: 'README.md', line: 1 } }] }), { ok: false, reason: 'internal_marker' });
+  assert.deepEqual(guide({ checks: [{ text: '형식이 틀린 항목', location: { path: '/abs', line: 1 } }] }), { ok: false, reason: 'guidance_input_invalid' });
 });
