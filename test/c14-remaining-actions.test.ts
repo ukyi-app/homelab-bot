@@ -1,6 +1,8 @@
 import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { CHANGE_TEXT } from '../src/change-commands.js';
 import { Denied } from '../src/contracts.js';
+import { ATTACH_COMMAND_TEXT } from '../src/external-task-commands.js';
 import { RAW_TEXT_NOTICE } from '../src/memory-commands.js';
 import { PROPOSAL_TEXT, PROPOSAL_TTL_MS } from '../src/proposals.js';
 import { localDatabase, thread } from './helpers.js';
@@ -218,7 +220,7 @@ test('C14 세션 연결 해제 제안은 이 스레드의 연결만 받고, 누�
   assert.equal(body(a.buttons().content), PROPOSAL_TEXT.detachQuestion(link.connectionId));
   assert.equal((await a.links.list(a.f.policy.owner, thread)).items[0]!.state, 'active');
   await a.press(yesOf(a));
-  assert.match(String(a.lastCallback()!.data.content), /^연결을 해제했습니다/);
+  assert.equal(String(a.lastCallback()!.data.content), ATTACH_COMMAND_TEXT.detached(true, 0));
   assert.equal((await a.links.list(a.f.policy.owner, thread)).items[0]!.state, 'revoked');
   await a.speak(message(), '없는 연결 끊어 줘', { action: 'detach', target: '00000000-0000-4000-8000-000000000000', content: null });
   assert.deepEqual((await a.dropped()).at(-1), { action: 'detach', reason: 'target_denied' });
@@ -248,7 +250,7 @@ test('C14 말로 한 변경 요청은 "<저장소>에 이 변경 PR을 준비할
 test('C14 말로 한 변경 요청도 /change와 같은 장소·저장소 규칙이라 알림 채널 스레드·정책 밖 저장소면 버려진다', async () => {
   const a = await wired();
   const slash = (await a.slash('change', { target: REPO.fullName, text: '공개 요약 | accept=시험 통과 | label=public', scope: notifyThread })).reply!;
-  assert.match(slash, /대화 채널의 스레드에서만/);
+  assert.equal(slash, CHANGE_TEXT.threadOnly(true));
   await a.speak(message(), '로그인 화면 오타 고쳐 줘', { action: 'change', target: REPO.fullName, content: null }, { scope: notifyThread });
   await a.speak(message(), '로그인 화면 오타 고쳐 줘', { action: 'change', target: 'fixture-org/not-in-policy', content: null });
   assert.deepEqual((await a.dropped()).map(d => d.reason), ['target_denied', 'target_denied']);
@@ -259,7 +261,8 @@ test('C14 말로 한 변경 요청도 /change와 같은 장소·저장소 규칙
 test('C14 / 변경 요청은 지금처럼 owner가 적은 label을 쓴다(적지 않으면 unknown으로 막힌다)', async () => {
   const a = await wired();
   const reply = (await a.slash('change', { target: REPO.fullName, text: '공개 요약 | accept=시험 통과' })).reply!;
-  assert.match(reply, /막았습니다/);
+  const id = (await database.db.query<{ id: string }>('SELECT id FROM change_requests')).rows[0]!.id;
+  assert.equal(reply, CHANGE_TEXT.blocked(true, id, CHANGE_TEXT.blockedLabel(true, 'unknown')));
   assert.equal((await database.db.query<{ label: string }>('SELECT label FROM change_requests')).rows[0]!.label, 'unknown');
 });
 
@@ -272,7 +275,7 @@ test('C14 변경 취소 제안은 이 스레드의 변경만 받고, 누르면 /
   assert.notEqual((await database.db.query<{ phase: string }>('SELECT phase FROM change_requests')).rows[0]!.phase, 'cancelled');
   await a.press(yesOf(a));
   assert.equal((await database.db.query<{ phase: string }>('SELECT phase FROM change_requests')).rows[0]!.phase, 'cancelled');
-  assert.match(String(a.lastCallback()!.data.content), new RegExp(`^변경 ${change}을 취소했습니다`));
+  assert.equal(String(a.lastCallback()!.data.content), CHANGE_TEXT.cancelled(true, change, false));
   await a.speak(message(), '없는 변경 취소', { action: 'change_cancel', target: 'fixture-unknown-change', content: null });
   assert.deepEqual((await a.dropped()).at(-1), { action: 'change_cancel', reason: 'target_denied' });
 });

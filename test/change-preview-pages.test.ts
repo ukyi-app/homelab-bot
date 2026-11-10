@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { ChangeRuntime } from '../src/change-runtime.js';
+import { CHANGE_NOTICE_TEXT, ChangeRuntime } from '../src/change-runtime.js';
 import type { ChangeRuntimeDeps } from '../src/change-runtime.js';
 import type { ChangeRequest } from '../src/change-store.js';
 import { PUBLISH_TEXT } from '../src/change-commands.js';
@@ -98,7 +98,9 @@ test('C17: 스위치가 켜져 있으면 여러 쪽 미리보기의 마지막 �
   const rows = await previewRows(true, APPROVAL);
   assert.ok(rows.length > 1, `미리보기가 여러 쪽이다(${rows.length})`);
   const preview = rows.map(row => row.payload.content).join('');
-  assert.ok(preview.includes(`/change-publish target:${request.id} text:${APPROVAL}`));
+  // 켜짐 판은 승인 명령 대신 이 글의 버튼을 가리킨다(C18).
+  assert.ok(preview.includes(CHANGE_NOTICE_TEXT.previewApprove(true, request.id, APPROVAL)));
+  assert.ok(!preview.includes('/change-publish'));
   for (const row of rows.slice(0, -1)) assert.equal(row.payload.buttons, undefined);
   const buttons = rows.at(-1)!.payload.buttons!;
   assert.equal(buttons.length, 1);
@@ -111,4 +113,5 @@ test('C17: 스위치가 꺼져 있으면 미리보기 글에 버튼이 없다', 
   const rows = await previewRows(false, APPROVAL);
   assert.ok(rows.length > 1);
   assert.ok(rows.every(row => row.payload.buttons === undefined));
+  assert.ok(rows.map(row => row.payload.content).join('').includes(`/change-publish target:${request.id} text:${APPROVAL}`), "꺼짐 판은 '/' 승인 명령 그대로다");
 });

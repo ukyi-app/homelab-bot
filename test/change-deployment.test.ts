@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { DEPLOYMENT_SETTLED_STATES, DeploymentObservationSchema } from '../src/change-contracts.js';
 import type { ChangeTarget, DeploymentObservation } from '../src/change-contracts.js';
 import { ARGOCD_APPLICATIONS, DEPLOY_TARGETS, SERVICES, TEMPLATES } from '../src/catalog.js';
-import { DEPLOYMENT_POLL, DeploymentReader, DeploymentTargetError, deploymentPollStep, describeDeployment } from '../src/change-deployment.js';
+import { DEPLOYMENT_POLL, DEPLOYMENT_TEXT, DeploymentReader, DeploymentTargetError, deploymentPollStep, describeDeployment } from '../src/change-deployment.js';
 import { deploymentKubernetesReader, kubernetesClient, publicGithubReader } from '../src/read-transports.js';
 
 // 가짜 HTTP만 쓴다. 실제 클러스터·GitHub에는 닿지 않는다. 값은 모두 합성이다.
@@ -625,13 +625,13 @@ test('문구: 배포 확인을 기능·DB·성능 성공으로 말하지 않고 
   const observed: DeploymentObservation = { state: 'observed', headSha: H, mergeCommit: M, configCommit: K, imageDigest: D, argoObservedAt: NOW, workloadObservedAt: NOW, observedAt: NOW, reason: null };
   const text = describeDeployment(observed);
   for (const value of [H, M, K, D]) assert.ok(text.includes(value), value);
-  assert.match(text, /기능·DB·성능은 확인하지 않았다/);
+  assert.ok(text.includes(DEPLOYMENT_TEXT.scope));
   assert.doesNotMatch(text, /성공|정상/);
   assert.match(text, new RegExp(new Date(NOW).toISOString()));
   for (const [state, reason] of [['pending', 'image_revision_behind'], ['unknown', 'github_unavailable'], ['blocked', 'deployment_target_unregistered'], ['not_applicable', 'docs_only']] as const) {
     const line = describeDeployment({ ...observed, state, reason, configCommit: null, imageDigest: null, argoObservedAt: null, workloadObservedAt: null });
     assert.ok(line.includes(reason));
-    assert.match(line, /기능·DB·성능은 확인하지 않았다/);
+    assert.ok(line.includes(DEPLOYMENT_TEXT.scope));
     assert.doesNotMatch(line, /성공|정상/);
     assert.match(line, /미확인/);
   }

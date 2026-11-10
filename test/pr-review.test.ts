@@ -14,6 +14,7 @@ import type { ArchiveFetcher, ReviewerInput, ReviewerModel, ReviewTask } from '.
 import { GitHubError, GitHubIngress, githubWebhook, pullRequest, RestrictedGitHub, restrictGitHubWrite, ReviewPolicySource,
   ReviewPublisher, ReviewQueue, ReviewReconciler, ReviewRuntime, reviewMarker, reviewRevision } from '../src/review.js';
 import type { GitHubReader, GitHubTransport, GitHubWrite, ReviewPolicy, ReviewResult } from '../src/review.js';
+import { REVIEW_NOTICE_TEXT } from '../src/review.js';
 import { archiveContract } from '../src/worker.js';
 import { HttpReviewWorker, reviewWorkerServer } from '../src/review-http.js';
 import { controlText } from '../src/control-format.js';
@@ -344,7 +345,11 @@ test('REVIEW-04 전체 경로: 게시 서버는 event=COMMENT와 검토 head를 
   assert.equal(summary[0]!.scope.channel, f.policy.notificationChannel);
   await f.publisher.deliver();
   assert.equal(f.rest.messages.length, 1);
-  assert.match(f.rest.messages[0]!.body.content, /PR 리뷰 게시: fixture-org\/fixture-repo#7/);
+  // 요약은 코드가 만든 숫자·리비전뿐이다(모델 문장 없음).
+  const posted = f.rest.messages[0]!.body.content;
+  assert.ok(posted.startsWith(REVIEW_NOTICE_TEXT.summary(REPO.fullName, 7, HEAD.slice(0, 12), false, 0, 0).split(', 검토')[0]!), posted);
+  assert.match(posted, /지적 \d+건\(인라인 1건\)\. /);
+  assert.ok(posted.includes('승인·병합 판단이 아니에요.'));
 });
 test('AC-13 PR 리뷰 말투: 심각도·한 문단 지적·승인·병합 아님 안내·첫 줄 대조 표식, Discord 요약에는 모델 문장 없음', async () => {
   const second = { severity: 'P3', title: '경계 시험 없음', path: 'src/app.ts', line: null, condition: 'count가 0인 경우를 시험하지 않아요.',
@@ -366,7 +371,7 @@ test('AC-13 PR 리뷰 말투: 심각도·한 문단 지적·승인·병합 아�
   assert.ok(body.includes(`\n- ${question}`));
   assert.deepEqual(write.body.comments.map(c => c.body), [`**[P1] 0으로 나누기**\n\n${p1}`]);
   const summary = (await rows('outbox')).find(o => o.idempotency_key.startsWith('review-summary:'))!.payload.content as string;
-  assert.ok(summary.includes('승인·병합 판단이 아닙니다'));
+  assert.ok(summary.includes('승인·병합 판단이 아니에요'));
   for (const text of [FINDING.title, FINDING.condition, FINDING.impact, second.title, second.suggestion, question, '나눗셈 경계만']) {
     assert.ok(!summary.includes(text), text);
   }

@@ -1,0 +1,100 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { ALERT_TEXT } from '../src/alerts.js';
+import { changeChildFailed, changeNextGeneration, changeRestart } from '../src/change-advice.js';
+import { CHANGE_TEXT, PUBLISH_TEXT } from '../src/change-commands.js';
+import { DEPLOYMENT_TEXT, describeDeployment } from '../src/change-deployment.js';
+import { CHANGE_NOTICE_TEXT } from '../src/change-runtime.js';
+import { commandDefinitions } from '../src/commands.js';
+import { ATTACH_COMMAND_TEXT } from '../src/external-task-commands.js';
+import { EXTERNAL_NOTICE_TEXT, formatNotice } from '../src/external-task-receiver.js';
+import { REVIEW_NOTICE_TEXT } from '../src/review.js';
+
+// C18 고정 문구 3(명세 §4.4·§4.9, AC-11·AC-23): 변경·Discord 리뷰 안내·경보·세션 연결. 경계는 S1의 문구 표 단위다.
+// 스위치가 켜지면 '/' 명령 이름이 없고, 꺼지면 지금처럼 '/'를 안내한다. 이름은 등록 명령 표 전체에서 읽는다.
+const registered = commandDefinitions(true, true, true, true, true).map(command => command.name);
+const slashName = /(^|[^\p{L}\p{N}])\/[a-z][a-z-]*/u;
+const ARGS = ['fixture-id', 'fixture-2', 'fixture-3', 'fixture-4'];
+type Text = string | ((...values: never[]) => string) | Readonly<Record<string, string>>;
+// 표의 항목마다 첫 인자가 스위치다(스위치를 받지 않는 항목은 앞 인자를 문자열로 받는다).
+const render = (colleague: boolean, table: Readonly<Record<string, Text>>) => Object.entries(table).flatMap(([name, text]) =>
+  typeof text === 'function' ? [[name, (text as (...values: unknown[]) => string)(colleague, ...ARGS)] as const]
+    : typeof text === 'string' ? [[name, text] as const] : Object.entries(text).map(([key, value]) => [`${name}.${key}`, value] as const));
+const SWITCHED = { CHANGE_TEXT, CHANGE_NOTICE_TEXT, ATTACH_COMMAND_TEXT };
+const advice = (c: boolean) => [['changeRestart', changeRestart(c)], ['changeNextGeneration', changeNextGeneration(c, 'fixture-id')],
+  ['changeChildFailed', changeChildFailed('fixture-job', 'fixture-id', c)]] as const;
+const all = (colleague: boolean) => [...Object.entries(SWITCHED).flatMap(([table, texts]) =>
+  render(colleague, texts as Readonly<Record<string, Text>>).map(([name, text]) => [`${table}.${name}`, text] as const)), ...advice(colleague)];
+// 스위치 밖 문구(인자에 스위치가 없다).
+const OBSERVATION = { state: 'observed' as const, reason: null, headSha: 'a'.repeat(40), mergeCommit: 'b'.repeat(40), configCommit: null, imageDigest: null,
+  observedAt: 0, argoObservedAt: null, workloadObservedAt: null };
+const fixed = () => [...Object.values(DEPLOYMENT_TEXT.state), DEPLOYMENT_TEXT.scope, describeDeployment(OBSERVATION),
+  REVIEW_NOTICE_TEXT.unpublished('ukyi-app/fixture', 7, 'c'.repeat(12)), REVIEW_NOTICE_TEXT.restricted('ukyi-app/fixture', 7),
+  REVIEW_NOTICE_TEXT.summary('ukyi-app/fixture', 7, 'c'.repeat(12), false, 2, 1), ALERT_TEXT.relayed('firing', 2),
+  formatNotice({ executor: 'codex', externalTaskId: 'fixture-session', summary: '턴 완료', occurredAt: 0, receivedAt: 1000 }),
+  ...Object.values(PUBLISH_TEXT).map(text => typeof text === 'function' ? text('fixture-id') : text)];
+
+test("C18 스위치 켜짐: 변경·세션 연결 고정 문구 어디에도 '/' 명령 이름이 없다", () => {
+  assert.ok(registered.includes('change-publish') && registered.includes('attach-list') && registered.includes('task-release'));
+  for (const [name, text] of all(true)) {
+    assert.doesNotMatch(text, slashName, name);
+    for (const command of registered) assert.ok(!text.includes(`/${command}`), `${name}: /${command}`);
+  }
+});
+
+test("C18 스위치 밖 문구(배포 관측·리뷰 안내·경보·R08 알림·게시 버튼 응답)에도 '/' 명령 이름이 없다", () => {
+  for (const text of fixed()) assert.doesNotMatch(text, slashName, text);
+});
+
+test("C18 스위치 꺼짐: '/' 안내 줄은 지금처럼 '/' 명령 이름을 안내한다", () => {
+  const off = Object.fromEntries(all(false));
+  assert.match(off['CHANGE_TEXT.usage']!, /\/change project:<저장소> text:<요약>/);
+  assert.match(off['CHANGE_TEXT.threadOnly']!, /\/chat/);
+  assert.match(off['CHANGE_TEXT.transient']!, /\/change-status/);
+  assert.match(off['CHANGE_TEXT.acceptedPost']!, /\/change-status target:fixture-id/);
+  assert.match(off['CHANGE_TEXT.accepted']!, /\/change-publish/);
+  assert.match(off['CHANGE_TEXT.nextUsage']!, /\/change project:fixture-id text:next/);
+  assert.match(off['CHANGE_TEXT.nextPurged']!, /\/change/);
+  assert.match(off['CHANGE_TEXT.cancelRace']!, /\/change-status/);
+  assert.match(off['CHANGE_TEXT.statusChildUnknown']!, /\/task-release target:fixture-id/);
+  assert.match(off['CHANGE_TEXT.answerUsage']!, /\/answer question:<ID> text:label=public/);
+  assert.match(off['CHANGE_NOTICE_TEXT.published']!, /\/change-status/);
+  assert.match(off['CHANGE_NOTICE_TEXT.previewApprove']!, /\/change-publish target:fixture-id text:fixture-2/);
+  assert.match(off['ATTACH_COMMAND_TEXT.usage']!, /\/attach target:<세션 ID>/);
+  assert.match(off['ATTACH_COMMAND_TEXT.threadOnly']!, /\/chat/);
+  assert.match(off['ATTACH_COMMAND_TEXT.notAttachable']!, /\/resume/);
+  assert.match(off['ATTACH_COMMAND_TEXT.alreadyAttached']!, /\/attach-list[\s\S]*\/detach[\s\S]*\/attach/);
+  assert.match(off['ATTACH_COMMAND_TEXT.deliveryFailed']!, /\/attach/);
+  assert.match(off['ATTACH_COMMAND_TEXT.revokeUnconfirmed']!, /\/attach-list[\s\S]*\/detach/);
+  assert.match(off.changeRestart!, /\/change/);
+  assert.match(off.changeNextGeneration!, /\/change project:fixture-id text:next/);
+  assert.match(off.changeChildFailed!, /\/change-status target:fixture-id/);
+});
+
+test('C18 켜짐 판은 말로 하는 안내다: 미리보기는 게시 승인 버튼을, 세션 연결은 말로 부탁하라고 한다', () => {
+  const on = Object.fromEntries(all(true));
+  assert.ok(on['CHANGE_NOTICE_TEXT.previewApprove']!.includes(PUBLISH_TEXT.label), '미리보기는 C17 버튼을 가리킨다');
+  assert.doesNotMatch(on['CHANGE_NOTICE_TEXT.previewApprove']!, /fixture-2/, '켜짐 판은 digest를 옮겨 적게 하지 않는다');
+  assert.match(on['ATTACH_COMMAND_TEXT.alreadyAttached']!, /말해 주세요/);
+  assert.match(on['CHANGE_TEXT.statusChildUnknown']!, /`homelab bot` CLI/);
+});
+
+test('C18 고정 문구는 해요체이고 자기를 봇이라 부르지 않는다', () => {
+  const texts = [...all(false), ...all(true)].map(([, text]) => text).concat(fixed());
+  for (const text of texts) {
+    assert.doesNotMatch(text, /봇/, text);
+    assert.doesNotMatch(text, /습니다|십시오|입니다|합니다|한다\.|이다\.|않았다/, text);
+  }
+});
+
+test('C18 안전 문장: 경보는 원문을 싣지 않는다고 말하고, 리뷰 요약은 승인·병합 판단이 아니며, R08 알림은 결과를 확인하지 않았다고 말한다', () => {
+  // 경보 중계 글은 상태와 건수만 받는다(원문을 받을 인자가 없다).
+  assert.equal(ALERT_TEXT.relayed.length, 2);
+  assert.match(ALERT_TEXT.relayed('firing', 3), /원문은 게시하지 않았어요/);
+  assert.match(REVIEW_NOTICE_TEXT.summary('ukyi-app/fixture', 7, 'c'.repeat(12), true, 0, 0), /승인·병합 판단이 아니에요/);
+  // 리뷰 요약은 숫자·리비전·고정 낱말만 받는다(모델 문장을 받을 문자열 인자가 저장소·head뿐이다).
+  assert.equal(REVIEW_NOTICE_TEXT.summary.length, 6);
+  const notice = formatNotice({ executor: 'claude', externalTaskId: 'fixture-session', summary: '빌드 끝', occurredAt: 0, receivedAt: 0 });
+  assert.ok(notice.includes(EXTERNAL_NOTICE_TEXT.unverified));
+  assert.ok(notice.includes('`fixture-session`') && notice.includes('`빌드 끝`'), '사용자 값은 코드 스팬에 둔다');
+});

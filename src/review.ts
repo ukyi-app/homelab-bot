@@ -42,6 +42,17 @@ export interface ReviewContext { base: Policy; review: ReviewPolicy; revision: s
 export const MODEL_CALL_ASSOCIATIONS = Object.freeze(['OWNER', 'MEMBER', 'COLLABORATOR']);
 // 게시 서버가 작업자에 보내는 리뷰 지시문. 작업자 요청의 literal이라 작업자가 이 판을 받게 먼저 배포돼 있어야 한다(명세 §4.2).
 export const SERVER_REVIEW_INSTRUCTIONS = REVIEW_INSTRUCTIONS_V2;
+
+// 알림 채널에 거는 리뷰 안내(동료 말투). '/' 이름이 없어 스위치와 상관없이 같다. 리뷰 대기(한도·인증) 안내는 여기 없다(review-waiting).
+// 함정: Discord 요약은 코드가 만든 숫자·리비전만 싣는다. 모델 문장(public_summary·지적)은 넣지 않는다.
+export const REVIEW_NOTICE_TEXT = Object.freeze({
+  unpublished: (repository: string, pr: number, head: string) => `PR 리뷰를 게시하지 못했어요: ${repository}#${pr}, head ${head}. `
+    + 'base가 움직여 결과가 오래됐고, 같은 head의 재리뷰 상한에 걸렸어요. 리뷰 명령 댓글로 다시 요청할 수 있어요.',
+  restricted: (repository: string, pr: number) => `PR 리뷰 결과가 공개 범위 검사에 걸려서 게시하지 않았어요: ${repository}#${pr}.`,
+  summary: (repository: string, pr: number, head: string, partial: boolean, findings: number, inline: number) =>
+    `PR 리뷰를 게시했어요: ${repository}#${pr}, head ${head}, ${partial ? '부분 검토' : '검토 완료'}, 지적 ${findings}건(인라인 ${inline}건). `
+    + '참고용 리뷰이고 승인·병합 판단이 아니에요.',
+});
 // 권한 필드(허용 목록·저장소)는 매번 다시 검사하므로 세대 revision에는 리뷰 내용에 닿는 값만 넣는다.
 export function reviewRevision(review: ReviewPolicy, instructions: string = SERVER_REVIEW_INSTRUCTIONS): string {
   return `rp-${createHash('sha256').update(JSON.stringify([instructions, review.input, review.comparison])).digest('hex').slice(0, 16)}`;
@@ -318,8 +329,7 @@ export class ReviewQueue {
         const scope = notificationScope(context.base);
         await this.store.enqueue({ key: `review-unpublished:${repo.id}:${pr.number}:${pr.head.sha}`, actor: context.base.owner, scope,
           revision: context.base.revision, payload: { kind: 'message', channel: scope.channel, classification: 'safe_summary',
-            content: `PR 리뷰를 게시하지 못했습니다: ${repo.fullName}#${pr.number}, head ${pr.head.sha.slice(0, 12)}. `
-              + 'base가 움직여 결과가 오래됐고 같은 head의 재리뷰 상한에 걸렸습니다. 리뷰 명령 댓글로 다시 요청할 수 있습니다.' } }, tx);
+            content: REVIEW_NOTICE_TEXT.unpublished(repo.fullName, pr.number, pr.head.sha.slice(0, 12)) } }, tx);
       }
       return { outcome: 'base_moved', key };
     }
@@ -835,7 +845,7 @@ export class ReviewRuntime {
       if (classification === 'restricted') {
         await tx.query('INSERT INTO audit(kind,subject,detail,created_at) VALUES ($1,$2,$3,$4)',
           ['review_restricted', job.id, json({ reason: 'output_classification', resend: false }), this.store.now()]);
-        await this.notify(tx, context, `review-restricted:${job.id}`, `PR 리뷰 결과를 공개 범위 검사에서 차단했습니다: ${review.repo_full_name}#${review.pr_number}. 게시하지 않았습니다.`);
+        await this.notify(tx, context, `review-restricted:${job.id}`, REVIEW_NOTICE_TEXT.restricted(review.repo_full_name, review.pr_number));
         return;
       }
       // 되살린 세대가 다시 게시할 수 있게 시도마다 키를 나눈다. 대조 marker도 이 키다.
@@ -1077,9 +1087,8 @@ export class ReviewPublisher {
       const result = (await tx.query<{ result: ReviewResult }>('SELECT result FROM pr_reviews WHERE job_id=$1', [row.job_id])).rows[0]?.result;
       const scope = notificationScope(context.base);
       // Discord 요약은 코드가 만든 숫자·리비전만 쓴다. 모델 문장은 넣지 않는다.
-      const content = `PR 리뷰 게시: ${row.repo_full_name}#${row.pr_number}, head ${row.head_sha.slice(0, 12)}, `
-        + `${result?.review_outcome === 'partial' ? '부분 검토' : '검토 완료'}, 지적 ${result?.findings.length ?? 0}건(인라인 ${row.comments.length}). `
-        + '참고 리뷰이며 승인·병합 판단이 아닙니다.';
+      const content = REVIEW_NOTICE_TEXT.summary(row.repo_full_name, row.pr_number, row.head_sha.slice(0, 12), result?.review_outcome === 'partial',
+        result?.findings.length ?? 0, row.comments.length);
       await this.store.enqueue({ key: `review-summary:${row.id}`, actor: context.base.owner, scope, revision: context.base.revision,
         payload: { kind: 'message', channel: scope.channel, content, classification: 'safe_summary' } }, tx);
     });
