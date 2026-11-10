@@ -2249,6 +2249,35 @@ test('AC-28 시험 실패 receipt 저장 직후 끊김: 재시작한 프로세�
   });
 });
 
+test('AC-28 시험 통과 receipt 저장 직후 끊김(C34): 재시작한 프로세스가 자체 리뷰·게시를 기다리지 않고 작성 job을 끝 상태로 정리해 작업 레인을 푼다', async () => {
+  const fake = discussionFake();
+  await withHarness({ changeV2: true, colleague: true, steps: [V2_WRITE_STEP, AMEND_STEP], amendments: { discussion: fake.read } }, async h => {
+    const id = await toProposed(h);
+    h.restart({ crash: { point: 'changes.recordAmendmentVerification', when: 'after' } });
+    await requestAmendment(h, id, 'amend-1', branchHead(h));
+    await h.pump(async () => (await h.db.query(`SELECT 1 FROM change_amendment_verifications WHERE change_id=$1 AND status='passed'`, [id])).rows.length > 0
+      && h.logs.some(entry => entry.event === 'change_step_failed'));
+    const amendAuthor = async () => (await h.db.query<{ state: string; session: string | null }>(`SELECT j.state,s.state AS session FROM jobs j JOIN change_child_jobs c ON c.job_id=j.id
+      LEFT JOIN codex_sessions s ON s.job_id=j.id WHERE c.change_id=$1 AND c.amendment_round=1 AND c.role='author'`, [id])).rows[0]!;
+    assert.equal((await amendAuthor()).session, 'running', '끊긴 순간에는 작성 세션이 정리되지 않았다');
+    h.restart();
+    // 리뷰·게시 바퀴(publishTick·리뷰 런타임)를 돌리지 않는다. 정리가 그쪽 진행에 기대면 차례가 끝날 때까지 레인이 막힌다.
+    for (let tick = 0; tick < 200; tick++) {
+      const row = await amendAuthor();
+      if (row.state === 'succeeded' && row.session === 'completed' && !await h.store.laneBusy('task')) break;
+      await h.runtime.childrenTick();
+      await h.runtime.laneTick();
+      await new Promise(resolve => setTimeout(resolve, 3));
+    }
+    assert.deepEqual(await amendAuthor(), { state: 'succeeded', session: 'completed' });
+    assert.equal(await h.store.laneBusy('task'), false);
+    assert.deepEqual((await roundsOf(h, id)).map(round => round.state), ['running'], '차례는 리뷰·게시를 기다리며 아직 돈다');
+    // 정리 뒤에도 차례는 그대로 이어져 커밋된다.
+    await h.pump(async () => (await roundsOf(h, id))[0]?.state === 'committed' && await h.phase(id) === 'proposed');
+    assert.equal(h.runs.verify, 2, '저장된 통과 시험을 다시 돌리지 않는다');
+  });
+});
+
 test('AC-28 안내 댓글 전송 실패: 줄 댓글이 거부되면 줄 댓글로 보내려던 항목도 diff 밖 항목과 함께 owner 호출 결과 요약에 싣는다', async () => {
   const fake = discussionFake();
   const reviews: GuidanceReview[] = [];

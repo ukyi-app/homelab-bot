@@ -757,7 +757,18 @@ export class ChangeRuntime {
     const required = request.brief?.verificationCommandIds ?? [];
     // receipt가 다 있어도 하나라도 통과가 아니면 시험 쪽에서 끝맺는다. 실패 receipt 저장 직후 끊기면 차례를 닫는 일이 여기서만 이어진다.
     if (round.verifierRevision === null || required.some(command => verified.get(command) !== 'passed')) return this.amendVerify(request, round);
-    return false;
+    return this.settleAmendAuthor(request, round);
+  }
+  // 시험이 모두 통과한 차례의 작성 세션 정리. 마지막 통과 receipt 저장 직후 끊기면 amendVerify의 finalize가 빠진다.
+  // 정리 바퀴(childrenTick)는 running 차례의 자식을 보지 않으므로 여기서 잇지 않으면 리뷰·게시가 끝날 때까지 작성 job이 작업 레인을 쥔다.
+  private async settleAmendAuthor(request: ChangeRequest, round: AmendmentRound): Promise<boolean> {
+    const child = await this.amendmentAuthorChild(request, round);
+    if (!child.session_generation || child.session_state !== 'running') return false;
+    if (child.state === 'cancel_requested') return this.failAmendment(request, round, 'owner_cancelled');
+    if (!await this.reacquire(child, false)) return false;
+    try { await this.deps.author.finalize(receiptOf(child)); }
+    catch (error) { this.deps.log('change_author_finalize_deferred', errorInfo(error)); this.wait(`step:${request.id}`, this.periods.authorPollMs); return false; }
+    return true;
   }
   // 차례를 시작하면 PR 브랜치 head를 다시 읽는다. 확인 때의 head이거나, 확인 뒤 head까지가 모두 이 change의 앞선 수정 차례가 올린 커밋이면 그 위에서 쓴다.
   // 차례 커밋은 늘 앞 head를 부모로 하는 fast-forward라, 지금 head가 마지막으로 확정한 수정 커밋(없으면 처음 게시의 head)과 같고 확인 때의 head가
