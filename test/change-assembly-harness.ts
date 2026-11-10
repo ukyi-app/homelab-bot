@@ -53,6 +53,8 @@ export class SimulatedCrash extends Error { constructor(point: string) { super(`
 export interface HarnessOptions {
   script?: string | ((f: ChangeWorkerFixture) => string); sandbox?: SandboxRunner; steps?: Step[]; reviewReply?: () => Awaited<ReturnType<ChangeReviewerModel>>;
   policyPatch?: (policy: Policy) => Policy; change?: boolean; crash?: Crash;
+  // 동료 기능 스위치(Store.colleague). 기본 꺼짐이다.
+  colleague?: boolean;
 }
 export interface Harness {
   db: Database; env: PublishEnv; f: ChangeWorkerFixture; store: Store; changes: ChangeStore; gate: PolicyGate; policy: { current: Policy }; rest: MockDiscord; ingress: DiscordIngress; discord: DiscordPublisher;
@@ -104,7 +106,7 @@ export async function changeHarness(db: Database, options: HarnessOptions = {}):
     dmEnabled: null, services: ['fixture-app'], change: { repositories: [env.policy.current!] } } };
   if (options.policyPatch) policy.current = options.policyPatch(policy.current);
   const gate = new PolicyGate(async () => policy.current, db);
-  const store = new Store(db);
+  const store = new Store(db, Date.now, options.colleague === true);
   const keys = generateKeyPairSync('ed25519');
   const used = new Set<string>();
   const signer = new WorkerSigner(keys.privateKey);
