@@ -735,14 +735,14 @@ POST 거부·GET 대조 거부·확정 ID 보존·인가 철회·local confirm �
 - 답은 argv가 아니라 stdin으로만 넘긴다. 답이 `--`로 시작해도 플래그가 되지 않고, 설정 파일·argv·샌드박스는 답과 무관하게 같다.
 - 답을 받은 뒤 재개 전에 권한이 철회되면 `Runtime.tick`의 인가에서 `cancelled`(`authorization_revoked`)로 끝나고 재개하지 않는다.
 
-**작업 질문 바로 답 (C16, 동료 기능 스위치 켜짐).** owner가 스레드에서 보낸 일반 메시지(멘션 여부 무관, 명령·버튼 아님)는 수신 트랜잭션 안에서 대화 행을 잠근 뒤 그 대화의 열린 질문을 본다(`openTaskQuestions`: 같은 대화, 응답자와 작업 owner가 보낸 사람, 기한 전, 답을 기다리는 job). 처리기의 `sealsAnswer`가 참인 질문(CHANGE 작성 job)은 세지 않는다. 바로 답을 받는 종류는 `src/question-pick.ts`의 `DIRECT` 표이고 지금은 작업 질문뿐이다(C28이 변경 질문을 더한다).
+**작업 질문 바로 답 (C16, 동료 기능 스위치 켜짐).** owner가 스레드에서 보낸 일반 메시지(멘션 여부 무관, 명령·버튼 아님)는 수신 트랜잭션 안에서 대화 행을 잠근 뒤 그 대화의 열린 질문을 본다(`openTaskQuestions`: 같은 대화, 응답자와 작업 owner가 보낸 사람, 기한 전, 답을 기다리는 job). 바로 답을 받는 종류는 `src/question-pick.ts`의 `DIRECT` 표다. 처리기의 `sealsAnswer`가 참인 질문(CHANGE 작성 job)도 들어가지만 저장 전 봉인과 공개 표시가 붙는다(C28, §16.5 "CHANGE 질문 선택지와 다음 말 답").
 
 - 0개: 지금처럼 대화로 받는다. 기한 지난 질문만 남은 경우도 여기다.
 - 1개: 그 메시지를 `/answer`와 같은 `answerIn`으로 같은 트랜잭션에서 처리한다. 답 이벤트(`answer_event`)는 그 메시지 ID다. 대화 작업을 만들지 않고 모델을 부르지 않는다. 결과는 `/answer`와 같은 제어 문구(`controlText('answer', …)`)를 그 메시지에 답장으로 게시한다(키 `answer:<event>`). 👀는 달지 않는다. 다른 실행기 세션의 질문이면 `answerIn`의 거부(`FOREIGN_SESSION_STATUS`)가 그 안내다.
 - 2개 이상: 대화 작업도 답도 만들지 않고 "어느 질문의 답인지" 한 줄 글을 그 메시지에 답장으로 게시한다(키 `question-pick:<event>`). 본문에 질문 앞부분(60자)을 번호와 함께 싣고 버튼은 "1번 질문"처럼 번호만 단다(최대 5개, 오래된 질문부터). 버튼 이름은 7일 정리(`payload.content`만 비움)가 닿지 않아서다. 버튼마다 `controls`에 `question-pick:<UUID>` 행을 두고 값에는 ID만 둔다(메시지 이벤트, 메시지 ID, 질문, 대화, owner, 번호). custom_id는 `question-pick:<UUID>`(50자)다.
 - 버튼: 스위치 꺼짐이면 받지 않는다. 누른 사람이 그 대화 owner인지 저장 전에 보고, 같은 상호작용은 한 번만 처리한다. 대화 행 → 고르기 행 순서로 잠그고, 메시지 이벤트가 같은 대화·같은 owner 것인지 다시 본 뒤 그 질문에만 `answerIn`으로 답을 붙인다. 붙으면 그 메시지의 고르기 행을 모두 지우고 글을 결과로 바꿔 버튼을 없앤다(`UPDATE_MESSAGE`). 그사이 질문이 닫혔거나 기한이 지났으면 답을 붙이지 않고 이유만 본인에게 답한다(버튼은 남아 다른 질문을 고를 수 있다). 메시지 원문이 7일 정리로 비었으면 고르기를 끝낸다. 닫힌 질문을 가리키는 옛 고르기 행은 같은 대화에 새 고르기를 만들 때 지운다.
-- 답의 저장·보존은 `/answer`(v1)와 같다: 원문은 `events.payload.text`와 `codex_questions.answer`에 있고 둘 다 7일 정리(T27·T31)를 받는다. CHANGE 질문의 답은 바로 답 대상이 아니므로 `/answer`·`label=public | <답>` 서식과 저장 전 봉인(§16.5)이 그대로다.
-- 질문 글의 답 안내(`taskQuestionFooter`): 켜짐 판은 "이 스레드에서 답을 말해 주세요"이고 질문 ID 옮겨 적기를 안내하지 않는다. 꺼짐 판과 CHANGE 질문 글(`changeQuestionFooter`)은 질문 ID와 `/answer`를 안내한다. 머리말의 질문 ID와 "답으로 도구 실행을 승인하거나 권한을 바꿀 수는 없어요"는 모든 판에 남는다.
+- 답의 저장·보존은 `/answer`(v1)와 같다: 원문은 `events.payload.text`와 `codex_questions.answer`에 있고 둘 다 7일 정리(T27·T31)를 받는다. CHANGE 질문의 답은 원문을 `events`에 두지 않는다(§16.5).
+- 질문 글의 답 안내(`taskQuestionFooter`): 켜짐 판은 "이 스레드에서 답을 말해 주세요"이고 질문 ID 옮겨 적기를 안내하지 않는다. CHANGE 질문 글(`changeQuestionFooter`)의 켜짐 판은 버튼이나 말로 답하라고 한다(C28). 꺼짐 판은 둘 다 질문 ID와 `/answer`를 안내한다. 머리말의 질문 ID와 "답으로 도구 실행을 승인하거나 권한을 바꿀 수는 없어요"는 모든 판에 남는다.
 
 ### 작업자 Codex 설정 (할 일 4)
 
@@ -1977,9 +1977,9 @@ bwrap은 `--unshare-all --die-with-parent --new-session --cap-drop ALL --clearen
 
 **슬롯을 보는 순서.** 파드 정리는 프로세스를 가리지 않아 슬롯이 겹치면 상대 시험까지 죽인다. 그래서 슬롯은 비동기 조회가 모두 끝난 뒤에 보고 같은 틱에 잡는다. `changeVerify`의 슬롯 확보, `removeGeneration`의 정리 판단이 이 순서를 따르고, 조회 사이에 종료가 시작됐는지도 슬롯 직전에 다시 본다. 재조회(`changeVerification`)는 반대로 슬롯을 receipt보다 먼저 본다. receipt는 슬롯을 놓기 전에 쓰므로, 이 순서면 막 끝난 시험을 `absent`로 답하지 않는다.
 
-**변경 작성 v2 판 (C25).** 동료 봇 명세 §4.10 "변경 질문 줄이기"·"수정 요청"의 작업자 쪽이다. 게시 서버는 아직 옛 판만 보내고, 새 판을 보내고 결과를 쓰는 일은 C27(수정 요청)·C28(선택지)·C29(확인할 것·안내 댓글)다.
+**변경 작성 v2 판 (C25).** 동료 봇 명세 §4.10 "변경 질문 줄이기"·"수정 요청"의 작업자 쪽이다. 새 판을 보내는 일은 C28이 했고(작업자가 `change.instructions`에 `change-v2`를 알릴 때만, 아니면 옛 판. 재개는 시작 턴의 판, 세션 `capabilities.instructions`), 결과를 쓰는 일은 C27(수정 요청)·C28(선택지, §16.5)·C29(확인할 것·안내 댓글)다.
 
-- **판 목록.** `TASK_INSTRUCTIONS_REVISIONS = ['task-v1', 'change-v2']`(`src/task-contracts.ts`). v1 `/v1/task`는 `task-v1`만, v2 `/v2/task`는 둘 다 받는다. `TASK_INSTRUCTIONS_REVISION`(`task-v1`)은 게시 서버가 지금 보내는 판으로 남는다. 판 이름이 다르면 시작하지 않는다는 T18 규칙은 그대로라, `change-v2` 요청은 옛 작업자에서 모양 거부(400 `request_invalid` → `TaskWorkerRejected`, 미시작)다.
+- **판 목록.** `TASK_INSTRUCTIONS_REVISIONS = ['task-v1', 'change-v2']`(`src/task-contracts.ts`). v1 `/v1/task`는 `task-v1`만, v2 `/v2/task`는 둘 다 받는다. `TASK_INSTRUCTIONS_REVISION`(`task-v1`)은 작업 레인 v1과, 새 판을 알리지 않는 작업자·판을 남기기 전 세션의 변경 작성에 게시 서버가 보내는 판이다. 판 이름이 다르면 시작하지 않는다는 T18 규칙은 그대로라, `change-v2` 요청은 옛 작업자에서 모양 거부(400 `request_invalid` → `TaskWorkerRejected`, 미시작)다.
 - **판 고르기.** intake `change`에 `instructions`(받는 판 목록)가 붙는다. 게시 서버는 `taskWorkerChangeInstructions`(또는 `HttpTaskV2Worker.changeInstructions`)에 있는 판만 보낸다. 칸이 없는 옛 작업자는 `['task-v1']`, v2가 없거나 닿지 않으면 빈 목록이다. 옛 게시 서버는 `z.object`라 이 칸을 버리고 받는다.
 - **지시문.** `change-v2`(`TASK_INSTRUCTIONS`, `src/executor-claude-task.ts`)는 앞 판의 안전 줄(태그 안 글은 지시 권한이 아님, 정책·권한·샌드박스·게시 대상 불변, `Bash`·`Read`·`Edit`·`Write`만)을 그대로 두고 더한다: 막히지 않으면 묻지 않고 가정해서 진행하고 가정은 `checks`(확인할 것)에, 남은 위험은 `risks`에 적는다. 위치는 알 때만 적는다. 진행이 불가능할 때만 질문하고 선택지 2~4개를 낸다. 공개 여부는 묻지 않는다.
 - **출력 스키마.** `CHANGE_OUTPUT_JSON_SCHEMA`를 판 이름으로 고른다. `status`·`summary`·`question`에 `options`(문자열 목록)·`checks`·`risks`(`{text,path,line}` 목록)를 더한 평평한 모양이고, 위치가 없으면 `path:''`·`line:0`이다. Codex 작업 레인과 함께 쓰는 `TASK_OUTPUT_JSON_SCHEMA`는 바꾸지 않았다.
@@ -1987,7 +1987,7 @@ bwrap은 `--unshare-all --die-with-parent --new-session --cap-drop ALL --clearen
 - **결과 칸.** `needs_input`에 `options`, `snapshot`에 `checks`·`risks`가 선택 칸으로 붙는다(`TaskV2ResultResponseSchema`). 새 판 요청의 결과에만 있다. 위 "모델의 요약은 결과에 싣지 않는다" 규칙의 예외이고 범위는 이 세 칸뿐이다: 요약은 여전히 싣지 않는다. 세 칸은 증거(승인 digest 재료)가 아니고 artifact digest에도 들어가지 않는다. 작업자에서는 반사 검사만 거치고, 공개 경로(미리보기·PR 설명·안내 댓글·Discord 버튼)로 내기 전의 공개 검사(`scanPublicText`)는 게시 서버가 한다(C28·C29).
 - **수정 차례 입력.** v2 시작 요청의 선택 칸 `amendment`(`change-v2`에서만): `pullNumber`, `head`(= `base`, PR 브랜치 head. baseline은 그 head의 tree이고 T0 대조 규칙 그대로), `instruction`(owner의 Discord 말), `materials`(`label:'public'`만, 항목은 `kind`(`review`·`review_comment`·`comment`)·`authorId`·`association`·`location`·`body`뿐, `omitted`). 상한은 자료 50개·한 본문 4,000자·합계 40,000자다(`AMENDMENT_LIMITS`, [제안]). `boundAmendmentMaterials`가 긴 본문을 자르고 넘치면 오래된 것부터 빼며 뺀 수를 `omitted`에 남긴다. 프롬프트(`taskPrompt`)에서 brief는 `untrusted_request`, owner 지시는 `owner_instruction`, 자료는 하나마다 `review_material`(첫 줄은 작성자·위치 JSON) 태그다. 뺀 자료가 있으면 "오래된 자료 n개는 상한으로 뺐다"를 남긴다. 새 판의 울타리는 자기 닫는 태그뿐 아니라 이 태그 이름들의 여닫기·대소문자·속성 변형을 모두 지워, 자료가 `owner_instruction`을 열어 지시 자리처럼 보이지 못한다. 옛 판 프롬프트는 바이트 그대로다.
 - **port 타입(`src/change-contracts.ts`).** `AuthorResult`의 `needs_input.options`, `snapshot.checks`·`risks`, `ChangeAuthorPort.start`의 `amendment`(`ChangeAmendmentInput`)가 선택 칸으로 있다. `ClaudeChangeAuthor`는 아직 채우거나 쓰지 않는다.
-- **배포 순서와 되돌림.** 게시 서버는 옛 판만 보내므로 병합 즉시 바뀌는 동작이 없다. 게시 서버만 이 판 이전으로 되돌려도 작업자는 옛 판 요청에 옛 칸만 낸다(시험 `C25 호환`). 작업자만 되돌리면 그 작업자가 저장해 둔 새 판 결과(세 칸이 든 것)를 읽지 못하므로, 게시 서버가 새 판을 보내기 시작한 뒤(C27~C29)에는 진행 중인 CHANGE 턴을 받아 두거나 drain한 뒤 되돌린다.
+- **배포 순서와 되돌림.** C25만으로는 게시 서버가 옛 판만 보내 병합 즉시 바뀌는 동작이 없었다. C28부터 게시 서버가 새 판을 보낸다(동료 기능 스위치 밖, 운영 영향은 DECISIONS "C28 변경 질문 선택지 구현 선택"). 게시 서버만 이 판 이전으로 되돌려도 작업자는 옛 판 요청에 옛 칸만 낸다(시험 `C25 호환`). 작업자만 되돌리면 그 작업자가 저장해 둔 새 판 결과(세 칸이 든 것)를 읽지 못하므로, 게시 서버가 새 판을 보내기 시작한 뒤(C27~C29)에는 진행 중인 CHANGE 턴을 받아 두거나 drain한 뒤 되돌린다.
 
 ### 16.5 조립과 꺼짐 배포 (B5)
 
@@ -2045,6 +2045,16 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 모델의 CHANGE 질문도 스레드로 내보내기 전에 같은 검사를 거친다. 걸리면 질문 행과 outbox를 만들지 않고 턴을 `task_question_sensitive`로 실패 처리해 부모를 `blocked`로 닫으며, 스레드에는 고정 문구만 알린다. 저장소가 정책에 없을 때도 같다. 정책을 잠시 못 읽으면 아무것도 내보내지 않고 다음 바퀴에 같은 결과를 다시 본다. 이 검사는 CHANGE 경로에만 있고 `/task`의 v1 질문은 그대로다. 탐지기는 완전성 증거가 아니라 추가 방어이고, 공개 metadata 기준이라 이메일·긴 숫자 ID·사설 IP가 든 평범한 질문도 닫힌다.
 
 모델 입력은 공개 brief와 공개 label의 답뿐이고 스레드 대화·기억·다른 스레드 글을 읽는 경로가 없다. 이 답의 원문도 `events`에 두지 않는다. 수신이 저장 전에 처리기(`sealsAnswer`)에 물어 CHANGE 질문이면 빈 글로 저장하고 원문은 그 호출의 값으로만 넘긴다. 원문의 자리는 `change_request_inputs`와, 공개 답이면 재개가 읽는 `codex_questions.answer`다. v1 `/answer`와 일반 대화의 저장은 그대로다.
+
+**CHANGE 질문 선택지와 다음 말 답 (C28, 동료 기능 스위치 켜짐).** 변경 작성 판(`change-v2`) 결과의 `needs_input`은 선택지 2~4개를 함께 낸다(개수가 틀리면 작업자가 `invalid_output`). 게시 서버는 질문을 내보내기 전에 `questionRisk`로 질문과 선택지 글을 함께 `scanPublicText`에 넣고, 걸리면 위 문단처럼 질문 행·outbox 없이 `task_question_sensitive`로 닫는다. 통과하면 선택지를 질문 행(`codex_questions.options`)에 같은 트랜잭션으로 둔다. 판과 무관하게 저장하지만 질문 글과 답 경로는 스위치가 정한다.
+
+- 질문 글(켜짐): 머리말(질문 ID), 질문, 번호 붙은 선택지, "버튼을 누르거나, 이 스레드에서 답을 말해도 돼요", 승인·권한 변경이 아니라는 문장. 버튼은 선택지마다 "n번"과 "직접 답하기" 한 줄이다. custom_id는 `change-choice:<질문 ID의 ':'→'.'>.<n>`·`change-direct:<같은 값>`(100자 안)이고 선택지 글은 싣지 않는다. 선택지가 없는 질문(옛 판 세션)은 "직접 답하기"만 단다. 꺼짐 판은 지금 그대로(질문 ID와 `/answer`, 버튼 없음)다.
+- 선택지 버튼: 스위치 꺼짐이면 받지 않는다. 누른 사람이 대화 owner인지 저장 전에 보고 같은 상호작용은 한 번만 처리한다. 질문이 같은 대화의 CHANGE 질문이고 응답자가 누른 사람이며 열려 있을 때만, 질문 행의 그 순번 선택지를 `label=public | <선택지>`로 `answerIn`(= `/answer`의 `ChangeAnswerGuard`)에 넘긴다. 기한·답 기다림·중복은 `answerIn`이 본다. 답이 붙으면 응답으로 질문 글을 바꿔 버튼을 없앤다(`UPDATE_MESSAGE`). 그 밖(닫힌 질문, 다른 선택지·같은 버튼 다시 누르기, 다른 대화, 기한 지남)은 본인만 보는 응답이고 답을 쓰지 않는다.
+- "직접 답하기": 누른 owner에게만 "이 스레드에 답을 말해 주세요"를 답하고 상태를 바꾸지 않는다.
+- 다음 말: 작업 질문 바로 답(§12 "질문 계약")과 같은 수신 분기이고 `DIRECT`에 CHANGE 질문이 들어간다. 수신은 저장 전에 잠그지 않고 이 말이 CHANGE 질문의 답이 될 수 있는지(`sealsNextMessage`) 보고 참이면 빈 글로 저장한다. 대화 행을 잠근 뒤 다시 세어, 열린 질문이 이 CHANGE 질문 하나면 원문을 `label=public | <말>`로 `answerIn`에 넘긴다. 대화 작업·모델 호출이 없다. 그사이 질문이 닫혀 답이 되지 않으면 일반 대화라 원문을 되돌리고, 그사이 CHANGE 질문이 열렸으면 그 자리에서 원문을 비운다. 봉인한 말은 history gap 중에도 복구 버퍼에 두지 않는다(재생이 `events`의 원문을 읽기 때문). 답이 되지 않으면 원문을 되돌린 뒤 버퍼에 둔다.
+- 열린 질문이 둘 이상이고 CHANGE 질문이 끼어 있으면 그 말은 봉인한 채 답으로 쓰지 않는다. C16 고르기 버튼을 단 "어느 질문에 답할지 먼저 골라 주세요" 글을 내고, 누르면 그 질문을 이 대화의 다음 말 대상(`controls`의 `question-chosen:<대화>`, 값은 질문 ID·owner)으로 적는다. 대상이 열려 있는 동안 owner의 다음 말이 그 질문의 답이다.
+- 공개 검사에 걸린 답은 위 `/answer` 규칙 그대로다(작성 모델에 넘기지 않고 출처를 private로 올려 기록하고 부모를 막는다). 어느 글도 공개 여부를 묻지 않는다. 처음 게시 전 질문의 답은 게시 승인 때 owner가 미리보기로 본다.
+- 보존: 선택지는 질문 원문과 같은 7일 정리(`purgeExpiredQuestionPrompts`)로 NULL이 되고 digest(`options_sha256`)가 남는다. 답 원문의 자리는 위 문단 그대로(`change_request_inputs`, `codex_questions.answer`)다.
 
 **단계별 복구.** 부모의 다음 할 일은 DB의 phase가 정한다. 메모리에는 재시도 시각만 있다. 일시 오류는 부모를 닫지 않고 간격을 5초에서 10분까지 늘려 다시 본다.
 

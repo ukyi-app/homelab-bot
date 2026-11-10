@@ -7,7 +7,7 @@ import { REPO } from './change-github-fake.js';
 import { OTHER_THREAD, REQUEST_TEXT, THREAD, WRITE_STEP, changeHarness } from './change-assembly-harness.js';
 import type { Harness } from './change-assembly-harness.js';
 import { OWNER } from './change-store-fixture.js';
-import { CHANGE_QUESTION_TEXT } from '../src/change-question.js';
+import { CHANGE_QUESTION_TEXT, changeChoiceId, changeDirectId } from '../src/change-question.js';
 import { localDatabase } from './helpers.js';
 import type { Step } from './task-worker-harness.js';
 
@@ -272,5 +272,22 @@ test('C28 꺼짐: 변경 질문이 열려 있어도 다음 말은 답이 아니�
     assert.deepEqual(await questionRow(h, question), { state: 'open', answer: null });
     assert.equal(await eventText(h, message), '그냥 한 말이에요');
     assert.equal(await chatJobs(h), before + 1);
+    // 꺼짐에서는 버튼을 만들지 않으므로 같은 모양의 상호작용도 받지 않는다.
+    await assert.rejects(press(h, changeChoiceId(question, 1)));
+    await assert.rejects(press(h, changeDirectId(question)));
+    assert.deepEqual(await questionRow(h, question), { state: 'open', answer: null });
+  });
+});
+
+test('C28 다음 말(history gap 중): 봉인한 말은 복구 버퍼에 두지 않고 바로 답 경로로 보내 원문 없이 답이 된다', async () => {
+  await withHarness({ changeV2: true, colleague: true, steps: [CHOICE_QUESTION, V2_WRITE] }, async h => {
+    await opened(h);
+    const { question } = await toQuestion(h);
+    // 재연결 뒤 누락 복구 전이다. 시계 대신 저장된 대화 상태를 바꾼다.
+    await h.db.query('UPDATE conversations SET gap=true WHERE id=$1', [h.store.scopeId(THREAD)]);
+    const message = await say(h, OPTIONS[0]!);
+    assert.deepEqual(await questionRow(h, question), { state: 'answered', answer: OPTIONS[0] });
+    const row = (await h.db.query<{ text: string; buffered: boolean }>(`SELECT payload->>'text' AS text,buffered FROM events WHERE delivery_id=$1`, [message])).rows[0]!;
+    assert.deepEqual(row, { text: '', buffered: false });
   });
 });
