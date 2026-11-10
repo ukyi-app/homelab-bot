@@ -12,7 +12,7 @@ import type { Scope } from '../src/contracts.js';
 import { ArchiveError, MODEL_OMITTED_MAX, readArchive, REVIEW_INSTRUCTIONS, REVIEW_INSTRUCTIONS_V2, ReviewWorker, unifiedDiff } from '../src/review-input.js';
 import type { ArchiveFetcher, ReviewerInput, ReviewerModel, ReviewTask } from '../src/review-input.js';
 import { GitHubError, GitHubIngress, githubWebhook, RestrictedGitHub, restrictGitHubWrite, ReviewPolicySource,
-  ReviewPublisher, ReviewQueue, ReviewReconciler, ReviewRuntime, reviewMarker } from '../src/review.js';
+  ReviewPublisher, ReviewQueue, ReviewReconciler, ReviewRuntime, reviewMarker, reviewRevision } from '../src/review.js';
 import type { GitHubReader, GitHubTransport, GitHubWrite, ReviewPolicy, ReviewResult } from '../src/review.js';
 import { archiveContract } from '../src/worker.js';
 import { HttpReviewWorker, reviewWorkerServer } from '../src/review-http.js';
@@ -353,6 +353,40 @@ test('AC-13 PR 리뷰 말투: 심각도·한 문단 지적·승인·병합 아�
   for (const text of [FINDING.title, FINDING.condition, FINDING.impact, second.title, second.suggestion, question, '나눗셈 경계만']) {
     assert.ok(!summary.includes(text), text);
   }
+});
+test('AC-13 리뷰 지시문 v1→v2 배포: 게시 대기 결과는 새 렌더로 게시, 같은 head에 결과가 있는 PR은 자동 재리뷰 없음, 모델 전 작업만 새 세대', async () => {
+  const current = r.source.current.bind(r.source);
+  // 배포 전 서버: 같은 정책에 v1 지시문으로 만든 세대 revision을 쓴다.
+  r.source.current = async () => { const context = await current(); return { ...context, revision: reviewRevision(context.review, REVIEW_INSTRUCTIONS) }; };
+  const legacy = reviewRevision(r.policy(), REVIEW_INSTRUCTIONS);
+  const prN = (n: number) => pull({ number: n });
+  for (const n of [7, 8, 9]) r.gh.pulls.set(n, prN(n));
+  await hook('pull_request', prEvent('opened', prN(7))); await r.runtime.tick(); await r.publisher.deliver();
+  await hook('pull_request', prEvent('opened', prN(8))); await r.runtime.tick();
+  await hook('pull_request', prEvent('opened', prN(9)));
+  assert.deepEqual((await deliveries()).map(d => [d.pr_number, d.state, d.policy_revision]), [[7, 'sent', legacy], [8, 'pending', legacy]]);
+  const generations = async () => (await database.db.query<{ pr_number: number; state: string; wait_reason: string | null; policy_revision: string }>(
+    'SELECT p.pr_number,j.state,j.wait_reason,p.policy_revision FROM pr_reviews p JOIN jobs j ON j.id=p.job_id ORDER BY j.created_at,p.pr_number')).rows
+    .map(g => [g.pr_number, g.state, g.wait_reason, g.policy_revision === legacy ? 'v1' : 'v2']);
+
+  r.source.current = current;
+  // 배포 전에 저장돼 게시를 기다리던 결과는 버리지 않고 새 렌더로 나간다.
+  await r.publisher.deliver();
+  assert.deepEqual(r.gh.writes.map(w => w.path), [7, 8].map(n => `/repos/${REPO.fullName}/pulls/${n}/reviews`));
+  assert.equal(r.gh.writes[1]!.body.body.split('\n')[1], '참고용 자동 리뷰예요. 승인·병합 판단이 아니고 안전을 보증하지도 않아요.');
+  assert.match(r.gh.writes[1]!.body.body, /^\*\*\[P1\] 0으로 나누기\*\* · `src\/app\.ts`:2$/m);
+  // 재조정은 같은 head에 결과가 이미 있는 PR(7·8)을 지시문 변경만으로 다시 리뷰하지 않는다. 모델을 아직 부르지 않은 PR 9만 새 세대다.
+  r.gh.open = [7, 8, 9].map(prN);
+  assert.deepEqual(await r.reconciler.run(), { admitted: 1, limited: false });
+  assert.deepEqual(await generations(), [[7, 'succeeded', null, 'v1'], [8, 'succeeded', null, 'v1'], [9, 'superseded', 'policy_changed', 'v1'],
+    [9, 'queued', null, 'v2']]);
+  assert.equal((await hook('pull_request', prEvent('ready_for_review', prN(8)))).outcome, 'instructions_only');
+  await r.runtime.tick(); await r.publisher.deliver();
+  assert.equal(r.inputs.at(-1)!.instructions, REVIEW_INSTRUCTIONS_V2);
+  assert.equal(r.gh.writes.length, 3);
+  assert.deepEqual(await r.reconciler.run(), { admitted: 0, limited: false });
+  // 명시 요청(댓글 리뷰 명령)은 새 지시문으로 다시 리뷰한다.
+  assert.equal((await hook('issue_comment', commentEvent())).outcome, 'queued');
 });
 test('REVIEW-04 게시 상한이 정해지지 않았거나 넘으면 자동 게시를 거부', async () => {
   r.policy().publish = null;

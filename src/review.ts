@@ -9,7 +9,7 @@ import { DRAIN_MS } from './runtime.js';
 import type { Store } from './store.js';
 import type { CancelRequest, WorkerSigner } from './worker.js';
 import { archiveContract } from './worker.js';
-import { CoverageSchema, FindingSchema, InputLimitsSchema, REVIEW_INSTRUCTIONS_V2, ReviewOutputSchema, ReviewTaskSchema,
+import { CoverageSchema, FindingSchema, InputLimitsSchema, REVIEW_INSTRUCTIONS, REVIEW_INSTRUCTIONS_V2, ReviewOutputSchema, ReviewTaskSchema,
   SECRET_PATTERNS, reviewOutcome } from './review-input.js';
 import type { Change, Coverage, ReviewOutput, ReviewTask, ReviewWorkerResult } from './review-input.js';
 
@@ -43,6 +43,12 @@ export const SERVER_REVIEW_INSTRUCTIONS = REVIEW_INSTRUCTIONS_V2;
 export function reviewRevision(review: ReviewPolicy, instructions: string = SERVER_REVIEW_INSTRUCTIONS): string {
   return `rp-${createHash('sha256').update(JSON.stringify([instructions, review.input, review.comparison])).digest('hex').slice(0, 16)}`;
 }
+// 출력 스키마가 같고 말투만 다른 지시문 판들. 이 판끼리만 다른 revision(입력 상한·비교 기준이 같음)으로 이미 나온 결과는 버리지 않는다.
+// 게시 대기 결과는 지금 렌더로 게시하고, 같은 head에 그런 결과가 있으면 자동 이벤트로 다시 리뷰하지 않는다(DECISIONS "C12 PR 리뷰 말투").
+// 모델을 아직 부르지 않은 작업은 이 규칙과 무관하게 policy_changed로 닫고 새 지시문으로 새 세대를 만든다.
+const VOICE_ONLY_INSTRUCTIONS = Object.freeze([REVIEW_INSTRUCTIONS, REVIEW_INSTRUCTIONS_V2]);
+const sameReviewContent = (revision: string, context: ReviewContext) =>
+  revision === context.revision || VOICE_ONLY_INSTRUCTIONS.some(instructions => reviewRevision(context.review, instructions) === revision);
 // 리뷰 정책이 없거나 비교 기준을 정하지 않은 값(comparison null)이면 새 요청만 받지 않는다. 철회(Denied)가 아니라
 // 일시 상태로 다뤄, 대기 작업과 미게시 결과를 지우지 않고 다시 켜질 때까지 기다린다.
 export class ReviewDisabled extends PolicyUnavailable {}
@@ -151,7 +157,8 @@ export interface ReviewRow {
   trigger: string; pr_updated_at: string; review_outcome: string | null; result: ReviewResult | null;
   superseded_reason: string | null; superseded_at: string | null;
 }
-type Admission = { outcome: 'queued' | 'requeued' | 'resumed' | 'duplicate_generation' | 'stale_event' | 'base_moved'; key: string; job?: string };
+type Admission = { outcome: 'queued' | 'requeued' | 'resumed' | 'duplicate_generation' | 'stale_event' | 'base_moved' | 'instructions_only';
+  key: string; job?: string };
 export const generationKey = (repo: number, pr: number, head: string, comparison: string, policy: string) =>
   `github:review:${repo}:${pr}:${head}:${comparison}:${policy}`;
 const json = (value: unknown) => JSON.stringify(value);
@@ -245,6 +252,15 @@ export class ReviewQueue {
       await tx.query(`UPDATE pr_reviews SET review_outcome=NULL,result=NULL,superseded_at=NULL,superseded_reason=NULL,pr_updated_at=$2,
         trigger=$3,defer_count=0 WHERE job_id=$1`, [existing.job_id, pr.updatedAt, trigger]);
       return { outcome: 'requeued', key, job: existing.job_id };
+    }
+    // 지시문 판만 바뀌었고 같은 head·비교 기준의 결과가 게시됐거나 게시를 기다리면 자동 이벤트로는 다시 리뷰하지 않는다.
+    // 배포 순간 열린 PR마다 새 세대가 생겨 모델 호출이 몰리는 것을 막는다. 댓글 명시 요청과 base 재지정은 늘 새 세대다.
+    if (trigger !== 'comment' && trigger !== 'retarget') {
+      const kept = (await tx.query<{ policy_revision: string }>(`SELECT DISTINCT p.policy_revision FROM pr_reviews p
+        WHERE p.repo_id=$1 AND p.pr_number=$2 AND p.head_sha=$3 AND p.comparison_revision=$4 AND p.policy_revision<>$5
+        AND EXISTS (SELECT 1 FROM review_deliveries d WHERE d.job_id=p.job_id AND d.state IN ('pending','sending','sent','unknown'))`,
+      [repo.id, pr.number, pr.head.sha, comparison, context.revision])).rows;
+      if (kept.some(row => sameReviewContent(row.policy_revision, context))) return { outcome: 'instructions_only', key };
     }
     const baseOnly = latest && latest.head_sha === pr.head.sha && latest.comparison_revision !== comparison
       && latest.policy_revision === context.revision;
@@ -891,7 +907,7 @@ export class ReviewPublisher {
     const repo = context.review.repositories.find(r => String(r.id) === String(row.repo_id) && r.fullName === row.repo_full_name
       && String(r.installationId) === String(saved?.installation_id));
     if (!repo) { await this.state(row, 'blocked', 'authorization_revoked'); return; }
-    if (context.revision !== row.policy_revision) { await this.state(row, 'superseded', 'policy_changed'); return; }
+    if (!sameReviewContent(row.policy_revision, context)) { await this.state(row, 'superseded', 'policy_changed'); return; }
     if (!context.review.publish) { await this.state(row, 'blocked', 'publish_limits_unset'); return; }
     // 내부 표식 목록은 결과 저장 뒤에도 바뀔 수 있어 게시 직전 현재 정책으로 다시 분류한다(DATA-01).
     const stored = saved?.result;
