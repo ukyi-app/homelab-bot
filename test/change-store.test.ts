@@ -969,8 +969,8 @@ test('C31 고치기 DB 방어: 코드를 거치지 않고 되돌리거나 증거
 
 const HEAD = git('h');
 const amend = (s: Awaited<ReturnType<typeof setup>>, changeId: string, overrides: Partial<Parameters<ChangeStore['requestAmendment']>[0]> = {}) => s.store.requestAmendment({
-  changeId, generation: 1, eventId: newEvent(), actor: OWNER, pullNumber: 7, head: HEAD, materials: ['review:11', 'comment:12'], instruction: '리뷰 반영해 줘',
-  label: 'public', ...overrides });
+  changeId, generation: 1, eventId: newEvent(), actor: OWNER, pullNumber: 7, head: HEAD, materials: ['review:11', 'comment:12'], materialsDigest: 'd'.repeat(64),
+  instruction: '리뷰 반영해 줘', label: 'public', ...overrides });
 
 test('C27 수정 차례: 확정된 요청은 대기열에 들고 proposed에서 하나씩 열린다. 끝나면 proposed로 돌아오고 다음 차례가 열린다', async () => {
   const s = await setup();
@@ -1014,6 +1014,7 @@ test('C27 수정 요청 거부: 11번째·병합·닫힌·남의 change·다른 
     failure(await amend(s, other.id, { actor: 'someone-else' }), 'owner_mismatch');
     failure(await amend(s, other.id, { pullNumber: 8 }), 'pull_mismatch');
     failure(await amend(s, other.id, { materials: ['issue:1'] }), 'invalid_input');
+    failure(await amend(s, other.id, { materialsDigest: 'D'.repeat(64) }), 'invalid_input');
     failure(await amend(s, other.id, { label: 'unknown' }), 'label_blocked');
     const once = newEvent();
     ok(await amend(s, other.id, { eventId: once }));

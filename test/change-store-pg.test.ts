@@ -255,7 +255,7 @@ test('C27 실제 PostgreSQL: 수정 요청이 동시에 확정돼도 차례 번�
     const r = await driveTo(d.store, 'proposed');
     const key = { changeId: r.id, generation: 1 };
     const request = () => d.store.requestAmendment({ ...key, eventId: newEvent(), actor: OWNER, pullNumber: 7, head: git('h'), materials: ['comment:1'],
-      instruction: '리뷰 반영', label: 'public' });
+      materialsDigest: 'd'.repeat(64), instruction: '리뷰 반영', label: 'public' });
     const first = await parallel(request, 2);
     assert.equal(wins(first), 2);
     const started = await parallel(() => d.store.startAmendment(key));

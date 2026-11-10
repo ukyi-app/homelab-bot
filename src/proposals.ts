@@ -422,10 +422,11 @@ const changeCancelHandler: RunHandler = {
 };
 
 // 변경 PR 수정(C27, DECISIONS "동료 봇 전환" 16). 대상은 이 스레드에서 owner가 낸 변경(변경 ID나 PR 번호)이고 그 PR이 열려 있어야 한다.
-// 지시는 owner 원문(멘션 표기 제거)이고, 확인 때 읽은 PR 리뷰·댓글 ID 묶음과 PR head를 값으로 묶는다. 버튼 때 원문이 바뀌거나 지워졌으면 실행하지 않는다.
+// 지시는 owner 원문(멘션 표기 제거)이고, 확인 때 읽은 PR 리뷰·댓글 ID 묶음과 그 글의 digest, PR head를 값으로 묶는다. 버튼 때 원문이 바뀌거나 지워졌으면 실행하지 않는다.
+// 리뷰·댓글 본문은 값에 넣지 않는다. 차례를 시작할 때 다시 읽은 글이 이 digest와 다르면 런타임이 작성 전에 닫는다.
 // 병합·닫힌 PR과 상한에 닿은 변경은 확인 글 없이 거절 한 줄로 답한다. 남의 변경은 존재를 알리지 않고 버린다.
-interface AmendValue { changeId: string; generation: number; pullNumber: number; head: string; materials: string[] }
-const amendContent = (instruction: string, value: AmendValue) => JSON.stringify([instruction, value.changeId, value.generation, value.pullNumber, value.head, [...value.materials].sort()]);
+interface AmendValue { changeId: string; generation: number; pullNumber: number; head: string; materials: string[]; materialsDigest: string }
+const amendContent = (instruction: string, value: AmendValue) => JSON.stringify([instruction, value.changeId, value.generation, value.pullNumber, value.head, [...value.materials].sort(), value.materialsDigest]);
 const parseAmendValue = (raw: string | null): AmendValue | undefined => {
   try { return raw ? JSON.parse(raw) as AmendValue : undefined; } catch { return undefined; }
 };
@@ -442,7 +443,7 @@ const changeAmendHandler: RunHandler = {
       if (found.reason === 'not_visible') return;
       return { refusal: found.reason === 'limit' ? AMENDMENT_REQUEST_TEXT.limit(CHANGE_AMENDMENT.maxRounds) : AMENDMENT_REQUEST_TEXT[found.reason] };
     }
-    const value: AmendValue = { changeId: found.changeId, generation: found.generation, pullNumber: found.pullNumber, head: found.head, materials: found.materials };
+    const value: AmendValue = { changeId: found.changeId, generation: found.generation, pullNumber: found.pullNumber, head: found.head, materials: found.materials, materialsDigest: found.materialsDigest };
     const question = AMENDMENT_REQUEST_TEXT.question(found.repository, found.pullNumber, found.materials.length);
     return { target: found.changeId, content: amendContent(instruction, value), value: JSON.stringify(value), sourceEvent: job.event_id, question, plainQuestion: question };
   },

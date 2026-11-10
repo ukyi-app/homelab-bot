@@ -31,6 +31,7 @@ $$;
 -- 수정 요청 하나가 차례 하나다. 확정된 요청은 queued로 들어가고 한 번에 하나만 running이다. 상한은 코드 CHANGE_AMENDMENT.maxRounds와 같고
 -- 대기열·실패한 차례도 센다. 지시 원문은 change_request_inputs의 같은 event_id 행이다(공개 경로가 읽지 않는 표, 7일 정리 대상).
 -- materials는 확인 때 센 PR 리뷰·리뷰 댓글·대화 댓글 ID 묶음이다. 실행은 이 묶음의 글만 자료로 쓰고 그 뒤 글은 다음 차례 몫이다.
+-- materials_digest는 확인 때 읽은 그 글들(ID·종류·작성자·관계·위치·본문)의 digest다. 원문은 두지 않는다. 시작 때 다시 읽은 글이 다르면 작성 전에 닫는다.
 -- base_commit·base_tree는 차례를 시작할 때 다시 읽은 PR head와 그 tree이고 작성의 base다. 결과·묶음 칸은 한 번 정해지면 바뀌지 않는다.
 CREATE TABLE IF NOT EXISTS change_amendments (
   change_id text NOT NULL,

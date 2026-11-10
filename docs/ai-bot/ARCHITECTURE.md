@@ -1713,7 +1713,7 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 
 **게시 뒤 수정 차례(C27).** owner가 Discord에서 봇 PR 수정을 확정하면 차례 하나가 생긴다. generation을 올리지 않는다. 지금 계약은 브랜치·artifact·시험·리뷰·승인·effect가 (change, generation)에 묶이고 새 generation은 새 브랜치에서 처음부터라 같은 PR 브랜치를 쓸 수 없기 때문이다. 그래서 차례는 (change, generation, round) 키를 하나 더 두고, 브랜치·승인 대상은 그 generation의 것 그대로다. 처음 게시의 승인 digest 규칙(generation마다 승인 대상 하나)과 표는 바꾸지 않는다.
 
-- **대기열과 상한.** 확정된 요청은 `change_amendments`에 queued로 들어간다(`requestAmendment`, 부모가 proposed·amending일 때만). 한 generation의 차례는 대기열·실패한 차례까지 `CHANGE_AMENDMENT.maxRounds`(10)번이고 11번째는 `amendment_limit`이다. DB `round` CHECK(1~10)가 같은 값이다. running은 change당 하나(부분 unique 인덱스)이고 부모를 잠가 동시 확정에도 차례 번호가 겹치지 않는다. 지시 원문은 `change_request_inputs`(label `public`, 7일 정리 대상)이고 차례 행에는 확인 때 센 PR 리뷰·리뷰 댓글·대화 댓글 ID 묶음과 PR head만 있다.
+- **대기열과 상한.** 확정된 요청은 `change_amendments`에 queued로 들어간다(`requestAmendment`, 부모가 proposed·amending일 때만). 한 generation의 차례는 대기열·실패한 차례까지 `CHANGE_AMENDMENT.maxRounds`(10)번이고 11번째는 `amendment_limit`이다. DB `round` CHECK(1~10)가 같은 값이다. running은 change당 하나(부분 unique 인덱스)이고 부모를 잠가 동시 확정에도 차례 번호가 겹치지 않는다. 지시 원문은 `change_request_inputs`(label `public`, 7일 정리 대상)이고 차례 행에는 확인 때 센 PR 리뷰·리뷰 댓글·대화 댓글 ID 묶음, 그 글들의 digest(`materials_digest`, 원문 없음), PR head만 있다. 차례를 시작할 때 그 ID의 글을 다시 읽어 digest가 다르면(고쳐짐·지워짐) 작성 claim·모델 호출 전에 `materials_changed`로 닫는다. 확인 뒤 달린 글은 자료에도 대조에도 들지 않는다.
 - **대상.** 모델 대상은 변경 ID나 PR 번호(`#n`·`n`·PR 링크)다. PR 링크면 링크의 저장소(정책 저장소 목록과 대소문자 무시 대조)와 번호를 함께 맞추고, 정책에 없는 저장소의 링크는 고르지 않는다. 확인 글은 "<저장소> PR #n에 …"로 저장소를 보인다.
 - **시작.** 런타임은 proposed 바퀴마다 대기열을 보고 `startAmendment`로 연다. 동료 기능 스위치가 꺼져 있거나 자료 읽기 포트가 없으면 열지 않는다(돌고 있는 차례는 끝까지 간다).
 - **base.** 차례를 시작하면 PR 브랜치 head를 다시 읽는다. head가 마지막으로 확정한 수정 커밋(없으면 처음 게시의 head)과 같고 확인 때의 head가 이 change가 올린 커밋 사슬(처음 게시 head와 확정된 수정 커밋들) 위에 있으면 그 head와 tree를 차례 base로 고정한다(`pinAmendmentBase`). 그래서 대기열의 요청은 앞 차례 커밋 위에서 `head_changed` 없이 이어지고, 사람 push 뒤에는 커밋 없이 `head_changed`로 닫힌다.
@@ -1740,7 +1740,7 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 | `change_approvals` | `event_id` unique, 살아 있는 승인 generation당 하나 | 승인과 무효화 |
 | `change_delivery_effects` | `(change_id, generation, stage)` | 게시 effect |
 | `change_deployments` | 위 키 | H, M, K, D, 관측 시각, 상태 |
-| `change_amendments` | `(change_id, generation, round)`, `event_id` unique | 수정 차례(C27). 상태, 지시 event·label, PR 번호, 확인 때 head·ID 묶음, 차례 base·묶음 칸, 커밋 SHA, 실패 사유 |
+| `change_amendments` | `(change_id, generation, round)`, `event_id` unique | 수정 차례(C27). 상태, 지시 event·label, PR 번호, 확인 때 head·ID 묶음·자료 digest, 차례 base·묶음 칸, 커밋 SHA, 실패 사유 |
 | `change_amendment_artifacts`, `change_amendment_artifact_files` | 위 키, 위 키+`path` | 차례 manifest·patch·바이트, 확인할 것·남은 위험 |
 | `change_amendment_verifications`, `change_amendment_reviews` | 위 키+`command_id`, 위 키 | 차례 시험·리뷰 receipt. 리뷰는 그 차례 자식 job만 |
 | `change_amendment_effects` | 위 키+`stage` | 차례 게시 effect(blob·tree·commit·ref). 승인 digest 대신 차례 조건 |

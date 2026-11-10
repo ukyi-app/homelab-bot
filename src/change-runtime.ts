@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { changeNextGeneration, changeRestart } from './change-advice.js';
 import { evaluateCi, readCiSnapshot } from './change-ci-policy.js';
-import { CHANGE_SELF_FIX, isTerminalPhase, labelAllowsAuthorInput, ReasonCodeSchema } from './change-contracts.js';
+import { amendmentMaterialsDigest, CHANGE_SELF_FIX, isTerminalPhase, labelAllowsAuthorInput, ReasonCodeSchema } from './change-contracts.js';
 import { ChangeGuidance, guidanceLimit, notesApproved, readChangeNotes, recordChangeNotes } from './change-guidance.js';
 import { noteLine, scanPublicText } from './change-publication.js';
 import { ChangeReviewFailed, ChangeReviewRejected, selfFixable } from './change-review.js';
@@ -10,7 +10,7 @@ import { DEPLOYMENT_POLL, DeploymentTargetError, deploymentPollStep, describeDep
 import { compilePathPolicy, taskPathRules } from './change-policy.js';
 import type { ChangeRepositoryPolicy } from './change-policy.js';
 import { discussionMaterials, parseChangeRequest, PUBLISH_TEXT, publishButton } from './change-commands.js';
-import type { AmendmentDiscussionReader } from './change-commands.js';
+import type { AmendmentDiscussionReader, AmendmentMaterialItem } from './change-commands.js';
 import type { ChangePublisher } from './change-publisher.js';
 import type { ChangeReviewService } from './change-review.js';
 import type { AmendmentRound, ChangePrivateInputs, ChangeRequest, ChangeStore } from './change-store.js';
@@ -75,6 +75,7 @@ const AMENDMENT_REASON: Readonly<Record<string, string>> = Object.freeze({
   worker_unsupported: '작업자가 아직 수정 요청을 받지 못하는 버전이에요',
   input_purged: '보존 기간이 지나 요청 내용을 지웠어요',
   policy_changed: '그 사이 정책이 바뀌었어요. 새로 변경을 요청해 주세요',
+  materials_changed: '확인한 뒤로 반영할 PR 리뷰·댓글이 고쳐지거나 지워졌어요. 지금 글을 보고 다시 부탁해 주세요',
   owner_cancelled: '취소했어요',
 });
 export const AMENDMENT_TEXT = Object.freeze({
@@ -824,15 +825,18 @@ export class ChangeRuntime {
     const policy = await this.deps.policy(request.repoId);
     if (!policy) return this.failAmendment(request, round, 'policy_revoked');
     if (policy.revision !== request.policyRevision) return this.failAmendment(request, round, 'policy_changed');
-    let materials: ReviewMaterial[];
+    let items: AmendmentMaterialItem[];
     try {
       const wanted = new Set(round.materials);
-      // 확인 때 센 ID 묶음의 글만 쓴다. 그 뒤에 달린 글은 다음 차례 몫이고, 그사이 지워진 글은 빠진다.
-      materials = discussionMaterials(await this.deps.discussion!({ repository: policy.fullName, pr: round.pullNumber })).filter(item => wanted.has(item.id)).map(item => item.material);
+      // 확인 때 센 ID 묶음의 글만 쓴다. 그 뒤에 달린 글(앞 차례의 안내 리뷰 포함)은 묶음 밖이라 자료에 들지 않고 다음 차례 몫이다.
+      items = discussionMaterials(await this.deps.discussion!({ repository: policy.fullName, pr: round.pullNumber })).filter(item => wanted.has(item.id));
     } catch (error) {
       this.deps.log('change_amendment_materials_failed', errorInfo(error));
       throw error;
     }
+    // 묶음 안의 글이 확인 뒤 고쳐지거나 지워졌으면 owner가 보지 않은 피드백이다. 작업 claim·모델 호출 전에 닫아 커밋이 생기지 않게 한다.
+    if (amendmentMaterialsDigest(items) !== round.materialsDigest) return this.failAmendment(request, round, 'materials_changed');
+    const materials: ReviewMaterial[] = items.map(item => item.material);
     if (child.state === 'queued') {
       if (!this.deps.intakeOpen()) return false;
       if (!await this.deps.store.claimChangeAuthor(child.id)) return false;

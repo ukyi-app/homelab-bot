@@ -1,7 +1,7 @@
 import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AMENDMENT_REQUEST_TEXT, discussionMaterials } from '../src/change-commands.js';
-import { CHANGE_AMENDMENT } from '../src/change-contracts.js';
+import { amendmentMaterialsDigest, CHANGE_AMENDMENT } from '../src/change-contracts.js';
 import { AMENDMENT_TEXT } from '../src/change-runtime.js';
 import { ChatReplySchema, PROPOSAL_RUN_ACTIONS } from '../src/contracts.js';
 import type { PullDiscussion } from '../src/github-review-io.js';
@@ -63,6 +63,10 @@ test('C27 수정 요청 확인: "PR #n에 리뷰 댓글 k개를 반영해서 수
   assert.equal(body(a.buttons().content), AMENDMENT_REQUEST_TEXT.question(REPO.fullName, 7, 3));
   assert.deepEqual(reads, [{ repository: REPO.fullName, pr: 7 }]);
   assert.equal((await rounds(id)).length, 0, '누르기 전에는 접수하지 않는다');
+  // 확인 글을 만들 때 읽은 글의 digest가 제안 값에 묶인다. 본문은 값에 없다(값은 누른 뒤 비워진다).
+  const pending = (await a.proposals()).at(-1)!;
+  assert.equal((JSON.parse(pending.value!) as { materialsDigest: string }).materialsDigest, amendmentMaterialsDigest(discussionMaterials(discussion())));
+  assert.ok(!pending.value!.includes('상수를 바꿔 주세요'));
   await a.press(a.buttons().ids[0]!);
   const [round] = await rounds(id);
   assert.deepEqual([round!.round, round!.state, Number(round!.pull_number), round!.confirmed_head], [1, 'queued', 7, git('h')]);
@@ -70,6 +74,8 @@ test('C27 수정 요청 확인: "PR #n에 리뷰 댓글 k개를 반영해서 수
   assert.deepEqual(round!.materials, ['review_comment:33', 'review:31', 'comment:34']);
   const proposal = (await a.proposals()).at(-1)!;
   assert.equal(round!.event_id, `proposal:${proposal.id}`);
+  const digest = (await database.db.query<{ materials_digest: string }>('SELECT materials_digest FROM change_amendments WHERE event_id=$1', [round!.event_id])).rows[0]!.materials_digest;
+  assert.equal(digest, amendmentMaterialsDigest(discussionMaterials(discussion())));
   const instruction = (await database.db.query<{ text: string; label: string }>('SELECT text,label FROM change_request_inputs WHERE event_id=$1', [round!.event_id])).rows[0]!;
   assert.deepEqual([instruction.text, instruction.label], ['PR 7에 리뷰 반영해 줘', 'public']);
   assert.equal(String(a.lastCallback()!.data.content), AMENDMENT_REQUEST_TEXT.accepted(1));
@@ -112,7 +118,7 @@ test('C27 수정 요청 거절: 병합·닫힌 PR과 상한에 닿은 변경은 
   const id = await published(a);
   for (let i = 0; i < CHANGE_AMENDMENT.maxRounds; i++) {
     ok(await a.changeStore.requestAmendment({ changeId: id, generation: 1, eventId: `limit-${i}`, actor: (await a.changeStore.get(id) as { value: { ownerId: string } }).value.ownerId,
-      pullNumber: 7, head: git('h'), materials: [], instruction: '반영', label: 'public' }));
+      pullNumber: 7, head: git('h'), materials: [], materialsDigest: amendmentMaterialsDigest([]), instruction: '반영', label: 'public' }));
   }
   await a.speak(message(), 'PR 7 고쳐 줘', { action: 'change_amend', target: '#7', content: null });
   assert.equal(a.buttons().posted.length, 0, '확인 글이 없다');

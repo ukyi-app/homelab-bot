@@ -164,9 +164,13 @@ export const evidenceBundleDigest = (bundle: EvidenceBundle): string => domainDi
 // 수정 차례의 증거 묶음. 묶음 8개 필드는 처음 게시와 같은 모양이고(baseCommit은 차례를 시작할 때 읽은 PR head) 차례 번호를 함께 묶는다.
 // domain이 달라 처음 게시의 묶음 digest·승인 digest 재료로 쓰이지 못한다.
 export const amendmentEvidenceDigest = (round: number, bundle: EvidenceBundle): string => domainDigest('change-amendment-evidence/v1', { round, bundle });
-// 수정 요청 확인 때 센 PR 리뷰·리뷰 댓글·대화 댓글 ID 묶음(`review:<id>`·`review_comment:<id>`·`comment:<id>`). 순서와 무관하다.
+// 수정 요청 확인 때 센 PR 리뷰·리뷰 댓글·대화 댓글 ID 묶음(`review:<id>`·`review_comment:<id>`·`comment:<id>`).
 export const AMENDMENT_MATERIAL_ID = /^(review|review_comment|comment):[1-9][0-9]{0,15}$/;
-export const amendmentMaterialsDigest = (ids: readonly string[]): string => domainDigest('change-amendment-materials/v1', [...new Set(ids)].sort(compareText));
+// owner가 확인한 자료의 digest. ID만 묶으면 확인 뒤 작성자가 같은 글을 고쳐 owner가 보지 않은 피드백을 실을 수 있어
+// 작성 모델이 받는 칸(종류·작성자·관계·위치·본문)을 모두 넣는다. 원문은 저장하지 않고 이 값만 둔다. 순서와 무관하다.
+export const amendmentMaterialsDigest = (items: readonly { id: string; material: ReviewMaterial }[]): string => domainDigest('change-amendment-materials/v1',
+  [...items].sort((a, b) => compareText(a.id, b.id)).map(({ id, material }) => [id, material.kind, material.authorId, material.association,
+    material.location ? [material.location.path, material.location.line ?? null] : null, material.body]));
 
 // ---- artifact ----
 

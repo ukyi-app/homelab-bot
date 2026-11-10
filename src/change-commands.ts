@@ -1,4 +1,4 @@
-import { AMENDMENT_MATERIAL_ID, AUTHOR_ASSOCIATIONS, CHANGE_AMENDMENT, CHANGE_ID, ChangePathSchema, labelAllowsAuthorInput, PROVENANCE_LABELS, propagateLabel } from './change-contracts.js';
+import { AMENDMENT_MATERIAL_ID, AUTHOR_ASSOCIATIONS, amendmentMaterialsDigest, CHANGE_AMENDMENT, CHANGE_ID, ChangePathSchema, labelAllowsAuthorInput, PROVENANCE_LABELS, propagateLabel } from './change-contracts.js';
 import type { ChangeKey, ProvenanceLabel, ReviewMaterial } from './change-contracts.js';
 import type { ChangeRepositoryPolicy } from './change-policy.js';
 import { scanPublicText } from './change-publication.js';
@@ -34,13 +34,13 @@ export interface ChangeCommandHandler {
 // 수정 요청의 대상 대조와 접수. 대상은 이 스레드에서 owner가 낸 변경이고, 그 변경의 PR이 열려 있어야(proposed·amending) 한다.
 export type AmendmentRefusal = 'no_pull' | 'not_open' | 'limit' | 'sensitive' | 'unavailable';
 export type AmendmentTarget =
-  | { ok: true; changeId: string; generation: number; repository: string; pullNumber: number; head: string; materials: string[] }
+  | { ok: true; changeId: string; generation: number; repository: string; pullNumber: number; head: string; materials: string[]; materialsDigest: string }
   | { ok: false; reason: 'not_visible' | AmendmentRefusal };
 export interface AmendmentRequests {
-  // 확인 글을 만들 때 부른다. PR 리뷰·댓글을 읽어 ID 묶음을 정한다(이 묶음까지가 이번 차례의 자료다). target은 변경 ID나 PR 번호(#n·n·PR 링크)다.
+  // 확인 글을 만들 때 부른다. PR 리뷰·댓글을 읽어 ID 묶음과 그 글의 digest를 정한다(이 묶음까지가 이번 차례의 자료다). target은 변경 ID나 PR 번호(#n·n·PR 링크)다.
   prepare(input: { actor: string; scope: Scope; target: string; instruction: string }): Promise<AmendmentTarget>;
   // 버튼을 누른 뒤 부른다. 확인 때 정한 값 그대로 대기열에 넣는다. 차례 시작은 런타임이 한다.
-  request(input: { id: string; actor: string; scope: Scope; changeId: string; generation: number; pullNumber: number; head: string; materials: readonly string[]; instruction: string }): Promise<ChangeCommandReply>;
+  request(input: { id: string; actor: string; scope: Scope; changeId: string; generation: number; pullNumber: number; head: string; materials: readonly string[]; materialsDigest: string; instruction: string }): Promise<ChangeCommandReply>;
 }
 // 수정 요청 문구. 동료 기능 스위치를 켰을 때만 보이므로 동료 말투다.
 export const AMENDMENT_REQUEST_TEXT = Object.freeze({
@@ -341,10 +341,11 @@ export class ChangeCommands implements ChangeCommandHandler {
     const pullNumber = (typeof pull.result === 'string' ? JSON.parse(pull.result) : pull.result as { number: number }).number as number;
     const head = await this.deps.changes.publishedHeadOf(key);
     if (!head) return { ok: false, reason: 'unavailable' };
-    let materials: string[];
-    try { materials = discussionMaterials(await this.deps.discussion({ repository: repository.fullName, pr: pullNumber })).map(item => item.id); }
+    let items: AmendmentMaterialItem[];
+    try { items = discussionMaterials(await this.deps.discussion({ repository: repository.fullName, pr: pullNumber })); }
     catch (error) { this.deps.log('change_amendment_discussion_failed', errorInfo(error)); return { ok: false, reason: 'unavailable' }; }
-    return { ok: true, changeId: found.id, generation: found.generation, repository: repository.fullName, pullNumber, head, materials };
+    return { ok: true, changeId: found.id, generation: found.generation, repository: repository.fullName, pullNumber, head,
+      materials: items.map(item => item.id), materialsDigest: amendmentMaterialsDigest(items) };
   }
   private async requestAmendment(input: Parameters<AmendmentRequests['request']>[0]): Promise<ChangeCommandReply> {
     if (this.deps.closedReason()) return { content: AMENDMENT_REQUEST_TEXT.closed, outcome: 'closed' };
@@ -352,7 +353,7 @@ export class ChangeCommands implements ChangeCommandHandler {
     if (!found) return { content: CHANGE_TEXT.notVisible, outcome: 'not_visible' };
     // 수정 요청 출처는 변경 요청과 같은 공개 표시다(DECISIONS "동료 봇 전환" 15·16, C27 판단).
     const queued = await this.deps.changes.requestAmendment({ changeId: input.changeId, generation: input.generation, eventId: input.id, actor: input.actor,
-      pullNumber: input.pullNumber, head: input.head, materials: input.materials, instruction: input.instruction, label: 'public' });
+      pullNumber: input.pullNumber, head: input.head, materials: input.materials, materialsDigest: input.materialsDigest, instruction: input.instruction, label: 'public' });
     if (queued.ok) {
       return found.phase === 'amending' ? { content: AMENDMENT_REQUEST_TEXT.queued(queued.value.round), outcome: 'queued' } : { content: AMENDMENT_REQUEST_TEXT.accepted(queued.value.round), outcome: 'accepted' };
     }

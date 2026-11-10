@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import {
   AMENDMENT_MATERIAL_ID, ARTIFACT_LIMITS, ApprovalSubjectSchema, ArtifactManifestSchema, CHANGE_AMENDMENT, CHANGE_ID, CHANGE_SELF_FIX, ChangeBriefSchema, DeploymentObservationSchema, EFFECT_LEASE_MS, EFFECT_STAGES,
-  EffectExpectedSchema, EffectResultSchema, EvidenceBundleSchema, GENERATION_RESTART, GIT_SHA, MAX_GENERATION, ReasonCodeSchema, ReviewReceiptSchema, RevisionSchema, UNKNOWN_RECONCILE_MS,
-  VerificationReceiptSchema, amendmentEvidenceDigest, amendmentMaterialsDigest, approvalDigest, artifactDigest, briefDigest, canTransition, changeBranchName, effectResultMatches, evidenceBundleDigest, isTerminalPhase,
+  EffectExpectedSchema, EffectResultSchema, EvidenceBundleSchema, GENERATION_RESTART, GIT_SHA, MAX_GENERATION, SHA256_HEX, ReasonCodeSchema, ReviewReceiptSchema, RevisionSchema, UNKNOWN_RECONCILE_MS,
+  VerificationReceiptSchema, amendmentEvidenceDigest, approvalDigest, artifactDigest, briefDigest, canTransition, changeBranchName, effectResultMatches, evidenceBundleDigest, isTerminalPhase,
   labelAllowsAuthorInput, newChangeId, previousEffectStage, propagateLabel, raiseLabel, reviewReceiptDigest, sha256Hex, validateArtifactFiles, verificationReceiptDigest,
 } from './change-contracts.js';
 import type {
@@ -709,10 +709,12 @@ export class ChangeStore {
   // 한 generation의 차례는 대기열·실패한 것까지 CHANGE_AMENDMENT.maxRounds번이다. 지시 원문은 공개 경로가 읽지 않는 입력 표에 둔다.
   // 차례를 시작하지는 않는다. 시작은 런타임이 스위치·PR 상태를 본 뒤 startAmendment로 한다.
   async requestAmendment(input: ChangeKey & {
-    eventId: string; actor: string; pullNumber: number; head: string; materials: readonly string[]; instruction: string; label: ProvenanceLabel;
+    eventId: string; actor: string; pullNumber: number; head: string; materials: readonly string[]; materialsDigest: string; instruction: string; label: ProvenanceLabel;
   }): Promise<StoreResult<AmendmentRound>> {
     if (!GIT_SHA.test(input.head) || !Number.isInteger(input.pullNumber) || input.pullNumber < 1) return fail('invalid_input', { detail: 'pull' });
-    if (input.materials.some(id => !AMENDMENT_MATERIAL_ID.test(id)) || new Set(input.materials).size !== input.materials.length) return fail('invalid_input', { detail: 'materials' });
+    if (input.materials.some(id => !AMENDMENT_MATERIAL_ID.test(id)) || new Set(input.materials).size !== input.materials.length || !SHA256_HEX.test(input.materialsDigest)) {
+      return fail('invalid_input', { detail: 'materials' });
+    }
     if (!input.instruction.trim()) return fail('invalid_input', { detail: 'instruction' });
     if (!labelAllowsAuthorInput(input.label)) return fail('label_blocked');
     return attempt<AmendmentRound>(this.database, async tx => {
@@ -730,7 +732,7 @@ export class ChangeStore {
       if (!await insertPrivateInput(tx, { changeId: input.changeId, generation: input.generation, eventId: input.eventId, label: input.label, text: input.instruction, now })) return fail('duplicate_event');
       const row = (await tx.query<Record<string, unknown>>(`INSERT INTO change_amendments(change_id,generation,round,state,event_id,label,pull_number,confirmed_head,materials,materials_digest,created_at)
         VALUES ($1,$2,$3,'queued',$4,$5,$6,$7,$8,$9,$10) RETURNING *`, [input.changeId, input.generation, last + 1, input.eventId, input.label, input.pullNumber, input.head,
-        JSON.stringify(input.materials), amendmentMaterialsDigest(input.materials), now])).rows[0]!;
+        JSON.stringify(input.materials), input.materialsDigest, now])).rows[0]!;
       await audit(tx, 'change_amendment_requested', input.changeId, { generation: input.generation, round: last + 1, materials: input.materials.length }, now);
       return success(amendmentRow(row));
     });
