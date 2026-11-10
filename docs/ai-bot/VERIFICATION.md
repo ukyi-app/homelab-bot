@@ -2480,3 +2480,27 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 - **시험이 실패할 수 있는지 확인:** 게시 순서 시험은 고치기 전 코드(dd0a53f)에서 돌려 실패를 봤다("답의 남은 쪽보다 확인 글이 먼저 나가면 안 된다", 버튼 글 1건). 나머지 시험은 동작 줄이 "연결 안 됨"이던 코드에서는 제안이 버려져 버튼·답이 없으므로 처음부터 성립하지 않는다(구현과 함께 들어갔다).
 - **못 잡는 범위:** 모델이 읽기와 실행을 헷갈리거나 요청을 잘못 읽는 비율은 S5(C24 표본)다. 실제 Discord에서 버튼 응답 모양은 S5다. `retry`·`memory_correct`·`memory_exclude`는 같은 처리기 묶음(`controlHandler`·`memoryWriteHandler`·`memoryTargetHandler`)의 다른 줄이라 따로 시험하지 않았다. 커밋 뒤 처리기 실행이 죽음으로 끊기는 경우(제안은 `confirmed`, 실행 없음)는 시험하지 않았다.
 - **운영 영향:** 스위치가 꺼져 있으면 제안을 보지 않고 확인 버튼도 받지 않아 지금 동작 그대로다. 스위치와 무관하게 바뀌는 것은 outbox 집기 조건 하나다(선행 키 `payload.after`가 있는 글만 기다리고, 지금 그 키를 두는 글은 확인 글·읽기 결과뿐이다).
+
+## C16 작업 질문 바로 답 (2026-11-10, 로컬)
+
+동료 봇 명세 §4.3 "작업 질문 바로 답"·§4.9(스위치)와 AC-8을 S1에서 고정했다: 수신은 실제 `DiscordProtocol`에 Gateway 프레임(owner 일반 메시지 `MESSAGE_CREATE`, 버튼 `INTERACTION_CREATE` type 3)을 넣고, 저장은 PGlite, 게시는 가짜 REST(`MockDiscord`), 버튼 응답은 가짜 API가 받은 callback 본문이다. 작업은 '/task'와 같은 `TaskCommands`를 운영처럼 CHANGE 답 봉인 처리기(`guardedTaskCommands`)로 감싸고 작업 레인(`ClaudeTaskBridge` + 가짜 작업자)으로 돈다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §12 "질문 계약"의 "작업 질문 바로 답", 구현 선택은 [DECISIONS](DECISIONS.md) "C16 작업 질문 바로 답 구현 선택". 시험 파일은 새 `test/c16-task-question.test.ts`와 `chat-task-text`·`codex-bridge`·`change-assembly`(하네스에 스위치 옵션)의 C16 줄이다.
+
+| 완료 조건 | 시험 |
+|---|---|
+| 열린 작업 질문 하나 → owner의 다음 말이 모델 없이 답, 작업이 이어짐 | `c16-task-question` "C16 열린 작업 질문이 하나면 owner의 다음 말이 모델을 거치지 않고 그 답이 되고 같은 세션으로 이어진다"(답·`answer_event`=메시지 ID, job `queued`, 대화 job 0·대화 작업자 요청 0, 안내 `taskAnswerAccepted` 1건, 재개 요청에 답, `succeeded`) |
+| 둘 이상 → 질문별 버튼, 고른 질문에만 답 | `c16-task-question` "C16 열린 작업 질문이 둘이면 질문마다 버튼을 단 글로 묻고, 고른 질문에만 그 말이 답으로 붙고 버튼이 사라진다"(고르기 전 두 질문 open·대화 job 0, 본문에 번호와 질문 앞부분, 버튼 "1번 질문"·"2번 질문", custom_id 100자 안·원문 없음, owner 아닌 사람 거부, callback type 7·`components: []`, 다른 버튼은 붙지 않음) |
+| 기한 지난 질문에 답이 붙지 않음, 대화 작업과 함께 생기지 않음 | `c16-task-question` "C16 기한이 지난 질문에는 바로 답이 붙지 않고, 그 말은 지금처럼 대화로 받는다", "C16 고르는 사이 질문의 기한이 지나면 답을 붙이지 않고 이유만 본인에게 답하며 버튼은 그대로 둔다"(callback type 4, `questionExpired`). 함께 생기지 않음은 위 두 시험의 대화 job 0 |
+| 다른 사람·다른 스레드 무시 | `c16-task-question` "C16 다른 사람의 말은 막히고, 다른 스레드에서 한 owner의 말은 이 스레드 질문의 답이 되지 않는다" |
+| 같은 이벤트 재전달 한 번 반영 | `c16-task-question` "C16 같은 메시지가 다시 전달돼도 답은 한 번만 반영되고 안내도 한 번이다" |
+| 답은 권한·도구 승인이 아님(안내 그대로) | `c16-task-question` 첫 시험의 켜짐 판 질문 글(“이 스레드에서 답을 말해 주세요”, `/answer` 없음, 승인·권한 문장 있음), `chat-task-text` "질문 안내는 모든 판에서 승인·권한 변경이 아니라는 문장을 남기고, …". 답 쓰기는 '/answer'와 같은 `answerIn`이다 |
+| 스위치 꺼짐: '/answer'만, 질문 글이 질문 ID 안내 | `c16-task-question` "C16 스위치 꺼짐: 질문 글은 질문 ID와 /answer를 안내하고, 그냥 한 말은 지금처럼 대화로 받는다", "C16 질문 고르기 버튼은 허용 목록 표의 이름·두 칸만 받고, 스위치가 꺼져 있으면 받지 않는다", `chat-task-text` "C16 작업 질문 답 안내: …" |
+| CHANGE 질문은 바로 답·고르기에서 빠지고 '/answer' 그대로 | `change-assembly` "C16 CHANGE 질문은 바로 답·질문 고르기 대상이 아니다: …"(실제 CHANGE 질문, 켜짐에서도 질문 글에 질문 ID·`/answer`, 그냥 한 말은 대화 job·질문 open, 작업 질문이 함께 열리면 그 하나에만 답·고르기 글 없음), `chat-task-text` "변경 질문 답 안내는 켜짐 판에서도 /answer 경로다 …" |
+| Codex 질문 같은 규칙, 다른 실행기 세션은 기존 거부 | `codex-bridge` "C16 Codex 작업 질문도 같은 규칙: …"(같은 스레드 `exec resume`, stdin이 답), `c16-task-question` "C16 다른 실행기 세션의 질문은 지금처럼 거부를 안내하고, 그 말로 대화 작업을 만들지 않는다" |
+| 답 원문 7일 정리 그대로 | `c16-task-question` "C16 바로 답한 원문도 지금처럼 작업이 끝난 지 7일 뒤 지워진다"(`purgeExpiredTaskAnswers`) |
+
+- **실행(origin/main dd0a53f 그대로라 병합할 것 없음, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 바뀐 파일을 참조하는 16개 파일(`c16-task-question`, `chat-task-text`, `codex-bridge`, `change-assembly`, `task-bridge`, `task-assembly`, `raw-input-retention`, `c13-proposal`, `c13-proposal-pg`, `foundation`, `chat-task-text-assembly`, `task-lane-pg`, `reaction-lifecycle`, `c08-mention-scope`, `c08-reply-context`, `chat-ack`) 471개 중 통과 470, 실패 1, skip 0. 실패 1은 이 티켓의 "다른 실행기 세션" 시험 준비가 Claude 세션 행의 `executor`만 바꾸다 CHECK 제약(`codex_sessions_executor_identity_check`)에 걸린 것이고, Codex 세션 행으로 바꿔 넣게 고친 뒤 `c16-task-question` 10개 모두 통과했다. 그 뒤 실행에서 "질문이 둘이면" 시험이 한 번 실패했다. 가짜 시계가 멈춘 채 두 질문을 만들어 번호 순서가 질문 ID(무작위 세션 UUID)로 갈렸기 때문이고, 두 질문 사이에 시계를 1초 넘기게 고쳤다(구현의 순서 규칙은 만든 시각 → ID 그대로). 마지막 실행(9cd213e): `c16-task-question`·`chat-task-text`·`codex-bridge` 91개 모두 통과, skip 0. origin/main(7560956, C17 게시 승인 버튼)을 병합한 뒤(f030465, 버튼 표·버튼 분기·문서 끝 절의 충돌을 두 줄 모두 남겨 풂) `c16-task-question`·`c17-publish-button`·`change-preview-pages`·`change-assembly`·`foundation`·`c13-proposal`·`codex-bridge`·`chat-task-text`·`task-bridge` 371개 모두 통과, skip 0.
+- **시험이 실패할 수 있는지 확인:** 구현이 시험보다 먼저 들어가 변이로 봤다. CHANGE 질문도 바로 답 대상으로 넣으면(`DIRECT`에 `change`) `change-assembly`의 C16 시험이 실패하고, 바로 답을 끄면 `c16-task-question` 6개와 `codex-bridge` C16 1개가 실패한다.
+
+- **운영 영향:** 스위치가 꺼져 있으면 수신 분기를 타지 않고 고르기 버튼도 받지 않아 지금 동작 그대로다. 스위치와 무관하게 바뀌는 것은 없다(질문 글의 꺼짐 판·변경 질문 글 문구는 그대로).
+- **못 잡는 범위.** owner가 질문과 무관한 말을 스레드에 보내면 그 말이 답이 된다(명세 그대로의 결과). 실제 Discord의 답장 표시와 `UPDATE_MESSAGE` 모양은 S5다. 한 스레드에 열린 작업 질문이 6개 이상이면 버튼은 오래된 5개만 달린다.
+- **PR #129 리뷰 수정(2건, 빨강→초록):** history gap 동안 받아 복구 때 바로 답·고르기로 보낸 메시지의 👀를 지운다(`c16-task-question` "C16 history gap 동안 받아 복구 때 바로 답으로 처리한 메시지는 👀를 지운다", "… 질문 고르기 글로 보낸 메시지도 👀를 지운다", 수정 전 반응 행 `received`로 실패). 옛 고르기 글의 닫힌 질문 버튼은 본인에게만 안내하고 그 글의 버튼을 남긴다("C16 옛 고르기 글의 닫힌 질문 버튼을 눌러도 그 글의 다른 버튼은 남아 아직 열린 질문에 답을 붙일 수 있다", 수정 전 callback type 7로 실패). `c16-task-question`·`change-assembly`·`reaction-lifecycle` 154개 모두 통과, skip 0.

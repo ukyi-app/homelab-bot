@@ -4,6 +4,7 @@ import type { Clock, EventInput } from './contracts.js';
 import { gatewayMessage, hasMarker } from './discord.js';
 import type { AckOutcome, DiscordIngress, DiscordRest, GatewayFrame } from './discord.js';
 import { PROPOSAL_BUTTONS } from './proposals.js';
+import { QUESTION_PICK_BUTTON } from './question-pick.js';
 import { PUBLISH_BUTTON } from './change-commands.js';
 import { SESSION_KEY_BUTTON } from './external-task-commands.js';
 
@@ -47,6 +48,7 @@ export const BUTTONS = Object.freeze([
   { name: 'cancel', parts: 2, route: 'control' },
   { name: PROPOSAL_BUTTONS.yes, parts: 2, route: 'proposal' },
   { name: PROPOSAL_BUTTONS.no, parts: 2, route: 'proposal' },
+  { name: QUESTION_PICK_BUTTON, parts: 2, route: 'question' },
   { name: PUBLISH_BUTTON, parts: 2, route: 'publish' },
   { name: SESSION_KEY_BUTTON, parts: 2, route: 'session-key' },
 ] as const);

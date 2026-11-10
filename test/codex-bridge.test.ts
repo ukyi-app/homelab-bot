@@ -18,6 +18,8 @@ import { execFile } from 'node:child_process';
 import { Runtime } from '../src/runtime.js';
 import { Store } from '../src/store.js';
 import type { Database } from '../src/database.js';
+import { ALL_COMMANDS, DiscordIngress } from '../src/discord.js';
+import type { TaskCommandHandler } from '../src/task-commands.js';
 import { localDatabase, fixture, event, thread } from './helpers.js';
 
 // JSONL fixture는 공식 문서의 `codex exec --json` 이벤트 형태로 합성했다. 실제 CLI 녹음은 모델 호출이라 쓰지 않는다(D-14).
@@ -350,6 +352,26 @@ test('TASK-02 질문을 대화로 중계 → owner 답 → 같은 스레드 resu
   assert.ok(f.rest.messages[1]!.body.content.startsWith(`<@fixture-owner> ${T.codexCompleted(false, job.id)}`));
   assert.match(f.rest.messages[1]!.body.content, /main 기준/);
 });
+test('C16 Codex 작업 질문도 같은 규칙: 스위치 켜짐이면 열린 질문 하나에 owner의 다음 말이 모델을 거치지 않고 답이 되어 같은 스레드로 이어 감', async () => {
+  const { job, question } = await asked('어느 브랜치 기준으로 고칠까요?');
+  const store = new Store(database.db, f.now, true);
+  const handler: TaskCommandHandler = { admit: async () => null, answerIn: (within, input) => bridge.answerIn(within, input),
+    cancelIn: async () => { throw new Error('not_used'); }, status: async () => { throw new Error('not_used'); }, release: () => { throw new Error('not_used'); } };
+  const ingress = new DiscordIngress(store, f.gate, f.rest, true, ALL_COMMANDS, () => {}, undefined, handler);
+  await ingress.receive(event('1700000000000000001', { text: 'main 기준', mention: false }));
+  const answered = (await rows('codex_questions'))[0]!;
+  assert.deepEqual([answered.id, answered.answer, answered.answer_event], [question, 'main 기준', '1700000000000000001']);
+  assert.equal((await jobs()).filter(row => row.type === 'chat').length, 0);
+  assert.equal((await jobs())[0]!.state, 'queued');
+  launcher.scripts.push(finished(out('completed', 'main 기준으로 고쳤습니다.'), [], null));
+  await runtime.tick();
+  assert.deepEqual(launcher.specs[1]!.args.slice(0, 2), ['exec', 'resume']);
+  assert.equal(launcher.specs[1]!.stdin, 'main 기준');
+  assert.equal((await jobs())[0]!.state, 'succeeded');
+  assert.equal(f.requests.length, 0);
+  assert.ok((await outbox()).some(row => row.payload.content === T.codexAnswerAccepted && row.idempotency_key.startsWith('answer:')), job.id);
+});
+
 test('TASK-02 옛 능력표 JSON(attach_task undecided)이 저장된 세션도 상태 조회·재개가 그대로 됨', async () => {
   const { job, question } = await asked();
   await database.db.query(`UPDATE codex_sessions SET capabilities=jsonb_set(capabilities,'{attach_task}','"undecided"') WHERE job_id=$1`, [job.id]);

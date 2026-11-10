@@ -14,6 +14,7 @@ import type { MemoryCommand, MemoryCommandHandler } from './memory-commands.js';
 import type { PolicyGate } from './policy.js';
 import { buttonAllowed, buttonRoute } from './discord-protocol.js';
 import { bindProposalHandlers, PROPOSAL_BUTTONS, PROPOSAL_TEXT, pressProposal } from './proposals.js';
+import { offerAnswer, pressQuestionPick } from './question-pick.js';
 import { moveReactions, ReactionSync, recordReceived, settleReactions } from './reactions.js';
 import { LaneClosed } from './store.js';
 import type { Delivery, Store } from './store.js';
@@ -81,6 +82,7 @@ export class DiscordIngress {
     const event = EventSchema.parse(input);
     if (event.bot || event.webhook) return;
     if (event.kind === 'button' && buttonRoute(event.command) === 'proposal') return this.proposalButton(event, recovered);
+    if (event.kind === 'button' && buttonRoute(event.command) === 'question') return this.questionButton(event, recovered);
     if (event.kind === 'button' && buttonRoute(event.command) === 'publish') return this.publishButton(event, recovered);
     if (event.kind === 'button' && buttonRoute(event.command) === 'session-key') return this.sessionKeyButton(event, recovered);
     // 이 단계에서 열지 않은 명령·버튼은 저장·권한 확인 전에 닫는다(task·review-*는 FOUNDATION 밖).
@@ -118,6 +120,8 @@ export class DiscordIngress {
     const started = this.store.now();
     // 작업 접수를 막은 안내. 받은 자리면 상호작용 응답으로, 복구 중이면 대화에 게시한다.
     let refused: string | undefined;
+    // 작업 질문 경로(바로 답 또는 질문 고르기)로 보냈다. 대화 작업이 없고, 받았다는 표시는 그 안내 글이 대신한다.
+    let answered = false;
     // 처리기가 맡은 답은 events에 원문을 남기지 않고 이 호출의 값으로만 넘긴다. /answer는 버퍼에 들어가지 않아 저장한 원문으로 되살릴 일이 없다.
     const spoken = event.text;
     const sealed = event.kind !== 'message' && event.command === 'answer' && !!event.target && await this.tasks?.sealsAnswer?.(this.store.db, event.target) === true;
@@ -125,6 +129,7 @@ export class DiscordIngress {
     if (!recovered && this.store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
     // Route durably before ACK: a lost response or process exit cannot orphan an acknowledged request.
     const routed = await this.store.atomic(async store => {
+      answered = false;
       const subscription = await store.ownedConversation(event.scope, event.actor, true);
       if (recovery && (!subscription.active || subscription.recovery_token !== recovery.token
         || subscription.subscription_epoch !== recovery.epoch || Number(subscription.recovery_until) <= store.now())) return false;
@@ -202,21 +207,31 @@ export class DiscordIngress {
           payload: { kind: 'thread', channel: event.scope.channel, content: saved.id, classification: 'safe_summary',
             ...(event.kind === 'message' ? { fromMessage: event.id } : {}) } });
       } else {
+        // 작업 질문 바로 답(스위치 켜짐). 이 스레드에 owner가 답할 열린 작업 질문이 있으면 대화 작업을 만들지 않고 답 경로로 보낸다.
+        // 결과 안내 글이 받았다는 표시라 👀를 달지 않는다.
+        answered = event.kind === 'message' && store.colleague && this.tasks
+          ? await offerAnswer(store, this.tasks, { event: saved.id, message: event.id, actor: event.actor, scope: event.scope, conversation: conversationId,
+            text: event.text, revision: current.revision }) !== undefined
+          : false;
         // admit 뒤에 레인이 닫힌 경합. SQL 오류가 아니라 트랜잭션은 그대로 쓸 수 있다.
-        try { await store.accept(saved.id, event.command === 'task' ? 'task' : event.command === 'read' ? 'read' : 'chat', current.revision, event.urgent || event.command === 'urgent'); }
-        catch (error) {
-          if (!(error instanceof LaneClosed) || !this.tasks) throw error;
-          return refuse(taskLaneClosedText(error.reason, store.colleague));
+        if (!answered) {
+          try { await store.accept(saved.id, event.command === 'task' ? 'task' : event.command === 'read' ? 'read' : 'chat', current.revision, event.urgent || event.command === 'urgent'); }
+          catch (error) {
+            if (!(error instanceof LaneClosed) || !this.tasks) throw error;
+            return refuse(taskLaneClosedText(error.reason, store.colleague));
+          }
         }
         if ((!recovered || inbox.buffered) && event.kind === 'message') await store.checkpoint(conversationId, event.id, inbox.buffered);
       }
-      await received();
+      // gap 버퍼에 둘 때 단 👀는 대화 작업이 없어 작업 정리(settleReactions)가 보지 못한다. 답·고르기로 보낸 여기서 지운다.
+      if (answered) await moveReactions(store.db, [saved.id], 'cleared');
+      else await received();
       if (!recovered && store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
       await store.db.query('UPDATE events SET accepted=true WHERE id=$1', [saved.id]);
       await store.db.query('UPDATE events SET buffered=false WHERE id=$1', [saved.id]);
       return true;
     }, recovered ? undefined : { expiresAt: started + DEFAULTS.inboxTimeoutMs, now: this.store.now });
-    if (routed && !recovered) await this.acknowledge(event, saved.id, refused);
+    if (routed && !recovered && !answered) await this.acknowledge(event, saved.id, refused);
     return saved.id;
   }
   // 작업 상태·해제. 수신 트랜잭션을 쥔 채 다른 연결을 쓰거나 작업자를 기다리지 않는다. 처리 방식은 기억 명령과 같다(같은 상호작용은 한 번만 처리한다).
@@ -276,6 +291,25 @@ export class DiscordIngress {
       });
     }
     // 응답을 전하지 못하면 결과 문장(공개해도 되는 고정 문구)을 그 스레드에 남긴다. 버튼은 남지만 다시 누르면 "이미 처리"로 답한다.
+    if (outcome) await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: outcome.content, update: outcome.update });
+    return saved.id;
+  }
+  // 질문 고르기 버튼(작업 질문 바로 답에서 열린 질문이 둘 이상일 때). 스위치가 꺼져 있으면 그 버튼을 만들지 않으므로 받지도 않는다.
+  // 처리 방식은 실행 확인 버튼과 같다(같은 상호작용은 한 번만, 고르기·답 쓰기·accepted를 한 트랜잭션에).
+  private async questionButton(event: z.infer<typeof EventSchema>, recovered: boolean): Promise<string | undefined> {
+    if (recovered || !this.store.colleague || !this.tasks || !event.target) throw new Denied();
+    const tasks = this.tasks;
+    const p = await this.gate.authorize(event.actor, event.scope);
+    const conversation = await this.store.conversation(event.scope);
+    if (!conversation || (event.scope.kind !== 'channel' && conversation.owner_id !== event.actor)) throw new Denied();
+    const started = this.store.now();
+    const saved = await this.store.save({ ...event, text: '' }, p.revision, false);
+    if (this.store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
+    const outcome = await this.store.atomic(async store => {
+      if (!await this.claimIn(store, event, saved.id)) return;
+      return pressQuestionPick(store, tasks, { button: event.target!, actor: event.actor, scope: event.scope });
+    }, { expiresAt: started + DEFAULTS.inboxTimeoutMs, now: this.store.now });
+    this.log('question_pick', { outcome: outcome ? (outcome.update ? 'settled' : 'refused') : 'duplicate' });
     if (outcome) await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: outcome.content, update: outcome.update });
     return saved.id;
   }

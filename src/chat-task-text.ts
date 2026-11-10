@@ -108,9 +108,13 @@ export const CHAT_TASK_TEXT = Object.freeze({
   foreignSession: '다른 실행기의 세션을 가진 작업이에요. 그 실행기 쪽 경로로만 답하거나 해제할 수 있어요.',
   taskQuestion: '작업하다가 여쭤볼 게 생겼어요',
   codexQuestion: 'Codex 작업하다가 여쭤볼 게 생겼어요',
-  // 켜짐 판도 /answer를 안내한다. 스레드에 그냥 말한 답은 답 경로(봉인·label 검사)를 거치지 않고 대화 기록으로 들어가
-  // CHANGE 질문의 private 답이 대화 모델에 샌다. 자연어 답 경로를 만드는 C16(작업)·C28(변경)이 이 줄을 함께 바꾼다.
-  questionFooter: (_c: boolean, id: string, expires: string) =>
+  // 작업 질문. 켜짐 판에서는 수신이 owner의 다음 말을 그 질문의 답으로 받는다(question-pick.ts).
+  taskQuestionFooter: (c: boolean, id: string, expires: string) => c
+    ? `기한: ${expires}. 이 스레드에서 답을 말해 주세요. 답으로 도구 실행을 승인하거나 권한을 바꿀 수는 없어요.`
+    : `기한: ${expires}. 이 스레드에서 /answer question:${id} 로 답해 주세요. 답으로 도구 실행을 승인하거나 권한을 바꿀 수는 없어요.`,
+  // 변경 질문. 켜짐 판도 /answer를 안내한다. 스레드에 그냥 말한 답은 답 경로(봉인·label 검사)를 거치지 않고 대화 기록으로 들어가
+  // private 답이 대화 모델에 샌다. 변경 질문의 자연어 답 경로를 만드는 C28이 이 줄을 바꾼다.
+  changeQuestionFooter: (_c: boolean, id: string, expires: string) =>
     `기한: ${expires}. 이 스레드에서 /answer question:${id} 로 답해 주세요. 답으로 도구 실행을 승인하거나 권한을 바꿀 수는 없어요.`,
   answerInvalid: '답이 비었거나 너무 길어요.',
   questionMissing: '질문을 찾지 못했어요.',
