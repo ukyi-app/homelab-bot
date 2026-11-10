@@ -2516,9 +2516,10 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 | P2·P3만이면 고치기 없이 미리보기·남은 위험 | `change-assembly` "C31 P2·P3만: …"(작성 1번, 미리보기 경고 줄), `change-self-fix` "C31 고치기 대상: …" |
 | 승인 digest는 마지막 차례 증거로만 | `change-store` "C31 고치기 차례: 승인 digest는 마지막 차례의 …"(앞 차례 리뷰 job의 receipt `job_not_linked`, 승인 대상의 리뷰·시험 receipt가 마지막 것), `change-assembly` "C31 고치기 1번: …"(승인 대상 리뷰 digest = 살아 있는 receipt ≠ 옮긴 receipt, artifact도 다름), `change-store` "C31 고치기 DB 방어: …"(코드 밖 되돌림·증거 삭제·묶음 비우기 거부, 코드 상한 = DB CHECK) |
 | 작업자가 고치기 요청을 받지 못하면 지금처럼 닫힘 | `change-assembly` "C31 작업자가 고치기 요청을 받지 못하면: …"(지금 작성 port는 차례를 열지 않음, 열렸는데 요청이 거부되면 새 실패 모양 없이 `review_blocked`, 레인 해제) |
-| 차례 중 취소·base 이동 | `change-assembly` "C31 차례 중 취소: …", "C31 차례 중 base 이동: …"(고정 base 그대로, `superseded(base_moved)`, GitHub 쓰기 없음) |
+| 차례 중 취소·base 이동 | `change-assembly` "C31 차례 중 취소: …", "C31 차례 중 base 이동: …"(고정 base 그대로 미리보기, 승인 뒤 게시 직전 `superseded(base_moved)`, GitHub 쓰기 없음) |
 | 자료 블록(S2) | `change-self-fix` "C31 자료 블록: …"(발견은 자료 항목으로만, 지시는 고정 문구, 경로 형식 아닌 위치 버림), "C31 고치기 발견: …"(P0·P1 모델 지적 + 코드 판정 고정 설명) |
 
+- **실행(origin/main 9d5621a 병합 뒤, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` `change-contracts`·`change-store`·`change-store-pg`·`change-self-fix`·`change-review`·`publisher-migrate`·`publisher-pg`·`change-assembly` 266개 중 265 통과·1 실패, 이어서 `change-assembly`·`change-recovery`·`change-review-pg`·`change-review-dispatch`·`change-purge-race`·`change-freshness`·`change-pg`·`change-verify-start`·`change-verification`·`change-artifact`·`change-preview-pages`·`c17-publish-button` 321개 중 319 통과·2 실패. 실패 셋은 시험 쪽이었다: base 이동 시험이 신선도 검사 시점을 미리보기로 잘못 잡았고(실제 검사는 승인 뒤 게시 직전), `change-pg`의 마이그레이션 목록에 023이 없었다. 고친 뒤 `change-assembly`·`change-pg` 138개 모두 통과, skip 0. 조립 시험이 처음엔 모두 멈췄는데 시험 도우미(`test/helpers.ts`)가 마이그레이션을 목록으로 직접 읽어 023을 더해야 했다.
 - **시험 경계의 한계:** 조립 시험은 작성 port의 `supportsSelfFix`만 열고 고치기 요청을 같은 base의 새 작성으로 보낸다. 실제 작업자 요청에 `amendment`로 싣는 길은 작업자 계약 칸이 PR 없는 고치기를 받을 때까지 없다(DECISIONS 같은 절 "분해 불일치"). 실제로 고치는 품질은 S5(C24)다.
 - **운영 영향:** 병합하면 migration 023(변경 표에 칸·표·트리거 추가, 옛 표 불변)이 돈다. 작성 port가 고치기 차례를 열지 않으므로 변경 흐름은 이전과 같고, 바뀌는 것은 `review_blocked` 알림에 남은 P0·P1 제목 줄(공개 검사를 지난 것만)이 붙는 것뿐이다. `CHANGE_PR_ENABLED`가 꺼져 있으면 동작이 없다.
 

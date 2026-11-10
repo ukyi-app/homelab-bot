@@ -1812,21 +1812,23 @@ test('C31 차례 중 취소: 고치기 작성 중 /change-cancel이면 cancelled
   });
 });
 
-test('C31 차례 중 base 이동: 고치기는 고정한 base 위에서 하고, 승인 대상을 만들 때 기존 신선도 규칙으로 superseded가 된다', async () => {
+test('C31 차례 중 base 이동: 고친 결과는 고정한 base 그대로 미리보기로 가고, 승인 뒤 게시 직전 기존 신선도 규칙으로 superseded가 된다', async () => {
   await withHarness({ steps: [WRITE_STEP, FIXED_STEP], reviewReply: replies([P0_FINDING], []) }, async h => {
     selfFixing(h);
     await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
     const id = await h.changeId();
-    await h.pump(async () => (await h.db.query('SELECT 1 FROM change_fix_rounds WHERE change_id=$1', [id])).rows.length === 1);
+    // 가짜 작업자는 작업 공간을 지금 main에서 만들어, 작성 중에 옮기면 baseline_mismatch로 먼저 막힌다. 고친 결과를 저장한 뒤 옮긴다.
+    await h.pump(async () => (await h.db.query('SELECT 1 FROM change_generations WHERE change_id=$1 AND fix_round=1 AND result_tree IS NOT NULL', [id])).rows.length === 1);
     const pinned = (await h.db.query<{ base_commit: string }>('SELECT base_commit FROM change_generations WHERE change_id=$1', [id])).rows[0]!.base_commit;
     h.env.github.moveBase();
-    await h.pump(async () => isTerminal(await h.phase(id)));
-    assert.deepEqual([await h.phase(id), (await h.changes.get(id) as any).value.phaseReason], ['superseded', 'base_moved']);
+    await h.pump(async () => await h.phase(id) === 'awaiting_publish_approval');
     assert.equal((await h.db.query<{ base_commit: string }>('SELECT base_commit FROM change_generations WHERE change_id=$1', [id])).rows[0]!.base_commit, pinned);
+    await h.command('101', 'change-publish', { target: id, text: await digestOf(h, id) });
+    await h.pump(async () => await h.phase(id) === 'superseded');
+    assert.equal((await h.changes.get(id) as any).value.phaseReason, 'base_moved');
     assert.equal(h.env.github.mutations().length, 0);
   });
 });
-const isTerminal = (phase: string) => ['superseded', 'blocked', 'cancelled', 'failed', 'awaiting_publish_approval'].includes(phase);
 
 test('호환 작업자: 옛 작업자(v2 없음)면 CHANGE는 admitted에서 멈추고 부모를 닫지 않는다', async () => {
   await withHarness({ change: false }, async h => {
