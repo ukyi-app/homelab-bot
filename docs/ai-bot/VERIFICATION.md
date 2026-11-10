@@ -2515,12 +2515,19 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 | 멈춤이면 2분 안에 Telegram에 원인 종류·풀리는 시각(KST)·할 일·지금 계정 | `bot.test.yaml` "HomelabBotModelPaused는 사용 한도 멈춤 다음 평가에 풀리는 시각(KST)과 할 일을 담아 발화한다"(`for` 없음, 두 파드 → 경보 하나, 946720800 → "2000-01-01 19:00 KST"), "… 풀리는 시각을 모르는 사용 한도에 모름과 30분 재시도를 적는다", "… 인증 만료·결제 멈춤을 종류별로 알리고 지금 계정 이름과 방식을 적는다"(C22 뒤 모양 `account="main",method="api"` → "main(API 크레딧)"), "… 모델 멈춤이 없으면 울리지 않는다". 2분 = 수집 30초 + 평가 30초 + `group_wait` 30초 |
 | Discord에는 가지 않음 | 경보에 `service` 라벨 없음(위 시험의 `exp_labels`가 `severity`·`kind`뿐). 봇 수신기가 버리는 것은 기존 `review-1` "R1-13 서비스 없는 플랫폼 경보는 감사 후 202, 잘못된 형식은 400"(outbox 0). route는 `alerting.ts` `alertname=HomelabBotModelPaused severity=warning kind=billing` → `bot,telegram` |
 | 멈춘 동안 4시간마다, 풀리면 해소 | Alertmanager `repeat_interval: 4h`·`send_resolved: true`(바꾸지 않음). 재시도 틈에 해소가 나가지 않는 것과 풀린 뒤 해소는 `bot.test.yaml` "HomelabBotModelPaused는 재시도·수집 공백에 해소되지 않고 풀리면 5분 뒤 해소된다" |
-| 운영 발화 시험 1회 | 미실행(S5, 주 진행자·사람 승인 뒤). 결과는 이 절과 homelab approvals.md에 적는다 |
+| 운영 발화 시험 1회 | 2026-11-11 통과(S5, owner 승인 "A로"). 아래 "운영 발화 시험" |
 
 - **실행(머신 잠금 도우미, node 24.22.0):** 봇 `npm run check`, `npm run build`, `node --test dist/test/ops-metrics.test.js` 15개 모두 통과, skip 0. homelab `bun run ci --only alerting`(vmalert-tool 1.154.1 unittest 다섯 파일, `amtool check-config`, route 시험) 통과, `pre-commit run --files`(바뀐 세 파일) 통과.
 - **시험이 실패할 수 있는지 확인:** 봇 시험은 구현 전에 5개가 실패했다(새 계열 없음). 규칙 시험은 규칙 전에 실패했고, 사본에서 `max`를 `sum`으로 바꾸면 두 파드 시험이(풀리는 시각이 두 배), `keep_firing_for`를 빼면 재시도 틈(5분)과 해소 지연(17분) 기대가 실패했다.
 - **이름·라벨 대조:** 규칙이 쓰는 이름은 `homelab_bot_model_paused_jobs`·`homelab_bot_model_pause_resets_at_seconds`·`homelab_bot_model_account`, 라벨은 `kind`(`rate_limit`·`auth_expired`·`billing`)·`account`·`method`(`none`·`api`·`subscription`)이고 `src/ops-metrics.ts`의 출력과 글자 그대로 같다.
-- **못 잡는 범위:** 실제 Telegram 전송과 도착 시간, 운영 vmsingle에 새 계열이 생겼는지(배포 뒤 주 진행자가 본다). 경보 문구의 CLI 명령(`homelab bot account use`, `--by api`, `homelab bot account list`)은 명세 §4.8의 이름이고 아직 CLI에 없다(C22·C23). `homelab bot resume <작업 ID> --apply`는 지금 CLI에 있지만, 결제로 멈춘 작업의 ID를 CLI로 볼 길이 아직 없다(`homelab bot status`는 멈춤 여부만 보인다). 그 전까지 결제 멈춤은 계정 전환(C22)이나 ID를 아는 경우의 해제로 푼다.
+- **운영 발화 시험(2026-11-11 01:14~01:25 KST, owner 승인 뒤 1회):** 실제 한도를 기다리지 않고 운영 DB에 시험 행을 넣어 봇이 내는 실제 지표로 발화시켰다.
+  - **주입:** 한 트랜잭션으로 `events` 한 행, `jobs` 한 행(`type='task'`, `state='waiting_user'`, `wait_reason='auth_expired'`), `model_pauses` 한 행(`kind='rate_limit'`, `resets_at` = 1시간 뒤, `retry_at` 없음). `model_pauses`만 넣어서는 발화하지 않는다. 지표가 `jobs`의 한도·인증 대기를 세고 멈춤 기록은 종류와 시각만 보태기 때문이다. 이 조합을 고른 이유: `retry_at`이 없어 재개 루프(`resumeDue`)가 집지 않고, 작업 레인의 인증 대기는 scheduler를 켜지 않으며 `releaseScheduler`가 막히지 않고, 대화·리뷰 레인(`laneBusy('interactive')`)과 작업 레인 접수(`taskLaneStopped`는 `model_limit`만 본다)를 건드리지 않는다. 시험 동안 작업 레인 실행 슬롯만 막힌다. 종류를 `rate_limit`으로 둔 것은 문구의 KST 시각을 보기 위해서다(이 조합은 실제 코드가 만들지 않는 시험용 상태다).
+  - **발화:** 주입 01:14:23 → vmalert `HomelabBotModelPausedRateLimit` firing(activeAt 01:14:30) → Alertmanager가 Telegram 전송 1건(`alertmanager_notifications_total{integration="telegram"}` 0 → 1), 봇 감사 `alert_ignored` 01:15:19. 주입부터 약 57초로 2분 예산 안이다. owner가 Telegram에서 받은 글: "봇 모델 멈춤: 사용 한도 / 풀리는 시각: 2026-11-11 02:14 KST / 지금 계정: 미등록 / 할 일 1)~3)과 계정 목록 명령". 넣은 `resets_at`(02:14:23 KST)과 문구의 시각이 같다.
+  - **Discord에 가지 않음:** 봇 수신기는 웹훅을 받아 `alert_ignored`로 감사만 남겼고 outbox 행 수는 그대로다(147). owner도 Discord에 온 것이 없다고 확인했다.
+  - **해소:** 01:15:42에 넣은 두 ID만 지웠다(`model_pauses`는 cascade). vmalert는 `keep_firing_for` 5분 뒤 01:21:30~01:21:50 사이에 꺼졌고, Alertmanager가 다음 묶음 주기(`group_interval` 5분)인 01:25:19에 해소를 보냈다(Telegram 전송 수 1 → 2, 전송 실패 0, 봇 `alert_ignored` 한 번 더). 해소 글이 Telegram에 보였는지는 owner에게 따로 확인받지 않았다(전송 수와 실패 0이 근거다).
+  - **시험 뒤 상태:** 시험 행 0, 한도·인증 대기 0, 멈춤 기록 0, `scheduler`·`scheduler_emergency` false, 봇 로그 오류 0.
+  - **못 본 것:** 멈춘 동안 4시간마다 다시 오는 것(`repeat_interval: 4h` 설정과 route 시험이 근거), 인증 만료·결제 종류의 실제 발화(규칙 단위 시험이 근거, 식은 종류 값만 다르다), 실제 한도 응답에서 멈춤 기록이 생기는 경로(C19 시험, S5는 C24).
+- **못 잡는 범위:** 4시간 반복 전송의 실제 도착(위 "못 본 것"). 경보 문구의 CLI 명령(`homelab bot account use`, `--by api`, `homelab bot account list`)은 명세 §4.8의 이름이고 아직 CLI에 없다(C22·C23). `homelab bot resume <작업 ID> --apply`는 지금 CLI에 있지만, 결제로 멈춘 작업의 ID를 CLI로 볼 길이 아직 없다(`homelab bot status`는 멈춤 여부만 보인다). 그 전까지 결제 멈춤은 계정 전환(C22)이나 ID를 아는 경우의 해제로 푼다.
 
 ## C30 리뷰 요청 (2026-11-10, 로컬)
 
