@@ -9,7 +9,7 @@ import {
   VERIFICATION_STATUSES, artifactDigest, briefDigest, canonicalJson, evidenceBundleDigest, gitBlobSha, labelAllowsAuthorInput, sha256Hex, verificationReceiptDigest,
 } from './change-contracts.js';
 import type {
-  ArtifactBundle, ArtifactFile, ArtifactManifest, ChangeBrief, ChangeKey, ChangeReviewPort, EvidenceBundle, ReviewReceipt, VerificationReceipt,
+  ArtifactBundle, ArtifactFile, ArtifactManifest, ChangeBrief, ChangeKey, ChangeReviewPort, EvidenceBundle, ReviewReceipt, SelfFixFinding, VerificationReceipt,
 } from './change-contracts.js';
 import type { ChangeRequest, ChangeStore } from './change-store.js';
 import { DEFAULTS, Denied, WorkerRejected } from './contracts.js';
@@ -394,6 +394,31 @@ export function decideReview(input: ReviewDecisionInput): { receipt: ReviewRecei
   return { receipt, findings };
 }
 
+// 게시 전 고치기 차례를 열 수 있는 막힘인지. 완전한 리뷰가 P0·P1을 냈을 때만이다. 범위 부족(incomplete)은 코드 문제가 아니고,
+// 리뷰 출력 자체에 비밀·내부 표식이 있으면(reviewer_output_restricted) 그 글을 작성 모델에 넘기지 않는다. P2·P3·data_exposure만인 막힘도 고치지 않는다.
+export function selfFixable(receipt: ReviewReceipt): boolean {
+  return receipt.verdict === 'blocked' && receipt.coverage === 'complete' && receipt.risks.some(risk => risk.priority === 'P0' || risk.priority === 'P1')
+    && !receipt.risks.some(risk => risk.code === 'reviewer_output_restricted');
+}
+// 모델 지적 없이 코드가 정한 P0·P1의 고정 설명이다. 모델 문장이 아니다.
+const CODE_FINDINGS: Readonly<Record<string, string>> = Object.freeze({
+  protected_path_changed: '보호 경로(.github, 지침·보안 설정 파일)를 바꿨다',
+  goal_not_met: '변경이 목표를 채우지 못했다',
+  acceptance_not_met: '채우지 못한 인수 조건이 있다',
+});
+// 막힌 리뷰의 P0·P1 발견. 모델 지적이 먼저이고, 같은 코드의 모델 지적이 없는 코드 판정은 고정 설명으로 더한다.
+export function blockingFindings(receipt: ReviewReceipt, output: ChangeReviewOutput | null): SelfFixFinding[] {
+  const fromModel: SelfFixFinding[] = (output?.findings ?? []).filter(finding => finding.priority === 'P0' || finding.priority === 'P1').map(finding => ({
+    priority: finding.priority as 'P0' | 'P1', code: finding.code, title: finding.title, detail: finding.detail, evidence: finding.evidence,
+    location: finding.path ? { path: finding.path, line: finding.line } : null }));
+  const covered = new Set(fromModel.map(finding => finding.code));
+  const fromCode: SelfFixFinding[] = receipt.risks.filter(risk => (risk.priority === 'P0' || risk.priority === 'P1') && !covered.has(risk.code)).map(risk => {
+    const text = CODE_FINDINGS[risk.code] ?? risk.code;
+    return { priority: risk.priority as 'P0' | 'P1', code: risk.code, title: text, detail: text, evidence: '코드 판정', location: null };
+  });
+  return [...fromModel, ...fromCode];
+}
+
 // ---- 작업자 쪽 ----
 
 // 게시 서버가 저장을 확인(ack)할 때까지 결과를 지우지 않는다. dir이 있으면 재시작 뒤에도 남는다. 리뷰 원문이 들어 있어 소유자만 읽게 쓴다.
@@ -719,14 +744,16 @@ export class ChangeReviewService implements ChangeReviewPort {
     return this.db.transaction(async tx => {
       const parent = (await tx.query<{ phase: string; generation: number; label: ChangeBrief['label'] }>('SELECT phase,generation,label FROM change_requests WHERE id=$1 FOR UPDATE', [changeId])).rows[0];
       if (!parent) throw new ChangeReviewRejected('not_found');
-      const existing = (await tx.query<{ job_id: string }>(`SELECT job_id FROM change_child_jobs WHERE change_id=$1 AND generation=$2 AND role='review'`, [changeId, generation])).rows[0];
+      // 리뷰 job은 고치기 차례마다 하나다. 앞 차례의 job은 이 차례의 리뷰가 아니다.
+      const round = Number((await tx.query<{ fix_round: number }>('SELECT fix_round FROM change_generations WHERE change_id=$1 AND generation=$2', [changeId, generation])).rows[0]?.fix_round ?? 0);
+      const existing = (await tx.query<{ job_id: string }>(`SELECT job_id FROM change_child_jobs WHERE change_id=$1 AND generation=$2 AND role='review' AND fix_round=$3`, [changeId, generation, round])).rows[0];
       if (existing) return existing.job_id;
       if (Number(parent.generation) !== generation || parent.phase !== 'reviewing') throw new ChangeReviewRejected('phase_conflict');
       if (!labelAllowsAuthorInput(parent.label)) throw new ChangeReviewRejected('label_blocked');
       if (await store.queueFull('review', tx)) throw new ChangeReviewRejected('queue_full');
       const now = store.now();
       const job = randomUUID(), event = randomUUID();
-      const delivery = `change-review:${changeId}:${generation}`;
+      const delivery = `change-review:${changeId}:${generation}${round ? `:r${round}` : ''}`;
       const target = JSON.stringify({ kind: 'change', changeId, generation });
       await tx.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,conversation_id,received_at,payload,accepted)
         VALUES ($1,'change',$2,$2,'change-review',$3,NULL,$4,$5,true)`, [event, delivery, target, now, JSON.stringify({ command: 'change_review' })]);
@@ -784,7 +811,25 @@ export class ChangeReviewService implements ChangeReviewPort {
     return ReviewReceiptSchema.parse(typeof row.receipt === 'string' ? JSON.parse(row.receipt) : row.receipt);
   }
   private async reviewJob(key: ChangeKey): Promise<ReviewJob | null> {
-    return (await this.db.query<ReviewJob>(`SELECT j.* FROM jobs j JOIN change_child_jobs c ON c.job_id=j.id WHERE c.change_id=$1 AND c.generation=$2 AND c.role='review'`, [key.changeId, key.generation])).rows[0] ?? null;
+    return (await this.db.query<ReviewJob>(`SELECT j.* FROM jobs j JOIN change_child_jobs c ON c.job_id=j.id JOIN change_generations g ON g.change_id=c.change_id AND g.generation=c.generation
+      WHERE c.change_id=$1 AND c.generation=$2 AND c.role='review' AND c.fix_round=g.fix_round`, [key.changeId, key.generation])).rows[0] ?? null;
+  }
+  // round번째 고치기 차례를 연 리뷰의 P0·P1 발견. 작성 모델에 자료로 넘긴다. 원문이 없으면(보존 정리) 코드 판정만 남는다.
+  async selfFixFindings(key: ChangeKey, round: number): Promise<SelfFixFinding[]> {
+    const opened = (await this.deps.changes.selfFixRounds(key)).find(item => item.round === round);
+    return opened ? this.findingsOf(key, opened.reviewReceipt) : [];
+  }
+  // 닫을 때 알릴 남은 문제. 살아 있는 리뷰가 먼저이고, 고치기 차례 중에 닫혔으면 그 차례를 연 리뷰다.
+  async remainingFindings(key: ChangeKey): Promise<SelfFixFinding[]> {
+    const live = await this.storedReceipt(key);
+    const receipt = live ?? (await this.deps.changes.selfFixRounds(key)).at(-1)?.reviewReceipt;
+    return receipt ? this.findingsOf(key, receipt) : [];
+  }
+  private async findingsOf(key: ChangeKey, receipt: ReviewReceipt): Promise<SelfFixFinding[]> {
+    const row = (await this.db.query<{ output: unknown }>('SELECT output FROM change_review_findings WHERE change_id=$1 AND generation=$2 AND findings_digest=$3',
+      [key.changeId, key.generation, receipt.findingsDigest])).rows[0];
+    const parsed = row?.output ? ChangeReviewOutputSchema.safeParse(typeof row.output === 'string' ? JSON.parse(row.output) : row.output) : null;
+    return blockingFindings(receipt, parsed?.success ? parsed.data : null);
   }
   // unknown 조사가 멈춤을 확인하면 job은 failed로 닫힌다. 그래도 작업자에 결과가 남아 있을 수 있어 그 경우까지 본다.
   private recoverable(job: ReviewJob): boolean {

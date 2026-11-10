@@ -19,7 +19,7 @@ import { z } from 'zod';
 const NotesSchema = z.strictObject({ checks: z.array(ChangeNoteSchema).max(CHANGE_NOTE_LIMITS.items), risks: z.array(ChangeNoteSchema).max(CHANGE_NOTE_LIMITS.items) });
 export interface ChangeNotes { checks: ChangeNote[]; risks: ChangeNote[] }
 const parsedJson = (value: unknown) => typeof value === 'string' ? JSON.parse(value) as unknown : value;
-// generation마다 처음 받은 목록 하나다. 같은 결과를 다시 받아도(응답 유실 뒤 재조회) 처음 것을 둔다. 새로 기록했으면 true.
+// generation의 지금 고치기 차례마다 처음 받은 목록 하나다(차례를 열면 앞 차례 목록을 지운다). 같은 결과를 다시 받아도(응답 유실 뒤 재조회) 처음 것을 둔다. 새로 기록했으면 true.
 export async function recordChangeNotes(db: Pick<Database, 'query'>, key: ChangeKey, notes: { checks: readonly ChangeNote[]; risks: readonly ChangeNote[] }, now: () => number = Date.now): Promise<boolean> {
   const parsed = NotesSchema.parse({ checks: [...notes.checks], risks: [...notes.risks] });
   const inserted = await db.query('INSERT INTO change_notes(change_id,generation,checks,risks,recorded_at) VALUES ($1,$2,$3::jsonb,$4::jsonb,$5) ON CONFLICT DO NOTHING RETURNING 1',
