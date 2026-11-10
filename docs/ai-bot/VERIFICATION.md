@@ -2505,6 +2505,26 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 - **못 잡는 범위.** owner가 질문과 무관한 말을 스레드에 보내면 그 말이 답이 된다(명세 그대로의 결과). 실제 Discord의 답장 표시와 `UPDATE_MESSAGE` 모양은 S5다. 한 스레드에 열린 작업 질문이 6개 이상이면 버튼은 오래된 5개만 달린다.
 - **PR #129 리뷰 수정(2건, 빨강→초록):** history gap 동안 받아 복구 때 바로 답·고르기로 보낸 메시지의 👀를 지운다(`c16-task-question` "C16 history gap 동안 받아 복구 때 바로 답으로 처리한 메시지는 👀를 지운다", "… 질문 고르기 글로 보낸 메시지도 👀를 지운다", 수정 전 반응 행 `received`로 실패). 옛 고르기 글의 닫힌 질문 버튼은 본인에게만 안내하고 그 글의 버튼을 남긴다("C16 옛 고르기 글의 닫힌 질문 버튼을 눌러도 그 글의 다른 버튼은 남아 아직 열린 질문에 답을 붙일 수 있다", 수정 전 callback type 7로 실패). `c16-task-question`·`change-assembly`·`reaction-lifecycle` 154개 모두 통과, skip 0.
 
+## C30 리뷰 요청 (2026-11-10, 로컬)
+
+동료 봇 명세 §4.10 "리뷰 요청"·§4.9(스위치)와 AC-30을 S1에서 고정했다: 수신은 실제 `DiscordProtocol`에 Gateway 프레임(owner 멘션 `MESSAGE_CREATE`)을 넣고, 대화 차례는 가짜 작업자가 `review_request` 제안을 내며, 저장은 PGlite, 리뷰는 실제 `ReviewQueue`·`ReviewRuntime`(가짜 리뷰 모델)·`ReviewPublisher`(가짜 GitHub 전송), 게시는 가짜 Discord REST다. 리뷰 App 설치 조회·저장소 정보·토큰 범위는 `githubReviewIO`에 가짜 `fetch`(GitHub REST 흉내)를 넣어 본다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §13 "리뷰 요청(C30)", 구현 선택은 [DECISIONS](DECISIONS.md) "C30 리뷰 요청 구현 선택".
+
+| 완료 조건 | 시험 |
+|---|---|
+| owner가 ukyi-app 저장소 PR 리뷰를 부탁하면 확인 버튼 없이 리뷰 작업이 생기고 `COMMENT` 리뷰가 달림 | `c30-review-request` "C30 정책 목록의 조직 저장소 PR 리뷰 부탁은 확인 버튼 없이 바로 리뷰 작업을 만들고 "리뷰 시작했어요"를 단다"(버튼 글 0, `pr_reviews` 1건 trigger `comment`, 답 `REVIEW_REQUEST_TEXT.started`, 리뷰 실행 뒤 `POST …/pulls/7/reviews` event `COMMENT`), "C30 정책 목록 밖이지만 리뷰 App이 설치된 조직 저장소 PR도 그 작업 하나로 리뷰하고 COMMENT를 게시한다(짧은 꼴 owner/repo#번호)"(정책 목록 그대로) |
+| 리뷰 App이 없는 저장소·조직 밖 PR은 못 한다고 답하고 작업 없음 | `c30-review-request` "C30 리뷰 App이 없는 조직 저장소와 조직 밖 PR은 못 한다고 답하고 리뷰 작업을 만들지 않는다. 조직 밖은 GitHub에 묻지 않는다"(조직 밖은 설치·PR 조회 0), `github-review-app` "C30 리뷰 요청 대상 조회: App JWT로 설치를 묻고, … 설치가 없으면 토큰을 받지 않는다"(404 → null, 토큰 발급 0) |
+| 정책 목록 밖 저장소의 PR 이벤트·댓글 명령은 자동 리뷰를 만들지 않음 | `pr-review` "C30 리뷰 App이 조직 전체에 설치돼도 정책 목록 밖 저장소의 PR 이벤트·댓글 명령은 자동 리뷰를 만들지 않는다(Discord 리뷰 요청 세대가 있어도)"(`opened`·`reopened`·`ready_for_review`·`synchronize`·`/fixture-review` 모두 `installation_or_repository`, 작업 수 그대로), `c30-review-request` "C30 목록 밖 저장소의 리뷰 요청 세대는 실행 전 head가 바뀌면 닫기만 하고 새 세대를 자동으로 만들지 않는다" |
+| 스위치 꺼짐이면 동작하지 않음 | `c30-review-request` "C30 동료 기능 스위치가 꺼져 있으면 리뷰 요청 제안을 버리고 리뷰 작업이 생기지 않는다"(GitHub 조회 0), "C30 리뷰 경로가 없는 게시 서버(묶인 리뷰 요청 없음)에서는 제안을 연결 안 됨으로 버린다" |
+| (잡는 실패) 맥락 자료가 고른 대상으로 리뷰 | `c30-review-request` "C30 owner 원문에 없는 PR을 모델이 대상으로 고르면(맥락 자료가 고른 대상) 리뷰하지 않고 이유를 답한다"(다른 PR 링크가 있는 원문, PR이 없는 원문 둘 다 `notInText`, GitHub 조회 0) |
+| fork·작성자 조건 거부 유지 | `c30-review-request` "C30 fork PR·작성자 조건 밖·닫힌 PR은 자동 리뷰와 같은 판단으로 거절하고, draft는 명시 요청이라 리뷰한다"(fork·삭제된 head·`CONTRIBUTOR`·허용 밖 봇·닫힘·병합 거절, draft 시작, 같은 커밋 재요청은 `already`) |
+| 실행·게시 직전 저장소 대조, 토큰 범위 | `c30-review-request` "C30 목록 밖 세대의 대상 기록이 그 행의 설치·저장소와 다르거나 조직 밖이면 실행하지 않고, 게시 직전에도 막는다"(실행 `cancelled`, 게시 `blocked`/`authorization_revoked`), `github-review-app` "C30 토큰 범위: 정책 목록 밖 저장소는 Discord 리뷰 요청 작업이 살아 있는 동안만 그 기록으로 토큰을 받는다", "C30 리뷰 요청 대상 조회: 설치 계정·토큰 저장소·저장소 정보가 요청한 저장소와 다르면 쓰지 않는다", "C30 리뷰 App 허용 경로: 저장소 설치 조회와 저장소 정보 GET 두 줄만 는다" |
+| `ukyi-review` 설치 범위 변경과 승인 기록 | 사람 작업(주 진행자, homelab `approvals.md`). 코드 시험 없음. 실제 설치 범위는 C24 S5 |
+
+- **실행(origin/main 9d5621a 병합 뒤, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 바뀐 파일을 참조하는 14개 파일(`c30-review-request`, `github-review-app`, `pr-review`, `publisher-review`, `review-9`, `review-9-pg`, `publisher-migrate`, `publisher-pg`, `worker-contract-v2`, `c13-proposal`, `c13-proposal-pg`, `c14-remaining-actions`, `c15-session-key`, `publisher-main`) 283개 중 279개 통과, 실패 4개는 모두 적용 마이그레이션 번호 목록 리터럴(023 추가 전 값)이었다. 그 목록을 쓰는 7개 파일(`publisher-migrate`, `publisher-pg`, `change-store`, `change-store-pg`, `change-pg`, `raw-text-retention`, `raw-input-retention`)을 고친 뒤 다시 돌려 86개 모두 통과, skip 0. `change-store`의 "기존 표를 바꾸지 않는다" 시험에는 023이 더하는 `pr_reviews.request_target`(NULL, 기본값 없음)을 허용 칸으로 적었다.
+- **시험이 실패할 수 있는지 확인:** 목록 밖 세대 시험은 실행·게시 경로에 대상 기록 대조를 넣기 전에 `cancelled`(`authorization_revoked`)로 실패했다(빨강 → 초록). 거절·스위치·원문 대조 시험은 첫 조각(제안 줄·접수) 구현 뒤에 써서 처음부터 통과했다.
+- **운영 영향:** 스위치가 꺼져 있으면 제안을 보지 않아 지금 동작 그대로다. 스위치와 무관하게 바뀌는 것은 마이그레이션 023(`pr_reviews.request_target` NULL 칸)과 리뷰 App 허용 경로 두 줄(부르는 곳은 리뷰 요청뿐)이다. 작업자 이미지를 바꾸기 전에는 모델이 `review_request`를 낼 수 없다(DECISIONS "C30 리뷰 요청 구현 선택").
+- **못 잡는 범위:** 실제 GitHub의 설치 조회 응답(선택 저장소 밖이면 404인지), 이름으로 좁힌 토큰 발급, App 설치 범위 설정은 S5(C24)다. 모델이 owner 말에서 `review_request`와 대상을 고르는지는 실제 모델 호출이라 시험하지 않았다.
+
 ## C21 운영 알림 (2026-11-10, 로컬)
 
 동료 봇 명세 §4.7 "운영 알림"과 AC-18을 S1(봇 지표 출력)과 S4(homelab vmalert 규칙 단위 시험, Alertmanager route 시험)에서 고정했다. 지표는 [ARCHITECTURE](ARCHITECTURE.md) §13 "지표", 구현 선택은 [DECISIONS](DECISIONS.md) "C21 운영 알림". 봇 시험은 `test/ops-metrics.test.ts`의 C21 줄, homelab 시험은 `platform/observability/stack/vmalert/tests/bot.test.yaml`의 `HomelabBotModelPaused` 다섯 개와 `tools/ci/alerting.ts` `ROUTES`의 경보 이름 줄이다.
