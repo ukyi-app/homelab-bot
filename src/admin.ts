@@ -27,7 +27,7 @@ export type AdminCommand =
 export type AdminState = { emergency: boolean; paused: boolean; executionPending: boolean; taskLaneClosed: ExecutionLaneClosedReason | null };
 // homelab CLI(cli/src/core/podops.ts BOT_RESULTS)가 받는 이름과 같아야 한다. 이름을 더하면 그쪽 집합도 넓힌다.
 export type AdminResult = 'stopped' | 'already_stopped' | 'released' | 'not_stopped' | 'running_jobs' | 'status' | 'unsupported' | 'usage' | 'failed'
-  | 'blocked' | 'already_blocked';
+  | 'blocked' | 'already_blocked' | 'resumed' | 'not_waiting' | 'emergency_stopped' | 'queue_full';
 export type AdminReport = { schema: typeof ADMIN_SCHEMA; command: string; result: AdminResult; state?: AdminState };
 
 export class AdminUsage extends Error {
@@ -60,7 +60,7 @@ export interface AdminPorts {
 
 export async function runAdmin(store: Store, command: AdminCommand, ports: AdminPorts = {}): Promise<{ code: number; report: AdminReport }> {
   const report = (result: AdminResult, state?: AdminState): AdminReport => ({ schema: ADMIN_SCHEMA, command: label(command), result, ...(state ? { state } : {}) });
-  if (command.name === 'release' || (command.name === 'resume' && command.target === 'job'))
+  if (command.name === 'release')
     return { code: ADMIN_EXIT.unsupported, report: report('unsupported') };
   // 상태 확인과 바꾸기를 한 트랜잭션에서 한다. Store.atomic은 안쪽 control의 atomic을 같은 트랜잭션으로 합친다.
   return store.atomic(async s => {
@@ -79,6 +79,11 @@ export async function runAdmin(store: Store, command: AdminCommand, ports: Admin
       const result = before.emergency ? 'already_stopped' : 'stopped';
       await audit(result);
       return { code: ADMIN_EXIT.ok, report: report(result, stateOf(await status())) };
+    }
+    if (command.target === 'job') {
+      const result = await s.adminResumeJob(command.job, ADMIN_ACTOR);
+      await audit(result);
+      return { code: result === 'resumed' ? ADMIN_EXIT.ok : ADMIN_EXIT.refused, report: report(result, stateOf(await status())) };
     }
     // 비상 정지가 없으면 바꾸지 않는다. '/resume-model target:emergency-stop'은 이때도 다른 대기의 일시 중지를 풀지만,
     // 관리 기능의 재실행은 상태를 바꾸지 않아야 한다(재실행 안전).

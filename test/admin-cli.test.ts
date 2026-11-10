@@ -149,6 +149,71 @@ test('관리 기능 차단: 해제 승인(revocationRestores)에 적힌 옛 거�
   await assert.rejects(f.gate.authorize(TARGET, thread));
 });
 
+// ---- C32 멈춘 작업 재개 ----
+const MISSING = '0f8b5a8e-3c1d-4e2f-9a7b-1c2d3e4f5a6b';
+const paused = async (reason = 'model_limit') => {
+  await queued();
+  const id = (await database.db.query<{ id: string }>('SELECT id FROM jobs')).rows[0]!.id;
+  await database.db.query("UPDATE jobs SET state='waiting_user',wait_reason=$2,attempt=1 WHERE id=$1", [id, reason]);
+  // 모델 멈춤은 전역 일시 중지만 켠다. 비상 정지 행이 없으면 lockScheduler가 scheduler 값을 옛 비상 정지로 옮긴다.
+  await database.db.query("INSERT INTO controls(key,value) VALUES ('scheduler','true'),('scheduler_emergency','false') ON CONFLICT (key) DO UPDATE SET value=excluded.value");
+  return id;
+};
+const job = async (id: string) => (await database.db.query<{ state: string; wait_reason: string | null }>('SELECT state,wait_reason FROM jobs WHERE id=$1', [id])).rows[0];
+
+test('관리 기능 멈춘 작업 재개: 작업 ID만으로 모델 멈춤 작업을 다시 큐에 넣고 감사 행위자가 cli다', async () => {
+  const id = await paused();
+  // 대화 구독이 꺼져 있어도 대조하지 않는다.
+  await database.db.query('UPDATE conversations SET active=false');
+  const out = await admin('resume', 'job', id);
+  assert.equal(out.code, 0);
+  assert.equal(out.report.result, 'resumed');
+  assert.equal(out.report.command, 'resume job');
+  assert.deepEqual(await job(id), { state: 'queued', wait_reason: null });
+  assert.equal(out.report.state?.paused, false);
+  assert.equal(await flag('scheduler'), false);
+  assert.deepEqual((await audits()).map(row => [row.kind, row.subject, row.detail.actor]),
+    [['model_wait_resumed', id, 'cli'], ['admin_command', 'resume job', 'cli']]);
+  assert.equal(f.requests.length, 0);
+});
+
+test('관리 기능 멈춘 작업 재개: 인증 대기도 같은 경로로 푼다', async () => {
+  const id = await paused('auth_expired');
+  assert.equal((await admin('resume', 'job', id)).report.result, 'resumed');
+  assert.equal((await job(id))?.state, 'queued');
+});
+
+test('관리 기능 멈춘 작업 재개: 그 대기 상태가 아니면 바꾸지 않고 not_waiting이다(재실행·없는 작업·질문 대기·시도 한도)', async () => {
+  const id = await paused();
+  assert.equal((await admin('resume', 'job', id)).report.result, 'resumed');
+  const rerun = await admin('resume', 'job', id);
+  assert.equal(rerun.code, 3);
+  assert.equal(rerun.report.result, 'not_waiting');
+  assert.equal((await admin('resume', 'job', MISSING)).report.result, 'not_waiting');
+  await database.db.query("UPDATE jobs SET state='waiting_user',wait_reason='clarification' WHERE id=$1", [id]);
+  assert.equal((await admin('resume', 'job', id)).report.result, 'not_waiting');
+  await database.db.query("UPDATE jobs SET wait_reason='model_limit',attempt=$2 WHERE id=$1", [id, DEFAULTS.maxRetries + 1]);
+  assert.equal((await admin('resume', 'job', id)).report.result, 'not_waiting');
+  assert.deepEqual(await job(id), { state: 'waiting_user', wait_reason: 'model_limit' });
+  assert.equal((await audits()).filter(row => row.kind === 'model_wait_resumed').length, 1);
+});
+
+test('관리 기능 멈춘 작업 재개: 비상 정지 중이면 바꾸지 않고 emergency_stopped다', async () => {
+  const id = await paused();
+  await admin('emergency-stop');
+  const out = await admin('resume', 'job', id);
+  assert.equal(out.code, 3);
+  assert.equal(out.report.result, 'emergency_stopped');
+  assert.deepEqual(await job(id), { state: 'waiting_user', wait_reason: 'model_limit' });
+});
+
+test("관리 기능 멈춘 작업 재개: '/resume-model'은 그대로 owner·대화를 대조해 같은 작업을 재개한다", async () => {
+  const id = await paused();
+  await f.ingress.receive(event('slash-resume-job', { kind: 'command', command: 'resume-model', target: id }));
+  assert.equal((await job(id))?.state, 'queued');
+  assert.equal((await admin('resume', 'job', id)).report.result, 'not_waiting');
+});
+
 test('관리 진입점 입력은 고정 명령 단어와 형식이 맞는 ID만 받는다', () => {
   for (const argv of [[], ['stop'], ['emergency-stop', 'now'], ['status', '--json'], ['resume'], ['resume', 'job'],
     ['resume', 'job', 'not-a-uuid'], ['block', 'fixture-owner'], ['block', '12345'], ['block', '123456789012345678', 'x'],
