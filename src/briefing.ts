@@ -4,6 +4,7 @@ import type { Scope } from './contracts.js';
 import type { Database } from './database.js';
 import { bounded } from './format.js';
 import { MemoryNotReady } from './memory.js';
+import { tokenExpiresAt } from './model-accounts.js';
 import type { MemoryService, MemoryView } from './memory.js';
 import type { TaskGateClosedReason } from './ops-metrics.js';
 import type { Policy, PolicyGate } from './policy.js';
@@ -30,7 +31,13 @@ export const BRIEFING_TEXT = Object.freeze({
     colleague: (reasons: string) => `- 모델 호출: 중지(${reasons}) · \`homelab bot\` CLI로 확인해 주세요`,
   },
   reviewsDeferred: (count: number) => `- 미룬 PR 리뷰: ${count}건이에요. 모델 사용 한도가 가까워서 한도가 풀리면 이어서 리뷰해요.`,
+  // 계정 이름은 CLI 이름 규칙(소문자·숫자·하이픈)을 통과한 값만 DB에 있어 멘션·서식이 될 수 없다.
+  tokenExpiring: (account: string, days: number) => days > 0
+    ? `- Claude 토큰(${account})이 ${days}일 뒤 만료돼요.` : `- Claude 토큰(${account})이 하루 안에 만료돼요.`,
+  tokenExpired: (account: string) => `- Claude 토큰(${account})이 만료됐어요. 새 토큰을 등록해 주세요.`,
 });
+// 토큰 만료 알림을 시작하는 남은 기간(COLLEAGUE_SPEC §4.7). 남은 날수는 인증서 만료 칸과 같이 내림이다.
+const TOKEN_NOTICE_MS = 30 * 86_400_000;
 export interface Observation {
   observedAt: number; status: 'ok' | 'problem'; summary: string; restoreVerifiedAt?: number | null;
   // 백업 원본만 낸다. 백업 status와 따로 판정해 복원 기록 문제·오류가 백업 정상·확인 필요를 바꾸지 않는다.
@@ -418,6 +425,14 @@ export class BriefingScheduler {
       const deferred = Number((await this.db.query<{ count: string | number }>(`SELECT count(*) AS count FROM jobs j WHERE j.type='review' AND j.state='queued'
         AND NOT EXISTS (SELECT 1 FROM change_child_jobs c WHERE c.job_id=j.id AND c.role='review')`)).rows[0]!.count);
       if (deferred) lines.push(BRIEFING_TEXT.reviewsDeferred(deferred));
+    }
+    // 토큰 만료(C22). CLI로 등록한 구독 토큰마다 본다. 지금 쓰지 않는 계정도 바꿔 쓸 수 있어야 하므로 함께 알린다.
+    const now = this.store.now();
+    for (const token of (await this.db.query<{ name: string; issued_at: string }>(`SELECT name,issued_at FROM model_accounts
+      WHERE method='subscription' AND issued_at IS NOT NULL ORDER BY name`)).rows) {
+      const left = tokenExpiresAt(Number(token.issued_at)) - now;
+      if (left > TOKEN_NOTICE_MS) continue;
+      lines.push(left > 0 ? BRIEFING_TEXT.tokenExpiring(token.name, Math.floor(left / 86_400_000)) : BRIEFING_TEXT.tokenExpired(token.name));
     }
     return lines;
   }

@@ -30,8 +30,8 @@ const iso = (value: string | number | null | undefined) => { const ms = num(valu
 
 // 구독 토큰(레인 둘)을 등록한 시각을 발급일로 둔다. 다시 등록하면(같은 계정의 토큰 교체) 발급일만 새로 한다. 지금 표시는 그대로다.
 export async function recordAccount(db: Database, name: string, method: AccountMethod, now: number): Promise<void> {
-  await db.query(`INSERT INTO model_accounts(name,method,issued_at,registered_at) VALUES ($1,$2,$3,$3)
-    ON CONFLICT (name,method) DO UPDATE SET issued_at=EXCLUDED.issued_at`, [name, method, method === 'subscription' ? now : null]);
+  await db.query(`INSERT INTO model_accounts(name,method,issued_at,registered_at) VALUES ($1,$2,$3,$4)
+    ON CONFLICT (name,method) DO UPDATE SET issued_at=EXCLUDED.issued_at`, [name, method, method === 'subscription' ? now : null, now]);
 }
 
 // 목록. 지금 계정의 한도 관측은 model_limit_state(C19)에서, 다른 계정은 그 계정에서 바꿀 때 옮겨 둔 값에서 읽는다.
@@ -61,4 +61,40 @@ async function pausedCounts(db: Database): Promise<PausedCounts> {
   return counts;
 }
 
-export type _StoreForAccounts = Store;
+export type SwitchOutcome = { result: 'unknown_account' } | { result: 'switched'; resumed: number; waiting: number; held: 'emergency_stopped' | 'queue_full' | null };
+
+// 계정 전환의 봇 쪽 끝(COLLEAGUE_SPEC §4.8 "계정 전환"). homelab CLI가 두 레인 자격을 작업자 키로 옮기고 작업자 볼륨 지문까지
+// 확인한 뒤에만 부른다(반영 전 해제 금지는 CLI의 단계 순서가 지킨다). 한 트랜잭션(호출자의 Store.atomic) 안에서 돈다.
+// - 지금 표시를 그 계정·방식으로 옮긴다. 계정이 바뀌면 지금 한도 관측(model_limit_state, 리뷰 미루기 기한 포함)은 옛 계정 행으로
+//   옮기고 비운다. 새 계정의 한도는 아직 모른다.
+// - 모델 멈춤으로 기다리는 작업을 모두 같은 해제 전이(Store.resumeWaiting)로 다시 큐에 넣는다. 결제 멈춤도 넣는다(재시도 시각이
+//   없어 예약 루프가 고르지 않는 멈춤이라, 계정을 바꾼 owner의 해제가 유일한 길이다). 같은 계정으로 다시 부르면 해제만 한다.
+// - 비상 정지 중이면 해제하지 않는다. 큐가 차면 거기서 멈추고, 남은 한도·인증 대기는 예약 루프가 30분 안에 다시 본다.
+export async function switchAccount(store: Store, name: string, method: AccountMethod, actor: string, conversation: string): Promise<SwitchOutcome> {
+  const db = store.db;
+  const target = (await db.query<{ current: boolean }>('SELECT current FROM model_accounts WHERE name=$1 AND method=$2 FOR UPDATE', [name, method])).rows[0];
+  if (!target) return { result: 'unknown_account' };
+  if (!target.current) {
+    await db.query(`UPDATE model_accounts a SET last_status=s.status,last_rate_limit_type=s.rate_limit_type,last_utilization=s.utilization,
+      last_resets_at=s.resets_at,last_observed_at=s.observed_at FROM model_limit_state s WHERE a.current AND s.id='account' AND s.observed_at IS NOT NULL`);
+    await db.query("DELETE FROM model_limit_state WHERE id='account'");
+    await db.query('UPDATE model_accounts SET current=false WHERE current');
+    await db.query('UPDATE model_accounts SET current=true WHERE name=$1 AND method=$2', [name, method]);
+  }
+  await store.lockScheduler();
+  const emergency = (await db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler_emergency'")).rows[0]?.value === true;
+  const waiting = (await db.query<{ id: string; type: string }>(`SELECT id,type FROM jobs WHERE state='waiting_user'
+    AND wait_reason IN ('model_limit','auth_expired') ORDER BY created_at,id`)).rows;
+  if (emergency) return { result: 'switched', resumed: 0, waiting: waiting.length, held: 'emergency_stopped' };
+  let resumed = 0;
+  for (const job of waiting) {
+    if (await store.queueFull(job.type === 'review' ? 'review' : 'chat'))
+      return { result: 'switched', resumed, waiting: waiting.length - resumed, held: 'queue_full' };
+    // 리뷰 작업은 '/review-resume'과 같은 리뷰 제어 경로, 그 밖은 관리 기능의 멈춘 작업 재개(C32)다. 둘 다 Store.resumeWaiting이다.
+    const ok = job.type === 'review'
+      ? (await store.control(actor, conversation, 'review-resume', job.id, undefined, { review: true }) as { ok: boolean }).ok
+      : await store.adminResumeJob(job.id, actor) === 'resumed';
+    if (ok) resumed++;
+  }
+  return { result: 'switched', resumed, waiting: waiting.length - resumed, held: null };
+}

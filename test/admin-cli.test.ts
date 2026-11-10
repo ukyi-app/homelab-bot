@@ -296,11 +296,93 @@ test('계정 기록: 구독 계정의 이름·방식·발급일만 남기고, �
   assert.equal(f.requests.length, 0);
 });
 
+// 결제로 멈춘 대화 작업 하나와 한도로 멈춘 PR 리뷰 작업 하나.
+const pausedPair = async () => {
+  const chat = await paused();
+  await database.db.query("INSERT INTO model_pauses(job_id,kind,retry_at,paused_at) VALUES ($1,'billing',NULL,$2)", [chat, f.now()]);
+  await database.db.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,received_at,payload)
+    VALUES ('fixture-review','github','fixture-review','fixture-review','fixture-owner','{}',0,'{}')`);
+  await database.db.query(`INSERT INTO jobs(id,event_id,type,owner_id,target,revision,budget,state,wait_reason,attempt,priority,available_at,created_at)
+    VALUES ('fixture-review','fixture-review','review','fixture-owner','{}','{}','{}','waiting_user','model_limit',1,20,0,$1)`, [f.now() + 1]);
+  await database.db.query("INSERT INTO model_pauses(job_id,kind,retry_at,paused_at) VALUES ('fixture-review','rate_limit',$1,$2)", [f.now() + 3_600_000, f.now()]);
+  return { chat, review: 'fixture-review' };
+};
+const currentAccount = async () => (await database.db.query<{ name: string }>('SELECT name FROM model_accounts WHERE current')).rows.map(row => row.name);
+
+test('계정 전환: 지금 계정을 바꾸고 결제 멈춤까지 모델 멈춤 작업을 모두 다시 큐에 넣으며 감사 행위자가 cli다', async () => {
+  await admin('account', 'record', 'main', 'subscription');
+  await admin('account', 'record', 'spare', 'subscription');
+  const { chat, review } = await pausedPair();
+  const before = await admin('account', 'list');
+  assert.deepEqual(before.report.paused, { rate_limit: 1, auth_expired: 0, billing: 1 });
+  const out = await admin('account', 'use', 'spare', 'subscription');
+  assert.equal(out.code, 0);
+  assert.equal(out.report.result, 'switched');
+  assert.deepEqual(out.report.switch, { resumed: 2, waiting: 0, held: null });
+  assert.deepEqual(await job(chat), { state: 'queued', wait_reason: null });
+  assert.deepEqual(await job(review), { state: 'queued', wait_reason: null });
+  assert.equal(await flag('scheduler'), false);
+  assert.deepEqual(await currentAccount(), ['spare']);
+  const after = await admin('account', 'list');
+  assert.deepEqual(after.report.accounts?.map(a => [a.name, a.current]), [['main', false], ['spare', true]]);
+  assert.deepEqual(after.report.paused, NO_PAUSES);
+  assert.deepEqual((await audits()).filter(row => row.detail.actor === ADMIN_ACTOR || row.subject === ADMIN_ACTOR).map(row => [row.kind, row.subject]).slice(2),
+    [['model_wait_resumed', chat], ['review_wait_resumed', review], ['admin_command', 'account use']]);
+  assert.equal(f.requests.length, 0);
+});
+
+test('계정 전환: 등록하지 않은 계정이면 아무것도 바꾸지 않고 unknown_account(3)다', async () => {
+  await admin('account', 'record', 'main', 'subscription');
+  await admin('account', 'use', 'main', 'subscription');
+  const { chat } = await pausedPair();
+  const out = await admin('account', 'use', 'other', 'subscription');
+  assert.equal(out.code, 3);
+  assert.equal(out.report.result, 'unknown_account');
+  assert.deepEqual(await currentAccount(), ['main']);
+  assert.deepEqual(await job(chat), { state: 'waiting_user', wait_reason: 'model_limit' });
+});
+
+test('계정 전환: 비상 정지 중이면 지금 계정만 바꾸고 멈춘 작업은 그대로 두며 이유를 알린다', async () => {
+  await admin('account', 'record', 'main', 'subscription');
+  const { chat } = await pausedPair();
+  await admin('emergency-stop');
+  const out = await admin('account', 'use', 'main', 'subscription');
+  assert.equal(out.code, 0);
+  assert.deepEqual(out.report.switch, { resumed: 0, waiting: 2, held: 'emergency_stopped' });
+  assert.deepEqual(await currentAccount(), ['main']);
+  assert.deepEqual(await job(chat), { state: 'waiting_user', wait_reason: 'model_limit' });
+  // 같은 계정으로 다시 실행하면(비상 정지를 푼 뒤) 그때 해제한다. 결제 멈춤을 같은 계정에서 푼 owner의 해제 경로이기도 하다.
+  await admin('resume', 'emergency-stop');
+  assert.deepEqual((await admin('account', 'use', 'main', 'subscription')).report.switch, { resumed: 2, waiting: 0, held: null });
+});
+
+test('계정 전환: 옛 계정의 마지막 한도 관측은 그 계정 목록에 남고, 새 계정은 관측 없음·리뷰 미루기 없음에서 시작한다', async () => {
+  await admin('account', 'record', 'main', 'subscription');
+  await admin('account', 'record', 'spare', 'subscription');
+  await admin('account', 'use', 'main', 'subscription');
+  const resets = Math.floor((f.now() + 3_600_000) / 1000);
+  await f.store.observeRateLimit({ event: { status: 'allowed_warning', rateLimitType: 'five_hour', utilization: 0.97, resetsAt: resets } });
+  const seen = { status: 'allowed_warning', rateLimitType: 'five_hour', utilization: 0.97, resetsAt: '2027-01-15T09:00:00Z', observedAt: '2027-01-15T08:00:00Z' };
+  assert.deepEqual((await admin('account', 'list')).report.accounts?.find(a => a.name === 'main')?.limit, seen);
+  assert.notEqual(await f.store.reviewDeferredUntil(), null);
+  await admin('account', 'use', 'spare', 'subscription');
+  const accounts = (await admin('account', 'list')).report.accounts!;
+  assert.deepEqual(accounts.find(a => a.name === 'main')?.limit, seen);
+  assert.equal(accounts.find(a => a.name === 'spare')?.limit, null);
+  assert.equal(await f.store.reviewDeferredUntil(), null);
+});
+
 test('관리 진입점 입력은 고정 명령 단어와 형식이 맞는 ID만 받는다', () => {
   for (const argv of [[], ['stop'], ['emergency-stop', 'now'], ['status', '--json'], ['resume'], ['resume', 'job'],
     ['resume', 'job', 'not-a-uuid'], ['block', 'fixture-owner'], ['block', '12345'], ['block', '123456789012345678', 'x'],
-    ['block', '123456789012345678;rm'], ['release', '0F8B5A8E-3C1D-4E2F-9A7B-1C2D3E4F5A6B'], ['release', '$(id)']])
+    ['block', '123456789012345678;rm'], ['release', '0F8B5A8E-3C1D-4E2F-9A7B-1C2D3E4F5A6B'], ['release', '$(id)'],
+    ['account'], ['account', 'list', 'x'], ['account', 'record', 'main'], ['account', 'use', 'main', 'api'],
+    ['account', 'use', 'Main', 'subscription'], ['account', 'use', '-main', 'subscription'], ['account', 'use', 'main-', 'subscription'],
+    ['account', 'use', 'a'.repeat(33), 'subscription'], ['account', 'use', '../x', 'subscription'], ['account', 'record', 'main', 'subscription', 'x'],
+    ['account', 'remove', 'main', 'subscription']])
     assert.throws(() => parseAdminArgs(argv), AdminUsage, argv.join(' '));
+  assert.deepEqual(parseAdminArgs(['account', 'use', 'a'.repeat(32), 'subscription']),
+    { name: 'account', action: 'use', account: 'a'.repeat(32), method: 'subscription' });
 });
 
 test('관리 진입점 실행: 사용법 오류는 DB를 열지 않고 64, 결과는 JSON 한 줄, 실패는 원문 없이 1', async () => {

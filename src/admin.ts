@@ -2,7 +2,7 @@ import type { PolicyGate } from './policy.js';
 import type { Store } from './store.js';
 import type { ReleaseOutcome, TaskBridge } from './task-bridge.js';
 import type { ExecutionLaneClosedReason } from './task-contracts.js';
-import { ACCOUNT_NAME, listAccounts, recordAccount } from './model-accounts.js';
+import { ACCOUNT_NAME, listAccounts, recordAccount, switchAccount } from './model-accounts.js';
 import type { AccountView, PausedCounts } from './model-accounts.js';
 
 // 관리 기능 진입점의 명령 처리(명세 §4.8, DECISIONS "동료 봇 전환" 3). owner가 클러스터 접근 권한으로 `homelab bot`을 실행하면
@@ -110,7 +110,11 @@ export async function runAdmin(store: Store, command: AdminCommand, ports: Admin
         await audit(s, 'recorded');
         return { code: ADMIN_EXIT.ok, report: report('recorded') };
       }
-      throw new AdminUsage();
+      const outcome = await switchAccount(s, command.account, command.method, ADMIN_ACTOR, ADMIN_CONVERSATION);
+      await audit(s, outcome.result);
+      if (outcome.result === 'unknown_account') return { code: ADMIN_EXIT.refused, report: report('unknown_account') };
+      const { resumed, waiting, held } = outcome;
+      return { code: ADMIN_EXIT.ok, report: { ...report('switched', stateOf(await status(s))), switch: { resumed, waiting, held } } };
     }
     if (command.name === 'block') {
       if (!ports.gate) throw new Error('admin_policy_unavailable');
