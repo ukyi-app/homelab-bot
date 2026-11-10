@@ -251,7 +251,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     const links = new ExternalTaskLinks(store, restoreEpoch === undefined ? {} : { restoreEpoch });
     const receiver = new ExternalTaskReceiver({ store, links, environment, log,
       authorize: (owner, scope, db) => gate.withDatabase(db).authorize(owner, scope) });
-    return { links, receiver, server: externalTaskServer(receiver), commands: new ExternalTaskCommands(links, environment, log) };
+    return { links, receiver, server: externalTaskServer(receiver), commands: new ExternalTaskCommands(links, environment, log, config.colleagueEnabled === true) };
   })() : undefined;
   log('external_task_gate', external ? { state: 'open' } : { state: 'closed', reason: 'switch_off' });
   if (external) health.watchExternalTasks(() => external.receiver.metrics());

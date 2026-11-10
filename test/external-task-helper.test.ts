@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { externalTaskServer, EXTERNAL_TASK_PATH, signatureInput as serverSignatureInput, sha256Hex, suspectSummary as serverSuspect } from '../src/external-task-receiver.js';
+import { EXTERNAL_NOTICE_TEXT, externalTaskServer, EXTERNAL_TASK_PATH, signatureInput as serverSignatureInput, sha256Hex, suspectSummary as serverSuspect } from '../src/external-task-receiver.js';
 import { ENVIRONMENT, SESSION, listen, receiverFixture, shut } from './external-task-fixture.js';
 import type { AddressInfo } from 'node:net';
 
@@ -377,7 +377,7 @@ test('R08 helper 끝까지: 훅 → 큐 → 전송기 서명 → 실제 수신 �
     assert.equal((await queue.status()).queued, 0);
     assert.equal(await ctx.f.publisher.deliver(), true);
     const { content } = ctx.f.rest.messages[0]!.body;
-    assert.ok(content.includes('사람 세션이 턴을 끝냈다고 알림'));
+    assert.ok(content.startsWith(EXTERNAL_NOTICE_TEXT.head('', '').split(' (')[0]!));
     assert.ok(content.includes('요약: `빌드가 끝났습니다.`'));
     // 보낸 뒤 ACK를 잃어 같은 본문을 다시 보내도 게시는 한 번이다.
     assert.deepEqual(await runHook({ executor: 'claude', input: claudeStop(), parse: parseClaudeStop, env, now }), ['queued']);

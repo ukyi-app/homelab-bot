@@ -229,23 +229,27 @@ export class DeploymentReader implements ChangeDeploymentPort {
 
 const shown = (value: string | null) => value ?? '미확인';
 const timeOf = (at: number | null) => at === null ? '미확인' : new Date(at).toISOString();
-const STATE_TEXT: Readonly<Record<DeploymentObservation['state'], string>> = Object.freeze({
-  observed: '기록된 버전이 image.yaml·Argo·workload에서 일치한다',
-  pending: '아직 일치를 확인하지 못했다. 기다리는 중이다',
-  unknown: '읽지 못해 미확인이다',
-  blocked: '이 경로로는 연결을 확인할 수 없다. 사람이 볼 일이다',
-  not_applicable: '배포 영향이 없는 변경이다. 배포를 읽지 않았다',
+// 배포 관측 알림의 고정 문구(동료 말투). '/' 이름이 없어 스위치와 상관없이 같다.
+export const DEPLOYMENT_TEXT = Object.freeze({
+  state: Object.freeze({
+    observed: '기록된 버전이 image.yaml·Argo·workload에서 일치해요',
+    pending: '아직 일치를 확인하지 못해서 기다리는 중이에요',
+    unknown: '읽지 못해서 미확인이에요',
+    blocked: '이 경로로는 연결을 확인할 수 없어요. 사람이 봐야 해요',
+    not_applicable: '배포 영향이 없는 변경이라 배포를 읽지 않았어요',
+  } satisfies Record<DeploymentObservation['state'], string>),
+  scope: '범위: 배포된 버전만 읽었어요. 기능·DB·성능은 확인하지 않았어요.',
 });
 // 사람이 읽는 상태 문구다. 이 관측은 버전 일치만 말하므로 범위 문장을 늘 함께 낸다.
 export function describeDeployment(observation: DeploymentObservation): string {
   return [
-    `배포 관측: ${observation.state}. ${STATE_TEXT[observation.state]}.`,
+    `배포 관측: ${observation.state}. ${DEPLOYMENT_TEXT.state[observation.state]}.`,
     ...(observation.reason ? [`사유: ${observation.reason}`] : []),
     `PR head H: ${observation.headSha}`,
     `병합 M: ${observation.mergeCommit}`,
     `배포 설정 K: ${shown(observation.configCommit)}`,
     `이미지 D: ${shown(observation.imageDigest)}`,
     `관측 시각: ${timeOf(observation.observedAt)} (Argo ${timeOf(observation.argoObservedAt)}, workload ${timeOf(observation.workloadObservedAt)})`,
-    '범위: 배포된 버전만 읽었다. 기능·DB·성능은 확인하지 않았다.',
+    DEPLOYMENT_TEXT.scope,
   ].join('\n');
 }

@@ -1,6 +1,7 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PUBLISH_TEXT } from '../src/change-commands.js';
+import { CHANGE_NOTICE_TEXT } from '../src/change-runtime.js';
 import { Denied } from '../src/contracts.js';
 import { DiscordProtocol } from '../src/discord-protocol.js';
 import { REPO } from './change-github-fake.js';
@@ -37,13 +38,15 @@ const protocol = new DiscordProtocol({ request: async (method, path) => {
 } }, BOT);
 const press = (h: Harness, id: string, customId: string, actor = OWNER) => protocol.gateway('INTERACTION_CREATE', { id, token: 'fixture-interaction-token', type: 3,
   channel_id: THREAD.channel, guild_id: THREAD.guild, member: { user: { id: actor } }, data: { custom_id: customId } }, h.ingress);
-// 게시된 미리보기 중 버튼이 달린 글(마지막 쪽)과 미리보기 본문에 적힌 승인 digest.
+// 게시된 미리보기 중 버튼이 달린 글(마지막 쪽)과 그 세대의 승인 digest.
 // 앞 세대 버튼 글이 섞이면 그 세대 digest를 잘못 집으므로 버튼 글도 custom_id의 세대 칸으로 거른다.
-const previewButton = (h: Harness, generation = 1) => {
+// 켜짐 판 미리보기 본문에는 '/' 승인 명령(digest)이 없어(C18) 저장된 승인 대상에서 읽는다.
+const previewButton = async (h: Harness, generation = 1) => {
   const posted = h.rest.messages.filter(message => message.body.content.includes(`g${generation} 게시 미리보기`)
     || message.body.components?.[0]?.components[0]?.custom_id.includes(`.${generation}.`));
   const withButton = posted.filter(message => message.body.components?.length);
-  const digest = /text:([0-9a-f]{64})/.exec(posted.map(message => message.body.content).join(''))?.[1];
+  const subject = await h.changes.approvalSubject({ changeId: await h.changeId(), generation });
+  const digest = subject.ok ? subject.value.digest : undefined;
   return { withButton, digest, customId: withButton.at(-1)?.body.components?.[0]?.components[0]?.custom_id };
 };
 const approvals = async (h: Harness, id: string) => (await h.db.query<{ generation: number; approval_digest: string; event_id: string; approved_by: string }>(
@@ -54,7 +57,7 @@ test('C17 AC-10: 스위치가 켜져 있으면 미리보기 버튼 하나로 그
   await withHarness({ colleague: true }, async h => {
     const id = await toAwaiting(h);
     await h.deliver();
-    const { withButton, digest, customId } = previewButton(h);
+    const { withButton, digest, customId } = await previewButton(h);
     assert.equal(withButton.length, 1, '버튼 글은 하나다');
     assert.equal(withButton[0]!.body.components![0]!.components.length, 1);
     assert.equal(withButton[0]!.body.components![0]!.components[0]!.label, PUBLISH_TEXT.label);
@@ -70,7 +73,8 @@ test('C17 AC-10: 스위치가 켜져 있으면 미리보기 버튼 하나로 그
     const ack = lastAck(h);
     assert.equal(ack.options?.update, true);
     assert.ok(ack.content!.endsWith(PUBLISH_TEXT.approved(id)));
-    assert.ok(ack.content!.includes('digest는 위 내용 전체에 묶여 있습니다.'));
+    assert.ok(ack.content!.includes(CHANGE_NOTICE_TEXT.previewBinding(true)));
+    assert.ok(!ack.content!.includes('/change-publish'), "켜짐 판 미리보기에는 '/' 승인 명령이 없다");
     await h.pump(async () => await h.phase(id) === 'proposed');
     assert.equal(h.env.github.pulls.length, 1);
   });
@@ -80,7 +84,7 @@ test('C17: 버튼 승인도 게시 직전 재확인을 거친다. 새 미리보�
   await withHarness({ colleague: true }, async h => {
     const id = await toAwaiting(h);
     await h.deliver();
-    const old = previewButton(h).customId!;
+    const old = (await previewButton(h)).customId!;
     h.env.github.moveBase();
     await press(h, 'fixture-press-1', old);
     await h.pump(async () => await h.phase(id) === 'superseded');
@@ -96,7 +100,7 @@ test('C17: 버튼 승인도 게시 직전 재확인을 거친다. 새 미리보�
     assert.equal(lastAck(h).content, PUBLISH_TEXT.stale);
     assert.notEqual(lastAck(h).options?.update, true, '거부는 누른 owner에게만 보이는 응답이다');
 
-    const current = previewButton(h, 2);
+    const current = await previewButton(h, 2);
     assert.equal(current.customId, `change-publish-ok:${id}.2.${current.digest!.slice(0, 16)}`);
     await press(h, 'fixture-press-3', current.customId!);
     assert.equal(await h.phase(id), 'approved');
@@ -107,7 +111,7 @@ test('C17: owner가 아닌 사람은 승인하지 못하고, 같은 버튼을 �
   await withHarness({ colleague: true }, async h => {
     const id = await toAwaiting(h);
     await h.deliver();
-    const { customId, digest } = previewButton(h);
+    const { customId, digest } = await previewButton(h);
     await assert.rejects(press(h, 'fixture-press-1', customId!, 'fixture-intruder'), Denied);
     assert.equal(await h.phase(id), 'awaiting_publish_approval');
     assert.deepEqual(await approvals(h, id), []);
@@ -126,7 +130,7 @@ test('C17: 구독이 꺼진 대화에서는 버튼으로 승인하지 않는다.
   await withHarness({ colleague: true }, async h => {
     const id = await toAwaiting(h);
     await h.deliver();
-    const { customId, digest } = previewButton(h);
+    const { customId, digest } = await previewButton(h);
     await h.command('101', 'stop');
     await press(h, 'fixture-press-1', customId!);
     assert.equal(lastAck(h).content, PUBLISH_TEXT.stopped);
@@ -142,7 +146,7 @@ test('C17: 스위치가 꺼져 있으면 미리보기에 버튼이 없고, 게�
   await withHarness({}, async h => {
     const id = await toAwaiting(h);
     await h.deliver();
-    const { withButton, digest } = previewButton(h);
+    const { withButton, digest } = await previewButton(h);
     assert.equal(withButton.length, 0);
     await assert.rejects(press(h, 'fixture-press-1', `change-publish-ok:${id}.1.${digest!.slice(0, 16)}`), Denied);
     assert.equal(await h.phase(id), 'awaiting_publish_approval');

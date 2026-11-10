@@ -40,8 +40,11 @@ export const CHAT_REPLY_JSON_SCHEMA = Object.freeze({
       description: 'owner 요청에서 읽어 낸 제안 하나. 없으면 null. 제안만 하고 실행되지 않는다(owner가 확인해야 실행된다)',
       properties: {
         action: { type: 'string', enum: [...PROPOSAL_ACTIONS], description: '동작' },
-        target: nullableText(`대상 ID(저장소, 작업, 변경, 기억, 읽기 템플릿, 기억 출처 키). 없으면 null. ${CHAT_REPLY_LIMITS.target}자 이하`),
-        content: nullableText('기억 저장·정정의 진술이나 기억 검색어. 작업·변경 요청의 내용은 owner 원문을 쓰므로 null. '
+        target: nullableText('대상 ID(저장소, 작업, 변경, 기억, 읽기 템플릿, 기억 출처 키, 세션 연결의 세션 ID). '
+          + 'PR 리뷰 요청은 owner 메시지에 적힌 PR 링크나 <소유자>/<저장소>#<번호>. '
+          + `없으면 null. ${CHAT_REPLY_LIMITS.target}자 이하`),
+        content: nullableText('기억 저장·정정의 진술이나 기억 검색어. 세션 연결은 실행기 `claude`나 `codex`이고, owner가 턴 요약을 받는 데 동의하면 '
+          + '한 칸 띄우고 summary=on을 붙인다(예: `codex summary=on`). 작업·변경 요청의 내용은 owner 원문을 쓰므로 null. '
           + `${CHAT_REPLY_LIMITS.content}자 이하`),
       },
     }] },

@@ -6,7 +6,7 @@ import type { PublisherConfig } from '../src/config.js';
 import { reviewPrecondition, reviewWorkerRouted, startPublisher } from '../src/main.js';
 import type { Publisher, PublisherDeps } from '../src/main.js';
 import { loadRuntimePolicy } from '../src/policy.js';
-import { ReviewPublisher, ReviewReconciler, ReviewRuntime } from '../src/review.js';
+import { REVIEW_NOTICE_TEXT, ReviewPublisher, ReviewReconciler, ReviewRuntime } from '../src/review.js';
 import { REVIEW_INSTRUCTIONS_V2 } from '../src/review-input.js';
 import { Store } from '../src/store.js';
 import { FakeGateway } from './fake-gateway.js';
@@ -252,7 +252,7 @@ test('T17 열림 조립: opened → 작업 생성 → 작업자 → COMMENT 게�
   assert.equal(world.tasks[0]!.instructions, REVIEW_INSTRUCTIONS_V2);
   assert.match(world.posted[0]!.body, /^\*\*\[P1\] 0으로 나누기\*\* · `src\/app\.ts`:2$/m);
   assert.equal(world.posted[0]!.body.split('\n')[1], '참고용 자동 리뷰예요. 승인·병합 판단이 아니고 안전을 보증하지도 않아요.');
-  await waitFor(() => rest.sent.some(m => m.channel === NOTIFY && m.content.includes('PR 리뷰 게시: fixture-org/fixture-repo#7')));
+  await waitFor(() => rest.sent.some(m => m.channel === NOTIFY && m.content.startsWith(REVIEW_NOTICE_TEXT.summary('fixture-org/fixture-repo', 7, HEAD.slice(0, 12), false, 0, 0).split(', 검토')[0]!)));
   assert.deepEqual((await reviewJobs()).map(j => [j.state, j.trigger]), [['succeeded', 'opened']]);
   assert.deepEqual((await deliveries()).map(d => d.state), ['sent']);
   // 같은 세대는 다시 넣지 않는다.

@@ -155,12 +155,18 @@ function delayText(ms: number): string {
 // 게시자의 sendMessage 본문에는 flags 칸이 없다. 그래서 링크 미리보기는 내용 쪽에서 막는다. 사용자 값을 모두 코드 스팬에 넣으면
 // Discord가 링크·마크다운·멘션으로 해석하지 않고, 이 밖에는 고정 문구와 시각뿐이다. 멘션은 게시자의 allowed_mentions.parse=[]가 한 번 더 막는다.
 const codeSpan = (text: string) => `\`${text.replaceAll('`', "'")}\``;
+// R08 턴 완료 알림의 고정 문구(동료 말투). '/' 이름이 없어 스위치와 상관없이 같다.
+export const EXTERNAL_NOTICE_TEXT = Object.freeze({
+  head: (executor: string, sessionSpan: string) => `사람 세션이 턴을 끝냈다고 알려 왔어요 (${executor} ${sessionSpan})`,
+  // 자기 보고라 성공·완료를 단정하지 않는다.
+  unverified: '결과를 제가 확인한 건 아니에요.',
+});
 export function formatNotice(input: { executor: string; externalTaskId: string; summary: string; occurredAt: number; receivedAt: number }): string {
   return [
-    `사람 세션이 턴을 끝냈다고 알림 (${input.executor} ${codeSpan(input.externalTaskId)})`,
+    EXTERNAL_NOTICE_TEXT.head(input.executor, codeSpan(input.externalTaskId)),
     `발생 ${kstTime(input.occurredAt)} · 수신 ${kstTime(input.receivedAt)} · 지연 ${delayText(input.receivedAt - input.occurredAt)}`,
     `요약: ${codeSpan(input.summary)}`,
-    '봇이 결과를 확인한 것은 아닙니다.',
+    EXTERNAL_NOTICE_TEXT.unverified,
   ].join('\n');
 }
 

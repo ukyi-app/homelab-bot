@@ -29,10 +29,67 @@ export interface ChangeCommandHandler {
   pressPublish?(request: PublishPress): Promise<PublishPressReply>;
 }
 
-const USAGE = '서식: /change project:<저장소> text:<요약> | goal=<목표> | accept=<인수 조건> | label=public. accept는 여러 번 쓸 수 있고 base=<브랜치>는 선택입니다. label은 이 글을 공개해도 되는지에 대한 owner의 판단입니다(public, approved_public_summary, private, unknown).';
-const THREAD_ONLY = '변경 요청은 대화 채널의 스레드에서만 받습니다. /chat으로 스레드를 연 뒤 그 스레드에서 실행하세요.';
-const NOT_VISIBLE = '이 스레드에서 볼 수 있는 변경이 아닙니다.';
-const TRANSIENT = '처리하지 못했습니다(일시 오류). /change-status로 상태를 확인한 뒤 다시 시도하세요.';
+// 변경 명령·답 처리기의 고정 문구. 동료 말투(해요체, 결론부터, 자기를 "봇"이라 부르지 않음)다.
+// 첫 인자 colleague는 동료 기능 스위치(Store.colleague)다. 켜지면 '/' 이름 대신 말로 하는 안내를, 꺼지면 지금의 '/' 안내를 낸다.
+// 함정: 항목마다 분기가 colleague 하나뿐이어야 시험이 모든 항목을 같은 인자로 불러 '/' 이름을 검사할 수 있다.
+// label=·goal= 같은 입력 칸 이름은 명령 이름이 아니라 두 판이 같다. 말로는 새 generation을 열 수 없어 켜짐 판은 새 변경으로 다시 부탁하라고 한다.
+const LABEL_HELP = 'label은 이 글을 공개해도 되는지에 대한 owner의 판단이에요(public, approved_public_summary, private, unknown).';
+const ASK_STATUS = '변경 상태를 물어봐서 확인한 뒤 다시 부탁해 주세요.';
+const usage = (c: boolean) => c
+  ? `요약 뒤에 \` | goal=<목표> | accept=<인수 조건> | label=public\`처럼 적어 주세요. accept는 여러 번 쓸 수 있고 base=<브랜치>는 선택이에요. ${LABEL_HELP}`
+  : `서식: /change project:<저장소> text:<요약> | goal=<목표> | accept=<인수 조건> | label=public. accept는 여러 번 쓸 수 있고 base=<브랜치>는 선택이에요. ${LABEL_HELP}`;
+export const CHANGE_TEXT = Object.freeze({
+  usage,
+  threadOnly: (c: boolean) => `변경 요청은 대화 채널의 스레드에서만 받아요. ${c
+    ? '대화 채널에서 저를 불러 스레드를 연 뒤 그 스레드에서 말해 주세요.' : '/chat으로 스레드를 연 뒤 그 스레드에서 실행해 주세요.'}`,
+  notVisible: '이 스레드에서 볼 수 있는 변경이 아니에요.',
+  transient: (c: boolean) => `처리하지 못했어요(일시 오류). ${c ? ASK_STATUS : '/change-status로 상태를 확인한 뒤 다시 시도해 주세요.'}`,
+  closed: (_c: boolean, reason: string) => `지금은 변경 요청을 받지 않아요(${reason}). 대화·작업·리뷰는 그대로 돼요.`,
+  repositoryUnknown: (_c: boolean, names: string) => `정책에 없는 저장소라 받지 않았어요.${names ? ` 받는 저장소: ${names}` : ''}`,
+  unreadable: (c: boolean, reason: string) => `요청을 읽지 못했어요(${reason}). ${usage(c)}`,
+  baseNotAllowed: (_c: boolean, branches: string) => `정책에 없는 base 브랜치예요. 받는 브랜치: ${branches}`,
+  duplicate: (_c: boolean, id: string) => `이미 받은 요청이에요. 변경 ID: ${id}`,
+  // 응답을 잃어도 ID가 남게 대화에 따로 거는 글이다.
+  acceptedPost: (c: boolean, id: string) => c ? `변경 ${id}을 받았어요. 진행 상황은 이 스레드에 알려 드릴게요.` : `변경 ${id}을 받았어요. /change-status target:${id}`,
+  blockedSensitive: (_c: boolean, found: string) => `입력에서 공개하면 안 되는 값(${found})을 찾았어요`,
+  blockedLabel: (_c: boolean, label: string) => `출처가 ${label}이에요`,
+  blocked: (_c: boolean, id: string, why: string) =>
+    `변경 ${id}을 막았어요. ${why}. 작성 모델과 GitHub에는 아무것도 보내지 않았어요. 공개해도 되는 내용만 담아 label=public으로 새로 요청해 주세요.`,
+  accepted: (c: boolean, id: string) => `변경 ${id}을 받았어요. 수정·시험·검토까지 하고 미리보기를 이 스레드에 보낼게요. ${c
+    ? '게시는 미리보기의 버튼으로 따로 승인해 주세요.' : '게시는 /change-publish로 따로 승인해요.'}`,
+  nextUsage: (c: boolean, id: string) => c ? '새 generation을 여는 말은 아직 받지 않아요. 같은 내용을 다시 부탁하면 새 변경으로 받아요.'
+    : `새 generation은 /change project:${id} text:next 로 열어요.`,
+  nextOpened: (_c: boolean, id: string, generation: number) =>
+    `변경 ${id}의 generation ${generation}을 열었어요. 최신 base에서 수정·시험·검토·승인을 처음부터 다시 받아요.`,
+  nextUnresolved: '확인되지 않은 게시 기록이 남아 있어요. 먼저 풀어야 해요',
+  nextPurged: (c: boolean) => `보존 기간(7일)이 지나 요청 원문을 지웠어요. ${c ? '같은 내용을 새로 부탁해 주세요' : '같은 내용을 /change로 새로 요청해 주세요'}`,
+  nextPhase: (_c: boolean, phase: string) => `superseded 상태에서만 열 수 있어요(지금 ${phase})`,
+  nextRefused: (_c: boolean, why: string) => `새 generation을 열지 않았어요: ${why}.`,
+  writerUnaccepted: '실제 writer의 AC-P8을 아직 확인하지 않아 게시를 받지 않아요. 승인 대기는 그대로예요.',
+  digestMismatch: '미리보기의 승인 digest와 달라서 승인하지 않았어요.',
+  approvalDuplicate: '이미 처리한 승인이에요.',
+  notAwaiting: (_c: boolean, phase: string) => `승인 대기 상태가 아니에요(지금 ${phase}).`,
+  cancelMerged: '이미 병합됐어요. 병합은 되돌릴 수 없어서 취소하지 않고 배포 관측만 계속해요.',
+  cancelFinished: (_c: boolean, phase: string) => `이미 끝난 변경이에요(${phase}).`,
+  cancelRace: (c: boolean) => `상태가 바뀌었어요. ${c ? ASK_STATUS : '/change-status로 확인한 뒤 다시 시도해 주세요.'}`,
+  cancelled: (_c: boolean, id: string, published: boolean) =>
+    `변경 ${id}을 취소했어요. 돌던 작업은 끝난 걸 확인한 뒤 정리해요.${published ? ' 이미 공개된 객체·PR은 닫지 않고 기록만 남겨요.' : ''}`,
+  // '/change-status' 응답의 문장 줄. 상태·사유·ID 칸은 코드 그대로다.
+  statusClosed: (_c: boolean, reason: string) => `새 요청·게시는 지금 닫혀 있어요(${reason}).`,
+  statusChildUnknown: (c: boolean, job: string) => `이 작업이 끝났는지 확인하지 못해 레인이 막혀 있을 수 있어요. ${c
+    ? '프로세스가 사라진 걸 확인한 뒤 `homelab bot` CLI로 풀어 주세요.' : `프로세스가 사라진 걸 확인한 뒤 /task-release target:${job}`}`,
+  statusUnresolved: '이 기록이 풀리기 전에는 새 게시를 시작하지 않아요.',
+  statusUntracked: '이 PR은 사람이 병합해도 배포를 추적하지 않아요.',
+  statusPurged: '보존 기간이 지나 artifact 바이트·리뷰 원문·요청 원문·요약을 지웠어요. digest와 receipt는 남아 있어요.',
+  // 변경 질문 답(ChangeAnswerGuard). 서식 안내는 owner가 분류(label=)를 적었는데 틀렸을 때만 나와 공개 여부를 먼저 묻는 글이 아니다.
+  answerUsage: (c: boolean) => c ? '변경 작업의 답에 분류를 적으려면 `label=public | <답>`처럼 써 주세요. 질문은 열려 있어요.'
+    : '변경 작업의 답은 공개해도 되는지 함께 적어야 해요. /answer question:<ID> text:label=public | <답> 으로 보내 주세요. 질문은 열려 있어요.',
+  answerLabelBlocked: (_c: boolean, label: string) => `출처가 ${label}인 답이라 작성 모델에 넘기지 않고 이 변경을 막았어요.`,
+  answerNoPolicy: '이 변경의 저장소가 정책에 없어 답을 검사하지 못했어요. 작성 모델에 넘기지 않았고 질문은 열려 있어요.',
+  answerSensitive: (_c: boolean, found: string) =>
+    `답에서 공개하면 안 되는 값(${found})을 찾아 작성 모델에 넘기지 않고 이 변경을 막았어요. 공개해도 되는 내용만 담아 새로 요청해 주세요.`,
+  answerNotRecorded: (_c: boolean, reason: string) => `답을 넘기지 않았어요(${reason}).`,
+});
 const CONTROL_FREE = /^(?:[^\p{Cc}]|[\n\t])+$/u;
 const LABELS: ReadonlySet<string> = new Set(PROVENANCE_LABELS);
 
@@ -68,7 +125,6 @@ export interface ChangeCommandDeps {
   closedReason: () => string | null;
   admit?: (request: ChangeRequest) => Promise<{ ok: true } | { ok: false; reason: string }>;
 }
-const closedText = (reason: string) => `지금 변경 요청을 받지 않습니다(${reason}). 대화·작업·리뷰는 그대로 동작합니다.`;
 
 // 게시 승인 버튼(COLLEAGUE_SPEC §4.3 "게시 승인"). custom_id는 `change-publish-ok:<변경 ID>.<generation>.<승인 digest 앞 16자>`다.
 // 전체 digest(64자)는 변경 ID(32자)와 함께 100자 상한에 들지 않는다. 승인 대상은 generation마다 하나이고 DB가 바꾸지 못하게 막으므로
@@ -97,6 +153,7 @@ export const publishButton = (changeId: string, generation: number, digest: stri
 
 export class ChangeCommands implements ChangeCommandHandler {
   constructor(private readonly deps: ChangeCommandDeps) {}
+  private get colleague(): boolean { return this.deps.store.colleague; }
   async handle(request: ChangeCommandRequest): Promise<ChangeCommandReply> {
     switch (request.command) {
       case 'change': return this.change(request);
@@ -113,68 +170,71 @@ export class ChangeCommands implements ChangeCommandHandler {
     return found.value;
   }
   private async change(request: ChangeCommandRequest): Promise<ChangeCommandReply> {
+    const c = this.colleague;
     const closed = this.deps.closedReason();
-    if (closed) return { content: closedText(closed), outcome: 'closed' };
+    if (closed) return { content: CHANGE_TEXT.closed(c, closed), outcome: 'closed' };
     const policy = await this.deps.gate.current();
-    if (request.scope.kind !== 'thread' || request.scope.parent !== policy.conversationChannel) return { content: THREAD_ONLY, outcome: 'thread_only' };
+    if (request.scope.kind !== 'thread' || request.scope.parent !== policy.conversationChannel) return { content: CHANGE_TEXT.threadOnly(c), outcome: 'thread_only' };
     if (request.target && CHANGE_ID.test(request.target)) return this.nextGeneration(request);
     const repository = policy.change?.repositories.find(item => item.fullName === request.target || String(item.repoId) === request.target);
     if (!repository) {
       const names = (policy.change?.repositories ?? []).map(item => item.fullName).join(', ');
-      return { content: `정책에 없는 저장소라 받지 않았습니다.${names ? ` 받는 저장소: ${names}` : ''}`, outcome: 'repository_unknown' };
+      return { content: CHANGE_TEXT.repositoryUnknown(c, names), outcome: 'repository_unknown' };
     }
     const parsed = parseChangeRequest(request.text);
-    if (!parsed.ok) return { content: `요청을 읽지 못했습니다(${parsed.reason}). ${USAGE}`, outcome: parsed.reason };
+    if (!parsed.ok) return { content: CHANGE_TEXT.unreadable(c, parsed.reason), outcome: parsed.reason };
     const base = parsed.value.base ?? repository.baseBranches[0]!;
-    if (!repository.baseBranches.includes(base)) return { content: `정책에 없는 base 브랜치입니다. 받는 브랜치: ${repository.baseBranches.join(', ')}`, outcome: 'base_not_allowed' };
+    if (!repository.baseBranches.includes(base)) return { content: CHANGE_TEXT.baseNotAllowed(c, repository.baseBranches.join(', ')), outcome: 'base_not_allowed' };
     await this.deps.store.atomic(async store => { await store.activate(await store.ownedConversation(request.scope, request.actor, true), request.id); });
     const sensitive = scanBrief(parsed.value, repository);
     const label = sensitive ? propagateLabel([parsed.value.label, 'private']) : parsed.value.label;
     const created = await this.deps.changes.createRequest({ eventId: request.id, ownerId: request.actor, conversationId: this.deps.store.scopeId(request.scope), scope: request.scope,
       repoId: repository.repoId, baseBranch: base, label, input: { text: request.text } });
     if (!created.ok) {
-      if (created.reason === 'duplicate_event') return { content: `이미 받은 요청입니다. 변경 ID: ${created.existingId ?? '알 수 없음'}`, outcome: 'duplicate' };
+      if (created.reason === 'duplicate_event') return { content: CHANGE_TEXT.duplicate(c, created.existingId ?? '알 수 없음'), outcome: 'duplicate' };
       this.deps.log('change_request_failed', { reason: created.reason });
-      return { content: TRANSIENT, outcome: 'error' };
+      return { content: CHANGE_TEXT.transient(c), outcome: 'error' };
     }
     const id = created.value.id;
     // 응답을 잃으면 ID를 알 길이 없다. 대화에도 영속 게시로 남긴다.
     await this.deps.store.enqueue({ key: `change-accepted:${id}`, conversation: created.value.conversationId, actor: request.actor, scope: request.scope, revision: policy.revision,
-      payload: { kind: 'message', channel: request.scope.channel, content: `변경 ${id}을 받았습니다. /change-status target:${id}`, classification: 'safe_summary' } });
+      payload: { kind: 'message', channel: request.scope.channel, content: CHANGE_TEXT.acceptedPost(c, id), classification: 'safe_summary' } });
     // 끊기면 런타임 바퀴가 같은 입력으로 admission을 다시 한다.
     const admitted = await this.deps.admit?.(created.value).catch(error => { this.deps.log('change_admit_deferred', errorInfo(error)); return null; });
     if (!labelAllowsAuthorInput(label) || admitted?.ok === false && admitted.reason === 'label_blocked') {
-      const why = sensitive ? `입력에서 공개하면 안 되는 값(${sensitive})을 찾았습니다` : `출처가 ${label}입니다`;
-      return { content: `변경 ${id}을 막았습니다. ${why}. 작성 모델과 GitHub에 아무것도 보내지 않았습니다. 공개해도 되는 내용만 담아 label=public으로 새로 요청하세요.`, outcome: 'label_blocked' };
+      const why = sensitive ? CHANGE_TEXT.blockedSensitive(c, sensitive) : CHANGE_TEXT.blockedLabel(c, label);
+      return { content: CHANGE_TEXT.blocked(c, id, why), outcome: 'label_blocked' };
     }
-    return { content: `변경 ${id}을 받았습니다. 수정·시험·검토까지 진행하고 미리보기를 이 스레드에 보냅니다. 게시는 /change-publish로 따로 승인합니다.`, outcome: 'accepted' };
+    return { content: CHANGE_TEXT.accepted(c, id), outcome: 'accepted' };
   }
   // 새 generation은 owner가 이렇게 말할 때만 연다. 자동 재시도는 없다.
   private async nextGeneration(request: ChangeCommandRequest): Promise<ChangeCommandReply> {
+    const c = this.colleague;
     const found = await this.own(request);
-    if (!found) return { content: NOT_VISIBLE, outcome: 'not_visible' };
-    if (request.text.trim() !== 'next') return { content: `새 generation은 /change project:${found.id} text:next 로 엽니다.`, outcome: 'usage' };
+    if (!found) return { content: CHANGE_TEXT.notVisible, outcome: 'not_visible' };
+    if (request.text.trim() !== 'next') return { content: CHANGE_TEXT.nextUsage(c, found.id), outcome: 'usage' };
     const opened = await this.deps.changes.startNextGeneration({ changeId: found.id, generation: found.generation });
     if (opened.ok) {
       await this.deps.admit?.(opened.value).catch(error => { this.deps.log('change_admit_deferred', errorInfo(error)); });
-      return { content: `변경 ${found.id}의 generation ${opened.value.generation}을 열었습니다. 최신 base에서 수정·시험·검토·승인을 처음부터 다시 받습니다.`, outcome: 'next_generation' };
+      return { content: CHANGE_TEXT.nextOpened(c, found.id, opened.value.generation), outcome: 'next_generation' };
     }
-    const why = opened.reason === 'unresolved_effects' ? '확인되지 않은 게시 기록이 남아 있습니다. 먼저 해소해야 합니다'
-      : opened.reason === 'input_purged' ? '보존 기간(7일)이 지나 요청 원문을 지웠습니다. 같은 내용을 /change로 새로 요청하세요'
-      : opened.reason === 'phase_conflict' ? `superseded 상태에서만 열 수 있습니다(지금 ${opened.current?.phase ?? found.phase})` : opened.reason;
-    return { content: `새 generation을 열지 않았습니다: ${why}.`, outcome: opened.reason };
+    const why = opened.reason === 'unresolved_effects' ? CHANGE_TEXT.nextUnresolved
+      : opened.reason === 'input_purged' ? CHANGE_TEXT.nextPurged(c)
+      : opened.reason === 'phase_conflict' ? CHANGE_TEXT.nextPhase(c, opened.current?.phase ?? found.phase) : opened.reason;
+    return { content: CHANGE_TEXT.nextRefused(c, why), outcome: opened.reason };
   }
   private async publish(request: ChangeCommandRequest): Promise<ChangeCommandReply> {
+    const c = this.colleague;
     const closed = this.deps.closedReason();
-    if (closed) return { content: closedText(closed), outcome: 'closed' };
+    if (closed) return { content: CHANGE_TEXT.closed(c, closed), outcome: 'closed' };
     const found = await this.own(request);
-    if (!found) return { content: NOT_VISIBLE, outcome: 'not_visible' };
+    if (!found) return { content: CHANGE_TEXT.notVisible, outcome: 'not_visible' };
     const approved = await this.approve(found, found.generation, request.text.trim(), request);
-    if (approved.ok) return { content: `변경 ${found.id} 게시를 승인했습니다. 게시 직전 base·정책·CI를 다시 확인하고, 결과는 이 스레드에 알립니다.`, outcome: 'approved' };
-    if (approved.reason === 'writer_unaccepted') return { content: '실제 writer의 AC-P8이 확인되지 않아 게시를 받지 않습니다. 승인 대기는 그대로입니다.', outcome: 'writer_unaccepted' };
-    const text: Partial<Record<string, string>> = { digest_mismatch: '미리보기의 승인 digest와 다릅니다. 승인하지 않았습니다.', duplicate_event: '이미 처리한 승인입니다.',
-      owner_mismatch: NOT_VISIBLE, phase_conflict: `승인 대기 상태가 아닙니다(지금 ${approved.phase ?? found.phase}).` };
-    return { content: text[approved.reason] ?? TRANSIENT, outcome: approved.reason };
+    if (approved.ok) return { content: PUBLISH_TEXT.approved(found.id), outcome: 'approved' };
+    if (approved.reason === 'writer_unaccepted') return { content: CHANGE_TEXT.writerUnaccepted, outcome: 'writer_unaccepted' };
+    const text: Partial<Record<string, string>> = { digest_mismatch: CHANGE_TEXT.digestMismatch, duplicate_event: CHANGE_TEXT.approvalDuplicate,
+      owner_mismatch: CHANGE_TEXT.notVisible, phase_conflict: CHANGE_TEXT.notAwaiting(c, approved.phase ?? found.phase) };
+    return { content: text[approved.reason] ?? CHANGE_TEXT.transient(c), outcome: approved.reason };
   }
   // '/change-publish'와 게시 승인 버튼이 함께 쓰는 승인. 저장 계층의 approve가 owner·generation·phase·digest·이벤트 멱등을 본다.
   private async approve(found: ChangeRequest, generation: number, digest: string, request: { id: string; actor: string }): Promise<{ ok: true } | { ok: false; reason: string; phase?: string }> {
@@ -213,38 +273,40 @@ export class ChangeCommands implements ChangeCommandHandler {
     return { content: PUBLISH_TEXT.failed, outcome: approved.reason };
   }
   private async cancel(request: ChangeCommandRequest): Promise<ChangeCommandReply> {
+    const c = this.colleague;
     const found = await this.own(request);
-    if (!found) return { content: NOT_VISIBLE, outcome: 'not_visible' };
-    if (found.phase === 'merged' || found.phase === 'observing_deploy') return { content: '이미 병합됐습니다. 병합은 되돌릴 수 없어 취소하지 않고 배포 관측만 계속합니다.', outcome: 'merged' };
+    if (!found) return { content: CHANGE_TEXT.notVisible, outcome: 'not_visible' };
+    if (found.phase === 'merged' || found.phase === 'observing_deploy') return { content: CHANGE_TEXT.cancelMerged, outcome: 'merged' };
     const moved = await this.deps.changes.transition({ changeId: found.id, generation: found.generation, from: found.phase, to: 'cancelled', reason: 'owner_cancelled' });
-    if (!moved.ok) return { content: moved.reason === 'transition_not_allowed' ? `이미 끝난 변경입니다(${found.phase}).` : '상태가 바뀌었습니다. /change-status로 확인한 뒤 다시 시도하세요.', outcome: moved.reason };
+    if (!moved.ok) return { content: moved.reason === 'transition_not_allowed' ? CHANGE_TEXT.cancelFinished(c, found.phase) : CHANGE_TEXT.cancelRace(c), outcome: moved.reason };
     const published = found.phase === 'publishing' || found.phase === 'proposed';
-    return { content: `변경 ${found.id}을 취소했습니다. 돌던 작업은 소멸을 확인한 뒤 정리합니다.${published ? ' 이미 공개된 객체·PR은 닫지 않고 기록만 남깁니다.' : ''}`, outcome: 'cancelled' };
+    return { content: CHANGE_TEXT.cancelled(c, found.id, published), outcome: 'cancelled' };
   }
   private async status(request: ChangeCommandRequest): Promise<ChangeCommandReply> {
+    const c = this.colleague;
     const found = await this.own(request);
-    if (!found) return { content: NOT_VISIBLE, outcome: 'not_visible' };
+    if (!found) return { content: CHANGE_TEXT.notVisible, outcome: 'not_visible' };
     const db = this.deps.store.db;
     const key: ChangeKey = { changeId: found.id, generation: found.generation };
     const lines = [`변경 ${found.id} g${found.generation}: ${found.phase}${found.phaseReason ? `(${found.phaseReason})` : ''}`, `저장소 ID ${found.repoId}, base ${found.baseBranch}, 출처 ${found.label}`];
     const closed = this.deps.closedReason();
-    if (closed) lines.push(`새 요청·게시는 지금 닫혀 있습니다(${closed}).`);
+    if (closed) lines.push(CHANGE_TEXT.statusClosed(c, closed));
     for (const child of (await db.query<{ role: string; id: string; state: string; wait_reason: string | null }>(`SELECT c.role,j.id,j.state,j.wait_reason FROM change_child_jobs c JOIN jobs j ON j.id=c.job_id
       WHERE c.change_id=$1 AND c.generation=$2 ORDER BY c.created_at`, [found.id, found.generation])).rows) {
       lines.push(`${child.role === 'author' ? '작성' : '리뷰'} 작업 ${child.id}: ${child.state}${child.wait_reason ? `(${child.wait_reason})` : ''}`);
-      if (child.state === 'unknown') lines.push(`이 작업의 종료를 확인하지 못해 레인이 막혀 있을 수 있습니다. 프로세스 소멸을 확인한 뒤 /task-release target:${child.id}`);
+      if (child.state === 'unknown') lines.push(CHANGE_TEXT.statusChildUnknown(c, child.id));
     }
     if (found.phase === 'awaiting_publish_approval') {
       const subject = await this.deps.changes.approvalSubject(key);
       if (subject.ok) lines.push(`승인 digest: ${subject.value.digest}`);
     }
     for (const effect of await this.deps.changes.unresolvedEffects({ changeId: found.id })) {
-      lines.push(`미확정 게시 기록: g${effect.generation} ${effect.stage} ${effect.state}${effect.blockedReason ? `(${effect.blockedReason})` : ''}. 이 기록이 풀리기 전에는 새 게시를 시작하지 않습니다.`);
+      lines.push(`미확정 게시 기록: g${effect.generation} ${effect.stage} ${effect.state}${effect.blockedReason ? `(${effect.blockedReason})` : ''}. ${CHANGE_TEXT.statusUnresolved}`);
     }
     const pull = (await db.query<{ result: unknown }>(`SELECT result FROM change_delivery_effects WHERE change_id=$1 AND generation=$2 AND stage='pull' AND state='confirmed'`, [found.id, found.generation])).rows[0];
     if (pull) {
       const number = (typeof pull.result === 'string' ? JSON.parse(pull.result) : pull.result as { number: number }).number;
-      lines.push(`PR #${number}${found.phase === 'superseded' || found.phase === 'blocked' ? ': 이 PR은 사람이 병합해도 배포를 추적하지 않습니다.' : ''}`);
+      lines.push(`PR #${number}${found.phase === 'superseded' || found.phase === 'blocked' ? `: ${CHANGE_TEXT.statusUntracked}` : ''}`);
     }
     const deployment = await this.deps.changes.deployment(key);
     if (deployment.ok) {
@@ -252,7 +314,7 @@ export class ChangeCommands implements ChangeCommandHandler {
       lines.push(describeDeployment(observation));
     }
     if ((await db.query(`SELECT 1 FROM change_artifacts WHERE change_id=$1 AND purged_at IS NOT NULL
-      UNION ALL SELECT 1 FROM change_requests WHERE id=$1 AND brief_purged_at IS NOT NULL LIMIT 1`, [found.id])).rows.length) lines.push('보존 기간이 지나 artifact 바이트·리뷰 원문·요청 원문·요약을 지웠습니다. digest와 receipt는 남아 있습니다.');
+      UNION ALL SELECT 1 FROM change_requests WHERE id=$1 AND brief_purged_at IS NOT NULL LIMIT 1`, [found.id])).rows.length) lines.push(CHANGE_TEXT.statusPurged);
     return { content: lines.join('\n'), outcome: 'status' };
   }
 }
@@ -262,7 +324,6 @@ function scanBrief(parsed: ParsedChangeRequest, policy: ChangeRepositoryPolicy):
 }
 
 const ANSWER_LABEL = /^\s*label=([a-z_]+)\s*\|\s*([\s\S]*)$/;
-const ANSWER_USAGE = '변경 작업의 답은 공개해도 되는지 함께 적어야 합니다. /answer question:<ID> text:label=public | <답> 으로 보내세요. 질문은 열려 있습니다.';
 // /answer는 작업 레인과 같은 명령이다. CHANGE 질문만 출처를 묻고 나머지는 그대로 넘긴다.
 // 답을 작성자에 넘기기 전에 출처를 기록한다. private·unknown이면 작성자에 닿기 전에 부모를 닫는다.
 export class ChangeAnswerGuard implements TaskCommandHandler {
@@ -286,25 +347,26 @@ export class ChangeAnswerGuard implements TaskCommandHandler {
     if (link.state !== 'open') return this.inner.answerIn(store, input);
     const matched = ANSWER_LABEL.exec(input.text);
     const label = matched?.[1];
-    if (!matched || !label || !LABELS.has(label)) return { ok: false, status: ANSWER_USAGE };
+    const c = store.colleague;
+    if (!matched || !label || !LABELS.has(label)) return { ok: false, status: CHANGE_TEXT.answerUsage(c) };
     const key = { changeId: link.change_id, generation: Number(link.generation) };
     const body = matched[2]!;
     if (!labelAllowsAuthorInput(label as ProvenanceLabel)) {
       await this.inputs.recordIn(store.db, { ...key, eventId: input.event, label: label as ProvenanceLabel, text: body });
-      return { ok: false, status: `출처가 ${label}인 답이라 작성 모델에 넘기지 않고 이 변경을 막았습니다.` };
+      return { ok: false, status: CHANGE_TEXT.answerLabelBlocked(c, label) };
     }
     const repository = policy.change?.repositories.find(item => item.repoId === Number(link.repo_id));
     // 내부 표식을 볼 수 없으면 공개 답이라고 말할 수 없다. 기록도 닫기도 하지 않아 정책이 돌아오면 다시 답할 수 있다.
-    if (!repository) return { ok: false, status: '이 변경의 저장소가 정책에 없어 답을 검사하지 못했습니다. 작성 모델에 넘기지 않았고 질문은 열려 있습니다.' };
+    if (!repository) return { ok: false, status: CHANGE_TEXT.answerNoPolicy };
     // 첫 요청의 scanBrief와 같은 규칙이다. owner가 public이라 적었어도 찾으면 private로 올린다.
     const sensitive = scanPublicText({ title: body, body }, repository);
     if (sensitive) {
       await this.inputs.recordIn(store.db, { ...key, eventId: input.event, label: propagateLabel([label as ProvenanceLabel, 'private']), text: body });
-      return { ok: false, status: `답에서 공개하면 안 되는 값(${sensitive})을 찾아 작성 모델에 넘기지 않고 이 변경을 막았습니다. 공개해도 되는 내용만 담아 새로 요청하세요.` };
+      return { ok: false, status: CHANGE_TEXT.answerSensitive(c, sensitive) };
     }
     const answered = await this.inner.answerIn(store, { ...input, text: body });
     if (!answered.ok || answered.duplicate) return answered;
     const recorded = await this.inputs.recordIn(store.db, { ...key, eventId: input.event, label: label as ProvenanceLabel, text: body });
-    return recorded.ok ? answered : { ok: false, status: `답을 넘기지 않았습니다(${recorded.reason}).` };
+    return recorded.ok ? answered : { ok: false, status: CHANGE_TEXT.answerNotRecorded(c, recorded.reason) };
   }
 }

@@ -11,6 +11,10 @@ const AlertSchema = z.object({
     labels: z.object({ service: z.string().max(100).optional(), severity: z.string().max(100).optional() }),
   })).min(1).max(100),
 });
+// 경보 중계 글(동료 말투). 함정: 경보 원문(라벨·설명)은 싣지 않는다. 상태와 건수만 코드가 채운다.
+export const ALERT_TEXT = Object.freeze({
+  relayed: (status: string, count: number) => `경보 ${status}: ${count}건이에요. 원문은 게시하지 않았어요. 복원할 수 있는지는 아직 확인하지 않았어요.`,
+});
 export class AlertIngress {
   constructor(private readonly store: Store, private readonly gate: PolicyGate) {}
   async receive(input: unknown): Promise<void> {
@@ -43,7 +47,7 @@ export class AlertIngress {
         ORDER BY e.event_order DESC LIMIT 1`, [key])).rows[0];
       await tx.query('UPDATE incidents SET status=$2,fingerprint=$3,count=count+1,updated_at=$4 WHERE group_key=$1', [key, alert.status, fingerprint, this.store.now()]);
       if (old.fingerprint === fingerprint && (pendingThread || (previous && previous.state !== 'blocked'))) return;
-      const content = `경보 ${alert.status}: ${supported.length}건. 원문은 게시하지 않았습니다. 복원 가능 여부는 미확인입니다.`;
+      const content = ALERT_TEXT.relayed(alert.status, supported.length);
       const pending = (await tx.query<{ count: string }>("SELECT count(*) FROM outbox WHERE state IN ('pending','sending')")).rows[0]!;
       if (Number(pending.count) >= DEFAULTS.maxQueue) throw new Error('alert_queue_full');
       if (old.conversation_id) {

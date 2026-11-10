@@ -2630,3 +2630,23 @@ T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·
 - **시험이 실패할 수 있는지 확인:** 새 시험 다섯(같은 밀리초, 파드 교체, port 셋)을 고치기 전 `src`로 돌려 모두 실패를 봤다. 같은 밀리초 시험은 충돌 1건에서 `blocked`·`verification_not_run`, 파드 교체 시험도 `not_run`으로 닫혔다.
 - **바뀐 기존 시험:** `change-verification` "검증 port: 세션이 없거나 거부되면 not_run, …"의 거부 경우는 재조회가 `absent`인 경우로 좁혔다(이 티켓이 바꾼 동작). 재조회가 닿지 않으면 `unknown`인 단언을 더했다.
 - **못 잡는 범위:** 토큰이 같아지는 것 자체(근본 수정, 작업자 배포 뒤), 실제 배포 교체 순간(C24 S5). 이긴 쪽이 슬롯을 잡기 전에 재조회가 `absent`를 받는 좁은 틈은 재전송으로 덮지만 결정적 시험으로 만들지 않았다.
+
+## C18 고정 문구 3 (2026-11-10, 로컬)
+
+동료 봇 명세 §4.4·§4.9, AC-11(변경·리뷰 알림·경보·세션 연결 문구)·AC-23(문구 두 판)을 S1(문구 표 단위, 가짜 Discord REST·Gateway, PGlite·실제 PostgreSQL)에서 고정했다. 넘겨받은 동작 수정 넷(대화 신뢰 문맥·출력 스키마 설명, 리뷰 요청 최신성, 변경 질문 "직접 답하기" 검사)은 S1·S2에서 시험했다. 판단은 [DECISIONS](DECISIONS.md) "C18 고정 문구 3".
+
+| 완료 조건 | 시험 |
+|---|---|
+| 해요체, "봇" 자기 지칭 없음 | `c18-fixed-text` "C18 고정 문구는 해요체이고 …"(두 판 전체 항목과 스위치 밖 문구에 `습니다·입니다·합니다·한다.·이다.`·`봇` 없음) |
+| 켜짐 '/' 이름 0, 꺼짐 '/' 안내 유지 | `c18-fixed-text` "C18 스위치 켜짐 …"(등록 명령 표 `commandDefinitions` 전체 이름과 `/이름` 모양), "C18 스위치 밖 문구 …", "C18 스위치 꺼짐 …", "C18 켜짐 판은 말로 하는 안내다 …". 조립: `change-preview-pages` "C17: 스위치가 켜져 있으면 …"(켜짐 미리보기에 '/change-publish' 없음, 버튼 안내), "C17: 스위치가 꺼져 있으면 …"('/' 승인 명령 그대로), `c17-publish-button` AC-10(켜짐 미리보기 본문), `c14-remaining-actions`(켜짐 Store의 변경 명령 응답이 `CHANGE_TEXT.threadOnly(true)`·`blocked(true, …)`·`cancelled(true, …)`) |
+| 경보 원문 비게시, 리뷰 요약에 모델 문장 없음, 공개 글에 연결 키 없음 | `c18-fixed-text` "C18 안전 문장 …", 기존 `pr-review` AC-13·DATA-01(요약에 지적·공개 요약 문장 없음), `review-2`(경보 상태·건수만), `external-task-assembly`·`external-task-pg`·`c15-session-key`(seed 비노출) |
+| 리터럴 시험이 상수 참조 | 바뀐 문구를 비교하던 12개 파일(`change-assembly`·`c14-remaining-actions`·`c17-publish-button`·`change-preview-pages`·`change-deployment`·`external-task-assembly`·`external-task-receiver`·`external-task-helper`·`pr-review`·`publisher-review`·`review-2`, 픽스처 `c14-actions-fixture`)를 `CHANGE_TEXT`·`CHANGE_NOTICE_TEXT`·`changeRestart`·`changeChildFailed`·`DEPLOYMENT_TEXT`·`REVIEW_NOTICE_TEXT`·`ALERT_TEXT`·`ATTACH_COMMAND_TEXT`·`EXTERNAL_NOTICE_TEXT` 참조로 옮겼다. 리터럴은 안전 문장("승인·병합 판단이 아니에요", 성공 단정 없음)에만 남겼다 |
+| 3a·3b 신뢰 문맥·스키마 | `worker-contract-v2` "C18 말로 하는 일 안내 …"(S2: 작업자 HTTP → 가짜 Claude CLI의 stdin·`--json-schema` 인자에 PR 리뷰 요청·대상 꼴·세션 연결 꼴), "C18 판 섞임 …"(게시 서버 요청 본문 칸이 판·식별자·지시문 literal·surface·기록·예산뿐이고 이 글이 없다) |
+| 3c 리뷰 요청 최신성 | `c30-review-request` "C30 GitHub 조회 중에 owner가 같은 대화에서 새 말을 보내면 …"(PR 조회 중 새 말 → 리뷰 작업 0, "리뷰 시작했어요" 없음, `proposal_dropped` 사유 `superseded`) |
+| 3d "직접 답하기" | `c28-change-question` "C28 "직접 답하기" 거부: …"(기한 지난 열린 질문 → `CHANGE_QUESTION_TEXT.expired`, 답 대기 아닌 작업 → `closed`, 두 경우 다음 답 대상 기록 0) |
+
+- **실행(origin/main 6b6d86b 위 ae2771e, 병합할 것 없음, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 49개 파일(바뀐 모듈을 import하거나 그 harness를 쓰는 46개 + `change-purge-race`·`change-recovery`·`change-freshness`) → 1255개 중 1253 통과, 실패 2, skip 0. 실패 둘은 `c28-change-question`의 "C28 다음 말 …" 두 시험의 `pump_timeout`(49개 파일 동시 실행 부하, 각 17~18초)이었고 그 파일만 다시 돌려 19개 모두 통과했다.
+- **운영 영향(스위치 밖, 병합 즉시):** '/' 이름이 없는 줄의 말투가 바뀐다. 변경 게시·막힘·병합 읽기 실패 알림, 배포 관측, 알림 채널의 리뷰 요약·미게시·공개 범위 막힘 안내, 경보 중계, R08 턴 완료 알림, 세션 연결 목록·해제 응답, 변경 명령의 '/' 없는 응답. 꺼짐 판 '/' 안내 줄도 말투(해요체)만 바뀌고 안내하는 명령은 같다. 리뷰 대기(한도·인증) 안내 `review-waiting`과 `change-assembly.ts`의 변경 리뷰 대기 안내는 C20 자리라 바꾸지 않았다.
+- **작업자 이미지:** 3a·3b 문자열은 작업자 안에서만 쓰여 이 변경이 든 작업자 이미지가 배포돼야 모델에 닿는다. 요청 본문·capability digest·지시문 literal은 그대로라 판이 섞여도 요청이 거부되지 않는다.
+- **자식 작업 실패 안내 배선(주 진행자 2026-11-10 허용):** `src/store.ts`의 `changeChildFailed` 호출이 `store.colleague`를 넘긴다. `change-assembly` "C18 자식 실패 안내(스위치 켜짐·꺼짐)" 2개가 조립(가짜 작성 모델 실패 → 게시)에서 켜짐은 자식·부모 안내에 '/' 이름 0, 꺼짐은 `/change-status target:<변경 ID>` 그대로임을 본다. 실행(e396fe8, `--pg`): `change-assembly`·`c18-fixed-text`·`c28-change-question`·`task-bridge`·`task-assembly`·`status-notice`·`codex-bridge`·`publisher-pg`·`change-pg`·`foundation`·`chat-task-text-assembly`·`external-task-receiver`·`external-task-assembly` 471개 모두 통과, 실패 0, skip 0.
+- **못 잡는 범위:** 문구의 자연스러움(owner 검토, C24 말투 표본), 실제 Discord 표시(S5).

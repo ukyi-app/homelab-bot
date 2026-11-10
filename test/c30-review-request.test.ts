@@ -57,7 +57,14 @@ class FakeGitHub implements GitHubReader {
     if (!value) throw new GitHubError(404);
     return structuredClone(value);
   }
-  async pullRequest(repository: string, number: number) { this.calls.push(`pull ${repository}#${number}`); return this.pullOf(repository, number); }
+  // PR 조회 중에 일어나는 일(같은 대화의 새 말 등). 한 번만 부른다.
+  duringPull?: () => Promise<void>;
+  async pullRequest(repository: string, number: number) {
+    this.calls.push(`pull ${repository}#${number}`);
+    const during = this.duringPull; this.duringPull = undefined;
+    await during?.();
+    return this.pullOf(repository, number);
+  }
   async openPullRequests() { return []; }
   async compare() { return { files: [{ path: 'src/app.ts', previousPath: null, status: 'modified', baseType: 'blob', headType: 'blob' }], truncated: false }; }
   async mergeBase(_repository: string, base: string) { return base; }
@@ -190,6 +197,18 @@ test('C30 owner 원문에 없는 PR을 모델이 대상으로 고르면(맥락 �
   assert.equal(lastPosted(w), REVIEW_REQUEST_TEXT.notInText);
   assert.deepEqual(await w.reviews(), []);
   assert.deepEqual(w.gh.calls, []);
+});
+
+test('C30 GitHub 조회 중에 owner가 같은 대화에서 새 말을 보내면(요청을 고치거나 거둠) 옛 요청의 리뷰 작업을 만들지 않고 답도 달지 않는다', async () => {
+  const w = await wired();
+  w.gh.duringPull = async () => { await w.h.say(message(), '아니 그 PR 말고 다른 거 볼게요'); };
+  await w.ask(`이 PR 리뷰해 줘 https://github.com/${LISTED.fullName}/pull/7`, `${LISTED.fullName}#7`);
+  assert.deepEqual(w.gh.calls, [`pull ${LISTED.fullName}#7`], 'GitHub 조회까지는 했다');
+  assert.deepEqual(await w.reviews(), [], '옛 요청의 리뷰 작업이 없다');
+  assert.ok(!w.posted().includes(REVIEW_REQUEST_TEXT.started(LISTED.fullName, 7)));
+  const dropped = (await database.db.query<{ detail: unknown }>("SELECT detail FROM audit WHERE kind='proposal_dropped'")).rows
+    .map(row => typeof row.detail === 'string' ? JSON.parse(row.detail) : row.detail);
+  assert.deepEqual(dropped, [{ action: 'review_request', reason: 'superseded' }]);
 });
 
 test('C30 동료 기능 스위치가 꺼져 있으면 리뷰 요청 제안을 버리고 리뷰 작업이 생기지 않는다', async () => {

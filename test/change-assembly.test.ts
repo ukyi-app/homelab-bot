@@ -9,9 +9,10 @@ import type { AddressInfo } from 'node:net';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CHANGE_RESTART, changeChildFailed } from '../src/change-advice.js';
+import { changeChildFailed, changeRestart } from '../src/change-advice.js';
 import { changePrecondition, changeTaskPathsMatch } from '../src/change-assembly.js';
-import { parseChangeRequest } from '../src/change-commands.js';
+import { CHANGE_TEXT, parseChangeRequest } from '../src/change-commands.js';
+import { CHANGE_NOTICE_TEXT } from '../src/change-runtime.js';
 import { CHANGE_QUESTION_TEXT } from '../src/change-question.js';
 import { QUESTION_PICK_TEXT } from '../src/question-pick.js';
 import { ChangePublisher } from '../src/change-publisher.js';
@@ -254,7 +255,7 @@ test('호환 진입점: 조건이 다 맞아도 옛 작업자면 접수만 닫�
     workers.v2 = true;
     await until(() => b.logs.some(entry => entry.event === 'change_workers' && (entry.fields as { task: boolean }).task), 4000);
     b.gw.dispatch(b.gw.latest, 3, 'INTERACTION_CREATE', interaction('904', 'change', { project: REPO.fullName, text: REQUEST_TEXT }));
-    await until(() => b.rest.interactions.some(text => text.includes('받았습니다')), 4000);
+    await until(() => b.rest.interactions.some(text => /^변경 [0-9a-f]{32}을 받았어요/.test(text)), 4000);
     assert.equal(Number((await database.db.query<{ count: string }>('SELECT count(*) FROM change_requests')).rows[0]!.count), 1);
   } finally { await b.close(); }
 });
@@ -341,7 +342,7 @@ test('CHANGE-01 local_integration: /change → v2 작성 → 무자격 검증 �
     assert.equal(await h.phase(id), 'awaiting_publish_approval');
     await h.command('102', 'change-publish', { target: id, text: digest, scope: OTHER_THREAD });
     assert.equal(await h.phase(id), 'awaiting_publish_approval');
-    assert.match(h.acknowledgements().at(-1)!, /볼 수 있는 변경이 아닙니다/);
+    assert.equal(h.acknowledgements().at(-1)!, CHANGE_TEXT.notVisible);
     await h.command('103', 'change-publish', { target: id, text: digest });
     await h.pump(async () => await h.phase(id) === 'proposed');
     const pull = h.env.github.pulls[0]!;
@@ -514,7 +515,7 @@ test('CHANGE-03 연결: 승인 뒤 base가 움직이면 superseded이고 자동�
     assert.ok(h.messages().some(text => text.includes(`/change project:${id} text:next`)));
     await h.command('102', 'change', { target: id, text: 'next', scope: OTHER_THREAD });
     assert.equal(await h.phase(id), 'superseded', '다른 스레드에서는 열지 못한다');
-    assert.match(h.acknowledgements().at(-1)!, /볼 수 있는 변경이 아닙니다/);
+    assert.equal(h.acknowledgements().at(-1)!, CHANGE_TEXT.notVisible);
     await h.f.script([WRITE_STEP]);
     await h.command('103', 'change', { target: id, text: 'next' });
     await h.pump(async () => await h.phase(id) === 'awaiting_publish_approval');
@@ -531,7 +532,7 @@ test('끝 상태 PR: 병합 전 PR이 blocked가 되면 /change-status가 추적
     await h.pump(async () => await h.phase(id) === 'blocked');
     assert.equal((await h.changes.get(id) as any).value.phaseReason, 'head_changed');
     await h.command('200', 'change-status', { target: id });
-    assert.match(h.acknowledgements().at(-1)!, /병합해도 배포를 추적하지 않습니다/);
+    assert.ok(h.acknowledgements().at(-1)!.includes(CHANGE_TEXT.statusUntracked));
   });
 });
 test('병합 읽기: 조회 실패는 미병합으로 처리하지 않고, 닫힌 PR은 cancelled, 병합은 관측으로 간다. 창 시작은 재시작 뒤에도 남는다', async () => {
@@ -621,7 +622,7 @@ for (const label of ['private', 'unknown'] as const) {
       await h.command('100', 'change', { target: REPO.fullName, text: `${CANARY} | goal=${CANARY} | accept=${CANARY} | label=${label}` });
       const id = await h.changeId();
       assert.equal(await h.phase(id), 'blocked');
-      assert.match(h.acknowledgements().at(-1)!, /막았습니다/);
+      assert.equal(h.acknowledgements().at(-1)!, CHANGE_TEXT.blocked(false, id, CHANGE_TEXT.blockedLabel(false, label)));
       for (let round = 0; round < 5; round++) { await h.runtime.laneTick(); await h.runtime.publishTick(); }
       await nothingSent(h);
       await h.deliver();
@@ -878,8 +879,8 @@ test('막힌 건 보고: 병합 여부를 읽을 수 없는 대상이면 phase�
     for (let round = 0; round < 3; round++) await h.runtime.publishTick();
     assert.equal(await h.phase(id), 'proposed');
     await h.deliver();
-    assert.equal(h.messages().filter(text => text.includes('병합 여부를 읽지 못합니다')).length, 1);
-    assert.match(h.messages().find(text => text.includes('병합 여부를 읽지 못합니다'))!, /deployment_target_unregistered/);
+    const pr = h.env.github.pulls[0]!.number;
+    assert.equal(h.messages().filter(text => text.startsWith(CHANGE_NOTICE_TEXT.mergeUnreadable(false, id, pr, 'deployment_target_unregistered'))).length, 1);
   });
 });
 test('EVENT-02 Discord ACK 유실: 요청·승인은 영속이고 ID는 스레드 게시로 남는다. 같은 상호작용은 한 번만 처리한다', async () => {
@@ -988,11 +989,11 @@ test('A06 자식 실패 안내: 작성 모델이 실패하면 자식·부모 안
     assert.equal(child.state, 'failed');
     for (let round = 0; round < 5; round++) await h.runtime.publishTick();
     await h.deliver();
-    const childNotice = bodies(h).find(text => text.includes(`작업 ${child.id} 실패`));
+    const childNotice = bodies(h).find(text => text.startsWith(`작업 ${child.id}`));
     assert.equal(childNotice, changeChildFailed(child.id, id));
     const parentNotice = bodies(h).find(text => text.startsWith(`변경 ${id} g1: failed`));
     assert.ok(parentNotice, '부모 안내도 나간다');
-    assert.ok(parentNotice.endsWith(CHANGE_RESTART) && childNotice!.endsWith(CHANGE_RESTART), '두 안내가 같은 복구 행동을 말한다');
+    assert.ok(parentNotice.endsWith(changeRestart(false)) && childNotice!.endsWith(changeRestart(false)), '두 안내가 같은 복구 행동을 말한다');
     // 변경 실패는 부모 안내 하나로만 owner를 부른다. 자식 실패 안내까지 부르면 한 실패에 알림이 둘이다.
     const calls = h.rest.messages.filter(message => message.body.allowed_mentions.users !== undefined).map(message => message.body.content);
     assert.equal(calls.length, 1);
@@ -1007,9 +1008,27 @@ test('A06 자식 실패 안내: 작성 모델이 실패하면 자식·부모 안
     assert.equal(retried.ok, false);
     // 안내한 새 /change는 받는다.
     await h.command('301', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
-    assert.match(h.acknowledgements().at(-1)!, /을 받았습니다/);
+    assert.ok(h.acknowledgements().at(-1)!.endsWith(CHANGE_TEXT.accepted(false, '').slice('변경 '.length)));
   });
 });
+for (const colleague of [true, false]) {
+  test(`C18 자식 실패 안내(스위치 ${colleague ? '켜짐' : '꺼짐'}): 자식·부모 안내가 ${colleague ? "'/' 이름 없는 켜짐 판" : "지금의 '/' 안내 판"}이다`, async () => {
+    await withHarness({ colleague, steps: [{ output: { status: 'cannot_complete', summary: '', question: '' } }] }, async h => {
+      await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+      const id = await h.changeId();
+      await h.pump(async () => await h.phase(id) === 'failed');
+      const child = (await childOf(h.db, id))!;
+      for (let round = 0; round < 5; round++) await h.runtime.publishTick();
+      await h.deliver();
+      const childNotice = bodies(h).find(text => text.startsWith(`작업 ${child.id}`));
+      assert.equal(childNotice, changeChildFailed(child.id, id, colleague));
+      const parentNotice = bodies(h).find(text => text.startsWith(`변경 ${id} g1: failed`))!;
+      assert.ok(parentNotice.endsWith(changeRestart(colleague)));
+      if (colleague) for (const text of [childNotice!, parentNotice]) assert.doesNotMatch(text, /(^|[^\p{L}\p{N}])\/[a-z][a-z-]*/u, text);
+      else assert.match(childNotice!, new RegExp(`/change-status target:${id}`));
+    });
+  });
+}
 test('호환 슬롯: 리뷰는 대화 레인이고 작업 레인과 겹치지 않는다. 승인 대기 중인 부모는 어느 슬롯도 잡지 않는다', async () => {
   await withHarness({}, async h => {
     const id = await toAwaiting(h);
@@ -1700,7 +1719,7 @@ test('공개 답 검사: 저장소가 정책에서 빠져 표식을 볼 수 없�
     assert.equal((await h.db.query<{ state: string; answer: string | null }>('SELECT state,answer FROM codex_questions WHERE id=$1', [question])).rows[0]!.state, 'open');
     assert.notEqual(await h.phase(id), 'blocked');
     await h.deliver();
-    assert.ok(h.messages().some(text => text.includes('검사하지 못했습니다')));
+    assert.ok(h.messages().some(text => text.includes(CHANGE_TEXT.answerNoPolicy)));
     assert.ok([...h.messages(), ...h.acknowledgements()].every(text => !text.includes(CANARY)));
     assert.equal((await h.db.query('SELECT 1 FROM change_request_inputs WHERE change_id=$1 AND event_id<>$2', [id, (await h.changes.get(id) as any).value.eventId])).rows.length, 0, '기록하지 않는다');
   });

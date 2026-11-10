@@ -4,7 +4,7 @@ import { generateKeyPairSync } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { connect } from 'node:net';
 import type { AddressInfo } from 'node:net';
-import { externalTaskServer, EXTERNAL_TASK_PATH, FIXED_SUMMARY, ProcessingExpired, RECEIVER_LIMITS, Slots, SlotsFull, formatNotice, kstTime, signatureInput, suspectSummary } from '../src/external-task-receiver.js';
+import { EXTERNAL_NOTICE_TEXT, externalTaskServer, EXTERNAL_TASK_PATH, FIXED_SUMMARY, ProcessingExpired, RECEIVER_LIMITS, Slots, SlotsFull, formatNotice, kstTime, signatureInput, suspectSummary } from '../src/external-task-receiver.js';
 import { thread } from './helpers.js';
 import { SESSION, atomicityScenario, eventBody, listen, raw, rawClient, receiverFixture, request, sender, shut, signedHeaders } from './external-task-fixture.js';
 
@@ -222,12 +222,12 @@ test('R08 게시: 고정 문구·시각·지연을 쓰고, 멘션과 링크 미�
     assert.equal(message.channel, thread.channel);
     assert.deepEqual(message.body.allowed_mentions, { parse: [] });
     const { content } = message.body;
-    assert.ok(content.startsWith(`사람 세션이 턴을 끝냈다고 알림 (claude \`${SESSION}\`)`));
+    assert.ok(content.startsWith(EXTERNAL_NOTICE_TEXT.head('claude', `\`${SESSION}\``)));
     assert.ok(content.includes(`발생 ${kstTime(occurred)}`));
     assert.ok(content.includes(`수신 ${kstTime(ctx.f.now())}`));
     assert.ok(content.includes('지연 1분 30초'));
-    assert.ok(content.includes('봇이 결과를 확인한 것은 아닙니다.'));
-    assert.equal(content.includes('완료했습니다') || content.includes('성공'), false);
+    assert.ok(content.includes(EXTERNAL_NOTICE_TEXT.unverified));
+    assert.equal(content.includes('완료했') || content.includes('성공'), false);
     // 코드 스팬 밖에는 링크·멘션·마크다운이 남지 않는다. Discord는 코드 스팬 안을 해석하지 않는다.
     const outside = content.replace(/`[^`]*`/g, '');
     for (const pattern of [/https?:/, /@everyone/, /<@/, /\*\*/]) assert.doesNotMatch(outside, pattern);
