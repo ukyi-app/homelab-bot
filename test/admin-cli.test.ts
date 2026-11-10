@@ -4,6 +4,9 @@ import { ADMIN_ACTOR, AdminUsage, parseAdminArgs, runAdmin } from '../src/admin.
 import type { AdminCommand, AdminPorts } from '../src/admin.js';
 import { adminPorts, executeAdmin } from '../src/admin-main.js';
 import { DEFAULTS, Denied } from '../src/contracts.js';
+import type { Database } from '../src/database.js';
+import { Runtime } from '../src/runtime.js';
+import { Store } from '../src/store.js';
 import { localDatabase, fixture, event, thread } from './helpers.js';
 import { codexBridge, codexSession, lane, reply, task } from './task-lane-fixture.js';
 
@@ -277,11 +280,178 @@ test('관리 기능 unknown 해제: 작업 레인을 조립하지 못했으면(�
   assert.deepEqual(await audits(), []);
 });
 
+// ---- C22 계정 등록·전환·목록(AC-21의 봇 쪽) ----
+const NO_PAUSES = { rate_limit: 0, auth_expired: 0, billing: 0 };
+test('계정 기록: 구독 계정의 이름·방식·발급일만 남기고, 목록이 만료일(발급 뒤 1년)과 지금 계정 아님을 보인다', async () => {
+  const out = await admin('account', 'record', 'main', 'subscription');
+  assert.equal(out.code, 0);
+  assert.equal(out.report.result, 'recorded');
+  assert.equal(out.report.command, 'account record');
+  const list = await admin('account', 'list');
+  assert.equal(list.code, 0);
+  assert.equal(list.report.result, 'accounts');
+  // fixture 시계는 2027-01-15T08:00:00Z다.
+  assert.deepEqual(list.report.accounts, [{ name: 'main', method: 'subscription', current: false,
+    issuedAt: '2027-01-15T08:00:00Z', expiresAt: '2028-01-15T08:00:00Z', limit: null }]);
+  assert.deepEqual(list.report.paused, NO_PAUSES);
+  assert.deepEqual((await audits()).map(row => [row.kind, row.subject, row.detail.actor]),
+    [['admin_command', 'account record', 'cli']]);
+  assert.equal(f.requests.length, 0);
+});
+
+// 결제로 멈춘 대화 작업 하나와 한도로 멈춘 PR 리뷰 작업 하나.
+const pausedPair = async () => {
+  const chat = await paused();
+  await database.db.query("INSERT INTO model_pauses(job_id,kind,retry_at,paused_at) VALUES ($1,'billing',NULL,$2)", [chat, f.now()]);
+  await database.db.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,received_at,payload)
+    VALUES ('fixture-review','github','fixture-review','fixture-review','fixture-owner','{}',0,'{}')`);
+  await database.db.query(`INSERT INTO jobs(id,event_id,type,owner_id,target,revision,budget,state,wait_reason,attempt,priority,available_at,created_at)
+    VALUES ('fixture-review','fixture-review','review','fixture-owner','{}','{}','{}','waiting_user','model_limit',1,20,0,$1)`, [f.now() + 1]);
+  await database.db.query("INSERT INTO model_pauses(job_id,kind,retry_at,paused_at) VALUES ('fixture-review','rate_limit',$1,$2)", [f.now() + 3_600_000, f.now()]);
+  return { chat, review: 'fixture-review' };
+};
+const currentAccount = async () => (await database.db.query<{ name: string }>('SELECT name FROM model_accounts WHERE current')).rows.map(row => row.name);
+
+test('계정 전환: 지금 계정을 바꾸고 결제 멈춤까지 모델 멈춤 작업을 모두 다시 큐에 넣으며 감사 행위자가 cli다', async () => {
+  await admin('account', 'record', 'main', 'subscription');
+  await admin('account', 'record', 'spare', 'subscription');
+  const { chat, review } = await pausedPair();
+  const before = await admin('account', 'list');
+  assert.deepEqual(before.report.paused, { rate_limit: 1, auth_expired: 0, billing: 1 });
+  const out = await admin('account', 'use', 'spare', 'subscription');
+  assert.equal(out.code, 0);
+  assert.equal(out.report.result, 'switched');
+  assert.deepEqual(out.report.switch, { resumed: 2, waiting: 0, held: null });
+  assert.deepEqual(await job(chat), { state: 'queued', wait_reason: null });
+  assert.deepEqual(await job(review), { state: 'queued', wait_reason: null });
+  assert.equal(await flag('scheduler'), false);
+  assert.deepEqual(await currentAccount(), ['spare']);
+  const after = await admin('account', 'list');
+  assert.deepEqual(after.report.accounts?.map(a => [a.name, a.current]), [['main', false], ['spare', true]]);
+  assert.deepEqual(after.report.paused, NO_PAUSES);
+  assert.deepEqual((await audits()).filter(row => row.detail.actor === ADMIN_ACTOR || row.subject === ADMIN_ACTOR).map(row => [row.kind, row.subject]).slice(2),
+    [['model_wait_resumed', chat], ['review_wait_resumed', review], ['admin_command', 'account use']]);
+  assert.equal(f.requests.length, 0);
+});
+
+test('계정 전환: 등록하지 않은 계정이면 아무것도 바꾸지 않고 unknown_account(3)다', async () => {
+  await admin('account', 'record', 'main', 'subscription');
+  await admin('account', 'use', 'main', 'subscription');
+  const { chat } = await pausedPair();
+  const out = await admin('account', 'use', 'other', 'subscription');
+  assert.equal(out.code, 3);
+  assert.equal(out.report.result, 'unknown_account');
+  assert.deepEqual(await currentAccount(), ['main']);
+  assert.deepEqual(await job(chat), { state: 'waiting_user', wait_reason: 'model_limit' });
+});
+
+test('계정 전환: 비상 정지 중이면 지금 계정만 바꾸고 멈춘 작업은 그대로 두며 이유를 알린다', async () => {
+  await admin('account', 'record', 'main', 'subscription');
+  const { chat } = await pausedPair();
+  await admin('emergency-stop');
+  const out = await admin('account', 'use', 'main', 'subscription');
+  assert.equal(out.code, 0);
+  assert.deepEqual(out.report.switch, { resumed: 0, waiting: 2, held: 'emergency_stopped' });
+  assert.deepEqual(await currentAccount(), ['main']);
+  assert.deepEqual(await job(chat), { state: 'waiting_user', wait_reason: 'model_limit' });
+  // 같은 계정으로 다시 실행하면(비상 정지를 푼 뒤) 그때 해제한다. 결제 멈춤을 같은 계정에서 푼 owner의 해제 경로이기도 하다.
+  await admin('resume', 'emergency-stop');
+  assert.deepEqual((await admin('account', 'use', 'main', 'subscription')).report.switch, { resumed: 2, waiting: 0, held: null });
+});
+
+test('계정 전환: 옛 계정의 마지막 한도 관측은 그 계정 목록에 남고, 새 계정은 관측 없음·리뷰 미루기 없음에서 시작한다', async () => {
+  await admin('account', 'record', 'main', 'subscription');
+  await admin('account', 'record', 'spare', 'subscription');
+  await admin('account', 'use', 'main', 'subscription');
+  const resets = Math.floor((f.now() + 3_600_000) / 1000);
+  await f.store.observeRateLimit({ event: { status: 'allowed_warning', rateLimitType: 'five_hour', utilization: 0.97, resetsAt: resets } }, null);
+  const seen = { status: 'allowed_warning', rateLimitType: 'five_hour', utilization: 0.97, resetsAt: '2027-01-15T09:00:00Z', observedAt: '2027-01-15T08:00:00Z' };
+  assert.deepEqual((await admin('account', 'list')).report.accounts?.find(a => a.name === 'main')?.limit, seen);
+  assert.notEqual(await f.store.reviewDeferredUntil(), null);
+  await admin('account', 'use', 'spare', 'subscription');
+  const accounts = (await admin('account', 'list')).report.accounts!;
+  assert.deepEqual(accounts.find(a => a.name === 'main')?.limit, seen);
+  assert.equal(accounts.find(a => a.name === 'spare')?.limit, null);
+  assert.equal(await f.store.reviewDeferredUntil(), null);
+  // A → B → A: 돌아온 지금 계정에 전환 뒤 관측이 아직 없으면 옮겨 둔 마지막 관측을 보인다. 리뷰 미루기는 되살리지 않는다.
+  await admin('account', 'use', 'main', 'subscription');
+  const back = (await admin('account', 'list')).report.accounts!.find(a => a.name === 'main')!;
+  assert.equal(back.current, true);
+  assert.deepEqual(back.limit, seen);
+  assert.equal(await f.store.reviewDeferredUntil(), null);
+});
+
+const warned = (status: 'allowed_warning' | 'rejected' = 'allowed_warning') =>
+  ({ status, rateLimitType: 'five_hour' as const, utilization: 0.97, resetsAt: Math.floor((f.now() + 3_600_000) / 1000) });
+const limitState = async () => (await database.db.query<{ utilization: number | null; review_deferred_until: string | null }>(
+  "SELECT utilization,review_deferred_until FROM model_limit_state WHERE id='account'")).rows;
+const switchMidRun = async (name: string) => { f.advance(1); await admin('account', 'use', name, 'subscription'); };
+
+test('계정 전환: 전환 전에 시작한 대화·작업 실행이 전환 뒤 한도 경고로 끝나도 새 계정의 사용률·리뷰 미루기는 비어 있고, 전환 뒤 시작한 실행의 관측은 적힌다', async () => {
+  await admin('account', 'record', 'main', 'subscription');
+  await admin('account', 'record', 'spare', 'subscription');
+  await admin('account', 'use', 'main', 'subscription');
+  // 대화: 실행 중에 owner가 spare로 바꾸고, 옛 자격으로 돈 실행이 한도 경고와 함께 끝난다.
+  f.setRun(async () => { await switchMidRun('spare');
+    return { status: 'succeeded', stopped: true, rateLimit: { event: warned() }, output: { reply: '답했어요.', proposal: null, ack_only: false } }; });
+  await queued('chat-before');
+  assert.equal(await f.runtime.tick(), true);
+  assert.deepEqual(await limitState(), []);
+  assert.equal(await f.store.reviewDeferredUntil(), null);
+  // 전환 뒤 시작한 대화의 관측은 지금 계정 상태에 적는다.
+  f.setRun(async () => ({ status: 'succeeded', stopped: true, rateLimit: { event: warned() }, output: { reply: '답했어요.', proposal: null, ack_only: false } }));
+  await queued('chat-after');
+  assert.equal(await f.runtime.tick(), true);
+  assert.deepEqual((await limitState()).map(row => row.utilization), [0.97]);
+  assert.notEqual(await f.store.reviewDeferredUntil(), null);
+  // 작업 레인: 실행 중에 main으로 바꾸고(전환이 한도 상태를 비운다), 옛 자격으로 돈 실행이 한도 경고를 실은 한도 멈춤으로 끝난다.
+  // 멈춤 기록과 30분 재시도는 그대로 남아 새 자격으로 다시 돈다.
+  const local = lane(f);
+  local.worker.scripts.push(async (request, worker) => { await switchMidRun('main');
+    return { ...reply.limited()(request, worker), rateLimit: { event: warned(), stop: { cause: 'rate_limit' } } }; });
+  const created = await task(f, database.db);
+  await local.runtime.tickTask();
+  assert.deepEqual(await job(created.id), { state: 'waiting_user', wait_reason: 'model_limit' });
+  const pause = (await database.db.query<{ kind: string; retry_at: string | null }>('SELECT kind,retry_at FROM model_pauses WHERE job_id=$1', [created.id])).rows;
+  assert.deepEqual(pause.map(row => [row.kind, row.retry_at !== null]), [['rate_limit', true]]);
+  assert.deepEqual(await limitState(), []);
+  assert.equal(await f.store.reviewDeferredUntil(), null);
+});
+
+test('계정 전환 잠금 순서: 전환과 모델 대기가 모두 scheduler 행을 한도 상태(model_limit_state)보다 먼저 잡는다', async () => {
+  await admin('account', 'record', 'main', 'subscription');
+  await admin('account', 'record', 'spare', 'subscription');
+  await admin('account', 'use', 'main', 'subscription');
+  await f.store.observeRateLimit({ event: warned() }, null);
+  const sequence: string[][] = [];
+  const kind = (sql: string) => /FROM controls WHERE key='scheduler' FOR UPDATE/.test(sql) ? 'scheduler'
+    : /^\s*(INSERT INTO|DELETE FROM|UPDATE) model_limit_state\b/.test(sql) ? 'limit' : undefined;
+  const recorded: Database = { query: (sql, params) => database.db.query(sql, params), transaction: (fn, deadline) => database.db.transaction(tx => {
+    const log: string[] = [];
+    sequence.push(log);
+    return fn({ query: (sql, params) => { const k = kind(sql); if (k) log.push(k); return tx.query(sql, params); }, transaction: inner => tx.transaction(inner) });
+  }, deadline) };
+  const local = new Store(recorded, f.now);
+  f.setRun(async () => ({ status: 'limited', stopped: true, rateLimit: { event: warned('rejected'), stop: { cause: 'rate_limit' } } }));
+  await queued();
+  assert.equal(await new Runtime(local, f.gate, f.worker, f.signer, f.reader).tick(), true);
+  assert.equal((await runAdmin(local, parseAdminArgs(['account', 'use', 'spare', 'subscription']))).report.result, 'switched');
+  const checked = sequence.filter(log => log.includes('limit'));
+  assert.equal(checked.length, 2, JSON.stringify(sequence));
+  for (const log of checked) assert.ok(log.includes('scheduler') && log.indexOf('scheduler') < log.indexOf('limit'), log.join(','));
+});
+
 test('관리 진입점 입력은 고정 명령 단어와 형식이 맞는 ID만 받는다', () => {
   for (const argv of [[], ['stop'], ['emergency-stop', 'now'], ['status', '--json'], ['resume'], ['resume', 'job'],
     ['resume', 'job', 'not-a-uuid'], ['block', 'fixture-owner'], ['block', '12345'], ['block', '123456789012345678', 'x'],
-    ['block', '123456789012345678;rm'], ['release', '0F8B5A8E-3C1D-4E2F-9A7B-1C2D3E4F5A6B'], ['release', '$(id)']])
+    ['block', '123456789012345678;rm'], ['release', '0F8B5A8E-3C1D-4E2F-9A7B-1C2D3E4F5A6B'], ['release', '$(id)'],
+    ['account'], ['account', 'list', 'x'], ['account', 'record', 'main'], ['account', 'use', 'main', 'api'],
+    ['account', 'use', 'Main', 'subscription'], ['account', 'use', '-main', 'subscription'], ['account', 'use', 'main-', 'subscription'],
+    ['account', 'use', 'a'.repeat(33), 'subscription'], ['account', 'use', '../x', 'subscription'], ['account', 'record', 'main', 'subscription', 'x'],
+    ['account', 'remove', 'main', 'subscription']])
     assert.throws(() => parseAdminArgs(argv), AdminUsage, argv.join(' '));
+  assert.deepEqual(parseAdminArgs(['account', 'use', 'a'.repeat(32), 'subscription']),
+    { name: 'account', action: 'use', account: 'a'.repeat(32), method: 'subscription' });
 });
 
 test('관리 진입점 실행: 사용법 오류는 DB를 열지 않고 64, 결과는 JSON 한 줄, 실패는 원문 없이 1', async () => {

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { Health } from '../src/health.js';
 import { TASK_GATE_CLOSED_REASONS } from '../src/ops-metrics.js';
 import { Store } from '../src/store.js';
+import { recordAccount } from '../src/model-accounts.js';
 import { localDatabase } from './helpers.js';
 
 // 운영 지표(개선안 v2 1-3). DB 값을 그대로 읽는 gauge다. 라벨에는 정해진 상태·종류 이름만 들어간다.
@@ -228,6 +229,21 @@ test('C21 운영 알림 지표: 모델 멈춤이 없으면 종류마다 0, 지�
   }
   assert.equal(m.get('homelab_bot_model_account{method="none"}'), 1);
   assert.equal(m.get('homelab_bot_model_reviews_deferred'), 0);
+});
+
+// homelab vmalert HomelabBotModelPaused*가 `max by (account, method) (homelab_bot_model_account)`로 읽고 method가 none이면
+// "미등록", api면 "API 크레딧", 그 밖이면 "구독"으로 적는다. 라벨 이름과 값이 그 규칙과 글자 그대로 맞아야 한다.
+test('C22 지금 계정 지표: 등록만 하고 고르지 않으면 method="none", 고른 계정이면 account와 method="subscription" 한 줄', async () => {
+  await recordAccount(database.db, 'main', 'subscription', NOW);
+  await recordAccount(database.db, 'spare', 'subscription', NOW);
+  let m = parse(await health.metrics());
+  assert.equal(m.get('homelab_bot_model_account{method="none"}'), 1);
+  await database.db.query("UPDATE model_accounts SET current=true WHERE name='spare'");
+  const text = await health.metrics();
+  m = parse(text);
+  assert.equal(m.get('homelab_bot_model_account{account="spare",method="subscription"}'), 1);
+  assert.deepEqual(text.split('\n').filter(line => line.startsWith('homelab_bot_model_account')),
+    ['homelab_bot_model_account{account="spare",method="subscription"} 1']);
 });
 
 test('C21 운영 알림 지표: 종류별 대기 작업 수와 가장 늦게 풀리는 시각(Unix 초, 모르면 0), 대기에서 나간 작업의 남은 기록은 세지 않음', async () => {

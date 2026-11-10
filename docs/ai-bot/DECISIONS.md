@@ -1165,3 +1165,49 @@ T19 B5 EVENT-02 "게시 서버 둘이 같은 부모를 동시에 밀어도 모�
 - **💤는 답할 때까지:** 멈춤이 풀려도 💤를 👀로 되돌리지 않고 답·실패·취소 확정이 지운다(명세 "답한 뒤 💤를 지운다"). 멈춤 중에 받은 메시지에도 👀는 지금처럼 수신 ACK가 달고(403/404 대체 글 규칙 유지), 동기화가 💤로 바꾼다. 반응 REST가 메시지마다 두 번 는다. 💤로 바꾸기는 회차 시작이 아니라 "지금 멈춤인가"를 따른다: 같은 회차 안에서 풀린 틈에 받은 메시지가 👀·⏳로 남지 않게 한다(봇 PR #141 Codex P2). 한 줄의 회차(스레드마다 한 번)는 그대로다.
 - **Gateway 상태는 바뀐 때만, 연결마다 다시:** 15초 루프가 상태를 넘기고 세션은 바뀐 것만 보낸다. RESUME 뒤 Discord가 상태를 지키는지 문서에 없어 READY·RESUMED마다 멈춤 기록을 다시 읽어 보낸다. IDENTIFY의 `presence` 칸은 쓰지 않았다(IDENTIFY는 예약 창 안에서 보내야 해 그 자리에서 DB를 읽지 않는다). 대가: 새 IDENTIFY 직후 READY까지 잠깐 online으로 보일 수 있다.
 - **넘김(C19, 봇 PR #126 Codex P2):** 작업 레인 `settle`이 대기가 아닌 응답(완료·질문·실패)에 실린 한도 칸을 트랜잭션 밖에서 `Store.observeRateLimit`으로 남긴다(실패는 로그 `task_rate_limit_record_failed`만). 이제 작업 레인에서 본 `allowed_warning`도 PR 리뷰를 미룬다. C19 "리뷰 미루기"의 "작업 레인 응답의 경고는 쓰지 않는다"는 이 판부터 바뀐다.
+
+## C22 약관 재확인: 다른 구독 계정으로 바꾸기 (2026-11-11, owner 판단 대기)
+
+"동료 봇 전환 (사용자 2026-11-09)" 8과 D-14 "변경(사용자 2026-11-09)"이 정한 "새 이용 정책 시행 뒤 구현을 시작할 때 다시 확인"의 결과다. 에이전트의 읽기이고 법적 판단이 아니다. **판단은 owner가 한다.**
+
+**읽은 곳(2026-11-11):**
+
+- 이용 정책 https://www.anthropic.com/legal/aup : 페이지 표시 "Effective Nov 12, 2026". 이 환경에서는 한국어 판이 왔다(영문 PDF는 글자를 뽑지 못했다). "범용 사용 표준 > 플랫폼을 남용하지 마세요" 아래 문장 그대로:
+  - (여러 계정) "여러 계정 전반에서 악성 활동을 조직하거나, 여러 계정을 생성하여 탐지를 피하거나, 제품 가드레일을 우회하거나, 당사의 사용 정책을 기타 방법으로 위반하는 동일하거나 유사한 입력을 생성하는 행위"
+  - (차단 회피) "신규 계정 생성, 기존 계정의 사용, 이전에 차단 당한 사람 또는 단체에게 접근 권한을 제공하는 등의 방법을 통해 차단을 우회하는 행위"
+  - (제한 우회) "계정 가입 또는 로그인 절차를 우회하거나 모델에게 유해한 출력을 생성하도록 지시(예: 탈옥, 프롬프트 인젝션)하는 행위를 포함하여 Anthropic의 사전 승인 없이 제품 내에 설정된 기능, 제한 사항, 가드레일을 의도적으로 우회하거나 방해하는 행위"
+  - (재판매·대리) "소비자 구독을 통해 요청을 처리하거나 사용 중인 제품이나 클라이언트를 왜곡하는 서비스를 포함해 허가되지 않은 수단을 통해 Claude를 재판매하거나, 대리하거나, 다른 방법으로 접근 권한을 제공하는 행위"
+  - (에이전트) "추가 사용 사례 가이드라인": "에이전틱 사용 사례는 사용 정책을 준수해야 합니다." "사용자는 도구, 브라우저, 연결된 시스템을 통해 수행하는 작업을 포함해 자신이 구축하거나 배포하는 에이전트가 본 사용 정책을 준수하도록 할 책임이 있습니다."
+- 개정 공지 https://www.anthropic.com/news/2026-usage-policy-update (Published Oct 8, 2026): "The updated policy takes effect on November 12."
+- 에이전트 사용 안내 https://support.claude.com/en/articles/12005017-using-agents-according-to-our-usage-policy (March 16, 2026), "Do Not Use Agents to Engage in Scaled Abuse": "Create or manage multiple accounts to evade detection or circumvent platform safeguards".
+- 구독 장기 토큰 https://code.claude.com/docs/en/authentication : `claude setup-token`은 브라우저 승인 뒤 토큰을 터미널에 출력하고 저장하지 않는다(직접 복사), 1년 추론 전용 토큰이다.
+
+**읽기: 애매하다(금지로 확정되지 않았다).**
+
+- 해석 A(허용): 문장들이 막는 것은 탐지 회피·가드레일 우회·차단 회피·악성 활동 조직이다. owner가 각자 값을 낸 자기 구독 계정 가운데 하나를 사람이 골라 쓰고, 봇은 한 번에 하나만 쓰며 스스로 바꾸지 않는다(D-14 조건 2·5). 사용 한도는 안전 가드레일이 아니라 요금제의 양이다.
+- 해석 B(금지로 읽힐 수 있음): 사용 한도도 "제품 내에 설정된 … 제한 사항"이다. 한 구독이 한도에 닿았을 때 두 번째 구독으로 바꿔 같은 일을 이어 가는 것은 "여러 계정을 생성하여 … 제품 가드레일을 우회"나 "제한 사항을 의도적으로 우회"로 읽힐 수 있다. 계정 전환의 주 용도(운영 경보 문구의 할 일 3 "다른 구독 계정으로 바꾸기")가 바로 이 경우다.
+- 같은 계정 안의 토큰 교체(만료 전 교체·유출 뒤 재발급): 위 문장 어디에도 닿지 않는다. 허용으로 읽었다.
+- API 크레딧 방식(C23): Console 키로 값을 내는 경로라 위 문장에 닿지 않는다. 명세 §8의 "허용된 유료 경로" 그대로다.
+- 따로 적어 둘 것: 재판매·대리 문장의 "소비자 구독을 통해 요청을 처리하는 … 서비스"는 계정 전환이 아니라 봇이 구독 토큰으로 도는 구조 자체(D-14 변경, 사용자 2026-10-30)에 닿을 수 있는 문장이다. 봇은 owner 한 사람이 자기 일에 쓰고 남에게 접근을 주지 않는다. 이 티켓 범위 밖이지만 owner가 함께 본다.
+
+**처리:** 사용자 결정 "정책으로 확인이 안 되었으니 일단 제공"(동료 봇 전환 8)과 작업 계약(애매하면 값과 무관한 부분은 구현하고 판단을 기다림)에 따라 C22 코드는 모두 만들었다. `account add`·`use`는 같은 계정의 토큰 교체(rotate.md 3e)에도 쓰여 해석과 무관하게 필요하다. **다른 구독 계정을 실제로 등록해 전환할지, 경보 문구의 할 일 3을 남길지는 owner 판단 대기다.** 판단이 금지로 나면 homelab 경보 문구(`vmalert/rules/bot.yaml`)의 할 일 3과 명세 §4.7 "운영 알림"의 할 일 목록을 고치는 후속이 필요하다(이 티켓은 그 파일을 고치지 않았다).
+
+## C22 계정 등록·전환과 토큰 만료 알림 (2026-11-11)
+
+명세 §4.7 "토큰 만료 알림", §4.8 "계정 등록"·"계정 전환"·"계정 목록"의 구현이다(구독 방식만, API 크레딧은 C23). 사용자 결정은 바꾸지 않았고 아래는 구현 선택이다. 약관 재확인은 바로 위 절, 시험은 [VERIFICATION](VERIFICATION.md) "C22 계정 등록·전환", 자격 배치는 [ARCHITECTURE](ARCHITECTURE.md) §5, 지표는 §13 "지표".
+
+- **계정 기록(`migrations/028_model_accounts.sql`, `src/model-accounts.ts`):** `model_accounts`의 키는 (이름, 방식)이다(한 계정이 구독·API 둘을 가질 수 있다). 이름은 `^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$`(DB CHECK, 진입점, homelab CLI 같은 규칙. Infisical 폴더 이름 조각이자 지표 라벨 값). 지금 계정은 부분 유일 인덱스로 하나다. 값 칸은 없다. 발급일은 CLI가 토큰을 저장한 직후 진입점이 적은 시각이고, 같은 계정을 `--replace`로 다시 등록하면 발급일만 새로 한다. CLI 밖에서 바꾼 토큰의 발급일은 모른다(AC-19의 못 잡는 범위).
+- **관리 진입점 동작(`src/admin.ts`):** `account record <이름> subscription`(결과 `recorded`), `account use <이름> subscription`(`switched`, 등록 안 됨 `unknown_account` 종료 3), `account list`(`accounts`). 셋 다 DATABASE_URL만 읽고 모델·작업자·정책을 읽지 않는다. 감사 행위자는 `cli`이고 `admin_command` detail에 계정 이름·방식을 더한다(목록은 감사하지 않는다, 상태 보기와 같다). `api`는 사용법 오류다(C23).
+- **전환 뒤 해제(`switchAccount`):** 지금 표시를 옮기고 같은 트랜잭션에서 모델 멈춤 작업을 모두 C19의 같은 해제 전이(`Store.resumeWaiting`)로 되돌린다. 대화·작업은 `Store.adminResumeJob`(C32), PR 리뷰는 `'/review-resume'`과 같은 리뷰 제어(`Store.control` `review-resume`, 리뷰 권한 확인 true. 권한의 근거는 클러스터 접근)다. **결제 멈춤도 해제한다**(C21 넘김 1): 재시도 시각이 없어 예약 루프가 고르지 않는 멈춤이라 owner의 전환이 유일한 해제 길이다. 같은 계정으로 다시 `use`하면 표시는 그대로 두고 해제만 한다. 그래서 결제 원인을 같은 계정에서 푼 owner도 `homelab bot account use <지금 계정>`으로 푼다. 비상 정지 중이면 표시만 바꾸고 해제하지 않으며(`held: emergency_stopped`), 큐가 차면 거기서 멈춘다(`held: queue_full`, 남은 한도·인증 대기는 예약 루프가 30분 안에 다시 본다). 결과에 해제 수·아직 대기 수를 싣는다. 해제는 homelab CLI가 작업자 반영(지문)을 확인한 뒤에만 부른다(아래).
+- **한도 관측은 계정을 따라간다(주 진행자 확인이 필요한 선택):** 계정이 바뀌면 `model_limit_state`(C19, 지금 계정의 마지막 한도 관측과 리뷰 미루기 기한)를 옛 계정 행의 `last_*`로 옮기고 비운다. 그래서 목록이 계정마다 마지막 사용률을 보이고, 새 계정은 리뷰 미루기 없이 시작한다. 옛 계정의 경고로 새 계정의 리뷰까지 미루면 전환한 이유가 사라진다. 처음 고르는 계정(그 전 지금 계정 없음)도 관측을 비운다(그 관측이 어느 토큰 것인지 모른다).
+- **전환 전에 시작한 실행의 관측은 버린다(Codex 1차 리뷰 반영):** 작업자는 실행을 시작할 때 자격 파일을 읽으므로, 전환 전에 시작해 전환 뒤 끝난 대화·리뷰·작업 실행은 옛 계정으로 돌았을 수 있다. 그 실행의 `allowed_warning`이 새 계정의 사용률이 되고 새 계정의 PR 리뷰를 옛 계정의 풀리는 시각까지 미루면 안 된다. 그래서 `model_accounts.switched_at`(마지막으로 지금 계정이 된 시각, migration 028 안)을 두고, 관측을 적는 한 자리 `Store.observeRateLimit(rateLimit, job)`가 그 실행의 `jobs.started_at`이 지금 계정의 `switched_at` 이하이면 `model_limit_state`에 적지 않는다(같은 밀리초는 순서를 몰라 버린다). 전환 직전에 시작해 이미 새 자격을 읽은 실행의 관측도 함께 버리는 보수적 판단이다. 멈춤 기록(`model_pauses`)과 재개는 그대로라, 옛 자격으로 멈춘 작업은 전환 해제가 지나간 뒤라도 30분 재시도로 새 자격에서 다시 돈다. 대기 경로(`recordPause`)는 이미 job을 알고, 대기가 아닌 결과의 관측 두 곳(`src/runtime.ts` 대화, `src/review.ts` 리뷰)은 호출에 `job.id` 인자 하나만 더했다. 버린 대안: (1) 호출부를 그대로 두고 "전환 전에 시작해 아직 도는 실행이 있으면 모든 관측을 버림": 작업 레인 실행이 몇 시간 도는 동안 새 계정의 경고까지 버려 리뷰 미루기가 늦는다. (2) 계정마다 한도 상태 행을 두기: 실행이 어느 자격으로 돌았는지는 결국 시각 비교로만 알고, `reviewDeferredUntil`·C19 지표·목록 쿼리가 함께 바뀐다. (3) 작업자 응답에 자격 지문을 싣기: 세 작업자 계약 변경이라 이 티켓 범위를 넘는다.
+- **잠금 순서(Codex 1차 리뷰 반영):** `switchAccount`는 scheduler 행을 가장 먼저 잡고 그 뒤에 계정 행·`model_limit_state`를 고친다. 모델 대기(`Store.waitForUser`)가 scheduler → `model_limit_state` 순서라, 거꾸로 잡으면 서로 기다리다 한쪽이 잠금 시간 제한으로 되돌려진다. 전환이 되돌려지면 작업자 자격은 이미 바뀌었는데 DB의 지금 계정과 해제가 옛 상태로 남는다. 관측의 계정 확인(`model_accounts` 읽기)은 잠그지 않는 SELECT라 순서에 끼지 않는다.
+- **돌아온 지금 계정의 목록 값:** A → B → A처럼 지금 계정이 되었는데 그 뒤 관측이 아직 없으면 목록은 그 계정에 옮겨 둔 `last_*`를 보인다. 표시만이고 리뷰 미루기 기한은 되살리지 않는다(옛 관측이라 지금 창과 맞는지 모른다).
+- **목록(C21 넘김 1):** 이름·방식·지금 계정·발급일·만료일(발급 뒤 달력 1년, 구독만)·마지막 한도 관측(상태·종류·사용률·풀리는 시각·관측 시각)과 종류별 모델 멈춤 작업 수(`paused`)를 낸다. 작업 ID는 싣지 않았다. 멈춘 일은 전환·같은 계정 재전환이 한꺼번에 풀고, 하나씩 풀 일은 `homelab bot resume <작업 ID>`(C32)가 이미 있다.
+- **토큰 만료 줄(`src/briefing.ts`):** CLI로 등록한 구독 토큰마다(지금 쓰지 않는 계정 포함, 바꿔 쓸 수 있어야 하므로) 만료까지 30일 이하이면 `BRIEFING_TEXT.tokenExpiring`("Claude 토큰(<이름>)이 N일 뒤 만료돼요.", N은 남은 시간을 일로 내림, 0이면 "하루 안에"), 지났으면 `tokenExpired`. 30일보다 많이 남으면 줄이 없다. 브리핑 모델 칸(`modelLines`)에 둔다.
+- **지표(`src/ops-metrics.ts`):** `homelab_bot_model_account{account,method}`를 지금 계정 행으로 채운다. 지금 계정이 없으면 C21 그대로 `{method="none"}`. 같은 쿼리에 한 줄을 더해 왕복이 늘지 않는다. homelab 경보 규칙(`max by (account, method)`, `none`→미등록, `api`→API 크레딧, 그 밖→구독)과 라벨 이름·값이 같다(시험).
+- **homelab CLI(C21 넘김 2):** 명령 이름은 경보 문구 그대로 `homelab bot account add|use|list`다. `--by`는 값 `subscription`·`api`를 받되 `api`는 "아직 없다"는 사용법 오류(64)로 아무것도 읽지 않는다(C23이 연다).
+- **계정 폴더:** 값은 Infisical `/bot-accounts/<이름>`의 `CLAUDE_CODE_OAUTH_TOKEN`(대화·리뷰)·`CLAUDE_CODE_OAUTH_TOKEN_TASK`(작업)다. 작업자 store `infisical-sandbox`는 `secretsPath: /apps/homelab-bot/worker`에 키를 하나씩 적는 ExternalSecret만 쓰고, 봇 앱 ExternalSecret(`platform/charts/app` `externalsecret.yaml`)은 store `infisical-apps`(`/apps`)에서 values `secrets` 목록의 `homelab-bot/<KEY>`를 하나씩 읽는다(재귀·`find`가 없다, 2026-11-11 코드 확인). 그래서 `/apps` 밖의 이 폴더를 읽는 ExternalSecret은 없다. Free 플랜은 경로 RBAC가 없어 secretsPath가 보안 경계는 아니다(homelab `platform/external-secrets` 머리 주석). 경계는 ExternalSecret이 Git PR로만 생긴다는 것이다.
+- **전환 순서(homelab `bot-account-use.ts`):** 계정 폴더 두 값 확인 → 봇 DB 기록 확인 → 두 값을 작업자 키로(둘 다 읽은 뒤 쓴다) → 두 ExternalSecret 즉시 동기화와 Secret 해시 확인 → 두 작업자 파드의 자격 파일 지문 확인(`kubectl exec deploy/worker|worker-task -c worker -- sha256sum`, exec 실패는 기다림의 일부라 기한 180초 안에서 다시 본다. `worker-task`의 exec가 정리 sweep에 죽는 함정) → 진입점 `account use`. 엔진이 실패한 단계에서 멈추므로 반영 전에는 해제하지 않는다. 기다림 합은 동기화 60초·Secret 90초·볼륨 180초가 상한이고 보통 kubelet 갱신 1분 안팎이라 "대략 2분" 안이다(실측은 S5).
+- **`setup-token` 출력 수집: 하지 않는다(미확인으로 남김).** `claude setup-token --help`(로컬 2.1.322)에 출력 선택지가 없고, 공식 문서는 토큰을 터미널에 출력한다고만 적고 꼴을 정하지 않는다. 그래서 CLI는 tty에서 레인마다 `claude setup-token`을 띄우고(core `exec`의 이 argv 하나만 예외) 토큰은 에코 없는 입력으로 받는다. 자식 stdout은 stderr로 보낸다(`stdout-to-stderr`만 허용): stdout은 결과 문서 하나라 `--json >파일`에 안내와 발급 토큰이 섞이면 안 된다. stderr가 터미널이 아니면 토큰이 그 파일·파이프에 남으므로 로그인을 띄우지 않고 아무것도 쓰기 전에 실패한다(종료 1. 64 사용법 오류로 하려면 실행 문맥에 stderr tty 여부를 넘기는 `main.ts`·`runtime.ts` 변경이 필요해 하지 않았다). 파이프면 stdin 두 줄이다. 두 값이 같으면 거부한다(레인 분리). 남는 위험: 토큰이 owner 터미널 스크롤에 한 번 남는다(안내에 지우라고 적었다).
+- **하지 않은 것(사람 단계, 티켓 할 일 10):** 실토큰 등록, 운영 전환 1회, approvals.md 기록, 봇 구독 계정이 owner 개인 사용과 같은 계정인지(명세 §8, 미확인) 묻기.

@@ -2717,3 +2717,28 @@ T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·
 - **Codex 1차 P2(💤가 회차 시작에만 붙음):** 풀린 뒤 5분 유예 안이나 30분 자동 재시도 중에 받은 메시지가 같은 회차로 다시 멈춰도 👀·⏳로 남았다. `Store.syncAwayIn`이 회차 시작(`started`)이 아니라 지금 멈춤이면 `sleepReactions`를 부르게 고쳤다. 위 "같은 회차 안에서 풀린 동안…" 시험이 수정 전 `reactionsOf('9202')`가 `[]`로 실패했고 수정 뒤 통과한다.
 - **운영에서 바뀌는 동작(스위치 밖, 병합하면 바로):** 모델 멈춤이면 봇 상태가 idle(자리 비움)이 되고 풀리면 online. 기다리던 메시지와 멈춘 동안 받은 메시지의 👀·⏳가 💤로 바뀌고 답한 뒤 지워진다. 대화·작업·PR 리뷰·변경 리뷰의 한도·인증·결제 대기 안내가 "지금은 잠깐 자리를 비웠어요. 돌아오면 이어서 할게요." 한 줄로 바뀌고, 원인·job ID·'/resume-model'·'/review-resume'·'/review-cancel' 안내가 Discord에서 사라진다. 멈춘 동안 owner가 부르면 스레드마다 한 번 같은 줄을 답장으로 단다. 작업 레인에서 본 한도 경고도 PR 리뷰를 미룬다. 마이그레이션 없음. 비상 정지의 모습은 그대로다.
 - **못 잡는 범위:** 실제 Discord 클라이언트의 idle 표시, 💤 바꾸기로 메시지마다 반응 REST가 두 번 느는 rate limit 영향(S5, C24). 변경 리뷰 자식의 대기 안내(`change-assembly.ts` `notifyWaiting`)는 조립 경로라 직접 시험하지 않았다(같은 `awayKey`·`T.away`를 쓰는 한 줄 바꿈). Codex 작업 레인의 인증 만료는 scheduler를 켜 대화를 막지만 자리 비움 판단에서 빠진다(Claude 작업 레인 인증 만료와 같은 행으로 본다). 그동안 대화 메시지는 👀로 기다린다.
+
+## C22 계정 등록·전환 (2026-11-11, 로컬)
+
+명세 §4.7 "토큰 만료 알림", §4.8 "계정 등록"·"계정 전환"·"계정 목록", AC-19·AC-21. 구현 선택은 [DECISIONS](DECISIONS.md) "C22 계정 등록·전환과 토큰 만료 알림", 약관 재확인은 같은 파일 "C22 약관 재확인"(owner 판단 대기). 경계는 S1(관리 진입점·브리핑 조립·지표, 가짜 시계, PGlite)과 homelab S3(CLI, 가짜 infisical·kubectl)이다. 사람 단계(실토큰 등록, 운영 전환 1회, approvals.md)는 하지 않았다.
+
+| 완료 조건 | 근거 |
+|---|---|
+| 약관 재확인 결과가 DECISIONS에 있다 | DECISIONS "C22 약관 재확인"(읽은 URL·시행일·문장, 해석 둘, 같은 계정 교체·API 크레딧 판단). 금지로 확정되지 않았고 다른 구독 계정 전환은 owner 판단 대기 |
+| `account add`가 레인 둘 토큰을 받고 값을 argv·출력·파일에 남기지 않는다 | homelab `cli/test/commands/bot-account-add.test.ts` "apply: 두 레인 토큰은 stdin → Infisical 요청 본문으로만 …"(값은 `infisical secrets set --file /dev/stdin`의 stdin에만, 나머지 호출 argv·stdout·stderr에 없음), "같은 토큰을 두 레인에 넣거나 줄 수가 레인 수와 다르면 …"(쓰기 0), "plan: stdin을 읽지 않고 쓰기·exec 0건". 파일: CLI는 core `temp.ts` 밖에서 파일을 쓰지 못한다(정적 시험 `static.test.ts`). 봇 쪽 `admin-cli` "계정 기록: 구독 계정의 이름·방식·발급일만 남기고 …" |
+| `account use`가 두 레인을 바꾸고 지문 확인 뒤 해제한다 | homelab `bot-account-use.test.ts` "두 레인 자격 → 두 Secret 동기화 → 두 볼륨 지문 확인 → 봇 지금 계정·해제 순서로 …", "작업 레인 볼륨이 기한 안에 따라오지 않으면 해제하지 않고 …", "작업 레인 키 쓰기가 실패하면 동기화·해제로 넘어가지 않고 …", "ESO가 Secret을 바꾸지 못하면 …", "계정 폴더에 레인 토큰이 하나라도 없거나 봇 DB에 기록이 없으면 …", "작업자 자격 지문 대기: exec가 죽거나(정리 sweep) 옛 값이면 다시 보고 …". 봇 쪽 `admin-cli` "계정 전환: 지금 계정을 바꾸고 결제 멈춤까지 …", "등록하지 않은 계정이면 …", "비상 정지 중이면 …", "옛 계정의 마지막 한도 관측은 …". "대략 2분"은 기다림 상한(60·90·180초)까지만 보고 실측은 S5다 |
+| `account list`가 이름·방식·현재 계정·만료일·마지막 사용률을 보이고 값은 없다 | 봇 `admin-cli` 계정 기록·전환 시험의 `account list` 단언(만료일 2027-01-15 발급 → 2028-01-15), homelab `bot-account-list.test.ts` "apply: 이름·방식·지금 계정·만료일·마지막 사용률·멈춘 작업 수를 …", "봇 출력에 정해진 꼴 밖의 칸이 있으면 …"(값처럼 보이는 문자열은 옮기지 않고 실패), "잘못된 파드·네임스페이스 대상이면 …" |
+| 만료 30일 전부터 브리핑에 계정 이름과 남은 날수, 30일보다 많이 남으면 없음 | `memory-briefing` "AC-19 토큰 만료 알림: …"(20일 10분 → 20일, 정확히 30일 → 30일, 30일 10분 → 줄 없음이다가 하루 뒤 29일, 3시간 → 하루 안에, 만료됨, API 방식은 줄 없음) |
+| 지금 계정 지표 칸 | `ops-metrics` "C22 지금 계정 지표: …"(고른 계정이 없으면 `{method="none"}`, 고르면 `homelab_bot_model_account{account="spare",method="subscription"} 1` 한 줄. homelab `bot.yaml`의 `max by (account, method)`와 `none`·`api` 비교 값 그대로) |
+| `rotate.md` 3e가 CLI 절차다 | homelab `docs/runbooks-public/rotate.md` 3e(drain → `account add`/`--replace` → `account use` → 반영 확인 → 해제 → 옛 토큰 철회 → 내보내기) |
+
+- **실행(origin/main 29e945e 병합 뒤, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 바뀐 모듈·migration 목록을 참조하는 17개 파일(`admin-cli`·`memory-briefing`·`memory-briefing-pg`·`briefing-task-lane`·`briefing-observations`·`ops-metrics`·`model-resume`·`task-lane-pg`·`revoke-dispatch-pg`·`health`·`publisher-migrate`·`publisher-pg`·`change-store`·`change-store-pg`·`change-pg`·`raw-input-retention`·`raw-text-retention`) 305개 모두 통과, 그리고 `t20-startup`·`t20-startup-pg`·`t20-memory-commands` 15개 통과. homelab(origin/main 병합 뒤 7b61a143, 머신 잠금 아래): `bun run test:cli` 784개 통과·실패 0, 바뀐 파일 `pre-commit run --files` 통과, `bun run ci` 30단계 통과.
+- **시험이 실패할 수 있는지:** AC-19 시험은 처음 실행에서 실제 결함 하나를 잡았다(API 방식 행의 등록 시각이 비어 NOT NULL 위반). homelab 쪽은 단계 순서를 바꾸거나(해제를 지문 확인 앞으로) 두 레인 같은 값 거부를 끄면 흐름 시험 다섯과 입력 시험이 실패하는 것을 보고 되돌렸다.
+- **운영 영향:** 병합하면 migration 028(새 표 하나, 옛 표 변경 없음)이 돈다. 등록된 계정이 없으면 목록이 비고 브리핑 줄이 없으며 지표는 C21과 같은 `{method="none"}`이다. homelab CLI는 owner가 실행할 때만 동작한다.
+- **못 잡는 범위:** `claude setup-token`의 실제 동작과 출력 자동 수집(하지 않음, 미확인), 실제 ESO·kubelet 반영 시간(S5, C24), 운영 RBAC(`kubectl exec` 두 작업자 Deployment), 발급일을 CLI 밖에서 바꾼 경우.
+- **Codex 1차 리뷰 수정(2026-11-11, 지적 넷, 모두 빨강 → 초록 확인):**
+  - 전환 잠금 순서: `admin-cli` "계정 전환 잠금 순서: 전환과 모델 대기가 모두 scheduler 행을 한도 상태(model_limit_state)보다 먼저 잡는다"(트랜잭션마다 질의 순서를 기록하는 기존 방식, `task-bridge` "잠금 순서"와 같다. 고치기 전 전환 트랜잭션이 `limit,scheduler`로 실패).
+  - 전환 전에 시작한 실행의 관측: `admin-cli` "계정 전환: 전환 전에 시작한 대화·작업 실행이 …"(대화 실행·작업 레인 실행 도중 전환 → 한도 상태·리뷰 미루기 비어 있음, 작업의 멈춤 기록과 재시도 시각은 남음, 전환 뒤 시작한 대화의 경고는 사용률 0.97·미루기 기한으로 적힘), `pr-review` "C22 계정 전환 전에 시작한 리뷰 실행의 한도 경고는 …"(리뷰 실행 도중 전환 → 비어 있음, 전환 뒤 리뷰의 경고는 풀리는 시각까지 미룸).
+  - 돌아온 지금 계정의 목록: `admin-cli` "계정 전환: 옛 계정의 마지막 한도 관측은 …"에 A → B → A 단언(목록의 A에 마지막 사용률·풀리는 시각, `reviewDeferredUntil` null).
+  - homelab `setup-token` 출력: `cli/test/core/exec.test.ts` "claude setup-token 로그인 … stdout-to-stderr로 …"(inherit 거부), "setup-token 로그인은 자식 stdout을 stderr로 보내 결과 stdout에는 JSON 문서 하나뿐이다"(가짜 exec로 넘긴 stdio 단언 + 하위 프로세스의 stdout이 JSON 한 줄뿐이고 스텁 토큰은 stderr에만), "stdin이 tty라도 stderr가 터미널이 아니면 setup-token 로그인을 띄우지 않고 …".
+  - 실행(머신 잠금 도우미, `--pg`): `admin-cli`·`pr-review`·`memory-briefing`·`memory-briefing-pg`·`ops-metrics`·`model-resume`·`review-lane`·`task-bridge`·`foundation`·`change-store`·`change-store-pg`·`publisher-migrate`·`publisher-pg` 483개(시험 순서를 고친 `admin-cli` 34개 재실행 포함) 모두 통과. homelab `bun run test:cli` 786개 통과·실패 0.

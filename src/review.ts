@@ -775,7 +775,7 @@ export class ReviewRuntime {
         return true;
       }
       // 대기가 아닌 결과의 한도 경고도 계정 기록에 남긴다(리뷰 미루기). 기록 실패가 결과 처리를 막지 않는다.
-      await this.store.observeRateLimit(result.rateLimit).catch(() => {});
+      await this.store.observeRateLimit(result.rateLimit, job.id).catch(() => {});
       if (result.status !== 'succeeded') { await this.close(job, review, 'failed', result.reason ?? 'model_failed'); return true; }
       await this.finish(job, review, context, task, result);
     } catch (error) {

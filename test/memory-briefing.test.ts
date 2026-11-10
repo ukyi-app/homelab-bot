@@ -9,6 +9,7 @@ import type { DeletionEntry, DeletionLedger, DocumentSource, MemoryInput } from 
 import { BRIEFING, BRIEFING_TEXT, BriefingScheduler, latestSlot, nextSlot } from '../src/briefing.js';
 import type { BriefingConfig, Observation, ObservationSource } from '../src/briefing.js';
 import { Store } from '../src/store.js';
+import { recordAccount } from '../src/model-accounts.js';
 import { localDatabase, fixture, event, thread } from './helpers.js';
 import { closeLedgers, faultyIo, initLedger, ledgerAt, openLedger } from './ledger-fixture.js';
 
@@ -57,7 +58,7 @@ before(async () => { database = await localDatabase(); await mkdir('.local', { r
 beforeEach(async () => {
   await database.pg.exec(`TRUNCATE events,conversations,jobs,results,outbox,schedules,denied_actors,controls,audit,incidents,
     memories,memory_terms,memory_exclusions,memory_deletions,briefing_runs,briefing_copies,briefing_observations,
-    deletion_ledger_generation,model_limit_state RESTART IDENTITY CASCADE`);
+    deletion_ledger_generation,model_limit_state,model_accounts RESTART IDENTITY CASCADE`);
   f = await fixture(database.db);
   ({ dir, generation } = await initLedger('memory'));
   ledger = new FlakyLedger(ledgerAt(dir, database.db));
@@ -485,10 +486,31 @@ test('AC-17 리뷰를 미루는 동안 브리핑에 미룬 PR 리뷰 건수가 �
   const none = (await briefings())[0]!.payload.content;
   assert.ok(!none.includes(BRIEFING_TEXT.reviewsDeferred(2)), none);
 
-  await f.store.observeRateLimit({ event: { status: 'allowed_warning', resetsAt: Math.floor((SLOT + DAY + 3_600_000) / 1000) } });
+  await f.store.observeRateLimit({ event: { status: 'allowed_warning', resetsAt: Math.floor((SLOT + DAY + 3_600_000) / 1000) } }, null);
   at(SLOT + DAY); assert.equal(await briefing.tick(), 'enqueued');
   const deferred = (await briefings())[1]!.payload.content;
   assert.ok(deferred.includes(BRIEFING_TEXT.reviewsDeferred(2)), deferred);
+});
+// AC-19: 등록된 구독 토큰마다 만료(발급 뒤 1년) 30일 전부터 계정 이름과 남은 날수가 나오고, 30일보다 많이 남으면 나오지 않는다.
+test('AC-19 토큰 만료 알림: 만료 30일 안의 구독 토큰마다 계정 이름과 남은 날수가 나오고 30일보다 많이 남으면 없다', async () => {
+  // SLOT은 2027-01-15T23:50:00Z다. 발급 뒤 1년이 만료다.
+  await recordAccount(database.db, 'soon', 'subscription', Date.UTC(2026, 1, 5));            // 만료 2027-02-05 00:00Z, 20일 10분
+  await recordAccount(database.db, 'edge', 'subscription', Date.UTC(2026, 1, 14, 23, 50));   // 만료 정확히 30일 뒤
+  await recordAccount(database.db, 'far', 'subscription', Date.UTC(2026, 1, 15));             // 30일 10분 뒤
+  await recordAccount(database.db, 'today', 'subscription', Date.UTC(2026, 0, 16, 3));        // 3시간 10분 뒤
+  await recordAccount(database.db, 'gone', 'subscription', Date.UTC(2026, 0, 10));            // 이미 만료
+  await recordAccount(database.db, 'credit', 'api', Date.UTC(2026, 0, 10));                   // API 크레딧은 만료일이 없다
+  const briefing = scheduler();
+  await briefing.ensure();
+  at(SLOT); assert.equal(await briefing.tick(), 'enqueued');
+  const content = (await briefings())[0]!.payload.content;
+  for (const line of ['- Claude 토큰(soon)이 20일 뒤 만료돼요.', '- Claude 토큰(edge)이 30일 뒤 만료돼요.',
+    '- Claude 토큰(today)이 하루 안에 만료돼요.', '- Claude 토큰(gone)이 만료됐어요. 새 토큰을 등록해 주세요.'])
+    assert.ok(content.includes(line), `${line}\n${content}`);
+  assert.doesNotMatch(content, /Claude 토큰\((far|credit)\)/);
+  // 하루 뒤에는 far도 30일 안으로 들어온다(29일 10분 → 29일).
+  at(SLOT + DAY); assert.equal(await briefing.tick(), 'enqueued');
+  assert.ok((await briefings())[1]!.payload.content.includes('- Claude 토큰(far)이 29일 뒤 만료돼요.'));
 });
 test('BRIEF-01 읽기 불가·오래된 관측은 미확인, 정상은 현재 관측일 때만, 복원 검증은 백업 성공과 구분', async () => {
   let certificate: Observation | Error = new Error('read_failed');
