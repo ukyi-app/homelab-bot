@@ -28,5 +28,9 @@ CREATE TABLE IF NOT EXISTS model_limit_state (
   review_deferred_until bigint
 );
 
+-- 작업 세션의 한도·인증 대기로 끝난 턴 수(결제 멈춤 제외). 턴 예산은 turn에서 이 값을 뺀 진행 턴으로 센다.
+-- 새 세대를 시작하면 0으로 돌아간다. 옛 코드는 이 칸을 모르고 기본값 0으로 쓴다.
+ALTER TABLE codex_sessions ADD COLUMN IF NOT EXISTS model_wait_turns integer NOT NULL DEFAULT 0;
+
 INSERT INTO schema_migrations VALUES (22) ON CONFLICT DO NOTHING;
 COMMIT;
