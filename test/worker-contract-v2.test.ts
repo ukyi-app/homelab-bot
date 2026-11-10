@@ -275,6 +275,37 @@ test("C02 신뢰 문맥: speech에는 '/' 명령 이름이 없고 말로 할 수
   } finally { await w.worker.close(); }
 });
 
+test('C18 말로 하는 일 안내: speech 신뢰 문맥에 PR 리뷰 요청(확인 없이 바로, 대상은 PR 링크나 짧은 꼴)이 있고, 출력 스키마가 리뷰 요청 대상과 세션 연결 content 꼴을 말한다', async () => {
+  const w = await boot();
+  try {
+    await mode({ reply: '네', proposal: null, ack_only: false });
+    await send(w, v2(job(), { surface: 'speech' }));
+    const speech = factsOf(w.launcher.specs.at(-1)!.stdin);
+    assert.match(speech, /PR 리뷰 요청/);
+    assert.match(speech, /확인 없이 바로 시작/);
+    assert.match(speech, /PR 링크/);
+    assert.ok(speech.includes('<소유자>/<저장소>#<번호>'));
+    // 실행기에 가는 출력 스키마(작업자 안의 값)에 꼴이 있다.
+    const spec = w.launcher.specs.at(-1)!;
+    const schema = JSON.parse(spec.args[spec.args.indexOf('--json-schema') + 1]!) as typeof CHAT_REPLY_JSON_SCHEMA;
+    const fields = schema.properties.proposal.anyOf[1]!.properties as Record<string, { description: string }>;
+    assert.match(fields.target!.description, /PR 링크/);
+    assert.ok(fields.target!.description.includes('<소유자>/<저장소>#<번호>'));
+    assert.match(fields.target!.description, /세션 ID/);
+    assert.ok(fields.content!.description.includes('`claude`') && fields.content!.description.includes('`codex`'));
+    assert.ok(fields.content!.description.includes('summary=on'));
+  } finally { await w.worker.close(); }
+});
+
+test('C18 판 섞임: 말로 하는 일 안내와 출력 스키마 설명은 작업자 안의 값이라 게시 서버 요청 본문(capability digest 재료)에 실리지 않는다', () => {
+  const chatJob = { id: randomUUID(), lease_token: randomUUID(), type: 'chat', revision: { policy: 'p' }, budget: { timeoutMs: 60_000, toolCalls: 8 } } as Job;
+  const request = workerRequest(chatJob, [{ from: 'owner', text: '상태 알려줘' }], { surface: 'speech', earlierPurged: false });
+  // 요청 칸은 판·식별자·지시문 literal·surface·기록·예산뿐이다. 옛 작업자(9b067e9)도 같은 칸을 같은 literal로 받는다.
+  assert.deepEqual(Object.keys(request).sort(), ['earlierPurged', 'instructions', 'job', 'lane', 'lease', 'policyRevision', 'surface', 'timeoutMs', 'toolCalls', 'untrusted', 'version']);
+  const body = JSON.stringify(request);
+  assert.ok(!body.includes('PR 리뷰 요청') && !body.includes('summary=on'));
+});
+
 test('C02 정리 표시: earlierPurged면 신뢰 문맥에 한 줄로 알리고, 아니면 없다(AC-5 작업자)', async () => {
   const w = await boot();
   try {
