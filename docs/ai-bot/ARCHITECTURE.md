@@ -1430,6 +1430,7 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - 기존 3개는 그대로. 더한 것: `homelab_bot_jobs{type,state}`(비종결 6상태 × chat·task·read·review, 0 포함), `homelab_bot_conversation_gaps`, `homelab_bot_outbox{state}`(pending·sending·unknown·blocked), `homelab_bot_scheduler_paused`, `homelab_bot_emergency_stop`, `homelab_bot_gateway_halted`(fatal close로 다시 연결하지 않는 상태, 첫 연결 fatal 포함).
 - 라벨은 코드의 고정 목록에서만 만든다(ID·본문 없음). 쿼리는 상수 3번이다. readiness 정의는 바꾸지 않았다(Gateway 장애에도 Ready).
 - RollingUpdate 동안 두 파드가 같은 DB 값을 낸다. 경보 룰은 `max()`로 묶는다(sum 금지). 스크레이프·룰·Telegram 경로는 플랫폼 D7 후속이다.
+- 모델 멈춤(C21, COLLEAGUE_SPEC §4.7 "운영 알림"): `homelab_bot_model_paused_jobs{kind}`(한도·인증 만료로 `waiting_user`인 작업 수, `kind`는 `rate_limit`·`auth_expired`·`billing`, 0 포함), `homelab_bot_model_pause_resets_at_seconds{kind}`(그 종류에서 가장 늦게 풀리는 시각, Unix 초, 모르면 0), `homelab_bot_model_account{account,method}`(지금 계정, 값 1. 계정 전환 C22 전에는 `{method="none"}`), `homelab_bot_model_reviews_deferred`(리뷰 미루기 기한 안에 대기열에 남은 PR 리뷰 수, 기한 밖이면 0). 읽는 곳은 C19 멈춤 기록 `model_pauses`·`model_limit_state`이고 같은 쿼리에 묶여 왕복이 늘지 않는다. 멈춤 기록이 아직 없는 대기(배포 전 판, 비상 정지 중이라 예약 루프가 채우지 않은 것)는 `wait_reason`으로 종류를 정해 센다. 경보는 homelab `vmalert/rules/bot.yaml` `HomelabBotModelPaused`(Telegram만)다. 라벨·KST 표기 선택은 [DECISIONS](DECISIONS.md) "C21 운영 알림".
 
 ### 잠금 순서 보강
 
