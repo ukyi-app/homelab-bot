@@ -11,6 +11,8 @@ const OPEN = ['queued', 'running', 'verifying', 'cancel_requested', 'waiting_use
 const TYPES = ['chat', 'task', 'read', 'review'];
 const OUTBOX = ['pending', 'sending', 'unknown', 'blocked'];
 const LEDGER = ['closed', 'ready', 'degraded', 'failed', 'fenced', 'disabled'];
+const PAUSE_KINDS = ['rate_limit', 'auth_expired', 'billing'];
+const ACCOUNT_METHODS = ['subscription', 'api', 'none'];
 const T20_SCALARS = ['homelab_bot_memory_deletions_pending', 'homelab_bot_memory_deletion_pending_oldest_seconds', 'homelab_bot_briefing_enabled'];
 const ledgerKey = (state: string) => `homelab_bot_deletion_ledger_state{state="${state}"}`;
 let database: Awaited<ReturnType<typeof localDatabase>>;
@@ -102,8 +104,10 @@ test('OPS-M1 빈 DB: 모든 상태×종류·gap·outbox·제어 계열이 0으�
   // 원장을 켜지 않은 기본은 disabled만 1, 삭제 대기·브리핑은 0.
   for (const state of LEDGER) assert.equal(m.get(ledgerKey(state)), state === 'disabled' ? 1 : 0, state);
   for (const name of T20_SCALARS) assert.equal(m.get(name), 0, name);
-  // 기본 3개 + jobs 24 + outbox 4 + gap·paused·emergency·halted 4 + 원장 상태 6·스칼라 3 + 게이트 사유 2.
-  assert.equal(m.size, 3 + TYPES.length * OPEN.length + OUTBOX.length + 4 + LEDGER.length + T20_SCALARS.length + TASK_GATE_CLOSED_REASONS.length);
+  // 기본 3개 + jobs 24 + outbox 4 + gap·paused·emergency·halted 4 + 원장 상태 6·스칼라 3 + 게이트 사유 2
+  // + 멈춤 종류별 작업 수·풀리는 시각 3·3, 지금 계정 1, 미룬 리뷰 수 1.
+  assert.equal(m.size, 3 + TYPES.length * OPEN.length + OUTBOX.length + 4 + LEDGER.length + T20_SCALARS.length + TASK_GATE_CLOSED_REASONS.length
+    + PAUSE_KINDS.length * 2 + 2);
 });
 
 test('OPS-M2 작업 상태·종류별 개수, 종결 상태는 내보내지 않음', async () => {
@@ -173,7 +177,8 @@ test('OPS-M8 라벨은 화이트리스트뿐: 모르는 종류·ID·본문·채�
     if (!labels) continue;
     for (const pair of labels.split(',')) {
       const [name, value] = pair.split('=') as [string, string];
-      const allowed: readonly string[] = name === 'type' ? TYPES : name === 'state' ? [...OPEN, ...OUTBOX, ...LEDGER] : name === 'reason' ? TASK_GATE_CLOSED_REASONS : [];
+      const allowed: readonly string[] = name === 'type' ? TYPES : name === 'state' ? [...OPEN, ...OUTBOX, ...LEDGER] : name === 'reason' ? TASK_GATE_CLOSED_REASONS
+        : name === 'kind' ? PAUSE_KINDS : name === 'method' ? ACCOUNT_METHODS : [];
       assert.ok(allowed.includes(JSON.parse(value)), `허용 밖 라벨: ${pair}`);
     }
   }
@@ -201,4 +206,58 @@ test('OPS-M9 [T20] 원장 상태는 지금 값만 1(one-hot), 브리핑 0/1, 삭
   assert.equal(m.get('homelab_bot_memory_deletions_pending'), 2);
   assert.equal(m.get('homelab_bot_memory_deletion_pending_oldest_seconds'), 90);
   assert.doesNotMatch(await health.metrics(), /fixture-memory/);
+});
+
+// 모델 멈춤 기록(C19 model_pauses)을 쓴 대기 작업. row=false면 멈춤 기록 전의 판이 남긴 대기다.
+async function pausedJob(kind: 'rate_limit' | 'auth_expired' | 'billing', resetsAt: number | null,
+  options: { type?: string; state?: string; row?: boolean } = {}) {
+  await job(options.type ?? 'chat', options.state ?? 'waiting_user');
+  const id = `fixture-job-${seq}`;
+  await database.db.query('UPDATE jobs SET wait_reason=$2 WHERE id=$1', [id, kind === 'auth_expired' ? 'auth_expired' : 'model_limit']);
+  if (options.row !== false) await database.db.query(`INSERT INTO model_pauses(job_id,kind,resets_at,retry_at,paused_at) VALUES ($1,$2,$3,$4,$5)`,
+    [id, kind, resetsAt, kind === 'billing' ? null : NOW + 60_000, NOW]);
+}
+const pausedKey = (kind: string) => `homelab_bot_model_paused_jobs{kind="${kind}"}`;
+const resetsKey = (kind: string) => `homelab_bot_model_pause_resets_at_seconds{kind="${kind}"}`;
+
+test('C21 운영 알림 지표: 모델 멈춤이 없으면 종류마다 0, 지금 계정은 C22 전이라 method="none", 미룬 리뷰 0', async () => {
+  const m = parse(await health.metrics());
+  for (const kind of PAUSE_KINDS) {
+    assert.equal(m.get(pausedKey(kind)), 0, kind);
+    assert.equal(m.get(resetsKey(kind)), 0, kind);
+  }
+  assert.equal(m.get('homelab_bot_model_account{method="none"}'), 1);
+  assert.equal(m.get('homelab_bot_model_reviews_deferred'), 0);
+});
+
+test('C21 운영 알림 지표: 종류별 대기 작업 수와 가장 늦게 풀리는 시각(Unix 초, 모르면 0), 대기에서 나간 작업의 남은 기록은 세지 않음', async () => {
+  await pausedJob('rate_limit', 1_800_003_600_000);
+  await pausedJob('rate_limit', 1_800_007_200_000, { type: 'review' });
+  await pausedJob('rate_limit', null, { type: 'task' });
+  await pausedJob('auth_expired', null);
+  // 재개돼 다시 도는 작업에 남은 기록과 끝난 작업의 기록.
+  await pausedJob('billing', null, { state: 'running' });
+  await pausedJob('rate_limit', 1_900_000_000_000, { state: 'succeeded' });
+  let m = parse(await health.metrics());
+  assert.deepEqual(PAUSE_KINDS.map(kind => m.get(pausedKey(kind))), [3, 1, 0]);
+  assert.deepEqual(PAUSE_KINDS.map(kind => m.get(resetsKey(kind))), [1_800_007_200, 0, 0]);
+  await pausedJob('billing', null, { type: 'task' });
+  m = parse(await health.metrics());
+  assert.equal(m.get(pausedKey('billing')), 1);
+  assert.doesNotMatch(await health.metrics(), /fixture/);
+});
+
+test('C21 운영 알림 지표: 멈춤 기록 전의 판이 남긴 대기도 wait_reason으로 종류를 정해 센다(비상 정지 중에는 기록이 채워지지 않는다)', async () => {
+  await pausedJob('rate_limit', null, { row: false });
+  await pausedJob('auth_expired', null, { row: false });
+  const m = parse(await health.metrics());
+  assert.deepEqual(PAUSE_KINDS.map(kind => m.get(pausedKey(kind))), [1, 1, 0]);
+});
+
+test('C21 운영 알림 지표: 리뷰 미루기 기한 안이면 대기열의 PR 리뷰 수, 기한이 지나면 0', async () => {
+  await job('review', 'queued'); await job('review', 'queued'); await job('review', 'running'); await job('chat', 'queued');
+  await database.db.query(`INSERT INTO model_limit_state(id,status,review_deferred_until) VALUES ('account','allowed_warning',$1)`, [NOW + 60_000]);
+  assert.equal(parse(await health.metrics()).get('homelab_bot_model_reviews_deferred'), 2);
+  await database.db.query(`UPDATE model_limit_state SET review_deferred_until=$1`, [NOW - 1]);
+  assert.equal(parse(await health.metrics()).get('homelab_bot_model_reviews_deferred'), 0);
 });
