@@ -3,7 +3,7 @@ import { changeChildFailed } from './change-advice.js';
 import { chatContext, earlierPurged } from './chat-context.js';
 import { CHAT_TASK_TEXT as T } from './chat-task-text.js';
 import { DEFAULTS, Denied, RateLimited } from './contracts.js';
-import type { Clock, EventInput, Job, Scope, State } from './contracts.js';
+import type { Clock, EventInput, Job, RateLimitInfo, Scope, State } from './contracts.js';
 import { remaining } from './database.js';
 import type { Database, TransactionDeadline } from './database.js';
 import { messagePages } from './format.js';
@@ -51,6 +51,12 @@ export const MODEL_QUEUE_LIMIT = DEFAULTS.maxQueue - READ_QUEUE_RESERVE;
 // unknown chat 조사 간격: 처음 조사 뒤 30초, 이후 두 배씩, 상한 10분.
 export const UNKNOWN_PROBE_FIRST_MS = 30_000;
 export const UNKNOWN_PROBE_MAX_MS = 600_000;
+// 모델 멈춤의 저절로 재개(COLLEAGUE_SPEC §4.7). 한도는 풀리는 시각 1분 뒤, 시각을 모르는 한도와 인증 만료는 30분마다다.
+// minDelayMs: 풀리는 시각이 이미 지났다고 오면(시계 차이) 곧바로 다시 부르기를 되풀이하지 않게 적어도 이만큼 둔다.
+export const MODEL_RESUME = Object.freeze({ afterResetMs: 60_000, retryMs: 30 * 60_000, minDelayMs: 60_000 });
+// 재개 예약 루프가 감사 기록에 남기는 행위자.
+export const AUTO_RESUME_ACTOR = 'auto_resume';
+export type ModelPauseKind = 'rate_limit' | 'auth_expired' | 'billing';
 // 작업 레인을 닫는 unknown job(별칭 j). 세션 행이 없어도 센다. 턴 시작 전에 lease가 끝난 Claude 작업이다. Codex 세션의 task는 뺀다.
 const TASK_LANE_UNKNOWN = `(j.execution_lane='task' AND j.state='unknown'
   AND NOT EXISTS (SELECT 1 FROM codex_sessions cs WHERE cs.job_id=j.id AND cs.executor='codex'))`;
@@ -434,16 +440,52 @@ export class Store {
     await this.notice(job, `task-cancelled:${job.id}`, T.taskCancelled(this.colleague, job.id), tx);
   }
   // laneOnly: 그 레인만 막는 대기다. scheduler를 켜지 않고 waiting_user 행이 laneBusy로 자기 레인만 막는다(작업 레인 토큰의 인증 만료).
-  async waitForUser(job: Job, reason: string, options: { laneOnly?: boolean } = {}): Promise<void> {
+  // rateLimit: 작업자가 그 실행에서 본 한도 정보(C03). 멈춤 기록(model_pauses)의 종류·풀리는 시각·다음 재시도 시각을 정한다.
+  async waitForUser(job: Job, reason: string, options: { laneOnly?: boolean; rateLimit?: RateLimitInfo | null } = {}): Promise<void> {
     await this.db.transaction(async tx => {
       await this.lockConversation(job, tx);
       await this.lockScheduler(tx);
       if (await this.complete(job, 'waiting_user', reason, tx) !== 'waiting_user') return;
+      await this.recordPause(job.id, reason, options.rateLimit ?? null, tx);
       if (!options.laneOnly) await tx.query(`UPDATE controls SET value='true' WHERE key='scheduler'`);
       // task는 작업 레인(codex.ts)이 따로 알린다. 여기서는 chat만.
       if (job.type === 'chat') await this.notice(job, `waiting:${job.id}:${job.attempt}`,
         reason === 'auth_expired' ? T.modelWaitAuth(this.colleague, job.id) : T.modelWaitLimit(this.colleague, job.id), tx);
     });
+  }
+  // 멈춤 기록. 결제는 저절로 재개하지 않아 다음 재시도 시각이 없다.
+  // 한도·인증으로 멈춘 실행은 시도로 세지 않는다(attempt를 되돌린다). 세면 30분 재시도가 두 번 만에 시도 한도에 닿아
+  // 그 작업이 재개될 수 없는 채 scheduler를 영영 막는다. 결제는 owner가 풀어야 하므로 지금처럼 센다.
+  private async recordPause(job: string, reason: string, rateLimit: RateLimitInfo | null, tx: Database): Promise<void> {
+    const now = this.now();
+    const kind: ModelPauseKind = reason === 'auth_expired' ? 'auth_expired' : rateLimit?.stop?.cause === 'billing' ? 'billing' : 'rate_limit';
+    const resetsAt = kind === 'rate_limit' && rateLimit?.stop?.resetsAt !== undefined ? rateLimit.stop.resetsAt * 1000 : null;
+    const retryAt = kind === 'billing' ? null
+      : resetsAt !== null ? Math.max(resetsAt + MODEL_RESUME.afterResetMs, now + MODEL_RESUME.minDelayMs) : now + MODEL_RESUME.retryMs;
+    await tx.query(`INSERT INTO model_pauses(job_id,kind,resets_at,rate_limit_type,utilization,retry_at,paused_at) VALUES ($1,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT (job_id) DO UPDATE SET kind=EXCLUDED.kind,resets_at=EXCLUDED.resets_at,rate_limit_type=EXCLUDED.rate_limit_type,
+      utilization=EXCLUDED.utilization,retry_at=EXCLUDED.retry_at,paused_at=EXCLUDED.paused_at`,
+    [job, kind, resetsAt, rateLimit?.event?.rateLimitType ?? null, rateLimit?.event?.utilization ?? null, retryAt, now]);
+    if (kind !== 'billing') await tx.query('UPDATE jobs SET attempt=GREATEST(0,attempt-1) WHERE id=$1', [job]);
+    await this.observeRateLimit(rateLimit, tx);
+  }
+  // 그 실행에서 본 마지막 한도 이벤트를 계정 기록에 남긴다. allowed_warning과 풀리는 시각이 오면 그때까지 새 PR 리뷰를 미룬다
+  // (COLLEAGUE_SPEC §4.7 "리뷰 미루기"). 기한은 늘리기만 한다. 5시간 창 경고 뒤에 주간 창 경고가 오면 주간 창이 풀릴 때까지다.
+  async observeRateLimit(rateLimit: RateLimitInfo | null | undefined, tx = this.db): Promise<void> {
+    const event = rateLimit?.event;
+    if (!event) return;
+    const deferUntil = event.status === 'allowed_warning' && event.resetsAt !== undefined ? event.resetsAt * 1000 : null;
+    await tx.query(`INSERT INTO model_limit_state(id,status,rate_limit_type,utilization,resets_at,observed_at,review_deferred_until)
+      VALUES ('account',$1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO UPDATE SET status=EXCLUDED.status,rate_limit_type=EXCLUDED.rate_limit_type,
+      utilization=EXCLUDED.utilization,resets_at=EXCLUDED.resets_at,observed_at=EXCLUDED.observed_at,
+      review_deferred_until=GREATEST(model_limit_state.review_deferred_until,EXCLUDED.review_deferred_until)`,
+    [event.status, event.rateLimitType ?? null, event.utilization ?? null, event.resetsAt === undefined ? null : event.resetsAt * 1000, this.now(), deferUntil]);
+  }
+  // 지금 PR 리뷰를 미루고 있으면 그 기한(ms), 아니면 null.
+  async reviewDeferredUntil(tx = this.db): Promise<number | null> {
+    const until = (await tx.query<{ review_deferred_until: string | null }>(
+      "SELECT review_deferred_until FROM model_limit_state WHERE id='account'")).rows[0]?.review_deferred_until;
+    return until !== null && until !== undefined && Number(until) > this.now() ? Number(until) : null;
   }
   async transition(job: Job, state: State, reason: string | null = null): Promise<boolean> {
     // Only an uncertain worker may override cancellation with unknown.
@@ -733,14 +775,56 @@ export class Store {
       const emergency = (await store.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler_emergency'")).rows[0]!.value;
       if (emergency) return 'emergency_stopped';
       if (await store.queueFull('chat')) return 'queue_full';
-      const changed = (await store.db.query<{ conversation_id: string | null }>(`UPDATE jobs SET state='queued',available_at=$2,wait_reason=NULL,
-        lease_token=NULL,lease_until=NULL,started_at=NULL,finished_at=NULL
-        WHERE id=$1 AND type<>'review' AND state='waiting_user' AND wait_reason IN ('model_limit','auth_expired') AND attempt<$3
-        RETURNING conversation_id`, [job, store.now(), DEFAULTS.maxRetries + 1])).rows[0];
-      if (!changed) return 'not_waiting';
-      const paused = await store.releaseScheduler();
-      await store.audit('model_wait_resumed', job, { actor, conversation: changed.conversation_id, paused });
-      return 'resumed';
+      return await store.resumeWaiting(job, actor, { types: 'model' }) ? 'resumed' : 'not_waiting';
+    });
+  }
+  // 한도·인증 대기 작업 하나를 대기열로 되돌리는 전이. '/resume-model <job>', 관리 진입점 재개, '/review-resume', 재개 예약 루프가
+  // 모두 이것을 부른다. 부르는 쪽이 스케줄러 행을 잠그고 비상 정지·큐 상한을 먼저 본다. 작업 행만 바꾸므로 계정·모델·실행기는 그대로다.
+  // 결과가 undefined면 바꾸지 않았다(대기가 아니거나, 시도 한도이거나, 조건이 맞지 않음).
+  private async resumeWaiting(job: string, actor: string,
+    match: { types: 'model' | 'review' | 'any'; owner?: string; conversation?: string }): Promise<{ paused: boolean } | undefined> {
+    const params: unknown[] = [job, this.now(), DEFAULTS.maxRetries + 1];
+    const extra = [match.types === 'model' ? "type<>'review'" : match.types === 'review' ? "type='review'" : null,
+      match.owner === undefined ? null : `owner_id=$${params.push(match.owner)}`,
+      match.conversation === undefined ? null : `conversation_id=$${params.push(match.conversation)}`]
+      .filter(condition => condition !== null).map(condition => ` AND ${condition}`).join('');
+    const changed = (await this.db.query<{ type: string; conversation_id: string | null }>(`UPDATE jobs SET state='queued',available_at=$2,wait_reason=NULL,
+      lease_token=NULL,lease_until=NULL,started_at=NULL,finished_at=NULL
+      WHERE id=$1 AND state='waiting_user' AND wait_reason IN ('model_limit','auth_expired') AND attempt<$3${extra}
+      RETURNING type,conversation_id`, params)).rows[0];
+    if (!changed) return undefined;
+    await this.db.query('DELETE FROM model_pauses WHERE job_id=$1', [job]);
+    const paused = await this.releaseScheduler();
+    if (changed.type === 'review') await this.audit('review_wait_resumed', job, { actor, paused });
+    else await this.audit('model_wait_resumed', job, { actor, conversation: changed.conversation_id, paused });
+    return { paused };
+  }
+  // 재개 예약 루프 한 바퀴(main.ts가 주기로 부른다). 다음 재시도 시각이 지난 한도·인증 대기를 같은 전이로 되돌리고 그 수를 낸다.
+  // 비상 정지 중에는 아무것도 하지 않는다. 결제 멈춤은 재시도 시각이 없어 고르지 않는다. 큐가 차면 다음 바퀴에 다시 본다.
+  // 멈춤 기록이 없는 대기(이 기록을 쓰기 전의 판이 남긴 것)는 시각을 모르는 한도처럼 처음 본 때부터 30분 뒤로 잡고,
+  // 그 멈춤도 시도로 세지 않는다(recordPause와 같은 규칙).
+  async resumeDue(): Promise<number> {
+    return this.atomic(async store => {
+      await store.lockScheduler();
+      if ((await store.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler_emergency'")).rows[0]!.value) return 0;
+      const now = store.now();
+      const legacy = (await store.db.query<{ id: string }>(`INSERT INTO model_pauses(job_id,kind,retry_at,paused_at)
+        SELECT j.id,CASE WHEN j.wait_reason='auth_expired' THEN 'auth_expired' ELSE 'rate_limit' END,$1::bigint+$2::bigint,$1 FROM jobs j
+        WHERE j.state='waiting_user' AND j.wait_reason IN ('model_limit','auth_expired')
+        AND NOT EXISTS (SELECT 1 FROM model_pauses p WHERE p.job_id=j.id) RETURNING job_id AS id`, [now, MODEL_RESUME.retryMs])).rows;
+      if (legacy.length) {
+        await store.db.query('UPDATE jobs SET attempt=GREATEST(0,attempt-1) WHERE id=ANY($1::text[])', [legacy.map(row => row.id)]);
+        await store.audit('model_pause_backfilled', AUTO_RESUME_ACTOR, { jobs: legacy.map(row => row.id) });
+      }
+      const due = (await store.db.query<{ id: string; type: Job['type'] | 'review' }>(`SELECT j.id,j.type FROM model_pauses p JOIN jobs j ON j.id=p.job_id
+        WHERE j.state='waiting_user' AND j.wait_reason IN ('model_limit','auth_expired') AND p.retry_at IS NOT NULL AND p.retry_at<=$1
+        ORDER BY p.retry_at,j.created_at,j.id`, [now])).rows;
+      let resumed = 0;
+      for (const row of due) {
+        if (await store.queueFull(row.type)) break;
+        if (await store.resumeWaiting(row.id, AUTO_RESUME_ACTOR, { types: 'any' })) resumed++;
+      }
+      return resumed;
     });
   }
   // 리뷰 작업은 대화가 없어 기존 대화 명령으로 재개·포기할 수 없다. 별도 명령과 별도 권한 검사로만 다룬다.
@@ -757,14 +841,9 @@ export class Store {
       const emergency = (await this.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler_emergency'")).rows[0]!.value;
       if (emergency) return { ok: false, status: T.emergencyHeld(this.colleague) };
       if (await this.queueFull('review')) return { ok: false, status: T.queueFullResume };
-      const changed = await this.db.query(`UPDATE jobs SET state='queued',available_at=$2,wait_reason=NULL,
-        lease_token=NULL,lease_until=NULL,started_at=NULL,finished_at=NULL
-        WHERE id=$1 AND type='review' AND state='waiting_user' AND wait_reason IN ('model_limit','auth_expired') AND attempt<$3 RETURNING id`,
-      [target, this.now(), DEFAULTS.maxRetries + 1]);
-      if (!changed.rows.length) return { ok: false, status: T.reviewNotWaiting(this.colleague) };
-      const paused = await this.releaseScheduler();
-      await this.audit('review_wait_resumed', target!, { actor, paused });
-      return { ok: true, paused, status: T.reviewResumed };
+      const changed = target === undefined ? undefined : await this.resumeWaiting(target, actor, { types: 'review' });
+      if (!changed) return { ok: false, status: T.reviewNotWaiting(this.colleague) };
+      return { ok: true, paused: changed.paused, status: T.reviewResumed };
     }
     const changed = await this.db.query(`UPDATE jobs SET state=CASE WHEN state IN ('queued','waiting_user') THEN 'cancelled' ELSE 'cancel_requested' END,
       finished_at=CASE WHEN state IN ('queued','waiting_user') THEN $2 ELSE finished_at END
@@ -831,15 +910,9 @@ export class Store {
       if (emergency) return { ok: false, status: T.emergencyHeld(this.colleague) };
       if (!current?.active || current.gap) return { ok: false, status: T.subscriptionGap };
       if (await this.queueFull('chat')) return { ok: false, status: T.queueFullResume };
-      const changed = await this.db.query(`UPDATE jobs SET state='queued',available_at=$4,wait_reason=NULL,
-        lease_token=NULL,lease_until=NULL,started_at=NULL,finished_at=NULL
-        WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND state='waiting_user'
-        AND wait_reason IN ('model_limit','auth_expired') AND attempt<$5 RETURNING id`,
-      [target, actor, conversation, this.now(), DEFAULTS.maxRetries + 1]);
-      if (!changed.rows.length) return { ok: false, status: T.jobNotWaiting(this.colleague) };
-      const paused = await this.releaseScheduler();
-      await this.audit('model_wait_resumed', target!, { actor, conversation, paused });
-      return { ok: true, paused, status: T.jobResumed };
+      const changed = target === undefined ? undefined : await this.resumeWaiting(target, actor, { types: 'any', owner: actor, conversation });
+      if (!changed) return { ok: false, status: T.jobNotWaiting(this.colleague) };
+      return { ok: true, paused: changed.paused, status: T.jobResumed };
     }
     if (action === 'cancel') {
       const changed = await this.db.query<Job>(`UPDATE jobs SET state=CASE WHEN state IN ('queued','waiting_user') THEN 'cancelled' ELSE 'cancel_requested' END,

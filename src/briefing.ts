@@ -29,6 +29,7 @@ export const BRIEFING_TEXT = Object.freeze({
     slash: (reasons: string) => `- 모델 호출: 중지(${reasons}) · /model-status로 확인`,
     colleague: (reasons: string) => `- 모델 호출: 중지(${reasons}) · \`homelab bot\` CLI로 확인해 주세요`,
   },
+  reviewsDeferred: (count: number) => `- 미룬 PR 리뷰: ${count}건이에요. 모델 사용 한도가 가까워서 한도가 풀리면 이어서 리뷰해요.`,
 });
 export interface Observation {
   observedAt: number; status: 'ok' | 'problem'; summary: string; restoreVerifiedAt?: number | null;
@@ -412,6 +413,12 @@ export class BriefingScheduler {
       ? BRIEFING_TEXT.modelStopped[this.config.colleague === true ? 'colleague' : 'slash'](reasons.join(', ') || '사유 미기록')
       : '- 모델 호출: 중지 신호 없음'];
     if (unknown) lines.push(`- 종료를 확인하지 못한 작업: ${unknown}건(unknown, 자동 재실행 안 함)`);
+    // 리뷰 미루기(C19). 미루는 동안 대기열에 남은 PR 리뷰만 센다(미게시 후보 리뷰는 미루지 않는다).
+    if (await this.store.reviewDeferredUntil() !== null) {
+      const deferred = Number((await this.db.query<{ count: string | number }>(`SELECT count(*) AS count FROM jobs j WHERE j.type='review' AND j.state='queued'
+        AND NOT EXISTS (SELECT 1 FROM change_child_jobs c WHERE c.job_id=j.id AND c.role='review')`)).rows[0]!.count);
+      if (deferred) lines.push(BRIEFING_TEXT.reviewsDeferred(deferred));
+    }
     return lines;
   }
   private async taskCounts(): Promise<TaskCounts> {

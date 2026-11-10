@@ -57,7 +57,7 @@ before(async () => { database = await localDatabase(); await mkdir('.local', { r
 beforeEach(async () => {
   await database.pg.exec(`TRUNCATE events,conversations,jobs,results,outbox,schedules,denied_actors,controls,audit,incidents,
     memories,memory_terms,memory_exclusions,memory_deletions,briefing_runs,briefing_copies,briefing_observations,
-    deletion_ledger_generation RESTART IDENTITY CASCADE`);
+    deletion_ledger_generation,model_limit_state RESTART IDENTITY CASCADE`);
   f = await fixture(database.db);
   ({ dir, generation } = await initLedger('memory'));
   ledger = new FlakyLedger(ledgerAt(dir, database.db));
@@ -467,6 +467,28 @@ test('C10 스위치 두 판: 모델 호출 중지 줄은 꺼지면 /model-status
   assert.ok(on.includes('`homelab bot` CLI'), on);
   // 켜짐 판 브리핑 전체에 '/' 명령 이름과 기억 명령 이름이 없다(AC-11).
   assert.doesNotMatch(on, /(^|[\s(`'"])\/[a-z]|memory-(save|search|correct|exclude|delete)|model-status/);
+});
+// AC-17: 한도 경고로 PR 리뷰를 미루는 동안 대기열의 PR 리뷰 건수를 브리핑에 적는다. 미루지 않을 때는 줄이 없다.
+test('AC-17 리뷰를 미루는 동안 브리핑에 미룬 PR 리뷰 건수가 나오고, 미루지 않으면 그 줄이 없다', async () => {
+  const review = async (id: string, state: string) => {
+    await database.db.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,received_at,payload)
+      VALUES ($1,'github',$1,$1,'fixture-owner','{}',0,'{}')`, [id]);
+    await database.db.query(`INSERT INTO jobs(id,event_id,type,owner_id,target,revision,budget,state,priority,available_at,created_at)
+      VALUES ($1,$1,'review','fixture-owner','{}','{}','{}',$2,20,0,0)`, [id, state]);
+  };
+  await review('fixture-review-1', 'queued');
+  await review('fixture-review-2', 'queued');
+  await review('fixture-review-3', 'succeeded');
+  const briefing = scheduler();
+  await briefing.ensure();
+  at(SLOT); assert.equal(await briefing.tick(), 'enqueued');
+  const none = (await briefings())[0]!.payload.content;
+  assert.ok(!none.includes(BRIEFING_TEXT.reviewsDeferred(2)), none);
+
+  await f.store.observeRateLimit({ event: { status: 'allowed_warning', resetsAt: Math.floor((SLOT + DAY + 3_600_000) / 1000) } });
+  at(SLOT + DAY); assert.equal(await briefing.tick(), 'enqueued');
+  const deferred = (await briefings())[1]!.payload.content;
+  assert.ok(deferred.includes(BRIEFING_TEXT.reviewsDeferred(2)), deferred);
 });
 test('BRIEF-01 읽기 불가·오래된 관측은 미확인, 정상은 현재 관측일 때만, 복원 검증은 백업 성공과 구분', async () => {
   let certificate: Observation | Error = new Error('read_failed');

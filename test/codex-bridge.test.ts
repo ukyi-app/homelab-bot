@@ -904,7 +904,9 @@ test('TASK-02 질문 대기 중 비상 중지를 풀었으면 기한 만료 정�
   assert.equal(await runtime.tick(), true);
   assert.equal((await jobs())[1]!.state, 'succeeded');
 });
-test('TASK-03 질문 재개로 시도 한도에 닿은 뒤 한도 대기가 오면 재개 대신 /cancel을 안내', async () => {
+// C19: 한도·인증 멈춤은 시도로 세지 않는다. 질문 재개로 시도 한도(3)에 닿은 실행이 한도로 멈추면 attempt가 2로 돌아가
+// 재개를 안내하고 '/resume-model'(과 재개 예약 루프)이 이어서 한다.
+test('TASK-03 질문 재개로 시도 한도에 닿은 뒤 한도 대기가 와도 그 멈춤은 시도로 세지 않아 재개를 안내하고 재개된다', async () => {
   const { job, question } = await asked();
   await owner(question, 'main', 'answer-1');
   launcher.scripts.push(finished(out('needs_input', '조사', '하나 더 묻습니다'), [], null));
@@ -913,9 +915,9 @@ test('TASK-03 질문 재개로 시도 한도에 닿은 뒤 한도 대기가 오�
   launcher.scripts.push({ lines: jsonl({ type: 'turn.started' }, { type: 'turn.failed', error: { message: 'usage_limit_reached' } }),
     exit: { code: 1, signal: null } });
   await runtime.tick();
-  assert.equal((await jobs())[0]!.attempt, 3); assert.equal((await jobs())[0]!.wait_reason, 'model_limit');
-  assert.ok((await outbox()).some(row => row.payload.content === `${T.codexLimitPaused(false, job.id)} ${T.modelPauseFinal(false)}`));
-  assert.equal((await f.store.control('fixture-owner', f.store.scopeId(thread), 'resume-model', job.id) as { ok: boolean }).ok, false);
+  assert.equal((await jobs())[0]!.attempt, 2); assert.equal((await jobs())[0]!.wait_reason, 'model_limit');
+  assert.ok((await outbox()).some(row => row.payload.content === `${T.codexLimitPaused(false, job.id)} ${T.modelPauseResume(false, job.id)}`));
+  assert.equal((await f.store.control('fixture-owner', f.store.scopeId(thread), 'resume-model', job.id) as { ok: boolean }).ok, true);
 });
 
 // ---- 세션 전 오류 판정·준비 중 중단·도구 예산·출력 상한·재개·실행 권한 회귀 시험 ----

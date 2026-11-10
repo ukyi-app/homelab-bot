@@ -30,7 +30,7 @@ export const TASK_LIMITS = Object.freeze({
   turnTimeoutMs: DEFAULTS.taskTimeoutMs,
   // job 전체 누적 실행 시간. 재개로 시간 예산이 새로 채워지지 않게 한다. 값은 [제안]: 최대 길이 턴 3회.
   runBudgetMs: 3 * DEFAULTS.taskTimeoutMs,
-  // 재개 횟수의 상한. 값은 [제안]이고 실측 뒤 조정한다.
+  // 진행한 턴 수의 예산. 한도·인증 대기로 끝난 턴은 세지 않는다. 값은 [제안]이고 실측 뒤 조정한다.
   turns: 16,
   toolCalls: DEFAULTS.maxToolCalls,
   untrustedChars: DEFAULTS.maxInputChars,
@@ -74,7 +74,8 @@ const uuid = z.string().uuid();
 const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
 // DB generation·turn 열이 integer다.
 const generation = z.number().int().positive().max(2_147_483_647);
-const turn = z.number().int().positive().max(TASK_LIMITS.turns);
+// 턴 번호는 세션 순번이라 프로토콜 한계만 둔다. 턴 예산(TASK_LIMITS.turns)은 한도·인증 대기 턴을 빼고 게시 서버가 센다.
+const turn = z.number().int().positive().max(2_147_483_647);
 const label = z.string().min(1).max(200);
 const bounded = (max: number) => z.number().int().positive().max(max);
 // 저장소 안의 상대 경로만. 비신뢰 입력이 들어오는 자리는 아니지만 작업자가 경로를 만들 때 이 모양을 믿는다.

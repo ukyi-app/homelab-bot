@@ -128,7 +128,8 @@ test('4316099215 동시 재개 요청은 하나만 재수락, 나머지는 상�
   const job = await paused();
   const results = await Promise.all(['resume-a', 'resume-b'].map(id => control('resume-model', job.id, id)));
   assert.equal(results.filter(r => r.ok === true).length, 1);
-  assert.equal((await rows('jobs')).length, 1); assert.equal((await rows('jobs'))[0]!.attempt, 1); assert.equal(await flag(), false);
+  // 재수락은 시도를 쓰지 않는다. 한도 멈춤은 시도로 세지 않아(C19) 대기에 들어갈 때 이미 0으로 돌아가 있다.
+  assert.equal((await rows('jobs')).length, 1); assert.equal((await rows('jobs'))[0]!.attempt, 0); assert.equal(await flag(), false);
 });
 test('R8-AUDIT emergency-stop은 waiting 취소로 해제되지 않고 명시 확인 뒤 해제', async () => {
   const job = await paused(); await control('emergency-stop');
