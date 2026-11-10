@@ -13,7 +13,8 @@ import type { Policy, PolicyGate } from './policy.js';
 import { DRAIN_MS } from './runtime.js';
 import type { TaskLane } from './runtime.js';
 import type { Store } from './store.js';
-import { FOREIGN_SESSION_STATUS, TaskBridge, TaskWorkerBusy, TaskWorkerRejected } from './task-bridge.js';
+import { FOREIGN_SESSION_STATUS, TaskBridge, TaskWorkerBusy, TaskWorkerRejected, releaseStatus } from './task-bridge.js';
+import type { ReleaseOutcome } from './task-bridge.js';
 import { taskOutputRisk } from './task-output.js';
 import type { TaskOutputRisk } from './task-output.js';
 import type { TaskStatus, TaskWorkerPort } from './task-bridge.js';
@@ -660,14 +661,22 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
   }
   // unknown 해제는 작업자의 소멸 확인을 거친다. 세션 공간도 함께 지우고, 지우지 못하면 cleanup_pending으로 레인을 계속 닫는다.
   async release(actor: string, scope: Scope, jobId: string): Promise<{ ok: boolean; status: string }> {
-    const job = await this.releasable(actor, scope, jobId);
+    const outcome = await this.releaseJob(await this.releasable(actor, scope, jobId), actor);
+    return { ok: outcome === 'released', status: releaseStatus(outcome, this.store.colleague) };
+  }
+  async adminRelease(jobId: string, actor: string): Promise<ReleaseOutcome> {
+    const job = await this.adminTarget(jobId);
+    return job ? this.releaseJob(job, actor) : 'missing';
+  }
+  private async releaseJob(job: Job, actor: string): Promise<ReleaseOutcome> {
+    const jobId = job.id;
     const session = (await this.store.db.query<SessionRow>('SELECT * FROM codex_sessions WHERE job_id=$1', [jobId])).rows[0];
     // Codex 세션은 작업자가 달라 여기서 소멸을 확인할 수 없다. CodexBridge.release가 그 작업자에게 묻는다.
-    if (session && session.executor !== 'claude') return { ok: false, status: FOREIGN_SESSION_STATUS };
-    if (job.state !== 'unknown' && session?.state !== 'unknown') return { ok: false, status: T.releaseNotUnknown };
+    if (session && session.executor !== 'claude') return 'foreign';
+    if (job.state !== 'unknown' && session?.state !== 'unknown') return 'not_unknown';
     // 세션 행이 없으면 어느 작업자에도 보낸 적이 없다. 턴 시작이 dispatch 전에 행을 남긴다.
     const stopped = session ? await this.confirmStopped(jobId, session) : true;
-    if (!stopped) return { ok: false, status: T.releaseWorkerAlive };
+    if (!stopped) return 'worker_alive';
     const changed = await this.store.atomic(async store => {
       await store.lockTaskControl(job.conversation_id);
       const held = (await store.db.query<{ lease_token: string | null }>('SELECT lease_token FROM jobs WHERE id=$1 FOR UPDATE', [jobId])).rows[0];
@@ -683,9 +692,9 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       await store.syncTaskLane();
       return true;
     });
-    if (!changed) return { ok: false, status: T.releaseStateChanged(this.store.colleague) };
+    if (!changed) return 'state_changed';
     await this.finalizeJob(jobId).catch(() => {});
-    return { ok: true, status: T.releaseConfirmed };
+    return 'released';
   }
   private async confirmStopped(job: string, session: SessionRow): Promise<boolean> {
     const expected = session.worker_instance && session.worker_storage ? { instance: session.worker_instance, storage: session.worker_storage } : null;

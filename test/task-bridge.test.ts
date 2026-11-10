@@ -1535,6 +1535,65 @@ test('executor 구분: Claude 해제는 Codex 세션을 실행 전 작업으로 
   assert.deepEqual(codex.confirms, [job.id]);
   assert.equal((await jobs(db()))[0]!.state, 'cancelled');
 });
+// ---- 관리 기능 unknown 해제(C32): 작업 ID만, owner·대화 대조 없이, 같은 소멸 확인 ----
+test('관리 기능 unknown 해제: 작업 ID만으로 소멸 확인 뒤에만 풀고, 확인하지 못하면 unknown과 레인 닫힘을 유지한다', async () => {
+  setup.worker.scripts.push(reply.unknown());
+  const job = await newTask();
+  await setup.runtime.tickTask();
+  // 권한의 근거는 클러스터 접근이다. owner가 바뀌고 정책을 읽지 못해도 소멸 확인만 본다.
+  f.policy.owner = 'replacement';
+  f.setPolicyUnavailable(true);
+  setup.worker.stopped = false;
+  assert.equal(await setup.bridge.adminRelease(job.id, 'cli'), 'worker_alive');
+  assert.equal((await jobs(db()))[0]!.state, 'unknown');
+  assert.equal((await laneRow(db())).closed_reason, 'unknown');
+  setup.worker.stopped = true;
+  assert.equal(await setup.bridge.adminRelease(job.id, 'cli'), 'released');
+  assert.equal((await jobs(db()))[0]!.state, 'cancelled');
+  assert.equal((await jobs(db()))[0]!.wait_reason, 'stop_confirmed_after_unknown');
+  assert.equal((await laneRow(db())).closed_reason, null);
+  const audit = (await rows('audit')).find(row => row.kind === 'task_unknown_released')!;
+  assert.equal((typeof audit.detail === 'string' ? JSON.parse(audit.detail) : audit.detail).actor, 'cli');
+  assert.equal(await setup.bridge.adminRelease(job.id, 'cli'), 'not_unknown');
+  assert.equal(await setup.bridge.adminRelease('0f8b5a8e-3c1d-4e2f-9a7b-1c2d3e4f5a6b', 'cli'), 'missing');
+  assert.equal(setup.worker.executes.length, 1, '다시 실행하지 않는다');
+});
+test("관리 기능 unknown 해제: 다른 저장소의 취소 응답은 소멸 증명이 아니고, 풀린 뒤 '/task-release'는 그대로 거부한다", async () => {
+  setup.worker.scripts.push(reply.unknown());
+  const job = await newTask();
+  await setup.runtime.tickTask();
+  const old = setup.worker.identity;
+  setup.worker.identity = { instance: crypto.randomUUID(), storage: OTHER_STORAGE };
+  assert.equal(await setup.bridge.adminRelease(job.id, 'cli'), 'worker_alive');
+  assert.equal((await jobs(db()))[0]!.state, 'unknown');
+  setup.worker.identity = old;
+  assert.equal(await setup.bridge.adminRelease(job.id, 'cli'), 'released');
+  const slash = await setup.bridge.release('fixture-owner', thread, job.id);
+  assert.deepEqual(slash, { ok: false, status: T.releaseNotUnknown });
+});
+test('관리 기능 unknown 해제: Codex 세션은 Codex 경로만 소멸 확인 뒤 풀고, 서로의 세션은 foreign으로 건드리지 않는다', async () => {
+  const { job } = await codexSession(f, db());
+  assert.equal(await setup.bridge.adminRelease(job.id, 'cli'), 'foreign');
+  assert.equal(setup.worker.cancels.length, 0);
+  const refused = codexBridge(f, false);
+  assert.equal(await refused.bridge.adminRelease(job.id, 'cli'), 'worker_alive');
+  assert.equal((await jobs(db()))[0]!.state, 'unknown');
+  const codex = codexBridge(f);
+  assert.equal(await codex.bridge.adminRelease(job.id, 'cli'), 'released');
+  assert.equal((await jobs(db()))[0]!.state, 'cancelled');
+  const audit = (await rows('audit')).find(row => row.kind === 'codex_unknown_released')!;
+  assert.equal((typeof audit.detail === 'string' ? JSON.parse(audit.detail) : audit.detail).actor, 'cli');
+  assert.equal(await codex.bridge.adminRelease(job.id, 'cli'), 'not_unknown');
+});
+test('관리 기능 unknown 해제: Codex 경로는 Claude 세션을 foreign으로 두고 소멸 확인을 묻지 않는다', async () => {
+  setup.worker.scripts.push(reply.unknown());
+  const job = await newTask();
+  await setup.runtime.tickTask();
+  const codex = codexBridge(f);
+  assert.equal(await codex.bridge.adminRelease(job.id, 'cli'), 'foreign');
+  assert.equal(codex.confirms.length, 0);
+  assert.equal((await jobs(db()))[0]!.state, 'unknown');
+});
 test('executor 구분: 세션 상태가 unknown이 아니어도, 질문이 있어도 Codex 세션은 건드리지 않는다', async () => {
   const { job } = await codexSession(f, db(), 'waiting_answer');
   await db().query(`INSERT INTO codex_questions(id,job_id,conversation_id,thread_id,turn,kind,responder_id,prompt,state,created_at,expires_at)

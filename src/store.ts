@@ -709,6 +709,25 @@ export class Store {
     if (action.startsWith('review-')) return this.atomic(store => store.reviewControlLocked(actor, action, target, options.review === true));
     return this.atomic(store => store.controlLocked(actor, conversation, action, target, cursor));
   }
+  // 관리 기능의 멈춘 작업 재개(COLLEAGUE_SPEC §4.8). 권한의 근거는 클러스터 접근이라 owner·대화·구독을 대조하지 않는다.
+  // 나머지 조건은 '/resume-model <job>'과 같다: 비상 정지가 없고, 큐에 자리가 있고, 그 작업이 한도·인증 대기이고, 시도 한도 안이다.
+  // 리뷰 작업은 review-resume이 맡고 '/resume-model'도 대화가 달라 닿지 않으므로 여기서도 고르지 않는다.
+  async adminResumeJob(job: string, actor: string): Promise<'resumed' | 'not_waiting' | 'emergency_stopped' | 'queue_full'> {
+    return this.atomic(async store => {
+      await store.lockScheduler();
+      const emergency = (await store.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler_emergency'")).rows[0]!.value;
+      if (emergency) return 'emergency_stopped';
+      if (await store.queueFull('chat')) return 'queue_full';
+      const changed = (await store.db.query<{ conversation_id: string | null }>(`UPDATE jobs SET state='queued',available_at=$2,wait_reason=NULL,
+        lease_token=NULL,lease_until=NULL,started_at=NULL,finished_at=NULL
+        WHERE id=$1 AND type<>'review' AND state='waiting_user' AND wait_reason IN ('model_limit','auth_expired') AND attempt<$3
+        RETURNING conversation_id`, [job, store.now(), DEFAULTS.maxRetries + 1])).rows[0];
+      if (!changed) return 'not_waiting';
+      const paused = await store.releaseScheduler();
+      await store.audit('model_wait_resumed', job, { actor, conversation: changed.conversation_id, paused });
+      return 'resumed';
+    });
+  }
   // 리뷰 작업은 대화가 없어 기존 대화 명령으로 재개·포기할 수 없다. 별도 명령과 별도 권한 검사로만 다룬다.
   private async reviewControlLocked(actor: string, action: string, target: string | undefined, allowed: boolean): Promise<unknown> {
     if (!allowed) return { ok: false, status: T.reviewControlDenied };
