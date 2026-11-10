@@ -1008,6 +1008,20 @@ export class ChangeStore {
       [key.changeId, key.generation, key.round])).rows[0];
     return row ? success(amendmentRow(row)) : fail('not_found');
   }
+  // writer의 쓰기 직전 확인(수정 차례). 부모가 amending이고 running 차례가 차례 effect를 보낼 수 있는 조건(DB 함수 change_amendment_may_send:
+  // 그 차례의 artifact, 필수 시험 전부 통과, 완전한 통과 리뷰)을 지금 만족할 때만 참이다. 트리거와 같은 함수를 불러 뜻이 갈라지지 않는다.
+  async amendmentWritable(key: ChangeKey): Promise<boolean> {
+    const round = (await this.database.query<{ round: number | string }>(`SELECT a.round FROM change_amendments a JOIN change_requests r ON r.id=a.change_id AND r.generation=a.generation
+      WHERE a.change_id=$1 AND a.generation=$2 AND a.state='running' AND r.phase='amending'`, [key.changeId, key.generation])).rows[0];
+    if (!round) return false;
+    try {
+      await this.database.transaction(tx => tx.query('SELECT change_amendment_may_send($1,$2,$3)', [key.changeId, key.generation, num(round.round)]));
+      return true;
+    } catch (error) {
+      if (isDatabaseError(error) && error.code === 'CH001') return false;
+      throw error;
+    }
+  }
   // 지금 PR 브랜치에 올라가 있어야 하는 head. 마지막으로 ref가 확정된 수정 커밋이고, 없으면 처음 게시의 head다.
   async publishedHeadOf(key: ChangeKey): Promise<string | null> {
     const pull = await this.readEffect(this.database, { ...key, stage: 'pull' });

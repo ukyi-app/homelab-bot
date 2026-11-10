@@ -26,7 +26,7 @@ import type { DiscordApi } from '../src/discord-protocol.js';
 import { startPublisher } from '../src/main.js';
 import type { Publisher } from '../src/main.js';
 import { loadRuntimePolicy } from '../src/policy.js';
-import { createGitHubWriter } from '../src/github-writer.js';
+import { createGitHubWriter, PublicationStopped } from '../src/github-writer.js';
 import type { GuidanceReview, GuidanceReviewPort } from '../src/github-review-io.js';
 import { TaskWorkerBusy } from '../src/task-bridge.js';
 import { HttpTaskV2Worker } from '../src/task-http.js';
@@ -2138,5 +2138,20 @@ test('AC-28 ref 갱신 응답 유실: 다시 보내지 않고 브랜치를 다�
     await h.pump(async () => (await roundsOf(h, id))[0]?.state === 'committed');
     assert.equal(h.env.github.mutations(/^PATCH .*git\/refs/).length, 1);
     assert.equal(branchHead(h), (await roundsOf(h, id))[0]!.commit_sha);
+  });
+});
+
+test('AC-28 쓰기 직전 확인(실제 조립): 처음 게시가 끝난 proposed, 시험·리뷰를 지나기 전의 수정 차례, 다른 generation에서는 쓰기를 받지 않는다', async () => {
+  const fake = discussionFake();
+  await withHarness({ changeV2: true, colleague: true, steps: [V2_WRITE_STEP, { kind: 'hang' }], amendments: { discussion: fake.read } }, async h => {
+    const id = await toProposed(h);
+    const target = { key: { changeId: id, generation: 1 }, repoId: REPO.id };
+    await assert.rejects(h.authorizeWrite(target), PublicationStopped, '게시가 끝난 proposed는 쓰지 않는다');
+    await requestAmendment(h, id, 'amend-1', branchHead(h));
+    await h.pump(async () => (await h.f.calls()).length === 2);
+    assert.equal(await h.phase(id), 'amending');
+    await assert.rejects(h.authorizeWrite(target), PublicationStopped, '차례 증거(시험·리뷰)가 없으면 쓰지 않는다');
+    await assert.rejects(h.authorizeWrite({ ...target, key: { changeId: id, generation: 2 } }), PublicationStopped);
+    assert.equal(h.env.github.mutations(/^PATCH/).length, 0, '브랜치 갱신이 없다');
   });
 });

@@ -35,13 +35,13 @@ function discussion(): PullDiscussion {
       path: 'src/a.ts', line: 1, side: 'RIGHT', commitId: 'a'.repeat(40) }],
     comments: [{ id: 34, author: null, association: 'NONE', createdAt: '2026-01-02T03:07:00Z', body: '탈퇴한 계정의 댓글' }] };
 }
-async function wired(options: { colleague?: boolean; fail?: boolean } = {}) {
+async function wired(options: { colleague?: boolean; fail?: boolean; reader?: false } = {}) {
   const reads: { repository: string; pr: number }[] = [];
-  open = await actions(database.db, { colleague: options.colleague ?? true, discussion: async input => {
+  open = await actions(database.db, { colleague: options.colleague ?? true, ...(options.reader === false ? {} : { discussion: async (input: { repository: string; pr: number }) => {
     reads.push(input);
     if (options.fail) throw new Error('read_failed');
     return discussion();
-  } });
+  } }) });
   return { a: open, reads };
 }
 // 이 스레드에서 '/change'로 받은 변경을 PR 게시(proposed, PR #7)까지 민다.
@@ -109,7 +109,7 @@ test('C27 수정 요청 거절: 병합·닫힌 PR과 상한에 닿은 변경은 
   assert.equal(a.buttons().posted.length, 0);
 });
 
-test('C27 수정 요청: 공개하면 안 되는 값이 섞인 말은 거절하고, 자료를 읽지 못하면 확인 글을 만들지 않으며, 스위치가 꺼져 있으면 동작이 없다', async () => {
+test('C27 수정 요청: 공개하면 안 되는 값이 섞인 말은 거절하고, 자료를 읽지 못하면 확인 글 없이 거절하며, 스위치가 꺼져 있으면 동작이 없다', async () => {
   const first = await wired();
   await published(first.a);
   await first.a.speak(message(), 'fixture-corp-host 주소로 바꿔 줘', { action: 'change_amend', target: '#7', content: null });
@@ -123,7 +123,8 @@ test('C27 수정 요청: 공개하면 안 되는 값이 섞인 말은 거절하�
   await published(failing.a);
   await failing.a.speak(message(), 'PR 7 고쳐 줘', { action: 'change_amend', target: '#7', content: null });
   assert.equal(failing.a.buttons().posted.length, 0);
-  assert.deepEqual((await failing.a.dropped()).at(-1), { action: 'change_amend', reason: 'target_denied' });
+  await failing.a.deliver();
+  assert.ok(failing.a.posted().includes(AMENDMENT_REQUEST_TEXT.unavailable));
   await open!.close(); open = undefined;
   await database.pg.exec(TRUNCATE);
 
@@ -153,4 +154,20 @@ test('C27 자료 항목: 리뷰·리뷰 댓글·대화 댓글을 오래된 것�
     ['comment:34', 'comment', null, null],
     ['review_comment:35', 'review_comment', 3, null],
   ]);
+});
+
+test('C27 리뷰 경로 없음: PR 리뷰·댓글 읽기가 없으면 수정 요청은 확인 글 없이 거절 한 줄로 끝나고, 변경 요청·게시 흐름은 그대로다', async () => {
+  const { a } = await wired({ reader: false });
+  const id = await published(a);
+  assert.equal((await a.changeStore.get(id) as { value: { phase: string } }).value.phase, 'proposed');
+  await a.speak(message(), 'PR 7에 리뷰 반영해 줘', { action: 'change_amend', target: '#7', content: null });
+  assert.equal(a.buttons().posted.length, 0);
+  await a.deliver();
+  assert.ok(a.posted().includes(AMENDMENT_REQUEST_TEXT.unavailable), JSON.stringify(a.posted()));
+  assert.equal((await rounds(id)).length, 0);
+  // 말로 한 변경 요청은 지금처럼 확인 뒤 접수된다.
+  await a.speak(message(), '로그인 화면 오타 고쳐 줘', { action: 'change', target: REPO.fullName, content: null });
+  assert.equal(body(a.buttons().content), `${REPO.fullName}에 이 변경 PR을 준비할까요?`);
+  await a.press(a.buttons().ids[0]!);
+  assert.equal((await database.db.query('SELECT id FROM change_requests')).rows.length, 2);
 });

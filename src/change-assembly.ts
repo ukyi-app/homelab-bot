@@ -2,6 +2,7 @@ import { DEPLOY_TARGETS } from './catalog.js';
 import type { DeployTarget } from './catalog.js';
 import { ChangeStoreArtifacts } from './change-artifact.js';
 import { ChangeAnswerGuard, ChangeCommands } from './change-commands.js';
+import type { AmendmentDiscussionReader } from './change-commands.js';
 import type { ChangeKey, ChangeTarget } from './change-contracts.js';
 import { DeploymentReader } from './change-deployment.js';
 import { compilePathPolicy, taskPathRules } from './change-policy.js';
@@ -94,6 +95,8 @@ export interface ChangeAssemblyOptions {
   periods?: ChangeRuntimeDeps['periods']; verificationPollMs?: number;
   // 봇 PR 안내 리뷰(리뷰 App). 리뷰 경로가 없으면 비고, 안내 댓글만 달지 않는다.
   guidance?: GuidanceReviewPort;
+  // 수정 요청(C27)의 PR 리뷰·댓글 읽기(리뷰 App). 리뷰 경로가 없으면 비고, 수정 차례를 열지 않는다.
+  discussion?: AmendmentDiscussionReader;
   // 시험이 port 사이에 중단을 넣는 자리.
   instrument?: (deps: ChangeRuntimeDeps) => ChangeRuntimeDeps;
 }
@@ -107,7 +110,12 @@ export function assembleChange(options: ChangeAssemblyOptions): ChangeAssembly {
     // 요청자를 모르면 권한을 말할 수 없다. 철회로 닫지 않고 writer가 보내지 않게만 한다.
     if (!request.ok) throw new Error('change_request_unavailable');
     // /change-cancel은 권한을 건드리지 않아 권한 확인만으로는 못 잡는다. 취소·막힘은 부모를 끝내고 승인을 무효로 한다.
-    if (request.value.generation !== target.key.generation || request.value.phase !== 'publishing' || !await changes.hasLiveApproval(target.key)) throw new PublicationStopped();
+    // 받는 경우는 둘이다. 처음 게시(publishing + 살아 있는 승인)와 게시 뒤 수정 차례(C27: amending + running 차례가 차례 effect 조건을 만족).
+    // 브랜치가 그 변경·generation의 것인지는 writer가 따로 본다.
+    if (request.value.generation !== target.key.generation) throw new PublicationStopped();
+    const publishing = request.value.phase === 'publishing' && await changes.hasLiveApproval(target.key);
+    const amending = request.value.phase === 'amending' && await changes.amendmentWritable(target.key);
+    if (!publishing && !amending) throw new PublicationStopped();
     await authorize(request.value);
   };
   const io = (options.createWriter ?? createGitHubWriter)({ app: options.app, repositories: policyWriterRepositories(policy), authorizeWrite, send, now });
@@ -140,14 +148,17 @@ export function assembleChange(options: ChangeAssemblyOptions): ChangeAssembly {
     resolveService: repoId => services.find(item => item.repoId === repoId)?.service ?? null });
   const runtimeDeps: ChangeRuntimeDeps = { store, changes, inputs, gate, author, artifacts, verification, review: options.review, publisher, preflight: io.preflight, deployment, policy,
     intakeOpen: options.intakeOpen, log, verifierRevision: VERIFIER_REVISION, ...(options.periods ? { periods: options.periods } : {}),
-    ...(options.guidance ? { guidance: options.guidance } : {}) };
+    ...(options.guidance ? { guidance: options.guidance } : {}), ...(options.discussion ? { discussion: options.discussion } : {}) };
   const runtime = new ChangeRuntime(options.instrument ? options.instrument(runtimeDeps) : runtimeDeps);
   return { runtime, author, inputs, publisher };
 }
 
-export function changeCommandHandler(deps: { store: Store; gate: PolicyGate; changes: ChangeStore; log: Log; closedReason: () => string | null; runtime?: ChangeRuntime }): ChangeCommands {
+// discussion이 없으면(리뷰 경로 없음) 말로 한 수정 요청은 확인 글 없이 거절 한 줄로 끝난다.
+export function changeCommandHandler(deps: { store: Store; gate: PolicyGate; changes: ChangeStore; log: Log; closedReason: () => string | null; runtime?: ChangeRuntime;
+  discussion?: AmendmentDiscussionReader }): ChangeCommands {
   const { runtime } = deps;
-  return new ChangeCommands({ store: deps.store, changes: deps.changes, gate: deps.gate, log: deps.log, closedReason: deps.closedReason, ...(runtime ? { admit: request => runtime.admit(request) } : {}) });
+  return new ChangeCommands({ store: deps.store, changes: deps.changes, gate: deps.gate, log: deps.log, closedReason: deps.closedReason, ...(runtime ? { admit: request => runtime.admit(request) } : {}),
+    ...(deps.discussion ? { discussion: deps.discussion } : {}) });
 }
 export function guardedTaskCommands(inner: TaskCommandHandler, inputs: ChangePrivateInputs, gate: PolicyGate): TaskCommandHandler {
   return new ChangeAnswerGuard(inner, inputs, gate);

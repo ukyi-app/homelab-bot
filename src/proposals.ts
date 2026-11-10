@@ -438,7 +438,7 @@ const changeAmendHandler: RunHandler = {
     if (!instruction) return;
     const found = await amendment.prepare({ actor: job.owner_id, scope: job.target, target: proposal.target, instruction });
     if (!found.ok) {
-      if (found.reason === 'not_visible' || found.reason === 'unavailable') return;
+      if (found.reason === 'not_visible') return;
       return { refusal: found.reason === 'limit' ? AMENDMENT_REQUEST_TEXT.limit(CHANGE_AMENDMENT.maxRounds) : AMENDMENT_REQUEST_TEXT[found.reason] };
     }
     const value: AmendValue = { changeId: found.changeId, generation: found.generation, pullNumber: found.pullNumber, head: found.head, materials: found.materials };

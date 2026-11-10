@@ -232,7 +232,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   const review = precondition.open ? (() => {
     const io = githubReviewIO({ app: precondition.app, repositories: policyRepositories(reviewPolicy, store), send, now, requests: { store, policy: reviewPolicy } });
     const queue = new ReviewQueue(store, io.reader);
-    return { queue, reader: io.reader, guidance: io.guidance,
+    return { queue, reader: io.reader, guidance: io.guidance, discussion: io.discussion,
       runtime: new ReviewRuntime(store, reviewPolicy, queue, io.reader, new HttpReviewWorker(config.workerUrl, send), signer, undefined,
         { shutdown: stop.signal, drainMs: deps.drainMs, lanes: taskLoop, ...(changeReview ? { changeReview: changeReview.service } : {}) }),
       publisher: new ReviewPublisher(store, reviewPolicy, io.reader, new RestrictedGitHub(io.transport), queue, undefined, stop.signal),
@@ -282,11 +282,16 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   if (taskBridge) health.watchTaskLane(() => ({ workerRouted: taskIntake.routed, intakeOpen: taskIntake.open }));
   // 옛 작업자면 이 값이 false라 CHANGE만 닫히고 v1 /task는 그대로 돈다. 작업자는 나중에 바뀌므로 주기로 다시 본다.
   const changeWorkers = { task: false, review: false };
+  // 수정 요청(C27)의 PR 리뷰·댓글 읽기. 리뷰 경로가 열려 있을 때만 있다. 작성자 구분 칸은 자료로 쓰지 않아 writer 숫자 ID만 넘긴다.
+  const discussion = review ? async (input: { repository: string; pr: number }) => review.discussion.read({ ...input,
+    selfAuthors: { reviewApp: [], writerApp: ((await gate.current()).change?.repositories ?? []).map(item => item.writerBotUserId) } }) : undefined;
   const change = changeGate.open && changeReview && taskBridge && changeWorker ? assembleChange({ app: changeGate.app, store, gate, changes: changeReview.changes, review: changeReview.service, bridge: taskBridge, worker: changeWorker,
-    kubernetes, send, now, log, shutdown: stop.signal, intakeOpen: () => taskIntake.routed && taskIntake.open, ...(review ? { guidance: review.guidance } : {}), ...deps.change }) : undefined;
+    kubernetes, send, now, log, shutdown: stop.signal, intakeOpen: () => taskIntake.routed && taskIntake.open, ...(review ? { guidance: review.guidance } : {}),
+    ...(discussion ? { discussion } : {}), ...deps.change }) : undefined;
   const changeClosedReason = (): string | null => !changeGate.open ? changeGate.reason : !changeWorkers.task ? 'task_worker_unsupported' : !changeWorkers.review ? 'review_worker_unsupported'
     : !reviewOpened ? 'review_closed' : !taskIntake.open ? 'task_intake_closed' : null;
-  const changeCommands = config.changePr ? changeCommandHandler({ store, gate, changes: changeReview?.changes ?? new ChangeStore(deps.db, now), log, closedReason: changeClosedReason, ...(change ? { runtime: change.runtime } : {}) }) : undefined;
+  const changeCommands = config.changePr ? changeCommandHandler({ store, gate, changes: changeReview?.changes ?? new ChangeStore(deps.db, now), log, closedReason: changeClosedReason, ...(change ? { runtime: change.runtime } : {}),
+    ...(change && discussion ? { discussion } : {}) }) : undefined;
   let ports: Publisher['ports'];
   try {
     ports = { app: await listen(servers.app, deps.ports?.app ?? PORTS.publisher),

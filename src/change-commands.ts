@@ -32,10 +32,10 @@ export interface ChangeCommandHandler {
   amendment?: AmendmentRequests;
 }
 // 수정 요청의 대상 대조와 접수. 대상은 이 스레드에서 owner가 낸 변경이고, 그 변경의 PR이 열려 있어야(proposed·amending) 한다.
-export type AmendmentRefusal = 'no_pull' | 'not_open' | 'limit' | 'sensitive';
+export type AmendmentRefusal = 'no_pull' | 'not_open' | 'limit' | 'sensitive' | 'unavailable';
 export type AmendmentTarget =
   | { ok: true; changeId: string; generation: number; pullNumber: number; head: string; materials: string[] }
-  | { ok: false; reason: 'not_visible' | 'unavailable' | AmendmentRefusal };
+  | { ok: false; reason: 'not_visible' | AmendmentRefusal };
 export interface AmendmentRequests {
   // 확인 글을 만들 때 부른다. PR 리뷰·댓글을 읽어 ID 묶음을 정한다(이 묶음까지가 이번 차례의 자료다). target은 변경 ID나 PR 번호(#n·n·PR 링크)다.
   prepare(input: { actor: string; scope: Scope; target: string; instruction: string }): Promise<AmendmentTarget>;
@@ -54,6 +54,8 @@ export const AMENDMENT_REQUEST_TEXT = Object.freeze({
   closed: '지금은 수정 요청을 받지 않아요. 잠시 뒤 다시 말해 주세요.',
   failed: '수정 요청을 받지 못했어요(일시 오류). 변경 상태를 확인한 뒤 다시 말해 주세요.',
   stale: 'PR 상태가 바뀌어서 이 요청은 받지 않았어요. 다시 말해 주세요.',
+  // PR 리뷰·댓글을 읽을 길이 없거나(리뷰 경로 꺼짐) 지금 읽지 못했다. 대상 변경이 이 스레드에서 보일 때만 이렇게 답한다.
+  unavailable: '지금은 PR 리뷰·댓글을 읽을 수 없어서 수정 요청을 받지 못해요. 잠시 뒤 다시 말해 주세요.',
 });
 
 const USAGE = '서식: /change project:<저장소> text:<요약> | goal=<목표> | accept=<인수 조건> | label=public. accept는 여러 번 쓸 수 있고 base=<브랜치>는 선택입니다. label은 이 글을 공개해도 되는지에 대한 owner의 판단입니다(public, approved_public_summary, private, unknown).';
@@ -125,10 +127,9 @@ export const publishButton = (changeId: string, generation: number, digest: stri
   ({ id: `${PUBLISH_BUTTON}:${changeId}.${generation}.${digest.slice(0, PUBLISH_DIGEST_CHARS)}`, label: PUBLISH_TEXT.label, style: 'primary' });
 
 export class ChangeCommands implements ChangeCommandHandler {
-  readonly amendment?: AmendmentRequests;
-  constructor(private readonly deps: ChangeCommandDeps) {
-    if (deps.discussion) this.amendment = { prepare: input => this.prepareAmendment(input), request: input => this.requestAmendment(input) };
-  }
+  // 리뷰 경로가 없어도 둔다. 그때는 보이는 변경에 거절 한 줄(unavailable)로 답해 말한 요청이 조용히 사라지지 않게 한다.
+  readonly amendment: AmendmentRequests = { prepare: input => this.prepareAmendment(input), request: input => this.requestAmendment(input) };
+  constructor(private readonly deps: ChangeCommandDeps) {}
   async handle(request: ChangeCommandRequest): Promise<ChangeCommandReply> {
     switch (request.command) {
       case 'change': return this.change(request);

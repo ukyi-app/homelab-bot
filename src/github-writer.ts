@@ -129,7 +129,7 @@ const snapshot = (row: PullRow): WriterPullSnapshot => ({
   authorId: row.user.id, title: row.title, body: row.body ?? '', repoId: row.base.repo.id,
 });
 
-// ChangeWriterPort(소유 C25)에 올리기 전까지 fast-forward 갱신은 이 타입에만 있다.
+// fast-forward 갱신(fastForwardBranch)은 ChangeWriterPort에 있고 수정 차례(C27) 게시자가 부른다. 아래는 그 구현 규칙이다.
 export interface GitHubWriterPort extends ChangeWriterPort {
   // 자기 change·generation 브랜치를 expectedHead에서 sha로만 옮긴다. sha의 부모가 expectedHead 하나여야 하고, 브랜치가 다른 SHA면 보내지 않는다(head_changed).
   // 응답 유실·409·422는 브랜치를 다시 읽어 sha면 confirmed, 다른 SHA·없음이면 rejected(head_changed), 그대로면 원래 결과다.
