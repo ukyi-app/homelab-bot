@@ -2614,6 +2614,23 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 - **시험 경계의 한계:** 옛 작업자는 HTTP 응답(400 `rejected`)만 흉내 낸다. 9b067e9 이미지 자체를 띄우지 않는다. 실제로 고치는 품질과 실제 작업자 이미지 위의 고치기는 S5(C24)다.
 - **운영 영향:** 병합하면 migration 026(변경 표에 칸·표·트리거 추가, 옛 표 불변)이 돈다. `CHANGE_PR_ENABLED`가 꺼져 있으면 동작이 없다. 켜져 있고 작업자가 9b067e9인 동안은 P0·P1 건이 차례를 하나 연 뒤 지금과 같은 `review_blocked`로 닫히고(모델 호출 없음), 알림에 남은 P0·P1 제목 줄(공개 검사를 지난 것만)이 붙는다. 이 변경이 든 작업자 이미지가 배포되면 실제로 최대 2번 고친다.
 
+## C33 시험 거부 뒤 재조회 (2026-11-10, 로컬)
+
+T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·PR이 하나)의 결함 수정을 S1(변경 런타임·시험 receipt, PGlite와 실제 PostgreSQL)과 검증 port에서 고정했다. 원인과 방법은 DECISIONS "C33 시험 거부 뒤 재조회". 같은 밀리초 충돌은 시험 하네스 옵션 `sameMillisecondVerify`(`test/change-assembly-harness.ts`)가 만든다. 처음 오는 `/v2/task/verify` 두 건을 같은 동기 구간에서 고정 시각으로 서명시켜 토큰을 같게 하고, 실제로 짝지어 서명했는지 `collisions.verify`로 센다.
+
+| 완료 조건 | 시험 |
+|---|---|
+| 같은 밀리초에 두 게시 서버가 verify를 보내도 `awaiting_publish_approval`까지 가고 모델·시험·PR이 하나 | `change-verify-recheck` "C33 같은 밀리초: …"(PGlite, 충돌 1건, 사유 없음, receipt `passed` 하나, 게시까지 가서 모델 1·시험 1·리뷰 1·PR 1), `change-pg` "C33 EVENT-02 실제 PostgreSQL: 게시 서버 둘이 같은 밀리초에 …"(충돌 1건, receipt `passed` 하나, 모델 1·시험 1) |
+| 시험이 정말 시작되지 않았으면 `verification_not_run` | `change-verification` "검증 port: 세션이 없거나 거부되면 not_run, …"(거부되고 재조회도 `absent`, 재전송도 거부 → `not_run`. 재조회가 끝내 닿지 않으면 `unknown`), "검증 port C33: 거부 뒤 작업자가 모르면 … 또 거부되면 not_run이다"(재전송은 한 번뿐) |
+| 기존 EVENT-02 실제 PostgreSQL 시험이 반복에서 실패하지 않음 | `change-pg` "T19 B5 EVENT-02 실제 PostgreSQL: 게시 서버 둘이 같은 부모를 동시에 …"를 조사 패치의 반복 계측(커밋하지 않음)으로 30번씩 세 번, 90번 중 0번 실패. 고치기 전 main `9377c33`은 55번 중 5번 |
+| 파드 교체(`worker_mismatch`) 동작 | `change-verify-recheck` "C33 파드 교체: …"(시험 요청 직전 작업자 재시작 → 재조회가 새 신원을 알려 같은 저장소의 새 파드에서 시험 1회, `passed`), `change-verification` "검증 port C33: 거부 뒤 작업자가 모르면 답한 작업자 신원으로 …"(두 번째 verify가 새 instance로 간다) |
+| 다른 쪽 시험을 따름 | `change-verification` "검증 port C33: 시작 요청이 거부돼도 작업자가 그 command를 돌리는 중이거나 끝냈으면 그 결과를 따른다"(running 뒤 done, 바로 done, 둘 다 verify 1회) |
+
+- **실행(origin/main 병합 뒤 2ed0ee3, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 바뀐 파일을 참조하는 9개 파일(`change-verify-recheck`, `change-verification`, `change-verify-start`, `change-pg`, `change-assembly`, `c28-change-question`, `task-stream`, `change-artifact`, `c17-publish-button`) 274개 모두 통과, skip 0.
+- **시험이 실패할 수 있는지 확인:** 새 시험 다섯(같은 밀리초, 파드 교체, port 셋)을 고치기 전 `src`로 돌려 모두 실패를 봤다. 같은 밀리초 시험은 충돌 1건에서 `blocked`·`verification_not_run`, 파드 교체 시험도 `not_run`으로 닫혔다.
+- **바뀐 기존 시험:** `change-verification` "검증 port: 세션이 없거나 거부되면 not_run, …"의 거부 경우는 재조회가 `absent`인 경우로 좁혔다(이 티켓이 바꾼 동작). 재조회가 닿지 않으면 `unknown`인 단언을 더했다.
+- **못 잡는 범위:** 토큰이 같아지는 것 자체(근본 수정, 작업자 배포 뒤), 실제 배포 교체 순간(C24 S5). 이긴 쪽이 슬롯을 잡기 전에 재조회가 `absent`를 받는 좁은 틈은 재전송으로 덮지만 결정적 시험으로 만들지 않았다.
+
 ## C18 고정 문구 3 (2026-11-10, 로컬)
 
 동료 봇 명세 §4.4·§4.9, AC-11(변경·리뷰 알림·경보·세션 연결 문구)·AC-23(문구 두 판)을 S1(문구 표 단위, 가짜 Discord REST·Gateway, PGlite·실제 PostgreSQL)에서 고정했다. 넘겨받은 동작 수정 넷(대화 신뢰 문맥·출력 스키마 설명, 리뷰 요청 최신성, 변경 질문 "직접 답하기" 검사)은 S1·S2에서 시험했다. 판단은 [DECISIONS](DECISIONS.md) "C18 고정 문구 3".
