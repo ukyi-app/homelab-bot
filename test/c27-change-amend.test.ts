@@ -28,8 +28,8 @@ const body = (content: string) => content.split('\n-# ref:')[0]!;
 let seq = 500;
 const message = () => `1000000000000${String(++seq).padStart(5, '0')}`;
 const user = (id: number) => ({ id, login: `user${id}`, kind: 'user' as const });
-function discussion(): PullDiscussion {
-  return { repository: REPO.fullName, pr: 7, truncated: false,
+function discussion(open = true): PullDiscussion {
+  return { repository: REPO.fullName, pr: 7, open, truncated: false,
     reviews: [{ id: 31, author: user(1), association: 'MEMBER', createdAt: '2026-01-02T03:05:00Z', body: '상수를 바꿔 주세요', state: 'COMMENTED', commitId: null },
       // 본문 없는 승인 리뷰는 반영할 내용이 없어 세지 않는다.
       { id: 32, author: user(2), association: 'OWNER', createdAt: '2026-01-02T03:06:00Z', body: '  ', state: 'APPROVED', commitId: null }],
@@ -39,12 +39,14 @@ function discussion(): PullDiscussion {
 }
 async function wired(options: { colleague?: boolean; fail?: boolean; reader?: false; repositories?: ChangeRepositoryPolicy[] } = {}) {
   const reads: { repository: string; pr: number }[] = [];
+  // GitHub에서 PR이 열려 있는지. 마지막 병합 읽기 뒤에 닫힌 경우를 만들 때 바꾼다.
+  const github = { open: true };
   open = await actions(database.db, { colleague: options.colleague ?? true, ...(options.repositories ? { repositories: options.repositories } : {}), ...(options.reader === false ? {} : { discussion: async (input: { repository: string; pr: number }) => {
     reads.push(input);
     if (options.fail) throw new Error('read_failed');
-    return discussion();
+    return discussion(github.open);
   } }) });
-  return { a: open, reads };
+  return { a: open, reads, github };
 }
 // 이 스레드에서 '/change'로 받은 변경을 PR 게시(proposed, PR #7)까지 민다.
 async function published(a: Actions) {
@@ -140,6 +142,25 @@ test('C27 수정 요청 거절: 병합·닫힌 PR과 상한에 닿은 변경은 
   await a.speak(message(), '그 PR 고쳐 줘', { action: 'change_amend', target: id, content: null }, { scope: notifyThread });
   assert.deepEqual((await a.dropped()).slice(-2).map(row => row.reason), ['target_denied', 'target_denied']);
   assert.equal(a.buttons().posted.length, 0);
+});
+
+test('C34 수정 요청 닫힌 PR: 마지막 병합 읽기 뒤 GitHub에서 병합·닫힌 PR은 DB가 아직 proposed여도 확인 글 없이 거절 한 줄로 답하고 차례를 만들지 않는다', async () => {
+  const { a, reads, github } = await wired();
+  const id = await published(a);
+  github.open = false;
+  await a.speak(message(), 'PR 7 리뷰 반영해 줘', { action: 'change_amend', target: '#7', content: null });
+  assert.equal(reads.length, 1, 'PR 상태를 GitHub에서 읽었다');
+  assert.equal(a.buttons().posted.length, 0, '확인 버튼이 없다');
+  assert.equal((await a.proposals()).length, 0);
+  await a.deliver();
+  assert.ok(a.posted().includes(AMENDMENT_REQUEST_TEXT.not_open), JSON.stringify(a.posted()));
+  assert.equal((await rounds(id)).length, 0, '수정 횟수를 쓰지 않는다');
+  assert.equal((await a.changeStore.get(id) as { value: { phase: string } }).value.phase, 'proposed', '변경 상태는 병합 읽기 바퀴가 옮긴다');
+
+  // 다시 열린 PR은 지금처럼 확인 글을 낸다.
+  github.open = true;
+  await a.speak(message(), 'PR 7 리뷰 반영해 줘', { action: 'change_amend', target: '#7', content: null });
+  assert.equal(body(a.buttons().content), AMENDMENT_REQUEST_TEXT.question(REPO.fullName, 7, 3));
 });
 
 test('C27 수정 요청: 공개하면 안 되는 값이 섞인 말은 거절하고, 자료를 읽지 못하면 확인 글 없이 거절하며, 스위치가 꺼져 있으면 동작이 없다', async () => {

@@ -112,8 +112,9 @@ export interface DiscussionReview extends DiscussionComment { state: string; com
 export interface DiscussionReviewComment extends DiscussionComment {
   reviewId: number | null; inReplyTo: number | null; path: string; line: number | null; side: 'LEFT' | 'RIGHT' | null; commitId: string;
 }
+// open은 읽은 시점에 PR이 열려 있는지다(병합·닫힘이면 false). 수정 요청은 DB phase가 마지막 병합 읽기에 머물러 있어 이 값으로 닫힌 PR을 거른다.
 export interface PullDiscussion {
-  repository: string; pr: number; truncated: boolean;
+  repository: string; pr: number; open: boolean; truncated: boolean;
   reviews: DiscussionReview[]; reviewComments: DiscussionReviewComment[]; comments: DiscussionComment[];
 }
 // 본문은 해석하지 않고 그대로 넘긴다. 지시로 쓸지는 부르는 쪽이 자료 블록으로 정한다.
@@ -300,10 +301,12 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
         truncated = true;
         return rows;
       };
+      const pull = pullRequest(await read(repository, `/pulls/${pr}`));
+      if (pull.number !== pr) throw new Error('github_pull_mismatch');
       const reviews = await pages(`/pulls/${pr}/reviews`, RemoteReviewRow, row => row.pull_request_url === pullUrl);
       const reviewComments = await pages(`/pulls/${pr}/comments`, RemoteReviewComment, row => row.pull_request_url === pullUrl);
       const comments = await pages(`/issues/${pr}/comments`, RemoteIssueComment, row => row.issue_url === issueUrl);
-      const result: PullDiscussion = { repository, pr, truncated: false, reviews: [], reviewComments: [], comments: [] };
+      const result: PullDiscussion = { repository, pr, open: pull.open, truncated: false, reviews: [], reviewComments: [], comments: [] };
       for (const row of reviews) {
         const body = admit(row.body ?? '');
         if (body !== null) result.reviews.push({ id: row.id, author: author(row.user), association: row.author_association, createdAt: row.submitted_at ?? null,
