@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { ownerText } from './chat-context.js';
+import { chatReplyRisk } from './chat-format.js';
 import type { Job, Proposal, Scope } from './contracts.js';
 import { controlText, taskLaneClosedText } from './control-format.js';
 import type { Policy, PolicyGate } from './policy.js';
@@ -19,12 +20,14 @@ export const PROPOSAL_TEXT = Object.freeze({
   yes: '할게요',
   no: '아니에요',
   taskQuestion: (project: string, preview: string) => `${project} 저장소에서 이 작업을 시작할까요?\n> ${preview}`,
+  taskQuestionWithheld: (project: string) => `${project} 저장소에서 방금 말한 작업을 시작할까요?\n> 밖에 보이면 안 되는 내용이 섞여 있어 말한 내용은 싣지 않았어요.`,
   taskStarted: (project: string, job: string) => `${project} 저장소에서 작업을 시작했어요. 작업 ID는 \`${job}\`예요.`,
   declined: '알겠어요, 하지 않을게요.',
   expired: '24시간이 지나서 이 제안은 끝났어요. 필요하면 다시 말해 주세요.',
   settled: '이미 처리한 제안이에요.',
   changed: '제안한 뒤로 내용이 바뀌어서 실행하지 않았어요. 다시 말해 주세요.',
   missing: '이 대화에서 찾을 수 없는 제안이에요.',
+  stopped: '이 대화는 구독이 꺼져 있어서 실행하지 않았어요. 구독을 다시 켠 뒤 다시 말해 주세요.',
   notOwner: '제안을 받은 사람만 누를 수 있어요.',
   unavailable: '지금은 이 일을 할 수 없어요. 잠시 뒤 다시 말해 주세요.',
 });
@@ -37,7 +40,9 @@ interface ReadHandler { kind: 'read'; run(context: ReadContext): Promise<string>
 interface Values { target: string | null; content: string | null }
 interface Prepared extends Values {
   // 모델이 고른 값(C14 기억 진술)만 value에 둔다. owner 원문은 sourceEvent 참조로만 둔다.
-  value: string | null; sourceEvent: string | null; question: string;
+  value: string | null; sourceEvent: string | null;
+  // question은 원문 미리보기를 싣고, plainQuestion은 서버가 대조한 값(저장소 등)만 싣는다. question이 공개 검사에 걸리면 plainQuestion을 쓴다.
+  question: string; plainQuestion: string;
 }
 interface PrepareContext { store: Store; job: Job; proposal: Proposal; policy: Policy; tasksConnected: boolean }
 export interface ProposalRow {
@@ -86,7 +91,7 @@ const taskHandler: RunHandler = {
     const content = await sourceText(store, job.event_id);
     if (!content) return;
     return { target: proposal.target, content, value: null, sourceEvent: job.event_id,
-      question: PROPOSAL_TEXT.taskQuestion(proposal.target, preview(content)) };
+      question: PROPOSAL_TEXT.taskQuestion(proposal.target, preview(content)), plainQuestion: PROPOSAL_TEXT.taskQuestionWithheld(proposal.target) };
   },
   async current(store, row) {
     const content = await sourceText(store, row.source_event);
@@ -171,7 +176,7 @@ export class ProposalDesk {
     const drop = async (reason: string) => { await this.store.audit('proposal_dropped', job.id, { action: proposal.action, reason }); return 'dropped' as const; };
     const handler = connected(proposal.action);
     if (!handler) return drop('not_connected');
-    if (!await this.current(job)) return drop('superseded');
+    if (!await current(this.store, job)) return drop('superseded');
     if (handler.kind === 'read') {
       // '/' 읽기 명령의 수신과 같은 인가(현재 정책 owner·허용 채널·거부 목록) 뒤 같은 처리기를 부른다.
       await this.gate.authorize(job.owner_id, job.target);
@@ -183,34 +188,43 @@ export class ProposalDesk {
     }
     const prepared = await handler.prepare({ store: this.store, job, proposal, policy, tasksConnected: this.tasksConnected });
     if (!prepared) return drop('target_denied');
+    // 확인 글은 owner 원문을 싣고 모델 답의 공개 검사(chatReplyRisk)를 거치지 않으므로 같은 정책으로 따로 본다.
+    // 걸리면 원문 없는 고정 문구로 되묻고, 그것도 걸리면(정책을 못 읽음 등) 버린다. 사유 코드만 남기고 값은 남기지 않는다.
+    const question = chatReplyRisk(prepared.question, policy) === null ? prepared.question
+      : chatReplyRisk(prepared.plainQuestion, policy) === null ? prepared.plainQuestion : undefined;
+    if (question === undefined) return drop('public_check');
     const id = randomUUID();
     // 확인 글은 대화 답(result:<job>) 뒤에 나가게 같은 접두의 키를 쓴다. 게시 순서는 created_at·message_key 순이다.
     const key = `result:${job.id}:proposal`;
     const made = await this.store.atomic(async store => {
-      // 버튼 처리와 같은 잠금 순서(대화 행 → 제안 행)다.
+      // 버튼 처리와 같은 잠금 순서(대화 행 → 제안 행)다. 새 요청 접수(Store.accept)도 이 행을 잡으므로,
+      // 잠근 뒤 같은 연결로 최신성을 다시 봐야 위 검사와 이 사이에 접수된 새 메시지를 놓치지 않는다.
       await store.db.query('SELECT id FROM conversations WHERE id=$1 FOR UPDATE', [job.conversation_id]);
+      if (!await current(store, job)) return 'superseded';
       await expirePending(store);
       const inserted = await store.db.query(`INSERT INTO proposals(id,conversation_id,owner_id,scope,action,target,value,source_event,digest,
         source_job,message_key,created_at,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
         ON CONFLICT (source_job) DO NOTHING RETURNING id`, [id, job.conversation_id, job.owner_id, JSON.stringify(job.target),
         proposal.action, prepared.target, prepared.value, prepared.sourceEvent, proposalDigest(proposal.action, prepared), job.id, key,
         store.now(), store.now() + PROPOSAL_TTL_MS]);
-      if (!inserted.rows.length) return false;
+      if (!inserted.rows.length) return 'duplicate';
       await store.enqueue({ key, job: job.id, conversation: job.conversation_id, actor: job.owner_id, scope: job.target,
-        revision: job.revision.policy, payload: { kind: 'message', channel: job.target.channel, content: prepared.question,
+        revision: job.revision.policy, payload: { kind: 'message', channel: job.target.channel, content: question,
           classification: 'safe_summary', buttons: proposalButtons(id) } });
-      return true;
+      return 'proposed';
     });
-    return made ? 'proposed' : 'dropped';
+    if (made === 'superseded') return drop('superseded');
+    return made === 'proposed' ? 'proposed' : 'dropped';
   }
-  // 결과가 succeeded로 확정됐고, 그 뒤 같은 대화에 새 대화 요청이 오지 않았다. 새 메시지가 대화를 대체했으면 제안을 만들지 않는다
-  // (다음 대화 차례가 같은 기록을 보고 다시 판단한다).
-  private async current(job: Job): Promise<boolean> {
-    const row = (await this.store.db.query<{ current: boolean }>(`SELECT j.state='succeeded' AND NOT EXISTS (SELECT 1 FROM jobs n
-      JOIN events ne ON ne.id=n.event_id WHERE n.conversation_id=j.conversation_id AND n.type='chat' AND n.id<>j.id
-        AND ne.event_order>(SELECT event_order FROM events WHERE id=j.event_id)) AS current FROM jobs j WHERE j.id=$1`, [job.id])).rows[0];
-    return row?.current === true;
-  }
+}
+
+// 결과가 succeeded로 확정됐고, 그 뒤 같은 대화에 새 대화 요청이 오지 않았다. 새 메시지가 대화를 대체했으면 제안을 만들지 않는다
+// (다음 대화 차례가 같은 기록을 보고 다시 판단한다).
+async function current(store: Store, job: Job): Promise<boolean> {
+  const row = (await store.db.query<{ current: boolean }>(`SELECT j.state='succeeded' AND NOT EXISTS (SELECT 1 FROM jobs n
+    JOIN events ne ON ne.id=n.event_id WHERE n.conversation_id=j.conversation_id AND n.type='chat' AND n.id<>j.id
+      AND ne.event_order>(SELECT event_order FROM events WHERE id=j.event_id)) AS current FROM jobs j WHERE j.id=$1`, [job.id])).rows[0];
+  return row?.current === true;
 }
 
 // 만료된 대기 제안을 끝내고 값을 비운다. 버튼을 누르지 않은 제안의 값이 24시간 넘게 남지 않게 새 제안을 만들 때마다 부른다.
@@ -238,6 +252,8 @@ export async function pressProposal(store: Store, input: PressInput): Promise<Pr
   };
   if (store.now() >= Number(row.expires_at)) { await settle('expired', 'expired'); return { content: PROPOSAL_TEXT.expired, update: true }; }
   if (input.answer === 'no') { await settle('declined', null); return { content: PROPOSAL_TEXT.declined, update: true }; }
+  // 구독이 꺼진 대화의 작업은 claim이 집지 않는다. '/task'와 달리 버튼은 owner가 끈 구독을 다시 켜지 않고 실행을 거절한다.
+  if (!conversation.active) { await settle('refused', 'subscription_stopped'); return { content: PROPOSAL_TEXT.stopped, update: true }; }
   const handler = connected(row.action);
   if (handler?.kind !== 'run') { await settle('refused', 'not_connected'); return { content: PROPOSAL_TEXT.unavailable, update: true }; }
   const values = await handler.current(store, row);

@@ -1,6 +1,7 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Denied } from '../src/contracts.js';
+import type { Database } from '../src/database.js';
 import { PROPOSAL_BUTTONS, PROPOSAL_TEXT, PROPOSAL_TTL_MS } from '../src/proposals.js';
 import { localDatabase, thread } from './helpers.js';
 import { BOT, harness, PROJECT } from './c13-proposal-fixture.js';
@@ -192,4 +193,72 @@ test('C13 실행 중에 새 메시지가 와서 대화를 대체하면 그 대�
   await h.turn();
   assert.equal(h.buttons().posted.length, 0);
   assert.equal((await database.db.query('SELECT id FROM proposals')).rows.length, 0);
+});
+
+// D-23·gitleaks에 걸리지 않게 조각을 이어 만든 GitHub 토큰 모양 값.
+const TOKEN = ['ghp', 'C13'.repeat(12)].join('_');
+
+test('C13 owner 원문에 공개 검사에 걸리는 값이 있으면 실행 확인 글은 원문 없이 고정 문구로 되묻고, 그 값은 확인 글·감사·outbox·제안 표 어디에도 없다', async () => {
+  const h = await harness(database.db);
+  h.reply(taskProposal());
+  await h.say('100000000000000010', `${REQUEST} 토큰은 ${TOKEN} 이에요`);
+  await h.turn();
+  const shown = h.buttons();
+  assert.equal(shown.posted.length, 1);
+  assert.deepEqual(shown.labels, ['할게요', '아니에요']);
+  assert.ok(shown.content.includes(PROJECT), shown.content);
+  // 원문 미리보기 자체를 싣지 않는다(걸린 값 앞의 안전한 부분도).
+  assert.ok(!shown.content.includes(REQUEST), shown.content);
+  for (const message of h.f.rest.messages) assert.ok(!message.body.content.includes(TOKEN), message.body.content);
+  for (const table of ['outbox', 'audit', 'proposals']) {
+    const dump = JSON.stringify((await database.db.query(`SELECT * FROM ${table}`)).rows);
+    assert.ok(!dump.includes(TOKEN), table);
+  }
+  // 실행은 '/task'처럼 owner 원문 그대로다.
+  await h.press(h.buttons().ids[0]!);
+  assert.equal((await h.taskJobs()).length, 1);
+});
+
+test('C13 제안 뒤 구독을 끈 대화에서 "할게요"를 누르면 작업을 접수하지 않고 버튼이 사라지며, 구독도 다시 켜지 않는다', async () => {
+  const h = await harness(database.db);
+  await proposed(h);
+  const [yes] = h.buttons().ids;
+  await h.ingress.receive({ id: 'fixture-stop-command', actor: h.f.policy.owner, scope: thread, kind: 'command', command: 'stop', text: '' });
+  await h.press(yes!);
+  assert.deepEqual(await h.taskJobs(), []);
+  assert.equal(h.callbacks.at(-1)!.body.type, 7);
+  assert.deepEqual(h.callbacks.at(-1)!.body.data.components, []);
+  assert.equal(h.callbacks.at(-1)!.body.data.content, '이 대화는 구독이 꺼져 있어서 실행하지 않았어요. 구독을 다시 켠 뒤 다시 말해 주세요.');
+  const row = (await database.db.query<{ state: string; reason: string }>('SELECT state,reason FROM proposals')).rows[0]!;
+  assert.deepEqual([row.state, row.reason], ['refused', 'subscription_stopped']);
+  const active = (await database.db.query<{ active: boolean }>('SELECT active FROM conversations')).rows.map(r => r.active);
+  assert.deepEqual(active, [false]);
+  // 다시 눌러도 이미 처리됨이다.
+  await h.press(yes!);
+  assert.equal(h.callbacks.at(-1)!.body.data.content, PROPOSAL_TEXT.settled);
+  assert.deepEqual(await h.taskJobs(), []);
+});
+
+test('C13 최신성 검사를 지난 뒤 제안을 저장하기 전에 새 메시지가 접수돼 대화가 대체되면 제안을 만들지 않는다', async () => {
+  // 제안 준비(원문 조회)가 돌아온 직후, 저장 트랜잭션 전에 owner의 새 메시지를 끼워 넣는다.
+  let h!: Harness;
+  let armed = false;
+  const hooked: Database = {
+    query: async <T>(sql: string, params?: unknown[]) => {
+      const result = await database.db.query<T>(sql, params);
+      if (armed && sql.startsWith('SELECT payload,text_purged_at FROM events')) { armed = false; await h.say('100000000000000040', '아 잠깐, 다른 걸로 할게'); }
+      return result;
+    },
+    transaction: (fn, deadline) => database.db.transaction(fn, deadline),
+  };
+  h = await harness(hooked);
+  h.reply(taskProposal());
+  await h.say('100000000000000010', REQUEST);
+  armed = true;
+  await h.turn();
+  assert.equal(armed, false, '훅이 불리지 않았다');
+  assert.equal(h.buttons().posted.length, 0);
+  assert.equal((await database.db.query('SELECT id FROM proposals')).rows.length, 0);
+  const dropped = (await database.db.query<{ detail: { reason: string } }>("SELECT detail FROM audit WHERE kind='proposal_dropped'")).rows.map(r => r.detail.reason);
+  assert.deepEqual(dropped, ['superseded']);
 });
