@@ -5,6 +5,7 @@ import type { EventInput, Scope } from './contracts.js';
 import { controlText, taskLaneClosedText } from './control-format.js';
 import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
+import { PUBLISH_TEXT } from './change-commands.js';
 import type { ChangeCommand, ChangeCommandHandler } from './change-commands.js';
 import type { ExternalTaskCommand, ExternalTaskCommandHandler } from './external-task-commands.js';
 import { MEMORY_GUIDE } from './memory-commands.js';
@@ -76,6 +77,7 @@ export class DiscordIngress {
     const event = EventSchema.parse(input);
     if (event.bot || event.webhook) return;
     if (event.kind === 'button' && buttonRoute(event.command) === 'proposal') return this.proposalButton(event, recovered);
+    if (event.kind === 'button' && buttonRoute(event.command) === 'publish') return this.publishButton(event, recovered);
     // 이 단계에서 열지 않은 명령·버튼은 저장·권한 확인 전에 닫는다(task·review-*는 FOUNDATION 밖).
     if (event.kind !== 'message' && !this.commands.has(event.command ?? '')) throw new Denied();
     if (event.kind !== 'message' && taskControls.has(event.command ?? '') && !this.tasks) throw new Denied();
@@ -262,6 +264,30 @@ export class DiscordIngress {
     this.log('proposal_button', { command: event.command!, outcome: outcome ? (outcome.update ? 'settled' : 'refused') : 'duplicate' });
     // 응답을 전하지 못하면 결과 문장(공개해도 되는 고정 문구)을 그 스레드에 남긴다. 버튼은 남지만 다시 누르면 "이미 처리"로 답한다.
     if (outcome) await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: outcome.content, update: outcome.update });
+    return saved.id;
+  }
+  // 게시 승인 버튼("게시해 주세요"). 스위치가 꺼져 있으면 그 버튼을 만들지 않으므로 받지도 않는다. 처리는 변경 명령처럼 받은 자리에서
+  // 같은 상호작용을 한 번만 하고, 승인 자체는 '/change-publish'와 같은 저장 경로(ChangeStore.approve)라 이벤트 멱등·owner·digest 검사가 같다.
+  private async publishButton(event: z.infer<typeof EventSchema>, recovered: boolean): Promise<string | undefined> {
+    if (recovered || !this.store.colleague || !this.changes?.pressPublish || !event.target) throw new Denied();
+    const p = await this.gate.authorize(event.actor, event.scope);
+    const conversation = await this.store.conversation(event.scope);
+    if (!conversation || (event.scope.kind !== 'channel' && conversation.owner_id !== event.actor)) throw new Denied();
+    const started = this.store.now();
+    const saved = await this.store.save({ ...event, text: '' }, p.revision, false);
+    if (this.store.now() - started > DEFAULTS.inboxTimeoutMs) throw new Error('inbox_deadline');
+    if (!await this.claimOnce(event, saved.id, started)) return saved.id;
+    let reply;
+    try {
+      // 실행 확인 버튼과 같이, 구독을 끈 대화에서는 버튼으로 실행하지 않는다. '/change-publish' 예비는 그대로다.
+      reply = conversation.active ? await this.changes.pressPublish({ id: event.id, actor: event.actor, scope: event.scope, target: event.target })
+        : { content: PUBLISH_TEXT.stopped, outcome: 'subscription_stopped' };
+    } catch (error) {
+      this.log('change_command_failed', { command: event.command!, ...errorInfo(error) });
+      reply = { content: PUBLISH_TEXT.failed, outcome: 'error' };
+    }
+    this.log('change_command', { command: event.command!, outcome: reply.outcome });
+    await this.acknowledge(event, saved.id, reply.content, { revision: p.revision, notice: CHANGE_ACK_NOTICE, ...('update' in reply && reply.update ? { update: true } : {}) });
     return saved.id;
   }
   // 기억 명령. 구독·gap·작업 큐를 거치지 않고 받은 자리에서 한 번 처리한 뒤 상호작용 응답으로 답한다.
