@@ -767,7 +767,8 @@ function migrationDatabase(pg: PGlite): Database {
     transaction: fn => pg.transaction(tx => fn({ query: (sql, params = []) => tx.query(sql, params), transaction: () => { throw new Error('nested'); } })),
   };
 }
-const OLD_TABLES = `table_schema='public' AND table_name NOT LIKE 'change\\_%' AND table_name <> 'schema_migrations'`;
+// 016 뒤에 새로 생긴 표(변경 PR 표, C13 proposals)는 비교에서 뺀다. 기존 표가 바뀌지 않았는지만 본다.
+const OLD_TABLES = `table_schema='public' AND table_name NOT LIKE 'change\\_%' AND table_name NOT IN ('schema_migrations','proposals')`;
 // 019(T27)·020(T31) 원문 보존은 옛 표에 NULL 허용 칸과 그 digest CHECK만 더한다. 아래 비교에서 빼고 따로 확인한다.
 const RETENTION_COLUMNS: Record<string, string[]> = {
   codex_questions: ['answer_purged_at', 'answer_sha256', 'prompt_purged_at', 'prompt_sha256'],
@@ -781,14 +782,15 @@ const RETENTION_CHECKS = ['codex_questions_answer_sha256_check', 'codex_question
 const schemaOf = async (db: Database) => JSON.stringify((await db.query(`SELECT table_name,column_name,data_type,is_nullable,column_default
   FROM information_schema.columns WHERE ${OLD_TABLES} AND ${T27_COLUMNS} ORDER BY table_name,ordinal_position`)).rows);
 const constraintsOf = async (db: Database) => JSON.stringify((await db.query(`SELECT conrelid::regclass::text AS t,conname,pg_get_constraintdef(oid) AS d FROM pg_constraint
-  WHERE connamespace='public'::regnamespace AND conrelid<>0 AND conrelid::regclass::text NOT LIKE 'change\\_%' AND conname<>ALL($1::text[]) ORDER BY t,conname`, [RETENTION_CHECKS])).rows);
+  WHERE connamespace='public'::regnamespace AND conrelid<>0 AND conrelid::regclass::text NOT LIKE 'change\\_%' AND conrelid::regclass::text<>'proposals'
+    AND conname<>ALL($1::text[]) ORDER BY t,conname`, [RETENTION_CHECKS])).rows);
 
 test('T19 B0 migration: 016 DB에 017만 더하고 기존 표·제약·행을 바꾸지 않으며 파일을 다시 돌려도 그대로다', async () => {
   const pg = new PGlite();
   try {
     const db = migrationDatabase(pg);
     const upTo016 = MIGRATIONS.filter(file => Number.parseInt(file, 10) <= 16);
-    assert.equal(upTo016.length, MIGRATIONS.length - 4);
+    assert.equal(upTo016.length, MIGRATIONS.length - 5);
     for (const file of upTo016) await pg.exec(await readFile(`migrations/${file}`, 'utf8'));
     await seedConversation(db);
     await insertChildJob(db, 'existing-job', 'task');
@@ -796,7 +798,7 @@ test('T19 B0 migration: 016 DB에 017만 더하고 기존 표·제약·행을 �
     const constraints = await constraintsOf(db);
     const jobs = JSON.stringify((await db.query('SELECT * FROM jobs')).rows);
 
-    assert.deepEqual(await migrate(db), [17, 18, 19, 20]);
+    assert.deepEqual(await migrate(db), [17, 18, 19, 20, 21]);
     assert.equal(await schemaOf(db), schema);
     const added = (await db.query<{ table_name: string; column_name: string; is_nullable: string; column_default: string | null }>(`SELECT table_name,column_name,is_nullable,column_default
       FROM information_schema.columns WHERE ${OLD_TABLES} AND NOT ${T27_COLUMNS} ORDER BY table_name,column_name`)).rows;
