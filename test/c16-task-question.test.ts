@@ -110,6 +110,8 @@ test('C16 열린 작업 질문이 하나면 owner의 다음 말이 모델을 거
 test('C16 열린 작업 질문이 둘이면 질문마다 버튼을 단 글로 묻고, 고른 질문에만 그 말이 답으로 붙고 버튼이 사라진다', async () => {
   const h = await harness(database.db);
   const first = await h.asked('어느 브랜치 기준으로 고칠까요?');
+  // 고르기 글은 먼저 만든 질문부터 번호를 매긴다. 가짜 시계가 멈춰 있으면 같은 시각이라 순서가 질문 ID로 갈린다.
+  h.f.advance(1000);
   const second = await h.asked('시험 이름을 바꿔도 될까요?');
   await h.deliver();
   const said = messageId();
