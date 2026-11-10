@@ -24,6 +24,6 @@ export const sessionAttachHandler: RunHandler = {
     await store.enqueue({ key: `session-key:${row.id}`, conversation: row.conversation_id, actor: row.owner_id, scope: row.scope, revision,
       payload: { kind: 'message', channel: row.scope.channel, content: SESSION_KEY_TEXT.ready, classification: 'safe_summary',
         buttons: [{ id: `${SESSION_KEY_BUTTON}:${row.id}`, label: SESSION_KEY_TEXT.button, style: 'primary' }] } });
-    return { state: 'confirmed', reason: KEY_PENDING, content: SESSION_KEY_TEXT.confirmed(spec.externalTaskId, spec.executor) };
+    return { state: 'confirmed', reason: KEY_PENDING, content: SESSION_KEY_TEXT.confirmed(spec.executor) };
   },
 };

@@ -124,12 +124,29 @@ test('C15 "할게요"로 확정하면 "키 보기" 버튼 글이 붙고, 키는 
   const update = h.callbacks.at(-1)!.body;
   assert.equal(update.type, 7);
   assert.deepEqual(update.data.components, []);
-  assert.equal(update.data.content, SESSION_KEY_TEXT.confirmed(SESSION, 'claude'));
+  assert.equal(update.data.content, SESSION_KEY_TEXT.confirmed('claude'));
   assert.equal(h.buttons().content, SESSION_KEY_TEXT.ready);
   // custom_id는 이름과 제안 ID만, Discord 상한 안.
   assert.ok(key.length <= CUSTOM_ID_MAX && key.split(':').length === 2, key);
   assert.equal(h.attaches(), 0);
   assert.deepEqual(await h.connections(), []);
+});
+
+test('C15 공개 검사에 걸리는 세션 ID는 확인 글에서 숨기고, "할게요" 뒤 바뀐 글과 버튼 글에도 다시 싣지 않는다', async () => {
+  const h = await harness(database.db);
+  const hidden = '10.20.30.40';
+  h.reply(attachProposal('claude', hidden));
+  await h.say('100000000000000010', REQUEST);
+  await h.turn();
+  const asked = h.buttons();
+  assert.equal(asked.content, SESSION_KEY_TEXT.questionWithheld('claude', false));
+  await h.press(asked.ids[0]!);
+  await h.publish();
+  const update = h.callbacks.at(-1)!.body;
+  assert.equal(update.type, 7);
+  assert.equal(update.data.content, 'claude 세션을 이 스레드에 연결하기로 했어요.');
+  assert.deepEqual(h.buttons().labels, ['키 보기']);
+  assert.ok(!JSON.stringify(h.callbacks).includes(hidden) && !posted(h).includes(hidden));
 });
 
 test('C15 "키 보기"를 누른 owner에게만 보이는 응답으로 키가 한 번 나오고, 공개 글·이벤트·outbox·감사·로그에는 키가 없다', async () => {

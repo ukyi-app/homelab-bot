@@ -41,7 +41,8 @@ export const SESSION_KEY_TEXT = Object.freeze({
     `이 스레드에 ${executor} 세션 \`${externalTaskId}\`를 연결할까요? ${consentText(consent)}.`,
   questionWithheld: (executor: ExternalTaskExecutor, consent: boolean) =>
     `방금 말한 ${executor} 세션을 이 스레드에 연결할까요? ${consentText(consent)}.\n> 밖에 보이면 안 되는 내용이 섞여 있어 세션 ID는 싣지 않았어요.`,
-  confirmed: (externalTaskId: string, executor: ExternalTaskExecutor) => `${executor} 세션 \`${externalTaskId}\`를 연결하기로 했어요.`,
+  // 확인 글을 이 문구로 바꾸는 응답은 공개 글이고 공개 검사를 거치지 않는다. 확인 글에서 숨겼을 수 있는 세션 ID를 싣지 않는다.
+  confirmed: (executor: ExternalTaskExecutor) => `${executor} 세션을 이 스레드에 연결하기로 했어요.`,
   ready: '"키 보기"를 누르면 연결 키가 누른 분에게만 한 번 보여요. 키는 다시 볼 수 없어요.',
   shown: '이 연결 키는 이미 보여 드렸어요. 다시 보여 드릴 수 없어요.',
   missing: '이 대화에서 찾을 수 없는 연결이에요.',
