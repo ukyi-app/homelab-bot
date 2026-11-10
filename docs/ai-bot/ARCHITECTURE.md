@@ -332,6 +332,10 @@ live 메시지 하나가 일시 장애(DB·REST·429 등)로 처리되지 못하
 긴 작업 중 수신·저장 ACK·조회 없이 가능한 제어 명령은 계속 처리한다. 실행 중 작업을 대화가 선점하지 않는다.
 실제 모델 답변은 직렬 대기하므로 대화의 즉시 답변을 보장하지 않는다. 파드 분리는 T18의 판단이다.
 
+**자동 재개(C19, COLLEAGUE_SPEC §4.7, AC-16).** 대기를 기록하는 같은 트랜잭션(`Store.waitForUser`)이 작업자 응답의 한도 칸(C03)으로 멈춤 기록 `model_pauses`를 쓴다: 종류(한도·인증 만료·결제, 결제는 `stop.cause='billing'`), 풀리는 시각, 한도 종류, 사용률, 다음 재시도 시각(한도 + 시각 → 시각 + 1분, 시각 없음·인증 만료 → 30분 뒤, 결제 → 없음). 대화·리뷰(`Runtime`·`ReviewRuntime`)와 Claude 작업 레인(`ClaudeTaskBridge.settle`)이 칸을 넘기고, 칸이 없는 응답(옛 작업자, Codex 작업 레인)은 30분 재시도로 내려앉는다. 게시 서버의 재개 예약 루프(`src/main.ts` `model_resume`, 15초)가 `Store.resumeDue()`로 시각이 지난 대기를 '/resume-model'과 같은 전이(`Store.resumeWaiting`: `waiting_user` → `queued`, 시도 한도 검사, 전역 정지 해제)로 되돌린다. 비상 정지 중이면 아무것도 하지 않는다. 작업 행만 바꾸므로 같은 계정·모델·실행기로 이어서 하고, 자동 인증 전환은 여전히 없다(D-14 조건 2). 한도·인증 멈춤은 시도로 세지 않아(대기에 들어갈 때 `attempt`를 되돌림) 반복 재시도가 시도 한도에 막혀 전역 정지를 영영 잡지 않는다. 결정과 이유는 [DECISIONS](DECISIONS.md) "C19 한도 재개와 리뷰 미루기".
+
+**리뷰 미루기(C19, AC-17).** 대화·리뷰 결과의 마지막 `rate_limit_event`가 `allowed_warning`이고 풀리는 시각이 있으면 `model_limit_state.review_deferred_until`에 남기고(늘리기만 함), `ReviewRuntime.claim`은 그 시각까지 PR 리뷰를 집지 않는다. 미게시 후보 리뷰와 대화·작업 claim은 그대로 돈다. 미룬 리뷰는 `queued`로 남아 기한 뒤 claim이 집는다.
+
 `audit.kind=model_timing`에 `queueWaitMs=started_at-created_at`, `executionMs=종료-started_at`을 남긴다.
 로컬 시험은 모의 작업이 실행 중인 동안 두 번째 대화의 ACK가 도착하고 두 번째 모델 호출이 없음을 확인한 뒤,
 가상 시계 5초를 전진하고 첫 작업을 끝낸다. 두 번째 호출의 기록된 대기가 **5초 이상**인지 검증한다.
@@ -1034,6 +1038,8 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 | 턴 수 | 16 | 제안. 실측 뒤 조정 |
 | patch | 1MiB, 넘치면 `truncated`와 전체 digest | 제안. 응답 본문 상한 안에 들어가게 정함 |
 
+**턴 번호와 턴 예산은 따로다(C19).** 요청·응답·상태의 `turn`은 세션 순번이라 스키마 상한이 프로토콜 한계(DB integer, 2,147,483,647)뿐이다. 위 표의 턴 수 16은 예산이고 게시 서버가 센다: 재개 턴 번호 − `codex_sessions.model_wait_turns`(한도·인증 대기로 끝난 턴 수, 결제 멈춤 제외, 새 세대에서 0) > 16이면 띄우지 않고 `task_turn_limit`(v1)·`change_turn_limit`(CHANGE 작성 재개)로 닫는다. 그래서 시각 모르는 한도의 30분 재시도가 이어져도 예산이 줄지 않는다. 작업자가 상한 16인 옛 스키마면 턴 17 이상의 재개를 400으로 거부하고 작업은 `task_worker_rejected`로 실패한다. 게시 서버가 먼저 나가고 작업자는 다음 sandbox 이미지 갱신(C23)에서 따라오므로, 그 전까지 대기 턴이 섞여 번호가 16을 넘는 재개는 여전히 실패한다.
+
 **DB(`migrations/013_task_lane.sql`, expand).** 009를 고치지 않는다. 새 열은 기본값이 있거나 비워 둘 수 있어 이 열을 모르는 코드가 그대로 돈다.
 
 | 대상 | 추가 | 의미 |
@@ -1319,6 +1325,8 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 | chat unknown 해소 | `unknown-resolved:<job>:<attempt>` | 멈춤 확인, `/retry target:<job>` |
 | read lease 만료 | `read-expired:<job>:<attempt>` | `/read`로 다시 요청 |
 
+한도·인증 대기 안내의 '/resume-model' 재개는 예비다. C19부터 한도는 풀리는 시각 1분 뒤(모르면 30분마다), 인증 만료는 30분마다 저절로 이어서 하고(§11 "호출 경로·직렬 대기·측정"의 자동 재개), 결제 멈춤만 사람이 풀어야 한다. 그래서 안내의 "원인을 해결한 뒤 재개해 주세요"는 틀린 말은 아니지만 저절로 이어서 한다는 말이 없다. 문구를 자리 비움으로 바꾸는 일은 C20이다. 같은 시도 번호로 다시 멈추면 멱등 키가 같아 안내가 되풀이되지 않는다(한도·인증 멈춤은 시도로 세지 않는다).
+
 권한 철회로 생긴 unknown은 안내하지 않는다(게시도 막힌다). 모두 `safe_summary`, `allowed_mentions.parse=[]`다. 이 표의 안내는 owner를 부르지 않는다. owner를 부르는 글은 **owner 호출** 넷(작업 질문, 작업 완료·실패, 변경 미리보기, 변경 실패)뿐이다(C07, §11 "표식·답장·스레드").
 
 ### 수신·진행 신호
@@ -1390,6 +1398,32 @@ set = { PATH = "/usr/local/bin:/usr/bin:/bin", HOME = "<작업 HOME>", LANG = "C
 - **확인 글 공개 검사:** 확인 글은 owner 원문을 싣고 모델 답의 `chatReplyRisk`를 거치지 않으므로, 확인 글 전체(원문 미리보기 포함)를 같은 정책의 `chatReplyRisk`(`scanPublicText`)로 따로 본다. 걸리면 원문 없는 고정 문구(`PROPOSAL_TEXT.taskQuestionWithheld`: 저장소만)로 되묻고, 그것도 걸리면(정책을 못 읽음 등) 버린다(`public_check`). 걸린 값은 확인 글·감사·outbox·제안 표 어디에도 남지 않는다. 실행 내용은 '/task'처럼 owner 원문 그대로다.
 - **구독 꺼진 대화:** "할게요"를 누를 때 잠근 대화가 비활성(`active=false`, `/stop`)이면 작업을 접수하지 않고 `refused`(`subscription_stopped`)로 끝내며 `PROPOSAL_TEXT.stopped`로 버튼을 없앤다. '/task' 수신과 달리 버튼은 owner가 끈 구독을 다시 켜지 않는다. "아니에요"는 구독과 무관하게 받는다.
 - **잠금 아래 최신성 재검사:** 제안 저장 트랜잭션은 대화 행을 `FOR UPDATE`로 잡은 뒤(새 요청 접수 `Store.accept`와 같은 잠금) 같은 연결로 최신성(`succeeded`이고 그 뒤 새 대화 job 없음)을 다시 보고 삽입한다. 트랜잭션 밖 첫 검사와 그 사이에 접수된 새 메시지가 있으면 `superseded`로 버린다.
+- **나머지 동작 줄(C14):** 처리기는 '/' 명령과 같은 함수다. 대상은 서버가 대조하고, 대조에 지면 제안을 버린다(`target_denied`, 대화 답만 나간다).
+
+  | 동작 | 종류 | '/'와 같은 처리 | 대상 대조(제안 때) | 버튼 실행 자리 |
+  |---|---|---|---|---|
+  | `task_status` | 읽기 | `TaskCommandHandler.status` | 이 대화의 owner 작업(아니면 `Denied` → 버림) | - |
+  | `change_status` | 읽기 | `ChangeCommandHandler.handle('change-status')` | 요청한 스레드의 owner 변경(`not_visible` → 버림) | - |
+  | `review_status` | 읽기 | `Store.control('review-status')` | 리뷰 제어 장소(아래) | - |
+  | `read` | 읽기 | '/read'와 같은 입력 이벤트로 read 레인 접수 | 템플릿 카탈로그(`TEMPLATES`) ID, 서비스는 카탈로그가 정함 | - |
+  | `memory_search` | 읽기 | `MemoryCommandHandler.handle('memory-search')` | 검색어(모델 `content`) 있음 | - |
+  | `attach_list` | 읽기 | `ExternalTaskCommandHandler.handle('attach-list')` | 없음 | - |
+  | `cancel`·`retry` | 실행 | `Store.control` | 이 대화의 owner job | 버튼 트랜잭션 안 |
+  | `task_cancel` | 실행 | `TaskCommandHandler.cancelIn` | 이 대화의 owner 작업 레인 job | 버튼 트랜잭션 안 |
+  | `review_resume`·`review_cancel` | 실행 | `Store.control(…, { review })` | 리뷰 job, 리뷰 제어 장소 | 버튼 트랜잭션 안 |
+  | `memory_save`·`memory_correct` | 실행 | `MemoryCommandHandler.handle` | 종류(`parseKind`)·기억 ID 모양(`parseIds`), 내용 있음 | 커밋 뒤 |
+  | `memory_exclude`·`memory_delete` | 실행 | `MemoryCommandHandler.handle` | 출처 키 모양·기억 ID 하나 | 커밋 뒤 |
+  | `detach` | 실행 | `ExternalTaskCommandHandler.handle('detach')` | 이 스레드에 연결한 열린 연결 | 커밋 뒤 |
+  | `change` | 실행 | `ChangeCommandHandler.handle('change')` | 변경 정책 저장소, 대화 채널 스레드 | 커밋 뒤 |
+  | `change_cancel` | 실행 | `ChangeCommandHandler.handle('change-cancel')` | '/change-status'가 보여 주는 변경 | 커밋 뒤 |
+
+  - **처리기 배선:** 기억·변경·세션 연결·작업 명령 처리기는 수신(`DiscordIngress`)이 갖고 있고, 제안을 대조하는 `ProposalDesk`(`Runtime`이 만든다)는 받지 않는다. 그래서 수신이 생성될 때 같은 `Store`에 처리기를 묶고(`bindProposalHandlers`), `ProposalDesk`가 그 묶음을 읽는다. 묶이지 않은 처리기의 동작은 "연결 안 됨"으로 버린다('/' 명령도 처리기가 없으면 닫힌다). 버튼 실행은 수신이 자기 처리기를 `ExecuteContext`로 바로 넘긴다.
+  - **커밋 뒤 실행:** 기억·변경·세션 연결 처리기는 자기 DB 연결로 트랜잭션을 연다. 버튼 트랜잭션은 대화·제안 행을 잠그고 있어 그 안에서 부르면 교착하거나 처리기가 그 트랜잭션의 쓰기를 보지 못한다. 그래서 버튼 트랜잭션에서 검사·상태 전이(`confirmed`)만 하고, 커밋 뒤 처리기를 '/' 명령과 같은 인자로 한 번 부른 결과로 응답한다(`PressOutcome.later`). 커밋과 호출 사이에 죽으면 다시 하지 않는다('/' 기억·변경 명령의 "한 번 잡은 뒤 처리"와 같다). 처리기가 던지면 `PROPOSAL_TEXT.failed`로 답하고 로그는 사유 코드만 남긴다.
+  - **원 메시지가 출처:** 기억 저장·정정의 대화 출처와 변경 요청의 입력 이벤트 키는 owner가 말한 원 메시지의 Discord ID(`events.delivery_id`)다. 그래서 기억 근거 판정이 '/'와 같이 "owner 대화"가 되고, 한 메시지에서 변경은 하나만 접수된다.
+  - **리뷰 제어 장소(DECISIONS "동료 봇 전환" 13):** 말로 하는 리뷰 상태·재개·취소는 owner가 허용 채널(대화·알림) 본문이나 그 아래 스레드에서 말했으면 받는다(`spokenReviewAllowed`). 버튼 때 누른 시점의 정책으로 다시 판단해 `Store.control`의 리뷰 권한 자리에 넣는다. '/' `review-*`는 이 판단을 쓰지 않고 지금처럼 알림 채널 본문만 받는다.
+  - **변경 요청 확인 문구(DECISIONS "동료 봇 전환" 15):** 확인 글은 `PROPOSAL_TEXT.changeQuestion`("<저장소>에 이 변경 PR을 준비할까요?", 저장소는 정책 대조를 지난 `fullName`) 한 줄이고 원문을 싣지 않는다. 공개 여부를 묻는 글·버튼은 없다. "할게요"를 누르면 owner 원문을 '/change' 서식으로 옮겨(`spokenChangeText`: 요약 = 원문, 인수 조건 = 서버 고정 문구 `SPOKEN_CHANGE_ACCEPTANCE`, `label=public`) 같은 처리기에 넘긴다. 접수 때 공개 검사(`scanBrief`)와 출처 label 규칙은 그대로라 걸리면 '/'처럼 막힌다. 서식 글자(` | `, `goal=` 등)·길이·제어 문자 때문에 요약이 원문과 달라지면 제안을 버린다. '/change'는 지금처럼 owner가 적은 `label`을 쓴다.
+  - **기억 저장·정정 확인 글:** 저장될 글(모델 `content`)을 줄이지 않고 줄마다 인용 표시로 싣는다(`PROPOSAL_TEXT.memorySaveQuestion`·`memoryCorrectQuestion`). 그 글은 `proposals.value`에 두고 digest 재료가 된다. 버튼 때 digest가 같은 그 글만 저장한다. 확인 글이 공개 검사에 걸리면 내용을 숨긴 채 물을 수 없어 버린다(`public_check`).
+- **게시 순서(선행 키):** 확인 글(`result:<job>:proposal`)과 읽기 결과(`result:<job>:read`)는 outbox `payload.after`에 대화 답의 `message_key`(`result:<job>`)를 둔다. `Store.claimDelivery`는 선행 글의 쪽 가운데 하나라도 `pending`·`sending`·`unknown`이면 그 글을 집지 않는다. 같은 `message_key`의 쪽 순서만으로는 긴 답의 남은 쪽이 늦어질 때 버튼이 먼저 보일 수 있다. 선행 글이 `blocked`·`failed`로 끝나면 기다리지 않는다(영영 `pending`으로 남지 않게).
 
 ### 지표 (`/metrics`, DB gauge)
 

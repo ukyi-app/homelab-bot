@@ -534,6 +534,29 @@ test('작성 port 재개: 답을 나르던 턴이 한도로 끝나면 질문을 
   assert.deepEqual(await statesOf(h), { job: 'waiting_user', session: 'waiting_model' });
   assert.equal((await h.db.query<{ state: string }>('SELECT state FROM codex_questions WHERE id=$1', [question.id])).rows[0]!.state, 'answered');
 });
+test('AC-16 작성 port 재개: 한도 대기 턴은 턴 예산에서 빠지고, 진행 턴이 16이면 스키마 예외가 아니라 change_turn_limit로 닫는다', async () => {
+  const h = await authorHarness();
+  await h.f.script([QUESTION, writeStep({ 'src/app.txt': 'answered\n' }), writeStep({ 'src/app.txt': 'again\n' })]);
+  const { receiptId } = await h.author.start(startInput(h));
+  assert.equal((await pollAuthor(h, receiptId)).kind, 'needs_input');
+  const question = (await h.db.query<{ id: string }>(`SELECT id FROM codex_questions WHERE job_id=$1 AND state='open'`, [h.job.id])).rows[0]!;
+  assert.equal((await h.bridge.answer({ question: question.id, actor: 'fixture-owner', scope: thread, text: 'src를 고쳐라', event: 'answer-1' })).ok, true);
+  assert.equal((await h.app.store.claimChangeAuthor(h.job.id))!.id, h.job.id);
+  await h.author.resume({ receiptId, answer: 'src를 고쳐라', label: 'public' });
+  assert.equal((await pollAuthor(h, receiptId)).kind, 'snapshot');
+  endResult(h, 'limited');
+  assert.deepEqual(await h.author.fetchResult(receiptId), { kind: 'unknown', code: 'model_limit' });
+  h.calls.intercept = undefined;
+  assert.equal((await h.app.store.control('fixture-owner', h.app.store.scopeId(thread), 'resume-model', h.job.id) as { ok?: boolean }).ok, true);
+  assert.equal((await h.app.store.claimChangeAuthor(h.job.id))!.id, h.job.id);
+  // 앞에서 진행 턴을 더 쓴 세션으로 둔다. 턴 2가 한도 대기라 턴 17까지는 진행 턴 16이다.
+  await h.db.query('UPDATE codex_sessions SET turn=17 WHERE job_id=$1', [h.job.id]);
+  await assert.rejects(h.author.resume({ receiptId, answer: 'src를 고쳐라', label: 'public' }), /change_turn_limit/);
+  await h.db.query('UPDATE codex_sessions SET turn=16 WHERE job_id=$1', [h.job.id]);
+  await h.author.resume({ receiptId, answer: 'src를 고쳐라', label: 'public' });
+  assert.equal((await pollAuthor(h, receiptId)).kind, 'snapshot');
+  assert.equal((await h.db.query<{ turn: number }>('SELECT turn FROM codex_sessions WHERE job_id=$1', [h.job.id])).rows[0]!.turn, 17);
+});
 
 test('작성 port 취소: 대기 중 세션을 취소하면 job·세션·질문을 닫고 공간을 지운다. 뒤의 fetchResult는 옛 결과를 주지 않는다', async () => {
   const asked = await authorHarness();

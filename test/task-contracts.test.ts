@@ -82,7 +82,15 @@ test('T18 B1 TaskRequest: 범위 밖 값을 거부한다', () => {
   })) rejects(TaskRequestSchema, input, name);
   assert.equal(TaskRequestSchema.safeParse({ ...start(), untrusted: { request: 'x'.repeat(TASK_LIMITS.untrustedChars) } }).success, true);
   rejects(TaskRequestSchema, { ...resume(), turn: 1 }, 'resume turn 1');
-  rejects(TaskRequestSchema, { ...resume(), turn: TASK_LIMITS.turns + 1 }, 'turn limit');
+  rejects(TaskRequestSchema, { ...resume(), turn: 2_147_483_648 }, 'protocol turn limit');
+});
+test('C19 턴 번호는 프로토콜 한계(DB integer)까지 받고, 턴 예산 16은 스키마가 아니라 게시 서버가 센다', () => {
+  // 한도·인증 대기 턴은 예산에서 빠져 진행 턴 16을 다 쓰지 않아도 턴 번호가 17을 넘는다.
+  assert.equal(TaskRequestSchema.safeParse({ ...resume(), turn: 17, resumeReason: 'model_limit' }).success, true);
+  assert.equal(TaskRequestSchema.safeParse({ ...resume(), turn: 2_147_483_647, resumeReason: 'model_limit' }).success, true);
+  TaskResponseSchema.parse({ ...common(), turn: 17, status: 'limited', stopped: true, sessionRetained: true, cleanupPending: false });
+  TaskStatusResponseSchema.parse({ ...control(), worker: WORKER, turn: 17, state: 'waiting', sessionExists: true, stopped: true });
+  assert.equal(TASK_LIMITS.turns, 16);
 });
 test('T18 B1 TaskRequest: 질문 ID는 같은 job·세션의 앞 턴만 가리킨다', () => {
   for (const [name, questionId] of Object.entries({

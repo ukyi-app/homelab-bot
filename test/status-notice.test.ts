@@ -83,9 +83,10 @@ for (const status of ['limited', 'auth_expired'] as const) test(`S4 ${status} wa
   await f.runtime.tick();
   const job = (await rows('jobs'))[0]!;
   assert.equal(job.state, 'waiting_user');
-  // 같은 attempt가 다시 대기에 들어가도(재시작 경합 등) 안내는 하나다.
+  // 같은 attempt가 다시 대기에 들어가도(재시작 경합 등) 안내는 하나다. 한도·인증 멈춤은 시도로 세지 않아(C19) 저장된 attempt가
+  // 되돌려져 있으므로, 처음 대기에 들어간 실행의 attempt(1)로 다시 넣는다.
   await database.db.query(`UPDATE jobs SET state='running',lease_until=$2 WHERE id=$1`, [job.id, f.now() + 1000]);
-  await f.store.waitForUser({ ...job, target: job.target, revision: job.revision } as never, status === 'limited' ? 'model_limit' : 'auth_expired');
+  await f.store.waitForUser({ ...job, attempt: 1, target: job.target, revision: job.revision } as never, status === 'limited' ? 'model_limit' : 'auth_expired');
   const sent = await notices('waiting:');
   assert.deepEqual(sent.map(o => o.idempotency_key), [`waiting:${job.id}:1`]);
   assert.match(sent[0]!.payload.content, new RegExp(`/resume-model target:${job.id}`));

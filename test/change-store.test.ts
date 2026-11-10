@@ -767,8 +767,11 @@ function migrationDatabase(pg: PGlite): Database {
     transaction: fn => pg.transaction(tx => fn({ query: (sql, params = []) => tx.query(sql, params), transaction: () => { throw new Error('nested'); } })),
   };
 }
-// 016 뒤에 새로 생긴 표(변경 PR 표, C13 proposals)는 비교에서 뺀다. 기존 표가 바뀌지 않았는지만 본다.
-const OLD_TABLES = `table_schema='public' AND table_name NOT LIKE 'change\\_%' AND table_name NOT IN ('schema_migrations','proposals')`;
+// 016 뒤에 새로 생긴 표(변경 PR 표, C13 proposals, C19 model_pauses·model_limit_state)는 비교에서 뺀다. 기존 표가 바뀌지 않았는지만 본다.
+// 옛 표에 더한 칸은 아래 RETENTION_COLUMNS·C19_COLUMNS로 따로 확인한다.
+const NEW_TABLES = ['proposals', 'model_pauses', 'model_limit_state'];
+const OLD_TABLES = `table_schema='public' AND table_name NOT LIKE 'change\\_%' AND table_name <> 'schema_migrations'
+  AND table_name NOT IN (${NEW_TABLES.map(t => `'${t}'`).join(',')})`;
 // 019(T27)·020(T31) 원문 보존은 옛 표에 NULL 허용 칸과 그 digest CHECK만 더한다. 아래 비교에서 빼고 따로 확인한다.
 const RETENTION_COLUMNS: Record<string, string[]> = {
   codex_questions: ['answer_purged_at', 'answer_sha256', 'prompt_purged_at', 'prompt_sha256'],
@@ -776,21 +779,25 @@ const RETENTION_COLUMNS: Record<string, string[]> = {
   outbox: ['content_purged_at', 'content_sha256'],
   results: ['result_purged_at', 'result_sha256'],
 };
-const RETENTION_MATCH = Object.entries(RETENTION_COLUMNS).map(([table, columns]) => `(table_name='${table}' AND column_name IN (${columns.map(c => `'${c}'`).join(',')}))`).join(' OR ');
-const T27_COLUMNS = `NOT (${RETENTION_MATCH})`;
+// 022(C19)는 codex_sessions에 기본값 0인 NOT NULL 칸 하나를 더한다. 옛 코드는 이 칸을 쓰지 않아 기본값이 들어간다.
+const C19_COLUMNS: Record<string, string[]> = { codex_sessions: ['model_wait_turns'] };
+const columnMatch = (map: Record<string, string[]>) => Object.entries(map).map(([table, columns]) => `(table_name='${table}' AND column_name IN (${columns.map(c => `'${c}'`).join(',')}))`).join(' OR ');
+const RETENTION_MATCH = columnMatch(RETENTION_COLUMNS);
+const T27_COLUMNS = `NOT (${RETENTION_MATCH}) AND NOT (${columnMatch(C19_COLUMNS)})`;
 const RETENTION_CHECKS = ['codex_questions_answer_sha256_check', 'codex_questions_prompt_sha256_check', 'events_text_sha256_check', 'outbox_content_sha256_check', 'results_result_sha256_check'];
+const C19_CONSTRAINTS = ['codex_sessions_model_wait_turns_not_null'];
 const schemaOf = async (db: Database) => JSON.stringify((await db.query(`SELECT table_name,column_name,data_type,is_nullable,column_default
   FROM information_schema.columns WHERE ${OLD_TABLES} AND ${T27_COLUMNS} ORDER BY table_name,ordinal_position`)).rows);
 const constraintsOf = async (db: Database) => JSON.stringify((await db.query(`SELECT conrelid::regclass::text AS t,conname,pg_get_constraintdef(oid) AS d FROM pg_constraint
-  WHERE connamespace='public'::regnamespace AND conrelid<>0 AND conrelid::regclass::text NOT LIKE 'change\\_%' AND conrelid::regclass::text<>'proposals'
-    AND conname<>ALL($1::text[]) ORDER BY t,conname`, [RETENTION_CHECKS])).rows);
+  WHERE connamespace='public'::regnamespace AND conrelid<>0 AND conrelid::regclass::text NOT LIKE 'change\\_%' AND conrelid::regclass::text<>ALL($2::text[])
+  AND conname<>ALL($1::text[]) ORDER BY t,conname`, [[...RETENTION_CHECKS, ...C19_CONSTRAINTS], NEW_TABLES])).rows);
 
 test('T19 B0 migration: 016 DB에 017만 더하고 기존 표·제약·행을 바꾸지 않으며 파일을 다시 돌려도 그대로다', async () => {
   const pg = new PGlite();
   try {
     const db = migrationDatabase(pg);
     const upTo016 = MIGRATIONS.filter(file => Number.parseInt(file, 10) <= 16);
-    assert.equal(upTo016.length, MIGRATIONS.length - 5);
+    assert.equal(upTo016.length, MIGRATIONS.length - 6);
     for (const file of upTo016) await pg.exec(await readFile(`migrations/${file}`, 'utf8'));
     await seedConversation(db);
     await insertChildJob(db, 'existing-job', 'task');
@@ -798,12 +805,14 @@ test('T19 B0 migration: 016 DB에 017만 더하고 기존 표·제약·행을 �
     const constraints = await constraintsOf(db);
     const jobs = JSON.stringify((await db.query('SELECT * FROM jobs')).rows);
 
-    assert.deepEqual(await migrate(db), [17, 18, 19, 20, 21]);
+    assert.deepEqual(await migrate(db), [17, 18, 19, 20, 21, 22]);
     assert.equal(await schemaOf(db), schema);
     const added = (await db.query<{ table_name: string; column_name: string; is_nullable: string; column_default: string | null }>(`SELECT table_name,column_name,is_nullable,column_default
-      FROM information_schema.columns WHERE ${OLD_TABLES} AND NOT ${T27_COLUMNS} ORDER BY table_name,column_name`)).rows;
-    assert.deepEqual(added.map(c => [c.table_name, c.column_name, c.is_nullable, c.column_default]),
-      Object.entries(RETENTION_COLUMNS).flatMap(([table, columns]) => columns.map(column => [table, column, 'YES', null])));
+      FROM information_schema.columns WHERE ${OLD_TABLES} AND NOT (${T27_COLUMNS}) ORDER BY table_name,column_name`)).rows;
+    assert.deepEqual(added.map(c => [c.table_name, c.column_name, c.is_nullable, c.column_default]), [
+      ...Object.entries(RETENTION_COLUMNS).flatMap(([table, columns]) => columns.map(column => [table, column, 'YES', null])),
+      ['codex_sessions', 'model_wait_turns', 'NO', '0'],
+    ].sort((a, b) => `${a[0]}.${a[1]}`.localeCompare(`${b[0]}.${b[1]}`)));
     assert.equal(await constraintsOf(db), constraints);
     assert.equal(JSON.stringify((await db.query('SELECT * FROM jobs')).rows), jobs);
     assert.deepEqual(await migrate(db), []);

@@ -118,7 +118,7 @@ let controls: ReturnType<typeof captureControls>;
 before(async () => { database = await localDatabase(); controls = captureControls(); });
 beforeEach(async () => {
   await database.pg.exec(`TRUNCATE events,conversations,jobs,results,outbox,schedules,denied_actors,controls,audit,incidents,
-    github_deliveries,pr_reviews,review_deliveries RESTART IDENTITY CASCADE`);
+    github_deliveries,pr_reviews,review_deliveries,model_limit_state RESTART IDENTITY CASCADE`);
   f = await fixture(database.db);
   r = await setup();
 });
@@ -1908,4 +1908,61 @@ test('4407851858 EVENT-02 조회 중 다른 lease로 넘어간 게시 행은 갱
   await r.publisher.deliver();
   assert.equal(r.gh.writes.length, 0);
   assert.deepEqual((await deliveries()).map(d => [d.state, d.lease_token, Number(d.lease_until)]), [['sending', 'fixture-other-lease', until]]);
+});
+
+// AC-17 리뷰 미루기(COLLEAGUE_SPEC §4.7). 경계 S1: 대화 runtime·리뷰 runtime의 claim 순서와 가짜 시계.
+const HOUR = 3_600_000;
+const warning = (resetsAtMs: number) => ({ event: { status: 'allowed_warning' as const, resetsAt: Math.floor(resetsAtMs / 1000), rateLimitType: 'five_hour' as const, utilization: 0.9 } });
+async function chat(id: string) { await f.ingress.receive(event(id)); f.advance(DEFAULTS.debounceMs); }
+test('AC-17 대화가 한도 경고를 받으면 풀리는 시각까지 새 PR 리뷰를 집지 않고 대화는 계속하며, 기한 뒤 미룬 리뷰를 이어서 한다', async () => {
+  const resetsAt = Math.floor((f.now() + 2 * HOUR) / 1000) * 1000;
+  f.setRun(async () => ({ status: 'succeeded', stopped: true, rateLimit: warning(resetsAt),
+    output: { reply: '답했어요.', proposal: null, ack_only: false } }));
+  await chat('warned-chat');
+  assert.equal(await f.runtime.tick(), true);
+  assert.equal((await opened()).outcome, 'queued');
+
+  assert.equal(await r.runtime.tick(), false);
+  assert.deepEqual((await reviewJobs()).map(j => j.state), ['queued']);
+  // 미루는 동안에도 대화는 바로 처리한다.
+  await chat('next-chat');
+  assert.equal(await f.runtime.tick(), true);
+  assert.equal((await rows('jobs')).filter(j => j.type === 'chat' && j.state === 'succeeded').length, 2);
+
+  f.advance(resetsAt - 1 - f.now());
+  assert.equal(await r.runtime.tick(), false);
+  assert.equal(r.inputs.length, 0);
+  f.advance(1);
+  assert.equal(await r.runtime.tick(), true);
+  assert.deepEqual((await reviewJobs()).map(j => j.state), ['succeeded']);
+  assert.equal(r.inputs.length, 1);
+});
+test('AC-17 리뷰 실행이 받은 한도 경고도 다음 PR 리뷰를 미룬다', async () => {
+  const resetsAt = Math.floor((f.now() + HOUR) / 1000) * 1000;
+  r.reply({ status: 'succeeded', output: OUTPUT, rateLimit: warning(resetsAt) });
+  await fullReview();
+  assert.deepEqual((await reviewJobs()).map(j => j.state), ['succeeded']);
+  r.gh.pulls.set(8, pull({ number: 8, updated_at: '2026-10-29T02:00:00Z' }));
+  assert.equal((await hook('pull_request', prEvent('opened', pull({ number: 8, updated_at: '2026-10-29T02:00:00Z' })))).outcome, 'queued');
+  assert.equal(await r.runtime.tick(), false);
+  f.advance(resetsAt - f.now());
+  assert.equal(await r.runtime.tick(), true);
+  assert.equal(r.inputs.length, 2);
+});
+test('AC-16 리뷰가 한도로 멈추면 풀리는 시각 1분 뒤 리뷰를 저절로 이어서 하고 게시까지 간다', async () => {
+  const resetsAt = Math.floor((f.now() + HOUR) / 1000);
+  r.reply({ status: 'limited', rateLimit: { stop: { cause: 'rate_limit', resetsAt } } });
+  await opened();
+  await r.runtime.tick();
+  assert.deepEqual((await reviewJobs()).map(j => [j.state, j.wait_reason]), [['waiting_user', 'model_limit']]);
+  f.advance(resetsAt * 1000 + 59_999 - f.now());
+  assert.equal(await f.store.resumeDue(), 0);
+  f.advance(1);
+  assert.equal(await f.store.resumeDue(), 1);
+  r.reply({ status: 'succeeded', output: OUTPUT });
+  assert.equal(await r.runtime.tick(), true);
+  await r.publisher.deliver();
+  assert.deepEqual((await reviewJobs()).map(j => j.state), ['succeeded']);
+  assert.equal(r.gh.writes.length, 1);
+  assert.deepEqual((await rows('audit')).filter(a => a.kind === 'review_wait_resumed').map(a => a.detail.actor), ['auto_resume']);
 });

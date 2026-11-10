@@ -155,15 +155,19 @@ export class Runtime {
       }
       stopped = result.stopped;
       waiting = result.stopped && (result.status === 'limited' || result.status === 'auth_expired');
+      // 대기가 아닌 결과의 한도 경고도 계정 기록에 남긴다(리뷰 미루기). 기록 실패가 답 처리를 막지 않는다.
+      if (result.stopped && !waiting) await this.store.observeRateLimit(result.rateLimit)
+        .catch(error => this.log('rate_limit_observe_failed', { job: job.id, ...errorInfo(error) }));
       try { latestPolicy = await this.gate.authorize(job.owner_id, job.target); }
       catch (error) {
         if (error instanceof Denied) { authorizationRevoked = true; abort.abort(); }
         else if (!(error instanceof PolicyUnavailable)) throw error;
       }
       const current = (await this.store.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0]!;
+      const rateLimit = result.stopped ? result.rateLimit : null;
       if (!authorizationRevoked && current.state !== 'cancel_requested' && result.stopped
         && (result.status === 'limited' || result.status === 'auth_expired')) {
-        await this.store.waitForUser(job, result.status === 'limited' ? 'model_limit' : 'auth_expired');
+        await this.store.waitForUser(job, result.status === 'limited' ? 'model_limit' : 'auth_expired', { rateLimit });
       } else if (current.state === 'cancel_requested' || abort.signal.aborted || authorizationRevoked) {
         if (!result.stopped) stopped = confirmed = await stopRequest();
         await this.stopOutcome(job, stopped, { revoked: authorizationRevoked, ownerCancel: current.state === 'cancel_requested',

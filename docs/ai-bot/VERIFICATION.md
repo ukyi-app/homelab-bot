@@ -2437,6 +2437,50 @@ AC-11(대화·작업·제어 안내 범위)·AC-23(문구 두 판)을 S1(가짜 
 - **못 잡는 범위.** Discord 클라이언트에서 실제로 본인에게만 보이는지(EPHEMERAL 표시)는 S5(C24)다. 두 연결에서 "키 보기"를 겹쳐 누르는 경합은 실제 PostgreSQL로 돌리지 않았다(표시는 C13의 "할게요"와 같은 행 잠금 + 조건부 UPDATE이고, 겹쳐도 활성 연결 유일 인덱스가 둘째 `attach`를 막는다).
 - **확정 글의 세션 ID(PR #128 Codex P1 수정).** "할게요" 응답은 확인 글을 공개 글로 바꾸고 공개 검사를 거치지 않는다. 그래서 확정 문구 `SESSION_KEY_TEXT.confirmed`는 실행기 이름만 싣고 세션 ID를 싣지 않는다. 시험 "C15 공개 검사에 걸리는 세션 ID는 확인 글에서 숨기고, \"할게요\" 뒤 바뀐 글과 버튼 글에도 다시 싣지 않는다"(사설 IP 꼴 ID `10.20.30.40`, 상호작용 응답·게시 글 어디에도 없음).
 
+## C19 한도 재개와 리뷰 미루기 (2026-11-10, 로컬)
+
+동료 봇 명세 §4.7 "멈춤 종류와 재개"·"리뷰 미루기"와 AC-16·AC-17을 S1(수신 `DiscordIngress` → PGlite → `Runtime`·`ReviewRuntime`·`ClaudeTaskBridge` → 가짜 작업자, 업무 시계를 옮기는 가짜 시계)과 S2(리뷰 `ReviewWorker`가 모델 결과의 한도 칸을 응답에 싣는 경로)에서 고정했다. 재개 예약 루프 한 바퀴는 `Store.resumeDue()`를 직접 불러 본다(운영은 `src/main.ts`가 15초마다). 결정·구현 선택은 [DECISIONS](DECISIONS.md) "C19 한도 재개와 리뷰 미루기", 계약은 [ARCHITECTURE](ARCHITECTURE.md) §11 "자동 재개"·"리뷰 미루기" 문단이다.
+
+| 완료 조건 | 시험 |
+|---|---|
+| `rejected` + 풀리는 시각 → 그 시각 1분 뒤 같은 작업자로 재개, 그 전에는 재개 없음 | `model-resume` "AC-16 한도와 풀리는 시각이 오면 그 시각 1분 뒤에 …"(1분 − 1ms에 0건, 1분에 1건, 같은 job의 두 번째 요청, 감사 행위자 `auto_resume`), `pr-review` "AC-16 리뷰가 한도로 멈추면 …게시까지 간다", `task-bridge` "AC-16 작업 레인 응답의 풀리는 시각 1분 뒤 같은 세션으로 …"(재개 턴이 같은 job의 `resume`) |
+| 시각 없음 → 30분마다, 시도 한도를 넘는 횟수도 계속 | `model-resume` "AC-16 풀리는 시각을 모르는 한도는 30분마다 …"(한도 칸 없는 응답 4번 연속, 대기 안내 1개), `task-bridge` 같은 시험의 둘째 멈춤(칸 없는 옛 작업자 응답) |
+| 인증 만료 → 30분 뒤, 관리 진입점·'/resume-model' 해제는 바로 | `model-resume` "AC-16 인증 만료는 30분 뒤 저절로, 관리 진입점 재개와 /resume-model은 그 자리에서 바로 …"(해제 뒤 예약 루프가 같은 작업을 또 재개하지 않음, 감사 행위자 `auto_resume`·`cli`·owner) |
+| 결제 멈춤은 저절로 재개 없음 | `model-resume` "AC-16 결제 멈춤은 하루가 지나도 …"(24시간 동안 0건, 관리 진입점으로만 재개) |
+| 비상 정지 중 재개 없음 | `model-resume` "AC-16 비상 정지 중에는 …"(정지 해제 뒤 다음 바퀴에 재개) |
+| 다른 계정·모델·실행기로 바뀐 실행 0건 | 재개는 작업 행만 바꾸는 `Store.resumeWaiting` 하나이고 게시 서버에 계정·실행기 전환 경로가 없다(코드). 시험은 재개된 실행이 같은 가짜 작업자·같은 job으로 가는 것을 본다(위 세 시험) |
+| 재시작 뒤 기록 유지 | `model-resume` "AC-16 게시 서버가 다시 떠도 …"(새 `Store`로 같은 시각) |
+| 배포 전 대기(기록 없음)의 동작 | `model-resume` "AC-16 배포 전 판이 남긴 기록 없는 한도·인증 대기는 처음 본 때부터 30분 뒤에 재개한다"(시도 한도에 닿은 옛 대기 포함) |
+| 경고 중 리뷰 claim 0, 대화 계속, 기한 뒤 리뷰 재개, 미룬 리뷰 유실 없음 | `pr-review` "AC-17 대화가 한도 경고를 받으면 …"(경고 중 리뷰 `queued` 유지·모델 입력 0, 대화 둘 처리, 기한 −1ms에 0, 기한에 리뷰), "AC-17 리뷰 실행이 받은 한도 경고도 다음 PR 리뷰를 미룬다" |
+| 브리핑에 미룬 건수 | `memory-briefing` "AC-17 리뷰를 미루는 동안 브리핑에 미룬 PR 리뷰 건수가 나오고, 미루지 않으면 그 줄이 없다" |
+
+- **실행(bdadd8f, origin/main 860b591 반영, 머신 잠금 도우미, node 24.22.0):** `npm run check`, `npm run build`, `node --test` 두 묶음. 첫 묶음 21개 파일 641개 중 통과 634, skip 5, 실패 2(`codex-bridge` TASK-03, `review-8` 4316099215, 둘 다 시도 규칙이 바뀐 옛 기대값, 위 "바뀐 기존 시험"). 고친 뒤 둘째 묶음 18개 파일(그 두 파일 포함, 대화·리뷰·작업 조립과 종료 시험) 579개 통과, 실패 0. 이어 `--pg`로 PG 경로 10개 파일(`status-notice-pg`·`task-lane-pg`·`publisher-pg`·`change-pg`·`change-store-pg`·`raw-input-retention`·`review-9-pg`·`memory-briefing-pg`·`change-review-pg`·`model-resume`) 81개 통과.
+- **고치기 전 실패 확인:** 첫 재개 시험은 `Store.resumeDue`가 없을 때 타입 검사에서 실패했다. 나머지 재개·리뷰 미루기·브리핑 시험은 구현과 같은 차례에 써서 구현 전 빨강을 따로 보지 않았다.
+- **바뀐 기존 시험:** 마이그레이션 022를 더해 적용 버전 목록을 적은 시험(`publisher-migrate`·`publisher-pg`·`change-pg`·`change-store-pg`·`raw-input-retention`·`change-store`)에 22를 더했다. `change-store`의 "016 DB에 017만 더하고 기존 표를 바꾸지 않는다" 비교에서 새 표 둘을 뺐다. `status-notice` "S4 … 같은 attempt 두 번이어도"는 저장된 `attempt`가 되돌려지므로 처음 대기에 들어간 실행의 attempt(1)를 넘기게 고쳤다. `codex-bridge` "TASK-03 질문 재개로 시도 한도에 닿은 뒤 한도 대기가 …"는 옛 동작(재개 대신 취소 안내)에서 새 규칙(그 멈춤은 시도로 세지 않아 재개 안내·재개 성공)으로, `review-8` "4316099215 동시 재개 …"의 재수락 뒤 `attempt`는 1에서 0으로 바꿨다.
+- **운영 영향(병합 즉시, 스위치와 무관).** 한도·인증 대기가 저절로 풀린다. 배포 순간의 대기는 첫 바퀴부터 30분 뒤에 재개된다. 한도 경고를 받으면 그 창이 풀릴 때까지 PR 리뷰가 미뤄진다(주간 창이면 며칠). 작업자 칸이 오지 않는 지금(2.1.308 미실측)은 경고가 없어 리뷰 미루기가 동작하지 않고 한도는 30분 재시도다.
+- **못 잡는 범위.** 2.1.308 `-p` 구독 모드에서 `resetsAt`·사용률·경고가 실제로 오는지, 실제 경고 빈도는 S5(C24 실측)다. 안내 문구(지금 '/' 재개 안내, 24시간 넘은 작업 대기의 "저절로 재개하거나 버리지 않아요")를 자동 재개에 맞추는 일은 C20이다.
+- **턴 예산과 대기 턴(PR #126 Codex 지적 수정).** `task-bridge` "AC-16 보존 세션에서 시각 모르는 한도가 16번 넘게 이어져도 턴 예산이 줄지 않고 같은 세션으로 잇는다"(한도 18번 뒤 턴 20에 완료), "AC-16 실제 진행 턴은 16에서 막히고, 결제 멈춤 턴은 예산에 센다"(대기 1·결제 1·질문 15 뒤 턴 18을 띄우지 않고 `task_turn_limit`), "배포 순서: 작업자가 새 이미지가 되기 전에는 턴 17 재개를 옛 스키마가 거부하고, 작업은 성공이 아니라 실패로 닫힌다"(`task_worker_rejected`, 결과 행 0), `change-artifact` "AC-16 작성 port 재개: 한도 대기 턴은 턴 예산에서 빠지고, 진행 턴이 16이면 스키마 예외가 아니라 change_turn_limit로 닫는다", `task-contracts` "C19 턴 번호는 프로토콜 한계(DB integer)까지 받고 …". 다섯 모두 고치기 전 코드에서 실패를 확인했다(작업 레인은 턴 17을 띄우기 전에 `task_turn_limit`, 작성 port·계약은 스키마 거부). 작업자가 C23 이미지로 바뀌기 전까지는 번호 16을 넘는 대기 재개가 여전히 실패한다(위 배포 순서 시험).
+
+## C14 나머지 동작 연결 (2026-11-10, 로컬)
+
+동료 봇 명세 §4.3(동작 목록, 제안 값의 출처, 리뷰 제어 장소, 변경 요청 확인 문구, 기억 원문)과 AC-6·AC-7·AC-26을 S1에서 고정했다. 경계는 C13과 같다: 실제 `DiscordProtocol`에 Gateway 프레임(owner 멘션 `MESSAGE_CREATE`, '/' 명령 `INTERACTION_CREATE` type 2, 버튼 type 3)을 넣고, 저장은 PGlite, 게시는 가짜 REST, 상호작용 응답은 가짜 API가 받은 callback 본문이다. 처리기는 '/'와 같은 것을 잇는다: 작업 명령(`TaskCommands` + 작업 레인), 기억(`MemoryCommands` + `MemoryService` + 실제 파일 원장), 세션 연결(`ExternalTaskCommands` + `ExternalTaskLinks`), 변경(`ChangeCommands` + `ChangeStore`, 작업자·GitHub 없이 접수까지). 비교 기준은 같은 대화에서 같은 '/' 명령을 보낸 결과다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §13 "제안과 실행 확인 (C13)"의 "나머지 동작 줄(C14)"·"게시 순서(선행 키)", 구현 선택은 [DECISIONS](DECISIONS.md) "C14 나머지 동작 연결: 값의 출처와 구현 선택". 시험 파일은 `test/c14-remaining-actions.test.ts`(경계 도우미 `test/c14-actions-fixture.ts`).
+
+| 완료 조건 | 시험 |
+|---|---|
+| 읽기 여섯 동작이 확인 없이 일반 답, 상태 안 바뀜 | `c14-remaining-actions` "C14 작업 상태 제안은 확인 없이 /task-status와 같은 결과를 일반 답으로 달고, 상태를 바꾸지 않으며, 이 대화에서 볼 수 없는 작업이면 버려진다", "C14 변경 상태·세션 연결 목록·기억 검색 제안은 확인 없이 같은 /명령 결과를 일반 답으로 단다", "C14 읽기 템플릿 제안은 카탈로그의 템플릿이면 /read와 같은 read 레인 결과를 달고, 카탈로그 밖이면 버려진다", "C14 리뷰 상태 제안은 스레드에서 말해도 알림 채널의 /review-status와 같은 결과를 단다"(버튼 글·제안 행 0, 작업 상태 그대로) |
+| 실행 요청은 버튼 전 실행 0건, 누르면 같은 '/' 처리기로 한 번 | "C14 작업 취소 제안은 버튼 전 실행 0건이고, 누르면 /cancel·/task-cancel과 같은 결과로 한 번 실행되며, 이 대화에서 볼 수 없는 작업이면 버려진다", "C14 기억 저장 제안은 …", "C14 기억 삭제 제안은 …", "C14 세션 연결 해제 제안은 이 스레드의 연결만 받고, 누르면 /detach와 같은 처리로 한 번 해제한다", "C14 말로 한 변경 요청은 …", "C14 변경 취소 제안은 이 스레드의 변경만 받고, 누르면 /change-cancel과 같은 처리로 취소한다", "C14 말로 하는 리뷰 재개·취소는 …"(누르기 전 상태 그대로, 누른 뒤 바뀜) |
+| 권한·장소 결과가 '/'와 같음 | 비 owner·허용 채널 밖은 수신에서 `Denied`(리뷰 시험), 이 대화에서 볼 수 없는 작업·변경·연결과 카탈로그 밖 템플릿은 버림(감사 `proposal_dropped`·`target_denied`), "C14 말로 한 변경 요청도 /change와 같은 장소·저장소 규칙이라 알림 채널 스레드·정책 밖 저장소면 버려진다"(같은 자리의 '/change'는 "대화 채널의 스레드에서만") |
+| 기억 저장은 확인 글에 보인 내용만, 변경 요청은 owner 원문 | "C14 기억 저장 제안은 저장될 내용이 확인 글에 그대로 보이고, 누르면 그 내용만 출처를 owner 대화로 저장하며, 값은 처리·거절·만료 뒤 비워진다"(출처 `conversation:<원 메시지 ID>`, 상태 active), "C14 기억 저장 제안의 값이 확인 글과 달라지면 버튼은 저장하지 않는다(owner가 본 값만 저장된다)", "C14 말로 한 변경 요청은 …"(입력 요약 = owner 원문, 모델 `content` 없음, 입력 이벤트 = 원 메시지 ID) |
+| 말로 하는 리뷰 재개·취소 장소, '/'는 알림 채널 본문만 | "C14 말로 하는 리뷰 재개·취소는 대화 채널·알림 채널 아래 스레드에서 owner면 받고, 허용 채널 밖·비 owner는 거부하며, / 리뷰 제어는 지금처럼 알림 채널 본문에서만 받는다" |
+| 변경 요청 확인 글, 누르면 공개 표시로 접수, '/' 규칙 그대로 | "C14 말로 한 변경 요청은 \"<저장소>에 이 변경 PR을 준비할까요?\"로 묻고, 누르기 전 접수 0건이며, 누르면 owner 원문을 공개 표시로 접수한다"(확인 글 리터럴 비교, 공개 여부를 묻는 글 0, `label=public`), "C14 / 변경 요청은 지금처럼 owner가 적은 label을 쓴다(적지 않으면 unknown으로 막힌다)" |
+| 기억 삭제 7일 안내가 버튼 응답에도 | "C14 기억 삭제 제안은 누르면 /memory-delete와 같은 처리로 지우고 원문 7일 안내가 버튼 응답에도 나온다"(`RAW_TEXT_NOTICE`) |
+| 확인 글 게시 순서(PR #125 Codex 2차 P2) | "C14 실행 확인 글은 대화 답의 모든 쪽이 게시된 뒤에만 나간다(긴 답의 남은 쪽이 늦어져도 버튼이 먼저 보이지 않는다)"(둘째 쪽 응답 유실로 `unknown`, 대조로 `sent`가 된 뒤에야 버튼 글) |
+
+- **실행(a6b119f, origin/main dd0a53f 그대로라 병합할 것 없음, 머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`, `npm run build`, `node --test` 바뀐 파일(`proposals.ts`·`discord.ts`·`store.ts`)과 티켓이 비교 대상으로 든 시험 19개 파일(새 `c14-remaining-actions`, `c13-proposal`·`c13-proposal-pg`, `foundation`, `memory-commands`·`memory-commands-pg`, `change-assembly`, `external-task-assembly`, `read-lane`·`read-lane-pg`, `review-9`·`review-9-pg`, `chat-ack`, `s16-display`, `chat-format`, `discord-rest-timeout`, `publisher-review`, `publisher-pg`, `publisher-recovery`) 362개 모두 통과, skip 0. origin/main 7560956(C17 #127)을 병합한 2902eaf에서 같은 묶음에 `c17-publish-button`·`change-preview-pages`를 더해 377개 모두 통과, skip 0(병합 충돌은 DECISIONS·VERIFICATION 끝 절끼리였고 둘 다 남겼다). 이어서 origin/main dc172ff(C15 #128)를 병합한 61adda6에서 `c15-session-key`를 더해 391개 모두 통과, skip 0(충돌은 `proposals.ts`의 `PrepareContext`·동작 표·`prepare` 호출이었고, C15의 `externalConnected`·`attach` 줄과 이 티켓의 `handlers`·나머지 줄을 함께 남겼다).
+- **시험이 실패할 수 있는지 확인:** 게시 순서 시험은 고치기 전 코드(dd0a53f)에서 돌려 실패를 봤다("답의 남은 쪽보다 확인 글이 먼저 나가면 안 된다", 버튼 글 1건). 나머지 시험은 동작 줄이 "연결 안 됨"이던 코드에서는 제안이 버려져 버튼·답이 없으므로 처음부터 성립하지 않는다(구현과 함께 들어갔다).
+- **못 잡는 범위:** 모델이 읽기와 실행을 헷갈리거나 요청을 잘못 읽는 비율은 S5(C24 표본)다. 실제 Discord에서 버튼 응답 모양은 S5다. `retry`·`memory_correct`·`memory_exclude`는 같은 처리기 묶음(`controlHandler`·`memoryWriteHandler`·`memoryTargetHandler`)의 다른 줄이라 따로 시험하지 않았다. 커밋 뒤 처리기 실행이 죽음으로 끊기는 경우(제안은 `confirmed`, 실행 없음)는 시험하지 않았다.
+- **운영 영향:** 스위치가 꺼져 있으면 제안을 보지 않고 확인 버튼도 받지 않아 지금 동작 그대로다. 스위치와 무관하게 바뀌는 것은 outbox 집기 조건 하나다(선행 키 `payload.after`가 있는 글만 기다리고, 지금 그 키를 두는 글은 확인 글·읽기 결과뿐이다).
+
 ## C16 작업 질문 바로 답 (2026-11-10, 로컬)
 
 동료 봇 명세 §4.3 "작업 질문 바로 답"·§4.9(스위치)와 AC-8을 S1에서 고정했다: 수신은 실제 `DiscordProtocol`에 Gateway 프레임(owner 일반 메시지 `MESSAGE_CREATE`, 버튼 `INTERACTION_CREATE` type 3)을 넣고, 저장은 PGlite, 게시는 가짜 REST(`MockDiscord`), 버튼 응답은 가짜 API가 받은 callback 본문이다. 작업은 '/task'와 같은 `TaskCommands`를 운영처럼 CHANGE 답 봉인 처리기(`guardedTaskCommands`)로 감싸고 작업 레인(`ClaudeTaskBridge` + 가짜 작업자)으로 돈다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) §12 "질문 계약"의 "작업 질문 바로 답", 구현 선택은 [DECISIONS](DECISIONS.md) "C16 작업 질문 바로 답 구현 선택". 시험 파일은 새 `test/c16-task-question.test.ts`와 `chat-task-text`·`codex-bridge`·`change-assembly`(하네스에 스위치 옵션)의 C16 줄이다.

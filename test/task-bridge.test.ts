@@ -9,11 +9,11 @@ import type { Database } from '../src/database.js';
 import { ReviewRuntime } from '../src/review.js';
 import { Runtime } from '../src/runtime.js';
 import { LaneClosed, Store } from '../src/store.js';
-import { TASK_RETENTION, taskQuestionId } from '../src/task-contracts.js';
+import { TASK_LIMITS, TASK_RETENTION, taskQuestionId } from '../src/task-contracts.js';
 import { repositoryPolicy } from './change-github-fake.js';
 import { event, fixture, localDatabase, thread } from './helpers.js';
 import { ABSENT, FakeTaskWorker, OTHER_STORAGE, PLAN, allRows, answer, answerOnAbort, codexBridge, codexSession, control, conversationId, expiredWhileWaiting, hang, jobs, lane, laneRow, rejectStart, reply, retainedThenStorageReplaced, task, until } from './task-lane-fixture.js';
-import type { Fixture } from './task-lane-fixture.js';
+import type { Fixture, Script } from './task-lane-fixture.js';
 
 // 중립 브리지와 작업 레인 스케줄링. 질문 사례는 test/codex-bridge.test.ts의 TASK-02·AUTH-02와 같은 의미를 Claude 턴으로 본다.
 // 다중 연결 경합은 test/task-lane-pg.test.ts다. PGlite는 연결이 하나라 행 잠금 대기를 재현하지 못한다.
@@ -542,6 +542,97 @@ test('계정 한도 대기는 양쪽을 막는다: 작업 쪽 한도가 대화�
   assert.equal(await f.store.claim('task'), undefined);
   await control(f, 'cancel', chatJob!.id);
   assert.equal((await f.store.claim('task'))?.type, 'task');
+});
+test('AC-16 작업 레인 응답의 풀리는 시각 1분 뒤 같은 세션으로 저절로 잇고, 한도 정보가 없는 응답은 30분 뒤 다시 시도한다', async () => {
+  const resetsAt = Math.floor((f.now() + 3_600_000) / 1000);
+  const limited = reply.limited('limited');
+  setup.worker.scripts.push((r, w) => ({ ...limited(r, w), rateLimit: { stop: { cause: 'rate_limit', resetsAt } } }));
+  const job = await newTask();
+  await setup.runtime.tickTask();
+  f.advance(resetsAt * 1000 + 59_999 - f.now()); f.policy.confirmedAt = f.now();
+  assert.equal(await f.store.resumeDue(), 0);
+  f.advance(1);
+  assert.equal(await f.store.resumeDue(), 1);
+  // 옛 작업자처럼 한도 칸 없이 다시 한도로 멈춘다.
+  setup.worker.scripts.push(reply.limited('limited'));
+  assert.equal(await setup.runtime.tickTask(), true);
+  assert.equal((await jobs(db()))[0]!.state, 'waiting_user');
+  f.advance(30 * 60_000 - 1); f.policy.confirmedAt = f.now();
+  assert.equal(await f.store.resumeDue(), 0);
+  f.advance(1);
+  assert.equal(await f.store.resumeDue(), 1);
+  setup.worker.scripts.push(reply.completed());
+  assert.equal(await setup.runtime.tickTask(), true);
+  assert.equal((await jobs(db()))[0]!.state, 'succeeded');
+  const turns = setup.worker.executes.slice(1);
+  assert.deepEqual(turns.map(t => [t.operation, t.job, t.operation === 'resume' ? t.resumeReason : null]),
+    [['resume', job.id, 'model_limit'], ['resume', job.id, 'model_limit']]);
+});
+// 도구를 쓰지 않은 턴으로 둔다. 작업당 도구 예산(8)이 턴 예산보다 먼저 닿지 않게 한다.
+const idle = (script: Script): Script => (r, w) => ({ ...script(r, w) as object, usage: { toolCalls: 0, model: null } });
+const billing: Script = (r, w) => ({ ...idle(reply.limited('limited'))(r, w) as object, rateLimit: { stop: { cause: 'billing' } } });
+const halfHourLater = async () => { f.advance(30 * 60_000); f.policy.confirmedAt = f.now(); return f.store.resumeDue(); };
+test('AC-16 보존 세션에서 시각 모르는 한도가 16번 넘게 이어져도 턴 예산이 줄지 않고 같은 세션으로 잇는다', async () => {
+  setup.worker.scripts.push(idle(reply.limited('limited')));
+  const job = await newTask();
+  await setup.runtime.tickTask();
+  for (let i = 0; i < 18; i++) {
+    assert.equal(await halfHourLater(), 1);
+    setup.worker.scripts.push(idle(reply.limited('limited')));
+    assert.equal(await setup.runtime.tickTask(), true);
+    assert.equal((await jobs(db()))[0]!.state, 'waiting_user', `한도 재시도 ${i + 1}번째`);
+  }
+  assert.equal(await halfHourLater(), 1);
+  setup.worker.scripts.push(reply.completed());
+  assert.equal(await setup.runtime.tickTask(), true);
+  assert.equal((await jobs(db()))[0]!.state, 'succeeded');
+  const last = setup.worker.executes.at(-1)!;
+  assert.deepEqual([last.operation, last.job, last.turn], ['resume', job.id, 20]);
+  assert.equal(new Set(setup.worker.executes.map(request => request.sessionId)).size, 1);
+});
+test('AC-16 실제 진행 턴은 16에서 막히고, 결제 멈춤 턴은 예산에 센다', async () => {
+  // 턴 1: 시각 모르는 한도(예산 밖). 턴 2: 결제 멈춤(예산 안). 턴 3~17: 질문 15번(예산 안). 진행 턴이 16이 되어 턴 18은 띄우지 않는다.
+  setup.worker.scripts.push(idle(reply.limited('limited')));
+  const job = await newTask();
+  await setup.runtime.tickTask();
+  assert.equal(await halfHourLater(), 1);
+  setup.worker.scripts.push(billing);
+  await setup.runtime.tickTask();
+  assert.equal(await halfHourLater(), 0);
+  assert.equal((await control(f, 'resume-model', job.id)).ok, true);
+  setup.worker.scripts.push(idle(reply.question()));
+  await setup.runtime.tickTask();
+  const sid = (await session()).claude_session_id as string;
+  for (let asked = 3; asked < 17; asked++) {
+    await answer(setup.bridge, taskQuestionId(job.id, sid, asked), 'main', `answer-${asked}`);
+    setup.worker.scripts.push(idle(reply.question()));
+    assert.equal(await setup.runtime.tickTask(), true);
+    assert.equal((await jobs(db()))[0]!.state, 'waiting_user', `질문 턴 ${asked + 1}`);
+  }
+  await answer(setup.bridge, taskQuestionId(job.id, sid, 17), 'main', 'answer-17');
+  await setup.runtime.tickTask();
+  assert.equal(setup.worker.executes.length, 17);
+  const [row] = await jobs(db());
+  assert.deepEqual([row!.state, row!.wait_reason], ['failed', 'task_turn_limit']);
+});
+test('배포 순서: 작업자가 새 이미지가 되기 전에는 턴 17 재개를 옛 스키마가 거부하고, 작업은 성공이 아니라 실패로 닫힌다', async () => {
+  // 옛 작업자는 턴 번호 상한이 16인 스키마로 요청을 400으로 거부한다. 게시 서버에는 TaskWorkerRejected로 닿는다.
+  const oldWorker = (script: Script): Script => (r, w, signal) => r.turn > 16 ? rejectStart(r, w, signal) : script(r, w, signal);
+  setup.worker.scripts.push(oldWorker(idle(reply.limited('limited'))));
+  await newTask();
+  await setup.runtime.tickTask();
+  for (let turn = 2; turn <= 16; turn++) {
+    assert.equal(await halfHourLater(), 1);
+    setup.worker.scripts.push(oldWorker(idle(reply.limited('limited'))));
+    await setup.runtime.tickTask();
+  }
+  assert.equal(await halfHourLater(), 1);
+  setup.worker.scripts.push(oldWorker(reply.completed()));
+  await setup.runtime.tickTask();
+  assert.equal(setup.worker.executes.at(-1)!.turn, 17);
+  const [row] = await jobs(db());
+  assert.deepEqual([row!.state, row!.wait_reason], ['failed', 'task_worker_rejected']);
+  assert.equal((await rows('results')).length, 0);
 });
 test('대화 레인 인증 대기는 작업 레인을 막지 않는다(토큰이 다르다). scheduler 표시는 지금 그대로', async () => {
   await chat('chat-1');
