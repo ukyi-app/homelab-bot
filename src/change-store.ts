@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   AMENDMENT_MATERIAL_ID, ARTIFACT_LIMITS, ApprovalSubjectSchema, ArtifactManifestSchema, CHANGE_AMENDMENT, CHANGE_ID, CHANGE_SELF_FIX, ChangeBriefSchema, DeploymentObservationSchema, EFFECT_LEASE_MS, EFFECT_STAGES,
   EffectExpectedSchema, EffectResultSchema, EvidenceBundleSchema, GENERATION_RESTART, GIT_SHA, MAX_GENERATION, ReasonCodeSchema, ReviewReceiptSchema, RevisionSchema, UNKNOWN_RECONCILE_MS,
-  VerificationReceiptSchema, amendmentMaterialsDigest, approvalDigest, artifactDigest, briefDigest, canTransition, changeBranchName, effectResultMatches, evidenceBundleDigest, isTerminalPhase,
+  VerificationReceiptSchema, amendmentEvidenceDigest, amendmentMaterialsDigest, approvalDigest, artifactDigest, briefDigest, canTransition, changeBranchName, effectResultMatches, evidenceBundleDigest, isTerminalPhase,
   labelAllowsAuthorInput, newChangeId, previousEffectStage, propagateLabel, raiseLabel, reviewReceiptDigest, sha256Hex, validateArtifactFiles, verificationReceiptDigest,
 } from './change-contracts.js';
 import type {
@@ -63,6 +63,8 @@ export interface AmendmentRound {
   verifierRevision: string | null; commitSha: string | null; reason: string | null; createdAt: number; startedAt: number | null; finishedAt: number | null;
 }
 export type EffectKey = ChangeKey & { stage: EffectStage };
+// 수정 차례 effect. 처음 게시의 effect와 같은 상태 표이고 승인 digest 대신 차례 번호가 있다.
+export type AmendmentEffect = Omit<EffectRecord, 'approvalDigest'> & { round: number };
 
 const num = (value: unknown) => Number(value);
 const optional = (value: unknown) => value === null || value === undefined ? null : Number(value);
@@ -93,6 +95,10 @@ const amendmentRow = (row: Record<string, unknown>): AmendmentRound => ({
   resultTree: row.result_tree as string | null, artifactDigest: row.artifact_digest as string | null, verifierRevision: row.verifier_revision as string | null,
   commitSha: row.commit_sha as string | null, reason: row.reason as string | null, createdAt: num(row.created_at), startedAt: optional(row.started_at), finishedAt: optional(row.finished_at),
 });
+const amendmentEffectRow = (row: Record<string, unknown>): AmendmentEffect => {
+  const { approvalDigest: _approval, ...rest } = effectRow(row);
+  return { ...rest, round: num(row.round) };
+};
 const stageOrder = (stage: string) => EFFECT_STAGES.indexOf(stage as EffectStage);
 const toBundle = (generation: GenerationRecord): EvidenceBundle | null => {
   const parsed = EvidenceBundleSchema.safeParse({ repoId: generation.repoId, generation: generation.generation, baseCommit: generation.baseCommit, baseTree: generation.baseTree,
@@ -766,6 +772,233 @@ export class ChangeStore {
     });
   }
 
+  // 차례 작성의 base. 차례를 시작한 뒤 다시 읽은 PR head와 그 tree이고 한 번만 정한다. head가 받을 수 있는지(확인 때 head이거나 앞 차례 커밋)는 호출자가 본다.
+  async pinAmendmentBase(input: AmendmentKey & { baseCommit: string; baseTree: string }): Promise<StoreResult<AmendmentRound>> {
+    if (!GIT_SHA.test(input.baseCommit) || !GIT_SHA.test(input.baseTree)) return fail('invalid_input', { detail: 'base' });
+    return attempt<AmendmentRound>(this.database, async tx => {
+      const running = await this.lockAmendment(tx, input);
+      if (!running.ok) return running;
+      if (running.value.baseCommit !== null) {
+        return running.value.baseCommit === input.baseCommit && running.value.baseTree === input.baseTree ? running : fail('base_mismatch');
+      }
+      const row = (await tx.query<Record<string, unknown>>('UPDATE change_amendments SET base_commit=$4,base_tree=$5 WHERE change_id=$1 AND generation=$2 AND round=$3 RETURNING *',
+        [input.changeId, input.generation, input.round, input.baseCommit, input.baseTree])).rows[0]!;
+      return success(amendmentRow(row));
+    });
+  }
+  // 차례 결과 저장. recordSnapshot과 같은 검사(바이트·patch·상한)에 base가 그 차례의 base인지를 본다. 같은 결과의 재저장은 멱등이다.
+  async recordAmendmentSnapshot(input: AmendmentKey & { manifest: ArtifactManifest; files: readonly ArtifactFile[]; patch: string; transportBytes: number }): Promise<StoreResult<{ artifactDigest: string; created: boolean }>> {
+    const parsed = ArtifactManifestSchema.safeParse(input.manifest);
+    if (!parsed.success) return fail('invalid_input', { detail: parsed.error.issues[0]?.message });
+    const manifest = parsed.data;
+    if (input.transportBytes > ARTIFACT_LIMITS.httpBodyBytes) return fail('artifact_too_large');
+    if (sha256Hex(Buffer.from(input.patch)) !== manifest.patchSha256) return fail('artifact_invalid', { detail: 'patch_mismatch' });
+    const files = validateArtifactFiles(manifest, input.files);
+    if (!files.ok) return fail('artifact_invalid', { detail: files.reason });
+    const digest = artifactDigest(manifest);
+    return attempt<{ artifactDigest: string; created: boolean }>(this.database, async tx => {
+      const running = await this.lockAmendment(tx, input);
+      if (!running.ok) return running;
+      const round = running.value;
+      if (round.artifactDigest !== null) return round.artifactDigest === digest ? success({ artifactDigest: digest, created: false }) : fail('artifact_conflict');
+      if (round.baseCommit !== manifest.baseCommit || round.baseTree !== manifest.baseTree) return fail('base_mismatch');
+      const now = this.now();
+      await tx.query(`INSERT INTO change_amendment_artifacts(change_id,generation,round,artifact_digest,result_tree,manifest,patch,label,changed_bytes,transport_bytes,created_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, [input.changeId, input.generation, input.round, digest, manifest.resultTree, JSON.stringify(manifest), input.patch, round.label,
+        files.changedBytes, input.transportBytes, now]);
+      for (const file of input.files) {
+        await tx.query('INSERT INTO change_amendment_artifact_files(change_id,generation,round,path,content) VALUES ($1,$2,$3,$4,$5)',
+          [input.changeId, input.generation, input.round, file.path, Buffer.from(file.content)]);
+      }
+      await tx.query('UPDATE change_amendments SET result_tree=$4,artifact_digest=$5 WHERE change_id=$1 AND generation=$2 AND round=$3',
+        [input.changeId, input.generation, input.round, manifest.resultTree, digest]);
+      return success({ artifactDigest: digest, created: true });
+    });
+  }
+  async loadAmendmentArtifact(key: AmendmentKey): Promise<StoreResult<ArtifactBundle & { artifactDigest: string }>> {
+    const row = (await this.database.query<Record<string, unknown>>('SELECT * FROM change_amendment_artifacts WHERE change_id=$1 AND generation=$2 AND round=$3',
+      [key.changeId, key.generation, key.round])).rows[0];
+    if (!row) return fail('not_found');
+    const files = (await this.database.query<{ path: string; content: Uint8Array }>('SELECT path,content FROM change_amendment_artifact_files WHERE change_id=$1 AND generation=$2 AND round=$3 ORDER BY path',
+      [key.changeId, key.generation, key.round])).rows;
+    return success({ manifest: parseJson<ArtifactManifest>(row.manifest), patch: row.patch as string, artifactDigest: row.artifact_digest as string,
+      files: files.map(file => ({ path: file.path, content: Buffer.from(file.content) })) });
+  }
+  // 차례 시험을 시작한다. 이 뒤에 차례의 증거 묶음이 완성된다.
+  async startAmendmentVerification(input: AmendmentKey & { verifierRevision: string }): Promise<StoreResult<EvidenceBundle>> {
+    if (!RevisionSchema.safeParse(input.verifierRevision).success) return fail('invalid_input', { detail: 'verifier_revision' });
+    return attempt<EvidenceBundle>(this.database, async tx => {
+      const running = await this.lockAmendment(tx, input);
+      if (!running.ok) return running;
+      if (running.value.artifactDigest === null) return fail('not_found', { detail: 'artifact_missing' });
+      if (running.value.verifierRevision === null) {
+        await tx.query('UPDATE change_amendments SET verifier_revision=$4 WHERE change_id=$1 AND generation=$2 AND round=$3', [input.changeId, input.generation, input.round, input.verifierRevision]);
+      }
+      const bundle = await this.amendmentBundleIn(tx, input);
+      return bundle ? success(bundle) : fail('not_found', { detail: 'bundle_incomplete' });
+    });
+  }
+  async amendmentBundle(key: AmendmentKey): Promise<StoreResult<EvidenceBundle>> {
+    const bundle = await this.amendmentBundleIn(this.database, key);
+    return bundle ? success(bundle) : fail('not_found', { detail: 'bundle_incomplete' });
+  }
+  async recordAmendmentVerification(input: AmendmentKey & { receipt: VerificationReceipt }): Promise<StoreResult<{ created: boolean; receiptDigest: string }>> {
+    const parsed = VerificationReceiptSchema.safeParse(input.receipt);
+    if (!parsed.success) return fail('invalid_input', { detail: parsed.error.issues[0]?.message });
+    const receipt = parsed.data;
+    const digest = verificationReceiptDigest(receipt);
+    return attempt<{ created: boolean; receiptDigest: string }>(this.database, async tx => {
+      const running = await this.lockAmendment(tx, input, 'FOR SHARE');
+      if (!running.ok) return running;
+      const existing = (await tx.query<{ receipt_digest: string }>('SELECT receipt_digest FROM change_amendment_verifications WHERE change_id=$1 AND generation=$2 AND round=$3 AND command_id=$4',
+        [input.changeId, input.generation, input.round, receipt.commandId])).rows[0];
+      if (existing) return existing.receipt_digest === digest ? success({ created: false, receiptDigest: digest }) : fail('receipt_conflict');
+      const request = await this.read(tx, input.changeId);
+      if (!request.ok) return request;
+      if (!request.value.brief?.verificationCommandIds.includes(receipt.commandId)) return fail('command_not_allowed');
+      const bundle = await this.amendmentBundleIn(tx, input);
+      if (!bundle || evidenceBundleDigest(bundle) !== evidenceBundleDigest(receipt.bundle)) return fail('bundle_mismatch');
+      const inserted = await tx.query(`INSERT INTO change_amendment_verifications(change_id,generation,round,command_id,status,bundle_digest,receipt,receipt_digest,created_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING RETURNING command_id`, [input.changeId, input.generation, input.round, receipt.commandId, receipt.status,
+        amendmentEvidenceDigest(input.round, bundle), JSON.stringify(receipt), digest, this.now()]);
+      return inserted.rows.length ? success({ created: true, receiptDigest: digest }) : fail('receipt_conflict', { detail: 'concurrent_receipt' });
+    });
+  }
+  async amendmentVerifications(key: AmendmentKey): Promise<VerificationReceipt[]> {
+    return (await this.database.query<{ receipt: unknown }>('SELECT receipt FROM change_amendment_verifications WHERE change_id=$1 AND generation=$2 AND round=$3 ORDER BY command_id',
+      [key.changeId, key.generation, key.round])).rows.map(row => parseJson<VerificationReceipt>(row.receipt));
+  }
+  // 그 차례에 묶인 리뷰 job의 receipt만 받는다. 앞 차례나 처음 게시의 리뷰 job은 이 차례의 receipt를 남기지 못한다.
+  async recordAmendmentReview(input: AmendmentKey & { receipt: ReviewReceipt }): Promise<StoreResult<{ created: boolean; receiptDigest: string }>> {
+    const parsed = ReviewReceiptSchema.safeParse(input.receipt);
+    if (!parsed.success) return fail('invalid_input', { detail: parsed.error.issues[0]?.message });
+    const receipt = parsed.data;
+    const digest = reviewReceiptDigest(receipt);
+    return attempt<{ created: boolean; receiptDigest: string }>(this.database, async tx => {
+      const running = await this.lockAmendment(tx, input, 'FOR SHARE');
+      if (!running.ok) return running;
+      const existing = (await tx.query<{ receipt_digest: string }>('SELECT receipt_digest FROM change_amendment_reviews WHERE change_id=$1 AND generation=$2 AND round=$3',
+        [input.changeId, input.generation, input.round])).rows[0];
+      if (existing) return existing.receipt_digest === digest ? success({ created: false, receiptDigest: digest }) : fail('receipt_conflict');
+      const bundle = await this.amendmentBundleIn(tx, input);
+      if (!bundle || evidenceBundleDigest(bundle) !== evidenceBundleDigest(receipt.bundle)) return fail('bundle_mismatch');
+      const job = await tx.query(`SELECT 1 FROM change_child_jobs WHERE job_id=$1 AND change_id=$2 AND generation=$3 AND role='review' AND amendment_round=$4`,
+        [receipt.jobId, input.changeId, input.generation, input.round]);
+      if (!job.rows.length) return fail('job_not_linked');
+      const inserted = await tx.query(`INSERT INTO change_amendment_reviews(change_id,generation,round,job_id,coverage,verdict,bundle_digest,receipt,receipt_digest,created_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING RETURNING job_id`, [input.changeId, input.generation, input.round, receipt.jobId, receipt.coverage, receipt.verdict,
+        amendmentEvidenceDigest(input.round, bundle), JSON.stringify(receipt), digest, this.now()]);
+      return inserted.rows.length ? success({ created: true, receiptDigest: digest }) : fail('receipt_conflict', { detail: 'concurrent_receipt' });
+    });
+  }
+  async amendmentReview(key: AmendmentKey): Promise<ReviewReceipt | null> {
+    const row = (await this.database.query<{ receipt: unknown }>('SELECT receipt FROM change_amendment_reviews WHERE change_id=$1 AND generation=$2 AND round=$3',
+      [key.changeId, key.generation, key.round])).rows[0];
+    return row ? parseJson<ReviewReceipt>(row.receipt) : null;
+  }
+
+  // ---- 수정 차례 effect ----
+  // 017의 effect 규칙(앞 stage 확정 뒤 intent, lease 없는 전송 없음, unknown은 대조로만)을 차례 키로 따른다. 보내는 조건은 DB 트리거가 다시 본다.
+
+  async recordAmendmentEffectIntent(input: AmendmentKey & { stage: EffectStage; requestDigest: string; expected: EffectExpected }): Promise<StoreResult<AmendmentEffect & { created: boolean }>> {
+    const parsed = EffectExpectedSchema.safeParse(input.expected);
+    if (input.stage === 'pull' || !parsed.success || parsed.data.stage !== input.stage) return fail('invalid_input', { detail: 'expected_stage' });
+    const expected = parsed.data;
+    return attempt<AmendmentEffect & { created: boolean }>(this.database, async tx => {
+      const running = await this.lockAmendment(tx, input, 'FOR SHARE');
+      if (!running.ok) return running;
+      const existing = await this.readAmendmentEffect(tx, input);
+      if (existing) return existing.requestDigest === input.requestDigest ? success({ ...existing, created: false }) : fail('effect_conflict');
+      const previous = previousEffectStage(input.stage);
+      const prior = previous ? await this.readAmendmentEffect(tx, { ...input, stage: previous }) : null;
+      if (previous && prior?.state !== 'confirmed') return fail('predecessor_unconfirmed');
+      const evidence = await this.amendmentEffectMatches(tx, input, running.value, expected, prior);
+      if (!evidence.ok) return evidence;
+      const now = this.now();
+      const row = (await tx.query<Record<string, unknown>>(`INSERT INTO change_amendment_effects(change_id,generation,round,stage,request_digest,expected,available_at,created_at,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$7) ON CONFLICT DO NOTHING RETURNING *`, [input.changeId, input.generation, input.round, input.stage, input.requestDigest, JSON.stringify(expected), now])).rows[0];
+      if (row) return success({ ...amendmentEffectRow(row), created: true });
+      return fail('unresolved_effects');
+    });
+  }
+  async claimAmendmentEffect(key: AmendmentKey & { stage: EffectStage }): Promise<StoreResult<AmendmentEffect & { leaseId: string; leaseUntil: number }>> {
+    return attempt(this.database, async tx => {
+      const running = await this.lockAmendment(tx, key, 'FOR SHARE');
+      if (!running.ok) return running;
+      const effect = await this.readAmendmentEffect(tx, key);
+      if (!effect) return fail('not_found');
+      if (effect.state !== 'pending') return fail('effect_conflict');
+      const now = this.now();
+      if (effect.availableAt > now) return fail('effect_not_due');
+      const leaseId = randomUUID();
+      const leaseUntil = now + EFFECT_LEASE_MS;
+      const row = (await tx.query<Record<string, unknown>>(`UPDATE change_amendment_effects SET state='sending',attempt=attempt+1,lease_id=$5,lease_until=$6,updated_at=$7
+        WHERE change_id=$1 AND generation=$2 AND round=$3 AND stage=$4 AND state='pending' RETURNING *`, [key.changeId, key.generation, key.round, key.stage, leaseId, leaseUntil, now])).rows[0];
+      return row ? success({ ...amendmentEffectRow(row), leaseId, leaseUntil }) : fail('effect_conflict');
+    });
+  }
+  // leaseId가 null이면 unknown 대조의 확정이다. 응답이 저장한 기대값과 다르면 확정하지 않는다.
+  async confirmAmendmentEffect(input: AmendmentKey & { stage: EffectStage; leaseId: string | null; result: EffectResult }): Promise<StoreResult<AmendmentEffect>> {
+    const parsed = EffectResultSchema.safeParse(input.result);
+    if (!parsed.success) return fail('invalid_input', { detail: 'result_shape' });
+    return attempt(this.database, async tx => {
+      const effect = await this.readAmendmentEffect(tx, input);
+      if (!effect) return fail('not_found');
+      if (effect.state !== 'sending' && effect.state !== 'unknown') return fail('effect_conflict');
+      if (effect.state === 'sending' && effect.leaseId !== input.leaseId) return fail('lease_mismatch');
+      if (!effectResultMatches(effect.expected, parsed.data)) return fail('result_mismatch');
+      const row = (await tx.query<Record<string, unknown>>(`UPDATE change_amendment_effects SET state='confirmed',lease_id=NULL,lease_until=NULL,result=$6,updated_at=$7
+        WHERE change_id=$1 AND generation=$2 AND round=$3 AND stage=$4 AND state=$5 RETURNING *`, [input.changeId, input.generation, input.round, input.stage, effect.state,
+        JSON.stringify(parsed.data), this.now()])).rows[0];
+      return row ? success(amendmentEffectRow(row)) : fail('effect_conflict');
+    });
+  }
+  async markAmendmentEffectUnknown(input: AmendmentKey & { stage: EffectStage; leaseId: string; code: string }): Promise<StoreResult<AmendmentEffect>> {
+    if (!ReasonCodeSchema.safeParse(input.code).success) return fail('invalid_input', { detail: 'reason_code' });
+    const now = this.now();
+    const row = (await this.database.query<Record<string, unknown>>(`UPDATE change_amendment_effects SET state='unknown',lease_id=NULL,lease_until=NULL,failure_code=$6,reconcile_deadline=$7,updated_at=$8
+      WHERE change_id=$1 AND generation=$2 AND round=$3 AND stage=$4 AND state='sending' AND lease_id=$5 RETURNING *`,
+    [input.changeId, input.generation, input.round, input.stage, input.leaseId, input.code, now + UNKNOWN_RECONCILE_MS, now])).rows[0];
+    return row ? success(amendmentEffectRow(row)) : fail('lease_mismatch');
+  }
+  // 연결 전 실패처럼 확실히 안 나간 경우만 쓴다. 다시 보내지 않고 안 나간 것으로 해소한다. 차례는 호출자가 실패로 닫는다(재시도는 다음 수정 요청이다).
+  async abandonUnsentAmendmentEffect(input: AmendmentKey & { stage: EffectStage; leaseId: string | null }): Promise<StoreResult<AmendmentEffect>> {
+    const now = this.now();
+    const row = (await this.database.query<Record<string, unknown>>(`UPDATE change_amendment_effects SET state='blocked',blocked_reason='abandoned_unsent',resolution='not_sent',resolved_by='system',resolved_at=$6,
+      lease_id=NULL,lease_until=NULL,updated_at=$6 WHERE change_id=$1 AND generation=$2 AND round=$3 AND stage=$4 AND ((state='sending' AND lease_id=$5) OR ($5::text IS NULL AND state='pending')) RETURNING *`,
+    [input.changeId, input.generation, input.round, input.stage, input.leaseId, now])).rows[0];
+    return row ? success(amendmentEffectRow(row)) : fail('lease_mismatch');
+  }
+  // 대조로도 풀리지 않는 effect. 부모를 blocked로 닫는다(공개된 객체가 어디까지인지 사람이 확인해야 한다).
+  async blockAmendmentEffect(input: AmendmentKey & { stage: EffectStage; reason: string }): Promise<StoreResult<AmendmentEffect>> {
+    if (!ReasonCodeSchema.safeParse(input.reason).success) return fail('invalid_input', { detail: 'reason_code' });
+    return attempt(this.database, async tx => {
+      const request = await this.read(tx, input.changeId, 'FOR UPDATE');
+      if (!request.ok) return request;
+      const now = this.now();
+      const row = (await tx.query<Record<string, unknown>>(`UPDATE change_amendment_effects SET state='blocked',blocked_reason=$5,lease_id=NULL,lease_until=NULL,updated_at=$6
+        WHERE change_id=$1 AND generation=$2 AND round=$3 AND stage=$4 AND state IN ('pending','sending','unknown') RETURNING *`,
+      [input.changeId, input.generation, input.round, input.stage, input.reason, now])).rows[0];
+      if (!row) return fail('effect_conflict');
+      if (request.value.generation === input.generation && request.value.phase === 'amending') {
+        const moved = await this.move(tx, { changeId: input.changeId, generation: input.generation, from: 'amending', to: 'blocked', reason: 'effect_blocked' });
+        if (!moved.ok) return moved;
+      }
+      return success(amendmentEffectRow(row));
+    });
+  }
+  async amendmentEffects(filter: { changeId?: string; unresolved?: boolean } = {}): Promise<AmendmentEffect[]> {
+    return (await this.database.query<Record<string, unknown>>(`SELECT * FROM change_amendment_effects WHERE ($1::text IS NULL OR change_id=$1)
+      AND (NOT $2::boolean OR (state<>'confirmed' AND resolution IS NULL)) ORDER BY change_id,generation,round`, [filter.changeId ?? null, filter.unresolved ?? false])).rows
+      .map(amendmentEffectRow).sort((a, b) => a.round - b.round || stageOrder(a.stage) - stageOrder(b.stage));
+  }
+  // 임대가 끝난 전송은 나갔는지 모른다. 대조 대상으로 옮긴다.
+  async expireSendingAmendmentEffects(): Promise<AmendmentEffect[]> {
+    const now = this.now();
+    return (await this.database.query<Record<string, unknown>>(`UPDATE change_amendment_effects SET state='unknown',lease_id=NULL,lease_until=NULL,failure_code='lease_expired',reconcile_deadline=$1,updated_at=$2
+      WHERE state='sending' AND lease_until<=$2 RETURNING *`, [now + UNKNOWN_RECONCILE_MS, now])).rows.map(amendmentEffectRow);
+  }
+
   async amendments(key: ChangeKey): Promise<AmendmentRound[]> {
     return (await this.database.query<Record<string, unknown>>('SELECT * FROM change_amendments WHERE change_id=$1 AND generation=$2 ORDER BY round', [key.changeId, key.generation])).rows.map(amendmentRow);
   }
@@ -778,6 +1011,53 @@ export class ChangeStore {
   async publishedHeadOf(key: ChangeKey): Promise<string | null> {
     const pull = await this.readEffect(this.database, { ...key, stage: 'pull' });
     return pull?.result?.stage === 'pull' ? this.publishedHead(this.database, key, pull.result.headSha) : null;
+  }
+  // 부모가 amending이고 그 차례가 running일 때만 차례 증거·effect를 받는다.
+  private async lockAmendment(tx: Database, key: AmendmentKey, lock: 'FOR SHARE' | 'FOR UPDATE' = 'FOR UPDATE'): Promise<StoreResult<AmendmentRound>> {
+    const request = await this.read(tx, key.changeId, lock);
+    if (!request.ok) return request;
+    if (request.value.generation !== key.generation || request.value.phase !== 'amending') return this.conflict(request.value);
+    const row = (await tx.query<Record<string, unknown>>('SELECT * FROM change_amendments WHERE change_id=$1 AND generation=$2 AND round=$3', [key.changeId, key.generation, key.round])).rows[0];
+    if (!row || row.state !== 'running') return fail('amendment_not_running');
+    return success(amendmentRow(row));
+  }
+  private async amendmentBundleIn(tx: Database, key: AmendmentKey): Promise<EvidenceBundle | null> {
+    const row = (await tx.query<Record<string, unknown>>(`SELECT a.*,g.repo_id,g.policy_revision FROM change_amendments a JOIN change_generations g ON g.change_id=a.change_id AND g.generation=a.generation
+      WHERE a.change_id=$1 AND a.generation=$2 AND a.round=$3`, [key.changeId, key.generation, key.round])).rows[0];
+    if (!row) return null;
+    const parsed = EvidenceBundleSchema.safeParse({ repoId: num(row.repo_id), generation: key.generation, baseCommit: row.base_commit, baseTree: row.base_tree, resultTree: row.result_tree,
+      artifactDigest: row.artifact_digest, policyRevision: row.policy_revision, verifierRevision: row.verifier_revision });
+    return parsed.success ? parsed.data : null;
+  }
+  private async readAmendmentEffect(tx: Database, key: AmendmentKey & { stage: EffectStage }): Promise<AmendmentEffect | null> {
+    const row = (await tx.query<Record<string, unknown>>('SELECT * FROM change_amendment_effects WHERE change_id=$1 AND generation=$2 AND round=$3 AND stage=$4',
+      [key.changeId, key.generation, key.round, key.stage])).rows[0];
+    return row ? amendmentEffectRow(row) : null;
+  }
+  // 기대값이 그 차례의 증거와 같아야 intent를 받는다. 부모는 차례 base(확인한 PR head) 하나이고 ref는 그 generation의 브랜치다.
+  private async amendmentEffectMatches(tx: Database, key: AmendmentKey, round: AmendmentRound, expected: EffectExpected, prior: AmendmentEffect | null): Promise<StoreResult<null>> {
+    const mismatch = fail('evidence_mismatch', { detail: expected.stage });
+    switch (expected.stage) {
+      case 'blob': {
+        const artifact = (await tx.query<{ manifest: unknown }>('SELECT manifest FROM change_amendment_artifacts WHERE change_id=$1 AND generation=$2 AND round=$3',
+          [key.changeId, key.generation, key.round])).rows[0];
+        if (!artifact) return fail('not_found');
+        const manifest = parseJson<ArtifactManifest>(artifact.manifest);
+        const required = new Set(manifest.entries.filter(entry => entry.changeKind === 'added' || entry.changeKind === 'modified').map(entry => entry.blobSha));
+        const given = new Set(expected.shas);
+        return given.size === required.size && [...required].every(sha => given.has(sha)) ? success(null) : mismatch;
+      }
+      case 'tree':
+        return expected.baseTree === round.baseTree && expected.treeSha === round.resultTree ? success(null) : mismatch;
+      case 'commit':
+        return expected.treeSha === round.resultTree && expected.parent === round.baseCommit ? success(null) : mismatch;
+      case 'ref': {
+        const generation = (await tx.query<{ branch: string }>('SELECT branch FROM change_generations WHERE change_id=$1 AND generation=$2', [key.changeId, key.generation])).rows[0];
+        if (expected.ref !== `refs/heads/${generation?.branch ?? ''}`) return fail('branch_mismatch');
+        return prior?.result?.stage === 'commit' && prior.result.commitSha === expected.sha ? success(null) : mismatch;
+      }
+      case 'pull': return mismatch;
+    }
   }
   private async publishedHead(tx: Database, key: ChangeKey, pullHead: string): Promise<string> {
     const row = (await tx.query<{ sha: string }>(`SELECT result->>'sha' AS sha FROM change_amendment_effects WHERE change_id=$1 AND generation=$2 AND stage='ref' AND state='confirmed'
