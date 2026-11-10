@@ -59,3 +59,40 @@ test('C28 판: 작업자가 받는 판을 알리지 않으면(옛 port) 지금�
     assert.ok(!call!.input.startsWith(TASK_INSTRUCTIONS[CHANGE_INSTRUCTIONS_REVISION]));
   });
 });
+
+// ---- 선택지 저장과 공개 검사 ----
+
+const options = async (h: Harness, question: string) => (await h.db.query<{ options: string[] | null }>('SELECT options FROM codex_questions WHERE id=$1', [question])).rows[0]!.options;
+test('C28 저장: 변경 작성 질문의 선택지가 질문 행에 그 순서로 저장된다', async () => {
+  await withHarness({ changeV2: true, steps: [CHOICE_QUESTION, V2_WRITE] }, async h => {
+    const { question } = await toQuestion(h);
+    assert.deepEqual(await options(h, question), OPTIONS);
+  });
+});
+
+test('C28 계약: 선택지가 1개·5개인 질문은 작업자 계약(C25)이 받지 않아 질문 없이 변경이 실패로 닫힌다', async () => {
+  for (const bad of [['하나뿐'], ['1', '2', '3', '4', '5']]) {
+    await withHarness({ changeV2: true, steps: [{ output: authored({ status: 'needs_input', summary: '', question: '어느 쪽?', options: bad }) }] }, async h => {
+      await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+      const id = await h.changeId();
+      await h.pump(async () => await h.phase(id) === 'failed');
+      assert.equal((await h.changes.get(id) as any).value.phaseReason, 'invalid_output', JSON.stringify(bad));
+      assert.equal((await h.db.query('SELECT 1 FROM codex_questions')).rows.length, 0);
+    });
+  }
+});
+
+const MARKER = 'fixture-corp-host';
+test('C28 공개 검사: 선택지에 내부 표식이 있으면 질문 행·게시 없이 task_question_sensitive로 막는다', async () => {
+  const leaking: Step = { output: authored({ status: 'needs_input', summary: '', question: '어느 쪽을 고칠까요?', options: ['그대로 둔다', `${MARKER}로 바꾼다`] }) };
+  await withHarness({ changeV2: true, colleague: true, steps: [leaking] }, async h => {
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    await h.pump(async () => await h.phase(id) === 'blocked');
+    assert.equal((await h.changes.get(id) as any).value.phaseReason, 'task_question_sensitive');
+    assert.equal((await h.db.query('SELECT 1 FROM codex_questions')).rows.length, 0, '질문 행을 만들지 않는다');
+    for (let round = 0; round < 20; round++) { await h.runtime.childrenTick(); await h.runtime.publishTick(); }
+    await h.deliver();
+    assert.ok(!JSON.stringify((await h.db.query('SELECT payload FROM outbox')).rows).includes(MARKER), 'outbox에 없다');
+  });
+});

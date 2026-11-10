@@ -781,10 +781,13 @@ const RETENTION_COLUMNS: Record<string, string[]> = {
 };
 // 022(C19)는 codex_sessions에 기본값 0인 NOT NULL 칸 하나를 더한다. 옛 코드는 이 칸을 쓰지 않아 기본값이 들어간다.
 const C19_COLUMNS: Record<string, string[]> = { codex_sessions: ['model_wait_turns'] };
+// 023(C28)은 codex_questions에 NULL 허용 칸 둘(선택지와 그 digest)과 각 CHECK를 더한다.
+const C28_COLUMNS: Record<string, string[]> = { codex_questions: ['options', 'options_sha256'] };
 const columnMatch = (map: Record<string, string[]>) => Object.entries(map).map(([table, columns]) => `(table_name='${table}' AND column_name IN (${columns.map(c => `'${c}'`).join(',')}))`).join(' OR ');
 const RETENTION_MATCH = columnMatch(RETENTION_COLUMNS);
-const T27_COLUMNS = `NOT (${RETENTION_MATCH}) AND NOT (${columnMatch(C19_COLUMNS)})`;
-const RETENTION_CHECKS = ['codex_questions_answer_sha256_check', 'codex_questions_prompt_sha256_check', 'events_text_sha256_check', 'outbox_content_sha256_check', 'results_result_sha256_check'];
+const T27_COLUMNS = `NOT (${RETENTION_MATCH}) AND NOT (${columnMatch(C19_COLUMNS)}) AND NOT (${columnMatch(C28_COLUMNS)})`;
+const RETENTION_CHECKS = ['codex_questions_answer_sha256_check', 'codex_questions_prompt_sha256_check', 'events_text_sha256_check', 'outbox_content_sha256_check', 'results_result_sha256_check',
+  'codex_questions_options_check', 'codex_questions_options_sha256_check'];
 const C19_CONSTRAINTS = ['codex_sessions_model_wait_turns_not_null'];
 const schemaOf = async (db: Database) => JSON.stringify((await db.query(`SELECT table_name,column_name,data_type,is_nullable,column_default
   FROM information_schema.columns WHERE ${OLD_TABLES} AND ${T27_COLUMNS} ORDER BY table_name,ordinal_position`)).rows);
@@ -797,7 +800,7 @@ test('T19 B0 migration: 016 DB에 017만 더하고 기존 표·제약·행을 �
   try {
     const db = migrationDatabase(pg);
     const upTo016 = MIGRATIONS.filter(file => Number.parseInt(file, 10) <= 16);
-    assert.equal(upTo016.length, MIGRATIONS.length - 6);
+    assert.equal(upTo016.length, MIGRATIONS.length - 7);
     for (const file of upTo016) await pg.exec(await readFile(`migrations/${file}`, 'utf8'));
     await seedConversation(db);
     await insertChildJob(db, 'existing-job', 'task');
@@ -805,12 +808,13 @@ test('T19 B0 migration: 016 DB에 017만 더하고 기존 표·제약·행을 �
     const constraints = await constraintsOf(db);
     const jobs = JSON.stringify((await db.query('SELECT * FROM jobs')).rows);
 
-    assert.deepEqual(await migrate(db), [17, 18, 19, 20, 21, 22]);
+    assert.deepEqual(await migrate(db), [17, 18, 19, 20, 21, 22, 23]);
     assert.equal(await schemaOf(db), schema);
     const added = (await db.query<{ table_name: string; column_name: string; is_nullable: string; column_default: string | null }>(`SELECT table_name,column_name,is_nullable,column_default
       FROM information_schema.columns WHERE ${OLD_TABLES} AND NOT (${T27_COLUMNS}) ORDER BY table_name,column_name`)).rows;
     assert.deepEqual(added.map(c => [c.table_name, c.column_name, c.is_nullable, c.column_default]), [
       ...Object.entries(RETENTION_COLUMNS).flatMap(([table, columns]) => columns.map(column => [table, column, 'YES', null])),
+      ...Object.entries(C28_COLUMNS).flatMap(([table, columns]) => columns.map(column => [table, column, 'YES', null])),
       ['codex_sessions', 'model_wait_turns', 'NO', '0'],
     ].sort((a, b) => `${a[0]}.${a[1]}`.localeCompare(`${b[0]}.${b[1]}`)));
     assert.equal(await constraintsOf(db), constraints);

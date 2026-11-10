@@ -64,7 +64,7 @@ export const MIGRATIONS = Object.freeze(['001_foundation.sql', '002_denial_revis
   '008_pr_review.sql', '009_codex_bridge.sql', '010_memory_briefing.sql', '011_reconcile_backoff.sql',
   '012_deletion_ledger_generation.sql', '013_task_lane.sql', '015_task_wait_reason.sql', '016_external_task_links.sql',
   '017_change_pr.sql', '018_change_runtime.sql', '019_raw_input_retention.sql', '020_raw_text_retention.sql', '021_proposals.sql',
-  '022_model_pause.sql']);
+  '022_model_pause.sql', '023_question_options.sql']);
 export const migrationVersion = (file: string) => Number.parseInt(file.slice(0, 3), 10);
 export async function appliedMigrations(db: Database): Promise<Set<number>> {
   const table = (await db.query<{ name: string | null }>("SELECT to_regclass('schema_migrations')::text AS name")).rows[0];

@@ -524,7 +524,9 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
           }
           return settled;
         }
-        if (await this.ask(job, revision, taskQuestionId(job.id, request.sessionId, request.turn), request.sessionId, request.turn, response.question, store)) {
+        // 선택지는 변경 작성 판(v2) 결과에만 있다. 공개 검사는 fetchResult가 질문과 함께 마쳤다(걸리면 question_blocked로 여기 오지 않는다).
+        const options = (response as { options?: readonly string[] }).options;
+        if (await this.ask(job, revision, taskQuestionId(job.id, request.sessionId, request.turn), request.sessionId, request.turn, response.question, store, options)) {
           await end('waiting_answer');
           return { terminal: false };
         }
@@ -747,8 +749,8 @@ export interface ChangeAuthorSource {
   // change generation의 작성 job.
   authorJob(key: ChangeKey): Promise<string | null>;
   keyOf(jobId: string): Promise<ChangeKey | null>;
-  // 모델 질문을 스레드에 내보내면 안 되는 사유 코드. 없으면 null이다.
-  questionRisk(jobId: string, question: string): Promise<string | null>;
+  // 모델 질문을 스레드에 내보내면 안 되는 사유 코드. 없으면 null이다. 선택지가 있으면 그 글도 함께 본다(질문 글과 버튼으로 나간다).
+  questionRisk(jobId: string, question: string, options?: readonly string[]): Promise<string | null>;
 }
 export interface ChangeAuthorDeps { bridge: ClaudeTaskBridge; store: Store; gate: PolicyGate; worker: TaskV2WorkerPort; source: ChangeAuthorSource; artifacts: ChangeArtifactPort }
 const TERMINAL_SESSION = new Set(['completed', 'failed', 'cancelled']);
@@ -896,11 +898,11 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
     }
     const stop = result.status === 'failed' && result.reason === 'aborted' ? 'cancel' as const : undefined;
     // 질문 경로는 스레드로 바로 나간다. 질문 행을 만들기 전에 본다. 정책을 못 읽어 던지면 아무것도 나가지 않고 다음 바퀴에 같은 결과를 다시 본다.
-    const risky = result.status === 'needs_input' && await this.deps.source.questionRisk(jobId, result.question) !== null;
+    const risky = result.status === 'needs_input' && await this.deps.source.questionRisk(jobId, result.question, result.options) !== null;
     const settled = await this.settled(job, session, result, stop, risky);
     this.deps.bridge.reportChangeEnd(jobId, settled);
     if (risky) return { kind: 'failed', code: CHANGE_QUESTION_BLOCKED };
-    if (result.status === 'needs_input') return { kind: 'needs_input', question: result.question };
+    if (result.status === 'needs_input') return { kind: 'needs_input', question: result.question, ...(result.options ? { options: result.options } : {}) };
     if (result.status === 'failed') return stop ? { kind: 'cancelled', code: 'aborted' } : { kind: 'failed', code: result.reason };
     if (result.status === 'unknown') return settled.terminal ? { kind: 'failed', code: 'task_worker_lost' } : { kind: 'unknown', code: 'stop_unconfirmed' };
     return { kind: 'unknown', code: result.status === 'limited' ? 'model_limit' : 'auth_expired' };
