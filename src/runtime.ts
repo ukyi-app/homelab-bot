@@ -156,7 +156,7 @@ export class Runtime {
       stopped = result.stopped;
       waiting = result.stopped && (result.status === 'limited' || result.status === 'auth_expired');
       // 대기가 아닌 결과의 한도 경고도 계정 기록에 남긴다(리뷰 미루기). 기록 실패가 답 처리를 막지 않는다.
-      if (result.stopped && !waiting) await this.store.observeRateLimit(result.rateLimit)
+      if (result.stopped && !waiting) await this.store.observeRateLimit(result.rateLimit, job.id)
         .catch(error => this.log('rate_limit_observe_failed', { job: job.id, ...errorInfo(error) }));
       try { latestPolicy = await this.gate.authorize(job.owner_id, job.target); }
       catch (error) {

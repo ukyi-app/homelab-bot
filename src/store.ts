@@ -467,13 +467,19 @@ export class Store {
       utilization=EXCLUDED.utilization,retry_at=EXCLUDED.retry_at,paused_at=EXCLUDED.paused_at`,
     [job, kind, resetsAt, rateLimit?.event?.rateLimitType ?? null, rateLimit?.event?.utilization ?? null, retryAt, now]);
     if (kind !== 'billing') await tx.query('UPDATE jobs SET attempt=GREATEST(0,attempt-1) WHERE id=$1', [job]);
-    await this.observeRateLimit(rateLimit, tx);
+    await this.observeRateLimit(rateLimit, job, tx);
   }
   // 그 실행에서 본 마지막 한도 이벤트를 계정 기록에 남긴다. allowed_warning과 풀리는 시각이 오면 그때까지 새 PR 리뷰를 미룬다
   // (COLLEAGUE_SPEC §4.7 "리뷰 미루기"). 기한은 늘리기만 한다. 5시간 창 경고 뒤에 주간 창 경고가 오면 주간 창이 풀릴 때까지다.
-  async observeRateLimit(rateLimit: RateLimitInfo | null | undefined, tx = this.db): Promise<void> {
+  // job: 그 관측을 낸 실행의 작업 ID. 지금 계정으로 바뀌기 전에 시작한 실행은 옛 자격으로 돌았을 수 있어(작업자는 실행을 시작할 때
+  // 자격 파일을 읽는다) 그 관측을 지금 계정의 한도 상태에 적지 않는다. 전환 직전에 시작해 이미 새 자격을 읽은 실행의 관측도 함께
+  // 버리지만, 옛 계정의 사용률로 새 계정의 리뷰를 미루는 쪽보다 낫다. 멈춤 기록(model_pauses)과 재개는 이 판단과 무관하다.
+  // 같은 밀리초는 어느 쪽이 먼저인지 몰라 버린다. null은 실행을 모르는 관측이다(시험에서만 쓴다).
+  async observeRateLimit(rateLimit: RateLimitInfo | null | undefined, job: string | null, tx = this.db): Promise<void> {
     const event = rateLimit?.event;
     if (!event) return;
+    if (job !== null && (await tx.query(`SELECT 1 FROM jobs j JOIN model_accounts a ON a.current
+      WHERE j.id=$1 AND j.started_at <= a.switched_at`, [job])).rows.length > 0) return;
     const deferUntil = event.status === 'allowed_warning' && event.resetsAt !== undefined ? event.resetsAt * 1000 : null;
     await tx.query(`INSERT INTO model_limit_state(id,status,rate_limit_type,utilization,resets_at,observed_at,review_deferred_until)
       VALUES ('account',$1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO UPDATE SET status=EXCLUDED.status,rate_limit_type=EXCLUDED.rate_limit_type,

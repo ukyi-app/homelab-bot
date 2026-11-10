@@ -486,7 +486,7 @@ test('AC-17 리뷰를 미루는 동안 브리핑에 미룬 PR 리뷰 건수가 �
   const none = (await briefings())[0]!.payload.content;
   assert.ok(!none.includes(BRIEFING_TEXT.reviewsDeferred(2)), none);
 
-  await f.store.observeRateLimit({ event: { status: 'allowed_warning', resetsAt: Math.floor((SLOT + DAY + 3_600_000) / 1000) } });
+  await f.store.observeRateLimit({ event: { status: 'allowed_warning', resetsAt: Math.floor((SLOT + DAY + 3_600_000) / 1000) } }, null);
   at(SLOT + DAY); assert.equal(await briefing.tick(), 'enqueued');
   const deferred = (await briefings())[1]!.payload.content;
   assert.ok(deferred.includes(BRIEFING_TEXT.reviewsDeferred(2)), deferred);

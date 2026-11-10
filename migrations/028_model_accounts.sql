@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS model_accounts (
   issued_at bigint,
   registered_at bigint NOT NULL,
   current boolean NOT NULL DEFAULT false,
+  -- 마지막으로 지금 계정이 된 시각(ms). 이보다 먼저 시작한 실행의 한도 관측은 옛 자격 것일 수 있어 지금 한도 상태에 적지 않는다.
+  switched_at bigint,
   -- 이 계정에서 다른 계정으로 바꿀 때 옮겨 둔 마지막 한도 관측(model_limit_state는 지금 계정 것만 든다).
   last_status text,
   last_rate_limit_type text,

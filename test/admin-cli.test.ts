@@ -4,6 +4,9 @@ import { ADMIN_ACTOR, AdminUsage, parseAdminArgs, runAdmin } from '../src/admin.
 import type { AdminCommand, AdminPorts } from '../src/admin.js';
 import { adminPorts, executeAdmin } from '../src/admin-main.js';
 import { DEFAULTS, Denied } from '../src/contracts.js';
+import type { Database } from '../src/database.js';
+import { Runtime } from '../src/runtime.js';
+import { Store } from '../src/store.js';
 import { localDatabase, fixture, event, thread } from './helpers.js';
 import { codexBridge, codexSession, lane, reply, task } from './task-lane-fixture.js';
 
@@ -361,7 +364,7 @@ test('계정 전환: 옛 계정의 마지막 한도 관측은 그 계정 목록�
   await admin('account', 'record', 'spare', 'subscription');
   await admin('account', 'use', 'main', 'subscription');
   const resets = Math.floor((f.now() + 3_600_000) / 1000);
-  await f.store.observeRateLimit({ event: { status: 'allowed_warning', rateLimitType: 'five_hour', utilization: 0.97, resetsAt: resets } });
+  await f.store.observeRateLimit({ event: { status: 'allowed_warning', rateLimitType: 'five_hour', utilization: 0.97, resetsAt: resets } }, null);
   const seen = { status: 'allowed_warning', rateLimitType: 'five_hour', utilization: 0.97, resetsAt: '2027-01-15T09:00:00Z', observedAt: '2027-01-15T08:00:00Z' };
   assert.deepEqual((await admin('account', 'list')).report.accounts?.find(a => a.name === 'main')?.limit, seen);
   assert.notEqual(await f.store.reviewDeferredUntil(), null);
@@ -370,6 +373,72 @@ test('계정 전환: 옛 계정의 마지막 한도 관측은 그 계정 목록�
   assert.deepEqual(accounts.find(a => a.name === 'main')?.limit, seen);
   assert.equal(accounts.find(a => a.name === 'spare')?.limit, null);
   assert.equal(await f.store.reviewDeferredUntil(), null);
+  // A → B → A: 돌아온 지금 계정에 전환 뒤 관측이 아직 없으면 옮겨 둔 마지막 관측을 보인다. 리뷰 미루기는 되살리지 않는다.
+  await admin('account', 'use', 'main', 'subscription');
+  const back = (await admin('account', 'list')).report.accounts!.find(a => a.name === 'main')!;
+  assert.equal(back.current, true);
+  assert.deepEqual(back.limit, seen);
+  assert.equal(await f.store.reviewDeferredUntil(), null);
+});
+
+const warned = (status: 'allowed_warning' | 'rejected' = 'allowed_warning') =>
+  ({ status, rateLimitType: 'five_hour' as const, utilization: 0.97, resetsAt: Math.floor((f.now() + 3_600_000) / 1000) });
+const limitState = async () => (await database.db.query<{ utilization: number | null; review_deferred_until: string | null }>(
+  "SELECT utilization,review_deferred_until FROM model_limit_state WHERE id='account'")).rows;
+const switchMidRun = async (name: string) => { f.advance(1); await admin('account', 'use', name, 'subscription'); };
+
+test('계정 전환: 전환 전에 시작한 대화·작업 실행이 전환 뒤 한도 경고로 끝나도 새 계정의 사용률·리뷰 미루기는 비어 있고, 전환 뒤 시작한 실행의 관측은 적힌다', async () => {
+  await admin('account', 'record', 'main', 'subscription');
+  await admin('account', 'record', 'spare', 'subscription');
+  await admin('account', 'use', 'main', 'subscription');
+  // 대화: 실행 중에 owner가 spare로 바꾸고, 옛 자격으로 돈 실행이 한도 경고와 함께 끝난다.
+  f.setRun(async () => { await switchMidRun('spare');
+    return { status: 'succeeded', stopped: true, rateLimit: { event: warned() }, output: { reply: '답했어요.', proposal: null, ack_only: false } }; });
+  await queued('chat-before');
+  assert.equal(await f.runtime.tick(), true);
+  assert.deepEqual(await limitState(), []);
+  assert.equal(await f.store.reviewDeferredUntil(), null);
+  // 전환 뒤 시작한 대화의 관측은 지금 계정 상태에 적는다.
+  f.setRun(async () => ({ status: 'succeeded', stopped: true, rateLimit: { event: warned() }, output: { reply: '답했어요.', proposal: null, ack_only: false } }));
+  await queued('chat-after');
+  assert.equal(await f.runtime.tick(), true);
+  assert.deepEqual((await limitState()).map(row => row.utilization), [0.97]);
+  assert.notEqual(await f.store.reviewDeferredUntil(), null);
+  // 작업 레인: 실행 중에 main으로 바꾸고(전환이 한도 상태를 비운다), 옛 자격으로 돈 실행이 한도 경고를 실은 한도 멈춤으로 끝난다.
+  // 멈춤 기록과 30분 재시도는 그대로 남아 새 자격으로 다시 돈다.
+  const local = lane(f);
+  local.worker.scripts.push(async (request, worker) => { await switchMidRun('main');
+    return { ...reply.limited()(request, worker), rateLimit: { event: warned(), stop: { cause: 'rate_limit' } } }; });
+  const created = await task(f, database.db);
+  await local.runtime.tickTask();
+  assert.deepEqual(await job(created.id), { state: 'waiting_user', wait_reason: 'model_limit' });
+  const pause = (await database.db.query<{ kind: string; retry_at: string | null }>('SELECT kind,retry_at FROM model_pauses WHERE job_id=$1', [created.id])).rows;
+  assert.deepEqual(pause.map(row => [row.kind, row.retry_at !== null]), [['rate_limit', true]]);
+  assert.deepEqual(await limitState(), []);
+  assert.equal(await f.store.reviewDeferredUntil(), null);
+});
+
+test('계정 전환 잠금 순서: 전환과 모델 대기가 모두 scheduler 행을 한도 상태(model_limit_state)보다 먼저 잡는다', async () => {
+  await admin('account', 'record', 'main', 'subscription');
+  await admin('account', 'record', 'spare', 'subscription');
+  await admin('account', 'use', 'main', 'subscription');
+  await f.store.observeRateLimit({ event: warned() }, null);
+  const sequence: string[][] = [];
+  const kind = (sql: string) => /FROM controls WHERE key='scheduler' FOR UPDATE/.test(sql) ? 'scheduler'
+    : /^\s*(INSERT INTO|DELETE FROM|UPDATE) model_limit_state\b/.test(sql) ? 'limit' : undefined;
+  const recorded: Database = { query: (sql, params) => database.db.query(sql, params), transaction: (fn, deadline) => database.db.transaction(tx => {
+    const log: string[] = [];
+    sequence.push(log);
+    return fn({ query: (sql, params) => { const k = kind(sql); if (k) log.push(k); return tx.query(sql, params); }, transaction: inner => tx.transaction(inner) });
+  }, deadline) };
+  const local = new Store(recorded, f.now);
+  f.setRun(async () => ({ status: 'limited', stopped: true, rateLimit: { event: warned('rejected'), stop: { cause: 'rate_limit' } } }));
+  await queued();
+  assert.equal(await new Runtime(local, f.gate, f.worker, f.signer, f.reader).tick(), true);
+  assert.equal((await runAdmin(local, parseAdminArgs(['account', 'use', 'spare', 'subscription']))).report.result, 'switched');
+  const checked = sequence.filter(log => log.includes('limit'));
+  assert.equal(checked.length, 2, JSON.stringify(sequence));
+  for (const log of checked) assert.ok(log.includes('scheduler') && log.indexOf('scheduler') < log.indexOf('limit'), log.join(','));
 });
 
 test('관리 진입점 입력은 고정 명령 단어와 형식이 맞는 ID만 받는다', () => {

@@ -41,8 +41,9 @@ export async function listAccounts(db: Database): Promise<{ accounts: AccountVie
     "SELECT status,rate_limit_type,utilization,resets_at,observed_at FROM model_limit_state WHERE id='account' AND observed_at IS NOT NULL")).rows[0];
   const accounts = rows.map((row): AccountView => {
     const issued = num(row.issued_at);
-    const seen = row.current
-      ? live && { status: live.status, rateLimitType: live.rate_limit_type, utilization: num(live.utilization), resetsAt: iso(live.resets_at), observedAt: iso(live.observed_at) }
+    // 지금 계정이라도 전환 뒤 관측이 아직 없으면 그 계정에서 옮겨 둔 값을 보인다(A → B → A). 표시만이고 리뷰 미루기는 되살리지 않는다.
+    const seen = row.current && live
+      ? { status: live.status, rateLimitType: live.rate_limit_type, utilization: num(live.utilization), resetsAt: iso(live.resets_at), observedAt: iso(live.observed_at) }
       : row.last_observed_at !== null && { status: row.last_status, rateLimitType: row.last_rate_limit_type, utilization: num(row.last_utilization),
         resetsAt: iso(row.last_resets_at), observedAt: iso(row.last_observed_at) };
     return { name: row.name, method: row.method, current: row.current, issuedAt: issued === null ? null : isoSeconds(issued),
@@ -72,6 +73,9 @@ export type SwitchOutcome = { result: 'unknown_account' } | { result: 'switched'
 // - 비상 정지 중이면 해제하지 않는다. 큐가 차면 거기서 멈추고, 남은 한도·인증 대기는 예약 루프가 30분 안에 다시 본다.
 export async function switchAccount(store: Store, name: string, method: AccountMethod, actor: string, conversation: string): Promise<SwitchOutcome> {
   const db = store.db;
+  // scheduler 행을 한도 상태보다 먼저 잡는다. 모델 대기(Store.waitForUser)가 scheduler → model_limit_state 순서로 잡으므로,
+  // 거꾸로 잡으면 둘이 서로 기다리다 한쪽이 잠금 시간 제한으로 되돌려진다(전환이 되돌려지면 작업자 자격만 바뀐 채 남는다).
+  await store.lockScheduler();
   const target = (await db.query<{ current: boolean }>('SELECT current FROM model_accounts WHERE name=$1 AND method=$2 FOR UPDATE', [name, method])).rows[0];
   if (!target) return { result: 'unknown_account' };
   if (!target.current) {
@@ -79,9 +83,8 @@ export async function switchAccount(store: Store, name: string, method: AccountM
       last_resets_at=s.resets_at,last_observed_at=s.observed_at FROM model_limit_state s WHERE a.current AND s.id='account' AND s.observed_at IS NOT NULL`);
     await db.query("DELETE FROM model_limit_state WHERE id='account'");
     await db.query('UPDATE model_accounts SET current=false WHERE current');
-    await db.query('UPDATE model_accounts SET current=true WHERE name=$1 AND method=$2', [name, method]);
+    await db.query('UPDATE model_accounts SET current=true,switched_at=$3 WHERE name=$1 AND method=$2', [name, method, store.now()]);
   }
-  await store.lockScheduler();
   const emergency = (await db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler_emergency'")).rows[0]?.value === true;
   const waiting = (await db.query<{ id: string; type: string }>(`SELECT id,type FROM jobs WHERE state='waiting_user'
     AND wait_reason IN ('model_limit','auth_expired') ORDER BY created_at,id`)).rows;

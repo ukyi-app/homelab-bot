@@ -2717,3 +2717,9 @@ T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·
 - **시험이 실패할 수 있는지:** AC-19 시험은 처음 실행에서 실제 결함 하나를 잡았다(API 방식 행의 등록 시각이 비어 NOT NULL 위반). homelab 쪽은 단계 순서를 바꾸거나(해제를 지문 확인 앞으로) 두 레인 같은 값 거부를 끄면 흐름 시험 다섯과 입력 시험이 실패하는 것을 보고 되돌렸다.
 - **운영 영향:** 병합하면 migration 028(새 표 하나, 옛 표 변경 없음)이 돈다. 등록된 계정이 없으면 목록이 비고 브리핑 줄이 없으며 지표는 C21과 같은 `{method="none"}`이다. homelab CLI는 owner가 실행할 때만 동작한다.
 - **못 잡는 범위:** `claude setup-token`의 실제 동작과 출력 자동 수집(하지 않음, 미확인), 실제 ESO·kubelet 반영 시간(S5, C24), 운영 RBAC(`kubectl exec` 두 작업자 Deployment), 발급일을 CLI 밖에서 바꾼 경우.
+- **Codex 1차 리뷰 수정(2026-11-11, 지적 넷, 모두 빨강 → 초록 확인):**
+  - 전환 잠금 순서: `admin-cli` "계정 전환 잠금 순서: 전환과 모델 대기가 모두 scheduler 행을 한도 상태(model_limit_state)보다 먼저 잡는다"(트랜잭션마다 질의 순서를 기록하는 기존 방식, `task-bridge` "잠금 순서"와 같다. 고치기 전 전환 트랜잭션이 `limit,scheduler`로 실패).
+  - 전환 전에 시작한 실행의 관측: `admin-cli` "계정 전환: 전환 전에 시작한 대화·작업 실행이 …"(대화 실행·작업 레인 실행 도중 전환 → 한도 상태·리뷰 미루기 비어 있음, 작업의 멈춤 기록과 재시도 시각은 남음, 전환 뒤 시작한 대화의 경고는 사용률 0.97·미루기 기한으로 적힘), `pr-review` "C22 계정 전환 전에 시작한 리뷰 실행의 한도 경고는 …"(리뷰 실행 도중 전환 → 비어 있음, 전환 뒤 리뷰의 경고는 풀리는 시각까지 미룸).
+  - 돌아온 지금 계정의 목록: `admin-cli` "계정 전환: 옛 계정의 마지막 한도 관측은 …"에 A → B → A 단언(목록의 A에 마지막 사용률·풀리는 시각, `reviewDeferredUntil` null).
+  - homelab `setup-token` 출력: `cli/test/core/exec.test.ts` "claude setup-token 로그인 … stdout-to-stderr로 …"(inherit 거부), "setup-token 로그인은 자식 stdout을 stderr로 보내 결과 stdout에는 JSON 문서 하나뿐이다"(가짜 exec로 넘긴 stdio 단언 + 하위 프로세스의 stdout이 JSON 한 줄뿐이고 스텁 토큰은 stderr에만), "stdin이 tty라도 stderr가 터미널이 아니면 setup-token 로그인을 띄우지 않고 …".
+  - 실행(머신 잠금 도우미, `--pg`): `admin-cli`·`pr-review`·`memory-briefing`·`memory-briefing-pg`·`ops-metrics`·`model-resume`·`review-lane`·`task-bridge`·`foundation`·`change-store`·`change-store-pg`·`publisher-migrate`·`publisher-pg` 483개(시험 순서를 고친 `admin-cli` 34개 재실행 포함) 모두 통과. homelab `bun run test:cli` 786개 통과·실패 0.

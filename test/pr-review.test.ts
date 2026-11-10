@@ -18,6 +18,7 @@ import { REVIEW_NOTICE_TEXT } from '../src/review.js';
 import { archiveContract } from '../src/worker.js';
 import { HttpReviewWorker, reviewWorkerServer } from '../src/review-http.js';
 import { controlText } from '../src/control-format.js';
+import { parseAdminArgs, runAdmin } from '../src/admin.js';
 import { captureControls, event, fixture, localDatabase, thread } from './helpers.js';
 
 const SECRET = 'fixture-webhook-secret';
@@ -119,7 +120,7 @@ let controls: ReturnType<typeof captureControls>;
 before(async () => { database = await localDatabase(); controls = captureControls(); });
 beforeEach(async () => {
   await database.pg.exec(`TRUNCATE events,conversations,jobs,results,outbox,schedules,denied_actors,controls,audit,incidents,
-    github_deliveries,pr_reviews,review_deliveries,model_limit_state RESTART IDENTITY CASCADE`);
+    github_deliveries,pr_reviews,review_deliveries,model_limit_state,model_accounts RESTART IDENTITY CASCADE`);
   f = await fixture(database.db);
   r = await setup();
 });
@@ -1992,6 +1993,30 @@ test('AC-17 리뷰 실행이 받은 한도 경고도 다음 PR 리뷰를 미룬�
   f.advance(resetsAt - f.now());
   assert.equal(await r.runtime.tick(), true);
   assert.equal(r.inputs.length, 2);
+});
+test('C22 계정 전환 전에 시작한 리뷰 실행의 한도 경고는 새 계정의 사용률·리뷰 미루기가 되지 않고, 전환 뒤 시작한 리뷰의 경고는 적힌다', async () => {
+  const account = (...argv: string[]) => runAdmin(f.store, parseAdminArgs(['account', ...argv]));
+  await account('record', 'main', 'subscription');
+  await account('record', 'spare', 'subscription');
+  await account('use', 'main', 'subscription');
+  const resetsAt = Math.floor((f.now() + HOUR) / 1000) * 1000;
+  // 리뷰 실행 중에 owner가 spare로 바꾼다. 그 실행은 옛 자격으로 돌았다.
+  r.reply((async () => {
+    f.advance(1);
+    await account('use', 'spare', 'subscription');
+    return { status: 'succeeded', output: OUTPUT, rateLimit: warning(resetsAt) };
+  }) as unknown as (signal: AbortSignal) => Promise<never>);
+  f.advance(1);
+  await fullReview();
+  assert.deepEqual((await reviewJobs()).map(j => j.state), ['succeeded']);
+  assert.deepEqual(await rows('model_limit_state'), []);
+  assert.equal(await f.store.reviewDeferredUntil(), null);
+  r.reply({ status: 'succeeded', output: OUTPUT, rateLimit: warning(resetsAt) });
+  r.gh.pulls.set(8, pull({ number: 8, updated_at: '2026-10-29T02:00:00Z' }));
+  assert.equal((await hook('pull_request', prEvent('opened', pull({ number: 8, updated_at: '2026-10-29T02:00:00Z' })))).outcome, 'queued');
+  f.advance(1);
+  assert.equal(await r.runtime.tick(), true);
+  assert.equal(await f.store.reviewDeferredUntil(), resetsAt);
 });
 test('AC-16 리뷰가 한도로 멈추면 풀리는 시각 1분 뒤 리뷰를 저절로 이어서 하고 게시까지 간다', async () => {
   const resetsAt = Math.floor((f.now() + HOUR) / 1000);
