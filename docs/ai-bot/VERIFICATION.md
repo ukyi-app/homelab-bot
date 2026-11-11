@@ -2884,3 +2884,19 @@ T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·
 - **실행(머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`·`npm run build`, `c14-remaining-actions`·`c13-proposal`·`c13-proposal-pg`·`c18-fixed-text`·`c27-change-amend`·`c15-session-key`·`c16-task-question`·`admin-cli`·`model-resume`·`model-account-switch-pg`·`change-review`·`change-artifact`·`c17-publish-button`·`change-preview-pages`·`chat-format`·`c28-change-question`·`review-3`·`review-4`·`memory-briefing`·`task-bridge`·`raw-text-retention`·`reaction-lifecycle`·`publisher-gateway`·`publisher-recovery` 24개 파일 578개 통과·실패 0·skip 0.
 - **운영에서 바뀌는 동작:** DECISIONS "C36 묶음 F"의 표. 스위치 밖에서는 계정 전환과 같은 밀리초에 시작한 실행의 멈춤 기록만 바뀐다.
 - **못 잡는 범위:** 실제 프로세스 강제 종료(시험은 끝나지 않는 응답으로 대신한다), 게시 서버 둘이 같은 제안의 완료 기록과 중단 정리를 동시에 하는 실제 PostgreSQL 경합(사유 조건부 UPDATE 하나라 한쪽만 바뀐다고 코드로 봤다), 응답이 10분을 넘겨 결과가 두 번 보이는 경우, 실제 파드에서 전환과 claim이 같은 밀리초에 놓이는 빈도.
+
+## C36 묶음 G: 재검토 2차 후속 (2026-11-11, 로컬)
+
+전체 리뷰 재검토 2차의 RR3-N2·RR3-N1. 구현 선택과 알려진 한계는 [DECISIONS](DECISIONS.md) "C36 묶음 G", 계약은 [ARCHITECTURE](ARCHITECTURE.md) 끝의 "C36 묶음 G". 경계는 S1(Gateway 프레임 → 수신·저장(PGlite) → 가짜 Discord REST, 가짜 시계)이다. 응답 전 종료는 묶음 F처럼 끝나지 않는 상호작용 응답으로 대신한다.
+
+| 완료 조건 | 근거 |
+|---|---|
+| 동기 실행의 결과도 응답 전 재시작에 남는다 | `c14-remaining-actions` "C36 묶음 G 작업 시작 제안이 레인 닫힘으로 접수 거절된 직후 버튼 응답 전에 멈추면 …"(말로 한 작업 시작 제안 → 작업 레인을 `retention_full`로 닫음 → "할게요" → 버튼 응답 직전에 멈춤 → 10분 + 1ms 뒤와 1시간 뒤 주기 정리·게시 → 그 스레드에 "작업 레인이 닫혀 있어요. 보존 세션 8개가 다 찼어요."로 시작하는 글 정확히 하나, 작업 0건, 제안 `refused`·값 비움 → 다시 누르면 `PROPOSAL_TEXT.settled`) |
+| 동기 실행도 응답이 전해지면 결과가 다시 나가지 않는다 | 같은 파일 "C36 묶음 G 동기 실행의 버튼 응답이 전해지면 …"(말로 한 작업 취소 → "할게요" → 10분 + 1ms 뒤 게시 → 버튼 응답 문장이 스레드에 없음, `proposal:` 글 0개. 작업 레인 자체의 취소 완료 알림은 따로 나간다) |
+| `here` 대상은 ID 없이 적힌다 | 같은 파일 "C36 묶음 G 말로 한 저장 제외(here)의 결과는 …"(스레드 ID를 내부 표식으로 둔 정책 → 말로 한 저장 제외(here) → 응답 전 멈춤 → 남는 글 = `MEMORY_TEXT.excluded('here', 0)` + 켜짐 판 삭제 안내 하나, outbox 어디에도 `channel:<스레드 ID>` 없음). `memory-commands` "MEM-CMD …"는 '/memory-exclude here' 응답이 `here`로 시작하고 스레드 ID가 없음을 본다 |
+| 지연 결과 글이 공개 검사를 거친다 | 같은 파일 "C36 묶음 G 실행 결과가 공개 검사에 걸리면 …"(말로 한 변경 취소, 확인 글이 나간 뒤 변경 ID를 내부 표식에 더함 → 응답 전 멈춤: 남는 글은 `PROPOSAL_TEXT.resultWithheld` 하나 / 응답 실패: 응답 실패 안내가 `resultWithheld` 하나, 10분 뒤 더 없음 → `proposal:`·`ack-notice:` 글 본문에 두 변경 ID 없음. `PROPOSAL_TEXT.interrupted`는 `chatReplyRisk`가 `null`) |
+
+- **시험이 실패할 수 있는지:** 고치기 전 코드(origin/main `2a480eb`)에서 레인 닫힘 시험은 남는 글 0개, `here` 시험은 `저장 제외했어요: \`channel:fixture-thread\``가 그대로 남음, 공개 검사 시험은 `변경 <ID>을 취소했어요. …`가 그대로 남아 실패했다. 응답이 전해진 동기 실행 시험은 고치기 전에도 결과 글이 생기지 않아 초록이고, 동기 실행의 거두기를 지키는 회귀 시험이다.
+- **실행(머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`·`npm run build`, `c14-remaining-actions`·`c13-proposal`·`c13-proposal-pg`·`c15-session-key`·`memory-commands`·`memory-commands-pg`·`t20-memory-commands`·`c16-task-question`·`c27-change-amend`·`c18-fixed-text`·`raw-text-retention`·`c28-change-question`·`c17-publish-button`·`reaction-lifecycle`·`publisher-gateway` 15개 파일 195개 통과·실패 0·skip 0.
+- **운영에서 바뀌는 동작:** DECISIONS "C36 묶음 G"의 표. 스위치 밖에서는 '/memory-exclude here' 응답의 대상 표기만 바뀐다.
+- **못 잡는 범위:** 알려진 한계 둘(RR3-N3 응답 실패 안내 뒤 거두기 전 종료, RR3-N4 응답 전 종료와 스위치 끄기가 겹침)은 고치지 않아 시험이 없다. 실제 Discord ID(17~20자리)가 공개 검사에 걸리는 것은 묶음 E 시험이 보고, 이 묶음은 같은 자리를 내부 표식으로 대신했다. 실제 프로세스 강제 종료, 게시 서버 둘의 실제 PostgreSQL 경합.

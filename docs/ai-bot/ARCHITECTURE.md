@@ -2206,3 +2206,14 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 - **실행 확인 버튼 수신(`DiscordIngress.proposalButton`):** 커밋 뒤 실행 → `finishProposalRun` → 버튼 응답(`acknowledge`) → 완료 기록이 결과 글을 남겼고 응답이 `true`면 `withdrawRunResult`. `acknowledge`는 응답을 보냈거나 응답 실패를 기록했으면(응답 실패 안내 `ack-notice:<이벤트 ID>` 포함) `true`, 그 기록마저 실패하면 `false`를 돌려준다. 다른 호출자는 반환값을 쓰지 않아 동작이 같다. 거두기 실패는 로그 `proposal_result_withdraw_failed`만 남긴다.
 - **멈춤 기록의 전환 경계(`Store.recordPause`):** 옛 실행 판정은 `jobs.started_at < model_accounts.switched_at`(지금 계정)이다. `observeRateLimit`은 `<=` 그대로다. 둘 다 `startedBeforeSwitch(job, tx, sameMs)` 하나를 쓰고 기본값은 같은 밀리초 포함이다.
 - **버튼 글의 쪽 나누기(`messagePages(content, lastPage)`, `src/format.ts`):** `lastPage < PAGE_SIZE`(지금은 `Store.enqueue`가 버튼 글에 넘기는 `BUTTON_PAGE_SIZE` 1500)이고 일반 글이면, 마지막 `\n\n` 뒤의 끝 단락이 `lastPage` 이하이고 그 앞에 공백이 아닌 글자가 있을 때 두 단계 나누기(1800자, 마지막 쪽 1500자) 모두에서 그 단락 안에 경계를 두지 않는다. 경계가 단락 안에 놓이면 단락 앞에서 자른다(앞 쪽은 빈 줄로 끝난다). 쪽을 이어 붙이면 원문과 같고, 멱등 키(`<key>`, `<key>:page:<n>`)·`page_index`·대조 표식 규칙은 같다. JSON 목록과 일반 글(`lastPage` 없음)은 바뀌지 않는다.
+
+## C36 묶음 G: 재검토 2차 후속 (2026-11-11)
+
+위 "C36 묶음 F"에 더하는 계약이다. 선택의 이유와 알려진 한계(RR3-N3·RR3-N4)는 [DECISIONS](DECISIONS.md) "C36 묶음 G".
+
+- **공개용 결과 본문(`publicRunResult(content, policy)`, `src/proposals.ts`):** `chatReplyRisk(content, policy)`가 `null`이면 `content`, 아니면 `PROPOSAL_TEXT.resultWithheld`. 정책이 없으면 고정 안내다. 지연 결과 글과 버튼 응답 실패 안내(`acknowledge`의 `direct.notice`)가 이 본문을 쓴다. 버튼 응답(본인 전용)은 처리기 결과 그대로다.
+- **결과 글 남기기(`enqueueRunResult(store, { proposal, conversation, owner, scope, publicNotice, revision })`, `src/proposal-retention.ts`):** 호출자의 트랜잭션에 묶인 `Store`로 outbox 글을 넣는다. 멱등 키·`message_key` `proposal:<제안 ID>`, payload `{ kind: 'message', channel: scope.channel, content: publicNotice, classification: 'safe_summary' }`, `available_at` = 그 Store의 지금 + `RUN_RESULT_NOTICE_AFTER_MS`(10분). `publicNotice`는 `publicRunResult`를 지난 본문이어야 한다(이 파일은 import 고리 때문에 공개 검사를 부르지 않는다).
+- **완료 기록(`finishProposalRun(db, { proposal, failed, publicNotice, revision, now })`):** 묶음 F와 같고, 결과 글은 `enqueueRunResult`로 남긴다. 결과 본문 칸은 `publicNotice`(공개 검사를 지난 본문)다.
+- **버튼 하나의 처리(`pressProposal`):** "할게요"가 이 트랜잭션에서 제안을 끝내면(구독 꺼짐·연결 안 됨·값이 바뀜으로 `refused`, `later` 없는 실행의 `confirmed`·`refused`) 상태 전이 뒤 같은 트랜잭션에서 `enqueueRunResult`(본문은 `publicRunResult(content, context.policy)`, `policy_revision`은 `context.revision`)를 부르고 `PressOutcome.resultPending: true`를 돌려준다. 만료·"아니에요"·이미 처리·남의 제안·없는 제안은 결과 글을 남기지 않는다. `later`가 있으면 묶음 F 그대로(`run_pending`, 완료 기록에서 결과 글).
+- **실행 확인 버튼 수신(`DiscordIngress.proposalButton`):** 거둘 결과 글이 있는지는 `resultPending`(동기) 또는 `finishProposalRun`의 반환(커밋 뒤 실행)이다. 응답이 `true`면 `withdrawRunResult`.
+- **저장 제외 결과의 대상 표기(`MemoryCommands`, `memory-exclude`):** 대상이 `here`면 결과 문장에 `here`를 적는다(제외 키는 `channel:<그 채널>`). 다른 대상은 지금처럼 키를 200자로 잘라 적는다.
