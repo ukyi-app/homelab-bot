@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { EFFECT_LEASE_MS } from '../src/change-contracts.js';
-import type { EffectStage } from '../src/change-contracts.js';
+import type { AuthorResult, EffectStage } from '../src/change-contracts.js';
 import { ChangePublisher } from '../src/change-publisher.js';
 import { readFile } from 'node:fs/promises';
 import { MIGRATIONS, Postgres, migrationVersion } from '../src/database.js';
@@ -13,6 +13,7 @@ import type { Harness } from './change-assembly-harness.js';
 import { OWNER, driveTo, git, hex, ok, seedConversation } from './change-store-fixture.js';
 import { REPO, publishEnv } from './change-github-fake.js';
 import { QUESTION } from './task-worker-harness.js';
+import { until } from './fake-gateway.js';
 
 // 실제 PostgreSQL(18) 시험. HOMELAB_TEST_PG_SOCKET(유닉스 소켓 디렉터리)이 없으면 건너뛴다. GitHub은 가짜다.
 const socket = process.env.HOMELAB_TEST_PG_SOCKET;
@@ -225,6 +226,57 @@ test('T19 B5 EVENT-02 실제 PostgreSQL: 게시 서버 둘이 같은 부모를 �
     assert.equal(h.reviewInputs.length, 1);
     assert.equal(h.env.github.pulls.length, 1);
     for (const stage of ['tree', 'commit', 'ref', 'pull'] as const) assert.equal(h.env.github.count(ROUTES[stage]), 1, stage);
+  } finally { await h.close(); await d.close(); }
+});
+// C36 묶음 D(F-8). 한 게시 서버가 앞 차례 작성 결과를 받아 들고 있는 동안 다른 게시 서버가 저장·시험·리뷰를 마치고 고치기 차례를 연다.
+// 늦게 풀린 앞 차례 결과는 새 차례의 단계·artifact·확인할 것을 바꾸지 않고, 새 차례는 자기 결과로 승인 대기까지 간다.
+test('C36 F-8 실제 PostgreSQL: 앞 차례 작성 결과를 들고 있던 게시 서버가 고치기 차례가 열린 뒤 풀려도 새 차례의 단계·artifact·확인할 것을 바꾸지 않는다', { skip }, async () => {
+  const d = await bare();
+  await runMigrations(d.raw);
+  const v2 = (summary: string, check: string) => ({ status: 'completed', summary, question: '', options: [], checks: [{ text: check, path: 'src/new.ts', line: 1 }], risks: [] });
+  const firstStep = { ...WRITE_STEP, output: v2('작성했어요', '고치기 전 가정을 확인') };
+  const fixedStep = { write: { ...WRITE_STEP.write, 'src/new.ts': 'export const n = 2;\n' }, output: v2('고쳤어요', '빈 입력 처리를 확인') };
+  const finding = { priority: 'P0' as const, code: 'logic_error' as const, path: 'src/new.ts', line: 1, title: '빈 입력에서 예외가 난다', detail: '입력이 비면 멈춘다', evidence: 'src/new.ts 1행' };
+  let reviews = 0;
+  const reviewReply = () => ({ status: 'succeeded' as const, output: { goal: 'met' as const, acceptance: [{ index: 0, status: 'met' as const }], reviewed_paths: ['src/a.ts', 'src/new.ts'],
+    findings: reviews++ === 0 ? [finding] : [], summary: 's' } });
+  const h = await changeHarness(d.db, { changeV2: true, steps: [firstStep, fixedStep], reviewReply });
+  try {
+    let held = false;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    h.restart({ instrument: deps => ({ ...deps, author: new Proxy(deps.author, { get(target, property) {
+      const value = Reflect.get(target, property) as (...args: unknown[]) => unknown;
+      if (property === 'fetchResult') return async (...args: unknown[]) => {
+        const result = await value.apply(target, args) as AuthorResult;
+        if (result.kind === 'snapshot' && !held) { held = true; await gate; }
+        return result;
+      };
+      return typeof value === 'function' ? value.bind(target) : value;
+    } }) }) });
+    const stale = h.runtime;
+    h.restart();
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    let stopping = false;
+    const staleLoop = (async () => { while (!stopping) { await stale.laneTick(); await new Promise(resolve => setTimeout(resolve, 3)); } })();
+    await until(() => held, 30_000);
+    await h.pump(async () => (await d.raw.query(`SELECT 1 FROM change_requests r JOIN change_generations g ON g.change_id=r.id AND g.generation=r.generation
+      WHERE r.id=$1 AND r.phase='authoring' AND g.fix_round=1`, [id])).rows.length === 1);
+    stopping = true;
+    release();
+    await staleLoop;
+    assert.equal(await h.phase(id), 'authoring', '앞 차례 결과가 새 차례를 snapshot_ready로 넘기지 않는다');
+    assert.equal((await d.raw.query('SELECT 1 FROM change_artifacts WHERE change_id=$1', [id])).rows.length, 0, '앞 차례 artifact가 새 차례 자리에 없다');
+    assert.equal((await d.raw.query('SELECT 1 FROM change_notes WHERE change_id=$1', [id])).rows.length, 0, '앞 차례 확인할 것이 새 차례 자리에 없다');
+
+    await h.pump(async () => await h.phase(id) === 'awaiting_publish_approval');
+    assert.equal((await h.f.calls()).length, 2, '처음 작성 + 고치기 1번');
+    const notes = (await d.raw.query<{ checks: unknown }>('SELECT checks FROM change_notes WHERE change_id=$1', [id])).rows;
+    assert.deepEqual(notes.map(row => row.checks), [[{ text: '빈 입력 처리를 확인', location: { path: 'src/new.ts', line: 1 } }]]);
+    const archived = (await d.raw.query<{ artifact_digest: string }>('SELECT artifact_digest FROM change_fix_rounds WHERE change_id=$1', [id])).rows[0]!.artifact_digest;
+    const live = (await d.raw.query<{ artifact_digest: string }>('SELECT artifact_digest FROM change_artifacts WHERE change_id=$1', [id])).rows[0]!.artifact_digest;
+    assert.notEqual(live, archived, '승인 대상은 새 차례 artifact다');
   } finally { await h.close(); await d.close(); }
 });
 test('C33 EVENT-02 실제 PostgreSQL: 게시 서버 둘이 같은 밀리초에 verify를 서명해 한쪽이 거부돼도 승인 대기까지 가고 시험 receipt는 passed 하나다', { skip }, async () => {
