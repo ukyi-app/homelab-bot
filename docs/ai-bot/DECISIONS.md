@@ -1254,6 +1254,16 @@ T19 B5 EVENT-02 "게시 서버 둘이 같은 부모를 동시에 밀어도 모�
 - 불일치·표시 오류의 사유 코드는 자격 오류(`WorkerStartError.code`)에 있고, 실행 중에는 공통부가 그 실행을 `failed`(띄우지 않음)로 닫으며 readiness가 503이 된다. 실행마다 사유 코드를 로그 줄로 남기는 것은 공통부(`run-control.ts`) 변경이라 하지 않았다. 기동 때는 `worker_start_failed` 사유로 남는다.
 - API 방식의 진짜 분당 한도도 결제 멈춤이 된다(위 분류의 대가).
 
+## C36 묶음 C: 문구·브리핑 (2026-11-11)
+
+전체 리뷰 1차의 F-5·F-12·F-13 수정이다. "동료 봇 전환 (사용자 2026-11-09)" 7(Discord에는 자리 비움만)·9(스위치)를 브리핑·24시간 대기 안내·명령 수신 안내에 맞춘 구현 선택이고, 결정은 바꾸지 않았다. 시험은 [VERIFICATION](VERIFICATION.md) "C36 묶음 C".
+
+- **브리핑의 모델 멈춤 줄(F-5):** 비상 정지와 모델 멈춤을 다른 줄로 나눴다. 비상 정지는 지금처럼 `BRIEFING_TEXT.modelStopped`(스위치 두 판, 꺼짐 `/model-status`·켜짐 `homelab bot` CLI)이고, 사유 칸에는 '비상 중지'만 들어간다. 모델 멈춤(한도·인증·결제 대기 작업이 있거나, 비상 정지 없이 scheduler가 닫힘)은 `BRIEFING_TEXT.modelAway` 한 줄("자리 비움 · 기다리는 일 n건은 돌아오면 이어서 해요")이고 스위치 밖이다. 원인 낱말과 '/' 이름이 없다. 그래서 위 "C10 고정 문구" 절의 "브리핑 모델 호출 중지 줄(`/model-status`)"은 이제 비상 정지 줄만 가리킨다. 둘이 겹치면 두 줄이 다 나온다. 미룬 PR 리뷰 건수(C19)·토큰 만료(C22) 줄은 그대로다.
+- **작업 레인 줄의 대기 건수(F-5, 티켓 범위보다 한 칸 넓음):** 같은 브리핑의 작업 레인 줄 "한도·인증 대기 n건"도 원인을 알려 주므로 "모델 대기 n건"으로 바꿨다. 세는 행(`waiting_user` + `model_limit`·`auth_expired`)은 그대로다.
+- **24시간 대기 안내(F-5, `CHAT_TASK_TEXT.modelWaitLong`):** "저절로 재개하거나 버리지 않아요"와 재개 명령(꺼짐 `/resume-model`, 켜짐 CLI 재개)을 뺐다. 재개는 재개 예약 루프(C19)가 하므로 owner가 정할 것은 세션을 계속 둘지뿐이다. 그만두는 길만 스위치로 고른다(꺼짐 `/cancel target:<작업>`, 켜짐 "작업을 취소해 달라고 말해 주세요"). 결제 멈춤도 같은 문구다(owner는 원인과 CLI 해제를 운영 알림으로 받는다).
+- **명령 수신 안내(F-12, `src/discord.ts` `COMMAND_INGRESS_TEXT`):** `CHANGE_ACK_NOTICE`·`EXTERNAL_ACK_NOTICE` 상수와 변경·세션 연결 처리기 예외 답 리터럴을 이 표 하나로 옮겼다(키 `changeAckLost`·`changeFailed`·`attachAckLost`·`attachFailed`). 첫 인자가 `Store.colleague`인 C18 규칙 그대로라 `c18-fixed-text`의 표 검사가 함께 돈다. `changeFailed`는 `CHANGE_TEXT.transient`, 켜짐 `attachFailed`는 `SESSION_KEY_TEXT.failed`를 그대로 쓴다(같은 뜻의 문구를 두 벌 두지 않음). 꺼짐 판은 '/' 안내를 해요체로만 바꿨다.
+- **주석(F-13):** `src/contracts.ts` `PROPOSAL_RUN_ACTIONS`의 이력 주석을 지금의 제약(동작 이름은 작업자 출력 스키마 enum에만 들어가 요청 본문·capability digest의 재료가 아님)으로 고쳐 썼다.
+
 ## C36 묶음 B: 제안·공개 범위 (2026-11-11)
 
 전체 리뷰 1차의 F-4·F-7·F-9·F-10·F-11을 닫는 구현 선택이다. 사용자 결정이 아니고 결정은 바꾸지 않았다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) 끝의 "C36 묶음 B", 시험은 [VERIFICATION](VERIFICATION.md) "C36 묶음 B". 마이그레이션은 없다(`proposals`의 기존 칸만 쓴다).

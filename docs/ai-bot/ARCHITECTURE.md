@@ -2149,6 +2149,12 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 
 **되돌리기.** 스위치를 끄면 새 접수와 루프만 멈춘다. 남은 작성 세션은 lease 만료 뒤 unknown으로 레인을 닫으므로 `/task-release`로 해제한다. `HttpTaskV2Worker`를 스위치와 무관하게 브리지에 넘겨 두는 이유다. 미확정 effect는 스위치를 켜야 대조가 돈다. `change` 절을 모르는 옛 게시 서버로 되돌릴 때는 정책 키를 먼저 뺀다.
 
+## C36 묶음 C: 브리핑의 모델 멈춤과 명령 수신 안내 (2026-11-11)
+
+**브리핑 "모델·작업" 칸.** 비상 정지 줄과 자리 비움 줄을 따로 낸다. 비상 정지(`scheduler_emergency`)는 `BRIEFING_TEXT.modelStopped`(스위치 두 판), 모델 멈춤(한도·인증·결제 대기 작업이 있거나 비상 정지 없이 `scheduler`가 닫힘)은 `BRIEFING_TEXT.modelAway`(원인·'/' 이름 없음, 대기 건수만)다. 둘 다 없으면 "중지 신호 없음"이다. 작업 레인 줄의 대기 건수 이름은 "모델 대기"다. 위 "브리핑 칸"(작업 레인)의 "한도·인증 대기"는 이 이름으로 읽는다. 원인·풀리는 시각·할 일은 C21 운영 알림(Telegram)에만 있다.
+
+**명령 수신 안내.** 변경·세션 연결 명령의 처리기 예외 답과 응답을 전하지 못했을 때 채널에 남기는 고정 안내(`ack-notice:<이벤트>`)는 `src/discord.ts` `COMMAND_INGRESS_TEXT`에서 `Store.colleague`로 판을 고른다. 게시 승인 버튼(`pressPublish`)의 응답 실패 안내도 같은 `changeAckLost`다.
+
 ## C36 묶음 B: 제안·공개 범위 (2026-11-11)
 
 §13 "제안과 실행 확인 (C13)"에 더하는 계약이다. 선택의 이유는 [DECISIONS](DECISIONS.md) "C36 묶음 B".

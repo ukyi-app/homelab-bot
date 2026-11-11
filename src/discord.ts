@@ -5,7 +5,7 @@ import type { EventInput, Scope } from './contracts.js';
 import { controlText, taskLaneClosedText } from './control-format.js';
 import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
-import { PUBLISH_TEXT } from './change-commands.js';
+import { CHANGE_TEXT, PUBLISH_TEXT } from './change-commands.js';
 import type { ChangeCommand, ChangeCommandHandler } from './change-commands.js';
 import { SESSION_KEY_TEXT } from './external-task-commands.js';
 import type { ExternalTaskCommand, ExternalTaskCommandHandler } from './external-task-commands.js';
@@ -64,9 +64,17 @@ const externalCommands = new Set<string>(['attach', 'detach', 'attach-list']);
 // 변경 명령. 처리기가 없으면(스위치 꺼짐) 닫는다. 구독·gap·작업 큐를 거치지 않고 받은 자리에서 처리한다.
 const changeCommands = new Set<string>(['change', 'change-status', 'change-cancel', 'change-publish']);
 export const ALL_COMMANDS: ReadonlySet<string> = new Set(['chat', 'urgent', 'task', 'read', ...controls, ...memoryCommands, ...externalCommands, ...changeCommands]);
-export const CHANGE_ACK_NOTICE = '변경 명령의 응답을 전하지 못했습니다(상호작용 만료·전송 실패). 결과는 이 스레드의 알림과 /change-status로 확인하세요.';
 // 기억 명령 응답을 전하지 못했을 때 그 채널에 남기는 안내는 처리기의 guide(스위치 판)를 쓴다. 결과(기억 내용)는 싣지 않는다.
-export const EXTERNAL_ACK_NOTICE = '세션 연결 명령의 응답을 전하지 못했습니다(상호작용 만료·전송 실패). 결과는 /attach-list로 확인하세요.';
+// 변경·세션 연결 명령을 받는 자리의 고정 안내. 처리기 표(CHANGE_TEXT·ATTACH_COMMAND_TEXT)처럼 첫 인자가 스위치(Store.colleague)이고
+// 분기는 그 값 하나뿐이다. ackLost는 본인만 볼 응답 대신 채널에 공개 게시되므로 처리 결과를 싣지 않는다.
+export const COMMAND_INGRESS_TEXT = Object.freeze({
+  changeAckLost: (c: boolean) => `변경 요청의 응답을 전하지 못했어요(상호작용 만료·전송 실패). ${c
+    ? '결과는 이 스레드의 알림으로 알려 드리고, 변경 상태는 물어보면 알려 드릴게요.' : '결과는 이 스레드의 알림과 /change-status로 확인해 주세요.'}`,
+  changeFailed: (c: boolean) => CHANGE_TEXT.transient(c),
+  attachAckLost: (c: boolean) => `세션 연결 응답을 전하지 못했어요(상호작용 만료·전송 실패). ${c
+    ? '결과는 세션 연결 목록을 물어보면 알려 드릴게요.' : '결과는 /attach-list로 확인해 주세요.'}`,
+  attachFailed: (c: boolean) => c ? SESSION_KEY_TEXT.failed : '처리하지 못했어요(일시 오류). /attach-list로 결과를 확인한 뒤 다시 해 주세요.',
+});
 const EventSchema = z.strictObject({
   id: z.string().min(1), actor: z.string().min(1), scope: ScopeSchema,
   text: z.string().max(DEFAULTS.maxInputChars), kind: z.enum(['message', 'command', 'button']),
@@ -382,7 +390,7 @@ export class DiscordIngress {
       reply = { content: PUBLISH_TEXT.failed, outcome: 'error' };
     }
     this.log('change_command', { command: event.command!, outcome: reply.outcome });
-    await this.acknowledge(event, saved.id, reply.content, { revision: p.revision, notice: CHANGE_ACK_NOTICE, ...('update' in reply && reply.update ? { update: true } : {}) });
+    await this.acknowledge(event, saved.id, reply.content, { revision: p.revision, notice: COMMAND_INGRESS_TEXT.changeAckLost(this.store.colleague), ...('update' in reply && reply.update ? { update: true } : {}) });
     return saved.id;
   }
   // 세션 연결 "키 보기". 키가 든 응답은 연결 명령과 같은 deliverPrivate(본인만 보는 새 메시지)로만 나가고, 버튼 글은 바꾸지 않는다.
@@ -449,11 +457,11 @@ export class DiscordIngress {
         content => this.deliverPrivate(event, saved.id, content));
     } catch (error) {
       this.log('external_task_command_failed', { command: event.command!, ...errorInfo(error) });
-      reply = { content: '처리하지 못했습니다(일시 오류). /attach-list로 결과를 확인한 뒤 다시 시도하세요.', outcome: 'error' };
+      reply = { content: COMMAND_INGRESS_TEXT.attachFailed(this.store.colleague), outcome: 'error' };
     }
     // 로그에는 명령과 결과 코드만 남긴다(세션 ID·키 ID·seed 없음).
     this.log('external_task_command', { command: event.command!, outcome: reply.outcome });
-    if (reply.content !== undefined) await this.acknowledge(event, saved.id, reply.content, { revision, notice: EXTERNAL_ACK_NOTICE });
+    if (reply.content !== undefined) await this.acknowledge(event, saved.id, reply.content, { revision, notice: COMMAND_INGRESS_TEXT.attachAckLost(this.store.colleague) });
     return saved.id;
   }
   // 변경 명령. 요청 글은 events에 두지 않는다(대화 맥락으로 모델에 들어간다). 처리기는 DB만 만져 응답 기한 안에 끝난다.
@@ -470,10 +478,10 @@ export class DiscordIngress {
       reply = await this.changes.handle({ id: event.id, actor: event.actor, scope: event.scope, command: event.command as ChangeCommand, text: event.text, target: event.target });
     } catch (error) {
       this.log('change_command_failed', { command: event.command!, ...errorInfo(error) });
-      reply = { content: '처리하지 못했습니다(일시 오류). /change-status로 상태를 확인한 뒤 다시 시도하세요.', outcome: 'error' };
+      reply = { content: COMMAND_INGRESS_TEXT.changeFailed(this.store.colleague), outcome: 'error' };
     }
     this.log('change_command', { command: event.command!, outcome: reply.outcome });
-    await this.acknowledge(event, saved.id, reply.content, { revision, notice: CHANGE_ACK_NOTICE });
+    await this.acknowledge(event, saved.id, reply.content, { revision, notice: COMMAND_INGRESS_TEXT.changeAckLost(this.store.colleague) });
     return saved.id;
   }
   // 키가 든 응답. acknowledge와 달리 실패를 돌려준다. 호출자가 그 키를 폐기해야 하기 때문이다.
