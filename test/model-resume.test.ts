@@ -143,6 +143,53 @@ test('AC-16 게시 서버가 다시 떠도 멈춤 기록이 남아 같은 시각
   assert.equal(await restarted.resumeDue(), 1);
 });
 
+// AC-16·21: 멈춘 동안 다른 요청이 쌓여 모델 대기열이 상한(MODEL_QUEUE_LIMIT 90)이 돼도, 이미 접수된 멈춤 작업의 재개는 막히지 않는다.
+// 막히면 멈춘 작업이 남아 scheduler가 닫힌 채고 대기열도 돌지 않아 서로를 기다린다.
+async function stuckBehindFullQueue(paused: number, queuedJobs: number): Promise<string[]> {
+  // 관리 진입점은 UUID 꼴의 작업 ID만 받는다. 만든 순서대로 정렬되게 앞자리를 순번으로 둔다.
+  const ids = Array.from({ length: paused }, (_, i) => `0000000${i + 1}-0000-4000-8000-000000000000`);
+  const fillers = Array.from({ length: queuedJobs }, (_, i) => `filler-${i + 1}`);
+  await database.db.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,received_at,payload)
+    SELECT id,'discord',id,id,'fixture-owner','{}',0,'{}' FROM unnest($1::text[]) id`, [[...ids, ...fillers]]);
+  await database.db.query(`INSERT INTO jobs(id,event_id,type,owner_id,target,revision,budget,state,wait_reason,attempt,priority,available_at,created_at,finished_at)
+    SELECT id,id,'chat','fixture-owner','{}','{}','{}','waiting_user','model_limit',0,10,0,$2,$2 FROM unnest($1::text[]) id`, [ids, f.now()]);
+  await database.db.query(`INSERT INTO model_pauses(job_id,kind,retry_at,paused_at) SELECT id,'rate_limit',$2::bigint+$3::bigint,$2 FROM unnest($1::text[]) id`,
+    [ids, f.now(), 30 * MINUTE]);
+  await database.db.query(`INSERT INTO jobs(id,event_id,type,owner_id,target,revision,budget,state,attempt,priority,available_at,created_at)
+    SELECT id,id,'task','fixture-owner','{}','{}','{}','queued',0,10,0,$2 FROM unnest($1::text[]) id`, [fillers, f.now()]);
+  await database.db.query(`INSERT INTO controls VALUES ('scheduler','true'),('scheduler_emergency','false') ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`);
+  // 89건이면 아직 한 자리가 남아, 첫 재개가 그 자리를 채운 뒤 둘째 재개가 상한을 만난다.
+  assert.equal(await f.store.queueFull('chat'), queuedJobs >= 90);
+  return ids;
+}
+const states = async (ids: string[]) => (await database.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=ANY($1::text[]) ORDER BY id', [ids])).rows.map(row => row.state);
+
+for (const [paused, queuedJobs] of [[1, 90], [2, 89]] as const) {
+  test(`AC-16 멈춤 ${paused}건 뒤에 대기열 ${queuedJobs}건이 쌓여 상한이어도 재개 시각이 지나면 사람 개입 없이 재개하고 scheduler가 풀린다`, async () => {
+    const ids = await stuckBehindFullQueue(paused, queuedJobs);
+    f.advance(30 * MINUTE);
+    assert.equal(await f.store.resumeDue(), paused);
+    assert.deepEqual(await states(ids), ids.map(() => 'queued'));
+    assert.equal(await scheduler(), false);
+    // 대기열 상한의 뜻은 그대로다: 새 요청은 받지 않는다.
+    await assert.rejects(f.ingress.receive(event('over-limit')), /queue_full/);
+  });
+  test(`AC-21 멈춤 ${paused}건 뒤에 대기열 ${queuedJobs}건이 쌓여 상한이어도 계정 전환이 멈춘 작업을 모두 다시 큐에 넣는다`, async () => {
+    await runAdmin(f.store, parseAdminArgs(['account', 'record', 'spare', 'subscription']));
+    const ids = await stuckBehindFullQueue(paused, queuedJobs);
+    const out = await runAdmin(f.store, parseAdminArgs(['account', 'use', 'spare', 'subscription']));
+    assert.deepEqual(out.report.switch, { resumed: paused, waiting: 0, held: null });
+    assert.deepEqual(await states(ids), ids.map(() => 'queued'));
+    assert.equal(await scheduler(), false);
+  });
+}
+
+test('AC-16 대기열이 상한이어도 관리 진입점의 멈춘 작업 재개는 그 자리에서 그 작업만 이어서 한다', async () => {
+  const [first, second] = await stuckBehindFullQueue(2, 90);
+  assert.equal((await runAdmin(f.store, parseAdminArgs(['resume', 'job', first!]))).report.result, 'resumed');
+  assert.deepEqual(await states([first!, second!]), ['queued', 'waiting_user']);
+});
+
 test('AC-16 배포 전 판이 남긴 기록 없는 한도·인증 대기는 처음 본 때부터 30분 뒤에 재개한다', async () => {
   await queued('legacy-limit');
   await queued('legacy-auth');

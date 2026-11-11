@@ -1263,3 +1263,27 @@ T19 B5 EVENT-02 "게시 서버 둘이 같은 부모를 동시에 밀어도 모�
 - **24시간 대기 안내(F-5, `CHAT_TASK_TEXT.modelWaitLong`):** "저절로 재개하거나 버리지 않아요"와 재개 명령(꺼짐 `/resume-model`, 켜짐 CLI 재개)을 뺐다. 재개는 재개 예약 루프(C19)가 하므로 owner가 정할 것은 세션을 계속 둘지뿐이다. 그만두는 길만 스위치로 고른다(꺼짐 `/cancel target:<작업>`, 켜짐 "작업을 취소해 달라고 말해 주세요"). 결제 멈춤도 같은 문구다(owner는 원인과 CLI 해제를 운영 알림으로 받는다).
 - **명령 수신 안내(F-12, `src/discord.ts` `COMMAND_INGRESS_TEXT`):** `CHANGE_ACK_NOTICE`·`EXTERNAL_ACK_NOTICE` 상수와 변경·세션 연결 처리기 예외 답 리터럴을 이 표 하나로 옮겼다(키 `changeAckLost`·`changeFailed`·`attachAckLost`·`attachFailed`). 첫 인자가 `Store.colleague`인 C18 규칙 그대로라 `c18-fixed-text`의 표 검사가 함께 돈다. `changeFailed`는 `CHANGE_TEXT.transient`, 켜짐 `attachFailed`는 `SESSION_KEY_TEXT.failed`를 그대로 쓴다(같은 뜻의 문구를 두 벌 두지 않음). 꺼짐 판은 '/' 안내를 해요체로만 바꿨다.
 - **주석(F-13):** `src/contracts.ts` `PROPOSAL_RUN_ACTIONS`의 이력 주석을 지금의 제약(동작 이름은 작업자 출력 스키마 enum에만 들어가 요청 본문·capability digest의 재료가 아님)으로 고쳐 썼다.
+
+## C36 묶음 A 한도·계정 (2026-11-11)
+
+전체 리뷰 1차의 F-1·F-2·F-3·F-6 수정이다. 사용자 결정("동료 봇 전환" 7·8)은 바꾸지 않았고 아래는 구현 선택이다. 위 "C19"·"C22"·"C23" 절의 문장 중 이 절과 다른 것은 이 절이 앞선다(그 절은 고치지 않았다): C19 "큐가 차면 다음 바퀴에 본다"·"미게시 후보 리뷰는 결과 스키마에 한도 칸이 없어 경고를 받지 못하고", C22 "큐가 차면 거기서 멈춘다(`held: queue_full` …)"·"멈춤 기록과 재개는 그대로라 … 30분 재시도로 새 자격에서 다시 돈다". 시험은 [VERIFICATION](VERIFICATION.md) "C36 묶음 A 한도·계정".
+
+- **F-1 자체 리뷰 한도 칸(`src/change-review.ts`):** 자체 리뷰 응답(`WorkerResultSchema`)의 성공·대기·실패 줄에 일반 PR 리뷰와 같은 선택 칸 `rateLimit`(`RateLimitInfoSchema`)을 두고, 작업자 `execute`가 실행기 결과의 칸을 그대로 싣는다. 게시 서버는 정상 응답이면 `waitForUser(job, reason, { rateLimit })`, 응답 유실 뒤 회수(`waitRecovered`)면 같은 scheduler 잠금 아래에서 `Store.recordPause`를 부른다(그래서 회수 경로도 옛 기록 보충의 30분이 아니라 종류·시각을 남긴다). 성공 결과의 경고는 receipt를 만들기 전에 `observeRateLimit`로 적는다(일반 PR 리뷰와 같은 자리, 실패는 삼킨다). 그래서 자체 리뷰의 경고도 PR 리뷰를 미룬다. 자체 리뷰 자신은 C19대로 미루지 않는다.
+- **F-1 판 호환: 요청 머리 `x-change-review-rate-limit: 1`.** 응답 스키마가 양쪽 strict라 선택 칸만으로는 "지금 게시 서버 + 새 작업자"가 칸 든 응답을 `worker_response_uncertain`으로 거부한다(C03 리뷰 레인이 롤백 순서로 감수한 조합). 그래서 새 게시 서버(`HttpChangeReviewWorker`)가 실행·회수 요청에 이 머리를 붙이고, 작업자 경로(`changeReviewRoutes`)는 머리가 있을 때만 칸을 싣는다. 저장해 둔 결과도 보낼 때 같은 규칙으로 뺀다. 머리는 strict 본문 밖이라 옛 작업자가 무시한다. 버린 대안: 요청 본문에 칸을 더하기(옛 작업자의 strict 요청 스키마가 거부), `reason` 문자열에 원인을 싣기(계약 밖 의미).
+- **F-1 되돌리기:** 작업자를 이 판에서 되돌리면, 이 판이 디스크(`ChangeReviewResults`)에 남긴 칸 든 결과를 옛 작업자가 읽지 못해(옛 strict 스키마) 그 lease의 회수가 `found: false`가 된다. 되돌리기 전에 진행 중인 자체 리뷰를 끝내거나 drain한다(C03 작업 레인 v2 결과와 같은 주의).
+- **F-2 전환 경계(`src/store.ts` `recordPause`):** 멈춘 실행의 `jobs.started_at`이 지금 계정의 `switched_at` 이하이면(`observeRateLimit`와 같은 경계, 같은 밀리초도 옛 실행, 판정 함수 `startedBeforeSwitch` 하나) 그 결과의 결제·풀리는 시각·종류·사용률을 버리고 `rate_limit`(인증 만료면 `auth_expired`), `resets_at` 없음, **재시도 시각 = 지금 + 1분(`MODEL_RESUME.minDelayMs`)** 으로 적는다. 시도로 세지 않는다(한도와 같은 규칙). scheduler는 지금처럼 닫고 재개 예약 루프(15초 주기)가 1분 뒤 같은 해제 전이로 다시 큐에 넣는다. 1분을 고른 이유: 이미 있는 "적어도 1분 뒤" 하한과 같아 곧바로 재실행이 반복되지 않고, 새 판단 경로(대기를 거치지 않고 바로 큐로 돌리기)를 만들지 않는다. 대가: 그 1분 동안 전역 정지와 자리 비움이 잠깐 보일 수 있다. 판정은 `waitForUser`·회수 경로가 쥔 scheduler 행 잠금 아래라, 커밋 전의 전환과 겹쳐도 전환이 끝난 계정을 본다(실제 PostgreSQL 시험). 전환 뒤에 시작한 실행의 결제 멈춤은 지금처럼 `billing`·재시도 시각 없음이다.
+- **F-3 재개는 대기열 상한을 보지 않는다(`Store.resumeWaiting`을 부르는 모든 자리):** 재개 예약 루프(`resumeDue`), 계정 전환(`switchAccount`), 관리 진입점 재개(`adminResumeJob`), `'/resume-model <job>'`, `'/review-resume'`. 멈춘 작업은 이미 접수돼 상한 안에서 자리를 받았던 것이고, 상한은 새 접수(`accept`·`/retry`·변경 자식 접수)만 막는다. 상한으로 재개를 막으면 멈춘 작업이 남아 scheduler가 닫힌 채고, 닫힌 scheduler 때문에 대기열도 줄지 않아 서로를 기다린다. 대가: 재개 직후 모델 대기열이 상한을 멈춘 작업 수만큼 넘을 수 있고, 그동안 새 모델 요청은 지금처럼 `queue_full`이다. 전체 상한(100, 조회 몫 10 포함)도 재개는 보지 않는다. `'/'` 명령 둘까지 넓힌 이유: 티켓은 자동·전환·관리 재개를 적었지만 전환이 리뷰 작업을 `'/review-resume'` 제어로 풀고, 다섯 진입점이 한 전이·한 규칙이라는 C19 결정을 지키려면 함께여야 한다. 그래서 `held: queue_full`과 관리 재개의 `queue_full` 결과는 더 나오지 않는다(`AdminResult`의 이름은 homelab CLI 집합과 맞추려고 남겼다). `'/'` 재개의 거부 문구 `queueFullResume`(`src/chat-task-text.ts`, 이 묶음 소유 아님)은 쓰이지 않게 됐고 지우지 않았다.
+- **F-6 변경 작성 snapshot의 경고(`src/claude-task-bridge.ts` `ClaudeChangeAuthor.fetchResult`):** 검증한 `snapshot` 결과에 `rateLimit`이 있으면 결과를 넘기기 전에 `observeRateLimit(rateLimit, job)`으로 적는다(전환 경계·scheduler 잠금은 그 함수가 지킨다, 실패는 삼킨다). 같은 결과를 다시 받아도 기한은 늘리기만 해 같다. 작업자는 C03부터 이 칸을 싣고 있어 작업자 변경은 없다.
+
+**운영에서 바뀌는 동작(봇 main `4df0a4f` 대비, 스위치 두 판 같음).** 게시 서버는 병합하면 바로, 작업자는 sandbox 사람 PR로 나중에 올라간다.
+
+| 바뀌는 것 | 지금 | 이 판 | 언제 나타나나 |
+|---|---|---|---|
+| 자체 리뷰의 결제 멈춤 | 30분마다 저절로 재개 | 재개하지 않음(전환·관리 재개로 품) | 게시 서버와 작업자가 모두 이 판일 때 |
+| 자체 리뷰의 풀리는 시각 있는 한도 | 30분 뒤 | 그 시각 + 1분 | 위와 같음 |
+| 자체 리뷰 성공 결과의 한도 경고 | 버림 | PR 리뷰를 그 시각까지 미룸 | 위와 같음 |
+| 전환 전에 시작한 실행의 멈춤(결제·먼 시각·인증) | 결제면 owner 개입까지, 시각이면 그때까지, 그 밖은 30분 | 1분 뒤 새 자격으로 재개 | 게시 서버 병합 즉시 |
+| 대기열 상한에서 재개(자동·전환·관리·'/' 둘) | 거부(`queue_full`, 자동은 다음 바퀴) → 서로 막힘 | 받음, 대기열이 상한을 잠깐 넘을 수 있음 | 게시 서버 병합 즉시 |
+| 변경 작성 snapshot의 한도 경고 | 버림 | PR 리뷰를 그 시각까지 미룸 | 게시 서버 병합 즉시 |
+
+마이그레이션은 쓰지 않았다(029 없음).
