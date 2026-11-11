@@ -19,6 +19,7 @@ import type { OutboxButton, Store } from './store.js';
 import type { TaskCommandHandler } from './task-commands.js';
 import { taskProject } from './task-policy.js';
 import { sessionAttachHandler } from './session-key-proposal.js';
+import { expirePending, PROPOSAL_INTERRUPTED_TEXT, RUN_PENDING } from './proposal-retention.js';
 
 // 제안과 실행 확인(COLLEAGUE_SPEC §4.3). 모델은 제안만 하고, 서버가 동작 표에 대조한다. 읽기 요청은 바로 '/'와 같은 경로로 답하고,
 // 실행 요청은 제안을 저장한 뒤 owner가 "할게요"를 눌러야 '/'와 같은 경로로 실행한다. 동료 기능 스위치가 꺼져 있으면 부르지 않는다.
@@ -57,6 +58,9 @@ export const PROPOSAL_TEXT = Object.freeze({
   detachQuestion: (connection: string) => `세션 연결 \`${connection}\`을 해제할까요?`,
   // 커밋 뒤 처리기가 실패했을 때. 처리됐는지 모를 수 있어 확인을 권한다.
   failed: '처리하지 못했어요(일시 오류). 상태를 확인해 달라고 한 뒤 필요하면 다시 말해 주세요.',
+  readWithheld: '결과에 밖에 보이면 안 되는 내용이 섞여 있어 여기에는 싣지 않았어요.',
+  // 확인한 실행이 끝났다는 기록 없이 게시 서버가 멈췄을 때 재시작 뒤 주기 정리가 남기는 안내(proposal-retention.ts).
+  interrupted: PROPOSAL_INTERRUPTED_TEXT,
 });
 // 저장될 글을 줄마다 인용 표시로 싣는다. 내용은 바꾸지 않는다.
 function quoted(text: string): string {
@@ -250,10 +254,12 @@ const memorySearchHandler: ReadHandler = {
 };
 const attachListHandler: ReadHandler = {
   kind: 'read',
-  async run({ job, handlers }) {
+  async run({ job, handlers, policy }) {
     if (!handlers.external) return skip('not_connected');
-    // 목록은 키를 싣지 않아 본인 전용 응답(deliver)을 쓰지 않는다.
-    const reply = await handlers.external.handle({ actor: job.owner_id, scope: job.target, command: 'attach-list', text: '' }, async () => false);
+    // 목록은 키를 싣지 않아 본인 전용 응답(deliver)을 쓰지 않는다. 대신 일반 글이라, 확인 글에서 숨겼던 세션 ID가 여기서 다시
+    // 보이지 않게 같은 공개 검사로 세션 ID를 거른다.
+    const reply = await handlers.external.handle({ actor: job.owner_id, scope: job.target, command: 'attach-list', text: '',
+      publicCheck: text => chatReplyRisk(text, policy) === null }, async () => false);
     return reply.content ?? skip('target_denied');
   },
 };
@@ -554,8 +560,10 @@ export class ProposalDesk {
     if (handler.kind === 'read') {
       // '/' 읽기 명령의 수신과 같은 인가(현재 정책 owner·허용 채널·거부 목록) 뒤 같은 처리기를 부른다.
       await this.gate.authorize(job.owner_id, job.target);
-      const content = await handler.run({ store: this.store, job, proposal, policy, handlers });
-      if (typeof content !== 'string') return content.skip === 'queued' ? 'read' : drop(content.skip);
+      const result = await handler.run({ store: this.store, job, proposal, policy, handlers });
+      if (typeof result !== 'string') return result.skip === 'queued' ? 'read' : drop(result.skip);
+      // '/' 읽기 명령은 본인 전용 응답이지만 여기 결과는 스레드의 일반 글이다. 모델 답과 같은 공개 검사를 지나지 못하면 결과 대신 고정 안내를 단다.
+      const content = chatReplyRisk(result, policy) === null ? result : PROPOSAL_TEXT.readWithheld;
       await this.store.enqueue({ key: `result:${job.id}:read`, job: job.id, conversation: job.conversation_id, actor: job.owner_id,
         scope: job.target, revision: job.revision.policy,
         payload: { kind: 'message', channel: job.target.channel, content, classification: 'safe_summary', after: `result:${job.id}` } });
@@ -583,7 +591,7 @@ export class ProposalDesk {
       // 잠근 뒤 같은 연결로 최신성을 다시 봐야 위 검사와 이 사이에 접수된 새 메시지를 놓치지 않는다.
       await store.db.query('SELECT id FROM conversations WHERE id=$1 FOR UPDATE', [job.conversation_id]);
       if (!await current(store, job)) return 'superseded';
-      await expirePending(store);
+      await expirePending(store.db, store.now());
       const inserted = await store.db.query(`INSERT INTO proposals(id,conversation_id,owner_id,scope,action,target,value,source_event,digest,
         source_job,message_key,created_at,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
         ON CONFLICT (source_job) DO NOTHING RETURNING id`, [id, job.conversation_id, job.owner_id, JSON.stringify(job.target),
@@ -604,11 +612,6 @@ export class ProposalDesk {
 // (다음 대화 차례가 같은 기록을 보고 다시 판단한다).
 const current = (store: Store, job: Job): Promise<boolean> => chatJobCurrent(store.db, job.id);
 
-// 만료된 대기 제안을 끝내고 값을 비운다. 버튼을 누르지 않은 제안의 값이 24시간 넘게 남지 않게 새 제안을 만들 때마다 부른다.
-async function expirePending(store: Store): Promise<void> {
-  await store.db.query(`UPDATE proposals SET state='expired',reason='expired',value=NULL,source_event=NULL,settled_at=$1
-    WHERE state='pending' AND expires_at<=$1`, [store.now()]);
-}
 
 export interface PressInput { proposal: string; answer: 'yes' | 'no'; actor: string; scope: Scope; event: string; context: ExecuteContext }
 // update: 응답으로 그 글의 버튼을 없앤다(처리·거절·만료·이미 처리됨). false면 본인만 보는 응답이고 버튼은 남는다.
@@ -622,9 +625,11 @@ export async function pressProposal(store: Store, input: PressInput): Promise<Pr
   if (!row || row.conversation_id !== conversation.id) return { content: PROPOSAL_TEXT.missing, update: true };
   if (row.owner_id !== input.actor) return { content: PROPOSAL_TEXT.notOwner, update: false };
   if (row.state !== 'pending') return { content: PROPOSAL_TEXT.settled, update: true };
-  const settle = async (state: string, reason: string | null, job: string | null = null) => {
-    const changed = await store.db.query(`UPDATE proposals SET state=$2,reason=$3,result_job=$4,value=NULL,source_event=NULL,settled_at=$5,settled_by=$6
-      WHERE id=$1 AND state='pending' RETURNING id`, [row.id, state, reason, job, store.now(), input.event]);
+  // keep: 커밋 뒤 실행(later)의 입력이라 실행이 끝날 때까지 value·source_event를 남긴다.
+  const settle = async (state: string, reason: string | null, job: string | null = null, keep = false) => {
+    const changed = await store.db.query(`UPDATE proposals SET state=$2,reason=$3,result_job=$4,value=CASE WHEN $7::boolean THEN value END,
+      source_event=CASE WHEN $7::boolean THEN source_event END,settled_at=$5,settled_by=$6
+      WHERE id=$1 AND state='pending' RETURNING id`, [row.id, state, reason, job, store.now(), input.event, keep]);
     if (!changed.rows.length) throw new Error('proposal_state_changed');
     await store.audit('proposal_settled', row.id, { action: row.action, state, reason, job });
   };
@@ -640,6 +645,7 @@ export async function pressProposal(store: Store, input: PressInput): Promise<Pr
     return { content: PROPOSAL_TEXT.changed, update: true };
   }
   const executed = await handler.execute(store, row, values, input.context);
-  await settle(executed.state, executed.reason ?? null, executed.job ?? null);
+  if (executed.later) await settle(executed.state, RUN_PENDING, executed.job ?? null, true);
+  else await settle(executed.state, executed.reason ?? null, executed.job ?? null);
   return { content: executed.content, update: true, ...(executed.later ? { later: executed.later } : {}) };
 }

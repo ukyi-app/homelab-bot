@@ -12,10 +12,13 @@ import type { ExternalTaskCommand, ExternalTaskCommandHandler } from './external
 import { MEMORY_GUIDE } from './memory-commands.js';
 import type { MemoryCommand, MemoryCommandHandler } from './memory-commands.js';
 import type { PolicyGate } from './policy.js';
-import { buttonAllowed, buttonRoute } from './discord-protocol.js';
+import { buttonAllowed, buttonRoute, parseButton } from './discord-protocol.js';
+import { previewWithoutButton } from './change-runtime.js';
+import { CHAT_TASK_TEXT } from './chat-task-text.js';
 import { bindProposalHandlers, PROPOSAL_BUTTONS, PROPOSAL_TEXT, pressProposal } from './proposals.js';
+import { finishProposalRun } from './proposal-retention.js';
 import { chooseNextAnswer, deferInGap, offerAnswer, pressQuestionPick, sealsNextMessage } from './question-pick.js';
-import { pressChangeQuestion } from './change-question.js';
+import { CHANGE_DIRECT_BUTTON, pressChangeQuestion } from './change-question.js';
 import type { ChangeQuestionPress } from './change-question.js';
 import { moveReactions, ReactionSync, recordReceived, settleReactions } from './reactions.js';
 import { LaneClosed } from './store.js';
@@ -310,11 +313,16 @@ export class DiscordIngress {
     }, { expiresAt: started + DEFAULTS.inboxTimeoutMs, now: this.store.now });
     this.log('proposal_button', { command: event.command!, outcome: outcome ? (outcome.update ? 'settled' : 'refused') : 'duplicate' });
     // 기억·변경·세션 연결 처리기는 커밋 뒤 '/' 명령과 같은 호출로 한 번 부른다. 실패하면 다시 하지 않고 확인을 권한다.
+    // 버튼 트랜잭션이 남긴 실행 의도(사유 run_pending과 실행 입력)는 끝난 뒤 지운다. 그 전에 멈추면 주기 정리가 실패 안내를 남긴다.
     if (outcome?.later) {
+      let failed = false;
       outcome.content = await outcome.later().catch(error => {
+        failed = true;
         this.log('proposal_execute_failed', { command: event.command!, ...errorInfo(error) });
         return PROPOSAL_TEXT.failed;
       });
+      // 지우지 못해도 응답은 보낸다. 남은 의도는 주기 정리가 실패 안내로 끝낸다.
+      await finishProposalRun(this.store.db, event.target!, failed).catch(error => { this.log('proposal_run_finish_failed', errorInfo(error)); });
     }
     // 응답을 전하지 못하면 결과 문장(공개해도 되는 고정 문구)을 그 스레드에 남긴다. 버튼은 남지만 다시 누르면 "이미 처리"로 답한다.
     if (outcome) await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: outcome.content, update: outcome.update });
@@ -658,6 +666,33 @@ export function ackFailureReason(error: unknown): string {
   if (message === 'discord_request_failed') return 'http_error';
   return 'error';
 }
+// 켜짐 판으로 저장한 버튼 글의 꺼짐 판. 버튼은 늘 뺀다. 게시 미리보기·변경 질문은 계속 필요한 글이라 버튼 안내를 '/' 안내로 바꾸고,
+// 꺼짐 판이 없는 동료 기능 전용 글(실행 확인·세션 키 보기·질문 고르기)은 undefined(보내지 않음)다. '/' 제어 버튼은 스위치 밖이라 그대로다.
+function unbuttoned(payload: Delivery['payload']): Delivery['payload'] | undefined {
+  const { buttons = [], ...rest } = payload;
+  const parsed = buttons.map(button => parseButton(button.id));
+  if (parsed.every(button => button?.route === 'control')) return payload;
+  if (parsed.every(button => button?.route === 'publish')) {
+    // custom_id 대상 칸은 `<변경 ID>.<generation>.<digest 앞 16자>`다.
+    const changeId = parsed[0]!.parts[1]!.split('.').slice(0, -2).join('.');
+    return { ...rest, content: previewWithoutButton(rest.content, changeId) };
+  }
+  const direct = parsed.find(button => button?.parts[0] === CHANGE_DIRECT_BUTTON);
+  if (direct && parsed.every(button => button?.route === 'change-question')) {
+    // "직접 답하기" 대상 칸은 질문 ID(`job:세션:턴`)의 ':'를 '.'로 바꾼 꼴이다(change-question.ts).
+    return { ...rest, content: changeQuestionWithoutButtons(rest.content, direct.parts[1]!.split('.').join(':')) };
+  }
+  return undefined;
+}
+// 변경 질문 글 끝의 켜짐 판 안내(버튼·말로 답하기)를 같은 기한의 꺼짐 판 안내('/answer')로 바꾼다. 못 찾으면 꺼짐 판 안내를 붙인다.
+function changeQuestionWithoutButtons(content: string, question: string): string {
+  const [head, tail] = CHAT_TASK_TEXT.changeQuestionFooter(true, question, '\u0000').split('\u0000') as [string, string];
+  const at = content.lastIndexOf(head);
+  if (at >= 0 && content.endsWith(tail) && at + head.length <= content.length - tail.length) {
+    return `${content.slice(0, at)}${CHAT_TASK_TEXT.changeQuestionFooter(false, question, content.slice(at + head.length, content.length - tail.length))}`;
+  }
+  return `${content}\n${CHAT_TASK_TEXT.changeQuestionFooter(false, question, '질문 기한')}`;
+}
 export function deliveryMarker(row: Delivery): string {
   return createHash('sha256').update(row.idempotency_key).digest('hex').slice(0, 24);
 }
@@ -748,6 +783,15 @@ export class DiscordPublisher {
     try {
       await this.authorized(row);
       await this.scheduled(row);
+      // 켜짐 때 저장한 버튼 글을 스위치를 끈 게시 서버가 보낸다(AC-23). 지금 스위치로 다시 고르고, 꺼짐 판이 없는 글은 막는다.
+      if (!this.store.colleague && row.payload.buttons?.length) {
+        const payload = unbuttoned(row.payload);
+        if (!payload) {
+          await this.store.audit('delivery_blocked_colleague_off', row.id, { attempt: row.attempt });
+          throw new Denied();
+        }
+        row = { ...row, payload };
+      }
       const pause = await this.store.discordPauseUntil(row.payload.channel);
       if (pause > this.store.now()) { await this.store.pauseDelivery(row, 'discord_global_pause'); return true; }
       const marker = deliveryMarker(row);

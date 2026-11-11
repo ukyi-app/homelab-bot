@@ -12,7 +12,9 @@ import type { Store } from './store.js';
 // R08 연결 명령과 연결 수명 사이. 개인 seed가 평문이 되는 곳은 seedMessage 하나뿐이고, 그 글은 deliver로만 나간다.
 // 반환값·로그·감사에는 seed가 실리지 않는다. 그래서 전달에 실패해도 그 글을 다시 보낼 수 없고, 키를 폐기한다.
 export type ExternalTaskCommand = 'attach' | 'detach' | 'attach-list';
-export interface ExternalCommandRequest { actor: string; scope: Scope; command: ExternalTaskCommand; text: string; target?: string }
+// publicCheck: 응답을 본인 전용이 아닌 일반 글로 낼 때(말로 한 목록) 값이 공개 검사를 지나는지 본다. 지나지 못한 세션 ID는 싣지 않는다.
+// '/' 명령의 본인 전용 응답은 이 칸을 주지 않아 지금처럼 세션 ID를 그대로 보인다.
+export interface ExternalCommandRequest { actor: string; scope: Scope; command: ExternalTaskCommand; text: string; target?: string; publicCheck?: (text: string) => boolean }
 // content가 없으면 deliver로 이미 답했다는 뜻이다.
 export interface ExternalCommandReply { content?: string; outcome: string }
 // "키 보기" 버튼 한 번. proposal은 custom_id의 제안 ID다. deadline은 제안 행 잠금 대기의 상한(수신 마감)이다.
@@ -72,6 +74,8 @@ export const ATTACH_COMMAND_TEXT = Object.freeze({
   listEmpty: '이 스레드에 연결한 세션이 없어요.',
   listHead: '읽기 전용 연결이에요. 사람 세션이 스스로 알린 것만 받고, 결과를 제가 확인하지는 않아요.',
   listMore: '(더 있어요. 활성 연결부터 최근 10건만 보여요)',
+  // 말로 한 목록(일반 글)에서 공개 검사에 걸린 세션 ID 자리. 해제에 쓰는 연결 ID는 그대로 보인다.
+  listIdWithheld: '(세션 ID는 밖에 보이면 안 되는 내용이 섞여 있어 싣지 않았어요)',
   // 본인에게만 보이는 키 응답의 문장 줄. 칸 이름(connection_id 등)과 값은 코드가 채운다.
   seedHead: '세션을 연결했어요. 이 응답은 본인에게만 보이고 **seed는 다시 볼 수 없어요.**',
   seedStore: 'seed는 Keychain 같은 비밀 저장소에 넣어 주세요. 명령 인자·셸 이력·설정 파일에 쓰지 마세요. 설치 안내는 저장소의 tools/r08-helper/README.md에 있어요.',
@@ -197,7 +201,9 @@ export class ExternalTaskCommands implements ExternalTaskCommandHandler {
     if (request.scope.kind === 'channel') return { content: ATTACH_COMMAND_TEXT.threadOnly(this.colleague), outcome: 'wrong_scope' };
     const { items, more } = await this.links.list(request.actor, request.scope);
     if (!items.length) return { content: ATTACH_COMMAND_TEXT.listEmpty, outcome: 'empty' };
-    const lines = items.map(item => `\`${item.connectionId}\` ${item.executor} \`${shortTaskId(item.externalTaskId)}\` · ${STATE_TEXT[item.state]}${item.revokedReason ? `(${item.revokedReason})` : ''}`
+    const shown = (id: string) => !request.publicCheck || (request.publicCheck(id) && request.publicCheck(shortTaskId(id)))
+      ? `\`${shortTaskId(id)}\`` : ATTACH_COMMAND_TEXT.listIdWithheld;
+    const lines = items.map(item => `\`${item.connectionId}\` ${item.executor} ${shown(item.externalTaskId)} · ${STATE_TEXT[item.state]}${item.revokedReason ? `(${item.revokedReason})` : ''}`
       + ` · 요약 ${item.summaryConsent ? '동의' : '없음'} · 만료 ${kstTime(item.expiresAt)} · 마지막 알림 ${item.lastEventAt === null ? '없음' : kstTime(item.lastEventAt)}`);
     return { content: [ATTACH_COMMAND_TEXT.listHead, ...lines, ...(more ? [ATTACH_COMMAND_TEXT.listMore] : [])].join('\n'), outcome: 'listed' };
   }

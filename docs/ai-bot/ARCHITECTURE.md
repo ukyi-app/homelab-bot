@@ -2171,3 +2171,21 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 - **멈춤 기록의 전환 경계:** `Store.recordPause`는 그 실행이 지금 계정으로 바뀌기 전(`jobs.started_at <= model_accounts.switched_at`)에 시작했으면 원인·시각을 버리고 1분 뒤 재시도로 적는다. 판정은 `observeRateLimit`과 같은 함수이고 둘 다 scheduler 행 잠금 아래다.
 - **재개와 대기열 상한:** `Store.resumeWaiting`을 부르는 다섯 진입점(재개 예약 루프, 계정 전환, 관리 진입점 재개, `/resume-model`, `/review-resume`)은 `queueFull`을 보지 않는다. 상한은 새 접수에만 걸린다. 재개 직후 모델 queued가 90을 멈춘 작업 수만큼 넘을 수 있다.
 - **변경 작성 snapshot의 관측:** `ClaudeChangeAuthor.fetchResult`가 검증한 `snapshot`의 `rateLimit`을 `observeRateLimit`으로 적는다. 그래서 대화·리뷰·작업 레인·변경 작성·자체 리뷰 결과의 `allowed_warning`이 모두 리뷰 미루기를 건다.
+
+## C36 묶음 B: 제안·공개 범위 (2026-11-11)
+
+§13 "제안과 실행 확인 (C13)"에 더하는 계약이다. 선택의 이유는 [DECISIONS](DECISIONS.md) "C36 묶음 B".
+
+- **읽기 결과 공개 검사:** `ProposalDesk.consider`의 읽기 분기는 처리기 결과를 outbox(`result:<job>:read`)에 넣기 전에 `chatReplyRisk`로 본다. 걸리면 `PROPOSAL_TEXT.readWithheld`만 넣는다(값은 outbox·게시에 없다). 세션 연결 목록은 `ExternalCommandRequest.publicCheck`를 넘겨 세션 ID 자리만 `ATTACH_COMMAND_TEXT.listIdWithheld`로 바꾸고 연결 ID는 남긴다. '/' 읽기 명령의 본인 전용 응답은 바뀌지 않는다.
+- **커밋 뒤 실행의 의도(제안 행 상태):**
+
+  | 때 | `state` | `reason` | `value`·`source_event` |
+  |---|---|---|---|
+  | "할게요" 커밋(커밋 뒤 실행이 있는 동작: 기억·변경·변경 취소·수정 요청·세션 연결 해제) | `confirmed` | `run_pending` | 남김(실행 입력) |
+  | 실행 끝(수신 `finishProposalRun`) | `confirmed` | 성공 `NULL`, 처리기 오류 `run_failed` | 비움 |
+  | 실행 끝 기록 없이 확정 뒤 10분 지남(주기 정리 `settleInterruptedRuns`) | `confirmed` | `run_interrupted` | 비움, 그 스레드에 `PROPOSAL_TEXT.interrupted` 한 번(outbox 키 `proposal:<제안 ID>`) |
+
+  세 전이는 모두 `reason='run_pending'` 조건부 UPDATE라 먼저 한 쪽만 적용된다. 실패 안내와 행 전이는 한 트랜잭션이다. 다시 실행하지 않는다. 버튼 트랜잭션 안에서 끝나는 동작(작업 시작·취소·재시도·리뷰 제어·세션 연결)은 지금처럼 커밋 때 값을 비운다.
+- **제안 정리 연결:** `purgeExpiredRawText`(게시 서버의 `raw_text_retention` 루프: 시작 직후, 그 뒤 1시간마다, 스위치·레인과 무관)가 네 원문 칸 정리 뒤 `expirePending`(만료 대기 제안 → `expired`, 값 비움)과 `settleInterruptedRuns`를 부른다. 반환값(`RawTextPurged`)의 모양은 그대로다. 함수는 `src/proposal-retention.ts`.
+- **보내기 직전 스위치(`DiscordPublisher.deliverRow`):** 스위치가 꺼진 게시자가 `payload.buttons`가 있는 글을 보낼 때 버튼 경로(`parseButton` route)로 고른다. `control`은 그대로, `publish`는 버튼을 빼고 끝 두 줄을 `previewApproveByStatus` + `previewBinding(false)`로, `change-question`은 버튼을 빼고 끝의 켜짐 판 안내를 같은 기한의 `changeQuestionFooter(false, …)`로 바꾼다. 그 밖(`proposal`·`session-key`·`question`)은 `Denied`로 `blocked`, 감사 `delivery_blocked_colleague_off`. 바꾼 본문은 발송에만 쓰고 outbox 행의 payload는 그대로다(대조 표식은 멱등 키에서 만들어 바뀌지 않는다).
+- **버튼 글의 마지막 쪽 상한(`BUTTON_PAGE_SIZE`, `src/format.ts`):** 위 치환은 버튼 안내를 늘린다(custom_id 100자 상한 안의 가장 긴 ID로 최대 약 290자). 그래서 `Store.enqueue`는 `payload.buttons`가 있는 일반 글의 마지막 쪽(버튼이 붙는 쪽)만 1500자 이하로 나눈다(`messagePages(content, lastPage)`). 앞 쪽은 그대로 1800자, 줄을 가르지 않는 규칙도 같다. 치환 뒤에도 게시자의 본문 상한 1900자 안이다. 쪽 수만 하나 늘 수 있고 멱등 키(`<key>`, `<key>:page:<n>`)·`message_key`·`page_index`·대조 표식 규칙은 같다. 이 규칙 전에 저장된 행에는 걸리지 않는다.

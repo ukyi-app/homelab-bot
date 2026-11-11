@@ -47,6 +47,16 @@ export const CHANGE_NOTICE_TEXT = Object.freeze({
   previewBinding: (c: boolean) => `${c ? '버튼 승인은' : 'digest는'} 위 내용 전체에 묶여 있어요. 승인 전에 base가 움직이면 게시하지 않아요.`,
 });
 
+// 켜짐 판으로 저장한 미리보기를 스위치를 끈 뒤 보낼 때의 꺼짐 판(AC-23, 게시자가 보내기 직전에 부른다). 끝의 버튼 안내 두 줄을 '/' 안내로 바꾼다.
+// 꺼짐 판 승인 명령은 전체 digest가 필요한데 저장된 글과 버튼(앞 16자)에는 없으므로, 승인 digest를 보여 주는 '/change-status'를 거치게 한다.
+export const previewApproveByStatus = (id: string) =>
+  `승인하려면 이 스레드에서 /change-status target:${id} 로 승인 digest를 확인한 뒤 /change-publish target:${id} text:<승인 digest> 로 승인해 주세요.`;
+export function previewWithoutButton(content: string, changeId: string): string {
+  const on = `${CHANGE_NOTICE_TEXT.previewApprove(true, changeId, '')}\n${CHANGE_NOTICE_TEXT.previewBinding(true)}`;
+  const off = `${previewApproveByStatus(changeId)}\n${CHANGE_NOTICE_TEXT.previewBinding(false)}`;
+  return content.endsWith(on) ? `${content.slice(0, -on.length)}${off}` : `${content}\n${off}`;
+}
+
 // 부모 change의 phase를 port 호출로 한 걸음씩 밀어 준다. 부모는 슬롯을 잡지 않고 모델 실행만 자식 job이다.
 // 프로세스 상태가 없다. 시각·재시도 간격만 메모리에 두고, 재시작하면 DB의 phase에서 이어 간다. 그래서 응답을 잃어도 모델을 다시 돌리는 길이 없다.
 // 호출 순서: fetchResult → artifacts.save → verification.run·recordVerification → finalize. finalize 뒤에는 시험할 결과가 작업자에 없다.

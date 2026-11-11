@@ -6,7 +6,7 @@ import { DEFAULTS, Denied, RateLimited } from './contracts.js';
 import type { Clock, EventInput, Job, RateLimitInfo, Scope, State } from './contracts.js';
 import { remaining } from './database.js';
 import type { Database, TransactionDeadline } from './database.js';
-import { messagePages } from './format.js';
+import { BUTTON_PAGE_SIZE, messagePages } from './format.js';
 import { awayKey, syncAway } from './away.js';
 import { moveReactions, settleReactions, sleepReactions } from './reactions.js';
 import { TASK_RETENTION } from './task-contracts.js';
@@ -661,7 +661,8 @@ export class Store {
   }
   async enqueue(input: { key: string; job?: string; conversation?: string; actor: string; scope: Scope; revision: string; services?: string[]; payload: Delivery['payload'] }, tx?: Database): Promise<void> {
     if (!tx) return this.db.transaction(inner => this.enqueue(input, inner));
-    const pages = input.payload.kind === 'message' ? messagePages(input.payload.content) : [input.payload.content];
+    const pages = input.payload.kind === 'message'
+      ? messagePages(input.payload.content, input.payload.buttons?.length ? BUTTON_PAGE_SIZE : undefined) : [input.payload.content];
     const { buttons, ...payload } = input.payload;
     for (const [index, content] of pages.entries()) await tx.query(`INSERT INTO outbox(id,job_id,conversation_id,owner_id,scope,policy_revision,idempotency_key,payload,available_at,created_at,service_ids,message_key,page_index)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$10,$11,$12) ON CONFLICT (idempotency_key) DO NOTHING`,

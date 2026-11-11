@@ -297,6 +297,22 @@ test('C18 말로 하는 일 안내: speech 신뢰 문맥에 PR 리뷰 요청(확
   } finally { await w.worker.close(); }
 });
 
+test('C36 F-10 말로 하는 일 안내: speech 신뢰 문맥의 실행 요청(확인 버튼) 줄에 변경 PR 수정과 대상(이 스레드에서 낸 변경의 ID나 PR 번호)이 있고, slash에는 없다', async () => {
+  const w = await boot();
+  try {
+    await mode({ reply: '네', proposal: null, ack_only: false });
+    await send(w, v2(job(), { surface: 'speech' }));
+    const speech = factsOf(w.launcher.specs.at(-1)!.stdin);
+    const run = speech.split('\n').find(line => line.includes('실행 요청(owner가 확인 버튼을 눌러야 실행된다)'));
+    assert.ok(run, speech);
+    assert.match(run, /변경 PR 수정/);
+    assert.match(run, /이 스레드에서 낸 변경의 ID나 PR 번호/);
+    assert.doesNotMatch(speech, /(^|[\s(`'"])\/[a-z]/m);
+    await send(w, v2(job(), { surface: 'slash' }));
+    assert.ok(!factsOf(w.launcher.specs.at(-1)!.stdin).includes('변경 PR 수정'));
+  } finally { await w.worker.close(); }
+});
+
 test('C18 판 섞임: 말로 하는 일 안내와 출력 스키마 설명은 작업자 안의 값이라 게시 서버 요청 본문(capability digest 재료)에 실리지 않는다', () => {
   const chatJob = { id: randomUUID(), lease_token: randomUUID(), type: 'chat', revision: { policy: 'p' }, budget: { timeoutMs: 60_000, toolCalls: 8 } } as Job;
   const request = workerRequest(chatJob, [{ from: 'owner', text: '상태 알려줘' }], { surface: 'speech', earlierPurged: false });

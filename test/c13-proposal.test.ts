@@ -1,7 +1,9 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Denied } from '../src/contracts.js';
+import { DEFAULTS, Denied } from '../src/contracts.js';
 import type { Database } from '../src/database.js';
+import { DiscordPublisher } from '../src/discord.js';
+import { Store } from '../src/store.js';
 import { PROPOSAL_BUTTONS, PROPOSAL_TEXT, PROPOSAL_TTL_MS } from '../src/proposals.js';
 import { localDatabase, thread } from './helpers.js';
 import { BOT, harness, PROJECT } from './c13-proposal-fixture.js';
@@ -127,6 +129,22 @@ test('C13 스위치가 꺼져 있으면 제안이 있어도 버튼 글이 없고
   assert.equal(h.f.rest.messages.length, 1);
   assert.equal((await database.db.query('SELECT id FROM proposals')).rows.length, 0);
   await assert.rejects(h.press(`${PROPOSAL_BUTTONS.yes}:00000000-0000-4000-8000-000000000000`), Denied);
+  assert.deepEqual(await h.taskJobs(), []);
+});
+
+test('C36 F-11 켜짐에서 저장한 실행 확인 글이 스위치를 끄고 다시 띄운 게시 서버에서 나가면, 버튼 글은 게시하지 않고 대화 답만 나간다', async () => {
+  const h = await harness(database.db);
+  h.reply(taskProposal());
+  await h.say('100000000000000010', REQUEST);
+  h.f.advance(DEFAULTS.debounceMs + 50);
+  await h.local.runtime.tick();
+  assert.equal((await database.db.query("SELECT 1 FROM outbox WHERE payload ? 'buttons' AND state='pending'")).rows.length, 1, '대조: 버튼 글이 저장됐다');
+  const off = new DiscordPublisher(new Store(database.db, h.f.now, false), h.f.gate, h.f.rest);
+  while (await off.deliver()) { /* 쌓인 게시를 비운다 */ }
+  assert.equal(h.buttons().posted.length, 0);
+  assert.ok(h.f.rest.messages.some(m => m.body.content.startsWith('그 저장소에서 시험을 고쳐 볼게요.')), '대화 답은 나간다');
+  assert.ok(!h.f.rest.messages.some(m => m.body.content.includes(REQUEST)), '확인 글(원문 미리보기)도 나가지 않는다');
+  assert.deepEqual((await database.db.query<{ state: string }>("SELECT state FROM outbox WHERE payload ? 'buttons'")).rows.map(r => r.state), ['blocked']);
   assert.deepEqual(await h.taskJobs(), []);
 });
 

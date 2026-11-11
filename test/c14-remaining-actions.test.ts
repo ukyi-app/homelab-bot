@@ -5,6 +5,8 @@ import { Denied } from '../src/contracts.js';
 import { ATTACH_COMMAND_TEXT } from '../src/external-task-commands.js';
 import { RAW_TEXT_NOTICE } from '../src/memory-commands.js';
 import { PROPOSAL_TEXT, PROPOSAL_TTL_MS } from '../src/proposals.js';
+import { purgeExpiredRawText } from '../src/raw-text-retention.js';
+import { Store } from '../src/store.js';
 import { localDatabase, thread } from './helpers.js';
 import { harness, PROJECT } from './c13-proposal-fixture.js';
 import { actions, notifyChannel, notifyThread, outsideThread, TRUNCATE } from './c14-actions-fixture.js';
@@ -93,6 +95,19 @@ test('C14 변경 상태·세션 연결 목록·기억 검색 제안은 확인 �
   assert.equal(a.posted().at(-1), searchSlash);
   assert.equal(a.buttons().posted.length, 0);
   assert.deepEqual(await a.proposals(), []);
+});
+
+test('C36 F-4 읽기 제안의 결과가 공개 검사에 걸리면 일반 답에는 고정 안내만 달고 값은 게시·outbox에 없다. 같은 /명령의 본인 전용 응답은 그대로다', async () => {
+  const a = await wired();
+  const hidden = '10.20.30.40';
+  await a.slash('memory-save', { target: 'decision', text: `배포 대상 노드는 ${hidden}이다 | applies=homelab` });
+  const searchSlash = (await a.slash('memory-search', { text: '배포 대상' })).reply;
+  assert.ok(searchSlash?.includes(hidden), '대조: 본인 전용 응답에는 있다');
+  await a.speak(message(), '배포 대상 노드 기억나?', { action: 'memory_search', target: null, content: '배포 대상' });
+  await a.deliver();
+  assert.equal(a.posted().at(-1), PROPOSAL_TEXT.readWithheld);
+  assert.ok(!a.posted().some(text => text.includes(hidden)));
+  assert.ok(!JSON.stringify((await database.db.query('SELECT payload FROM outbox')).rows).includes(hidden));
 });
 
 test('C14 읽기 템플릿 제안은 카탈로그의 템플릿이면 /read와 같은 read 레인 결과를 달고, 카탈로그 밖이면 버려진다', async () => {
@@ -190,6 +205,44 @@ test('C14 기억 저장 제안은 저장될 내용이 확인 글에 그대로 �
   assert.deepEqual((await a.proposals()).map(p => [p.state, p.value, p.source_event]),
     [['confirmed', null, null], ['declined', null, null], ['expired', null, null]]);
   assert.equal((await a.memoryService.search(a.f.policy.owner, thread, '결정')).length, 0);
+});
+
+test('C36 F-9 누르지 않고 새 제안도 없는 기억 제안의 진술은 만료 뒤 주기 원문 정리가 비운다(스위치를 끈 게시 서버에서도)', async () => {
+  const a = await wired();
+  const statement = '토요일에는 배포하지 않는다 | applies=homelab';
+  await a.speak(message(), '토요일 배포 규칙 기억해 둬', { action: 'memory_save', target: 'decision', content: statement });
+  // 만료 전에는 남는다(버튼을 누를 수 있다).
+  await purgeExpiredRawText(database.db, a.f.now());
+  assert.deepEqual((await a.proposals()).map(p => [p.state, p.value]), [['pending', statement]]);
+  a.f.advance(PROPOSAL_TTL_MS + 1);
+  // 스위치를 끄고 다시 띄운 게시 서버도 같은 정리를 돈다(정리는 DB와 시각만 받는다).
+  const off = new Store(database.db, a.f.now, false);
+  await purgeExpiredRawText(off.db, off.now());
+  assert.deepEqual((await a.proposals()).map(p => [p.state, p.value, p.source_event, p.reason]), [['expired', null, null, 'expired']]);
+  assert.ok(!JSON.stringify((await database.db.query('SELECT * FROM proposals')).rows).includes('토요일'));
+});
+
+test('C36 F-7 "할게요" 확정 커밋 뒤 실행 전에 멈추면, 다시 띄운 게시 서버의 주기 정리가 그 스레드에 실패 안내를 한 번 남기고 값을 비운다', async () => {
+  const a = await wired();
+  const statement = '일요일에는 배포하지 않는다 | applies=homelab';
+  await a.speak(message(), '일요일 배포 규칙 기억해 둬', { action: 'memory_save', target: 'decision', content: statement });
+  // 커밋 뒤 처리기 호출에서 프로세스가 멈춘 것과 같다: 처리기가 끝나지 않는다.
+  a.memoryService.remember = () => new Promise(() => {});
+  void a.press(yesOf(a));
+  for (let spin = 0; spin < 200 && (await a.proposals())[0]!.state === 'pending'; spin++) await new Promise(resolve => setImmediate(resolve));
+  // 확정했지만 실행이 끝나지 않은 동안에는 값(실행 입력)을 남긴다.
+  assert.deepEqual((await a.proposals()).map(p => [p.state, p.value]), [['confirmed', statement]]);
+  const posted = a.posted().length;
+  // 실행 중일 수 있는 동안(10분)은 건드리지 않는다.
+  await purgeExpiredRawText(database.db, a.f.now());
+  await a.deliver();
+  assert.equal(a.posted().length, posted);
+  a.f.advance(10 * 60_000 + 1);
+  await purgeExpiredRawText(database.db, a.f.now());
+  await purgeExpiredRawText(database.db, a.f.now());
+  await a.deliver();
+  assert.deepEqual(a.posted().slice(posted), [PROPOSAL_TEXT.interrupted]);
+  assert.deepEqual((await a.proposals()).map(p => [p.state, p.value, p.source_event, p.reason]), [['confirmed', null, null, 'run_interrupted']]);
 });
 
 test('C14 기억 저장 제안의 값이 확인 글과 달라지면 버튼은 저장하지 않는다(owner가 본 값만 저장된다)', async () => {
