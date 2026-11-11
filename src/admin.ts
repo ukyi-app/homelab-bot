@@ -2,8 +2,8 @@ import type { PolicyGate } from './policy.js';
 import type { Store } from './store.js';
 import type { ReleaseOutcome, TaskBridge } from './task-bridge.js';
 import type { ExecutionLaneClosedReason } from './task-contracts.js';
-import { ACCOUNT_NAME, listAccounts, recordAccount, switchAccount } from './model-accounts.js';
-import type { AccountView, PausedCounts } from './model-accounts.js';
+import { ACCOUNT_METHODS, ACCOUNT_NAME, listAccounts, recordAccount, switchAccount } from './model-accounts.js';
+import type { AccountMethod, AccountView, PausedCounts } from './model-accounts.js';
 
 // 관리 기능 진입점의 명령 처리(명세 §4.8, DECISIONS "동료 봇 전환" 3). owner가 클러스터 접근 권한으로 `homelab bot`을 실행하면
 // CLI가 게시 서버 파드 안에서 admin-main을 부른다. 권한의 근거는 클러스터 접근이지 Discord owner ID가 아니다.
@@ -28,7 +28,7 @@ export type AdminCommand =
   | { name: 'status' }
   | { name: 'block'; user: string }
   | { name: 'release'; job: string }
-  | { name: 'account'; action: 'record' | 'use'; account: string; method: 'subscription' }
+  | { name: 'account'; action: 'record' | 'use'; account: string; method: AccountMethod }
   | { name: 'account'; action: 'list' };
 
 export type AdminState = { emergency: boolean; paused: boolean; executionPending: boolean; taskLaneClosed: ExecutionLaneClosedReason | null };
@@ -59,11 +59,12 @@ export function parseAdminArgs(argv: readonly string[]): AdminCommand {
   if (name === 'release' && a !== undefined && b === undefined && UUID.test(a)) return { name, job: a };
   throw new AdminUsage();
 }
-// 계정 동작은 `account list`와 `account record|use <이름> subscription`뿐이다. API 크레딧(api)은 C23이 받는다.
+// 계정 동작은 `account list`와 `account record|use <이름> subscription|api`뿐이다(api는 API 크레딧 방식).
 function parseAccount([action, account, method, ...rest]: readonly string[]): AdminCommand {
   if (action === 'list' && account === undefined) return { name: 'account', action };
-  if ((action === 'record' || action === 'use') && account !== undefined && ACCOUNT_NAME.test(account) && method === 'subscription' && !rest.length)
-    return { name: 'account', action, account, method };
+  if ((action === 'record' || action === 'use') && account !== undefined && ACCOUNT_NAME.test(account)
+    && (ACCOUNT_METHODS as readonly (string | undefined)[]).includes(method) && !rest.length)
+    return { name: 'account', action, account, method: method as AccountMethod };
   throw new AdminUsage();
 }
 

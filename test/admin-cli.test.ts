@@ -299,6 +299,29 @@ test('계정 기록: 구독 계정의 이름·방식·발급일만 남기고, �
   assert.equal(f.requests.length, 0);
 });
 
+test('C23 계정 기록·전환(API 크레딧): 발급일·만료일 없이 기록되고, 같은 이름의 구독과 따로 지금 계정·방식이 되며 결제 멈춤을 푼다', async () => {
+  await admin('account', 'record', 'main', 'subscription');
+  const recorded = await admin('account', 'record', 'main', 'api');
+  assert.equal(recorded.code, 0);
+  assert.equal(recorded.report.result, 'recorded');
+  await admin('account', 'use', 'main', 'subscription');
+  const { chat } = await pausedPair();
+  const out = await admin('account', 'use', 'main', 'api');
+  assert.equal(out.code, 0);
+  assert.equal(out.report.result, 'switched');
+  assert.deepEqual(out.report.switch, { resumed: 2, waiting: 0, held: null });
+  assert.deepEqual(await job(chat), { state: 'queued', wait_reason: null });
+  const list = (await admin('account', 'list')).report.accounts!;
+  assert.deepEqual(list.map(a => [a.name, a.method, a.current, a.issuedAt === null, a.expiresAt === null]),
+    [['main', 'api', true, true, true], ['main', 'subscription', false, false, false]]);
+  // 지표의 method 라벨 값(api)과 감사 detail이 방식을 싣는다.
+  const detail = (await database.db.query<{ detail: { method?: string } }>("SELECT detail FROM audit WHERE kind='admin_command' AND subject='account use' ORDER BY id")).rows;
+  assert.deepEqual(detail.map(row => row.detail.method), ['subscription', 'api']);
+  // 등록하지 않은 방식으로는 바꾸지 않는다.
+  await admin('account', 'record', 'spare', 'subscription');
+  assert.equal((await admin('account', 'use', 'spare', 'api')).report.result, 'unknown_account');
+});
+
 // 결제로 멈춘 대화 작업 하나와 한도로 멈춘 PR 리뷰 작업 하나.
 const pausedPair = async () => {
   const chat = await paused();
@@ -445,13 +468,14 @@ test('관리 진입점 입력은 고정 명령 단어와 형식이 맞는 ID만 
   for (const argv of [[], ['stop'], ['emergency-stop', 'now'], ['status', '--json'], ['resume'], ['resume', 'job'],
     ['resume', 'job', 'not-a-uuid'], ['block', 'fixture-owner'], ['block', '12345'], ['block', '123456789012345678', 'x'],
     ['block', '123456789012345678;rm'], ['release', '0F8B5A8E-3C1D-4E2F-9A7B-1C2D3E4F5A6B'], ['release', '$(id)'],
-    ['account'], ['account', 'list', 'x'], ['account', 'record', 'main'], ['account', 'use', 'main', 'api'],
+    ['account'], ['account', 'list', 'x'], ['account', 'record', 'main'], ['account', 'use', 'main', 'API'], ['account', 'use', 'main', 'credit'],
     ['account', 'use', 'Main', 'subscription'], ['account', 'use', '-main', 'subscription'], ['account', 'use', 'main-', 'subscription'],
     ['account', 'use', 'a'.repeat(33), 'subscription'], ['account', 'use', '../x', 'subscription'], ['account', 'record', 'main', 'subscription', 'x'],
     ['account', 'remove', 'main', 'subscription']])
     assert.throws(() => parseAdminArgs(argv), AdminUsage, argv.join(' '));
   assert.deepEqual(parseAdminArgs(['account', 'use', 'a'.repeat(32), 'subscription']),
     { name: 'account', action: 'use', account: 'a'.repeat(32), method: 'subscription' });
+  assert.deepEqual(parseAdminArgs(['account', 'record', 'main', 'api']), { name: 'account', action: 'record', account: 'main', method: 'api' });
 });
 
 test('관리 진입점 실행: 사용법 오류는 DB를 열지 않고 64, 결과는 JSON 한 줄, 실패는 원문 없이 1', async () => {
