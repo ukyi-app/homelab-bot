@@ -2763,23 +2763,6 @@ T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·
 - **운영에서 바뀌는 동작:** 봇 병합으로는 게시 서버만 바뀐다(관리 진입점이 `api`를 받음, 한도 관측이 scheduler 잠금 아래에서 적힘). 작업자 변경은 sandbox 배포 PR(할 일 6)로만 올라간다. 새 작업자는 방식 표시가 없는 지금 Secret에서 구독으로 돈다. homelab CLI의 구독 `account use`가 이제 방식 표시(`subscription`)와 API 키 두 자리(`unset`)를 작업자 Infisical 키에 함께 쓴다(지금 ExternalSecret은 읽지 않으므로 운영 영향 없음, sandbox 배포 PR의 전제 키가 생긴다).
 - **못 잡는 범위:** 실제 크레딧 차감과 실제 소진 응답(S5에서 Console로 본다), 실제 CLI의 API 키 출처 표시(바이너리 정적 읽기만), API 방식 egress, 실제 ESO·kubelet 반영 시간, Infisical에 키를 먼저 넣는 사람 순서, 방식 표시·자격 파일 읽기와 볼륨 교체의 엇갈림.
 
-<<<<<<< HEAD
-## C36 묶음 D 자체 고치기 경합 (2026-11-11, 로컬)
-
-전체 리뷰 F-8, AC-31. 구현 선택은 [DECISIONS](DECISIONS.md) "C36 묶음 D 자체 고치기 경합 구현 선택", 계약은 [ARCHITECTURE](ARCHITECTURE.md) "C36 묶음 D: 고치기 차례의 늦은 작성 결과". 경계는 S1(실제 PostgreSQL, 게시 서버 둘)이다.
-
-| 완료 조건 | 근거 |
-|---|---|
-| 늦은 앞 차례 결과가 새 고치기 차례를 바꾸지 않는다 | `change-pg` "C36 F-8 실제 PostgreSQL: 앞 차례 작성 결과를 들고 있던 게시 서버가 …"(런타임 둘, 한쪽이 처음 작성 결과를 받은 채 멈추고 다른 쪽이 저장·시험·리뷰·`startSelfFix`까지 간 뒤 풀면: 단계 `authoring`, artifact·확인할 것 없음. 이어서 새 차례 결과로 승인 대기, 확인할 것은 새 차례 것, 승인 artifact ≠ 앞 차례 artifact) |
-| 차례 확인 뒤 저장 직전에 차례가 바뀌어도 앞 차례 artifact가 들어가지 않는다 | `change-pg` "C36 F-8 실제 PostgreSQL: 차례 확인 뒤 artifact 저장 직전에 멈춘 게시 서버가 …"(런타임 둘, 한쪽이 확인할 것 기록을 지나 `artifacts.save` 직전에 멈추고 다른 쪽이 저장·시험·리뷰·`startSelfFix`까지 간 뒤 풀면: 풀린 저장은 `phase_conflict`, 단계 `authoring`, artifact 없음. 이어서 새 차례 결과로 승인 대기, 승인 artifact ≠ 앞 차례 artifact) |
-| 부모 잠금 아래에서 지금 차례와 같을 때만 저장 | `change-store-pg` "C36 F-8 실제 PostgreSQL: 고치기 차례를 여는 것과 앞 차례 작성 job의 늦은 저장이 겹쳐도 …"(`startSelfFix`와 앞 차례 job의 `recordChangeNotes`를 동시에 5번: 앞서 닿으면 기록 뒤 지워지고 뒤에 닿으면 `stale`, 새 차례 자리는 비어 있음. 앞 차례 job의 `recordSnapshot`은 `phase_conflict`, 지금 차례 job은 기록·저장) |
-
-- **빨강:** 고치기 전 `change-pg` 시험이 "앞 차례 결과가 새 차례를 snapshot_ready로 넘기지 않는다" 단언에서 `snapshot_ready`로 실패했다(리뷰 보고의 재현 순서 그대로).
-- **바꾼 기존 시험:** `change-guidance` "AC-25 승인 묶음: …"이 `recordChangeNotes`의 결과를 참·거짓 대신 `recorded`·`kept`로 본다. 두 번째 기록은 빈 목록 대신 다른 목록을 넣어 "처음 것 그대로"를 본다(빈 목록은 이제 기록 자체를 하지 않는다).
-- **저장 직전 멈춤의 빨강:** 런타임이 포트에 작성 job을 넘기기 전에는 새 시험이 풀린 저장의 결과 단언에서 `{ ok: true, artifactDigest: … }`로 실패했다(앞 차례 artifact가 새 차례 자리에 들어갔다).
-- **못 잡는 범위:** 두 파드의 실제 네트워크 지연 조합.
-||||||| 4df0a4f
-=======
 ## C36 묶음 C: 문구·브리핑 (2026-11-11, 로컬)
 
 전체 리뷰 1차의 F-5·F-12·F-13. 명세 §4.4·§4.7("지금 안내문 교체")·§4.9, AC-11·15·23. 구현 선택은 [DECISIONS](DECISIONS.md) "C36 묶음 C". 경계는 S1(PGlite 저장소·가짜 시계의 예약 브리핑 → outbox, 가짜 Discord REST의 `DiscordIngress.receive`, 문구 표). 발견마다 고치기 전에 빨간 시험으로 재현했다(F-5: 결제 멈춤도 "중지(한도 대기 2건) · /model-status로 확인"과 작업 레인 "한도·인증 대기 1건"으로 나감, F-12: 켜짐 판 답·채널 안내에 `/change-status`·`/attach-list`와 "못했습니다").
@@ -2797,4 +2780,18 @@ T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·
 - **바꾼 기존 시험:** `chat-task-text` 꺼짐 판 기대값(`/resume-model` 뺌, `/cancel`만), 작업 레인 줄 리터럴 넷(`briefing-task-lane` 둘, `briefing-observations`·`memory-briefing` 하나씩, "한도·인증 대기" → "모델 대기"), `external-task-assembly`·`c15-session-key`의 `EXTERNAL_ACK_NOTICE` → `COMMAND_INGRESS_TEXT.attachAckLost(false)`(두 시험 모두 꺼짐 판).
 - **운영에서 바뀌는 동작(스위치 밖, 병합하면 바로 게시 서버에 나감):** 브리핑 모델 멈춤 줄·작업 레인 줄 이름, 24시간 대기 안내(꺼짐 판에서 `/resume-model` 빠짐), 변경·세션 연결 명령의 오류·ACK 실패 안내 말투(꺼짐 판도 해요체). 작업자·스키마·DB는 바뀌지 않아 작업자 배포 순서와 무관하다.
 - **못 잡는 범위:** 문구의 자연스러움(owner 검토·C24 표본). 24시간 안내는 문구 표 단위로 봤고 `ClaudeTaskBridge.sweep`에서 48시간 대기 작업으로 실제 게시까지 잇는 시험은 두지 않았다(그 자리는 표의 문구를 그대로 넘긴다).
->>>>>>> origin/main
+
+## C36 묶음 D 자체 고치기 경합 (2026-11-11, 로컬)
+
+전체 리뷰 F-8, AC-31. 구현 선택은 [DECISIONS](DECISIONS.md) "C36 묶음 D 자체 고치기 경합 구현 선택", 계약은 [ARCHITECTURE](ARCHITECTURE.md) "C36 묶음 D: 고치기 차례의 늦은 작성 결과". 경계는 S1(실제 PostgreSQL, 게시 서버 둘)이다.
+
+| 완료 조건 | 근거 |
+|---|---|
+| 늦은 앞 차례 결과가 새 고치기 차례를 바꾸지 않는다 | `change-pg` "C36 F-8 실제 PostgreSQL: 앞 차례 작성 결과를 들고 있던 게시 서버가 …"(런타임 둘, 한쪽이 처음 작성 결과를 받은 채 멈추고 다른 쪽이 저장·시험·리뷰·`startSelfFix`까지 간 뒤 풀면: 단계 `authoring`, artifact·확인할 것 없음. 이어서 새 차례 결과로 승인 대기, 확인할 것은 새 차례 것, 승인 artifact ≠ 앞 차례 artifact) |
+| 차례 확인 뒤 저장 직전에 차례가 바뀌어도 앞 차례 artifact가 들어가지 않는다 | `change-pg` "C36 F-8 실제 PostgreSQL: 차례 확인 뒤 artifact 저장 직전에 멈춘 게시 서버가 …"(런타임 둘, 한쪽이 확인할 것 기록을 지나 `artifacts.save` 직전에 멈추고 다른 쪽이 저장·시험·리뷰·`startSelfFix`까지 간 뒤 풀면: 풀린 저장은 `phase_conflict`, 단계 `authoring`, artifact 없음. 이어서 새 차례 결과로 승인 대기, 승인 artifact ≠ 앞 차례 artifact) |
+| 부모 잠금 아래에서 지금 차례와 같을 때만 저장 | `change-store-pg` "C36 F-8 실제 PostgreSQL: 고치기 차례를 여는 것과 앞 차례 작성 job의 늦은 저장이 겹쳐도 …"(`startSelfFix`와 앞 차례 job의 `recordChangeNotes`를 동시에 5번: 앞서 닿으면 기록 뒤 지워지고 뒤에 닿으면 `stale`, 새 차례 자리는 비어 있음. 앞 차례 job의 `recordSnapshot`은 `phase_conflict`, 지금 차례 job은 기록·저장) |
+
+- **빨강:** 고치기 전 `change-pg` 시험이 "앞 차례 결과가 새 차례를 snapshot_ready로 넘기지 않는다" 단언에서 `snapshot_ready`로 실패했다(리뷰 보고의 재현 순서 그대로).
+- **바꾼 기존 시험:** `change-guidance` "AC-25 승인 묶음: …"이 `recordChangeNotes`의 결과를 참·거짓 대신 `recorded`·`kept`로 본다. 두 번째 기록은 빈 목록 대신 다른 목록을 넣어 "처음 것 그대로"를 본다(빈 목록은 이제 기록 자체를 하지 않는다).
+- **저장 직전 멈춤의 빨강:** 런타임이 포트에 작성 job을 넘기기 전에는 새 시험이 풀린 저장의 결과 단언에서 `{ ok: true, artifactDigest: … }`로 실패했다(앞 차례 artifact가 새 차례 자리에 들어갔다).
+- **못 잡는 범위:** 두 파드의 실제 네트워크 지연 조합.
