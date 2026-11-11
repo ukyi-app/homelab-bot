@@ -16,7 +16,7 @@ import { CHAT, GUILD, NOTIFY, OWNER, ProbeLedger, Trace, boot, breakable, briefi
 
 // 브리핑의 작업 레인 칸. 브리핑은 알림 채널에 공개되므로 건수와 상태 상수만 담는다.
 const SLOT = Date.UTC(2027, 0, 15, 23, 50);
-const COUNTS_ZERO = '실행 중 0건 · 질문 대기 0건 · 한도·인증 대기 0건 · unknown 0건 · 도구 승인 대기: 지원 안 함';
+const COUNTS_ZERO = '실행 중 0건 · 질문 대기 0건 · 모델 대기 0건 · unknown 0건 · 도구 승인 대기: 지원 안 함';
 const OPEN: BriefingTaskSource = { gate: () => ({ open: true, routed: true, intakeOpen: true }) };
 const SECRETS = ['fixture-secret-request', 'fixture-secret-prompt', 'fixture-secret-org/fixture-secret-repo', '/fixture/secret/path', 'fixture-secret-token'];
 const memory = { recheckDue: async () => ({ items: [], total: 0 }), live: async () => true } as unknown as MemoryService;
@@ -91,7 +91,7 @@ test('브리핑 칸 열림: 작업 레인 건수만 세고 질문 대기에 가�
   await job('task', 'queued'); await job('task', 'succeeded'); await job('chat', 'running'); await job('review', 'unknown');
   await question(await job('task', 'queued'), SLOT - 300 * 60_000, 'answered');
   assert.equal(laneLine(await compose(OPEN)),
-    '- 작업 레인: 열림 · 실행 중 2건 · 질문 대기 2건(가장 오래된 42분) · 한도·인증 대기 2건 · unknown 1건 · 도구 승인 대기: 지원 안 함');
+    '- 작업 레인: 열림 · 실행 중 2건 · 질문 대기 2건(가장 오래된 42분) · 모델 대기 2건 · unknown 1건 · 도구 승인 대기: 지원 안 함');
 });
 
 for (const [elapsed, text] of [[30_000, '1분 미만'], [65 * 60_000, '1시간 5분'], [-60_000, '1분 미만']] as const) {

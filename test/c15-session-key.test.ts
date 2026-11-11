@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { DEFAULTS, Denied, RateLimited } from '../src/contracts.js';
 import type { Proposal } from '../src/contracts.js';
 import type { Database } from '../src/database.js';
-import { ALL_COMMANDS, DiscordIngress, EXTERNAL_ACK_NOTICE } from '../src/discord.js';
+import { ALL_COMMANDS, COMMAND_INGRESS_TEXT, DiscordIngress } from '../src/discord.js';
 import { CUSTOM_ID_MAX, DiscordProtocol } from '../src/discord-protocol.js';
 import { ExternalTaskCommands, SESSION_KEY_TEXT } from '../src/external-task-commands.js';
 import { ExternalTaskLinks, OneTimeSeed } from '../src/external-task-links.js';
@@ -285,5 +285,5 @@ test('C15 동료 기능 스위치가 꺼져 있으면 "키 보기" 버튼을 받
     new ExternalTaskCommands(new ExternalTaskLinks(h.f.store), ENVIRONMENT, () => {}));
   await slash.receive(event('slash-attach', { kind: 'command', command: 'attach', target: SESSION, text: 'claude' }));
   assert.match(acks.at(-1)!.content, /^seed: `[^`]+`$/m);
-  assert.notEqual(acks.at(-1)!.content, EXTERNAL_ACK_NOTICE);
+  assert.notEqual(acks.at(-1)!.content, COMMAND_INGRESS_TEXT.attachAckLost(false));
 });

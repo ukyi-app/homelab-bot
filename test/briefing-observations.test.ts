@@ -314,7 +314,7 @@ test('[T20 B5] 일부 종류만 연결하면 나머지 종류를 연결 없음·
   assert.equal(await scheduler.tick(), 'enqueued');
   const content = (await database.db.query<{ payload: { content: string } }>("SELECT payload FROM outbox WHERE message_key LIKE 'briefing:%'")).rows[0]!.payload.content;
   assert.match(content, /■ 확인 필요\n- 백업·인증서: 연결된 조회 없음 · 미확인\n■ 관측 결과\n- jobs: 정상 · 정상 요약/);
-  assert.match(content, /- 작업 레인: 상태 미확인 · 실행 중 0건 · 질문 대기 0건 · 한도·인증 대기 0건 · unknown 0건 · 도구 승인 대기: 지원 안 함/);
+  assert.match(content, /- 작업 레인: 상태 미확인 · 실행 중 0건 · 질문 대기 0건 · 모델 대기 0건 · unknown 0건 · 도구 승인 대기: 지원 안 함/);
 });
 
 test('[T20 B5 fix2] 시계가 작성 시작과 원본 읽기 사이에 지나가도 방금 읽은 관측을 읽기 불가로 버리지 않음', async () => {

@@ -469,6 +469,49 @@ test('C10 스위치 두 판: 모델 호출 중지 줄은 꺼지면 /model-status
   // 켜짐 판 브리핑 전체에 '/' 명령 이름과 기억 명령 이름이 없다(AC-11).
   assert.doesNotMatch(on, /(^|[\s(`'"])\/[a-z]|memory-(save|search|correct|exclude|delete)|model-status/);
 });
+// C36 F-5(AC-15, 결정 7): 모델 멈춤 중 브리핑은 Discord에 나가므로 자리 비움만 적는다. 원인(한도·인증·결제)과 '/' 이름은
+// 두 판 모두 없다. 결제는 jobs.wait_reason이 model_limit이고 멈춤 기록의 kind로만 가른다.
+const PAUSES = { rate_limit: 'model_limit', auth_expired: 'auth_expired', billing: 'model_limit' } as const;
+async function pausedJob(id: string, kind: keyof typeof PAUSES, type = 'chat') {
+  await database.db.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,received_at,payload)
+    VALUES ($1,'discord',$1,$1,'fixture-owner','{}',0,'{}')`, [id]);
+  await database.db.query(`INSERT INTO jobs(id,event_id,type,owner_id,target,revision,budget,state,wait_reason,priority,available_at,created_at)
+    VALUES ($1,$1,$2,'fixture-owner','{}','{}','{}','waiting_user',$3,20,0,0)`, [id, type, PAUSES[kind]]);
+  await database.db.query(`INSERT INTO model_pauses(job_id,kind,retry_at,paused_at) VALUES ($1,$2,$3,0)`, [id, kind, kind === 'billing' ? null : 1]);
+}
+const CAUSE = /한도|인증 만료|인증 대기|결제|billing|rate.?limit|auth_expired/i;
+const SLASH = /(^|[\s(`'"])\/[a-z]/;
+for (const kind of Object.keys(PAUSES) as (keyof typeof PAUSES)[]) {
+  test(`C36 F-5 모델 멈춤(${kind}) 중 브리핑은 두 판 모두 원인·'/' 이름 없이 자리 비움만 적는다`, async () => {
+    await database.db.query("INSERT INTO controls VALUES ('scheduler','true')");
+    await pausedJob('fixture-paused-chat', kind);
+    await pausedJob('fixture-paused-task', kind, 'task');
+    const slash = scheduler();
+    await slash.ensure();
+    at(SLOT); assert.equal(await slash.tick(), 'enqueued');
+    const colleague = scheduler([], { config: { ...seoul, colleague: true } });
+    at(SLOT + DAY); assert.equal(await colleague.tick(), 'enqueued');
+    const [off, on] = (await briefings()).map(row => row.payload.content);
+    for (const content of [off!, on!]) {
+      assert.ok(content.includes('- 모델 호출: 자리 비움'), content);
+      assert.ok(content.includes('2건'), content);
+      assert.doesNotMatch(content, CAUSE);
+      assert.doesNotMatch(content, SLASH);
+      assert.doesNotMatch(content, /비상/);
+    }
+  });
+}
+test('C36 F-5 비상 정지는 모델 멈춤과 따로 지금처럼 보이고, 같이 있으면 원인 없이 자리 비움 줄이 따로 붙는다', async () => {
+  await database.db.query("INSERT INTO controls VALUES ('scheduler','true'),('scheduler_emergency','true')");
+  await pausedJob('fixture-paused', 'rate_limit');
+  const slash = scheduler();
+  await slash.ensure();
+  at(SLOT); assert.equal(await slash.tick(), 'enqueued');
+  const off = (await briefings())[0]!.payload.content;
+  assert.ok(off.includes(BRIEFING_TEXT.modelStopped.slash('비상 중지')), off);
+  assert.ok(off.includes('- 모델 호출: 자리 비움'), off);
+  assert.doesNotMatch(off, CAUSE);
+});
 // AC-17: 한도 경고로 PR 리뷰를 미루는 동안 대기열의 PR 리뷰 건수를 브리핑에 적는다. 미루지 않을 때는 줄이 없다.
 test('AC-17 리뷰를 미루는 동안 브리핑에 미룬 PR 리뷰 건수가 나오고, 미루지 않으면 그 줄이 없다', async () => {
   const review = async (id: string, state: string) => {
@@ -530,7 +573,7 @@ test('BRIEF-01 읽기 불가·오래된 관측은 미확인, 정상은 현재 �
   assert.doesNotMatch(first, /jobs: 정상/);
   assert.match(first, /malformed: 읽기 불가 · 마지막 정상 수집 없음 · 미확인/);
   assert.match(first, /fractional: 읽기 불가 · 마지막 정상 수집 없음 · 미확인/);
-  assert.match(first, /- 작업 레인: 상태 미확인 · 실행 중 0건 · 질문 대기 0건 · 한도·인증 대기 0건 · unknown 0건 · 도구 승인 대기: 지원 안 함/);
+  assert.match(first, /- 작업 레인: 상태 미확인 · 실행 중 0건 · 질문 대기 0건 · 모델 대기 0건 · unknown 0건 · 도구 승인 대기: 지원 안 함/);
   assert.doesNotMatch(first, /연결 전\(T18\)/);
   certificate = { observedAt: SLOT + DAY - 1000, status: 'problem', summary: '14일 뒤 만료' };
   at(SLOT + DAY); await s.tick();
