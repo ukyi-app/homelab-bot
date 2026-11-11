@@ -1,10 +1,13 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { PUBLISH_TEXT } from '../src/change-commands.js';
-import { CHANGE_NOTICE_TEXT } from '../src/change-runtime.js';
-import { Denied } from '../src/contracts.js';
+import { PUBLISH_TEXT, publishButton } from '../src/change-commands.js';
+import { changeDirectId } from '../src/change-question.js';
+import { CHANGE_NOTICE_TEXT, previewWithoutButton } from '../src/change-runtime.js';
+import { CHAT_TASK_TEXT } from '../src/chat-task-text.js';
+import { Denied, RateLimited } from '../src/contracts.js';
 import { DiscordPublisher } from '../src/discord.js';
-import { DiscordProtocol } from '../src/discord-protocol.js';
+import { CUSTOM_ID_MAX, DiscordProtocol } from '../src/discord-protocol.js';
+import { BUTTON_PAGE_SIZE, messagePages } from '../src/format.js';
 import { Store } from '../src/store.js';
 import { REPO } from './change-github-fake.js';
 import { REQUEST_TEXT, THREAD, WRITE_STEP, changeHarness } from './change-assembly-harness.js';
@@ -159,6 +162,71 @@ test("C36 F-11 켜짐에서 저장한 미리보기가 스위치를 끄고 다시
     assert.ok(shown.content.includes(CHANGE_NOTICE_TEXT.previewBinding(false)), shown.content);
     assert.ok(!shown.content.includes(PUBLISH_TEXT.label), shown.content);
   });
+});
+
+// 꺼짐 판 치환은 버튼 안내를 '/' 안내로 바꿔 글을 늘린다. 켜짐 때 저장한 미리보기의 마지막 쪽이 쪽 상한(1800자) 근처여도
+// 게시자의 본문 상한(1900자)에 걸려 막히지 않아야 owner가 미리보기 끝과 승인 방법을 받는다.
+const SENT_LIMIT = 1900;
+// 대조 표식과 첫 쪽의 owner 호출을 뗀 본문.
+const unmarked = (content: string) => content.replace(/\n-# ref:[0-9a-f]{24}$/, '').replace(/^<@[^>]+> /, '');
+// 앞 쪽은 1800자에 꽉 차고, 고치기 전 규칙(쪽 상한 하나)이면 마지막 쪽이 lastPage자인 켜짐 판 미리보기 글.
+const longPreview = (id: string, lastPage: number) => {
+  const on = `${CHANGE_NOTICE_TEXT.previewApprove(true, id, '')}\n${CHANGE_NOTICE_TEXT.previewBinding(true)}`;
+  let body = '';
+  for (let line = 0; body.length < 1800 + lastPage; line++) body += `- ${line % 10}${'가'.repeat(96)}\n`;
+  return `${body.slice(0, 1800 + lastPage - on.length - 1).trimEnd().padEnd(1800 + lastPage - on.length - 1, '나')}\n${on}`;
+};
+for (const lastPage of [1800, 1790]) {
+  test(`C36 F-11 켜짐 판 미리보기의 마지막 쪽이 ${lastPage}자여도 꺼진 게시자가 본문 전체와 '/' 승인 안내를 막힘 없이 한 번씩 보낸다(재시도·재시작 포함)`, async () => {
+    await withHarness({ colleague: true }, async h => {
+      const id = await toAwaiting(h);
+      const stored = (await h.db.query<{ id: string; owner_id: string; scope: never; policy_revision: string; conversation_id: string | null; payload: Record<string, unknown> }>(
+        "SELECT id,owner_id,scope,policy_revision,conversation_id,payload FROM outbox WHERE payload ? 'buttons'")).rows[0]!;
+      await h.db.query('DELETE FROM outbox WHERE id=$1', [stored.id]);
+      let shift = 0;
+      const offStore = () => new Store(h.db, () => Date.now() + shift, false);
+      let off = new DiscordPublisher(offStore(), h.gate, h.rest);
+      for (let index = 0; index < 20 && await off.deliver(); index++) { /* 앞서 쌓인 다른 글을 비운다 */ }
+      const before = h.rest.messages.length;
+
+      const content = longPreview(id, lastPage);
+      const old = messagePages(content);
+      assert.deepEqual(old.map(page => page.length), [1800, lastPage], '대조: 쪽 상한 하나로 나누면 마지막 쪽이 상한 근처다');
+      assert.ok(previewWithoutButton(old[1]!, id).length > SENT_LIMIT, '대조: 그 마지막 쪽을 꺼짐 판으로 바꾸면 본문 상한을 넘는다');
+      await h.store.enqueue({ key: `c36b-long-preview-${lastPage}`, actor: stored.owner_id, scope: stored.scope, revision: stored.policy_revision,
+        ...(stored.conversation_id ? { conversation: stored.conversation_id } : {}), payload: { ...stored.payload, content } as never });
+
+      assert.equal(await off.deliver(), true);
+      h.rest.rateLimit = new RateLimited(1000, false);
+      assert.equal(await off.deliver(), true, '둘째 쪽은 429로 미뤄진다');
+      shift += 5000;
+      off = new DiscordPublisher(offStore(), h.gate, h.rest);
+      for (let index = 0; index < 20 && await off.deliver(); index++) { /* 다시 띄운 게시자가 이어 보낸다 */ }
+      off = new DiscordPublisher(offStore(), h.gate, h.rest);
+      for (let index = 0; index < 5 && await off.deliver(); index++) { /* 한 번 더 다시 띄워도 보낼 것이 없다 */ }
+
+      const rows = (await h.db.query<{ state: string; page_index: number }>('SELECT state,page_index FROM outbox WHERE message_key=$1 ORDER BY page_index',
+        [`c36b-long-preview-${lastPage}`])).rows;
+      assert.ok(rows.length > 2 && rows.every(row => row.state === 'sent'), JSON.stringify(rows));
+      const sent = h.rest.messages.slice(before);
+      assert.equal(sent.length, rows.length, '쪽마다 한 번씩만 나간다');
+      assert.ok(sent.every(message => !message.body.components?.length && unmarked(message.body.content).length <= SENT_LIMIT));
+      assert.equal(sent.map(message => unmarked(message.body.content)).join(''), previewWithoutButton(content, id), '본문 전체와 꺼짐 판 안내');
+      assert.ok(sent.at(-1)!.body.content.includes(`/change-status target:${id}`));
+      assert.equal((await h.db.query("SELECT 1 FROM audit WHERE kind='delivery_blocked_colleague_off'")).rows.length, 0);
+    });
+  });
+}
+
+test('C36 F-11 버튼 글의 마지막 쪽 상한은 가장 긴 ID의 꺼짐 판 안내를 붙여도 본문 상한 안이다', () => {
+  // custom_id(100자 상한)에 들어가는 가장 긴 변경 ID·질문 ID. 안내를 못 찾아 통째로 덧붙일 때가 가장 길다.
+  const changeId = 'c'.repeat(CUSTOM_ID_MAX - publishButton('', 1, 'd'.repeat(64)).id.length);
+  assert.equal(publishButton(changeId, 1, 'd'.repeat(64)).id.length, CUSTOM_ID_MAX);
+  const question = 'q'.repeat(CUSTOM_ID_MAX - changeDirectId('').length);
+  const page = 'x'.repeat(BUTTON_PAGE_SIZE);
+  assert.ok(previewWithoutButton(page, changeId).length <= SENT_LIMIT);
+  assert.ok(`${page}\n${CHAT_TASK_TEXT.changeQuestionFooter(false, question, '질문 기한')}`.length <= SENT_LIMIT);
+  assert.deepEqual(messagePages(`${'y'.repeat(1700)}\n${'z'.repeat(1700)}`, BUTTON_PAGE_SIZE).map(page => page.length), [1701, 1500, 200]);
 });
 
 test('C17: 스위치가 꺼져 있으면 미리보기에 버튼이 없고, 게시 버튼 상호작용을 받지 않는다', async () => {
