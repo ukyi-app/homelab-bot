@@ -1253,3 +1253,16 @@ T19 B5 EVENT-02 "게시 서버 둘이 같은 부모를 동시에 밀어도 모�
 - 방식 표시와 자격 파일은 따로 읽는다. kubelet의 볼륨 교체와 엇갈리면 그 실행 하나가 불일치로 거부될 수 있다(다른 방식으로 돌지는 않는다). CLI는 자격을 쓰고 동기화를 한 번에 하므로 보통 Secret 한 판에 함께 바뀐다.
 - 불일치·표시 오류의 사유 코드는 자격 오류(`WorkerStartError.code`)에 있고, 실행 중에는 공통부가 그 실행을 `failed`(띄우지 않음)로 닫으며 readiness가 503이 된다. 실행마다 사유 코드를 로그 줄로 남기는 것은 공통부(`run-control.ts`) 변경이라 하지 않았다. 기동 때는 `worker_start_failed` 사유로 남는다.
 - API 방식의 진짜 분당 한도도 결제 멈춤이 된다(위 분류의 대가).
+
+## C36 묶음 D 자체 고치기 경합 구현 선택 (2026-11-11)
+
+전체 리뷰 F-8(AC-31)의 수정이다. 사용자 결정이 아니라 구현 선택이고 C31 결정은 바꾸지 않았다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) "C36 묶음 D: 고치기 차례의 늦은 작성 결과", 시험은 [VERIFICATION](VERIFICATION.md) "C36 묶음 D 자체 고치기 경합".
+
+- **차례 확인 자리는 확인할 것 기록:** 런타임은 작성 결과를 받을 때마다 `recordChangeNotes`를 부르고 자기 작성 job ID를 넘긴다. 함수는 부모 행을 `FOR SHARE`로 잡고 그 job이 이 generation의 지금 고치기 차례(`change_child_jobs.fix_round = change_generations.fix_round`, `amendment_round = 0`)의 작성 job인지 본다. `startSelfFix`가 부모를 `FOR UPDATE`로 잡고 차례를 올리므로 둘은 엇갈리지 않는다. 아니면 `stale`이고 런타임은 artifact를 저장하지 않고(`change_author_result_stale` 로그) 부모를 닫지 않는다. 지금 단계는 다른 게시 서버의 것이 맞다.
+- **빈 목록은 기록하지 않는다:** 이전엔 런타임이 목록이 있을 때만 불렀다. 이제 확인을 위해 늘 부르므로 그 조건을 함수 안으로 옮겼다. 읽는 쪽(`readChangeNotes`)은 행이 없으면 빈 목록이라 결과가 같다.
+- **`recordSnapshot`의 선택 칸 `authorJobId`:** 주면 같은 잠금(부모 `FOR UPDATE`) 아래에서 같은 확인을 하고 아니면 `phase_conflict`다(런타임은 이 사유에 부모를 닫지 않는다). 런타임은 아직 이 칸을 넘기지 못한다. 저장은 `ChangeArtifactPort.save`(`src/change-contracts.ts`)와 어댑터 `ChangeStoreArtifacts`(`src/change-artifact.ts`)를 거치는데 둘 다 이 묶음의 소유 밖이라 고치지 않았다. 잇는 데는 `save`의 넷째 인수에 `authorJobId?`를 더하고 어댑터가 `recordSnapshot`에 넘기는 두 줄이면 된다.
+- **버린 안: 앞 차례 artifact digest 거부.** `change_fix_rounds.artifact_digest`와 같은 결과를 받지 않으면 포트 없이 막을 수 있지만, 고치기 차례가 앞 차례와 같은 결과를 내는 정상 경우(C31 상한 시험이 그렇다)를 막아 지금의 차례 수·리뷰 횟수가 바뀐다.
+- **수정 차례(C27)는 같은 구멍이 없다:** 결과는 차례 번호 키(`change_amendment_artifacts`의 round)에만 저장되고, `recordAmendmentSnapshot`은 부모 `amending`과 그 차례 `running`을 잠금 아래에서 본다. 끝난 차례의 늦은 결과는 `amendment_not_running`이고, 런타임의 실패 처리(`finishAmendment`)도 `state='running'` 조건이라 바꾸지 않는다.
+- **마이그레이션 없음:** 기존 칸 `fix_round`로 판정한다.
+
+**남는 위험.** 런타임의 확인과 `artifacts.save` 사이의 틈. 두 호출은 연달아 돌아 틈은 DB 왕복 몇 번이지만, 그 사이에 다른 게시 서버가 저장·시험·리뷰·차례 열기를 모두 마치면 앞 차례 artifact가 새 차례에 들어간다. 위 두 줄로 포트를 이으면 닫힌다.

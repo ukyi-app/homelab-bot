@@ -2148,3 +2148,11 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 **비공개 저장과 보존.** migration 018은 additive다. `change_review_findings`(리뷰 원문), `change_deployment_windows`, `change_artifacts.purged_at`을 더한다. `purgeExpiredChangeContent`가 시간마다 끝 상태 뒤 7일이 지난 건의 `change_artifact_files`, `change_artifacts.patch`, 리뷰 원문을 지운다. receipt·digest·manifest·effect는 남는다. 진행 중이거나, 미확정 effect·살아 있는 자식 job·정리 안 끝난 세션이 있는 건은 고르지 않는다. 트리거는 artifact에 "아직 비우지 않은 행의 patch를 빈 값으로 만들고 시각을 적는" 변경만 받는다. 요청 원문과 추가 답변(`change_request_inputs.text`)도 같은 건·같은 기준 시각으로 같은 트랜잭션에서 빈 값으로 두고 `purged_at`을 적는다(migration 019, T27). `text_sha256`·label·event_id는 남는다. 이 SQL은 `ChangePrivateInputs`의 정적 함수(`HELD`·`purgeIn`·`purgedIn`)에 있어 원문 표를 만지는 코드가 그 클래스와 공용 INSERT뿐이다. 새 generation의 접수는 요청 원문을 다시 읽으므로, 원문을 지운 superseded 건은 `startNextGeneration`이 `input_purged`로 거절하고 `/change` 새 요청을 안내한다. 같은 트랜잭션에서 `change_requests.brief`의 summary·goal·acceptanceCriteria도 빈 값으로 두고 `brief_purged_at`을 적는다(migration 020, T31). brief는 admission CHECK·`brief_digest` 불변 트리거·짝 CHECK 때문에 NULL로 둘 수 없어 세 칸만 비우고, 경로·명령·label과 원래 brief의 `brief_digest`는 남는다. brief를 읽는 경로는 모두 진행 단계다. `change_retention`은 `purgeExpiredChangeContentRounds`로 한 바퀴에 20건씩 최대 20번 골라 복원 직후 밀린 건도 한 주기 안에 지운다.
 
 **되돌리기.** 스위치를 끄면 새 접수와 루프만 멈춘다. 남은 작성 세션은 lease 만료 뒤 unknown으로 레인을 닫으므로 `/task-release`로 해제한다. `HttpTaskV2Worker`를 스위치와 무관하게 브리지에 넘겨 두는 이유다. 미확정 effect는 스위치를 켜야 대조가 돈다. `change` 절을 모르는 옛 게시 서버로 되돌릴 때는 정책 키를 먼저 뺀다.
+
+### C36 묶음 D: 고치기 차례의 늦은 작성 결과
+
+§16 "게시 전 고치기 차례(C31)"에 더하는 규칙이다. 고치기 차례는 같은 generation·같은 B·T0라 base 대조로는 앞 차례 작성 결과를 가려내지 못한다. 그래서 작성 결과의 저장은 결과를 낸 작성 job이 지금 차례의 작성 job일 때만 받는다.
+
+- **확인.** `recordChangeNotes(db, {changeId, generation, authorJobId}, notes)`가 부모 행을 `FOR SHARE`로 잡고 그 job의 `change_child_jobs.fix_round`가 `change_generations.fix_round`와 같은지 본다(`isCurrentAuthorJob`). 결과는 `recorded`·`kept`(빈 목록·이미 있음)·`stale`이다. 런타임 `pollAuthor`는 수정 차례가 아닌 작성 결과마다 이 함수를 먼저 부르고, `stale`이면 `artifacts.save`를 부르지 않고 단계도 건드리지 않는다.
+- **저장.** `ChangeStore.recordSnapshot`은 선택 칸 `authorJobId`를 받으면 부모 잠금 아래에서 같은 확인을 하고 아니면 `phase_conflict`다. 지금 포트(`ChangeArtifactPort.save`)는 이 칸을 넘기지 않는다(DECISIONS "C36 묶음 D" 남는 위험).
+- **수정 차례(C27).** 결과가 차례 키에만 저장되고 `running` 차례만 받으므로 이 확인이 필요 없다.
