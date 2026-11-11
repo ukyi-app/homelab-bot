@@ -136,8 +136,9 @@ export const CHAT_TASK_TEXT = Object.freeze({
   taskCompleted: (_c: boolean, job: string) => `작업을 마쳤어요 (작업 ${job})`,
   codexCompleted: (_c: boolean, job: string) => `Codex 작업을 마쳤어요 (작업 ${job})`,
   summaryBlocked: (_c: boolean, risk: string) => `요약이 공개 검사에 걸려서(사유: ${risk}) 올리지 않았어요. 작업을 마친 건 기록했어요.`,
-  modelWaitLong: (c: boolean, job: string) => `작업 ${job}의 모델 대기가 24시간을 넘었어요. 저절로 재개하거나 버리지 않아요. 세션을 계속 보존할지 정해서 ${c
-    ? `${CLI}로 재개하거나, 작업을 취소해 달라고 말해 주세요.` : `/resume-model target:${job} 또는 /cancel target:${job} 해 주세요.`}`,
+  // 자리 비움(스위치 밖)과 같이 원인과 재개 명령을 적지 않는다. 재개는 재개 예약 루프가 저절로 하므로 owner가 정할 것은 세션을 둘지뿐이다.
+  modelWaitLong: (c: boolean, job: string) => `작업 ${job}의 대기가 24시간을 넘었어요. 돌아오면 이어서 할 수 있게 세션을 보존하고 있어요. 계속 보존할지 정해 주세요. 그만두려면 ${c
+    ? '작업을 취소해 달라고 말해 주세요.' : `/cancel target:${job} 해 주세요.`}`,
   releaseNotUnknown: '끝났는지 확인하지 못한 작업이 아니에요.',
   releaseWorkerAlive: '작업자 프로세스가 남아 있거나 확인할 수 없어요. 작업자 파드를 다시 만든 뒤 확인해 주세요.',
   releaseStateChanged: (c: boolean) => c ? '상태가 바뀌었어요. 작업 목록을 보여 달라고 해서 확인해 주세요.' : '상태가 바뀌었어요. /list로 확인해 주세요.',
