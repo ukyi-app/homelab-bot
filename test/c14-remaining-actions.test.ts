@@ -1,7 +1,8 @@
 import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { CHANGE_TEXT } from '../src/change-commands.js';
-import { Denied } from '../src/contracts.js';
+import { DEFAULTS, Denied } from '../src/contracts.js';
+import { DiscordPublisher } from '../src/discord.js';
 import { ATTACH_COMMAND_TEXT } from '../src/external-task-commands.js';
 import { RAW_TEXT_NOTICE } from '../src/memory-commands.js';
 import { PROPOSAL_TEXT, PROPOSAL_TTL_MS } from '../src/proposals.js';
@@ -92,7 +93,9 @@ test('C14 변경 상태·세션 연결 목록·기억 검색 제안은 확인 �
   const searchSlash = (await a.slash('memory-search', { text: '금요일' })).reply;
   assert.ok(searchSlash?.includes('금요일에는 배포하지 않는다'), searchSlash);
   await a.speak(message(), '금요일 배포 규칙 기억나?', { action: 'memory_search', target: null, content: '금요일' });
-  assert.equal(a.posted().at(-1), searchSlash);
+  // 일반 글이라 대화 출처는 ID 없이 "대화"로만 적는다(C36 묶음 E). 나머지는 '/' 결과와 같다.
+  assert.match(searchSlash!, /출처 conversation:fixture-c14-command-\d+ · /);
+  assert.equal(a.posted().at(-1), searchSlash!.replace(/출처 conversation:fixture-c14-command-\d+ · /, '출처 대화 · '));
   assert.equal(a.buttons().posted.length, 0);
   assert.deepEqual(await a.proposals(), []);
 });
@@ -108,6 +111,45 @@ test('C36 F-4 읽기 제안의 결과가 공개 검사에 걸리면 일반 답�
   assert.equal(a.posted().at(-1), PROPOSAL_TEXT.readWithheld);
   assert.ok(!a.posted().some(text => text.includes(hidden)));
   assert.ok(!JSON.stringify((await database.db.query('SELECT payload FROM outbox')).rows).includes(hidden));
+});
+
+test('C36 묶음 E 대화 출처가 있는 안전한 기억을 말로 검색하면 일반 답에 진술은 보이고 출처의 Discord ID는 없다. 같은 /memory-search 본인 전용 응답에는 ID가 있다', async () => {
+  const a = await wired();
+  const said = message();
+  await a.speak(said, '금요일 배포 규칙 기억해 둬', { action: 'memory_save', target: 'decision', content: '금요일에는 배포하지 않는다 | applies=homelab' });
+  await a.press(yesOf(a));
+  const searchSlash = (await a.slash('memory-search', { text: '금요일' })).reply;
+  assert.ok(searchSlash?.includes(`conversation:${said}`), '대조: 본인 전용 응답에는 대화 출처 ID가 있다');
+  await a.speak(message(), '금요일 배포 규칙 기억나?', { action: 'memory_search', target: null, content: '금요일' });
+  await a.deliver();
+  const answer = a.posted().at(-1)!;
+  assert.notEqual(answer, PROPOSAL_TEXT.readWithheld);
+  assert.ok(answer.includes('금요일에는 배포하지 않는다'), answer);
+  assert.ok(answer.includes('출처 대화 · '), answer);
+  assert.ok(!a.posted().some(text => text.includes(said)), '일반 글 어디에도 출처 ID가 없다');
+  assert.ok(!JSON.stringify((await database.db.query("SELECT payload FROM outbox WHERE message_key LIKE 'result:%:read'")).rows).includes(said));
+});
+
+test('C36 묶음 E 켜짐에서 저장한 여러 쪽의 기억 저장 확인 글은 스위치를 끈 게시 서버가 어느 쪽도 게시하지 않고, 대화 답은 나간다', async () => {
+  const a = await wired();
+  const statement = `${'금요일 저녁에는 배포하지 않는다. '.repeat(90).trim()} | applies=homelab`;
+  assert.ok(statement.length >= 1600);
+  a.reply({ action: 'memory_save', target: 'decision', content: statement }, '저장할지 물어볼게요.');
+  await a.say(message(), '긴 배포 규칙 기억해 둬');
+  a.f.advance(DEFAULTS.debounceMs + 50);
+  await a.local.runtime.tick();
+  const pages = (await database.db.query<{ page_index: number; buttons: boolean }>(`SELECT page_index,payload ? 'buttons' AS buttons FROM outbox
+    WHERE message_key LIKE 'result:%:proposal' ORDER BY page_index`)).rows;
+  assert.ok(pages.length >= 2 && pages.at(-1)!.buttons && pages.slice(0, -1).every(page => !page.buttons), `대조: 버튼은 마지막 쪽에만 있다 ${JSON.stringify(pages)}`);
+  const off = new DiscordPublisher(new Store(database.db, a.f.now, false), a.f.gate, a.f.rest);
+  while (await off.deliver()) { /* 쌓인 게시를 비운다 */ }
+  assert.ok(a.posted().includes('저장할지 물어볼게요.'), '대화 답은 나간다');
+  assert.ok(!a.posted().some(text => text.includes('금요일 저녁에는') || text.includes('기억으로 저장할까요')), JSON.stringify(a.posted()));
+  assert.equal(a.buttons().posted.length, 0);
+  // 모든 쪽이 끝 상태(blocked)라 원문 주기 정리가 본문을 비울 수 있다.
+  assert.deepEqual((await database.db.query<{ state: string }>("SELECT state FROM outbox WHERE message_key LIKE 'result:%:proposal'")).rows.map(r => r.state),
+    pages.map(() => 'blocked'));
+  assert.deepEqual((await a.proposals()).map(p => p.state), ['pending']);
 });
 
 test('C14 읽기 템플릿 제안은 카탈로그의 템플릿이면 /read와 같은 read 레인 결과를 달고, 카탈로그 밖이면 버려진다', async () => {
