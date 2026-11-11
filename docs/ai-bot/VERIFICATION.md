@@ -2770,8 +2770,10 @@ T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·
 | 완료 조건 | 근거 |
 |---|---|
 | 늦은 앞 차례 결과가 새 고치기 차례를 바꾸지 않는다 | `change-pg` "C36 F-8 실제 PostgreSQL: 앞 차례 작성 결과를 들고 있던 게시 서버가 …"(런타임 둘, 한쪽이 처음 작성 결과를 받은 채 멈추고 다른 쪽이 저장·시험·리뷰·`startSelfFix`까지 간 뒤 풀면: 단계 `authoring`, artifact·확인할 것 없음. 이어서 새 차례 결과로 승인 대기, 확인할 것은 새 차례 것, 승인 artifact ≠ 앞 차례 artifact) |
+| 차례 확인 뒤 저장 직전에 차례가 바뀌어도 앞 차례 artifact가 들어가지 않는다 | `change-pg` "C36 F-8 실제 PostgreSQL: 차례 확인 뒤 artifact 저장 직전에 멈춘 게시 서버가 …"(런타임 둘, 한쪽이 확인할 것 기록을 지나 `artifacts.save` 직전에 멈추고 다른 쪽이 저장·시험·리뷰·`startSelfFix`까지 간 뒤 풀면: 풀린 저장은 `phase_conflict`, 단계 `authoring`, artifact 없음. 이어서 새 차례 결과로 승인 대기, 승인 artifact ≠ 앞 차례 artifact) |
 | 부모 잠금 아래에서 지금 차례와 같을 때만 저장 | `change-store-pg` "C36 F-8 실제 PostgreSQL: 고치기 차례를 여는 것과 앞 차례 작성 job의 늦은 저장이 겹쳐도 …"(`startSelfFix`와 앞 차례 job의 `recordChangeNotes`를 동시에 5번: 앞서 닿으면 기록 뒤 지워지고 뒤에 닿으면 `stale`, 새 차례 자리는 비어 있음. 앞 차례 job의 `recordSnapshot`은 `phase_conflict`, 지금 차례 job은 기록·저장) |
 
 - **빨강:** 고치기 전 `change-pg` 시험이 "앞 차례 결과가 새 차례를 snapshot_ready로 넘기지 않는다" 단언에서 `snapshot_ready`로 실패했다(리뷰 보고의 재현 순서 그대로).
 - **바꾼 기존 시험:** `change-guidance` "AC-25 승인 묶음: …"이 `recordChangeNotes`의 결과를 참·거짓 대신 `recorded`·`kept`로 본다. 두 번째 기록은 빈 목록 대신 다른 목록을 넣어 "처음 것 그대로"를 본다(빈 목록은 이제 기록 자체를 하지 않는다).
-- **못 잡는 범위:** 런타임의 차례 확인(`recordChangeNotes`)과 artifact 저장(`artifacts.save`) 사이의 틈. 그 사이에 다른 게시 서버가 저장·시험·리뷰·차례 열기를 모두 마치면 앞 차례 artifact가 들어갈 수 있다. 포트가 작성 job을 넘기지 않아서다(DECISIONS 남는 위험). 두 파드의 실제 네트워크 지연 조합.
+- **저장 직전 멈춤의 빨강:** 런타임이 포트에 작성 job을 넘기기 전에는 새 시험이 풀린 저장의 결과 단언에서 `{ ok: true, artifactDigest: … }`로 실패했다(앞 차례 artifact가 새 차례 자리에 들어갔다).
+- **못 잡는 범위:** 두 파드의 실제 네트워크 지연 조합.

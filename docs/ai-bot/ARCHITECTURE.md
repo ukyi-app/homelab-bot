@@ -2154,5 +2154,5 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 §16 "게시 전 고치기 차례(C31)"에 더하는 규칙이다. 고치기 차례는 같은 generation·같은 B·T0라 base 대조로는 앞 차례 작성 결과를 가려내지 못한다. 그래서 작성 결과의 저장은 결과를 낸 작성 job이 지금 차례의 작성 job일 때만 받는다.
 
 - **확인.** `recordChangeNotes(db, {changeId, generation, authorJobId}, notes)`가 부모 행을 `FOR SHARE`로 잡고 그 job의 `change_child_jobs.fix_round`가 `change_generations.fix_round`와 같은지 본다(`isCurrentAuthorJob`). 결과는 `recorded`·`kept`(빈 목록·이미 있음)·`stale`이다. 런타임 `pollAuthor`는 수정 차례가 아닌 작성 결과마다 이 함수를 먼저 부르고, `stale`이면 `artifacts.save`를 부르지 않고 단계도 건드리지 않는다.
-- **저장.** `ChangeStore.recordSnapshot`은 선택 칸 `authorJobId`를 받으면 부모 잠금 아래에서 같은 확인을 하고 아니면 `phase_conflict`다. 지금 포트(`ChangeArtifactPort.save`)는 이 칸을 넘기지 않는다(DECISIONS "C36 묶음 D" 남는 위험).
+- **저장.** `ChangeStore.recordSnapshot`은 선택 칸 `authorJobId`를 받으면 부모 잠금 아래에서 같은 확인을 하고 아니면 `phase_conflict`다. 런타임은 `ChangeArtifactPort.save`의 넷째 인수 `{ authorJobId: child.id }`로 넘기고 어댑터 `ChangeStoreArtifacts`가 처음 게시 자리일 때만 `recordSnapshot`에 잇는다. 그래서 확인과 저장 사이에 차례가 바뀌어도 앞 차례 artifact는 들어가지 않는다.
 - **수정 차례(C27).** 결과가 차례 키에만 저장되고 `running` 차례만 받으므로 이 확인이 필요 없다.
