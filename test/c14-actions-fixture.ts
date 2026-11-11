@@ -47,12 +47,14 @@ export async function actions(db: Database, options: { colleague?: boolean; disc
   const tasks = new TaskCommands(h.f.store, h.f.gate, h.local.bridge, () => ({ routed: true, open: true, reasons: [] }), () => {}, () => {});
   const channels = new Map([thread, notifyThread, outsideThread].map(scope => [scope.channel, scope]));
   const callbacks: { body: { type: number; data: Record<string, unknown> } }[] = [];
+  // 상호작용 응답 직전에 부른다. 끝나지 않는 약속을 주면 응답 전에 멈춘 게시 서버, 던지면 응답 실패가 된다.
+  const hooks: { beforeCallback?: () => Promise<void> } = {};
   const protocol = new DiscordProtocol({ request: async (method, path, body) => {
     const scope = method === 'GET' ? channels.get(path.replace('/channels/', '')) : undefined;
     if (scope) return { id: scope.channel, type: 11, parent_id: scope.parent, guild_id: scope.guild };
     if (method === 'GET' && path === `/channels/${notifyChannel.channel}`) return { id: notifyChannel.channel, type: 0, guild_id: thread.guild };
     if (method === 'PUT') return undefined;
-    if (method === 'POST' && path.endsWith('/callback')) { callbacks.push({ body: body as never }); return undefined; }
+    if (method === 'POST' && path.endsWith('/callback')) { await hooks.beforeCallback?.(); callbacks.push({ body: body as never }); return undefined; }
     throw new Error(`unexpected_route ${method} ${path}`);
   } }, BOT, h.f.now);
   const ingress = new DiscordIngress(h.f.store, h.f.gate, protocol, true, ALL_COMMANDS, () => {}, memory, tasks, external, changes);
@@ -61,7 +63,7 @@ export async function actions(db: Database, options: { colleague?: boolean; disc
   const content = (text: string) => text.split('\n-# ref:')[0]!;
   const deliver = async () => { while (await h.f.publisher.deliver()) { /* 쌓인 게시를 비운다 */ } };
   const self = {
-    f: h.f, local: h.local, ingress, memoryService, links, changeStore, callbacks, deliver,
+    f: h.f, local: h.local, ingress, memoryService, links, changeStore, callbacks, deliver, hooks,
     reply: (proposal: Proposal | null, text = '확인해 주세요.') => h.reply(proposal, text),
     // owner의 멘션 메시지 한 통(Gateway MESSAGE_CREATE).
     say: (id: string, text: string, options: { author?: string; scope?: Scope } = {}) => protocol.gateway('MESSAGE_CREATE', { id,

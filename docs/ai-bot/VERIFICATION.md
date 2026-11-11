@@ -2866,3 +2866,21 @@ T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·
 
   작업자 계약·스키마·마이그레이션은 바뀌지 않았다.
 - **못 잡는 범위:** 문서 출처 URL에 Discord 링크(17~20자리 숫자)가 있는 기억은 지금처럼 결과 전체가 `readWithheld`다(내용으로 보고 가리지 않았다). 말로 검색한 결과에서 대화 출처 키를 볼 수 없어, 그 출처를 말로 제외하려면 '/memory-search'로 키를 봐야 한다. internal 기억을 스레드에 내도 되는지(C24 할 일 1a)는 owner 결정 대기다. 이 규칙 전에 앞 쪽이 이미 게시된 글은 되돌리지 않는다.
+
+## C36 묶음 F: 재검토 후속 (2026-11-11, 로컬)
+
+전체 리뷰 재검토의 F-7 잔여·RR1-N1·RR2-N2와 F-5 시험 보강. 구현 선택은 [DECISIONS](DECISIONS.md) "C36 묶음 F", 계약은 [ARCHITECTURE](ARCHITECTURE.md) 끝의 "C36 묶음 F". 경계는 S1(Gateway 프레임 → 수신·저장(PGlite) → 가짜 Discord REST, 가짜 시계)과 S2(작업자 응답)다. 발견마다 먼저 빨간 시험으로 재현했다.
+
+| 완료 조건 | 근거 |
+|---|---|
+| 실행 결과 안내가 응답 전 재시작에도 남는다 | `c14-remaining-actions` "C36 묶음 F 제안 실행이 거절로 끝난 직후 버튼 응답 전에 멈추면 …"(말로 한 변경 취소 제안 → '/change-cancel'로 먼저 취소 → "할게요" → 처리기는 거절로 끝나고 버튼 응답 직전에 멈춤(가짜 REST가 끝나지 않음) → 10분 + 1ms 뒤와 1시간 뒤 주기 정리·게시 → 그 스레드에 "이미 끝난 변경이에요(cancelled)." 정확히 한 번, `proposal:` 글 하나, 값 비움 → 다시 누르면 `PROPOSAL_TEXT.settled`) |
+| 성공한 실행에 실패 안내가 나가지 않는다 | 같은 파일 "C36 묶음 F 제안 실행이 성공한 직후 버튼 응답 전에 멈추면 …"(남는 글은 `CHANGE_TEXT.cancelled` 하나, `failed`·`interrupted` 없음) |
+| 응답이 전해지면 결과가 두 번 나가지 않는다 | 같은 파일 "C36 묶음 F 제안 실행의 버튼 응답이 전해졌거나 응답 실패 안내를 남겼으면 …"(응답 성공: 10분 뒤 새 글 0. 응답 실패: 응답 실패 안내 하나만, 10분 뒤 더 없음) |
+| 같은 밀리초의 새 계정 결제 멈춤이 보존된다 | `admin-cli` "C36 묶음 F 계정 전환: 전환과 같은 밀리초에 시작한 실행의 결제 멈춤은 …"(작업 접수 → 시계를 움직이지 않고 `account use spare` → 바로 claim, `started_at = switched_at` 대조 → 결제 멈춤 → `kind='billing'`, `retry_at` NULL → 1시간씩 24번 `resumeDue` 0). 전환 전에 시작한 실행의 1분 재개(묶음 A)와 한도 관측의 같은 밀리초 버림(C22)은 기존 `admin-cli`·`model-account-switch-pg` 시험이 그대로 통과 |
+| 갈린 안내 줄이 꺼짐 판에서 버튼 안내를 남기지 않는다 | `c17-publish-button` "C36 묶음 F 미리보기의 버튼 안내 첫 줄의 줄바꿈이 마지막 쪽 상한에 정확히 놓여도 …"(켜짐 미리보기 행의 payload로 본문만 바꿔 저장, 대조: 첫 안내 줄의 줄바꿈 다음 위치 = 1500 → 꺼진 게시자로 비움 → 어느 쪽에도 버튼·`previewApprove(true)`·`previewBinding(true)` 없음, `/change-status` 안내 한 번, 이어 붙이면 `previewWithoutButton(content)`, 막힘 0) |
+| 24시간 안내의 실제 경로 시험 | `task-bridge` "C36 묶음 F 48시간 뒤 풀리는 한도로 멈춘 작업(스위치 꺼짐/켜짐) …" 두 판(작업자 `limited` + `rateLimit.stop.resetsAt` = 48시간 뒤 → 24시간 뒤 `ClaudeTaskBridge.sweep`의 `task-owner-confirm:` 글 하나, 본문에 작업 ID와 "보존"이 있고 "저절로 재개하지 않"·"재개하거나 버리지 않"·"한도"·"인증"·"결제"·"/resume-model"·"/model-status" 없음 → 풀리는 시각 + 1분 - 1ms까지 `resumeDue` 0 → 1ms 뒤 1, 작업 `queued`) |
+
+- **시험이 실패할 수 있는지:** 고치기 전 코드(origin/main `3ed69dd`)에서 결과 안내 시험 둘(거절·성공)은 남는 글이 0개, 같은 밀리초 시험은 `kind='rate_limit'`·`retry_at` 있음, 미리보기 시험은 앞 쪽에 "게시하려면 이 글의 … 버튼을 눌러 주세요."가 그대로 나가 실패했다. 24시간 시험은 코드가 이미 맞아 초록이었고, 문구를 묶음 C 전 판("저절로 재개하거나 버리지 않아요", '/resume-model')으로 되돌린 사본에서 두 판 모두 실패하는 것을 확인한 뒤 복구했다.
+- **실행(머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`·`npm run build`, `c14-remaining-actions`·`c13-proposal`·`c13-proposal-pg`·`c18-fixed-text`·`c27-change-amend`·`c15-session-key`·`c16-task-question`·`admin-cli`·`model-resume`·`model-account-switch-pg`·`change-review`·`change-artifact`·`c17-publish-button`·`change-preview-pages`·`chat-format`·`c28-change-question`·`review-3`·`review-4`·`memory-briefing`·`task-bridge`·`raw-text-retention`·`reaction-lifecycle`·`publisher-gateway`·`publisher-recovery` 24개 파일 578개 통과·실패 0·skip 0.
+- **운영에서 바뀌는 동작:** DECISIONS "C36 묶음 F"의 표. 스위치 밖에서는 계정 전환과 같은 밀리초에 시작한 실행의 멈춤 기록만 바뀐다.
+- **못 잡는 범위:** 실제 프로세스 강제 종료(시험은 끝나지 않는 응답으로 대신한다), 게시 서버 둘이 같은 제안의 완료 기록과 중단 정리를 동시에 하는 실제 PostgreSQL 경합(사유 조건부 UPDATE 하나라 한쪽만 바뀐다고 코드로 봤다), 응답이 10분을 넘겨 결과가 두 번 보이는 경우, 실제 파드에서 전환과 claim이 같은 밀리초에 놓이는 빈도.

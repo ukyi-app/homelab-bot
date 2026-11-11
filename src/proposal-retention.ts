@@ -16,16 +16,38 @@ export async function expirePending(db: Database, now: number): Promise<number> 
 }
 
 // 커밋 뒤 실행(later)의 의도 표시. "할게요" 트랜잭션이 confirmed와 함께 사유 칸에 적고 실행 입력(value·source_event)을 남긴다.
-// 실행이 끝나면 finishProposalRun이 지우고, 그 전에 게시 서버가 멈췄으면 settleInterruptedRuns가 실패 안내를 남기고 지운다.
+// 실행이 끝나면 finishProposalRun이 지우고(결과 안내 글을 남긴다), 그 전에 게시 서버가 멈췄으면 settleInterruptedRuns가 실패 안내를 남기고 지운다.
 export const RUN_PENDING = 'run_pending';
 // 커밋 뒤 실행이 아직 도는 중일 수 있는 시간. 처리기는 DB와 짧은 외부 호출이라 이보다 오래 걸리면 멈춘 것으로 본다.
 export const RUN_INTERRUPTED_AFTER_MS = 10 * 60_000;
 
+// 끝난 실행의 결과를 버튼 응답이 전하지 못했을 때 그 스레드에 대신 게시하기까지의 시간. 응답은 이보다 훨씬 빨리 끝난다.
+export const RUN_RESULT_NOTICE_AFTER_MS = 10 * 60_000;
+const resultKey = (proposal: string) => `proposal:${proposal}`;
+
+export interface FinishedRun { proposal: string; failed: boolean; content: string; revision: string; now: number }
 // 커밋 뒤 실행이 끝났다(성공이든 처리기 오류든). 값 보존 계약대로 실행 입력을 비운다. 사유는 성공이면 비우고 오류면 run_failed다.
-// 주기 정리가 먼저 run_interrupted로 끝냈으면 바꾸지 않는다.
-export async function finishProposalRun(db: Database, proposal: string, failed: boolean): Promise<void> {
-  await db.query('UPDATE proposals SET reason=$2,value=NULL,source_event=NULL WHERE id=$1 AND reason=$3',
-    [proposal, failed ? 'run_failed' : null, RUN_PENDING]);
+// 같은 트랜잭션에 그 결과 문장을 RUN_RESULT_NOTICE_AFTER_MS 뒤에 게시할 글로 남긴다. 실행 대기를 지운 뒤 버튼 응답 전에 멈춰도
+// 결과(거절·실패 포함, 성공이면 성공 문장)가 그 스레드에 남는다. 응답이 전해지면 호출자가 withdrawRunResult로 그 글을 지운다.
+// 주기 정리가 먼저 run_interrupted로 끝냈으면 바꾸지 않고(그쪽 안내가 같은 키로 이미 있다) false를 돌려준다.
+export async function finishProposalRun(db: Database, run: FinishedRun): Promise<boolean> {
+  return db.transaction(async tx => {
+    const row = (await tx.query<{ conversation_id: string; owner_id: string; scope: Scope | string }>(
+      `UPDATE proposals SET reason=$2,value=NULL,source_event=NULL WHERE id=$1 AND reason=$3 RETURNING conversation_id,owner_id,scope`,
+      [run.proposal, run.failed ? 'run_failed' : null, RUN_PENDING])).rows[0];
+    if (!row) return false;
+    const scope = typeof row.scope === 'string' ? JSON.parse(row.scope) as Scope : row.scope;
+    await new Store(tx, () => run.now).enqueue({ key: resultKey(run.proposal), conversation: row.conversation_id, actor: row.owner_id, scope,
+      revision: run.revision, payload: { kind: 'message', channel: scope.channel, content: run.content, classification: 'safe_summary' } }, tx);
+    await tx.query("UPDATE outbox SET available_at=$2 WHERE message_key=$1 AND state='pending'", [resultKey(run.proposal), run.now + RUN_RESULT_NOTICE_AFTER_MS]);
+    return true;
+  });
+}
+
+// 버튼 응답이 전해졌거나 응답 실패 안내가 남았다. 대신 게시할 결과 글은 아직 잡히지 않았을 때만 지운다(blocked로 두면 운영 지표의
+// 막힌 게시로 쌓인다). 응답이 RUN_RESULT_NOTICE_AFTER_MS를 넘겨 게시자가 이미 잡았으면 결과가 한 번 더 보일 수 있다.
+export async function withdrawRunResult(db: Database, proposal: string): Promise<void> {
+  await db.query("DELETE FROM outbox WHERE message_key=$1 AND state='pending'", [resultKey(proposal)]);
 }
 
 // 확정했지만 실행이 끝났다는 기록 없이 오래된 제안. 실행됐는지 알 수 없어 다시 실행하지 않고(기억 저장처럼 두 번 하면 둘이 되는

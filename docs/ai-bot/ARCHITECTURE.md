@@ -2196,3 +2196,13 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 
 - **보내기 직전 스위치의 판단 범위(`DiscordPublisher.deliverRow`):** 스위치가 꺼진 게시자는 버튼이 없는 `message` 행도 같은 `message_key`의 뒤 쪽(`page_index`가 큰 행) 중 `payload.buttons`가 있는 행의 버튼으로 판단한다. 판단이 "보내지 않음"(실행 확인·세션 키 보기·질문 고르기)이면 이 행은 `blocked`, 같은 글의 `pending`인 뒤 쪽도 `blocked`, 감사 `delivery_blocked_colleague_off` 한 줄(이 행 ID). 그 밖의 판단(`control`·`publish`·`change-question`)이면 버튼 없는 쪽은 본문을 바꾸지 않고 보낸다. 버튼이 있는 쪽의 치환은 묶음 B와 같다. 켜진 게시자와 '/' 제어 버튼 글은 바뀌지 않는다.
 - **일반 글의 기억 검색 결과(`MemoryCommandInput.threadReply`, 선택 칸):** 말로 한 기억 검색(`memorySearchHandler`)만 `threadReply: true`를 넘긴다. 그러면 `searchText`가 출처 칸의 대화 출처를 `MEMORY_TEXT.conversationSource`("대화")로 적고 같은 줄의 겹친 값을 한 번만 적는다. 작업·문서·외부 출처는 `sourceKey` 그대로다. 결과는 묶음 B의 읽기 결과 공개 검사(`chatReplyRisk`, 걸리면 `PROPOSAL_TEXT.readWithheld`)를 그대로 지난다. '/memory-search'는 이 칸을 넘기지 않아 응답이 같다.
+
+## C36 묶음 F: 재검토 후속 (2026-11-11)
+
+위 "C36 묶음 A"·"C36 묶음 B"·"C36 묶음 E"에 더하는 계약이다. 선택의 이유는 [DECISIONS](DECISIONS.md) "C36 묶음 F".
+
+- **제안 실행의 완료 기록(`finishProposalRun(db, { proposal, failed, content, revision, now })`, `src/proposal-retention.ts`):** 한 트랜잭션에서 `reason='run_pending'`인 제안 행의 사유를 비우거나 `run_failed`로 두고 `value`·`source_event`를 비운다. 바뀐 행이 있으면 같은 트랜잭션에 outbox 글을 넣는다: 멱등 키·`message_key` `proposal:<제안 ID>`, 대화·owner·scope는 제안 행, `policy_revision`은 버튼을 받은 정책, payload `{ kind: 'message', channel: scope.channel, content: <결과 문장>, classification: 'safe_summary' }`, `available_at` = 지금 + `RUN_RESULT_NOTICE_AFTER_MS`(10분). 바뀐 행이 없으면(주기 정리가 먼저 `run_interrupted`로 끝냄) 아무것도 쓰지 않고 `false`다.
+- **결과 글 거두기(`withdrawRunResult(db, proposal)`):** `message_key='proposal:<제안 ID>'`이고 `state='pending'`인 outbox 행을 지운다. 게시자가 이미 잡은 행(`sending` 이후)은 두어 그대로 게시된다.
+- **실행 확인 버튼 수신(`DiscordIngress.proposalButton`):** 커밋 뒤 실행 → `finishProposalRun` → 버튼 응답(`acknowledge`) → 완료 기록이 결과 글을 남겼고 응답이 `true`면 `withdrawRunResult`. `acknowledge`는 응답을 보냈거나 응답 실패를 기록했으면(응답 실패 안내 `ack-notice:<이벤트 ID>` 포함) `true`, 그 기록마저 실패하면 `false`를 돌려준다. 다른 호출자는 반환값을 쓰지 않아 동작이 같다. 거두기 실패는 로그 `proposal_result_withdraw_failed`만 남긴다.
+- **멈춤 기록의 전환 경계(`Store.recordPause`):** 옛 실행 판정은 `jobs.started_at < model_accounts.switched_at`(지금 계정)이다. `observeRateLimit`은 `<=` 그대로다. 둘 다 `startedBeforeSwitch(job, tx, sameMs)` 하나를 쓰고 기본값은 같은 밀리초 포함이다.
+- **버튼 글의 쪽 나누기(`messagePages(content, lastPage)`, `src/format.ts`):** `lastPage < PAGE_SIZE`(지금은 `Store.enqueue`가 버튼 글에 넘기는 `BUTTON_PAGE_SIZE` 1500)이고 일반 글이면, 마지막 `\n\n` 뒤의 끝 단락이 `lastPage` 이하이고 그 앞에 공백이 아닌 글자가 있을 때 두 단계 나누기(1800자, 마지막 쪽 1500자) 모두에서 그 단락 안에 경계를 두지 않는다. 경계가 단락 안에 놓이면 단락 앞에서 자른다(앞 쪽은 빈 줄로 끝난다). 쪽을 이어 붙이면 원문과 같고, 멱등 키(`<key>`, `<key>:page:<n>`)·`page_index`·대조 표식 규칙은 같다. JSON 목록과 일반 글(`lastPage` 없음)은 바뀌지 않는다.

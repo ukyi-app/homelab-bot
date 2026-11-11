@@ -834,6 +834,34 @@ test('모델 대기 24시간(가짜 시계): owner 확인 요청 표시·알림 
   assert.equal((await session()).owner_confirm_requested_at, null);
   assert.equal(Number((await session()).waiting_since), f.now());
 });
+// C36 F-5(AC-15, 결정 7): 24시간 안내는 원인과 '/' 재개 명령 없이 세션 보존만 묻고, 재개는 예정 시각에 저절로 한다.
+for (const colleague of [false, true]) {
+  test(`C36 묶음 F 48시간 뒤 풀리는 한도로 멈춘 작업(스위치 ${colleague ? '켜짐' : '꺼짐'}): 24시간 안내에 원인·'저절로 재개하지 않아요'·'/' 재개 명령이 없고, 풀리는 시각 1분 뒤 저절로 재개한다`, async () => {
+    const HOUR = 3_600_000;
+    f = await fixture(db(), { colleague });
+    setup = lane(f);
+    const resetsAt = Math.floor((f.now() + 48 * HOUR) / 1000);
+    setup.worker.scripts.push((request, worker) => ({ ...reply.limited('limited')(request, worker), rateLimit: { stop: { cause: 'rate_limit', resetsAt } } }));
+    const job = await newTask();
+    await setup.runtime.tickTask();
+    assert.equal((await jobs(db()))[0]!.state, 'waiting_user');
+    f.advance(24 * HOUR); f.policy.confirmedAt = f.now();
+    await setup.bridge.sweep();
+    const notices = (await outbox()).filter(row => row.idempotency_key.startsWith('task-owner-confirm:'));
+    assert.equal(notices.length, 1);
+    const content = String(notices[0]!.payload.content);
+    assert.ok(content.includes(job.id) && content.includes('보존'), content);
+    for (const banned of ['저절로 재개하지 않', '재개하거나 버리지 않', '한도', '인증', '결제', '/resume-model', '/model-status', 'resume-model']) {
+      assert.ok(!content.includes(banned), `${banned}: ${content}`);
+    }
+    assert.equal(await f.store.resumeDue(), 0, '24시간 안내 뒤에도 풀리는 시각 전에는 재개하지 않는다');
+    f.advance(resetsAt * 1000 + 60_000 - 1 - f.now()); f.policy.confirmedAt = f.now();
+    assert.equal(await f.store.resumeDue(), 0, '풀리는 시각 1분 전까지 0');
+    f.advance(1); f.policy.confirmedAt = f.now();
+    assert.equal(await f.store.resumeDue(), 1);
+    assert.equal((await jobs(db()))[0]!.state, 'queued');
+  });
+}
 test('lease 교체: 넘겨받은 뒤 도착한 옛 응답은 어떤 행도 바꾸지 않고, lease가 끝난 응답은 unknown이다', async () => {
   let release!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });

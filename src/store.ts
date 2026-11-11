@@ -484,10 +484,12 @@ export class Store {
   // 호출자는 tx에서 scheduler 행을 이미 잠갔다(waitForUser, 변경 자체 리뷰의 회수 경로).
   // 지금 계정으로 바뀌기 전에 시작한 실행의 멈춤은 옛 자격의 사실이라 결제·풀리는 시각·사용률을 버리고, 원인 모를 짧은 멈춤으로
   // 적어 1분(minDelayMs) 뒤 새 자격으로 다시 돌린다. 결제로 적으면 owner가 이미 바꾼 계정이 다시 owner 개입까지 서고,
-  // 옛 계정의 먼 풀리는 시각이면 그때까지 선다. 경계는 observeRateLimit과 같다(같은 밀리초도 옛 실행으로 본다).
+  // 옛 계정의 먼 풀리는 시각이면 그때까지 선다. 경계는 observeRateLimit과 달리 같은 밀리초를 새 계정 실행으로 본다:
+  // claim과 전환은 같은 밀리초에 차례로 커밋될 수 있고, 그 새 계정의 결제 멈춤을 옛 것으로 버리면 owner가 풀기 전에 다시 돈다.
+  // 반대로 틀리면(정말 옛 실행) 옛 계정의 결제로 owner 재개를 기다리는데, 결제 멈춤을 잘못 재개하는 쪽보다 낫다.
   async recordPause(job: string, reason: string, rateLimit: RateLimitInfo | null, tx: Database): Promise<void> {
     const now = this.now();
-    const stale = await this.startedBeforeSwitch(job, tx);
+    const stale = await this.startedBeforeSwitch(job, tx, false);
     const seen = stale ? null : rateLimit;
     const kind: ModelPauseKind = reason === 'auth_expired' ? 'auth_expired' : seen?.stop?.cause === 'billing' ? 'billing' : 'rate_limit';
     const resetsAt = kind === 'rate_limit' && seen?.stop?.resetsAt !== undefined ? seen.stop.resetsAt * 1000 : null;
@@ -504,7 +506,8 @@ export class Store {
   // (COLLEAGUE_SPEC §4.7 "리뷰 미루기"). 기한은 늘리기만 한다. 5시간 창 경고 뒤에 주간 창 경고가 오면 주간 창이 풀릴 때까지다.
   // job: 그 관측을 낸 실행의 작업 ID. 지금 계정으로 바뀌기 전에 시작한 실행은 옛 자격으로 돌았을 수 있어(작업자는 실행을 시작할 때
   // 자격 파일을 읽는다) 그 관측을 지금 계정의 한도 상태에 적지 않는다. 전환 직전에 시작해 이미 새 자격을 읽은 실행의 관측도 함께
-  // 버리지만, 옛 계정의 사용률로 새 계정의 리뷰를 미루는 쪽보다 낫다. 멈춤 기록(recordPause)도 같은 경계로 옛 실행의 원인을 버린다.
+  // 버리지만, 옛 계정의 사용률로 새 계정의 리뷰를 미루는 쪽보다 낫다. 멈춤 기록(recordPause)도 이 경계로 옛 실행의 원인을 버리되
+  // 같은 밀리초는 새 계정 실행으로 본다(결제 멈춤을 지키는 쪽).
   // 같은 밀리초는 어느 쪽이 먼저인지 몰라 버린다. null은 실행을 모르는 관측이다(시험에서만 쓴다).
   // 확인과 쓰기는 계정 전환(switchAccount)과 같은 scheduler 행 잠금 아래에서 한 번에 한다. 잠그지 않으면 커밋 전의 전환을
   // 보지 못한 채 확인을 지나고, 전환이 한도 상태를 비운 뒤에 옛 계정의 관측이 새 계정 것으로 적힌다.
@@ -524,10 +527,11 @@ export class Store {
       review_deferred_until=GREATEST(model_limit_state.review_deferred_until,EXCLUDED.review_deferred_until)`,
     [event.status, event.rateLimitType ?? null, event.utilization ?? null, event.resetsAt === undefined ? null : event.resetsAt * 1000, this.now(), deferUntil]);
   }
-  // 그 작업의 실행이 지금 계정으로 바뀌기 전(같은 밀리초 포함)에 시작했는지. 계정 기록이 없으면 전환도 없었다.
-  private async startedBeforeSwitch(job: string, tx: Database): Promise<boolean> {
+  // 그 작업의 실행이 지금 계정으로 바뀌기 전에 시작했는지. sameMs: 전환과 같은 밀리초에 시작한 실행도 옛 실행으로 볼지.
+  // 계정 기록이 없으면 전환도 없었다.
+  private async startedBeforeSwitch(job: string, tx: Database, sameMs = true): Promise<boolean> {
     return (await tx.query(`SELECT 1 FROM jobs j JOIN model_accounts a ON a.current
-      WHERE j.id=$1 AND j.started_at <= a.switched_at`, [job])).rows.length > 0;
+      WHERE j.id=$1 AND (j.started_at < a.switched_at OR ($2::boolean AND j.started_at = a.switched_at))`, [job, sameMs])).rows.length > 0;
   }
   // 지금 PR 리뷰를 미루고 있으면 그 기한(ms), 아니면 null.
   async reviewDeferredUntil(tx = this.db): Promise<number | null> {
