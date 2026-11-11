@@ -500,9 +500,16 @@ export class Store {
   // 자격 파일을 읽는다) 그 관측을 지금 계정의 한도 상태에 적지 않는다. 전환 직전에 시작해 이미 새 자격을 읽은 실행의 관측도 함께
   // 버리지만, 옛 계정의 사용률로 새 계정의 리뷰를 미루는 쪽보다 낫다. 멈춤 기록(model_pauses)과 재개는 이 판단과 무관하다.
   // 같은 밀리초는 어느 쪽이 먼저인지 몰라 버린다. null은 실행을 모르는 관측이다(시험에서만 쓴다).
-  async observeRateLimit(rateLimit: RateLimitInfo | null | undefined, job: string | null, tx = this.db): Promise<void> {
+  // 확인과 쓰기는 계정 전환(switchAccount)과 같은 scheduler 행 잠금 아래에서 한 번에 한다. 잠그지 않으면 커밋 전의 전환을
+  // 보지 못한 채 확인을 지나고, 전환이 한도 상태를 비운 뒤에 옛 계정의 관측이 새 계정 것으로 적힌다.
+  // tx를 넘기는 호출자(recordPause)는 이미 scheduler 행을 쥐고 있다. 잠금 순서는 scheduler → model_limit_state 그대로다.
+  async observeRateLimit(rateLimit: RateLimitInfo | null | undefined, job: string | null, tx?: Database): Promise<void> {
     const event = rateLimit?.event;
     if (!event) return;
+    if (!tx) {
+      await this.db.transaction(async locked => { await this.lockScheduler(locked); await this.observeRateLimit(rateLimit, job, locked); });
+      return;
+    }
     if (job !== null && (await tx.query(`SELECT 1 FROM jobs j JOIN model_accounts a ON a.current
       WHERE j.id=$1 AND j.started_at <= a.switched_at`, [job])).rows.length > 0) return;
     const deferUntil = event.status === 'allowed_warning' && event.resetsAt !== undefined ? event.resetsAt * 1000 : null;
