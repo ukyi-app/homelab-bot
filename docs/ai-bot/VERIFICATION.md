@@ -2763,6 +2763,24 @@ T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·
 - **운영에서 바뀌는 동작:** 봇 병합으로는 게시 서버만 바뀐다(관리 진입점이 `api`를 받음, 한도 관측이 scheduler 잠금 아래에서 적힘). 작업자 변경은 sandbox 배포 PR(할 일 6)로만 올라간다. 새 작업자는 방식 표시가 없는 지금 Secret에서 구독으로 돈다. homelab CLI의 구독 `account use`가 이제 방식 표시(`subscription`)와 API 키 두 자리(`unset`)를 작업자 Infisical 키에 함께 쓴다(지금 ExternalSecret은 읽지 않으므로 운영 영향 없음, sandbox 배포 PR의 전제 키가 생긴다).
 - **못 잡는 범위:** 실제 크레딧 차감과 실제 소진 응답(S5에서 Console로 본다), 실제 CLI의 API 키 출처 표시(바이너리 정적 읽기만), API 방식 egress, 실제 ESO·kubelet 반영 시간, Infisical에 키를 먼저 넣는 사람 순서, 방식 표시·자격 파일 읽기와 볼륨 교체의 엇갈림.
 
+## C36 묶음 C: 문구·브리핑 (2026-11-11, 로컬)
+
+전체 리뷰 1차의 F-5·F-12·F-13. 명세 §4.4·§4.7("지금 안내문 교체")·§4.9, AC-11·15·23. 구현 선택은 [DECISIONS](DECISIONS.md) "C36 묶음 C". 경계는 S1(PGlite 저장소·가짜 시계의 예약 브리핑 → outbox, 가짜 Discord REST의 `DiscordIngress.receive`, 문구 표). 발견마다 고치기 전에 빨간 시험으로 재현했다(F-5: 결제 멈춤도 "중지(한도 대기 2건) · /model-status로 확인"과 작업 레인 "한도·인증 대기 1건"으로 나감, F-12: 켜짐 판 답·채널 안내에 `/change-status`·`/attach-list`와 "못했습니다").
+
+| 완료 조건 | 근거 |
+|---|---|
+| 한도·인증·결제 대기 중 브리핑에 원인·'/' 이름이 없다(두 판) | `memory-briefing` "C36 F-5 모델 멈춤(rate_limit·auth_expired·billing) 중 브리핑은 두 판 모두 원인·'/' 이름 없이 자리 비움만 적는다"(대화·작업 레인 대기 작업 둘과 멈춤 기록, scheduler 닫힘 → 꺼짐·켜짐 브리핑 outbox 본문 전체에 원인 낱말·'/' 이름·"비상" 없음, 자리 비움 줄과 2건) |
+| 비상 정지는 그대로 보인다 | 같은 파일 "C36 F-5 비상 정지는 모델 멈춤과 따로 지금처럼 보이고 …"(비상 정지 + 한도 대기 → `modelStopped.slash('비상 중지')` 줄 + 원인 없는 자리 비움 줄), 기존 "BRIEF-01 모델 비상 중지 중에도 …"·"C10 스위치 두 판 …" 통과 |
+| 미룬 리뷰 건수·토큰 만료 줄은 그대로다 | 기존 "AC-17 리뷰를 미루는 동안 …"·"AC-19 토큰 만료 알림 …" 통과(문구·조건 변경 없음) |
+| 24시간 대기 안내에 원인·'/' 재개 명령이 없다(두 판) | `chat-task-text` "C36 F-5 24시간 대기 안내는 두 판 모두 원인·'/' 재개 명령이 없고 …"(원인 낱말·`resume`·"재개하지 않"·"재개하거나 버리지 않" 없음, "보존"·"이어서" 있음, 켜짐 '/' 없음), 꺼짐 판 '/' 검사는 `/cancel target:job-1`만 본다 |
+| 켜짐 판 오류·ACK 안내에 '/' 이름이 없다, 꺼짐은 '/' 안내 유지 | `c18-fixed-text` 표 검사 대상에 `COMMAND_INGRESS_TEXT` 추가(켜짐 '/' 없음·해요체·봇 낱말 없음, 꺼짐 `/change-status`·`/attach-list`), "C36 F-12 스위치 켜짐·꺼짐: 변경·세션 연결 처리기 예외의 답은 스위치 판 문구다"(처리기가 던짐 → 본인 응답), "… 응답을 전하지 못하면 채널에 남는 안내가 스위치 판 문구다"(ACK 실패 → outbox 고정 안내) |
+| 주석이 규칙에 맞다(F-13) | diff 확인(`src/contracts.ts` `PROPOSAL_RUN_ACTIONS` 주석) |
+
+- **명령:** `/home/ukyi/fp-voice/.fpb/test.sh … -- dist/test/memory-briefing.test.js dist/test/chat-task-text.test.js dist/test/c18-fixed-text.test.js dist/test/briefing-task-lane.test.js dist/test/briefing-observations.test.js dist/test/external-task-assembly.test.js dist/test/c15-session-key.test.js`(`npm run check`·build 포함).
+- **바꾼 기존 시험:** `chat-task-text` 꺼짐 판 기대값(`/resume-model` 뺌, `/cancel`만), 작업 레인 줄 리터럴 넷(`briefing-task-lane` 둘, `briefing-observations`·`memory-briefing` 하나씩, "한도·인증 대기" → "모델 대기"), `external-task-assembly`·`c15-session-key`의 `EXTERNAL_ACK_NOTICE` → `COMMAND_INGRESS_TEXT.attachAckLost(false)`(두 시험 모두 꺼짐 판).
+- **운영에서 바뀌는 동작(스위치 밖, 병합하면 바로 게시 서버에 나감):** 브리핑 모델 멈춤 줄·작업 레인 줄 이름, 24시간 대기 안내(꺼짐 판에서 `/resume-model` 빠짐), 변경·세션 연결 명령의 오류·ACK 실패 안내 말투(꺼짐 판도 해요체). 작업자·스키마·DB는 바뀌지 않아 작업자 배포 순서와 무관하다.
+- **못 잡는 범위:** 문구의 자연스러움(owner 검토·C24 표본). 24시간 안내는 문구 표 단위로 봤고 `ClaudeTaskBridge.sweep`에서 48시간 대기 작업으로 실제 게시까지 잇는 시험은 두지 않았다(그 자리는 표의 문구를 그대로 넘긴다).
+
 ## C36 묶음 A 한도·계정 (2026-11-11, 로컬)
 
 전체 리뷰 1차(봇 `e160cb1..4df0a4f`)의 F-1·F-2·F-3·F-6 수정이다. 명세 §4.7·§4.8, AC-16·17·21·22. 구현 선택은 [DECISIONS](DECISIONS.md) "C36 묶음 A", 계약은 [ARCHITECTURE](ARCHITECTURE.md) 끝 "C36 묶음 A". 리뷰 작업자는 시험을 돌리지 않았으므로 발견마다 먼저 빨간 시험으로 재현했고, 넷 모두 재현됐다(아래 "재현"). 경계는 S1(저장소·가짜 시계, 실제 변경 리뷰 작업자·게시 서버 객체), S2(자체 리뷰 HTTP 응답, 작업 레인 v2 결과), 실제 PostgreSQL 두 연결이다. 모델·클러스터 호출은 없다.

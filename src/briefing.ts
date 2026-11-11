@@ -19,7 +19,8 @@ export const BRIEFING = Object.freeze({
 // colleague는 동료 기능 스위치 값(config.colleagueEnabled === true)이다. 없으면 꺼짐 판이다.
 export interface BriefingConfig { time: string | null; timezone: string | null; colleague?: boolean }
 // 브리핑의 문장 줄. 칸 이름과 상태 표시(정상·미확인·확인 필요 등)는 명사형 그대로 두고 문장만 해요체로 쓴다.
-// '/' 이름을 안내하는 줄(모델 호출 중지)만 스위치로 두 판을 고른다(명세 §4.9). 켜짐 판의 관리 기능은 CLI다(명세 §4.8).
+// '/' 이름을 안내하는 줄(비상 정지)만 스위치로 두 판을 고른다(명세 §4.9). 켜짐 판의 관리 기능은 CLI다(명세 §4.8).
+// 모델 멈춤(한도·인증·결제)은 알림 채널에 공개되므로 자리 비움 줄 하나다. 원인·시각·할 일은 Telegram 운영 알림이 맡는다(결정 7).
 // C19(미룬 리뷰 건수)·C22(토큰 만료)는 줄을 이 표와 modelLines에 더한다.
 export const BRIEFING_TEXT = Object.freeze({
   missed: (dates: string) => `누락: ${dates} 브리핑은 보내지 않았어요(재시작한 뒤 몰아서 보내지 않아요).`,
@@ -30,6 +31,7 @@ export const BRIEFING_TEXT = Object.freeze({
     slash: (reasons: string) => `- 모델 호출: 중지(${reasons}) · /model-status로 확인`,
     colleague: (reasons: string) => `- 모델 호출: 중지(${reasons}) · \`homelab bot\` CLI로 확인해 주세요`,
   },
+  modelAway: (waiting: number) => `- 모델 호출: 자리 비움 · ${waiting ? `기다리는 일 ${waiting}건은 ` : ''}돌아오면 이어서 해요.`,
   reviewsDeferred: (count: number) => `- 미룬 PR 리뷰: ${count}건이에요. 모델 사용 한도가 가까워서 한도가 풀리면 이어서 리뷰해요.`,
   // 계정 이름은 CLI 이름 규칙(소문자·숫자·하이픈)을 통과한 값만 DB에 있어 멘션·서식이 될 수 없다.
   tokenExpiring: (account: string, days: number) => days > 0
@@ -411,14 +413,17 @@ export class BriefingScheduler {
   private async modelLines(): Promise<string[]> {
     const controls = new Map((await this.db.query<{ key: string; value: unknown }>(
       "SELECT key,value FROM controls WHERE key IN ('scheduler','scheduler_emergency')")).rows.map(row => [row.key, row.value === true]));
-    const waits = (await this.db.query<{ wait_reason: string; count: string | number }>(`SELECT wait_reason,count(*) AS count FROM jobs
-      WHERE state='waiting_user' AND wait_reason IN ('model_limit','auth_expired') GROUP BY wait_reason ORDER BY wait_reason`)).rows;
+    const waiting = Number((await this.db.query<{ count: string | number }>(`SELECT count(*) AS count FROM jobs
+      WHERE state='waiting_user' AND wait_reason IN ('model_limit','auth_expired')`)).rows[0]!.count);
     const unknown = Number((await this.db.query<{ count: string | number }>("SELECT count(*) AS count FROM jobs WHERE state='unknown'")).rows[0]!.count);
-    const label: Record<string, string> = { model_limit: '한도 대기', auth_expired: '인증 만료 대기' };
-    const reasons = [...(controls.get('scheduler_emergency') ? ['비상 중지'] : []), ...waits.map(row => `${label[row.wait_reason]} ${Number(row.count)}건`)];
-    const lines = [controls.get('scheduler') || reasons.length
-      ? BRIEFING_TEXT.modelStopped[this.config.colleague === true ? 'colleague' : 'slash'](reasons.join(', ') || '사유 미기록')
-      : '- 모델 호출: 중지 신호 없음'];
+    const emergency = controls.get('scheduler_emergency') === true;
+    // 비상 정지는 scheduler도 함께 닫는다. 그래서 비상 정지 없이 닫힌 scheduler는 모델 멈춤이다(대기 행이 없어도).
+    const away = waiting > 0 || (controls.get('scheduler') === true && !emergency);
+    const lines = [
+      ...(emergency ? [BRIEFING_TEXT.modelStopped[this.config.colleague === true ? 'colleague' : 'slash']('비상 중지')] : []),
+      ...(away ? [BRIEFING_TEXT.modelAway(waiting)] : []),
+    ];
+    if (!lines.length) lines.push('- 모델 호출: 중지 신호 없음');
     if (unknown) lines.push(`- 종료를 확인하지 못한 작업: ${unknown}건(unknown, 자동 재실행 안 함)`);
     // 리뷰 미루기(C19). 미루는 동안 대기열에 남은 PR 리뷰만 센다(미게시 후보 리뷰는 미루지 않는다).
     if (await this.store.reviewDeferredUntil() !== null) {
@@ -456,7 +461,7 @@ export class BriefingScheduler {
     const [counts, connections] = await Promise.all([this.taskCounts().catch(() => undefined),
       this.task?.externalConnections?.().catch(() => null)]);
     const question = !counts?.question ? '' : counts.oldest === null ? '(대기 시간 미확인)' : `(가장 오래된 ${waited(this.store.now() - counts.oldest)})`;
-    const numbers = counts ? `실행 중 ${counts.running}건 · 질문 대기 ${counts.question}건${question} · 한도·인증 대기 ${counts.waiting}건 · unknown ${counts.unknown}건` : '건수 미확인';
+    const numbers = counts ? `실행 중 ${counts.running}건 · 질문 대기 ${counts.question}건${question} · 모델 대기 ${counts.waiting}건 · unknown ${counts.unknown}건` : '건수 미확인';
     const external = connections === undefined ? '' : ` · R08 연결 ${connections === null ? '미확인' : `${connections}건`}`;
     return `- 작업 레인: ${taskLaneState(gate, counts)} · ${numbers} · 도구 승인 대기: 지원 안 함${external}`;
   }

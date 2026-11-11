@@ -40,7 +40,7 @@ test("스위치 꺼짐: '/' 안내 줄은 지금처럼 '/' 명령 이름을 안�
   assert.match(off.codexBlocked!, /\/codex-release target:job-1/);
   assert.match(off.taskQuestionFooter!, /\/answer question:job-1/);
   assert.match(off.changeQuestionFooter!, /\/answer question:job-1/);
-  assert.match(off.modelWaitLong!, /\/resume-model target:job-1[\s\S]*\/cancel target:job-1/);
+  assert.match(off.modelWaitLong!, /\/cancel target:job-1/);
   assert.match(taskLaneClosedText('unknown'), /\/task-release target:<job-id>/);
   assert.match(taskLaneClosedText('retention_full'), /\/answer[\s\S]*\/resume-model[\s\S]*\/task-cancel/);
   assert.match(controlText('stop', { active: false }), /\/resume/);
@@ -54,6 +54,19 @@ test("AC-15 자리 비움 문장은 스위치와 상관없이 같고 원인·시
     assert.equal(on[name], off[name], name);
     assert.doesNotMatch(on[name]!, /한도|인증|결제|요금|토큰|\d|KST|\//, name);
   }
+});
+
+// C36 F-5(AC-15·16, 결정 7): 24시간 대기는 재개 예약 루프가 저절로 이어서 하는 동안에도 온다. 원인과 '/' 재개 명령을 적지 않고,
+// 자동 재개를 부정하지 않으며, 세션을 계속 둘지는 owner가 정한다는 뜻을 남긴다.
+test("C36 F-5 24시간 대기 안내는 두 판 모두 원인·'/' 재개 명령이 없고 저절로 이어서 함을 부정하지 않으며 세션 보존을 묻는다", () => {
+  const on = Object.fromEntries(all(true)), off = Object.fromEntries(all(false));
+  for (const text of [on.modelWaitLong!, off.modelWaitLong!]) {
+    assert.doesNotMatch(text, /한도|인증|결제|요금|토큰|KST/, text);
+    assert.doesNotMatch(text, /resume|재개하지 않|재개하거나 버리지 않/, text);
+    assert.match(text, /보존/, text);
+    assert.match(text, /이어서/, text);
+  }
+  assert.doesNotMatch(on.modelWaitLong!, slashName);
 });
 
 test('관리 기능 안내의 켜짐 판은 homelab bot CLI로 한다고 말한다', () => {

@@ -585,7 +585,8 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     }
     return rows.length;
   }
-  // 모델 대기가 24시간을 넘으면 owner 확인을 요청했다고 표시하고 알린다. 자동 재개·폐기는 하지 않는다.
+  // 모델 대기가 24시간을 넘으면 owner 확인을 요청했다고 표시하고 알린다. 여기서는 재개·폐기를 하지 않는다.
+  // 재개는 재개 예약 루프(Store.resumeDue)가 따로 하므로, 안내는 원인·재개 명령 없이 세션을 계속 둘지만 묻는다.
   private async requestOwnerConfirm(): Promise<number> {
     const due = this.store.now() - TASK_RETENTION.modelWaitOwnerConfirmMs;
     const rows = (await this.store.db.query<Job & { waiting_since: string }>(`SELECT j.*,s.waiting_since FROM codex_sessions s JOIN jobs j ON j.id=s.job_id
