@@ -2916,3 +2916,20 @@ T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·
 - **실행(머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`·`npm run build`, `c13-proposal`·`c13-proposal-pg`·`c14-remaining-actions`·`c15-session-key`·`c16-task-question`·`c17-publish-button`·`c18-fixed-text`·`c27-change-amend`·`c28-change-question`·`publisher-gateway`·`reaction-lifecycle` 11개 파일 164개 통과·실패 0·skip 0.
 - **운영에서 바뀌는 동작:** 없다. 네 버튼은 동료 기능 스위치가 켜졌을 때만 만들어지고 받으므로 스위치 밖 동작은 같다. 켜짐 판에서는 공개 검사에 걸리는 `update` 응답 본문과 변경 질문의 응답 실패 안내가 고정 안내 `resultWithheld`가 된다.
 - **못 잡는 범위:** 알려진 한계 RR3-N6(구독을 끈 스레드의 거절 결과 + 응답 전 종료)은 고치지 않아 시험이 없다. 실제 Discord가 `type: 7`을 어떻게 보여 주는지, 실제 Discord ID(17~20자리)로 걸리는 경우(내부 표식으로 대신했다).
+
+## C37 말로 한 기억 검색에서 internal 기억 빼기 (2026-11-11, 로컬)
+
+owner 결정(명세 질문 Q1 = C24 할 일 1a)의 구현. 결정은 [DECISIONS](DECISIONS.md) "C37", 계약은 [ARCHITECTURE](ARCHITECTURE.md) 끝의 "C37". 경계는 S1(Gateway 프레임 → 수신·저장(PGlite) → 가짜 Discord REST)이고 시험은 `test/c14-remaining-actions.test.ts`에 있다.
+
+| 완료 조건 | 근거 |
+|---|---|
+| 말로 한 기억 검색의 스레드 글에 internal 기억의 진술·주제·출처가 실리지 않는다 | "C37 말로 한 기억 검색의 일반 답에는 internal 기억의 진술·출처가 없고 건수 한 줄만 붙는다…": 게시 글 어디에도 internal 진술·ID가 없고 outbox payload에도 진술이 없다 |
+| 빠진 internal 기억이 있으면 건수 한 줄, 없으면 지금과 같은 글 | 같은 시험(safe 1건 + internal 1건 → "기억을 1건 찾았어요." … 끝 줄 건수), "C37 … internal뿐이면 일반 답은 건수 한 줄이다", "C37 … 길어 잘려도 남은 건수와 internal 건수 한 줄이 함께 남고 …"(1900자 안). 뺀 기억이 없는 경우는 기존 C14 "기억 검색 제안은 … 같은 /명령 결과를 일반 답으로 단다"·C36 묶음 E 시험이 그대로 지킨다 |
+| `/memory-search` 응답은 지금과 같다(internal 포함) | 첫 C37 시험의 대조: 같은 검색의 본인 전용 응답에 internal 진술과 ID가 있고 "기억을 2건 찾았어요."다. 기존 `memory-commands`·`t20-memory-commands` 시험이 그대로 통과 |
+| 스위치 꺼짐 판 동작은 바뀌지 않는다 | 거르기는 `threadReply`(말로 한 제안의 읽기 결과, 스위치 켜짐에서만 처리)에서만 일어난다. '/memory-search'는 위 대조와 기존 시험 |
+
+- **고치기 전 빨강:** 기준 `36c96b6`에서 새 C37 시험 둘이 실패했다. 스레드 글이 "기억을 2건 찾았어요. …"로 시작하고 internal 진술("금요일 배포 금지는 결제 장애 때문이다" 등)을 그대로 실었다.
+- **기존 시험 고침:** C14 기억 검색 비교, C36 F-4(공개 검사에 걸리는 기억), C36 묶음 E(대화 출처 가림) 시험은 기본 분류(internal) 기억으로 말로 한 검색을 봤다. 이제 그 기억은 실리지 않으므로 시험의 뜻(같은 결과·공개 검사·출처 가림)을 지키게 `briefing=yes`(`safe_summary`)로 저장한다.
+- **못 잡는 범위:** 실제 모델이 기억 검색 제안을 내는지, 실제 Discord 표시(C24 S5). 20건 상한 밖의 `safe_summary` 기억(DECISIONS "C37" 건수의 범위)은 시험하지 않았다.
+- **재검토 RR6-N1(공개 검사에 걸려도 건수 줄 유지):** 새 시험 "C37 말로 한 기억 검색의 실린 본문이 공개 검사에 걸려도 일반 답은 고정 안내 뒤에 internal 건수 한 줄을 남기고, 금지 값과 internal 기억은 게시·outbox에 없다": internal 1건 + 내부 주소(`10.20.30.40`)를 담은 `safe_summary` 1건이 맞는 말로 한 검색의 게시 글이 `PROPOSAL_TEXT.readWithheld` + "\n" + `MEMORY_TEXT.withheld(1)`이고, 게시 글·outbox에 주소와 internal 진술이 없으며 검색 결과 글(`result:%:read`)에 internal ID가 없다. internal 없이 공개 검사에만 걸리는 경우는 기존 "C36 F-4" 시험(고정 안내 한 줄)이 그대로 지킨다.
+  - **고치기 전 빨강:** `9671daa`의 소스에 새 시험만 얹어 `c14-remaining-actions`를 돌리자 이 시험 하나가 실패했다(33개 중 32 통과). 게시 글이 고정 안내 한 줄뿐이고 건수 줄이 없었다.

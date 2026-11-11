@@ -14,7 +14,8 @@ export type MemoryCommand = 'memory-save' | 'memory-search' | 'memory-correct' |
 // threadReply: 결과가 본인 전용 응답이 아니라 스레드 일반 글로 나간다(말로 한 기억 검색). 대화 출처의 Discord ID를 싣지 않는다.
 export interface MemoryCommandInput { id: string; actor: string; scope: Scope; command: MemoryCommand; text: string; target?: string; threadReply?: true }
 // outcome은 로그용 고정 코드다(ok, 거부 사유 코드). 내용을 담지 않는다.
-export interface MemoryCommandReply { content: string; outcome: string }
+// parts는 말로 한 검색(threadReply)이 성공했을 때만 있다. content는 parts를 합친 글과 같다.
+export interface MemoryCommandReply { content: string; outcome: string; parts?: SearchParts }
 // guide가 없으면 수신은 꺼짐 판(slash) 안내를 쓴다.
 export interface MemoryCommandHandler { handle(input: MemoryCommandInput): Promise<MemoryCommandReply>; readonly guide?: MemoryGuide }
 
@@ -195,6 +196,8 @@ export const MEMORY_TEXT = Object.freeze({
   noMatch: '이 채널에서 볼 수 있는 기억 중에 맞는 게 없어요.',
   found: (count: number) => `기억을 ${count}건 찾았어요.`,
   more: (count: number) => `(${count}건 더 있어요. 검색어를 좁혀 주세요)`,
+  // 말로 한 검색(일반 글)에서 뺀 internal 기억의 건수. 진술·주제·출처는 싣지 않는다. 켜짐 판에서만 나가므로 '/' 이름을 쓰지 않는다.
+  withheld: (count: number) => `공개하지 않는 기억 ${count}건은 여기에 싣지 않았어요.`,
   saved: '저장했어요',
   corrected: '정정했어요. 새 기억',
   candidate: '근거가 이 종류에 맞지 않거나(설정·장애는 확인된 문서·작업이 있어야 해요) 충돌이 있어서 확정하지 않았어요.',
@@ -212,11 +215,29 @@ export const MEMORY_TEXT = Object.freeze({
 function threadSourceKey(source: SourceRef): string {
   return source.type === 'conversation' ? MEMORY_TEXT.conversationSource : sourceKey(source);
 }
-export function searchText(views: MemoryView[], threadReply = false): string {
+// 일반 글 검색 결과를 두 부분으로 나눈 것. body는 공개 검사를 받을 본문(실린 기억이 없으면 null)이고, withheld는 뺀 internal
+// 기억의 건수다. 건수 줄은 숫자와 고정 문구뿐이라 본문이 공개 검사에 걸려 고정 안내로 바뀌어도 따로 남긴다. 숫자로 넘기는 이유는
+// 본문 끝에서 줄을 잘라 찾으면 모델·사용자 글이 같은 문구를 흉내 내 검사를 비켜 갈 수 있어서다.
+export interface SearchParts { body: string | null; withheld: number }
+export function joinWithheld(body: string | null, withheld: number): string {
+  const note = withheld > 0 ? MEMORY_TEXT.withheld(withheld) : null;
+  return [body, note].filter((part): part is string => part !== null).join('\n');
+}
+export function searchText(found: MemoryView[], threadReply = false): string {
+  const { body, withheld } = searchParts(found, threadReply);
+  return joinWithheld(body, withheld);
+}
+export function searchParts(found: MemoryView[], threadReply = false): SearchParts {
   const key = threadReply ? threadSourceKey : sourceKey;
   // 대화 출처가 여럿이면 일반 글에서는 같은 "대화"가 겹치므로 한 번만 적는다.
   const sources = (keys: string[]) => threadReply ? [...new Set(keys)] : keys;
-  if (!views.length) return `${MEMORY_TEXT.noMatch}\n${SEARCH_HEADER}`;
+  // 일반 글에는 safe_summary 기억만 싣고 나머지는 건수만 적는다(internal은 본인 전용 응답에서만 보인다). 게시 전 공개 검사는
+  // 비밀 모양만 잡아 internal 진술을 못 거르므로 본문을 만들기 전에 뺀다.
+  const views = threadReply ? found.filter(view => view.classification === 'safe_summary') : found;
+  const withheld = found.length - views.length;
+  // 건수 줄은 본문 뒤에 붙으므로 잘림 계산에 그 길이를 미리 넣는다(합친 글이 REPLY_LIMIT 안).
+  const note = withheld ? `\n${MEMORY_TEXT.withheld(withheld)}` : '';
+  if (!views.length) return { body: withheld ? null : `${MEMORY_TEXT.noMatch}\n${SEARCH_HEADER}`, withheld };
   const lines = [`${MEMORY_TEXT.found(views.length)} ${SEARCH_HEADER}`];
   let shown = 0;
   for (const view of views) {
@@ -226,11 +247,11 @@ export function searchText(views: MemoryView[], threadReply = false): string {
       `  ${clip(view.statement, 200)}`,
       `  출처 ${sources(view.sources.map(source => clip(key(source), 120))).join(', ') || '없음'} · ${at}`].join('\n');
     const tail = `\n${MEMORY_TEXT.more(views.length - shown)}`;
-    if ([...lines, line].join('\n').length + tail.length > REPLY_LIMIT) { lines.push(tail.trim()); break; }
+    if ([...lines, line].join('\n').length + tail.length + note.length > REPLY_LIMIT) { lines.push(tail.trim()); break; }
     lines.push(line);
     shown++;
   }
-  return lines.join('\n');
+  return { body: lines.join('\n'), withheld };
 }
 // 충돌 ID 수에는 상한이 없다(같은 주제의 진술이 쌓이면 늘어난다). 저장·정정은 응답 전에 이미 끝났으므로 응답이 Discord 한도를
 // 넘어 거부되면 사용자는 결과를 못 본다. 검색처럼 전체 길이를 자르고 남은 충돌은 개수로 적는다.
@@ -290,7 +311,11 @@ export class MemoryCommands implements MemoryCommandHandler {
     // 종료 중이거나 원장이 닫힘·실패·차단이면 쓰지 않는다. degraded는 다음 성공에 돌아오는 상태라 받는다
     // (그때 삭제는 pending으로 답한다).
     if (this.closed() || ['closed', 'failed', 'fenced'].includes(this.ledger())) return { content: UNAVAILABLE, outcome: 'unavailable' };
-    try { return { content: await this.run(input), outcome: 'ok' }; } catch (error) {
+    try {
+      const result = await this.run(input);
+      return typeof result === 'string' ? { content: result, outcome: 'ok' }
+        : { content: joinWithheld(result.body, result.withheld), outcome: 'ok', parts: result };
+    } catch (error) {
       if (error instanceof CommandInputError) return { content: error.reply, outcome: error.code };
       if (error instanceof MemoryNotReady) return { content: UNAVAILABLE, outcome: 'memory_not_ready' };
       if (error instanceof MemoryRejected) return { content: REJECTED[error.message] ?? MEMORY_TEXT.rejected, outcome: error.message };
@@ -300,13 +325,16 @@ export class MemoryCommands implements MemoryCommandHandler {
       throw error;
     }
   }
-  private async run({ id, actor, scope, command, text, target, threadReply }: MemoryCommandInput): Promise<string> {
+  private async run({ id, actor, scope, command, text, target, threadReply }: MemoryCommandInput): Promise<string | SearchParts> {
     const context = { actor, eventId: id, now: this.now() };
     if (command === 'memory-save') {
       const { input } = parseMemoryText(parseKind(target), text, context);
       return savedText(MEMORY_TEXT.saved, await this.memory.remember(actor, scope, input), REPLY_LIMIT, this.surface);
     }
-    if (command === 'memory-search') return searchText(await this.memory.search(actor, scope, text), threadReply === true);
+    if (command === 'memory-search') {
+      const found = await this.memory.search(actor, scope, text);
+      return threadReply ? searchParts(found, true) : searchText(found);
+    }
     if (command === 'memory-correct') {
       const ids = parseIds(target);
       // kind·reason은 진술 뒤 키로 받는다(옵션이 text·target 둘뿐이라 target은 ID가 쓴다).

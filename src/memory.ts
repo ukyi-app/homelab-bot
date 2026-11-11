@@ -61,6 +61,7 @@ export interface MemoryView {
   details: Record<string, unknown>; sources: SourceRef[]; observedAt: number | null; createdAt: number;
   recheckAt: number | null; expiresAt: number | null; service: string | null;
   flags: ('unverified' | 'conflict' | 'recheck_due')[];
+  classification: 'internal' | 'safe_summary';
 }
 export interface DeletionResult { status: 'deleted' | 'pending'; reason?: 'ledger_unconfirmed' | 'db_purge_pending'; publishedCopies: number; message: string }
 
@@ -470,7 +471,7 @@ export class MemoryService {
       return { id: row.id, kind: row.kind, statement: row.statement, status: row.status as 'candidate' | 'active',
         topic: row.topic, details: row.details, sources: row.source_refs, observedAt: num(row.observed_at),
         createdAt: Number(row.created_at), recheckAt: num(row.recheck_at), expiresAt: num(row.expires_at),
-        service: row.scope.service ?? null, flags };
+        service: row.scope.service ?? null, flags, classification: row.output_classification };
     });
   }
   private assertReady(): void { if (!this.ready) throw new MemoryNotReady(); }
