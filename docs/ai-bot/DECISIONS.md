@@ -1211,3 +1211,45 @@ T19 B5 EVENT-02 "게시 서버 둘이 같은 부모를 동시에 밀어도 모�
 - **전환 순서(homelab `bot-account-use.ts`):** 계정 폴더 두 값 확인 → 봇 DB 기록 확인 → 두 값을 작업자 키로(둘 다 읽은 뒤 쓴다) → 두 ExternalSecret 즉시 동기화와 Secret 해시 확인 → 두 작업자 파드의 자격 파일 지문 확인(`kubectl exec deploy/worker|worker-task -c worker -- sha256sum`, exec 실패는 기다림의 일부라 기한 180초 안에서 다시 본다. `worker-task`의 exec가 정리 sweep에 죽는 함정) → 진입점 `account use`. 엔진이 실패한 단계에서 멈추므로 반영 전에는 해제하지 않는다. 기다림 합은 동기화 60초·Secret 90초·볼륨 180초가 상한이고 보통 kubelet 갱신 1분 안팎이라 "대략 2분" 안이다(실측은 S5).
 - **`setup-token` 출력 수집: 하지 않는다(미확인으로 남김).** `claude setup-token --help`(로컬 2.1.322)에 출력 선택지가 없고, 공식 문서는 토큰을 터미널에 출력한다고만 적고 꼴을 정하지 않는다. 그래서 CLI는 tty에서 레인마다 `claude setup-token`을 띄우고(core `exec`의 이 argv 하나만 예외) 토큰은 에코 없는 입력으로 받는다. 자식 stdout은 stderr로 보낸다(`stdout-to-stderr`만 허용): stdout은 결과 문서 하나라 `--json >파일`에 안내와 발급 토큰이 섞이면 안 된다. stderr가 터미널이 아니면 토큰이 그 파일·파이프에 남으므로 로그인을 띄우지 않고 아무것도 쓰기 전에 실패한다(종료 1. 64 사용법 오류로 하려면 실행 문맥에 stderr tty 여부를 넘기는 `main.ts`·`runtime.ts` 변경이 필요해 하지 않았다). 파이프면 stdin 두 줄이다. 두 값이 같으면 거부한다(레인 분리). 남는 위험: 토큰이 owner 터미널 스크롤에 한 번 남는다(안내에 지우라고 적었다).
 - **하지 않은 것(사람 단계, 티켓 할 일 10):** 실토큰 등록, 운영 전환 1회, approvals.md 기록, 봇 구독 계정이 owner 개인 사용과 같은 계정인지(명세 §8, 미확인) 묻기.
+
+## C23 API 크레딧 방식 (2026-11-11)
+
+"동료 봇 전환 (사용자 2026-11-09)" 8의 API 크레딧 방식과 명세 §4.8 "API 크레딧 방식"·AC-22의 구현이다. 사용자 결정은 바꾸지 않았고 아래는 구현 선택이다. 시험은 [VERIFICATION](VERIFICATION.md) "C23 API 크레딧 방식", 자격 배치는 [ARCHITECTURE](ARCHITECTURE.md) §5.
+
+**키 이름과 방식 표시(sandbox 배포 PR과 homelab CLI가 이 이름을 그대로 쓴다).** Infisical 프로젝트 homelab, 환경 prod.
+
+| 폴더 | Infisical 키 | 값 | 작업자 Secret 키(= 파일 이름) |
+|---|---|---|---|
+| `/apps/homelab-bot/worker` | `CLAUDE_AUTH_METHOD` | 방식 표시 `subscription` 또는 `api`(비밀 아님). 두 레인이 이 키 하나를 함께 읽는다 | 두 Secret 모두 `CLAUDE_AUTH_METHOD` |
+| | `CLAUDE_CODE_OAUTH_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN_TASK` | 대화·리뷰 / 작업 레인 구독 토큰(지금 그대로), 안 쓰면 `unset` | `CLAUDE_CODE_OAUTH_TOKEN`(작업 Secret은 `_TASK`를 이 이름으로) |
+| | `ANTHROPIC_API_KEY` / `ANTHROPIC_API_KEY_TASK` | 대화·리뷰 / 작업 레인 Console API 키, 안 쓰면 `unset` | `ANTHROPIC_API_KEY`(작업 Secret은 `_TASK`를 이 이름으로) |
+| `/bot-accounts/<이름>` | `ANTHROPIC_API_KEY`, `ANTHROPIC_API_KEY_TASK` | 계정의 두 레인 API 키(`homelab bot account add --by api`). 구독 토큰 두 키는 C22 그대로 | 없음(작업자가 읽지 않는다) |
+
+- 방식 표시 값 글자는 봇 DB `model_accounts.method`·지표 `homelab_bot_model_account{method}` 값과 같다(`none`은 지표에만, "계정 없음"). 기본값은 지금과 같은 구독이다: 표시 키가 없으면 구독으로 본다(아래).
+- 안 쓰는 방식의 작업자 키는 지우지 않고 값 `unset`(자리 표시값)으로 둔다. ExternalSecret은 적힌 키가 Infisical에 모두 있어야 Ready라, 키를 지우면 Degraded로 root가 sandbox wave에서 멈춘다. 작업자는 `unset`을 "자격 없음"(`credential_missing`)으로 읽는다. 작업자 Secret 이름(`worker-credential-claude-subscription` 등)과 `WORKER_CREDENTIAL_KEY=CLAUDE_CODE_OAUTH_TOKEN`·프로필 이름 `claude-subscription`은 바꾸지 않는다(sandbox values·schema `const`와 호환).
+- sandbox 배포 PR(할 일 6) 전제: 병합 전에 Infisical에 `CLAUDE_AUTH_METHOD`(=`subscription`)·`ANTHROPIC_API_KEY`·`ANTHROPIC_API_KEY_TASK`(=`unset`)가 있어야 한다. `homelab bot account use <지금 계정> --apply`를 한 번 치면 셋이 생긴다(구독 전환도 방식 표시와 `unset`을 쓴다). 이 값들은 16자 미만이라 `homelab secret set`(시크릿 입력 16자 하한)으로는 넣을 수 없다.
+
+**"표시가 없으면 실행하지 않는다"(할 일 2)와 "기본값은 지금과 같은 구독"(티켓 목표)이 부딪힌 곳: 표시가 없으면 구독으로 본다(분해 불일치로 보고).** 비교한 두 안:
+
+1. 표시가 없으면 실행하지 않고, sandbox PR 병합 전에 Infisical에 표시 키를 먼저 넣는 순서로 푼다: 봇 이미지 digest만 먼저 올리는 PR, 복구 스위치(`externalSecrets.enabled: false`)로 손 Secret을 토큰 하나만 만든 복원(restore.md 3.1), 키를 하나 빠뜨린 손 실수 모두에서 작업자가 모든 실행을 거부해 봇 전체가 멈춘다. 새 작업자 + 표시 없는 지금 Secret 조합이 지금처럼 구독으로 돌아야 한다는 호환 조건도 깨진다.
+2. **(채택)** 표시 파일이 없으면 구독이다. 표시가 있는데 모르는 값이면 실행하지 않는다(`credential_method_invalid`). 표시한 방식의 자격이 없거나 `unset`인데 다른 방식의 자격이 있으면 실행하지 않는다(`credential_method_mismatch`). 그래서 표시가 없고 API 키만 있는 경우도 API 키로 몰래 돌지 않고 거부된다. 할 일 2가 막으려던 "다른 방식의 자격으로 도는 것"은 그대로 막히고, 잃는 것은 "표시 키 누락을 실행 거부로 알아채는 것"뿐이다(그때도 구독 토큰으로 돌 뿐이라 지금 동작과 같다).
+
+**실행마다 방식 고르기(`src/credentials.ts` `MethodEnvCredential`, `src/executor-profiles.ts` `methods`·`staticCredential`).** 방식은 기동 env가 아니라 Secret 볼륨의 방식 표시 파일이 고른다(전환이 파드 재시작 없이 다음 실행부터 반영돼야 한다). 자격은 실행 준비 때마다 표시 → 그 방식의 자격 → 다른 방식의 자격 순으로 다시 읽고 `RunCredential.method`를 싣는다. Claude 어댑터(대화·리뷰 `ClaudeChatAdapter`, 작업 `ClaudeTaskAdapter`)는 `start`에서 그 방식으로 자격 변수 이름(`CLAUDE_CODE_OAUTH_TOKEN` 또는 `ANTHROPIC_API_KEY`)과 init `apiKeySource` 기대값(`none` 또는 `ANTHROPIC_API_KEY`)을 고른다. 어댑터의 `credentialEnv`·`envNames`는 그 실행의 값을 돌려주는 getter라, 공통부(`RunControl`, 바꾸지 않음)가 `start` 직후 하는 env 허용 목록 검사가 "자격 변수는 그 실행의 것 하나"를 강제한다. 다른 방식의 변수가 끼면 띄우지 않는다. 반사·유출 검사에는 읽을 수 있는 두 방식의 자격을 모두 쓴다. 작업 레인의 `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` 목록에 `ANTHROPIC_API_KEY`가 들어 있다 [확인: 2.1.308 바이너리]. 버린 대안: (1) API 키 프로필 줄을 따로 두고 기동 env로 고르기: 전환마다 sandbox PR과 파드 재시작이 든다. (2) 공통부 `assertLaunchSafe`에 "자격 변수 정확히 하나" 검사를 더하기: `run-control.ts`는 이 티켓 소유가 아니고, getter로 같은 효과가 난다.
+
+**`--bare`와 금지 플래그 재검토 결론: 바꾸지 않는다.** `--bare`는 두 방식 모두 쓰지 않고 `CLAUDE_FORBIDDEN_FLAGS`에 그대로 둔다. bare는 OAuth를 읽지 않아(2.1.308 `--help` "strictly ANTHROPIC_API_KEY or apiKeyHelper via --settings (OAuth and keychain are never read)") 구독에는 못 쓰고, API 방식에만 쓰면 방식마다 argv가 갈려 검증한 argv 하나(`claudeArgs`)가 둘이 된다. 비대화 실행은 bare 없이도 env의 `ANTHROPIC_API_KEY`를 쓰고 출처를 `ANTHROPIC_API_KEY`로 알린다 [확인: 2.1.308 바이너리의 자격 출처 함수, SDK init `apiKeySource` enum]. bare가 끄는 사용자 지정(hooks·plugins·CLAUDE.md 등)은 이미 `--safe-mode`·빈 `CLAUDE_CONFIG_DIR`·init 검사가 끈다. `apiKeyHelper`를 여는 `--settings`도 계속 금지다(리뷰 레인의 고정 인라인 JSON만 예외).
+
+**크레딧 소진 분류(`classifyClaudeError`).** 결제 구분이 작업자 응답에 실리는 방식은 C19 그대로다(`rateLimit.stop.cause === 'billing'`, 저절로 재개하지 않음, 경보 `HomelabBotModelPausedBilling`). 모양 근거: API는 소진을 400 `invalid_request_error`("Your credit balance is too low to access the Anthropic API…")로 주고 CLI가 이 문구를 error `billing_error`로 바꾼다 [확인: 봇 이미지 고정 2.1.308 바이너리, 로컬 2.1.319·2.1.322도 같음]. 공식 오류 문서(platform.claude.com/docs/en/api/errors, 2026-11-11)는 402 `billing_error`, 400(조직·workspace 지출 한도), 429(분당 한도와 사용 등급 월 지출 상한·Claude Code workspace 지출 한도)를 적고 선불 크레딧 소진의 모양은 적지 않는다. 그래서 확인하지 못한 모양은 결제 쪽으로 닫는다: (1) 서버 오류 식별자(`api_error`·`api_error_code`)가 `billing`·`credit`·`spend` 단어를 담으면 종류와 무관하게 결제, (2) API 방식의 한도(`rate_limit` 종류·429)는 결제. 짧은 429는 CLI가 안에서 다시 시도한 뒤라 여기 온 429는 오래 가는 상한일 수 있고, API 방식에는 풀리는 시각(`rate_limit_event`)이 없어 한도로 두면 30분마다 헛돈다. 대가: API 방식의 진짜 분당 한도도 owner가 `account use`로 풀어야 한다. 구독 방식의 분류는 그대로다. 본문 문구("credit balance")는 보지 않는다(모델 답에 실릴 수 있어서, 기존 원칙).
+
+**egress.** API 방식도 모델 요청은 `api.anthropic.com:443`이다 [가정: 공식 네트워크 문서의 필수 호스트, 구독 OAuth 갱신 호스트는 API 키에 필요 없음]. 실제 확인은 S5(C24)다. 프록시 허용 목록은 이 티켓이 바꾸지 않았다.
+
+**관리 진입점.** `account record|use <이름> api`를 받는다(`src/admin.ts`). API 계정은 발급일·만료일이 없어 토큰 만료 줄이 없다(C22 그대로). 등록하지 않은 방식으로 `use`하면 `unknown_account`(종료 3)다.
+
+**homelab CLI 순서(자격 둘을 두지 않기).** `account use --by <방식>`은 작업자 키를 그 방식의 두 값 → 방식 표시 → 다른 방식 두 키 `unset` 순서로 쓴다. 어느 순간에 멈춰도 표시는 자격이 있는 방식을 가리켜 작업자가 불일치로 거부하는 틈이 없고, 다 쓴 뒤에는 작업자 키에 자격이 하나뿐이다. 반대 순서(옛 자격부터 비우기)는 중간에 멈추면 봇 전체가 불일치로 멈춰 버렸다. 그 뒤는 C22 순서(즉시 동기화 → Secret 해시·표시 → 볼륨 지문·표시 → 해제)다. 구독은 방식 표시 파일이 없어도 반영으로 본다(sandbox 배포 전 Secret). 방식 표시·`unset`은 비밀이 아닌 고정 값이라 core의 `setMarker`(값 셋만)로 쓴다.
+
+**C22 넘김(할 일 4a, `Store.observeRateLimit`).** "이 실행이 계정 전환보다 먼저 시작했는가" 확인과 `model_limit_state` 쓰기를 전환과 같은 scheduler 행 잠금 아래 한 트랜잭션에서 한다. 트랜잭션 밖 호출(대화 `runtime.ts`, 리뷰 `review.ts`, 작업 `claude-task-bridge.ts` `settle` 뒤)은 스스로 트랜잭션을 열어 scheduler를 먼저 잡고, 대기 경로(`recordPause`)는 이미 scheduler를 쥔 트랜잭션을 넘긴다. 잠금 순서는 scheduler → `model_limit_state` 그대로다. `settle`은 자기 트랜잭션(작업 제어·job 행)을 끝낸 뒤에 관측을 부르므로 잡은 잠금이 없어 순환하지 않는다.
+
+**남는 위험.**
+
+- 방식 표시와 자격 파일은 따로 읽는다. kubelet의 볼륨 교체와 엇갈리면 그 실행 하나가 불일치로 거부될 수 있다(다른 방식으로 돌지는 않는다). CLI는 자격을 쓰고 동기화를 한 번에 하므로 보통 Secret 한 판에 함께 바뀐다.
+- 불일치·표시 오류의 사유 코드는 자격 오류(`WorkerStartError.code`)에 있고, 실행 중에는 공통부가 그 실행을 `failed`(띄우지 않음)로 닫으며 readiness가 503이 된다. 실행마다 사유 코드를 로그 줄로 남기는 것은 공통부(`run-control.ts`) 변경이라 하지 않았다. 기동 때는 `worker_start_failed` 사유로 남는다.
+- API 방식의 진짜 분당 한도도 결제 멈춤이 된다(위 분류의 대가).
