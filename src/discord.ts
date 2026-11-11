@@ -16,7 +16,7 @@ import { buttonAllowed, buttonRoute, parseButton } from './discord-protocol.js';
 import { previewWithoutButton } from './change-runtime.js';
 import { CHAT_TASK_TEXT } from './chat-task-text.js';
 import { bindProposalHandlers, PROPOSAL_BUTTONS, PROPOSAL_TEXT, pressProposal } from './proposals.js';
-import { finishProposalRun } from './proposal-retention.js';
+import { finishProposalRun, withdrawRunResult } from './proposal-retention.js';
 import { chooseNextAnswer, deferInGap, offerAnswer, pressQuestionPick, sealsNextMessage } from './question-pick.js';
 import { CHANGE_DIRECT_BUTTON, pressChangeQuestion } from './change-question.js';
 import type { ChangeQuestionPress } from './change-question.js';
@@ -314,6 +314,8 @@ export class DiscordIngress {
     this.log('proposal_button', { command: event.command!, outcome: outcome ? (outcome.update ? 'settled' : 'refused') : 'duplicate' });
     // 기억·변경·세션 연결 처리기는 커밋 뒤 '/' 명령과 같은 호출로 한 번 부른다. 실패하면 다시 하지 않고 확인을 권한다.
     // 버튼 트랜잭션이 남긴 실행 의도(사유 run_pending과 실행 입력)는 끝난 뒤 지운다. 그 전에 멈추면 주기 정리가 실패 안내를 남긴다.
+    // 지우는 트랜잭션이 결과 문장을 늦게 게시할 글로 남기고, 응답이 전해지면 그 글을 지운다. 그 사이에 멈추면 그 글이 결과를 전한다.
+    let pendingResult = false;
     if (outcome?.later) {
       let failed = false;
       outcome.content = await outcome.later().catch(error => {
@@ -322,10 +324,13 @@ export class DiscordIngress {
         return PROPOSAL_TEXT.failed;
       });
       // 지우지 못해도 응답은 보낸다. 남은 의도는 주기 정리가 실패 안내로 끝낸다.
-      await finishProposalRun(this.store.db, event.target!, failed).catch(error => { this.log('proposal_run_finish_failed', errorInfo(error)); });
+      pendingResult = await finishProposalRun(this.store.db, { proposal: event.target!, failed, content: outcome.content, revision: p.revision, now: this.store.now() })
+        .catch(error => { this.log('proposal_run_finish_failed', errorInfo(error)); return false; });
     }
     // 응답을 전하지 못하면 결과 문장(공개해도 되는 고정 문구)을 그 스레드에 남긴다. 버튼은 남지만 다시 누르면 "이미 처리"로 답한다.
-    if (outcome) await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: outcome.content, update: outcome.update });
+    if (!outcome) return saved.id;
+    const replied = await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: outcome.content, update: outcome.update });
+    if (pendingResult && replied) await withdrawRunResult(this.store.db, event.target!).catch(error => { this.log('proposal_result_withdraw_failed', errorInfo(error)); });
     return saved.id;
   }
   // 질문 고르기 버튼(작업 질문 바로 답에서 열린 질문이 둘 이상일 때). 스위치가 꺼져 있으면 그 버튼을 만들지 않으므로 받지도 않는다.
@@ -512,8 +517,10 @@ export class DiscordIngress {
   // 메시지 이벤트에서 던지면 main의 guard()가 그 대화에 history gap 장벽을 세운다.
   // content: 상호작용 응답 본문(기억·연결 명령은 처리 결과). direct가 있으면 응답 실패 때 결과 대신 그 고정 안내를 채널에 남긴다.
   // direct.update: 버튼 응답으로 그 글을 content로 바꾸고 버튼을 없앤다(실행 확인).
-  private async acknowledge(event: EventInput, id: string, content?: string, direct?: { revision: string; notice: string; update?: boolean }): Promise<void> {
+  // 응답을 보냈거나 응답 실패를 기록했으면(안내 글 포함) true. 그 기록마저 못 했으면 false다.
+  private async acknowledge(event: EventInput, id: string, content?: string, direct?: { revision: string; notice: string; update?: boolean }): Promise<boolean> {
     let outcome: AckOutcome | void;
+    let delivered = false;
     try {
       try {
         await this.beforeReply(event);
@@ -534,11 +541,14 @@ export class DiscordIngress {
             else await store.ackNotice(id);
           }
         });
-        return;
+        return true;
       }
+      delivered = true;
       if (outcome) await this.store.audit('ack_reaction_fallback', id, { status: outcome.fallback });
+      return true;
     } catch (error) {
       this.log('ack_failure_unrecorded', { kind: event.kind, ...errorInfo(error) });
+      return delivered;
     }
   }
   // 결과: done(빈틈 없이 따라잡고 gap 해제), budget(쪽 수·30초 복구 한도를 넘어 gap 유지, 수동 처리. 도중 lease 만료 포함),

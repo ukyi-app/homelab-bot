@@ -287,6 +287,76 @@ test('C36 F-7 "할게요" 확정 커밋 뒤 실행 전에 멈추면, 다시 띄�
   assert.deepEqual((await a.proposals()).map(p => [p.state, p.value, p.source_event, p.reason]), [['confirmed', null, null, 'run_interrupted']]);
 });
 
+// 말로 한 변경 취소 제안을 하나 띄운다. 그 변경 ID와 "할게요" 버튼을 돌려준다.
+async function changeCancelProposal(a: Actions) {
+  const ids = async () => (await database.db.query<{ id: string }>('SELECT id FROM change_requests')).rows.map(row => row.id);
+  const before = await ids();
+  await a.slash('change', { target: REPO.fullName, text: '공개 요약 | accept=시험 통과 | label=public' });
+  const change = (await ids()).find(id => !before.includes(id))!;
+  await a.speak(message(), '그 변경 취소해 줘', { action: 'change_cancel', target: change, content: null });
+  return { change, yes: yesOf(a) };
+}
+// 처리기는 끝났고(완료 기록까지) 버튼 응답은 아직 보내지 못한 채 멈춘 게시 서버. 다시 띄운 게시 서버의 정리·게시로 남는 글을 돌려준다.
+async function stopBeforeReply(a: Actions, yes: string) {
+  let reached = false;
+  a.hooks.beforeCallback = () => { reached = true; return new Promise(() => {}); };
+  void a.press(yes);
+  for (let spin = 0; spin < 400 && !reached; spin++) await new Promise(resolve => setImmediate(resolve));
+  assert.ok(reached, '버튼 응답 직전까지 가야 한다');
+  a.hooks.beforeCallback = undefined;
+  const posted = a.posted().length;
+  a.f.advance(10 * 60_000 + 1);
+  await purgeExpiredRawText(database.db, a.f.now());
+  await a.deliver();
+  a.f.advance(60 * 60_000);
+  await purgeExpiredRawText(database.db, a.f.now());
+  await a.deliver();
+  return a.posted().slice(posted);
+}
+
+test('C36 묶음 F 제안 실행이 거절로 끝난 직후 버튼 응답 전에 멈추면, 다시 띄운 게시 서버가 그 스레드에 그 결과를 한 번 남기고 다시 누르면 이미 처리다', async () => {
+  const a = await wired();
+  const { change, yes } = await changeCancelProposal(a);
+  // 버튼을 누르기 전에 '/change-cancel'로 먼저 취소했다. 버튼의 실행은 쓰지 않고 거절로 끝난다.
+  await a.slash('change-cancel', { target: change });
+  assert.deepEqual(await stopBeforeReply(a, yes), ['이미 끝난 변경이에요(cancelled).']);
+  assert.equal((await database.db.query("SELECT 1 FROM outbox WHERE message_key LIKE 'proposal:%' AND scope->>'channel'=$1", [thread.channel])).rows.length, 1);
+  assert.deepEqual((await a.proposals()).map(p => [p.state, p.value, p.source_event]), [['confirmed', null, null]]);
+  await a.press(yes);
+  assert.equal(a.lastCallback()!.data.content, PROPOSAL_TEXT.settled);
+});
+
+test('C36 묶음 F 제안 실행이 성공한 직후 버튼 응답 전에 멈추면, 남는 안내는 성공 결과이고 실패 안내가 아니다', async () => {
+  const a = await wired();
+  const { change, yes } = await changeCancelProposal(a);
+  const after = await stopBeforeReply(a, yes);
+  assert.equal((await database.db.query<{ phase: string }>('SELECT phase FROM change_requests')).rows[0]!.phase, 'cancelled');
+  assert.deepEqual(after, [CHANGE_TEXT.cancelled(true, change, false)]);
+  assert.ok(!after.some(text => text === PROPOSAL_TEXT.failed || text === PROPOSAL_TEXT.interrupted));
+});
+
+test('C36 묶음 F 제안 실행의 버튼 응답이 전해졌거나 응답 실패 안내를 남겼으면, 10분 뒤 결과 안내를 또 남기지 않는다', async () => {
+  const a = await wired();
+  const { yes } = await changeCancelProposal(a);
+  await a.press(yes);
+  const posted = a.posted().length;
+  a.f.advance(10 * 60_000 + 1);
+  await purgeExpiredRawText(database.db, a.f.now());
+  await a.deliver();
+  assert.equal(a.posted().length, posted, '응답이 전해진 실행');
+  // 응답이 실패하면 그 결과는 응답 실패 안내로 한 번만 남는다.
+  const second = await changeCancelProposal(a);
+  a.hooks.beforeCallback = async () => { throw new Error('fixture_callback_failed'); };
+  await a.press(second.yes);
+  a.hooks.beforeCallback = undefined;
+  await a.deliver();
+  a.f.advance(10 * 60_000 + 1);
+  await purgeExpiredRawText(database.db, a.f.now());
+  await a.deliver();
+  const result = CHANGE_TEXT.cancelled(true, second.change, false);
+  assert.equal(a.posted().slice(posted).filter(text => text === result).length, 1, JSON.stringify(a.posted().slice(posted)));
+});
+
 test('C14 기억 저장 제안의 값이 확인 글과 달라지면 버튼은 저장하지 않는다(owner가 본 값만 저장된다)', async () => {
   const a = await wired();
   await a.speak(message(), '기억해 둬', { action: 'memory_save', target: 'decision', content: '보인 진술 | applies=homelab' });
