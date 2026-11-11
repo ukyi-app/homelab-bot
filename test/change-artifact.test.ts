@@ -22,6 +22,7 @@ import { CHANGE_INSTRUCTIONS_REVISION, CHANGE_NOTE_LIMITS, TASK_ENDPOINTS, TASK_
 import { TaskWorkerRejected } from '../src/task-bridge.js';
 import { HttpTaskV2Worker, taskWorkerChangeContract, taskWorkerChangeInstructions, taskWorkerIntake } from '../src/task-http.js';
 import { parseTaskArchive } from '../src/task-workspace.js';
+import { ReviewRuntime } from '../src/review.js';
 import type { TaskEvidence } from '../src/task-workspace.js';
 import { BASE_ITEMS, FIXTURE_TOKEN, baseTreeOf, changeWorkerFixture, identity, leavesOf, settledResult } from './change-worker-harness.js';
 import type { ChangeWorkerFixture } from './change-worker-harness.js';
@@ -450,6 +451,33 @@ test('작성 port: 저장을 끝내기 전에는 finalize가 작업자를 부르
   const session = (await h.db.query<{ state: string; session_retained: boolean; cleanup_state: string }>('SELECT state,session_retained,cleanup_state FROM codex_sessions WHERE job_id=$1', [h.job.id])).rows[0]!;
   assert.deepEqual(session, { state: 'completed', session_retained: false, cleanup_state: 'cleaned' });
   assert.equal((await h.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [h.job.id])).rows[0]!.state, 'succeeded');
+});
+
+// AC-17(C20 6a의 남은 부분): 변경 작성이 성공 결과(snapshot)와 함께 받은 한도 경고도 계정 기록에 남아 PR 리뷰를 미룬다.
+test('AC-17 변경 작성의 snapshot에 실린 한도 경고가 그 풀리는 시각까지 새 PR 리뷰 claim을 미루고, 기한 뒤에는 집는다', async () => {
+  const h = await authorHarness();
+  await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  const resetsAt = Math.floor((h.app.now() + 3_600_000) / 1000);
+  const rateLimit = { event: { status: 'allowed_warning', resetsAt, rateLimitType: 'five_hour', utilization: 0.9 } };
+  h.calls.intercept = async (endpoint, send) => {
+    const sent = await send();
+    const response = sent.response as { status?: string };
+    return endpoint === '/v2/task/result' && response.status === 'snapshot' ? { ...sent, response: { ...response, rateLimit } } : sent;
+  };
+  const { receiptId } = await h.author.start(startInput(h));
+  const result = await pollAuthor(h, receiptId);
+  assert.ok(result.kind === 'snapshot');
+  await new ChangeStoreArtifacts(h.store).save(h.key, result.artifact, result.transportBytes);
+  await h.author.finalize(receiptId);
+  // 게시 PR 리뷰 하나가 대기열에 있다. 작성 job이 끝나 실행 중인 작업은 없다.
+  await h.db.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,received_at,payload)
+    VALUES ('pr-review','github','pr-review','pr-review','fixture-owner','{}',0,'{}')`);
+  await h.db.query(`INSERT INTO jobs(id,event_id,type,owner_id,target,revision,budget,state,attempt,priority,available_at,created_at)
+    VALUES ('pr-review','pr-review','review','fixture-owner','{}','{}','{}','queued',0,20,0,$1)`, [h.app.now()]);
+  const reviews = new ReviewRuntime(h.app.store, null as never, null as never, null as never, null as never, h.app.signer, 5);
+  assert.equal(await reviews.claim(), undefined);
+  h.app.advance(resetsAt * 1000 - h.app.now());
+  assert.equal((await reviews.claim())?.id, 'pr-review');
 });
 
 test('작성 port: 모델 질문·실패를 v1과 같은 상태로 확정하고 차단 사유를 코드로 돌려준다', async () => {

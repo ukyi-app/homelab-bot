@@ -62,7 +62,7 @@ async function pausedCounts(db: Database): Promise<PausedCounts> {
   return counts;
 }
 
-export type SwitchOutcome = { result: 'unknown_account' } | { result: 'switched'; resumed: number; waiting: number; held: 'emergency_stopped' | 'queue_full' | null };
+export type SwitchOutcome = { result: 'unknown_account' } | { result: 'switched'; resumed: number; waiting: number; held: 'emergency_stopped' | null };
 
 // 계정 전환의 봇 쪽 끝(COLLEAGUE_SPEC §4.8 "계정 전환"). homelab CLI가 두 레인 자격을 작업자 키로 옮기고 작업자 볼륨 지문까지
 // 확인한 뒤에만 부른다(반영 전 해제 금지는 CLI의 단계 순서가 지킨다). 한 트랜잭션(호출자의 Store.atomic) 안에서 돈다.
@@ -70,7 +70,7 @@ export type SwitchOutcome = { result: 'unknown_account' } | { result: 'switched'
 //   옮기고 비운다. 새 계정의 한도는 아직 모른다.
 // - 모델 멈춤으로 기다리는 작업을 모두 같은 해제 전이(Store.resumeWaiting)로 다시 큐에 넣는다. 결제 멈춤도 넣는다(재시도 시각이
 //   없어 예약 루프가 고르지 않는 멈춤이라, 계정을 바꾼 owner의 해제가 유일한 길이다). 같은 계정으로 다시 부르면 해제만 한다.
-// - 비상 정지 중이면 해제하지 않는다. 큐가 차면 거기서 멈추고, 남은 한도·인증 대기는 예약 루프가 30분 안에 다시 본다.
+// - 비상 정지 중이면 해제하지 않는다. 대기열 상한은 해제를 막지 않는다(Store.resumeWaiting: 이미 접수된 작업의 재개다).
 export async function switchAccount(store: Store, name: string, method: AccountMethod, actor: string, conversation: string): Promise<SwitchOutcome> {
   const db = store.db;
   // scheduler 행을 한도 상태보다 먼저 잡는다. 모델 대기(Store.waitForUser)가 scheduler → model_limit_state 순서로 잡으므로,
@@ -91,8 +91,6 @@ export async function switchAccount(store: Store, name: string, method: AccountM
   if (emergency) return { result: 'switched', resumed: 0, waiting: waiting.length, held: 'emergency_stopped' };
   let resumed = 0;
   for (const job of waiting) {
-    if (await store.queueFull(job.type === 'review' ? 'review' : 'chat'))
-      return { result: 'switched', resumed, waiting: waiting.length - resumed, held: 'queue_full' };
     // 리뷰 작업은 '/review-resume'과 같은 리뷰 제어 경로, 그 밖은 관리 기능의 멈춘 작업 재개(C32)다. 둘 다 Store.resumeWaiting이다.
     const ok = job.type === 'review'
       ? (await store.control(actor, conversation, 'review-resume', job.id, undefined, { review: true }) as { ok: boolean }).ok
