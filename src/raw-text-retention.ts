@@ -1,4 +1,5 @@
 import type { Database } from './database.js';
+import { expirePending, settleInterruptedRuns } from './proposal-retention.js';
 import { JOB_FINAL, sessionHeld } from './task-bridge.js';
 
 // 정리 경로가 따로 없던 원문 칸 네 개의 7일 보존(DECISIONS T31). 다섯 번째 칸 change_requests.brief는
@@ -87,11 +88,16 @@ export async function purgeExpiredOutboxContent(db: Database, now: number, reten
     AND o.content_purged_at IS NULL AND o.state IN ('sent','blocked') RETURNING o.id`, [now - retentionMs, now])).rows.length);
 }
 
+// 제안 표의 값(기억 진술·실행 입력)도 여기서 정리한다. 7일이 아니라 제안 만료(24시간)와 커밋 뒤 실행 중단 기준이라 retentionMs와 무관하다.
+// 이 정리는 스위치와 무관하게 시작·1시간마다 돌아, 스위치를 끈 뒤에도 켜짐 때 남은 값이 비워진다.
 export async function purgeExpiredRawText(db: Database, now: number, retentionMs = RAW_TEXT_RETENTION_MS): Promise<RawTextPurged> {
-  return {
+  const purged = {
     events: await purgeExpiredEventText(db, now, retentionMs),
     prompts: await purgeExpiredQuestionPrompts(db, now, retentionMs),
     results: await purgeExpiredResults(db, now, retentionMs),
     outbox: await purgeExpiredOutboxContent(db, now, retentionMs),
   };
+  await expirePending(db, now);
+  await settleInterruptedRuns(db, now);
+  return purged;
 }

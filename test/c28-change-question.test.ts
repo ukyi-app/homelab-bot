@@ -1,6 +1,8 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { DiscordPublisher } from '../src/discord.js';
 import { buttonAllowed } from '../src/discord-protocol.js';
+import { Store } from '../src/store.js';
 import { TASK_INSTRUCTIONS } from '../src/executor-claude-task.js';
 import { CHANGE_INSTRUCTIONS_REVISION, TASK_INSTRUCTIONS_REVISION } from '../src/task-contracts.js';
 import { REPO } from './change-github-fake.js';
@@ -145,6 +147,18 @@ test('C28 질문 글(꺼짐): 선택지는 저장하되 질문 글은 지금 판
     assert.match(post.body.content, new RegExp(`/answer question:${question}`));
     assert.equal(buttonsOf(post).length, 0);
     assert.ok(OPTIONS.every(option => !post.body.content.includes(option)), '지금 판 글 그대로다');
+  });
+});
+
+test("C36 F-11 켜짐에서 저장한 질문 글이 스위치를 끄고 다시 띄운 게시 서버에서 나가면 버튼 없이 '/answer' 안내로 바뀐다", async () => {
+  await withHarness({ changeV2: true, colleague: true, steps: [CHOICE_QUESTION, V2_WRITE] }, async h => {
+    const { question } = await toQuestion(h);
+    const off = new DiscordPublisher(new Store(h.db, h.store.now, false), h.gate, h.rest);
+    for (let index = 0; index < 20 && await off.deliver(); index++) { /* 쌓인 게시를 비운다 */ }
+    const post = h.rest.messages.filter(message => message.body.content.includes('어느 쪽을 고칠까요?')).at(-1)!;
+    assert.equal(buttonsOf(post).length, 0);
+    assert.match(post.body.content, new RegExp(`/answer question:${question}`));
+    assert.doesNotMatch(post.body.content, /버튼을 누르거나/);
   });
 });
 

@@ -2148,3 +2148,20 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 **비공개 저장과 보존.** migration 018은 additive다. `change_review_findings`(리뷰 원문), `change_deployment_windows`, `change_artifacts.purged_at`을 더한다. `purgeExpiredChangeContent`가 시간마다 끝 상태 뒤 7일이 지난 건의 `change_artifact_files`, `change_artifacts.patch`, 리뷰 원문을 지운다. receipt·digest·manifest·effect는 남는다. 진행 중이거나, 미확정 effect·살아 있는 자식 job·정리 안 끝난 세션이 있는 건은 고르지 않는다. 트리거는 artifact에 "아직 비우지 않은 행의 patch를 빈 값으로 만들고 시각을 적는" 변경만 받는다. 요청 원문과 추가 답변(`change_request_inputs.text`)도 같은 건·같은 기준 시각으로 같은 트랜잭션에서 빈 값으로 두고 `purged_at`을 적는다(migration 019, T27). `text_sha256`·label·event_id는 남는다. 이 SQL은 `ChangePrivateInputs`의 정적 함수(`HELD`·`purgeIn`·`purgedIn`)에 있어 원문 표를 만지는 코드가 그 클래스와 공용 INSERT뿐이다. 새 generation의 접수는 요청 원문을 다시 읽으므로, 원문을 지운 superseded 건은 `startNextGeneration`이 `input_purged`로 거절하고 `/change` 새 요청을 안내한다. 같은 트랜잭션에서 `change_requests.brief`의 summary·goal·acceptanceCriteria도 빈 값으로 두고 `brief_purged_at`을 적는다(migration 020, T31). brief는 admission CHECK·`brief_digest` 불변 트리거·짝 CHECK 때문에 NULL로 둘 수 없어 세 칸만 비우고, 경로·명령·label과 원래 brief의 `brief_digest`는 남는다. brief를 읽는 경로는 모두 진행 단계다. `change_retention`은 `purgeExpiredChangeContentRounds`로 한 바퀴에 20건씩 최대 20번 골라 복원 직후 밀린 건도 한 주기 안에 지운다.
 
 **되돌리기.** 스위치를 끄면 새 접수와 루프만 멈춘다. 남은 작성 세션은 lease 만료 뒤 unknown으로 레인을 닫으므로 `/task-release`로 해제한다. `HttpTaskV2Worker`를 스위치와 무관하게 브리지에 넘겨 두는 이유다. 미확정 effect는 스위치를 켜야 대조가 돈다. `change` 절을 모르는 옛 게시 서버로 되돌릴 때는 정책 키를 먼저 뺀다.
+
+## C36 묶음 B: 제안·공개 범위 (2026-11-11)
+
+§13 "제안과 실행 확인 (C13)"에 더하는 계약이다. 선택의 이유는 [DECISIONS](DECISIONS.md) "C36 묶음 B".
+
+- **읽기 결과 공개 검사:** `ProposalDesk.consider`의 읽기 분기는 처리기 결과를 outbox(`result:<job>:read`)에 넣기 전에 `chatReplyRisk`로 본다. 걸리면 `PROPOSAL_TEXT.readWithheld`만 넣는다(값은 outbox·게시에 없다). 세션 연결 목록은 `ExternalCommandRequest.publicCheck`를 넘겨 세션 ID 자리만 `ATTACH_COMMAND_TEXT.listIdWithheld`로 바꾸고 연결 ID는 남긴다. '/' 읽기 명령의 본인 전용 응답은 바뀌지 않는다.
+- **커밋 뒤 실행의 의도(제안 행 상태):**
+
+  | 때 | `state` | `reason` | `value`·`source_event` |
+  |---|---|---|---|
+  | "할게요" 커밋(커밋 뒤 실행이 있는 동작: 기억·변경·변경 취소·수정 요청·세션 연결 해제) | `confirmed` | `run_pending` | 남김(실행 입력) |
+  | 실행 끝(수신 `finishProposalRun`) | `confirmed` | 성공 `NULL`, 처리기 오류 `run_failed` | 비움 |
+  | 실행 끝 기록 없이 확정 뒤 10분 지남(주기 정리 `settleInterruptedRuns`) | `confirmed` | `run_interrupted` | 비움, 그 스레드에 `PROPOSAL_TEXT.interrupted` 한 번(outbox 키 `proposal:<제안 ID>`) |
+
+  세 전이는 모두 `reason='run_pending'` 조건부 UPDATE라 먼저 한 쪽만 적용된다. 실패 안내와 행 전이는 한 트랜잭션이다. 다시 실행하지 않는다. 버튼 트랜잭션 안에서 끝나는 동작(작업 시작·취소·재시도·리뷰 제어·세션 연결)은 지금처럼 커밋 때 값을 비운다.
+- **제안 정리 연결:** `purgeExpiredRawText`(게시 서버의 `raw_text_retention` 루프: 시작 직후, 그 뒤 1시간마다, 스위치·레인과 무관)가 네 원문 칸 정리 뒤 `expirePending`(만료 대기 제안 → `expired`, 값 비움)과 `settleInterruptedRuns`를 부른다. 반환값(`RawTextPurged`)의 모양은 그대로다. 함수는 `src/proposal-retention.ts`.
+- **보내기 직전 스위치(`DiscordPublisher.deliverRow`):** 스위치가 꺼진 게시자가 `payload.buttons`가 있는 글을 보낼 때 버튼 경로(`parseButton` route)로 고른다. `control`은 그대로, `publish`는 버튼을 빼고 끝 두 줄을 `previewApproveByStatus` + `previewBinding(false)`로, `change-question`은 버튼을 빼고 끝의 켜짐 판 안내를 같은 기한의 `changeQuestionFooter(false, …)`로 바꾼다. 그 밖(`proposal`·`session-key`·`question`)은 `Denied`로 `blocked`, 감사 `delivery_blocked_colleague_off`. 바꾼 본문은 발송에만 쓰고 outbox 행의 payload는 그대로다(대조 표식은 멱등 키에서 만들어 바뀌지 않는다).

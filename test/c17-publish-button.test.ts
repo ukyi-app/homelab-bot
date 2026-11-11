@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { PUBLISH_TEXT } from '../src/change-commands.js';
 import { CHANGE_NOTICE_TEXT } from '../src/change-runtime.js';
 import { Denied } from '../src/contracts.js';
+import { DiscordPublisher } from '../src/discord.js';
 import { DiscordProtocol } from '../src/discord-protocol.js';
+import { Store } from '../src/store.js';
 import { REPO } from './change-github-fake.js';
 import { REQUEST_TEXT, THREAD, WRITE_STEP, changeHarness } from './change-assembly-harness.js';
 import type { Harness } from './change-assembly-harness.js';
@@ -139,6 +141,23 @@ test('C17: 구독이 꺼진 대화에서는 버튼으로 승인하지 않는다.
     await h.command('102', 'change-publish', { target: id, text: digest! });
     assert.equal(await h.phase(id), 'approved');
     assert.deepEqual((await approvals(h, id)).map(row => row.event_id), ['102']);
+  });
+});
+
+test("C36 F-11 켜짐에서 저장한 미리보기가 스위치를 끄고 다시 띄운 게시 서버에서 나가면 버튼 없이 '/' 승인 안내로 바뀐다", async () => {
+  await withHarness({ colleague: true }, async h => {
+    const id = await toAwaiting(h);
+    assert.equal((await h.db.query("SELECT 1 FROM outbox WHERE payload ? 'buttons' AND state='pending'")).rows.length, 1, '대조: 버튼 미리보기가 저장됐다');
+    const off = new DiscordPublisher(new Store(h.db, h.store.now, false), h.gate, h.rest);
+    for (let index = 0; index < 20 && await off.deliver(); index++) { /* 쌓인 게시를 비운다 */ }
+    const previews = h.rest.messages.filter(message => message.body.content.includes('게시하려면') || message.body.content.includes('/change-publish'));
+    assert.equal(previews.length, 1, JSON.stringify(h.rest.messages.map(m => m.body.content)));
+    const shown = previews[0]!.body;
+    assert.equal(shown.components?.length ?? 0, 0);
+    assert.ok(shown.content.includes(`/change-status target:${id}`), shown.content);
+    assert.ok(shown.content.includes(`/change-publish target:${id}`), shown.content);
+    assert.ok(shown.content.includes(CHANGE_NOTICE_TEXT.previewBinding(false)), shown.content);
+    assert.ok(!shown.content.includes(PUBLISH_TEXT.label), shown.content);
   });
 });
 

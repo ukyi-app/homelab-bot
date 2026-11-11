@@ -149,6 +149,27 @@ test('C15 공개 검사에 걸리는 세션 ID는 확인 글에서 숨기고, "�
   assert.ok(!JSON.stringify(h.callbacks).includes(hidden) && !posted(h).includes(hidden));
 });
 
+test('C36 F-4 공개 검사에 걸리는 세션 ID는 연결한 뒤 말로 한 세션 연결 목록(일반 답)에도 싣지 않고, 연결 줄은 남긴다', async () => {
+  const h = await harness(database.db);
+  const hidden = '10.20.30.40';
+  h.reply(attachProposal('claude', hidden));
+  await h.say('100000000000000010', REQUEST);
+  await h.turn();
+  await h.press(h.buttons().ids[0]!);
+  await h.publish();
+  await h.press(h.buttons().ids[0]!);
+  const [connection] = await h.connections();
+  assert.equal(connection!.external_task_id, hidden, '대조: 숨긴 ID로 연결이 생겼다');
+  h.reply({ action: 'attach_list', target: null, content: null });
+  await h.say('100000000000000011', '연결한 세션 보여 줘');
+  await h.turn();
+  const list = h.f.rest.messages.at(-1)!.body.content;
+  assert.ok(list.includes(connection!.id), list);
+  assert.ok(!posted(h).includes(hidden), list);
+  const outbox = JSON.stringify((await database.db.query('SELECT payload FROM outbox')).rows);
+  assert.ok(outbox.includes(connection!.id) && !outbox.includes(hidden), 'outbox에도 없다');
+});
+
 test('C15 "키 보기"를 누른 owner에게만 보이는 응답으로 키가 한 번 나오고, 공개 글·이벤트·outbox·감사·로그에는 키가 없다', async () => {
   const h = await harness(database.db);
   const key = await confirmed(h);

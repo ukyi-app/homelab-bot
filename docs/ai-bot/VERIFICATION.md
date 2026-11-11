@@ -2762,3 +2762,30 @@ T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·
 - **바꾼 기존 시험:** `worker-claude`·`task-worker-harness`의 가짜 CLI가 env에 `ANTHROPIC_API_KEY`가 있으면 `apiKeySource`를 그 이름으로 낸다(실제 CLI의 출처 규칙). `admin-cli` 사용법 오류 목록에서 `api`를 뺐다. homelab `bot-account-use.test.ts`의 가짜 세계가 방식 표시·두 방식 키·ExternalSecret 키 매핑(sandbox 배포 전후)을 다루고, C22 흐름 시험의 쓰기 기대값에 방식 표시와 `unset` 쓰기를 더했다. 지문 argv 시험은 파일 둘(자격, 방식 표시)로 바뀌었다.
 - **운영에서 바뀌는 동작:** 봇 병합으로는 게시 서버만 바뀐다(관리 진입점이 `api`를 받음, 한도 관측이 scheduler 잠금 아래에서 적힘). 작업자 변경은 sandbox 배포 PR(할 일 6)로만 올라간다. 새 작업자는 방식 표시가 없는 지금 Secret에서 구독으로 돈다. homelab CLI의 구독 `account use`가 이제 방식 표시(`subscription`)와 API 키 두 자리(`unset`)를 작업자 Infisical 키에 함께 쓴다(지금 ExternalSecret은 읽지 않으므로 운영 영향 없음, sandbox 배포 PR의 전제 키가 생긴다).
 - **못 잡는 범위:** 실제 크레딧 차감과 실제 소진 응답(S5에서 Console로 본다), 실제 CLI의 API 키 출처 표시(바이너리 정적 읽기만), API 방식 egress, 실제 ESO·kubelet 반영 시간, Infisical에 키를 먼저 넣는 사람 순서, 방식 표시·자격 파일 읽기와 볼륨 교체의 엇갈림.
+
+## C36 묶음 B: 제안·공개 범위 (2026-11-11, 로컬)
+
+전체 리뷰 1차의 F-4·F-7·F-9·F-10·F-11. 구현 선택은 [DECISIONS](DECISIONS.md) "C36 묶음 B", 계약은 [ARCHITECTURE](ARCHITECTURE.md) 끝의 "C36 묶음 B". 경계는 S1(Gateway 프레임 → 수신·저장(PGlite) → 가짜 Discord REST, 가짜 시계)과 S2(작업자 입력 계약)다. 리뷰는 정적 대조였으므로 발견마다 먼저 빨간 시험으로 재현했다.
+
+| 완료 조건 | 근거 |
+|---|---|
+| F-4 말로 한 목록 답에 공개 검사에 걸리는 세션 ID가 없다 | `c15-session-key` "C36 F-4 공개 검사에 걸리는 세션 ID는 연결한 뒤 말로 한 세션 연결 목록(일반 답)에도 싣지 않고, 연결 줄은 남긴다"(C15 시험과 같은 `10.20.30.40`으로 확인 글 → "할게요" → "키 보기"로 연결 → 말로 목록 → 게시·outbox에 ID 없음, 연결 ID는 있음). `c14-remaining-actions` "C36 F-4 읽기 제안의 결과가 공개 검사에 걸리면 …"(같은 값을 담은 기억을 말로 검색 → 일반 답은 `readWithheld`, 게시·outbox에 값 없음, 같은 '/memory-search' 본인 전용 응답에는 있음) |
+| F-7 제안 확정 뒤 실행 전에 죽어도 실패 안내가 남는다 | `c14-remaining-actions` "C36 F-7 …"(기억 저장 "할게요" 커밋 뒤 처리기가 끝나지 않게 둠 → 확정 상태에 실행 입력이 남음 → 10분 전 정리는 아무것도 안 함 → 10분 뒤 정리 두 번 → 그 스레드에 `PROPOSAL_TEXT.interrupted` 한 번, 행은 `run_interrupted`·값 비움). 정상 경로(실행 끝에 값 비움)는 기존 C14 기억 저장 시험의 `[confirmed, null, null]`이 그대로 지킨다 |
+| F-9 입력이 없어도 만료된 제안의 값이 정리된다(스위치 꺼짐 포함) | `c14-remaining-actions` "C36 F-9 …"(누르지 않은 기억 저장 제안, 만료 전 정리는 남김, 24시간 뒤 스위치가 꺼진 `Store`로 원문 주기 정리 → `expired`·값·원문 참조 비움, 표 어디에도 진술 없음) |
+| F-10 대화 지시문에 변경 PR 수정이 있고 작업자 입력 계약 시험이 고정한다 | `worker-contract-v2` "C36 F-10 …"(실제 작업자에 speech 요청 → 실행기 stdin의 신뢰 문맥에서 실행 요청(확인 버튼) 줄에 "변경 PR 수정"과 대상 "이 스레드에서 낸 변경의 ID나 PR 번호", '/' 이름 없음, slash 판에는 없음) |
+| F-11 스위치를 끈 뒤 보내는 알림에 버튼이 없고 필요한 '/' 안내가 있다 | `c13-proposal` "C36 F-11 … 실행 확인 글 …"(켜짐에서 저장한 확인 글을 스위치 꺼진 게시자가 보냄 → 대화 답만 나가고 확인 글은 `blocked`, 작업 없음), `c17-publish-button` "C36 F-11 … 미리보기 …"(버튼 없음, `/change-status target:<id>`·`/change-publish target:<id>`·`previewBinding(false)`, 버튼 이름 없음), `c28-change-question` "C36 F-11 … 질문 글 …"(버튼 없음, `/answer question:<id>`, 켜짐 판 안내 없음) |
+
+- **시험이 실패할 수 있는지:** 위 시험 중 일곱은 고치기 전 코드(origin/main 4df0a4f)에서 실패했다. F-4 목록은 `10.20.30.40`이 목록 줄에 그대로 있었고, F-7은 커밋 때 값이 이미 비워져 실행 의도가 없었고, F-9는 행이 `pending`·진술 그대로였고, F-11 셋은 버튼 글이 그대로 게시됐고, F-10은 실행 요청 줄에 수정이 없었다. F-4 읽기 결과 시험은 구현과 함께 더해 빨강을 실행으로 보지 않았다(공개 검사가 없으면 '/' 결과가 그대로 실리므로 같은 값이 게시된다). 목록 줄의 띄어쓰기를 한 칸 잘못 고친 것을 `external-task-assembly`의 목록 형식 시험이 잡았다.
+- **실행(머신 잠금 도우미, node 24.22.0):** `npm run check`·`npm run build`, `c15-session-key`·`c16-task-question`·`c27-change-amend`·`c18-fixed-text`·`c14-remaining-actions`·`c13-proposal`·`c17-publish-button`·`c28-change-question`·`c30-review-request`·`external-task-assembly`·`raw-text-retention`·`worker-contract-v2`·`reaction-lifecycle`, `--pg`로 `c13-proposal-pg`·`external-task-pg`·`memory-briefing-pg`·`revoke-dispatch-pg`·`publisher-pg`·`raw-text-retention`.
+- **운영에서 바뀌는 동작:** 운영은 스위치가 꺼져 있고 켠 적이 없어 제안·버튼 글이 없으므로 병합으로 바뀌는 것이 없다. 스위치를 켠 뒤에는 아래가 다르다.
+
+  | 무엇 | 지금(`4df0a4f`) | 바뀐 뒤 |
+  |---|---|---|
+  | 말로 한 읽기 결과 | '/' 결과 그대로 일반 글 | 공개 검사에 걸리면 고정 안내, 세션 연결 목록은 걸린 세션 ID 자리만 숨김 |
+  | 커밋 뒤 실행 동작의 제안 행 | 커밋 때 값 비움 | 실행이 끝날 때 비움, 멈추면 10분 뒤 주기 정리가 실패 안내 한 번 |
+  | 누르지 않은 제안 | 다음 제안·버튼 때만 만료 정리 | 원문 주기 정리(시작·1시간마다, 스위치 무관)도 정리 |
+  | 켜짐 때 저장한 버튼 글을 꺼진 뒤 보냄 | 버튼째 게시 | 실행 확인·키 보기·질문 고르기는 막음, 미리보기·변경 질문은 버튼 빼고 '/' 안내 |
+  | 대화 신뢰 문맥(speech) | 수정 요청 없음 | 실행 요청 줄에 변경 PR 수정(작업자 재배포 뒤) |
+
+  게시 서버·작업자 판 섞임: 작업자 계약·스키마는 바뀌지 않았다(신뢰 문맥은 작업자 안의 글). 새 게시 서버 + 지금 작업자, 지금 게시 서버 + 새 작업자 모두 지금처럼 돈다. 마이그레이션은 없다.
+- **못 잡는 범위:** 실제 모델이 수정 요청을 제안하는지(S5, C24), 게시 서버 둘이 같은 `run_pending` 행을 동시에 정리하는 실제 PostgreSQL 경합(조건부 UPDATE와 outbox 멱등 키로 막았으나 두 연결 시험은 없다), 10분을 넘겨 실제로 돈 커밋 뒤 실행(결과 응답과 실패 안내가 둘 다 보일 수 있다), 켜짐 때 저장한 질문 고르기 글을 막았을 때 그 말이 답으로 쓰이지 않고 남는 경우(스위치를 끈 직후 몇 초의 경합).
