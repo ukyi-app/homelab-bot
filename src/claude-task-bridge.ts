@@ -925,6 +925,9 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
       if (!artifact) return { kind: 'unknown', code: 'artifact_response_invalid' };
       await this.deps.bridge.bindChangeWorker(jobId, session, result.worker);
       await this.deps.store.heartbeat(job).catch(() => {});
+      // 성공 결과에 실린 한도 경고도 계정 기록에 남긴다(리뷰 미루기, AC-17). 전환 경계·scheduler 잠금은 observeRateLimit이 지킨다.
+      // 같은 결과를 다시 받아도 기한은 늘리기만 해 같다. 기록이 실패해도 결과는 넘긴다.
+      if (result.rateLimit) await this.deps.store.observeRateLimit(result.rateLimit, jobId).catch(() => {});
       // 확인할 것·남은 위험은 변경 작성 판(change-v2) 결과에만 있다. 옛 판 결과면 칸 없이 넘긴다.
       return { kind: 'snapshot', artifact, transportBytes: raw.bytes, ...(result.checks ? { checks: result.checks } : {}), ...(result.risks ? { risks: result.risks } : {}) };
     }
