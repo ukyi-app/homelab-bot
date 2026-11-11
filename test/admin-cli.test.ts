@@ -486,6 +486,27 @@ test('계정 전환: 전환 뒤에 시작한 실행의 결제 멈춤은 하루�
   assert.equal(await flag('scheduler'), true);
 });
 
+test('C36 묶음 F 계정 전환: 전환과 같은 밀리초에 시작한 실행의 결제 멈춤은 새 계정의 것이라 재시도 시각이 없고 하루가 지나도 재개하지 않는다', async () => {
+  await admin('account', 'record', 'main', 'subscription');
+  await admin('account', 'record', 'spare', 'subscription');
+  await admin('account', 'use', 'main', 'subscription');
+  await queued('same-ms-run');
+  f.setRun(async () => ({ status: 'limited', stopped: true, rateLimit: { stop: { cause: 'billing' } } }));
+  // 시계를 움직이지 않고 전환한 뒤 바로 집는다: 전환 시각과 실행 시작 시각이 같다.
+  await admin('account', 'use', 'spare', 'subscription');
+  assert.equal(await f.runtime.tick(), true);
+  const [timing] = (await database.db.query<{ started_at: string; switched_at: string }>(`SELECT j.started_at,a.switched_at FROM jobs j
+    JOIN model_accounts a ON a.current WHERE j.type='chat'`)).rows;
+  assert.equal(Number(timing!.started_at), Number(timing!.switched_at));
+  const [pause] = (await database.db.query<{ kind: string; retry_at: string | null }>('SELECT kind,retry_at FROM model_pauses')).rows;
+  assert.deepEqual({ kind: pause?.kind, retry_at: pause?.retry_at }, { kind: 'billing', retry_at: null });
+  for (let hour = 1; hour <= 24; hour++) {
+    f.advance(60 * MINUTE);
+    assert.equal(await f.store.resumeDue(), 0, `${hour}시간 뒤`);
+  }
+  assert.deepEqual((await chatJob()).map(row => row.state), ['waiting_user']);
+});
+
 test('계정 전환 잠금 순서: 전환과 모델 대기가 모두 scheduler 행을 한도 상태(model_limit_state)보다 먼저 잡는다', async () => {
   await admin('account', 'record', 'main', 'subscription');
   await admin('account', 'record', 'spare', 'subscription');
