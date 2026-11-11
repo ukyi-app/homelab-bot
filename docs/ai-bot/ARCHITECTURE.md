@@ -2226,3 +2226,11 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 - **버튼 응답(`DiscordIngress.acknowledge(event, id, content, direct)`, `src/discord.ts`):** `direct`는 `{ revision, notice, update?, policy? }`다. `direct.update`가 참이면 Discord로 보내는 본문은 `publicRunResult(content, direct.policy)`다(걸리거나 `policy`가 없으면 `PROPOSAL_TEXT.resultWithheld`). `update`가 없으면 본문은 `content` 그대로다. 응답 실패 때 스레드에 남는 글은 지금처럼 `direct.notice`이고, 호출자가 공개 검사를 지난 본문이나 고정 안내를 넘긴다.
 - **호출자:** 실행 확인(`proposalButton`)·질문 고르기(`questionButton`)·변경 질문(`changeQuestionButton`)은 `policy: p`(그 누름에서 인가한 정책)를 넘기고, 게시 승인(`publishButton`)은 `update`일 때 같이 넘긴다. 실행 확인과 변경 질문의 `notice`는 `publicRunResult(outcome.content, p)`다. 질문 고르기의 `notice`는 고정 문구라 그대로다.
 - **바뀌지 않는 것:** `DiscordProtocol.acknowledge`의 `update` 분기(본문 모양 `{ type: 7, data: { content, allowed_mentions, components: [] } }`), 처리기의 `PressOutcome`·`PickOutcome`·`ChangeQuestionOutcome`·`PublishPressReply`, 결과 글(`proposal:<제안 ID>`)의 계약.
+
+## C37 말로 한 기억 검색에서 internal 기억 빼기 (2026-11-11)
+
+§13 "제안과 실행 확인"의 읽기 요청 중 `memory_search` 줄과 위 "C36 묶음 E"(출처 ID 가림)에 더하는 계약이다. 결정과 이유는 [DECISIONS](DECISIONS.md) "C37".
+
+- **`MemoryView.classification`(`src/memory.ts`):** `'internal' | 'safe_summary'`. `memories.output_classification` 값 그대로다. `search`·`recheckDue`가 돌려주는 보기에 실린다.
+- **`searchText(found, threadReply)`(`src/memory-commands.ts`):** `threadReply`가 참(말로 한 기억 검색, `memorySearchHandler`)이면 본문을 만들기 전에 `classification === 'safe_summary'`인 보기만 남긴다. 뺀 수가 0보다 크면 본문 끝에 `MEMORY_TEXT.withheld(N)` 한 줄을 붙이고, 남은 보기가 없으면 그 한 줄만 돌려준다. 뺀 수가 0이면 출력은 C36 묶음 E 그대로다. 줄을 붙여도 본문은 `REPLY_LIMIT`(1900자) 안이다. `threadReply`가 거짓('/memory-search' 본인 전용 응답)이면 거르지 않는다.
+- **바뀌지 않는 것:** `memorySearchHandler`의 호출(`threadReply: true`)과 결과 공개 검사, `MemoryCommandInput`, 수신의 '/memory-search' 경로, 브리핑, 작업자 계약. 작업자 프로세스는 이 모듈을 import로 싣지만 `MemoryCommands`·`MemoryService`를 만드는 곳은 게시 서버(`src/main.ts`)뿐이라 작업자 동작은 같다.

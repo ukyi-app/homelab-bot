@@ -256,7 +256,7 @@ const memorySearchHandler: ReadHandler = {
     if (!proposal.content?.trim()) return skip('target_denied');
     const id = await deliveryOf(store, job.event_id);
     if (!id) return skip('target_denied');
-    // 결과는 스레드 일반 글이다. 출처 ID를 먼저 빼고 진술은 consider의 공개 검사가 본다.
+    // 결과는 스레드 일반 글이다. internal 기억과 출처 ID를 먼저 빼고(searchText) 남은 진술은 consider의 공개 검사가 본다.
     return (await handlers.memory.handle({ id, actor: job.owner_id, scope: job.target, command: 'memory-search', text: proposal.content,
       threadReply: true })).content;
   },
