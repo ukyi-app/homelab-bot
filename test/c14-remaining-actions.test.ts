@@ -179,6 +179,25 @@ test('C37 말로 한 기억 검색 결과가 길어 잘려도 남은 건수와 i
   assert.ok(!answer.includes('결제 장애'), answer);
 });
 
+test('C37 말로 한 기억 검색의 실린 본문이 공개 검사에 걸려도 일반 답은 고정 안내 뒤에 internal 건수 한 줄을 남기고, 금지 값과 internal 기억은 게시·outbox에 없다', async () => {
+  const a = await wired();
+  const hidden = '10.20.30.40';
+  const internal = '배포 대상 변경은 결제 장애 때문이다';
+  await a.slash('memory-save', { target: 'decision', text: `${internal} | applies=homelab` });
+  const internalId = (await database.db.query<{ id: string }>('SELECT id FROM memories')).rows[0]!.id;
+  await a.slash('memory-save', { target: 'decision', text: `배포 대상 노드는 ${hidden}이다 | applies=homelab | briefing=yes` });
+  await a.speak(message(), '배포 대상 노드 기억나?', { action: 'memory_search', target: null, content: '배포 대상' });
+  await a.deliver();
+  assert.equal(a.posted().at(-1), `${PROPOSAL_TEXT.readWithheld}\n${MEMORY_TEXT.withheld(1)}`);
+  assert.ok(!a.posted().some(text => text.includes(hidden) || text.includes(internal) || text.includes(internalId)),
+    '일반 글 어디에도 금지 값과 internal 기억이 없다');
+  const outbox = JSON.stringify((await database.db.query('SELECT payload FROM outbox')).rows);
+  assert.ok(!outbox.includes(hidden) && !outbox.includes(internal), outbox);
+  // 저장 응답이 ID를 싣는 것과 섞이지 않게 ID는 검색 결과 글에서만 본다.
+  const read = JSON.stringify((await database.db.query("SELECT payload FROM outbox WHERE message_key LIKE 'result:%:read'")).rows);
+  assert.ok(read.includes(MEMORY_TEXT.withheld(1)) && !read.includes(internalId), read);
+});
+
 test('C36 묶음 E 켜짐에서 저장한 여러 쪽의 기억 저장 확인 글은 스위치를 끈 게시 서버가 어느 쪽도 게시하지 않고, 대화 답은 나간다', async () => {
   const a = await wired();
   const statement = `${'금요일 저녁에는 배포하지 않는다. '.repeat(90).trim()} | applies=homelab`;

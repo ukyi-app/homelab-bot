@@ -10,8 +10,8 @@ import { Denied } from './contracts.js';
 import type { Job, Proposal, Scope } from './contracts.js';
 import { controlText, taskLaneClosedText } from './control-format.js';
 import type { ExternalTaskCommandHandler } from './external-task-commands.js';
-import { CommandInputError, parseIds, parseKind } from './memory-commands.js';
-import type { MemoryCommandHandler } from './memory-commands.js';
+import { CommandInputError, joinWithheld, parseIds, parseKind } from './memory-commands.js';
+import type { MemoryCommandHandler, SearchParts } from './memory-commands.js';
 import type { Policy, PolicyGate } from './policy.js';
 import { pullReferences, pullTarget, REVIEW_REQUEST_TEXT, reviewRequestsOf, samePull } from './review-request.js';
 import { LaneClosed } from './store.js';
@@ -86,7 +86,8 @@ export function bindProposalHandlers(store: Store, handlers: ProposalHandlers): 
 interface ReadContext { store: Store; job: Job; proposal: Proposal; policy: Policy; handlers: ProposalHandlers }
 // 결과를 일반 답으로 싣지 않는 경우. queued는 다른 레인(read)이 결과를 게시한다. 나머지는 제안을 버린다.
 interface ReadSkip { skip: 'queued' | 'not_connected' | 'target_denied' | 'superseded' }
-interface ReadHandler { kind: 'read'; run(context: ReadContext): Promise<string | ReadSkip> }
+// SearchParts는 말로 한 기억 검색만 돌려준다(본문과 뺀 internal 건수를 나눠 consider가 본문만 공개 검사한다).
+interface ReadHandler { kind: 'read'; run(context: ReadContext): Promise<string | ReadSkip | SearchParts> }
 // digest 재료. 버튼을 누를 때 저장된 참조로 다시 만들어 제안 때의 digest와 대조한다.
 interface Values { target: string | null; content: string | null }
 // 확인 글 대신 거절 한 줄로 답하는 경우(C27 수정 요청: 병합·닫힌 PR, 상한). 대상이 보이지 않으면 거절하지 않고 버린다.
@@ -256,9 +257,11 @@ const memorySearchHandler: ReadHandler = {
     if (!proposal.content?.trim()) return skip('target_denied');
     const id = await deliveryOf(store, job.event_id);
     if (!id) return skip('target_denied');
-    // 결과는 스레드 일반 글이다. internal 기억과 출처 ID를 먼저 빼고(searchText) 남은 진술은 consider의 공개 검사가 본다.
-    return (await handlers.memory.handle({ id, actor: job.owner_id, scope: job.target, command: 'memory-search', text: proposal.content,
-      threadReply: true })).content;
+    // 결과는 스레드 일반 글이다. internal 기억과 출처 ID를 먼저 빼고(searchParts) 남은 진술은 consider의 공개 검사가 본다.
+    // 실패 응답(쓸 수 없음·거부 등)은 parts 없이 고정 문구만 오므로 글 그대로 넘긴다.
+    const reply = await handlers.memory.handle({ id, actor: job.owner_id, scope: job.target, command: 'memory-search', text: proposal.content,
+      threadReply: true });
+    return reply.parts ?? reply.content;
   },
 };
 const attachListHandler: ReadHandler = {
@@ -570,9 +573,12 @@ export class ProposalDesk {
       // '/' 읽기 명령의 수신과 같은 인가(현재 정책 owner·허용 채널·거부 목록) 뒤 같은 처리기를 부른다.
       await this.gate.authorize(job.owner_id, job.target);
       const result = await handler.run({ store: this.store, job, proposal, policy, handlers });
-      if (typeof result !== 'string') return result.skip === 'queued' ? 'read' : drop(result.skip);
+      if (typeof result !== 'string' && 'skip' in result) return result.skip === 'queued' ? 'read' : drop(result.skip);
+      const { body, withheld } = typeof result === 'string' ? { body: result, withheld: 0 } : result;
       // '/' 읽기 명령은 본인 전용 응답이지만 여기 결과는 스레드의 일반 글이다. 모델 답과 같은 공개 검사를 지나지 못하면 결과 대신 고정 안내를 단다.
-      const content = chatReplyRisk(result, policy) === null ? result : PROPOSAL_TEXT.readWithheld;
+      // 검사는 본문만 본다. 뺀 internal 건수 줄은 숫자와 고정 문구뿐이라 본문이 걸려도 고정 안내 뒤에 남긴다.
+      const checked = body === null || chatReplyRisk(body, policy) === null ? body : PROPOSAL_TEXT.readWithheld;
+      const content = joinWithheld(checked, withheld);
       await this.store.enqueue({ key: `result:${job.id}:read`, job: job.id, conversation: job.conversation_id, actor: job.owner_id,
         scope: job.target, revision: job.revision.policy,
         payload: { kind: 'message', channel: job.target.channel, content, classification: 'safe_summary', after: `result:${job.id}` } });
