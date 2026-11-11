@@ -15,7 +15,7 @@ import type { PolicyGate } from './policy.js';
 import { buttonAllowed, buttonRoute, parseButton } from './discord-protocol.js';
 import { previewWithoutButton } from './change-runtime.js';
 import { CHAT_TASK_TEXT } from './chat-task-text.js';
-import { bindProposalHandlers, PROPOSAL_BUTTONS, PROPOSAL_TEXT, pressProposal } from './proposals.js';
+import { bindProposalHandlers, PROPOSAL_BUTTONS, PROPOSAL_TEXT, pressProposal, publicRunResult } from './proposals.js';
 import { finishProposalRun, withdrawRunResult } from './proposal-retention.js';
 import { chooseNextAnswer, deferInGap, offerAnswer, pressQuestionPick, sealsNextMessage } from './question-pick.js';
 import { CHANGE_DIRECT_BUTTON, pressChangeQuestion } from './change-question.js';
@@ -315,7 +315,8 @@ export class DiscordIngress {
     // 기억·변경·세션 연결 처리기는 커밋 뒤 '/' 명령과 같은 호출로 한 번 부른다. 실패하면 다시 하지 않고 확인을 권한다.
     // 버튼 트랜잭션이 남긴 실행 의도(사유 run_pending과 실행 입력)는 끝난 뒤 지운다. 그 전에 멈추면 주기 정리가 실패 안내를 남긴다.
     // 지우는 트랜잭션이 결과 문장을 늦게 게시할 글로 남기고, 응답이 전해지면 그 글을 지운다. 그 사이에 멈추면 그 글이 결과를 전한다.
-    let pendingResult = false;
+    // later 없이 버튼 트랜잭션에서 끝난 실행은 그 트랜잭션이 이미 결과 글을 남겼다(resultPending).
+    let pendingResult = outcome?.resultPending === true;
     if (outcome?.later) {
       let failed = false;
       outcome.content = await outcome.later().catch(error => {
@@ -324,12 +325,13 @@ export class DiscordIngress {
         return PROPOSAL_TEXT.failed;
       });
       // 지우지 못해도 응답은 보낸다. 남은 의도는 주기 정리가 실패 안내로 끝낸다.
-      pendingResult = await finishProposalRun(this.store.db, { proposal: event.target!, failed, content: outcome.content, revision: p.revision, now: this.store.now() })
-        .catch(error => { this.log('proposal_run_finish_failed', errorInfo(error)); return false; });
+      pendingResult = await finishProposalRun(this.store.db, { proposal: event.target!, failed, publicNotice: publicRunResult(outcome.content, p),
+        revision: p.revision, now: this.store.now() }).catch(error => { this.log('proposal_run_finish_failed', errorInfo(error)); return false; });
     }
-    // 응답을 전하지 못하면 결과 문장(공개해도 되는 고정 문구)을 그 스레드에 남긴다. 버튼은 남지만 다시 누르면 "이미 처리"로 답한다.
+    // 응답을 전하지 못하면 결과 문장을 그 스레드 일반 글로 남긴다(결과 글과 같은 공개 검사를 거친다. 본인 전용 응답 문장은 그대로다).
+    // 버튼은 남지만 다시 누르면 "이미 처리"로 답한다.
     if (!outcome) return saved.id;
-    const replied = await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: outcome.content, update: outcome.update });
+    const replied = await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: publicRunResult(outcome.content, p), update: outcome.update });
     if (pendingResult && replied) await withdrawRunResult(this.store.db, event.target!).catch(error => { this.log('proposal_result_withdraw_failed', errorInfo(error)); });
     return saved.id;
   }

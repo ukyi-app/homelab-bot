@@ -8,7 +8,6 @@ import { Store } from './store.js';
 
 // 확인한 실행이 끝났다는 기록 없이 게시 서버가 멈췄다. 실행됐을 수도 있어 확인을 권한다.
 export const PROPOSAL_INTERRUPTED_TEXT = '확인한 요청을 처리하는 중에 제가 멈춰서 처리됐는지 확인하지 못했어요. 상태를 확인해 달라고 한 뒤 필요하면 다시 말해 주세요.';
-
 // 만료된 대기 제안을 끝내고 값을 비운다. 새 제안을 만들 때(proposals.ts)와 주기 정리가 부른다.
 export async function expirePending(db: Database, now: number): Promise<number> {
   return (await db.query(`UPDATE proposals SET state='expired',reason='expired',value=NULL,source_event=NULL,settled_at=$1
@@ -25,10 +24,22 @@ export const RUN_INTERRUPTED_AFTER_MS = 10 * 60_000;
 export const RUN_RESULT_NOTICE_AFTER_MS = 10 * 60_000;
 const resultKey = (proposal: string) => `proposal:${proposal}`;
 
-export interface FinishedRun { proposal: string; failed: boolean; content: string; revision: string; now: number }
+// publicNotice: 결과 문장을 스레드 일반 글로 낼 본문. 공개 검사를 지난 결과이거나 값 없는 고정 안내다(proposals.ts publicRunResult).
+// 검사가 proposals.ts에 있는 것은 위의 import 고리 때문이다(공개 검사 → 리뷰 정책 → … → 제안 처리).
+export interface RunResult { proposal: string; conversation: string; owner: string; scope: Scope; publicNotice: string; revision: string }
+// "할게요"로 끝난 실행의 결과를 RUN_RESULT_NOTICE_AFTER_MS 뒤에 그 스레드에 게시할 글로 남긴다. 제안 행을 끝낸 트랜잭션 안에서
+// 부른다. 그래서 끝낸 뒤 버튼 응답 전에 멈춰도 결과가 남는다. 응답이 전해지면 호출자가 withdrawRunResult로 지운다.
+// 멱등 키는 중단 안내와 같은 proposal:<id>다. 한 제안은 둘 중 한 트랜잭션에서만 끝나므로 둘이 같이 생기지 않는다.
+// store는 그 트랜잭션에 묶인 Store여야 한다(enqueue에 같은 연결을 넘긴다. 트랜잭션 연결에서 새 트랜잭션은 열 수 없다).
+export async function enqueueRunResult(store: Store, run: RunResult): Promise<void> {
+  await store.enqueue({ key: resultKey(run.proposal), conversation: run.conversation, actor: run.owner, scope: run.scope, revision: run.revision,
+    payload: { kind: 'message', channel: run.scope.channel, content: run.publicNotice, classification: 'safe_summary' } }, store.db);
+  await store.db.query("UPDATE outbox SET available_at=$2 WHERE message_key=$1 AND state='pending'", [resultKey(run.proposal), store.now() + RUN_RESULT_NOTICE_AFTER_MS]);
+}
+
+export interface FinishedRun { proposal: string; failed: boolean; publicNotice: string; revision: string; now: number }
 // 커밋 뒤 실행이 끝났다(성공이든 처리기 오류든). 값 보존 계약대로 실행 입력을 비운다. 사유는 성공이면 비우고 오류면 run_failed다.
-// 같은 트랜잭션에 그 결과 문장을 RUN_RESULT_NOTICE_AFTER_MS 뒤에 게시할 글로 남긴다. 실행 대기를 지운 뒤 버튼 응답 전에 멈춰도
-// 결과(거절·실패 포함, 성공이면 성공 문장)가 그 스레드에 남는다. 응답이 전해지면 호출자가 withdrawRunResult로 그 글을 지운다.
+// 같은 트랜잭션에 결과 글(enqueueRunResult)을 남긴다(거절·실패 포함, 성공이면 성공 문장).
 // 주기 정리가 먼저 run_interrupted로 끝냈으면 바꾸지 않고(그쪽 안내가 같은 키로 이미 있다) false를 돌려준다.
 export async function finishProposalRun(db: Database, run: FinishedRun): Promise<boolean> {
   return db.transaction(async tx => {
@@ -37,9 +48,8 @@ export async function finishProposalRun(db: Database, run: FinishedRun): Promise
       [run.proposal, run.failed ? 'run_failed' : null, RUN_PENDING])).rows[0];
     if (!row) return false;
     const scope = typeof row.scope === 'string' ? JSON.parse(row.scope) as Scope : row.scope;
-    await new Store(tx, () => run.now).enqueue({ key: resultKey(run.proposal), conversation: row.conversation_id, actor: row.owner_id, scope,
-      revision: run.revision, payload: { kind: 'message', channel: scope.channel, content: run.content, classification: 'safe_summary' } }, tx);
-    await tx.query("UPDATE outbox SET available_at=$2 WHERE message_key=$1 AND state='pending'", [resultKey(run.proposal), run.now + RUN_RESULT_NOTICE_AFTER_MS]);
+    await enqueueRunResult(new Store(tx, () => run.now), { proposal: run.proposal, conversation: row.conversation_id, owner: row.owner_id, scope,
+      publicNotice: run.publicNotice, revision: run.revision });
     return true;
   });
 }

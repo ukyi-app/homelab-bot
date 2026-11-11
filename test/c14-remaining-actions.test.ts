@@ -1,10 +1,11 @@
 import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { CHANGE_TEXT } from '../src/change-commands.js';
+import { chatReplyRisk } from '../src/chat-format.js';
 import { DEFAULTS, Denied } from '../src/contracts.js';
 import { DiscordPublisher } from '../src/discord.js';
 import { ATTACH_COMMAND_TEXT } from '../src/external-task-commands.js';
-import { RAW_TEXT_NOTICE } from '../src/memory-commands.js';
+import { MEMORY_GUIDE, MEMORY_TEXT, RAW_TEXT_NOTICE } from '../src/memory-commands.js';
 import { PROPOSAL_TEXT, PROPOSAL_TTL_MS } from '../src/proposals.js';
 import { purgeExpiredRawText } from '../src/raw-text-retention.js';
 import { Store } from '../src/store.js';
@@ -12,7 +13,7 @@ import { localDatabase, thread } from './helpers.js';
 import { harness, PROJECT } from './c13-proposal-fixture.js';
 import { actions, notifyChannel, notifyThread, outsideThread, TRUNCATE } from './c14-actions-fixture.js';
 import type { Actions } from './c14-actions-fixture.js';
-import { REPO } from './change-github-fake.js';
+import { REPO, repositoryPolicy } from './change-github-fake.js';
 
 // C14 나머지 동작 연결(COLLEAGUE_SPEC §4.3, AC-6·AC-7·AC-26). 경계는 S1이다: Gateway 프레임 → 수신·저장(PGlite) → 가짜 Discord REST.
 // 비교 기준은 같은 대화에서 같은 '/' 명령을 직접 보낸 결과다.
@@ -355,6 +356,71 @@ test('C36 묶음 F 제안 실행의 버튼 응답이 전해졌거나 응답 실�
   await a.deliver();
   const result = CHANGE_TEXT.cancelled(true, second.change, false);
   assert.equal(a.posted().slice(posted).filter(text => text === result).length, 1, JSON.stringify(a.posted().slice(posted)));
+});
+
+test('C36 묶음 G 작업 시작 제안이 레인 닫힘으로 접수 거절된 직후 버튼 응답 전에 멈추면, 다시 띄운 게시 서버가 그 스레드에 거절 안내를 한 번 남긴다', async () => {
+  const a = await wired();
+  await a.speak(message(), '시험을 고쳐 줘', { action: 'task', target: PROJECT, content: null });
+  const yes = yesOf(a);
+  await database.db.query("UPDATE execution_lanes SET closed_reason='retention_full',closed_at=1 WHERE lane='task'");
+  const after = await stopBeforeReply(a, yes);
+  assert.equal(after.length, 1, JSON.stringify(after));
+  assert.ok(after[0]!.startsWith('작업 레인이 닫혀 있어요. 보존 세션 8개가 다 찼어요.'), after[0]);
+  assert.equal((await a.jobs('task')).length, 0, '실행은 0건');
+  assert.deepEqual((await a.proposals()).map(p => [p.state, p.value, p.source_event]), [['refused', null, null]]);
+  await a.press(yes);
+  assert.equal(a.lastCallback()!.data.content, PROPOSAL_TEXT.settled);
+});
+
+test('C36 묶음 G 동기 실행의 버튼 응답이 전해지면 10분 뒤 결과 안내를 또 남기지 않는다', async () => {
+  const a = await wired();
+  const job = await task(a);
+  await a.speak(message(), '그 작업 취소해 줘', { action: 'cancel', target: job, content: null });
+  await a.press(yesOf(a));
+  const reply = String(a.lastCallback()!.data.content);
+  const posted = a.posted().length;
+  a.f.advance(10 * 60_000 + 1);
+  await purgeExpiredRawText(database.db, a.f.now());
+  await a.deliver();
+  // 작업 레인의 취소 완료 알림은 따로 나간다. 버튼 응답 문장은 다시 나가지 않는다.
+  assert.ok(!a.posted().slice(posted).includes(reply), JSON.stringify([reply, a.posted().slice(posted)]));
+  assert.equal((await database.db.query("SELECT 1 FROM outbox WHERE message_key LIKE 'proposal:%'")).rows.length, 0);
+});
+
+test('C36 묶음 G 말로 한 저장 제외(here)의 결과는 스레드 ID 없이 here로 적혀, 응답 전에 멈춰도 남는 글에 ID가 없다', async () => {
+  // 스레드 ID를 공개 검사의 내부 표식으로 둔다. 실제 Discord에서는 17~20자리 ID가 metadata_sensitive로 걸리는 자리다.
+  open = await actions(database.db, { repositories: [repositoryPolicy({ internalMarkers: ['fixture-corp-host', thread.channel] })] });
+  const a = open;
+  await a.speak(message(), '이 스레드는 기억에서 빼 줘', { action: 'memory_exclude', target: 'here', content: null });
+  const after = await stopBeforeReply(a, yesOf(a));
+  assert.deepEqual(after, [`${MEMORY_TEXT.excluded('here', 0)} ${MEMORY_GUIDE.colleague.deleteExcluded}`]);
+  assert.ok(!JSON.stringify((await database.db.query('SELECT payload FROM outbox')).rows).includes(`channel:${thread.channel}`));
+});
+
+test('C36 묶음 G 실행 결과가 공개 검사에 걸리면 지연 결과 글과 응답 실패 안내 모두 값 없는 고정 안내만 싣는다', async () => {
+  const a = await wired();
+  const markers = (a.f.policy as unknown as { change: { repositories: { internalMarkers: string[] }[] } }).change.repositories[0]!.internalMarkers;
+  const first = await changeCancelProposal(a);
+  // 확인 글이 나간 뒤 결과에 실릴 변경 ID를 내부 표식으로 둔다(결과만 공개 검사에 걸린다).
+  markers.push(first.change);
+  assert.deepEqual(await stopBeforeReply(a, first.yes), [PROPOSAL_TEXT.resultWithheld]);
+  const second = await changeCancelProposal(a);
+  markers.push(second.change);
+  const posted = a.posted().length;
+  a.hooks.beforeCallback = async () => { throw new Error('fixture_callback_failed'); };
+  await a.press(second.yes);
+  a.hooks.beforeCallback = undefined;
+  await a.deliver();
+  a.f.advance(10 * 60_000 + 1);
+  await purgeExpiredRawText(database.db, a.f.now());
+  await a.deliver();
+  assert.deepEqual(a.posted().slice(posted), [PROPOSAL_TEXT.resultWithheld]);
+  // 확인 글은 변경 ID를 싣고 이미 나갔다. 결과 글(proposal:)·응답 실패 안내(ack-notice:)에는 없다.
+  const payloads = JSON.stringify((await database.db.query("SELECT payload FROM outbox WHERE message_key LIKE 'proposal:%' OR message_key LIKE 'ack-notice:%'")).rows);
+  assert.ok(payloads.includes(PROPOSAL_TEXT.resultWithheld), payloads);
+  assert.ok(!payloads.includes(first.change) && !payloads.includes(second.change), payloads);
+  // 중단 안내는 값 없는 고정 문구라 같은 검사를 지난다.
+  assert.equal(chatReplyRisk(PROPOSAL_TEXT.interrupted, a.f.policy), null);
 });
 
 test('C14 기억 저장 제안의 값이 확인 글과 달라지면 버튼은 저장하지 않는다(owner가 본 값만 저장된다)', async () => {

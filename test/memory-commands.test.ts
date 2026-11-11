@@ -131,7 +131,8 @@ test('MEM-CMD 흐름: 저장 → 검색 → 정정 → 삭제 → 저장 제외,
   assert.ok((await run('memory-delete', { target: decision }))!.includes(DELETION_MESSAGE.already));
 
   const excluded = await run('memory-exclude', { target: 'here' });
-  assert.ok(excluded!.startsWith(MEMORY_TEXT.excluded(`channel:${thread.channel}`, 1)), excluded);
+  assert.ok(excluded!.startsWith(MEMORY_TEXT.excluded('here', 1)), excluded);
+  assert.ok(!excluded!.includes(thread.channel), excluded);
   assert.ok((await run('memory-search', { text: '답은' }))!.startsWith(MEMORY_TEXT.noMatch));
   // 저장 제외한 채널에서는 새로 저장하지 않는다.
   assert.ok((await run('memory-save', { target: 'preference', text: '다시 | expires=1d | end=해제' }))!.includes('저장 제외한 출처'));

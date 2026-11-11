@@ -19,7 +19,7 @@ import type { OutboxButton, Store } from './store.js';
 import type { TaskCommandHandler } from './task-commands.js';
 import { taskProject } from './task-policy.js';
 import { sessionAttachHandler } from './session-key-proposal.js';
-import { expirePending, PROPOSAL_INTERRUPTED_TEXT, RUN_PENDING } from './proposal-retention.js';
+import { enqueueRunResult, expirePending, PROPOSAL_INTERRUPTED_TEXT, RUN_PENDING } from './proposal-retention.js';
 
 // 제안과 실행 확인(COLLEAGUE_SPEC §4.3). 모델은 제안만 하고, 서버가 동작 표에 대조한다. 읽기 요청은 바로 '/'와 같은 경로로 답하고,
 // 실행 요청은 제안을 저장한 뒤 owner가 "할게요"를 눌러야 '/'와 같은 경로로 실행한다. 동료 기능 스위치가 꺼져 있으면 부르지 않는다.
@@ -61,7 +61,14 @@ export const PROPOSAL_TEXT = Object.freeze({
   readWithheld: '결과에 밖에 보이면 안 되는 내용이 섞여 있어 여기에는 싣지 않았어요.',
   // 확인한 실행이 끝났다는 기록 없이 게시 서버가 멈췄을 때 재시작 뒤 주기 정리가 남기는 안내(proposal-retention.ts).
   interrupted: PROPOSAL_INTERRUPTED_TEXT,
+  // 실행 결과가 공개 검사에 걸렸을 때 스레드 일반 글(지연 결과 글·응답 실패 안내)에 대신 싣는다. 값과 '/' 이름이 없어 스위치 두 판에 같다.
+  resultWithheld: '확인한 요청은 끝났지만 결과에 밖에 보이면 안 되는 내용이 섞여 있어 여기에는 싣지 않았어요. 필요하면 상태를 확인해 달라고 해 주세요.',
 });
+// 실행 결과를 스레드 일반 글(지연 결과 글·버튼 응답 실패 안내)로 낼 때의 본문. 버튼 응답은 본인 전용이라 처리기 결과에 채널 ID 같은
+// 값이 들어 있을 수 있다. 모델 답과 같은 공개 검사(chatReplyRisk)를 지나지 못하면 값 없는 고정 안내로 바꾼다. 정책을 모르면 닫는다.
+export function publicRunResult(content: string, policy: Policy | undefined): string {
+  return chatReplyRisk(content, policy) === null ? content : PROPOSAL_TEXT.resultWithheld;
+}
 // 저장될 글을 줄마다 인용 표시로 싣는다. 내용은 바꾸지 않는다.
 function quoted(text: string): string {
   return text.split('\n').map(line => `> ${line}`).join('\n');
@@ -618,7 +625,8 @@ const current = (store: Store, job: Job): Promise<boolean> => chatJobCurrent(sto
 export interface PressInput { proposal: string; answer: 'yes' | 'no'; actor: string; scope: Scope; event: string; context: ExecuteContext }
 // update: 응답으로 그 글의 버튼을 없앤다(처리·거절·만료·이미 처리됨). false면 본인만 보는 응답이고 버튼은 남는다.
 // later: 있으면 호출자가 트랜잭션 커밋 뒤에 부르고, 그 결과 문장이 content 대신 응답이 된다(제안은 이미 confirmed다).
-export interface PressOutcome { content: string; update: boolean; later?: () => Promise<string> }
+// resultPending: 같은 트랜잭션이 결과 글(proposal-retention.ts enqueueRunResult)을 남겼다. 응답이 전해지면 호출자가 거둔다.
+export interface PressOutcome { content: string; update: boolean; later?: () => Promise<string>; resultPending?: true }
 // 버튼 하나의 처리. 호출자(수신)의 트랜잭션 안에서 부른다. 대화 행 → 제안 행 순서로 잠그고, 상태 전이는 state='pending' 조건부라
 // 같은 제안을 두 번 눌러도 한 번만 실행된다. 실행은 '/' 처리기와 같은 경로라 권한·정책 검사가 같다.
 export async function pressProposal(store: Store, input: PressInput): Promise<PressOutcome> {
@@ -637,17 +645,22 @@ export async function pressProposal(store: Store, input: PressInput): Promise<Pr
   };
   if (store.now() >= Number(row.expires_at)) { await settle('expired', 'expired'); return { content: PROPOSAL_TEXT.expired, update: true }; }
   if (input.answer === 'no') { await settle('declined', null); return { content: PROPOSAL_TEXT.declined, update: true }; }
+  // "할게요"를 이 트랜잭션에서 끝낸 결과(접수·거절)는 커밋 뒤 실행(later)의 완료 기록과 같은 결과 글로 남긴다. 커밋 뒤 버튼
+  // 응답 전에 멈춰도 그 스레드에 결과가 남는다. 만료·"아니에요"는 실행을 시도하지 않아 남기지 않는다.
+  const answered = async (content: string, state: string, reason: string | null, job: string | null = null): Promise<PressOutcome> => {
+    await settle(state, reason, job);
+    await enqueueRunResult(store, { proposal: row.id, conversation: row.conversation_id, owner: row.owner_id, scope: row.scope,
+      publicNotice: publicRunResult(content, input.context.policy), revision: input.context.revision });
+    return { content, update: true, resultPending: true };
+  };
   // 구독이 꺼진 대화의 작업은 claim이 집지 않는다. '/task'와 달리 버튼은 owner가 끈 구독을 다시 켜지 않고 실행을 거절한다.
-  if (!conversation.active) { await settle('refused', 'subscription_stopped'); return { content: PROPOSAL_TEXT.stopped, update: true }; }
+  if (!conversation.active) return answered(PROPOSAL_TEXT.stopped, 'refused', 'subscription_stopped');
   const handler = connected(row.action);
-  if (handler?.kind !== 'run') { await settle('refused', 'not_connected'); return { content: PROPOSAL_TEXT.unavailable, update: true }; }
+  if (handler?.kind !== 'run') return answered(PROPOSAL_TEXT.unavailable, 'refused', 'not_connected');
   const values = await handler.current(store, row);
-  if (!values || proposalDigest(row.action, values) !== row.digest) {
-    await settle('refused', 'digest_changed');
-    return { content: PROPOSAL_TEXT.changed, update: true };
-  }
+  if (!values || proposalDigest(row.action, values) !== row.digest) return answered(PROPOSAL_TEXT.changed, 'refused', 'digest_changed');
   const executed = await handler.execute(store, row, values, input.context);
-  if (executed.later) await settle(executed.state, RUN_PENDING, executed.job ?? null, true);
-  else await settle(executed.state, executed.reason ?? null, executed.job ?? null);
-  return { content: executed.content, update: true, ...(executed.later ? { later: executed.later } : {}) };
+  if (!executed.later) return answered(executed.content, executed.state, executed.reason ?? null, executed.job ?? null);
+  await settle(executed.state, RUN_PENDING, executed.job ?? null, true);
+  return { content: executed.content, update: true, later: executed.later };
 }
