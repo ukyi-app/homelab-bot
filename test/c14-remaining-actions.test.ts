@@ -160,6 +160,25 @@ test('C37 말로 한 기억 검색에 맞는 기억이 internal뿐이면 일반 
   assert.equal(a.posted().at(-1), '공개하지 않는 기억 2건은 여기에 싣지 않았어요.');
 });
 
+test('C37 말로 한 기억 검색 결과가 길어 잘려도 남은 건수와 internal 건수 한 줄이 함께 남고 응답 상한(1900자)을 넘지 않는다', async () => {
+  const a = await wired();
+  await a.slash('memory-save', { target: 'decision', text: '금요일 배포 금지는 결제 장애 때문이다 | applies=homelab' });
+  for (let i = 0; i < 9; i++) {
+    await a.slash('memory-save', { target: 'decision', text: `금요일 규칙 ${i}번 ${'가'.repeat(190)} | applies=homelab | briefing=yes` });
+  }
+  await a.speak(message(), '금요일 규칙 기억나?', { action: 'memory_search', target: null, content: '금요일' });
+  await a.deliver();
+  // 게시 단계가 1800자 쪽으로 나누므로 결과 글의 쪽들을 이어서 본다.
+  const pages = a.posted().slice(a.posted().findIndex(text => text.startsWith('기억을 ')));
+  assert.ok(pages[0]!.startsWith('기억을 9건 찾았어요.'), pages[0]);
+  const answer = pages.join('\n');
+  assert.ok(answer.length <= 1900, String(answer.length));
+  const [more, withheld] = answer.split('\n').slice(-2);
+  assert.match(more!, /^\(\d+건 더 있어요\. 검색어를 좁혀 주세요\)$/);
+  assert.equal(withheld, '공개하지 않는 기억 1건은 여기에 싣지 않았어요.');
+  assert.ok(!answer.includes('결제 장애'), answer);
+});
+
 test('C36 묶음 E 켜짐에서 저장한 여러 쪽의 기억 저장 확인 글은 스위치를 끈 게시 서버가 어느 쪽도 게시하지 않고, 대화 답은 나간다', async () => {
   const a = await wired();
   const statement = `${'금요일 저녁에는 배포하지 않는다. '.repeat(90).trim()} | applies=homelab`;
