@@ -2189,3 +2189,10 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 - **제안 정리 연결:** `purgeExpiredRawText`(게시 서버의 `raw_text_retention` 루프: 시작 직후, 그 뒤 1시간마다, 스위치·레인과 무관)가 네 원문 칸 정리 뒤 `expirePending`(만료 대기 제안 → `expired`, 값 비움)과 `settleInterruptedRuns`를 부른다. 반환값(`RawTextPurged`)의 모양은 그대로다. 함수는 `src/proposal-retention.ts`.
 - **보내기 직전 스위치(`DiscordPublisher.deliverRow`):** 스위치가 꺼진 게시자가 `payload.buttons`가 있는 글을 보낼 때 버튼 경로(`parseButton` route)로 고른다. `control`은 그대로, `publish`는 버튼을 빼고 끝 두 줄을 `previewApproveByStatus` + `previewBinding(false)`로, `change-question`은 버튼을 빼고 끝의 켜짐 판 안내를 같은 기한의 `changeQuestionFooter(false, …)`로 바꾼다. 그 밖(`proposal`·`session-key`·`question`)은 `Denied`로 `blocked`, 감사 `delivery_blocked_colleague_off`. 바꾼 본문은 발송에만 쓰고 outbox 행의 payload는 그대로다(대조 표식은 멱등 키에서 만들어 바뀌지 않는다).
 - **버튼 글의 마지막 쪽 상한(`BUTTON_PAGE_SIZE`, `src/format.ts`):** 위 치환은 버튼 안내를 늘린다(custom_id 100자 상한 안의 가장 긴 ID로 최대 약 290자). 그래서 `Store.enqueue`는 `payload.buttons`가 있는 일반 글의 마지막 쪽(버튼이 붙는 쪽)만 1500자 이하로 나눈다(`messagePages(content, lastPage)`). 앞 쪽은 그대로 1800자, 줄을 가르지 않는 규칙도 같다. 치환 뒤에도 게시자의 본문 상한 1900자 안이다. 쪽 수만 하나 늘 수 있고 멱등 키(`<key>`, `<key>:page:<n>`)·`message_key`·`page_index`·대조 표식 규칙은 같다. 이 규칙 전에 저장된 행에는 걸리지 않는다.
+
+## C36 묶음 E: 묶음 B의 리뷰 후속 (2026-11-11)
+
+위 "C36 묶음 B"에 더하는 계약이다. 선택의 이유는 [DECISIONS](DECISIONS.md) "C36 묶음 E".
+
+- **보내기 직전 스위치의 판단 범위(`DiscordPublisher.deliverRow`):** 스위치가 꺼진 게시자는 버튼이 없는 `message` 행도 같은 `message_key`의 뒤 쪽(`page_index`가 큰 행) 중 `payload.buttons`가 있는 행의 버튼으로 판단한다. 판단이 "보내지 않음"(실행 확인·세션 키 보기·질문 고르기)이면 이 행은 `blocked`, 같은 글의 `pending`인 뒤 쪽도 `blocked`, 감사 `delivery_blocked_colleague_off` 한 줄(이 행 ID). 그 밖의 판단(`control`·`publish`·`change-question`)이면 버튼 없는 쪽은 본문을 바꾸지 않고 보낸다. 버튼이 있는 쪽의 치환은 묶음 B와 같다. 켜진 게시자와 '/' 제어 버튼 글은 바뀌지 않는다.
+- **일반 글의 기억 검색 결과(`MemoryCommandInput.threadReply`, 선택 칸):** 말로 한 기억 검색(`memorySearchHandler`)만 `threadReply: true`를 넘긴다. 그러면 `searchText`가 출처 칸의 대화 출처를 `MEMORY_TEXT.conversationSource`("대화")로 적고 같은 줄의 겹친 값을 한 번만 적는다. 작업·문서·외부 출처는 `sourceKey` 그대로다. 결과는 묶음 B의 읽기 결과 공개 검사(`chatReplyRisk`, 걸리면 `PROPOSAL_TEXT.readWithheld`)를 그대로 지난다. '/memory-search'는 이 칸을 넘기지 않아 응답이 같다.
