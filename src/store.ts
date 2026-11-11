@@ -481,7 +481,8 @@ export class Store {
   // 멈춤 기록. 결제는 저절로 재개하지 않아 다음 재시도 시각이 없다.
   // 한도·인증으로 멈춘 실행은 시도로 세지 않는다(attempt를 되돌린다). 세면 30분 재시도가 두 번 만에 시도 한도에 닿아
   // 그 작업이 재개될 수 없는 채 scheduler를 영영 막는다. 결제는 owner가 풀어야 하므로 지금처럼 센다.
-  private async recordPause(job: string, reason: string, rateLimit: RateLimitInfo | null, tx: Database): Promise<void> {
+  // 호출자는 tx에서 scheduler 행을 이미 잠갔다(waitForUser, 변경 자체 리뷰의 회수 경로).
+  async recordPause(job: string, reason: string, rateLimit: RateLimitInfo | null, tx: Database): Promise<void> {
     const now = this.now();
     const kind: ModelPauseKind = reason === 'auth_expired' ? 'auth_expired' : rateLimit?.stop?.cause === 'billing' ? 'billing' : 'rate_limit';
     const resetsAt = kind === 'rate_limit' && rateLimit?.stop?.resetsAt !== undefined ? rateLimit.stop.resetsAt * 1000 : null;
