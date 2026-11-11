@@ -11,7 +11,7 @@ import { SESSION_KEY_TEXT } from './external-task-commands.js';
 import type { ExternalTaskCommand, ExternalTaskCommandHandler } from './external-task-commands.js';
 import { MEMORY_GUIDE } from './memory-commands.js';
 import type { MemoryCommand, MemoryCommandHandler } from './memory-commands.js';
-import type { PolicyGate } from './policy.js';
+import type { Policy, PolicyGate } from './policy.js';
 import { buttonAllowed, buttonRoute, parseButton } from './discord-protocol.js';
 import { previewWithoutButton } from './change-runtime.js';
 import { CHAT_TASK_TEXT } from './chat-task-text.js';
@@ -328,10 +328,10 @@ export class DiscordIngress {
       pendingResult = await finishProposalRun(this.store.db, { proposal: event.target!, failed, publicNotice: publicRunResult(outcome.content, p),
         revision: p.revision, now: this.store.now() }).catch(error => { this.log('proposal_run_finish_failed', errorInfo(error)); return false; });
     }
-    // 응답을 전하지 못하면 결과 문장을 그 스레드 일반 글로 남긴다(결과 글과 같은 공개 검사를 거친다. 본인 전용 응답 문장은 그대로다).
-    // 버튼은 남지만 다시 누르면 "이미 처리"로 답한다.
+    // 응답을 전하지 못하면 결과 문장을 그 스레드 일반 글로 남긴다(결과 글과 같은 공개 검사를 거친다).
+    // 버튼은 남지만 다시 누르면 "이미 처리"로 답한다. 정상 응답(update)도 공개된 확인 글을 바꾸므로 acknowledge가 같은 검사를 건다.
     if (!outcome) return saved.id;
-    const replied = await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: publicRunResult(outcome.content, p), update: outcome.update });
+    const replied = await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: publicRunResult(outcome.content, p), update: outcome.update, policy: p });
     if (pendingResult && replied) await withdrawRunResult(this.store.db, event.target!).catch(error => { this.log('proposal_result_withdraw_failed', errorInfo(error)); });
     return saved.id;
   }
@@ -351,7 +351,7 @@ export class DiscordIngress {
       return pressQuestionPick(store, tasks, { button: event.target!, actor: event.actor, scope: event.scope });
     }, { expiresAt: started + DEFAULTS.inboxTimeoutMs, now: this.store.now });
     this.log('question_pick', { outcome: outcome ? (outcome.update ? 'settled' : 'refused') : 'duplicate' });
-    if (outcome) await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: outcome.content, update: outcome.update });
+    if (outcome) await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: outcome.content, update: outcome.update, policy: p });
     return saved.id;
   }
   // 변경 질문의 선택지·"직접 답하기" 버튼. 스위치가 꺼져 있으면 그 버튼을 만들지 않으므로 받지도 않는다. 처리 방식은 질문 고르기 버튼과 같다
@@ -373,7 +373,7 @@ export class DiscordIngress {
       return pressed;
     }, { expiresAt: started + DEFAULTS.inboxTimeoutMs, now: this.store.now });
     this.log('change_question_button', { command: event.command!, outcome: outcome ? (outcome.update ? 'settled' : 'refused') : 'duplicate' });
-    if (outcome) await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: outcome.content, update: outcome.update });
+    if (outcome) await this.acknowledge(event, saved.id, outcome.content, { revision: p.revision, notice: publicRunResult(outcome.content, p), update: outcome.update, policy: p });
     return saved.id;
   }
   // 게시 승인 버튼("게시해 주세요"). 스위치가 꺼져 있으면 그 버튼을 만들지 않으므로 받지도 않는다. 처리는 변경 명령처럼 받은 자리에서
@@ -397,7 +397,7 @@ export class DiscordIngress {
       reply = { content: PUBLISH_TEXT.failed, outcome: 'error' };
     }
     this.log('change_command', { command: event.command!, outcome: reply.outcome });
-    await this.acknowledge(event, saved.id, reply.content, { revision: p.revision, notice: COMMAND_INGRESS_TEXT.changeAckLost(this.store.colleague), ...('update' in reply && reply.update ? { update: true } : {}) });
+    await this.acknowledge(event, saved.id, reply.content, { revision: p.revision, notice: COMMAND_INGRESS_TEXT.changeAckLost(this.store.colleague), ...('update' in reply && reply.update ? { update: true, policy: p } : {}) });
     return saved.id;
   }
   // 세션 연결 "키 보기". 키가 든 응답은 연결 명령과 같은 deliverPrivate(본인만 보는 새 메시지)로만 나가고, 버튼 글은 바꾸지 않는다.
@@ -518,16 +518,20 @@ export class DiscordIngress {
   // 처리는 이미 영속됐다. 여기서 나는 오류(ACK 실패를 기록하는 DB 쓰기 포함)는 수신 결과를 바꾸지 않는다.
   // 메시지 이벤트에서 던지면 main의 guard()가 그 대화에 history gap 장벽을 세운다.
   // content: 상호작용 응답 본문(기억·연결 명령은 처리 결과). direct가 있으면 응답 실패 때 결과 대신 그 고정 안내를 채널에 남긴다.
-  // direct.update: 버튼 응답으로 그 글을 content로 바꾸고 버튼을 없앤다(실행 확인).
+  // direct.update: 버튼 응답으로 그 글을 content로 바꾸고 버튼을 없앤다(실행 확인·변경 질문·게시 승인 등).
   // 응답을 보냈거나 응답 실패를 기록했으면(안내 글 포함) true. 그 기록마저 못 했으면 false다.
-  private async acknowledge(event: EventInput, id: string, content?: string, direct?: { revision: string; notice: string; update?: boolean }): Promise<boolean> {
+  private async acknowledge(event: EventInput, id: string, content?: string,
+    direct?: { revision: string; notice: string; update?: boolean; policy?: Policy }): Promise<boolean> {
+    // update는 본인 전용이 아니라 스레드에 보이는 버튼 글 자체를 바꾼다(type 7). 그래서 결과 글과 같은 공개 검사를 지나야 하고,
+    // 걸리면 값 없는 고정 안내로 바꾼다. 정책을 넘기지 않은 호출은 검사를 통과하지 못하는 쪽으로 닫힌다.
+    const shown = direct?.update && content !== undefined ? publicRunResult(content, direct.policy) : content;
     let outcome: AckOutcome | void;
     let delivered = false;
     try {
       try {
         await this.beforeReply(event);
         // 일반 메시지는 👀 리액션이고 이 문구는 권한 거부 때의 대체 텍스트로만 쓰인다.
-        outcome = await this.rest.acknowledge(event, content
+        outcome = await this.rest.acknowledge(event, shown
           ?? (this.messageContent ? '받아서 기록해 뒀어요. 처리 상태는 따로 알려 드릴게요.' : '받아서 기록해 뒀어요. 지금은 명령과 버튼으로만 받아요.'),
         direct?.update ? { ...noMentions, update: true } : direct ? { ...noMentions, flags: SUPPRESS_EMBEDS } : noMentions);
       } catch (error) {

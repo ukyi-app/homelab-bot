@@ -423,6 +423,33 @@ test('C36 묶음 G 실행 결과가 공개 검사에 걸리면 지연 결과 글
   assert.equal(chatReplyRisk(PROPOSAL_TEXT.interrupted, a.f.policy), null);
 });
 
+test('C36 묶음 H 실행 결과가 공개 검사에 걸리면 실행 확인 버튼의 정상 응답은 공개된 확인 글을 값 없는 고정 안내로 바꾼다', async () => {
+  const a = await wired();
+  const markers = (a.f.policy as unknown as { change: { repositories: { internalMarkers: string[] }[] } }).change.repositories[0]!.internalMarkers;
+  const { change, yes } = await changeCancelProposal(a);
+  markers.push(change);
+  await a.press(yes);
+  await a.deliver();
+  // type 7(UPDATE_MESSAGE)은 본인 전용이 아니라 스레드에 보이는 확인 글 자체를 바꾼다.
+  const update = a.lastCallback()!;
+  assert.equal(update.type, 7);
+  assert.equal(update.data.content, '확인한 요청은 끝났지만 결과에 밖에 보이면 안 되는 내용이 섞여 있어 여기에는 싣지 않았어요. 필요하면 상태를 확인해 달라고 해 주세요.');
+  // '/change' 접수 응답(type 4, 본인 전용)에는 변경 ID가 있다. 스레드에 보이는 type 7 응답에만 없어야 한다.
+  const updates = a.callbacks.filter(callback => callback.body.type === 7);
+  assert.ok(updates.length === 1 && !JSON.stringify(updates).includes(change), JSON.stringify(updates));
+  // 실행은 그대로 한 번이다.
+  assert.equal((await database.db.query<{ phase: string }>('SELECT phase FROM change_requests WHERE id=$1', [change])).rows[0]!.phase, 'cancelled');
+});
+
+test('C36 묶음 H 공개 검사를 지나는 실행 결과는 정상 응답이 그 문장으로 확인 글을 바꾼다', async () => {
+  const a = await wired();
+  const { change, yes } = await changeCancelProposal(a);
+  await a.press(yes);
+  const update = a.lastCallback()!;
+  assert.equal(update.type, 7);
+  assert.equal(update.data.content, CHANGE_TEXT.cancelled(true, change, false));
+});
+
 test('C14 기억 저장 제안의 값이 확인 글과 달라지면 버튼은 저장하지 않는다(owner가 본 값만 저장된다)', async () => {
   const a = await wired();
   await a.speak(message(), '기억해 둬', { action: 'memory_save', target: 'decision', content: '보인 진술 | applies=homelab' });

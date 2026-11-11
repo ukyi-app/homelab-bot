@@ -85,6 +85,22 @@ test('C17 AC-10: 스위치가 켜져 있으면 미리보기 버튼 하나로 그
   });
 });
 
+test('C36 묶음 H 게시 승인 응답이 바꿀 글 본문이 공개 검사에 걸리면 승인은 그대로 하고 그 글은 값 없는 고정 안내로 바꾼다', async () => {
+  await withHarness({ colleague: true }, async h => {
+    const id = await toAwaiting(h);
+    await h.deliver();
+    const { customId, digest } = await previewButton(h);
+    // 미리보기가 나간 뒤 변경 ID를 내부 표식으로 둔다. 승인 응답 본문(미리보기 마지막 쪽 + 승인 줄)이 공개 검사에 걸린다.
+    const repository = h.policy.current.change!.repositories[0]!;
+    h.policy.current = { ...h.policy.current, change: { repositories: [{ ...repository, internalMarkers: [...repository.internalMarkers, id] }] } };
+    await press(h, 'fixture-press-1', customId!);
+    assert.deepEqual(await approvals(h, id), [{ generation: 1, approval_digest: digest!, event_id: 'fixture-press-1', approved_by: OWNER }]);
+    const ack = lastAck(h);
+    assert.equal(ack.options?.update, true);
+    assert.equal(ack.content, '확인한 요청은 끝났지만 결과에 밖에 보이면 안 되는 내용이 섞여 있어 여기에는 싣지 않았어요. 필요하면 상태를 확인해 달라고 해 주세요.');
+  });
+});
+
 test('C17: 버튼 승인도 게시 직전 재확인을 거친다. 새 미리보기가 나온 뒤 옛 버튼은 거부되고 상태가 바뀌지 않는다', async () => {
   await withHarness({ colleague: true }, async h => {
     const id = await toAwaiting(h);
