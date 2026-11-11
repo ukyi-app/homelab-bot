@@ -2799,3 +2799,18 @@ T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·
 - **바꾼 기존 시험:** `review-8` "4316099215 resume 대상 누락·재시도 상한·큐 상한은 차단하고 cancel은 가능"을 "… 재시도 상한은 차단하고, 큐 상한이어도 재개는 받는다"로 바꾸고(상한에서 `/resume-model`이 받아 scheduler가 풀림), 같은 시험 끝에 있던 cancel 확인을 "4316099215 대기 중인 작업은 cancel로 끝내면 scheduler가 풀린다"로 떼었다. `admin-cli` "계정 전환: 전환 전에 시작한 대화·작업 실행이 …"의 주석만 1분 재시도로 고쳤다(기대값 `rate_limit`·재시도 시각 있음은 그대로).
 - **운영에서 바뀌는 동작:** [DECISIONS](DECISIONS.md) "C36 묶음 A"의 표. F-1의 자체 리뷰 쪽은 작업자가 이 판이 돼야(sandbox 사람 PR) 나타나고, 그 전에는 지금과 같다.
 - **못 잡는 범위:** 실제 CLI가 자체 리뷰에서 `rate_limit_event`·결제 오류를 내는지(C03 "미확인"과 같음, S5), 두 파드의 실제 네트워크 지연 조합, 작업자를 이 판에서 되돌릴 때 디스크에 남은 칸 든 결과(아래 DECISIONS "되돌리기").
+
+## C36 묶음 D 자체 고치기 경합 (2026-11-11, 로컬)
+
+전체 리뷰 F-8, AC-31. 구현 선택은 [DECISIONS](DECISIONS.md) "C36 묶음 D 자체 고치기 경합 구현 선택", 계약은 [ARCHITECTURE](ARCHITECTURE.md) "C36 묶음 D: 고치기 차례의 늦은 작성 결과". 경계는 S1(실제 PostgreSQL, 게시 서버 둘)이다.
+
+| 완료 조건 | 근거 |
+|---|---|
+| 늦은 앞 차례 결과가 새 고치기 차례를 바꾸지 않는다 | `change-pg` "C36 F-8 실제 PostgreSQL: 앞 차례 작성 결과를 들고 있던 게시 서버가 …"(런타임 둘, 한쪽이 처음 작성 결과를 받은 채 멈추고 다른 쪽이 저장·시험·리뷰·`startSelfFix`까지 간 뒤 풀면: 단계 `authoring`, artifact·확인할 것 없음. 이어서 새 차례 결과로 승인 대기, 확인할 것은 새 차례 것, 승인 artifact ≠ 앞 차례 artifact) |
+| 차례 확인 뒤 저장 직전에 차례가 바뀌어도 앞 차례 artifact가 들어가지 않는다 | `change-pg` "C36 F-8 실제 PostgreSQL: 차례 확인 뒤 artifact 저장 직전에 멈춘 게시 서버가 …"(런타임 둘, 한쪽이 확인할 것 기록을 지나 `artifacts.save` 직전에 멈추고 다른 쪽이 저장·시험·리뷰·`startSelfFix`까지 간 뒤 풀면: 풀린 저장은 `phase_conflict`, 단계 `authoring`, artifact 없음. 이어서 새 차례 결과로 승인 대기, 승인 artifact ≠ 앞 차례 artifact) |
+| 부모 잠금 아래에서 지금 차례와 같을 때만 저장 | `change-store-pg` "C36 F-8 실제 PostgreSQL: 고치기 차례를 여는 것과 앞 차례 작성 job의 늦은 저장이 겹쳐도 …"(`startSelfFix`와 앞 차례 job의 `recordChangeNotes`를 동시에 5번: 앞서 닿으면 기록 뒤 지워지고 뒤에 닿으면 `stale`, 새 차례 자리는 비어 있음. 앞 차례 job의 `recordSnapshot`은 `phase_conflict`, 지금 차례 job은 기록·저장) |
+
+- **빨강:** 고치기 전 `change-pg` 시험이 "앞 차례 결과가 새 차례를 snapshot_ready로 넘기지 않는다" 단언에서 `snapshot_ready`로 실패했다(리뷰 보고의 재현 순서 그대로).
+- **바꾼 기존 시험:** `change-guidance` "AC-25 승인 묶음: …"이 `recordChangeNotes`의 결과를 참·거짓 대신 `recorded`·`kept`로 본다. 두 번째 기록은 빈 목록 대신 다른 목록을 넣어 "처음 것 그대로"를 본다(빈 목록은 이제 기록 자체를 하지 않는다).
+- **저장 직전 멈춤의 빨강:** 런타임이 포트에 작성 job을 넘기기 전에는 새 시험이 풀린 저장의 결과 단언에서 `{ ok: true, artifactDigest: … }`로 실패했다(앞 차례 artifact가 새 차례 자리에 들어갔다).
+- **못 잡는 범위:** 두 파드의 실제 네트워크 지연 조합.

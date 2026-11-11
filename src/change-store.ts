@@ -307,7 +307,8 @@ export class ChangeStore {
   }
 
   // authoring → snapshot_ready. 같은 결과를 다시 저장하면 멱등이라 응답 유실 뒤 재시도가 안전하다. 성공한 뒤에야 작업자 결과를 지운다.
-  async recordSnapshot(input: ChangeKey & { manifest: ArtifactManifest; files: readonly ArtifactFile[]; patch: string; transportBytes: number }): Promise<StoreResult<{ artifactDigest: string; created: boolean }>> {
+  // authorJobId를 주면 그 job이 지금 고치기 차례의 작성 job일 때만 받는다. 고치기 차례는 B·T0가 같아 base 대조로는 앞 차례 결과를 가려내지 못한다.
+  async recordSnapshot(input: ChangeKey & { manifest: ArtifactManifest; files: readonly ArtifactFile[]; patch: string; transportBytes: number; authorJobId?: string }): Promise<StoreResult<{ artifactDigest: string; created: boolean }>> {
     const parsed = ArtifactManifestSchema.safeParse(input.manifest);
     if (!parsed.success) return fail('invalid_input', { detail: parsed.error.issues[0]?.message });
     const manifest = parsed.data;
@@ -326,6 +327,7 @@ export class ChangeStore {
       const generation = (await tx.query<Record<string, unknown>>('SELECT * FROM change_generations WHERE change_id=$1 AND generation=$2', [input.changeId, input.generation])).rows[0];
       if (!generation) return fail('not_found');
       const record = generationRow(generation);
+      if (input.authorJobId !== undefined && !await isCurrentAuthorJob(tx, input, input.authorJobId)) return this.conflict(locked.value);
       if (record.baseCommit !== manifest.baseCommit || record.baseTree !== manifest.baseTree) return fail('base_mismatch');
       const now = this.now();
       await tx.query(`INSERT INTO change_artifacts(change_id,generation,artifact_digest,result_tree,manifest,patch,label,changed_bytes,transport_bytes,created_at)
@@ -1263,6 +1265,12 @@ const changePurgeDue = () => `FROM change_requests r
     AND (EXISTS (SELECT 1 FROM change_artifacts a WHERE a.change_id=r.id AND a.purged_at IS NULL) OR EXISTS (SELECT 1 FROM change_review_findings f WHERE f.change_id=r.id)
       OR ${ChangePrivateInputs.HELD} OR ${BRIEF_HELD} OR ${NOTES_HELD} OR ${AMENDMENT_HELD})`;
 // 지운 건수를 돌려준다. 고른 뒤 조건이 깨져 건너뛴 건은 세지 않는다.
+// 게시 전 작성 job이 이 generation의 지금 고치기 차례 것인가. 호출자가 부모 행을 잡은 트랜잭션에서 불러야 차례를 여는 startSelfFix와 엇갈리지 않는다.
+export async function isCurrentAuthorJob(db: Pick<Database, 'query'>, key: ChangeKey, jobId: string): Promise<boolean> {
+  return (await db.query(`SELECT 1 FROM change_child_jobs c JOIN change_generations g ON g.change_id=c.change_id AND g.generation=c.generation
+    WHERE c.job_id=$1 AND c.change_id=$2 AND c.generation=$3 AND c.role='author' AND c.amendment_round=0 AND c.fix_round=g.fix_round`, [jobId, key.changeId, key.generation])).rows.length === 1;
+}
+
 export async function purgeExpiredChangeContent(database: Database, now: number, retentionMs = CHANGE_RETENTION_MS): Promise<number> {
   const cutoff = now - retentionMs;
   const due = (await database.query<{ id: string }>(`SELECT r.id ${changePurgeDue()} ORDER BY r.updated_at LIMIT ${CHANGE_PURGE_BATCH}`, [cutoff])).rows;

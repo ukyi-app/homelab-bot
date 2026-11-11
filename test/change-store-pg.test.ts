@@ -8,8 +8,9 @@ import { ChangePrivateInputs, ChangeStore } from '../src/change-store.js';
 import type { StoreResult } from '../src/change-store.js';
 import { MIGRATIONS, Postgres, appliedMigrations, migrationVersion } from '../src/database.js';
 import { runMigrations } from '../src/migrate-main.js';
+import { recordChangeNotes } from '../src/change-guidance.js';
 import {
-  CONVERSATION, OWNER, REPO_ID, driveTo, fixtureExpected, fixtureResult, fixtureReview, git, hex, insertChildJob, newEvent, ok, seedConversation,
+  CONVERSATION, OWNER, REPO_ID, driveTo, fixtureExpected, fixtureManifest, fixtureManifestFiles, fixturePatch, fixtureResult, fixtureReview, git, hex, insertChildJob, newEvent, ok, seedConversation,
 } from './change-store-fixture.js';
 
 // 실제 PostgreSQL(18) 시험. HOMELAB_TEST_PG_SOCKET(유닉스 소켓 디렉터리)이 없으면 건너뛴다. 실행 방법은 VERIFICATION T20 절과 같다.
@@ -246,6 +247,43 @@ test('C31 실제 PostgreSQL: 고치기 차례를 두 연결이 동시에 열어�
     const phase = ok(await d.store.get(second.key.changeId)).phase;
     const rounds = await number(d.raw, 'change_fix_rounds WHERE change_id=$1', [second.key.changeId]);
     assert.deepEqual([phase, rounds], raced[0]!.ok ? ['authoring', 1] : ['cancelled', 0]);
+  } finally { await d.close(); }
+});
+
+test('C36 F-8 실제 PostgreSQL: 고치기 차례를 여는 것과 앞 차례 작성 job의 늦은 저장이 겹쳐도 새 차례에는 앞 차례의 확인할 것·artifact가 남지 않는다', { skip }, async () => {
+  const d = await database();
+  try {
+    const notes = { checks: [{ text: '고치기 전 가정을 확인' }], risks: [] };
+    const snapshot = (key: { changeId: string; generation: number }, authorJobId: string) =>
+      d.store.recordSnapshot({ ...key, manifest: fixtureManifest(), files: fixtureManifestFiles(), patch: fixturePatch(), transportBytes: 4096, authorJobId });
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const r = await driveTo(d.store, 'reviewing');
+      const key = { changeId: r.id, generation: 1 };
+      const before = `fixture-author-${r.id}-r0`;
+      await insertChildJob(d.db, before, 'task');
+      ok(await d.store.linkChildJob({ ...key, jobId: before, role: 'author' }));
+      const review = `fixture-review-${r.id}-r0`;
+      await insertChildJob(d.db, review);
+      ok(await d.store.linkChildJob({ ...key, jobId: review, role: 'review' }));
+      const bundle = ok(await d.store.evidenceBundle(key));
+      ok(await d.store.recordReview({ ...key, receipt: fixtureReview({ bundle, jobId: review, verdict: 'blocked', risks: [{ priority: 'P0', category: 'correctness', code: 'logic_error' }] }) }));
+      // 늦은 저장이 차례를 열기 전에 닿으면 기록되고 차례를 열 때 지워진다. 뒤에 닿으면 stale이다. 어느 쪽이든 새 차례 자리는 비어 있다.
+      const [opened, recorded] = await Promise.all([d.store.startSelfFix({ ...key, reviewJobId: review }), recordChangeNotes(d.db, { ...key, authorJobId: before }, notes)]);
+      assert.equal(ok(opened).round, 1);
+      assert.ok(['recorded', 'stale'].includes(recorded), recorded);
+      assert.equal(await recordChangeNotes(d.db, { ...key, authorJobId: before }, notes), 'stale');
+      const late = await snapshot(key, before);
+      assert.deepEqual([late.ok, !late.ok && late.reason], [false, 'phase_conflict']);
+      assert.deepEqual([ok(await d.store.get(r.id)).phase, await number(d.raw, 'change_artifacts WHERE change_id=$1', [r.id]), await number(d.raw, 'change_notes WHERE change_id=$1', [r.id])],
+        ['authoring', 0, 0]);
+      // 지금 차례의 작성 job은 받는다.
+      const after = `fixture-author-${r.id}-r1`;
+      await insertChildJob(d.db, after, 'task');
+      ok(await d.store.linkChildJob({ ...key, jobId: after, role: 'author' }));
+      assert.equal(await recordChangeNotes(d.db, { ...key, authorJobId: after }, notes), 'recorded');
+      ok(await snapshot(key, after));
+      assert.equal(ok(await d.store.get(r.id)).phase, 'snapshot_ready');
+    }
   } finally { await d.close(); }
 });
 
