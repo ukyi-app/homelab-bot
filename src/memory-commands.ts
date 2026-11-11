@@ -195,6 +195,8 @@ export const MEMORY_TEXT = Object.freeze({
   noMatch: '이 채널에서 볼 수 있는 기억 중에 맞는 게 없어요.',
   found: (count: number) => `기억을 ${count}건 찾았어요.`,
   more: (count: number) => `(${count}건 더 있어요. 검색어를 좁혀 주세요)`,
+  // 말로 한 검색(일반 글)에서 뺀 internal 기억의 건수. 진술·주제·출처는 싣지 않는다. 켜짐 판에서만 나가므로 '/' 이름을 쓰지 않는다.
+  withheld: (count: number) => `공개하지 않는 기억 ${count}건은 여기에 싣지 않았어요.`,
   saved: '저장했어요',
   corrected: '정정했어요. 새 기억',
   candidate: '근거가 이 종류에 맞지 않거나(설정·장애는 확인된 문서·작업이 있어야 해요) 충돌이 있어서 확정하지 않았어요.',
@@ -212,11 +214,16 @@ export const MEMORY_TEXT = Object.freeze({
 function threadSourceKey(source: SourceRef): string {
   return source.type === 'conversation' ? MEMORY_TEXT.conversationSource : sourceKey(source);
 }
-export function searchText(views: MemoryView[], threadReply = false): string {
+export function searchText(found: MemoryView[], threadReply = false): string {
   const key = threadReply ? threadSourceKey : sourceKey;
   // 대화 출처가 여럿이면 일반 글에서는 같은 "대화"가 겹치므로 한 번만 적는다.
   const sources = (keys: string[]) => threadReply ? [...new Set(keys)] : keys;
-  if (!views.length) return `${MEMORY_TEXT.noMatch}\n${SEARCH_HEADER}`;
+  // 일반 글에는 safe_summary 기억만 싣고 나머지는 건수만 적는다(internal은 본인 전용 응답에서만 보인다). 게시 전 공개 검사는
+  // 비밀 모양만 잡아 internal 진술을 못 거르므로 본문을 만들기 전에 뺀다.
+  const views = threadReply ? found.filter(view => view.classification === 'safe_summary') : found;
+  const withheld = found.length - views.length;
+  const note = withheld ? `\n${MEMORY_TEXT.withheld(withheld)}` : '';
+  if (!views.length) return withheld ? MEMORY_TEXT.withheld(withheld) : `${MEMORY_TEXT.noMatch}\n${SEARCH_HEADER}`;
   const lines = [`${MEMORY_TEXT.found(views.length)} ${SEARCH_HEADER}`];
   let shown = 0;
   for (const view of views) {
@@ -226,11 +233,11 @@ export function searchText(views: MemoryView[], threadReply = false): string {
       `  ${clip(view.statement, 200)}`,
       `  출처 ${sources(view.sources.map(source => clip(key(source), 120))).join(', ') || '없음'} · ${at}`].join('\n');
     const tail = `\n${MEMORY_TEXT.more(views.length - shown)}`;
-    if ([...lines, line].join('\n').length + tail.length > REPLY_LIMIT) { lines.push(tail.trim()); break; }
+    if ([...lines, line].join('\n').length + tail.length + note.length > REPLY_LIMIT) { lines.push(tail.trim()); break; }
     lines.push(line);
     shown++;
   }
-  return lines.join('\n');
+  return lines.join('\n') + note;
 }
 // 충돌 ID 수에는 상한이 없다(같은 주제의 진술이 쌓이면 늘어난다). 저장·정정은 응답 전에 이미 끝났으므로 응답이 Discord 한도를
 // 넘어 거부되면 사용자는 결과를 못 본다. 검색처럼 전체 길이를 자르고 남은 충돌은 개수로 적는다.

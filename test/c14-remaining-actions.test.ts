@@ -90,7 +90,7 @@ test('C14 변경 상태·세션 연결 목록·기억 검색 제안은 확인 �
   const listSlash = (await a.slash('attach-list')).reply;
   await a.speak(message(), '연결한 세션 보여 줘', { action: 'attach_list', target: null, content: null });
   assert.equal(a.posted().at(-1), listSlash);
-  await a.slash('memory-save', { target: 'decision', text: '금요일에는 배포하지 않는다 | applies=homelab' });
+  await a.slash('memory-save', { target: 'decision', text: '금요일에는 배포하지 않는다 | applies=homelab | briefing=yes' });
   const searchSlash = (await a.slash('memory-search', { text: '금요일' })).reply;
   assert.ok(searchSlash?.includes('금요일에는 배포하지 않는다'), searchSlash);
   await a.speak(message(), '금요일 배포 규칙 기억나?', { action: 'memory_search', target: null, content: '금요일' });
@@ -104,7 +104,7 @@ test('C14 변경 상태·세션 연결 목록·기억 검색 제안은 확인 �
 test('C36 F-4 읽기 제안의 결과가 공개 검사에 걸리면 일반 답에는 고정 안내만 달고 값은 게시·outbox에 없다. 같은 /명령의 본인 전용 응답은 그대로다', async () => {
   const a = await wired();
   const hidden = '10.20.30.40';
-  await a.slash('memory-save', { target: 'decision', text: `배포 대상 노드는 ${hidden}이다 | applies=homelab` });
+  await a.slash('memory-save', { target: 'decision', text: `배포 대상 노드는 ${hidden}이다 | applies=homelab | briefing=yes` });
   const searchSlash = (await a.slash('memory-search', { text: '배포 대상' })).reply;
   assert.ok(searchSlash?.includes(hidden), '대조: 본인 전용 응답에는 있다');
   await a.speak(message(), '배포 대상 노드 기억나?', { action: 'memory_search', target: null, content: '배포 대상' });
@@ -117,7 +117,7 @@ test('C36 F-4 읽기 제안의 결과가 공개 검사에 걸리면 일반 답�
 test('C36 묶음 E 대화 출처가 있는 안전한 기억을 말로 검색하면 일반 답에 진술은 보이고 출처의 Discord ID는 없다. 같은 /memory-search 본인 전용 응답에는 ID가 있다', async () => {
   const a = await wired();
   const said = message();
-  await a.speak(said, '금요일 배포 규칙 기억해 둬', { action: 'memory_save', target: 'decision', content: '금요일에는 배포하지 않는다 | applies=homelab' });
+  await a.speak(said, '금요일 배포 규칙 기억해 둬', { action: 'memory_save', target: 'decision', content: '금요일에는 배포하지 않는다 | applies=homelab | briefing=yes' });
   await a.press(yesOf(a));
   const searchSlash = (await a.slash('memory-search', { text: '금요일' })).reply;
   assert.ok(searchSlash?.includes(`conversation:${said}`), '대조: 본인 전용 응답에는 대화 출처 ID가 있다');
@@ -129,6 +129,35 @@ test('C36 묶음 E 대화 출처가 있는 안전한 기억을 말로 검색하�
   assert.ok(answer.includes('출처 대화 · '), answer);
   assert.ok(!a.posted().some(text => text.includes(said)), '일반 글 어디에도 출처 ID가 없다');
   assert.ok(!JSON.stringify((await database.db.query("SELECT payload FROM outbox WHERE message_key LIKE 'result:%:read'")).rows).includes(said));
+});
+
+test('C37 말로 한 기억 검색의 일반 답에는 internal 기억의 진술·출처가 없고 건수 한 줄만 붙는다. 같은 /memory-search 본인 전용 응답에는 internal 기억이 있다', async () => {
+  const a = await wired();
+  const internal = '금요일 배포 금지는 결제 장애 때문이다';
+  const safe = '금요일에는 배포하지 않는다';
+  await a.slash('memory-save', { target: 'decision', text: `${internal} | applies=homelab` });
+  const internalId = (await database.db.query<{ id: string }>('SELECT id FROM memories')).rows[0]!.id;
+  await a.slash('memory-save', { target: 'decision', text: `${safe} | applies=homelab | briefing=yes` });
+  const searchSlash = (await a.slash('memory-search', { text: '금요일' })).reply!;
+  assert.ok(searchSlash.includes(internal) && searchSlash.includes(internalId), '본인 전용 응답에는 internal 기억이 그대로 있다');
+  assert.ok(searchSlash.startsWith('기억을 2건 찾았어요.'), searchSlash);
+  await a.speak(message(), '금요일 배포 규칙 기억나?', { action: 'memory_search', target: null, content: '금요일' });
+  await a.deliver();
+  const answer = a.posted().at(-1)!;
+  assert.ok(answer.startsWith('기억을 1건 찾았어요.'), answer);
+  assert.ok(answer.includes(safe), answer);
+  assert.ok(answer.endsWith('\n공개하지 않는 기억 1건은 여기에 싣지 않았어요.'), answer);
+  assert.ok(!a.posted().some(text => text.includes(internal) || text.includes(internalId)), '일반 글 어디에도 internal 기억이 없다');
+  assert.ok(!JSON.stringify((await database.db.query('SELECT payload FROM outbox')).rows).includes(internal));
+});
+
+test('C37 말로 한 기억 검색에 맞는 기억이 internal뿐이면 일반 답은 건수 한 줄이다', async () => {
+  const a = await wired();
+  await a.slash('memory-save', { target: 'decision', text: '금요일 배포 금지는 결제 장애 때문이다 | applies=homelab' });
+  await a.slash('memory-save', { target: 'decision', text: '금요일 저녁 점검은 사내 일정 때문이다 | applies=homelab' });
+  await a.speak(message(), '금요일 배포 규칙 기억나?', { action: 'memory_search', target: null, content: '금요일' });
+  await a.deliver();
+  assert.equal(a.posted().at(-1), '공개하지 않는 기억 2건은 여기에 싣지 않았어요.');
 });
 
 test('C36 묶음 E 켜짐에서 저장한 여러 쪽의 기억 저장 확인 글은 스위치를 끈 게시 서버가 어느 쪽도 게시하지 않고, 대화 답은 나간다', async () => {
