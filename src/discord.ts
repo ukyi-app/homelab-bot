@@ -22,7 +22,7 @@ import { CHANGE_DIRECT_BUTTON, pressChangeQuestion } from './change-question.js'
 import type { ChangeQuestionPress } from './change-question.js';
 import { moveReactions, ReactionSync, recordReceived, settleReactions } from './reactions.js';
 import { LaneClosed } from './store.js';
-import type { Delivery, Store } from './store.js';
+import type { Delivery, OutboxButton, Store } from './store.js';
 import type { TaskCommandHandler } from './task-commands.js';
 
 // 일반 메시지 수신 표시가 리액션 대신 텍스트로 대체됐을 때의 거부 상태(권한 점검 신호).
@@ -784,13 +784,16 @@ export class DiscordPublisher {
       await this.authorized(row);
       await this.scheduled(row);
       // 켜짐 때 저장한 버튼 글을 스위치를 끈 게시 서버가 보낸다(AC-23). 지금 스위치로 다시 고르고, 꺼짐 판이 없는 글은 막는다.
-      if (!this.store.colleague && row.payload.buttons?.length) {
-        const payload = unbuttoned(row.payload);
+      if (!this.store.colleague) {
+        // 여러 쪽 글의 버튼은 마지막 쪽에만 있다. 앞 쪽도 같은 글(message_key)의 버튼으로 판단해야 동료 전용 글의 앞 쪽이 새지 않는다.
+        const buttons = row.payload.buttons?.length ? row.payload.buttons : await this.laterPageButtons(row);
+        const payload = buttons?.length ? unbuttoned({ ...row.payload, buttons }) : row.payload;
         if (!payload) {
-          await this.store.audit('delivery_blocked_colleague_off', row.id, { attempt: row.attempt });
+          await this.blockColleagueOnly(row);
           throw new Denied();
         }
-        row = { ...row, payload };
+        // 앞 쪽은 본문을 바꾸지 않는다. 버튼 안내는 마지막 쪽 끝에만 있다.
+        if (row.payload.buttons?.length) row = { ...row, payload };
       }
       const pause = await this.store.discordPauseUntil(row.payload.channel);
       if (pause > this.store.now()) { await this.store.pauseDelivery(row, 'discord_global_pause'); return true; }
@@ -826,6 +829,21 @@ export class DiscordPublisher {
       else await this.store.deliveryState(row, 'unknown');
     }
     return true;
+  }
+  private async laterPageButtons(row: Delivery): Promise<OutboxButton[] | undefined> {
+    if (row.payload.kind !== 'message') return;
+    const found = (await this.store.db.query<{ buttons: OutboxButton[] | string }>(`SELECT payload->'buttons' AS buttons FROM outbox
+      WHERE message_key=$1 AND page_index>$2 AND payload ? 'buttons' ORDER BY page_index DESC LIMIT 1`, [row.message_key, row.page_index])).rows[0];
+    if (!found) return;
+    return typeof found.buttons === 'string' ? JSON.parse(found.buttons) as OutboxButton[] : found.buttons;
+  }
+  // 이 쪽은 호출자가 Denied로 blocked로 바꾼다. 뒤 쪽은 앞 쪽이 sent가 아니라 게시되지 않지만, pending으로 두면 원문 정리
+  // (끝 상태만 고른다)가 본문을 비우지 못하므로 같이 끝낸다. 뒤 쪽은 아직 잡힌 적이 없어 pending이다.
+  private async blockColleagueOnly(row: Delivery): Promise<void> {
+    await this.store.atomic(async store => {
+      await store.db.query("UPDATE outbox SET state='blocked' WHERE message_key=$1 AND page_index>$2 AND state='pending'", [row.message_key, row.page_index]);
+      await store.audit('delivery_blocked_colleague_off', row.id, { attempt: row.attempt });
+    });
   }
   // 답장·owner 호출은 첫 쪽에만 건다. 뒤 쪽까지 걸면 한 답에 알림·답장 줄이 쪽 수만큼 붙는다.
   // 답장 대상이 지워졌으면(fail_if_not_exists=false) Discord가 일반 글로 게시해 답이 막히지 않는다.

@@ -11,7 +11,8 @@ import type { MemoryInput, MemoryService, MemoryView, SourceRef } from './memory
 // 검색 결과는 사람에게 보여 줄 뿐 모델 입력에 넣지 않는다(SEC-01, 모델 맥락 주입은 이 범위 밖).
 
 export type MemoryCommand = 'memory-save' | 'memory-search' | 'memory-correct' | 'memory-exclude' | 'memory-delete';
-export interface MemoryCommandInput { id: string; actor: string; scope: Scope; command: MemoryCommand; text: string; target?: string }
+// threadReply: 결과가 본인 전용 응답이 아니라 스레드 일반 글로 나간다(말로 한 기억 검색). 대화 출처의 Discord ID를 싣지 않는다.
+export interface MemoryCommandInput { id: string; actor: string; scope: Scope; command: MemoryCommand; text: string; target?: string; threadReply?: true }
 // outcome은 로그용 고정 코드다(ok, 거부 사유 코드). 내용을 담지 않는다.
 export interface MemoryCommandReply { content: string; outcome: string }
 // guide가 없으면 수신은 꺼짐 판(slash) 안내를 쓴다.
@@ -204,8 +205,17 @@ export const MEMORY_TEXT = Object.freeze({
   denied: '기억을 찾을 수 없거나 이 채널에서는 쓸 수 없어요.',
   policyUnavailable: '정책을 확인할 수 없어서 처리하지 않았어요. 잠시 뒤에 다시 해 주세요.',
   rejected: '저장하지 않았어요.',
+  conversationSource: '대화',
 });
-export function searchText(views: MemoryView[]): string {
+// 일반 글의 출처 표기. 대화 출처는 Discord 메시지·상호작용 ID(17~20자리)라 공개 검사에 걸리고 남에게 보일 값도 아니어서
+// 종류만 적는다. 작업(UUID)·문서·외부 위치는 그대로 두고 공개 검사가 본다.
+function threadSourceKey(source: SourceRef): string {
+  return source.type === 'conversation' ? MEMORY_TEXT.conversationSource : sourceKey(source);
+}
+export function searchText(views: MemoryView[], threadReply = false): string {
+  const key = threadReply ? threadSourceKey : sourceKey;
+  // 대화 출처가 여럿이면 일반 글에서는 같은 "대화"가 겹치므로 한 번만 적는다.
+  const sources = (keys: string[]) => threadReply ? [...new Set(keys)] : keys;
   if (!views.length) return `${MEMORY_TEXT.noMatch}\n${SEARCH_HEADER}`;
   const lines = [`${MEMORY_TEXT.found(views.length)} ${SEARCH_HEADER}`];
   let shown = 0;
@@ -214,7 +224,7 @@ export function searchText(views: MemoryView[]): string {
     const at = view.observedAt !== null ? `관측 ${when(view.observedAt)}` : `저장 ${when(view.createdAt)}`;
     const line = [`- \`${view.id}\` ${STATUS[view.status]} ${view.kind}${flags.length ? ` [${flags.join('·')}]` : ''}`,
       `  ${clip(view.statement, 200)}`,
-      `  출처 ${view.sources.map(source => clip(sourceKey(source), 120)).join(', ') || '없음'} · ${at}`].join('\n');
+      `  출처 ${sources(view.sources.map(source => clip(key(source), 120))).join(', ') || '없음'} · ${at}`].join('\n');
     const tail = `\n${MEMORY_TEXT.more(views.length - shown)}`;
     if ([...lines, line].join('\n').length + tail.length > REPLY_LIMIT) { lines.push(tail.trim()); break; }
     lines.push(line);
@@ -290,13 +300,13 @@ export class MemoryCommands implements MemoryCommandHandler {
       throw error;
     }
   }
-  private async run({ id, actor, scope, command, text, target }: MemoryCommandInput): Promise<string> {
+  private async run({ id, actor, scope, command, text, target, threadReply }: MemoryCommandInput): Promise<string> {
     const context = { actor, eventId: id, now: this.now() };
     if (command === 'memory-save') {
       const { input } = parseMemoryText(parseKind(target), text, context);
       return savedText(MEMORY_TEXT.saved, await this.memory.remember(actor, scope, input), REPLY_LIMIT, this.surface);
     }
-    if (command === 'memory-search') return searchText(await this.memory.search(actor, scope, text));
+    if (command === 'memory-search') return searchText(await this.memory.search(actor, scope, text), threadReply === true);
     if (command === 'memory-correct') {
       const ids = parseIds(target);
       // kind·reason은 진술 뒤 키로 받는다(옵션이 text·target 둘뿐이라 target은 ID가 쓴다).
