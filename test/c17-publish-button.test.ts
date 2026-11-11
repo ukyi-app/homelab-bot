@@ -218,6 +218,37 @@ for (const lastPage of [1800, 1790]) {
   });
 }
 
+test("C36 묶음 F 미리보기의 버튼 안내 첫 줄의 줄바꿈이 마지막 쪽 상한에 정확히 놓여도, 꺼진 게시자가 보낸 어느 쪽에도 버튼 안내가 없고 '/' 승인 안내는 한 번이다", async () => {
+  await withHarness({ colleague: true }, async h => {
+    const id = await toAwaiting(h);
+    const stored = (await h.db.query<{ id: string; owner_id: string; scope: never; policy_revision: string; conversation_id: string | null; payload: Record<string, unknown> }>(
+      "SELECT id,owner_id,scope,policy_revision,conversation_id,payload FROM outbox WHERE payload ? 'buttons'")).rows[0]!;
+    await h.db.query('DELETE FROM outbox WHERE id=$1', [stored.id]);
+    const off = new DiscordPublisher(new Store(h.db, h.store.now, false), h.gate, h.rest);
+    for (let index = 0; index < 20 && await off.deliver(); index++) { /* 앞서 쌓인 다른 글을 비운다 */ }
+    const before = h.rest.messages.length;
+
+    const approve = CHANGE_NOTICE_TEXT.previewApprove(true, id, '');
+    const head = `${'- 변경 파일 줄\n'.repeat(80)}`.slice(0, BUTTON_PAGE_SIZE - approve.length - 3).padEnd(BUTTON_PAGE_SIZE - approve.length - 3, '나');
+    const content = `${head}\n\n${approve}\n${CHANGE_NOTICE_TEXT.previewBinding(true)}`;
+    assert.ok(content.length <= 1800);
+    assert.equal(content.indexOf('\n', content.indexOf(approve)) + 1, BUTTON_PAGE_SIZE, '대조: 첫 안내 줄의 줄바꿈이 마지막 쪽 상한에 놓인다');
+    await h.store.enqueue({ key: 'c36f-split-notice', actor: stored.owner_id, scope: stored.scope, revision: stored.policy_revision,
+      ...(stored.conversation_id ? { conversation: stored.conversation_id } : {}), payload: { ...stored.payload, content } as never });
+    for (let index = 0; index < 20 && await off.deliver(); index++) { /* 쌓인 게시를 비운다 */ }
+
+    const sent = h.rest.messages.slice(before).map(message => ({ content: unmarked(message.body.content), buttons: message.body.components?.length ?? 0 }));
+    assert.ok(sent.length >= 1 && sent.every(page => page.buttons === 0), JSON.stringify(sent));
+    for (const page of sent) {
+      assert.ok(!page.content.includes(approve), page.content);
+      assert.ok(!page.content.includes(CHANGE_NOTICE_TEXT.previewBinding(true)), page.content);
+    }
+    assert.equal(sent.filter(page => page.content.includes(`/change-status target:${id}`)).length, 1);
+    assert.equal(sent.map(page => page.content).join(''), previewWithoutButton(content, id));
+    assert.equal((await h.db.query("SELECT 1 FROM audit WHERE kind='delivery_blocked_colleague_off'")).rows.length, 0);
+  });
+});
+
 test('C36 F-11 버튼 글의 마지막 쪽 상한은 가장 긴 ID의 꺼짐 판 안내를 붙여도 본문 상한 안이다', () => {
   // custom_id(100자 상한)에 들어가는 가장 긴 변경 ID·질문 ID. 안내를 못 찾아 통째로 덧붙일 때가 가장 길다.
   const changeId = 'c'.repeat(CUSTOM_ID_MAX - publishButton('', 1, 'd'.repeat(64)).id.length);

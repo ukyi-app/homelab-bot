@@ -6,6 +6,8 @@ export const BUTTON_PAGE_SIZE = 1500;
 
 // JSON list pages remain independently parseable; ordinary text is never discarded.
 // lastPage는 일반 글의 마지막 쪽에만 거는 더 작은 상한이다. 앞쪽은 그대로 PAGE_SIZE로 나눈다.
+// lastPage가 PAGE_SIZE보다 작은 글(버튼 글)은 끝 단락(마지막 빈 줄 뒤)을 쪽 경계로 가르지 않는다. 그 단락이 버튼 안내라
+// 꺼진 게시 서버가 마지막 쪽에서만 '/' 안내로 바꾸는데(discord.ts unbuttoned), 갈리면 앞 쪽에 "버튼을 눌러 주세요"가 남는다.
 export function messagePages(content: string, lastPage = PAGE_SIZE): string[] {
   if (content.length <= Math.min(PAGE_SIZE, lastPage)) return [content];
   let list: unknown;
@@ -22,15 +24,25 @@ export function messagePages(content: string, lastPage = PAGE_SIZE): string[] {
     if (page.length) pages.push(JSON.stringify(page));
     return pages;
   }
-  const pages = textPages(content, PAGE_SIZE);
+  const tail = lastPage < PAGE_SIZE ? lastParagraph(content, lastPage) : 0;
+  const pages = textPages(content, PAGE_SIZE, tail);
   const last = pages.pop()!;
-  return [...pages, ...textPages(last, Math.min(PAGE_SIZE, lastPage))];
+  return [...pages, ...textPages(last, Math.min(PAGE_SIZE, lastPage), tail)];
 }
-function textPages(content: string, size: number): string[] {
+// 끝 단락의 길이. 빈 줄이 없거나 단락이 한 쪽(size)보다 길거나 앞이 공백뿐이면 0(지키지 않는다).
+function lastParagraph(content: string, size: number): number {
+  const at = content.lastIndexOf('\n\n');
+  const length = content.length - (at + 2);
+  return at >= 0 && length <= size && /\S/.test(content.slice(0, at)) ? length : 0;
+}
+// tail: 끝에서 이 길이만큼은 한 쪽에 둔다. 경계가 그 안에 놓이면 그 단락 앞에서 자른다.
+function textPages(content: string, size: number, tail = 0): string[] {
   const pages: string[] = [];
   while (content.length) {
     let end = Math.min(size, content.length);
-    if (end < content.length) {
+    const keep = content.length - tail;
+    if (end < content.length && tail && end > keep && keep > 0 && /\S/.test(content.slice(0, keep))) end = keep;
+    else if (end < content.length) {
       // 쪽 상한보다 짧은 줄은 두 메시지로 가르지 않는다. 승인 명령(/change-publish … text:<digest>)처럼
       // 한 줄을 통째로 복사해야 하는 토큰이 경계에 걸려도 한 메시지에 남는다.
       // 앞쪽이 공백뿐이면 Discord가 빈 메시지로 거부하므로 그때와 줄바꿈이 없을 때만 글자 수로 자른다.
