@@ -332,10 +332,11 @@ export async function freezeSource(root: string): Promise<void> {
 // round가 1 이상이면 수정 차례(C27)의 자리(change_amendment_artifacts)에 둔다. 처음 게시의 artifact는 승인 대상이 가리켜 덮을 수 없다.
 export class ChangeStoreArtifacts implements ChangeArtifactPort {
   constructor(private readonly store: ChangeStore) {}
-  async save(key: EvidenceKey, artifact: ArtifactBundle, transportBytes: number, notes: { checks?: readonly ChangeNote[]; risks?: readonly ChangeNote[] } = {}): Promise<ArtifactSaveResult> {
+  async save(key: EvidenceKey, artifact: ArtifactBundle, transportBytes: number, { authorJobId, ...notes }: { checks?: readonly ChangeNote[]; risks?: readonly ChangeNote[]; authorJobId?: string } = {}): Promise<ArtifactSaveResult> {
     const fields = { manifest: artifact.manifest, files: artifact.files, patch: artifact.patch, transportBytes };
+    // 수정 차례는 running 차례만 받아 작성 job 확인이 필요 없다. authorJobId는 처음 게시 자리에만 넘긴다.
     const saved = key.round ? await this.store.recordAmendmentSnapshot({ ...key, round: key.round, ...fields, ...notes })
-      : await this.store.recordSnapshot({ changeId: key.changeId, generation: key.generation, ...fields });
+      : await this.store.recordSnapshot({ changeId: key.changeId, generation: key.generation, ...fields, ...(authorJobId === undefined ? {} : { authorJobId }) });
     return saved.ok ? { ok: true, artifactDigest: saved.value.artifactDigest } : { ok: false, reason: saved.reason };
   }
   async load(key: EvidenceKey): Promise<(ArtifactBundle & { artifactDigest: string }) | null> {

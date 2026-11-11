@@ -463,7 +463,8 @@ export interface ChangeAuthorPort {
 export type ArtifactSaveResult = { ok: true; artifactDigest: string } | { ok: false; reason: string };
 export interface ChangeArtifactPort {
   // 수정 차례의 결과는 차례 키(round ≥ 1)의 자리에 둔다. 처음 게시의 artifact를 덮지 않는다.
-  save(key: EvidenceKey, artifact: ArtifactBundle, transportBytes: number, notes?: { checks?: readonly ChangeNote[]; risks?: readonly ChangeNote[] }): Promise<ArtifactSaveResult>;
+  // authorJobId를 주면 처음 게시 자리는 그 job이 지금 고치기 차례의 작성 job일 때만 받고 아니면 phase_conflict다. 고치기 차례는 B·T0가 같아 base로는 앞 차례 결과를 가려내지 못한다.
+  save(key: EvidenceKey, artifact: ArtifactBundle, transportBytes: number, notes?: { checks?: readonly ChangeNote[]; risks?: readonly ChangeNote[]; authorJobId?: string }): Promise<ArtifactSaveResult>;
   load(key: EvidenceKey): Promise<(ArtifactBundle & { artifactDigest: string }) | null>;
 }
 // B1. 무자격 시험 실행기. commandId는 registry 키이고 argv를 받지 않는다. 실행하지 못한 경우도 status='not_run' receipt로 돌려준다.
