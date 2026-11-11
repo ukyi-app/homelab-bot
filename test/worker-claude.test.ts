@@ -13,8 +13,8 @@ import { StaticEnvCredential } from '../src/credentials.js';
 import type { WorkerCredential } from '../src/credentials.js';
 import { CLAUDE_CHAT_CAPABILITIES, CLAUDE_FIXED_ENV, CLAUDE_FORBIDDEN_FLAGS, ClaudeChatAdapter, claudeArgs,
   interpretClaudeStream } from '../src/executor-claude.js';
-import type { AdapterRun, ChatRun } from '../src/executor.js';
-import { PROFILES, executorVersion, selectProfile } from '../src/executor-profiles.js';
+import type { AdapterRun, ChatAdapter, ChatRun } from '../src/executor.js';
+import { PROFILES, createExecutor, executorVersion, selectProfile } from '../src/executor-profiles.js';
 import { SerialWorker, WorkerSigner, WorkerVerifier } from '../src/worker.js';
 import type { WorkerRequestV1, WorkerRequestV2 } from '../src/worker.js';
 import { HttpWorker } from '../src/worker-http.js';
@@ -66,7 +66,8 @@ process.stdin.on('end', () => {
   const emit = e => process.stdout.write(JSON.stringify({ session_id: 'fixture-session', ...e }) + '\\n');
   const model = args[args.indexOf('--model') + 1];
   emit({ type: 'system', subtype: 'init', cwd: process.cwd(), tools: ['StructuredOutput'], mcp_servers: [], model,
-    permissionMode: 'dontAsk', apiKeySource: 'none', claude_code_version: '2.1.308', slash_commands: [], output_style: 'default',
+    // 실제 CLI처럼 -p에서 ANTHROPIC_API_KEY가 있으면 그 키를 쓰고 출처를 그 이름으로 알린다(2.1.308 바이너리의 자격 출처 함수).
+    permissionMode: 'dontAsk', apiKeySource: process.env.ANTHROPIC_API_KEY ? 'ANTHROPIC_API_KEY' : 'none', claude_code_version: '2.1.308', slash_commands: [], output_style: 'default',
     skills: [], plugins: [], uuid: 'u0', ...(mode.init || {}) });
   for (const event of mode.events || []) emit(event);
   if (mode.kind === 'hang') { setInterval(() => {}, 1000); return; }
@@ -84,6 +85,7 @@ process.stdin.on('end', () => {
   if (mode.kind === 'error') {
     // API 오류는 CLI가 만든 합성 assistant 메시지다(모델 표식 <synthetic>, 2.1.308 바이너리).
     emit({ type: 'assistant', parent_tool_use_id: null, uuid: 'u1', error: mode.error, api_error_status: mode.status,
+      ...(mode.apiError ? { api_error: mode.apiError } : {}), ...(mode.apiErrorCode ? { api_error_code: mode.apiErrorCode } : {}),
       message: { model: '<synthetic>', content: [{ type: 'text', text: 'API Error' }] } });
     emit({ type: 'result', subtype: mode.subtype || 'success', is_error: true, api_error_status: mode.status, result: 'API Error',
       num_turns: 1, uuid: 'u2' });
@@ -138,7 +140,7 @@ const env = (overrides: Record<string, string | undefined> = {}) => ({ WORKER_EX
 const tokenFile = () => join(tokenDir, 'CLAUDE_CODE_OAUTH_TOKEN');
 const credential = (homes: string[] = []) => new StaticEnvCredential(tokenFile(), homes);
 const claudeLane = (launcher: SpawnLauncher, options: Partial<ChatLaneOptions> = {}, cred: WorkerCredential = credential(),
-  adapter = new ClaudeChatAdapter('subscription-token')) => new ChatLane(adapter, cred, launcher, { model: MODEL, tmp: base, ...options });
+  adapter: ChatAdapter = new ClaudeChatAdapter('subscription-token')) => new ChatLane(adapter, cred, launcher, { model: MODEL, tmp: base, ...options });
 const runs = async () => (await readdir(base)).filter(name => name.startsWith('homelab-chat-'));
 const code = async (promise: Promise<unknown>) => {
   try { await promise; return 'ok'; } catch (error) { return error instanceof WorkerStartError ? error.code : `other:${String(error)}`; }
@@ -751,4 +753,128 @@ test('C03 한도 정보 읽기: 모르는 상태 값은 이벤트 없음, 깨진
   assert.equal(overloaded.kind === 'failed' && overloaded.reason, 'api_error');
   assert.deepEqual(overloaded.rateLimit, { event: REJECTED });
   assert.deepEqual(read(event(REJECTED)), { kind: 'output', value: ANSWER, rateLimit: { event: REJECTED } });
+});
+
+// C23 API 크레딧 방식(AC-22, S2). 키 이름과 방식 표시 값은 DECISIONS "C23 API 크레딧 방식"의 표 그대로다.
+// 작업자의 실제 조립(createExecutor)으로 자격·어댑터를 받아 가짜 CLI로 돌린다. API 키는 합성 값이다.
+const API_KEY = 'sk-ant-api03-fixture-key-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789';
+const apiKeyFile = () => join(tokenDir, 'ANTHROPIC_API_KEY');
+const methodFile = () => join(tokenDir, 'CLAUDE_AUTH_METHOD');
+const CREDENTIAL_ENVS = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'];
+const credentialEnvs = (env: Record<string, string>) => Object.keys(env).filter(name => CREDENTIAL_ENVS.includes(name));
+const workerLane = (launcher: SpawnLauncher) => {
+  const executor = createExecutor(selectProfile('claude', 'CLAUDE_CODE_OAUTH_TOKEN', MODEL), { credentialFile: tokenFile() }, []);
+  return { lane: claudeLane(launcher, {}, executor.credential, executor.adapter), credential: executor.credential };
+};
+const failure = async (promise: Promise<unknown>) => {
+  try { await promise; return 'ok'; } catch (error) { return error instanceof WorkerStartError ? error.code : `other:${String(error)}`; }
+};
+
+test('C23 API 크레딧 방식: 방식 표시가 api면 실행 env에 API 키 하나만 있고 구독 토큰은 없으며, 구독으로 돌아가면 반대다(재시작 없이 다음 실행부터)', async () => {
+  await writeFile(apiKeyFile(), `${API_KEY}\n`);
+  await writeFile(methodFile(), 'api\n');
+  const launcher = new SpawnLauncher(fakeBin);
+  const { lane } = workerLane(launcher);
+  assert.deepEqual(await lane.run(chatRequest(job()), new AbortController().signal), { status: 'succeeded', stopped: true, answer: ANSWER });
+  let s = await seen();
+  assert.deepEqual(credentialEnvs(s.env), ['ANTHROPIC_API_KEY']);
+  assert.equal(s.env.ANTHROPIC_API_KEY, API_KEY);
+  for (const [name, value] of Object.entries(s.env)) assert.ok(!value.includes(TOKEN), name);
+  for (const [name, value] of Object.entries(s.env)) if (name !== 'ANTHROPIC_API_KEY') assert.ok(!value.includes(API_KEY), name);
+  assert.ok(!s.args.some(arg => arg.includes(API_KEY)) && !s.input.includes(API_KEY));
+  // 모델은 같은 Opus 5.5이고 argv는 구독과 같다(--bare 없음).
+  assert.deepEqual(s.args, claudeArgs(MODEL, CHAT_OUTPUT_JSON_SCHEMA));
+  // 구독으로 돌아가면 다음 실행부터 구독 토큰 하나만 있다.
+  await writeFile(methodFile(), 'subscription\n');
+  assert.equal((await lane.run(chatRequest(job()), new AbortController().signal)).status, 'succeeded');
+  s = await seen();
+  assert.deepEqual(credentialEnvs(s.env), ['CLAUDE_CODE_OAUTH_TOKEN']);
+  assert.equal(s.env.CLAUDE_CODE_OAUTH_TOKEN, TOKEN);
+  for (const value of Object.values(s.env)) assert.ok(!value.includes(API_KEY));
+  // 다시 api로. API 방식인데 CLI가 다른 자격 출처를 알리면(키를 쓰지 않았다) 정책 위반으로 멈추고 실패다.
+  await writeFile(methodFile(), 'api');
+  await mode({ kind: 'answer', answer: ANSWER, init: { apiKeySource: 'none' } });
+  assert.deepEqual(await lane.run(chatRequest(job()), new AbortController().signal), { status: 'failed', stopped: true });
+  assert.equal(launcher.specs.length, 3);
+});
+
+test('C23 두 자격 동시 주입: API 방식 실행에 어댑터가 구독 토큰 변수를 더 넣으면 공통부가 띄우지 않는다(반대도 같다)', async () => {
+  await writeFile(apiKeyFile(), API_KEY);
+  class Doubled extends ClaudeChatAdapter {
+    override async start(run: ChatRun): Promise<AdapterRun> {
+      const plan = await super.start(run);
+      return { ...plan, env: { ...plan.env, CLAUDE_CODE_OAUTH_TOKEN: TOKEN, ANTHROPIC_API_KEY: API_KEY } };
+    }
+  }
+  for (const method of ['api', 'subscription']) {
+    await writeFile(methodFile(), method);
+    const launcher = new SpawnLauncher(fakeBin);
+    const executor = createExecutor(selectProfile('claude', 'CLAUDE_CODE_OAUTH_TOKEN', MODEL), { credentialFile: tokenFile() }, []);
+    const lane = claudeLane(launcher, {}, executor.credential, new Doubled('subscription-token'));
+    assert.deepEqual(await lane.run(chatRequest(job()), new AbortController().signal), { status: 'failed', stopped: true }, method);
+    assert.equal(launcher.specs.length, 0, method);
+  }
+});
+
+test('C23 방식 표시와 자격이 맞지 않으면 실행하지 않고 값 없는 사유 코드만 남긴다, 표시가 없으면 지금처럼 구독이다', async () => {
+  const launcher = new SpawnLauncher(fakeBin);
+  const { lane, credential: cred } = workerLane(launcher);
+  // 지금의 Secret(방식 표시 없음, 구독 토큰만)과 새 작업자: 구독으로 돈다.
+  assert.equal((await lane.run(chatRequest(job()), new AbortController().signal)).status, 'succeeded');
+  assert.deepEqual(credentialEnvs((await seen()).env), ['CLAUDE_CODE_OAUTH_TOKEN']);
+  assert.equal(launcher.specs.length, 1);
+  // 안 쓰는 방식의 자리 표시값은 'unset'이다(Infisical 키가 있어야 ExternalSecret이 Ready라 비워 두지 않는다).
+  const cases: [Record<string, string | null>, string][] = [
+    [{ CLAUDE_AUTH_METHOD: 'api', ANTHROPIC_API_KEY: 'unset', CLAUDE_CODE_OAUTH_TOKEN: TOKEN }, 'credential_method_mismatch'],
+    [{ CLAUDE_AUTH_METHOD: 'api', ANTHROPIC_API_KEY: null, CLAUDE_CODE_OAUTH_TOKEN: TOKEN }, 'credential_method_mismatch'],
+    [{ CLAUDE_AUTH_METHOD: 'subscription', ANTHROPIC_API_KEY: API_KEY, CLAUDE_CODE_OAUTH_TOKEN: 'unset' }, 'credential_method_mismatch'],
+    // 표시가 없는데 API 키만 있으면 구독으로 보고, 구독 토큰이 없으니 불일치다(API 키로 몰래 돌지 않는다).
+    [{ CLAUDE_AUTH_METHOD: null, ANTHROPIC_API_KEY: API_KEY, CLAUDE_CODE_OAUTH_TOKEN: 'unset' }, 'credential_method_mismatch'],
+    [{ CLAUDE_AUTH_METHOD: 'API', ANTHROPIC_API_KEY: API_KEY, CLAUDE_CODE_OAUTH_TOKEN: TOKEN }, 'credential_method_invalid'],
+    [{ CLAUDE_AUTH_METHOD: 'credit', ANTHROPIC_API_KEY: API_KEY, CLAUDE_CODE_OAUTH_TOKEN: TOKEN }, 'credential_method_invalid'],
+    [{ CLAUDE_AUTH_METHOD: '', ANTHROPIC_API_KEY: API_KEY, CLAUDE_CODE_OAUTH_TOKEN: TOKEN }, 'credential_method_invalid'],
+    // 두 방식 모두 자격이 없으면 지금처럼 자격 없음이다.
+    [{ CLAUDE_AUTH_METHOD: 'api', ANTHROPIC_API_KEY: 'unset', CLAUDE_CODE_OAUTH_TOKEN: 'unset' }, 'credential_missing'],
+  ];
+  for (const [files, expected] of cases) {
+    for (const [name, content] of Object.entries(files)) {
+      await rm(join(tokenDir, name), { force: true });
+      if (content !== null) await writeFile(join(tokenDir, name), content);
+    }
+    const label = JSON.stringify(files);
+    assert.equal(await failure(cred.forRun()), expected, label);
+    assert.equal(await cred.ready(), false, label);
+    assert.deepEqual(await lane.run(chatRequest(job()), new AbortController().signal), { status: 'failed', stopped: true }, label);
+    let error: unknown;
+    try { await cred.forRun(); } catch (caught) { error = caught; }
+    assert.ok(!String((error as Error).message).includes(API_KEY.slice(0, 20)) && !String((error as Error).stack).includes(TOKEN.slice(0, 20)), label);
+  }
+  // 하나도 띄우지 않았다.
+  assert.equal(launcher.specs.length, 1);
+});
+
+test('C23 크레딧 소진: CLI의 billing_error(400)는 결제 멈춤이고, API 방식의 한도·429와 결제 식별자는 한도가 아니라 결제로 닫는다, 구독의 한도는 그대로다', async () => {
+  await writeFile(apiKeyFile(), API_KEY);
+  await writeFile(methodFile(), 'api');
+  const { lane } = workerLane(new SpawnLauncher(fakeBin));
+  const billing = { status: 'limited', stopped: true, rateLimit: { stop: { cause: 'billing' } } };
+  const run = async (value: Record<string, unknown>) => { await mode({ kind: 'error', ...value }); return lane.run(chatV2(job()), new AbortController().signal); };
+  // 2.1.308 바이너리: API의 "credit balance is too low"(400 invalid_request_error)를 error billing_error로 바꾼다.
+  assert.deepEqual(await run({ error: 'billing_error', status: 400 }), billing);
+  // 공식 오류 문서: 429는 사용 등급의 월 지출 상한·workspace 지출 한도에도 온다. API 방식에는 풀리는 시각이 오지 않아
+  // 한도로 두면 30분마다 헛돌기만 한다.
+  assert.deepEqual(await run({ error: 'rate_limit', status: 429 }), billing);
+  assert.deepEqual(await run({ error: 'unknown', status: 429 }), billing);
+  assert.deepEqual(await run({ error: 'unknown', status: 402 }), billing);
+  // 종류를 모르는데 서버 오류 식별자가 결제·크레딧을 가리키면 결제다.
+  assert.deepEqual(await run({ error: 'invalid_request', status: 400, apiErrorCode: 'credit_balance_too_low' }), billing);
+  assert.deepEqual(await run({ error: 'unknown', status: 400, apiError: 'billing_error' }), billing);
+  // 결제와 무관한 오류는 지금처럼 나뉜다.
+  assert.equal((await run({ error: 'authentication_failed', status: 401 })).status, 'auth_expired');
+  assert.deepEqual(await run({ error: 'invalid_request', status: 400 }), { status: 'failed', stopped: true, rateLimit: null });
+  assert.deepEqual(await run({ error: 'overloaded', status: 529 }), { status: 'failed', stopped: true, rateLimit: null });
+  // 구독 방식의 한도는 그대로 한도다(풀리는 시각 자동 재개, C19).
+  await writeFile(methodFile(), 'subscription');
+  assert.deepEqual(await run({ error: 'rate_limit', status: 429 }), { status: 'limited', stopped: true, rateLimit: { stop: { cause: 'rate_limit' } } });
+  assert.deepEqual(await run({ error: 'invalid_request', status: 400, apiErrorCode: 'credit_balance_too_low' }), billing);
 });

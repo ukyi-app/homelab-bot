@@ -6,7 +6,7 @@ import { ARTIFACT_LIMITS, ChangePathSchema, artifactDigest } from './change-cont
 import type { ArtifactBundle, ChangeNote } from './change-contracts.js';
 import { TASK_OUTPUT_JSON_SCHEMA, TaskOutputSchema, echoesSecret } from './codex-events.js';
 import { CLAUDE_AUTH, CLAUDE_CLI_VERSION, CLAUDE_FIXED_ENV, ClaudeChatAdapter, MODEL_REFUSAL, REVIEW_DISABLED_BUILTIN_PLUGINS, STRUCTURED_OUTPUT_TOOL,
-  compactClaudeEvent, interpretClaudeStream, modelViolation, noteClaudeError, safeIdentifier, seenApiError, seenStopReason } from './executor-claude.js';
+  compactClaudeEvent, interpretClaudeStream, modelViolation, noteClaudeError, runAuth, safeIdentifier, seenApiError, seenStopReason } from './executor-claude.js';
 import type { ClaudeAuth, ClaudeErrorSeen, ClaudeExpectation, ClaudeStreamPolicy, Compact } from './executor-claude.js';
 import type { AdapterRun, ChatAdapter, ChatRun, EngineOutcome, ExecutorCapabilities, ExitStatus, Observation, PolicyViolation } from './executor.js';
 import { bounded } from './format.js';
@@ -191,24 +191,24 @@ export interface ClaudeTaskTurn { operation: ClaudeTaskOperation; sessionId: str
 // 턴마다 새로 만든다. 이번 턴의 세션 ID·경로를 쥐고, 흐름에서 본 사용량과 오류 필드를 runTaskTurn에 넘긴다.
 export class ClaudeTaskAdapter implements ChatAdapter {
   readonly capabilities = CLAUDE_TASK_CAPABILITIES;
-  readonly envNames: readonly string[];
-  readonly credentialEnv: string;
   // 마지막 result 줄의 모델 사용량. 없으면 null이다(0으로 바꾸지 않는다).
   usage: TaskModelUsage | null = null;
-  private readonly apiKeySource: string;
+  // 이번 턴의 인증 방식. 대화 어댑터와 같이 start가 자격이 알려 준 방식으로 정하고, 공통부가 그 직후 env를 검사한다.
+  private auth: ClaudeAuth;
   private readonly versioning: ClaudeChatAdapter;
-  constructor(auth: ClaudeAuth, private readonly turn: ClaudeTaskTurn, private readonly trace: TaskTurnTrace = newTrace()) {
-    this.credentialEnv = CLAUDE_AUTH[auth].env;
-    this.apiKeySource = CLAUDE_AUTH[auth].apiKeySource;
-    this.versioning = new ClaudeChatAdapter(auth);
-    this.envNames = Object.freeze(['CLAUDE_CONFIG_DIR', this.credentialEnv, ...Object.keys(CLAUDE_TASK_ENV)]);
+  constructor(private readonly defaultAuth: ClaudeAuth, private readonly turn: ClaudeTaskTurn, private readonly trace: TaskTurnTrace = newTrace()) {
+    this.auth = defaultAuth;
+    this.versioning = new ClaudeChatAdapter(defaultAuth);
   }
+  get credentialEnv(): string { return CLAUDE_AUTH[this.auth].env; }
+  get envNames(): readonly string[] { return ['CLAUDE_CONFIG_DIR', this.credentialEnv, ...Object.keys(CLAUDE_TASK_ENV)]; }
   versionEnv(scratch: string): Record<string, string> { return this.versioning.versionEnv(scratch); }
   parseVersion(stdout: string): string | null { return this.versioning.parseVersion(stdout); }
   async start(run: ChatRun): Promise<AdapterRun> {
-    // 토큰은 실행마다 공통부(credential.forRun)가 파일에서 다시 읽어 준 값이다. 자식 env 한 변수에만 두고, argv·설정·stdin에 싣지 않는다.
+    // 자격은 실행마다 공통부(credential.forRun)가 파일에서 다시 읽어 준 값이다. 자식 env 한 변수에만 두고, argv·설정·stdin에 싣지 않는다.
     if (run.credential.value === undefined) throw new Error('credential_missing');
-    const expect: ClaudeExpectation = { model: run.model, apiKeySource: this.apiKeySource, version: this.capabilities.cliVersion };
+    const auth = this.auth = runAuth(run.credential, this.defaultAuth);
+    const expect: ClaudeExpectation = { model: run.model, apiKeySource: CLAUDE_AUTH[auth].apiKeySource, version: this.capabilities.cliVersion, auth };
     const { sessionId, operation, sandbox } = this.turn;
     const policy = taskStreamPolicy(sessionId);
     let initChecked = false;
@@ -218,7 +218,7 @@ export class ClaudeTaskAdapter implements ChatAdapter {
     const settings = taskSettings({ ...sandbox, config: run.dirs.config, run: run.dirs.run, tmp: run.dirs.tmp });
     return {
       args: taskArgs({ model: run.model, schema: run.schema, operation, sessionId, settings, workspace: run.dirs.workspace }),
-      env: { CLAUDE_CONFIG_DIR: run.dirs.config, ...CLAUDE_TASK_ENV, [this.credentialEnv]: run.credential.value },
+      env: { CLAUDE_CONFIG_DIR: run.dirs.config, ...CLAUDE_TASK_ENV, [CLAUDE_AUTH[auth].env]: run.credential.value },
       observe(line: string): Observation {
         const compact = compactTaskEvent(line);
         if (!compact) return { line: '<malformed>', tools: [], violation: null };
