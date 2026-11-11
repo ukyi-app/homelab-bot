@@ -1,5 +1,6 @@
 import { RateLimitEventSchema } from './contracts.js';
 import type { LimitCause, RateLimitEvent, RateLimitInfo } from './contracts.js';
+import type { CredentialMethod, RunCredential } from './credentials.js';
 import type { AdapterRun, ChatAdapter, ChatRun, EngineOutcome, ExecutorCapabilities, ExitStatus, Observation, PolicyViolation } from './executor.js';
 
 // Claude Code CLI 대화 어댑터(D-14, 사용자 결정: Claude Code CLI, 구독 장기 토큰, 첫 모델 Opus 5.5).
@@ -35,13 +36,21 @@ export const CLAUDE_FIXED_ENV: Readonly<Record<string, string>> = Object.freeze(
 });
 // API 오류를 알리려고 CLI가 만드는 assistant 메시지의 모델 표식. 모델이 쓴 답이 아니다 [확인: 2.1.308 바이너리].
 export const SYNTHETIC_MODEL = '<synthetic>';
-// 인증 방식별 자격 변수와 init 이벤트의 apiKeySource 기대값. 지금은 구독 장기 토큰 하나만 있다(사용자 결정).
-// API 키 방식을 더하려면 `ANTHROPIC_API_KEY`·apiKeySource `ANTHROPIC_API_KEY`·`--bare` 검토와 프로필 항목이 함께 필요하다.
-// `-p`에서는 API 키가 OAuth 토큰보다 우선하므로 [확인: 공식 인증 문서] 한 실행에 자격 변수는 하나만 넣는다.
+// 인증 방식별 자격 변수와 init 이벤트의 apiKeySource 기대값(구독 장기 토큰, API 크레딧 방식의 Console API 키).
+// `-p`에서는 API 키가 OAuth 토큰보다 우선하므로 [확인: 공식 인증 문서] 한 실행에 자격 변수는 하나만 넣는다. 어느 변수를
+// 넣을지는 실행마다 자격이 알려 준 방식(RunCredential.method)이 정한다. 비대화 실행에서 ANTHROPIC_API_KEY가 있으면 CLI는
+// 그 키를 쓰고 출처를 `ANTHROPIC_API_KEY`로 알린다 [확인: 2.1.308 바이너리의 자격 출처 함수와 SDK init 스키마 enum].
+// `--bare`는 두 방식 모두 쓰지 않는다(DECISIONS "C23 API 크레딧 방식"): 구독 토큰을 읽지 않아 방식마다 argv가 갈리고,
+// API 키는 bare 없이도 env에서 바로 쓰인다. 사용자 지정을 끄는 일은 이미 `--safe-mode`·빈 설정 디렉터리가 한다.
 export const CLAUDE_AUTH = Object.freeze({
   'subscription-token': Object.freeze({ env: 'CLAUDE_CODE_OAUTH_TOKEN', apiKeySource: 'none' }),
+  'api-key': Object.freeze({ env: 'ANTHROPIC_API_KEY', apiKeySource: 'ANTHROPIC_API_KEY' }),
 } as const);
 export type ClaudeAuth = keyof typeof CLAUDE_AUTH;
+const METHOD_AUTH: Readonly<Record<CredentialMethod, ClaudeAuth>> = Object.freeze({ subscription: 'subscription-token', api: 'api-key' });
+// 이 실행의 인증 방식. 방식을 싣지 않는 자격(StaticEnvCredential)이면 어댑터를 만들 때 준 방식이다.
+export const runAuth = (credential: RunCredential, fallback: ClaudeAuth): ClaudeAuth =>
+  credential.method === undefined ? fallback : METHOD_AUTH[credential.method];
 // 넘기지 않는 플래그(시험이 확인한다). 도구·권한을 넓히거나, 세션을 잇거나, 자격·설정을 다른 곳에서 읽거나, 폴백한다.
 export const CLAUDE_FORBIDDEN_FLAGS: readonly string[] = Object.freeze(['--bare', '--dangerously-skip-permissions',
   '--allow-dangerously-skip-permissions', '--fallback-model', '--resume', '-r', '--continue', '-c', '--fork-session',
@@ -127,7 +136,8 @@ export function compactClaudeEvent(line: string): Compact | null {
   return compact;
 }
 
-export interface ClaudeExpectation { model: string; apiKeySource: string; version: string }
+// auth: 이 실행의 인증 방식(오류 분류가 본다). 없으면 구독과 같다.
+export interface ClaudeExpectation { model: string; apiKeySource: string; version: string; auth?: ClaudeAuth }
 // 실행마다 첫 init 이벤트로 확인하는 정책. 하나라도 다르면 그 실행은 정책 위반으로 멈추고 실패다.
 // 도구는 출력 전달용 StructuredOutput만, MCP 서버 0개, 요청한 모델 그대로(별칭·폴백 아님), 선택한 자격 방식, 고정 버전.
 export function initViolation(init: Compact, expect: ClaudeExpectation): PolicyViolation | null {
@@ -154,19 +164,30 @@ export function modelViolation(event: Compact, expect: ClaudeExpectation): Polic
 // "401"·"rate limit"이 있어도 보지 않는다. 종류 이름은 2.1.308 바이너리의 SDK 스키마 enum이다 [가정: 실제 값 S12].
 const AUTH_KINDS = new Set(['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required']);
 // billing_error는 사람이 결제·한도를 확인해야 한다. 자동 재시도하지 않게 한도 대기로 두고, 원인을 billing으로 갈라
-// 게시 서버가 저절로 재개하지 않게 한다. 402는 Messages API의 billing_error 상태다.
+// 게시 서버가 저절로 재개하지 않게 한다. 402는 Messages API의 billing_error 상태다. API 크레딧 소진은 API가 400
+// invalid_request_error("credit balance is too low")로 주고 CLI가 error billing_error로 바꾼다 [확인: 2.1.308 바이너리].
 const LIMIT_KINDS = new Map<string, LimitCause>([['rate_limit', 'rate_limit'], ['billing_error', 'billing']]);
 const LIMIT_STATUSES = new Map<unknown, LimitCause>([[429, 'rate_limit'], [402, 'billing']]);
+// 결제·크레딧·지출 한도를 가리키는 서버 오류 식별자(api_error·api_error_code). 이 빌드가 모르는 결제 쪽 모양을 한도가 아닌
+// 결제로 닫으려는 것이다. 단어 경계로만 맞춘다(credential은 credit이 아니다).
+const BILLING_CODE = /(?:^|_)(?:billing|credit|spend)(?:_|$)/;
 const limited = (cause: LimitCause): EngineOutcome => ({ kind: 'limited', rateLimit: { stop: { cause } } });
-export function classifyClaudeError(kind: unknown, status: unknown): EngineOutcome | null {
+// auth: 이 실행의 인증 방식. API 키 방식의 한도(rate_limit·429)는 결제로 닫는다. 공식 오류 문서는 429를 분당 한도 말고도
+// 사용 등급의 월 지출 상한·workspace 지출 한도에 쓴다고 적고, 짧은 429는 CLI가 이미 안에서 다시 시도한 뒤라 여기 온 429는
+// 오래 가는 상한일 수 있다. API 방식에는 풀리는 시각(rate_limit_event)도 없어 한도로 두면 30분마다 헛돌기만 한다.
+export interface ClaudeErrorContext { auth?: ClaudeAuth | undefined; codes?: readonly unknown[] }
+export function classifyClaudeError(kind: unknown, status: unknown, context: ClaudeErrorContext = {}): EngineOutcome | null {
   if (typeof kind === 'string' && AUTH_KINDS.has(kind)) return { kind: 'auth_expired' };
-  const byKind = typeof kind === 'string' ? LIMIT_KINDS.get(kind) : undefined;
-  if (byKind) return limited(byKind);
-  // overloaded·server_error 등 다른 종류는 대기가 아니다. 종류를 모를 때만 HTTP 상태를 본다.
-  if (typeof kind === 'string' && kind !== 'unknown') return null;
-  if (status === 401 || status === 403) return { kind: 'auth_expired' };
-  const byStatus = LIMIT_STATUSES.get(status);
-  return byStatus ? limited(byStatus) : null;
+  if ((context.codes ?? []).some(code => typeof code === 'string' && BILLING_CODE.test(code))) return limited('billing');
+  let cause = typeof kind === 'string' ? LIMIT_KINDS.get(kind) : undefined;
+  if (!cause) {
+    // overloaded·server_error 등 다른 종류는 대기가 아니다. 종류를 모를 때만 HTTP 상태를 본다.
+    if (typeof kind === 'string' && kind !== 'unknown') return null;
+    if (status === 401 || status === 403) return { kind: 'auth_expired' };
+    cause = LIMIT_STATUSES.get(status);
+    if (!cause) return null;
+  }
+  return limited(cause === 'rate_limit' && context.auth === 'api-key' ? 'billing' : cause);
 }
 
 // 오류 판정과 진단이 함께 보는 이벤트. 값은 result에 있으면 그것을, 없으면 마지막 assistant의 것을 쓴다.
@@ -234,10 +255,12 @@ function judgeClaudeStream(events: readonly Compact[], exit: ExitStatus, expect:
   for (const event of events) noteClaudeError(seen, event);
   const lastError = seen.assistantError;
   const result = results[0];
-  if (!result) return classifyClaudeError(lastError?.error, lastError?.api_error_status) ?? failed('no_result');
+  const context: ClaudeErrorContext = { auth: expect.auth,
+    codes: [seenApiError(seen), result?.api_error_code ?? seen.assistantDetail?.api_error_code] };
+  if (!result) return classifyClaudeError(lastError?.error, lastError?.api_error_status, context) ?? failed('no_result');
   if (result.is_error !== false || result.subtype !== 'success') {
     if (refused(seen)) return failed(MODEL_REFUSAL);
-    return classifyClaudeError(lastError?.error, result.api_error_status ?? lastError?.api_error_status)
+    return classifyClaudeError(lastError?.error, result.api_error_status ?? lastError?.api_error_status, context)
       ?? failed(result.subtype === 'success' ? 'api_error' : 'execution_error');
   }
   if (exit.code !== 0) return failed('exit_nonzero');
@@ -247,27 +270,26 @@ function judgeClaudeStream(events: readonly Compact[], exit: ExitStatus, expect:
 
 export class ClaudeChatAdapter implements ChatAdapter {
   readonly capabilities = CLAUDE_CHAT_CAPABILITIES;
-  readonly envNames: readonly string[];
-  readonly credentialEnv: string;
-  private readonly apiKeySource: string;
-  constructor(auth: ClaudeAuth) {
-    this.credentialEnv = CLAUDE_AUTH[auth].env;
-    this.apiKeySource = CLAUDE_AUTH[auth].apiKeySource;
-    this.envNames = Object.freeze(['CLAUDE_CONFIG_DIR', this.credentialEnv, ...Object.keys(CLAUDE_FIXED_ENV)]);
-  }
+  // 지금 준비한 실행의 인증 방식. 공통부는 start 바로 뒤에 envNames·credentialEnv로 그 실행의 env를 검사한다(RunControl은
+  // 한 번에 한 실행만 준비한다). 그래서 허용 env 이름에 자격 변수가 이 실행의 것 하나뿐이고, 다른 방식의 변수가 끼면 띄우지 않는다.
+  private auth: ClaudeAuth;
+  constructor(private readonly defaultAuth: ClaudeAuth) { this.auth = defaultAuth; }
+  get credentialEnv(): string { return CLAUDE_AUTH[this.auth].env; }
+  get envNames(): readonly string[] { return ['CLAUDE_CONFIG_DIR', this.credentialEnv, ...Object.keys(CLAUDE_FIXED_ENV)]; }
   // `--version`은 빈 임시 디렉터리를 HOME·CLAUDE_CONFIG_DIR로 준다. 자격은 넘기지 않는다.
   versionEnv(scratch: string): Record<string, string> { return { CLAUDE_CONFIG_DIR: scratch, ...CLAUDE_FIXED_ENV }; }
   parseVersion(stdout: string): string | null { return /^(\d+\.\d+\.\d+) \(Claude Code\)\s*$/m.exec(stdout)?.[1] ?? null; }
   async start(run: ChatRun): Promise<AdapterRun> {
     if (run.credential.value === undefined) throw new Error('credential_missing');
-    const expect: ClaudeExpectation = { model: run.model, apiKeySource: this.apiKeySource, version: this.capabilities.cliVersion };
+    const auth = this.auth = runAuth(run.credential, this.defaultAuth);
+    const expect: ClaudeExpectation = { model: run.model, apiKeySource: CLAUDE_AUTH[auth].apiKeySource, version: this.capabilities.cliVersion, auth };
     let initChecked = false;
     // ID가 없는 호출은 서로 합치지 않는다. 같은 호출을 두 번 세어도 예산 쪽으로 틀리지만, 합치면 초과를 놓친다.
     let unnamed = 0;
     return {
       args: claudeArgs(run.model, run.schema),
       // 자격은 이 실행의 자식 env 한 변수에만 둔다. 설정 파일·argv에는 넣지 않는다(공통부가 실행 전에 확인한다).
-      env: { CLAUDE_CONFIG_DIR: run.dirs.config, ...CLAUDE_FIXED_ENV, [this.credentialEnv]: run.credential.value },
+      env: { CLAUDE_CONFIG_DIR: run.dirs.config, ...CLAUDE_FIXED_ENV, [CLAUDE_AUTH[auth].env]: run.credential.value },
       observe(line: string): Observation {
         const compact = compactClaudeEvent(line);
         if (!compact) return { line: '<malformed>', tools: [], violation: null };

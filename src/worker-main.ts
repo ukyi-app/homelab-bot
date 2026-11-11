@@ -7,14 +7,13 @@ import { once } from 'node:events';
 import { pathToFileURL } from 'node:url';
 import { createArchiveFetcher } from './archive-fetcher.js';
 import { ChatLane } from './chat-lane.js';
-import { StaticEnvCredential } from './credentials.js';
 import { ClaudeChatAdapter } from './executor-claude.js';
 import { RevisionSchema } from './change-contracts.js';
 import { ChangeReviewResults, ChangeReviewWorker, changeReviewRoutes } from './change-review.js';
 import { IsolatedVerifier } from './change-verifier.js';
 import type { VerifierOptions } from './change-verifier.js';
 import { runChangeTurn, runTaskTurn, taskImageProblems } from './executor-claude-task.js';
-import { createExecutor, executorVersion, selectProfile } from './executor-profiles.js';
+import { createExecutor, executorVersion, selectProfile, staticCredential } from './executor-profiles.js';
 import type { ExecutorProfile } from './executor-profiles.js';
 import { PORTS } from './http.js';
 import { ProcessGroupLauncher } from './process-launcher.js';
@@ -43,6 +42,8 @@ import { FileNonceStore, WorkerStartError, assertNotPersonal, humanHomes } from 
 
 // 자격은 Secret 볼륨 파일 `<WORKER_CREDENTIAL_DIR>/<WORKER_CREDENTIAL_KEY>`다. 키 이름은 Infisical 키 그대로이고 인증 방식을
 // 뜻한다(CLAUDE_CODE_OAUTH_TOKEN: Claude 구독 장기 토큰, CODEX_AUTH_JSON: Codex 구독 auth.json 시드).
+// Claude는 같은 디렉터리의 CLAUDE_AUTH_METHOD(방식 표시)·ANTHROPIC_API_KEY도 실행마다 읽는다(executor-profiles staticCredential).
+// 방식은 기동 env가 아니라 그 파일이 고른다. 그래서 WORKER_ENV는 그대로다.
 export const WORKER_ENV = ['WORKER_EXECUTOR', 'WORKER_MODEL', 'WORKER_CREDENTIAL_DIR', 'WORKER_CREDENTIAL_KEY',
   'WORKER_NONCE_DIR', 'WORKER_CONTROL_PUBLIC_KEY'] as const;
 export interface WorkerConfig {
@@ -150,7 +151,7 @@ async function startTaskWorker(config: WorkerConfig, stateRoot: string, options:
     try { cleanup = await PodPidSpace.record({ dedicatedTaskPod: true }); }
     catch (error) { startup.push(`pid_${error instanceof ContainmentUnavailable ? error.code : 'record_failed'}`); }
   }
-  const credential = new StaticEnvCredential(config.credentialFile, homes);
+  const credential = staticCredential(config.profile, config.credentialFile, homes);
   const launcher = cleanup && (options.launcher ?? new ProcessGroupLauncher([config.executorBin], { cleanup }));
   let control: RunControl | undefined;
   if (launcher) {

@@ -323,6 +323,30 @@ test('B5 가용성(자격): 토큰 파일이 사라지면 수락만 닫고 돌�
   await waitUntil(async () => (await intake(fixture!)).open);
 });
 
+test('C23 작업 레인 API 크레딧 방식: 방식 표시가 api면 턴의 env에 API 키 하나만 있고, 표시와 자격이 맞지 않으면 수락을 닫는다', async () => {
+  fixture = await workerFixture({ start: { taskProbe: { probeMs: 20 } } });
+  const dir = fixture.env.WORKER_CREDENTIAL_DIR!;
+  const apiKey = 'sk-ant-api03-fixture-task-key-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123';
+  await writeFile(join(dir, 'ANTHROPIC_API_KEY'), `${apiKey}\n`);
+  await writeFile(join(dir, 'CLAUDE_AUTH_METHOD'), 'api\n');
+  await writeFile(join(dir, 'CLAUDE_CODE_OAUTH_TOKEN'), 'unset\n');
+  const response = await fixture.signed('/v1/task', startRequest());
+  assert.equal(TaskResponseSchema.parse(response.json).status, 'completed');
+  const [call] = await fixture.calls();
+  assert.equal(call!.apiKey, apiKey);
+  assert.equal(call!.token, undefined);
+  assert.ok(!call!.args.join(' ').includes(apiKey), 'API 키가 argv에 없다');
+  // 표시는 api인데 API 키 자리가 비고 구독 토큰만 있으면(불일치) 새 작업을 받지 않는다.
+  await writeFile(join(dir, 'CLAUDE_CODE_OAUTH_TOKEN'), 'sk-ant-oat01-fixture-token-replaced-0123456789\n');
+  await writeFile(join(dir, 'ANTHROPIC_API_KEY'), 'unset\n');
+  await waitUntil(async () => (await intake(fixture!)).reasons.includes('credential_unavailable'));
+  assert.equal((await fixture.signed('/v1/task', startRequest())).status, 503);
+  assert.equal((await fixture.calls()).length, 1);
+  // 구독으로 돌아가면 다시 연다.
+  await writeFile(join(dir, 'CLAUDE_AUTH_METHOD'), 'subscription\n');
+  await waitUntil(async () => (await intake(fixture!)).open);
+});
+
 test('B5 가용성(볼륨을 못 씀): 기동해도 죽지 않고 503, 볼륨이 돌아오면 identity를 세우고 연다', { skip: process.getuid?.() === 0 ? 'root는 권한 시험을 건너뛴다' : false }, async () => {
   fixture = await workerFixture({ start: { taskProbe: { probeMs: 20 } } });
   await fixture.running.close();

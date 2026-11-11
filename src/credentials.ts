@@ -6,16 +6,28 @@ import { openDir, readAt } from './codex-workspace.js';
 import { WorkerStartError, readSecretFile, seedAuth } from './worker-state.js';
 
 // 모델 자격 방식. 실행기 이름과 따로 둔다(같은 실행기도 방식이 다를 수 있다, 예: Claude 구독 토큰과 API 키).
-// - env-static: 정적 값(Claude 구독 장기 토큰). Secret 볼륨 파일을 실행 준비 때마다 다시 읽어 그 실행의 자식 env
+// - env-static: 정적 값(Claude 구독 장기 토큰 또는 API 키). Secret 볼륨 파일을 실행 준비 때마다 다시 읽어 그 실행의 자식 env
 //   한 변수에만 넣는다. 영속 공간에 복사·되쓰기하지 않는다. ESO가 값을 바꾸면 다음 실행부터 새 값이다(파드 재시작 불필요).
 // - file-mutable: CLI가 스스로 갱신하는 파일(Codex 구독 auth.json). 영속 공간에 없을 때만 시드하고 갱신본을 덮지 않는다
 //   (D-14 조건 4). 시드 설치 규칙은 worker-state.seedAuth 그대로다.
 // 어느 방식도 자격 값을 로그·오류·결과에 싣지 않는다. 실패는 사유 코드(WorkerStartError.code)뿐이다.
 export type CredentialKind = 'env-static' | 'file-mutable';
 
+// Claude 인증 방식(COLLEAGUE_SPEC §4.8 "API 크레딧 방식"). 값 글자는 방식 표시 파일 내용이자 봇 DB model_accounts.method,
+// 지표 homelab_bot_model_account의 method 라벨과 같다.
+export const CREDENTIAL_METHODS = ['subscription', 'api'] as const;
+export type CredentialMethod = (typeof CREDENTIAL_METHODS)[number];
+// Secret 볼륨 파일 이름(= Infisical 키 이름, DECISIONS "C23 API 크레딧 방식" 표). 구독 토큰 파일 이름은 WORKER_CREDENTIAL_KEY다.
+export const METHOD_FILE = 'CLAUDE_AUTH_METHOD';
+export const API_KEY_FILE = 'ANTHROPIC_API_KEY';
+// 안 쓰는 방식의 키에 두는 값. ExternalSecret은 키가 Infisical에 있어야 Ready라 키를 지우지 않고 이 값으로 비운다.
+export const CREDENTIAL_PLACEHOLDER = 'unset';
+
 export interface RunCredential {
   // env-static: 어댑터가 자식 env에 넣을 값. 넣을 변수 이름은 어댑터(credentialEnv)가 정한다.
   value?: string;
+  // 이 실행의 인증 방식. 방식을 고르는 자격(MethodEnvCredential)만 싣는다. 어댑터가 이 값으로 자격 변수 이름을 고른다.
+  method?: CredentialMethod;
   // 반사 검사·유출 검사에 쓰는 비밀 문자열(실행 전에 읽은 값).
   secrets: readonly string[];
 }
@@ -46,11 +58,58 @@ export class StaticEnvCredential implements WorkerCredential {
     return { value, secrets: [value] };
   }
   async secrets(): Promise<string[]> { return [await this.read()]; }
-  private async read(): Promise<string> {
-    const raw = await readSecretFile(this.file, this.homes, { prefix: 'credential', limit: STATIC_LIMIT });
+  private read(): Promise<string> { return readStatic(this.file, this.homes); }
+}
+async function readStatic(file: string, homes: readonly string[]): Promise<string> {
+  const raw = await readSecretFile(file, homes, { prefix: 'credential', limit: STATIC_LIMIT });
+  const value = raw.toString('utf8').replace(/^\s+|\s+$/g, '');
+  if (value === CREDENTIAL_PLACEHOLDER) throw new WorkerStartError('credential_missing');
+  if (!STATIC_SHAPE.test(value)) throw new WorkerStartError('credential_invalid');
+  return value;
+}
+
+// Claude 구독 토큰과 API 키 중 방식 표시가 고른 하나(env-static). 같은 Secret 볼륨의 세 파일을 실행 준비 때마다 다시 읽는다.
+// owner가 계정을 바꾸면(ESO가 볼륨을 갱신하면) 파드 재시작 없이 다음 실행부터 바뀐다.
+// - 방식 표시 파일이 없으면 구독이다. 방식 표시 키가 없는 지금의 Secret과 새 작업자 조합이 지금처럼 돌아야 해서다.
+//   표시는 있는데 모르는 값이면 실행하지 않는다(credential_method_invalid).
+// - 표시한 방식의 자격만 실행 env에 넣는다. 그 자격이 없거나 자리 표시값인데 다른 방식의 자격이 있으면 실행하지 않는다
+//   (credential_method_mismatch). 다른 방식으로 몰래 돌지 않는다.
+// - 반사·유출 검사에는 읽을 수 있는 두 방식의 자격을 모두 쓴다. 실행 env에 없는 자격이 출력에 실려도 막는다.
+// 방식 표시와 자격 파일은 따로 읽어 kubelet의 볼륨 교체와 엇갈릴 수 있다. 그때도 표시와 자격이 맞지 않으면 실행하지 않을 뿐
+// 다른 방식으로 돌지 않는다(다음 실행에서 맞는다).
+const METHOD_LIMIT = 64;
+export class MethodEnvCredential implements WorkerCredential {
+  readonly kind = 'env-static';
+  constructor(private readonly files: Readonly<Record<CredentialMethod, string>>, private readonly methodFile: string,
+    private readonly homes: readonly string[]) {}
+  async open(): Promise<'present'> { await this.forRun(); return 'present'; }
+  async ready(): Promise<boolean> { return this.forRun().then(() => true, () => false); }
+  async forRun(): Promise<RunCredential> {
+    const method = await this.method();
+    const other = method === 'subscription' ? 'api' : 'subscription';
+    const extra = await readStatic(this.files[other], this.homes).catch(() => null);
+    let value: string;
+    try { value = await readStatic(this.files[method], this.homes); } catch (error) {
+      if (extra !== null) throw new WorkerStartError('credential_method_mismatch');
+      throw error;
+    }
+    return { value, method, secrets: extra === null ? [value] : [value, extra] };
+  }
+  async secrets(): Promise<string[]> {
+    const found = (await Promise.all(CREDENTIAL_METHODS.map(m => readStatic(this.files[m], this.homes).catch(() => null))))
+      .filter((value): value is string => value !== null);
+    if (!found.length) throw new WorkerStartError('credential_unreadable');
+    return found;
+  }
+  private async method(): Promise<CredentialMethod> {
+    let raw: Buffer;
+    try { raw = await readSecretFile(this.methodFile, this.homes, { prefix: 'credential_method', limit: METHOD_LIMIT }); } catch (error) {
+      if (error instanceof WorkerStartError && error.code === 'credential_method_missing') return 'subscription';
+      throw error;
+    }
     const value = raw.toString('utf8').replace(/^\s+|\s+$/g, '');
-    if (!STATIC_SHAPE.test(value)) throw new WorkerStartError('credential_invalid');
-    return value;
+    if (!(CREDENTIAL_METHODS as readonly string[]).includes(value)) throw new WorkerStartError('credential_method_invalid');
+    return value as CredentialMethod;
   }
 }
 

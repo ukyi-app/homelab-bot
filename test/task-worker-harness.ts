@@ -29,7 +29,7 @@ process.stdin.on('end', () => {
   const model = args[args.indexOf('--model') + 1];
   const calls = path.join(__dirname, 'calls.jsonl');
   const index = fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').split('\\n').filter(Boolean).length : 0;
-  fs.appendFileSync(calls, JSON.stringify({ args, cwd: process.cwd(), input, session, resume, config: process.env.CLAUDE_CONFIG_DIR, token: process.env.CLAUDE_CODE_OAUTH_TOKEN, scrub: process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB }) + '\\n');
+  fs.appendFileSync(calls, JSON.stringify({ args, cwd: process.cwd(), input, session, resume, config: process.env.CLAUDE_CONFIG_DIR, token: process.env.CLAUDE_CODE_OAUTH_TOKEN, apiKey: process.env.ANTHROPIC_API_KEY, scrub: process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB }) + '\\n');
   const step = script[Math.min(index, script.length - 1)];
   const dir = path.join(process.env.CLAUDE_CONFIG_DIR, 'projects', 'workspace');
   fs.mkdirSync(dir, { recursive: true });
@@ -37,7 +37,7 @@ process.stdin.on('end', () => {
   for (const [file, data] of Object.entries(step.write ?? {})) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, data); }
   const emit = e => process.stdout.write(JSON.stringify({ session_id: session, ...e }) + '\\n');
   emit({ type: 'system', subtype: 'init', tools: ['Bash', 'Edit', 'Read', 'StructuredOutput', 'Write'], mcp_servers: [], model, permissionMode: 'default',
-    slash_commands: [], apiKeySource: 'none', claude_code_version: '2.1.308', skills: [], plugins: [] });
+    slash_commands: [], apiKeySource: process.env.ANTHROPIC_API_KEY ? 'ANTHROPIC_API_KEY' : 'none', claude_code_version: '2.1.308', skills: [], plugins: [] });
   if (step.kind === 'hang') { setInterval(() => {}, 1000); return; }
   emit({ type: 'assistant', message: { model, content: [{ type: 'tool_use', id: 'toolu_out', name: 'StructuredOutput', input: step.output }] } });
   process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, session_id: session, structured_output: step.output,
@@ -76,7 +76,7 @@ export interface WorkerFixture {
   fetchArchive: ArchiveFetcher; archiveUrls: string[];
   env: Record<string, string>;
   script(steps: Step[]): Promise<void>;
-  calls(): Promise<{ args: string[]; cwd: string; input: string; session: string; resume: boolean; config: string; token: string; scrub: string }[]>;
+  calls(): Promise<{ args: string[]; cwd: string; input: string; session: string; resume: boolean; config: string; token?: string; apiKey?: string; scrub: string }[]>;
   restart(options?: Partial<StartWorkerOptions>): Promise<void>;
   post(path: string, body: unknown, token?: string): Promise<{ status: number; json: any }>;
   signed(endpoint: TaskEndpoint, body: unknown, signer?: TaskWorkerSigner): Promise<{ status: number; json: any }>;
