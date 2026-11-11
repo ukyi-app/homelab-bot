@@ -12,8 +12,8 @@ import type {
   ArtifactBundle, ArtifactFile, ArtifactManifest, ChangeBrief, ChangeKey, ChangeReviewPort, EvidenceBundle, EvidenceKey, ReviewReceipt, SelfFixFinding, VerificationReceipt,
 } from './change-contracts.js';
 import type { ChangeRequest, ChangeStore } from './change-store.js';
-import { DEFAULTS, Denied, WorkerRejected } from './contracts.js';
-import type { Job } from './contracts.js';
+import { DEFAULTS, Denied, RateLimitInfoSchema, WorkerRejected } from './contracts.js';
+import type { Job, RateLimitInfo } from './contracts.js';
 import { ArchiveError, SECRET_PATTERNS, readArchive } from './review-input.js';
 import type { ArchiveFetcher, ReviewerResult, ReviewerRun } from './review-input.js';
 import type { Store } from './store.js';
@@ -114,11 +114,22 @@ export interface ChangeReviewerInput {
 export type ChangeReviewerModel = (input: ChangeReviewerInput, signal: AbortSignal, run: ReviewerRun) => Promise<ReviewerResult>;
 
 // problems가 있으면 모델을 부르지 않았다는 뜻이고 output은 null이다.
+// rateLimit은 그 실행에서 본 한도 정보다(일반 PR 리뷰 응답과 같은 선택 칸). 멈춤 기록의 종류·풀리는 시각을 정한다.
 const WorkerResultSchema = z.discriminatedUnion('status', [
-  z.strictObject({ status: z.literal('succeeded'), stopped: z.literal(true), sessionId: uuid, problems: z.array(ReasonCodeSchema).max(16), output: z.unknown() }),
-  z.strictObject({ status: z.enum(['limited', 'auth_expired', 'failed']), stopped: z.literal(true), reason: z.string().max(100).optional() }),
+  z.strictObject({ status: z.literal('succeeded'), stopped: z.literal(true), sessionId: uuid, problems: z.array(ReasonCodeSchema).max(16), output: z.unknown(),
+    rateLimit: RateLimitInfoSchema.optional() }),
+  z.strictObject({ status: z.enum(['limited', 'auth_expired', 'failed']), stopped: z.literal(true), reason: z.string().max(100).optional(),
+    rateLimit: RateLimitInfoSchema.optional() }),
   z.strictObject({ status: z.literal('unknown'), stopped: z.literal(false) }),
 ]);
+// 게시 서버가 응답의 한도 칸을 받는다는 표시. 칸을 모르는 옛 게시 서버의 strict 스키마는 칸이 든 응답을 거부하므로,
+// 작업자는 이 머리가 있는 요청에만 칸을 싣는다. 판이 엇갈려도(새 작업자 + 옛 게시 서버) 응답이 거부되지 않는다.
+export const RATE_LIMIT_ACCEPT_HEADER = 'x-change-review-rate-limit';
+const withoutRateLimit = (result: ChangeReviewWorkerResult): ChangeReviewWorkerResult => {
+  if (!('rateLimit' in result)) return result;
+  const { rateLimit: _dropped, ...rest } = result;
+  return rest;
+};
 export type ChangeReviewWorkerResult = z.infer<typeof WorkerResultSchema>;
 const LookupShape = { version: z.literal(1), job: uuid, lease: uuid };
 // kind가 본문에 들어가 서명 digest가 끝점마다 달라진다. 한 끝점의 capability를 다른 끝점에 쓸 수 없다.
@@ -522,8 +533,9 @@ export class ChangeReviewWorker {
       trusted: { guidelines: guidelines.text, verifications: task.trusted.verifications }, untrusted: task.untrusted }, signal,
     { job: task.job, timeoutMs: Math.max(1, task.timeoutMs - (Date.now() - started)) });
     if (result.status === 'unknown') return { status: 'unknown', stopped: false };
-    if (result.status !== 'succeeded') return { status: result.status, stopped: true, ...(result.reason ? { reason: result.reason.slice(0, 100) } : {}) };
-    return { status: 'succeeded', stopped: true, sessionId, problems: [], output: result.output };
+    const rateLimit = result.rateLimit ? { rateLimit: result.rateLimit } : {};
+    if (result.status !== 'succeeded') return { status: result.status, stopped: true, ...(result.reason ? { reason: result.reason.slice(0, 100) } : {}), ...rateLimit };
+    return { status: 'succeeded', stopped: true, sessionId, problems: [], output: result.output, ...rateLimit };
   }
   private async readBase(task: ChangeReviewTask, signal: AbortSignal): Promise<{ kind: 'ok'; text: string | null; entries: ReturnType<typeof readArchive> } | { kind: 'problem'; problem: string } | { kind: 'failed'; reason: string }> {
     const { archive, blobSha, verifiable } = task.trusted.guidelines;
@@ -611,13 +623,18 @@ export function changeReviewRoutes(worker: Pick<ChangeReviewWorker, 'review' | '
     let input: unknown;
     try { input = await readBody(req); } catch { reject(400); return; }
     const capability = auth.slice('Capability '.length);
+    const shape = req.headers[RATE_LIMIT_ACCEPT_HEADER] === '1' ? (result: ChangeReviewWorkerResult) => result : withoutRateLimit;
     try {
       if (req.url === '/v1/change-review/cancel') { send(200, await worker.cancel(CancelRequestSchema.parse(input), capability)); return; }
-      if (req.url === '/v1/change-review/result') { send(200, await worker.result(ResultLookupSchema.parse(input), capability)); return; }
+      if (req.url === '/v1/change-review/result') {
+        const found = await worker.result(ResultLookupSchema.parse(input), capability);
+        send(200, found.found ? { found: true, result: shape(found.result) } : found);
+        return;
+      }
       if (req.url === '/v1/change-review/ack') { await worker.ack(AckSchema.parse(input), capability); send(200, { acknowledged: true }); return; }
       const task = ChangeReviewTaskSchema.parse(input);
       if (accepting && !accepting()) throw new WorkerRejected('worker_closing');
-      send(200, await worker.review(task, capability, new AbortController().signal));
+      send(200, shape(await worker.review(task, capability, new AbortController().signal)));
     } catch (error) {
       if (error instanceof WorkerRejected || error instanceof Denied || error instanceof z.ZodError) reject(403);
       else send(500, { status: 'unknown', stopped: false });
@@ -632,7 +649,7 @@ export class HttpChangeReviewWorker implements ChangeReviewWorkerClient {
     if (url.protocol !== 'http:' || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('invalid_worker_service');
     this.origin = url.origin;
   }
-  private headers(capability: string) { return { 'content-type': 'application/json', authorization: `Capability ${capability}` }; }
+  private headers(capability: string) { return { 'content-type': 'application/json', authorization: `Capability ${capability}`, [RATE_LIMIT_ACCEPT_HEADER]: '1' }; }
   async review(task: ChangeReviewTask, capability: string, signal: AbortSignal): Promise<ChangeReviewWorkerResult> {
     const body = JSON.stringify(ChangeReviewTaskSchema.parse(task));
     const dispatcher = new Agent({ headersTimeout: task.timeoutMs + 30_000, bodyTimeout: task.timeoutMs + 30_000 });
@@ -860,7 +877,7 @@ export class ChangeReviewService implements ChangeReviewPort {
     if (!found.found || found.result.status === 'unknown') return null;
     if (found.result.status === 'limited' || found.result.status === 'auth_expired') {
       const reason = found.result.status === 'limited' ? 'model_limit' : 'auth_expired';
-      if (await this.waitRecovered(job, reason)) await this.deps.notifyWaiting(job, reason);
+      if (await this.waitRecovered(job, reason, found.result.rateLimit ?? null)) await this.deps.notifyWaiting(job, reason);
       await this.acknowledge(job);
       return null;
     }
@@ -872,12 +889,13 @@ export class ChangeReviewService implements ChangeReviewPort {
     return this.settle(job, key, found.result);
   }
   // 정상 응답의 store.waitForUser와 같은 대기다. 그 함수는 실행 중 lease만 받아 회수 경로의 unknown을 옮기지 못한다.
-  private async waitRecovered(job: Job, reason: 'model_limit' | 'auth_expired'): Promise<boolean> {
+  private async waitRecovered(job: Job, reason: 'model_limit' | 'auth_expired', rateLimit: RateLimitInfo | null): Promise<boolean> {
     return this.db.transaction(async tx => {
       await this.deps.store.lockScheduler(tx);
       const moved = (await tx.query(`UPDATE jobs SET state='waiting_user',wait_reason=$3,finished_at=$4 WHERE id=$1 AND lease_token=$2
         AND (state='unknown' OR (state='failed' AND wait_reason='stop_confirmed_after_unknown')) RETURNING id`, [job.id, job.lease_token, reason, this.deps.store.now()])).rows.length > 0;
       if (moved) {
+        await this.deps.store.recordPause(job.id, reason, rateLimit, tx);
         await tx.query(`UPDATE controls SET value='true' WHERE key='scheduler'`);
         await tx.query('DELETE FROM controls WHERE key=$1', [`unknown_probe:${job.id}`]);
       }
@@ -903,6 +921,8 @@ export class ChangeReviewService implements ChangeReviewPort {
   }
   // 멈춤이 확인된 결과로 receipt를 만든다. 비공개 저장 → receipt 기록 → job 종료 → ack 순서라 어느 단계에서 끊겨도 작업자 결과로 다시 올 수 있다.
   private async settle(job: Job, key: EvidenceKey, result: Extract<ChangeReviewWorkerResult, { status: 'succeeded' }>): Promise<ReviewReceipt | null> {
+    // 대기가 아닌 응답의 한도 경고도 계정 기록에 남긴다(리뷰 미루기, AC-17). 기록 실패가 receipt 저장을 막지 않는다.
+    await this.deps.store.observeRateLimit(result.rateLimit, job.id).catch(() => {});
     if ((await this.authorSessions(key.changeId)).has(result.sessionId)) { await this.closeJob(job, 'failed', 'author_session_reused'); return null; }
     let output: ChangeReviewOutput | null = null;
     if (result.output !== null) {
@@ -1027,7 +1047,7 @@ export class ChangeReviewService implements ChangeReviewPort {
       stopped = true;
       if (result.status === 'limited' || result.status === 'auth_expired') {
         const reason = result.status === 'limited' ? 'model_limit' : 'auth_expired';
-        await store.waitForUser(job, reason);
+        await store.waitForUser(job, reason, { rateLimit: result.rateLimit ?? null });
         await this.deps.notifyWaiting(job, reason);
         await this.acknowledge(job);
         return;

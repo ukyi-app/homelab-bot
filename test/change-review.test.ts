@@ -18,6 +18,7 @@ import { ReviewReceiptSchema, artifactDigest, gitBlobSha, reviewReceiptDigest, s
 import type { ArtifactFile, ArtifactManifest, ChangeBrief, ChangeKey, EvidenceBundle, VerificationReceipt } from '../src/change-contracts.js';
 import { ChangeStore } from '../src/change-store.js';
 import { WorkerRejected } from '../src/contracts.js';
+import type { RateLimitInfo } from '../src/contracts.js';
 import { StaticEnvCredential } from '../src/credentials.js';
 import { ClaudeReviewAdapter } from '../src/executor-claude.js';
 import { readArchive } from '../src/review-input.js';
@@ -758,6 +759,42 @@ test('T19 B2 모델 실패·한도: 확인된 실패는 receipt 없이 끝나고
   assert.deepEqual(limited.waits, ['model_limit']);
 });
 
+// AC-16·22: 자체 리뷰의 한도 대기도 일반 PR 리뷰처럼 실행기의 한도 정보로 멈춤 기록을 남긴다.
+const MINUTE = 60_000;
+const lostResponse = (worker: ChangeReviewWorker): ChangeReviewWorkerClient => ({ ...bind(worker), review: async (task, capability, signal) => {
+  await worker.review(task, capability, signal);
+  throw new Error('worker_response_uncertain');
+} });
+async function pausedReview(rateLimit: RateLimitInfo, recovered: boolean) {
+  const h = harness({ reply: () => ({ status: 'limited', rateLimit }), ...(recovered ? { client: lostResponse } : {}) });
+  const input = await reviewing();
+  assert.equal(await runReview(h, input), null);
+  const job = await jobOf(input.key);
+  assert.deepEqual([job.state, job.wait_reason], ['waiting_user', 'model_limit']);
+  return input;
+}
+for (const recovered of [false, true]) {
+  const path = recovered ? '응답 유실 뒤 회수' : '정상 응답';
+  test(`AC-16 변경 자체 리뷰(${path})의 결제 멈춤은 하루가 지나도 저절로 재개하지 않는다`, async () => {
+    const input = await pausedReview({ stop: { cause: 'billing' } }, recovered);
+    for (let hour = 1; hour <= 24; hour++) {
+      f.advance(60 * MINUTE);
+      assert.equal(await f.store.resumeDue(), 0, `${hour}시간 뒤`);
+    }
+    assert.equal((await jobOf(input.key)).state, 'waiting_user');
+  });
+  test(`AC-16 변경 자체 리뷰(${path})의 풀리는 시각이 있는 한도는 그 시각 1분 뒤에 재개하고 그 전에는 재개하지 않는다`, async () => {
+    const resetsAt = Math.floor((f.now() + 3 * 60 * MINUTE) / 1000);
+    const input = await pausedReview({ event: { status: 'rejected', resetsAt }, stop: { cause: 'rate_limit', resetsAt } }, recovered);
+    f.advance(resetsAt * 1000 + MINUTE - 1 - f.now());
+    assert.equal(await f.store.resumeDue(), 0);
+    assert.equal((await jobOf(input.key)).state, 'waiting_user');
+    f.advance(1);
+    assert.equal(await f.store.resumeDue(), 1);
+    assert.equal((await jobOf(input.key)).state, 'queued');
+  });
+}
+
 test('T19 B2 저장 실패: 비공개 저장이 실패하면 receipt를 만들지 않고 결과를 남겨 모델 없이 다시 받는다', async () => {
   let down = true;
   const h = harness({ saveFails: () => down });
@@ -926,6 +963,39 @@ test('T19 B2 HTTP: 인증 없는 요청은 본문을 읽기 전에 401, 서명 �
     const large = ChangeReviewTaskSchema.parse({ ...baseTask(), untrusted: { ...baseTask().untrusted, patch: 'xxx\n'.repeat(500_000) } });
     assert.ok(Buffer.byteLength(JSON.stringify(large)) > 2 * 1024 * 1024);
     assert.equal((await client.review(large, f.signer.issue({ id: large.job, lease_token: large.lease } as never, 'execute', large), new AbortController().signal)).status, 'succeeded');
+  } finally { await new Promise(done => server.close(done)); }
+});
+
+test('AC-17 변경 자체 리뷰가 통과하며 받은 한도 경고도 그 풀리는 시각까지 PR 리뷰를 미룬다', async () => {
+  const resetsAt = Math.floor((f.now() + 2 * 60 * MINUTE) / 1000);
+  const h = harness({ reply: () => ({ status: 'succeeded', output: OUTPUT, rateLimit: { event: { status: 'allowed_warning', resetsAt, rateLimitType: 'five_hour', utilization: 0.9 } } }) });
+  assert.equal((await runReview(h, await reviewing()))!.verdict, 'pass');
+  assert.equal(await f.store.reviewDeferredUntil(), resetsAt * 1000);
+});
+
+test('AC-16 자체 리뷰 응답의 한도 칸: 이 판의 게시 서버는 칸을 받고, 칸을 모르는 옛 게시 서버의 요청에는 칸 없이 답한다', async () => {
+  const resetsAt = Math.floor((f.now() + 60 * MINUTE) / 1000);
+  const rateLimit: RateLimitInfo = { stop: { cause: 'rate_limit', resetsAt } };
+  const h = harness({ reply: () => ({ status: 'limited', rateLimit }) });
+  const routes = changeReviewRoutes(h.worker);
+  const server: Server = createServer(async (req, res) => {
+    const route = routes.get(req.url ?? '');
+    if (route) await route(req, res); else res.writeHead(404).end();
+  });
+  await new Promise<void>(done => server.listen(0, '127.0.0.1', done));
+  try {
+    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const task = ChangeReviewTaskSchema.parse(baseTask());
+    const job = { id: task.job, lease_token: task.lease } as never;
+    const lookup = { version: 1 as const, job: task.job, lease: task.lease, kind: 'result' as const };
+    const client = new HttpChangeReviewWorker(origin, fetch);
+    assert.deepEqual(await client.review(task, f.signer.issue(job, 'execute', task), new AbortController().signal), { status: 'limited', stopped: true, rateLimit });
+    assert.deepEqual(await client.result(lookup, f.signer.issue(job, 'execute', lookup)), { found: true, result: { status: 'limited', stopped: true, rateLimit } });
+    // 옛 게시 서버(4df0a4f)의 요청 모양: 같은 본문·capability, 한도 칸을 받는다는 표시가 없다. 그 판의 strict 스키마가 받는 모양이어야 한다.
+    const old = async (path: string, body: unknown) => { f.advance(1); return (await fetch(`${origin}${path}`, { method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Capability ${f.signer.issue(job, 'execute', body as never)}` }, body: JSON.stringify(body) })).json(); };
+    assert.deepEqual(await old('/v1/change-review', task), { status: 'limited', stopped: true });
+    assert.deepEqual(await old('/v1/change-review/result', lookup), { found: true, result: { status: 'limited', stopped: true } });
   } finally { await new Promise(done => server.close(done)); }
 });
 

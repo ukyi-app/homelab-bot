@@ -37,8 +37,9 @@ export type AdminResult = 'stopped' | 'already_stopped' | 'released' | 'not_stop
   | 'blocked' | 'already_blocked' | 'not_releasable' | 'resumed' | 'not_waiting' | 'emergency_stopped' | 'queue_full'
   | 'recorded' | 'accounts' | 'switched' | 'unknown_account';
 // 계정 전환 뒤 해제의 결과. resumed는 다시 큐에 넣은 작업 수, waiting은 아직 모델 멈춤으로 기다리는 수,
-// held는 비상 정지·큐 상한으로 해제를 못 한 이유(없으면 null).
-export type AccountSwitch = { resumed: number; waiting: number; held: 'emergency_stopped' | 'queue_full' | null };
+// held는 비상 정지로 해제를 못 했으면 그 이유, 아니면 null. 대기열 상한은 해제를 막지 않는다(Store.resumeWaiting).
+// 결과 이름 queue_full은 homelab CLI 집합과 맞추려고 AdminResult에 남아 있고 지금은 내지 않는다.
+export type AccountSwitch = { resumed: number; waiting: number; held: 'emergency_stopped' | null };
 export type AdminReport = { schema: typeof ADMIN_SCHEMA; command: string; result: AdminResult; state?: AdminState;
   accounts?: AccountView[]; paused?: PausedCounts; switch?: AccountSwitch };
 

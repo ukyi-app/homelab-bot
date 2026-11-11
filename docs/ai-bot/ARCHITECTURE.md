@@ -2162,3 +2162,12 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 **브리핑 "모델·작업" 칸.** 비상 정지 줄과 자리 비움 줄을 따로 낸다. 비상 정지(`scheduler_emergency`)는 `BRIEFING_TEXT.modelStopped`(스위치 두 판), 모델 멈춤(한도·인증·결제 대기 작업이 있거나 비상 정지 없이 `scheduler`가 닫힘)은 `BRIEFING_TEXT.modelAway`(원인·'/' 이름 없음, 대기 건수만)다. 둘 다 없으면 "중지 신호 없음"이다. 작업 레인 줄의 대기 건수 이름은 "모델 대기"다. 위 "브리핑 칸"(작업 레인)의 "한도·인증 대기"는 이 이름으로 읽는다. 원인·풀리는 시각·할 일은 C21 운영 알림(Telegram)에만 있다.
 
 **명령 수신 안내.** 변경·세션 연결 명령의 처리기 예외 답과 응답을 전하지 못했을 때 채널에 남기는 고정 안내(`ack-notice:<이벤트>`)는 `src/discord.ts` `COMMAND_INGRESS_TEXT`에서 `Store.colleague`로 판을 고른다. 게시 승인 버튼(`pressPublish`)의 응답 실패 안내도 같은 `changeAckLost`다.
+
+## C36 묶음 A 한도·계정 (2026-11-11)
+
+앞 절의 문장 중 이 절과 다른 것은 이 절이 앞선다(§12 "T16b 실행기 프로필"의 "미게시 후보 리뷰는 … 결과 스키마에 칸이 없어 싣지 않는다", §12 "T18 게시 서버 스케줄링과 질문"의 "`/resume-model`·`/review-resume`도 같은 모델 상한이다"). 이유와 대안은 [DECISIONS](DECISIONS.md) "C36 묶음 A".
+
+- **자체 리뷰 한도 칸:** `/v1/change-review`와 `/v1/change-review/result`의 결과(성공·`limited`·`auth_expired`·`failed`)에 선택 칸 `rateLimit`(`RateLimitInfoSchema`)이 있다. 작업자는 요청에 머리 `x-change-review-rate-limit: 1`이 있을 때만 싣고, 없으면 칸 없는 지금 모양으로 답한다. 게시 서버는 그 칸으로 멈춤 기록(정상·회수 경로 모두 `Store.recordPause`)과 리뷰 미루기(성공 결과)를 적는다.
+- **멈춤 기록의 전환 경계:** `Store.recordPause`는 그 실행이 지금 계정으로 바뀌기 전(`jobs.started_at <= model_accounts.switched_at`)에 시작했으면 원인·시각을 버리고 1분 뒤 재시도로 적는다. 판정은 `observeRateLimit`과 같은 함수이고 둘 다 scheduler 행 잠금 아래다.
+- **재개와 대기열 상한:** `Store.resumeWaiting`을 부르는 다섯 진입점(재개 예약 루프, 계정 전환, 관리 진입점 재개, `/resume-model`, `/review-resume`)은 `queueFull`을 보지 않는다. 상한은 새 접수에만 걸린다. 재개 직후 모델 queued가 90을 멈춘 작업 수만큼 넘을 수 있다.
+- **변경 작성 snapshot의 관측:** `ClaudeChangeAuthor.fetchResult`가 검증한 `snapshot`의 `rateLimit`을 `observeRateLimit`으로 적는다. 그래서 대화·리뷰·작업 레인·변경 작성·자체 리뷰 결과의 `allowed_warning`이 모두 리뷰 미루기를 건다.

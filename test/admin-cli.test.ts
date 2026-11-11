@@ -428,7 +428,7 @@ test('계정 전환: 전환 전에 시작한 대화·작업 실행이 전환 뒤
   assert.deepEqual((await limitState()).map(row => row.utilization), [0.97]);
   assert.notEqual(await f.store.reviewDeferredUntil(), null);
   // 작업 레인: 실행 중에 main으로 바꾸고(전환이 한도 상태를 비운다), 옛 자격으로 돈 실행이 한도 경고를 실은 한도 멈춤으로 끝난다.
-  // 멈춤 기록과 30분 재시도는 그대로 남아 새 자격으로 다시 돈다.
+  // 멈춤 기록은 원인 모를 한도로 남아 곧(1분 뒤) 새 자격으로 다시 돈다.
   const local = lane(f);
   local.worker.scripts.push(async (request, worker) => { await switchMidRun('main');
     return { ...reply.limited()(request, worker), rateLimit: { event: warned(), stop: { cause: 'rate_limit' } } }; });
@@ -439,6 +439,51 @@ test('계정 전환: 전환 전에 시작한 대화·작업 실행이 전환 뒤
   assert.deepEqual(pause.map(row => [row.kind, row.retry_at !== null]), [['rate_limit', true]]);
   assert.deepEqual(await limitState(), []);
   assert.equal(await f.store.reviewDeferredUntil(), null);
+});
+
+// AC-16·21: 전환 전에 시작한 실행의 멈춤은 옛 계정의 사실이다. 새 계정을 그 결제·풀리는 시각까지 세우지 않는다.
+const MINUTE = 60_000;
+const chatJob = async () => (await database.db.query<{ id: string; state: string }>("SELECT id,state FROM jobs WHERE type='chat' ORDER BY created_at")).rows;
+for (const [name, stop] of [
+  ['결제 멈춤으로', { cause: 'billing' as const }],
+  ['일주일 뒤 풀리는 한도로', { cause: 'rate_limit' as const, resetsAt: 0 }],
+] as const) test(`계정 전환: 전환 전에 시작한 실행이 전환 뒤 ${name} 끝나도 새 계정은 1분 뒤 저절로 이어서 한다`, async () => {
+  await admin('account', 'record', 'main', 'subscription');
+  await admin('account', 'record', 'spare', 'subscription');
+  await admin('account', 'use', 'main', 'subscription');
+  const resetsAt = Math.floor((f.now() + 7 * 24 * 60 * MINUTE) / 1000);
+  f.setRun(async () => { await switchMidRun('spare');
+    return { status: 'limited', stopped: true, rateLimit: { stop: stop.cause === 'billing' ? stop : { ...stop, resetsAt } } }; });
+  await queued('old-run');
+  assert.equal(await f.runtime.tick(), true);
+  assert.deepEqual((await chatJob()).map(row => row.state), ['waiting_user']);
+  f.advance(MINUTE - 1);
+  assert.equal(await f.store.resumeDue(), 0);
+  f.advance(1);
+  assert.equal(await f.store.resumeDue(), 1);
+  assert.deepEqual((await chatJob()).map(row => row.state), ['queued']);
+  assert.equal(await flag('scheduler'), false);
+  // 새 자격으로 다시 돈다.
+  f.setRun(async () => ({ status: 'succeeded', stopped: true, rateLimit: null, output: { reply: '이어서 답했어요.', proposal: null, ack_only: false } }));
+  assert.equal(await f.runtime.tick(), true);
+  assert.deepEqual((await chatJob()).map(row => row.state), ['succeeded']);
+});
+
+test('계정 전환: 전환 뒤에 시작한 실행의 결제 멈춤은 하루가 지나도 저절로 재개하지 않는다', async () => {
+  await admin('account', 'record', 'main', 'subscription');
+  await admin('account', 'record', 'spare', 'subscription');
+  await admin('account', 'use', 'main', 'subscription');
+  await switchMidRun('spare');
+  f.setRun(async () => ({ status: 'limited', stopped: true, rateLimit: { stop: { cause: 'billing' } } }));
+  f.advance(1);
+  await queued('new-run');
+  assert.equal(await f.runtime.tick(), true);
+  for (let hour = 1; hour <= 24; hour++) {
+    f.advance(60 * MINUTE);
+    assert.equal(await f.store.resumeDue(), 0, `${hour}시간 뒤`);
+  }
+  assert.deepEqual((await chatJob()).map(row => row.state), ['waiting_user']);
+  assert.equal(await flag('scheduler'), true);
 });
 
 test('계정 전환 잠금 순서: 전환과 모델 대기가 모두 scheduler 행을 한도 상태(model_limit_state)보다 먼저 잡는다', async () => {
