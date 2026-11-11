@@ -324,7 +324,8 @@ export class MemoryCommands implements MemoryCommandHandler {
       // here: 이 명령을 쓴 채널·스레드. 그 채널을 출처로 한 대화·작업 기억이 모두 빠진다(memory.ts 출처 키).
       const key = raw === 'here' ? `channel:${scope.channel}` : raw;
       const { hidden } = await this.memory.exclude(actor, scope, key);
-      return `${MEMORY_TEXT.excluded(clip(key, 200), hidden)} ${this.guide.deleteExcluded}`;
+      // here는 채널 ID 없이 그대로 적는다. 말로 한 저장 제외의 결과는 스레드 일반 글로도 나가고, 채널 ID는 공개 검사에 걸린다.
+      return `${MEMORY_TEXT.excluded(clip(raw === 'here' ? 'here' : key, 200), hidden)} ${this.guide.deleteExcluded}`;
     }
     const ids = parseIds(target);
     if (ids.length !== 1) throw new CommandInputError('memory_cmd_id', INPUT_ERROR.deleteOne);
