@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { Postgres, migrate } from '../src/database.js';
 import { recordAccount, switchAccount } from '../src/model-accounts.js';
+import { Store } from '../src/store.js';
 import { fixture } from './helpers.js';
 
 // C22 넘김(C23 할 일 4a): 계정 전환과 겹친 옛 실행의 한도 관측. 실제 PostgreSQL 두 연결에서 본다(PGlite는 트랜잭션을 직렬화해
@@ -126,5 +127,27 @@ test('AC-16·21 전환 커밋과 겹쳐 도착한 옛 실행의 결제 멈춤은
     f.advance(60_000);
     assert.equal(await f.store.resumeDue(), 1);
     assert.equal((await db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler'")).rows[0]!.value, false);
+  });
+});
+
+test('AC-16 게시 서버 둘의 재개 예약 루프가 겹쳐도 상한인 대기열 뒤의 멈춤 작업을 한 번씩만 재개하고 scheduler를 푼다', { skip }, async () => {
+  await freshDatabase('c36queue', async db => {
+    const f = await fixture(db);
+    const paused = ['paused-1', 'paused-2'];
+    const fillers = Array.from({ length: 89 }, (_, i) => `filler-${i + 1}`);
+    await db.query(`INSERT INTO events(id,provider,delivery_id,semantic_key,actor_id,scope,received_at,payload)
+      SELECT id,'discord',id,id,'fixture-owner','{}',0,'{}' FROM unnest($1::text[]) id`, [[...paused, ...fillers]]);
+    await db.query(`INSERT INTO jobs(id,event_id,type,owner_id,target,revision,budget,state,wait_reason,attempt,priority,available_at,created_at,finished_at)
+      SELECT id,id,'chat','fixture-owner','{}','{}','{}','waiting_user','model_limit',0,10,0,$2,$2 FROM unnest($1::text[]) id`, [paused, f.now()]);
+    await db.query(`INSERT INTO model_pauses(job_id,kind,retry_at,paused_at) SELECT id,'rate_limit',$2,$2 FROM unnest($1::text[]) id`, [paused, f.now()]);
+    await db.query(`INSERT INTO jobs(id,event_id,type,owner_id,target,revision,budget,state,attempt,priority,available_at,created_at)
+      SELECT id,id,'task','fixture-owner','{}','{}','{}','queued',0,10,0,$2 FROM unnest($1::text[]) id`, [fillers, f.now()]);
+    await db.query(`INSERT INTO controls VALUES ('scheduler','true'),('scheduler_emergency','false') ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`);
+    const other = new Store(db, f.now);
+    const counts = await Promise.all([f.store.resumeDue(), other.resumeDue()]);
+    assert.equal(counts[0]! + counts[1]!, 2);
+    assert.deepEqual((await db.query<{ state: string }>('SELECT state FROM jobs WHERE id=ANY($1::text[])', [paused])).rows.map(row => row.state), ['queued', 'queued']);
+    assert.equal((await db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler'")).rows[0]!.value, false);
+    assert.equal((await db.query("SELECT 1 FROM audit WHERE kind='model_wait_resumed'")).rows.length, 2);
   });
 });

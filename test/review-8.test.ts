@@ -102,7 +102,8 @@ test('4316099215 다른 actor·대화·잘못된 원인·unknown은 resume으로
   assert.equal((await control('resume-model', 'emergency-stop')).ok, false); assert.equal((await control('cancel', job.id)).ok, false);
   assert.equal(await flag(), true); assert.equal((await rows('jobs'))[0]!.state, 'unknown');
 });
-test('4316099215 resume 대상 누락·재시도 상한·큐 상한은 차단하고 cancel은 가능', async () => {
+// 큐 상한은 새 접수만 막는다. 이미 접수된 멈춤 작업의 재개는 상한이어도 받는다(C36 F-3).
+test('4316099215 resume 대상 누락·재시도 상한은 차단하고, 큐 상한이어도 재개는 받는다', async () => {
   const job = await paused();
   await assert.rejects(f.ingress.receive(event('missing', { kind: 'command', command: 'resume-model' })), Denied);
   await database.db.query('UPDATE jobs SET attempt=$1', [DEFAULTS.maxRetries + 1]);
@@ -112,7 +113,10 @@ test('4316099215 resume 대상 누락·재시도 상한·큐 상한은 차단하
     const saved = await f.store.save(event(`queue-${i}`, { kind: 'command', command: 'task' }), f.policy.revision, false);
     await f.store.accept(saved.id, 'task', f.policy.revision);
   }
-  assert.equal((await control('resume-model', job.id, 'full')).ok, false); assert.equal(await flag(), true);
+  assert.equal((await control('resume-model', job.id, 'full')).ok, true); assert.equal(await flag(), false);
+});
+test('4316099215 대기 중인 작업은 cancel로 끝내면 scheduler가 풀린다', async () => {
+  const job = await paused();
   await control('cancel', job.id); assert.equal(await flag(), false);
 });
 for (const stage of ['scheduler', 'outbox']) test(`4316099215 재개 중 ${stage} 쓰기 실패는 job과 scheduler 모두 rollback`, async () => {

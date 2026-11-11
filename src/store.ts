@@ -815,19 +815,21 @@ export class Store {
     return this.atomic(store => store.controlLocked(actor, conversation, action, target, cursor));
   }
   // 관리 기능의 멈춘 작업 재개(COLLEAGUE_SPEC §4.8). 권한의 근거는 클러스터 접근이라 owner·대화·구독을 대조하지 않는다.
-  // 나머지 조건은 '/resume-model <job>'과 같다: 비상 정지가 없고, 큐에 자리가 있고, 그 작업이 한도·인증 대기이고, 시도 한도 안이다.
+  // 나머지 조건은 '/resume-model <job>'과 같다: 비상 정지가 없고, 그 작업이 한도·인증 대기이고, 시도 한도 안이다.
   // 리뷰 작업은 review-resume이 맡고 '/resume-model'도 대화가 달라 닿지 않으므로 여기서도 고르지 않는다.
-  async adminResumeJob(job: string, actor: string): Promise<'resumed' | 'not_waiting' | 'emergency_stopped' | 'queue_full'> {
+  async adminResumeJob(job: string, actor: string): Promise<'resumed' | 'not_waiting' | 'emergency_stopped'> {
     return this.atomic(async store => {
       await store.lockScheduler();
       const emergency = (await store.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler_emergency'")).rows[0]!.value;
       if (emergency) return 'emergency_stopped';
-      if (await store.queueFull('chat')) return 'queue_full';
       return await store.resumeWaiting(job, actor, { types: 'model' }) ? 'resumed' : 'not_waiting';
     });
   }
-  // 한도·인증 대기 작업 하나를 대기열로 되돌리는 전이. '/resume-model <job>', 관리 진입점 재개, '/review-resume', 재개 예약 루프가
-  // 모두 이것을 부른다. 부르는 쪽이 스케줄러 행을 잠그고 비상 정지·큐 상한을 먼저 본다. 작업 행만 바꾸므로 계정·모델·실행기는 그대로다.
+  // 한도·인증 대기 작업 하나를 대기열로 되돌리는 전이. '/resume-model <job>', 관리 진입점 재개, '/review-resume', 재개 예약 루프,
+  // 계정 전환이 모두 이것을 부른다. 부르는 쪽이 스케줄러 행을 잠그고 비상 정지를 먼저 본다. 작업 행만 바꾸므로 계정·모델·실행기는 그대로다.
+  // 대기열 상한(queueFull)은 보지 않는다. 이 작업은 이미 접수돼 상한 안에서 자리를 받았던 것이고, 상한은 새 접수만 막는다.
+  // 상한으로 재개를 막으면 멈춘 작업이 남아 scheduler가 닫힌 채고, 닫힌 scheduler 때문에 대기열도 줄지 않아 서로를 기다린다.
+  // 그래서 재개 뒤 잠깐 상한을 넘을 수 있고(최대 멈춘 작업 수만큼), 그동안 새 모델 요청은 받지 않는다.
   // 결과가 undefined면 바꾸지 않았다(대기가 아니거나, 시도 한도이거나, 조건이 맞지 않음).
   private async resumeWaiting(job: string, actor: string,
     match: { types: 'model' | 'review' | 'any'; owner?: string; conversation?: string }): Promise<{ paused: boolean } | undefined> {
@@ -848,7 +850,7 @@ export class Store {
     return { paused };
   }
   // 재개 예약 루프 한 바퀴(main.ts가 주기로 부른다). 다음 재시도 시각이 지난 한도·인증 대기를 같은 전이로 되돌리고 그 수를 낸다.
-  // 비상 정지 중에는 아무것도 하지 않는다. 결제 멈춤은 재시도 시각이 없어 고르지 않는다. 큐가 차면 다음 바퀴에 다시 본다.
+  // 비상 정지 중에는 아무것도 하지 않는다. 결제 멈춤은 재시도 시각이 없어 고르지 않는다. 대기열 상한은 보지 않는다(resumeWaiting).
   // 멈춤 기록이 없는 대기(이 기록을 쓰기 전의 판이 남긴 것)는 시각을 모르는 한도처럼 처음 본 때부터 30분 뒤로 잡고,
   // 그 멈춤도 시도로 세지 않는다(recordPause와 같은 규칙).
   async resumeDue(): Promise<number> {
@@ -864,14 +866,11 @@ export class Store {
         await store.db.query('UPDATE jobs SET attempt=GREATEST(0,attempt-1) WHERE id=ANY($1::text[])', [legacy.map(row => row.id)]);
         await store.audit('model_pause_backfilled', AUTO_RESUME_ACTOR, { jobs: legacy.map(row => row.id) });
       }
-      const due = (await store.db.query<{ id: string; type: Job['type'] | 'review' }>(`SELECT j.id,j.type FROM model_pauses p JOIN jobs j ON j.id=p.job_id
+      const due = (await store.db.query<{ id: string }>(`SELECT j.id FROM model_pauses p JOIN jobs j ON j.id=p.job_id
         WHERE j.state='waiting_user' AND j.wait_reason IN ('model_limit','auth_expired') AND p.retry_at IS NOT NULL AND p.retry_at<=$1
         ORDER BY p.retry_at,j.created_at,j.id`, [now])).rows;
       let resumed = 0;
-      for (const row of due) {
-        if (await store.queueFull(row.type)) break;
-        if (await store.resumeWaiting(row.id, AUTO_RESUME_ACTOR, { types: 'any' })) resumed++;
-      }
+      for (const row of due) if (await store.resumeWaiting(row.id, AUTO_RESUME_ACTOR, { types: 'any' })) resumed++;
       return resumed;
     });
   }
@@ -888,7 +887,6 @@ export class Store {
     if (action === 'review-resume') {
       const emergency = (await this.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler_emergency'")).rows[0]!.value;
       if (emergency) return { ok: false, status: T.emergencyHeld(this.colleague) };
-      if (await this.queueFull('review')) return { ok: false, status: T.queueFullResume };
       const changed = target === undefined ? undefined : await this.resumeWaiting(target, actor, { types: 'review' });
       if (!changed) return { ok: false, status: T.reviewNotWaiting(this.colleague) };
       return { ok: true, paused: changed.paused, status: T.reviewResumed };
@@ -957,7 +955,6 @@ export class Store {
       const emergency = (await this.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler_emergency'")).rows[0]!.value;
       if (emergency) return { ok: false, status: T.emergencyHeld(this.colleague) };
       if (!current?.active || current.gap) return { ok: false, status: T.subscriptionGap };
-      if (await this.queueFull('chat')) return { ok: false, status: T.queueFullResume };
       const changed = target === undefined ? undefined : await this.resumeWaiting(target, actor, { types: 'any', owner: actor, conversation });
       if (!changed) return { ok: false, status: T.jobNotWaiting(this.colleague) };
       return { ok: true, paused: changed.paused, status: T.jobResumed };
