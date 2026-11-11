@@ -132,6 +132,7 @@
 | | (C23, Claude 프로필) `CLAUDE_AUTH_METHOD`(방식 표시 `subscription`·`api`, 없으면 구독), `ANTHROPIC_API_KEY`·`ANTHROPIC_API_KEY_TASK`(레인별 Console API 키). 작업 레인 구독 토큰은 `CLAUDE_CODE_OAUTH_TOKEN_TASK`(T18) | 두 레인 Secret 모두 파일 `CLAUDE_AUTH_METHOD`·`CLAUDE_CODE_OAUTH_TOKEN`·`ANTHROPIC_API_KEY`(작업 레인은 `_TASK` 원격 키를 같은 파일 이름으로). 작업자는 실행마다 방식 표시가 고른 자격 하나만 env에 넣고, 표시와 자격이 맞지 않으면 실행하지 않는다. 안 쓰는 방식의 키는 값 `unset`(ExternalSecret이 키를 요구해서 지우지 않는다). 쓰는 것은 `homelab bot account use`뿐이다([DECISIONS](DECISIONS.md) "C23 API 크레딧 방식") |
 | `/bot-accounts/<계정 이름>` | `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN_TASK`(계정의 두 레인 구독 토큰, C22), `ANTHROPIC_API_KEY`, `ANTHROPIC_API_KEY_TASK`(두 레인 Console API 키, C23) | 아무 실행체도 읽지 않는다. owner가 `homelab bot account add [--by api]`로 넣고 `homelab bot account use [--by api]`가 지금 계정·방식의 값을 `/apps/homelab-bot/worker`의 같은 키로 옮긴다. 작업자 store(`/apps/homelab-bot/worker`)와 앱 store(`/apps`) 기본 경로 밖이고 이 폴더를 읽는 ExternalSecret이 없다. 봇 DB `model_accounts`에는 이름·방식·발급일·지금 표시만 있다(값 없음) |
 
+- 한도 뒤 API 사용(C38)이 켜진 계정은 작업자 키에 두 방식의 자격을 함께 두고(안 쓰는 방식 `unset` 없음) 계정 묶음 식별 정보를 더한다. 맨 끝 "C38" 절이 앞선다.
 - 작업자 경로에는 모델 자격 외에 아무것도 두지 않는다 [확인: 설계 C.8]. Kubernetes SA `bot-reader` 토큰은 Infisical이 아니라 공유 차트의 `serviceAccountName`으로 받는다 [확인: 설계 C.4.5].
 - `ARGOCD_READER_TOKEN`(과 주소 `ARGOCD_URL`)은 없앴다(D9, 사용자 2026-10-30). `argocd-server`는 설계상 자체 서명 TLS만 써서 봇이 서버 인증서를 검증할 수 없고(사람용 Tailscale 프록시도 https+insecure로 붙는다), 봇이 읽는 것은 앱 객체 하나다. 그래서 Argo CD 앱 상태는 SA `bot-reader`(`get applications.argoproj.io -n argocd`)로 Kubernetes API의 Application CR을 읽는다. Kubernetes API는 SA의 클러스터 CA로 TLS를 검증한다. Infisical에 이미 넣은 값이 있으면 봇은 읽지 않으니 지워도 된다.
 - App ID는 비밀이 아니지만 값 목록을 한곳에 모으려고 같은 경로에 둔다 [가정].
@@ -141,6 +142,8 @@
 ### 5.1 작업자에 구독 인증 파일이 있는 구조 (D-14·D-15)
 
 > D-14 변경(사용자 2026-10-30) 뒤 첫 운영 프로필은 Claude 구독 장기 토큰이다. 토큰은 회전 파일이 아니라 Secret 볼륨 파일 + 실행 중 모델 CLI 자식의 env 변수 하나에 있다(§12 "T16b 실행기 프로필"). 아래 대책과 남는 위험(같은 파드·UID의 비신뢰 코드가 자격을 읽을 수 있음, 작업별 세션 분리, 인증 파일 분리)은 토큰에도 같은 뜻으로 적용된다. T16b 대화 레인은 Claude 도구를 모두 끄고(`--tools ""`, MCP 없음, 실행 중 도구 호출 = 즉시 중단) 비신뢰 코드를 실행하지 않는다. 갱신본 되쓰기 항목은 Codex 프로필에만 해당한다.
+
+> 한도 뒤 API 사용(C38)이 켜지면 작업자 Secret의 자격이 레인마다 둘(구독 토큰, API 키)이 된다. 실행 env에는 하나뿐이지만 같은 파드의 비신뢰 코드가 읽을 수 있는 값이 는다. 맨 끝 "C38" 절.
 
 D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 있다. 같은 파드에서 PR 코드의 패키지 설치·시험과 Codex가 띄우는 셸 명령이 돈다. 공식 문서는 비대화 실행에 키를 줄 때 같은 환경에서 비신뢰 코드가 돌지 않게 하라고 하고, 빌드 스크립트·시험·의존성 lifecycle 훅이 그 환경 변수를 읽을 수 있다고 적는다 [확인: https://learn.chatgpt.com/docs/non-interactive-mode]. 이 경고는 API 키 환경 변수에 대한 것이지만 같은 파일시스템의 `auth.json`에도 같은 이치가 적용된다 [가정].
 
@@ -189,6 +192,8 @@ D-14 A라서 작업자 파드에는 장기 갱신 토큰이 든 `auth.json`이 �
 | 프롬프트 인젝션 | 로그·PR 본문·댓글·변경된 `AGENTS.md`·기억은 자료 블록으로만 넘긴다. 리뷰 기준은 기준 리비전의 지침만. 허용 봇 작성자(Renovate 등)의 PR 본문도 비신뢰 자료(D-16 하위 결정) | SEC-01 |
 | 현재 vs 과거 | 결과마다 `head_sha`·`comparison_revision`·`policy_revision`·관측 시각. 셋 중 하나라도 바뀌면(새 head, base 이동·재지정, 새 정책) 이전 결과 `superseded`(§7 대조) | REVIEW-02, R06 |
 | 자동 실행 | V1에는 운영 실행 경로가 없다 | 해당 없음 |
+
+**실행 방식 선택(C38):** 한도 뒤 API 사용이 켜지면 구독·API 중 어느 자격으로 돌지는 게시 서버가 서명한 요청 칸으로만 정해지고, 작업자는 설치된 계정 묶음과 대조한 뒤 그 하나만 쓴다. 모델 출력은 방식을 고르지 못한다. 맨 끝 "C38" 절.
 
 **외부인 입력:** 봇 저장소와 앱 저장소가 public이라(D-29) 모델 호출 전 게이트를 둔다. 설치·저장소 허용, fork 제외, `author_association` 또는 허용 봇 작성자 ID(D-16 하위 결정). `CONTRIBUTOR`는 허용하지 않는다. 댓글 트리거는 `comment.author_association`을 보고 Bot 댓글은 무시한다. 댓글 트리거도 대상 PR을 조회해, 같은 저장소 PR이고 PR 작성자가 자동 리뷰와 같은 조건일 때만 모델을 호출한다(DECISIONS D-16 규칙 스케치).
 
@@ -2238,3 +2243,45 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
   - `SearchParts`(`src/memory-commands.ts`)는 `{ body: string | null; withheld: number }`다. `body`는 실린 기억의 본문(실린 기억이 없으면 `null`), `withheld`는 뺀 internal 건수다. `searchParts(found, threadReply)`가 만들고, `searchText`는 `joinWithheld(body, withheld)`(본문 뒤에 `MEMORY_TEXT.withheld(N)` 한 줄, `N`이 0이면 본문만)로 합친 글이다. 출력 글은 위 계약 그대로다.
   - `MemoryCommandReply.parts?`: 말로 한 검색(`threadReply`)이 성공했을 때만 `SearchParts`가 실린다. `content`는 그 둘을 합친 글과 같다. '/memory-search'와 실패 응답에는 없다.
   - `ReadHandler.run`(`src/proposals.ts`)은 `string | ReadSkip | SearchParts`를 돌려준다. `SearchParts`는 `memorySearchHandler`만 돌려준다(`reply.parts ?? reply.content`). `ProposalDesk.consider`는 `body`만 `chatReplyRisk`로 보고, 걸리면 `PROPOSAL_TEXT.readWithheld`로 바꾼 뒤 `joinWithheld`로 건수 줄을 붙인다. 문자열 결과는 `withheld` 0으로 다뤄 다른 읽기 처리기의 글은 같다.
+
+## C38 한도 뒤 API 사용 설계 계약 (2026-11-12)
+
+명세 [COLLEAGUE_SPEC](COLLEAGUE_SPEC.md) §4.11·AC-32~AC-43, 결정 [DECISIONS](DECISIONS.md) "C38"의 설계 계약이다. 아직 코드가 없다. 칸·표·명령 이름은 제안이고 구현 티켓(C39~C43)이 정한다. 스위치가 꺼져 있으면 §5·§12·C23의 지금 계약 그대로다.
+
+**1. 게시 서버가 실행마다 방식을 골라 서명한다(C40).**
+
+- 입력은 스위치, 지금 계정과 설치된 묶음 revision, 구독 상태, API 상태다. 고른 방식은 서명된 요청의 신뢰 칸(계정, 묶음 revision, 방식, 실행 ID)에 싣고 본문 digest와 capability에 넣는다. 모델 출력이나 모델이 만든 글은 이 칸이 되지 않는다.
+- 상태는 셋으로 나눈다: (1) owner가 설치한 지금 계정·묶음 revision, (2) 구독 상태(쓸 수 있음 / 한도(풀리는 시각, 다음 확인 시각) / 인증 막힘)와 API 상태(쓸 수 있음 / 결제 막힘 / 인증 막힘), (3) 실행마다 고정된 방식·실행 ID·revision. 지금의 한 행 `model_limit_state(id='account')`와 작업별 `model_pauses`만으로 두 방식의 시각을 표현하지 않는다.
+- 넘어감은 scheduler 행 잠금 아래 한 트랜잭션이고 기대 epoch 비교로 한 번만 일어난다. API를 쓸 수 있는 동안 전역 scheduler를 모델 한도로 닫아 두지 않는다(지금 `Store.waitForUser`가 닫는 자리를 함께 바꾼다). 쓸 방식이 하나도 없으면 지금처럼 모델 대기다.
+- owner 계정 전환의 `switchAccount`는 쓰지 않는다. 그 함수는 모든 모델 대기를 풀고 한도 상태를 비운다. 방식 선택·복귀는 좁은 전이다.
+- 구독 확인은 `MODEL_RESUME`(풀리는 시각 + 1분, 모르면 30분)을 쓰고, 재개 예약 루프가 실제로 기다리는 작업 하나만 구독으로 고른다. 빈 큐에는 호출하지 않는다.
+- 결과는 요청에 저장한 계정·revision·실행 ID로 귀속한다. 지금의 `startedBeforeSwitch` 밀리초 비교는 옛 판 응답 호환용으로만 남는다.
+
+**2. 작업자는 같은 계정의 두 자격 중 지정된 하나만 실행 env에 넣는다(C39).**
+
+- 대화, PR 리뷰, 변경 자체 리뷰, 작업(v1·v2)에 방식 선택이 든 새 요청 판(또는 명시적 협상)을 둔다. 옛 판의 필드·직렬화 순서는 그대로이고, 옛 요청에 선택 칸을 몰래 더하지 않는다. 지금 해당 스키마는 모두 strict이고 digest는 키 순서도 계약이다.
+- 작업자는 두 자격(레인마다 구독 토큰과 API 키)과 계정 묶음을 읽어 요청의 계정·revision과 대조한다. 맞으면 지정된 방식의 변수 하나(`CLAUDE_CODE_OAUTH_TOKEN` 또는 `ANTHROPIC_API_KEY`)만 실행 env에 넣는다. 어긋남·누락·`unset`·섞인 조합이면 모델 호출 없이 거부하고, 게시 서버가 일반 `WorkerRejected → failed`와 구분해 비실행 재대기로 다룰 수 있는 응답을 낸다.
+- 두 자격 모두 출력 반사·유출 검사와 작업 sandbox 가림(`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`) 대상이다.
+- 새 판 요청에만 새 응답 칸(실제 방식·revision·실행 ID)을 낸다. unknown이라도 실행이 시작됐으면 채운다. 저장해 둔 결과(변경 자체 리뷰 `ChangeReviewResults`, 작업 결과)와 ACK도 원래 실행의 칸을 보존한다. 모델 출력 스키마(`ChatReplySchema`·`ReviewOutputSchema`·`ChangeReviewOutputSchema`)에는 방식 칸을 넣지 않는다. `x-change-review-rate-limit` 머리는 응답 호환 표시일 뿐 방식 권한의 근거가 아니다.
+- 지원 표시: 작업 접수(intake)의 지원 광고와 대화·리뷰 쪽 확인 자리를 둔다. 게시 서버는 두 작업자 모두 새 판을 받는다고 확인하기 전에는 새 판 요청을 보내지 않는다.
+- 작업 이어가기: 구독 한도 응답의 세션 보존과 실제 세션 파일을 확인한 뒤 같은 job·generation·sessionId, 늘어난 턴, 새 lease·capability로 `--resume`한다. 지금은 한도·인증 대기 턴을 진행 예산에서 빼는데, API로 돈 턴은 예산에 합산한다.
+
+**3. 계정 묶음을 대조한다(C42·C43).**
+
+- owner의 자동 사용 `use`가 원본 `/bot-accounts/<이름>`의 네 값을 활성 `/apps/homelab-bot/worker`의 네 키로 옮기고, 비밀 아닌 묶음 식별 정보(계정 이름, revision, 키 지문)를 설치한다. 반대 방식 키를 `unset`으로 비우지 않는다. 수동 `use`는 지금처럼 비운다.
+- 같은 Secret에 값 둘이 있다는 것만으로 같은 계정이 보장되지 않는다. 작업자는 한 Secret 볼륨 세대의 일관된 스냅샷으로 묶음의 기대 지문과 두 자격을 함께 대조하고, Infisical 여러 쓰기 도중 ESO가 읽은 중간 조합은 거부한다. revision 파일만 마지막에 쓰고 자격과 따로 읽는 수준은 충분하지 않다(지금 `MethodEnvCredential`은 파일을 따로 읽는다). 레인별 bundle 값 하나로 원자적으로 바꾸는 안과 키 넷 + descriptor 안은 C42·C43이 비교한다.
+- `CLAUDE_AUTH_METHOD`는 옛 판 요청의 수동 기본값으로 남고 새 판 요청의 선택을 덮지 않는다.
+- 계정 교체(A→B) 동안 새 dispatch를 닫고, 새 묶음 준비·반영·대조 뒤 활성화한다. A의 API 키와 B의 구독 토큰이 함께 쓰이는 틈은 없다. 이미 도는 실행은 A로 끝나고 결과는 A의 revision에 귀속한다. 부분 실패 뒤 같은 명령을 다시 돌리면 준비한 revision을 잇는다.
+- 지문과 값은 모델 프롬프트, 공개 지표, 로그에 넣지 않는다.
+
+**4. 권한 변화.** 게시 서버는 모델 자격도 Infisical 쓰기 권한도 얻지 않는다. 서명 권한만 "승인된 지금 계정의 두 방식 중 고르기"로 넓어진다. 작업자는 여전히 자격·표시 파일을 바꾸지 못한다. 작업자 Secret의 실자격은 레인마다 하나에서 둘이 된다(§5.1 남는 위험).
+
+**5. 구/신 판 호환 배포 3단계.**
+
+1. **받기부터:** 새 응답을 읽고 DB 칸을 더한(추가만 하는 migration) 게시 서버를 스위치 꺼짐으로 먼저 배포한다. 옛 작업자에게 새 칸을 보내지 않는다.
+2. **작업자 수용:** 두 작업자 이미지(사람 sandbox PR, C43)를 옛·새 요청을 함께 받는 판으로 올린다. 옛 요청은 지금처럼 방식 표시로 돌고 옛 응답만 낸다.
+3. **선택 켜기:** owner가 묶음을 설치하고(C42) 두 파드 반영을 확인한 뒤 스위치를 켠다. 구독 경로를 새 요청으로 먼저 확인한 뒤 자동 API를 쓴다(C45).
+
+**6. 되돌리기 순서.** 스위치 끄기와 구독 고정 → 진행 중인 새 판 요청·작업 턴·변경 자체 리뷰 저장 결과를 끝내거나 안전히 대기로 둠(옛 strict 스키마는 새 칸 든 저장 결과를 읽지 못한다. C36 묶음 A F-1과 같은 주의) → 필요하면 활성 API 키를 `unset` → 작업자 되돌리기 → 게시 서버 되돌리기. 작업 세션 기록 판을 바꿨으면 옛 이미지가 읽을 수 있는지 먼저 보고, 못 읽으면 세션을 보존한 채 미룬다. 전환 기록·API 잠금·누계를 지우는 되돌리기는 하지 않고, 더한 DB 칸은 바로 지우지 않는다. 이미 쓴 API 비용은 되돌릴 수 없다.
+
+**7. 미확인(C45 S5).** 구독 ↔ API `--resume` 실호환, 2.1.308의 구독 포함량 거절 필드와 API 소진 응답 모양, 실제 클러스터의 RBAC·ESO·kubelet 반영(저장소 선언만 읽었다), Console 설정.
