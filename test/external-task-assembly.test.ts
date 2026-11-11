@@ -10,7 +10,7 @@ import { ConfigError, EXTERNAL_TASK_KEYS, loadPublisherConfig } from '../src/con
 import { Denied } from '../src/contracts.js';
 import type { Scope } from '../src/contracts.js';
 import type { Database } from '../src/database.js';
-import { ALL_COMMANDS, DiscordIngress, EXTERNAL_ACK_NOTICE } from '../src/discord.js';
+import { ALL_COMMANDS, COMMAND_INGRESS_TEXT, DiscordIngress } from '../src/discord.js';
 import { ATTACH_COMMAND_TEXT, ExternalTaskCommands } from '../src/external-task-commands.js';
 import type { ExternalTaskCommandHandler } from '../src/external-task-commands.js';
 import { EXTERNAL_LINK_TTL_MS, ExternalTaskLinks, OneTimeSeed } from '../src/external-task-links.js';
@@ -282,7 +282,7 @@ test('R08 전달 실패(실행 경로): 상호작용 응답이 실패하면 키�
   rest.failCallback = content => { seed = field(content, 'seed') ?? seed; return new Error(`callback failed: ${content}`); };
   command('attach', THREAD, { target: SESSION, text: 'claude' });
   await waitFor(async () => (await rows<{ revoked_reason: string | null }>('SELECT revoked_reason FROM external_task_connections'))[0]?.revoked_reason === 'delivery_failed');
-  await waitFor(() => rest.sent.some(m => m.content.includes(EXTERNAL_ACK_NOTICE)));
+  await waitFor(() => rest.sent.some(m => m.content.includes(COMMAND_INGRESS_TEXT.attachAckLost(false))));
   assert.match(seed, /^[A-Za-z0-9_-]{43}$/);
   for (const [name, text] of Object.entries({ dump: await dumpTables(database.db), logs: JSON.stringify(logs), sent: JSON.stringify(rest.sent) })) {
     assert.equal(text.includes(seed), false, name);
@@ -422,7 +422,7 @@ for (const [name, failure] of [
       assert.equal(dump.includes(FAKE_SEED), false);
       assert.equal(ctx.logged.join('\n').includes(FAKE_SEED), false);
       const notices = (await ctx.db.query<{ payload: { content: string } }>('SELECT payload FROM outbox')).rows.map(r => r.payload.content);
-      assert.deepEqual(notices, [EXTERNAL_ACK_NOTICE]);
+      assert.deepEqual(notices, [COMMAND_INGRESS_TEXT.attachAckLost(false)]);
       assert.ok(ctx.logged.join('\n').includes('"outcome":"delivery_failed"'));
       ctx.f.rest.acknowledge = working;
       await ctx.ingress.receive(event('a2', { kind: 'command', command: 'attach', target: SESSION, text: 'claude' }));

@@ -9,6 +9,11 @@ import { commandDefinitions } from '../src/commands.js';
 import { ATTACH_COMMAND_TEXT } from '../src/external-task-commands.js';
 import { EXTERNAL_NOTICE_TEXT, formatNotice } from '../src/external-task-receiver.js';
 import { REVIEW_NOTICE_TEXT } from '../src/review.js';
+import { ALL_COMMANDS, COMMAND_INGRESS_TEXT, DiscordIngress } from '../src/discord.js';
+import type { ChangeCommandHandler } from '../src/change-commands.js';
+import type { ExternalTaskCommandHandler } from '../src/external-task-commands.js';
+import { seedConversation } from './external-task-fixture.js';
+import { event, fixture, localDatabase } from './helpers.js';
 
 // C18 고정 문구 3(명세 §4.4·§4.9, AC-11·AC-23): 변경·Discord 리뷰 안내·경보·세션 연결. 경계는 S1의 문구 표 단위다.
 // 스위치가 켜지면 '/' 명령 이름이 없고, 꺼지면 지금처럼 '/'를 안내한다. 이름은 등록 명령 표 전체에서 읽는다.
@@ -20,7 +25,7 @@ type Text = string | ((...values: never[]) => string) | Readonly<Record<string, 
 const render = (colleague: boolean, table: Readonly<Record<string, Text>>) => Object.entries(table).flatMap(([name, text]) =>
   typeof text === 'function' ? [[name, (text as (...values: unknown[]) => string)(colleague, ...ARGS)] as const]
     : typeof text === 'string' ? [[name, text] as const] : Object.entries(text).map(([key, value]) => [`${name}.${key}`, value] as const));
-const SWITCHED = { CHANGE_TEXT, CHANGE_NOTICE_TEXT, ATTACH_COMMAND_TEXT };
+const SWITCHED = { CHANGE_TEXT, CHANGE_NOTICE_TEXT, ATTACH_COMMAND_TEXT, COMMAND_INGRESS_TEXT };
 const advice = (c: boolean) => [['changeRestart', changeRestart(c)], ['changeNextGeneration', changeNextGeneration(c, 'fixture-id')],
   ['changeChildFailed', changeChildFailed('fixture-job', 'fixture-id', c)]] as const;
 const all = (colleague: boolean) => [...Object.entries(SWITCHED).flatMap(([table, texts]) =>
@@ -69,7 +74,56 @@ test("C18 스위치 꺼짐: '/' 안내 줄은 지금처럼 '/' 명령 이름을 
   assert.match(off.changeRestart!, /\/change/);
   assert.match(off.changeNextGeneration!, /\/change project:fixture-id text:next/);
   assert.match(off.changeChildFailed!, /\/change-status target:fixture-id/);
+  assert.match(off['COMMAND_INGRESS_TEXT.changeAckLost']!, /\/change-status/);
+  assert.match(off['COMMAND_INGRESS_TEXT.changeFailed']!, /\/change-status/);
+  assert.match(off['COMMAND_INGRESS_TEXT.attachAckLost']!, /\/attach-list/);
+  assert.match(off['COMMAND_INGRESS_TEXT.attachFailed']!, /\/attach-list/);
 });
+
+// C36 F-12(AC-11·23): 변경·세션 연결 명령의 처리기 예외와 응답 실패 안내도 스위치 판을 따른다. 문구 표가 아니라 실제 수신
+// (DiscordIngress.receive)에 예외·ACK 실패를 넣어, 본인 응답과 채널에 남는 고정 안내를 본다.
+async function ingressWith(colleague: boolean, reply: 'throw' | 'ok') {
+  const { db, pg } = await localDatabase();
+  const f = await fixture(db, { colleague });
+  await seedConversation(db, f.store, f.now());
+  const answer = async () => { if (reply === 'throw') throw new Error('fixture handler failed'); return { content: '처리했어요.', outcome: 'ok' }; };
+  const changes: ChangeCommandHandler = { handle: answer };
+  const external: ExternalTaskCommandHandler = { handle: answer };
+  const acks: string[] = [];
+  const ingress = new DiscordIngress(f.store, f.gate, f.rest, true, ALL_COMMANDS, () => {}, undefined, undefined, external, changes);
+  const outbox = async () => (await db.query<{ payload: { content: string } }>('SELECT payload FROM outbox ORDER BY created_at')).rows.map(row => row.payload.content);
+  return { f, acks, ingress, outbox, close: () => pg.close() };
+}
+for (const colleague of [true, false]) {
+  const name = colleague ? '켜짐' : '꺼짐';
+  test(`C36 F-12 스위치 ${name}: 변경·세션 연결 처리기 예외의 답은 스위치 판 문구다`, async () => {
+    const ctx = await ingressWith(colleague, 'throw');
+    try {
+      ctx.f.rest.acknowledge = async (_e, content) => { ctx.acks.push(content); };
+      await ctx.ingress.receive(event('fixture-change', { kind: 'command', command: 'change-status', target: 'fixture-id' }));
+      await ctx.ingress.receive(event('fixture-attach', { kind: 'command', command: 'attach-list' }));
+      assert.deepEqual(ctx.acks, [COMMAND_INGRESS_TEXT.changeFailed(colleague), COMMAND_INGRESS_TEXT.attachFailed(colleague)]);
+      for (const text of ctx.acks) {
+        if (colleague) assert.doesNotMatch(text, slashName, text);
+        else assert.match(text, /\/(change-status|attach-list)/, text);
+      }
+    } finally { await ctx.close(); }
+  });
+  test(`C36 F-12 스위치 ${name}: 변경·세션 연결 명령의 응답을 전하지 못하면 채널에 남는 안내가 스위치 판 문구다`, async () => {
+    const ctx = await ingressWith(colleague, 'ok');
+    try {
+      ctx.f.rest.acknowledge = async () => { throw new Error('ack_lost'); };
+      await ctx.ingress.receive(event('fixture-change', { kind: 'command', command: 'change-status', target: 'fixture-id' }));
+      await ctx.ingress.receive(event('fixture-attach', { kind: 'command', command: 'attach-list' }));
+      const notices = await ctx.outbox();
+      assert.deepEqual(notices, [COMMAND_INGRESS_TEXT.changeAckLost(colleague), COMMAND_INGRESS_TEXT.attachAckLost(colleague)]);
+      for (const text of notices) {
+        if (colleague) assert.doesNotMatch(text, slashName, text);
+        else assert.match(text, /\/(change-status|attach-list)/, text);
+      }
+    } finally { await ctx.close(); }
+  });
+}
 
 test('C18 켜짐 판은 말로 하는 안내다: 미리보기는 게시 승인 버튼을, 세션 연결은 말로 부탁하라고 한다', () => {
   const on = Object.fromEntries(all(true));
