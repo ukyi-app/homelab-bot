@@ -2900,3 +2900,19 @@ T19 B5 EVENT-02(게시 서버 둘이 같은 부모를 밀어도 모델·시험·
 - **실행(머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`·`npm run build`, `c14-remaining-actions`·`c13-proposal`·`c13-proposal-pg`·`c15-session-key`·`memory-commands`·`memory-commands-pg`·`t20-memory-commands`·`c16-task-question`·`c27-change-amend`·`c18-fixed-text`·`raw-text-retention`·`c28-change-question`·`c17-publish-button`·`reaction-lifecycle`·`publisher-gateway` 15개 파일 195개 통과·실패 0·skip 0.
 - **운영에서 바뀌는 동작:** DECISIONS "C36 묶음 G"의 표. 스위치 밖에서는 '/memory-exclude here' 응답의 대상 표기만 바뀐다.
 - **못 잡는 범위:** 알려진 한계 둘(RR3-N3 응답 실패 안내 뒤 거두기 전 종료, RR3-N4 응답 전 종료와 스위치 끄기가 겹침)은 고치지 않아 시험이 없다. 실제 Discord ID(17~20자리)가 공개 검사에 걸리는 것은 묶음 E 시험이 보고, 이 묶음은 같은 자리를 내부 표식으로 대신했다. 실제 프로세스 강제 종료, 게시 서버 둘의 실제 PostgreSQL 경합.
+
+## C36 묶음 H: 재검토 3차 후속 (2026-11-11, 로컬)
+
+전체 리뷰 재검토 3차의 RR3-N5. 구현 선택, `update` 응답을 쓰는 버튼 표, 알려진 한계 RR3-N6은 [DECISIONS](DECISIONS.md) "C36 묶음 H", 계약은 [ARCHITECTURE](ARCHITECTURE.md) 끝의 "C36 묶음 H". 경계는 S1(Gateway 프레임 → 수신·저장(PGlite) → 가짜 Discord REST)이다. 공개 검사에 걸리는 값은 묶음 G처럼, 글이 나간 뒤 그 값을 정책의 내부 표식에 더해 만든다.
+
+| 완료 조건 | 근거 |
+|---|---|
+| 실행 확인 버튼의 정상 응답 본문이 공개 검사를 거친다 | `c14-remaining-actions` "C36 묶음 H 실행 결과가 공개 검사에 걸리면 실행 확인 버튼의 정상 응답은 …"(말로 한 변경 취소 → 확인 글이 나간 뒤 변경 ID를 내부 표식에 더함 → "할게요" → 실제 `DiscordProtocol`이 만든 상호작용 콜백이 `type: 7`이고 `content`가 고정 안내 리터럴, `type: 7` 콜백 어디에도 변경 ID 없음, 변경은 `cancelled`) |
+| 검사를 지나는 결과는 그대로 보인다 | 같은 파일 "C36 묶음 H 공개 검사를 지나는 실행 결과는 …"(같은 순서, 표식 없음 → `type: 7`, `content` = `CHANGE_TEXT.cancelled(true, <변경 ID>, false)`) |
+| 게시 승인 버튼의 응답 본문이 공개 검사를 거친다 | `c17-publish-button` "C36 묶음 H 게시 승인 응답이 바꿀 글 본문이 …"(미리보기가 나간 뒤 변경 ID를 표식에 더함 → 누름 → 승인 행 하나(그 digest·이벤트), 응답은 `update`이고 본문은 고정 안내). 표식이 없을 때 미리보기 + 승인 줄이 그대로 남는 것은 기존 "C17 AC-10 …"이 본다 |
+| 변경 질문 선택지 버튼의 응답 본문과 응답 실패 안내가 공개 검사를 거친다 | `c28-change-question` "C36 묶음 H 선택지 버튼 응답이 바꿀 질문 글 본문이 …"(질문 글이 나간 뒤 고르지 않은 선택지의 글 `src/a.ts`를 표식에 더함 → 2번 누름 → 답은 2번으로 접수, 응답은 `update`이고 본문은 고정 안내), 같은 파일 "C36 묶음 H 선택지 버튼 응답이 실패해 …"(같은 순서에서 응답 실패 → 스레드에 남는 글은 고정 안내 하나) |
+
+- **시험이 실패할 수 있는지:** 고치기 전 코드(origin/main `9572c92`)에서 새 시험 넷은 실패했다. 실행 확인은 `변경 <ID>을 취소했어요. …`, 게시 승인은 미리보기 마지막 쪽 + `변경 <ID> 게시를 승인했어요. …`, 변경 질문은 `어느 쪽을 고칠까요?\n1. src/a.ts를 고친다 …`가 그대로 나갔다. 응답 실패 안내 시험은 그 한 줄만 되돌린 사본에서 실패했다. "검사를 지나는 결과" 시험은 고치기 전에도 초록이고, 과하게 가리지 않는지 지키는 회귀 시험이다.
+- **실행(머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`·`npm run build`, `c13-proposal`·`c13-proposal-pg`·`c14-remaining-actions`·`c15-session-key`·`c16-task-question`·`c17-publish-button`·`c18-fixed-text`·`c27-change-amend`·`c28-change-question`·`publisher-gateway`·`reaction-lifecycle` 11개 파일 164개 통과·실패 0·skip 0.
+- **운영에서 바뀌는 동작:** 없다. 네 버튼은 동료 기능 스위치가 켜졌을 때만 만들어지고 받으므로 스위치 밖 동작은 같다. 켜짐 판에서는 공개 검사에 걸리는 `update` 응답 본문과 변경 질문의 응답 실패 안내가 고정 안내 `resultWithheld`가 된다.
+- **못 잡는 범위:** 알려진 한계 RR3-N6(구독을 끈 스레드의 거절 결과 + 응답 전 종료)은 고치지 않아 시험이 없다. 실제 Discord가 `type: 7`을 어떻게 보여 주는지, 실제 Discord ID(17~20자리)로 걸리는 경우(내부 표식으로 대신했다).

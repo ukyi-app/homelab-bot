@@ -207,6 +207,36 @@ test('C28 선택지 버튼: 누르면 그 선택지 글이 공개 표시로 작�
   });
 });
 
+test('C36 묶음 H 선택지 버튼 응답이 바꿀 질문 글 본문이 지금 정책의 공개 검사에 걸리면 답은 그대로 받고 그 글은 값 없는 고정 안내로 바꾼다', async () => {
+  await withHarness({ changeV2: true, colleague: true, steps: [CHOICE_QUESTION, V2_WRITE] }, async h => {
+    const { question } = await toQuestion(h);
+    const buttons = buttonsOf(await questionPost(h));
+    // 질문 글이 나간 뒤 고르지 않은 선택지의 글이 내부 표식이 된다. 고른 답(2번)은 걸리지 않고, 질문·선택지를 다시 싣는 응답 본문만 걸린다.
+    const repository = h.policy.current.change!.repositories[0]!;
+    h.policy.current = { ...h.policy.current, change: { repositories: [{ ...repository, internalMarkers: [...repository.internalMarkers, 'src/a.ts'] }] } };
+    await press(h, buttons[1]!.custom_id, { id: 'fixture-press-1' });
+    assert.deepEqual(await questionRow(h, question), { state: 'answered', answer: OPTIONS[1] });
+    assert.equal(lastAck(h).update, true);
+    assert.equal(lastAck(h).content, '확인한 요청은 끝났지만 결과에 밖에 보이면 안 되는 내용이 섞여 있어 여기에는 싣지 않았어요. 필요하면 상태를 확인해 달라고 해 주세요.');
+  });
+});
+
+test('C36 묶음 H 선택지 버튼 응답이 실패해 스레드에 남기는 안내도 같은 공개 검사를 거쳐 질문·선택지를 다시 싣지 않는다', async () => {
+  await withHarness({ changeV2: true, colleague: true, steps: [CHOICE_QUESTION, V2_WRITE] }, async h => {
+    await toQuestion(h);
+    const buttons = buttonsOf(await questionPost(h));
+    await h.deliver();
+    const repository = h.policy.current.change!.repositories[0]!;
+    h.policy.current = { ...h.policy.current, change: { repositories: [{ ...repository, internalMarkers: [...repository.internalMarkers, 'src/a.ts'] }] } };
+    const posted = h.messages().length;
+    h.rest.failAck = true;
+    await press(h, buttons[1]!.custom_id, { id: 'fixture-press-1' });
+    h.rest.failAck = false;
+    await h.deliver();
+    assert.deepEqual(h.messages().slice(posted).map(text => text.split('\n-# ref:')[0]), ['확인한 요청은 끝났지만 결과에 밖에 보이면 안 되는 내용이 섞여 있어 여기에는 싣지 않았어요. 필요하면 상태를 확인해 달라고 해 주세요.']);
+  });
+});
+
 test('C28 선택지 버튼 거부: 다른 사람, 다른 스레드, 기한 지난 질문의 버튼은 답이 되지 않는다', async () => {
   await withHarness({ changeV2: true, colleague: true, steps: [CHOICE_QUESTION, V2_WRITE] }, async h => {
     const { question } = await toQuestion(h);

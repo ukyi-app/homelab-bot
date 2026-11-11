@@ -2217,3 +2217,12 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 - **버튼 하나의 처리(`pressProposal`):** "할게요"가 이 트랜잭션에서 제안을 끝내면(구독 꺼짐·연결 안 됨·값이 바뀜으로 `refused`, `later` 없는 실행의 `confirmed`·`refused`) 상태 전이 뒤 같은 트랜잭션에서 `enqueueRunResult`(본문은 `publicRunResult(content, context.policy)`, `policy_revision`은 `context.revision`)를 부르고 `PressOutcome.resultPending: true`를 돌려준다. 만료·"아니에요"·이미 처리·남의 제안·없는 제안은 결과 글을 남기지 않는다. `later`가 있으면 묶음 F 그대로(`run_pending`, 완료 기록에서 결과 글).
 - **실행 확인 버튼 수신(`DiscordIngress.proposalButton`):** 거둘 결과 글이 있는지는 `resultPending`(동기) 또는 `finishProposalRun`의 반환(커밋 뒤 실행)이다. 응답이 `true`면 `withdrawRunResult`.
 - **저장 제외 결과의 대상 표기(`MemoryCommands`, `memory-exclude`):** 대상이 `here`면 결과 문장에 `here`를 적는다(제외 키는 `channel:<그 채널>`). 다른 대상은 지금처럼 키를 200자로 잘라 적는다.
+
+## C36 묶음 H: 재검토 3차 후속 (2026-11-11)
+
+위 "C36 묶음 G"에 더하는 계약이다. 선택의 이유, `update` 응답을 쓰는 버튼 표, 알려진 한계 RR3-N6은 [DECISIONS](DECISIONS.md) "C36 묶음 H".
+
+- **바로잡음:** 위 "C36 묶음 G"의 "버튼 응답(본인 전용)은 처리기 결과 그대로다"는 틀렸다. `update: true` 응답은 `type: 7`로 스레드에 보이는 버튼 글을 바꾼다. 본인 전용(`type: 4`, `flags 64`)은 `update`가 없는 응답뿐이다.
+- **버튼 응답(`DiscordIngress.acknowledge(event, id, content, direct)`, `src/discord.ts`):** `direct`는 `{ revision, notice, update?, policy? }`다. `direct.update`가 참이면 Discord로 보내는 본문은 `publicRunResult(content, direct.policy)`다(걸리거나 `policy`가 없으면 `PROPOSAL_TEXT.resultWithheld`). `update`가 없으면 본문은 `content` 그대로다. 응답 실패 때 스레드에 남는 글은 지금처럼 `direct.notice`이고, 호출자가 공개 검사를 지난 본문이나 고정 안내를 넘긴다.
+- **호출자:** 실행 확인(`proposalButton`)·질문 고르기(`questionButton`)·변경 질문(`changeQuestionButton`)은 `policy: p`(그 누름에서 인가한 정책)를 넘기고, 게시 승인(`publishButton`)은 `update`일 때 같이 넘긴다. 실행 확인과 변경 질문의 `notice`는 `publicRunResult(outcome.content, p)`다. 질문 고르기의 `notice`는 고정 문구라 그대로다.
+- **바뀌지 않는 것:** `DiscordProtocol.acknowledge`의 `update` 분기(본문 모양 `{ type: 7, data: { content, allowed_mentions, components: [] } }`), 처리기의 `PressOutcome`·`PickOutcome`·`ChangeQuestionOutcome`·`PublishPressReply`, 결과 글(`proposal:<제안 ID>`)의 계약.
