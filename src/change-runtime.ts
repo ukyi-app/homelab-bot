@@ -513,8 +513,11 @@ export class ChangeRuntime {
           return saved.reason === 'phase_conflict' ? true : this.failAmendment(request, round, saved.reason);
         }
         // 저장보다 먼저 남긴다. 저장 뒤에 끊기면 phase가 넘어가 이 결과를 다시 읽지 않는다. 같은 결과를 다시 받아도 처음 기록 그대로다.
-        if (result.checks?.length || result.risks?.length) await recordChangeNotes(this.db, keyOf(request), { checks: result.checks ?? [], risks: result.risks ?? [] }, this.now);
-        const saved = await this.deps.artifacts.save(keyOf(request), result.artifact, result.transportBytes);
+        // 결과를 받는 사이 다른 게시 서버가 이 차례를 저장·리뷰하고 고치기 차례를 열었으면 앞 차례 결과다. 새 차례의 목록·artifact 자리에 두지 않는다.
+        const notes = await recordChangeNotes(this.db, { ...keyOf(request), authorJobId: child.id }, { checks: result.checks ?? [], risks: result.risks ?? [] }, this.now);
+        if (notes === 'stale') { this.deps.log('change_author_result_stale', {}); return true; }
+        // 위 확인과 저장 사이에도 차례가 바뀔 수 있어 저장도 같은 job으로 다시 확인한다. 그 경우는 phase_conflict다.
+        const saved = await this.deps.artifacts.save(keyOf(request), result.artifact, result.transportBytes, { authorJobId: child.id });
         if (saved.ok) return true;
         if (saved.reason === 'busy') throw new Error('change_store_busy');
         // 경합으로 다른 phase가 됐으면 그 경로가 맞다. 받을 수 없는 결과는 막는다. 모델을 다시 돌리지 않는다.

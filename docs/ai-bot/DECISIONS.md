@@ -1288,6 +1288,20 @@ T19 B5 EVENT-02 "게시 서버 둘이 같은 부모를 동시에 밀어도 모�
 
 마이그레이션은 쓰지 않았다(029 없음).
 
+## C36 묶음 D 자체 고치기 경합 구현 선택 (2026-11-11)
+
+전체 리뷰 F-8(AC-31)의 수정이다. 사용자 결정이 아니라 구현 선택이고 C31 결정은 바꾸지 않았다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) "C36 묶음 D: 고치기 차례의 늦은 작성 결과", 시험은 [VERIFICATION](VERIFICATION.md) "C36 묶음 D 자체 고치기 경합".
+
+- **차례 확인 자리는 확인할 것 기록:** 런타임은 작성 결과를 받을 때마다 `recordChangeNotes`를 부르고 자기 작성 job ID를 넘긴다. 함수는 부모 행을 `FOR SHARE`로 잡고 그 job이 이 generation의 지금 고치기 차례(`change_child_jobs.fix_round = change_generations.fix_round`, `amendment_round = 0`)의 작성 job인지 본다. `startSelfFix`가 부모를 `FOR UPDATE`로 잡고 차례를 올리므로 둘은 엇갈리지 않는다. 아니면 `stale`이고 런타임은 artifact를 저장하지 않고(`change_author_result_stale` 로그) 부모를 닫지 않는다. 지금 단계는 다른 게시 서버의 것이 맞다.
+- **빈 목록은 기록하지 않는다:** 이전엔 런타임이 목록이 있을 때만 불렀다. 이제 확인을 위해 늘 부르므로 그 조건을 함수 안으로 옮겼다. 읽는 쪽(`readChangeNotes`)은 행이 없으면 빈 목록이라 결과가 같다.
+- **`recordSnapshot`의 선택 칸 `authorJobId`:** 주면 같은 잠금(부모 `FOR UPDATE`) 아래에서 같은 확인을 하고 아니면 `phase_conflict`다(런타임은 이 사유에 부모를 닫지 않는다).
+- **포트로 작성 job 넘기기:** `ChangeArtifactPort.save`(`src/change-contracts.ts`)의 넷째 인수(확인할 것 목록 객체)에 선택 칸 `authorJobId`를 두고, 어댑터 `ChangeStoreArtifacts`(`src/change-artifact.ts`)가 처음 게시 자리일 때만 `recordSnapshot`에 넘긴다. 런타임 `pollAuthor`는 자기 `child.id`를 넘긴다. 새 인수 대신 기존 객체에 둔 것은 다른 구현(시험용 가짜)의 모양을 바꾸지 않기 위해서다. 수정 차례(`recordAmendmentSnapshot`)에는 넘기지 않아 동작이 같다.
+- **버린 안: 앞 차례 artifact digest 거부.** `change_fix_rounds.artifact_digest`와 같은 결과를 받지 않으면 포트 없이 막을 수 있지만, 고치기 차례가 앞 차례와 같은 결과를 내는 정상 경우(C31 상한 시험이 그렇다)를 막아 지금의 차례 수·리뷰 횟수가 바뀐다.
+- **수정 차례(C27)는 같은 구멍이 없다:** 결과는 차례 번호 키(`change_amendment_artifacts`의 round)에만 저장되고, `recordAmendmentSnapshot`은 부모 `amending`과 그 차례 `running`을 잠금 아래에서 본다. 끝난 차례의 늦은 결과는 `amendment_not_running`이고, 런타임의 실패 처리(`finishAmendment`)도 `state='running'` 조건이라 바꾸지 않는다.
+- **마이그레이션 없음:** 기존 칸 `fix_round`로 판정한다.
+
+**닫힌 틈.** 런타임의 확인(`recordChangeNotes`)과 `artifacts.save` 사이에 다른 게시 서버가 저장·시험·리뷰·차례 열기를 모두 마치는 경우. 저장이 같은 작성 job으로 부모 잠금 아래에서 다시 확인하므로 `phase_conflict`로 거부되고 새 차례에 artifact가 들어가지 않는다(VERIFICATION "C36 묶음 D"의 저장 직전 멈춤 시험).
+
 ## C36 묶음 B: 제안·공개 범위 (2026-11-11)
 
 전체 리뷰 1차의 F-4·F-7·F-9·F-10·F-11을 닫는 구현 선택이다. 사용자 결정이 아니고 결정은 바꾸지 않았다. 계약은 [ARCHITECTURE](ARCHITECTURE.md) 끝의 "C36 묶음 B", 시험은 [VERIFICATION](VERIFICATION.md) "C36 묶음 B". 마이그레이션은 없다(`proposals`의 기존 칸만 쓴다).

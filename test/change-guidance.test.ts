@@ -249,8 +249,8 @@ test('AC-25 승인 묶음: 승인 digest가 확인할 것 목록에 묶인다. �
   try {
     const key = await env.newRequest();
     const review = await env.driveToReview(key, DEFAULT_CHANGES, { patch: PATCH });
-    assert.equal(await recordChangeNotes(env.db, key, NOTES), true);
-    assert.equal(await recordChangeNotes(env.db, key, { checks: [], risks: [] }), false, '같은 generation의 목록은 처음 것 그대로다');
+    assert.equal(await recordChangeNotes(env.db, key, NOTES), 'recorded');
+    assert.equal(await recordChangeNotes(env.db, key, { checks: [OUTSIDE_FILE], risks: [] }), 'kept', '같은 generation의 목록은 처음 것 그대로다');
     assert.deepEqual(await readChangeNotes(env.db, key), NOTES);
     const prepared = await env.publisher.prepareApproval(key, { review, at: env.clock.now });
     assert.ok(prepared.ok);

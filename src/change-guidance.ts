@@ -1,6 +1,7 @@
 import type { ChangeKey, ChangeNote, WriterOutcome } from './change-contracts.js';
 import type { ChangeRepositoryPolicy } from './change-policy.js';
 import { noteLine, renderGuidance } from './change-publication.js';
+import { isCurrentAuthorJob } from './change-store.js';
 import type { ChangeStore } from './change-store.js';
 import type { Database } from './database.js';
 import type { GuidanceReviewPort } from './github-review-io.js';
@@ -19,12 +20,26 @@ import { z } from 'zod';
 const NotesSchema = z.strictObject({ checks: z.array(ChangeNoteSchema).max(CHANGE_NOTE_LIMITS.items), risks: z.array(ChangeNoteSchema).max(CHANGE_NOTE_LIMITS.items) });
 export interface ChangeNotes { checks: ChangeNote[]; risks: ChangeNote[] }
 const parsedJson = (value: unknown) => typeof value === 'string' ? JSON.parse(value) as unknown : value;
-// generation의 지금 고치기 차례마다 처음 받은 목록 하나다(차례를 열면 앞 차례 목록을 지운다). 같은 결과를 다시 받아도(응답 유실 뒤 재조회) 처음 것을 둔다. 새로 기록했으면 true.
-export async function recordChangeNotes(db: Pick<Database, 'query'>, key: ChangeKey, notes: { checks: readonly ChangeNote[]; risks: readonly ChangeNote[] }, now: () => number = Date.now): Promise<boolean> {
+// generation의 지금 고치기 차례마다 처음 받은 목록 하나다(차례를 열면 앞 차례 목록을 지운다). 같은 결과를 다시 받아도(응답 유실 뒤 재조회) 처음 것을 둔다.
+// 빈 목록은 남기지 않는다(옛 판 결과와 같다). 결과: recorded 새로 기록, kept 기록할 것 없음·이미 있음, stale 앞 차례 결과.
+// authorJobId를 주면 부모 행을 잡고 그 job이 지금 고치기 차례의 작성 job인지 본다. 고치기 차례를 여는 startSelfFix가 부모를 FOR UPDATE로 잡으므로 둘은 엇갈리지 않는다.
+export type NotesRecord = 'recorded' | 'kept' | 'stale';
+export async function recordChangeNotes(db: Pick<Database, 'query' | 'transaction'>, key: ChangeKey & { authorJobId?: string },
+  notes: { checks: readonly ChangeNote[]; risks: readonly ChangeNote[] }, now: () => number = Date.now): Promise<NotesRecord> {
   const parsed = NotesSchema.parse({ checks: [...notes.checks], risks: [...notes.risks] });
-  const inserted = await db.query('INSERT INTO change_notes(change_id,generation,checks,risks,recorded_at) VALUES ($1,$2,$3::jsonb,$4::jsonb,$5) ON CONFLICT DO NOTHING RETURNING 1',
-    [key.changeId, key.generation, JSON.stringify(parsed.checks), JSON.stringify(parsed.risks), now()]);
-  return inserted.rows.length === 1;
+  const insert = async (tx: Pick<Database, 'query'>): Promise<NotesRecord> => {
+    if (!parsed.checks.length && !parsed.risks.length) return 'kept';
+    const inserted = await tx.query('INSERT INTO change_notes(change_id,generation,checks,risks,recorded_at) VALUES ($1,$2,$3::jsonb,$4::jsonb,$5) ON CONFLICT DO NOTHING RETURNING 1',
+      [key.changeId, key.generation, JSON.stringify(parsed.checks), JSON.stringify(parsed.risks), now()]);
+    return inserted.rows.length === 1 ? 'recorded' : 'kept';
+  };
+  const { authorJobId } = key;
+  if (authorJobId === undefined) return insert(db);
+  return db.transaction(async tx => {
+    const parent = (await tx.query<{ generation: number | string }>('SELECT generation FROM change_requests WHERE id=$1 FOR SHARE', [key.changeId])).rows[0];
+    if (!parent || Number(parent.generation) !== key.generation || !await isCurrentAuthorJob(tx, key, authorJobId)) return 'stale';
+    return insert(tx);
+  });
 }
 // 기록이 없거나(옛 판 결과) 7일 원문 정리(purgeExpiredChangeContent)가 비웠으면 빈 목록이다.
 // 비우는 건은 끝난 변경뿐이라 승인 준비·미리보기·처음 게시 안내는 비운 목록을 읽지 않는다.
