@@ -538,6 +538,9 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
           }
           if (routed.action === 'wait') { reason = 'model_limit'; rateLimit = routed.rateLimit; laneOnly = false; }
           else if (reason === 'model_limit' && await this.methods.apiChosen(store.db, 'task')) laneOnly = true;
+        } else if (reason === 'model_limit' && this.methods && await this.methods.routesOthers(store.db)) {
+          // 선택 없이 구독으로 돈 턴(작업 경로 칸 꺼짐)은 넘어가지 않고 기다린다. 다른 경로가 넘어갈 수 있으면 작업 레인만 세운다.
+          laneOnly = true;
         }
         // 계정 한도는 대화·리뷰도 같은 계정이라 양쪽을 막고, 인증 만료는 레인 토큰의 일이라 작업 레인만 막는다.
         // 한도 정보가 없으면(옛 작업자) 멈춤 기록은 시각을 모르는 한도로 남아 30분마다 다시 시도한다.

@@ -26,7 +26,7 @@ async function autoLane() {
   await f.store.atomic(s => switchAccount(s, 'main', 'subscription', 'cli', 'cli'));
   await f.store.atomic(s => installMethods(s, 'main', 'rev-1'));
   const local = lane(f);
-  local.bridge.useMethods(new MethodRouter(f.store, { enabled: true, supported: () => true }));
+  local.bridge.useMethods(new MethodRouter(f.store, { enabled: true, task: true, supported: () => true }));
   return local;
 }
 // 작업자 응답에 그 요청 선택의 실행 칸을 붙인다(작업자는 요청 선택으로만 돈다).
@@ -58,6 +58,22 @@ test('AC-38 작업 레인의 구독 한도 뒤 같은 작업 공간·세션의 �
   assert.ok(second!.runBudgetRemainingMs <= first!.runBudgetRemainingMs);
   // 진행 없던 한도 턴은 턴 예산에서 빠진다.
   assert.equal(Number((await allRows(database.db, 'codex_sessions'))[0]!.model_wait_turns), 1);
+});
+
+// 명세 §4.11: 구독 ↔ API --resume 실호환을 C45가 확인하기 전에는 작업 경로를 켜지 않는다. 한도 뒤 API 사용 스위치만 켠 라우터다.
+test('AC-38 작업 경로 칸이 꺼져 있으면 스위치가 켜져도 작업 턴은 선택 없이 구독으로 돌고, 한도면 작업 레인만 지금처럼 기다린다', async () => {
+  const local = await autoLane();
+  local.bridge.useMethods(new MethodRouter(f.store, { enabled: true, supported: () => true }));
+  await task(f, database.db);
+  local.worker.scripts = [(r, w) => ({ ...reply.limited()(r, w), rateLimit: { stop: { cause: 'rate_limit', resetsAt: resetsAt() } } })];
+  await local.runtime.tickTask();
+  assert.equal(local.worker.executes.length, 1);
+  assert.equal(local.worker.executes[0]!.execution, undefined);
+  assert.equal((await jobs(database.db))[0]!.state, 'waiting_user');
+  assert.deepEqual(await allRows(database.db, 'method_runs'), []);
+  // 넘어가지 않았다. 다른 경로(대화·PR 리뷰·변경 자체 리뷰)는 한도를 스스로 만나 넘어갈 수 있어야 하므로 전역 scheduler는 닫지 않는다.
+  assert.deepEqual((await allRows(database.db, 'method_routing')).map(row => row.subscription_state), ['available']);
+  assert.notEqual((await allRows(database.db, 'controls')).find(row => row.key === 'scheduler')?.value, true);
 });
 
 test('AC-38 세션이 남지 않은 첫 턴의 구독 한도는 API로 새로 시작하지 않고 작업을 보존한 채 지금처럼 기다리며, 대화 쪽 scheduler는 닫지 않는다', async () => {

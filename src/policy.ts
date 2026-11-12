@@ -29,6 +29,10 @@ const PolicyFields = z.strictObject({
   // 켜도 지금 계정에 두 방식이 설치돼 있고(관리 진입점 account auto) 두 작업자가 새 판을 받을 때만 실행마다 방식을 고른다.
   // 이 칸을 모르는 옛 게시 서버는 strict 스키마라 기동에 실패하므로, 새 게시 서버가 배포된 뒤에만 운영 정책에 넣는다.
   apiAfterLimit: z.boolean().optional(),
+  // 작업 경로(작업 레인 턴과 변경 작성 턴)의 한도 뒤 API 사용. apiAfterLimit이 켜져 있을 때만 뜻이 있고 없으면 꺼짐이다.
+  // 구독 세션을 API --resume으로 잇는 실호환을 C45가 확인하기 전에는 켜지 않는다(COLLEAGUE_SPEC §4.11). 꺼져 있으면 작업 턴은 구독으로만 돈다.
+  // apiAfterLimit과 같은 이유로 새 게시 서버가 배포된 뒤에만 운영 정책에 넣고, 게시 서버를 되돌리기 전에 먼저 뺀다.
+  apiAfterLimitTask: z.boolean().optional(),
 });
 // 이 값이 증거 묶음의 policy revision이 된다. 묶음이 받지 않는 모양이면 모델을 돌린 뒤에야 막힌다.
 const changeRevisionShape = (policy: { revision: string; change?: unknown }, ctx: z.RefinementCtx) => {

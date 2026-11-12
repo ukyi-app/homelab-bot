@@ -270,7 +270,22 @@ test('AC-32·AC-42 한도 뒤 API 사용 스위치가 꺼져 있으면 지원 �
     await registered();
     await waitFor(() => sends.some(s => s.url.endsWith('/v1/contracts')));
     await settle(150);
-    assert.deepEqual(gateLog(), [{ state: 'waiting_worker' }]);
+    // 작업 경로 칸은 따로다(명세 §4.11, C45 전에는 켜지 않는다). 스위치만 켜면 작업 경로는 닫혀 있다.
+    assert.deepEqual(gateLog(), [{ state: 'waiting_worker', task: 'closed' }]);
+    await publisher!.stop(); publisher = undefined; logs = []; sends = [];
+    await boot({ policy: { ...policyWith(TASK_POLICY), apiAfterLimit: true, apiAfterLimitTask: true }, taskLane });
+    await registered();
+    await waitFor(() => sends.some(s => s.url.endsWith('/v1/contracts')));
+    await settle(150);
+    assert.deepEqual(gateLog(), [{ state: 'waiting_worker', task: 'waiting_worker' }]);
+    // 작업 경로 칸만으로는 아무것도 열지 않는다(지원 확인도 없다).
+    await publisher!.stop(); publisher = undefined; logs = []; sends = [];
+    await boot({ policy: { ...policyWith(TASK_POLICY), apiAfterLimitTask: true }, taskLane });
+    await registered();
+    await waitFor(() => sends.some(s => s.url.endsWith('/v1/task/intake')));
+    await settle(150);
+    assert.deepEqual(gateLog(), [{ state: 'closed' }]);
+    assert.deepEqual(sends.filter(s => s.url.includes('/v1/contracts')), []);
   } finally { old.closeAllConnections(); old.close(); }
 });
 

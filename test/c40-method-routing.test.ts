@@ -62,6 +62,14 @@ test('AC-32 정책에 한도 뒤 API 사용 스위치 칸이 없으면 꺼짐으
   assert.throws(() => loadRuntimePolicy(JSON.stringify({ ...base, apiAfterLimit: 'true' }), 1), /runtime_policies_invalid: apiAfterLimit/);
 });
 
+test('AC-38 작업 경로 칸(apiAfterLimitTask)은 따로 있고, 없으면 꺼짐으로 읽으며 참·거짓만 받는다', () => {
+  const base = { revision: 'r', owner: 'o', guild: 'g', conversationChannel: 'c', notificationChannel: 'n', dmEnabled: null, services: [] };
+  assert.equal(loadRuntimePolicy(JSON.stringify({ ...base, apiAfterLimit: true }), 1).apiAfterLimitTask, undefined);
+  const both = loadRuntimePolicy(JSON.stringify({ ...base, apiAfterLimit: true, apiAfterLimitTask: true }), 1);
+  assert.deepEqual([both.apiAfterLimit, both.apiAfterLimitTask], [true, true]);
+  assert.throws(() => loadRuntimePolicy(JSON.stringify({ ...base, apiAfterLimitTask: 'true' }), 1), /runtime_policies_invalid: apiAfterLimitTask/);
+});
+
 test('AC-32 스위치가 꺼져 있으면 두 방식이 설치돼 있어도 새 판 요청이 없고 구독 한도는 지금처럼 기다린다', async () => {
   await installed();
   const runtime = runtimeWith(router(false));

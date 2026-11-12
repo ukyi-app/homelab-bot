@@ -228,9 +228,14 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   // 한도 뒤 API 사용(C40). 스위치(정책 apiAfterLimit)가 켜져 있어도 두 작업자가 새 판을 받는다고 확인하기 전에는 고르지 않는다(옛 판 그대로).
   // 확인은 아래 method_support_probe가 주기로 한다. 꺼져 있으면 확인 요청도 보내지 않는다.
   const methodsEnabled = config.policy.apiAfterLimit === true;
+  // 작업 경로(작업 레인·변경 작성 턴)는 따로 연다. 구독 ↔ API --resume 실호환(C45) 확인 전에는 켜지 않는다(COLLEAGUE_SPEC §4.11).
+  const methodsTask = methodsEnabled && config.policy.apiAfterLimitTask === true;
   let methodsSupported = false;
-  const methods = new MethodRouter(store, { enabled: methodsEnabled, supported: () => methodsSupported });
-  log('method_routing_gate', { state: methodsEnabled ? 'waiting_worker' : 'closed' });
+  // 변경 작성 턴은 작업자가 /v2/task에도 선택 칸을 받는다고 알릴 때만 고른다(변경 작성이 꺼진 작업자는 /v1/task만 알린다).
+  let methodsChangeSupported = false;
+  const methods = new MethodRouter(store, { enabled: methodsEnabled, task: methodsTask,
+    supported: path => methodsSupported && (path !== 'change_author' || methodsChangeSupported) });
+  log('method_routing_gate', methodsEnabled ? { state: 'waiting_worker', task: methodsTask ? 'waiting_worker' : 'closed' } : { state: 'closed' });
   taskBridge?.useMethods(methods);
   const runtime = new Runtime(store, gate, new HttpWorker(config.workerUrl, send), signer, reader,
     taskBridge, { shutdown: stop.signal, drainMs: deps.drainMs, taskLoop, externalTask: !!config.externalTask, methods });
@@ -629,7 +634,9 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   if (methodsEnabled) every('method_support_probe', deps.taskWorkerProbeMs ?? TASK_WORKER_PROBE_MS, async () => {
     const listed = (await new HttpWorker(config.workerUrl, send).contracts().catch(() => ({ executionSelection: [] as string[] }))).executionSelection;
     const chat = EXECUTION_SELECTION_PATHS.every(path => listed.includes(path));
-    const task = !taskGate.open || (await taskWorkerExecutionSelection(taskGate.workerUrl, send, stop.signal)).includes('/v1/task');
+    const taskListed = taskGate.open ? await taskWorkerExecutionSelection(taskGate.workerUrl, send, stop.signal) : [];
+    const task = !taskGate.open || taskListed.includes('/v1/task');
+    methodsChangeSupported = taskListed.includes('/v2/task');
     if (methodsSupported !== (chat && task)) log('method_routing_gate', { state: chat && task ? 'open' : 'waiting_worker', chat, task });
     methodsSupported = chat && task;
   });

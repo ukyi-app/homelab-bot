@@ -14,10 +14,14 @@ import type { Store } from './store.js';
 // owner 계정 전환(switchAccount)은 쓰지 않는다. 그 전이는 모든 모델 대기·결제 대기를 풀고 한도 관측을 지운다.
 // 고를 수 없으면 select가 null이고 호출자는 옛 판 요청을 보낸다(지금 동작). 스위치·설치·작업자 지원 셋 중 하나라도 없으면 그렇다.
 
-export type MethodPath = 'chat' | 'review' | 'change_review' | 'task';
+// change_author: 변경 작성 턴(v2). 작업 레인과 같은 세션 표·같은 작업 경로라 실행 기록(method_runs.path)에는 'task'로 남는다.
+export type MethodPath = 'chat' | 'review' | 'change_review' | 'task' | 'change_author';
+const TASK_PATHS: ReadonlySet<MethodPath> = new Set(['task', 'change_author']);
 export interface MethodRouterOptions {
   // 정책 apiAfterLimit === true. 기동 때 한 번 읽는다.
   enabled: boolean;
+  // 정책 apiAfterLimitTask === true. 작업 경로(task·change_author)는 enabled에 더해 이것도 켜져야 고른다. 없으면 꺼짐이다.
+  task?: boolean;
   // 두 작업자가 이 경로의 새 판을 받는다고 확인됐는지(main.ts가 주기로 지원 확인 경로를 읽어 둔 값). 확인 못 했으면 false다.
   supported: (path: MethodPath) => boolean;
 }
@@ -62,10 +66,13 @@ async function activeInstall(db: Database): Promise<RoutingRow | undefined> {
 export class MethodRouter {
   constructor(private readonly store: Store, private readonly options: MethodRouterOptions) {}
   get enabled(): boolean { return this.options.enabled; }
+  private open(path: MethodPath): boolean {
+    return this.options.enabled && (!TASK_PATHS.has(path) || this.options.task === true) && this.options.supported(path);
+  }
 
   // 이 실행의 방식. null이면 옛 판 요청을 보낸다. 고르면 실행 기록을 남기고, 그 실행 ID가 요청의 서명된 선택 칸이 된다.
   async select(job: Pick<Job, 'id' | 'budget' | 'lease_token'>, path: MethodPath): Promise<ExecutionSelection | null> {
-    if (!this.options.enabled || !this.options.supported(path)) return null;
+    if (!this.open(path)) return null;
     return this.store.atomic(async s => {
       // 넘어감·복귀 전이와 같은 scheduler 행 잠금 아래에서 읽고 고른다(두 게시 서버가 같은 확인 자리를 함께 잡지 않게).
       await s.lockScheduler();
@@ -87,7 +94,7 @@ export class MethodRouter {
         } else method = 'api';
       }
       await s.db.query(`INSERT INTO method_runs(run_id,job_id,lease,path,account,revision,method,epoch,probe,selected_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-        [runId, job.id, job.lease_token ?? null, path, row.account, row.revision, method, row.epoch, probe, now]);
+        [runId, job.id, job.lease_token ?? null, TASK_PATHS.has(path) ? 'task' : path, row.account, row.revision, method, row.epoch, probe, now]);
       return { account: row.account, credentialRevision: row.revision, method, runId };
     });
   }
@@ -95,10 +102,21 @@ export class MethodRouter {
   // 지금 고를 방식이 API인가(구독이 실제 한도이고 API가 잠기지 않았다). PR 리뷰 claim이 리뷰 미루기를 건너뛸지 정할 때 쓴다.
   // 구독 확인 시각이 지났어도 확인이 성공하기 전까지는 API다. 호출자가 scheduler 행을 이미 잠근 트랜잭션에서 부른다.
   async apiChosen(tx: Database, path: MethodPath = 'review'): Promise<boolean> {
-    if (!this.options.enabled || !this.options.supported(path)) return false;
+    if (!this.open(path)) return false;
     const row = (await tx.query<RoutingRow>(`SELECT * FROM method_routing WHERE id='current'`)).rows[0];
     if (!row || row.install_state !== 'active' || row.subscription_state !== 'limited' || row.api_state !== 'eligible') return false;
     return (await tx.query('SELECT 1 FROM model_accounts WHERE name=$1 AND current', [row.account])).rows.length > 0;
+  }
+
+  // 대화 경로가 구독 한도를 만나면 API로 넘어갈 수 있는가(구독 상태와 무관하게 설치가 켜져 있고 API가 잠기지 않았다).
+  // 선택 없이 돈 작업 턴(작업 경로 칸 꺼짐)이 구독 한도로 끝났을 때 작업 레인만 세울지 정한다. 전역 scheduler를 닫으면
+  // 대화·PR 리뷰가 한도를 스스로 만나지 못해 넘어가지 못한다.
+  async routesOthers(tx: Database): Promise<boolean> {
+    if (!this.open('chat')) return false;
+    const row = (await tx.query<RoutingRow>(`SELECT * FROM method_routing WHERE id='current'`)).rows[0];
+    if (!row || row.install_state !== 'active' || row.api_state !== 'eligible') return false;
+    const accounts = (await tx.query<{ current: boolean }>('SELECT current FROM model_accounts WHERE name=$1', [row.account])).rows;
+    return accounts.length === 2 && accounts.some(account => account.current);
   }
 
   // 그 job lease로 보낸 새 판 요청의 선택(결과를 아직 귀속하지 않은 것). 저장 결과 회수가 v2 결과를 읽고 대조할 때 쓴다.
