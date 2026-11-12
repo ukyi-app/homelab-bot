@@ -27,6 +27,8 @@ export interface RoutedOutcome {
   rateLimit?: RateLimitInfo | null;
   subscriptionLimit?: boolean;
   refusal?: string;
+  // false면 그 일을 다른 방식으로 이을 수 없다(작업 레인에 이어 갈 세션이 남지 않음). 상태 전이는 하되 다시 넣지 않는다.
+  resumable?: boolean;
 }
 // requeued: 이 일을 다시 대기열에 넣었다(다른 방식으로 이어서 하거나, 옛 판으로 다시 보내려고). 호출자는 더 쓰지 않는다.
 // wait: 두 방식이 다 막혀 모델 멈춤이다. 호출자는 이 rateLimit(구독 확인 시각)으로 waitForUser를 부른다.
@@ -111,9 +113,10 @@ export class MethodRouter {
   // 작업자 결과(멈춤이 확인된 것)를 그 실행의 고정된 선택으로 귀속하고, 필요하면 같은 트랜잭션에서 이 일을 다시 대기열에 넣는다.
   // 같은 실행의 두 번째 보고는 아무것도 바꾸지 않는다(default).
   // recovered: 저장 결과 회수로 받은 결과다. 그 job은 실행 중이 아니라 unknown(또는 멈춤 확인 뒤 failed)이라 그 상태에서 되돌린다.
+  // within: 호출자가 이미 연 트랜잭션의 Store(작업 레인의 턴 확정). 그 트랜잭션이 scheduler 행을 잡았거나 잡을 순서여야 한다.
   async settle(job: Pick<Job, 'id' | 'lease_token'>, selection: ExecutionSelection, outcome: RoutedOutcome,
-    options: { recovered?: boolean } = {}): Promise<Settlement> {
-    return this.store.atomic(async s => {
+    options: { recovered?: boolean; within?: Store } = {}): Promise<Settlement> {
+    return (options.within ?? this.store).atomic(async s => {
       // 같은 한도를 두 게시 서버·두 실행 자리가 함께 보고해도 넘어감이 한 번이 되도록 scheduler 행 → 상태 행 순서로 잡는다
       // (모델 대기 Store.waitForUser·계정 전환과 같은 순서).
       await s.lockScheduler();
@@ -127,7 +130,8 @@ export class MethodRouter {
       // 고를 때의 설치와 지금 설치가 같은 계정·revision이고 켜져 있을 때만 상태를 바꾼다. 옛 계정·옛 revision의 늦은 결과는
       // 지금 상태·API 잠금·리뷰 미룸을 건드리지 않는다. 그 일은 지금 설치(또는 옛 판)로 다시 고르도록 대기열로 돌린다.
       const current = row !== undefined && row.install_state === 'active' && row.account === run.account && row.revision === run.revision;
-      const requeue = async (): Promise<Settlement> => await this.requeue(s, job, options.recovered === true) ? { action: 'requeued' } : DEFAULT;
+      const requeue = async (): Promise<Settlement> => outcome.resumable !== false && await this.requeue(s, job, options.recovered === true)
+        ? { action: 'requeued' } : DEFAULT;
       if (outcome.status === 'not_run') {
         if (current) {
           await s.db.query(`UPDATE method_routing SET install_state='refused',refused_reason=$1,epoch=epoch+1,updated_at=$2 WHERE id='current'`,

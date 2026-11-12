@@ -13,6 +13,7 @@ import type { Policy, PolicyGate } from './policy.js';
 import { DRAIN_MS } from './runtime.js';
 import type { TaskLane } from './runtime.js';
 import type { Store } from './store.js';
+import type { MethodRouter } from './method-routing.js';
 import { FOREIGN_SESSION_STATUS, TaskBridge, TaskWorkerBusy, TaskWorkerRejected, releaseStatus } from './task-bridge.js';
 import type { ReleaseOutcome } from './task-bridge.js';
 import { taskOutputRisk } from './task-output.js';
@@ -115,6 +116,10 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
   private readonly options: ClaudeTaskBridgeOptions;
   // 정리 재시도 시각. 잃어도 다음 sweep이 바로 다시 시도할 뿐이라 메모리에 둔다.
   private readonly nextFinalize = new Map<string, number>();
+  private methods?: MethodRouter;
+  // 한도 뒤 API 사용(C40). 게시 서버 조립(main)이 붙인다. 없거나 고를 수 없으면 v1 작업 턴은 선택 칸 없이 지금 그대로다.
+  // 변경 작성 턴(v2, ClaudeChangeAuthor)은 여기서 선택을 싣지 않는다.
+  useMethods(methods: MethodRouter): void { this.methods = methods; }
   constructor(store: Store, gate: PolicyGate, private readonly worker: TaskWorkerPort, private readonly plans: TaskPlanSource,
     options: Partial<ClaudeTaskBridgeOptions> = {}, private readonly change?: TaskV2WorkerPort) {
     const merged = { ...CLAUDE_TASK_DEFAULTS, ...options };
@@ -144,6 +149,10 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       if (current.state !== 'running') return;
       request = await this.prepare(job, policy, session);
       if (!request) return;
+      // 방식을 고를 수 있으면 요청 끝에 선택 칸을 싣는다(작업 레인은 판을 늘리지 않는 명시적 협상, DECISIONS "C39").
+      // 턴·도구·실행 시간 예산은 세션에서 이어 오므로 방식이 바뀌어도 새로 채워지지 않는다.
+      const selection = this.methods ? await this.methods.select(job, 'task') : null;
+      if (selection) request = TASK_ENDPOINTS['/v1/task'].request.parse({ ...request, execution: selection });
       // 답 수락 뒤 dispatch 전 철회를 여기서 막는다. Denied는 Runtime이 cancelled로 끝내고 sweep이 세션을 닫는다.
       await this.gate.authorize(job.owner_id, job.target);
       if (this.options.shutdown?.aborted) { await this.unchanged(job, session, store => store.defer(job, 'publisher_shutdown')); return; }
@@ -395,6 +404,10 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     if (response.job !== request.job || response.lease !== request.lease || response.generation !== request.generation
       || response.sessionId !== request.sessionId || response.turn !== request.turn
       || !sameWorker(request.operation === 'resume' ? request.expectedWorker : null, response.worker)) return { kind: 'lost' };
+    // 선택을 실은 턴의 결과는 실행 칸이 보낸 선택과 같아야 한다(작업자는 요청 선택으로만 돈다). 다르거나 없으면 모름이다.
+    if (request.execution && response.status !== 'not_run'
+      && (!response.execution || (['account', 'credentialRevision', 'method', 'runId'] as const).some(key => response.execution![key] !== request.execution![key]))) return { kind: 'lost' };
+    if (!request.execution && (response.status === 'not_run' || response.execution)) return { kind: 'lost' };
     return { kind: 'response', response };
   }
   private async factsOf(turn: Turn, request: TaskRequest, cancel?: () => Promise<CancelFacts | null>): Promise<Facts> {
@@ -493,16 +506,46 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       if (turn.kind === 'lost') return fail('task_worker_lost');
       if (turn.kind === 'question_blocked') return fail(CHANGE_QUESTION_BLOCKED);
       const response = turn.response;
+      if (response.status === 'not_run') {
+        // 선택이 설치된 묶음과 맞지 않아 모델을 띄우지 않았다(모델 턴 아님). 작업자 영수증이 이 턴 번호를 이미 썼으므로 재개 턴은 다음 턴 번호로,
+        // 첫 턴은 새 세대로 잇는다. 턴 예산에서는 뺀다. router가 설치를 refused로 바꿔 다음 턴은 선택 없이 간다.
+        const routed = request.execution && this.methods
+          ? await this.methods.settle(job, request.execution, { status: 'not_run', refusal: response.refusal }, { within: store }) : undefined;
+        if (routed?.action !== 'requeued') return fail('task_worker_not_run');
+        if (request.operation === 'resume') {
+          await session('waiting_model', { reason: 'model_limit', budgeted: false });
+          if (request.questionId) await store.db.query("UPDATE codex_questions SET state='answered' WHERE id=$1 AND state='resumed'", [request.questionId]);
+        } else await session('cancelled');
+        await store.syncTaskLane();
+        return { terminal: false };
+      }
       if (response.status === 'failed') return fail(`task_${response.reason}`);
       if (response.status === 'limited' || response.status === 'auth_expired') {
-        const reason = response.status === 'limited' ? 'model_limit' : 'auth_expired';
+        let reason: 'model_limit' | 'auth_expired' = response.status === 'limited' ? 'model_limit' : 'auth_expired';
+        let rateLimit = response.rateLimit ?? null;
+        let laneOnly = reason === 'auth_expired';
+        if (request.execution && this.methods) {
+          // 한도 뒤 API 사용: 같은 세션을 다음 턴(--resume)으로 다른 방식에 잇는다. 이어 갈 세션이 남지 않았으면(첫 턴이 세션을 만들기 전에
+          // 끝남) 스스로 새로 시작하지 않고 지금처럼 기다린다. 다른 경로는 API를 쓸 수 있으니 그때는 작업 레인만 막는다.
+          const routed = await this.methods.settle(job, request.execution, { status: response.status, rateLimit, resumable: facts.retained === true,
+            subscriptionLimit: response.execution?.subscriptionLimit === true }, { within: store });
+          if (routed.action === 'requeued') {
+            // 진행이 없던 턴이라 턴 예산에서 뺀다. 실행 시간·도구 수는 지금처럼 합산된다.
+            await session('waiting_model', { reason: 'model_limit', budgeted: false });
+            if (request.operation === 'resume' && request.questionId) await store.db.query("UPDATE codex_questions SET state='answered' WHERE id=$1 AND state='resumed'", [request.questionId]);
+            await store.syncTaskLane();
+            return { terminal: false };
+          }
+          if (routed.action === 'wait') { reason = 'model_limit'; rateLimit = routed.rateLimit; laneOnly = false; }
+          else if (reason === 'model_limit' && await this.methods.apiChosen(store.db, 'task')) laneOnly = true;
+        }
         // 계정 한도는 대화·리뷰도 같은 계정이라 양쪽을 막고, 인증 만료는 레인 토큰의 일이라 작업 레인만 막는다.
         // 한도 정보가 없으면(옛 작업자) 멈춤 기록은 시각을 모르는 한도로 남아 30분마다 다시 시도한다.
-        await store.waitForUser(job, reason, { laneOnly: reason === 'auth_expired', rateLimit: response.rateLimit ?? null });
+        await store.waitForUser(job, reason, { laneOnly, rateLimit });
         const now = (await store.db.query<{ state: string; attempt: number }>('SELECT state,attempt FROM jobs WHERE id=$1', [job.id])).rows[0]!;
         if (now.state !== 'waiting_user') return skipped('waiting_user');
         // 한도·인증 대기 턴은 진행이 없어 턴 예산에서 뺀다. 결제는 저절로 재개하지 않고 owner가 풀 때마다 한 턴을 써서 센다.
-        await session('waiting_model', { reason, budgeted: reason === 'model_limit' && response.rateLimit?.stop?.cause === 'billing' });
+        await session('waiting_model', { reason, budgeted: reason === 'model_limit' && rateLimit?.stop?.cause === 'billing' });
         await store.syncTaskLane();
         // 그 턴이 나르던 답은 처리되지 않았다. /resume-model 뒤 같은 답으로 잇는다.
         if (request.operation === 'resume' && request.questionId) await store.db.query("UPDATE codex_questions SET state='answered' WHERE id=$1 AND state='resumed'", [request.questionId]);
@@ -554,6 +597,11 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     const response = turn.kind === 'response' ? turn.response : undefined;
     if (response && 'rateLimit' in response && response.rateLimit && response.status !== 'limited' && response.status !== 'auth_expired') {
       await this.store.observeRateLimit(response.rateLimit, job.id).catch(error => { this.options.log('task_rate_limit_record_failed', { job: job.id, ...errorInfo(error) }); });
+    }
+    // 진행한 턴(완료·질문·실패)도 그 실행의 선택으로 귀속한다(구독 확인 성공이 구독 복귀가 된다). 기록 실패는 확정한 턴을 바꾸지 않는다.
+    if (response && request.execution && this.methods && (response.status === 'completed' || response.status === 'needs_input' || response.status === 'failed')) {
+      await this.methods.settle(job, request.execution, { status: response.status === 'failed' ? 'failed' : 'succeeded' })
+        .catch(error => { this.options.log('task_method_settle_failed', { job: job.id, ...errorInfo(error) }); });
     }
     return settled;
   }
