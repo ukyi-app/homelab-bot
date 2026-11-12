@@ -19,7 +19,7 @@ import { archiveContract } from '../src/worker.js';
 import { HttpReviewWorker, reviewWorkerServer } from '../src/review-http.js';
 import { controlText } from '../src/control-format.js';
 import { parseAdminArgs, runAdmin } from '../src/admin.js';
-import { MethodRouter, installMethods } from '../src/method-routing.js';
+import { MethodRouter, installMethods, methodRoutingView } from '../src/method-routing.js';
 import { recordAccount, switchAccount } from '../src/model-accounts.js';
 import { Runtime } from '../src/runtime.js';
 import { captureControls, event, fixture, localDatabase, thread } from './helpers.js';
@@ -123,7 +123,8 @@ let controls: ReturnType<typeof captureControls>;
 before(async () => { database = await localDatabase(); controls = captureControls(); });
 beforeEach(async () => {
   await database.pg.exec(`TRUNCATE events,conversations,jobs,results,outbox,schedules,denied_actors,controls,audit,incidents,
-    github_deliveries,pr_reviews,review_deliveries,model_limit_state,model_accounts,method_routing,method_runs,model_pauses RESTART IDENTITY CASCADE`);
+    github_deliveries,pr_reviews,review_deliveries,model_limit_state,model_accounts,method_routing,method_subscription,method_api,method_runs,model_pauses
+    RESTART IDENTITY CASCADE`);
   f = await fixture(database.db);
   r = await setup();
 });
@@ -2086,13 +2087,31 @@ test('AC-39 고를 방식이 API인 동안은 구독 경고로 미룬 PR 리뷰�
   assert.equal(await f.store.resumeDue(), 1);
   f.setRun(async () => ({ status: 'succeeded', stopped: true, rateLimit: null, output: { reply: '돌아왔어요.', proposal: null, ack_only: false } }));
   await chatRuntime.tick();
-  assert.equal((await rows('method_routing'))[0]!.subscription_state, 'available');
+  assert.equal((await methodRoutingView(database.db)).subscription!.state, 'available');
   r.gh.pulls.set(8, pull({ number: 8, updated_at: '2026-10-29T02:00:00Z' }));
   assert.equal((await hook('pull_request', prEvent('opened', pull({ number: 8, updated_at: '2026-10-29T02:00:00Z' })))).outcome, 'queued');
   assert.equal(await m.runtime.tick(), false);
   f.advance(warned - f.now());
   assert.equal(await m.runtime.tick(), true);
   assert.deepEqual(m.runs, ['api', 'subscription']);
+});
+test('AC-39 구독 확인 시각이 리뷰 미루기 기한보다 이르면, 그 시각 뒤 미룬 PR 리뷰는 구독 확인으로 집히지 않고 기다린다', async () => {
+  await autoInstalled();
+  const limitResets = Math.floor((f.now() + HOUR) / 1000);
+  const warned = Math.floor((f.now() + 5 * HOUR) / 1000) * 1000;
+  await f.store.observeRateLimit(warning(warned), null);
+  const m = methodReviewer(() => ({ status: 'succeeded', output: OUTPUT }));
+  const chatRuntime = new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, undefined, { methods: m.router });
+  f.setRun(chatByMethod(limitResets, 'succeeded'));
+  await chat('limited-chat');
+  await chatRuntime.tick();
+  await chatRuntime.tick();
+  // 구독 확인 시각(풀리는 시각 + 1분)은 지났고 미루기 기한(5시간)은 남았다. API는 잠기지 않았다.
+  f.advance(limitResets * 1000 + 60_000 - f.now());
+  await opened();
+  assert.equal(await m.runtime.tick(), false);
+  assert.deepEqual(m.runs, []);
+  assert.deepEqual((await reviewJobs()).map(j => j.state), ['queued']);
 });
 test('AC-16 리뷰가 한도로 멈추면 풀리는 시각 1분 뒤 리뷰를 저절로 이어서 하고 게시까지 간다', async () => {
   const resetsAt = Math.floor((f.now() + HOUR) / 1000);

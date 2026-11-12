@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { Postgres, migrate } from '../src/database.js';
-import { MethodRouter, installMethods } from '../src/method-routing.js';
+import type { ExecutionSelection } from '../src/execution-auth.js';
+import { MethodRouter, installMethods, methodRoutingView } from '../src/method-routing.js';
+import type { MethodPath } from '../src/method-routing.js';
 import { recordAccount, switchAccount } from '../src/model-accounts.js';
 import { fixture } from './helpers.js';
 
@@ -12,6 +14,8 @@ import { fixture } from './helpers.js';
 const socket = process.env.HOMELAB_TEST_PG_SOCKET;
 const skip = socket ? false : 'HOMELAB_TEST_PG_SOCKET 없음(로컬 PostgreSQL 필요)';
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+// 고를 수 있는 상태에서만 부른다(기다림·옛 판이 아닌 선택).
+const pick = async (router: MethodRouter, job: Parameters<MethodRouter['select']>[0], path: MethodPath = 'chat') => (await router.select(job, path)) as ExecutionSelection;
 
 async function freshDatabase(fn: (db: Postgres) => Promise<void>): Promise<void> {
   const admin = new pg.Pool({ host: socket, user: 'postgres', database: 'postgres', max: 1 });
@@ -53,7 +57,7 @@ test('AC-37 두 게시 서버가 같은 구독 한도를 동시에 보고해도 
     await f.store.atomic(s => installMethods(s, 'main', 'rev-1'));
     const servers = [new MethodRouter(f.store, { enabled: true, supported: () => true }), new MethodRouter(f.store, { enabled: true, supported: () => true })];
     const jobs = [await running(db, 'a', f.now()), await running(db, 'b', f.now())];
-    const selections = await Promise.all(jobs.map((job, index) => servers[index]!.select(job, 'chat')));
+    const selections = await Promise.all(jobs.map((job, index) => pick(servers[index]!, job)));
     assert.deepEqual(selections.map(selection => selection!.method), ['subscription', 'subscription']);
     const resetsAt = Math.floor((f.now() + 3_600_000) / 1000);
     // 다른 연결이 방식 상태 행을 쥔 동안 두 보고가 함께 들어와 기다린다. 잠금 없이 읽으면 둘 다 "쓸 수 있음"을 보고 둘 다 넘긴다.
@@ -75,7 +79,7 @@ test('AC-37 두 게시 서버가 같은 구독 한도를 동시에 보고해도 
     assert.equal((await servers[1]!.settle(jobs[0]!, selections[0]!, { status: 'limited', subscriptionLimit: true })).action, 'default');
     // 다음 실행은 두 서버 모두 API다.
     const next = await running(db, 'c', f.now());
-    assert.equal((await servers[1]!.select(next, 'chat'))!.method, 'api');
+    assert.equal((await pick(servers[1]!, next)).method, 'api');
   });
 });
 
@@ -88,23 +92,78 @@ test('AC-37 옛 revision·옛 계정 실행의 늦은 실패는 지금 상태·A
     await f.store.atomic(s => installMethods(s, 'main', 'rev-1'));
     const router = new MethodRouter(f.store, { enabled: true, supported: () => true });
     const first = await running(db, 'a', f.now());
-    const subscription = (await router.select(first, 'chat'))!;
+    const subscription = await pick(router, first);
     await router.settle(first, subscription, { status: 'limited', subscriptionLimit: true });
     // 구독 한도 뒤 API로 고른 실행이 도는 사이 owner가 새 묶음(revision)을 설치했다. 같은 밀리초다.
     const late = await running(db, 'b', f.now());
-    const api = (await router.select(late, 'chat'))!;
+    const api = await pick(router, late);
     assert.equal(api.method, 'api');
     await f.store.atomic(s => installMethods(s, 'main', 'rev-2'));
     assert.equal((await router.settle(late, api, { status: 'limited', rateLimit: { stop: { cause: 'billing' } } })).action, 'requeued');
-    const state = (await db.query<{ api_state: string; subscription_state: string; revision: string }>(
-      "SELECT api_state,subscription_state,revision FROM method_routing")).rows[0]!;
-    assert.deepEqual(state, { api_state: 'eligible', subscription_state: 'limited', revision: 'rev-2' });
+    const state = await methodRoutingView(db);
+    assert.deepEqual([state.api!.state, state.subscription!.state, state.revision], ['eligible', 'limited', 'rev-2']);
     assert.equal((await db.query("SELECT 1 FROM audit WHERE kind='method_route_api_locked'")).rows.length, 0);
     // 지금 revision의 API 결제 실패는 잠근다.
     const current = await running(db, 'c', f.now());
-    const fresh = (await router.select(current, 'chat'))!;
+    const fresh = await pick(router, current);
     assert.equal(fresh.credentialRevision, 'rev-2');
     assert.equal((await router.settle(current, fresh, { status: 'limited', rateLimit: { stop: { cause: 'billing' } } })).action, 'wait');
-    assert.equal((await db.query<{ api_state: string }>('SELECT api_state FROM method_routing')).rows[0]!.api_state, 'billing_blocked');
+    assert.equal((await methodRoutingView(db)).api!.state, 'billing_blocked');
+  });
+});
+
+// 구독 한도로 API를 쓰는 상태를 만든다(대화 실행 하나가 넘어감).
+async function routedLimited(db: Postgres, f: Awaited<ReturnType<typeof fixture>>, resetsAt: number) {
+  await recordAccount(db, 'main', 'subscription', f.now());
+  await recordAccount(db, 'main', 'api', f.now());
+  await f.store.atomic(s => switchAccount(s, 'main', 'subscription', 'cli', 'cli'));
+  await f.store.atomic(s => installMethods(s, 'main', 'rev-1'));
+  const router = new MethodRouter(f.store, { enabled: true, task: true, supported: () => true });
+  const first = await running(db, 'limited', f.now());
+  await router.settle(first, await pick(router, first), { status: 'limited', subscriptionLimit: true, rateLimit: { stop: { cause: 'rate_limit', resetsAt } } });
+  return router;
+}
+
+test('AC-36 API 잠금과 고른 API 실행의 시작 확인이 두 연결에서 겹쳐도, 잠금이 먼저 커밋되면 그 실행은 시작하지 않는다', { skip }, async () => {
+  await freshDatabase(async db => {
+    const f = await fixture(db);
+    const servers = [await routedLimited(db, f, Math.floor((f.now() + 3_600_000) / 1000)), new MethodRouter(f.store, { enabled: true, task: true, supported: () => true })];
+    for (let round = 0; round < 5; round++) {
+      await db.query(`UPDATE method_api SET state='eligible',blocked_at=NULL`);
+      const pending = await running(db, `pending-${round}`, f.now());
+      const locker = await running(db, `locker-${round}`, f.now());
+      const [chosen, locking] = [await pick(servers[0]!, pending), await pick(servers[1]!, locker)];
+      assert.deepEqual([chosen.method, locking.method], ['api', 'api']);
+      // 두 게시 서버: 하나는 고른 API 실행을 보내려 하고, 다른 하나는 API 결제 실패로 잠근다.
+      const [started] = await Promise.all([servers[0]!.start(pending, chosen),
+        servers[1]!.settle(locker, locking, { status: 'limited', rateLimit: { stop: { cause: 'billing' } } })]);
+      // 같은 scheduler 잠금 아래라 둘 중 하나가 먼저다. 시작하지 못했다면 잠금이 먼저였고, 그 실행은 시작 기록이 없다.
+      const run = (await db.query<{ started_at: string | null }>('SELECT started_at FROM method_runs WHERE run_id=$1', [chosen.runId])).rows[0]!;
+      assert.equal(run.started_at !== null, started);
+      assert.equal((await methodRoutingView(db)).api!.state, 'billing_blocked');
+      // 잠금 뒤에는 어느 서버도 API 실행을 시작하지 않는다.
+      const after = await running(db, `after-${round}`, f.now());
+      const next = await servers[round % 2]!.select(after, 'chat');
+      assert.ok(next === null || 'wait' in next || next.method !== 'api');
+    }
+  });
+});
+
+test('AC-36 API가 잠긴 동안 두 실행 자리(대화·작업)가 구독 확인 시각 뒤 동시에 고르면 구독 확인은 정확히 한 건이고, 시각 전에는 0건이다', { skip }, async () => {
+  await freshDatabase(async db => {
+    const f = await fixture(db);
+    const resetsAt = Math.floor((f.now() + 3_600_000) / 1000);
+    const router = await routedLimited(db, f, resetsAt);
+    const other = new MethodRouter(f.store, { enabled: true, task: true, supported: () => true });
+    const locker = await running(db, 'locker', f.now());
+    assert.equal((await router.settle(locker, await pick(router, locker), { status: 'limited', rateLimit: { stop: { cause: 'billing' } } })).action, 'wait');
+    const lanes = async (tag: string) => Promise.all([router.select(await running(db, `chat-${tag}`, f.now()), 'chat'),
+      other.select(await running(db, `task-${tag}`, f.now()), 'task')]);
+    const before = await lanes('before');
+    assert.deepEqual(before.map(routed => routed !== null && 'wait' in routed), [true, true]);
+    f.advance(resetsAt * 1000 + 60_000 - f.now());
+    const after = await lanes('after');
+    assert.deepEqual(after.map(routed => routed !== null && 'wait' in routed ? 'wait' : routed?.method).sort(), ['subscription', 'wait']);
+    assert.equal((await db.query(`SELECT 1 FROM method_runs WHERE probe`)).rows.length, 1);
   });
 });

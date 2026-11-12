@@ -701,6 +701,21 @@ test('C39 넘김: 변경 작성 턴의 실행 안 됨(not_run)은 재개 턴이�
     [['start', 1, 'subscription'], ['start', 2, null]]);
 });
 
+test('AC-37 두 게시 서버가 같은 작성 job·lease로 각각 고르고 늦게 고른 쪽이 턴 시작(begin)에서 지면, 실제로 시작한 턴의 선택으로 결과를 받는다', async () => {
+  const h = await routedAuthor();
+  await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  routedEnds(h, []);
+  // 서버 A가 고르고 턴을 시작했다.
+  const { receiptId } = await h.author.start(startInput(h));
+  const started = h.calls.sent[0]!;
+  // 서버 B도 세션 없음을 읽고 준비했다. 같은 lease로 더 늦게 고르지만 시작 CAS에서 진다.
+  h.app.advance(1);
+  const late = await h.bridge.selectChangeTurn(h.job);
+  assert.ok(late && 'runId' in late);
+  assert.equal(await h.bridge.beginChangeTurn(h.job, { ...started, execution: late } as never, undefined), 'conflict');
+  assert.equal((await pollAuthor(h, receiptId)).kind, 'snapshot');
+});
+
 test('AC-37 변경 작성 결과의 실행 칸이 보낸 선택과 다르면 결과를 믿지 않고 응답 유실로 다룬다', async () => {
   const h = await routedAuthor();
   await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);

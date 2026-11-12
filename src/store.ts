@@ -456,7 +456,7 @@ export class Store {
       await this.lockConversation(job, tx);
       await this.lockScheduler(tx);
       if (await this.complete(job, 'waiting_user', reason, tx) !== 'waiting_user') return;
-      await this.recordPause(job.id, reason, options.rateLimit ?? null, tx);
+      await this.recordPause(job.id, reason, options.rateLimit ?? null, tx, options.laneOnly === true);
       if (!options.laneOnly) await tx.query(`UPDATE controls SET value='true' WHERE key='scheduler'`);
       const away = await this.syncAwayIn(tx);
       // task는 작업 레인(codex.ts)이 따로 알린다. 여기서는 chat만. 자리 비움 한 줄이라 원인·시각·'/' 명령이 없다.
@@ -487,7 +487,8 @@ export class Store {
   // 옛 계정의 먼 풀리는 시각이면 그때까지 선다. 경계는 observeRateLimit과 달리 같은 밀리초를 새 계정 실행으로 본다:
   // claim과 전환은 같은 밀리초에 차례로 커밋될 수 있고, 그 새 계정의 결제 멈춤을 옛 것으로 버리면 owner가 풀기 전에 다시 돈다.
   // 반대로 틀리면(정말 옛 실행) 옛 계정의 결제로 owner 재개를 기다리는데, 결제 멈춤을 잘못 재개하는 쪽보다 낫다.
-  async recordPause(job: string, reason: string, rateLimit: RateLimitInfo | null, tx: Database): Promise<void> {
+  // laneOnly: 그 레인만 막는 대기다. 멈춤 기록에 남겨(lane_only_at = paused_at) 전역 scheduler 해제가 이 대기를 기다리지 않게 한다.
+  async recordPause(job: string, reason: string, rateLimit: RateLimitInfo | null, tx: Database, laneOnly = false): Promise<void> {
     const now = this.now();
     const stale = await this.startedBeforeSwitch(job, tx, false);
     const seen = stale ? null : rateLimit;
@@ -495,10 +496,10 @@ export class Store {
     const resetsAt = kind === 'rate_limit' && seen?.stop?.resetsAt !== undefined ? seen.stop.resetsAt * 1000 : null;
     const retryAt = kind === 'billing' ? null : stale ? now + MODEL_RESUME.minDelayMs
       : resetsAt !== null ? Math.max(resetsAt + MODEL_RESUME.afterResetMs, now + MODEL_RESUME.minDelayMs) : now + MODEL_RESUME.retryMs;
-    await tx.query(`INSERT INTO model_pauses(job_id,kind,resets_at,rate_limit_type,utilization,retry_at,paused_at) VALUES ($1,$2,$3,$4,$5,$6,$7)
+    await tx.query(`INSERT INTO model_pauses(job_id,kind,resets_at,rate_limit_type,utilization,retry_at,paused_at,lane_only_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
       ON CONFLICT (job_id) DO UPDATE SET kind=EXCLUDED.kind,resets_at=EXCLUDED.resets_at,rate_limit_type=EXCLUDED.rate_limit_type,
-      utilization=EXCLUDED.utilization,retry_at=EXCLUDED.retry_at,paused_at=EXCLUDED.paused_at`,
-    [job, kind, resetsAt, seen?.event?.rateLimitType ?? null, seen?.event?.utilization ?? null, retryAt, now]);
+      utilization=EXCLUDED.utilization,retry_at=EXCLUDED.retry_at,paused_at=EXCLUDED.paused_at,lane_only_at=EXCLUDED.lane_only_at`,
+    [job, kind, resetsAt, seen?.event?.rateLimitType ?? null, seen?.event?.utilization ?? null, retryAt, now, laneOnly ? now : null]);
     if (kind !== 'billing') await tx.query('UPDATE jobs SET attempt=GREATEST(0,attempt-1) WHERE id=$1', [job]);
     await this.observeRateLimit(rateLimit, job, tx);
   }
@@ -508,7 +509,8 @@ export class Store {
   // 자격 파일을 읽는다) 그 관측을 지금 계정의 한도 상태에 적지 않는다. 전환 직전에 시작해 이미 새 자격을 읽은 실행의 관측도 함께
   // 버리지만, 옛 계정의 사용률로 새 계정의 리뷰를 미루는 쪽보다 낫다. 멈춤 기록(recordPause)도 이 경계로 옛 실행의 원인을 버리되
   // 같은 밀리초는 새 계정 실행으로 본다(결제 멈춤을 지키는 쪽).
-  // 같은 밀리초는 어느 쪽이 먼저인지 몰라 버린다. null은 실행을 모르는 관측이다(시험에서만 쓴다).
+  // 같은 밀리초는 어느 쪽이 먼저인지 몰라 버린다. null이면 시각을 비교하지 않는다: 한도 뒤 API 사용의 귀속(MethodRouter.settle)이
+  // 그 실행의 계정·revision이 지금 설치인지 이미 확인한 관측이다(시험도 쓴다).
   // 확인과 쓰기는 계정 전환(switchAccount)과 같은 scheduler 행 잠금 아래에서 한 번에 한다. 잠그지 않으면 커밋 전의 전환을
   // 보지 못한 채 확인을 지나고, 전환이 한도 상태를 비운 뒤에 옛 계정의 관측이 새 계정 것으로 적힌다.
   // tx를 넘기는 호출자(recordPause)는 이미 scheduler 행을 쥐고 있다. 잠금 순서는 scheduler → model_limit_state 그대로다.
@@ -806,11 +808,13 @@ export class Store {
       ON CONFLICT DO NOTHING`);
   }
   // 비상 중지와 전역 대기가 없으면 정지를 푼다. 질문 대기와 작업 레인의 인증 대기는 scheduler를 켜지 않는 대기라 해제를 막지 않는다.
+  // 작업 레인만 막은 모델 대기(멈춤 기록의 lane_only_at이 그 멈춤 시각)도 같다.
   async releaseScheduler(): Promise<boolean> {
     await this.db.query(`UPDATE controls SET value='false' WHERE key='scheduler'
       AND NOT EXISTS (SELECT 1 FROM controls WHERE key='scheduler_emergency' AND value='true')
       AND NOT EXISTS (SELECT 1 FROM jobs WHERE state='waiting_user' AND wait_reason IS DISTINCT FROM 'clarification'
-        AND NOT (type='task' AND wait_reason='auth_expired'))`);
+        AND NOT (type='task' AND wait_reason='auth_expired')
+        AND NOT EXISTS (SELECT 1 FROM model_pauses p WHERE p.job_id=jobs.id AND p.lane_only_at=p.paused_at))`);
     return (await this.db.query<{ value: boolean }>("SELECT value FROM controls WHERE key='scheduler'")).rows[0]!.value;
   }
   // options.review는 호출자가 "정책 owner가 알림 채널에서 보낸 명령"임을 확인했을 때만 true다(리뷰 작업 제어).

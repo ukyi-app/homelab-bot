@@ -767,9 +767,10 @@ function migrationDatabase(pg: PGlite): Database {
     transaction: fn => pg.transaction(tx => fn({ query: (sql, params = []) => tx.query(sql, params), transaction: () => { throw new Error('nested'); } })),
   };
 }
-// 016 뒤에 새로 생긴 표(변경 PR 표, C13 proposals, C19 model_pauses·model_limit_state, C22 model_accounts, C40 method_routing·method_runs)는 비교에서 뺀다.
+// 016 뒤에 새로 생긴 표(변경 PR 표, C13 proposals, C19 model_pauses·model_limit_state, C22 model_accounts,
+// C40 method_routing·method_subscription·method_api·method_runs)는 비교에서 뺀다.
 // 기존 표가 바뀌지 않았는지만 본다. 옛 표에 더한 칸은 아래 RETENTION_COLUMNS·C19_COLUMNS로 따로 확인한다.
-const NEW_TABLES = ['proposals', 'model_pauses', 'model_limit_state', 'model_accounts', 'method_routing', 'method_runs'];
+const NEW_TABLES = ['proposals', 'model_pauses', 'model_limit_state', 'model_accounts', 'method_routing', 'method_subscription', 'method_api', 'method_runs'];
 const OLD_TABLES = `table_schema='public' AND table_name NOT LIKE 'change\\_%' AND table_name <> 'schema_migrations'
   AND table_name NOT IN (${NEW_TABLES.map(t => `'${t}'`).join(',')})`;
 // 019(T27)·020(T31) 원문 보존은 옛 표에 NULL 허용 칸과 그 digest CHECK만 더한다. 아래 비교에서 빼고 따로 확인한다.

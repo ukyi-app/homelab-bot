@@ -80,7 +80,8 @@ let changes: ChangeStore;
 before(async () => { database = await localDatabase(); await mkdir('.local', { recursive: true }); });
 beforeEach(async () => {
   await database.pg.exec(`TRUNCATE events,conversations,jobs,results,outbox,schedules,denied_actors,controls,audit,incidents,
-    github_deliveries,pr_reviews,review_deliveries,change_requests,model_accounts,method_routing,method_runs RESTART IDENTITY CASCADE`);
+    github_deliveries,pr_reviews,review_deliveries,change_requests,model_accounts,method_routing,method_subscription,method_api,method_runs
+    RESTART IDENTITY CASCADE`);
   f = await fixture(database.db);
   await seedConversation(database.db);
   changes = new ChangeStore(database.db, f.now);
@@ -854,6 +855,26 @@ test('T19 B2 저장 실패: 비공개 저장이 실패하면 receipt를 만들�
   assert.equal((await h.service.fetchReceipt(input.key))!.verdict, 'pass');
   assert.equal(h.saved.length, 1);
   assert.equal(h.inputs.length, 1);
+});
+
+test('AC-39 v2 변경 자체 리뷰가 성공한 뒤 저장이 실패해도 재시작한 게시 서버가 모델 없이 v2 결과를 회수해 receipt를 만들고 ACK한다', async () => {
+  let down = true;
+  const h = harness({ saveFails: () => down });
+  await methodsInstalled(h);
+  const input = await reviewing();
+  await h.service.submit(portInput(input));
+  await h.runtime.tick();
+  const job = await jobOf(input.key);
+  assert.deepEqual([job.state, job.wait_reason], ['unknown', 'receipt_save_failed']);
+  // 귀속은 이미 확정됐다(성공). 회수는 그와 무관하게 그 lease의 선택으로 v2 결과를 읽는다.
+  assert.deepEqual((await database.db.query<{ outcome: string }>('SELECT outcome FROM method_runs')).rows.map(row => row.outcome), ['succeeded']);
+  down = false;
+  // 서비스는 선택을 메모리에 들고 있지 않다(재시작과 같다). 새 라우터로 바꿔 끼워도 DB의 실행 기록으로 찾는다.
+  h.service.useMethods(new MethodRouter(f.store, { enabled: true, supported: () => true }));
+  const receipt = await h.service.fetchReceipt(input.key);
+  assert.equal(receipt?.verdict, 'pass');
+  assert.equal(h.inputs.length, 1);
+  assert.equal(await h.results.get(job.id, job.lease_token), null);
 });
 
 test('T19 B2 출처를 알 수 없는 job은 dispatcher가 받아도 모델 없이 실패로 닫는다', async () => {

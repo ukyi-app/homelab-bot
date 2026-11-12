@@ -14,6 +14,7 @@ import { archiveContract } from './worker.js';
 import { CoverageSchema, FindingSchema, InputLimitsSchema, REVIEW_INSTRUCTIONS, REVIEW_INSTRUCTIONS_V2, ReviewOutputSchema, ReviewTaskSchema,
   ReviewTaskV2Schema, SECRET_PATTERNS, reviewOutcome } from './review-input.js';
 import type { Change, Coverage, ReviewOutput, ReviewTask, ReviewTaskV2, ReviewWorkerResult, ReviewWorkerResultV2 } from './review-input.js';
+import { methodWait } from './method-routing.js';
 import type { MethodRouter } from './method-routing.js';
 import type { ExecutionSelection } from './execution-auth.js';
 import { REVIEW_REQUEST_ORGANIZATION } from './review-request.js';
@@ -720,7 +721,16 @@ export class ReviewRuntime {
       const revoked = pullRequestDecision(pr, freshRepo, fresh.review, await this.explicit(job.id));
       if (revoked) { await this.close(job, review, revoked.outcome === 'denied' ? 'cancelled' : 'superseded', revoked.reason); return true; }
       // 방식을 고를 수 있으면 v1 칸·순서 그대로 끝에 선택 칸을 붙인 v2를 보낸다. 선택은 실행 기록과 함께 저장된다.
-      selection = this.methods ? await this.methods.select(asJob(job), 'review') : null;
+      const routed = this.methods ? await this.methods.select(asJob(job), 'review') : null;
+      // 구독은 한도, API는 잠김, 구독 확인 자리도 없다: 보내지 않고 구독 확인 시각까지 모델 멈춤이다.
+      if (methodWait(routed)) { await this.store.waitForUser(asJob(job), 'model_limit', { rateLimit: routed.wait }); await this.away(job, context); return true; }
+      selection = routed;
+      // 리뷰 미루기의 예외(고를 방식이 API)는 실제 선택과 같아야 한다. claim 뒤 구독 확인 시각이 지나 구독을 골랐으면 미루기 기한까지 되돌린다.
+      if (this.methods && selection?.method !== 'api' && await this.store.reviewDeferredUntil() !== null) {
+        if (selection) await this.methods.abandon(selection);
+        await this.store.defer(asJob(job), 'review_deferred');
+        return true;
+      }
       const sent: ReviewTask | ReviewTaskV2 = selection ? ReviewTaskV2Schema.parse({ ...task, version: 2, execution: selection }) : task;
       // PR·목록 조회 동안 들어온 취소·비상 중지와 lease 만료를 dispatch 직전에 다시 본다.
       const live = (await this.store.db.query<{ state: string; lease_token: string; lease_until: string }>(
@@ -728,6 +738,15 @@ export class ReviewRuntime {
       if (!live || live.lease_token !== job.lease_token || Number(live.lease_until) <= this.store.now()) return true;
       if (live.state === 'cancel_requested') { await this.close(job, review, 'cancelled', 'cancel_before_dispatch'); return true; }
       if (live.state !== 'running' || !await this.store.heartbeat(asJob(job))) return true;
+      // 고른 뒤 그 사이 API가 잠기거나 구독이 한도가 됐으면 이 선택으로 보내지 않고 다시 고르게 한다. 이 확인 뒤의 잠금은 이미 시작한 실행이다.
+      // 되돌리지 못했으면(그 사이 취소 요청·lease 상실) 취소 요청만 여기서 닫는다. lease 상실은 아래 finally가 되돌린다.
+      if (selection && !await this.methods!.start(asJob(job), selection)) {
+        if (!await this.methods!.reroute(asJob(job), selection)
+          && (await this.store.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0]?.state === 'cancel_requested') {
+          await this.close(job, review, 'cancelled', 'cancel_before_dispatch');
+        }
+        return true;
+      }
       // 여기부터 아래 리스너 등록까지 await가 없어 신호를 놓치지 않는다. 신호 뒤 dispatch하지 않는다.
       if (this.shutdown?.aborted) throw new ReviewShutdown();
       const abort = new AbortController();
@@ -768,6 +787,10 @@ export class ReviewRuntime {
       }
       const current = (await this.store.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0]?.state;
       if (current === 'cancel_requested' || abort.signal.aborted) {
+        // 끝은 취소·종료가 정하지만, 확인된 API 결제·인증 실패의 잠금은 따로 적는다(다른 일이 같은 API를 다시 부르지 않게).
+        if (selection && this.methods && result.stopped && (result.status === 'limited' || result.status === 'auth_expired')) {
+          await this.methods.settle(asJob(job), selection, { status: result.status, rateLimit: result.rateLimit ?? null }, { record: true }).catch(() => {});
+        }
         const confirmation = result.stopped ? { stopped: true } : await stopRequest();
         // 멈춤을 확인하지 못하면 unknown으로 두어 전역 슬롯을 잡는다. 자동 재실행하지 않는다.
         const state = !confirmation.stopped ? 'unknown' : current === 'cancel_requested' ? 'cancelled' : 'failed';
@@ -792,14 +815,12 @@ export class ReviewRuntime {
         if (settled?.action === 'requeued') return true;
         if (settled?.action === 'wait') await this.store.waitForUser(asJob(job), 'model_limit', { rateLimit: settled.rateLimit });
         else await this.store.waitForUser(asJob(job), result.status === 'limited' ? 'model_limit' : 'auth_expired', { rateLimit: result.rateLimit ?? null });
-        // 알림 채널에 자리 비움 한 줄만 단다. 원인·풀리는 시각·할 일은 운영 알림(Telegram)이 보내고 재개는 저절로 한다.
-        const scope = notificationScope(context.base);
-        await this.store.enqueue({ key: await this.store.awayKey(scope.channel, `review-waiting:${job.id}`), actor: context.base.owner, scope, revision: context.base.revision,
-          payload: { kind: 'message', channel: scope.channel, classification: 'safe_summary', content: T.away } });
+        await this.away(job, context);
         return true;
       }
       // 대기가 아닌 결과의 한도 경고도 계정 기록에 남긴다(리뷰 미루기). 기록 실패가 결과 처리를 막지 않는다.
-      await this.store.observeRateLimit(result.rateLimit, job.id).catch(() => {});
+      // 선택을 실은 실행은 settle이 그 계정·revision이 지금 설치일 때만 남긴다.
+      if (!selection) await this.store.observeRateLimit(result.rateLimit, job.id).catch(() => {});
       // 그 실행의 선택으로 귀속한다(구독 확인 성공이 구독 복귀가 된다).
       if (selection && this.methods) await this.methods.settle(asJob(job), selection, outcome).catch(() => {});
       if (result.status !== 'succeeded') { await this.close(job, review, 'failed', result.reason ?? 'model_failed'); return true; }
@@ -823,6 +844,8 @@ export class ReviewRuntime {
       else await this.store.transition(asJob(job), 'unknown', 'runtime_uncertain');
     } finally {
       clearInterval(keepalive);
+      // 보내지 않은 선택은 버린다(구독 확인 자리를 쥔 채 남지 않게). 이미 귀속·버린 선택은 바뀌지 않는다.
+      if (!dispatched && selection) await this.methods?.abandon(selection).catch(() => {});
       // dispatch 전에 lease를 잃어 상태를 못 바꿨으면, 모델을 부르지 않은 것이 확실하므로 대기열로 되돌린다.
       // 조기 return 경로도 지나가야 해서 finally에 둔다. 정상 종료된 작업은 상태 조건에 걸리지 않는다.
       if (!dispatched) await this.releaseUndispatched(job).catch(() => {});
@@ -831,6 +854,12 @@ export class ReviewRuntime {
   }
   private async explicit(job: string): Promise<boolean> {
     return (await this.store.db.query<{ trigger: string }>('SELECT trigger FROM pr_reviews WHERE job_id=$1', [job])).rows[0]?.trigger === 'comment';
+  }
+  // 알림 채널에 자리 비움 한 줄만 단다. 원인·풀리는 시각·할 일은 운영 알림(Telegram)이 보내고 재개는 저절로 한다.
+  private async away(job: Job, context: ReviewContext): Promise<void> {
+    const scope = notificationScope(context.base);
+    await this.store.enqueue({ key: await this.store.awayKey(scope.channel, `review-waiting:${job.id}`), actor: context.base.owner, scope, revision: context.base.revision,
+      payload: { kind: 'message', channel: scope.channel, classification: 'safe_summary', content: T.away } });
   }
   private async releaseUndispatched(job: Job): Promise<void> {
     await this.store.db.query(`UPDATE jobs SET state='queued',attempt=GREATEST(0,attempt-1),available_at=$3,lease_token=NULL,

@@ -1,7 +1,7 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { CHAT_TASK_TEXT } from '../src/chat-task-text.js';
-import { MethodRouter, installMethods } from '../src/method-routing.js';
+import { MethodRouter, installMethods, methodRoutingView } from '../src/method-routing.js';
 import { recordAccount, switchAccount } from '../src/model-accounts.js';
 import type { TaskRequest, TaskResponse, TaskWorkerIdentity } from '../src/task-contracts.js';
 import { localDatabase, fixture } from './helpers.js';
@@ -14,7 +14,7 @@ let f: Fixture;
 before(async () => { database = await localDatabase(); });
 beforeEach(async () => {
   await database.pg.exec(`TRUNCATE events,conversations,jobs,results,outbox,schedules,denied_actors,controls,audit,incidents,codex_sessions,codex_questions,
-    model_limit_state,model_pauses,model_accounts,method_routing,method_runs RESTART IDENTITY CASCADE;
+    model_limit_state,model_pauses,model_accounts,method_routing,method_subscription,method_api,method_runs RESTART IDENTITY CASCADE;
     UPDATE execution_lanes SET closed_reason=NULL,closed_at=NULL;`);
   f = await fixture(database.db);
 });
@@ -72,8 +72,15 @@ test('AC-38 작업 경로 칸이 꺼져 있으면 스위치가 켜져도 작업 
   assert.equal((await jobs(database.db))[0]!.state, 'waiting_user');
   assert.deepEqual(await allRows(database.db, 'method_runs'), []);
   // 넘어가지 않았다. 다른 경로(대화·PR 리뷰·변경 자체 리뷰)는 한도를 스스로 만나 넘어갈 수 있어야 하므로 전역 scheduler는 닫지 않는다.
-  assert.deepEqual((await allRows(database.db, 'method_routing')).map(row => row.subscription_state), ['available']);
+  assert.equal((await methodRoutingView(database.db)).subscription!.state, 'available');
   assert.notEqual((await allRows(database.db, 'controls')).find(row => row.key === 'scheduler')?.value, true);
+  // 작업 레인만 막는 이 대기는 비상 정지를 푼 뒤 전역 scheduler 해제를 막지 않는다.
+  const [row] = await jobs(database.db);
+  await f.store.control(row!.owner_id, row!.conversation_id, 'emergency-stop');
+  const released = await f.store.control(row!.owner_id, row!.conversation_id, 'resume-model', 'emergency-stop') as { ok: boolean; paused: boolean };
+  assert.deepEqual([released.ok, released.paused], [true, false]);
+  assert.equal((await allRows(database.db, 'controls')).find(row => row.key === 'scheduler')?.value, false);
+  assert.equal((await jobs(database.db))[0]!.state, 'waiting_user');
 });
 
 test('AC-38 세션이 남지 않은 첫 턴의 구독 한도는 API로 새로 시작하지 않고 작업을 보존한 채 지금처럼 기다리며, 대화 쪽 scheduler는 닫지 않는다', async () => {
@@ -88,7 +95,7 @@ test('AC-38 세션이 남지 않은 첫 턴의 구독 한도는 API로 새로 �
   // 자리 비움 안내가 남는다(지금 규칙). 다른 경로는 API로 갈 수 있어 전역 scheduler는 열려 있다.
   assert.equal((await allRows(database.db, 'outbox')).filter(row => row.payload.content === CHAT_TASK_TEXT.away).length, 1);
   assert.notEqual((await allRows(database.db, 'controls')).find(row => row.key === 'scheduler')?.value, true);
-  assert.deepEqual((await allRows(database.db, 'method_routing')).map(row => row.subscription_state), ['limited']);
+  assert.equal((await methodRoutingView(database.db)).subscription!.state, 'limited');
 });
 
 test('C39 넘김: 작업 턴의 실행 안 됨(not_run)은 첫 턴이면 새 세대로, 재개 턴이면 다음 턴 번호로 선택 없이 다시 보낸다', async () => {
@@ -105,7 +112,8 @@ test('C39 넘김: 작업 턴의 실행 안 됨(not_run)은 첫 턴이면 새 세
   assert.deepEqual([refused!.operation, refused!.generation, !!refused!.execution], ['start', 1, true]);
   assert.deepEqual([fresh!.operation, fresh!.generation, !!fresh!.execution], ['start', 2, false]);
 
-  await database.pg.exec(`TRUNCATE events,conversations,jobs,outbox,codex_sessions,codex_questions,method_routing,method_runs,model_accounts RESTART IDENTITY CASCADE`);
+  await database.pg.exec(`TRUNCATE events,conversations,jobs,outbox,codex_sessions,codex_questions,method_routing,method_subscription,method_api,method_runs,model_accounts
+    RESTART IDENTITY CASCADE`);
   f = await fixture(database.db);
   local = await autoLane();
   await task(f, database.db, 'resumed');

@@ -10,6 +10,7 @@ import { workerRequest, workerRequestV3 } from './worker.js';
 import type { VersionedWorker, WorkerResultV2, WorkerResultV3, WorkerSigner } from './worker.js';
 import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
+import { methodWait } from './method-routing.js';
 import type { MethodRouter } from './method-routing.js';
 import type { ExecutionSelection } from './execution-auth.js';
 
@@ -112,12 +113,23 @@ export class Runtime {
       const requestOptions = { surface: this.store.colleague ? 'speech' as const : 'slash' as const,
         earlierPurged: await this.store.earlierPurged(job.conversation_id, job.event_id) };
       // 방식을 고를 수 있으면 선택 칸이 든 v3, 아니면 지금의 v2다. 선택은 실행 기록과 함께 저장돼 결과를 그 선택으로 귀속한다.
-      selection = this.methods ? await this.methods.select(job, 'chat') : null;
+      const routed = this.methods ? await this.methods.select(job, 'chat') : null;
+      // 구독은 한도, API는 잠김, 구독 확인 자리도 없다: 보내지 않고 구독 확인 시각까지 모델 멈춤이다.
+      if (methodWait(routed)) { await this.store.waitForUser(job, 'model_limit', { rateLimit: routed.wait }); return true; }
+      selection = routed;
       const request = selection ? workerRequestV3(job, context, requestOptions, selection) : workerRequest(job, context, requestOptions);
       await this.gate.authorize(job.owner_id, job.target);
-      if (!await this.dispatchable(job)) return true;
+      // 고른 뒤 그 사이 API가 잠기거나 구독이 한도가 됐으면 이 선택으로 보내지 않고 다시 고르게 한다. 이 확인 뒤의 잠금은 이미 시작한 실행이다.
+      // 되돌리지 못했으면(그 사이 취소 요청·lease 상실) dispatch 전 확인이 그 끝을 정한다.
+      if (selection && !await this.methods!.start(job, selection)) {
+        if (!await this.methods!.reroute(job, selection)) await this.dispatchable(job);
+        return true;
+      }
       // 여기부터 dispatch까지는 await가 없어 신호가 끼어들 틈이 없다. 이후의 신호는 드레인 타이머가 받는다.
-      if (await this.deferOnShutdown(job)) return true;
+      if (!await this.dispatchable(job) || await this.deferOnShutdown(job)) {
+        if (selection) await this.methods!.abandon(selection);
+        return true;
+      }
       const abort = new AbortController();
       let timeout: ReturnType<typeof setTimeout> | undefined;
       let monitorTask: Promise<void> | undefined;
@@ -179,7 +191,8 @@ export class Runtime {
       if (selection && this.methods && result.stopped && !waiting) await this.methods.settle(job, selection, routedOutcome(result))
         .catch(error => this.log('method_settle_failed', { job: job.id, ...errorInfo(error) }));
       // 대기가 아닌 결과의 한도 경고도 계정 기록에 남긴다(리뷰 미루기). 기록 실패가 답 처리를 막지 않는다.
-      if (result.stopped && !waiting) await this.store.observeRateLimit(result.rateLimit, job.id)
+      // 선택을 실은 실행은 settle이 그 계정·revision이 지금 설치일 때만 남긴다.
+      if (result.stopped && !waiting && !selection) await this.store.observeRateLimit(result.rateLimit, job.id)
         .catch(error => this.log('rate_limit_observe_failed', { job: job.id, ...errorInfo(error) }));
       try { latestPolicy = await this.gate.authorize(job.owner_id, job.target); }
       catch (error) {
@@ -196,6 +209,11 @@ export class Runtime {
         if (settled?.action === 'wait') await this.store.waitForUser(job, 'model_limit', { rateLimit: settled.rateLimit });
         else if (settled?.action !== 'requeued') await this.store.waitForUser(job, result.status === 'limited' ? 'model_limit' : 'auth_expired', { rateLimit });
       } else if (current.state === 'cancel_requested' || abort.signal.aborted || authorizationRevoked) {
+        // 끝은 취소·종료·철회가 정하지만, 확인된 API 결제·인증 실패의 잠금은 따로 적는다(다른 일이 같은 API를 다시 부르지 않게).
+        if (selection && this.methods && result.stopped && (result.status === 'limited' || result.status === 'auth_expired')) {
+          await this.methods.settle(job, selection, routedOutcome(result), { record: true })
+            .catch(error => this.log('method_settle_failed', { job: job.id, ...errorInfo(error) }));
+        }
         if (!result.stopped) stopped = confirmed = await stopRequest();
         await this.stopOutcome(job, stopped, { revoked: authorizationRevoked, ownerCancel: current.state === 'cancel_requested',
           drained, unknownReason: 'stop_confirmation' });
@@ -233,6 +251,8 @@ export class Runtime {
       // A known limit retains the slot even if subsequent policy/state reads or writes fail.
       if (waiting && !authorizationRevoked && !(error instanceof Denied)) return true;
       const revoked = authorizationRevoked || error instanceof Denied;
+      // 보내지 않은 선택은 버린다(구독 확인 자리를 쥔 채 남지 않게).
+      if (!dispatched && selection) await this.methods?.abandon(selection).catch(() => {});
       if (!dispatched || error instanceof WorkerRejected) {
         if (revoked) await this.store.transition(job, 'cancelled', 'authorization_revoked');
         else if (error instanceof PolicyUnavailable && !dispatched) await this.store.defer(job);

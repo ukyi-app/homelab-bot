@@ -19,6 +19,7 @@ import type { ExecutionSelection } from './execution-auth.js';
 import { ArchiveError, SECRET_PATTERNS, readArchive } from './review-input.js';
 import type { ArchiveFetcher, ReviewerResult, ReviewerRun } from './review-input.js';
 import type { Store } from './store.js';
+import { methodWait } from './method-routing.js';
 import type { MethodRouter } from './method-routing.js';
 import { archiveContract, CancelRequestSchema, ExecutionSlot, REPOSITORY_NAME } from './worker.js';
 import type { CancelRequest, WorkerSigner, WorkerVerifier } from './worker.js';
@@ -972,7 +973,7 @@ export class ChangeReviewService implements ChangeReviewPort {
       await this.acknowledge(job);
       return null;
     }
-    return this.settle(job, key, result);
+    return this.settle(job, key, result, selection !== null);
   }
   // 정상 응답의 store.waitForUser와 같은 대기다. 그 함수는 실행 중 lease만 받아 회수 경로의 unknown을 옮기지 못한다.
   private async waitRecovered(job: Job, reason: 'model_limit' | 'auth_expired', rateLimit: RateLimitInfo | null): Promise<boolean> {
@@ -1006,9 +1007,10 @@ export class ChangeReviewService implements ChangeReviewPort {
     return new Set(rows.flatMap(row => [row.claude_session_id, row.thread_id]).filter((value): value is string => !!value));
   }
   // 멈춤이 확인된 결과로 receipt를 만든다. 비공개 저장 → receipt 기록 → job 종료 → ack 순서라 어느 단계에서 끊겨도 작업자 결과로 다시 올 수 있다.
-  private async settle(job: Job, key: EvidenceKey, result: Extract<ChangeReviewWorkerResult, { status: 'succeeded' }>): Promise<ReviewReceipt | null> {
+  // routed: 선택을 실은 실행의 결과다. 그 한도 경고는 방식 귀속(MethodRouter.settle)이 그 계정·revision이 지금 설치일 때만 남겼다.
+  private async settle(job: Job, key: EvidenceKey, result: Extract<ChangeReviewWorkerResult, { status: 'succeeded' }>, routed = false): Promise<ReviewReceipt | null> {
     // 대기가 아닌 응답의 한도 경고도 계정 기록에 남긴다(리뷰 미루기, AC-17). 기록 실패가 receipt 저장을 막지 않는다.
-    await this.deps.store.observeRateLimit(result.rateLimit, job.id).catch(() => {});
+    if (!routed) await this.deps.store.observeRateLimit(result.rateLimit, job.id).catch(() => {});
     if ((await this.authorSessions(key.changeId)).has(result.sessionId)) { await this.closeJob(job, 'failed', 'author_session_reused'); return null; }
     let output: ChangeReviewOutput | null = null;
     if (result.output !== null) {
@@ -1093,7 +1095,20 @@ export class ChangeReviewService implements ChangeReviewPort {
       if (live.state !== 'running' || !await store.heartbeat(job)) return;
       if (shutdown?.aborted) { await store.defer(job, 'publisher_shutdown'); return; }
       // 방식을 고를 수 있으면 v1 칸·순서 그대로 끝에 선택 칸을 붙인 v2를 보낸다. 작성 세션과 다른 별도 리뷰 실행이라 선택도 따로다.
-      selection = this.methods ? await this.methods.select(job, 'change_review') : null;
+      const routed = this.methods ? await this.methods.select(job, 'change_review') : null;
+      // 구독은 한도, API는 잠김, 구독 확인 자리도 없다: 보내지 않고 구독 확인 시각까지 모델 멈춤이다.
+      if (methodWait(routed)) { await store.waitForUser(job, 'model_limit', { rateLimit: routed.wait }); await this.deps.notifyWaiting(job, 'model_limit'); return; }
+      selection = routed;
+      // 고른 뒤 그 사이 API가 잠기거나 구독이 한도가 됐으면 이 선택으로 보내지 않고 다시 고르게 한다. 이 확인 뒤의 잠금은 이미 시작한 실행이다.
+      // 되돌리지 못했으면(그 사이 취소 요청·lease 상실) 취소 요청만 여기서 닫는다. lease 상실은 아래 finally가 되돌린다.
+      if (selection && !await this.methods!.start(job, selection)) {
+        if (!await this.methods!.reroute(job, selection)
+          && (await this.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0]?.state === 'cancel_requested') {
+          await this.closeJob(job, 'cancelled', 'cancel_before_dispatch');
+        }
+        return;
+      }
+      if (shutdown?.aborted) { await store.defer(job, 'publisher_shutdown'); return; }
       const sent: ChangeReviewTask | ChangeReviewTaskV2 = selection ? ChangeReviewTaskV2Schema.parse({ ...task, version: 2, execution: selection }) : task;
       const abort = new AbortController();
       const cancelBody = { job: job.id, lease: job.lease_token };
@@ -1128,6 +1143,10 @@ export class ChangeReviewService implements ChangeReviewPort {
       }
       const current = (await this.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0]?.state;
       if (current === 'cancel_requested' || abort.signal.aborted) {
+        // 끝은 취소·종료가 정하지만, 확인된 API 결제·인증 실패의 잠금은 따로 적는다(다른 일이 같은 API를 다시 부르지 않게).
+        if (selection && this.methods && result.stopped && (result.status === 'limited' || result.status === 'auth_expired')) {
+          await this.methods.settle(job, selection, { status: result.status, rateLimit: result.rateLimit ?? null }, { record: true }).catch(() => {});
+        }
         const confirmation = result.stopped ? { stopped: true } : await stopRequest();
         if (!confirmation.stopped) await store.transition(job, 'unknown', drained ? 'publisher_shutdown' : 'stop_confirmation');
         else await this.closeJob(job, current === 'cancel_requested' ? 'cancelled' : 'failed', 'stop_confirmation');
@@ -1160,7 +1179,7 @@ export class ChangeReviewService implements ChangeReviewPort {
         await this.acknowledge(job);
         return;
       }
-      await this.settle(job, key, result);
+      await this.settle(job, key, result, selection !== null);
     } catch (error) {
       // 모델을 부르기 전의 예외는 다시 집어도 같을 수 있다. 대기열로 돌리면 끝없이 돌아 실패로 닫는다.
       if (!dispatched && !stopped) await this.closeJob(job, 'failed', 'before_dispatch');
@@ -1169,6 +1188,8 @@ export class ChangeReviewService implements ChangeReviewPort {
       else await store.transition(job, 'unknown', stopped ? 'receipt_save_failed' : 'runtime_uncertain');
     } finally {
       clearInterval(keepalive);
+      // 보내지 않은 선택은 버린다(구독 확인 자리를 쥔 채 남지 않게). 이미 귀속·버린 선택은 바뀌지 않는다.
+      if (!dispatched && selection) await this.methods?.abandon(selection).catch(() => {});
       if (!dispatched && !stopped) await this.releaseUndispatched(job).catch(() => {});
     }
   }
