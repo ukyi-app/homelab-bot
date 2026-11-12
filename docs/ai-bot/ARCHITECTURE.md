@@ -2316,17 +2316,17 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 
 위 "C38" 1절의 게시 서버 쪽 구현이다. 이름·전이 표·관리 명령은 [DECISIONS](DECISIONS.md) "C40"이다.
 
-**흐름.** claim → 경로가 `MethodRouter.select(job, 경로)` → (스위치·지원 확인·설치가 모두 맞으면) scheduler 잠금 아래에서 방식을 고르고 `method_runs`에 실행 ID와 함께 적음 → 새 판 요청(대화 v3·리뷰 v2·변경 자체 리뷰 v2·작업 `execution` 칸)에 서명 → 작업자 → 응답의 실행 칸이 보낸 선택과 같은지 대조(다르면 모름) → `MethodRouter.settle(job, 선택, 결과)`가 한 트랜잭션에서 그 실행 행을 닫고 상태를 좁게 바꾸고 필요하면 같은 job을 대기열로 돌림 → 경로는 `requeued`면 멈추지 않고 끝, `wait`면 구독 확인 시각으로 `waitForUser`, `default`면 지금 동작. select가 null이면 처음부터 옛 판이다.
+**흐름.** claim → 경로가 `MethodRouter.select(job, 경로)` → (스위치·지원 확인·설치가 모두 맞으면) scheduler 잠금 아래에서 방식을 고르고 `method_runs`에 실행 ID와 함께 적음(고를 방식이 없으면 `{ wait }`로 모델 멈춤) → 보내기 직전 `start`(작업 레인·변경 작성은 `begin` 안의 `admit`·`started`)로 다시 확인하고 시작 시각을 적음(거절이면 `reroute`) → 새 판 요청(대화 v3·리뷰 v2·변경 자체 리뷰 v2·작업 `execution` 칸)에 서명 → 작업자 → 응답의 실행 칸이 보낸 선택과 같은지 대조(다르면 모름) → `MethodRouter.settle(job, 선택, 결과)`가 한 트랜잭션에서 그 실행 행을 닫고 상태를 좁게 바꾸고 필요하면 같은 job을 대기열로 돌림 → 경로는 `requeued`면 멈추지 않고 끝, `wait`면 구독 확인 시각으로 `waitForUser`, `default`면 지금 동작. select가 null이면 처음부터 옛 판이다.
 
 **모듈.**
 
-- `method-routing.ts`: `MethodRouter`(`select`·`settle`·`apiChosen`·`pendingSelection`), 설치·끄기·API 잠금 해제·보기(`installMethods`·`disableMethods`·`unlockApi`·`methodRoutingView`). store·model-accounts·execution-auth만 읽는다.
-- `migrations/029_method_routing.sql`: `method_routing`(한 행)·`method_runs`. 추가만이라 옛 게시 서버 코드가 그대로 돈다.
+- `method-routing.ts`: `MethodRouter`(`select`·`start`/`admit`·`started`·`reroute`·`abandon`·`settle`·`apiChosen`·`pendingSelection`), 설치·끄기·API 잠금 해제·보기(`installMethods`·`disableMethods`·`unlockApi`·`methodRoutingView`). store·model-accounts·execution-auth만 읽는다.
+- `migrations/029_method_routing.sql`: `method_routing`(지금 설치 한 행)·`method_subscription`(계정별)·`method_api`(계정·revision별)·`method_runs`, 기존 표에는 `model_pauses.lane_only_at` 하나. 추가만이라 옛 게시 서버 코드가 그대로 돈다.
 - `policy.ts`: `apiAfterLimit`과 작업 경로 칸 `apiAfterLimitTask`. `main.ts`: 라우터 하나를 만들어(작업 경로는 두 칸이 다 참일 때만 연다) 대화 runtime·PR 리뷰 runtime·변경 자체 리뷰 서비스(`useMethods`)·작업 브리지(`useMethods`, 변경 작성 턴도 이 브리지를 지난다)에 넘기고, 스위치가 켜졌을 때만 `method_support_probe`(30초)로 두 작업자의 지원을 본다. 변경 작성 경로(`change_author`)는 작업 접수의 `executionSelection`에 `/v2/task`가 있어야 연다.
 - 경로별 연결: `runtime.ts`(대화), `review.ts`(PR 리뷰 claim의 미루기와 v2), `change-review.ts`(즉시 결과·저장 결과 회수·ACK), `claude-task-bridge.ts`(v1 작업 턴과 변경 작성 v2 턴, `not_run`, 실행 칸 대조), `change-runtime.ts`(변경 작성·수정 차례 작성의 첫 턴 `not_run` 뒤 새 세대 시작), `admin.ts`(관리 명령 넷).
-- 변경 작성 턴: `ClaudeChangeAuthor.send`가 `selectChangeTurn`으로 고른 선택을 요청에 싣는다. 결과는 `fetchResult`가 나중에(다른 프로세스일 수 있다) 읽으므로, 확정 때 세션 `worker_lease`로 `method_runs`의 그 선택을 다시 찾아(`pendingSelection(…, settled=true)`) 대조하고 v1과 같은 `settle`에 넘긴다.
+- 변경 작성 턴: `ClaudeChangeAuthor.send`가 `selectChangeTurn`으로 고른 선택을 요청에 싣는다. 결과는 `fetchResult`가 나중에(다른 프로세스일 수 있다) 읽으므로, 확정 때 세션 `worker_lease`로 `method_runs`에서 실제로 시작한 그 선택을 다시 찾아(`pendingSelection`, 귀속 여부 무관) 대조하고 v1과 같은 `settle`에 넘긴다.
 
-**잠금 순서.** scheduler 행 → `method_runs` 행 → `method_routing` 행. 작업 레인은 턴 확정 트랜잭션(대화 행 → scheduler → 레인 행 → job) 안에서 같은 트랜잭션으로 `settle`을 부른다(`within`). 두 게시 서버의 동시 보고는 scheduler 행에서 줄을 서고, 고를 때의 `epoch`가 지금과 다르면 넘어감을 다시 하지 않는다.
+**잠금 순서.** scheduler 행 → `method_runs` 행 → `method_routing`·`method_subscription`·`method_api` 행. 작업 레인은 턴 확정 트랜잭션(대화 행 → scheduler → 레인 행 → job) 안에서 같은 트랜잭션으로 `settle`을 부른다(`within`). 두 게시 서버의 동시 보고는 scheduler 행에서 줄을 서고, 고를 때의 `epoch`가 지금과 다르면 넘어감을 다시 하지 않는다.
 
 **호환.** 스위치 꺼짐·지원 미확인·설치 없음이면 요청·응답·DB 쓰기가 지금과 같다(`method_routing`·`method_runs`에 쓰지 않는다). 옛 작업자(지원 404)에는 새 판을 보내지 않는다. 변경 자체 리뷰의 v2 저장 결과는 새 게시 서버가 스위치와 무관하게 회수한다. 되돌려도 두 표와 감사 기록은 지우지 않는다.
 
@@ -2339,3 +2339,23 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 5. 게시 서버를 되돌린다.
 
 구독 고정, 작업 세션 기록 판 확인, 기록·DB 칸을 지우지 않는 것 등 나머지 주의는 "C38" 6절 그대로다.
+
+## C40 재검토 보완 (2026-11-12)
+
+결정과 근거는 [DECISIONS](DECISIONS.md) "C40 재검토 보완"이다. 설계 모양만 적는다.
+
+**선택의 수명.** `select`가 고른 선택은 세 끝 중 하나다.
+
+| 끝 | 누가 | `method_runs` |
+|---|---|---|
+| 보냄 | `start`(대화·PR 리뷰·변경 자체 리뷰), `begin` 안의 `admit` + `started`(작업 턴·변경 작성 턴) | `started_at` 기록, 결과는 뒤에 `settle` |
+| 다시 고름 | `start`·`admit` 거절 → `reroute` | `outcome='unstarted'`, 확인 자리 놓음, job은 대기열(시도로 세지 않음) |
+| 버림 | dispatch 전 다른 끝(취소·종료 되돌림·lease 상실·턴 CAS에서 짐·리뷰 미루기) → `abandon` | `outcome='unstarted'`, 확인 자리 놓음 |
+
+`select`가 `{ wait }`를 돌려주면 선택이 없고 경로가 `waitForUser(model_limit)`한다. 작업 레인은 `unchanged` 안에서(세션 그대로), 변경 작성은 `waitForUser` 뒤 `change_turn_stale`로 던져 change-runtime이 시작하지 못한 턴으로 다룬다.
+
+**상태 읽기.** 라우터는 `method_routing` 행에 그 계정의 `method_subscription` 행과 그 계정·revision의 `method_api` 행, 실제 지금 계정 여부(`model_accounts.current`)와 등록 방식 수를 붙인 한 행으로 읽는다. 설치가 두 상태 행을 만든다(`ON CONFLICT DO NOTHING`, 구독 확인 자리는 가리키는 설치가 바뀔 때만 비움).
+
+**귀속.** `settle`의 "지금 설치"는 설치 active·계정·revision 일치·그 계정이 실제 지금 계정이다. `record`는 취소·종료 분기에서 확인된 API 실패의 잠금만 적는다. 선택이 있는 실행의 대기 아닌 결과의 한도 경고는 `settle`이 `observeRateLimit(…, null)`로 남기고(구독·지금 설치일 때만), 경로는 자기 `observeRateLimit`을 선택이 없을 때만 부른다.
+
+**작업 레인만 막는 대기.** `waitForUser(…, { laneOnly })` → `recordPause(…, laneOnly)`가 `model_pauses.lane_only_at = paused_at`을 적는다. `releaseScheduler`는 이 조건의 대기를 전역 대기로 세지 않는다. 작업 레인은 지금처럼 `taskLaneStopped`(모델 한도 대기 있음)로 닫힌다.

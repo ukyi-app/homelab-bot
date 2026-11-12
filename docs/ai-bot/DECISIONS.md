@@ -1606,10 +1606,12 @@ owner 결정(2026-11-11 "좋아 그렇게해", 전체 리뷰 1차 명세 질문 
   - 작업 경로 칸이 꺼져 있으면 작업 턴은 선택 칸 없이 지금처럼 구독으로 돈다. 그 턴이 구독 한도로 끝나면 넘어가지 않고 지금처럼 기다리되, 다른 경로가 넘어갈 수 있으면(설치 active·지금 계정·두 방식 등록·API `eligible`, `routesOthers`) 작업 레인만 막는다. 전역 scheduler를 닫으면 대화·PR 리뷰가 한도를 스스로 만나지 못해 넘어가지 못한다. 상태(`method_routing`)는 바꾸지 않고 실행 기록도 없다.
   - 기동 로그 `method_routing_gate`는 스위치가 켜졌을 때 `{ state, task: 'closed' | 'waiting_worker' }`다.
 
-**2. 상태 저장(migration 029, 추가만).** 조사 제안의 세 종류를 두 표로 나눴다.
+**2. 상태 저장(migration 029, 추가만).** 지금 설치를 가리키는 행과 두 방식의 상태를 나눴다(아래 "C40 재검토 보완" 3).
 
-- `method_routing`(한 행 `id='current'`): 설치(계정·묶음 revision·`install_state` `active|off|refused`), 구독 상태(`available|limited`, 풀리는 시각, 다음 확인 시각, 확인 실행 ID와 그 자리 유효 시각), API 상태(`eligible|billing_blocked|auth_blocked`, 잠긴 시각·revision), `epoch`.
-- `method_runs`(실행마다 한 행): 실행 ID, job, lease, 경로, 계정, revision, 방식, 고를 때의 epoch, 구독 확인 여부, 결과, 넘어갈 근거(`subscription_limit`). jobs 외래 키가 없다(작업 정리가 지워도 누계가 남는다).
+- `method_routing`(한 행 `id='current'`): 지금 설치(계정·묶음 revision·`install_state` `active|off|refused`·거부 사유)와 `epoch`.
+- `method_subscription`(계정마다 한 행): 구독 상태(`available|limited`, 풀리는 시각, 다음 확인 시각, 확인 실행 ID와 그 자리 유효 시각).
+- `method_api`(계정·revision마다 한 행): API 상태(`eligible|billing_blocked|auth_blocked`, 잠긴 시각).
+- `method_runs`(실행마다 한 행): 실행 ID, job, lease, 경로, 계정, revision, 방식, 고를 때의 epoch, 구독 확인 여부, 시작 시각(`started_at`, 보낸 실행만), 결과, 넘어갈 근거(`subscription_limit`). jobs 외래 키가 없다(작업 정리가 지워도 누계가 남는다).
 - 구독 `auth_blocked`는 두지 않았다. 구독 인증 실패는 넘어감 근거가 아니라(AC-35) 지금의 인증 대기 그대로다.
 - `model_limit_state`·`model_pauses`·`switchAccount`는 그대로 쓰고 바꾸지 않았다. 구독 한도를 넘길 때 그 실행의 한도 관측은 `observeRateLimit`으로 지금처럼 계정 기록에 남긴다.
 
@@ -1626,18 +1628,18 @@ owner 결정(2026-11-11 "좋아 그렇게해", 전체 리뷰 1차 명세 질문 
 | 고를 때 설치와 계정·revision이 다르거나 설치가 꺼진 실행의 한도·인증·`not_run` | 그대로 | 다시 넣어 지금 설치(또는 옛 판)로 다시 고른다 |
 | 경고만 본 한도·분류 못 한 한도·인증·과부하·실패·unknown·취소·비상 정지 | 그대로 | 지금 동작 |
 
-- **고르기:** 구독 `available`이면 구독. `limited`면 확인 시각이 지났고 다른 확인 실행이 없을 때 그 실행 하나가 구독(확인), 나머지는 API. API가 잠겼으면 구독(재개 예약 루프가 확인 시각에 되돌린 일)이다. 확인용 모델 호출은 따로 만들지 않는다(실제 작업이 올 때만).
+- **고르기:** 구독 `available`이면 구독. `limited`면 확인 시각이 지났고 다른 확인 실행이 없을 때 그 실행 하나가 구독(확인), 나머지는 API. API가 잠겼으면 나머지는 보내지 않고 구독 확인 시각까지 모델 멈춤이다(API 잠금과 무관하게 확인은 시각 뒤 하나뿐). 확인용 모델 호출은 따로 만들지 않는다(실제 작업이 올 때만). 고른 선택은 보내기 직전에 한 번 더 확인한다("C40 재검토 보완" 1).
 - **API를 쓸 수 있는 동안 전역 scheduler를 닫지 않는다:** 넘어간 일은 `waitForUser`를 거치지 않고 대기열로 돌아간다.
 - **API 잠금 해제:** 관리 진입점 `account api-unlock`과 새 revision의 `account auto-install`뿐이다. 같은 revision 재설치, 구독 성공, 달 바뀜으로는 풀리지 않는다. 잠금과 구독 확인 예약은 따로 남는다.
 
 **4. 경로.**
 
 - **대화·PR 리뷰·변경 자체 리뷰:** 고를 수 있으면 대화 v3·리뷰 v2·변경 자체 리뷰 v2, 아니면 옛 판. 넘어가면 자리 비움 안내 없이 같은 job을 다시 넣는다.
-- **PR 리뷰 미루기:** claim이 `reviewDeferredUntil`을 보되 고를 방식이 API인 동안(`apiChosen`: 설치 active·지금 계정·구독 `limited`·API `eligible`)은 미루기 조건을 빼고 집는다. 기한(`review_deferred_until`)은 지우지 않아 API가 잠기거나 구독으로 돌아오면 다시 적용된다.
+- **PR 리뷰 미루기:** claim이 `reviewDeferredUntil`을 보되 고를 방식이 API인 동안(`apiChosen`: 설치 active·지금 계정·구독 `limited`·API `eligible`이고, 구독 확인 시각 전이거나 다른 실행이 확인 중)은 미루기 조건을 빼고 집는다. claim 뒤 실제 선택이 API가 아니면 미루기 기한까지 되돌린다. 기한(`review_deferred_until`)은 지우지 않아 API가 잠기거나 구독으로 돌아오면 다시 적용된다.
 - **변경 자체 리뷰 회수:** 이 lease로 v2를 보냈으면(`method_runs.lease`) v2 저장 결과를 `lookup(…, 기대 선택)`으로 읽고 같은 규칙으로 귀속한다. 회수에서 다시 넣을 때는 unknown(또는 멈춤 확인 뒤 failed)에서 되돌리고 unknown 조사 표식을 지운다. ACK는 지금처럼 한다. 이 회수는 스위치를 꺼도 된다(끈 뒤에도 v2로 낸 결과를 읽어야 한다).
 - **작업(v1 `/v1/task`):** 요청 끝 `execution` 칸에 선택을 싣는다. 구독 한도 + 근거 + 세션 보존(`sessionRetained`)이면 세션을 `waiting_model`(턴 예산 제외)로 두고 같은 job을 다시 넣어 다음 턴(`--resume`, 같은 세대·세션)으로 API에 잇는다. 도구 수·실행 시간은 세션에 합산된 값에서 이어 와 새로 채워지지 않는다. 세션이 남지 않았으면 넘어가지 않고 지금처럼 기다리되, 다른 경로가 API를 쓸 수 있으면 작업 레인만 막는다(`laneOnly`). 실행 칸이 보낸 선택과 다르거나 없으면 응답 유실로 다룬다.
 - **작업 `not_run`(C39 넘김):** 재개 턴이면 세션을 `waiting_model`로 두어 다음 턴 번호로, 첫 턴이면 세션을 `cancelled`로 닫아 새 세대로 다시 보낸다. 턴 예산에서는 뺀다.
-- **변경 작성 턴(v2 `/v2/task`, `ClaudeChangeAuthor`):** 작업 턴과 같은 규칙이다. 시작·재개 턴 요청 끝 `execution` 칸에 선택을 싣는다(실행 기록 경로는 `task`). 결과 확정은 응답과 다른 때·다른 프로세스에서 일어나므로, 그 턴의 선택은 세션의 `worker_lease`(= 보낸 요청의 lease)로 `method_runs`에서 다시 찾는다(이미 귀속한 실행 포함). 같은 세션의 다음 턴·예산 합산·세션이 없으면 새로 시작하지 않음·`not_run` 턴 번호는 v1과 같은 확정 코드(`settle`)가 맡는다. 결과의 실행 칸이 그 선택과 다르거나, 선택 없이 보낸 턴에 실행 칸·`not_run`이 오면 응답 유실이다. snapshot은 성공으로 귀속해 구독 확인이 될 수 있다. 첫 턴 `not_run`이면 세션이 닫히고 job이 대기열로 돌아오고, change-runtime이 부모(수정 차례 작성이면 그 차례)를 닫지 않고 새 세대로 다시 시작한다(`fetchResult`는 `unknown/not_run`).
+- **변경 작성 턴(v2 `/v2/task`, `ClaudeChangeAuthor`):** 작업 턴과 같은 규칙이다. 시작·재개 턴 요청 끝 `execution` 칸에 선택을 싣는다(실행 기록 경로는 `task`). 결과 확정은 응답과 다른 때·다른 프로세스에서 일어나므로, 그 턴의 선택은 세션의 `worker_lease`(= 보낸 요청의 lease)로 `method_runs`에서 실제로 시작한 실행(`started_at`)을 다시 찾는다(이미 귀속한 실행 포함). 같은 세션의 다음 턴·예산 합산·세션이 없으면 새로 시작하지 않음·`not_run` 턴 번호는 v1과 같은 확정 코드(`settle`)가 맡는다. 결과의 실행 칸이 그 선택과 다르거나, 선택 없이 보낸 턴에 실행 칸·`not_run`이 오면 응답 유실이다. snapshot은 성공으로 귀속해 구독 확인이 될 수 있다. 첫 턴 `not_run`이면 세션이 닫히고 job이 대기열로 돌아오고, change-runtime이 부모(수정 차례 작성이면 그 차례)를 닫지 않고 새 세대로 다시 시작한다(`fetchResult`는 `unknown/not_run`).
 
 **5. 관리 진입점(`homelab-bot-admin/v1`).** C42 CLI가 부를 명령과 출력 모양이다.
 
@@ -1652,13 +1654,55 @@ owner 결정(2026-11-11 "좋아 그렇게해", 전체 리뷰 1차 명세 질문 
 - C42 순서: 두 방식 값 넷·묶음을 두 파드에 반영·확인 → (계정이 바뀌면) 지금처럼 `account use <이름> subscription` → `account auto-install <이름> <revision>`. 수동 `account use`는 바꾸지 않았다. 수동으로 같은 계정의 다른 방식을 쓰면(CLI가 반대 자격을 비움) 다음 새 판 요청이 `not_run`으로 거부되고 설치가 `refused`가 되어 지금 동작으로 돌아간다.
 - homelab CLI의 결과 이름 집합(`BOT_RESULTS`)에 새 이름 일곱을 더하는 것은 C42다.
 
-**6. C41이 읽을 재료.** 지워지지 않는 감사 기록 `method_route_subscription_limited`(넘어감 "선택됨", 풀리는 시각·API 상태), `method_route_subscription_returned`(구독 성공 확인 뒤 돌아옴, 한도 시작 시각), `method_route_api_locked`(이유), `method_route_api_unlocked`(`by: owner|revision`), `method_route_refused`. 실행마다 `method_runs`(API로 "실제 실행됨"은 `method='api' AND outcome IS NOT NULL AND outcome<>'not_run'`). 모델을 부르지 않은 변경 자체 리뷰 결과(`problems`만)는 `method_runs`가 생기기 전에 끝나 세지 않는다.
+**6. C41이 읽을 재료.** 지워지지 않는 감사 기록 `method_route_subscription_limited`(넘어감 "선택됨", 풀리는 시각·API 상태), `method_route_subscription_returned`(구독 성공 확인 뒤 돌아옴, 한도 시작 시각), `method_route_api_locked`(이유), `method_route_api_unlocked`(`by: owner|revision`), `method_route_refused`. 실행마다 `method_runs`(API로 "실제 실행됨"은 `method='api' AND started_at IS NOT NULL AND outcome IS DISTINCT FROM 'not_run'`. 보내지 않고 버린 선택은 `started_at`이 없고 `outcome='unstarted'`다). 모델을 부르지 않은 변경 자체 리뷰 결과(`problems`만)는 `method_runs`가 생기기 전에 끝나 세지 않는다.
 
 **알려진 한계.**
 
 - **되돌리기 순서(정책 칸 먼저).** 정책 스키마가 strict라 `apiAfterLimit`·`apiAfterLimitTask` 중 하나라도 든 정책으로는 이 칸을 모르는 옛 게시 서버가 기동하지 못한다(`runtime_policies_invalid`). 게시 서버를 C40 전으로 되돌리기 전에 운영 `RUNTIME_POLICIES`에서 두 칸을 먼저 빼고 파드 재시작으로 반영한 뒤 이미지를 되돌린다. 순서를 바꾸면 되돌린 파드가 기동 실패로 남는다. 칸을 넣는 것도 새 게시 서버 배포를 확인한 뒤다.
 - **작업 경로 칸을 켜는 시점.** `apiAfterLimitTask`는 C45가 구독 ↔ API `--resume` 실호환을 확인한 뒤에만 켠다. 이 저장소의 시험은 가짜 작업자라 그 호환을 확인하지 못한다.
-- **API 잠금 동안의 구독 확인 수:** API가 잠겨 두 방식이 다 막힌 동안은 지금의 재개 예약 루프가 확인 시각에 멈춘 작업을 모두 되돌린다. 슬롯이 직렬이라 첫 확인이 다시 한도면 나머지는 다시 멈춘다(지금 동작과 같다).
+- **API 잠금 동안의 구독 확인 수:** API가 잠겨 두 방식이 다 막힌 동안 재개 예약 루프는 확인 시각에 멈춘 작업을 모두 되돌린다. 실행 자리는 대화·작업이 따로라 자리의 직렬성이 확인을 하나로 막지 않는다. 그래서 고르기가 확인 자리를 잡은 실행 하나만 구독으로 보내고, 나머지는 보내지 않고 다시 멈춘다(다음 시도는 최소 1분 뒤, "C40 재검토 보완" 2).
 - **확인 실행을 잃으면:** 확인 실행의 결과를 받지 못하면(unknown·재시작) 그 자리는 작업 실행 상한 + lease 뒤에 다른 실행이 대신한다.
 - **세션이 남지 않은 첫 턴의 API 결제 실패**는 구독이 쓸 수 있어도 다시 넣지 않고 지금 규칙(결제 멈춤)이다.
 - **늦은 결과의 일:** 고를 때와 설치가 달라진 실행의 한도·인증 결과는 상태를 바꾸지 않고 그 일을 다시 넣는다. 그 일이 옛 계정에서 이미 실행됐어도 다시 한 번 실행된다(대화·리뷰는 같은 입력의 재실행, 작업은 다음 턴).
+
+## C40 재검토 보완 (2026-11-12)
+
+독립 재검토 둘(RR8A·RR8B)과 GitHub Codex 리뷰가 찾은 결함의 수정이다. 위 "C40"의 owner 결정·스위치·관리 명령 넷의 인자·결과 이름·출력 모양은 그대로다. 시험은 [VERIFICATION](VERIFICATION.md) 끝 "C40 재검토 보완"이다.
+
+**1. 보내기 직전 다시 확인(RR8A-N1).** 고르기(`select`)와 보내기 사이에 다른 실행 자리가 API를 잠글 수 있다. 그래서 모든 경로가 작업자에 보내기 직전에 `MethodRouter.start`(작업 레인·변경 작성은 턴 시작 CAS `begin` 안의 `admit` + `started`)로 그 선택을 다시 본다.
+
+- API 잠금·구독 한도 전이·설치와 같은 scheduler 행 잠금 아래라 잠금과 시작 확인 중 하나가 먼저다. 잠금이 먼저면 그 선택은 보내지 않고(`reroute`: 선택을 버리고 그 일을 시도로 세지 않고 대기열로) 다시 고른다. 시작 확인이 먼저면 그 실행은 잠금 전에 시작한 것이다.
+- 통과 조건: 설치가 켜져 있고 그 계정이 지금 계정이며 계정·revision이 고를 때와 같다. API면 그 설치의 API가 `eligible`, 구독 확인이면 그 확인 자리를 아직 쥐고 있음, 다른 구독 실행이면 구독이 `available`.
+- 통과한 실행만 `method_runs.started_at`이 있다. 보내지 않은 선택은 `outcome='unstarted'`로 닫고 구독 확인 자리를 놓는다.
+
+**2. 구독 확인은 API 잠금과 무관하게 시각 뒤 하나(RR8A-N3·RR8B-N4).** 구독이 한도이고 API가 잠겼을 때도 확인 시각 전이거나 다른 실행이 확인 중이면 보내지 않는다. 고르기는 기다림(`{ wait }`)을 돌려주고 경로는 구독 확인 시각(이미 지났으면 지금)을 풀리는 시각으로 `waitForUser(model_limit)`한다. 재시도는 그 시각 + 1분과 지금 + 1분 중 늦은 때다. 작업 레인은 세션을 그대로 두고, 변경 작성은 시작하지 못한 턴(`change_turn_stale`)으로 다룬다.
+
+**3. 상태를 계정·revision별로 보존(RR8B-N2).** `method_routing` 한 행은 지금 설치를 가리키기만 한다. 구독 상태는 `method_subscription`(계정별), API 잠금은 `method_api`(계정·revision별)다.
+
+- `A 잠금 → B 설치 → A 같은 revision 재설치`에서 A의 API 잠금과 구독 한도·확인 예약이 남는다. 새 revision은 새 API 행이라 `eligible`로 시작한다(키 교체로 잠금이 풀리는 규칙 그대로). 잠긴 옛 revision을 다시 설치하면 그 잠금이 그대로다.
+- 가리키는 설치가 바뀌면 그 계정의 구독 확인 자리를 놓는다. 다른 설치로 고른 확인 실행의 결과는 귀속되지 않아 자리를 영영 쥐게 되기 때문이다.
+- `api-unlock`은 지금 설치(계정·revision)의 잠금만 푼다. `auto-status` 출력 모양은 같고 지금 설치의 두 방식 상태를 보인다.
+- 029는 아직 main에 없어 그 파일 안에서 바꿨다(새 migration 없음). 새 표 셋과 `method_runs.started_at`, 기존 표에는 `model_pauses.lane_only_at`(아래 8) 하나뿐이다.
+
+**4. 회수는 시작한 실행의 선택으로(RR8A-N4·RR8B-N1, Codex P2).** `pendingSelection`은 그 lease로 실제로 시작한 실행(`started_at`)을 귀속 여부와 무관하게 찾는다. v2 변경 자체 리뷰가 성공을 귀속한 뒤 findings·receipt 저장이 실패해도 다음 회수가 v2 저장 결과를 읽어 모델 없이 receipt와 ACK까지 간다. 두 번째 귀속은 아무것도 바꾸지 않는다.
+
+**5. 변경 작성 준비 경합(RR8A-N5).** 두 게시 서버가 같은 작성 job·lease로 각각 골라도, 턴 시작 CAS에 이긴 턴의 선택만 `started_at`을 얻는다. 결과 대조·회수는 그 선택을 쓴다(`started_at` 순). 진 쪽의 선택은 버린다.
+
+**6. 확인된 API 실패의 잠금은 취소와 따로(RR8A-N6).** API 실행의 `limited`·`auth_expired`가 멈춤 확인(`stopped:true`)과 함께 왔으면, 그 일의 끝을 취소·철회·종료·lease 상실이 정해도 `settle(…, { record: true })`로 API 잠금만 적는다. 다시 넣거나 기다리지 않는다. 구독 실행의 결과는 이 경로에서 아무것도 하지 않는다(넘어감 조건을 넓히지 않는다).
+
+**7. 한도 경고는 실행의 계정·revision으로 귀속(RR8A-N7·RR8B-N3).**
+
+- 선택을 실은 실행의 대기가 아닌 결과(성공·실패)의 한도 경고는 `settle`이 남긴다. 그 실행이 구독이고 계정·revision이 지금 설치이며 그 계정이 실제 지금 계정일 때만이다. 실행 시작 시각과 전환 시각의 비교(`startedBeforeSwitch`)는 선택이 없는 옛 요청 경로에만 남는다. 같은 계정의 새 revision 설치는 전환 시각을 바꾸지 않기 때문이다. API 실행의 경고는 리뷰 미루기에 남기지 않는다.
+- `settle`의 "지금 설치" 판단은 `model_accounts.current`까지 본다. owner가 `account use B`로 바꾼 뒤(자동 설치 없이) 도착한 A의 늦은 결과는 A의 상태도, B의 scheduler·멈춤도 바꾸지 않고 그 일을 다시 넣는다. 같은 밀리초 전환도 같다(시각을 비교하지 않는다).
+
+**8. 리뷰 미루기 예외와 실제 선택(RR8A-N8).** `apiChosen`은 고르기와 같은 판단이다: 구독 확인 시각이 지났고 확인 자리가 비어 있으면 고르기가 구독 확인을 고르므로 false다. claim과 고르기 사이에 그 시각이 지나 구독을 골랐으면, PR 리뷰는 선택을 버리고 대기열로 돌아가(`review_deferred`) 미루기 기한까지 집히지 않는다.
+
+**9. 작업 레인만 막는 대기의 저장(Codex P2 `claude-task-bridge.ts:566`).** `apiAfterLimit`만 켠 배치에서 작업 턴의 구독 한도는 작업 레인만 막는다(`laneOnly`). 이 범위를 멈춤 기록에 `lane_only_at = paused_at`으로 남기고, 전역 scheduler 해제(`releaseScheduler`)는 이 대기를 기다리지 않는다. 비상 정지를 풀면 scheduler가 열리고 그 작업은 작업 레인만 막은 채 기다린다.
+
+- 옛 코드 호환: `ALTER TABLE model_pauses ADD COLUMN IF NOT EXISTS lane_only_at bigint DEFAULT NULL`. 옛 코드의 멈춤 기록은 칸 이름을 적어 넣어 이 칸을 모른다. 옛 코드가 같은 작업의 멈춤을 다시 쓰면 `paused_at`만 바뀌어 이 칸과 달라지므로 전역 대기로 읽힌다(옛 코드의 규칙 그대로). 같은 밀리초에 다시 쓴 경우만 작업 레인 대기로 남는다.
+
+**알려진 한계(보완 뒤).**
+
+- **배포 종료가 같은 대화를 API로 다시 실행한다(RR8A-N2).** 드레인 기한을 넘긴 대화는 작업자가 실행을 취소로 멈추므로 작업자에 남은 결과가 없다(대화 작업자에는 결과 회수 경로도 없다). 그래서 회수 대신 지금 재시도 규칙을 상한으로 고정했다: **한 대화의 실제 API 시작은 배포 종료만으로 최대 3번**(`DEFAULTS.maxRetries + 1`)이다. 구독 한도로 넘어갈 때 시도 수를 되돌려(0) API 첫 실행이 시도 1이고, 종료 되돌림은 시도 수를 바꾸지 않아 세 번째 종료 뒤에는 `failed/stop_confirmation`으로 닫힌다. 구독 한도·확인 같은 다른 사건이 시도 수를 되돌리면 그 사이에 더 실행될 수 있다(사건마다 위 상한이 다시 적용된다).
+- **보내기 확인 뒤의 잠금.** 시작 확인을 통과한 실행은 잠금보다 먼저 시작한 것으로 본다. 확인과 실제 HTTP 전송 사이(인가·dispatch 확인 몇 ms)에 커밋된 잠금은 그 실행을 막지 않는다.
+- **확인 자리를 기다리는 일의 재시도 간격.** 다른 실행이 구독 확인 중이면 남은 일은 1분마다 다시 고른다(확인이 끝나면 다음 시도에 구독 또는 API로 간다). 확인이 그보다 일찍 끝나도 그 1분은 기다린다.

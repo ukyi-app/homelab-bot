@@ -2995,3 +2995,26 @@ DECISIONS "C40" 1절(작업 경로 칸 `apiAfterLimitTask`)·4절(변경 작성 
 - **실행(머신 잠금 도우미, node 24.22.0):** 매번 `npm run check`·`npm run build`. 네 묶음 모두 통과, 실패·skip 0: (1, `--pg`) `c40-method-routing`·`c40-method-routing-pg`·`c40-method-routing-task`·`task-assembly`·`c39-execution-selection`·`task-contracts`·`change-contracts`·`publisher-policy` 118, (2) `change-artifact`·`change-assembly`·`change-review`·`pr-review`·`change-self-fix`·`c27-change-amend`·`c28-change-question`·`change-verify-recheck` 422, (3, `--pg`) `change-pg`·`task-bridge`·`task-lane-pg`·`task-settle-log`·`c16-task-question`·`publisher-main`·`admin-cli`·`publisher-pg` 235, (4, `--pg`) `publisher-review`·`publisher-shutdown`·`briefing-task-lane`·`memory-briefing`·`change-store` 174.
 - **기존 시험 고침:** `c40-method-routing-task`의 라우터에 작업 경로 칸(`task: true`)을 켰다. 시험 도구 둘(`change-artifact` 작성 port, `change-assembly-harness`)에 턴 요청 기록·선택 칸 빼기·결과 바꾸기 자리를 더했다(쓰지 않는 시험은 그대로).
 - **못 잡는 범위:** 위와 같다. 특히 변경 작성 턴의 구독 → API `--resume` 실호환은 C45 S5다. 작업 경로 칸은 그 확인 뒤에만 켠다.
+
+## C40 재검토 보완 (2026-11-12, 로컬)
+
+결정은 [DECISIONS](DECISIONS.md) "C40 재검토 보완", 설계는 [ARCHITECTURE](ARCHITECTURE.md) 끝 "C40 재검토 보완". 경계는 위 "C40"과 같다(S1, PGlite, 경합은 실제 PostgreSQL 두 연결, 가짜 시계).
+
+| 발견 | 근거(시험) |
+|---|---|
+| RR8A-N1 고른 뒤 보내기 전 API 잠금 | `c40-method-routing` "AC-36 API를 고른 뒤 보내기 전에 다른 자리의 결제 실패로 API가 잠기면 …"(두 번째 인가 확인 중 다른 자리가 잠금 → API 요청 0건, 그 일은 다시 골라 구독 확인 시각까지 `waiting_user/model_limit`), `c40-method-routing-pg` "AC-36 API 잠금과 고른 API 실행의 시작 확인이 두 연결에서 겹쳐도 …"(5회, 시작하지 못했으면 시작 기록 없음, 잠금 뒤 어느 서버도 API를 고르지 않음) |
+| RR8A-N2 배포 종료 뒤 같은 대화의 API 재실행 | "AC-33 배포 종료가 같은 대화를 되돌려도 …"(드레인 초과 → 취소 확인 → 새 runtime 반복: API 시작 정확히 3번 뒤 `failed/stop_confirmation`) |
+| RR8A-N3·RR8B-N4 API 잠금 중 구독 확인의 시각·한 자리 | "AC-36 API가 잠긴 동안에도 구독 확인은 예약 시각 전 0건이고 …"(시각 전 작업 자리 선택 = 기다림 `{ wait: 구독 풀리는 시각 }`, 시각 뒤 대화·작업 두 자리 중 먼저 고른 하나만 구독 확인), `c40-method-routing-pg` "AC-36 API가 잠긴 동안 두 실행 자리(대화·작업)가 …"(두 연결 동시 선택: 시각 전 둘 다 기다림, 시각 뒤 구독 확인 1건·기다림 1건) |
+| RR8A-N4·RR8B-N1·Codex P2 v2 저장 실패 뒤 회수 | `change-review` "AC-39 v2 변경 자체 리뷰가 성공한 뒤 저장이 실패해도 …"(라우터 설치, 귀속은 이미 `succeeded`, 저장 복구 뒤 receipt `pass`, 모델 호출 1회, 작업자 결과 ACK로 지움) |
+| RR8A-N5 변경 작성 준비 경합 | `change-artifact` "AC-37 두 게시 서버가 같은 작성 job·lease로 각각 고르고 …"(늦게 고른 쪽 `begin`은 `conflict`, 결과는 시작한 턴의 선택으로 snapshot) |
+| RR8A-N6 확인된 API 실패와 취소 | "AC-36 확인된 API 결제 실패가 취소와 겹쳐도 …"(API 결제 실패 + 취소 → `cancelled`이고 API `billing_blocked`, 구독 한도 + 취소 → 구독 `available`) |
+| RR8A-N7 옛 revision의 한도 경고 | "AC-37 같은 계정에 새 revision을 설치한 뒤 …"(옛 revision 실행의 경고는 리뷰 미루기 없음, 지금 revision의 경고는 미루기) |
+| RR8A-N8 미루기 예외와 실제 선택 | `pr-review` "AC-39 구독 확인 시각이 리뷰 미루기 기한보다 이르면 …"(확인 시각 뒤·미루기 기한 전 PR 리뷰를 집지 않음, 모델 호출 0) |
+| RR8B-N2 계정 왕복 설치 | "AC-36 계정 A의 API 잠금·구독 확인 예약은 B를 설치한 뒤 …"(A 잠금·구독 한도·다음 확인 시각이 그대로, 되돌려진 일은 API·구독 어느 쪽으로도 나가지 않음) |
+| RR8B-N3 `account use` 뒤 옛 계정 결과 | "AC-37 owner가 account use로 다른 계정으로 바꾼 뒤(같은 밀리초/1ms 뒤) …"(scheduler 열림, 멈춤 기록 없음, 그 일은 새 계정의 옛 판 요청으로 성공) |
+| Codex P2 작업 레인만 막는 대기 | `c40-method-routing-task` "AC-38 작업 경로 칸이 꺼져 있으면 …"(비상 정지 → 해제 뒤 `paused:false`, scheduler 열림, 작업은 계속 대기) |
+
+- **고치기 전 빨강:** 위 시험을 구현 전에 먼저 써서 돌렸다(`70a47ae`, 로그 `c40-fix2-red-1112-132114`): 265건 중 10건이 의도한 이유로 실패했다(API 요청이 나감·`{ wait }` 대신 구독 선택·잠금 `eligible`로 남음·리뷰 미루기 기한이 적힘·A 잠금과 예약이 초기화됨·scheduler 닫힘 둘·작성 결과 `failed`·receipt 없음·PR 리뷰를 집음·해제 뒤 `paused:true`). 배포 종료 상한 시험(RR8A-N2)은 지금 규칙을 고정하는 시험이라 처음부터 통과했다. PG 시험 둘은 구현과 함께 썼다(두 자리 동시 선택 시험은 구현 전 코드였다면 둘 다 구독을 고른다. 시작 확인 시험은 새 `start`를 쓴다).
+- **기존 시험 고침:** 상태 칸을 `method_routing` 행에서 읽던 시험을 `methodRoutingView`로 바꿨다(`c40-method-routing`·`c40-method-routing-task`·`c40-method-routing-pg`·`pr-review`). TRUNCATE 목록과 016 뒤 새 표 목록(`change-store`)에 `method_subscription`·`method_api`를 더했다. PG 시험의 `select` 결과에 기다림 모양이 생겨 선택으로 좁히는 도우미를 썼다.
+- **실행(머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`·`npm run build` 뒤 53개 파일(`c40-method-routing`·`-task`·`-pg`, `c39-execution-selection`, `change-review`·`-dispatch`·`-pg`, `change-artifact`, `change-assembly`, `pr-review`, `publisher-shutdown`·`-main`·`-migrate`·`-policy`·`-review`·`-pg`, `task-assembly`·`task-bridge`·`task-contracts`·`task-lane-pg`·`task-lane-migration`·`task-settle-log`, `c16-task-question`, `briefing-task-lane`, `change-store`·`-pg`, `change-pg`, `admin-cli`, `away-status`, `model-resume`, `model-account-switch-pg`, `memory-briefing`, `ops-metrics`, `review-lane`, `worker-contract-v2`, `chat-ack`, `raw-text-retention`, `raw-input-retention`, `review-1`~`review-9`, `review-9-pg`, `change-self-fix`, `c27-change-amend`, `c28-change-question`, `change-verify-recheck`, `stop-confirmation`) 1,343건 통과, 실패·skip 0.
+- **못 잡는 범위:** 위 "C40"과 같다. 시작 확인과 실제 HTTP 전송 사이 몇 ms의 잠금, 실제 두 파드의 배포 중 공존은 시험하지 않았다.
