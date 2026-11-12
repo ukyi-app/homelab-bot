@@ -142,7 +142,7 @@ test('거절 판정의 경계: 명시한 거절만 model_refusal이고 인증·�
   assert.deepEqual(judge([init, finished({ subtype: 'error_during_execution', stop_reason: 'refusal' })]), refusal, '실행 오류 result의 거절도 거절이다');
   // HTTP 상태만 보면 403이 인증 만료로 읽혀 재인증을 기다리게 된다.
   assert.deepEqual(judge([init, live({ api_error: 'dlp_request_denied', api_error_status: 403 }), finished({ api_error_status: 403 })]), refusal);
-  assert.deepEqual(judge([init, live({ error: 'rate_limit' }), finished()]), { kind: 'limited', rateLimit: { stop: { cause: 'rate_limit' } } });
+  assert.deepEqual(judge([init, live({ error: 'rate_limit' }), finished()]), { kind: 'limited', rateLimit: { stop: { cause: 'rate_limit' } }, basis: 'error_kind' });
   assert.deepEqual(judge([init, finished({ api_error_status: 401 })]), { kind: 'auth_expired' });
   assert.deepEqual(judge([init, live({ error: 'server_error', api_error: 'no_response' }), finished()]), { kind: 'failed', reason: 'api_error' });
   assert.deepEqual(judge([init, finished({ stop_reason: 'end_turn' })]), { kind: 'failed', reason: 'api_error' });

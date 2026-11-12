@@ -93,7 +93,7 @@ test('stream 음성: hook·허용 밖 도구·다른 세션·다른 모델은 re
 
 test('stream 한도·인증은 구조화 필드로만 가른다(모델 글에 든 숫자는 보지 않는다)', () => {
   const init = initEvent(SESSION);
-  assert.deepEqual(judge([init, assistant([], { error: 'rate_limit' }), result({ is_error: true })]), { kind: 'limited', rateLimit: { stop: { cause: 'rate_limit' } } });
+  assert.deepEqual(judge([init, assistant([], { error: 'rate_limit' }), result({ is_error: true })]), { kind: 'limited', rateLimit: { stop: { cause: 'rate_limit' } }, basis: 'error_kind' });
   assert.deepEqual(judge([init, assistant([], { error: 'authentication_failed' }), result({ is_error: true })]), { kind: 'auth_expired' });
   assert.deepEqual(judge([init, assistant([{ type: 'text', text: '401 rate limit' }]), result({ structured_output: { ...OUTPUT, summary: '429' } })]), { kind: 'output', value: { ...OUTPUT, summary: '429' } });
   // 실제 CLI가 네트워크 없을 때 낸 오류 모양 [실측].

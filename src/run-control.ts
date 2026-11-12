@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assertWorkerRoot } from './codex-config.js';
 import type { RunCredential, WorkerCredential } from './credentials.js';
+import { SelectionRefused } from './execution-auth.js';
+import type { ExecutionSelection, SelectionRefusal } from './execution-auth.js';
 import type { AdapterRun, ChatAdapter, EngineOutcome, ExecutorCapabilities, ExitStatus, PolicyViolation, RunDirs } from './executor.js';
 import { LaunchFailed, TASK_MARKER } from './process-launcher.js';
 import type { LaunchResult, ProcessLauncher } from './process-launcher.js';
@@ -83,7 +85,9 @@ export interface RunReport {
   outcome?: EngineOutcome;
   secrets?: readonly string[];
   // 띄우기 전에 거절한 사유(launchFailed와 함께, 남은 프로세스 없음).
-  refused?: 'lane_closed' | 'busy' | 'survivors_unconfirmed' | 'cleanup_pending' | 'prepare_failed' | 'aborted';
+  refused?: 'lane_closed' | 'busy' | 'survivors_unconfirmed' | 'cleanup_pending' | 'prepare_failed' | 'aborted' | 'selection';
+  // refused 'selection'의 사유. 새 판 요청의 선택이 계정 묶음·자격과 맞지 않아 자격을 넣지 않았다.
+  selectionRefusal?: SelectionRefusal;
   // 실행은 끝났지만 임시 공간을 지우지 못했다. 답을 내보내지 않는다.
   cleanupFailed?: boolean;
   credentialRecheckFailed?: boolean;
@@ -108,6 +112,8 @@ export type RunSpec = RunSpace & {
   // stdin으로만 넘긴다. argv·파일에 두지 않는다.
   prompt: string;
   limits: RunLimits;
+  // 새 판 요청의 방식 선택. 있으면 자격이 방식 표시 대신 이 선택을 계정 묶음과 대조한다.
+  selection?: ExecutionSelection;
 };
 // 정책 위반으로 멈춘 실행의 종류. 결과 reason은 policy_violation 한 단어라 원인을 가르는 곳은 이 사건뿐이다.
 export interface RunViolationEvent { event: 'run_policy_violation'; lane: RunLane; kind: PolicyViolation }
@@ -268,14 +274,15 @@ export class RunControl {
           workspace: join(base, 'workspace'), run: join(base, 'run'), tmp: join(base, 'tmp') };
         for (const dir of [dirs.home, dirs.config, dirs.workspace, dirs.run, dirs.tmp]) await mkdir(dir, { mode: 0o700 });
       }
-      credential = await this.credential.forRun();
+      credential = await this.credential.forRun(spec.selection);
       plan = state.plan = await adapter.start({ job: spec.job, model: spec.model, dirs, credential, schema: spec.schema });
       // 작업자 프로세스 env를 읽거나 병합하지 않는다. 작업자 env에는 다른 자격·공개 키·플랫폼 값이 있을 수 있다.
       env = { ...plan.env, ...baseEnvironment(dirs, spec.job, this.options.proxy) };
       await assertLaunchSafe(adapter, plan, env, credential, spec.session ? null : dirs.root);
-    } catch {
+    } catch (error) {
       // 프로세스를 띄우기 전 실패다. 남은 프로세스가 없으니 unknown이 아니다.
       state.survivors = 0;
+      if (error instanceof SelectionRefused) return { ...refused('selection'), selectionRefusal: error.refusal };
       return refused('prepare_failed');
     }
     const limits = spec.limits;

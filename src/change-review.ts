@@ -14,6 +14,8 @@ import type {
 import type { ChangeRequest, ChangeStore } from './change-store.js';
 import { DEFAULTS, Denied, RateLimitInfoSchema, WorkerRejected } from './contracts.js';
 import type { Job, RateLimitInfo } from './contracts.js';
+import { ExecutionAuthSchema, ExecutionSelectionSchema, NotRunSchema, executionAuth } from './execution-auth.js';
+import type { ExecutionSelection } from './execution-auth.js';
 import { ArchiveError, SECRET_PATTERNS, readArchive } from './review-input.js';
 import type { ArchiveFetcher, ReviewerResult, ReviewerRun } from './review-input.js';
 import type { Store } from './store.js';
@@ -106,6 +108,10 @@ export const ChangeReviewTaskSchema = z.strictObject({
   }),
 });
 export type ChangeReviewTask = z.infer<typeof ChangeReviewTaskSchema>;
+// v2: v1과 같은 칸·순서 뒤에 방식 선택(execution)을 붙인 판(DECISIONS "C39"). 게시 서버 운영 경로는 아직 v1만 보낸다.
+export const ChangeReviewTaskV2Schema = z.strictObject({ ...ChangeReviewTaskSchema.shape, version: z.literal(2), execution: ExecutionSelectionSchema });
+export type ChangeReviewTaskV2 = z.infer<typeof ChangeReviewTaskV2Schema>;
+export const AnyChangeReviewTaskSchema = z.discriminatedUnion('version', [ChangeReviewTaskSchema, ChangeReviewTaskV2Schema]);
 export interface ChangeReviewerInput {
   instructions: string;
   trusted: { guidelines: string | null; verifications: ChangeReviewTask['trusted']['verifications'] };
@@ -125,12 +131,27 @@ const WorkerResultSchema = z.discriminatedUnion('status', [
 // 게시 서버가 응답의 한도 칸을 받는다는 표시. 칸을 모르는 옛 게시 서버의 strict 스키마는 칸이 든 응답을 거부하므로,
 // 작업자는 이 머리가 있는 요청에만 칸을 싣는다. 판이 엇갈려도(새 작업자 + 옛 게시 서버) 응답이 거부되지 않는다.
 export const RATE_LIMIT_ACCEPT_HEADER = 'x-change-review-rate-limit';
-const withoutRateLimit = (result: ChangeReviewWorkerResult): ChangeReviewWorkerResult => {
+const withoutRateLimit = <T extends AnyChangeReviewResult>(result: T): T => {
   if (!('rateLimit' in result)) return result;
   const { rateLimit: _dropped, ...rest } = result;
-  return rest;
+  return rest as T;
 };
 export type ChangeReviewWorkerResult = z.infer<typeof WorkerResultSchema>;
+// v2 요청의 응답: v1 갈래마다 실행 칸, 그리고 not_run. 저장 결과도 이 모양 그대로 남아 회수 때 원래 실행의 칸을 보존한다.
+// 결과 조회·ACK 요청은 판을 늘리지 않는다(job·lease가 저장 결과를 가리킨다). 그래서 옛 게시 서버가 v2 저장 결과를 조회하면
+// 옛 strict 스키마가 읽지 못해 모름(worker_response_uncertain)이 된다(되돌리기 전에 회수한다, ARCHITECTURE "C38" 6절).
+export const ChangeReviewWorkerResultV2Schema = z.discriminatedUnion('status', [
+  WorkerResultSchema.options[0].extend({ execution: ExecutionAuthSchema }),
+  WorkerResultSchema.options[1].extend({ execution: ExecutionAuthSchema }),
+  WorkerResultSchema.options[2].extend({ execution: ExecutionAuthSchema }),
+  NotRunSchema,
+]);
+export type ChangeReviewWorkerResultV2 = z.infer<typeof ChangeReviewWorkerResultV2Schema>;
+type AnyChangeReviewResult = ChangeReviewWorkerResult | ChangeReviewWorkerResultV2;
+// 작업자는 요청 선택으로만 돌 수 있어 실행 칸은 그 선택과 같아야 한다. 칸이 없는(옛 판) 결과는 v2 요청의 결과가 아니다.
+const sameChangeSelection = (expected: ExecutionSelection, result: AnyChangeReviewResult) => result.status === 'not_run'
+  || ('execution' in result && (['account', 'credentialRevision', 'method', 'runId'] as const).every(key => result.execution[key] === expected[key]));
+const StoredResultSchema = z.union([WorkerResultSchema, ChangeReviewWorkerResultV2Schema]);
 const LookupShape = { version: z.literal(1), job: uuid, lease: uuid };
 // kind가 본문에 들어가 서명 digest가 끝점마다 달라진다. 한 끝점의 capability를 다른 끝점에 쓸 수 없다.
 const ResultLookupSchema = z.strictObject({ ...LookupShape, kind: z.literal('result') });
@@ -139,6 +160,10 @@ export type ChangeReviewResultLookup = z.infer<typeof ResultLookupSchema>;
 export type ChangeReviewAck = z.infer<typeof AckSchema>;
 const LookupResponseSchema = z.union([z.strictObject({ found: z.literal(true), result: WorkerResultSchema }), z.strictObject({ found: z.literal(false) })]);
 export type ChangeReviewLookupResponse = z.infer<typeof LookupResponseSchema>;
+// v2 요청으로 낸 결과까지 읽는 조회 응답(C40이 v2를 보낼 때 쓴다).
+export const ChangeReviewLookupResponseV2Schema = z.union([z.strictObject({ found: z.literal(true), result: StoredResultSchema }),
+  z.strictObject({ found: z.literal(false) })]);
+export type ChangeReviewLookupResponseV2 = z.infer<typeof ChangeReviewLookupResponseV2Schema>;
 export interface ChangeReviewWorkerClient {
   review(task: ChangeReviewTask, capability: string, signal: AbortSignal): Promise<ChangeReviewWorkerResult>;
   cancel(request: CancelRequest, capability: string): Promise<{ stopped: boolean }>;
@@ -434,7 +459,7 @@ export function blockingFindings(receipt: ReviewReceipt, output: ChangeReviewOut
 
 // 게시 서버가 저장을 확인(ack)할 때까지 결과를 지우지 않는다. dir이 있으면 재시작 뒤에도 남는다. 리뷰 원문이 들어 있어 소유자만 읽게 쓴다.
 export class ChangeReviewResults {
-  private readonly memory = new Map<string, ChangeReviewWorkerResult>();
+  private readonly memory = new Map<string, AnyChangeReviewResult>();
   private order: string[] = [];
   constructor(private readonly dir?: string, private readonly limit = WORKER_RESULT_RETENTION) {}
   async open(): Promise<void> {
@@ -446,7 +471,7 @@ export class ChangeReviewResults {
     const times = await Promise.all(results.map(async name => [name, (await stat(join(this.dir!, name))).mtimeMs] as const));
     this.order = times.sort((a, b) => a[1] - b[1]).map(([name]) => name.slice(0, -'.json'.length));
   }
-  async save(job: string, lease: string, result: ChangeReviewWorkerResult): Promise<void> {
+  async save(job: string, lease: string, result: AnyChangeReviewResult): Promise<void> {
     const key = `${job}.${lease}`;
     this.memory.set(key, result);
     this.order = [...this.order.filter(item => item !== key), key];
@@ -457,7 +482,7 @@ export class ChangeReviewResults {
     }
     while (this.order.length > this.limit) await this.remove(this.order[0]!);
   }
-  async get(job: string, lease: string): Promise<ChangeReviewWorkerResult | null> {
+  async get(job: string, lease: string): Promise<AnyChangeReviewResult | null> {
     const key = `${job}.${lease}`;
     const known = this.memory.get(key);
     if (known) return known;
@@ -465,7 +490,7 @@ export class ChangeReviewResults {
     let raw: string;
     try { raw = await readFile(join(this.dir, `${key}.json`), 'utf8'); }
     catch (error) { if ((error as { code?: string }).code === 'ENOENT') return null; throw error; }
-    const parsed = WorkerResultSchema.safeParse(JSON.parse(raw));
+    const parsed = StoredResultSchema.safeParse(JSON.parse(raw));
     return parsed.success ? parsed.data : null;
   }
   delete(job: string, lease: string): Promise<void> { return this.remove(`${job}.${lease}`); }
@@ -483,10 +508,13 @@ export class ChangeReviewWorker {
   private closed = false;
   constructor(private readonly verifier: WorkerVerifier, private readonly fetchArchive: ArchiveFetcher, private readonly model: ChangeReviewerModel,
     private readonly results: ChangeReviewResults, private readonly stopWaitMs = 5000, private readonly slot = new ExecutionSlot()) {}
-  async review(input: ChangeReviewTask, capability: string, signal: AbortSignal): Promise<ChangeReviewWorkerResult> {
-    let task: ChangeReviewTask;
+  review(input: ChangeReviewTask, capability: string, signal: AbortSignal): Promise<ChangeReviewWorkerResult>;
+  review(input: ChangeReviewTaskV2, capability: string, signal: AbortSignal): Promise<ChangeReviewWorkerResultV2>;
+  review(input: ChangeReviewTask | ChangeReviewTaskV2, capability: string, signal: AbortSignal): Promise<AnyChangeReviewResult>;
+  async review(input: ChangeReviewTask | ChangeReviewTaskV2, capability: string, signal: AbortSignal): Promise<AnyChangeReviewResult> {
+    let task: ChangeReviewTask | ChangeReviewTaskV2;
     try {
-      task = ChangeReviewTaskSchema.parse(input);
+      task = AnyChangeReviewTaskSchema.parse(input);
       await this.verifier.check(capability, 'execute', task);
       const { baseCommit } = task.trusted.evidence;
       if (task.trusted.guidelines.archive !== archiveContract(task.trusted.repository, baseCommit, baseCommit).base) throw new Denied();
@@ -514,30 +542,40 @@ export class ChangeReviewWorker {
       return result;
     } catch {
       stopped = false;
-      return { status: 'unknown', stopped: false };
+      return task.version === 2 ? { status: 'unknown', stopped: false, execution: executionAuth(task.execution) } : { status: 'unknown', stopped: false };
     } finally {
       if (this.running === run) this.running = undefined;
       if (stopped) this.slot.release(held); else this.slot.lock(held);
       settle(stopped);
     }
   }
-  private async execute(task: ChangeReviewTask, signal: AbortSignal, started: number): Promise<ChangeReviewWorkerResult> {
+  private async execute(task: ChangeReviewTask | ChangeReviewTaskV2, signal: AbortSignal, started: number): Promise<AnyChangeReviewResult> {
+    const selection = task.version === 2 ? task.execution : undefined;
+    let subscriptionLimit = false;
+    // 요청 판에 맞는 응답 판. 실행 칸은 요청 선택으로 만든다. problems로 끝난 결과(output null)는 모델을 부르지 않았다.
+    const reply = (result: ChangeReviewWorkerResult): AnyChangeReviewResult => selection
+      ? { ...result, execution: executionAuth(selection, result.status === 'limited' && subscriptionLimit) } : result;
     // 이 CLI 실행은 --no-session-persistence라 이어 쓸 세션이 없다. 이 값은 실행마다 새로 정해 receipt가 어떤 실행인지 가리킨다.
     const sessionId = randomUUID();
     const guidelines = await this.readBase(task, signal);
-    if (guidelines.kind === 'failed') return { status: 'failed', stopped: true, reason: guidelines.reason };
-    if (guidelines.kind === 'problem') return { status: 'succeeded', stopped: true, sessionId, problems: [guidelines.problem], output: null };
+    if (guidelines.kind === 'failed') return reply({ status: 'failed', stopped: true, reason: guidelines.reason });
+    if (guidelines.kind === 'problem') return reply({ status: 'succeeded', stopped: true, sessionId, problems: [guidelines.problem], output: null });
     const hidden = patchBaseProblems(task.trusted.expected, task.untrusted.patch, guidelines.entries);
-    if (hidden.length) return { status: 'succeeded', stopped: true, sessionId, problems: hidden, output: null };
+    if (hidden.length) return reply({ status: 'succeeded', stopped: true, sessionId, problems: hidden, output: null });
     const result = await this.model({ instructions: task.instructions,
       trusted: { guidelines: guidelines.text, verifications: task.trusted.verifications }, untrusted: task.untrusted }, signal,
-    { job: task.job, timeoutMs: Math.max(1, task.timeoutMs - (Date.now() - started)) });
-    if (result.status === 'unknown') return { status: 'unknown', stopped: false };
+    { job: task.job, timeoutMs: Math.max(1, task.timeoutMs - (Date.now() - started)), ...(selection ? { selection } : {}) });
+    if (result.status === 'unknown') return reply({ status: 'unknown', stopped: false });
+    // 선택 대조 실패는 모델을 부르지 않은 것이다. 선택이 없는 v1 요청에는 오지 않는다.
+    if (result.status === 'not_run') return selection ? result : { status: 'failed', stopped: true, reason: 'not_run' };
     const rateLimit = result.rateLimit ? { rateLimit: result.rateLimit } : {};
-    if (result.status !== 'succeeded') return { status: result.status, stopped: true, ...(result.reason ? { reason: result.reason.slice(0, 100) } : {}), ...rateLimit };
-    return { status: 'succeeded', stopped: true, sessionId, problems: [], output: result.output, ...rateLimit };
+    if (result.status !== 'succeeded') {
+      subscriptionLimit = result.subscriptionLimit === true;
+      return reply({ status: result.status, stopped: true, ...(result.reason ? { reason: result.reason.slice(0, 100) } : {}), ...rateLimit });
+    }
+    return reply({ status: 'succeeded', stopped: true, sessionId, problems: [], output: result.output, ...rateLimit });
   }
-  private async readBase(task: ChangeReviewTask, signal: AbortSignal): Promise<{ kind: 'ok'; text: string | null; entries: ReturnType<typeof readArchive> } | { kind: 'problem'; problem: string } | { kind: 'failed'; reason: string }> {
+  private async readBase(task: ChangeReviewTask | ChangeReviewTaskV2, signal: AbortSignal): Promise<{ kind: 'ok'; text: string | null; entries: ReturnType<typeof readArchive> } | { kind: 'problem'; problem: string } | { kind: 'failed'; reason: string }> {
     const { archive, blobSha, verifiable } = task.trusted.guidelines;
     let entries: ReturnType<typeof readArchive>;
     try {
@@ -554,10 +592,18 @@ export class ChangeReviewWorker {
     try { return { kind: 'ok', text: new TextDecoder('utf-8', { fatal: true }).decode(entry.data), entries }; }
     catch { return { kind: 'problem', problem: 'guidelines_unavailable' }; }
   }
-  async result(input: ChangeReviewResultLookup, capability: string): Promise<ChangeReviewLookupResponse> {
+  // 저장 결과 그대로(v2 요청으로 낸 결과는 실행 칸·not_run 포함). HTTP 결과 조회 경로가 쓴다.
+  async lookup(input: ChangeReviewResultLookup, capability: string): Promise<ChangeReviewLookupResponseV2> {
     const request = await this.verifyLookup(ResultLookupSchema, input, capability);
     const result = await this.results.get(request.job, request.lease);
     return result ? { found: true, result } : { found: false };
+  }
+  // 옛 판 모양만 읽는 호출자(ChangeReviewWorkerClient)용. v2 결과는 옛 strict 파서가 HTTP에서 읽지 못하는 것과 같게 모름으로 둔다.
+  async result(input: ChangeReviewResultLookup, capability: string): Promise<ChangeReviewLookupResponse> {
+    const found = await this.lookup(input, capability);
+    const parsed = LookupResponseSchema.safeParse(found);
+    if (!parsed.success) throw new Error('worker_response_uncertain');
+    return parsed.data;
   }
   async ack(input: ChangeReviewAck, capability: string): Promise<void> {
     const request = await this.verifyLookup(AckSchema, input, capability);
@@ -610,7 +656,7 @@ async function readBody(request: IncomingMessage): Promise<unknown> {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 // 인증 없는 POST의 401은 T17 경로와 같은 준비 확인 신호다. 본문을 읽기 전에 답한다.
-export function changeReviewRoutes(worker: Pick<ChangeReviewWorker, 'review' | 'cancel' | 'result' | 'ack'>, accepting?: () => boolean): ReadonlyMap<string, WorkerRoute> {
+export function changeReviewRoutes(worker: Pick<ChangeReviewWorker, 'review' | 'cancel' | 'lookup' | 'ack'>, accepting?: () => boolean): ReadonlyMap<string, WorkerRoute> {
   const route: WorkerRoute = async (req, res) => {
     if (req.method !== 'POST') { res.writeHead(404).end(); return; }
     const send = (status: number, payload: unknown) => {
@@ -623,16 +669,16 @@ export function changeReviewRoutes(worker: Pick<ChangeReviewWorker, 'review' | '
     let input: unknown;
     try { input = await readBody(req); } catch { reject(400); return; }
     const capability = auth.slice('Capability '.length);
-    const shape = req.headers[RATE_LIMIT_ACCEPT_HEADER] === '1' ? (result: ChangeReviewWorkerResult) => result : withoutRateLimit;
+    const shape = req.headers[RATE_LIMIT_ACCEPT_HEADER] === '1' ? (result: AnyChangeReviewResult) => result : withoutRateLimit;
     try {
       if (req.url === '/v1/change-review/cancel') { send(200, await worker.cancel(CancelRequestSchema.parse(input), capability)); return; }
       if (req.url === '/v1/change-review/result') {
-        const found = await worker.result(ResultLookupSchema.parse(input), capability);
+        const found = await worker.lookup(ResultLookupSchema.parse(input), capability);
         send(200, found.found ? { found: true, result: shape(found.result) } : found);
         return;
       }
       if (req.url === '/v1/change-review/ack') { await worker.ack(AckSchema.parse(input), capability); send(200, { acknowledged: true }); return; }
-      const task = ChangeReviewTaskSchema.parse(input);
+      const task = AnyChangeReviewTaskSchema.parse(input);
       if (accepting && !accepting()) throw new WorkerRejected('worker_closing');
       send(200, shape(await worker.review(task, capability, new AbortController().signal)));
     } catch (error) {
@@ -650,8 +696,10 @@ export class HttpChangeReviewWorker implements ChangeReviewWorkerClient {
     this.origin = url.origin;
   }
   private headers(capability: string) { return { 'content-type': 'application/json', authorization: `Capability ${capability}`, [RATE_LIMIT_ACCEPT_HEADER]: '1' }; }
-  async review(task: ChangeReviewTask, capability: string, signal: AbortSignal): Promise<ChangeReviewWorkerResult> {
-    const body = JSON.stringify(ChangeReviewTaskSchema.parse(task));
+  review(task: ChangeReviewTask, capability: string, signal: AbortSignal): Promise<ChangeReviewWorkerResult>;
+  review(task: ChangeReviewTaskV2, capability: string, signal: AbortSignal): Promise<ChangeReviewWorkerResultV2>;
+  async review(task: ChangeReviewTask | ChangeReviewTaskV2, capability: string, signal: AbortSignal): Promise<AnyChangeReviewResult> {
+    const body = JSON.stringify(AnyChangeReviewTaskSchema.parse(task));
     const dispatcher = new Agent({ headersTimeout: task.timeoutMs + 30_000, bodyTimeout: task.timeoutMs + 30_000 });
     try {
       const options = { method: 'POST', redirect: 'error' as const, signal, dispatcher, headers: this.headers(capability), body };
@@ -665,10 +713,24 @@ export class HttpChangeReviewWorker implements ChangeReviewWorkerClient {
         if ([400, 401, 403, 409].includes(response.status) && Denial.safeParse(await response.json().catch(() => null)).success) throw new WorkerRejected();
         throw new Error('worker_response_uncertain');
       }
-      const result = WorkerResultSchema.safeParse(await response.json());
+      const raw: unknown = await response.json();
+      if (task.version === 2) {
+        const result = ChangeReviewWorkerResultV2Schema.safeParse(raw);
+        if (!result.success || !sameChangeSelection(task.execution, result.data)) throw new Error('worker_response_uncertain');
+        return result.data;
+      }
+      const result = WorkerResultSchema.safeParse(raw);
       if (!result.success) throw new Error('worker_response_uncertain');
       return result.data;
     } finally { await dispatcher.destroy().catch(() => {}); }
+  }
+  // v2 요청으로 낸 저장 결과까지 읽는 회수(C40이 v2를 보낼 때 쓴다). expected를 주면 실행 칸이 그 선택과 다를 때 모름으로 둔다.
+  async lookup(request: ChangeReviewResultLookup, capability: string, expected?: ExecutionSelection): Promise<ChangeReviewLookupResponseV2> {
+    const response = await this.post('/v1/change-review/result', request, capability);
+    if (!response.ok) throw new Error('worker_response_uncertain');
+    const found = ChangeReviewLookupResponseV2Schema.parse(await response.json());
+    if (expected && found.found && !sameChangeSelection(expected, found.result)) throw new Error('worker_response_uncertain');
+    return found;
   }
   private post(path: string, body: unknown, capability: string): Promise<Response> {
     return this.send(`${this.origin}${path}`, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10_000), headers: this.headers(capability), body: JSON.stringify(body) });

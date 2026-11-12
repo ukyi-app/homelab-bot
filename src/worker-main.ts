@@ -28,7 +28,8 @@ import { taskWorkerServer } from './task-http.js';
 import { TaskWorkerService } from './task-worker.js';
 import type { TaskChangeRuntime, TaskTurnContext, TaskWorkerOptions } from './task-worker.js';
 import { ExecutionSlot, SerialWorker, WorkerVerifier } from './worker.js';
-import { workerServer } from './worker-http.js';
+import { contractsRoute, workerServer } from './worker-http.js';
+import { EXECUTION_SELECTION_PATHS, WORKER_CONTRACTS_PATH } from './execution-auth.js';
 import { FileNonceStore, WorkerStartError, assertNotPersonal, humanHomes } from './worker-state.js';
 
 // 작업자 진입점(ns sandbox 상주 파드, D-15). 게시 서버와 같은 이미지이고 sandbox가 command만 이 파일로 바꾼다(D2).
@@ -178,6 +179,8 @@ async function startTaskWorker(config: WorkerConfig, stateRoot: string, options:
     survivors: async job => launcher ? launcher.survivors(job) : null,
     accepting: () => control?.accepting() ?? true,
     credentialReady: () => credential.ready(),
+    // 계정 묶음을 읽는 프로필(methods)만 방식 선택을 받는다.
+    executionSelection: config.profile.methods !== null,
     log: options.log,
     ...options.taskProbe });
   const server = taskWorkerServer(service, config.profile.taskCapabilities!, options.log);
@@ -248,7 +251,11 @@ export async function startWorker(config: WorkerConfig, options: StartWorkerOpti
     options.log?.({ level: 'warn', event: 'review_lane_closed', reason: error.code });
   }
   const accepting = () => control.accepting();
-  const routes = review && new Map([...reviewRoutes(review, accepting), ...(changeReview ? changeReviewRoutes(changeReview, accepting) : [])]);
+  // 지원 확인 경로는 레인과 무관하게 연다. 방식 고르기는 계정 묶음을 읽는 프로필(methods)만 받고, 연 레인의 경로만 알린다.
+  const opened = { chat: true, review: !!review, change_review: !!changeReview };
+  const selectable = config.profile.methods ? EXECUTION_SELECTION_PATHS.filter(path => opened[path]) : [];
+  const routes = new Map([[WORKER_CONTRACTS_PATH, contractsRoute(selectable)],
+    ...(review ? reviewRoutes(review, accepting) : []), ...(review && changeReview ? changeReviewRoutes(changeReview, accepting) : [])]);
   // 종료가 시작되면 새 실행 요청은 실행 전에 거부한다(취소는 계속 받는다).
   const server = workerServer(worker, () => control.ready(), accepting, routes);
   server.listen(options.port ?? PORTS.worker, options.host);

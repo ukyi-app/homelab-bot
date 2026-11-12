@@ -736,17 +736,17 @@ test('C03 한도 정보 읽기: 모르는 상태 값은 이벤트 없음, 깨진
     JSON.stringify({ type: 'assistant', error, api_error_status: status, message: { model: '<synthetic>', content: [] } }),
     JSON.stringify({ type: 'result', subtype: 'success', is_error: true, api_error_status: status })], { code: 1, signal: null }, expect);
   assert.deepEqual(errored('rate_limit', 429, event(REJECTED), event({ status: 'allowed', rateLimitType: 'seven_day' })),
-    { kind: 'limited', rateLimit: { event: { status: 'allowed', rateLimitType: 'seven_day' }, stop: { cause: 'rate_limit', resetsAt: RESETS_AT } } });
+    { kind: 'limited', rateLimit: { event: { status: 'allowed', rateLimitType: 'seven_day' }, stop: { cause: 'rate_limit', resetsAt: RESETS_AT } }, basis: 'error_kind' });
   // rejected가 없으면 멈춤에 시각을 붙이지 않는다(경고의 풀리는 시각은 멈춤의 시각이 아니다).
   assert.deepEqual(errored('rate_limit', 429, event(WARNING)),
-    { kind: 'limited', rateLimit: { event: WARNING, stop: { cause: 'rate_limit' } } });
+    { kind: 'limited', rateLimit: { event: WARNING, stop: { cause: 'rate_limit' } }, basis: 'error_kind' });
   assert.deepEqual(errored('billing_error', 402, event(REJECTED)),
-    { kind: 'limited', rateLimit: { event: REJECTED, stop: { cause: 'billing', resetsAt: RESETS_AT } } });
+    { kind: 'limited', rateLimit: { event: REJECTED, stop: { cause: 'billing', resetsAt: RESETS_AT } }, basis: 'error_kind' });
   // 종류 없이 HTTP 상태로 고른 한도도 원인을 가른다.
   const statusOnly = (status: number) => interpretClaudeStream([init, JSON.stringify({ type: 'result', subtype: 'success', is_error: true, api_error_status: status })],
     { code: 1, signal: null }, expect);
-  assert.deepEqual(statusOnly(429), { kind: 'limited', rateLimit: { stop: { cause: 'rate_limit' } } });
-  assert.deepEqual(statusOnly(402), { kind: 'limited', rateLimit: { stop: { cause: 'billing' } } });
+  assert.deepEqual(statusOnly(429), { kind: 'limited', rateLimit: { stop: { cause: 'rate_limit' } }, basis: 'http_status' });
+  assert.deepEqual(statusOnly(402), { kind: 'limited', rateLimit: { stop: { cause: 'billing' } }, basis: 'http_status' });
   // rejected 이벤트가 있어도 분류는 CLI 오류 종류가 정한다.
   assert.equal(errored('authentication_failed', 401, event(REJECTED)).kind, 'auth_expired');
   const overloaded = errored('overloaded', 529, event(REJECTED));

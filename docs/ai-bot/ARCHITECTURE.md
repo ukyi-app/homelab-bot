@@ -2285,3 +2285,29 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 **6. 되돌리기 순서.** 스위치 끄기와 구독 고정 → 진행 중인 새 판 요청·작업 턴·변경 자체 리뷰 저장 결과를 끝내거나 안전히 대기로 둠(옛 strict 스키마는 새 칸 든 저장 결과를 읽지 못한다. C36 묶음 A F-1과 같은 주의) → 필요하면 활성 API 키를 `unset` → 작업자 되돌리기 → 게시 서버 되돌리기. 작업 세션 기록 판을 바꿨으면 옛 이미지가 읽을 수 있는지 먼저 보고, 못 읽으면 세션을 보존한 채 미룬다. 전환 기록·API 잠금·누계를 지우는 되돌리기는 하지 않고, 더한 DB 칸은 바로 지우지 않는다. 이미 쓴 API 비용은 되돌릴 수 없다.
 
 **7. 미확인(C45 S5).** 구독 ↔ API `--resume` 실호환, 2.1.308의 구독 포함량 거절 필드와 API 소진 응답 모양, 실제 클러스터의 RBAC·ESO·kubelet 반영(저장소 선언만 읽었다), Console 설정.
+
+## C39 작업자 방식 선택 계약 (2026-11-12)
+
+위 "C38" 2·3절의 작업자 쪽 구현이다. 칸 이름·판·허용 목록의 결정과 한계는 [DECISIONS](DECISIONS.md) "C39"다. 게시 서버의 선택·상태(C40)는 아직 없고 운영 경로는 옛 판만 보낸다.
+
+**흐름.** 서명된 새 판 요청 → 작업자 HTTP 모양·서명 확인(선택 칸이 digest에 들어 있어 바꾸면 403) → 레인 → `RunControl.run(spec.selection)` → `MethodEnvCredential.forRun(selection)`이 묶음·두 자격을 한 볼륨 세대로 읽어 대조 → 맞으면 그 방식의 값 하나와 두 비밀(반사 검사용)을 어댑터에 넘김, 어긋나면 `SelectionRefused` → `RunReport.refused: 'selection'` → 레인이 `not_run`. 실행 뒤 레인이 v2 판정에 `execution`을 붙이고, 한도면 `subscriptionLimitFailure`로 넘어갈 근거를 판정한다.
+
+**모듈.**
+
+- `execution-auth.ts`: 선택·응답 칸 스키마, 거부 사유, 계정 묶음 스키마와 지문, 넘어갈 근거 허용 목록, 지원 확인 경로 이름. 다른 모듈에 의존하지 않는 계약 모듈이다(`credentials.ts`가 이것을 읽는다).
+- `credentials.ts`: `WorkerCredential.forRun(selection?)`. 묶음을 읽는 것은 `MethodEnvCredential`(Claude 프로필)뿐이고 `StaticEnvCredential`·`FileMutableCredential`은 선택이 오면 `selection_unsupported`다.
+- `executor-profiles.ts`: Claude 프로필의 `methods.bundle = CLAUDE_ACCOUNT_BUNDLE`. 대화·리뷰 작업자와 작업 작업자가 같은 조립(`staticCredential`)을 쓴다.
+- `worker.ts`·`worker-http.ts`: 대화 v3 요청·응답, `GET /v1/contracts`(인증 없음, `{ executionSelection: string[] }`, 연 레인만). 옛 작업자는 404라 빈 목록으로 읽는다.
+- `review-input.ts`·`review-http.ts`·`review-lane.ts`: PR 리뷰 v2. `change-review.ts`: 변경 자체 리뷰 v2, 저장 결과(`ChangeReviewResults`)가 v1·v2 결과를 모두 읽는다.
+- `task-contracts.ts`·`executor-claude-task.ts`·`task-worker.ts`·`task-http.ts`: 작업 v1·v2 요청 끝의 `execution` 칸, 응답·저장 결과의 `execution`과 `not_run`, 작업 접수의 `executionSelection`. `TaskReceipts.begin`이 선택이 실린 턴의 선택을 영수증 옆 `<job>.selection.json`에 실행 전에 남기고, 턴 예외와 결과 유실·재시작 뒤 재조회의 `unknown`이 그 기록으로 실행 칸을 붙인다(영수증 파일 모양은 그대로).
+
+**판 조합(AC-42).**
+
+| 게시 서버 | 작업자 | 결과 |
+|---|---|---|
+| 옛(새 판 모름) | 새 | 옛 요청만 오고 옛 응답만 나간다. 묶음이 없어도 지금처럼 방식 표시로 돈다 |
+| 새, 지원 확인 전 또는 스위치 꺼짐 | 옛 | 지원 확인이 빈 목록이라 새 판을 보내지 않는다. 잘못 보내면 옛 작업자가 모양에서 거부한다(대화·리뷰 403, 작업 400, 모두 `rejected`·시작 안 함) |
+| 새, 지원 확인 뒤 | 새 + 묶음 없음 | 새 판 요청은 `not_run`(`bundle_missing`). 옛 요청은 그대로 |
+| 새, 지원 확인 뒤 | 새 + 묶음 있음 | 요청 선택의 방식 하나로 돌고 실행 칸을 돌려준다 |
+
+**자격 표면.** 실행 env의 자격 변수는 여전히 하나다. 작업자 Secret에는 레인마다 두 자격과 비밀 아닌 묶음이 있고(C42 설치 뒤), 작업 sandbox는 그 디렉터리 전체를 읽기·쓰기 금지로 가린다.

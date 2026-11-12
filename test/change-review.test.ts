@@ -11,7 +11,7 @@ import { dirname, join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import {
   CHANGE_REVIEW_INSTRUCTIONS, CHANGE_REVIEW_INSTRUCTION_REVISION, ChangeReviewFailed, ChangeReviewOutputSchema, ChangeReviewRejected, ChangeReviewResults, ChangeReviewService, ChangeReviewTaskSchema,
-  ChangeReviewWorker, HttpChangeReviewWorker, changeReviewRoutes, decideReview, findingsDigest, patchBaseProblems, patchProblems,
+  ChangeReviewTaskV2Schema, ChangeReviewWorker, HttpChangeReviewWorker, changeReviewRoutes, decideReview, findingsDigest, patchBaseProblems, patchProblems,
 } from '../src/change-review.js';
 import type { ChangeReviewOutput, ChangeReviewTask, ChangeReviewWorkerClient, ChangeReviewerInput, ChangeReviewerModel, FindingsEntry } from '../src/change-review.js';
 import { ReviewReceiptSchema, artifactDigest, gitBlobSha, reviewReceiptDigest, sha256Hex } from '../src/change-contracts.js';
@@ -19,6 +19,7 @@ import type { ArtifactFile, ArtifactManifest, ChangeBrief, ChangeKey, EvidenceBu
 import { ChangeStore } from '../src/change-store.js';
 import { WorkerRejected } from '../src/contracts.js';
 import type { RateLimitInfo } from '../src/contracts.js';
+import type { ExecutionSelection } from '../src/execution-auth.js';
 import { StaticEnvCredential } from '../src/credentials.js';
 import { ClaudeReviewAdapter } from '../src/executor-claude.js';
 import { readArchive } from '../src/review-input.js';
@@ -1105,6 +1106,51 @@ test('T19 B2 전체: 도구 호출로 끝난 실행은 receipt 없이 실패로 
 });
 
 // OWNER는 fixture가 만든 부모 소유자다. 리뷰 자식 job이 owner 대화에 안내를 끼우지 않는지 outbox로 본다.
+test('C39 변경 자체 리뷰 v2: 선택을 모델 실행에 넘기고, 즉시 결과·저장 결과 회수 모두 실행 칸을 보존한다(AC-39·AC-42)', async () => {
+  const execution = { account: 'main', credentialRevision: 'r7', method: 'subscription' as const, runId: randomUUID() };
+  const runs: (ExecutionSelection | undefined)[] = [];
+  let reply: Awaited<ReturnType<ChangeReviewerModel>> = { status: 'limited', subscriptionLimit: true, rateLimit: { stop: { cause: 'rate_limit' } } };
+  const model: ChangeReviewerModel = async (_input, _signal, run) => { runs.push(run.selection); return reply; };
+  const worker = new ChangeReviewWorker(f.verifier, async () => tarGz({ 'AGENTS.md': GUIDELINES, 'src/app.ts': APP_BEFORE }), model, new ChangeReviewResults(), 50);
+  const routes = changeReviewRoutes(worker);
+  const server: Server = createServer(async (req, res) => {
+    const route = routes.get(req.url ?? '');
+    if (route) await route(req, res); else res.writeHead(404).end();
+  });
+  await new Promise<void>(done => server.listen(0, '127.0.0.1', done));
+  try {
+    const client = new HttpChangeReviewWorker(`http://127.0.0.1:${(server.address() as AddressInfo).port}`, fetch);
+    const task = ChangeReviewTaskV2Schema.parse({ ...baseTask(), version: 2, execution });
+    const job = { id: task.job, lease_token: task.lease } as never;
+    // 실행 칸은 요청 선택으로 만들고, 넘어갈 근거 판정(레인 몫)은 한도 결과에만 싣는다.
+    const limited = await client.review(task, f.signer.issue(job, 'execute', task), new AbortController().signal);
+    assert.deepEqual(limited, { status: 'limited', stopped: true, rateLimit: { stop: { cause: 'rate_limit' } }, execution: { ...execution, subscriptionLimit: true } });
+    assert.deepEqual(runs, [execution]);
+    const lookup = { version: 1 as const, job: task.job, lease: task.lease, kind: 'result' as const };
+    f.advance(1);
+    assert.deepEqual(await client.lookup(lookup, f.signer.issue(job, 'execute', lookup), execution), { found: true, result: limited });
+    // 옛 판 파서는 실행 칸이 든 저장 결과를 읽지 못해 모름으로 둔다(조용히 칸을 떼고 성공시키지 않는다).
+    f.advance(1);
+    await assert.rejects(client.result(lookup, f.signer.issue(job, 'execute', lookup)), /Unrecognized key/);
+    f.advance(1);
+    await assert.rejects(worker.result(lookup, f.signer.issue(job, 'execute', lookup)), /worker_response_uncertain/);
+    // 다른 실행의 runId를 기대하면 모름이다.
+    f.advance(1);
+    await assert.rejects(client.lookup(lookup, f.signer.issue(job, 'execute', lookup), { ...execution, runId: randomUUID() }), /worker_response_uncertain/);
+    // 대조 실패(not_run)는 그대로 나가고, 옛 v1 요청은 옛 응답 모양이다.
+    reply = { status: 'not_run', stopped: true, refusal: 'bundle_mismatch' };
+    const refused = ChangeReviewTaskV2Schema.parse({ ...baseTask(), version: 2, execution });
+    assert.deepEqual(await client.review(refused, f.signer.issue({ id: refused.job, lease_token: refused.lease } as never, 'execute', refused), new AbortController().signal),
+      { status: 'not_run', stopped: true, refusal: 'bundle_mismatch' });
+    reply = { status: 'succeeded', output: OUTPUT };
+    const old = ChangeReviewTaskSchema.parse(baseTask());
+    const done = await client.review(old, f.signer.issue({ id: old.job, lease_token: old.lease } as never, 'execute', old), new AbortController().signal);
+    assert.equal(done.status, 'succeeded');
+    assert.equal('execution' in done, false);
+    assert.deepEqual(runs.at(-1), undefined);
+  } finally { await new Promise(done => server.close(done)); }
+});
+
 test('T19 B2 안내: 리뷰 자식 job은 owner 대화 outbox에 원문을 넣지 않는다', async () => {
   const h = harness({ reply: () => ({ status: 'succeeded', output: { ...OUTPUT, findings: [finding({ priority: 'P1' })] } }) });
   await runReview(h, await reviewing());
