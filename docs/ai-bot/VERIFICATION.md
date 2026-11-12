@@ -2974,4 +2974,23 @@ owner 결정(명세 질문 Q1 = C24 할 일 1a)의 구현. 결정은 [DECISIONS]
 - **고치기 전 빨강:** 새 시험은 구현과 같은 조각에서 썼다. 시험이 실패를 잡는지는 고친 코드를 하나씩 되돌려 확인했다: 상태 전이의 scheduler 잠금과 상태 행 잠금을 빼면 경합 시험이 넘어감 감사 2건으로 실패했다(처음 쓴 경합 시험은 scheduler 행을 쥐어 두 보고를 겹치게 하지 못해 잠금 없이도 통과했다. 상태 행을 쥐도록 고쳐 빨강을 봤다), claim의 `apiChosen`을 빼면 PR 리뷰 미루기 시험이, `useMethods`를 막으면 변경 자체 리뷰 두 시험이, 작업 응답의 실행 칸 대조를 빼면 작업 대조 시험이 실패했다.
 - **기존 시험 고침:** migration 번호 목록을 28까지 고정한 시험 파일 일곱(`publisher-migrate`·`change-store`·`change-store-pg`·`change-pg`·`raw-text-retention`·`raw-input-retention`·`publisher-pg`)과 016 뒤 새 표 목록(`change-store`)에 029를 더했다. `pr-review`·`change-review`의 TRUNCATE 목록에 새 표를 더하고, `change-review` 시험 도구의 모델 자리가 실행 선택을 받게 했다.
 - **실행(머신 잠금 도우미, node 24.22.0, `--pg`):** 매번 `npm run check`·`npm run build`. 바뀐 모듈(`runtime`·`review`·`change-review`·`claude-task-bridge`·`admin`·`main`·`policy`·`method-routing`·`database`·`change-assembly`)을 직접 읽는 시험 69개 파일을 아홉 묶음으로 돌렸다. 첫 회에 migration 목록 고정 시험 3건이 실패했고, 그중 `change-store`는 실패 뒤 열린 DB로 멈춰 끊었다. 목록을 고친 뒤 실패·중단 묶음 둘을 다시 돌려 모두 통과: 마지막 실행 기준 통과 1,548회(133 + 255 + 142 + 56(`change-store`·`change-store-pg` 재실행, 앞 142와 겹침) + 283 + 174 + 106 + 162 + 161 + 76)·skip 0. 묶음 3 재실행의 실패 1건(`change-store` 016 표 비교)은 새 표를 비교 목록에 더한 뒤 두 파일 재실행으로 통과했다.
-- **못 잡는 범위:** 구독 ↔ API `--resume` 실호환, 2.1.308의 실제 구독 한도·API 소진 응답 모양, 실제 두 파드의 지원 확인과 묶음 반영(C45 S5). 변경 작성 턴(v2)은 방식을 고르지 않아 시험하지 않았다(DECISIONS "C40" 4절). 전환 기록·지표·브리핑·목록 출력(C41)과 homelab CLI(C42)는 이 티켓 밖이다.
+- **못 잡는 범위:** 구독 ↔ API `--resume` 실호환, 2.1.308의 실제 구독 한도·API 소진 응답 모양, 실제 두 파드의 지원 확인과 묶음 반영(C45 S5). 전환 기록·지표·브리핑·목록 출력(C41)과 homelab CLI(C42)는 이 티켓 밖이다.
+
+### C40 보완: 작업 경로 칸과 변경 작성 v2 턴 (2026-11-12, 로컬)
+
+DECISIONS "C40" 1절(작업 경로 칸 `apiAfterLimitTask`)·4절(변경 작성 턴)·알려진 한계(되돌리기 순서), ARCHITECTURE "C40" 되돌리기 순서. 경계는 위와 같다. 변경 작성 턴 시험은 실제 작업자 객체(`changeWorkerFixture`, 가짜 CLI)를 쓰되 계정 묶음이 없어 선택을 받지 않으므로, 시험 도구가 턴 요청의 선택 칸을 기록한 뒤 빼고 보내고 결과에 그 선택의 실행 칸(또는 한도·`not_run`)을 붙인다.
+
+| 바뀐 동작 | 근거(시험) |
+|---|---|
+| 작업 경로 칸은 따로이고 없으면 꺼짐, 참·거짓만 받는다 | `c40-method-routing` "AC-38 작업 경로 칸(apiAfterLimitTask)은 따로 있고 …" |
+| `apiAfterLimit`만 켜면 작업 턴은 선택 없이 구독으로 돌고, 한도면 작업 레인만 기다린다(상태·실행 기록 그대로, 전역 scheduler 열림) | `c40-method-routing-task` "AC-38 작업 경로 칸이 꺼져 있으면 …" |
+| 게시 서버 기동: 스위치만 켜면 작업 경로 닫힘, 둘 다 켜면 작업 경로 지원 확인 대기, 작업 경로 칸만 켜면 아무것도 열지 않음(지원 확인 0건) | `task-assembly` "AC-32·AC-42 …"(기동 로그 `method_routing_gate`) |
+| 변경 작성 턴이 구독 한도 뒤 같은 세션의 다음 턴(턴 2, 같은 세대·세션, `resumeReason: model_limit`)으로 API에 이어지고 도구 수·실행 시간 예산이 늘지 않으며 한도 턴은 턴 예산에서 빠진다. 같은 결과를 다시 읽어도 받는다. 실행 기록은 경로 `task`로 구독 limited → API succeeded | `change-artifact` "AC-38 변경 작성 턴: 구독 한도 뒤 …" |
+| 작업 경로 칸이 꺼져 있으면 변경 작성 턴에 선택 칸이 없고 실행 기록이 없다 | `change-artifact` "AC-38 변경 작성 턴: 작업 경로 칸이 꺼져 있으면 …" |
+| 세션이 남지 않은 첫 턴의 구독 한도는 새로 시작하지 않고 기다린다 | `change-artifact` "AC-38 변경 작성 턴: 세션이 남지 않은 첫 턴 …" |
+| `not_run`: 재개 턴이면 선택 없는 턴 3, 첫 턴이면 선택 없는 새 세대 2 | `change-artifact` "C39 넘김: 변경 작성 턴의 실행 안 됨(not_run)은 …", `change-assembly` "C39 넘김 연결: 변경 작성의 첫 턴이 …"(change-runtime이 부모를 닫지 않고 새 세대로 다시 시작해 게시 승인 대기까지 감, 설치 `refused`), "C39 넘김 연결: 수정 차례 작성의 첫 턴이 …"(차례를 닫지 않고 새 세대로 다시 시작해 커밋까지 감) |
+| 결과의 실행 칸이 보낸 선택과 다르면 응답 유실(실패, 결과 없음) | `change-artifact` "AC-37 변경 작성 결과의 실행 칸이 …" |
+
+- **고치기 전 빨강:** 작업 경로 시험·기동 시험을 먼저 써서 실패 2건(작업 턴에 선택이 실림, 기동 로그에 작업 경로 없음)을 봤고, 정책 칸 시험은 타입 검사 실패로 봤다. 작업 레인만 기다리는 줄을 막으면 작업 경로 시험이 전역 scheduler 닫힘으로 실패했다. 변경 작성 시험 넷은 구현 전 모두 실패했고, change-runtime의 새 세대 재시작을 막으면 조립 시험이 부모 `cancelled`로 실패했다. 수정 차례 시험은 구현 전 차례 `failed/cancelled`로 실패했다.
+- **기존 시험 고침:** `c40-method-routing-task`의 라우터에 작업 경로 칸(`task: true`)을 켰다. 시험 도구 둘(`change-artifact` 작성 port, `change-assembly-harness`)에 턴 요청 기록·선택 칸 빼기·결과 바꾸기 자리를 더했다(쓰지 않는 시험은 그대로).
+- **못 잡는 범위:** 위와 같다. 특히 변경 작성 턴의 구독 → API `--resume` 실호환은 C45 S5다. 작업 경로 칸은 그 확인 뒤에만 켠다.

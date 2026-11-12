@@ -841,7 +841,8 @@ export class ChangeRuntime {
       await this.deps.store.requeueChangeAuthor(child.id, child.conversation_id);
       return false;
     }
-    if (!child.session_state) {
+    // 첫 턴 실행 안 됨 뒤 새 세대로 다시 시작한다(authoring과 같다).
+    if (!child.session_state || (child.session_state === 'cancelled' && child.state === 'queued')) {
       if (JOB_ENDED.has(child.state)) return this.failAmendment(request, round, child.wait_reason ?? `author_${child.state}`);
       return this.startAmendAuthor(request, round, child);
     }

@@ -2322,9 +2322,20 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 
 - `method-routing.ts`: `MethodRouter`(`select`·`settle`·`apiChosen`·`pendingSelection`), 설치·끄기·API 잠금 해제·보기(`installMethods`·`disableMethods`·`unlockApi`·`methodRoutingView`). store·model-accounts·execution-auth만 읽는다.
 - `migrations/029_method_routing.sql`: `method_routing`(한 행)·`method_runs`. 추가만이라 옛 게시 서버 코드가 그대로 돈다.
-- `policy.ts`: `apiAfterLimit`. `main.ts`: 라우터 하나를 만들어 대화 runtime·PR 리뷰 runtime·변경 자체 리뷰 서비스(`useMethods`)·작업 브리지(`useMethods`)에 넘기고, 스위치가 켜졌을 때만 `method_support_probe`(30초)로 두 작업자의 지원을 본다.
-- 경로별 연결: `runtime.ts`(대화), `review.ts`(PR 리뷰 claim의 미루기와 v2), `change-review.ts`(즉시 결과·저장 결과 회수·ACK), `claude-task-bridge.ts`(v1 작업 턴, `not_run`, 실행 칸 대조), `admin.ts`(관리 명령 넷).
+- `policy.ts`: `apiAfterLimit`과 작업 경로 칸 `apiAfterLimitTask`. `main.ts`: 라우터 하나를 만들어(작업 경로는 두 칸이 다 참일 때만 연다) 대화 runtime·PR 리뷰 runtime·변경 자체 리뷰 서비스(`useMethods`)·작업 브리지(`useMethods`, 변경 작성 턴도 이 브리지를 지난다)에 넘기고, 스위치가 켜졌을 때만 `method_support_probe`(30초)로 두 작업자의 지원을 본다. 변경 작성 경로(`change_author`)는 작업 접수의 `executionSelection`에 `/v2/task`가 있어야 연다.
+- 경로별 연결: `runtime.ts`(대화), `review.ts`(PR 리뷰 claim의 미루기와 v2), `change-review.ts`(즉시 결과·저장 결과 회수·ACK), `claude-task-bridge.ts`(v1 작업 턴과 변경 작성 v2 턴, `not_run`, 실행 칸 대조), `change-runtime.ts`(변경 작성·수정 차례 작성의 첫 턴 `not_run` 뒤 새 세대 시작), `admin.ts`(관리 명령 넷).
+- 변경 작성 턴: `ClaudeChangeAuthor.send`가 `selectChangeTurn`으로 고른 선택을 요청에 싣는다. 결과는 `fetchResult`가 나중에(다른 프로세스일 수 있다) 읽으므로, 확정 때 세션 `worker_lease`로 `method_runs`의 그 선택을 다시 찾아(`pendingSelection(…, settled=true)`) 대조하고 v1과 같은 `settle`에 넘긴다.
 
 **잠금 순서.** scheduler 행 → `method_runs` 행 → `method_routing` 행. 작업 레인은 턴 확정 트랜잭션(대화 행 → scheduler → 레인 행 → job) 안에서 같은 트랜잭션으로 `settle`을 부른다(`within`). 두 게시 서버의 동시 보고는 scheduler 행에서 줄을 서고, 고를 때의 `epoch`가 지금과 다르면 넘어감을 다시 하지 않는다.
 
-**호환.** 스위치 꺼짐·지원 미확인·설치 없음이면 요청·응답·DB 쓰기가 지금과 같다(`method_routing`·`method_runs`에 쓰지 않는다). 옛 작업자(지원 404)에는 새 판을 보내지 않는다. 되돌리기 순서는 "C38" 6절 그대로이고, 추가로 정책의 `apiAfterLimit` 칸을 게시 서버를 되돌리기 전에 뺀다(옛 strict 스키마가 기동에 실패한다). 변경 자체 리뷰의 v2 저장 결과는 새 게시 서버가 스위치와 무관하게 회수한다. 되돌려도 두 표와 감사 기록은 지우지 않는다.
+**호환.** 스위치 꺼짐·지원 미확인·설치 없음이면 요청·응답·DB 쓰기가 지금과 같다(`method_routing`·`method_runs`에 쓰지 않는다). 옛 작업자(지원 404)에는 새 판을 보내지 않는다. 변경 자체 리뷰의 v2 저장 결과는 새 게시 서버가 스위치와 무관하게 회수한다. 되돌려도 두 표와 감사 기록은 지우지 않는다.
+
+**되돌리기 순서.** "C38" 6절에 정책 칸 단계를 넣은 것이다.
+
+1. 운영 `RUNTIME_POLICIES`에서 `apiAfterLimitTask`·`apiAfterLimit` 칸을 지우고 파드 재시작으로 반영한다(스위치 꺼짐). 정책 스키마가 strict라 이 칸이 남은 정책으로는 옛 게시 서버가 기동하지 못한다(`runtime_policies_invalid`). 그래서 이 단계는 게시 서버를 되돌리기 전, 맨 앞이다. `false`로 두는 것으로는 부족하고 칸 자체를 뺀다.
+2. 진행 중인 새 판 요청·작업 턴·변경 작성 턴·변경 자체 리뷰 저장 결과를 끝내거나 안전히 대기로 둔다(새 게시 서버가 v2 저장 결과를 회수한다).
+3. 필요하면 활성 API 키를 `unset`한다.
+4. 작업자를 되돌린다.
+5. 게시 서버를 되돌린다.
+
+구독 고정, 작업 세션 기록 판 확인, 기록·DB 칸을 지우지 않는 것 등 나머지 주의는 "C38" 6절 그대로다.
