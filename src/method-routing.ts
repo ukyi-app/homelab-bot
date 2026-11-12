@@ -103,6 +103,8 @@ export class MethodRouter {
   // 같은 실행의 두 번째 보고는 아무것도 바꾸지 않는다(default).
   async settle(job: Pick<Job, 'id' | 'lease_token'>, selection: ExecutionSelection, outcome: RoutedOutcome): Promise<Settlement> {
     return this.store.atomic(async s => {
+      // 같은 한도를 두 게시 서버·두 실행 자리가 함께 보고해도 넘어감이 한 번이 되도록 scheduler 행 → 상태 행 순서로 잡는다
+      // (모델 대기 Store.waitForUser·계정 전환과 같은 순서).
       await s.lockScheduler();
       const now = s.now();
       const run = (await s.db.query<RunRow>('SELECT * FROM method_runs WHERE run_id=$1 FOR UPDATE', [selection.runId])).rows[0];
