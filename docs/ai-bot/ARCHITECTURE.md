@@ -2299,7 +2299,7 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 - `executor-profiles.ts`: Claude 프로필의 `methods.bundle = CLAUDE_ACCOUNT_BUNDLE`. 대화·리뷰 작업자와 작업 작업자가 같은 조립(`staticCredential`)을 쓴다.
 - `worker.ts`·`worker-http.ts`: 대화 v3 요청·응답, `GET /v1/contracts`(인증 없음, `{ executionSelection: string[] }`, 연 레인만). 옛 작업자는 404라 빈 목록으로 읽는다.
 - `review-input.ts`·`review-http.ts`·`review-lane.ts`: PR 리뷰 v2. `change-review.ts`: 변경 자체 리뷰 v2, 저장 결과(`ChangeReviewResults`)가 v1·v2 결과를 모두 읽는다.
-- `task-contracts.ts`·`executor-claude-task.ts`·`task-worker.ts`·`task-http.ts`: 작업 v1·v2 요청 끝의 `execution` 칸, 응답·저장 결과의 `execution`과 `not_run`, 작업 접수의 `executionSelection`.
+- `task-contracts.ts`·`executor-claude-task.ts`·`task-worker.ts`·`task-http.ts`: 작업 v1·v2 요청 끝의 `execution` 칸, 응답·저장 결과의 `execution`과 `not_run`, 작업 접수의 `executionSelection`. `TaskReceipts.begin`이 선택이 실린 턴의 선택을 영수증 옆 `<job>.selection.json`에 실행 전에 남기고, 턴 예외와 결과 유실·재시작 뒤 재조회의 `unknown`이 그 기록으로 실행 칸을 붙인다(영수증 파일 모양은 그대로).
 
 **판 조합(AC-42).**
 

@@ -69,7 +69,7 @@ export const AccountBundleSchema = z.strictObject({
 });
 export type AccountBundle = z.infer<typeof AccountBundleSchema>;
 // 지문: 자격 값(앞뒤 공백·줄바꿈을 뗀 문자열)의 UTF-8 바이트 SHA-256, 소문자 hex. 레인마다 자기 Secret의 두 값으로 계산한다.
-// 자격은 고엔트로피 값이라 지문에서 값을 되돌릴 수 없다.
+// 소금 없는 해시라 새어 나간 지문은 후보 값 대조에 쓰일 수 있다. 지문을 밖에 내지 않는 것과 자격의 높은 엔트로피가 방어다.
 export const credentialFingerprint = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex');
 export const fingerprintMatches = (value: string, expected: string): boolean =>
   timingSafeEqual(Buffer.from(credentialFingerprint(value), 'hex'), Buffer.from(expected, 'hex'));
