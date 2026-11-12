@@ -3,8 +3,9 @@ import type { IncomingMessage } from 'node:http';
 import { z } from 'zod';
 import { Agent } from 'undici';
 import { Denied, RateLimitInfoSchema, WorkerRejected } from './contracts.js';
-import { CoverageSchema, ReviewTaskSchema } from './review-input.js';
-import type { ReviewTask, ReviewWorker, ReviewWorkerResult } from './review-input.js';
+import { ExecutionAuthSchema, NotRunSchema } from './execution-auth.js';
+import { AnyReviewTaskSchema, CoverageSchema } from './review-input.js';
+import type { ReviewTask, ReviewTaskV2, ReviewWorker, ReviewWorkerResult, ReviewWorkerResultV2 } from './review-input.js';
 import type { ReviewWorkerClient } from './review.js';
 import { CancelRequestSchema } from './worker.js';
 import type { CancelRequest } from './worker.js';
@@ -22,6 +23,13 @@ const ResultSchema = z.discriminatedUnion('status', [
   z.strictObject({ status: z.enum(['limited', 'auth_expired', 'failed']), stopped: z.literal(true), reason: z.string().max(100).optional(),
     rateLimit: RateLimitInfoSchema.optional() }),
   z.strictObject({ status: z.literal('unknown'), stopped: z.literal(false) }),
+]);
+// v2 요청의 응답: v1 갈래마다 실행 칸, 그리고 not_run(DECISIONS "C39"). 받기부터 배포의 파서다.
+const ResultV2Schema = z.discriminatedUnion('status', [
+  ResultSchema.options[0].extend({ execution: ExecutionAuthSchema }),
+  ResultSchema.options[1].extend({ execution: ExecutionAuthSchema }),
+  ResultSchema.options[2].extend({ execution: ExecutionAuthSchema }),
+  NotRunSchema,
 ]);
 const Denial = z.strictObject({ status: z.literal('rejected'), started: z.literal(false) });
 export const MAX_TASK_BYTES = 2_097_152;
@@ -48,8 +56,10 @@ export class HttpReviewWorker implements ReviewWorkerClient {
     if (url.protocol !== 'http:' || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('invalid_worker_service');
     this.origin = url.origin;
   }
-  async review(task: ReviewTask, capability: string, signal: AbortSignal): Promise<ReviewWorkerResult> {
-    const body = JSON.stringify(ReviewTaskSchema.parse(task));
+  review(task: ReviewTask, capability: string, signal: AbortSignal): Promise<ReviewWorkerResult>;
+  review(task: ReviewTaskV2, capability: string, signal: AbortSignal): Promise<ReviewWorkerResultV2>;
+  async review(task: ReviewTask | ReviewTaskV2, capability: string, signal: AbortSignal): Promise<ReviewWorkerResult | ReviewWorkerResultV2> {
+    const body = JSON.stringify(AnyReviewTaskSchema.parse(task));
     // 긴 리뷰가 undici 기본 300초 응답 대기에 끊기지 않게 작업 예산에 맞춘다(R1-06과 같은 함정).
     const dispatcher = new Agent({ headersTimeout: task.timeoutMs + 30_000, bodyTimeout: task.timeoutMs + 30_000 });
     try {
@@ -65,7 +75,19 @@ export class HttpReviewWorker implements ReviewWorkerClient {
         if ([400, 401, 403, 409].includes(response.status) && Denial.safeParse(await response.json().catch(() => null)).success) throw new WorkerRejected();
         throw new Error('worker_response_uncertain');
       }
-      const result = ResultSchema.safeParse(await response.json());
+      const raw: unknown = await response.json();
+      if (task.version === 2) {
+        const result = ResultV2Schema.safeParse(raw);
+        if (!result.success) throw new Error('worker_response_uncertain');
+        const data = result.data;
+        // 실행 칸이 보낸 선택과 다르면 믿지 않는다(작업자는 요청 선택으로만 돌 수 있다).
+        if (data.status !== 'not_run'
+          && (['account', 'credentialRevision', 'method', 'runId'] as const).some(key => data.execution[key] !== task.execution[key])) {
+          throw new Error('worker_response_uncertain');
+        }
+        return data;
+      }
+      const result = ResultSchema.safeParse(raw);
       if (!result.success) throw new Error('worker_response_uncertain');
       return result.data;
     } finally { await dispatcher.destroy().catch(() => {}); }
@@ -95,7 +117,7 @@ export function reviewRoutes(worker: Pick<ReviewWorker, 'review' | 'cancel'>, ac
       if (req.url === '/v1/review/cancel') {
         send(200, await worker.cancel(CancelRequestSchema.parse(input), auth.slice(11))); return;
       }
-      const task = ReviewTaskSchema.parse(input);
+      const task = AnyReviewTaskSchema.parse(input);
       if (accepting && !accepting()) throw new WorkerRejected('worker_closing');
       send(200, await worker.review(task, auth.slice(11), new AbortController().signal));
     } catch (error) {

@@ -2,6 +2,8 @@ import { gunzipSync } from 'node:zlib';
 import { z } from 'zod';
 import { DEFAULTS, Denied, WorkerRejected } from './contracts.js';
 import type { RateLimitInfo } from './contracts.js';
+import { ExecutionSelectionSchema, executionAuth } from './execution-auth.js';
+import type { ExecutionAuth, ExecutionSelection, NotRun } from './execution-auth.js';
 import { archiveContract, CancelRequestSchema, ExecutionSlot, REPOSITORY_NAME } from './worker.js';
 import type { CancelRequest, WorkerVerifier } from './worker.js';
 
@@ -66,6 +68,11 @@ export const ReviewTaskSchema = z.strictObject({
   timeoutMs: z.number().int().positive().max(DEFAULTS.taskTimeoutMs),
 });
 export type ReviewTask = z.infer<typeof ReviewTaskSchema>;
+// v2: v1과 같은 칸·순서 뒤에 방식 선택(execution)을 붙인 판(DECISIONS "C39"). 게시 서버(review.ts)는 아직 v1만 보낸다.
+export const ReviewTaskV2Schema = z.strictObject({ ...ReviewTaskSchema.shape, version: z.literal(2), execution: ExecutionSelectionSchema });
+export type ReviewTaskV2 = z.infer<typeof ReviewTaskV2Schema>;
+// 작업자가 받는 리뷰 요청. 요청 판에 맞는 응답 판을 돌려준다(v1 요청에는 실행 칸이 없다).
+export const AnyReviewTaskSchema = z.discriminatedUnion('version', [ReviewTaskSchema, ReviewTaskV2Schema]);
 export interface ReviewFile { path: string; status: Change['status']; patch: string; rightLines: number[] }
 // 모델에 알리는 제외 파일 수의 상한. 목록 전체(최대 5000)를 넣으면 입력 예산을 잡아먹는다. 넘으면 omittedTotal로 수만 알린다.
 export const MODEL_OMITTED_MAX = 200;
@@ -78,17 +85,24 @@ export interface ReviewerInput {
 }
 // unknown: 모델 프로세스가 멈췄는지 확인하지 못했다. 실패로 뭉개면 슬롯이 풀려 살아 있는 프로세스 옆에서 다음 작업이 돈다.
 // rateLimit은 그 실행에서 본 한도 정보다(없으면 칸 없음). 응답의 선택 칸으로 그대로 넘긴다.
+// subscriptionLimit: 선택 실행에서만, 넘어갈 근거 허용 목록(execution-auth)에 든 구독 한도 실패면 true.
+// not_run: 선택 실행의 대조 실패로 모델을 부르지 않았다.
 export type ReviewerResult =
   | { status: 'succeeded'; output: unknown; rateLimit?: RateLimitInfo }
-  | { status: 'limited' | 'auth_expired' | 'failed'; reason?: string; rateLimit?: RateLimitInfo }
-  | { status: 'unknown' };
+  | { status: 'limited' | 'auth_expired' | 'failed'; reason?: string; rateLimit?: RateLimitInfo; subscriptionLimit?: boolean }
+  | { status: 'unknown' }
+  | NotRun;
 // job은 프로세스 표식이고 timeoutMs는 이 호출에 남은 시간이다(압축본 받기·diff 계산에 쓴 만큼 뺀 값).
-export interface ReviewerRun { job: string; timeoutMs: number }
+// selection: 새 판 요청의 방식 선택. 있으면 그 방식의 자격 하나로만 돈다.
+export interface ReviewerRun { job: string; timeoutMs: number; selection?: ExecutionSelection }
 export type ReviewerModel = (input: ReviewerInput, signal: AbortSignal, run: ReviewerRun) => Promise<ReviewerResult>;
 export type ReviewWorkerResult =
   | { status: 'succeeded'; stopped: true; coverage: Coverage; positions: { path: string; lines: number[] }[]; output: unknown; rateLimit?: RateLimitInfo }
   | { status: 'limited' | 'auth_expired' | 'failed'; stopped: true; reason?: string; rateLimit?: RateLimitInfo }
   | { status: 'unknown'; stopped: false };
+// v2 요청의 응답: v1 갈래마다 실행 칸, 그리고 not_run. unknown에도 실행 칸이 있다(chat v3과 같은 규칙).
+type WithExecution<T> = T extends unknown ? T & { execution: ExecutionAuth } : never;
+export type ReviewWorkerResultV2 = WithExecution<ReviewWorkerResult> | NotRun;
 // 압축본 받기는 자격 없는 GET 하나다. init에는 인증 헤더를 넣을 자리가 없다.
 export type ArchiveFetcher = (url: string, init: { credentials: 'omit'; redirect: 'error'; maxBytes: number; signal: AbortSignal }) => Promise<Uint8Array>;
 
@@ -355,10 +369,13 @@ export class ReviewWorker {
   // 슬롯을 대화와 함께 쓰면 실행 잠금·unknown 잠금이 두 레인에 함께 걸린다.
   constructor(private readonly verifier: WorkerVerifier, private readonly fetchArchive: ArchiveFetcher,
     private readonly model: ReviewerModel, private readonly stopWaitMs = 5000, private readonly slot = new ExecutionSlot()) {}
-  async review(input: ReviewTask, capability: string, signal: AbortSignal): Promise<ReviewWorkerResult> {
-    let task: ReviewTask;
+  review(input: ReviewTask, capability: string, signal: AbortSignal): Promise<ReviewWorkerResult>;
+  review(input: ReviewTaskV2, capability: string, signal: AbortSignal): Promise<ReviewWorkerResultV2>;
+  review(input: ReviewTask | ReviewTaskV2, capability: string, signal: AbortSignal): Promise<ReviewWorkerResult | ReviewWorkerResultV2>;
+  async review(input: ReviewTask | ReviewTaskV2, capability: string, signal: AbortSignal): Promise<ReviewWorkerResult | ReviewWorkerResultV2> {
+    let task: ReviewTask | ReviewTaskV2;
     try {
-      task = ReviewTaskSchema.parse(input);
+      task = AnyReviewTaskSchema.parse(input);
       await this.verifier.check(capability, 'execute', task);
       const contract = archiveContract(task.repository, task.base, task.head);
       // 게시 서버가 보낸 URL을 그대로 믿지 않는다. 고정 SHA의 codeload 주소만 받는다.
@@ -366,6 +383,11 @@ export class ReviewWorker {
     } catch { throw new WorkerRejected(); }
     // 서명 확인이 끝나기를 기다리는 사이 종료가 시작될 수 있다. 압축본 받기는 실행 제어가 막아 주지 않는다.
     if (this.closed) throw new WorkerRejected('worker_closing');
+    const selection = task.version === 2 ? task.execution : undefined;
+    let subscriptionLimit = false;
+    // 요청 판에 맞는 응답 판. 실행 칸은 요청 선택으로 만든다(작업자는 그 방식으로만 돌 수 있다).
+    const reply = (result: ReviewWorkerResult): ReviewWorkerResult | ReviewWorkerResultV2 => selection
+      ? { ...result, execution: executionAuth(selection, result.status === 'limited' && subscriptionLimit) } : result;
     const started = Date.now();
     const abort = new AbortController();
     let settle!: (stopped: boolean) => void;
@@ -383,7 +405,7 @@ export class ReviewWorker {
         base = readArchive(await this.fetchArchive(task.archives.base, options), task.limits.maxArchiveBytes);
         head = readArchive(await this.fetchArchive(task.archives.head, options), task.limits.maxArchiveBytes);
       } catch (error) {
-        return { status: 'failed', stopped: true, reason: error instanceof ArchiveError ? error.message : 'archive_fetch_failed' };
+        return reply({ status: 'failed', stopped: true, reason: error instanceof ArchiveError ? error.message : 'archive_fetch_failed' });
       }
       // 리뷰 기준 지침은 기준(base) 리비전의 것만. PR이 바꾼 AGENTS.md는 diff 안의 자료로만 남는다.
       // 지침도 파일 상한과 모델 입력 예산을 받는다. 다 읽을 수 없으면 자르지 않고 빼고 partial로 표시한다.
@@ -393,7 +415,7 @@ export class ReviewWorker {
       let built: Awaited<ReturnType<typeof buildReviewFiles>>;
       // 모델을 부르기 전의 실패는 실행이 없었다는 것이 확실하므로 unknown이 아니라 failed다.
       try { built = await buildReviewFiles(task.changes, task.truncated, base, head, task.limits, guidelines ? Buffer.byteLength(guidelines) : 0, signal); }
-      catch { return { status: 'failed', stopped: true, reason: 'input_build_failed' }; }
+      catch { return reply({ status: 'failed', stopped: true, reason: 'input_build_failed' }); }
       const { files, coverage } = built;
       if (entry && !guidelines && (entry.data.length > 0)) coverage.limits_hit.push('guidelines_limit');
       const body = task.pullRequest.body.slice(0, task.limits.maxBodyChars);
@@ -403,16 +425,21 @@ export class ReviewWorker {
         untrusted: { pullRequest: { title: task.pullRequest.title, body }, files,
           omitted: coverage.omitted_files_with_reasons.slice(0, MODEL_OMITTED_MAX).map(({ path, reason }) => ({ path, reason })),
           omittedTotal: coverage.omitted_files_with_reasons.length, limitsHit: [...coverage.limits_hit] } }, signal,
-      { job: task.job, timeoutMs: Math.max(1, task.timeoutMs - (Date.now() - started)) });
-      if (result.status === 'unknown') { stopped = false; return { status: 'unknown', stopped: false }; }
+      { job: task.job, timeoutMs: Math.max(1, task.timeoutMs - (Date.now() - started)), ...(selection ? { selection } : {}) });
+      if (result.status === 'unknown') { stopped = false; return reply({ status: 'unknown', stopped: false }); }
+      // 선택 대조 실패는 모델을 부르지 않은 것이라 멈춤이 확실하다. 선택이 없는 v1 요청에는 오지 않는다.
+      if (result.status === 'not_run') return selection ? result : { status: 'failed', stopped: true, reason: 'not_run' };
       const rateLimit = result.rateLimit ? { rateLimit: result.rateLimit } : {};
-      if (result.status !== 'succeeded') return { status: result.status, stopped: true, ...(result.reason ? { reason: result.reason } : {}), ...rateLimit };
-      return { status: 'succeeded', stopped: true, coverage, output: result.output,
-        positions: files.map(f => ({ path: f.path, lines: f.rightLines })), ...rateLimit };
+      if (result.status !== 'succeeded') {
+        subscriptionLimit = result.subscriptionLimit === true;
+        return reply({ status: result.status, stopped: true, ...(result.reason ? { reason: result.reason } : {}), ...rateLimit });
+      }
+      return reply({ status: 'succeeded', stopped: true, coverage, output: result.output,
+        positions: files.map(f => ({ path: f.path, lines: f.rightLines })), ...rateLimit });
     } catch {
       // 깨진 응답은 모델 실행이 멈췄다는 증거가 아니다. 다음 작업을 받지 않는다(SerialWorker와 같은 규칙).
       stopped = false;
-      return { status: 'unknown', stopped: false };
+      return reply({ status: 'unknown', stopped: false });
     } finally {
       if (this.running === run) this.running = undefined;
       if (stopped) this.slot.release(held); else this.slot.lock(held);

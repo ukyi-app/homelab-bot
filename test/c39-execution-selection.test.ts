@@ -2,14 +2,22 @@ import { afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, randomUUID } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import { join, resolve } from 'node:path';
+import { gzipSync } from 'node:zlib';
 import { CHAT_REPLY_JSON_SCHEMA, ChatLane, chatPrompt } from '../src/chat-lane.js';
 import { SYSTEM_INSTRUCTIONS } from '../src/contracts.js';
 import type { Job } from '../src/contracts.js';
 import { createExecutor, selectProfile } from '../src/executor-profiles.js';
 import type { ExecutionSelection } from '../src/execution-auth.js';
-import { SerialWorker, WorkerRequestSchema, WorkerSigner, WorkerVerifier, capabilityDigest, workerRequest, workerRequestV3 } from '../src/worker.js';
+import { HttpReviewWorker, reviewWorkerServer } from '../src/review-http.js';
+import { REVIEW_INSTRUCTIONS_V2, ReviewWorker } from '../src/review-input.js';
+import type { ReviewTask, ReviewTaskV2 } from '../src/review-input.js';
+import { createReviewerModel } from '../src/review-lane.js';
+import { RunControl } from '../src/run-control.js';
+import { SerialWorker, WorkerRequestSchema, WorkerSigner, WorkerVerifier, archiveContract, capabilityDigest, workerRequest,
+  workerRequestV3 } from '../src/worker.js';
 import type { WorkerRequestV1, WorkerRequestV3 } from '../src/worker.js';
 import { HttpWorker } from '../src/worker-http.js';
 import { startWorker, workerConfig } from '../src/worker-main.js';
@@ -288,4 +296,92 @@ test('C39 HTTP 끝까지: 서명한 새 판 요청 → 고른 방식 실행 → 
   // 옛 작업자(지원 확인 경로 없음)는 빈 목록으로 읽는다.
   const legacy = new HttpWorker('http://127.0.0.1:9/', async () => new Response('', { status: 404 }));
   assert.deepEqual(await legacy.contracts(), { executionSelection: [] });
+});
+
+// PR 리뷰 v2. 압축본 해석은 pr-review 시험이 맡아 여기서는 파일 하나짜리 tar.gz만 만든다.
+function tarGz(files: Record<string, string>): Buffer {
+  const header = (name: string, size: number) => {
+    const h = Buffer.alloc(512);
+    h.write(name, 0, 100); h.write('0000644\0', 100); h.write('0000000\0', 108); h.write('0000000\0', 116);
+    h.write(`${size.toString(8).padStart(11, '0')}\0`, 124); h.write('00000000000\0', 136); h.write('        ', 148);
+    h.write('0', 156); h.write('ustar\0', 257); h.write('00', 263);
+    let sum = 0; for (const b of h) sum += b;
+    h.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148);
+    return h;
+  };
+  const blocks: Buffer[] = [];
+  for (const [path, content] of Object.entries(files)) {
+    const data = Buffer.from(content);
+    blocks.push(header(`root/${path}`, data.length), data, Buffer.alloc((512 - (data.length % 512)) % 512));
+  }
+  blocks.push(Buffer.alloc(1024));
+  return gzipSync(Buffer.concat(blocks));
+}
+const BASE_SHA = 'a'.repeat(40), HEAD_SHA = 'b'.repeat(40);
+const REVIEW_OUTPUT = { findings: [], open_questions: [], public_summary: '바뀐 줄에서 문제를 찾지 못했어요.' };
+const reviewTask = (): ReviewTask => {
+  const contract = archiveContract('ukyi-app/homelab-smoke', BASE_SHA, HEAD_SHA);
+  return { version: 1, job: randomUUID(), lease: randomUUID(), lane: 'review', repository: 'ukyi-app/homelab-smoke', base: BASE_SHA, head: HEAD_SHA,
+    archives: { base: contract.base, head: contract.head },
+    changes: [{ path: 'src/app.ts', previousPath: null, status: 'modified', baseType: 'blob', headType: 'blob' }], truncated: false,
+    pullRequest: { title: '제목', body: '본문' },
+    limits: { maxFiles: 10, maxFileBytes: 100_000, maxDiffBytes: 100_000, maxArchiveBytes: 1_000_000, maxBodyChars: 1000 },
+    policyRevision: 'rp-x', instructions: REVIEW_INSTRUCTIONS_V2, timeoutMs: 60_000 };
+};
+const reviewV2 = (chosen: ExecutionSelection): ReviewTaskV2 => ({ ...reviewTask(), version: 2, execution: chosen });
+const archives = async (url: string) => tarGz({ 'src/app.ts': url.endsWith(BASE_SHA) ? 'a\n' : 'b\n' });
+const reviewer = (launcher: SpawnLauncher) => {
+  const executor = createExecutor(selectProfile('claude', 'CLAUDE_CODE_OAUTH_TOKEN', MODEL), { credentialFile: join(dir, 'CLAUDE_CODE_OAUTH_TOKEN') }, []);
+  const control = new RunControl(executor.credential, launcher,
+    { tmp: base, proxy: { https: 'http://127.0.0.1:3128', noProxy: '127.0.0.1,localhost' } });
+  const anyVerifier = { check: async () => {} } as unknown as WorkerVerifier;
+  return new ReviewWorker(anyVerifier, archives, createReviewerModel(executor, control, { model: MODEL }), 50);
+};
+
+test('C39 PR 리뷰 v2: 고른 방식 하나로 돌고 실행 칸을 내며, 대조 실패는 not_run, 옛 v1 요청은 옛 응답 그대로다(AC-34·AC-42)', async () => {
+  await mode({ kind: 'answer', answer: REVIEW_OUTPUT });
+  const launcher = new SpawnLauncher(fakeBin);
+  const worker = reviewer(launcher);
+  const api = selection({ method: 'api' });
+  const done = await worker.review(reviewV2(api), 'capability', signal());
+  assert.equal(done.status, 'succeeded');
+  assert.deepEqual('execution' in done && done.execution, { ...api, subscriptionLimit: false });
+  assert.deepEqual(credentialEnvs(await seenEnv()), ['ANTHROPIC_API_KEY']);
+  // 옛 v1 요청: 방식 표시(subscription)로 돌고 실행 칸이 없다.
+  const old = await worker.review(reviewTask(), 'capability', signal());
+  assert.equal(old.status, 'succeeded');
+  assert.equal('execution' in old, false);
+  assert.deepEqual(credentialEnvs(await seenEnv()), ['CLAUDE_CODE_OAUTH_TOKEN']);
+  // 묶음과 다른 계정은 모델 호출 없이 not_run이다.
+  assert.deepEqual(await worker.review(reviewV2(selection({ account: 'other' })), 'capability', signal()),
+    { status: 'not_run', stopped: true, refusal: 'bundle_mismatch' });
+  assert.equal(launcher.specs.length, 2);
+  // 구독 한도 실패는 넘어갈 근거로 표시된다.
+  await mode({ kind: 'error', error: 'rate_limit', status: 429, events: [RATE_LIMIT_EVENTS.rejected] });
+  const sub = selection();
+  const limited = await worker.review(reviewV2(sub), 'capability', signal());
+  assert.equal(limited.status, 'limited');
+  assert.deepEqual('execution' in limited && limited.execution, { ...sub, subscriptionLimit: true });
+});
+
+test('C39 PR 리뷰 v2 HTTP: 게시 서버 파서가 실행 칸·not_run을 읽고, 보낸 선택과 다른 실행 칸은 믿지 않는다(AC-42)', async () => {
+  await mode({ kind: 'answer', answer: REVIEW_OUTPUT });
+  const server = reviewWorkerServer(reviewer(new SpawnLauncher(fakeBin)));
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  try {
+    const client = new HttpReviewWorker(`http://127.0.0.1:${(server.address() as AddressInfo).port}/`, fetch);
+    const chosen = selection({ method: 'api' });
+    const result = await client.review(reviewV2(chosen), 'capability', signal());
+    assert.deepEqual(result.status === 'succeeded' && result.execution, { ...chosen, subscriptionLimit: false });
+    assert.deepEqual(await client.review(reviewV2(selection({ credentialRevision: 'r6' })), 'capability', signal()),
+      { status: 'not_run', stopped: true, refusal: 'bundle_mismatch' });
+    const old = await client.review(reviewTask(), 'capability', signal());
+    assert.equal(old.status === 'succeeded' && 'execution' in old, false);
+  } finally { server.close(); }
+  // 작업자가 다른 runId를 실어 보내면 결과를 모름으로 둔다.
+  const chosen = selection();
+  const forged = new HttpReviewWorker('http://127.0.0.1:9/', async () => Response.json({ status: 'failed', stopped: true,
+    execution: { ...chosen, runId: randomUUID(), subscriptionLimit: false } }));
+  await assert.rejects(forged.review(reviewV2(chosen), 'capability', signal()), /worker_response_uncertain/);
 });

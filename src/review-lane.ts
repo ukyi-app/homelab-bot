@@ -2,6 +2,8 @@ import { z } from 'zod';
 import { ChangeReviewOutputSchema } from './change-review.js';
 import type { ChangeReviewerInput, ChangeReviewerModel } from './change-review.js';
 import { echoesSecret } from './codex-events.js';
+import { notRun, subscriptionLimitFailure } from './execution-auth.js';
+import type { ExecutionSelection } from './execution-auth.js';
 import type { Executor } from './executor-profiles.js';
 import { ReviewOutputSchema } from './review-input.js';
 import type { ReviewerInput, ReviewerModel, ReviewerResult } from './review-input.js';
@@ -60,6 +62,14 @@ export function interpretReview(report: RunReport, schema: z.ZodType = ReviewOut
   return { status: 'succeeded', output: parsed.data, ...rateLimit };
 }
 
+// 선택 실행(새 판 요청): 대조 실패는 모델을 부르지 않은 not_run, 한도면 넘어갈 근거 판정을 붙인다. 선택이 없으면 위와 같다.
+export function interpretSelectedReview(report: RunReport, selection: ExecutionSelection | undefined, schema?: z.ZodType): ReviewerResult {
+  if (selection && report.refused === 'selection' && report.selectionRefusal) return notRun(report.selectionRefusal);
+  const result = interpretReview(report, schema);
+  if (!selection || result.status !== 'limited') return result;
+  return { ...result, subscriptionLimit: subscriptionLimitFailure(selection.method, report.outcome) };
+}
+
 // 무도구 경계 (d): 모델 CLI의 egress가 플랫폼 프록시로만 나가는지를 env로 보이는 범위에서 묶는다. 실제 차단은 프록시 허용 목록과 NetworkPolicy다.
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 export function assertEgressBound(proxy: RunControl['proxy']): void {
@@ -77,9 +87,10 @@ export function createReviewerModel(executor: Pick<Executor, 'reviewAdapter'>, c
   const adapter = executor.reviewAdapter;
   if (!adapter?.capabilities.lanes.review) throw new WorkerStartError('review_unsupported');
   assertEgressBound(control.proxy);
-  return async (input, signal, run) => interpretReview(await control.run({ adapter, lane: 'review', job: run.job, model: options.model,
+  return async (input, signal, run) => interpretSelectedReview(await control.run({ adapter, lane: 'review', job: run.job, model: options.model,
     prefix: RUN_PREFIX.review, timeoutMs: run.timeoutMs, toolCalls: 0, schema: REVIEW_OUTPUT_JSON_SCHEMA,
-    prompt: reviewPrompt(input), limits: options.limits ?? REVIEW_LIMITS }, signal));
+    prompt: reviewPrompt(input), limits: options.limits ?? REVIEW_LIMITS, ...(run.selection ? { selection: run.selection } : {}) }, signal),
+  run.selection);
 }
 
 // 미게시 후보 리뷰. 실행 경계(도구 0개, MCP·hooks·skills 없음, 임시 공간, 반사 검사)는 위와 같고 지시·입력·출력 스키마만 다르다.

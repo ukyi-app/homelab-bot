@@ -533,6 +533,8 @@ export class ChangeReviewWorker {
       trusted: { guidelines: guidelines.text, verifications: task.trusted.verifications }, untrusted: task.untrusted }, signal,
     { job: task.job, timeoutMs: Math.max(1, task.timeoutMs - (Date.now() - started)) });
     if (result.status === 'unknown') return { status: 'unknown', stopped: false };
+    // 변경 자체 리뷰 요청에는 아직 방식 선택이 없어(DECISIONS "C39" 남은 경로) 오지 않는다. 오면 모델을 부르지 않은 실패다.
+    if (result.status === 'not_run') return { status: 'failed', stopped: true, reason: 'not_run' };
     const rateLimit = result.rateLimit ? { rateLimit: result.rateLimit } : {};
     if (result.status !== 'succeeded') return { status: result.status, stopped: true, ...(result.reason ? { reason: result.reason.slice(0, 100) } : {}), ...rateLimit };
     return { status: 'succeeded', stopped: true, sessionId, problems: [], output: result.output, ...rateLimit };
