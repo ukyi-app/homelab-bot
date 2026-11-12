@@ -12,7 +12,9 @@ import type { Job } from '../src/contracts.js';
 import { createExecutor, selectProfile } from '../src/executor-profiles.js';
 import type { ExecutionSelection } from '../src/execution-auth.js';
 import { HttpReviewWorker, reviewWorkerServer } from '../src/review-http.js';
-import { REVIEW_INSTRUCTIONS_V2, ReviewWorker } from '../src/review-input.js';
+import { AnyReviewTaskSchema, REVIEW_INSTRUCTIONS_V2, ReviewWorker } from '../src/review-input.js';
+import { TaskRequestSchema } from '../src/task-contracts.js';
+import { startRequest } from './task-fixtures.js';
 import type { ReviewTask, ReviewTaskV2 } from '../src/review-input.js';
 import { createReviewerModel } from '../src/review-lane.js';
 import { RunControl } from '../src/run-control.js';
@@ -131,6 +133,20 @@ test('C39 옛 판 고정: 대화 v1·v2 요청의 키 순서와 digest가 지금
   assert.equal(capabilityDigest(WorkerRequestSchema.parse(v1)), 'a9f11ad7b4d7dbf22d9d74cab63578f0db4301b615270ac0c1b4a23b6d785b71');
   // 옛 판에 선택 칸을 더한 요청은 받지 않는다(strict).
   assert.equal(WorkerRequestSchema.safeParse({ ...v2, execution: selection() }).success, false);
+});
+
+test('C39 옛 판 고정: PR 리뷰 v1·작업 v1 요청은 칸 순서가 지금과 같고, 선택 칸이 있으면 끝에만 붙는다(AC-42)', () => {
+  const review = AnyReviewTaskSchema.parse(reviewTask());
+  const REVIEW_V1_KEYS = ['version', 'job', 'lease', 'lane', 'repository', 'base', 'head', 'archives', 'changes', 'truncated', 'pullRequest', 'limits',
+    'policyRevision', 'instructions', 'timeoutMs'];
+  assert.deepEqual(Object.keys(review), REVIEW_V1_KEYS);
+  assert.deepEqual(Object.keys(AnyReviewTaskSchema.parse(reviewV2(selection()))), [...REVIEW_V1_KEYS, 'execution']);
+  // 옛 판 요청에 선택 칸을 더하면 받지 않는다.
+  assert.equal(AnyReviewTaskSchema.safeParse({ ...reviewTask(), execution: selection() }).success, false);
+  const TASK_START_KEYS = ['version', 'lane', 'job', 'lease', 'generation', 'policyRevision', 'instructions', 'sessionId', 'repository', 'base', 'project',
+    'timeoutMs', 'runBudgetRemainingMs', 'toolCalls', 'limits', 'operation', 'turn', 'untrusted'];
+  assert.deepEqual(Object.keys(TaskRequestSchema.parse(startRequest())), TASK_START_KEYS);
+  assert.deepEqual(Object.keys(TaskRequestSchema.parse(startRequest({ execution: selection() }))), [...TASK_START_KEYS, 'execution']);
 });
 
 test('C39 새 판 요청: 선택 칸(계정·revision·방식·runId)이 끝에 붙고 digest에 들어가, 방식만 바꿔도 digest가 다르다', () => {

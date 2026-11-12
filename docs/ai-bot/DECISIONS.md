@@ -1532,3 +1532,59 @@ owner 결정(2026-11-11 "좋아 그렇게해", 전체 리뷰 1차 명세 질문 
 - PR 리뷰 claim 필터를 "고를 방식의 리뷰 허용"으로 바꾸는 방법(C40, 지금은 `review_deferred_until`을 `GREATEST`로만 늘린다).
 
 **조사와 지금 코드.** 조사 기준 `36c96b6`와 이 절을 쓴 기준 main `c5baa40` 사이 커밋은 C37(기억 검색) 하나라, 조사가 인용한 `executor-claude.ts`·`model-accounts.ts`·`store.ts`·`change-review.ts`·`credentials.ts`는 같다. 조사가 짚은 문서와 코드의 차이 둘은 지금도 그대로다: C19·C22의 "큐가 차면 재개를 멈춘다"는 C36 묶음 A F-3이, C19의 "자체 리뷰에 한도 칸이 없다"는 C36 묶음 A F-1이 앞선다.
+
+## C39 실행마다 방식 고르기: 작업자 계약과 자격 (2026-11-12)
+
+명세 §4.11·AC-34·AC-35(분류)·AC-42(판 조합)와 AC-32·33·38·40의 작업자 쪽 구현 선택이다. 위 "C38"이 C39에 맡긴 칸 이름·판·허용 목록·지원 표시 자리를 여기서 정한다. 계약 모양은 [ARCHITECTURE](ARCHITECTURE.md) 끝 "C39", 시험은 [VERIFICATION](VERIFICATION.md) 끝 "C39"다. 게시 서버가 새 판을 실제로 보내는 일, 상태·DB, 방식 고르기, 한도 뒤 재큐는 C40이다. 이 티켓은 운영 경로에서 새 판을 부르지 않는다.
+
+**1. 판과 칸 이름.** 선택 칸은 `execution: { account, credentialRevision, method, runId }`(코드 `ExecutionSelectionSchema`), 응답 칸은 `execution: { account, credentialRevision, method, runId, subscriptionLimit }`(`ExecutionAuthSchema`)다.
+
+| 경로 | 새 요청 | 지원 확인 |
+|---|---|---|
+| 대화 `/v1/execute` | `version: 3`(v2 칸·순서 그대로 + 끝에 `execution`) | `GET /v1/contracts`의 `chat` |
+| PR 리뷰 `/v1/review` | `version: 2`(v1 칸·순서 그대로 + 끝에 `execution`) | 같은 경로의 `review` |
+| 변경 자체 리뷰 `/v1/change-review` | `version: 2`(같은 규칙) | 같은 경로의 `change_review` |
+| 작업 `/v1/task`, `/v2/task` | 판은 그대로, 끝에 선택 칸 `execution`(없으면 직렬화·digest가 옛 요청과 같다) | 작업 접수 `GET /v1/task/intake`의 `executionSelection: ["/v1/task", "/v2/task"]` |
+
+- **근거(작업은 판 대신 명시적 협상):** 작업 capability가 `version`을 operation(v1·v2 끝점)에 묶어 판을 늘리면 서명 스키마가 양쪽에서 바뀐다. 이미 쓰는 `amendment` 칸과 같은 "끝에 두는 선택 칸 + 접수의 지원 표시" 방식이 작다. 칸을 모르는 옛 작업자는 strict 모양에서 시작 전에 거부한다(조용히 무시하지 않는다).
+- **근거(대화·리뷰는 새 판):** 옛 판 strict 스키마와 digest 키 순서가 계약이라 옛 요청에 칸을 더하지 않는다. 옛 작업자는 새 판을 모양에서 거부한다.
+- **조사 제안 중 넣지 않은 칸:** `selectionEpoch`. 기대 epoch 비교는 게시 서버 트랜잭션(C40) 안의 일이고, 작업자는 실행 ID로 귀속하면 된다. C40은 DB에서 실행 ID와 epoch를 잇는다.
+- **응답:** 새 판 요청의 응답에만 `execution`이 있고 `unknown`에도 있다(시작했을 수 있는 실행은 요청 선택의 방식뿐이다). 작업자는 레인이 낸 값이 아니라 요청 선택으로 이 칸을 만든다. 게시 서버 파서는 실행 칸이 보낸 선택과 다르면 결과를 모름으로 둔다. 모델 출력 스키마(`ChatReplySchema`·`ReviewOutputSchema`·`ChangeReviewOutputSchema`, 작업 출력)에는 칸이 없다.
+
+**2. 실행 안 됨(`not_run`).** 선택이 계정 묶음·자격과 맞지 않으면 모델을 띄우지 않고 HTTP 200 `{ status: 'not_run', stopped: true, refusal }`(작업은 같은 갈래에 identity·`sessionRetained`)을 낸다. 서명·모양 거부는 지금처럼 403 `rejected`라 게시 서버가 둘을 가른다. `refusal`은 여섯이다: `selection_unsupported`(Codex 등 묶음을 읽지 않는 프로필), `bundle_missing`, `bundle_invalid`, `bundle_mismatch`(계정·revision 다름), `credential_missing`(두 자격 중 하나라도 없음·`unset`·모양 틀림), `credential_mixed`(지문 불일치 또는 서로 다른 볼륨 세대).
+
+**3. 계정 묶음(작업자가 읽는 쪽 계약, C42·C43이 맞춘다).**
+
+- **파일:** 레인 Secret 볼륨의 `CLAUDE_ACCOUNT_BUNDLE`. 두 자격 파일(`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`)과 같은 디렉터리(`WORKER_CREDENTIAL_DIR`)다. 원격(Infisical) 키 이름과 ExternalSecret 매핑은 C42·C43이 정한다(기존 패턴이면 대화·리뷰 `CLAUDE_ACCOUNT_BUNDLE`, 작업 `CLAUDE_ACCOUNT_BUNDLE_TASK`).
+- **모양:** UTF-8 JSON 한 객체, 1024바이트 이하, 모르는 칸 없음. `{ "version": 1, "account": "<계정 이름>", "revision": "<revision>", "fingerprints": { "subscription": "<64 hex>", "api": "<64 hex>" } }`. 계정 이름은 `model-accounts.ts` `ACCOUNT_NAME`, revision은 `^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$`.
+- **지문:** 그 레인 Secret에 든 자격 값에서 앞뒤 공백·줄바꿈을 뗀 문자열의 UTF-8 바이트 SHA-256, 소문자 hex(`printf '%s' "$VALUE" | sha256sum`과 같다). 레인마다 자기 두 값으로 계산한다(`--separate-tokens`면 대화와 작업의 지문이 다르다). 값에서 되돌릴 수 없고, 작업자는 지문을 로그·응답·프롬프트에 싣지 않는다.
+- **일관된 스냅샷:** 묶음·두 자격 세 파일을 실제 경로로 풀어 같은 디렉터리일 때만 읽는다. kubelet Secret 볼륨은 이름 → `..data` → 세대 디렉터리 심링크이고 세대 디렉터리는 바뀌지 않아, 한 디렉터리면 한 볼륨 세대다. 같은 세대 안의 섞인 값(Infisical 여러 쓰기 도중 ESO가 읽은 조합)은 지문이 잡는다. 두 자격이 모두 있어야 한다(고른 쪽만 있어도 거부).
+- **묶음이 없을 때:** 지금 운영 Secret이 그렇다. 옛 요청은 지금처럼 `CLAUDE_AUTH_METHOD` 표시로 돌고, 새 판 요청은 `not_run`(`bundle_missing`)이다. readiness는 묶음을 보지 않는다(옛 요청을 계속 받아야 한다).
+
+**4. 넘어갈 근거 허용 목록(`subscriptionLimit`, AC-35).** 게시 서버(C40)가 넘어갈지 정할 재료다. 구독 선택 실행의 응답이 `limited`이고 아래 둘 중 하나일 때만 `true`다. 모르는 모양은 `false`이고 지금처럼 구독 대기다.
+
+| 실행 결과 모양(고정 stream-json) | 방식 | 상태 | subscriptionLimit |
+|---|---|---|---|
+| assistant `error: rate_limit`(429), 같은 실행의 `rejected` 있음·없음 | 구독 | limited | true |
+| 오류 종류 없음 + HTTP 429 + 같은 실행의 마지막 `rate_limit_event`가 `rejected` | 구독 | limited | true |
+| 오류 종류 없음 + 429, `rejected` 없음 또는 경고(`allowed_warning`)만 | 구독 | limited | false |
+| 한도 경고 뒤 성공, `rejected`가 보였지만 성공(Usage credits) | 구독 | succeeded | false |
+| `authentication_failed`(401) | 구독 | auth_expired | false |
+| `overloaded`(529) | 구독 | failed | false |
+| `billing_error`(402)·결제 오류 식별자 | 구독 | limited(billing) | false |
+| `rate_limit`(429) | API | limited(billing, C23 보수 분류 그대로) | false |
+
+- 판정 근거를 보이려고 실행기 결과(`EngineOutcome` limited)에 `basis: 'error_kind' | 'http_status'`를 더했다. 분류 자체(`classifyClaudeError`)는 바뀌지 않았다.
+- 2.1.308의 실제 구독 포함량 거절 필드는 미확인이다(C45 S5). 실측에서 다른 모양이 나오면 이 표에 더한다.
+
+**5. 자격 주입.** 새 판 요청은 방식 표시를 보지 않는다. 고른 방식의 변수 하나(`CLAUDE_CODE_OAUTH_TOKEN` 또는 `ANTHROPIC_API_KEY`)만 실행 env에 넣고, 반사·유출 검사에는 두 값을 모두 쓴다. 작업 sandbox는 자격 디렉터리 전체를 가리고(`denyRead`) 자식 env를 지운다(`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`). 묶음 파일도 같은 디렉터리라 함께 가려진다.
+
+**알려진 한계.**
+
+- **작업 레인 `not_run`이 턴 번호를 쓴다.** 접수 영수증(receipt)이 모델 실행 전에 그 턴을 기록해 같은 턴 번호로는 다시 받지 않는다. 재개 턴이면 다음 턴 번호로 잇고, 첫 턴(start)이면 세대를 새로 연다(C40). 모델 턴으로는 세지 않는다.
+- **변경 자체 리뷰 결과 조회 판은 그대로다.** 조회·ACK는 job·lease로 저장 결과를 가리켜 판을 늘리지 않았다. v2 요청으로 낸 저장 결과를 옛 게시 서버가 조회하면 옛 strict 파서가 읽지 못해 모름이 된다. 되돌리기 전에 회수한다(ARCHITECTURE "C38" 6절).
+- **라우트 예외의 500 unknown**에는 실행 칸이 없다(대화·리뷰·작업 공통). 게시 서버는 그 실행을 보낸 선택에 귀속한다.
+- **모델을 부르지 않은 변경 자체 리뷰 결과**(지침 대조 문제로 `problems`만 있고 `output: null`)에도 실행 칸이 붙는다. 실제 실행 수를 셀 때(C41) 이 결과를 빼야 한다.
+- **반사 검사의 실행 뒤 재읽기**는 스냅샷이 아니라 지금 파일을 읽는다. 검사할 비밀이 늘 수 있을 뿐 줄지 않는다.
+
+**C40이 쓸 진입점.** `execution-auth.ts`(`ExecutionSelectionSchema`·`ExecutionAuthSchema`·`NotRunSchema`·`SELECTION_REFUSALS`·`WORKER_CONTRACTS_PATH`), 대화 `workerRequestV3`·`HttpWorker.execute`(v3 겹쳐 쓰기)·`HttpWorker.contracts()`, PR 리뷰 `ReviewTaskV2Schema`·`HttpReviewWorker.review`(v2), 변경 자체 리뷰 `ChangeReviewTaskV2Schema`·`HttpChangeReviewWorker.review`(v2)·`HttpChangeReviewWorker.lookup(요청, capability, 기대 선택)`, 작업 `TaskRequestSchema`·`TaskV2RequestSchema`의 `execution` 칸·`taskWorkerExecutionSelection()`. 운영 경로(`runtime.ts`·`review.ts`·`claude-task-bridge.ts`·`change-review.ts` 게시 서버 쪽)는 아직 옛 판만 보낸다.
