@@ -2933,3 +2933,21 @@ owner 결정(명세 질문 Q1 = C24 할 일 1a)의 구현. 결정은 [DECISIONS]
 - **못 잡는 범위:** 실제 모델이 기억 검색 제안을 내는지, 실제 Discord 표시(C24 S5). 20건 상한 밖의 `safe_summary` 기억(DECISIONS "C37" 건수의 범위)은 시험하지 않았다.
 - **재검토 RR6-N1(공개 검사에 걸려도 건수 줄 유지):** 새 시험 "C37 말로 한 기억 검색의 실린 본문이 공개 검사에 걸려도 일반 답은 고정 안내 뒤에 internal 건수 한 줄을 남기고, 금지 값과 internal 기억은 게시·outbox에 없다": internal 1건 + 내부 주소(`10.20.30.40`)를 담은 `safe_summary` 1건이 맞는 말로 한 검색의 게시 글이 `PROPOSAL_TEXT.readWithheld` + "\n" + `MEMORY_TEXT.withheld(1)`이고, 게시 글·outbox에 주소와 internal 진술이 없으며 검색 결과 글(`result:%:read`)에 internal ID가 없다. internal 없이 공개 검사에만 걸리는 경우는 기존 "C36 F-4" 시험(고정 안내 한 줄)이 그대로 지킨다.
   - **고치기 전 빨강:** `9671daa`의 소스에 새 시험만 얹어 `c14-remaining-actions`를 돌리자 이 시험 하나가 실패했다(33개 중 32 통과). 게시 글이 고정 안내 한 줄뿐이고 건수 줄이 없었다.
+
+## C39 실행마다 방식 고르기: 작업자 계약과 자격 (2026-11-12, 로컬)
+
+결정·계약 모양은 [DECISIONS](DECISIONS.md) "C39", 설계 계약은 [ARCHITECTURE](ARCHITECTURE.md) 끝 "C39". 경계는 S2(서명한 작업자 요청 → 실제 레인·`RunControl` → 가짜 Claude CLI → 응답)이고, 자격·묶음은 시험이 임시 디렉터리에 쓰는 합성 값이다. 지문 기대값은 구현으로 다시 계산하지 않고 `printf '%s' <값> | sha256sum`으로 따로 얻은 리터럴이다. 모델 호출 없음.
+
+| 완료 조건 | 근거 |
+|---|---|
+| 구독 실행에는 구독 토큰만, API 실행에는 API 키만 env에 있다 | `c39-execution-selection` "C39 실행 env"(방식 표시가 api여도 구독 선택이면 `CLAUDE_CODE_OAUTH_TOKEN` 하나, 반대도 같음, env 어디에도 다른 쪽 값 없음, 다른 쪽 값을 답에 실으면 failed), "C39 HTTP 끝까지"(작업자 진입점), "C39 PR 리뷰 v2", `task-worker` "C39 작업 v1 방식 선택", `change-artifact` "C39 작업 v2 방식 선택"(가짜 CLI가 본 env) |
+| 방식·계정·revision을 바꾼 요청, 누락·섞인 묶음은 모델 호출 0건으로 거부된다 | "C39 HTTP 끝까지"(구독으로 서명한 요청의 방식만 api로 바꾸면 서명 불일치 403, 실행 0건), "C39 거부"(다른 계정·revision → `bundle_mismatch`, 묶음 없음·깨짐·모르는 칸, 자격 없음·`unset`(고른 쪽·다른 쪽) → `credential_missing`, 지문 다른 키·토큰 → `credential_mixed`, 열 경우 모두 실행 0건·응답에 값·지문 없음), "C39 볼륨 세대"(kubelet 모양 심링크에서 한 파일만 다른 세대 → `credential_mixed`, 한 세대로 맞추면 돈다), PR 리뷰·변경 자체 리뷰·작업 v1·v2의 `not_run` |
+| 옛 요청은 옛 응답만 받고 동작이 같다. 새 응답 칸이 옛 strict 스키마로 새지 않는다 | "C39 옛 판 고정"(대화 v1·v2 키 순서와 digest 리터럴, PR 리뷰 v1·작업 v1 키 순서, 옛 판에 선택 칸을 더하면 거부), "C39 응답 판"(옛 요청 응답에 칸 없음, 새 판 unknown에 실행 칸), 각 경로 시험의 옛 요청 대조, `change-review` "C39 변경 자체 리뷰 v2"(옛 판 파서는 실행 칸이 든 저장 결과를 성공으로 읽지 않음), 기존 대화·리뷰·작업 시험 전부 |
+| 스위치 꺼짐 판과 지금 운영 경로의 동작이 바뀌지 않는다 | 운영 경로(게시 서버)는 새 판을 부르지 않는다. 묶음 없는 지금의 Secret에서 옛 요청이 방식 표시로 도는 것은 "C39 거부" 끝 대조와 각 경로의 옛 요청 대조. 아래 관련 시험 49개 파일 전부 통과 |
+
+- **넘어갈 근거 fixture 표(AC-35):** "C39 넘어갈 근거 fixture 표"가 DECISIONS "C39" 4절 표의 행을 그대로 돌린다(구독 `rate_limit` 이벤트 있음·없음, 종류 없는 429 + `rejected`/없음/경고만, 경고 뒤 성공, `rejected` 뒤 성공, 인증, 과부하, 구독 결제, API 429). 분류 판정 근거 칸(`basis`)을 더해 기존 `worker-claude`·`task-stream`·`task-diagnostics`의 한도 결과 비교 여섯 곳에 그 칸을 더했다(분류 값은 그대로).
+- **지원 확인:** "C39 HTTP 끝까지"(`GET /v1/contracts`가 연 레인만 알림, 옛 작업자 404 → 빈 목록), "C39 작업 v1 방식 선택"(작업 접수의 `executionSelection`).
+- **시험이 실패할 수 있는지:** 새 시험은 구현과 함께 썼고 기준 `55cb3cb`에서 따로 빨강을 돌리지 않았다. 기준에는 새 판 스키마·`execution-auth.ts`·묶음 대조가 없어 새 시험 파일은 컴파일부터 되지 않는다. 대화 v1·v2 digest 리터럴은 기준과 같은 코드(이 브랜치는 v1·v2 스키마·`workerRequest`·`SYSTEM_INSTRUCTIONS*`를 바꾸지 않았다)에서 나온 값이다.
+- **실행(머신 잠금 도우미, node 24.22.0):** 매번 `npm run check`·`npm run build`. 바뀐 모듈을 읽는 시험 49개 파일을 여섯 묶음으로 1,310개 실행, 통과 1,298·실패 0·skip 12. PostgreSQL이 필요해 skip된 12개는 그 다섯 파일(`task-cancel-notice`·`task-settle-log`·`raw-text-retention`·`raw-input-retention`·`change-purge-race`)을 `--pg`로 다시 돌려 72개 통과·skip 0.
+- **운영에서 바뀌는 동작:** 없다. 게시 서버는 여전히 대화 v2·리뷰 v1·변경 자체 리뷰 v1·작업 칸 없는 요청만 보낸다. 작업자는 `GET /v1/contracts`(인증 없음)를 더 열고, 작업 접수 응답에 `executionSelection` 칸이 더해진다(`z.object`라 옛 게시 서버가 버린다).
+- **못 잡는 범위:** 실제 API 키 init(`apiKeySource`)·egress, 2.1.308의 실제 구독 한도 거절 모양(C45 S5), 실제 kubelet 볼륨 교체 타이밍(심링크 모양만 흉내 냈다), 게시 서버가 새 판을 보내고 결과를 귀속하는 일(C40).
