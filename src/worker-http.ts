@@ -74,7 +74,15 @@ export class HttpWorker implements WorkerClient {
       const raw: unknown = await response.json();
       if (request.version === 3) {
         const result = ResultV3Schema.safeParse(raw);
-        if (result.success && sameSelection(request, result.data)) return result.data;
+        if (result.success) {
+          if (sameSelection(request, result.data)) return result.data;
+          throw new Error('worker_response_uncertain');
+        }
+        // 출력 모양만 틀린 응답을 실패로 닫는 것은 그 응답이 이 실행의 것일 때뿐이다. 다른 실행의 stopped는 이 실행의 종료 증거가 아니다.
+        const execution = z.object({ execution: ExecutionAuthSchema }).safeParse(raw);
+        if (!execution.success || !sameSelection(request, { status: 'unknown', stopped: false, execution: execution.data.execution })) {
+          throw new Error('worker_response_uncertain');
+        }
         // 멈췄다는 것만 확실하면 실패로 닫되, 시작했을 수 있는 방식은 요청 선택뿐이라 그 칸을 단다.
         if (z.object({ stopped: z.literal(true) }).safeParse(raw).success) {
           return { status: 'failed', stopped: true, rateLimit: null, execution: executionAuth(request.execution) };

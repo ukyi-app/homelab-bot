@@ -401,3 +401,24 @@ test('C39 PR 리뷰 v2 HTTP: 게시 서버 파서가 실행 칸·not_run을 읽�
     execution: { ...chosen, runId: randomUUID(), subscriptionLimit: false } }));
   await assert.rejects(forged.review(reviewV2(chosen), 'capability', signal()), /worker_response_uncertain/);
 });
+
+test('C39 대화 v3 HTTP: 실행 칸의 계정·revision·방식·실행 ID가 보낸 선택과 다르면 확정 실패가 아니라 모름이다(RR7-N2)', async () => {
+  const chosen = selection();
+  const j = job();
+  const request = v3(j, chosen);
+  const capability = new WorkerSigner(keys.privateKey).issue(j, 'execute', request);
+  const answering = (body: unknown) => new HttpWorker('http://127.0.0.1:9/', async () => Response.json(body));
+  const changed: Partial<ExecutionSelection>[] = [{ account: 'other' }, { credentialRevision: 'r6' }, { method: 'api' }, { runId: randomUUID() }];
+  for (const change of changed) {
+    const execution = { ...chosen, ...change, subscriptionLimit: false };
+    // 모양이 맞는 응답과, 출력 모양이 틀려 확정 실패 fallback으로 갈 응답 둘 다 다른 실행의 것이면 모름이다.
+    await assert.rejects(answering({ status: 'failed', stopped: true, rateLimit: null, execution }).execute(request, capability, signal()),
+      /worker_response_uncertain/, JSON.stringify(change));
+    await assert.rejects(answering({ status: 'succeeded', stopped: true, output: { broken: true }, rateLimit: null, execution }).execute(request, capability, signal()),
+      /worker_response_uncertain/, JSON.stringify(change));
+  }
+  // 같은 실행의 출력 모양 오류는 지금처럼 확정 실패로 닫는다.
+  assert.deepEqual(await answering({ status: 'succeeded', stopped: true, output: { broken: true }, rateLimit: null,
+    execution: { ...chosen, subscriptionLimit: false } }).execute(request, capability, signal()),
+  { status: 'failed', stopped: true, rateLimit: null, execution: { ...chosen, subscriptionLimit: false } });
+});
