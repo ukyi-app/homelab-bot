@@ -2311,3 +2311,20 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 | 새, 지원 확인 뒤 | 새 + 묶음 있음 | 요청 선택의 방식 하나로 돌고 실행 칸을 돌려준다 |
 
 **자격 표면.** 실행 env의 자격 변수는 여전히 하나다. 작업자 Secret에는 레인마다 두 자격과 비밀 아닌 묶음이 있고(C42 설치 뒤), 작업 sandbox는 그 디렉터리 전체를 읽기·쓰기 금지로 가린다.
+
+## C40 게시 서버의 방식 선택 (2026-11-12)
+
+위 "C38" 1절의 게시 서버 쪽 구현이다. 이름·전이 표·관리 명령은 [DECISIONS](DECISIONS.md) "C40"이다.
+
+**흐름.** claim → 경로가 `MethodRouter.select(job, 경로)` → (스위치·지원 확인·설치가 모두 맞으면) scheduler 잠금 아래에서 방식을 고르고 `method_runs`에 실행 ID와 함께 적음 → 새 판 요청(대화 v3·리뷰 v2·변경 자체 리뷰 v2·작업 `execution` 칸)에 서명 → 작업자 → 응답의 실행 칸이 보낸 선택과 같은지 대조(다르면 모름) → `MethodRouter.settle(job, 선택, 결과)`가 한 트랜잭션에서 그 실행 행을 닫고 상태를 좁게 바꾸고 필요하면 같은 job을 대기열로 돌림 → 경로는 `requeued`면 멈추지 않고 끝, `wait`면 구독 확인 시각으로 `waitForUser`, `default`면 지금 동작. select가 null이면 처음부터 옛 판이다.
+
+**모듈.**
+
+- `method-routing.ts`: `MethodRouter`(`select`·`settle`·`apiChosen`·`pendingSelection`), 설치·끄기·API 잠금 해제·보기(`installMethods`·`disableMethods`·`unlockApi`·`methodRoutingView`). store·model-accounts·execution-auth만 읽는다.
+- `migrations/029_method_routing.sql`: `method_routing`(한 행)·`method_runs`. 추가만이라 옛 게시 서버 코드가 그대로 돈다.
+- `policy.ts`: `apiAfterLimit`. `main.ts`: 라우터 하나를 만들어 대화 runtime·PR 리뷰 runtime·변경 자체 리뷰 서비스(`useMethods`)·작업 브리지(`useMethods`)에 넘기고, 스위치가 켜졌을 때만 `method_support_probe`(30초)로 두 작업자의 지원을 본다.
+- 경로별 연결: `runtime.ts`(대화), `review.ts`(PR 리뷰 claim의 미루기와 v2), `change-review.ts`(즉시 결과·저장 결과 회수·ACK), `claude-task-bridge.ts`(v1 작업 턴, `not_run`, 실행 칸 대조), `admin.ts`(관리 명령 넷).
+
+**잠금 순서.** scheduler 행 → `method_runs` 행 → `method_routing` 행. 작업 레인은 턴 확정 트랜잭션(대화 행 → scheduler → 레인 행 → job) 안에서 같은 트랜잭션으로 `settle`을 부른다(`within`). 두 게시 서버의 동시 보고는 scheduler 행에서 줄을 서고, 고를 때의 `epoch`가 지금과 다르면 넘어감을 다시 하지 않는다.
+
+**호환.** 스위치 꺼짐·지원 미확인·설치 없음이면 요청·응답·DB 쓰기가 지금과 같다(`method_routing`·`method_runs`에 쓰지 않는다). 옛 작업자(지원 404)에는 새 판을 보내지 않는다. 되돌리기 순서는 "C38" 6절 그대로이고, 추가로 정책의 `apiAfterLimit` 칸을 게시 서버를 되돌리기 전에 뺀다(옛 strict 스키마가 기동에 실패한다). 변경 자체 리뷰의 v2 저장 결과는 새 게시 서버가 스위치와 무관하게 회수한다. 되돌려도 두 표와 감사 기록은 지우지 않는다.

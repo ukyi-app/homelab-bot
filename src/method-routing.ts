@@ -162,6 +162,8 @@ export class MethodRouter {
     }
     // 넘어갈 근거는 작업자의 허용 목록 판정뿐이다. 경고만 본 한도·분류할 수 없는 한도·인증·과부하는 지금 동작이다.
     if (outcome.status !== 'limited' || outcome.subscriptionLimit !== true) return DEFAULT;
+    // 모델 멈춤(waitForUser)을 거치지 않으므로 그 실행의 한도 관측을 여기서 계정 기록에 남긴다(계정 목록의 마지막 관측). scheduler 행은 잡혀 있다.
+    await s.observeRateLimit(outcome.rateLimit, job.id, s.db);
     const resetsAt = outcome.rateLimit?.stop?.resetsAt;
     const until = resetsAt === undefined ? null : resetsAt * 1000;
     const next = until !== null ? Math.max(until + MODEL_RESUME.afterResetMs, now + MODEL_RESUME.minDelayMs) : now + MODEL_RESUME.retryMs;

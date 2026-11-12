@@ -1591,3 +1591,69 @@ owner 결정(2026-11-11 "좋아 그렇게해", 전체 리뷰 1차 명세 질문 
 - **반사 검사의 실행 뒤 재읽기**는 스냅샷이 아니라 지금 파일을 읽는다. 검사할 비밀이 늘 수 있을 뿐 줄지 않는다.
 
 **C40이 쓸 진입점.** `execution-auth.ts`(`ExecutionSelectionSchema`·`ExecutionAuthSchema`·`NotRunSchema`·`SELECTION_REFUSALS`·`WORKER_CONTRACTS_PATH`), 대화 `workerRequestV3`·`HttpWorker.execute`(v3 겹쳐 쓰기)·`HttpWorker.contracts()`, PR 리뷰 `ReviewTaskV2Schema`·`HttpReviewWorker.review`(v2), 변경 자체 리뷰 `ChangeReviewTaskV2Schema`·`HttpChangeReviewWorker.review`(v2)·`HttpChangeReviewWorker.lookup(요청, capability, 기대 선택)`, 작업 `TaskRequestSchema`·`TaskV2RequestSchema`의 `execution` 칸·`taskWorkerExecutionSelection()`. 운영 경로(`runtime.ts`·`review.ts`·`claude-task-bridge.ts`·`change-review.ts` 게시 서버 쪽)는 아직 옛 판만 보낸다.
+
+## C40 게시 서버의 방식 선택, 대기, 이어가기 (2026-11-12)
+
+명세 §4.11·AC-32·33·35·36·37·38·39와 AC-40의 관리 진입점 쪽 구현 선택이다. 위 "C38"이 C40에 맡긴 이름·모양을 여기서 정한다. 설계 모양은 [ARCHITECTURE](ARCHITECTURE.md) 끝 "C40", 시험은 [VERIFICATION](VERIFICATION.md) 끝 "C40"이다.
+
+**1. 스위치.** 런타임 정책 `apiAfterLimit`(참·거짓, 없으면 꺼짐). 동료 기능 스위치 `colleagueEnabled`와 따로 읽는다. 기동 때 한 번 읽는다.
+
+- 운영 `RUNTIME_POLICIES`에는 지금 이 칸이 없고, 없으면 꺼짐으로 읽혀 기동이 실패하지 않는다. 정책 스키마가 strict라 **이 칸을 넣은 정책은 이 칸을 모르는 옛 게시 서버를 기동 실패시킨다.** 그래서 칸은 새 게시 서버가 배포된 뒤(되돌릴 일이 없을 때) 켜는 순간에만 넣고, 게시 서버를 되돌리기 전에는 칸을 먼저 뺀다.
+- 꺼짐이면 새 판 요청 0건, 새 표 쓰기 0건, 지원 확인 요청도 0건이다. 켜져도 (a) 지금 계정의 자동 사용 설치 기록이 있고 그 계정이 지금 계정이며 두 방식이 모두 등록돼 있고, (b) 두 작업자가 새 판을 받는다고 확인됐을 때만 고른다. 하나라도 아니면 지금 동작이다.
+- **작업자 지원 확인:** 대화 작업자의 `GET /v1/contracts`에 `chat`·`review`·`change_review` 셋이 모두 있고, 작업 레인을 열었으면 작업 접수의 `executionSelection`에 `/v1/task`가 있어야 한다. 30초마다 다시 본다. 경로별로 따로 열지 않고 둘 다 확인돼야 모든 경로가 연다(되돌린 옛 작업자에 새 판을 보내지 않는다).
+
+**2. 상태 저장(migration 029, 추가만).** 조사 제안의 세 종류를 두 표로 나눴다.
+
+- `method_routing`(한 행 `id='current'`): 설치(계정·묶음 revision·`install_state` `active|off|refused`), 구독 상태(`available|limited`, 풀리는 시각, 다음 확인 시각, 확인 실행 ID와 그 자리 유효 시각), API 상태(`eligible|billing_blocked|auth_blocked`, 잠긴 시각·revision), `epoch`.
+- `method_runs`(실행마다 한 행): 실행 ID, job, lease, 경로, 계정, revision, 방식, 고를 때의 epoch, 구독 확인 여부, 결과, 넘어갈 근거(`subscription_limit`). jobs 외래 키가 없다(작업 정리가 지워도 누계가 남는다).
+- 구독 `auth_blocked`는 두지 않았다. 구독 인증 실패는 넘어감 근거가 아니라(AC-35) 지금의 인증 대기 그대로다.
+- `model_limit_state`·`model_pauses`·`switchAccount`는 그대로 쓰고 바꾸지 않았다. 구독 한도를 넘길 때 그 실행의 한도 관측은 `observeRateLimit`으로 지금처럼 계정 기록에 남긴다.
+
+**3. 전이.** 모두 scheduler 행 → `method_runs` 행 → `method_routing` 행 순서의 잠금 아래 한 트랜잭션이다(모델 대기·계정 전환과 같은 순서).
+
+| 결과(그 실행의 고정 선택 기준) | 상태 | 그 일 |
+|---|---|---|
+| 구독, `limited` + 넘어갈 근거, 고를 때 epoch = 지금 epoch, 구독 `available` | 구독 `limited`(풀리는 시각 + 1분, 모르면 30분 뒤 확인), epoch + 1 | API가 `eligible`이면 같은 job을 대기열로(시도로 세지 않음). 잠겼으면 지금처럼 모델 대기 |
+| 같은 한도의 두 번째 보고(epoch가 이미 넘어감) | 그대로 | 위와 같음 |
+| 구독 확인 실행이 다시 한도 | 다음 확인 시각만 바꿈 | 위와 같음 |
+| 구독 확인 실행 성공 | 구독 `available`, epoch + 1 | 그대로 |
+| API, 결제(보수 분류한 429 포함)·인증 실패 | API `billing_blocked`/`auth_blocked`, epoch + 1 | 구독 `available`이면 구독으로 다시 넣고, 아니면 구독 확인 시각을 재시도 시각으로 하는 모델 멈춤(결제 멈춤이 아님) |
+| `not_run` | 설치 `refused`(사유 저장) | 다시 넣는다(다음은 옛 판) |
+| 고를 때 설치와 계정·revision이 다르거나 설치가 꺼진 실행의 한도·인증·`not_run` | 그대로 | 다시 넣어 지금 설치(또는 옛 판)로 다시 고른다 |
+| 경고만 본 한도·분류 못 한 한도·인증·과부하·실패·unknown·취소·비상 정지 | 그대로 | 지금 동작 |
+
+- **고르기:** 구독 `available`이면 구독. `limited`면 확인 시각이 지났고 다른 확인 실행이 없을 때 그 실행 하나가 구독(확인), 나머지는 API. API가 잠겼으면 구독(재개 예약 루프가 확인 시각에 되돌린 일)이다. 확인용 모델 호출은 따로 만들지 않는다(실제 작업이 올 때만).
+- **API를 쓸 수 있는 동안 전역 scheduler를 닫지 않는다:** 넘어간 일은 `waitForUser`를 거치지 않고 대기열로 돌아간다.
+- **API 잠금 해제:** 관리 진입점 `account api-unlock`과 새 revision의 `account auto-install`뿐이다. 같은 revision 재설치, 구독 성공, 달 바뀜으로는 풀리지 않는다. 잠금과 구독 확인 예약은 따로 남는다.
+
+**4. 경로.**
+
+- **대화·PR 리뷰·변경 자체 리뷰:** 고를 수 있으면 대화 v3·리뷰 v2·변경 자체 리뷰 v2, 아니면 옛 판. 넘어가면 자리 비움 안내 없이 같은 job을 다시 넣는다.
+- **PR 리뷰 미루기:** claim이 `reviewDeferredUntil`을 보되 고를 방식이 API인 동안(`apiChosen`: 설치 active·지금 계정·구독 `limited`·API `eligible`)은 미루기 조건을 빼고 집는다. 기한(`review_deferred_until`)은 지우지 않아 API가 잠기거나 구독으로 돌아오면 다시 적용된다.
+- **변경 자체 리뷰 회수:** 이 lease로 v2를 보냈으면(`method_runs.lease`) v2 저장 결과를 `lookup(…, 기대 선택)`으로 읽고 같은 규칙으로 귀속한다. 회수에서 다시 넣을 때는 unknown(또는 멈춤 확인 뒤 failed)에서 되돌리고 unknown 조사 표식을 지운다. ACK는 지금처럼 한다. 이 회수는 스위치를 꺼도 된다(끈 뒤에도 v2로 낸 결과를 읽어야 한다).
+- **작업(v1 `/v1/task`):** 요청 끝 `execution` 칸에 선택을 싣는다. 구독 한도 + 근거 + 세션 보존(`sessionRetained`)이면 세션을 `waiting_model`(턴 예산 제외)로 두고 같은 job을 다시 넣어 다음 턴(`--resume`, 같은 세대·세션)으로 API에 잇는다. 도구 수·실행 시간은 세션에 합산된 값에서 이어 와 새로 채워지지 않는다. 세션이 남지 않았으면 넘어가지 않고 지금처럼 기다리되, 다른 경로가 API를 쓸 수 있으면 작업 레인만 막는다(`laneOnly`). 실행 칸이 보낸 선택과 다르거나 없으면 응답 유실로 다룬다.
+- **작업 `not_run`(C39 넘김):** 재개 턴이면 세션을 `waiting_model`로 두어 다음 턴 번호로, 첫 턴이면 세션을 `cancelled`로 닫아 새 세대로 다시 보낸다. 턴 예산에서는 뺀다.
+- **변경 작성 턴(v2, `ClaudeChangeAuthor`)은 고르지 않는다.** 요청을 만드는 자리가 이 티켓의 소유 파일 밖이라 옛 판(방식 표시) 그대로다.
+
+**5. 관리 진입점(`homelab-bot-admin/v1`).** C42 CLI가 부를 명령과 출력 모양이다.
+
+| 명령 | 결과 이름(종료 코드) | 하는 일 |
+|---|---|---|
+| `account auto-install <이름> <revision>` | `auto_installed`(0), `unknown_account`(3, 두 방식 중 하나라도 미등록), `not_current`(3) | 설치 기록. 지금 계정·모델 대기·한도 관측은 건드리지 않는다. 같은 계정이면 구독 상태를 남기고, 새 revision이면 API 잠금을 푼다 |
+| `account auto-off` | `auto_disabled`(0), `not_installed`(0) | 설치를 `off`로. 상태·잠금·기록은 지우지 않는다 |
+| `account auto-status` | `auto_status`(0) | 보기만 |
+| `account api-unlock` | `api_unlocked`(0), `not_locked`(0) | API 잠금 해제(owner의 명시 동작) |
+
+- 네 명령의 보고에는 `methods: { installed, account, revision, state, refusal, current, subscription: { state, until, nextProbeAt } | null, api: { state, blockedAt } | null }`가 붙는다(시각은 ms, 값·지문·잔액 없음). revision 모양은 `^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$`이고 틀리면 `usage`(64)다.
+- C42 순서: 두 방식 값 넷·묶음을 두 파드에 반영·확인 → (계정이 바뀌면) 지금처럼 `account use <이름> subscription` → `account auto-install <이름> <revision>`. 수동 `account use`는 바꾸지 않았다. 수동으로 같은 계정의 다른 방식을 쓰면(CLI가 반대 자격을 비움) 다음 새 판 요청이 `not_run`으로 거부되고 설치가 `refused`가 되어 지금 동작으로 돌아간다.
+- homelab CLI의 결과 이름 집합(`BOT_RESULTS`)에 새 이름 일곱을 더하는 것은 C42다.
+
+**6. C41이 읽을 재료.** 지워지지 않는 감사 기록 `method_route_subscription_limited`(넘어감 "선택됨", 풀리는 시각·API 상태), `method_route_subscription_returned`(구독 성공 확인 뒤 돌아옴, 한도 시작 시각), `method_route_api_locked`(이유), `method_route_api_unlocked`(`by: owner|revision`), `method_route_refused`. 실행마다 `method_runs`(API로 "실제 실행됨"은 `method='api' AND outcome IS NOT NULL AND outcome<>'not_run'`). 모델을 부르지 않은 변경 자체 리뷰 결과(`problems`만)는 `method_runs`가 생기기 전에 끝나 세지 않는다.
+
+**알려진 한계.**
+
+- **작업 경로의 자동 사용은 C45 확인 전이라도 같은 스위치로 켜진다.** 명세 §4.11은 구독 ↔ API `--resume` 실호환을 C45가 확인하기 전에는 작업 경로를 켜지 않는다고 했다. 경로별 스위치를 따로 두지 않았으므로, owner가 C45 전에 스위치를 켜려면 작업 레인을 끄거나 C45를 먼저 해야 한다(분해 불일치로 보고).
+- **API 잠금 동안의 구독 확인 수:** API가 잠겨 두 방식이 다 막힌 동안은 지금의 재개 예약 루프가 확인 시각에 멈춘 작업을 모두 되돌린다. 슬롯이 직렬이라 첫 확인이 다시 한도면 나머지는 다시 멈춘다(지금 동작과 같다).
+- **확인 실행을 잃으면:** 확인 실행의 결과를 받지 못하면(unknown·재시작) 그 자리는 작업 실행 상한 + lease 뒤에 다른 실행이 대신한다.
+- **세션이 남지 않은 첫 턴의 API 결제 실패**는 구독이 쓸 수 있어도 다시 넣지 않고 지금 규칙(결제 멈춤)이다.
+- **늦은 결과의 일:** 고를 때와 설치가 달라진 실행의 한도·인증 결과는 상태를 바꾸지 않고 그 일을 다시 넣는다. 그 일이 옛 계정에서 이미 실행됐어도 다시 한 번 실행된다(대화·리뷰는 같은 입력의 재실행, 작업은 다음 턴).

@@ -95,6 +95,8 @@ test('AC-33 구독 한도 실패 뒤 같은 계정·revision의 API 실행이 �
   // 구독 한도가 이 일을 멈추지 않는다: 같은 작업이 대기열로 돌아가고 전역 scheduler도 닫히지 않는다.
   assert.equal((await job()).state, 'queued');
   assert.notEqual(await scheduler(), true);
+  // 계정 기록에는 그 구독 실행의 마지막 한도 관측이 남는다.
+  assert.deepEqual((await rows('model_limit_state')).map(row => row.status), ['rejected']);
   f.setRun(answered);
   await runtime.tick();
   assert.equal((await job()).state, 'succeeded');
