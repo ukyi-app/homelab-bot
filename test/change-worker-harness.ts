@@ -8,7 +8,7 @@ import { gitBlobSha } from '../src/change-contracts.js';
 import { gitTreeSha } from '../src/change-artifact.js';
 import { IsolatedVerifier } from '../src/change-verifier.js';
 import type { VerifierOptions } from '../src/change-verifier.js';
-import { StaticEnvCredential } from '../src/credentials.js';
+import { MethodEnvCredential, StaticEnvCredential } from '../src/credentials.js';
 import { runChangeTurn } from '../src/executor-claude-task.js';
 import { ProcessGroupLauncher } from '../src/process-launcher.js';
 import type { ArchiveFetcher } from '../src/review-input.js';
@@ -45,7 +45,9 @@ export interface ChangeWorkerFixture {
 }
 export async function changeWorkerFixture(options: { items?: TarItem[]; currentItems?: () => TarItem[]; verifier?: Partial<VerifierOptions>; change?: boolean;
   // 게시 서버 서명 시계. 두 요청을 같은 밀리초에 서명시키는 시험이 쓴다.
-  signerNow?: () => number; } = {}): Promise<ChangeWorkerFixture> {
+  signerNow?: () => number;
+  // 두 방식과 계정 묶음을 함께 설치한 운영 자격 조립(방식 선택 시험, DECISIONS "C39"). 묶음·API 키 파일은 시험이 쓴다.
+  methods?: boolean; } = {}): Promise<ChangeWorkerFixture> {
   const base = await realpath(await mkdtemp(join(tmpdir(), 't19-b1-')));
   const fake = join(base, 'fake');
   const credential = join(base, 'credential');
@@ -66,7 +68,10 @@ export async function changeWorkerFixture(options: { items?: TarItem[]; currentI
   const archiveUrls: string[] = [];
   const fetchArchive: ArchiveFetcher = async url => { archiveUrls.push(url); return archive(options.currentItems?.() ?? items); };
   const boot = async (): Promise<{ service: TaskWorkerService; running: Server; url: string; close: () => Promise<void> }> => {
-    const credentialStore = new StaticEnvCredential(credentialFile, []);
+    const credentialStore = options.methods
+      ? new MethodEnvCredential({ subscription: credentialFile, api: join(credential, 'ANTHROPIC_API_KEY') }, join(credential, 'CLAUDE_AUTH_METHOD'), [],
+        join(credential, 'CLAUDE_ACCOUNT_BUNDLE'))
+      : new StaticEnvCredential(credentialFile, []);
     const launcher = new ProcessGroupLauncher([bin], { cleanup });
     const control = new RunControl(credentialStore, launcher, { homes: [] });
     const verifier = new IsolatedVerifier({ imageRevision: 'fixture-image', cleanup, secrets: () => credentialStore.secrets(), ...options.verifier });

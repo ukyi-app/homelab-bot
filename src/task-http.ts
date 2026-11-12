@@ -26,7 +26,21 @@ export const TaskIntakeSchema = z.object({ version: z.literal(1), open: z.boolea
   capabilities: z.object({ lanes: z.object({ task: z.literal(true) }) }).loose(),
   // v2 계약을 받는 작업자에만 있다. instructions는 v2 요청에 받는 지시문 판 목록이고, 칸이 없는 옛 작업자는 옛 판(TASK_INSTRUCTIONS_REVISION)만 받는다.
   // z.object라 이 칸을 모르는 옛 게시 서버도 칸을 버리고 받는다.
-  change: z.object({ contract: z.number().int(), verifierRevision: z.string().max(128), instructions: z.array(z.string().max(64)).max(16).optional() }).optional() });
+  change: z.object({ contract: z.number().int(), verifierRevision: z.string().max(128), instructions: z.array(z.string().max(64)).max(16).optional() }).optional(),
+  // 방식 선택(execution 칸)을 받는 끝점. 계정 묶음을 읽는 작업자에만 있고, 칸이 없으면 어느 끝점도 받지 않는다(DECISIONS "C39").
+  executionSelection: z.array(z.string().max(64)).max(16).optional() });
+export const TASK_EXECUTION_SELECTION_ENDPOINTS = ['/v1/task', '/v2/task'] as const;
+// 이 작업자가 방식 선택을 받는 끝점. 게시 서버는 여기 있는 끝점에만 execution 칸을 싣는다. 확인하지 못하면 빈 목록이다(C40이 쓴다).
+export async function taskWorkerExecutionSelection(workerUrl: string, send: typeof fetch, signal: AbortSignal): Promise<readonly string[]> {
+  try {
+    const response = await send(new URL(TASK_INTAKE_PATH, workerUrl).href, { method: 'GET', redirect: 'error', signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]) });
+    if (!response.ok) { await response.body?.cancel().catch(() => {}); return []; }
+    const parsed = TaskIntakeSchema.safeParse(await response.json());
+    if (!parsed.success) return [];
+    const listed = parsed.data.executionSelection ?? [];
+    return TASK_EXECUTION_SELECTION_ENDPOINTS.filter(path => listed.includes(path));
+  } catch { return []; }
+}
 export type TaskIntakeStatus = { routed: boolean; open: boolean; reasons: readonly string[] };
 export const TASK_INTAKE_UNREACHED: TaskIntakeStatus = Object.freeze({ routed: false, open: false, reasons: [] });
 export async function taskWorkerIntake(workerUrl: string, send: typeof fetch, signal: AbortSignal): Promise<TaskIntakeStatus> {
@@ -234,7 +248,8 @@ export function taskRoutes(service: TaskWorkerService, capabilities: object, log
   const intake: WorkerRoute = async (req, res) => {
     if (req.method !== 'GET') { res.writeHead(404).end(); return; }
     res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ version: 1, open: service.intake.open, reasons: service.intake.reasons, capabilities,
-      ...(service.changeEnabled ? { change: { contract: TASK_V2_CONTRACT, verifierRevision: VERIFIER_REVISION, instructions: TASK_INSTRUCTIONS_REVISIONS } } : {}) }));
+      ...(service.changeEnabled ? { change: { contract: TASK_V2_CONTRACT, verifierRevision: VERIFIER_REVISION, instructions: TASK_INSTRUCTIONS_REVISIONS } } : {}),
+      ...(service.executionSelection ? { executionSelection: [...TASK_EXECUTION_SELECTION_ENDPOINTS].filter(path => path === '/v1/task' || service.changeEnabled) } : {}) }));
   };
   return new Map<string, WorkerRoute>([...(Object.keys(TASK_ENDPOINTS) as TaskEndpoint[]).map(endpoint => [endpoint, route(endpoint)] as const),
     ...(service.changeEnabled ? (Object.keys(TASK_V2_ENDPOINTS) as TaskV2Endpoint[]).map(endpoint => [endpoint, routeV2(endpoint)] as const) : []),

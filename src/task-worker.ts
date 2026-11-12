@@ -167,6 +167,9 @@ export interface TaskWorkerOptions {
   survivors(job: string): Promise<number | null>;
   accepting(): boolean;
   credentialReady(): Promise<boolean>;
+  // 자격이 계정 묶음을 읽어 방식 선택(execution 칸)을 받는가. true면 작업 접수가 지원을 알린다(DECISIONS "C39").
+  // 선택 대조에 실패한 턴은 not_run이고, 접수 영수증이 그 턴 번호를 기록해 같은 턴 번호로는 다시 받지 않는다.
+  executionSelection?: boolean;
   log?: (fields: Record<string, unknown>) => void;
   now?: Clock;
   probeMs?: number;
@@ -225,6 +228,7 @@ export class TaskWorkerService {
     this.results = new ChangeResults(join(this.controlDir, 'change-results'));
   }
   get changeEnabled(): boolean { return this.options.change !== undefined; }
+  get executionSelection(): boolean { return this.options.executionSelection === true; }
   // 기동 때 한 번, 그 뒤로 주기마다. 어떤 실패도 던지지 않는다.
   async start(): Promise<void> {
     await this.probe();

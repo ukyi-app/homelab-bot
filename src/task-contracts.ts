@@ -7,6 +7,7 @@ import { CODEX_DEFAULTS, CODEX_LIMITS, EVIDENCE_PATHS } from './codex.js';
 import { DEFAULTS, Denied, RateLimitInfoSchema } from './contracts.js';
 import type { Clock } from './contracts.js';
 import { MAX_TASK_BYTES } from './review-http.js';
+import { ExecutionAuthSchema, ExecutionSelectionSchema, SELECTION_REFUSALS } from './execution-auth.js';
 import { CAPABILITY_TTL_MS, REPOSITORY_NAME, capabilityDigest, capabilityLive, openCapability, sealCapability } from './worker.js';
 import { NONCE_RETENTION_MS } from './worker-state.js';
 
@@ -116,9 +117,13 @@ const executionShape = {
   toolCalls: bounded(TASK_LIMITS.toolCalls),
   limits: TaskRunLimitsSchema,
 };
+// 방식 선택(DECISIONS "C39"). 이 턴을 돌릴 계정·묶음 revision·방식·실행 ID이고 끝에 두는 선택 칸이다. 칸이 없으면 직렬화·digest가
+// 옛 요청과 같고 작업자는 방식 표시로 돈다. 게시 서버는 작업 접수(intake)의 executionSelection에 그 끝점이 있을 때만 싣는다.
+// 칸을 모르는 옛 작업자는 strict 모양에서 시작 전에 거부한다(조용히 무시하지 않는다).
+const executionSlot = { execution: ExecutionSelectionSchema.optional() };
 const TaskStartSchema = z.strictObject({
   ...executionShape, operation: z.literal('start'), turn: z.literal(1),
-  untrusted: z.strictObject({ request: untrustedText }),
+  untrusted: z.strictObject({ request: untrustedText }), ...executionSlot,
 });
 const TaskResumeSchema = z.strictObject({
   ...executionShape, operation: z.literal('resume'), turn: turn.min(2),
@@ -126,7 +131,7 @@ const TaskResumeSchema = z.strictObject({
   resumeReason: z.enum(['clarification', 'model_limit', 'auth_expired']),
   questionId: z.string().max(100).optional(),
   // 한도·인증으로 끊긴 턴이 답을 나르던 중이었으면 같은 답으로 잇는다. 그 밖에는 작업자의 고정 재개 글을 쓴다.
-  untrusted: z.strictObject({ answer: untrustedText }).optional(),
+  untrusted: z.strictObject({ answer: untrustedText }).optional(), ...executionSlot,
 });
 export const TaskRequestSchema = z.discriminatedUnion('operation', [TaskStartSchema, TaskResumeSchema]).superRefine((request, ctx) => {
   if (request.timeoutMs > request.runBudgetRemainingMs) ctx.addIssue({ code: 'custom', path: ['timeoutMs'], message: 'over_run_budget' });
@@ -185,18 +190,23 @@ const responseShape = {
 // 칸이 없는 옛 작업자 응답도 그대로 받는다. 이 칸을 모르는 옛 게시 서버는 칸이 있는 응답을 거부하므로, 작업자를 이 판으로 둔 채
 // 게시 서버만 이전 판으로 되돌리면 안 된다(VERIFICATION "C03 작업자 한도 정보").
 const rateLimitSlot = { rateLimit: RateLimitInfoSchema.optional() };
+// 방식 선택이 든 요청의 응답에만 있는 실행 칸. unknown에도 있다(시작했을 수 있는 실행은 요청 선택의 방식뿐이다).
+const executionAuthSlot = { execution: ExecutionAuthSchema.optional() };
 // stopped: 이 턴의 프로세스가 0개임을 확인했다. 세션 삭제 여부는 sessionRetained가 따로 말한다.
 // completed·needs_input은 정리가 남아 있으면 내보내지 않는다(실행 뒤 기록 제거 계약). 그 경우는 failed의 cleanup_pending이다.
 export const TaskResponseSchema = z.discriminatedUnion('status', [
   z.strictObject({ ...responseShape, status: z.literal('completed'), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.literal(false),
-    summary: z.string().max(TASK_LIMITS.summaryChars), ...TaskEvidenceShape, ...rateLimitSlot }),
+    summary: z.string().max(TASK_LIMITS.summaryChars), ...TaskEvidenceShape, ...rateLimitSlot, ...executionAuthSlot }),
   z.strictObject({ ...responseShape, status: z.literal('needs_input'), stopped: z.literal(true), sessionRetained: z.literal(true), cleanupPending: z.literal(false),
-    question: z.string().max(TASK_LIMITS.questionChars).refine(text => text.trim().length > 0, 'empty_text'), ...rateLimitSlot }),
-  z.strictObject({ ...responseShape, status: z.enum(['limited', 'auth_expired']), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.boolean(), ...rateLimitSlot }),
+    question: z.string().max(TASK_LIMITS.questionChars).refine(text => text.trim().length > 0, 'empty_text'), ...rateLimitSlot, ...executionAuthSlot }),
+  z.strictObject({ ...responseShape, status: z.enum(['limited', 'auth_expired']), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.boolean(), ...rateLimitSlot, ...executionAuthSlot }),
   z.strictObject({ ...responseShape, status: z.literal('failed'), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.boolean(),
-    reason: z.enum(TASK_FAILURE_REASONS), ...rateLimitSlot }),
+    reason: z.enum(TASK_FAILURE_REASONS), ...rateLimitSlot, ...executionAuthSlot }),
   // 소멸을 확인하지 못했다. 살아 있는 프로세스가 쓸 수 있어 결과·diff를 담지 않고 공간을 지웠다고 말하지 않는다.
-  z.strictObject({ ...responseShape, status: z.literal('unknown'), stopped: z.literal(false), sessionRetained: z.literal(true), cleanupPending: z.boolean() }),
+  z.strictObject({ ...responseShape, status: z.literal('unknown'), stopped: z.literal(false), sessionRetained: z.literal(true), cleanupPending: z.boolean(), ...executionAuthSlot }),
+  // 방식 선택이 든 요청만: 선택 대조에 실패해 모델을 부르지 않았다(모델 턴 아님). 첫 턴이면 작업 공간은 만들어졌을 수 있다.
+  z.strictObject({ ...responseShape, status: z.literal('not_run'), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.literal(false),
+    refusal: z.enum(SELECTION_REFUSALS) }),
 ]);
 export type TaskResponse = z.infer<typeof TaskResponseSchema>;
 
@@ -299,12 +309,12 @@ const { version: _v1Version, ...sharedExecution } = executionShape;
 const v2Execution = { ...sharedExecution, ...v2Identity, instructions: z.enum(TASK_INSTRUCTIONS_REVISIONS) };
 // amendment는 수정 차례에만 있는 선택 칸이고 끝에 둔다. 칸이 없으면 직렬화가 옛 요청과 같다.
 const TaskV2StartSchema = z.strictObject({ ...v2Execution, operation: z.literal('start'), turn: z.literal(1),
-  baseline: TaskV2BaselineSchema, untrusted: z.strictObject({ request: v2Text }), amendment: AmendmentSchema.optional() });
+  baseline: TaskV2BaselineSchema, untrusted: z.strictObject({ request: v2Text }), amendment: AmendmentSchema.optional(), ...executionSlot });
 // 답의 출처를 다시 확인한다. private·unknown은 모양부터 받지 않는다.
 const TaskV2ResumeSchema = z.strictObject({ ...v2Execution, operation: z.literal('resume'), turn: turn.min(2),
   expectedWorker: TaskWorkerIdentitySchema, resumeReason: z.enum(['clarification', 'model_limit', 'auth_expired']),
   questionId: z.string().max(100).optional(),
-  untrusted: z.strictObject({ answer: untrustedText, label: z.enum(['public', 'approved_public_summary']) }).optional() });
+  untrusted: z.strictObject({ answer: untrustedText, label: z.enum(['public', 'approved_public_summary']) }).optional(), ...executionSlot });
 export const TaskV2RequestSchema = z.discriminatedUnion('operation', [TaskV2StartSchema, TaskV2ResumeSchema]).superRefine((request, ctx) => {
   if (request.timeoutMs > request.runBudgetRemainingMs) ctx.addIssue({ code: 'custom', path: ['timeoutMs'], message: 'over_run_budget' });
   if (request.operation === 'start' && request.amendment) {
@@ -342,15 +352,18 @@ export const TaskV2ResultResponseSchema = z.discriminatedUnion('status', [
   z.strictObject({ ...v2Response, status: z.literal('absent'), finalized: z.boolean(), stopped: z.boolean() }),
   // options·checks·risks는 변경 작성 판 요청의 결과에만 있다. 이 칸을 모르는 옛 게시 서버는 칸이 있는 결과를 거부하지만, 옛 서버는 옛 판만 보내므로 받을 일이 없다.
   z.strictObject({ ...turnedResponse, status: z.literal('needs_input'), stopped: z.literal(true), sessionRetained: z.literal(true), cleanupPending: z.literal(false),
-    question: z.string().max(TASK_LIMITS.questionChars).refine(text => text.trim().length > 0, 'empty_text'), ...rateLimitSlot, options: ChangeOptionsSchema.optional() }),
-  z.strictObject({ ...turnedResponse, status: z.enum(['limited', 'auth_expired']), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.boolean(), ...rateLimitSlot }),
-  z.strictObject({ ...turnedResponse, status: z.literal('failed'), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.boolean(), reason: z.enum(TASK_V2_FAILURE_REASONS), ...rateLimitSlot }),
+    question: z.string().max(TASK_LIMITS.questionChars).refine(text => text.trim().length > 0, 'empty_text'), ...rateLimitSlot, options: ChangeOptionsSchema.optional(), ...executionAuthSlot }),
+  z.strictObject({ ...turnedResponse, status: z.enum(['limited', 'auth_expired']), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.boolean(), ...rateLimitSlot, ...executionAuthSlot }),
+  z.strictObject({ ...turnedResponse, status: z.literal('failed'), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.boolean(), reason: z.enum(TASK_V2_FAILURE_REASONS), ...rateLimitSlot, ...executionAuthSlot }),
   // 소멸을 확인하지 못했거나 그 턴의 결과를 잃었다. 다시 돌리지 않는다.
-  z.strictObject({ ...turnedResponse, status: z.literal('unknown'), stopped: z.boolean(), sessionRetained: z.literal(true), cleanupPending: z.boolean() }),
+  z.strictObject({ ...turnedResponse, status: z.literal('unknown'), stopped: z.boolean(), sessionRetained: z.literal(true), cleanupPending: z.boolean(), ...executionAuthSlot }),
+  // 방식 선택이 든 요청만: 선택 대조에 실패해 모델을 부르지 않았다(v1 응답의 not_run과 같은 뜻).
+  z.strictObject({ ...turnedResponse, status: z.literal('not_run'), stopped: z.literal(true), sessionRetained: z.boolean(), cleanupPending: z.literal(false),
+    refusal: z.enum(SELECTION_REFUSALS) }),
   // 프로세스 소멸을 확인한 뒤 실제 파일로 계산한 결과다. 모델의 요약은 싣지 않는다.
   // checks·risks는 작성 모델이 쓴 확인할 것·남은 위험이다. 증거(승인 digest 재료)가 아니고, 공개 경로로 내기 전에 게시 서버가 공개 검사를 거친다.
   z.strictObject({ ...turnedResponse, status: z.literal('snapshot'), stopped: z.literal(true), sessionRetained: z.literal(true), cleanupPending: z.literal(false),
-    artifactDigest: Sha256Schema, artifact: WireArtifactSchema, ...rateLimitSlot, checks: ChangeNotesSchema.optional(), risks: ChangeNotesSchema.optional() }),
+    artifactDigest: Sha256Schema, artifact: WireArtifactSchema, ...rateLimitSlot, checks: ChangeNotesSchema.optional(), risks: ChangeNotesSchema.optional(), ...executionAuthSlot }),
 ]);
 export type TaskV2ResultResponse = z.infer<typeof TaskV2ResultResponseSchema>;
 // 저장해 두는 결과. identity는 읽을 때 지금 작업자로 다시 채운다. 파드가 바뀌어도 같은 저장소면 같은 결과다.

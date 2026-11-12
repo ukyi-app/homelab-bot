@@ -896,3 +896,34 @@ test('C25 intake: 받는 지시문 판을 알린다. 칸이 없는 옛 작업자
   const g = await fresh({ change: false });
   assert.deepEqual(await taskWorkerChangeInstructions(g.url, fetch, AbortSignal.timeout(2000)), []);
 });
+
+test('C39 작업 v2 방식 선택: 저장 결과가 실행 칸을 보존하고, 대조 실패는 모델 호출 없이 not_run 결과다. 칸 없는 요청의 결과는 옛 모양이다(AC-34·AC-42)', async () => {
+  const f = await fresh({ methods: true });
+  // 지문은 `printf '%s' <값> | sha256sum`으로 따로 얻은 값이다(FIXTURE_TOKEN과 아래 합성 API 키).
+  const apiKey = 'sk-ant-api03-fixture-key-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789';
+  await writeFile(join(f.base, 'credential', 'ANTHROPIC_API_KEY'), `${apiKey}\n`);
+  await writeFile(join(f.base, 'credential', 'CLAUDE_ACCOUNT_BUNDLE'), JSON.stringify({ version: 1, account: 'main', revision: 'r7', fingerprints: {
+    subscription: '9985396575295f03c5721663be755c756073d47e517f1d41f2d7cd26200ce0eb', api: '4df03dd919b430eb05b7562f34a740af803661d8c3896c0a6affeec0dc608bf7' } }));
+  await f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  const execution = { account: 'main', credentialRevision: 'r7', method: 'api' as const, runId: randomUUID() };
+  const request = f.start({ execution });
+  await f.signed('/v2/task', request);
+  const done = await settledResult(f, request);
+  assert.equal(done.status, 'snapshot');
+  assert.deepEqual(done.execution, { ...execution, subscriptionLimit: false });
+  // 가짜 CLI가 실행 env의 두 자격 변수를 그대로 적어 둔다(task-worker-harness FAKE_CLAUDE).
+  const [call] = await f.calls() as unknown as { apiKey?: string; token?: string }[];
+  assert.deepEqual([call!.apiKey, call!.token], [apiKey, undefined]);
+  // 다른 계정: 모델 호출 없이 not_run 결과.
+  const other = f.start({ execution: { ...execution, account: 'other', runId: randomUUID() } });
+  await f.signed('/v2/task', other);
+  const refused = await settledResult(f, other);
+  assert.deepEqual([refused.status, refused.refusal, refused.stopped], ['not_run', 'bundle_mismatch', true]);
+  assert.equal((await f.calls()).length, 1);
+  // 칸 없는 요청: 방식 표시(없으면 구독)로 돌고 결과에 실행 칸이 없다.
+  const old = f.start();
+  await f.signed('/v2/task', old);
+  const plain = await settledResult(f, old);
+  assert.equal(plain.status, 'snapshot');
+  assert.equal('execution' in plain, false);
+});

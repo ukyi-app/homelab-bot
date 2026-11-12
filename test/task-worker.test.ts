@@ -401,3 +401,35 @@ test('B5 기동 검사: CLI 버전이 다르면 닫힘, 기준 상태가 깨끗�
   const status = TaskStatusResponseSchema.parse((await fixture.signed('/v1/task/status', control(request))).json);
   assert.deepEqual([status.state, status.stopped], ['unknown', false]);
 });
+
+// C39 작업 레인 방식 선택(S2). 자격은 합성 값이고 지문은 `printf '%s' <값> | sha256sum`으로 따로 얻은 값이다(harness의 TOKEN과 같은 값).
+const C39_API_KEY = 'sk-ant-api03-fixture-key-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789';
+const C39_BUNDLE = { version: 1, account: 'main', revision: 'r7', fingerprints: {
+  subscription: '9985396575295f03c5721663be755c756073d47e517f1d41f2d7cd26200ce0eb',
+  api: '4df03dd919b430eb05b7562f34a740af803661d8c3896c0a6affeec0dc608bf7' } };
+test('C39 작업 v1 방식 선택: 접수가 지원을 알리고, 고른 방식 하나로 돌아 실행 칸을 내며, 대조 실패는 모델 호출 없이 not_run이다(AC-34·AC-42)', async () => {
+  fixture = await workerFixture();
+  const credentialDir = fixture.env.WORKER_CREDENTIAL_DIR!;
+  await writeFile(join(credentialDir, 'ANTHROPIC_API_KEY'), `${C39_API_KEY}\n`);
+  await writeFile(join(credentialDir, 'CLAUDE_ACCOUNT_BUNDLE'), JSON.stringify(C39_BUNDLE));
+  const advertised = await (await fetch(`${fixture.url}/v1/task/intake`)).json() as { executionSelection?: string[] };
+  assert.deepEqual(advertised.executionSelection, ['/v1/task', '/v2/task']);
+  const execution = { account: 'main', credentialRevision: 'r7', method: 'api' as const, runId: randomUUID() };
+  const done = await fixture.signed('/v1/task', startRequest({ execution }));
+  assert.equal(done.json.status, 'completed');
+  assert.deepEqual(done.json.execution, { ...execution, subscriptionLimit: false });
+  let call = (await fixture.calls()).at(-1)!;
+  assert.deepEqual([call.apiKey, call.token], [C39_API_KEY, undefined]);
+  // 옛 요청(칸 없음)은 방식 표시(없으면 구독)로 돌고 응답에 실행 칸이 없다.
+  const old = await fixture.signed('/v1/task', startRequest());
+  assert.equal(old.json.status, 'completed');
+  assert.equal('execution' in old.json, false);
+  call = (await fixture.calls()).at(-1)!;
+  assert.deepEqual([typeof call.token, call.apiKey], ['string', undefined]);
+  // 묶음과 다른 revision: 모델 호출 0건, 턴으로 세지 않는 not_run.
+  const calls = (await fixture.calls()).length;
+  const refused = await fixture.signed('/v1/task', startRequest({ execution: { ...execution, credentialRevision: 'r6', runId: randomUUID() } }));
+  assert.equal(TaskResponseSchema.parse(refused.json).status, 'not_run');
+  assert.equal(refused.json.refusal, 'bundle_mismatch');
+  assert.equal((await fixture.calls()).length, calls);
+});

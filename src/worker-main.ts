@@ -179,6 +179,8 @@ async function startTaskWorker(config: WorkerConfig, stateRoot: string, options:
     survivors: async job => launcher ? launcher.survivors(job) : null,
     accepting: () => control?.accepting() ?? true,
     credentialReady: () => credential.ready(),
+    // 계정 묶음을 읽는 프로필(methods)만 방식 선택을 받는다.
+    executionSelection: config.profile.methods !== null,
     log: options.log,
     ...options.taskProbe });
   const server = taskWorkerServer(service, config.profile.taskCapabilities!, options.log);

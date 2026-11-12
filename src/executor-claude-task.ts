@@ -9,6 +9,7 @@ import { CLAUDE_AUTH, CLAUDE_CLI_VERSION, CLAUDE_FIXED_ENV, ClaudeChatAdapter, M
   compactClaudeEvent, interpretClaudeStream, modelViolation, noteClaudeError, runAuth, safeIdentifier, seenApiError, seenStopReason } from './executor-claude.js';
 import type { ClaudeAuth, ClaudeErrorSeen, ClaudeExpectation, ClaudeStreamPolicy, Compact } from './executor-claude.js';
 import type { AdapterRun, ChatAdapter, ChatRun, EngineOutcome, ExecutorCapabilities, ExitStatus, Observation, PolicyViolation } from './executor.js';
+import { executionAuth, subscriptionLimitFailure } from './execution-auth.js';
 import { bounded } from './format.js';
 import type { ArchiveFetcher } from './review-input.js';
 import type { RunControl, RunReport } from './run-control.js';
@@ -366,7 +367,7 @@ export type TaskLog = (fields: Record<string, unknown>) => void;
 const KNOWN_REASONS = new Set<string>(TASK_FAILURE_REASONS);
 const REFUSALS: Readonly<Record<NonNullable<RunReport['refused']>, TaskFailureReason>> = {
   lane_closed: 'lane_closed', busy: 'busy', survivors_unconfirmed: 'lane_closed', cleanup_pending: 'cleanup_pending', prepare_failed: 'prepare_failed', aborted: 'aborted',
-  // 작업 레인 요청에는 아직 방식 선택이 없어(DECISIONS "C39" 남은 경로) 오지 않는다. 오면 띄우기 전 실패다.
+  // 방식 선택 거부는 판정 전에 not_run으로 끝나(executeTaskTurn) 여기 오지 않는다. 오면 띄우기 전 실패다.
   selection: 'prepare_failed',
 };
 type Base = Pick<TaskResponse, 'version' | 'job' | 'lease' | 'generation' | 'sessionId' | 'turn' | 'worker' | 'usage'>;
@@ -380,7 +381,7 @@ type JudgeInput = { request: TaskRequest; base: Base; report: RunReport; cancell
 export async function judgeTaskRun(input: JudgeInput): Promise<TaskResponse> {
   const judged = await judgeTurn(input);
   const rateLimit = input.report.outcome?.rateLimit;
-  return rateLimit && judged.status !== 'unknown' ? { ...judged, rateLimit } : judged;
+  return rateLimit && judged.status !== 'unknown' && judged.status !== 'not_run' ? { ...judged, rateLimit } : judged;
 }
 async function judgeTurn(input: JudgeInput): Promise<TaskResponse> {
   const { request, base, report, cancelled, session, sessions, log, change } = input;
@@ -496,18 +497,21 @@ export async function runChangeTurn(deps: TaskTurnDeps, request: TaskV2Request, 
   const v1 = { ...shared, version: 1 } as unknown as TaskRequest;
   const response = await runTaskTurn({ ...deps, change }, v1, signal);
   const identity = { version: TASK_V2_CONTRACT, job: response.job, lease: response.lease, generation: response.generation, sessionId: response.sessionId, turn: response.turn, worker: response.worker, usage: response.usage } as const;
-  if (response.status === 'unknown') return { ...identity, status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: response.cleanupPending };
+  if (response.status === 'not_run') return { ...identity, status: 'not_run', stopped: true, sessionRetained: response.sessionRetained, cleanupPending: false, refusal: response.refusal };
+  // v1 판정이 붙인 실행 칸을 v2 결과로 옮긴다(방식 선택이 든 요청에만 있다).
+  const execution = response.execution ? { execution: response.execution } : {};
+  if (response.status === 'unknown') return { ...identity, status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: response.cleanupPending, ...execution };
   const rateLimit = response.rateLimit ? { rateLimit: response.rateLimit } : {};
-  if (response.status === 'limited' || response.status === 'auth_expired') return { ...identity, status: response.status, stopped: true, sessionRetained: response.sessionRetained, cleanupPending: response.cleanupPending, ...rateLimit };
+  if (response.status === 'limited' || response.status === 'auth_expired') return { ...identity, status: response.status, stopped: true, sessionRetained: response.sessionRetained, cleanupPending: response.cleanupPending, ...rateLimit, ...execution };
   if (response.status === 'needs_input') {
     const options = notes && 'options' in notes ? { options: notes.options } : {};
-    return { ...identity, status: 'needs_input', stopped: true, sessionRetained: true, cleanupPending: false, question: response.question, ...rateLimit, ...options };
+    return { ...identity, status: 'needs_input', stopped: true, sessionRetained: true, cleanupPending: false, question: response.question, ...rateLimit, ...options, ...execution };
   }
-  const failed = (reason: TaskV2FailureReason, sessionRetained: boolean, cleanupPending = false): TaskV2TurnResult => ({ ...identity, status: 'failed', stopped: true, sessionRetained, cleanupPending, reason, ...rateLimit });
+  const failed = (reason: TaskV2FailureReason, sessionRetained: boolean, cleanupPending = false): TaskV2TurnResult => ({ ...identity, status: 'failed', stopped: true, sessionRetained, cleanupPending, reason, ...rateLimit, ...execution });
   if (response.status === 'failed') return failed(blocked ?? response.reason, response.sessionRetained, response.cleanupPending);
   if (!artifact) return failed(blocked ?? 'artifact_incomplete', response.sessionRetained);
   const authored = notes && 'checks' in notes ? { checks: notes.checks, risks: notes.risks } : {};
-  const snapshot: TaskV2TurnResult = { ...identity, status: 'snapshot', stopped: true, sessionRetained: true, cleanupPending: false, artifactDigest: artifactDigest(artifact.manifest), artifact: encodeArtifact(artifact), ...rateLimit, ...authored };
+  const snapshot: TaskV2TurnResult = { ...identity, status: 'snapshot', stopped: true, sessionRetained: true, cleanupPending: false, artifactDigest: artifactDigest(artifact.manifest), artifact: encodeArtifact(artifact), ...rateLimit, ...authored, ...execution };
   // 결과 전체가 한 응답에 들어가야 한다. 넘으면 자르지 않고 닫는다.
   if (Buffer.byteLength(JSON.stringify(snapshot)) > ARTIFACT_LIMITS.httpBodyBytes) return failed('artifact_too_large', response.sessionRetained);
   return snapshot;
@@ -533,15 +537,27 @@ async function executeTaskTurn(deps: TaskTurnDeps, request: TaskRequest, signal:
   const report = await deps.control.run({ adapter, lane: 'task', job: request.job, model: deps.model, session: { dirs: session.dirs },
     timeoutMs: request.timeoutMs, toolCalls: request.toolCalls,
     schema: deps.change?.authoring?.schema ?? TASK_OUTPUT_JSON_SCHEMA, prompt: deps.change?.authoring?.prompt ?? taskPrompt(request),
-    limits: { lineBytes: request.limits.lineBytes, outputBytes: request.limits.outputBytes, events: request.limits.events } }, signal);
+    limits: { lineBytes: request.limits.lineBytes, outputBytes: request.limits.outputBytes, events: request.limits.events },
+    ...(request.execution ? { selection: request.execution } : {}) }, signal);
   trace.report = report;
+  // 선택 대조 실패는 모델을 부르지 않은 것이라 턴으로 세지 않는다.
+  if (request.execution && report.refused === 'selection' && report.selectionRefusal) {
+    return { ...base, status: 'not_run', stopped: true, sessionRetained: await retained(), cleanupPending: false, refusal: report.selectionRefusal };
+  }
   base.usage = { toolCalls: report.toolCalls ?? null, model: adapter.usage };
   const launched = report.survivors === 0 && !report.refused && !report.launchFailed;
   if (launched) await deps.sessions.recordTurn(session, request.turn).catch(() => {});
   const judged = await judgeTaskRun({ request, base, report, cancelled: signal.aborted, session, sessions: deps.sessions, ...(deps.log ? { log: deps.log } : {}), ...(deps.change ? { change: deps.change } : {}) });
   // 판정은 공간이 남아 있다고 가정하고 값을 채운다. 소멸을 확인한 응답은 실제 경로로 덮는다. needs_input은 보존이 계약이라 공간이 없으면 아래에서 실패가 된다.
-  const response = judged.status === 'unknown' ? judged : { ...judged, sessionRetained: await retained() } as TaskResponse;
+  const response = withExecution(request, report, judged.status === 'unknown' ? judged : { ...judged, sessionRetained: await retained() } as TaskResponse);
   // 계약에 맞지 않는 응답은 내보내지 않는다. 소멸을 확인한 경우에만 실패로 바꿀 수 있고, 아니면 unknown 그대로다.
   if (TaskResponseSchema.safeParse(response).success) return response;
-  return report.survivors === 0 ? failedResponse(base, 'finish_failed', await retained()) : { ...base, status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: false };
+  return withExecution(request, report, report.survivors === 0 ? failedResponse(base, 'finish_failed', await retained())
+    : { ...base, status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: false });
+}
+// 방식 선택이 든 요청의 응답에만 실행 칸을 붙인다. 칸은 요청 선택으로 만들고, 넘어갈 근거 판정은 한도 응답에만 싣는다.
+function withExecution(request: TaskRequest, report: RunReport, response: TaskResponse): TaskResponse {
+  if (!request.execution || response.status === 'not_run') return response;
+  const limit = response.status === 'limited' && subscriptionLimitFailure(request.execution.method, report.outcome);
+  return { ...response, execution: executionAuth(request.execution, limit) };
 }
