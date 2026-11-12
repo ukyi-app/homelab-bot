@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS method_routing (
 CREATE TABLE IF NOT EXISTS method_runs (
   run_id text PRIMARY KEY,
   job_id text NOT NULL,
+  -- 그 실행의 job lease. 저장 결과 회수(변경 자체 리뷰)가 lease로 이 선택을 찾아 v2 결과를 읽는다.
+  lease text,
   path text NOT NULL CHECK (path IN ('chat', 'review', 'change_review', 'task')),
   account text NOT NULL,
   revision text NOT NULL,

@@ -62,7 +62,7 @@ export class MethodRouter {
   get enabled(): boolean { return this.options.enabled; }
 
   // 이 실행의 방식. null이면 옛 판 요청을 보낸다. 고르면 실행 기록을 남기고, 그 실행 ID가 요청의 서명된 선택 칸이 된다.
-  async select(job: Pick<Job, 'id' | 'budget'>, path: MethodPath): Promise<ExecutionSelection | null> {
+  async select(job: Pick<Job, 'id' | 'budget' | 'lease_token'>, path: MethodPath): Promise<ExecutionSelection | null> {
     if (!this.options.enabled || !this.options.supported(path)) return null;
     return this.store.atomic(async s => {
       // 넘어감·복귀 전이와 같은 scheduler 행 잠금 아래에서 읽고 고른다(두 게시 서버가 같은 확인 자리를 함께 잡지 않게).
@@ -84,8 +84,8 @@ export class MethodRouter {
           await s.db.query(`UPDATE method_routing SET probe_run=$1,probe_until=$2,updated_at=$3 WHERE id='current'`, [runId, now + hold, now]);
         } else method = 'api';
       }
-      await s.db.query(`INSERT INTO method_runs(run_id,job_id,path,account,revision,method,epoch,probe,selected_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-        [runId, job.id, path, row.account, row.revision, method, row.epoch, probe, now]);
+      await s.db.query(`INSERT INTO method_runs(run_id,job_id,lease,path,account,revision,method,epoch,probe,selected_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+        [runId, job.id, job.lease_token ?? null, path, row.account, row.revision, method, row.epoch, probe, now]);
       return { account: row.account, credentialRevision: row.revision, method, runId };
     });
   }
@@ -99,9 +99,20 @@ export class MethodRouter {
     return (await tx.query('SELECT 1 FROM model_accounts WHERE name=$1 AND current', [row.account])).rows.length > 0;
   }
 
+  // 그 job lease로 보낸 새 판 요청의 선택(결과를 아직 귀속하지 않은 것). 저장 결과 회수가 v2 결과를 읽고 대조할 때 쓴다.
+  // 스위치·지원과 무관하게 찾는다: 끈 뒤에도 이미 v2로 낸 결과는 회수해야 한다(옛 판 파서는 읽지 못한다).
+  async pendingSelection(job: Pick<Job, 'id' | 'lease_token'>): Promise<ExecutionSelection | null> {
+    if (!job.lease_token) return null;
+    const run = (await this.store.db.query<RunRow>(`SELECT * FROM method_runs WHERE job_id=$1 AND lease=$2 AND settled_at IS NULL
+      ORDER BY selected_at DESC LIMIT 1`, [job.id, job.lease_token])).rows[0];
+    return run ? { account: run.account, credentialRevision: run.revision, method: run.method, runId: run.run_id } : null;
+  }
+
   // 작업자 결과(멈춤이 확인된 것)를 그 실행의 고정된 선택으로 귀속하고, 필요하면 같은 트랜잭션에서 이 일을 다시 대기열에 넣는다.
   // 같은 실행의 두 번째 보고는 아무것도 바꾸지 않는다(default).
-  async settle(job: Pick<Job, 'id' | 'lease_token'>, selection: ExecutionSelection, outcome: RoutedOutcome): Promise<Settlement> {
+  // recovered: 저장 결과 회수로 받은 결과다. 그 job은 실행 중이 아니라 unknown(또는 멈춤 확인 뒤 failed)이라 그 상태에서 되돌린다.
+  async settle(job: Pick<Job, 'id' | 'lease_token'>, selection: ExecutionSelection, outcome: RoutedOutcome,
+    options: { recovered?: boolean } = {}): Promise<Settlement> {
     return this.store.atomic(async s => {
       // 같은 한도를 두 게시 서버·두 실행 자리가 함께 보고해도 넘어감이 한 번이 되도록 scheduler 행 → 상태 행 순서로 잡는다
       // (모델 대기 Store.waitForUser·계정 전환과 같은 순서).
@@ -116,7 +127,7 @@ export class MethodRouter {
       // 고를 때의 설치와 지금 설치가 같은 계정·revision이고 켜져 있을 때만 상태를 바꾼다. 옛 계정·옛 revision의 늦은 결과는
       // 지금 상태·API 잠금·리뷰 미룸을 건드리지 않는다. 그 일은 지금 설치(또는 옛 판)로 다시 고르도록 대기열로 돌린다.
       const current = row !== undefined && row.install_state === 'active' && row.account === run.account && row.revision === run.revision;
-      const requeue = async (): Promise<Settlement> => await this.requeue(s, job) ? { action: 'requeued' } : DEFAULT;
+      const requeue = async (): Promise<Settlement> => await this.requeue(s, job, options.recovered === true) ? { action: 'requeued' } : DEFAULT;
       if (outcome.status === 'not_run') {
         if (current) {
           await s.db.query(`UPDATE method_routing SET install_state='refused',refused_reason=$1,epoch=epoch+1,updated_at=$2 WHERE id='current'`,
@@ -184,11 +195,15 @@ export class MethodRouter {
   }
 
   // 실행 중이던 작업을 같은 행 그대로 대기열로 되돌린다. 한도·거부로 끝난 실행은 시도로 세지 않는다(멈춤 기록과 같은 규칙).
-  // lease가 살아 있고 running일 때만이다(취소 요청은 호출자의 취소 경로가 맡는다).
-  private async requeue(s: Store, job: Pick<Job, 'id' | 'lease_token'>): Promise<boolean> {
-    return (await s.db.query(`UPDATE jobs SET state='queued',available_at=$3,wait_reason=NULL,lease_token=NULL,lease_until=NULL,
-      started_at=NULL,finished_at=NULL,attempt=GREATEST(0,attempt-1) WHERE id=$1 AND lease_token=$2 AND lease_until>$3 AND state='running'
+  // lease가 살아 있고 running일 때만이다(취소 요청은 호출자의 취소 경로가 맡는다). 회수한 결과면 그 lease의 unknown(또는 멈춤 확인 뒤
+  // failed)에서 되돌리고 unknown 조사 표식을 지운다(변경 자체 리뷰의 waitRecovered와 같은 조건).
+  private async requeue(s: Store, job: Pick<Job, 'id' | 'lease_token'>, recovered: boolean): Promise<boolean> {
+    const from = recovered ? `(state='unknown' OR (state='failed' AND wait_reason='stop_confirmed_after_unknown'))` : `lease_until>$3 AND state='running'`;
+    const moved = (await s.db.query(`UPDATE jobs SET state='queued',available_at=$3,wait_reason=NULL,lease_token=NULL,lease_until=NULL,
+      started_at=NULL,finished_at=NULL,attempt=GREATEST(0,attempt-1) WHERE id=$1 AND lease_token=$2 AND ${from}
       RETURNING id`, [job.id, job.lease_token, s.now()])).rows.length > 0;
+    if (moved && recovered) await s.db.query('DELETE FROM controls WHERE key=$1', [`unknown_probe:${job.id}`]);
+    return moved;
   }
 }
 

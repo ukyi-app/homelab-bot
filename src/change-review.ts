@@ -19,6 +19,7 @@ import type { ExecutionSelection } from './execution-auth.js';
 import { ArchiveError, SECRET_PATTERNS, readArchive } from './review-input.js';
 import type { ArchiveFetcher, ReviewerResult, ReviewerRun } from './review-input.js';
 import type { Store } from './store.js';
+import type { MethodRouter } from './method-routing.js';
 import { archiveContract, CancelRequestSchema, ExecutionSlot, REPOSITORY_NAME } from './worker.js';
 import type { CancelRequest, WorkerSigner, WorkerVerifier } from './worker.js';
 import { beforeConnection } from './worker-http.js';
@@ -147,7 +148,7 @@ export const ChangeReviewWorkerResultV2Schema = z.discriminatedUnion('status', [
   NotRunSchema,
 ]);
 export type ChangeReviewWorkerResultV2 = z.infer<typeof ChangeReviewWorkerResultV2Schema>;
-type AnyChangeReviewResult = ChangeReviewWorkerResult | ChangeReviewWorkerResultV2;
+export type AnyChangeReviewResult = ChangeReviewWorkerResult | ChangeReviewWorkerResultV2;
 // 작업자는 요청 선택으로만 돌 수 있어 실행 칸은 그 선택과 같아야 한다. 칸이 없는(옛 판) 결과는 v2 요청의 결과가 아니다.
 const sameChangeSelection = (expected: ExecutionSelection, result: AnyChangeReviewResult) => result.status === 'not_run'
   || ('execution' in result && (['account', 'credentialRevision', 'method', 'runId'] as const).every(key => result.execution[key] === expected[key]));
@@ -164,11 +165,13 @@ export type ChangeReviewLookupResponse = z.infer<typeof LookupResponseSchema>;
 export const ChangeReviewLookupResponseV2Schema = z.union([z.strictObject({ found: z.literal(true), result: StoredResultSchema }),
   z.strictObject({ found: z.literal(false) })]);
 export type ChangeReviewLookupResponseV2 = z.infer<typeof ChangeReviewLookupResponseV2Schema>;
+// v2 요청(방식 선택 칸)에는 v2 응답이 온다. lookup은 v2 저장 결과까지 읽는 회수이고, 없는 클라이언트에는 v2를 보내지 않는다.
 export interface ChangeReviewWorkerClient {
-  review(task: ChangeReviewTask, capability: string, signal: AbortSignal): Promise<ChangeReviewWorkerResult>;
+  review(task: ChangeReviewTask | ChangeReviewTaskV2, capability: string, signal: AbortSignal): Promise<AnyChangeReviewResult>;
   cancel(request: CancelRequest, capability: string): Promise<{ stopped: boolean }>;
   result(request: ChangeReviewResultLookup, capability: string): Promise<ChangeReviewLookupResponse>;
   ack(request: ChangeReviewAck, capability: string): Promise<void>;
+  lookup?(request: ChangeReviewResultLookup, capability: string, expected?: ExecutionSelection): Promise<ChangeReviewLookupResponseV2>;
 }
 
 // ---- diff 완전성 ----
@@ -785,10 +788,14 @@ const sleep = (ms: number) => new Promise(resolve => { setTimeout(resolve, ms); 
 export class ChangeReviewService implements ChangeReviewPort {
   private readonly pollMs: number;
   private readonly drainMs: number;
+  private methods?: MethodRouter;
   constructor(private readonly deps: ChangeReviewServiceOptions) {
     this.pollMs = deps.pollMs ?? 1000;
     this.drainMs = deps.drainMs ?? 0;
   }
+  // 한도 뒤 API 사용(C40). 조립(change-assembly)이 만든 서비스에 게시 서버 조립(main)이 붙인다. 없으면 v1 요청 그대로다.
+  // v2 저장 결과를 회수하려면 작업자 클라이언트에 lookup이 있어야 해서, 없으면 붙이지 않는다.
+  useMethods(methods: MethodRouter): void { if (this.deps.worker.lookup) this.methods = methods; }
   private get db() { return this.deps.changes.database; }
 
   // round가 1 이상이면 그 수정 차례(C27)의 증거다. 처음 게시의 증거와 섞이지 않는다.
@@ -933,22 +940,39 @@ export class ChangeReviewService implements ChangeReviewPort {
   private async recover(job: Job, key: EvidenceKey): Promise<ReviewReceipt | null> {
     // 서명 digest는 키 순서를 탄다. 작업자가 파싱한 모양과 같도록 스키마를 거친 값에 서명한다.
     const lookup = ResultLookupSchema.parse({ version: 1, kind: 'result', job: job.id, lease: job.lease_token });
-    let found: ChangeReviewLookupResponse;
-    try { found = await this.deps.worker.result(lookup, this.deps.signer.issue(job, 'execute', lookup)); }
-    catch { return null; }
+    // 이 lease로 v2를 보냈으면 v2 저장 결과를 읽고 실행 칸을 그 선택과 대조한다. 옛 판 회수로는 v2 결과를 읽지 못한다.
+    const selection = this.methods ? await this.methods.pendingSelection(job) : null;
+    let found: ChangeReviewLookupResponse | ChangeReviewLookupResponseV2;
+    try {
+      const capability = this.deps.signer.issue(job, 'execute', lookup);
+      found = selection && this.deps.worker.lookup ? await this.deps.worker.lookup(lookup, capability, selection) : await this.deps.worker.result(lookup, capability);
+    } catch { return null; }
     if (!found.found || found.result.status === 'unknown') return null;
-    if (found.result.status === 'limited' || found.result.status === 'auth_expired') {
-      const reason = found.result.status === 'limited' ? 'model_limit' : 'auth_expired';
-      if (await this.waitRecovered(job, reason, found.result.rateLimit ?? null)) await this.deps.notifyWaiting(job, reason);
+    const result = found.result;
+    if (result.status === 'not_run') {
+      const settled = selection && this.methods ? await this.methods.settle(job, selection, { status: 'not_run', refusal: result.refusal }, { recovered: true }) : undefined;
+      if (settled?.action !== 'requeued') await this.closeJob(job, 'failed', 'worker_not_run');
       await this.acknowledge(job);
       return null;
     }
-    if (found.result.status !== 'succeeded') {
-      await this.closeJob(job, 'failed', found.result.status === 'failed' ? reasonCode(found.result.reason) : found.result.status);
+    const outcome = { status: result.status, rateLimit: result.rateLimit ?? null, subscriptionLimit: 'execution' in result && result.execution.subscriptionLimit };
+    if (result.status === 'limited' || result.status === 'auth_expired') {
+      // 회수한 결과도 즉시 결과와 같은 규칙이다: 다른 방식으로 이으면 같은 리뷰를 다시 넣는다.
+      const settled = selection && this.methods ? await this.methods.settle(job, selection, outcome, { recovered: true }) : undefined;
+      if (settled?.action !== 'requeued') {
+        const reason = settled?.action === 'wait' || result.status === 'limited' ? 'model_limit' : 'auth_expired';
+        if (await this.waitRecovered(job, reason, settled?.action === 'wait' ? settled.rateLimit : result.rateLimit ?? null)) await this.deps.notifyWaiting(job, reason);
+      }
       await this.acknowledge(job);
       return null;
     }
-    return this.settle(job, key, found.result);
+    if (selection && this.methods) await this.methods.settle(job, selection, outcome, { recovered: true }).catch(() => {});
+    if (result.status !== 'succeeded') {
+      await this.closeJob(job, 'failed', result.status === 'failed' ? reasonCode(result.reason) : result.status);
+      await this.acknowledge(job);
+      return null;
+    }
+    return this.settle(job, key, result);
   }
   // 정상 응답의 store.waitForUser와 같은 대기다. 그 함수는 실행 중 lease만 받아 회수 경로의 unknown을 옮기지 못한다.
   private async waitRecovered(job: Job, reason: 'model_limit' | 'auth_expired', rateLimit: RateLimitInfo | null): Promise<boolean> {
@@ -1038,6 +1062,7 @@ export class ChangeReviewService implements ChangeReviewPort {
     const { store, signer, worker, shutdown } = this.deps;
     let dispatched = false;
     let stopped = false;
+    let selection: ExecutionSelection | null = null;
     const keepalive = setInterval(() => { void store.heartbeat(job).catch(() => {}); }, this.pollMs);
     try {
       const link = (await this.db.query<{ change_id: string; generation: number; role: string; amendment_round: number | string }>('SELECT change_id,generation,role,amendment_round FROM change_child_jobs WHERE job_id=$1', [job.id])).rows[0];
@@ -1067,6 +1092,9 @@ export class ChangeReviewService implements ChangeReviewPort {
       if (live.state === 'cancel_requested') { await this.closeJob(job, 'cancelled', 'cancel_before_dispatch'); return; }
       if (live.state !== 'running' || !await store.heartbeat(job)) return;
       if (shutdown?.aborted) { await store.defer(job, 'publisher_shutdown'); return; }
+      // 방식을 고를 수 있으면 v1 칸·순서 그대로 끝에 선택 칸을 붙인 v2를 보낸다. 작성 세션과 다른 별도 리뷰 실행이라 선택도 따로다.
+      selection = this.methods ? await this.methods.select(job, 'change_review') : null;
+      const sent: ChangeReviewTask | ChangeReviewTaskV2 = selection ? ChangeReviewTaskV2Schema.parse({ ...task, version: 2, execution: selection }) : task;
       const abort = new AbortController();
       const cancelBody = { job: job.id, lease: job.lease_token };
       let stopping: Promise<{ stopped: boolean }> | undefined;
@@ -1075,7 +1103,7 @@ export class ChangeReviewService implements ChangeReviewPort {
       let drain: ReturnType<typeof setTimeout> | undefined;
       const onShutdown = () => { drain = setTimeout(() => { drained = true; void stopRequest(); abort.abort(); }, this.drainMs); };
       shutdown?.addEventListener('abort', onShutdown, { once: true });
-      const interrupted = new Promise<ChangeReviewWorkerResult>(resolve => {
+      const interrupted = new Promise<AnyChangeReviewResult>(resolve => {
         abort.signal.addEventListener('abort', () => resolve({ status: 'unknown', stopped: false }), { once: true });
       });
       let checking: Promise<void> | undefined;
@@ -1087,11 +1115,11 @@ export class ChangeReviewService implements ChangeReviewPort {
         })().catch(() => abort.abort()).finally(() => { checking = undefined; });
       }, this.pollMs);
       let timeout: ReturnType<typeof setTimeout> | undefined;
-      let result: ChangeReviewWorkerResult;
+      let result: AnyChangeReviewResult;
       try {
-        const capability = signer.issue(job, 'execute', task);
+        const capability = signer.issue(job, 'execute', sent);
         dispatched = true;
-        result = await Promise.race([worker.review(task, capability, abort.signal), interrupted,
+        result = await Promise.race([worker.review(sent, capability, abort.signal), interrupted,
           new Promise<ChangeReviewWorkerResult>(resolve => { timeout = setTimeout(() => { abort.abort(); resolve({ status: 'unknown', stopped: false }); }, task.timeoutMs); })]);
       } finally {
         clearInterval(monitor); clearTimeout(timeout); clearTimeout(drain);
@@ -1107,13 +1135,26 @@ export class ChangeReviewService implements ChangeReviewPort {
       }
       if (!result.stopped) { await store.transition(job, 'unknown', 'worker_disconnected'); return; }
       stopped = true;
-      if (result.status === 'limited' || result.status === 'auth_expired') {
-        const reason = result.status === 'limited' ? 'model_limit' : 'auth_expired';
-        await store.waitForUser(job, reason, { rateLimit: result.rateLimit ?? null });
-        await this.deps.notifyWaiting(job, reason);
+      if (result.status === 'not_run') {
+        // 선택이 설치된 묶음과 맞지 않아 모델을 부르지 않았다. 시도로 세지 않고 다시 넣는다(다음은 옛 판). 못 넣으면 실패로 닫는다.
+        const settled = selection && this.methods ? await this.methods.settle(job, selection, { status: 'not_run', refusal: result.refusal }) : undefined;
+        if (settled?.action !== 'requeued') await this.closeJob(job, 'failed', 'worker_not_run');
         await this.acknowledge(job);
         return;
       }
+      const outcome = { status: result.status, rateLimit: result.rateLimit ?? null, subscriptionLimit: 'execution' in result && result.execution.subscriptionLimit };
+      if (result.status === 'limited' || result.status === 'auth_expired') {
+        // 한도 뒤 API 사용: 다른 방식으로 이으면 같은 리뷰를 다시 넣고 멈추지 않는다. 두 방식이 다 막히면 구독 확인 시각의 멈춤이다.
+        const settled = selection && this.methods ? await this.methods.settle(job, selection, outcome) : undefined;
+        if (settled?.action !== 'requeued') {
+          const reason = settled?.action === 'wait' || result.status === 'limited' ? 'model_limit' : 'auth_expired';
+          await store.waitForUser(job, reason, { rateLimit: settled?.action === 'wait' ? settled.rateLimit : result.rateLimit ?? null });
+          await this.deps.notifyWaiting(job, reason);
+        }
+        await this.acknowledge(job);
+        return;
+      }
+      if (selection && this.methods) await this.methods.settle(job, selection, outcome).catch(() => {});
       if (result.status !== 'succeeded') {
         await this.closeJob(job, 'failed', reasonCode(result.reason));
         await this.acknowledge(job);

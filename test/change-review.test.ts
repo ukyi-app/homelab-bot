@@ -23,7 +23,9 @@ import type { ExecutionSelection } from '../src/execution-auth.js';
 import { StaticEnvCredential } from '../src/credentials.js';
 import { ClaudeReviewAdapter } from '../src/executor-claude.js';
 import { readArchive } from '../src/review-input.js';
-import type { ArchiveFetcher } from '../src/review-input.js';
+import type { ArchiveFetcher, ReviewerRun } from '../src/review-input.js';
+import { MethodRouter, installMethods } from '../src/method-routing.js';
+import { recordAccount, switchAccount } from '../src/model-accounts.js';
 import { CHANGE_REVIEW_OUTPUT_JSON_SCHEMA, changeReviewPrompt, createChangeReviewerModel } from '../src/review-lane.js';
 import { ReviewRuntime } from '../src/review.js';
 import { RunControl } from '../src/run-control.js';
@@ -78,7 +80,7 @@ let changes: ChangeStore;
 before(async () => { database = await localDatabase(); await mkdir('.local', { recursive: true }); });
 beforeEach(async () => {
   await database.pg.exec(`TRUNCATE events,conversations,jobs,results,outbox,schedules,denied_actors,controls,audit,incidents,
-    github_deliveries,pr_reviews,review_deliveries,change_requests RESTART IDENTITY CASCADE`);
+    github_deliveries,pr_reviews,review_deliveries,change_requests,model_accounts,method_routing,method_runs RESTART IDENTITY CASCADE`);
   f = await fixture(database.db);
   await seedConversation(database.db);
   changes = new ChangeStore(database.db, f.now);
@@ -105,10 +107,10 @@ async function reviewing(options: { patch?: string; manifest?: ArtifactManifest;
 }
 type Input = Awaited<ReturnType<typeof reviewing>>;
 
-function harness(options: { reply?: () => Awaited<ReturnType<ChangeReviewerModel>>; client?: (worker: ChangeReviewWorker) => ChangeReviewWorkerClient; dir?: string; archive?: Record<string, string>; saveFails?: () => boolean } = {}) {
+function harness(options: { reply?: (run: ReviewerRun) => Awaited<ReturnType<ChangeReviewerModel>>; client?: (worker: ChangeReviewWorker) => ChangeReviewWorkerClient; dir?: string; archive?: Record<string, string>; saveFails?: () => boolean } = {}) {
   const inputs: ChangeReviewerInput[] = [];
   const reply = options.reply ?? (() => ({ status: 'succeeded' as const, output: OUTPUT }));
-  const model: ChangeReviewerModel = async input => { inputs.push(structuredClone(input)); return structuredClone(reply()); };
+  const model: ChangeReviewerModel = async (input, _signal, run) => { inputs.push(structuredClone(input)); return structuredClone(reply(run)); };
   const archive = tarGz(options.archive ?? { 'AGENTS.md': GUIDELINES, 'src/app.ts': APP_BEFORE });
   const fetches: { url: string; init: Parameters<ArchiveFetcher>[1] }[] = [];
   const fetcher: ArchiveFetcher = async (url, init) => { fetches.push({ url, init }); return archive; };
@@ -793,6 +795,47 @@ for (const recovered of [false, true]) {
     f.advance(1);
     assert.equal(await f.store.resumeDue(), 1);
     assert.equal((await jobOf(input.key)).state, 'queued');
+  });
+}
+
+// C40 한도 뒤 API 사용의 변경 자체 리뷰 경로(AC-39). 즉시 결과·저장 결과 회수·ACK가 같은 넘어감 규칙과 실행별 방식 귀속을 따른다.
+async function methodsInstalled(h: ReturnType<typeof harness>) {
+  await recordAccount(database.db, 'main', 'subscription', f.now());
+  await recordAccount(database.db, 'main', 'api', f.now());
+  await f.store.atomic(s => switchAccount(s, 'main', 'subscription', 'cli', 'cli'));
+  await f.store.atomic(s => installMethods(s, 'main', 'rev-1'));
+  h.service.useMethods(new MethodRouter(f.store, { enabled: true, supported: () => true }));
+}
+const runsByMethod = (methods: (string | undefined)[], resetsAt: number) => (run: ReviewerRun) => {
+  methods.push(run.selection?.method);
+  return run.selection?.method === 'subscription'
+    ? { status: 'limited' as const, rateLimit: { stop: { cause: 'rate_limit' as const, resetsAt } }, subscriptionLimit: true }
+    : { status: 'succeeded' as const, output: OUTPUT };
+};
+// 응답을 잃어도 v2 저장 결과를 lookup으로 회수할 수 있는 클라이언트.
+const lostResponseV2 = (worker: ChangeReviewWorker): ChangeReviewWorkerClient => ({ ...lostResponse(worker), lookup: (r, c) => worker.lookup(r, c) });
+for (const recovered of [false, true]) {
+  const path = recovered ? '응답 유실 뒤 회수' : '정상 응답';
+  test(`AC-39 변경 자체 리뷰(${path})도 구독 한도 실패 뒤 같은 리뷰를 같은 계정의 API로 한 번 이어서 receipt를 만들고 결과를 지운다`, async () => {
+    const methods: (string | undefined)[] = [];
+    const h = harness({ reply: runsByMethod(methods, Math.floor((f.now() + 60 * MINUTE) / 1000)), ...(recovered ? { client: lostResponseV2 } : {}) });
+    await methodsInstalled(h);
+    const input = await reviewing();
+    await h.service.submit(portInput(input));
+    await h.runtime.tick();
+    const first = await jobOf(input.key);
+    if (recovered) assert.equal(await h.service.fetchReceipt(input.key), null);
+    // 자리 비움 안내 없이 같은 리뷰가 대기열로 돌아갔고 작업자의 저장 결과는 ACK로 지워졌다.
+    assert.equal((await jobOf(input.key)).state, 'queued');
+    assert.deepEqual(h.waits, []);
+    assert.equal(await h.results.get(first.id, first.lease_token), null);
+    await h.runtime.tick();
+    const receipt = recovered ? await h.service.fetchReceipt(input.key) : (await storedReviews(input.key))[0]?.receipt;
+    assert.equal((receipt as { verdict: string }).verdict, 'pass');
+    assert.equal((await jobOf(input.key)).state, 'succeeded');
+    assert.deepEqual(methods, ['subscription', 'api']);
+    const runs = (await database.db.query<{ method: string; outcome: string; path: string }>('SELECT method,outcome,path FROM method_runs ORDER BY selected_at,method DESC')).rows;
+    assert.deepEqual(runs.map(row => [row.path, row.method, row.outcome]), [['change_review', 'subscription', 'limited'], ['change_review', 'api', 'succeeded']]);
   });
 }
 
