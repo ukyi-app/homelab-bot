@@ -87,7 +87,8 @@ export function subscriptionLimitFailure(method: Method, outcome: EngineOutcome 
 // 지원 확인. 작업자 HTTP의 인증 없는 GET 경로이고, 방식 고르기를 받는 요청 경로 이름 목록을 낸다. 옛 작업자는 이 경로가 없어 404다.
 // 게시 서버는 목록에 그 경로가 있을 때만 새 판 요청을 보낸다. 모르는 이름은 무시한다(뒤 판이 이름을 더할 수 있다).
 export const WORKER_CONTRACTS_PATH = '/v1/contracts';
-// chat: 대화 요청 v3(/v1/execute). review: PR 리뷰 요청 v2(/v1/review).
-export const EXECUTION_SELECTION_PATHS = ['chat', 'review'] as const;
+// chat: 대화 요청 v3(/v1/execute). review: PR 리뷰 요청 v2(/v1/review). change_review: 변경 자체 리뷰 요청 v2(/v1/change-review).
+// 작업 레인은 이 경로가 아니라 작업 접수(/v1/task/intake)의 지원 표시로 알린다.
+export const EXECUTION_SELECTION_PATHS = ['chat', 'review', 'change_review'] as const;
 export const WorkerContractsSchema = z.object({ executionSelection: z.array(z.string().max(64)).max(32) });
 export type WorkerContracts = z.infer<typeof WorkerContractsSchema>;

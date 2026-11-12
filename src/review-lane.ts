@@ -104,7 +104,8 @@ export function createChangeReviewerModel(executor: Pick<Executor, 'reviewAdapte
   const adapter = executor.reviewAdapter;
   if (!adapter?.capabilities.lanes.review) throw new WorkerStartError('review_unsupported');
   assertEgressBound(control.proxy);
-  return async (input, signal, run) => interpretReview(await control.run({ adapter, lane: 'review', job: run.job, model: options.model,
+  return async (input, signal, run) => interpretSelectedReview(await control.run({ adapter, lane: 'review', job: run.job, model: options.model,
     prefix: RUN_PREFIX.review, timeoutMs: run.timeoutMs, toolCalls: 0, schema: CHANGE_REVIEW_OUTPUT_JSON_SCHEMA,
-    prompt: changeReviewPrompt(input), limits: options.limits ?? REVIEW_LIMITS }, signal), ChangeReviewOutputSchema);
+    prompt: changeReviewPrompt(input), limits: options.limits ?? REVIEW_LIMITS, ...(run.selection ? { selection: run.selection } : {}) }, signal),
+  run.selection, ChangeReviewOutputSchema);
 }

@@ -250,7 +250,8 @@ export async function startWorker(config: WorkerConfig, options: StartWorkerOpti
   }
   const accepting = () => control.accepting();
   // 지원 확인 경로는 레인과 무관하게 연다. 방식 고르기는 계정 묶음을 읽는 프로필(methods)만 받고, 연 레인의 경로만 알린다.
-  const selectable = config.profile.methods ? EXECUTION_SELECTION_PATHS.filter(path => path !== 'review' || review) : [];
+  const opened = { chat: true, review: !!review, change_review: !!changeReview };
+  const selectable = config.profile.methods ? EXECUTION_SELECTION_PATHS.filter(path => opened[path]) : [];
   const routes = new Map([[WORKER_CONTRACTS_PATH, contractsRoute(selectable)],
     ...(review ? reviewRoutes(review, accepting) : []), ...(review && changeReview ? changeReviewRoutes(changeReview, accepting) : [])]);
   // 종료가 시작되면 새 실행 요청은 실행 전에 거부한다(취소는 계속 받는다).
