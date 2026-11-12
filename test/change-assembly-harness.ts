@@ -68,6 +68,9 @@ export interface HarnessOptions {
   amendments?: { discussion: AmendmentDiscussionReader };
   // 처음 오는 /v2/task/verify 두 건을 같은 밀리초에 서명한다. 게시 서버 둘의 토큰이 같아져 작업자가 늦은 쪽을 재사용으로 거부한다.
   sameMillisecondVerify?: boolean;
+  // 한도 뒤 API 사용(C40). 작업자 fixture에는 계정 묶음이 없어 방식 선택을 받지 않으므로, 턴 요청은 sent에 기록하고 선택 칸을 빼고 보낸다.
+  // result가 있으면 턴 결과를 그것으로 바꾼다(작업자의 실행 칸·실행 안 됨을 시험이 만든다).
+  methods?: { sent: Record<string, any>[]; result?: (response: any, sent: Record<string, any>[]) => unknown };
 }
 export interface Harness {
   db: Database; env: PublishEnv; f: ChangeWorkerFixture; store: Store; changes: ChangeStore; gate: PolicyGate; policy: { current: Policy }; rest: MockDiscord; ingress: DiscordIngress; discord: DiscordPublisher;
@@ -176,7 +179,14 @@ export async function changeHarness(db: Database, options: HarnessOptions = {}):
   const v2 = { callV2: (async (endpoint: never, body: never, signal?: AbortSignal) => {
     reach();
     if (armed && endpoint === '/v2/task/verify') return collide(() => f.port.callV2(endpoint, body, signal));
-    const answered = await f.port.callV2(endpoint, body, signal);
+    let forwarded: never = body;
+    if (options.methods && endpoint === '/v2/task') {
+      options.methods.sent.push(body);
+      const { execution: _execution, ...rest } = body as Record<string, unknown>;
+      forwarded = rest as never;
+    }
+    const answered = await f.port.callV2(endpoint, forwarded, signal);
+    if (options.methods?.result && endpoint === '/v2/task/result') return { ...answered, response: options.methods.result(answered.response, options.methods.sent) };
     // 변경 작성 판 작업자처럼 결과에 확인할 것·남은 위험을 싣는다. 게시 서버가 아직 옛 판을 보내 실제 작업자는 이 칸을 내지 않는다.
     const response = answered.response as { status?: string };
     if (options.notes && endpoint === '/v2/task/result' && response.status === 'snapshot') return { ...answered, response: { ...response, ...options.notes } };

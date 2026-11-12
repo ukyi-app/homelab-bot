@@ -121,9 +121,10 @@ export class MethodRouter {
 
   // 그 job lease로 보낸 새 판 요청의 선택(결과를 아직 귀속하지 않은 것). 저장 결과 회수가 v2 결과를 읽고 대조할 때 쓴다.
   // 스위치·지원과 무관하게 찾는다: 끈 뒤에도 이미 v2로 낸 결과는 회수해야 한다(옛 판 파서는 읽지 못한다).
-  async pendingSelection(job: Pick<Job, 'id' | 'lease_token'>): Promise<ExecutionSelection | null> {
+  // settled: 이미 귀속한 실행도 찾는다. 변경 작성은 같은 턴 결과(snapshot)를 저장 전에 다시 읽을 수 있어, 귀속 뒤에도 그 결과의 실행 칸을 대조해야 한다.
+  async pendingSelection(job: Pick<Job, 'id' | 'lease_token'>, settled = false): Promise<ExecutionSelection | null> {
     if (!job.lease_token) return null;
-    const run = (await this.store.db.query<RunRow>(`SELECT * FROM method_runs WHERE job_id=$1 AND lease=$2 AND settled_at IS NULL
+    const run = (await this.store.db.query<RunRow>(`SELECT * FROM method_runs WHERE job_id=$1 AND lease=$2${settled ? '' : ' AND settled_at IS NULL'}
       ORDER BY selected_at DESC LIMIT 1`, [job.id, job.lease_token])).rows[0];
     return run ? { account: run.account, credentialRevision: run.revision, method: run.method, runId: run.run_id } : null;
   }

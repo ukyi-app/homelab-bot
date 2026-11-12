@@ -391,7 +391,10 @@ export class ChangeRuntime {
       await this.deps.store.requeueChangeAuthor(child.id, child.conversation_id);
       return false;
     }
-    if (!child.session_state) {
+    // 첫 턴이 실행 안 됨(not_run)으로 끝나 다시 보낼 수 있으면 세션은 닫히고 job만 대기열에 돌아와 있다. 새 세대로 다시 시작한다.
+    // 다른 경로는 대기열 job에 닫힌 세션을 남기지 않는다(취소는 job을 끝내고, lease 만료 되돌리기는 세션이 없거나 대기일 때만이다).
+    const restart = child.session_state === 'cancelled' && child.state === 'queued';
+    if (!child.session_state || restart) {
       if (JOB_ENDED.has(child.state)) { await this.authorEnded(request, { to: child.state === 'cancelled' ? 'cancelled' : 'failed', reason: child.wait_reason ?? `author_${child.state}` }); return true; }
       return this.startAuthor(request, child);
     }

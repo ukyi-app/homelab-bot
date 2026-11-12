@@ -42,6 +42,8 @@ import type { Harness } from './change-assembly-harness.js';
 import { OWNER, driveTo, git, hex, insertChildJob, ok, seedConversation } from './change-store-fixture.js';
 import { chatContext } from '../src/chat-context.js';
 import { localDatabase } from './helpers.js';
+import { MethodRouter, installMethods } from '../src/method-routing.js';
+import { recordAccount, switchAccount } from '../src/model-accounts.js';
 import { QUESTION } from './task-worker-harness.js';
 
 // T19 B5 조립 시험. 실제 Discord·GitHub·모델·클러스터에 닿지 않는다. 값은 모두 합성이다.
@@ -939,6 +941,25 @@ test('EVENT-02 결과 유실: 작업자가 결과를 잃은 턴은 모델을 다
     assert.equal((await h.changes.get(id) as any).value.phaseReason, 'task_worker_lost');
     assert.equal((await h.f.calls()).length, 1);
     assert.equal(h.env.github.mutations().length, 0);
+  });
+});
+
+test('C39 넘김 연결: 변경 작성의 첫 턴이 실행 안 됨(not_run)이면 부모를 닫지 않고 새 세대로 선택 없이 다시 시작해 이어 간다', async () => {
+  const turnEnds = new Set(['snapshot', 'needs_input', 'limited', 'auth_expired', 'failed', 'unknown']);
+  const methods = { sent: [] as Record<string, any>[], result: (response: any, sent: Record<string, any>[]) => sent.length === 1 && turnEnds.has(response.status)
+    ? { version: response.version, job: response.job, lease: response.lease, generation: response.generation, sessionId: response.sessionId, worker: response.worker,
+      turn: response.turn, usage: { toolCalls: 0, model: null }, status: 'not_run', stopped: true, sessionRetained: false, cleanupPending: false, refusal: 'bundle_mismatch' }
+    : response };
+  await withHarness({ methods, steps: [WRITE_STEP, WRITE_STEP] }, async h => {
+    await recordAccount(h.db, 'main', 'subscription', Date.now());
+    await recordAccount(h.db, 'main', 'api', Date.now());
+    await h.store.atomic(s => switchAccount(s, 'main', 'subscription', 'cli', 'cli'));
+    assert.equal((await h.store.atomic(s => installMethods(s, 'main', 'rev-1'))).result, 'installed');
+    h.bridge.useMethods(new MethodRouter(h.store, { enabled: true, task: true, supported: () => true }));
+    await toAwaiting(h);
+    assert.deepEqual(methods.sent.map(request => [request.operation, request.generation, request.execution?.method ?? null]), [['start', 1, 'subscription'], ['start', 2, null]]);
+    // 거부한 묶음은 owner가 다시 설치할 때까지 고르지 않는다.
+    assert.deepEqual((await h.db.query<{ install_state: string }>('SELECT install_state FROM method_routing')).rows.map(row => row.install_state), ['refused']);
   });
 });
 
