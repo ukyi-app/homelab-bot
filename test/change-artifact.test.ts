@@ -29,7 +29,7 @@ import type { ChangeWorkerFixture } from './change-worker-harness.js';
 import { REPO_ID, fixtureBrief, git } from './change-store-fixture.js';
 import { fixture as dbFixture, localDatabase, thread } from './helpers.js';
 import { FakeTaskWorker, PLAN, task } from './task-lane-fixture.js';
-import { LIMITS, SHA, archive } from './task-fixtures.js';
+import { LIMITS, SHA, archive, startRequest } from './task-fixtures.js';
 import type { TarItem } from './task-fixtures.js';
 import { QUESTION, COMPLETED } from './task-worker-harness.js';
 import type { Step } from './task-worker-harness.js';
@@ -926,4 +926,96 @@ test('C39 작업 v2 방식 선택: 저장 결과가 실행 칸을 보존하고, 
   const plain = await settledResult(f, old);
   assert.equal(plain.status, 'snapshot');
   assert.equal('execution' in plain, false);
+});
+
+// 두 방식과 계정 묶음을 설치한 작업자. 지문은 위 시험과 같은 `sha256sum` 값이다.
+const C39_API_KEY = 'sk-ant-api03-fixture-key-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789';
+async function methodsFixture(options: Parameters<typeof changeWorkerFixture>[0] = {}) {
+  const f = await fresh({ ...options, methods: true });
+  await writeFile(join(f.base, 'credential', 'ANTHROPIC_API_KEY'), `${C39_API_KEY}\n`);
+  await writeFile(join(f.base, 'credential', 'CLAUDE_ACCOUNT_BUNDLE'), JSON.stringify({ version: 1, account: 'main', revision: 'r7', fingerprints: {
+    subscription: '9985396575295f03c5721663be755c756073d47e517f1d41f2d7cd26200ce0eb', api: '4df03dd919b430eb05b7562f34a740af803661d8c3896c0a6affeec0dc608bf7' } }));
+  return f;
+}
+const c39Selection = () => ({ account: 'main', credentialRevision: 'r7', method: 'api' as const, runId: randomUUID() });
+const dropResults = async (f: ChangeWorkerFixture) => {
+  const dir = join(f.root, '.homelab-worker', 'change-results');
+  for (const name of await readdir(dir).catch(() => [] as string[])) await rm(join(dir, name), { force: true });
+};
+const fetchResult = async (f: ChangeWorkerFixture, request: { job: string; lease: string; generation: number; sessionId: string }) =>
+  (await f.signed('/v2/task/result', { ...identity(request), expectedWorker: null })).json;
+// 되돌린 옛 이미지(55cb3cb)의 영수증 읽기 계약을 그대로 옮긴 리터럴: 이 이름의 파일만 읽고 이 strict 모양만 받는다.
+const OLD_RECEIPT_FILE = /^[0-9a-f-]{36}\.json$/;
+const OLD_RECEIPT_KEYS = { job: ['generations', 'highest', 'touched'], generation: ['cleanupPending', 'fenced', 'finalized', 'lease', 'turn'] };
+
+test('C39 결과 유실·재시작: 선택이 실린 턴의 unknown 재조회에도 원래 실행 칸이 붙고, 칸 없는 요청은 옛 모양 그대로다(RR7-N1)', async () => {
+  const f = await methodsFixture();
+  await f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  const execution = c39Selection();
+  const request = f.start({ execution });
+  await f.signed('/v2/task', request);
+  assert.equal((await settledResult(f, request)).status, 'snapshot');
+  // 결과 파일을 잃었다: 같은 프로세스의 재조회.
+  await dropResults(f);
+  const lost = await fetchResult(f, request);
+  assert.deepEqual([lost.status, lost.execution], ['unknown', { ...execution, subscriptionLimit: false }]);
+  // 재시작 뒤의 재조회: 메모리가 비어도 실행 전에 남긴 선택으로 답한다.
+  await f.restart();
+  const restarted = await fetchResult(f, request);
+  assert.deepEqual([restarted.status, restarted.execution], ['unknown', { ...execution, subscriptionLimit: false }]);
+  // 실행 중 재시작: 결과를 저장하기 전에 프로세스가 사라진 모양(꺼진 사이 결과 파일 없음).
+  await f.script([{ kind: 'hang' }]);
+  const hanging = c39Selection();
+  const running = f.start({ execution: hanging });
+  await f.signed('/v2/task', running);
+  for (let attempt = 0; attempt < 400 && (await f.calls()).length < 2; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+  await f.restart(() => dropResults(f));
+  const crashed = await fetchResult(f, running);
+  assert.deepEqual([crashed.status, crashed.execution], ['unknown', { ...hanging, subscriptionLimit: false }]);
+  // 칸 없는 요청: 같은 유실에도 실행 칸이 없는 옛 unknown이고, 선택 기록 파일도 만들지 않는다.
+  await f.script([writeStep({ 'src/app.txt': 'three\n' })]);
+  const old = f.start();
+  await f.signed('/v2/task', old);
+  await settledResult(f, old);
+  await dropResults(f);
+  const plain = await fetchResult(f, old);
+  assert.equal(plain.status, 'unknown');
+  assert.equal('execution' in plain, false);
+  const receipts = join(f.root, '.homelab-worker', 'receipts');
+  const names = await readdir(receipts);
+  assert.deepEqual(names.filter(name => name.startsWith(old.job)), [`${old.job}.json`]);
+  // 되돌리기: 옛 이미지가 읽는 이름의 파일은 모두 옛 strict 모양이고, 선택 기록은 옛 이미지가 건너뛰는 이름이다.
+  for (const name of names) {
+    if (!OLD_RECEIPT_FILE.test(name)) { assert.ok(name.startsWith(request.job) || name.startsWith(running.job), name); continue; }
+    const record = JSON.parse(await readFile(join(receipts, name), 'utf8')) as { generations: Record<string, object> };
+    assert.deepEqual(Object.keys(record).sort(), OLD_RECEIPT_KEYS.job);
+    for (const generation of Object.values(record.generations)) assert.deepEqual(Object.keys(generation).sort(), OLD_RECEIPT_KEYS.generation);
+  }
+  assert.ok(names.some(name => name.startsWith(request.job) && !OLD_RECEIPT_FILE.test(name)), '선택 기록이 있다');
+  // 선택 기록이 깨져도 기동은 그대로고, 선택을 모르는 unknown은 실행 칸 없이 답한다(다른 선택을 지어내지 않는다).
+  await f.restart(async () => { for (const name of names.filter(name => !OLD_RECEIPT_FILE.test(name))) await writeFile(join(receipts, name), '{broken'); });
+  assert.equal(f.service.intake.open, true);
+  const unread = await fetchResult(f, request);
+  assert.equal(unread.status, 'unknown');
+  assert.equal('execution' in unread, false);
+});
+
+test('C39 턴 예외: 선택이 실린 v1 즉시 응답과 v2 재조회의 unknown에 원래 실행 칸이 붙고, 칸 없는 v1은 옛 모양이다(RR7-N1)', async () => {
+  const f = await methodsFixture({ breakTurn: true });
+  const execution = c39Selection();
+  const request = f.start({ execution });
+  await f.signed('/v2/task', request);
+  const broken = await settledResult(f, request);
+  assert.deepEqual([broken.status, broken.execution], ['unknown', { ...execution, subscriptionLimit: false }]);
+  // v1: 이 도구의 v1 턴은 늘 예외다. 소멸 미확인이 남으면 다음 실행을 받지 않으므로 작업자를 새로 띄운다.
+  const v1 = async (f: ChangeWorkerFixture, overrides: Record<string, unknown>) => {
+    const body = TASK_ENDPOINTS['/v1/task'].request.parse(startRequest(overrides));
+    return (await f.raw('/v1/task', body, f.signer.issue(TASK_ENDPOINTS['/v1/task'].operation, body))).json;
+  };
+  const chosen = c39Selection();
+  const immediate = await v1(await methodsFixture(), { execution: chosen });
+  assert.deepEqual([immediate.status, immediate.execution], ['unknown', { ...chosen, subscriptionLimit: false }]);
+  const old = await v1(await methodsFixture(), {});
+  assert.equal(old.status, 'unknown');
+  assert.equal('execution' in old, false);
 });

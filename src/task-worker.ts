@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import { Denied } from './contracts.js';
 import type { Clock } from './contracts.js';
+import { ExecutionSelectionSchema, executionAuth } from './execution-auth.js';
+import type { ExecutionSelection } from './execution-auth.js';
 import { ChangeResults, decodeArtifact, readBaseline } from './change-artifact.js';
 import { VerificationRecordSchema } from './change-verifier.js';
 import type { IsolatedVerifier, VerificationInput, VerificationRecord } from './change-verifier.js';
@@ -56,25 +58,48 @@ export class TaskIntake {
 const GenerationReceiptSchema = z.strictObject({ lease: z.string(), turn: z.number().int().nonnegative(), fenced: z.boolean(), finalized: z.boolean(), cleanupPending: z.boolean() });
 const JobReceiptSchema = z.strictObject({ highest: z.number().int().positive(), touched: z.number().int(), generations: z.record(z.string(), GenerationReceiptSchema) });
 type GenerationReceipt = z.infer<typeof GenerationReceiptSchema>;
+// 선택이 실린 턴의 unknown에 붙이는 실행 칸. 시작했을 수 있는 실행은 그 선택의 방식뿐이다. 선택이 없으면 옛 모양 그대로다.
+const selected = (execution: ExecutionSelection | undefined) => execution ? { execution: executionAuth(execution) } : {};
 type JobReceipt = z.infer<typeof JobReceiptSchema>;
 const JOB_FILE = /^[0-9a-f-]{36}\.json$/;
+// 방식 선택(DECISIONS "C39")이 실린 턴의 선택 기록. 영수증과 같은 디렉터리·수명의 옆 파일이다.
+// 영수증 파일에 칸을 더하지 않는 이유: 되돌린 옛 이미지가 영수증을 strict 모양으로 읽어 기동에 실패한다. 옛 이미지는 JOB_FILE 이름만 읽어 이 파일을 건너뛴다.
+const SELECTION_FILE = /^([0-9a-f-]{36})\.selection\.json$/;
+const SelectionRecordSchema = z.strictObject({ generations: z.record(z.string(), z.strictObject({ turn: z.number().int().positive(), execution: ExecutionSelectionSchema })) });
+type SelectionRecord = z.infer<typeof SelectionRecordSchema>;
 // 실행 영수증. nonce는 재생 방지이고 실행 멱등은 이것이 맡는다. 재시작 뒤에도 취소된 세대의 늦은 시작과 지난 턴을 거부한다.
 // 메모리가 기준이고 파일은 재시작용 사본이다. 파일을 못 쓰면 실행은 받지 않지만 이미 정해진 fence는 메모리에 남긴다.
 export class TaskReceipts {
   private readonly jobs = new Map<string, JobReceipt>();
+  private readonly selections = new Map<string, SelectionRecord>();
   private queue: Promise<unknown> = Promise.resolve();
   constructor(private readonly dir: string, private readonly now: Clock) {}
   async load(): Promise<void> {
     await mkdir(this.dir, { recursive: true, mode: 0o700 });
-    for (const name of await readdir(this.dir)) {
+    const names = await readdir(this.dir);
+    for (const name of names) {
       if (!JOB_FILE.test(name)) continue;
       this.jobs.set(name.slice(0, -5), JobReceiptSchema.parse(JSON.parse(await readFile(join(this.dir, name), 'utf8'))));
+    }
+    // 선택 기록은 응답에 칸을 붙이는 데만 쓴다. 읽지 못하면 기동을 막지 않고 선택을 모르는 것으로 둔다(칸 없는 unknown).
+    for (const name of names) {
+      const job = SELECTION_FILE.exec(name)?.[1];
+      if (!job || !this.jobs.has(job)) continue;
+      const parsed = SelectionRecordSchema.safeParse(await readFile(join(this.dir, name), 'utf8').then(JSON.parse).catch(() => null));
+      if (parsed.success) this.selections.set(job, parsed.data);
     }
   }
   job(job: string): JobReceipt | undefined { return this.jobs.get(job); }
   generation(job: string, generation: number): GenerationReceipt | undefined { return this.jobs.get(job)?.generations[String(generation)]; }
+  // 그 턴이 실행 전에 남긴 선택. 같은 세대의 다른 턴(칸 없는 턴 포함)의 선택은 돌려주지 않는다.
+  selection(job: string, generation: number, turn: number): ExecutionSelection | undefined {
+    const entry = this.selections.get(job)?.generations[String(generation)];
+    return entry?.turn === turn ? entry.execution : undefined;
+  }
   private async persist(job: string, record: JobReceipt): Promise<void> {
-    const path = join(this.dir, `${job}.json`);
+    await this.write(join(this.dir, `${job}.json`), record);
+  }
+  private async write(path: string, record: unknown): Promise<void> {
     const temporary = `${path}.${randomUUID()}.tmp`;
     try {
       await writeFile(temporary, JSON.stringify(record), { mode: 0o600 });
@@ -95,11 +120,19 @@ export class TaskReceipts {
       generations: { ...record?.generations, [key]: { ...current, ...change } } };
   }
   // 실행 전 기록. 파일에 남겼을 때만 메모리를 바꾼다. 실패한 시도가 뒤의 정상 요청을 막으면 안 된다.
-  begin(job: string, generation: number, lease: string, turn: number): Promise<boolean> {
+  // 선택이 실린 턴은 선택 기록을 먼저 쓴다. 영수증만 남고 선택이 없으면 재시작 뒤 그 턴의 unknown에 칸을 붙일 수 없다.
+  begin(job: string, generation: number, lease: string, turn: number, execution?: ExecutionSelection): Promise<boolean> {
     return this.serial(async () => {
       const record = this.next(job, generation, { lease, turn });
-      try { await this.persist(job, record); } catch { return false; }
+      const current = this.selections.get(job);
+      const selected: SelectionRecord | undefined = execution
+        ? { generations: { ...current?.generations, [String(generation)]: { turn, execution } } } : undefined;
+      try {
+        if (selected) await this.write(join(this.dir, `${job}.selection.json`), selected);
+        await this.persist(job, record);
+      } catch { return false; }
       this.jobs.set(job, record);
+      if (selected) this.selections.set(job, selected);
       return true;
     });
   }
@@ -117,7 +150,14 @@ export class TaskReceipts {
       for (const [job, record] of [...this.jobs]) {
         if (this.now() - record.touched <= RECEIPT_TTL_MS || await hasSpace(job)) continue;
         await rm(join(this.dir, `${job}.json`), { force: true });
+        await rm(join(this.dir, `${job}.selection.json`), { force: true });
         this.jobs.delete(job);
+        this.selections.delete(job);
+      }
+      // 영수증 없는 선택 기록(되돌린 옛 이미지가 영수증만 지운 경우)도 지운다.
+      for (const name of await readdir(this.dir)) {
+        const job = SELECTION_FILE.exec(name)?.[1];
+        if (job && !this.jobs.has(job)) await rm(join(this.dir, name), { force: true });
       }
     });
   }
@@ -321,7 +361,7 @@ export class TaskWorkerService {
   async execute(request: TaskRequest, token: string): Promise<TaskResponse> {
     const { context, active, finish } = await this.claim('task_execute', request, token);
     try {
-      if (!await this.receipts.begin(request.job, request.generation, request.lease, request.turn)) {
+      if (!await this.receipts.begin(request.job, request.generation, request.lease, request.turn, request.execution)) {
         this.intake.close('receipt_write_failed');
         finish(true);
         throw new TaskRouteError(503, 'receipt_write_failed');
@@ -337,7 +377,8 @@ export class TaskWorkerService {
       this.unconfirmed.add(request.job);
       finish(false);
       return { version: 1, job: request.job, lease: request.lease, generation: request.generation, sessionId: request.sessionId, turn: request.turn,
-        worker: context.worker, usage: { toolCalls: null, model: null }, status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: false };
+        worker: context.worker, usage: { toolCalls: null, model: null }, status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: false,
+        ...selected(request.execution) };
     } finally { if (this.turn === active) this.turn = undefined; }
   }
   // ---- v2 ----
@@ -352,7 +393,7 @@ export class TaskWorkerService {
     const { context, active, finish } = await this.claim('task_v2_execute', request, token);
     const release = (stopped: boolean) => { finish(stopped); if (this.turn === active) this.turn = undefined; };
     try {
-      if (!await this.receipts.begin(request.job, request.generation, request.lease, request.turn)) {
+      if (!await this.receipts.begin(request.job, request.generation, request.lease, request.turn, request.execution)) {
         this.intake.close('receipt_write_failed');
         throw new TaskRouteError(503, 'receipt_write_failed');
       }
@@ -369,7 +410,8 @@ export class TaskWorkerService {
         // 깨진 실행은 프로세스가 멈췄다는 증거가 아니다.
         this.unconfirmed.add(request.job);
         result = { version: TASK_V2_CONTRACT, job: request.job, lease: request.lease, generation: request.generation, sessionId: request.sessionId, turn: request.turn,
-          worker: context.worker, usage: { toolCalls: null, model: null }, status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: false };
+          worker: context.worker, usage: { toolCalls: null, model: null }, status: 'unknown', stopped: false, sessionRetained: true, cleanupPending: false,
+          ...selected(request.execution) };
       }
       // 저장하지 못하면 재조회가 unknown을 답한다. 결과 없는 성공으로 넘어가지 않는다.
       await this.results.writeResult(result).catch(() => { this.intake.close('receipt_write_failed'); });
@@ -397,7 +439,8 @@ export class TaskWorkerService {
     if (stored && stored.turn === receipt.turn && stored.lease === request.lease) return { ...stored, worker };
     // 시작을 기록한 턴의 결과가 없다. 재시작 뒤라면 그 프로세스는 없지만 결과도 없다. 모델을 다시 돌리지 않고 그대로 말한다.
     const gone = !this.unconfirmed.has(request.job) && (!!active || !!this.sweeps || await this.options.survivors(request.job).catch(() => null) === 0);
-    return { ...shape, turn: receipt.turn, usage: { toolCalls: null, model: null }, status: 'unknown', stopped: gone, sessionRetained: true, cleanupPending: receipt.cleanupPending };
+    return { ...shape, turn: receipt.turn, usage: { toolCalls: null, model: null }, status: 'unknown', stopped: gone, sessionRetained: true, cleanupPending: receipt.cleanupPending,
+      ...selected(this.receipts.selection(request.job, request.generation, receipt.turn)) };
   }
   private async storedRecord(job: string, generation: number, commandId: string): Promise<VerificationRecord | null> {
     const raw = await this.results.readVerification(job, generation, commandId).catch(() => null);

@@ -47,7 +47,9 @@ export async function changeWorkerFixture(options: { items?: TarItem[]; currentI
   // 게시 서버 서명 시계. 두 요청을 같은 밀리초에 서명시키는 시험이 쓴다.
   signerNow?: () => number;
   // 두 방식과 계정 묶음을 함께 설치한 운영 자격 조립(방식 선택 시험, DECISIONS "C39"). 묶음·API 키 파일은 시험이 쓴다.
-  methods?: boolean; } = {}): Promise<ChangeWorkerFixture> {
+  methods?: boolean;
+  // 턴이 실제로 돈 뒤 예외로 끝나게 한다(실행이 시작된 뒤 깨진 턴, task-worker의 예외 처리 경로).
+  breakTurn?: boolean; } = {}): Promise<ChangeWorkerFixture> {
   const base = await realpath(await mkdtemp(join(tmpdir(), 't19-b1-')));
   const fake = join(base, 'fake');
   const credential = join(base, 'credential');
@@ -77,7 +79,11 @@ export async function changeWorkerFixture(options: { items?: TarItem[]; currentI
     const verifier = new IsolatedVerifier({ imageRevision: 'fixture-image', cleanup, secrets: () => credentialStore.secrets(), ...options.verifier });
     const service = new TaskWorkerService({ root, nonceDir: join(root, '.homelab-worker', 'nonces'), publicKey: keys.publicKey, homes: [], startup: [], log: () => {},
       runTurn: async () => { throw new Error('v1_not_used'); },
-      ...(options.change === false ? {} : { change: { verifier, runTurn: ({ worker, sessions }, request, signal) => runChangeTurn({ control, sessions, fetchArchive, worker, model: 'claude-opus-5-5', auth: 'subscription-token', credentialDir: credential }, request, signal) } }),
+      ...(options.change === false ? {} : { change: { verifier, runTurn: async ({ worker, sessions }, request, signal) => {
+        const result = await runChangeTurn({ control, sessions, fetchArchive, worker, model: 'claude-opus-5-5', auth: 'subscription-token', credentialDir: credential }, request, signal);
+        if (options.breakTurn) throw new Error('turn_broken');
+        return result;
+      } } }),
       stop: job => control.stop(job), survivors: job => launcher.survivors(job), accepting: () => control.accepting(), credentialReady: () => credentialStore.ready() });
     const running = taskWorkerServer(service, { lanes: { task: true } }, () => {});
     await service.start();
