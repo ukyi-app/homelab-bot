@@ -253,6 +253,27 @@ test('B5 호환(게시 서버 gate on + 옛 작업자 이미지): 명령을 열�
   } finally { old.closeAllConnections(); old.close(); }
 });
 
+test('AC-32·AC-42 한도 뒤 API 사용 스위치가 꺼져 있으면 지원 확인조차 보내지 않고, 켜도 두 작업자가 새 판을 알리지 않으면 열리지 않는다', async () => {
+  const old: Server = createServer((_req, res) => { res.writeHead(404).end(); });
+  old.listen(0, '127.0.0.1'); await once(old, 'listening');
+  const taskLane = { workerUrl: `http://127.0.0.1:${(old.address() as AddressInfo).port}/` };
+  const gateLog = () => logs.filter(l => l.event === 'method_routing_gate').map(l => l.detail);
+  try {
+    await boot({ policy: policyWith(TASK_POLICY), taskLane });
+    await registered();
+    await waitFor(() => sends.some(s => s.url.endsWith('/v1/task/intake')));
+    await settle(150);
+    assert.deepEqual(gateLog(), [{ state: 'closed' }]);
+    assert.deepEqual(sends.filter(s => s.url.includes('/v1/contracts')), []);
+    await publisher!.stop(); publisher = undefined; logs = []; sends = [];
+    await boot({ policy: { ...policyWith(TASK_POLICY), apiAfterLimit: true }, taskLane });
+    await registered();
+    await waitFor(() => sends.some(s => s.url.endsWith('/v1/contracts')));
+    await settle(150);
+    assert.deepEqual(gateLog(), [{ state: 'waiting_worker' }]);
+  } finally { old.closeAllConnections(); old.close(); }
+});
+
 test('B5 수직 흐름(둘 다 새 + gate on): /task → needs_input → /answer → 같은 세션 resume → completed → 세션 정리, 작업 중에도 대화는 돎', async () => {
   worker = await workerFixture();
   const keys = generateKeyPairSync('ed25519');

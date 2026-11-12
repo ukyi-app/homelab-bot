@@ -4,6 +4,9 @@ import type { ReleaseOutcome, TaskBridge } from './task-bridge.js';
 import type { ExecutionLaneClosedReason } from './task-contracts.js';
 import { ACCOUNT_METHODS, ACCOUNT_NAME, listAccounts, recordAccount, switchAccount } from './model-accounts.js';
 import type { AccountMethod, AccountView, PausedCounts } from './model-accounts.js';
+import { CREDENTIAL_REVISION } from './execution-auth.js';
+import { disableMethods, installMethods, methodRoutingView, unlockApi } from './method-routing.js';
+import type { MethodRoutingView } from './method-routing.js';
 
 // 관리 기능 진입점의 명령 처리(명세 §4.8, DECISIONS "동료 봇 전환" 3). owner가 클러스터 접근 권한으로 `homelab bot`을 실행하면
 // CLI가 게시 서버 파드 안에서 admin-main을 부른다. 권한의 근거는 클러스터 접근이지 Discord owner ID가 아니다.
@@ -29,19 +32,23 @@ export type AdminCommand =
   | { name: 'block'; user: string }
   | { name: 'release'; job: string }
   | { name: 'account'; action: 'record' | 'use'; account: string; method: AccountMethod }
-  | { name: 'account'; action: 'list' };
+  | { name: 'account'; action: 'list' }
+  // 한도 뒤 API 사용(C40). auto-install은 homelab CLI(C42)가 두 방식·묶음 반영을 확인한 뒤에만 부른다.
+  | { name: 'account'; action: 'auto-install'; account: string; revision: string }
+  | { name: 'account'; action: 'auto-off' } | { name: 'account'; action: 'auto-status' } | { name: 'account'; action: 'api-unlock' };
 
 export type AdminState = { emergency: boolean; paused: boolean; executionPending: boolean; taskLaneClosed: ExecutionLaneClosedReason | null };
 // homelab CLI(cli/src/core/podops.ts BOT_RESULTS)가 받는 이름과 같아야 한다. 이름을 더하면 그쪽 집합도 넓힌다.
 export type AdminResult = 'stopped' | 'already_stopped' | 'released' | 'not_stopped' | 'running_jobs' | 'status' | 'unsupported' | 'usage' | 'failed'
   | 'blocked' | 'already_blocked' | 'not_releasable' | 'resumed' | 'not_waiting' | 'emergency_stopped' | 'queue_full'
-  | 'recorded' | 'accounts' | 'switched' | 'unknown_account';
+  | 'recorded' | 'accounts' | 'switched' | 'unknown_account'
+  | 'auto_installed' | 'not_current' | 'auto_disabled' | 'not_installed' | 'auto_status' | 'api_unlocked' | 'not_locked';
 // 계정 전환 뒤 해제의 결과. resumed는 다시 큐에 넣은 작업 수, waiting은 아직 모델 멈춤으로 기다리는 수,
 // held는 비상 정지로 해제를 못 했으면 그 이유, 아니면 null. 대기열 상한은 해제를 막지 않는다(Store.resumeWaiting).
 // 결과 이름 queue_full은 homelab CLI 집합과 맞추려고 AdminResult에 남아 있고 지금은 내지 않는다.
 export type AccountSwitch = { resumed: number; waiting: number; held: 'emergency_stopped' | null };
 export type AdminReport = { schema: typeof ADMIN_SCHEMA; command: string; result: AdminResult; state?: AdminState;
-  accounts?: AccountView[]; paused?: PausedCounts; switch?: AccountSwitch };
+  accounts?: AccountView[]; paused?: PausedCounts; switch?: AccountSwitch; methods?: MethodRoutingView };
 
 export class AdminUsage extends Error {
   constructor() { super('admin_usage'); }
@@ -63,6 +70,11 @@ export function parseAdminArgs(argv: readonly string[]): AdminCommand {
 // 계정 동작은 `account list`와 `account record|use <이름> subscription|api`뿐이다(api는 API 크레딧 방식).
 function parseAccount([action, account, method, ...rest]: readonly string[]): AdminCommand {
   if (action === 'list' && account === undefined) return { name: 'account', action };
+  if (action === 'auto-off' && account === undefined) return { name: 'account', action };
+  if (action === 'auto-status' && account === undefined) return { name: 'account', action };
+  if (action === 'api-unlock' && account === undefined) return { name: 'account', action };
+  if (action === 'auto-install' && account !== undefined && ACCOUNT_NAME.test(account) && method !== undefined && CREDENTIAL_REVISION.test(method) && !rest.length)
+    return { name: 'account', action, account, revision: method };
   if ((action === 'record' || action === 'use') && account !== undefined && ACCOUNT_NAME.test(account)
     && (ACCOUNT_METHODS as readonly (string | undefined)[]).includes(method) && !rest.length)
     return { name: 'account', action, account, method: method as AccountMethod };
@@ -88,7 +100,8 @@ const releaseResult = (outcome: ReleaseOutcome): AdminResult =>
 
 export async function runAdmin(store: Store, command: AdminCommand, ports: AdminPorts = {}): Promise<{ code: number; report: AdminReport }> {
   const report = (result: AdminResult, state?: AdminState): AdminReport => ({ schema: ADMIN_SCHEMA, command: label(command), result, ...(state ? { state } : {}) });
-  const target = command.name === 'account' && command.action !== 'list' ? { account: command.account, method: command.method } : {};
+  const target = command.name !== 'account' ? {} : command.action === 'record' || command.action === 'use' ? { account: command.account, method: command.method }
+    : command.action === 'auto-install' ? { account: command.account, revision: command.revision } : {};
   const audit = (s: Store, result: AdminResult) => s.audit('admin_command', label(command), { actor: ADMIN_ACTOR, result, ...target });
   const status = (s: Store) => s.control(ADMIN_ACTOR, ADMIN_CONVERSATION, 'model-status') as Promise<ModelStatus>;
   if (command.name === 'release') {
@@ -107,6 +120,20 @@ export async function runAdmin(store: Store, command: AdminCommand, ports: Admin
   return store.atomic(async s => {
     if (command.name === 'account') {
       if (command.action === 'list') return { code: ADMIN_EXIT.ok, report: { ...report('accounts'), ...await listAccounts(s.db) } };
+      // 한도 뒤 API 사용(C40). 모델 대기·한도 관측·지금 계정 표시는 건드리지 않는 좁은 동작이다(계정 전환 switchAccount를 쓰지 않는다).
+      if (command.action === 'auto-status') return { code: ADMIN_EXIT.ok, report: { ...report('auto_status'), methods: await methodRoutingView(s.db) } };
+      if (command.action === 'auto-install') {
+        const outcome = await installMethods(s, command.account, command.revision);
+        const result = outcome.result === 'installed' ? 'auto_installed' : outcome.result;
+        await audit(s, result);
+        return { code: result === 'auto_installed' ? ADMIN_EXIT.ok : ADMIN_EXIT.refused, report: { ...report(result), methods: await methodRoutingView(s.db) } };
+      }
+      if (command.action === 'auto-off' || command.action === 'api-unlock') {
+        const changed = command.action === 'auto-off' ? await disableMethods(s) : await unlockApi(s);
+        const result = command.action === 'auto-off' ? (changed ? 'auto_disabled' : 'not_installed') : (changed ? 'api_unlocked' : 'not_locked');
+        await audit(s, result);
+        return { code: ADMIN_EXIT.ok, report: { ...report(result), methods: await methodRoutingView(s.db) } };
+      }
       if (command.action === 'record') {
         await recordAccount(s.db, command.account, command.method, s.now());
         await audit(s, 'recorded');

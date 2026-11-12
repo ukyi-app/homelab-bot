@@ -1,5 +1,6 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { parseAdminArgs, runAdmin } from '../src/admin.js';
 import { DEFAULTS } from '../src/contracts.js';
 import type { RateLimitInfo } from '../src/contracts.js';
 import type { ExecutionSelection } from '../src/execution-auth.js';
@@ -216,4 +217,53 @@ test('AC-42 작업자가 설치 기록과 다른 묶음으로 실행을 거부�
   assert.equal((await job()).state, 'succeeded');
   assert.deepEqual(f.requests.map(request => request.version), [3, 2]);
   assert.deepEqual((await rows('method_routing')).map(row => [row.install_state, row.refused_reason]), [['refused', 'bundle_mismatch']]);
+});
+
+const admin = (...argv: string[]) => runAdmin(f.store, parseAdminArgs(['account', ...argv]));
+test('AC-40 관리 진입점의 자동 사용 설치는 두 방식이 등록된 지금 계정에만 되고, 지금 표시·모델 대기를 바꾸지 않는다', async () => {
+  await admin('record', 'main', 'subscription');
+  assert.deepEqual([(await admin('auto-install', 'main', 'rev-1')).report.result], ['unknown_account']);
+  await admin('record', 'main', 'api');
+  assert.equal((await admin('auto-install', 'main', 'rev-1')).report.result, 'not_current');
+  await admin('use', 'main', 'subscription');
+  // 모델 한도로 기다리는 일이 있어도 설치는 그 대기를 풀지 않는다(계정 전환과 다른 좁은 동작).
+  const runtime = runtimeWith(router(false));
+  await queued();
+  f.setRun(limited(limitInfo(secondsFromNow(60 * MINUTE))));
+  await runtime.tick();
+  const installed = await admin('auto-install', 'main', 'rev-1');
+  assert.deepEqual([installed.code, installed.report.result], [0, 'auto_installed']);
+  assert.equal((await job()).state, 'waiting_user');
+  assert.deepEqual((await rows('model_accounts')).filter(row => row.current).map(row => [row.name, row.method]), [['main', 'subscription']]);
+  const status = (await admin('auto-status')).report.methods!;
+  assert.deepEqual({ ...status, subscription: null, api: null }, { installed: true, account: 'main', revision: 'rev-1', state: 'active', refusal: null, current: true,
+    subscription: null, api: null });
+  assert.equal(status.api!.state, 'eligible');
+  assert.throws(() => parseAdminArgs(['account', 'auto-install', 'main', 'bad revision']));
+  assert.equal((await admin('auto-off')).report.result, 'auto_disabled');
+  assert.equal((await admin('auto-off')).report.result, 'not_installed');
+  assert.equal((await admin('auto-status')).report.methods!.state, 'off');
+});
+
+test('AC-36 API 잠금은 관리 진입점의 명시적 해제나 새 묶음 revision 설치로만 풀리고, 같은 revision 재설치로는 풀리지 않는다', async () => {
+  await installed();
+  const runtime = runtimeWith(router());
+  await queued();
+  f.setRun(limited(limitInfo(secondsFromNow(60 * MINUTE))));
+  await runtime.tick();
+  f.setRun(limited(billing));
+  await runtime.tick();
+  const apiState = async () => (await rows('method_routing'))[0]!.api_state;
+  assert.equal(await apiState(), 'billing_blocked');
+  assert.equal((await admin('auto-install', 'main', 'rev-1')).report.result, 'auto_installed');
+  assert.equal(await apiState(), 'billing_blocked');
+  assert.equal((await admin('api-unlock')).report.result, 'api_unlocked');
+  assert.equal(await apiState(), 'eligible');
+  assert.equal((await admin('api-unlock')).report.result, 'not_locked');
+  // 다시 잠근 뒤 키 교체(새 revision)로 풀린다. 구독 한도·확인 예약은 같은 계정이라 남는다.
+  await database.pg.exec("UPDATE method_routing SET api_state='auth_blocked'");
+  assert.equal((await admin('auto-install', 'main', 'rev-2')).report.result, 'auto_installed');
+  const [state] = await rows('method_routing');
+  assert.deepEqual([state!.api_state, state!.revision, state!.subscription_state], ['eligible', 'rev-2', 'limited']);
+  assert.deepEqual((await rows('audit')).filter(row => row.kind === 'method_route_api_unlocked').map(row => row.detail.by), ['owner', 'revision']);
 });
