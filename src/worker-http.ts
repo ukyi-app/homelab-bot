@@ -4,8 +4,10 @@ import { z } from 'zod';
 import { Agent } from 'undici';
 import { AnswerSchema, ChatReplySchema, RateLimitSlotSchema, WORKER_ACCEPT, WorkerRejected } from './contracts.js';
 import { body } from './http.js';
-import type { CancelRequest, VersionedWorker, WorkerClient, WorkerRequest, WorkerRequestV1, WorkerRequestV2, WorkerResult,
-  WorkerResultV2 } from './worker.js';
+import { ExecutionAuthSchema, NotRunSchema, WORKER_CONTRACTS_PATH, WorkerContractsSchema, executionAuth } from './execution-auth.js';
+import type { WorkerContracts } from './execution-auth.js';
+import type { CancelRequest, VersionedWorker, WorkerClient, WorkerRequest, WorkerRequestV1, WorkerRequestV2, WorkerRequestV3, WorkerResult,
+  WorkerResultV2, WorkerResultV3 } from './worker.js';
 import { CancelRequestSchema, WorkerRequestSchema } from './worker.js';
 
 // 게시 서버가 읽는 작업자 응답. 보낸 요청의 판으로 고른다: v1 요청에 v2 모양이 오거나 그 반대면 성공으로 읽지 않는다.
@@ -19,6 +21,16 @@ const ResultV2Schema = z.discriminatedUnion('status', [
   z.strictObject({ status: z.enum(['limited', 'auth_expired', 'failed']), stopped: z.literal(true), rateLimit: RateLimitSlotSchema }),
   z.strictObject({ status: z.literal('unknown'), stopped: z.literal(false) }),
 ]);
+// v3: v2 갈래마다 실행 칸, 그리고 모델을 부르지 않은 not_run. 받기부터 배포(ARCHITECTURE "C38" 5절 1단계)의 파서다.
+const ResultV3Schema = z.discriminatedUnion('status', [
+  ResultV2Schema.options[0].extend({ execution: ExecutionAuthSchema }),
+  ResultV2Schema.options[1].extend({ execution: ExecutionAuthSchema }),
+  ResultV2Schema.options[2].extend({ execution: ExecutionAuthSchema }),
+  NotRunSchema,
+]);
+// 작업자가 낸 실행 칸이 보낸 요청의 선택과 다르면 믿지 않는다(작업자는 요청 선택 말고 다른 방식으로 돌 수 없다).
+const sameSelection = (request: WorkerRequestV3, result: WorkerResultV3) => result.status === 'not_run'
+  || (['account', 'credentialRevision', 'method', 'runId'] as const).every(key => result.execution[key] === request.execution[key]);
 const connectionFailures = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
 export function beforeConnection(error: unknown): boolean {
   if (error instanceof AggregateError) return error.errors.length > 0 && error.errors.every(beforeConnection);
@@ -35,8 +47,9 @@ export class HttpWorker implements WorkerClient {
   }
   execute(request: WorkerRequestV1, capability: string, signal: AbortSignal): Promise<WorkerResult>;
   execute(request: WorkerRequestV2, capability: string, signal: AbortSignal): Promise<WorkerResultV2>;
-  execute(request: WorkerRequest, capability: string, signal: AbortSignal): Promise<WorkerResult | WorkerResultV2>;
-  async execute(request: WorkerRequest, capability: string, signal: AbortSignal): Promise<WorkerResult | WorkerResultV2> {
+  execute(request: WorkerRequestV3, capability: string, signal: AbortSignal): Promise<WorkerResultV3>;
+  execute(request: WorkerRequest, capability: string, signal: AbortSignal): Promise<WorkerResult | WorkerResultV2 | WorkerResultV3>;
+  async execute(request: WorkerRequest, capability: string, signal: AbortSignal): Promise<WorkerResult | WorkerResultV2 | WorkerResultV3> {
     let dispatcher: Agent;
     let payload: string;
     try {
@@ -59,6 +72,15 @@ export class HttpWorker implements WorkerClient {
         throw new Error('worker_response_uncertain');
       }
       const raw: unknown = await response.json();
+      if (request.version === 3) {
+        const result = ResultV3Schema.safeParse(raw);
+        if (result.success && sameSelection(request, result.data)) return result.data;
+        // 멈췄다는 것만 확실하면 실패로 닫되, 시작했을 수 있는 방식은 요청 선택뿐이라 그 칸을 단다.
+        if (z.object({ stopped: z.literal(true) }).safeParse(raw).success) {
+          return { status: 'failed', stopped: true, rateLimit: null, execution: executionAuth(request.execution) };
+        }
+        throw new Error('worker_response_uncertain');
+      }
       const result = (request.version === 2 ? ResultV2Schema : ResultSchema).safeParse(raw);
       if (result.success) return result.data;
       if (z.object({ stopped: z.literal(true) }).safeParse(raw).success) {
@@ -74,6 +96,22 @@ export class HttpWorker implements WorkerClient {
     if (!response.ok) return { stopped: false };
     return z.strictObject({ stopped: z.boolean() }).parse(await response.json());
   }
+  // 이 작업자가 방식 고르기를 받는 요청 경로. 옛 작업자는 경로가 없어(404) 빈 목록이다. 그 밖의 실패는 모름이라 throw다
+  // (게시 서버는 확인하지 못한 작업자에 새 판을 보내지 않는다).
+  async contracts(): Promise<WorkerContracts> {
+    const response = await this.send(`${this.origin}${WORKER_CONTRACTS_PATH}`, { method: 'GET', redirect: 'error', signal: AbortSignal.timeout(5000) });
+    if (response.status === 404) return { executionSelection: [] };
+    if (!response.ok) throw new Error('worker_contracts_uncertain');
+    return WorkerContractsSchema.parse(await response.json());
+  }
+}
+// 지원 확인 경로(인증 없음, 본문에 상태·비밀 없음). 방식 고르기를 못 하는 프로필이면 빈 목록이다.
+export function contractsRoute(executionSelection: readonly string[]): WorkerRoute {
+  const body = JSON.stringify({ executionSelection });
+  return async (req, res) => {
+    if (req.method !== 'GET') { res.writeHead(404).end(); return; }
+    res.writeHead(200, { 'content-type': 'application/json' }).end(body);
+  };
 }
 // ready를 넘기면 GET /readyz를 연다(kubelet readiness, 인증 없음. 응답에 상태 본문을 싣지 않는다).
 // accepting이 false를 돌려주면(종료 중) 새 실행 요청을 실행 전에 거부한다(403, started:false). 취소는 계속 받는다.

@@ -4,6 +4,8 @@ import { z } from 'zod';
 import { AnswerSchema, ChatReplySchema, DEFAULTS, Denied, SYSTEM_INSTRUCTIONS, SYSTEM_INSTRUCTIONS_V2, WORKER_ACCEPT,
   WorkerRejected } from './contracts.js';
 import type { Answer, ChatReply, Clock, Job, RateLimitInfo } from './contracts.js';
+import { ExecutionSelectionSchema, executionAuth } from './execution-auth.js';
+import type { ExecutionAuth, ExecutionSelection, NotRun } from './execution-auth.js';
 
 // 키 순서가 계약이다: capability digest는 schema를 거친 본문의 JSON.stringify라, 순서가 바뀌면 다른 판의 게시 서버가
 // 서명한 요청을 작업자가 거부한다. v1은 옛 순서 그대로 두고, 칸을 더할 때는 v2처럼 새 판에만 더한다.
@@ -27,10 +29,16 @@ export const WorkerRequestV2Schema = z.strictObject({
     .refine(items => Buffer.byteLength(JSON.stringify(items)) <= WORKER_ACCEPT.contextBytesV2, 'context_too_large'),
   timeoutMs, toolCalls,
 });
-export const WorkerRequestSchema = z.discriminatedUnion('version', [WorkerRequestV1Schema, WorkerRequestV2Schema]);
+// v3: v2와 같은 칸·순서 뒤에 방식 선택(execution)을 붙인 판(DECISIONS "C39"). 선택은 digest에 들어가 서명이 덮는다.
+// 게시 서버는 작업자가 지원 확인 경로(execution-auth WORKER_CONTRACTS_PATH)로 'chat'을 알릴 때만 보낸다.
+export const WorkerRequestV3Schema = z.strictObject({
+  ...WorkerRequestV2Schema.shape, version: z.literal(3), execution: ExecutionSelectionSchema,
+});
+export const WorkerRequestSchema = z.discriminatedUnion('version', [WorkerRequestV1Schema, WorkerRequestV2Schema, WorkerRequestV3Schema]);
 export type WorkerRequestV1 = z.infer<typeof WorkerRequestV1Schema>;
 export type WorkerRequestV2 = z.infer<typeof WorkerRequestV2Schema>;
-export type WorkerRequest = WorkerRequestV1 | WorkerRequestV2;
+export type WorkerRequestV3 = z.infer<typeof WorkerRequestV3Schema>;
+export type WorkerRequest = WorkerRequestV1 | WorkerRequestV2 | WorkerRequestV3;
 export const CancelRequestSchema = z.strictObject({ job: z.string().uuid(), lease: z.string().uuid() });
 export type CancelRequest = z.infer<typeof CancelRequestSchema>;
 export type WorkerResult =
@@ -42,14 +50,22 @@ export type WorkerResultV2 =
   | { status: 'succeeded'; output: ChatReply; stopped: true; rateLimit: RateLimitInfo | null }
   | { status: 'limited' | 'auth_expired' | 'failed'; stopped: true; rateLimit: RateLimitInfo | null }
   | { status: 'unknown'; stopped: false };
-// 게시 서버가 쓰는 작업자 꼴. 게시 서버는 v2만 보낸다.
+// v3 응답. v2 각 갈래에 실행 칸(execution)을 붙이고, 선택 대조에 실패해 모델을 부르지 않은 not_run 갈래를 더한다.
+// unknown에도 실행 칸이 있다: 시작했을 수 있는 실행은 요청 선택의 방식으로만 돌 수 있다.
+export type WorkerResultV3 =
+  | { status: 'succeeded'; output: ChatReply; stopped: true; rateLimit: RateLimitInfo | null; execution: ExecutionAuth }
+  | { status: 'limited' | 'auth_expired' | 'failed'; stopped: true; rateLimit: RateLimitInfo | null; execution: ExecutionAuth }
+  | { status: 'unknown'; stopped: false; execution: ExecutionAuth }
+  | NotRun;
+type AnyResult = WorkerResult | WorkerResultV2 | WorkerResultV3;
+// 게시 서버가 쓰는 작업자 꼴. 게시 서버는 v2만 보낸다(v3은 C40이 HttpWorker로 직접 쓴다).
 export interface WorkerClient {
   execute(request: WorkerRequestV2, capability: string, signal: AbortSignal): Promise<WorkerResultV2>;
   cancel(request: CancelRequest, capability: string): Promise<{ stopped: boolean }>;
 }
 // 작업자 서버가 받는 꼴. 두 판을 모두 받고 요청 판에 맞는 응답 판을 돌려준다(v1 요청에는 v1 모양만).
 export interface VersionedWorker {
-  execute(request: WorkerRequest, capability: string, signal: AbortSignal): Promise<WorkerResult | WorkerResultV2>;
+  execute(request: WorkerRequest, capability: string, signal: AbortSignal): Promise<AnyResult>;
   cancel(request: CancelRequest, capability: string): Promise<{ stopped: boolean }>;
 }
 const CapabilitySchema = z.strictObject({
@@ -111,6 +127,11 @@ export function workerRequest(job: Job, context: unknown[],
     policyRevision: job.revision.policy, instructions: SYSTEM_INSTRUCTIONS_V2,
     surface: options.surface, earlierPurged: options.earlierPurged, untrusted: context,
     timeoutMs: job.budget.timeoutMs, toolCalls: job.budget.toolCalls });
+}
+// v3 요청. 칸과 순서는 v2 그대로이고 끝에 선택이 붙는다. 운영 경로는 아직 부르지 않는다(C40이 스위치 뒤에서 쓴다).
+export function workerRequestV3(job: Job, context: unknown[], options: ChatRequestOptions,
+  execution: ExecutionSelection): WorkerRequestV3 {
+  return WorkerRequestV3Schema.parse({ ...workerRequest(job, context, options), version: 3, execution });
 }
 
 // 작업자의 실행 자리 하나. 대화와 리뷰가 같은 인스턴스를 써서 한쪽이 잡은 동안 다른 쪽을 거절한다.
@@ -188,7 +209,15 @@ export class ExecutionSlot {
 }
 
 // 멈춤을 확인한 실행기 결과를 요청 판의 응답 모양으로 다시 맞춘다. 판이 다르거나 답이 계약 밖이면 성공으로 내보내지 않는다.
-function settled(request: WorkerRequest, result: WorkerResult | WorkerResultV2): WorkerResult | WorkerResultV2 {
+function settled(request: WorkerRequest, result: AnyResult): AnyResult {
+  if (request.version === 3) {
+    if (result.status === 'not_run') return result;
+    // 실행 칸은 레인이 낸 값이 아니라 요청 선택으로 다시 만든다. 레인 몫은 넘어갈 근거 판정뿐이다.
+    const limit = 'execution' in result && result.status === 'limited' && result.execution.subscriptionLimit === true;
+    const base = settled({ ...request, version: 2 } as WorkerRequestV2, result) as WorkerResultV2;
+    return { ...base, execution: executionAuth(request.execution, base.status === 'limited' && limit) } as WorkerResultV3;
+  }
+  if (result.status === 'not_run') return request.version === 1 ? { status: 'failed', stopped: true } : { status: 'failed', stopped: true, rateLimit: null };
   if (request.version === 1) {
     if (result.status !== 'succeeded') return { status: result.status as 'limited' | 'auth_expired' | 'failed', stopped: true };
     return 'answer' in result && AnswerSchema.safeParse(result.answer).success
@@ -204,13 +233,14 @@ function settled(request: WorkerRequest, result: WorkerResult | WorkerResultV2):
 // A mutex is also enforced here, independently of the publisher's SQL scheduler.
 export class SerialWorker implements WorkerClient, VersionedWorker {
   constructor(private readonly verifier: WorkerVerifier,
-    private readonly run: (r: WorkerRequest, s: AbortSignal) => Promise<WorkerResult | WorkerResultV2>,
+    private readonly run: (r: WorkerRequest, s: AbortSignal) => Promise<AnyResult>,
     private readonly stop: (request: CancelRequest) => Promise<boolean>,
     private readonly slot = new ExecutionSlot()) {}
   execute(input: WorkerRequestV1, capability: string, signal: AbortSignal): Promise<WorkerResult>;
   execute(input: WorkerRequestV2, capability: string, signal: AbortSignal): Promise<WorkerResultV2>;
-  execute(input: WorkerRequest, capability: string, signal: AbortSignal): Promise<WorkerResult | WorkerResultV2>;
-  async execute(input: WorkerRequest, capability: string, signal: AbortSignal): Promise<WorkerResult | WorkerResultV2> {
+  execute(input: WorkerRequestV3, capability: string, signal: AbortSignal): Promise<WorkerResultV3>;
+  execute(input: WorkerRequest, capability: string, signal: AbortSignal): Promise<AnyResult>;
+  async execute(input: WorkerRequest, capability: string, signal: AbortSignal): Promise<AnyResult> {
     let r: WorkerRequest;
     try {
       r = WorkerRequestSchema.parse(input);
@@ -219,15 +249,17 @@ export class SerialWorker implements WorkerClient, VersionedWorker {
     const request = { job: r.job, lease: r.lease };
     const held = this.slot.acquire(r.job, r.lease, () => this.stop(request));
     if (!held) throw new WorkerRejected('worker_busy');
+    const unknown = (): AnyResult => r.version === 3 ? { status: 'unknown', stopped: false, execution: executionAuth(r.execution) }
+      : { status: 'unknown', stopped: false };
     try {
       const result = await this.run(r, signal);
-      if (!result.stopped) { this.slot.lock(held); return { status: 'unknown', stopped: false }; }
+      if (!result.stopped) { this.slot.lock(held); return unknown(); }
       this.slot.release(held);
       return settled(r, result);
     } catch {
       // A broken response is not proof that a process stopped.
       this.slot.lock(held);
-      return { status: 'unknown', stopped: false };
+      return unknown();
     }
   }
   async cancel(input: CancelRequest, capability: string): Promise<{ stopped: boolean }> {

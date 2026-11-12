@@ -9,6 +9,7 @@ import type { CredentialKind, WorkerCredential } from './credentials.js';
 import { CLAUDE_CHAT_CAPABILITIES, ClaudeChatAdapter, ClaudeReviewAdapter } from './executor-claude.js';
 import { CLAUDE_TASK_CAPABILITIES } from './executor-claude-task.js';
 import { CODEX_CHAT_CAPABILITIES, CodexChatAdapter } from './executor-codex.js';
+import { ACCOUNT_BUNDLE_FILE } from './execution-auth.js';
 import type { ChatAdapter, ExecutorCapabilities, ExecutorId } from './executor.js';
 import { WorkerStartError } from './worker-state.js';
 
@@ -34,9 +35,9 @@ export interface ExecutorProfile {
   readonly taskCapabilities: ExecutorCapabilities | null;
   // 이 프로필에만 필요한 env.
   readonly requiredEnv: readonly string[];
-  // 실행마다 인증 방식을 고르는 프로필의 파일 이름(credentialKey와 같은 디렉터리). 방식 표시 파일과 API 키 파일이다.
-  // credentialKey는 구독 토큰 파일이다. null이면 credentialKey 하나만 읽는다.
-  readonly methods: { readonly marker: string; readonly apiKey: string } | null;
+  // 실행마다 인증 방식을 고르는 프로필의 파일 이름(credentialKey와 같은 디렉터리). 방식 표시 파일, API 키 파일, 새 판 요청이
+  // 대조하는 계정 묶음 파일이다. credentialKey는 구독 토큰 파일이다. null이면 credentialKey 하나만 읽고 방식 고르기를 받지 않는다.
+  readonly methods: { readonly marker: string; readonly apiKey: string; readonly bundle: string } | null;
 }
 // claude-subscription은 이름이 옛 그대로지만 API 크레딧 방식도 맡는다. 방식은 기동 env가 아니라 실행마다 방식 표시 파일이 고른다
 // (owner의 계정 전환이 파드 재시작 없이 반영돼야 한다). 프로필 이름·WORKER_CREDENTIAL_KEY를 바꾸지 않아 sandbox 값과 호환된다.
@@ -44,7 +45,7 @@ export const PROFILES: readonly ExecutorProfile[] = Object.freeze([
   Object.freeze({ id: 'claude-subscription', executor: 'claude', credentialKey: 'CLAUDE_CODE_OAUTH_TOKEN',
     auth: 'subscription-token', credential: 'env-static', bin: '/usr/local/bin/claude',
     model: /^claude-[a-z0-9]+(?:-[a-z0-9]+){1,8}$/, capabilities: CLAUDE_CHAT_CAPABILITIES, taskCapabilities: CLAUDE_TASK_CAPABILITIES, requiredEnv: Object.freeze([]),
-    methods: Object.freeze({ marker: METHOD_FILE, apiKey: API_KEY_FILE }) }),
+    methods: Object.freeze({ marker: METHOD_FILE, apiKey: API_KEY_FILE, bundle: ACCOUNT_BUNDLE_FILE }) }),
   // Codex 대화 경로(D4). 모델은 CLI 기본값(`cli-default`, -m 없음)이다.
   Object.freeze({ id: 'codex-subscription', executor: 'codex', credentialKey: 'CODEX_AUTH_JSON',
     auth: 'subscription-auth-json', credential: 'file-mutable', bin: '/usr/local/bin/codex',
@@ -89,7 +90,8 @@ export function createExecutor(profile: ExecutorProfile, paths: { credentialFile
 export function staticCredential(profile: ExecutorProfile, credentialFile: string, homes: readonly string[]): WorkerCredential {
   if (!profile.methods) return new StaticEnvCredential(credentialFile, homes);
   const dir = dirname(credentialFile);
-  return new MethodEnvCredential({ subscription: credentialFile, api: join(dir, profile.methods.apiKey) }, join(dir, profile.methods.marker), homes);
+  return new MethodEnvCredential({ subscription: credentialFile, api: join(dir, profile.methods.apiKey) }, join(dir, profile.methods.marker), homes,
+    join(dir, profile.methods.bundle));
 }
 
 const run = promisify(execFile);

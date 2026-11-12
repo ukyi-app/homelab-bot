@@ -366,6 +366,8 @@ export type TaskLog = (fields: Record<string, unknown>) => void;
 const KNOWN_REASONS = new Set<string>(TASK_FAILURE_REASONS);
 const REFUSALS: Readonly<Record<NonNullable<RunReport['refused']>, TaskFailureReason>> = {
   lane_closed: 'lane_closed', busy: 'busy', survivors_unconfirmed: 'lane_closed', cleanup_pending: 'cleanup_pending', prepare_failed: 'prepare_failed', aborted: 'aborted',
+  // 작업 레인 요청에는 아직 방식 선택이 없어(DECISIONS "C39" 남은 경로) 오지 않는다. 오면 띄우기 전 실패다.
+  selection: 'prepare_failed',
 };
 type Base = Pick<TaskResponse, 'version' | 'job' | 'lease' | 'generation' | 'sessionId' | 'turn' | 'worker' | 'usage'>;
 const failedResponse = (base: Base, reason: TaskFailureReason, sessionRetained: boolean, cleanupPending = false): TaskResponse =>

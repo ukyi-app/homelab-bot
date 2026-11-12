@@ -180,14 +180,16 @@ export function classifyClaudeError(kind: unknown, status: unknown, context: Cla
   if (typeof kind === 'string' && AUTH_KINDS.has(kind)) return { kind: 'auth_expired' };
   if ((context.codes ?? []).some(code => typeof code === 'string' && BILLING_CODE.test(code))) return limited('billing');
   let cause = typeof kind === 'string' ? LIMIT_KINDS.get(kind) : undefined;
+  let basis: 'error_kind' | 'http_status' = 'error_kind';
   if (!cause) {
     // overloaded·server_error 등 다른 종류는 대기가 아니다. 종류를 모를 때만 HTTP 상태를 본다.
     if (typeof kind === 'string' && kind !== 'unknown') return null;
     if (status === 401 || status === 403) return { kind: 'auth_expired' };
     cause = LIMIT_STATUSES.get(status);
     if (!cause) return null;
+    basis = 'http_status';
   }
-  return limited(cause === 'rate_limit' && context.auth === 'api-key' ? 'billing' : cause);
+  return { kind: 'limited', rateLimit: { stop: { cause: cause === 'rate_limit' && context.auth === 'api-key' ? 'billing' : cause } }, basis };
 }
 
 // 오류 판정과 진단이 함께 보는 이벤트. 값은 result에 있으면 그것을, 없으면 마지막 assistant의 것을 쓴다.

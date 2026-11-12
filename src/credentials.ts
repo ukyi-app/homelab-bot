@@ -1,8 +1,10 @@
 import type { FileHandle } from 'node:fs/promises';
-import { lstat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { lstat, realpath } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { authSecrets } from './codex-events.js';
 import { openDir, readAt } from './codex-workspace.js';
+import { ACCOUNT_BUNDLE_LIMIT, AccountBundleSchema, SelectionRefused, fingerprintMatches } from './execution-auth.js';
+import type { AccountBundle, ExecutionSelection, SelectionRefusal } from './execution-auth.js';
 import { WorkerStartError, readSecretFile, seedAuth } from './worker-state.js';
 
 // 모델 자격 방식. 실행기 이름과 따로 둔다(같은 실행기도 방식이 다를 수 있다, 예: Claude 구독 토큰과 API 키).
@@ -37,8 +39,9 @@ export interface WorkerCredential {
   open(): Promise<'seeded' | 'kept' | 'present'>;
   // readiness. 모델을 부르지 않고 자격이 쓸 수 있는 모양으로 있는지만 본다.
   ready(): Promise<boolean>;
-  // 실행 준비 때. 읽지 못하면 throw다(실행하지 않는다).
-  forRun(): Promise<RunCredential>;
+  // 실행 준비 때. 읽지 못하면 throw다(실행하지 않는다). selection이 있으면(새 판 요청) 방식 표시 대신 그 선택을 계정 묶음과
+  // 대조해 그 방식의 자격을 준다. 대조에 실패하면 SelectionRefused다(모델을 부르지 않는다).
+  forRun(selection?: ExecutionSelection): Promise<RunCredential>;
   // 실행 뒤 다시 읽은 비밀(회전 파일이면 갱신본). 반사 검사에 실행 전 값과 함께 쓴다.
   // 읽지 못하거나 비어 있으면 throw다. 빈 목록으로 반사 검사를 건너뛰지 않는다.
   secrets(): Promise<string[]>;
@@ -53,7 +56,8 @@ export class StaticEnvCredential implements WorkerCredential {
   constructor(private readonly file: string, private readonly homes: readonly string[]) {}
   async open(): Promise<'present'> { await this.read(); return 'present'; }
   async ready(): Promise<boolean> { return this.read().then(() => true, () => false); }
-  async forRun(): Promise<RunCredential> {
+  async forRun(selection?: ExecutionSelection): Promise<RunCredential> {
+    if (selection) throw new SelectionRefused('selection_unsupported');
     const value = await this.read();
     return { value, secrets: [value] };
   }
@@ -77,14 +81,22 @@ async function readStatic(file: string, homes: readonly string[]): Promise<strin
 // - 반사·유출 검사에는 읽을 수 있는 두 방식의 자격을 모두 쓴다. 실행 env에 없는 자격이 출력에 실려도 막는다.
 // 방식 표시와 자격 파일은 따로 읽어 kubelet의 볼륨 교체와 엇갈릴 수 있다. 그때도 표시와 자격이 맞지 않으면 실행하지 않을 뿐
 // 다른 방식으로 돌지 않는다(다음 실행에서 맞는다).
+//
+// 새 판 요청(selection)은 방식 표시를 보지 않고 계정 묶음(bundleFile)과 대조한다(DECISIONS "C39"):
+// - 묶음·두 자격의 세 파일을 실제 경로로 풀어 같은 디렉터리여야 읽는다. kubelet Secret 볼륨은 이름 → ..data → 세대 디렉터리
+//   심링크이고 세대 디렉터리는 바뀌지 않으므로, 세 실제 경로가 한 디렉터리면 한 볼륨 세대의 일관된 스냅샷이다.
+// - 요청의 계정·revision이 묶음과 같아야 하고, 두 자격 모두 있어야 하며(unset이면 없음), 두 값의 지문이 묶음의 지문과 같아야 한다.
+//   ESO가 Infisical 여러 쓰기 도중 읽은 중간 조합(새 계정 토큰 + 옛 계정 API 키)은 지문에서 걸린다.
+// - 그 선택의 자격 하나만 실행 env에 넣고, 반사 검사에는 두 값을 모두 쓴다.
 const METHOD_LIMIT = 64;
 export class MethodEnvCredential implements WorkerCredential {
   readonly kind = 'env-static';
   constructor(private readonly files: Readonly<Record<CredentialMethod, string>>, private readonly methodFile: string,
-    private readonly homes: readonly string[]) {}
+    private readonly homes: readonly string[], private readonly bundleFile?: string) {}
   async open(): Promise<'present'> { await this.forRun(); return 'present'; }
   async ready(): Promise<boolean> { return this.forRun().then(() => true, () => false); }
-  async forRun(): Promise<RunCredential> {
+  async forRun(selection?: ExecutionSelection): Promise<RunCredential> {
+    if (selection) return this.selected(selection);
     const method = await this.method();
     const other = method === 'subscription' ? 'api' : 'subscription';
     const extra = await readStatic(this.files[other], this.homes).catch(() => null);
@@ -111,6 +123,35 @@ export class MethodEnvCredential implements WorkerCredential {
     if (!(CREDENTIAL_METHODS as readonly string[]).includes(value)) throw new WorkerStartError('credential_method_invalid');
     return value as CredentialMethod;
   }
+  private async selected(selection: ExecutionSelection): Promise<RunCredential> {
+    if (!this.bundleFile) throw new SelectionRefused('selection_unsupported');
+    const bundlePath = await resolved(this.bundleFile, 'bundle_missing');
+    const paths = { subscription: await resolved(this.files.subscription, 'credential_missing'),
+      api: await resolved(this.files.api, 'credential_missing') };
+    if (new Set([bundlePath, paths.subscription, paths.api].map(path => dirname(path))).size !== 1) throw new SelectionRefused('credential_mixed');
+    const bundle = await this.bundle(bundlePath);
+    if (bundle.account !== selection.account || bundle.revision !== selection.credentialRevision) throw new SelectionRefused('bundle_mismatch');
+    const values = { subscription: await this.value(paths.subscription), api: await this.value(paths.api) };
+    for (const method of CREDENTIAL_METHODS) {
+      if (!fingerprintMatches(values[method], bundle.fingerprints[method])) throw new SelectionRefused('credential_mixed');
+    }
+    const other = selection.method === 'subscription' ? 'api' : 'subscription';
+    return { value: values[selection.method], method: selection.method, secrets: [values[selection.method], values[other]] };
+  }
+  private async bundle(path: string): Promise<AccountBundle> {
+    let raw: Buffer;
+    try { raw = await readSecretFile(path, this.homes, { prefix: 'bundle', limit: ACCOUNT_BUNDLE_LIMIT }); } catch (error) {
+      throw new SelectionRefused(error instanceof WorkerStartError && error.code === 'bundle_missing' ? 'bundle_missing' : 'bundle_invalid');
+    }
+    try { return AccountBundleSchema.parse(JSON.parse(raw.toString('utf8'))); } catch { throw new SelectionRefused('bundle_invalid'); }
+  }
+  private value(path: string): Promise<string> {
+    return readStatic(path, this.homes).catch(() => { throw new SelectionRefused('credential_missing'); });
+  }
+}
+// 심링크를 끝까지 푼 실제 경로. 없거나 못 풀면 그 사유로 거부한다.
+async function resolved(path: string, missing: SelectionRefusal): Promise<string> {
+  try { return await realpath(path); } catch { throw new SelectionRefused(missing); }
 }
 
 // Codex 구독 auth.json. home은 작업자 영속 공간의 CODEX_HOME이다(PVC, 갱신본이 남는 곳).
@@ -123,7 +164,10 @@ export class FileMutableCredential implements WorkerCredential {
   async ready(): Promise<boolean> {
     try { return (await lstat(join(this.home, 'auth.json'))).isFile(); } catch { return false; }
   }
-  async forRun(): Promise<RunCredential> { return { secrets: await this.secrets() }; }
+  async forRun(selection?: ExecutionSelection): Promise<RunCredential> {
+    if (selection) throw new SelectionRefused('selection_unsupported');
+    return { secrets: await this.secrets() };
+  }
   // 고정한 디렉터리 핸들 아래에서 읽는다. auth.json 자리에 심링크가 있으면 따라가지 않는다. home은 공장 함수가
   // 해석한 실제 경로여야 한다(openDir이 O_NOFOLLOW라 별칭 경로면 열리지 않는다).
   async secrets(): Promise<string[]> {

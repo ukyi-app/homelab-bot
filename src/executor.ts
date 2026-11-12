@@ -58,7 +58,8 @@ export interface Observation { line: string; tools: readonly string[]; violation
 // 한도 대기의 원인(rateLimit.stop)은 원인을 가를 근거가 없는 실행기(Codex)면 비어 있다.
 export type EngineOutcome =
   | { kind: 'output'; value: unknown; rateLimit?: RateLimitInfo }
-  | { kind: 'limited'; rateLimit?: RateLimitInfo }
+  // basis: 한도 원인을 무엇으로 갈랐는지(CLI 오류 종류, 종류 없는 HTTP 상태). 넘어갈 근거 허용 목록(execution-auth)이 본다.
+  | { kind: 'limited'; rateLimit?: RateLimitInfo; basis?: 'error_kind' | 'http_status' }
   | { kind: 'auth_expired'; rateLimit?: RateLimitInfo }
   | { kind: 'failed'; reason: string; violation?: PolicyViolation; rateLimit?: RateLimitInfo };
 export interface ExitStatus { code: number | null; signal: string | null }
