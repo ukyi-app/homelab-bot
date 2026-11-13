@@ -271,7 +271,7 @@ test('C14 말로 하는 리뷰 재개·취소는 대화 채널·알림 채널 �
   const waiting = await a.reviewJob();
   // '/' 예비: 스레드에서 보낸 리뷰 취소는 지금처럼 거부된다.
   const refused = (await a.slash('review-cancel', { target: first })).posted.at(-1)!;
-  assert.ok(refused.includes('리뷰 작업은 owner가 알림 채널에서만 제어할 수 있어요.'), refused);
+  assert.ok(refused.includes('리뷰 작업은 관리자가 알림 채널에서만 제어할 수 있어요.'), refused);
   assert.equal((await a.jobs('review')).find(j => j.id === first)!.state, 'queued');
   // 대화 채널 아래 스레드: 확인 뒤 취소된다. 버튼 전에는 그대로다.
   await a.speak(message(), '그 리뷰 취소해 줘', { action: 'review_cancel', target: first, content: null });

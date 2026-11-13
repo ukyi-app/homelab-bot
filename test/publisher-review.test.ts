@@ -427,7 +427,7 @@ test('T17 제어 명령: owner가 알림 채널에서만 동작, 다른 채널·
   command('review-status', NOTIFY);
   await waitFor(() => rest.sent.some(m => m.channel === NOTIFY && m.content.includes(job.id)));
   command('review-cancel', CHAT, { target: job.id });
-  await waitFor(() => rest.sent.some(m => m.channel === CHAT && m.content.includes('owner가 알림 채널에서만')));
+  await waitFor(() => rest.sent.some(m => m.channel === CHAT && m.content.includes('관리자가 알림 채널에서만')));
   const before = await count('events');
   command('review-cancel', NOTIFY, { target: job.id }, 'fixture-intruder');
   await new Promise(resolve => setTimeout(resolve, 100));

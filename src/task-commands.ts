@@ -57,7 +57,7 @@ export class TaskCommands implements TaskCommandHandler {
     return [`작업 ${job}: ${jobStateText(status.state)}${status.waitReason ? `(${waitReasonText(status.waitReason)})` : ''}`,
       `세션: ${status.session ? `있음${status.generation ? `, 세대 ${status.generation}` : ''}` : '없음'}${status.cleanup && status.cleanup !== 'none' ? `, 정리 ${CLEANUP[status.cleanup] ?? status.cleanup}` : ''}`,
       ...(status.question ? [`열린 질문: ${status.question.id} (기한 ${time(status.question.expiresAt)})`] : []),
-      ...(status.waitingSince !== null ? [`모델 대기 시작: ${time(status.waitingSince)}${status.ownerConfirmRequestedAt !== null ? ', owner 확인 요청함' : ''}`] : [])].join('\n');
+      ...(status.waitingSince !== null ? [`모델 대기 시작: ${time(status.waitingSince)}${status.ownerConfirmRequestedAt !== null ? ', 관리자 확인 요청함' : ''}`] : [])].join('\n');
   }
   release(request: { id: string; actor: string; scope: Scope; job: string; revision: string }): string {
     this.track((async () => {

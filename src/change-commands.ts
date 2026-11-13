@@ -62,7 +62,7 @@ export const AMENDMENT_REQUEST_TEXT = Object.freeze({
 // 첫 인자 colleague는 동료 기능 스위치(Store.colleague)다. 켜지면 '/' 이름 대신 말로 하는 안내를, 꺼지면 지금의 '/' 안내를 낸다.
 // 함정: 항목마다 분기가 colleague 하나뿐이어야 시험이 모든 항목을 같은 인자로 불러 '/' 이름을 검사할 수 있다.
 // label=·goal= 같은 입력 칸 이름은 명령 이름이 아니라 두 판이 같다. 말로는 새 generation을 열 수 없어 켜짐 판은 새 변경으로 다시 부탁하라고 한다.
-const LABEL_HELP = 'label은 이 글을 공개해도 되는지에 대한 owner의 판단이에요(public, approved_public_summary, private, unknown).';
+const LABEL_HELP = 'label은 이 글을 공개해도 되는지에 대한 관리자의 판단이에요(public, approved_public_summary, private, unknown).';
 const ASK_STATUS = '변경 상태를 물어봐서 확인한 뒤 다시 부탁해 주세요.';
 const usage = (c: boolean) => c
   ? `요약 뒤에 \` | goal=<목표> | accept=<인수 조건> | label=public\`처럼 적어 주세요. accept는 여러 번 쓸 수 있고 base=<브랜치>는 선택이에요. ${LABEL_HELP}`

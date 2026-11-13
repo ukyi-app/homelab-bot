@@ -42,7 +42,7 @@ export const CHAT_TASK_TEXT = Object.freeze({
     : '요청은 기록해 뒀는데 응답을 전하지 못했어요(상호작용 만료·확인 실패). 다시 보내기 전에 이 대화에서 /list로 처리 상태를 확인해 주세요.',
 
   // 제어 결과(Store.control·reviewControl의 status)
-  reviewControlDenied: '리뷰 작업은 owner가 알림 채널에서만 제어할 수 있어요.',
+  reviewControlDenied: '리뷰 작업은 관리자가 알림 채널에서만 제어할 수 있어요.',
   reviewStatus: (c: boolean) => c ? '한도·인증 원인을 해결한 뒤 리뷰를 재개하거나 취소해 달라고 말해 주세요.'
     : '한도·인증 원인을 해결한 뒤 /review-resume target:<job-id>로 재개하고, 포기하려면 /review-cancel target:<job-id>를 써 주세요.',
   emergencyHeld: (c: boolean) => `비상 정지나 이전 멈춤이 아직 걸려 있어요. ${c ? `상태는 ${CLI}로 확인해 주세요.` : '/model-status로 확인해 주세요.'}`,
