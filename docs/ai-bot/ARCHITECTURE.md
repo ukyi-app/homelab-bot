@@ -2352,10 +2352,27 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 | 다시 고름 | `start`·`admit` 거절 → `reroute` | `outcome='unstarted'`, 확인 자리 놓음, job은 대기열(시도로 세지 않음) |
 | 버림 | dispatch 전 다른 끝(취소·종료 되돌림·lease 상실·턴 CAS에서 짐·리뷰 미루기) → `abandon` | `outcome='unstarted'`, 확인 자리 놓음 |
 
-`select`가 `{ wait }`를 돌려주면 선택이 없고 경로가 `waitForUser(model_limit)`한다. 작업 레인은 `unchanged` 안에서(세션 그대로), 변경 작성은 `waitForUser` 뒤 `change_turn_stale`로 던져 change-runtime이 시작하지 못한 턴으로 다룬다.
+`select`가 `{ wait }`를 돌려주면 선택이 없고 경로가 `waitForUser(model_limit)`한다. 작업 레인은 `unchanged` 안에서(세션 그대로), 변경 작성은 `waitChangeTurn`(같은 `unchanged`) 뒤 `change_turn_stale`로 던져 change-runtime이 시작하지 못한 턴으로 다룬다.
 
 **상태 읽기.** 라우터는 `method_routing` 행에 그 계정의 `method_subscription` 행과 그 계정·revision의 `method_api` 행, 실제 지금 계정 여부(`model_accounts.current`)와 등록 방식 수를 붙인 한 행으로 읽는다. 설치가 두 상태 행을 만든다(`ON CONFLICT DO NOTHING`, 구독 확인 자리는 가리키는 설치가 바뀔 때만 비움).
 
 **귀속.** `settle`의 "지금 설치"는 설치 active·계정·revision 일치·그 계정이 실제 지금 계정이다. `record`는 취소·종료 분기에서 확인된 API 실패의 잠금만 적는다. 선택이 있는 실행의 대기 아닌 결과의 한도 경고는 `settle`이 `observeRateLimit(…, null)`로 남기고(구독·지금 설치일 때만), 경로는 자기 `observeRateLimit`을 선택이 없을 때만 부른다.
 
 **작업 레인만 막는 대기.** `waitForUser(…, { laneOnly })` → `recordPause(…, laneOnly)`가 `model_pauses.lane_only_at = paused_at`을 적는다. `releaseScheduler`는 이 조건의 대기를 전역 대기로 세지 않는다. 작업 레인은 지금처럼 `taskLaneStopped`(모델 한도 대기 있음)로 닫힌다.
+
+### 재검토 보완 2회차 (2026-11-13)
+
+결정은 [DECISIONS](DECISIONS.md) "C40 재검토 보완"의 10~15다.
+
+**`settle`의 두 층.** 귀속과 후속 결정을 나눴다.
+
+| 층 | 언제 | 하는 일 |
+|---|---|---|
+| 귀속 | 실행마다 한 번(`settled_at` 없음) | 결과·확인 자리 놓기, 확인된 API 실패의 `lockApi(실행의 계정·revision)`, 지금 설치면 구독 상태 전이·`not_run` 거부·한도 경고 |
+| 결정 | 귀속 때, 그리고 회수(`recovered`)가 같은 결과를 다시 가져올 때 | 지금 설치·실제 지금 계정 여부로 `requeued`·`wait`·`held`·`default` |
+
+**`held`.** `resumable:false`인 옛 설치 결과(옛 계정이거나 API 실패)에만 나온다. 이 값을 받는 호출자는 작업 턴 확정뿐이다(다른 경로는 `resumable`을 넘기지 않는다). 작업 턴은 `waitForUser(…, { laneOnly: true, rateLimit: null, stale: true })`로 둔다. `stale`은 `recordPause`가 시각 비교 없이 옛 자격의 멈춤(1분 뒤 재시도)으로 적게 한다.
+
+**작업 레인 잠금 순서.** 세션·질문·작업 job을 바꾸는 경로(`begin`·턴 확정·`unchanged`)는 모두 `lockTaskControl`(대화 → scheduler → 레인)로 시작해 job → 세션 순서다. 늦은 준비의 판정(`sessionKept`)은 job 행을 잡은 뒤 세션 행을 잡고 준비 때의 상태·턴·세대와 비교한다. `begin`은 `admit` 거절에서 세션이 바뀌었으면 `reroute` 없이 `conflict`다.
+
+**PR 리뷰 claim 표시.** claim이 미루기를 고를 방식(API) 때문에 건너뛰면 돌려주는 job 객체에 열거되지 않는 심볼 표시를 붙인다. tick은 이 표시가 있는 job만 보내기 전에 미루기를 다시 본다. 표시는 DB에 남지 않는다(같은 tick 안에서만 쓴다).

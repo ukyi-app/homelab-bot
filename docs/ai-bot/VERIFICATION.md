@@ -3018,3 +3018,21 @@ DECISIONS "C40" 1절(작업 경로 칸 `apiAfterLimitTask`)·4절(변경 작성 
 - **기존 시험 고침:** 상태 칸을 `method_routing` 행에서 읽던 시험을 `methodRoutingView`로 바꿨다(`c40-method-routing`·`c40-method-routing-task`·`c40-method-routing-pg`·`pr-review`). TRUNCATE 목록과 016 뒤 새 표 목록(`change-store`)에 `method_subscription`·`method_api`를 더했다. PG 시험의 `select` 결과에 기다림 모양이 생겨 선택으로 좁히는 도우미를 썼다.
 - **실행(머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`·`npm run build` 뒤 53개 파일(`c40-method-routing`·`-task`·`-pg`, `c39-execution-selection`, `change-review`·`-dispatch`·`-pg`, `change-artifact`, `change-assembly`, `pr-review`, `publisher-shutdown`·`-main`·`-migrate`·`-policy`·`-review`·`-pg`, `task-assembly`·`task-bridge`·`task-contracts`·`task-lane-pg`·`task-lane-migration`·`task-settle-log`, `c16-task-question`, `briefing-task-lane`, `change-store`·`-pg`, `change-pg`, `admin-cli`, `away-status`, `model-resume`, `model-account-switch-pg`, `memory-briefing`, `ops-metrics`, `review-lane`, `worker-contract-v2`, `chat-ack`, `raw-text-retention`, `raw-input-retention`, `review-1`~`review-9`, `review-9-pg`, `change-self-fix`, `c27-change-amend`, `c28-change-question`, `change-verify-recheck`, `stop-confirmation`) 1,343건 통과, 실패·skip 0.
 - **못 잡는 범위:** 위 "C40"과 같다. 시작 확인과 실제 HTTP 전송 사이 몇 ms의 잠금, 실제 두 파드의 배포 중 공존은 시험하지 않았다.
+
+### 재검토 보완 2회차 (2026-11-13, 로컬)
+
+결정은 [DECISIONS](DECISIONS.md) "C40 재검토 보완" 10~15. 경합은 실제 PostgreSQL 두 연결이고, 순서는 훅(고르기·턴 시작 직전)과 다른 연결이 쥔 행·`pg_stat_activity`의 잠금 대기 수로 고정했다(`sleep`으로 순서를 정하지 않는다).
+
+| 발견 | 근거(시험) |
+|---|---|
+| RR9A-N1·RR9B-N1 늦은 작성 준비의 기다림 | `change-artifact` "AC-37 늦은 게시 서버의 변경 작성 준비가 구독 확인 대기를 받아도 …(PostgreSQL)"(B가 세션 없음을 읽은 뒤 고르기 직전에 A가 확인 자리를 잡고 턴 시작 → B는 `change_turn_stale`, job 상태·lease·시도 수 그대로, 멈춤 기록 없음, A의 결과 저장·finalize로 job `succeeded`·세션 `completed`) |
+| RR9A-N1·RR9B-N1 늦은 작성 준비의 거절 | `change-artifact` "AC-37 늦은 게시 서버의 변경 작성 턴 시작이 그 사이 잠긴 API로 거절돼도 …(PostgreSQL)"(B가 API를 고른 뒤 턴 시작 직전에 A가 고르고 시작, 이어 API 잠금 → B는 `change_turn_conflict`, job 그대로, B 선택 `unstarted`, A 선택만 `started_at`, A 확정) |
+| RR9A-N2 전환 뒤 도착한 API 실패의 잠금 | `c40-method-routing` "AC-36 account use B 뒤 도착한 계정 A의 API 결제 실패도 …"(B scheduler 열림·멈춤 기록 없음, `method_api(main, rev-1)=billing_blocked`, 감사 1건, A로 돌아와 같은 revision 재설치 뒤 요청 0건). `c40-method-routing-pg` "AC-37 옛 revision 실행의 늦은 API 실패는 그 revision만 잠그고 …"(옛 기대값 "잠금 감사 0건"을 이 결정대로 바꿈: rev-1 잠김, 지금 rev-2 `eligible`) |
+| RR9B "F4 잔여" 귀속 뒤 대기 저장 실패 | `change-review` "AC-39 변경 자체 리뷰의 API 실패를 귀속한 뒤 대기 저장이 실패해도 …"(API 잠금·`settled_at` 커밋 뒤 `waitForUser`만 실패 → `unknown`, 회수 뒤 `waiting_user/model_limit`, 멈춤 `rate_limit`·`retry_at` = 구독 다음 확인 시각, 그 시각에 재개) |
+| RR9A "F10 잔여" 세션 없는 옛 계정 작업 결과 | `c40-method-routing-task` "AC-37 세션을 남기지 못한 첫 작업 턴의 옛 계정 API 실패가 account use 뒤(같은 밀리초/1ms 뒤) …"(scheduler 열림, `waiting_user/model_limit`, 멈춤 `rate_limit`·1분 뒤·`lane_only_at = paused_at`, A rev-1 잠김, 1분 뒤 재개) |
+| RR9A-N3 대기와 비상 정지의 잠금 순서 | `c40-method-routing-pg` "AC-37 작업 턴의 구독 확인 대기와 다른 대화의 비상 정지가 …"(다른 연결이 scheduler 행을 쥔 동안 비상 정지가 먼저 줄 서고, 작업 턴의 `{ wait }` 정리가 뒤에 줄 선 것을 잠금 대기 2로 확인한 뒤 풂 → 셋 다 오류 없음, job `cancelled`) |
+| RR9A-N4·RR9B-N2 꺼짐에서 claim 뒤 미루기 | `pr-review` "AC-32 라우터 없음(기준판)/꺼진 라우터/켜졌지만 설치 없는 라우터: claim과 전송 사이에 리뷰 미루기가 생겨도 …"(GitHub 조회 중 경고 기록 → 세 조립 모두 모델 1회·job `succeeded`) |
+
+- **고치기 전 빨강:** 위 시험을 `bf49cdf`에서 먼저 돌렸다(로그 `c40-fix3-red-1113-160742`): 279건 중 10건이 의도한 이유로 실패했다(꺼진·설치 없는 라우터의 리뷰 되돌림 둘·`method_api` `eligible`로 남음 둘·늦은 준비가 job을 `waiting_user`·시도 0으로 바꿈·거절이 `change_turn_stale`(재큐)·scheduler 닫힘 둘(같은 ms·1ms)·잠금 대기 시간 초과(`canceling statement due to lock timeout`)·회수 뒤 멈춤 `billing`/`retry_at` 없음). 라우터 없는 기준판 조립은 처음부터 통과했다(비교 기준).
+- **실행(머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`·`npm run build` 뒤 위 "재검토 보완"의 53개 파일에 `task-cancel-notice`·`task-observation`·`task-diagnostics`를 더한 56개 파일 1,376건 통과, 실패·skip 0(로그 `c40-fix3-1113-161540`).
+- **못 잡는 범위:** 같은 lease 준비 경합은 훅으로 순서를 정한 두 연결 실행이다(두 프로세스가 아니다). 지금 설치의 세션 없는 첫 턴 API 실패(결제 멈춤 그대로)는 바꾸지 않아 시험하지 않았다.
