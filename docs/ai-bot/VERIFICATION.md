@@ -3036,3 +3036,17 @@ DECISIONS "C40" 1절(작업 경로 칸 `apiAfterLimitTask`)·4절(변경 작성 
 - **고치기 전 빨강:** 위 시험을 `bf49cdf`에서 먼저 돌렸다(로그 `c40-fix3-red-1113-160742`): 279건 중 10건이 의도한 이유로 실패했다(꺼진·설치 없는 라우터의 리뷰 되돌림 둘·`method_api` `eligible`로 남음 둘·늦은 준비가 job을 `waiting_user`·시도 0으로 바꿈·거절이 `change_turn_stale`(재큐)·scheduler 닫힘 둘(같은 ms·1ms)·잠금 대기 시간 초과(`canceling statement due to lock timeout`)·회수 뒤 멈춤 `billing`/`retry_at` 없음). 라우터 없는 기준판 조립은 처음부터 통과했다(비교 기준).
 - **실행(머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`·`npm run build` 뒤 위 "재검토 보완"의 53개 파일에 `task-cancel-notice`·`task-observation`·`task-diagnostics`를 더한 56개 파일 1,376건 통과, 실패·skip 0(로그 `c40-fix3-1113-161540`).
 - **못 잡는 범위:** 같은 lease 준비 경합은 훅으로 순서를 정한 두 연결 실행이다(두 프로세스가 아니다). 지금 설치의 세션 없는 첫 턴 API 실패(결제 멈춤 그대로)는 바꾸지 않아 시험하지 않았다.
+
+### 재검토 보완 3회차 (2026-11-13, 로컬)
+
+결정은 [DECISIONS](DECISIONS.md) "C40 재검토 보완" 16~17. 경합은 실제 PostgreSQL 두 연결의 두 `ChangeRuntime`이고, 순서는 늦은 쪽의 턴 시작 직전 훅(장벽)으로 고정했다(`sleep`으로 순서를 정하지 않는다). 가짜 작업 작업자(`task-lane-fixture`)는 `sessionRetained:false`로 끝난 턴의 status를 실제 작업자처럼 `absent`·세션 없음으로 답한다.
+
+| 발견 | 근거(시험) |
+|---|---|
+| RR10A-N1·RR10B "G1 잔여" 재개 준비 경합의 턴 충돌 | `change-pg` "C40 AC-37 실제 PostgreSQL: 두 게시 서버의 변경 작성 재개 준비가 겹쳐 …"(첫 턴 구독 한도로 대기열에 돌아온 작성 job을 B가 집고 API를 고른 뒤 턴 시작 직전에 A의 `laneTick`이 같은 lease로 API 재개 턴을 시작, 이어 API 잠금 → B는 충돌. 부모 `authoring`·job `running`·`change_closed` 없음, B 선택 `unstarted`·A 선택만 시작. 두 runtime을 이어 돌려 승인 대기까지: 작성 job `succeeded`·세션 `completed`·시도 수 그대로, 모델 2회(첫 턴 + A 턴), 시험 1회, 리뷰 1회) |
+| RR10A-N2·RR10B-N1 지금 설치의 세션 없는 첫 턴 API 실패 | `c40-method-routing-task` "AC-36 지금 설치의 세션 없는 첫 작업 턴이 API 결제로 끝나면 …"(구독이 돌아온 경우·한도인 경우 둘: `method_api=billing_blocked`, 다음 대화 고르기는 각각 구독·구독 확인 시각의 `{ wait }`). `change-artifact` "AC-36 변경 작성 턴: 세션이 남지 않은 첫 턴이 API 결제로 끝나면 …"(API 잠김, job `waiting_user`, 멈춤 `retry_at` 없음·작업 레인만, scheduler 열림, 6시간 뒤 재개 0건·요청 1건) |
+| RR10A "G4 잔여" 보존한 작업의 자동 재개 | 위 둘과 `c40-method-routing-task` "AC-37 세션을 남기지 못한 첫 작업 턴의 옛 계정 API 실패가 …(같은 밀리초/1ms 뒤)"가 같은 확인(`assertHeld`)을 지난다: `waiting_user/model_limit`, 멈춤 `retry_at` 없음·`lane_only_at = paused_at`, scheduler 열림, 자리 비움 아님, `awayFinal` 1건, 6시간 뒤 재개 0건·레인 tick 0건, 관리 재개 뒤 준비가 `failed/task_session_missing`으로 닫고 모델 요청은 처음 1건뿐 |
+
+- **고치기 전 빨강:** 위 시험을 `3b0c4fc`에서 먼저 돌렸다(로그 `c40-fix4-red-1113-163932`): 84건 중 6건이 의도한 이유로 실패했다(부모 `failed`·옛 계정 결과의 다시 시도 1분 뒤 둘·지금 설치 결과가 전역 대기(구독 돌아옴: 결제 멈춤, 한도: 구독 확인 시각) 둘·변경 작성의 전역 대기).
+- **실행(머신 잠금 도우미, node 24.22.0, `--pg`):** `npm run check`·`npm run build` 뒤 2회차와 같은 56개 파일 1,380건 통과, 실패·skip 0(로그 `c40-fix4-1113-164825`).
+- **못 잡는 범위:** 재개 준비 경합은 훅으로 순서를 정한 한 프로세스의 두 연결 실행이다. 세션 없는 첫 턴의 구독 한도(풀리는 시각 뒤 재개 → 준비에서 실패 안내로 닫힘)는 바꾸지 않았다.

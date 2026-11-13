@@ -2371,8 +2371,28 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 | 귀속 | 실행마다 한 번(`settled_at` 없음) | 결과·확인 자리 놓기, 확인된 API 실패의 `lockApi(실행의 계정·revision)`, 지금 설치면 구독 상태 전이·`not_run` 거부·한도 경고 |
 | 결정 | 귀속 때, 그리고 회수(`recovered`)가 같은 결과를 다시 가져올 때 | 지금 설치·실제 지금 계정 여부로 `requeued`·`wait`·`held`·`default` |
 
-**`held`.** `resumable:false`인 옛 설치 결과(옛 계정이거나 API 실패)에만 나온다. 이 값을 받는 호출자는 작업 턴 확정뿐이다(다른 경로는 `resumable`을 넘기지 않는다). 작업 턴은 `waitForUser(…, { laneOnly: true, rateLimit: null, stale: true })`로 둔다. `stale`은 `recordPause`가 시각 비교 없이 옛 자격의 멈춤(1분 뒤 재시도)으로 적게 한다.
+**`held`.** `resumable:false`인 옛 설치 결과(옛 계정이거나 API 실패)에 나온다(3회차부터 지금 설치의 API 실패도). 이 값을 받는 호출자는 작업 턴 확정뿐이다(다른 경로는 `resumable`을 넘기지 않는다). 작업 턴의 처리는 3회차의 `hold`다.
 
 **작업 레인 잠금 순서.** 세션·질문·작업 job을 바꾸는 경로(`begin`·턴 확정·`unchanged`)는 모두 `lockTaskControl`(대화 → scheduler → 레인)로 시작해 job → 세션 순서다. 늦은 준비의 판정(`sessionKept`)은 job 행을 잡은 뒤 세션 행을 잡고 준비 때의 상태·턴·세대와 비교한다. `begin`은 `admit` 거절에서 세션이 바뀌었으면 `reroute` 없이 `conflict`다.
 
 **PR 리뷰 claim 표시.** claim이 미루기를 고를 방식(API) 때문에 건너뛰면 돌려주는 job 객체에 열거되지 않는 심볼 표시를 붙인다. tick은 이 표시가 있는 job만 보내기 전에 미루기를 다시 본다. 표시는 DB에 남지 않는다(같은 tick 안에서만 쓴다).
+
+### 재검토 보완 3회차 (2026-11-13)
+
+결정은 [DECISIONS](DECISIONS.md) "C40 재검토 보완"의 16~17이다.
+
+**`held`의 범위와 처리.** `settleApi`는 확인된 API 실패라도 `resumable:false`면 구독 상태와 무관하게 `held`다(재큐·`{ wait }`를 내지 않는다). 작업 턴 확정은 `held`를 받으면 `waitForUser(…, { laneOnly: true, rateLimit: null, hold: true })`와 `awayFinal` 안내를 한 트랜잭션에서 한다.
+
+| 칸 | `hold`일 때 | 효과 |
+|---|---|---|
+| `jobs` | `waiting_user/model_limit` | `/resume-model`·관리 재개·취소가 닿는다 |
+| `model_pauses.retry_at` | NULL | `resumeDue`가 고르지 않는다 |
+| `model_pauses.lane_only_at` | `= paused_at` | `releaseScheduler`·자리 비움(`away.ts`의 `PAUSED`)이 세지 않는다. 작업 레인만 닫힌다 |
+| `model_pauses.kind` | `rate_limit` | 시도 수를 되돌린다(owner 재개가 시도 한도에 걸리지 않게) |
+| `codex_sessions` | `waiting_model` | 24시간 owner 확인 안내 대상 |
+
+`recordPause(…, hold)`는 `stale`과 같이 한도 관측을 버리고 다시 시도 시각만 비운다. owner가 재개하면 준비(`prepare`·`ClaudeChangeAuthor.resume`)가 작업자 status의 `absent`·세션 없음으로 닫는다(모델 호출 없음).
+
+**두 방식이 모두 막힌 경우의 모델 멈춤.** 세션 없는 작업은 멈춤의 주인이 아니다. 전역 멈춤은 다음 실행의 `select` → `{ wait }` → 그 경로의 `waitForUser(model_limit, 구독 확인 시각)`이 건다(대화 `runtime.ts`, PR 리뷰 `review.ts`, 변경 자체 리뷰, 작업 턴의 `unchanged`).
+
+**턴 충돌의 처리 자리.** `ClaudeChangeAuthor.send`는 지금처럼 `change_turn_conflict`를 던진다. `ChangeRuntime.resumeAuthor`만 이 코드를 비종료로 받는다(`wait` 뒤 `false`, job 미루기 없음). 다음 바퀴의 `authoring`·`amendAuthor`는 세션이 `running`이라 `pollAuthor`로 이긴 턴을 읽는다.
