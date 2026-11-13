@@ -253,6 +253,42 @@ test('B5 호환(게시 서버 gate on + 옛 작업자 이미지): 명령을 열�
   } finally { old.closeAllConnections(); old.close(); }
 });
 
+test('AC-32·AC-42 한도 뒤 API 사용 스위치가 꺼져 있으면 지원 확인조차 보내지 않고, 켜도 두 작업자가 새 판을 알리지 않으면 열리지 않는다', async () => {
+  const old: Server = createServer((_req, res) => { res.writeHead(404).end(); });
+  old.listen(0, '127.0.0.1'); await once(old, 'listening');
+  const taskLane = { workerUrl: `http://127.0.0.1:${(old.address() as AddressInfo).port}/` };
+  const gateLog = () => logs.filter(l => l.event === 'method_routing_gate').map(l => l.detail);
+  try {
+    await boot({ policy: policyWith(TASK_POLICY), taskLane });
+    await registered();
+    await waitFor(() => sends.some(s => s.url.endsWith('/v1/task/intake')));
+    await settle(150);
+    assert.deepEqual(gateLog(), [{ state: 'closed' }]);
+    assert.deepEqual(sends.filter(s => s.url.includes('/v1/contracts')), []);
+    await publisher!.stop(); publisher = undefined; logs = []; sends = [];
+    await boot({ policy: { ...policyWith(TASK_POLICY), apiAfterLimit: true }, taskLane });
+    await registered();
+    await waitFor(() => sends.some(s => s.url.endsWith('/v1/contracts')));
+    await settle(150);
+    // 작업 경로 칸은 따로다(명세 §4.11, C45 전에는 켜지 않는다). 스위치만 켜면 작업 경로는 닫혀 있다.
+    assert.deepEqual(gateLog(), [{ state: 'waiting_worker', task: 'closed' }]);
+    await publisher!.stop(); publisher = undefined; logs = []; sends = [];
+    await boot({ policy: { ...policyWith(TASK_POLICY), apiAfterLimit: true, apiAfterLimitTask: true }, taskLane });
+    await registered();
+    await waitFor(() => sends.some(s => s.url.endsWith('/v1/contracts')));
+    await settle(150);
+    assert.deepEqual(gateLog(), [{ state: 'waiting_worker', task: 'waiting_worker' }]);
+    // 작업 경로 칸만으로는 아무것도 열지 않는다(지원 확인도 없다).
+    await publisher!.stop(); publisher = undefined; logs = []; sends = [];
+    await boot({ policy: { ...policyWith(TASK_POLICY), apiAfterLimitTask: true }, taskLane });
+    await registered();
+    await waitFor(() => sends.some(s => s.url.endsWith('/v1/task/intake')));
+    await settle(150);
+    assert.deepEqual(gateLog(), [{ state: 'closed' }]);
+    assert.deepEqual(sends.filter(s => s.url.includes('/v1/contracts')), []);
+  } finally { old.closeAllConnections(); old.close(); }
+});
+
 test('B5 수직 흐름(둘 다 새 + gate on): /task → needs_input → /answer → 같은 세션 resume → completed → 세션 정리, 작업 중에도 대화는 돎', async () => {
   worker = await workerFixture();
   const keys = generateKeyPairSync('ed25519');

@@ -9,10 +9,12 @@ import { ChangeStoreArtifacts, collectArtifact, compareBaseline, decodeArtifact,
 import type { ChangeBaseline } from '../src/change-artifact.js';
 import { ARTIFACT_LIMITS, artifactDigest, gitBlobSha, sha256Hex } from '../src/change-contracts.js';
 import type { ChangeKey } from '../src/change-contracts.js';
+import pg from 'pg';
+import { Postgres, migrate } from '../src/database.js';
 import type { Database } from '../src/database.js';
 import { ChangeStore } from '../src/change-store.js';
 import { ClaudeChangeAuthor, ClaudeTaskBridge, renderChangeBrief } from '../src/claude-task-bridge.js';
-import type { ChangeAuthorSource } from '../src/claude-task-bridge.js';
+import type { ChangeAuthorDeps, ChangeAuthorSource } from '../src/claude-task-bridge.js';
 import { fileWorkspace } from '../src/codex-workspace.js';
 import type { Job } from '../src/contracts.js';
 import type { RunDirs } from '../src/executor.js';
@@ -22,6 +24,8 @@ import { CHANGE_INSTRUCTIONS_REVISION, CHANGE_NOTE_LIMITS, TASK_ENDPOINTS, TASK_
 import { TaskWorkerRejected } from '../src/task-bridge.js';
 import { HttpTaskV2Worker, taskWorkerChangeContract, taskWorkerChangeInstructions, taskWorkerIntake } from '../src/task-http.js';
 import { parseTaskArchive } from '../src/task-workspace.js';
+import { MethodRouter, installMethods } from '../src/method-routing.js';
+import { recordAccount, switchAccount } from '../src/model-accounts.js';
 import { ReviewRuntime } from '../src/review.js';
 import type { TaskEvidence } from '../src/task-workspace.js';
 import { BASE_ITEMS, FIXTURE_TOKEN, baseTreeOf, changeWorkerFixture, identity, leavesOf, settledResult } from './change-worker-harness.js';
@@ -370,10 +374,10 @@ test('응답 상한: 받는 쪽도 2MiB를 넘으면 자르지 않고 실패다'
 // ---- 게시 서버 port ----
 
 interface AuthorHarness { f: ChangeWorkerFixture; author: ClaudeChangeAuthor; bridge: ClaudeTaskBridge; app: Awaited<ReturnType<typeof dbFixture>>; job: Job; db: Database; key: ChangeKey; store: ChangeStore; baseCommit: string; baseTree: string;
-  calls: { finalize: number; intercept?: (endpoint: string, send: () => Promise<{ response: unknown; bytes: number }>) => Promise<{ response: unknown; bytes: number }> } }
-async function authorHarness(options: { items?: TarItem[] } = {}): Promise<AuthorHarness> {
+  calls: { finalize: number; sent: Record<string, any>[]; intercept?: (endpoint: string, send: () => Promise<{ response: unknown; bytes: number }>) => Promise<{ response: unknown; bytes: number }> } }
+async function authorHarness(options: { items?: TarItem[]; db?: Database } = {}): Promise<AuthorHarness> {
   const f = await fresh(options);
-  const { db } = await localDatabase();
+  const db = options.db ?? (await localDatabase()).db;
   const app = await dbFixture(db);
   const jobRow = await task(app, db, 'author-1', '자식 작업');
   const jobId = jobRow.id as string;
@@ -396,11 +400,18 @@ async function authorHarness(options: { items?: TarItem[] } = {}): Promise<Autho
     keyOf: async () => key,
     questionRisk: async () => null,
   };
-  const calls: AuthorHarness['calls'] = { finalize: 0 };
+  const calls: AuthorHarness['calls'] = { finalize: 0, sent: [] };
   const counted: HttpTaskV2Worker = Object.create(f.port) as HttpTaskV2Worker;
   counted.callV2 = (async (endpoint: never, body: never, signal?: AbortSignal) => {
     if (endpoint === '/v2/task/finalize') calls.finalize++;
-    const send = () => f.port.callV2(endpoint, body, signal);
+    // 작업자 fixture에는 계정 묶음이 없어 방식 선택을 받지 않는다. 턴 요청은 기록하고 선택 칸은 빼고 보낸다(실행 칸은 시험이 결과에 붙인다).
+    let forwarded: never = body;
+    if (endpoint === '/v2/task') {
+      calls.sent.push(body);
+      const { execution: _execution, ...rest } = body as Record<string, unknown>;
+      forwarded = rest as never;
+    }
+    const send = () => f.port.callV2(endpoint, forwarded, signal);
     return calls.intercept ? calls.intercept(endpoint, send) : send();
   }) as HttpTaskV2Worker['callV2'];
   // 이 묶음은 판과 무관한 작성 port 동작을 옛 판 출력으로 본다. 받는 판을 알리지 않는 옛 port 모양이라 게시 서버가 옛 판을 보낸다(새 판은 c28 시험).
@@ -586,6 +597,247 @@ test('AC-16 작성 port 재개: 한도 대기 턴은 턴 예산에서 빠지고,
   await h.author.resume({ receiptId, answer: 'src를 고쳐라', label: 'public' });
   assert.equal((await pollAuthor(h, receiptId)).kind, 'snapshot');
   assert.equal((await h.db.query<{ turn: number }>('SELECT turn FROM codex_sessions WHERE job_id=$1', [h.job.id])).rows[0]!.turn, 17);
+});
+
+// ---- 한도 뒤 API 사용(C40): 변경 작성 턴 ----
+
+// 지금 계정에 두 방식을 설치하고 라우터를 붙인다. task: 정책 apiAfterLimitTask(작업 경로 칸).
+async function routedAuthor(task = true, db?: Database): Promise<AuthorHarness> {
+  const h = await authorHarness(db ? { db } : {});
+  await recordAccount(h.db, 'main', 'subscription', h.app.now());
+  await recordAccount(h.db, 'main', 'api', h.app.now());
+  await h.app.store.atomic(s => switchAccount(s, 'main', 'subscription', 'cli', 'cli'));
+  assert.equal((await h.app.store.atomic(s => installMethods(s, 'main', 'rev-1'))).result, 'installed');
+  h.bridge.useMethods(new MethodRouter(h.app.store, { enabled: true, task, supported: () => true }));
+  return h;
+}
+const TURN_ENDS = new Set(['snapshot', 'needs_input', 'limited', 'auth_expired', 'failed', 'unknown']);
+// 턴 결말에 그 턴 요청의 실행 칸을 붙인다(작업자는 요청 선택으로만 돈다). ends[i]가 있으면 i번째 턴 요청의 결말을 그 모양으로 바꾼다.
+const routedEnds = (h: AuthorHarness, ends: (((response: any, request: any) => Record<string, unknown>) | null)[]) => {
+  h.calls.intercept = async (endpoint, send) => {
+    const sent = await send();
+    const response = sent.response as any;
+    if (endpoint !== '/v2/task/result' || !TURN_ENDS.has(response.status)) return sent;
+    const request = h.calls.sent.at(-1)!;
+    const ended = ends[h.calls.sent.length - 1]?.(response, request) ?? response;
+    if (ended.status === 'not_run' || ended.execution || !request.execution) return { ...sent, response: ended };
+    return { ...sent, response: { ...ended, execution: { ...request.execution, subscriptionLimit: false } } };
+  };
+};
+const subscriptionLimitEnd = (h: AuthorHarness, retained = true) => (response: any, request: any) => ({ ...turnEnd(response, 'limited'), sessionRetained: retained,
+  rateLimit: { stop: { cause: 'rate_limit', resetsAt: Math.floor((h.app.now() + 3_600_000) / 1000) } }, execution: { ...request.execution, subscriptionLimit: true } });
+const notRunEnd = (retained: boolean) => (response: any) => ({ ...turnEnd(response, 'not_run'), sessionRetained: retained, refusal: 'bundle_mismatch' });
+const runs = async (h: AuthorHarness) => (await h.db.query<{ path: string; method: string; outcome: string | null }>('SELECT path,method,outcome FROM method_runs ORDER BY selected_at')).rows;
+
+test('AC-38 변경 작성 턴: 구독 한도 뒤 같은 세션의 다음 턴이 API로 이어지고 예산은 새로 채워지지 않는다', async () => {
+  const h = await routedAuthor();
+  await h.f.script([writeStep({ 'src/app.txt': 'two\n' }), writeStep({ 'src/app.txt': 'three\n' })]);
+  routedEnds(h, [subscriptionLimitEnd(h)]);
+  const { receiptId } = await h.author.start(startInput(h));
+  assert.deepEqual(await pollAuthor(h, receiptId), { kind: 'unknown', code: 'model_limit' });
+  // 같은 일이 대기열로 돌아가고 세션은 한도 대기(턴 예산 밖)다. 전역 scheduler는 닫지 않는다.
+  assert.deepEqual(await statesOf(h), { job: 'queued', session: 'waiting_model' });
+  assert.notEqual((await h.db.query<{ value: unknown }>(`SELECT value FROM controls WHERE key='scheduler'`)).rows[0]?.value, true);
+  assert.equal((await h.app.store.claimChangeAuthor(h.job.id))!.id, h.job.id);
+  await h.author.resume({ receiptId, answer: '', label: 'public' });
+  assert.equal((await pollAuthor(h, receiptId)).kind, 'snapshot');
+  // 저장 전에 같은 결과를 다시 읽어도(재시작) 귀속한 선택과 대조해 그대로 받는다.
+  assert.equal((await h.author.fetchResult(receiptId)).kind, 'snapshot');
+  const [first, second] = h.calls.sent;
+  assert.deepEqual([first!.operation, first!.execution?.method], ['start', 'subscription']);
+  assert.deepEqual([second!.operation, second!.turn, second!.execution?.method, second!.resumeReason], ['resume', 2, 'api', 'model_limit']);
+  assert.deepEqual([second!.sessionId, second!.generation], [first!.sessionId, first!.generation]);
+  assert.deepEqual([second!.execution.account, second!.execution.credentialRevision], ['main', 'rev-1']);
+  assert.ok(second!.toolCalls <= first!.toolCalls && second!.runBudgetRemainingMs <= first!.runBudgetRemainingMs);
+  assert.equal(Number((await h.db.query<{ model_wait_turns: number }>('SELECT model_wait_turns FROM codex_sessions WHERE job_id=$1', [h.job.id])).rows[0]!.model_wait_turns), 1);
+  // 두 실행 모두 작업 경로로 기록되고 결과가 귀속됐다.
+  assert.deepEqual(await runs(h), [{ path: 'task', method: 'subscription', outcome: 'limited' }, { path: 'task', method: 'api', outcome: 'succeeded' }]);
+});
+
+test('AC-38 변경 작성 턴: 작업 경로 칸이 꺼져 있으면 선택 칸 없이 구독으로 보내고 실행 기록을 남기지 않는다', async () => {
+  const h = await routedAuthor(false);
+  await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  routedEnds(h, []);
+  const { receiptId } = await h.author.start(startInput(h));
+  assert.equal((await pollAuthor(h, receiptId)).kind, 'snapshot');
+  assert.equal(h.calls.sent[0]!.execution, undefined);
+  assert.deepEqual(await runs(h), []);
+});
+
+test('AC-38 변경 작성 턴: 세션이 남지 않은 첫 턴의 구독 한도는 구독 한도만 적고, API로 새로 시작하지 않고 시간 재개 없이 작업 레인에서 보존한다', async () => {
+  const h = await routedAuthor();
+  await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  routedEnds(h, [subscriptionLimitEnd(h, false)]);
+  const { receiptId } = await h.author.start(startInput(h));
+  assert.deepEqual(await pollAuthor(h, receiptId), { kind: 'unknown', code: 'model_limit' });
+  assert.equal(h.calls.sent[0]!.execution.method, 'subscription');
+  assert.deepEqual((await h.db.query<{ state: string }>('SELECT state FROM method_subscription')).rows.map(row => row.state), ['limited']);
+  assert.equal((await statesOf(h)).job, 'waiting_user');
+  const pause = (await h.db.query<{ retry_at: string | null; lane_only_at: string | null; paused_at: string }>('SELECT retry_at,lane_only_at,paused_at FROM model_pauses')).rows[0]!;
+  assert.deepEqual([pause.retry_at, Number(pause.lane_only_at)], [null, Number(pause.paused_at)]);
+  assert.notEqual((await h.db.query<{ value: unknown }>(`SELECT value FROM controls WHERE key='scheduler'`)).rows[0]?.value, true);
+  h.app.advance(6 * 3_600_000);
+  assert.equal(await h.app.store.resumeDue(), 0);
+  assert.equal((await statesOf(h)).job, 'waiting_user');
+  assert.equal(h.calls.sent.length, 1);
+});
+
+test('AC-36 변경 작성 턴: 세션이 남지 않은 첫 턴이 API 결제로 끝나면 API만 잠그고, 그 작업은 시간 재개 없이 작업 레인에서 보존하며 전역 scheduler는 열어 둔다', async () => {
+  const h = await routedAuthor();
+  await h.db.query(`UPDATE method_subscription SET state='limited',limited_at=$1,next_probe_at=$2`, [h.app.now(), h.app.now() + 3_600_000]);
+  await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  routedEnds(h, [(response, request) => ({ ...turnEnd(response, 'limited'), sessionRetained: false, rateLimit: { stop: { cause: 'billing' } },
+    execution: { ...request.execution, subscriptionLimit: false } })]);
+  const { receiptId } = await h.author.start(startInput(h));
+  assert.deepEqual(await pollAuthor(h, receiptId), { kind: 'unknown', code: 'model_limit' });
+  assert.equal(h.calls.sent[0]!.execution.method, 'api');
+  assert.deepEqual((await h.db.query<{ state: string }>('SELECT state FROM method_api')).rows.map(row => row.state), ['billing_blocked']);
+  assert.equal((await statesOf(h)).job, 'waiting_user');
+  const pause = (await h.db.query<{ retry_at: string | null; lane_only_at: string | null; paused_at: string }>('SELECT retry_at,lane_only_at,paused_at FROM model_pauses')).rows[0]!;
+  assert.deepEqual([pause.retry_at, Number(pause.lane_only_at)], [null, Number(pause.paused_at)]);
+  assert.notEqual((await h.db.query<{ value: unknown }>(`SELECT value FROM controls WHERE key='scheduler'`)).rows[0]?.value, true);
+  h.app.advance(6 * 3_600_000);
+  assert.equal(await h.app.store.resumeDue(), 0);
+  assert.equal((await statesOf(h)).job, 'waiting_user');
+  assert.equal(h.calls.sent.length, 1);
+});
+
+test('C39 넘김: 변경 작성 턴의 실행 안 됨(not_run)은 재개 턴이면 다음 턴 번호로, 첫 턴이면 새 세대로 선택 없이 다시 보낸다', async () => {
+  const h = await routedAuthor();
+  await h.f.script([writeStep({ 'src/app.txt': 'two\n' }), writeStep({ 'src/app.txt': 'three\n' }), writeStep({ 'src/app.txt': 'four\n' })]);
+  routedEnds(h, [subscriptionLimitEnd(h), notRunEnd(true)]);
+  const { receiptId } = await h.author.start(startInput(h));
+  assert.deepEqual(await pollAuthor(h, receiptId), { kind: 'unknown', code: 'model_limit' });
+  assert.equal((await h.app.store.claimChangeAuthor(h.job.id))!.id, h.job.id);
+  await h.author.resume({ receiptId, answer: '', label: 'public' });
+  assert.deepEqual(await pollAuthor(h, receiptId), { kind: 'unknown', code: 'not_run' });
+  assert.deepEqual(await statesOf(h), { job: 'queued', session: 'waiting_model' });
+  assert.equal((await h.app.store.claimChangeAuthor(h.job.id))!.id, h.job.id);
+  await h.author.resume({ receiptId, answer: '', label: 'public' });
+  assert.equal((await pollAuthor(h, receiptId)).kind, 'snapshot');
+  assert.deepEqual(h.calls.sent.map(request => [request.operation, request.turn, request.execution?.method ?? null]),
+    [['start', 1, 'subscription'], ['resume', 2, 'api'], ['resume', 3, null]]);
+
+  const first = await routedAuthor();
+  await first.f.script([writeStep({ 'src/app.txt': 'two\n' }), writeStep({ 'src/app.txt': 'three\n' })]);
+  routedEnds(first, [notRunEnd(false)]);
+  const refused = await first.author.start(startInput(first));
+  assert.deepEqual(await pollAuthor(first, refused.receiptId), { kind: 'unknown', code: 'not_run' });
+  assert.deepEqual(await statesOf(first), { job: 'queued', session: 'cancelled' });
+  assert.equal((await first.app.store.claimChangeAuthor(first.job.id))!.id, first.job.id);
+  const fresh = await first.author.start(startInput(first));
+  assert.equal((await pollAuthor(first, fresh.receiptId)).kind, 'snapshot');
+  assert.deepEqual(first.calls.sent.map(request => [request.operation, request.generation, request.execution?.method ?? null]),
+    [['start', 1, 'subscription'], ['start', 2, null]]);
+});
+
+test('AC-37 두 게시 서버가 같은 작성 job·lease로 각각 고르고 늦게 고른 쪽이 턴 시작(begin)에서 지면, 실제로 시작한 턴의 선택으로 결과를 받는다', async () => {
+  const h = await routedAuthor();
+  await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  routedEnds(h, []);
+  // 서버 A가 고르고 턴을 시작했다.
+  const { receiptId } = await h.author.start(startInput(h));
+  const started = h.calls.sent[0]!;
+  // 서버 B도 세션 없음을 읽고 준비했다. 같은 lease로 더 늦게 고르지만 시작 CAS에서 진다.
+  h.app.advance(1);
+  const late = await h.bridge.selectChangeTurn(h.job);
+  assert.ok(late && 'runId' in late);
+  assert.equal(await h.bridge.beginChangeTurn(h.job, { ...started, execution: late } as never, undefined), 'conflict');
+  assert.equal((await pollAuthor(h, receiptId)).kind, 'snapshot');
+});
+
+// 실제 PostgreSQL(HOMELAB_TEST_PG_SOCKET). 두 게시 서버의 트랜잭션이 각자 연결을 쓴다. 없으면 건너뛴다.
+const pgSocket = process.env.HOMELAB_TEST_PG_SOCKET;
+const pgSkip = pgSocket ? false : 'HOMELAB_TEST_PG_SOCKET 없음(로컬 PostgreSQL 필요)';
+async function pgDatabase(fn: (db: Database) => Promise<void>): Promise<void> {
+  const admin = new pg.Pool({ host: pgSocket, user: 'postgres', database: 'postgres', max: 1 });
+  const name = `c40author_${randomUUID().replaceAll('-', '').slice(0, 12)}`;
+  await admin.query(`CREATE DATABASE ${name}`);
+  const pool = new pg.Pool({ host: pgSocket, user: 'postgres', database: name, max: 8 });
+  try {
+    const db = new Postgres(pool);
+    await migrate(db);
+    await fn(db);
+  } finally {
+    await pool.end();
+    for (let attempt = 0; ; attempt++) {
+      try { await admin.query(`DROP DATABASE ${name}`); break; } catch (error) {
+        if (attempt >= 50 || !/being accessed by other users/.test((error as Error).message)) throw error;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+    await admin.end();
+  }
+}
+// 같은 작성 job·lease를 함께 준비하는 늦은 게시 서버 B. 같은 DB·작업자를 쓰고, 고르기(select)·턴 시작(begin) 직전에 장벽(hook)을 둔다.
+function lateServer(h: AuthorHarness, hooks: { beforeSelect?: () => Promise<void>; beforeBegin?: () => Promise<void> }): ClaudeChangeAuthor {
+  const bridge = Object.create(h.bridge) as ClaudeTaskBridge;
+  bridge.selectChangeTurn = async job => { await hooks.beforeSelect?.(); return h.bridge.selectChangeTurn.call(bridge, job); };
+  bridge.beginChangeTurn = async (job, request, session) => { await hooks.beforeBegin?.(); return h.bridge.beginChangeTurn.call(bridge, job, request, session); };
+  return new ClaudeChangeAuthor({ ...(h.author as unknown as { deps: ChangeAuthorDeps }).deps, bridge });
+}
+const jobFacts = async (h: AuthorHarness) => (await h.db.query<{ state: string; lease_token: string | null; attempt: number }>(
+  'SELECT state,lease_token,attempt FROM jobs WHERE id=$1', [h.job.id])).rows[0]!;
+// 이긴 서버 A의 턴이 끝까지 확정되는가: 결과를 받고 저장한 뒤 finalize가 job을 성공으로 닫는다.
+async function winnerSettles(h: AuthorHarness, receiptId: string): Promise<void> {
+  const result = await pollAuthor(h, receiptId);
+  assert.ok(result.kind === 'snapshot', JSON.stringify(result));
+  await new ChangeStoreArtifacts(h.store).save(h.key, result.artifact, result.transportBytes);
+  await h.author.finalize(receiptId);
+  assert.deepEqual(await statesOf(h), { job: 'succeeded', session: 'completed' });
+}
+
+test('AC-37 늦은 게시 서버의 변경 작성 준비가 구독 확인 대기를 받아도, 먼저 시작한 턴의 job·lease·시도 수를 바꾸지 않고 그 턴이 확정된다(PostgreSQL)', { skip: pgSkip }, async () => {
+  await pgDatabase(async db => {
+    const h = await routedAuthor(true, db);
+    await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+    routedEnds(h, []);
+    // 구독은 한도이고 확인 시각이 됐다. API는 잠겼다. 구독 확인 자리는 하나뿐이다.
+    await db.query(`UPDATE method_subscription SET state='limited',limited_at=$1,next_probe_at=$1`, [h.app.now()]);
+    await db.query(`UPDATE method_api SET state='billing_blocked',blocked_at=$1`, [h.app.now()]);
+    const before = await jobFacts(h);
+    let receiptId = '';
+    // B는 세션 없음을 읽고 준비했다. B가 고르기 직전에 A가 확인 자리를 잡고 턴을 시작한다.
+    const late = lateServer(h, { beforeSelect: async () => { receiptId = (await h.author.start(startInput(h))).receiptId; } });
+    await assert.rejects(late.start(startInput(h)), /change_turn_stale/);
+    assert.deepEqual(h.calls.sent.map(request => request.execution?.method), ['subscription']);
+    assert.deepEqual(await jobFacts(h), before);
+    assert.deepEqual((await db.query('SELECT job_id FROM model_pauses')).rows, []);
+    await winnerSettles(h, receiptId);
+  });
+});
+
+test('AC-37 늦은 게시 서버의 변경 작성 턴 시작이 그 사이 잠긴 API로 거절돼도, 먼저 시작한 턴의 job을 재큐하지 않고 자기 선택만 버린다(PostgreSQL)', { skip: pgSkip }, async () => {
+  await pgDatabase(async db => {
+    const h = await routedAuthor(true, db);
+    await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+    routedEnds(h, []);
+    // 구독은 한도(확인 시각 전)라 두 서버 모두 API를 고른다.
+    await db.query(`UPDATE method_subscription SET state='limited',limited_at=$1,next_probe_at=$2`, [h.app.now(), h.app.now() + 3_600_000]);
+    const before = await jobFacts(h);
+    let receiptId = '';
+    // B가 고른 뒤 턴 시작 직전에 A가 고르고 시작한다. 이어서 다른 실행의 API 결제 실패로 API가 잠긴다.
+    const late = lateServer(h, { beforeBegin: async () => {
+      receiptId = (await h.author.start(startInput(h))).receiptId;
+      await db.query(`UPDATE method_api SET state='billing_blocked',blocked_at=$1`, [h.app.now()]);
+    } });
+    await assert.rejects(late.start(startInput(h)), /change_turn_conflict/);
+    assert.deepEqual(h.calls.sent.map(request => request.execution?.method), ['api']);
+    assert.deepEqual(await jobFacts(h), before);
+    const runs = (await db.query<{ run_id: string; started_at: string | null; outcome: string | null }>('SELECT run_id,started_at,outcome FROM method_runs')).rows;
+    const winner = h.calls.sent[0]!.execution.runId;
+    assert.deepEqual(runs.map(run => [run.run_id === winner, run.started_at !== null, run.outcome]).sort(), [[false, false, 'unstarted'], [true, true, null]]);
+    await winnerSettles(h, receiptId);
+  });
+});
+
+test('AC-37 변경 작성 결과의 실행 칸이 보낸 선택과 다르면 결과를 믿지 않고 응답 유실로 다룬다', async () => {
+  const h = await routedAuthor();
+  await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  routedEnds(h, [(response, request) => ({ ...response, execution: { ...request.execution, method: 'api', subscriptionLimit: false } })]);
+  const { receiptId } = await h.author.start(startInput(h));
+  assert.deepEqual(await pollAuthor(h, receiptId), { kind: 'failed', code: 'task_worker_lost' });
+  assert.equal((await statesOf(h)).job, 'failed');
 });
 
 test('작성 port 취소: 대기 중 세션을 취소하면 job·세션·질문을 닫고 공간을 지운다. 뒤의 fetchResult는 옛 결과를 주지 않는다', async () => {

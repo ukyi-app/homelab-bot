@@ -391,7 +391,10 @@ export class ChangeRuntime {
       await this.deps.store.requeueChangeAuthor(child.id, child.conversation_id);
       return false;
     }
-    if (!child.session_state) {
+    // 첫 턴이 실행 안 됨(not_run)으로 끝나 다시 보낼 수 있으면 세션은 닫히고 job만 대기열에 돌아와 있다. 새 세대로 다시 시작한다.
+    // 다른 경로는 대기열 job에 닫힌 세션을 남기지 않는다(취소는 job을 끝내고, lease 만료 되돌리기는 세션이 없거나 대기일 때만이다).
+    const restart = child.session_state === 'cancelled' && child.state === 'queued';
+    if (!child.session_state || restart) {
       if (JOB_ENDED.has(child.state)) { await this.authorEnded(request, { to: child.state === 'cancelled' ? 'cancelled' : 'failed', reason: child.wait_reason ?? `author_${child.state}` }); return true; }
       return this.startAuthor(request, child);
     }
@@ -473,6 +476,13 @@ export class ChangeRuntime {
       return true;
     } catch (error) {
       const code = error instanceof Error ? error.message : '';
+      // 다른 게시 서버가 같은 job·lease로 그 사이 턴을 시작했다(세션이 준비 때와 다르다). 그 턴이 이 작성의 진행이라 부모·job을 건드리지 않고
+      // 다음 바퀴에 그 턴의 결과를 읽는다. 미루기(defer)도 하지 않는다: 그 job의 lease는 이긴 턴의 것이다.
+      if (code === 'change_turn_conflict') {
+        this.deps.log('change_author_turn_conflict', {});
+        this.wait(`step:${request.id}`, this.periods.authorPollMs);
+        return false;
+      }
       if (code.startsWith('change_') && code !== 'change_turn_stale' && code !== 'change_job_not_claimed') return this.authorEnd(request, round, { to: 'failed', reason: code });
       const row = (await this.db.query<Job>('SELECT * FROM jobs WHERE id=$1', [child.id])).rows[0];
       if (row && WAITING_SESSION.has(await this.sessionState(child.id) ?? '')) await this.deps.store.defer(row, 'change_resume_deferred');
@@ -838,7 +848,8 @@ export class ChangeRuntime {
       await this.deps.store.requeueChangeAuthor(child.id, child.conversation_id);
       return false;
     }
-    if (!child.session_state) {
+    // 첫 턴 실행 안 됨 뒤 새 세대로 다시 시작한다(authoring과 같다).
+    if (!child.session_state || (child.session_state === 'cancelled' && child.state === 'queued')) {
       if (JOB_ENDED.has(child.state)) return this.failAmendment(request, round, child.wait_reason ?? `author_${child.state}`);
       return this.startAmendAuthor(request, round, child);
     }

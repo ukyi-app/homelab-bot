@@ -2311,3 +2311,90 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 | 새, 지원 확인 뒤 | 새 + 묶음 있음 | 요청 선택의 방식 하나로 돌고 실행 칸을 돌려준다 |
 
 **자격 표면.** 실행 env의 자격 변수는 여전히 하나다. 작업자 Secret에는 레인마다 두 자격과 비밀 아닌 묶음이 있고(C42 설치 뒤), 작업 sandbox는 그 디렉터리 전체를 읽기·쓰기 금지로 가린다.
+
+## C40 게시 서버의 방식 선택 (2026-11-12)
+
+위 "C38" 1절의 게시 서버 쪽 구현이다. 이름·전이 표·관리 명령은 [DECISIONS](DECISIONS.md) "C40"이다.
+
+**흐름.** claim → 경로가 `MethodRouter.select(job, 경로)` → (스위치·지원 확인·설치가 모두 맞으면) scheduler 잠금 아래에서 방식을 고르고 `method_runs`에 실행 ID와 함께 적음(고를 방식이 없으면 `{ wait }`로 모델 멈춤) → 보내기 직전 `start`(작업 레인·변경 작성은 `begin` 안의 `admit`·`started`)로 다시 확인하고 시작 시각을 적음(거절이면 `reroute`) → 새 판 요청(대화 v3·리뷰 v2·변경 자체 리뷰 v2·작업 `execution` 칸)에 서명 → 작업자 → 응답의 실행 칸이 보낸 선택과 같은지 대조(다르면 모름) → `MethodRouter.settle(job, 선택, 결과)`가 한 트랜잭션에서 그 실행 행을 닫고 상태를 좁게 바꾸고 필요하면 같은 job을 대기열로 돌림 → 경로는 `requeued`면 멈추지 않고 끝, `wait`면 구독 확인 시각으로 `waitForUser`, `default`면 지금 동작. select가 null이면 처음부터 옛 판이다.
+
+**모듈.**
+
+- `method-routing.ts`: `MethodRouter`(`select`·`start`/`admit`·`started`·`reroute`·`abandon`·`settle`·`apiChosen`·`pendingSelection`), 설치·끄기·API 잠금 해제·보기(`installMethods`·`disableMethods`·`unlockApi`·`methodRoutingView`). store·model-accounts·execution-auth만 읽는다.
+- `migrations/029_method_routing.sql`: `method_routing`(지금 설치 한 행)·`method_subscription`(계정별)·`method_api`(계정·revision별)·`method_runs`, 기존 표에는 `model_pauses.lane_only_at` 하나. 추가만이라 옛 게시 서버 코드가 그대로 돈다.
+- `policy.ts`: `apiAfterLimit`과 작업 경로 칸 `apiAfterLimitTask`. `main.ts`: 라우터 하나를 만들어(작업 경로는 두 칸이 다 참일 때만 연다) 대화 runtime·PR 리뷰 runtime·변경 자체 리뷰 서비스(`useMethods`)·작업 브리지(`useMethods`, 변경 작성 턴도 이 브리지를 지난다)에 넘기고, 스위치가 켜졌을 때만 `method_support_probe`(30초)로 두 작업자의 지원을 본다. 변경 작성 경로(`change_author`)는 작업 접수의 `executionSelection`에 `/v2/task`가 있어야 연다.
+- 경로별 연결: `runtime.ts`(대화), `review.ts`(PR 리뷰 claim의 미루기와 v2), `change-review.ts`(즉시 결과·저장 결과 회수·ACK), `claude-task-bridge.ts`(v1 작업 턴과 변경 작성 v2 턴, `not_run`, 실행 칸 대조), `change-runtime.ts`(변경 작성·수정 차례 작성의 첫 턴 `not_run` 뒤 새 세대 시작), `admin.ts`(관리 명령 넷).
+- 변경 작성 턴: `ClaudeChangeAuthor.send`가 `selectChangeTurn`으로 고른 선택을 요청에 싣는다. 결과는 `fetchResult`가 나중에(다른 프로세스일 수 있다) 읽으므로, 확정 때 세션 `worker_lease`로 `method_runs`에서 실제로 시작한 그 선택을 다시 찾아(`pendingSelection`, 귀속 여부 무관) 대조하고 v1과 같은 `settle`에 넘긴다.
+
+**잠금 순서.** scheduler 행 → `method_runs` 행 → `method_routing`·`method_subscription`·`method_api` 행. 작업 레인은 턴 확정 트랜잭션(대화 행 → scheduler → 레인 행 → job) 안에서 같은 트랜잭션으로 `settle`을 부른다(`within`). 두 게시 서버의 동시 보고는 scheduler 행에서 줄을 서고, 고를 때의 `epoch`가 지금과 다르면 넘어감을 다시 하지 않는다.
+
+**호환.** 스위치 꺼짐·지원 미확인·설치 없음이면 요청·응답·DB 쓰기가 지금과 같다(`method_routing`·`method_runs`에 쓰지 않는다). 옛 작업자(지원 404)에는 새 판을 보내지 않는다. 변경 자체 리뷰의 v2 저장 결과는 새 게시 서버가 스위치와 무관하게 회수한다. 되돌려도 두 표와 감사 기록은 지우지 않는다.
+
+**되돌리기 순서.** "C38" 6절에 정책 칸 단계를 넣은 것이다.
+
+1. 운영 `RUNTIME_POLICIES`에서 `apiAfterLimitTask`·`apiAfterLimit` 칸을 지우고 파드 재시작으로 반영한다(스위치 꺼짐). 정책 스키마가 strict라 이 칸이 남은 정책으로는 옛 게시 서버가 기동하지 못한다(`runtime_policies_invalid`). 그래서 이 단계는 게시 서버를 되돌리기 전, 맨 앞이다. `false`로 두는 것으로는 부족하고 칸 자체를 뺀다.
+2. 진행 중인 새 판 요청·작업 턴·변경 작성 턴·변경 자체 리뷰 저장 결과를 끝내거나 안전히 대기로 둔다(새 게시 서버가 v2 저장 결과를 회수한다).
+3. 필요하면 활성 API 키를 `unset`한다.
+4. 작업자를 되돌린다.
+5. 게시 서버를 되돌린다.
+
+구독 고정, 작업 세션 기록 판 확인, 기록·DB 칸을 지우지 않는 것 등 나머지 주의는 "C38" 6절 그대로다.
+
+## C40 재검토 보완 (2026-11-12)
+
+결정과 근거는 [DECISIONS](DECISIONS.md) "C40 재검토 보완"이다. 설계 모양만 적는다.
+
+**선택의 수명.** `select`가 고른 선택은 세 끝 중 하나다.
+
+| 끝 | 누가 | `method_runs` |
+|---|---|---|
+| 보냄 | `start`(대화·PR 리뷰·변경 자체 리뷰), `begin` 안의 `admit` + `started`(작업 턴·변경 작성 턴) | `started_at` 기록, 결과는 뒤에 `settle` |
+| 다시 고름 | `start`·`admit` 거절 → `reroute` | `outcome='unstarted'`, 확인 자리 놓음, job은 대기열(시도로 세지 않음) |
+| 버림 | dispatch 전 다른 끝(취소·종료 되돌림·lease 상실·턴 CAS에서 짐·리뷰 미루기) → `abandon` | `outcome='unstarted'`, 확인 자리 놓음 |
+
+`select`가 `{ wait }`를 돌려주면 선택이 없고 경로가 `waitForUser(model_limit)`한다. 작업 레인은 `unchanged` 안에서(세션 그대로), 변경 작성은 `waitChangeTurn`(같은 `unchanged`) 뒤 `change_turn_stale`로 던져 change-runtime이 시작하지 못한 턴으로 다룬다.
+
+**상태 읽기.** 라우터는 `method_routing` 행에 그 계정의 `method_subscription` 행과 그 계정·revision의 `method_api` 행, 실제 지금 계정 여부(`model_accounts.current`)와 등록 방식 수를 붙인 한 행으로 읽는다. 설치가 두 상태 행을 만든다(`ON CONFLICT DO NOTHING`, 구독 확인 자리는 가리키는 설치가 바뀔 때만 비움).
+
+**귀속.** `settle`의 "지금 설치"는 설치 active·계정·revision 일치·그 계정이 실제 지금 계정이다. `record`는 취소·종료 분기에서 확인된 API 실패의 잠금만 적는다. 선택이 있는 실행의 대기 아닌 결과의 한도 경고는 `settle`이 `observeRateLimit(…, null)`로 남기고(구독·지금 설치일 때만), 경로는 자기 `observeRateLimit`을 선택이 없을 때만 부른다.
+
+**작업 레인만 막는 대기.** `waitForUser(…, { laneOnly })` → `recordPause(…, laneOnly)`가 `model_pauses.lane_only_at = paused_at`을 적는다. `releaseScheduler`는 이 조건의 대기를 전역 대기로 세지 않는다. 작업 레인은 지금처럼 `taskLaneStopped`(모델 한도 대기 있음)로 닫힌다.
+
+### 재검토 보완 2회차 (2026-11-13)
+
+결정은 [DECISIONS](DECISIONS.md) "C40 재검토 보완"의 10~15다.
+
+**`settle`의 두 층.** 귀속과 후속 결정을 나눴다.
+
+| 층 | 언제 | 하는 일 |
+|---|---|---|
+| 귀속 | 실행마다 한 번(`settled_at` 없음) | 결과·확인 자리 놓기, 확인된 API 실패의 `lockApi(실행의 계정·revision)`, 지금 설치면 구독 상태 전이·`not_run` 거부·한도 경고 |
+| 결정 | 귀속 때, 그리고 회수(`recovered`)가 같은 결과를 다시 가져올 때 | 지금 설치·실제 지금 계정 여부로 `requeued`·`wait`·`held`·`default` |
+
+**`held`.** `resumable:false`인 옛 설치 결과(옛 계정이거나 API 실패)에 나온다(3회차부터 지금 설치의 API 실패와 넘어갈 근거가 있는 구독 한도도). 이 값을 받는 호출자는 작업 턴 확정뿐이다(다른 경로는 `resumable`을 넘기지 않는다). 작업 턴의 처리는 3회차의 `hold`다.
+
+**작업 레인 잠금 순서.** 세션·질문·작업 job을 바꾸는 경로(`begin`·턴 확정·`unchanged`)는 모두 `lockTaskControl`(대화 → scheduler → 레인)로 시작해 job → 세션 순서다. 늦은 준비의 판정(`sessionKept`)은 job 행을 잡은 뒤 세션 행을 잡고 준비 때의 상태·턴·세대와 비교한다. `begin`은 `admit` 거절에서 세션이 바뀌었으면 `reroute` 없이 `conflict`다.
+
+**PR 리뷰 claim 표시.** claim이 미루기를 고를 방식(API) 때문에 건너뛰면 돌려주는 job 객체에 열거되지 않는 심볼 표시를 붙인다. tick은 이 표시가 있는 job만 보내기 전에 미루기를 다시 본다. 표시는 DB에 남지 않는다(같은 tick 안에서만 쓴다).
+
+### 재검토 보완 3회차 (2026-11-13)
+
+결정은 [DECISIONS](DECISIONS.md) "C40 재검토 보완"의 16~17이다.
+
+**`held`의 범위와 처리.** `settleApi`는 확인된 API 실패라도 `resumable:false`면 구독 상태와 무관하게 `held`다(재큐·`{ wait }`를 내지 않는다). 작업 턴 확정은 `held`를 받으면 `waitForUser(…, { laneOnly: true, rateLimit: null, hold: true })`와 `awayFinal` 안내를 한 트랜잭션에서 한다.
+
+| 칸 | `hold`일 때 | 효과 |
+|---|---|---|
+| `jobs` | `waiting_user/model_limit` | `/resume-model`·관리 재개·취소가 닿는다 |
+| `model_pauses.retry_at` | NULL | `resumeDue`가 고르지 않는다 |
+| `model_pauses.lane_only_at` | `= paused_at` | `releaseScheduler`·자리 비움(`away.ts`의 `PAUSED`)이 세지 않는다. 작업 레인만 닫힌다 |
+| `model_pauses.kind` | `rate_limit` | 시도 수를 되돌린다(owner 재개가 시도 한도에 걸리지 않게) |
+| `codex_sessions` | `waiting_model` | 24시간 owner 확인 안내 대상 |
+
+`recordPause(…, hold)`는 `stale`과 같이 한도 관측을 버리고 다시 시도 시각만 비운다. owner가 재개하면 준비(`prepare`·`ClaudeChangeAuthor.resume`)가 작업자 status의 `absent`·세션 없음으로 닫는다(모델 호출 없음).
+
+**두 방식이 모두 막힌 경우의 모델 멈춤.** 세션 없는 작업은 멈춤의 주인이 아니다. 전역 멈춤은 다음 실행의 `select` → `{ wait }` → 그 경로의 `waitForUser(model_limit, 구독 확인 시각)`이 건다(대화 `runtime.ts`, PR 리뷰 `review.ts`, 변경 자체 리뷰, 작업 턴의 `unchanged`).
+
+**턴 충돌의 처리 자리.** `ClaudeChangeAuthor.send`는 지금처럼 `change_turn_conflict`를 던진다. `ChangeRuntime.resumeAuthor`만 이 코드를 비종료로 받는다(`wait` 뒤 `false`, job 미루기 없음). 다음 바퀴의 `authoring`·`amendAuthor`는 세션이 `running`이라 `pollAuthor`로 이긴 턴을 읽는다.
+
+**구독 한도의 `held`(3회차 마무리, DECISIONS 18).** `settleSubscription`은 넘어갈 근거가 있는 구독 한도의 상태 전이(`limited`·확인 시각·epoch)를 마친 뒤, `resumable:false`면 API 상태와 무관하게 `held`다(재큐하지 않는다). 회수 재진입(`first=false`)도 같은 조건에서 `held`다. 작업 턴 확정의 처리는 위 `hold`와 같다. 선택이 없는 턴(스위치 꺼짐·미설치·작업 경로 칸 꺼짐)은 `settle`을 지나지 않아 지금처럼 `waitForUser(model_limit, 풀리는 시각)`이다.

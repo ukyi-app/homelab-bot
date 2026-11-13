@@ -6,10 +6,13 @@ import { ProposalDesk } from './proposals.js';
 import type { ReadAdapter } from './read.js';
 import { ReadRuntime, dispatchable } from './read-runtime.js';
 import type { Store } from './store.js';
-import { workerRequest } from './worker.js';
-import type { WorkerClient, WorkerResultV2, WorkerSigner } from './worker.js';
+import { workerRequest, workerRequestV3 } from './worker.js';
+import type { VersionedWorker, WorkerResultV2, WorkerResultV3, WorkerSigner } from './worker.js';
 import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
+import { methodWait } from './method-routing.js';
+import type { MethodRouter } from './method-routing.js';
+import type { ExecutionSelection } from './execution-auth.js';
 
 // 봇 소유 Codex 작업 경로. dispatch 뒤의 오류는 스스로 상태로 기록하고 던지지 않는다.
 export interface TaskLane { run(job: Job): Promise<void>; sweep?(): Promise<unknown> }
@@ -19,8 +22,13 @@ export interface TaskLane { run(job: Job): Promise<void>; sweep?(): Promise<unkn
 // taskLoop: 작업 레인을 tickTask 루프로 따로 돌린다. tick은 대화만 집어 긴 작업이 대화를 기다리게 하지 않는다.
 // 끄면(기본) tick 하나가 모든 모델 job을 슬롯 하나로 처리한다.
 // externalTask: R08 연결 명령을 조립했는가. 켜졌을 때만 세션 연결 제안을 받는다(키 보기 버튼을 받을 곳이 없다).
-export interface RuntimeOptions { shutdown?: AbortSignal; drainMs?: number; log?: Log; taskLoop?: boolean; externalTask?: boolean }
+// methods: 한도 뒤 API 사용(C40). 없거나 고를 수 없으면 대화는 v2 요청 그대로다.
+export interface RuntimeOptions { shutdown?: AbortSignal; drainMs?: number; log?: Log; taskLoop?: boolean; externalTask?: boolean; methods?: MethodRouter }
+type ChatResult = WorkerResultV2 | WorkerResultV3;
 export const DRAIN_MS = 10_000;
+// 작업자 결과에서 방식 상태에 쓰는 칸. 넘어갈 근거는 v3 응답의 실행 칸에만 있다.
+const routedOutcome = (result: Exclude<ChatResult, { status: 'unknown' } | { status: 'not_run' }>) => ({ status: result.status, rateLimit: result.rateLimit,
+  subscriptionLimit: 'execution' in result && result.execution.subscriptionLimit });
 // 멈춤이 확인된 뒤의 상태 쓰기 시도 횟수. 간격은 200ms, 400ms로 짧게 둔다(종료 기한 안에 들어가야 한다).
 export const STOPPED_WRITE_ATTEMPTS = 3;
 const STOPPED_WRITE_DELAY_MS = 200;
@@ -31,10 +39,12 @@ export class Runtime {
   private readonly drainMs: number;
   private readonly log: Log;
   private readonly taskLoop: boolean;
+  private readonly methods?: MethodRouter;
   constructor(private readonly store: Store, private readonly gate: PolicyGate,
-    private readonly worker: WorkerClient, private readonly signer: WorkerSigner,
+    private readonly worker: VersionedWorker, private readonly signer: WorkerSigner,
     reader: ReadAdapter, private readonly tasks?: TaskLane, options: RuntimeOptions = {}) {
     this.shutdown = options.shutdown;
+    if (options.methods) this.methods = options.methods;
     this.drainMs = options.drainMs ?? DRAIN_MS;
     this.log = options.log ?? jsonLog;
     this.taskLoop = options.taskLoop ?? false;
@@ -78,6 +88,7 @@ export class Runtime {
     // 쓰기가 실패해도 catch가 cancel을 다시 묻지 않게 한다.
     let confirmed = false;
     let latestPolicy: Policy | undefined;
+    let selection: ExecutionSelection | null = null;
     try {
       // 종료 신호 전에 시작한 claim이 늦게 돌아온 경우. 작업자에 보내기 전이라 시도 횟수를 쓰지 않고 되돌린다.
       if (await this.deferOnShutdown(job)) return true;
@@ -98,17 +109,31 @@ export class Runtime {
         return true;
       }
       // surface는 동료 기능 스위치를 따른다(켜짐이면 '/' 명령 이름이 없는 speech).
-      const request = workerRequest(job, await this.store.context(job.conversation_id, job.event_id), {
-        surface: this.store.colleague ? 'speech' : 'slash',
-        earlierPurged: await this.store.earlierPurged(job.conversation_id, job.event_id) });
+      const context = await this.store.context(job.conversation_id, job.event_id);
+      const requestOptions = { surface: this.store.colleague ? 'speech' as const : 'slash' as const,
+        earlierPurged: await this.store.earlierPurged(job.conversation_id, job.event_id) };
+      // 방식을 고를 수 있으면 선택 칸이 든 v3, 아니면 지금의 v2다. 선택은 실행 기록과 함께 저장돼 결과를 그 선택으로 귀속한다.
+      const routed = this.methods ? await this.methods.select(job, 'chat') : null;
+      // 구독은 한도, API는 잠김, 구독 확인 자리도 없다: 보내지 않고 구독 확인 시각까지 모델 멈춤이다.
+      if (methodWait(routed)) { await this.store.waitForUser(job, 'model_limit', { rateLimit: routed.wait }); return true; }
+      selection = routed;
+      const request = selection ? workerRequestV3(job, context, requestOptions, selection) : workerRequest(job, context, requestOptions);
       await this.gate.authorize(job.owner_id, job.target);
-      if (!await this.dispatchable(job)) return true;
+      // 고른 뒤 그 사이 API가 잠기거나 구독이 한도가 됐으면 이 선택으로 보내지 않고 다시 고르게 한다. 이 확인 뒤의 잠금은 이미 시작한 실행이다.
+      // 되돌리지 못했으면(그 사이 취소 요청·lease 상실) dispatch 전 확인이 그 끝을 정한다.
+      if (selection && !await this.methods!.start(job, selection)) {
+        if (!await this.methods!.reroute(job, selection)) await this.dispatchable(job);
+        return true;
+      }
       // 여기부터 dispatch까지는 await가 없어 신호가 끼어들 틈이 없다. 이후의 신호는 드레인 타이머가 받는다.
-      if (await this.deferOnShutdown(job)) return true;
+      if (!await this.dispatchable(job) || await this.deferOnShutdown(job)) {
+        if (selection) await this.methods!.abandon(selection);
+        return true;
+      }
       const abort = new AbortController();
       let timeout: ReturnType<typeof setTimeout> | undefined;
       let monitorTask: Promise<void> | undefined;
-      const interrupted = new Promise<WorkerResultV2>(resolve => {
+      const interrupted = new Promise<ChatResult>(resolve => {
         abort.signal.addEventListener('abort', () => resolve({ status: 'unknown', stopped: false }), { once: true });
       });
       const monitor = setInterval(() => {
@@ -127,15 +152,15 @@ export class Runtime {
         drain = setTimeout(() => { drained = true; void stopRequest(); abort.abort(); }, this.drainMs);
       };
       this.shutdown?.addEventListener('abort', onShutdown, { once: true });
-      let result: WorkerResultV2 | undefined;
+      let result: ChatResult | undefined;
       let rejected = false;
       try {
         const capability = this.signer.issue(job, 'execute', request);
         dispatched = true;
         result = await Promise.race([
-          this.worker.execute(request, capability, abort.signal),
+          this.worker.execute(request, capability, abort.signal) as Promise<ChatResult>,
           interrupted,
-          new Promise<WorkerResultV2>(resolve => {
+          new Promise<ChatResult>(resolve => {
             timeout = setTimeout(() => { abort.abort(); resolve({ status: 'unknown', stopped: false }); }, job.budget.timeoutMs);
           }),
         ]);
@@ -154,9 +179,20 @@ export class Runtime {
         await monitorTask;
       }
       stopped = result.stopped;
+      if (result.status === 'not_run') {
+        // 작업자가 선택을 설치된 묶음·자격과 대조하다 모델을 부르지 않고 거부했다. 실행이 아니라 시도로 세지 않고 다시 넣는다
+        // (router가 설치를 refused로 바꿔 다음은 옛 판이다). 다시 넣지 못하면(lease 상실·취소 요청) 지금 규칙의 실패다.
+        const settled = selection && this.methods ? await this.methods.settle(job, selection, { status: 'not_run', refusal: result.refusal }) : undefined;
+        if (settled?.action !== 'requeued') await this.store.fail(job, 'worker_not_run');
+        return true;
+      }
       waiting = result.stopped && (result.status === 'limited' || result.status === 'auth_expired');
+      // 대기가 아닌 결과도 그 실행의 선택으로 귀속한다(구독 확인 성공이 구독 복귀가 된다). 기록 실패가 답 처리를 막지 않는다.
+      if (selection && this.methods && result.stopped && !waiting) await this.methods.settle(job, selection, routedOutcome(result))
+        .catch(error => this.log('method_settle_failed', { job: job.id, ...errorInfo(error) }));
       // 대기가 아닌 결과의 한도 경고도 계정 기록에 남긴다(리뷰 미루기). 기록 실패가 답 처리를 막지 않는다.
-      if (result.stopped && !waiting) await this.store.observeRateLimit(result.rateLimit, job.id)
+      // 선택을 실은 실행은 settle이 그 계정·revision이 지금 설치일 때만 남긴다.
+      if (result.stopped && !waiting && !selection) await this.store.observeRateLimit(result.rateLimit, job.id)
         .catch(error => this.log('rate_limit_observe_failed', { job: job.id, ...errorInfo(error) }));
       try { latestPolicy = await this.gate.authorize(job.owner_id, job.target); }
       catch (error) {
@@ -167,8 +203,17 @@ export class Runtime {
       const rateLimit = result.stopped ? result.rateLimit : null;
       if (!authorizationRevoked && current.state !== 'cancel_requested' && result.stopped
         && (result.status === 'limited' || result.status === 'auth_expired')) {
-        await this.store.waitForUser(job, result.status === 'limited' ? 'model_limit' : 'auth_expired', { rateLimit });
+        // 한도 뒤 API 사용: 넘어가거나(구독 한도 → API) 남은 방식으로 이으면(API 잠금 → 구독) 같은 일을 다시 넣고 멈추지 않는다.
+        // 두 방식이 다 막히면 구독 확인 시각을 재시도 시각으로 하는 모델 멈춤이다.
+        const settled = selection && this.methods ? await this.methods.settle(job, selection, routedOutcome(result)) : undefined;
+        if (settled?.action === 'wait') await this.store.waitForUser(job, 'model_limit', { rateLimit: settled.rateLimit });
+        else if (settled?.action !== 'requeued') await this.store.waitForUser(job, result.status === 'limited' ? 'model_limit' : 'auth_expired', { rateLimit });
       } else if (current.state === 'cancel_requested' || abort.signal.aborted || authorizationRevoked) {
+        // 끝은 취소·종료·철회가 정하지만, 확인된 API 결제·인증 실패의 잠금은 따로 적는다(다른 일이 같은 API를 다시 부르지 않게).
+        if (selection && this.methods && result.stopped && (result.status === 'limited' || result.status === 'auth_expired')) {
+          await this.methods.settle(job, selection, routedOutcome(result), { record: true })
+            .catch(error => this.log('method_settle_failed', { job: job.id, ...errorInfo(error) }));
+        }
         if (!result.stopped) stopped = confirmed = await stopRequest();
         await this.stopOutcome(job, stopped, { revoked: authorizationRevoked, ownerCancel: current.state === 'cancel_requested',
           drained, unknownReason: 'stop_confirmation' });
@@ -206,6 +251,8 @@ export class Runtime {
       // A known limit retains the slot even if subsequent policy/state reads or writes fail.
       if (waiting && !authorizationRevoked && !(error instanceof Denied)) return true;
       const revoked = authorizationRevoked || error instanceof Denied;
+      // 보내지 않은 선택은 버린다(구독 확인 자리를 쥔 채 남지 않게).
+      if (!dispatched && selection) await this.methods?.abandon(selection).catch(() => {});
       if (!dispatched || error instanceof WorkerRejected) {
         if (revoked) await this.store.transition(job, 'cancelled', 'authorization_revoked');
         else if (error instanceof PolicyUnavailable && !dispatched) await this.store.defer(job);

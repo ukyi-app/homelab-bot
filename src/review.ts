@@ -12,8 +12,11 @@ import type { Store } from './store.js';
 import type { CancelRequest, WorkerSigner } from './worker.js';
 import { archiveContract } from './worker.js';
 import { CoverageSchema, FindingSchema, InputLimitsSchema, REVIEW_INSTRUCTIONS, REVIEW_INSTRUCTIONS_V2, ReviewOutputSchema, ReviewTaskSchema,
-  SECRET_PATTERNS, reviewOutcome } from './review-input.js';
-import type { Change, Coverage, ReviewOutput, ReviewTask, ReviewWorkerResult } from './review-input.js';
+  ReviewTaskV2Schema, SECRET_PATTERNS, reviewOutcome } from './review-input.js';
+import type { Change, Coverage, ReviewOutput, ReviewTask, ReviewTaskV2, ReviewWorkerResult, ReviewWorkerResultV2 } from './review-input.js';
+import { methodWait } from './method-routing.js';
+import type { MethodRouter } from './method-routing.js';
+import type { ExecutionSelection } from './execution-auth.js';
 import { REVIEW_REQUEST_ORGANIZATION } from './review-request.js';
 import type { ReviewRequestPort, ReviewRequestRefusal, ReviewRequestResult } from './review-request.js';
 
@@ -579,10 +582,13 @@ export function classify(output: Pick<ReviewOutput, 'findings' | 'open_questions
 }
 const asJob = (row: Record<string, unknown>) => row as unknown as Job;
 const MAX_DEFERS = 10;
+// claim이 리뷰 미루기를 고를 방식(API) 때문에 건너뛴 job에 붙이는 표시. 열거되지 않아 job 행 값·서명에 섞이지 않는다.
+const DEFERRAL_EXEMPT = Symbol('review_deferral_exempt');
 export const notificationScope = (policy: Policy): Scope => ({ guild: policy.guild, channel: policy.notificationChannel, parent: null, kind: 'channel' });
 
+// v2 요청(방식 선택 칸)에는 v2 응답이 온다. v1 요청에는 v1 응답만 온다.
 export interface ReviewWorkerClient {
-  review(task: ReviewTask, capability: string, signal: AbortSignal): Promise<ReviewWorkerResult>;
+  review(task: ReviewTask | ReviewTaskV2, capability: string, signal: AbortSignal): Promise<ReviewWorkerResult | ReviewWorkerResultV2>;
   cancel(request: CancelRequest, capability: string): Promise<{ stopped: boolean }>;
 }
 // 종료 규칙은 대화 runtime과 같다(ARCHITECTURE "정상 종료"). 신호 뒤에는 claim하지 않고, dispatch 전이면 대기열로 되돌리고,
@@ -590,13 +596,15 @@ export interface ReviewWorkerClient {
 // lanes: 작업 루프를 켠 배치. 리뷰는 대화와 interactive 레인을 나눠 쓰고 작업 레인의 실행·대기에 막히지 않는다.
 // changeReview: 미게시 후보 job을 맡을 실행기. 없으면 그 job을 집지 않는다. 있든 없든 게시 PR 리뷰 경로는 그대로다.
 export interface ChangeReviewDispatcher { run(job: Job): Promise<void> }
-export interface ReviewRuntimeOptions { shutdown?: AbortSignal; drainMs?: number; lanes?: boolean; changeReview?: ChangeReviewDispatcher }
+// methods: 한도 뒤 API 사용(C40). 없거나 고를 수 없으면 PR 리뷰는 v1 요청 그대로다.
+export interface ReviewRuntimeOptions { shutdown?: AbortSignal; drainMs?: number; lanes?: boolean; changeReview?: ChangeReviewDispatcher; methods?: MethodRouter }
 class ReviewShutdown extends Error {}
 export class ReviewRuntime {
   private readonly shutdown?: AbortSignal;
   private readonly drainMs: number;
   private readonly lanes: boolean;
   private readonly changeReview?: ChangeReviewDispatcher;
+  private readonly methods?: MethodRouter;
   constructor(private readonly store: Store, private readonly policy: ReviewPolicySource, private readonly queue: ReviewQueue,
     private readonly reader: GitHubReader, private readonly worker: ReviewWorkerClient, private readonly signer: WorkerSigner,
     private readonly pollMs = 1000, options: ReviewRuntimeOptions = {}) {
@@ -604,6 +612,7 @@ export class ReviewRuntime {
     this.drainMs = options.drainMs ?? DRAIN_MS;
     this.lanes = options.lanes ?? false;
     if (options.changeReview) this.changeReview = options.changeReview;
+    if (options.methods) this.methods = options.methods;
   }
   // dispatch 전 GitHub 조회를 종료 기한까지 기다리지 않는다. 끝까지 기다리면 프로세스가 먼저 끝나
   // 모델을 부르지 않은 작업이 lease 만료로 unknown이 되고 전역 슬롯을 잡는다.
@@ -635,13 +644,19 @@ export class ReviewRuntime {
       const unassigned = this.changeReview ? '' : `AND NOT EXISTS (SELECT 1 FROM change_child_jobs c WHERE c.job_id=jobs.id AND c.role='review')`;
       // 리뷰 미루기(COLLEAGUE_SPEC §4.7): 한도 경고의 풀리는 시각까지 새 PR 리뷰를 집지 않는다. 미룬 리뷰는 queued로 남아 기한 뒤에 집힌다.
       // 미게시 후보 리뷰는 owner가 시킨 변경 작업의 한 단계라 작업처럼 계속한다.
-      const deferred = await this.store.reviewDeferredUntil(tx) === null ? ''
+      // 한도 뒤 API 사용: 고를 방식이 API인 동안(구독이 실제 한도이고 API가 잠기지 않음)은 구독 경고로 미룬 리뷰도 집는다.
+      // API가 잠기거나 구독으로 돌아오면 남아 있는 미루기 기한이 다시 적용된다.
+      // exempt: 미루기 기한이 있는데 고를 방식이 API라 건너뛰었다. 이런 claim만 보내기 전에 실제 선택을 다시 맞춘다(tick).
+      const until = await this.store.reviewDeferredUntil(tx);
+      const exempt = until !== null && await this.methods?.apiChosen(tx, 'review') === true;
+      const deferred = until === null || exempt ? ''
         : `AND EXISTS (SELECT 1 FROM change_child_jobs c WHERE c.job_id=jobs.id AND c.role='review')`;
       const row = (await tx.query<{ id: string }>(`SELECT id FROM jobs WHERE type='review' AND state='queued' AND available_at<=$1 ${unassigned} ${deferred}
         ORDER BY priority,created_at FOR UPDATE SKIP LOCKED LIMIT 1`, [this.store.now()])).rows[0];
       if (!row) return;
-      return (await tx.query<Job & Record<string, unknown>>(`UPDATE jobs SET state='running',attempt=attempt+1,lease_token=$2,
+      const claimed = (await tx.query<Job & Record<string, unknown>>(`UPDATE jobs SET state='running',attempt=attempt+1,lease_token=$2,
         lease_until=$3,started_at=$4 WHERE id=$1 RETURNING *`, [row.id, randomUUID(), this.store.now() + DEFAULTS.leaseMs, this.store.now()])).rows[0];
+      return claimed && exempt ? Object.defineProperty(claimed, DEFERRAL_EXEMPT, { value: true }) : claimed;
     });
   }
   async tick(): Promise<boolean> {
@@ -658,6 +673,7 @@ export class ReviewRuntime {
     }
     let dispatched = false;
     let stopped = false;
+    let selection: ExecutionSelection | null = null;
     // dispatch 전 GitHub 조회가 lease(30초)보다 길어질 수 있어 그동안에도 lease를 늘린다.
     const keepalive = setInterval(() => { void this.store.heartbeat(asJob(job)).catch(() => {}); }, this.pollMs);
     try {
@@ -710,12 +726,34 @@ export class ReviewRuntime {
       }
       const revoked = pullRequestDecision(pr, freshRepo, fresh.review, await this.explicit(job.id));
       if (revoked) { await this.close(job, review, revoked.outcome === 'denied' ? 'cancelled' : 'superseded', revoked.reason); return true; }
+      // 방식을 고를 수 있으면 v1 칸·순서 그대로 끝에 선택 칸을 붙인 v2를 보낸다. 선택은 실행 기록과 함께 저장된다.
+      const routed = this.methods ? await this.methods.select(asJob(job), 'review') : null;
+      // 구독은 한도, API는 잠김, 구독 확인 자리도 없다: 보내지 않고 구독 확인 시각까지 모델 멈춤이다.
+      if (methodWait(routed)) { await this.store.waitForUser(asJob(job), 'model_limit', { rateLimit: routed.wait }); await this.away(job, context); return true; }
+      selection = routed;
+      // 리뷰 미루기의 예외(고를 방식이 API)는 실제 선택과 같아야 한다. claim 뒤 구독 확인 시각이 지나 구독을 골랐으면 미루기 기한까지 되돌린다.
+      // 그 예외로 집은 리뷰만 다시 본다. 미루기 없이 집은 리뷰는 그 뒤 생긴 미루기로 되돌리지 않는다(스위치 꺼짐과 같은 동작).
+      if (this.methods && (job as unknown as Record<symbol, unknown>)[DEFERRAL_EXEMPT] === true && selection?.method !== 'api' && await this.store.reviewDeferredUntil() !== null) {
+        if (selection) await this.methods.abandon(selection);
+        await this.store.defer(asJob(job), 'review_deferred');
+        return true;
+      }
+      const sent: ReviewTask | ReviewTaskV2 = selection ? ReviewTaskV2Schema.parse({ ...task, version: 2, execution: selection }) : task;
       // PR·목록 조회 동안 들어온 취소·비상 중지와 lease 만료를 dispatch 직전에 다시 본다.
       const live = (await this.store.db.query<{ state: string; lease_token: string; lease_until: string }>(
         'SELECT state,lease_token,lease_until FROM jobs WHERE id=$1', [job.id])).rows[0];
       if (!live || live.lease_token !== job.lease_token || Number(live.lease_until) <= this.store.now()) return true;
       if (live.state === 'cancel_requested') { await this.close(job, review, 'cancelled', 'cancel_before_dispatch'); return true; }
       if (live.state !== 'running' || !await this.store.heartbeat(asJob(job))) return true;
+      // 고른 뒤 그 사이 API가 잠기거나 구독이 한도가 됐으면 이 선택으로 보내지 않고 다시 고르게 한다. 이 확인 뒤의 잠금은 이미 시작한 실행이다.
+      // 되돌리지 못했으면(그 사이 취소 요청·lease 상실) 취소 요청만 여기서 닫는다. lease 상실은 아래 finally가 되돌린다.
+      if (selection && !await this.methods!.start(asJob(job), selection)) {
+        if (!await this.methods!.reroute(asJob(job), selection)
+          && (await this.store.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0]?.state === 'cancel_requested') {
+          await this.close(job, review, 'cancelled', 'cancel_before_dispatch');
+        }
+        return true;
+      }
       // 여기부터 아래 리스너 등록까지 await가 없어 신호를 놓치지 않는다. 신호 뒤 dispatch하지 않는다.
       if (this.shutdown?.aborted) throw new ReviewShutdown();
       const abort = new AbortController();
@@ -730,7 +768,7 @@ export class ReviewRuntime {
       // 드레인 기한이 되면 DB 후처리를 기다리지 않고 그 자리에서 cancel을 보낸다(대화 runtime과 같은 이유).
       const onShutdown = () => { drain = setTimeout(() => { drained = true; void stopRequest(); abort.abort(); }, this.drainMs); };
       this.shutdown?.addEventListener('abort', onShutdown, { once: true });
-      const interrupted = new Promise<ReviewWorkerResult>(resolve => {
+      const interrupted = new Promise<ReviewWorkerResult | ReviewWorkerResultV2>(resolve => {
         abort.signal.addEventListener('abort', () => resolve({ status: 'unknown', stopped: false }), { once: true });
       });
       // 비상 중지·취소 요청·lease 상실을 실행 중에도 본다(대화 레인과 같은 규칙).
@@ -741,11 +779,11 @@ export class ReviewRuntime {
           if (state === 'cancel_requested' || !await this.store.heartbeat(asJob(job))) abort.abort();
         })().catch(() => abort.abort()).finally(() => { checking = undefined; });
       }, this.pollMs);
-      let result: ReviewWorkerResult;
+      let result: ReviewWorkerResult | ReviewWorkerResultV2;
       try {
-        const capability = this.signer.issue(asJob(job), 'execute', task);
+        const capability = this.signer.issue(asJob(job), 'execute', sent);
         dispatched = true;
-        result = await Promise.race([this.worker.review(task, capability, abort.signal), interrupted,
+        result = await Promise.race([this.worker.review(sent, capability, abort.signal), interrupted,
           new Promise<ReviewWorkerResult>(resolve => {
             timeout = setTimeout(() => { abort.abort(); resolve({ status: 'unknown', stopped: false }); }, task.timeoutMs);
           })]);
@@ -756,6 +794,10 @@ export class ReviewRuntime {
       }
       const current = (await this.store.db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [job.id])).rows[0]?.state;
       if (current === 'cancel_requested' || abort.signal.aborted) {
+        // 끝은 취소·종료가 정하지만, 확인된 API 결제·인증 실패의 잠금은 따로 적는다(다른 일이 같은 API를 다시 부르지 않게).
+        if (selection && this.methods && result.stopped && (result.status === 'limited' || result.status === 'auth_expired')) {
+          await this.methods.settle(asJob(job), selection, { status: result.status, rateLimit: result.rateLimit ?? null }, { record: true }).catch(() => {});
+        }
         const confirmation = result.stopped ? { stopped: true } : await stopRequest();
         // 멈춤을 확인하지 못하면 unknown으로 두어 전역 슬롯을 잡는다. 자동 재실행하지 않는다.
         const state = !confirmation.stopped ? 'unknown' : current === 'cancel_requested' ? 'cancelled' : 'failed';
@@ -766,16 +808,28 @@ export class ReviewRuntime {
       }
       if (!result.stopped) { await this.store.transition(asJob(job), 'unknown', 'worker_disconnected'); return true; }
       stopped = true;
+      if (result.status === 'not_run') {
+        // 선택이 설치된 묶음과 맞지 않아 모델을 부르지 않았다. 시도로 세지 않고 다시 넣는다(다음은 옛 판). 못 넣으면 실패로 닫는다.
+        const settled = selection && this.methods ? await this.methods.settle(asJob(job), selection, { status: 'not_run', refusal: result.refusal }) : undefined;
+        if (settled?.action !== 'requeued') await this.close(job, review, 'failed', 'worker_not_run');
+        return true;
+      }
+      const outcome = { status: result.status, rateLimit: result.rateLimit ?? null,
+        subscriptionLimit: 'execution' in result && result.execution.subscriptionLimit };
       if (result.status === 'limited' || result.status === 'auth_expired') {
-        await this.store.waitForUser(asJob(job), result.status === 'limited' ? 'model_limit' : 'auth_expired', { rateLimit: result.rateLimit ?? null });
-        // 알림 채널에 자리 비움 한 줄만 단다. 원인·풀리는 시각·할 일은 운영 알림(Telegram)이 보내고 재개는 저절로 한다.
-        const scope = notificationScope(context.base);
-        await this.store.enqueue({ key: await this.store.awayKey(scope.channel, `review-waiting:${job.id}`), actor: context.base.owner, scope, revision: context.base.revision,
-          payload: { kind: 'message', channel: scope.channel, classification: 'safe_summary', content: T.away } });
+        // 한도 뒤 API 사용: 다른 방식으로 이으면 같은 리뷰를 다시 넣고 자리 비움을 알리지 않는다. 두 방식이 다 막히면 구독 확인 시각의 멈춤이다.
+        const settled = selection && this.methods ? await this.methods.settle(asJob(job), selection, outcome) : undefined;
+        if (settled?.action === 'requeued') return true;
+        if (settled?.action === 'wait') await this.store.waitForUser(asJob(job), 'model_limit', { rateLimit: settled.rateLimit });
+        else await this.store.waitForUser(asJob(job), result.status === 'limited' ? 'model_limit' : 'auth_expired', { rateLimit: result.rateLimit ?? null });
+        await this.away(job, context);
         return true;
       }
       // 대기가 아닌 결과의 한도 경고도 계정 기록에 남긴다(리뷰 미루기). 기록 실패가 결과 처리를 막지 않는다.
-      await this.store.observeRateLimit(result.rateLimit, job.id).catch(() => {});
+      // 선택을 실은 실행은 settle이 그 계정·revision이 지금 설치일 때만 남긴다.
+      if (!selection) await this.store.observeRateLimit(result.rateLimit, job.id).catch(() => {});
+      // 그 실행의 선택으로 귀속한다(구독 확인 성공이 구독 복귀가 된다).
+      if (selection && this.methods) await this.methods.settle(asJob(job), selection, outcome).catch(() => {});
       if (result.status !== 'succeeded') { await this.close(job, review, 'failed', result.reason ?? 'model_failed'); return true; }
       await this.finish(job, review, context, task, result);
     } catch (error) {
@@ -797,6 +851,8 @@ export class ReviewRuntime {
       else await this.store.transition(asJob(job), 'unknown', 'runtime_uncertain');
     } finally {
       clearInterval(keepalive);
+      // 보내지 않은 선택은 버린다(구독 확인 자리를 쥔 채 남지 않게). 이미 귀속·버린 선택은 바뀌지 않는다.
+      if (!dispatched && selection) await this.methods?.abandon(selection).catch(() => {});
       // dispatch 전에 lease를 잃어 상태를 못 바꿨으면, 모델을 부르지 않은 것이 확실하므로 대기열로 되돌린다.
       // 조기 return 경로도 지나가야 해서 finally에 둔다. 정상 종료된 작업은 상태 조건에 걸리지 않는다.
       if (!dispatched) await this.releaseUndispatched(job).catch(() => {});
@@ -805,6 +861,12 @@ export class ReviewRuntime {
   }
   private async explicit(job: string): Promise<boolean> {
     return (await this.store.db.query<{ trigger: string }>('SELECT trigger FROM pr_reviews WHERE job_id=$1', [job])).rows[0]?.trigger === 'comment';
+  }
+  // 알림 채널에 자리 비움 한 줄만 단다. 원인·풀리는 시각·할 일은 운영 알림(Telegram)이 보내고 재개는 저절로 한다.
+  private async away(job: Job, context: ReviewContext): Promise<void> {
+    const scope = notificationScope(context.base);
+    await this.store.enqueue({ key: await this.store.awayKey(scope.channel, `review-waiting:${job.id}`), actor: context.base.owner, scope, revision: context.base.revision,
+      payload: { kind: 'message', channel: scope.channel, classification: 'safe_summary', content: T.away } });
   }
   private async releaseUndispatched(job: Job): Promise<void> {
     await this.store.db.query(`UPDATE jobs SET state='queued',attempt=GREATEST(0,attempt-1),available_at=$3,lease_token=NULL,

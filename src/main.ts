@@ -60,7 +60,9 @@ import { Store } from './store.js';
 import { TASK_ANSWER_PURGE_EVERY_MS, purgeExpiredTaskAnswers } from './task-bridge.js';
 import { TaskCommands } from './task-commands.js';
 import { TaskWorkerSigner } from './task-contracts.js';
-import { HttpTaskV2Worker, HttpTaskWorker, TASK_INTAKE_UNREACHED, taskWorkerChangeContract, taskWorkerIntake } from './task-http.js';
+import { HttpTaskV2Worker, HttpTaskWorker, TASK_INTAKE_UNREACHED, taskWorkerChangeContract, taskWorkerExecutionSelection, taskWorkerIntake } from './task-http.js';
+import { MethodRouter } from './method-routing.js';
+import { EXECUTION_SELECTION_PATHS } from './execution-auth.js';
 import type { TaskIntakeStatus } from './task-http.js';
 import { PolicyTaskPlans, TaskPolicySchema } from './task-policy.js';
 import { WorkerSigner } from './worker.js';
@@ -223,9 +225,23 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     { shutdown: stop.signal, ...(deps.drainMs !== undefined ? { drainMs: deps.drainMs } : {}) }, changeWorker) : undefined;
   // taskLoop와 lanes는 함께 켠다. 하나만 켜면 해제 문구와 실제 슬롯이 어긋난다.
   const taskLoop = !!taskBridge;
+  // 한도 뒤 API 사용(C40). 스위치(정책 apiAfterLimit)가 켜져 있어도 두 작업자가 새 판을 받는다고 확인하기 전에는 고르지 않는다(옛 판 그대로).
+  // 확인은 아래 method_support_probe가 주기로 한다. 꺼져 있으면 확인 요청도 보내지 않는다.
+  const methodsEnabled = config.policy.apiAfterLimit === true;
+  // 작업 경로(작업 레인·변경 작성 턴)는 따로 연다. 구독 ↔ API --resume 실호환(C45) 확인 전에는 켜지 않는다(COLLEAGUE_SPEC §4.11).
+  const methodsTask = methodsEnabled && config.policy.apiAfterLimitTask === true;
+  let methodsSupported = false;
+  // 변경 작성 턴은 작업자가 /v2/task에도 선택 칸을 받는다고 알릴 때만 고른다(변경 작성이 꺼진 작업자는 /v1/task만 알린다).
+  let methodsChangeSupported = false;
+  const methods = new MethodRouter(store, { enabled: methodsEnabled, task: methodsTask,
+    supported: path => methodsSupported && (path !== 'change_author' || methodsChangeSupported) });
+  log('method_routing_gate', methodsEnabled ? { state: 'waiting_worker', task: methodsTask ? 'waiting_worker' : 'closed' } : { state: 'closed' });
+  taskBridge?.useMethods(methods);
   const runtime = new Runtime(store, gate, new HttpWorker(config.workerUrl, send), signer, reader,
-    taskBridge, { shutdown: stop.signal, drainMs: deps.drainMs, taskLoop, externalTask: !!config.externalTask });
+    taskBridge, { shutdown: stop.signal, drainMs: deps.drainMs, taskLoop, externalTask: !!config.externalTask, methods });
   const changeReview = changeGate.open ? assembleChangeReview({ store, gate, signer, workerUrl: config.workerUrl, send, now, shutdown: stop.signal, log, ...(deps.drainMs !== undefined ? { drainMs: deps.drainMs } : {}) }) : undefined;
+  // 스위치와 무관하게 붙인다: 끈 뒤에도 이미 v2로 낸 변경 자체 리뷰 결과는 v2 회수로 읽어야 한다(고르기는 스위치가 막는다).
+  changeReview?.service.useMethods(methods);
   // 객체는 만들기만 한다(I/O 없음). 조건 (d)를 확인하기 전에는 reviewOpened가 false라 webhook·명령이 닫힌 그대로다.
   const precondition = reviewGate;
   let reviewOpened = false;
@@ -235,7 +251,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     const queue = new ReviewQueue(store, io.reader);
     return { queue, reader: io.reader, guidance: io.guidance, discussion: io.discussion,
       runtime: new ReviewRuntime(store, reviewPolicy, queue, io.reader, new HttpReviewWorker(config.workerUrl, send), signer, undefined,
-        { shutdown: stop.signal, drainMs: deps.drainMs, lanes: taskLoop, ...(changeReview ? { changeReview: changeReview.service } : {}) }),
+        { shutdown: stop.signal, drainMs: deps.drainMs, lanes: taskLoop, methods, ...(changeReview ? { changeReview: changeReview.service } : {}) }),
       publisher: new ReviewPublisher(store, reviewPolicy, io.reader, new RestrictedGitHub(io.transport), queue, undefined, stop.signal),
       reconciler: new ReviewReconciler(store, reviewPolicy, queue, io.reader, stop.signal) };
   })() : undefined;
@@ -612,6 +628,17 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     taskIntake = await taskWorkerIntake(taskGate.workerUrl, send, stop.signal);
     if (before.routed !== taskIntake.routed || before.open !== taskIntake.open) log('task_worker_intake', { routed: taskIntake.routed, open: taskIntake.open, reasons: taskIntake.reasons });
     if (taskIntake.routed && !taskOpened && !stop.signal.aborted) openTaskLane();
+  });
+  // 두 작업자의 새 판 지원 확인. 대화 작업자는 대화·PR 리뷰·변경 자체 리뷰 셋을, 작업 작업자(작업 레인을 열었으면)는 /v1/task를 알려야 한다.
+  // 하나라도 확인하지 못하면 모든 경로가 옛 판 그대로다(되돌린 옛 작업자에 새 판을 보내지 않는다).
+  if (methodsEnabled) every('method_support_probe', deps.taskWorkerProbeMs ?? TASK_WORKER_PROBE_MS, async () => {
+    const listed = (await new HttpWorker(config.workerUrl, send).contracts().catch(() => ({ executionSelection: [] as string[] }))).executionSelection;
+    const chat = EXECUTION_SELECTION_PATHS.every(path => listed.includes(path));
+    const taskListed = taskGate.open ? await taskWorkerExecutionSelection(taskGate.workerUrl, send, stop.signal) : [];
+    const task = !taskGate.open || taskListed.includes('/v1/task');
+    methodsChangeSupported = taskListed.includes('/v2/task');
+    if (methodsSupported !== (chat && task)) log('method_routing_gate', { state: chat && task ? 'open' : 'waiting_worker', chat, task });
+    methodsSupported = chat && task;
   });
   if (change && taskGate.open) every('change_worker_probe', deps.taskWorkerProbeMs ?? TASK_WORKER_PROBE_MS, async () => {
     const task = await taskWorkerChangeContract(taskGate.workerUrl, send, stop.signal);

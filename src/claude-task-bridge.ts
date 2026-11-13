@@ -5,7 +5,7 @@ import { ChangePathSchema, labelAllowsAuthorInput } from './change-contracts.js'
 import type { AuthorResult, ChangeArtifactPort, ChangeAuthorPort, ChangeBrief, ChangeKey, EvidenceKey, ProvenanceLabel, ReviewMaterial, SelfFixFinding } from './change-contracts.js';
 import type { ChangeVerificationControl, ChangeVerificationWorker } from './change-verifier.js';
 import { Denied, PolicyUnavailable, DEFAULTS } from './contracts.js';
-import type { Job, Scope } from './contracts.js';
+import type { Job, RateLimitInfo, Scope } from './contracts.js';
 import { bounded } from './format.js';
 import { errorInfo, jsonLog } from './log.js';
 import type { Log } from './log.js';
@@ -13,6 +13,9 @@ import type { Policy, PolicyGate } from './policy.js';
 import { DRAIN_MS } from './runtime.js';
 import type { TaskLane } from './runtime.js';
 import type { Store } from './store.js';
+import { methodWait } from './method-routing.js';
+import type { MethodRouter, MethodWait } from './method-routing.js';
+import type { ExecutionAuth, ExecutionSelection } from './execution-auth.js';
 import { FOREIGN_SESSION_STATUS, TaskBridge, TaskWorkerBusy, TaskWorkerRejected, releaseStatus } from './task-bridge.js';
 import type { ReleaseOutcome } from './task-bridge.js';
 import { taskOutputRisk } from './task-output.js';
@@ -106,6 +109,13 @@ const echoed = <T extends ControlTarget>(asked: ControlTarget, response: T): T =
 // 턴 번호는 세션 프로토콜의 순번이고 예산은 진행한 턴만 센다. 한도·인증 대기 턴이 예산을 다 쓰면 30분 재시도만으로 작업이 끝나 버린다.
 // 작업자가 턴 번호 상한 16인 옛 스키마면 17 이상의 재개를 400으로 거부하고 작업은 task_worker_rejected로 실패한다.
 const overTurnBudget = (prior: Pick<SessionRow, 'turn' | 'model_wait_turns'>) => prior.turn + 1 - Number(prior.model_wait_turns ?? 0) > TASK_LIMITS.turns;
+// 선택을 실은 턴의 결과는 실행 칸이 보낸 선택과 같아야 한다(작업자는 요청 선택으로만 돈다). 다르거나 없으면 모름이다.
+// 선택 없이 보낸 턴에 실행 안 됨·실행 칸이 오는 것도 모름이다.
+function executionMismatch(sent: ExecutionSelection | null | undefined, response: { status: string; execution?: ExecutionAuth }): boolean {
+  if (!sent) return response.status === 'not_run' || response.execution !== undefined;
+  if (response.status === 'not_run') return false;
+  return !response.execution || (['account', 'credentialRevision', 'method', 'runId'] as const).some(key => response.execution![key] !== sent[key]);
+}
 const HELD = new Set(['running', 'verifying', 'cancel_requested']);
 const SETTLEABLE = new Set([...HELD, 'unknown']);
 const sameSession = (a: SessionRow | undefined, b: SessionRow | undefined) => a?.executor === b?.executor && a?.generation === b?.generation
@@ -115,6 +125,28 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
   private readonly options: ClaudeTaskBridgeOptions;
   // 정리 재시도 시각. 잃어도 다음 sweep이 바로 다시 시도할 뿐이라 메모리에 둔다.
   private readonly nextFinalize = new Map<string, number>();
+  private methods?: MethodRouter;
+  // 한도 뒤 API 사용(C40). 게시 서버 조립(main)이 붙인다. 없거나 고를 수 없으면 작업 턴(v1)·변경 작성 턴(v2)은 선택 칸 없이 지금 그대로다.
+  useMethods(methods: MethodRouter): void { this.methods = methods; }
+  // 변경 작성 턴의 방식. 결과 확정(settleChangeTurn)은 응답과 다른 때·다른 프로세스에서 일어나 요청을 들고 있지 않으므로,
+  // 그 턴의 선택은 세션의 worker_lease(= 보낸 요청의 lease)로 실행 기록에서 다시 찾는다.
+  selectChangeTurn(job: Job): Promise<ExecutionSelection | MethodWait | null> {
+    return this.methods ? this.methods.select(job, 'change_author') : Promise.resolve(null);
+  }
+  // 턴을 시작하지 못한 선택을 버린다(구독 확인 자리를 놓는다).
+  async abandonChangeTurn(selection: ExecutionSelection): Promise<void> { await this.methods?.abandon(selection); }
+  // 그 턴(세션의 worker_lease)으로 실제로 시작한 실행의 선택. 귀속 여부와 무관하다: 같은 턴 결과(snapshot)를 저장 전에 다시 읽을 수 있다.
+  async changeSelection(job: string, session: SessionRow): Promise<ExecutionSelection | null> {
+    return this.methods && session.worker_lease ? this.methods.pendingSelection({ id: job, lease_token: session.worker_lease }) : null;
+  }
+  changeExecutionMismatch(sent: ExecutionSelection | null, result: TaskV2TurnResult): boolean { return executionMismatch(sent, result); }
+  // 변경 작성의 성공 결과(snapshot)를 그 실행의 선택으로 귀속한다(구독 확인 성공이 구독 복귀가 된다). 기록 실패는 결과를 바꾸지 않는다.
+  // 결과에 실린 한도 경고도 함께 넘긴다: 그 계정·revision이 지금 설치일 때만 리뷰 미루기에 남는다.
+  async settleChangeSuccess(job: Job, selection: ExecutionSelection | null, rateLimit: RateLimitInfo | null = null): Promise<void> {
+    if (!selection || !this.methods) return;
+    await this.methods.settle(job, selection, { status: 'succeeded', rateLimit })
+      .then(() => {}, error => { this.options.log('task_method_settle_failed', { job: job.id, ...errorInfo(error) }); });
+  }
   constructor(store: Store, gate: PolicyGate, private readonly worker: TaskWorkerPort, private readonly plans: TaskPlanSource,
     options: Partial<ClaudeTaskBridgeOptions> = {}, private readonly change?: TaskV2WorkerPort) {
     const merged = { ...CLAUDE_TASK_DEFAULTS, ...options };
@@ -129,6 +161,8 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     let request: TaskRequest | undefined;
     let session: SessionRow | undefined;
     let revision = job.revision.policy;
+    // 고르고 아직 턴을 시작하지 않은 선택. 시작하면 비운다.
+    let selection: ExecutionSelection | null = null;
     try {
       const policy = await this.gate.authorize(job.owner_id, job.target);
       revision = policy.revision;
@@ -144,16 +178,28 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       if (current.state !== 'running') return;
       request = await this.prepare(job, policy, session);
       if (!request) return;
+      // 방식을 고를 수 있으면 요청 끝에 선택 칸을 싣는다(작업 레인은 판을 늘리지 않는 명시적 협상, DECISIONS "C39").
+      // 턴·도구·실행 시간 예산은 세션에서 이어 오므로 방식이 바뀌어도 새로 채워지지 않는다.
+      const routed = this.methods ? await this.methods.select(job, 'task') : null;
+      // 구독은 한도, API는 잠김, 구독 확인 자리도 없다: 턴을 띄우지 않고 구독 확인 시각까지 모델 멈춤이다(세션은 그대로 둔다).
+      if (methodWait(routed)) { await this.unchanged(job, session, store => store.waitForUser(job, 'model_limit', { rateLimit: routed.wait })); return; }
+      selection = routed;
+      if (selection) request = TASK_ENDPOINTS['/v1/task'].request.parse({ ...request, execution: selection });
       // 답 수락 뒤 dispatch 전 철회를 여기서 막는다. Denied는 Runtime이 cancelled로 끝내고 sweep이 세션을 닫는다.
       await this.gate.authorize(job.owner_id, job.target);
       if (this.options.shutdown?.aborted) { await this.unchanged(job, session, store => store.defer(job, 'publisher_shutdown')); return; }
       const begun = await this.begin(job, request, session);
       if (begun !== 'started') return;
+      selection = null;
     } catch (error) {
       // dispatch 전 오류의 끝은 Runtime이 정한다. 여기서는 그 원인만 남긴다.
       this.options.log('task_job_prepare_error', { job: job.id, ...errorInfo(error) });
       throw error;
-    } finally { clearInterval(keepalive); }
+    } finally {
+      clearInterval(keepalive);
+      // 턴을 시작하지 못한 선택은 버린다(구독 확인 자리를 쥔 채 남지 않게). 이미 버렸거나 귀속된 선택은 바뀌지 않는다.
+      if (selection) await this.methods?.abandon(selection).catch(() => {});
+    }
     await this.dispatch(job, request, revision);
   }
   // task_job_finished는 이 실행이 job을 그 상태로 커밋했다는 뜻이다. 전이가 막히면 다른 이벤트로 남겨 "끝났다"로 읽히지 않게 한다.
@@ -167,16 +213,28 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
   }
   // 이 실행이 아직 job을 쥐고 있고 읽어 둔 세션 상태가 그대로일 때만 job을 정리한다. 그 사이 lease가 끝났거나 다른 실행이 턴을 시작했으면 어떤 행도 건드리지 않는다.
   // act가 돌았으면 그 결과를, 아니면 undefined를 돌려준다.
+  // 잠금은 턴 시작·확정과 같은 대화 → scheduler → 레인 → job → 세션 순서다. act의 모델 대기(waitForUser)가 scheduler 행을 잡으므로,
+  // job을 먼저 잡으면 scheduler → job 순서인 비상 정지와 서로 기다린다.
   private async unchanged<T>(job: Job, session: SessionRow | undefined, act: (store: Store) => Promise<T>): Promise<T | undefined> {
     return this.store.atomic(async store => {
-      await store.db.query('SELECT id FROM conversations WHERE id=$1 FOR UPDATE', [job.conversation_id]);
+      await store.lockTaskControl(job.conversation_id);
       const held = (await store.db.query<{ state: string; lease_token: string; lease_until: string }>(
         'SELECT state,lease_token,lease_until FROM jobs WHERE id=$1 FOR UPDATE', [job.id])).rows[0];
       if (!held || held.lease_token !== job.lease_token || Number(held.lease_until) <= store.now() || !HELD.has(held.state)) return undefined;
-      const now = (await store.db.query<{ state: string; turn: number }>('SELECT state,turn FROM codex_sessions WHERE job_id=$1 FOR UPDATE', [job.id])).rows[0];
-      if (session ? now?.state !== session.state || now.turn !== session.turn : !!now) return undefined;
+      if (!await this.sessionKept(store, job.id, session)) return undefined;
       return act(store);
     });
+  }
+  // 준비 때 읽은 세션이 그대로인가. 아니면 다른 게시 서버가 같은 job·lease로 그 사이 턴을 시작했거나 끝냈다. 호출자가 job 행까지 잠근 뒤 부른다.
+  private async sessionKept(store: Store, jobId: string, session: SessionRow | undefined): Promise<boolean> {
+    const now = (await store.db.query<{ state: string; turn: number; generation: number | null }>(
+      'SELECT state,turn,generation FROM codex_sessions WHERE job_id=$1 FOR UPDATE', [jobId])).rows[0];
+    return session ? now?.state === session.state && now.turn === session.turn && now.generation === session.generation : !now;
+  }
+  // 변경 작성 턴을 띄우지 않고 구독 확인 시각까지 모델 멈춤에 넣는다(구독 한도·API 잠김·확인 자리 없음).
+  // 준비 때 읽은 세션이 그대로일 때만이다: 다른 게시 서버가 같은 lease로 이미 턴을 시작했으면 그 job을 대기로 바꾸지 않는다.
+  async waitChangeTurn(job: Job, session: SessionRow | undefined, rateLimit: RateLimitInfo | null): Promise<void> {
+    await this.unchanged(job, session, store => store.waitForUser(job, 'model_limit', { rateLimit }));
   }
   // act는 job을 끝냈으면 참을 돌려준다. 그 사이의 /cancel로 failed가 아니라 cancelled가 될 수 있고 lease가 끝나 막힐 수도 있어, 끝은 DB 값으로 적는다.
   private async giveUp(job: Job, session: SessionRow | undefined, reason: string,
@@ -253,19 +311,23 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
   }
   // v2 턴의 저장. 시작·재개의 CAS와 응답 해석을 v1과 한 벌로 쓴다. v2는 응답을 기다리지 않아 결과 확정이 다른 시점에 일어난다.
   // 시작 턴의 지시문 판을 세션에 남긴다. 재개는 그 판을 그대로 보낸다(재개의 begin은 capabilities를 바꾸지 않는다).
-  beginChangeTurn(job: Job, request: TaskV2Request, session: SessionRow | undefined): Promise<'started' | 'stale' | 'conflict'> {
+  beginChangeTurn(job: Job, request: TaskV2Request, session: SessionRow | undefined): Promise<'started' | 'stale' | 'conflict' | 'reroute'> {
     return this.begin(job, request, session, { version: TASK_V2_CONTRACT, lane: 'task', tool_approval_relay: false, instructions: request.instructions });
   }
   // snapshot 외의 턴 결말을 v1과 같은 규칙으로 확정한다.
-  async settleChangeTurn(job: Job, session: SessionRow, result: Exclude<TaskV2TurnResult, { status: 'snapshot' }> | null, stop?: Stop, questionBlocked = false): Promise<Settled> {
+  // lost: 결과의 실행 칸이 그 턴의 선택과 달라 결과를 믿지 않는다(v1 응답 대조와 같은 규칙). snapshot은 이때만 온다.
+  async settleChangeTurn(job: Job, session: SessionRow, result: TaskV2TurnResult | null, stop?: Stop, questionBlocked = false, lost = false): Promise<Settled> {
+    if (result?.status === 'snapshot' && !lost) throw new Error('change_snapshot_not_settled');
     // 이 턴이 나르던 답이다. 한도·인증으로 끝나면 settle이 answered로 되돌려 다음 재개가 같은 답을 잇는다. 앞 턴의 질문도 resumed로 남아 있어 가장 뒤의 것이다.
     const question = session.turn > 1 ? (await this.store.db.query<{ id: string }>(`SELECT id FROM codex_questions WHERE job_id=$1 AND thread_id=$2 AND state='resumed' ORDER BY turn DESC LIMIT 1`, [job.id, session.claude_session_id])).rows[0] : undefined;
-    const request = { operation: session.turn > 1 ? 'resume' : 'start', lease: session.worker_lease!, generation: session.generation!, sessionId: session.claude_session_id!, turn: session.turn, ...(question ? { questionId: question.id } : {}) } as unknown as TaskRequest;
+    const execution = await this.changeSelection(job.id, session);
+    const request = { operation: session.turn > 1 ? 'resume' : 'start', lease: session.worker_lease!, generation: session.generation!, sessionId: session.claude_session_id!, turn: session.turn,
+      ...(question ? { questionId: question.id } : {}), ...(execution ? { execution } : {}) } as unknown as TaskRequest;
     const usedMs = this.store.now() - Number(session.updated_at);
     if (!result) return this.settle(job, request, job.revision.policy, { kind: 'rejected' }, { stopped: true, retained: session.turn > 1, cleanupPending: false, worker: null, tools: 0 }, stop, usedMs);
     const facts: Facts = { stopped: result.stopped, retained: result.sessionRetained, cleanupPending: result.cleanupPending, worker: result.worker, tools: result.usage.toolCalls };
     // 작업자가 시작을 기록한 뒤 결과 없이 재시작하면 v1에 없는 "소멸 확인 + 결과 없음"이 온다. 모델을 다시 돌리지 않고 결과를 잃은 턴으로 닫는다.
-    const turn: Turn = questionBlocked ? { kind: 'question_blocked' } : result.status === 'unknown' && result.stopped ? { kind: 'lost' } : { kind: 'response', response: result as unknown as TaskResponse };
+    const turn: Turn = questionBlocked ? { kind: 'question_blocked' } : lost || (result.status === 'unknown' && result.stopped) ? { kind: 'lost' } : { kind: 'response', response: result as unknown as TaskResponse };
     return this.settle(job, request, job.revision.policy, turn, facts, stop, usedMs);
   }
   reportChangeEnd(job: string, settled: Settled): void { if (settled.end) this.report(job, settled.end); }
@@ -285,12 +347,22 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       [jobId, worker.instance, worker.storage, session.generation, session.claude_session_id]);
   }
   // 턴을 세션에 고정한다. 대기→실행 CAS라 같은 세션의 재개가 겹쳐도 하나만 띄운다.
-  private async begin(job: Job, request: TaskRequest | TaskV2Request, session: SessionRow | undefined, capabilities: object = { version: 1, lane: 'task', tool_approval_relay: false }): Promise<'started' | 'stale' | 'conflict'> {
+  // 선택을 실은 턴은 같은 트랜잭션(scheduler 행 잠금 아래)에서 그 선택을 다시 확인하고, CAS에 이긴 턴의 선택만 시작한 실행으로 적는다.
+  // 두 게시 서버가 같은 job·lease로 각각 골라도 결과 대조·회수는 실제로 시작한 턴의 선택을 쓴다.
+  // reroute: 고른 뒤 그 사이 API가 잠기거나 구독이 한도가 됐다. 턴을 띄우지 않고 선택을 버린 뒤 job을 대기열로 되돌렸다(세션은 그대로).
+  // 다른 게시 서버가 같은 lease로 이미 턴을 시작했으면 reroute하지 않고 conflict다: 되돌리면 실행 중인 그 턴의 job·lease·시도 수를 바꾼다.
+  private async begin(job: Job, request: TaskRequest | TaskV2Request, session: SessionRow | undefined, capabilities: object = { version: 1, lane: 'task', tool_approval_relay: false }): Promise<'started' | 'stale' | 'conflict' | 'reroute'> {
     return this.store.atomic(async store => {
       await store.lockTaskControl(job.conversation_id);
       const row = (await store.db.query<{ state: string; lease_token: string; lease_until: string }>(
         'SELECT state,lease_token,lease_until FROM jobs WHERE id=$1 FOR UPDATE', [job.id])).rows[0];
       if (!row || row.lease_token !== job.lease_token || Number(row.lease_until) <= store.now() || row.state !== 'running') return 'stale';
+      if (request.execution && this.methods && !await this.methods.admit(job, request.execution, store)) {
+        if (!await this.sessionKept(store, job.id, session)) return 'conflict';
+        await this.methods.reroute(job, request.execution, store);
+        await store.syncTaskLane();
+        return 'reroute';
+      }
       const now = store.now();
       if (request.operation === 'start') {
         // 기록이 없으면 내보낸 세션을 잃는다. 보존 칸은 응답 전부터 잡아 둔다.
@@ -319,6 +391,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
           if (!taken.rows.length) throw new Error('question_not_answered');
         }
       }
+      if (request.execution && this.methods) await this.methods.started(request.execution, store);
       await store.syncTaskLane();
       return 'started';
     });
@@ -395,6 +468,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     if (response.job !== request.job || response.lease !== request.lease || response.generation !== request.generation
       || response.sessionId !== request.sessionId || response.turn !== request.turn
       || !sameWorker(request.operation === 'resume' ? request.expectedWorker : null, response.worker)) return { kind: 'lost' };
+    if (executionMismatch(request.execution, response)) return { kind: 'lost' };
     return { kind: 'response', response };
   }
   private async factsOf(turn: Turn, request: TaskRequest, cancel?: () => Promise<CancelFacts | null>): Promise<Facts> {
@@ -479,6 +553,12 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
         return applied(state, facts.stopped);
       };
       const leaseLost = stop === 'lease' || Number(row.lease_until) <= store.now();
+      // 끝은 취소·철회·종료·lease 상실이 정하더라도, 확인된 API 결제·인증 실패의 잠금은 따로 적는다(다른 일이 같은 API를 다시 부르지 않게).
+      // 정상 경로(아래 한도·인증 처리)는 같은 귀속을 넘어감·대기와 함께 한다.
+      if (turn.kind === 'response' && facts.stopped && request.execution && this.methods && (stop || row.state === 'cancel_requested' || leaseLost)
+        && (turn.response.status === 'limited' || turn.response.status === 'auth_expired')) {
+        await this.methods.settle(job, request.execution, { status: turn.response.status, rateLimit: turn.response.rateLimit ?? null }, { within: store, record: true });
+      }
       if (stop === 'revoked') return stopWith('authorization_revoked', false);
       if (stop === 'cancel' || row.state === 'cancel_requested') return stopWith('stop_confirmation', true);
       // lease를 잃었으면 다른 기록이 이 작업을 넘겨받았을 수 있어 종료 확인과 무관하게 unknown이다.
@@ -493,21 +573,59 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
       if (turn.kind === 'lost') return fail('task_worker_lost');
       if (turn.kind === 'question_blocked') return fail(CHANGE_QUESTION_BLOCKED);
       const response = turn.response;
+      if (response.status === 'not_run') {
+        // 선택이 설치된 묶음과 맞지 않아 모델을 띄우지 않았다(모델 턴 아님). 작업자 영수증이 이 턴 번호를 이미 썼으므로 재개 턴은 다음 턴 번호로,
+        // 첫 턴은 새 세대로 잇는다. 턴 예산에서는 뺀다. router가 설치를 refused로 바꿔 다음 턴은 선택 없이 간다.
+        const routed = request.execution && this.methods
+          ? await this.methods.settle(job, request.execution, { status: 'not_run', refusal: response.refusal }, { within: store }) : undefined;
+        if (routed?.action !== 'requeued') return fail('task_worker_not_run');
+        if (request.operation === 'resume') {
+          await session('waiting_model', { reason: 'model_limit', budgeted: false });
+          if (request.questionId) await store.db.query("UPDATE codex_questions SET state='answered' WHERE id=$1 AND state='resumed'", [request.questionId]);
+        } else await session('cancelled');
+        await store.syncTaskLane();
+        return { terminal: false };
+      }
       if (response.status === 'failed') return fail(`task_${response.reason}`);
       if (response.status === 'limited' || response.status === 'auth_expired') {
-        const reason = response.status === 'limited' ? 'model_limit' : 'auth_expired';
+        let reason: 'model_limit' | 'auth_expired' = response.status === 'limited' ? 'model_limit' : 'auth_expired';
+        let rateLimit = response.rateLimit ?? null;
+        let laneOnly = reason === 'auth_expired';
+        let hold = false;
+        if (request.execution && this.methods) {
+          // 한도 뒤 API 사용: 같은 세션을 다음 턴(--resume)으로 다른 방식에 잇는다. 이어 갈 세션이 남지 않았으면(첫 턴이 세션을 만들기 전에
+          // 끝남) 스스로 새로 시작하지 않고 아래 held로 보존한다(넘어갈 근거가 있는 구독 한도, API 실패, 옛 설치의 결과).
+          const routed = await this.methods.settle(job, request.execution, { status: response.status, rateLimit, resumable: facts.retained === true,
+            subscriptionLimit: response.execution?.subscriptionLimit === true }, { within: store });
+          if (routed.action === 'requeued') {
+            // 진행이 없던 턴이라 턴 예산에서 뺀다. 실행 시간·도구 수는 지금처럼 합산된다.
+            await session('waiting_model', { reason: 'model_limit', budgeted: false });
+            if (request.operation === 'resume' && request.questionId) await store.db.query("UPDATE codex_questions SET state='answered' WHERE id=$1 AND state='resumed'", [request.questionId]);
+            await store.syncTaskLane();
+            return { terminal: false };
+          }
+          if (routed.action === 'wait') { reason = 'model_limit'; rateLimit = routed.rateLimit; laneOnly = false; }
+          // 이을 세션 없이 끝난 턴이다. 세션이 없어 어느 방식으로도 이어 갈 수 없으므로 시간으로 다시 돌리지 않고 작업 레인에서
+          // owner 판단까지 보존한다(COLLEAGUE_SPEC §4.11 "작업 이어가기"). 그 결과의 결제·풀리는 시각으로 지금 계정의 scheduler를 닫지 않는다.
+          else if (routed.action === 'held') { reason = 'model_limit'; rateLimit = null; laneOnly = true; hold = true; }
+          else if (reason === 'model_limit' && await this.methods.apiChosen(store.db, 'task', { probe: false })) laneOnly = true;
+        } else if (reason === 'model_limit' && this.methods && await this.methods.routesOthers(store.db)) {
+          // 선택 없이 구독으로 돈 턴(작업 경로 칸 꺼짐)은 넘어가지 않고 기다린다. 다른 경로가 넘어갈 수 있으면 작업 레인만 세운다.
+          laneOnly = true;
+        }
         // 계정 한도는 대화·리뷰도 같은 계정이라 양쪽을 막고, 인증 만료는 레인 토큰의 일이라 작업 레인만 막는다.
         // 한도 정보가 없으면(옛 작업자) 멈춤 기록은 시각을 모르는 한도로 남아 30분마다 다시 시도한다.
-        await store.waitForUser(job, reason, { laneOnly: reason === 'auth_expired', rateLimit: response.rateLimit ?? null });
+        await store.waitForUser(job, reason, { laneOnly, rateLimit, ...(hold ? { hold } : {}) });
         const now = (await store.db.query<{ state: string; attempt: number }>('SELECT state,attempt FROM jobs WHERE id=$1', [job.id])).rows[0]!;
         if (now.state !== 'waiting_user') return skipped('waiting_user');
         // 한도·인증 대기 턴은 진행이 없어 턴 예산에서 뺀다. 결제는 저절로 재개하지 않고 owner가 풀 때마다 한 턴을 써서 센다.
-        await session('waiting_model', { reason, budgeted: reason === 'model_limit' && response.rateLimit?.stop?.cause === 'billing' });
+        await session('waiting_model', { reason, budgeted: reason === 'model_limit' && rateLimit?.stop?.cause === 'billing' });
         await store.syncTaskLane();
         // 그 턴이 나르던 답은 처리되지 않았다. /resume-model 뒤 같은 답으로 잇는다.
         if (request.operation === 'resume' && request.questionId) await store.db.query("UPDATE codex_questions SET state='answered' WHERE id=$1 AND state='resumed'", [request.questionId]);
         // 자리 비움 한 줄(원인·시각·'/' 명령 없음). 이어서 할 수 있으면 같은 멈춤 동안 이 스레드에 한 번만 나간다.
-        const resumable = Number(now.attempt) < DEFAULTS.maxRetries + 1;
+        // 보존한 작업은 돌아와도 이어 갈 수 없다는 줄이다.
+        const resumable = !hold && Number(now.attempt) < DEFAULTS.maxRetries + 1;
         const fallback = `task-wait:${job.id}:${job.attempt}`;
         await store.enqueue({ key: resumable ? await store.awayKey(job.target.channel, fallback) : fallback, job: job.id, conversation: job.conversation_id, actor: job.owner_id, scope: job.target, revision,
           payload: { kind: 'message', channel: job.target.channel, classification: 'safe_summary', content: resumable ? T.away : T.awayFinal } });
@@ -552,8 +670,15 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
     // 대기가 아닌 응답(완료·질문·실패)에 실린 한도 경고도 계정 기록에 남긴다(리뷰 미루기). 대기 응답은 waitForUser가 이미 남겼다.
     // 트랜잭션 안에서 기록이 실패하면 턴 확정 전체가 깨지므로 밖에서 부르고, 실패는 로그만 남긴다.
     const response = turn.kind === 'response' ? turn.response : undefined;
-    if (response && 'rateLimit' in response && response.rateLimit && response.status !== 'limited' && response.status !== 'auth_expired') {
-      await this.store.observeRateLimit(response.rateLimit, job.id).catch(error => { this.options.log('task_rate_limit_record_failed', { job: job.id, ...errorInfo(error) }); });
+    // 선택을 실은 턴은 아래 귀속(settle)이 그 계정·revision이 지금 설치일 때만 남긴다.
+    const rateLimit = response && 'rateLimit' in response ? response.rateLimit ?? null : null;
+    if (response && !request.execution && rateLimit && response.status !== 'limited' && response.status !== 'auth_expired') {
+      await this.store.observeRateLimit(rateLimit, job.id).catch(error => { this.options.log('task_rate_limit_record_failed', { job: job.id, ...errorInfo(error) }); });
+    }
+    // 진행한 턴(완료·질문·실패)도 그 실행의 선택으로 귀속한다(구독 확인 성공이 구독 복귀가 된다). 기록 실패는 확정한 턴을 바꾸지 않는다.
+    if (response && request.execution && this.methods && (response.status === 'completed' || response.status === 'needs_input' || response.status === 'failed')) {
+      await this.methods.settle(job, request.execution, { status: response.status === 'failed' ? 'failed' : 'succeeded', rateLimit })
+        .catch(error => { this.options.log('task_method_settle_failed', { job: job.id, ...errorInfo(error) }); });
     }
     return settled;
   }
@@ -806,9 +931,22 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
     return { job: match[1]!, generation: Number(match[2]) };
   }
   private async jobRow(id: string): Promise<Job> { return (await this.deps.store.db.query<Job>('SELECT * FROM jobs WHERE id=$1', [id])).rows[0]!; }
-  private async send(job: Job, session: SessionRow | undefined, request: TaskV2Request): Promise<void> {
+  private async send(job: Job, session: SessionRow | undefined, unrouted: TaskV2Request): Promise<void> {
+    // 방식을 고를 수 있으면 요청 끝에 선택 칸을 싣는다(작업 턴 v1과 같은 규칙). 턴·도구·실행 시간 예산은 세션에서 이어 온 값 그대로다.
+    const routed = await this.deps.bridge.selectChangeTurn(job);
+    // 구독은 한도, API는 잠김, 구독 확인 자리도 없다: 턴을 띄우지 않고 구독 확인 시각까지 모델 멈춤이다. 호출자는 시작하지 못한 턴으로 다룬다.
+    // 다른 게시 서버가 그 사이 같은 lease로 턴을 시작했으면 대기에 넣지 않는다(waitChangeTurn이 세션을 다시 본다).
+    if (methodWait(routed)) {
+      await this.deps.bridge.waitChangeTurn(job, session, routed.wait);
+      throw new Error('change_turn_stale');
+    }
+    const request = routed ? TASK_V2_ENDPOINTS['/v2/task'].request.parse({ ...unrouted, execution: routed }) : unrouted;
     const begun = await this.deps.bridge.beginChangeTurn(job, request, session);
-    if (begun !== 'started') throw new Error(`change_turn_${begun}`);
+    if (begun !== 'started') {
+      if (routed && begun !== 'reroute') await this.deps.bridge.abandonChangeTurn(routed);
+      // reroute는 job을 대기열로 되돌렸다. 시작하지 못한 턴이라 change-runtime이 다음 바퀴에 다시 고른다.
+      throw new Error(`change_turn_${begun === 'reroute' ? 'stale' : begun}`);
+    }
     try {
       // 정리 요청이 도는 잠깐 동안 슬롯이 찬다. 시작하지 않았다는 답이라 같은 턴을 다시 보내도 안전하다. 이것으로 턴을 닫으면 일시 경합이 끝 상태가 된다.
       let reply: { response: unknown; bytes: number } | undefined;
@@ -921,6 +1059,12 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
     if (result.status === 'running') { await this.deps.store.heartbeat(job).catch(() => {}); return { kind: 'running' }; }
     if (result.status === 'absent') return { kind: 'unknown', code: result.finalized ? 'already_finalized' : 'start_unconfirmed' };
     if (result.turn !== session.turn) return { kind: 'unknown', code: 'turn_mismatch' };
+    const selection = await this.deps.bridge.changeSelection(jobId, session);
+    if (this.deps.bridge.changeExecutionMismatch(selection, result)) {
+      const settled = await this.settled(job, session, result, undefined, false, true);
+      this.deps.bridge.reportChangeEnd(jobId, settled);
+      return settled.terminal ? { kind: 'failed', code: 'task_worker_lost' } : { kind: 'unknown', code: 'stop_unconfirmed' };
+    }
     if (result.status === 'snapshot') {
       const artifact = decodeArtifact(result.artifact, result.artifactDigest);
       if (!artifact) return { kind: 'unknown', code: 'artifact_response_invalid' };
@@ -928,7 +1072,10 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
       await this.deps.store.heartbeat(job).catch(() => {});
       // 성공 결과에 실린 한도 경고도 계정 기록에 남긴다(리뷰 미루기, AC-17). 전환 경계·scheduler 잠금은 observeRateLimit이 지킨다.
       // 같은 결과를 다시 받아도 기한은 늘리기만 해 같다. 기록이 실패해도 결과는 넘긴다.
-      if (result.rateLimit) await this.deps.store.observeRateLimit(result.rateLimit, jobId).catch(() => {});
+      // 선택을 실은 턴은 귀속(settleChangeSuccess)이 그 계정·revision이 지금 설치일 때만 남긴다.
+      if (result.rateLimit && !selection) await this.deps.store.observeRateLimit(result.rateLimit, jobId).catch(() => {});
+      // 같은 결과를 다시 받아도 두 번째 귀속은 아무것도 바꾸지 않는다.
+      await this.deps.bridge.settleChangeSuccess(job, selection, result.rateLimit ?? null);
       // 확인할 것·남은 위험은 변경 작성 판(change-v2) 결과에만 있다. 옛 판 결과면 칸 없이 넘긴다.
       return { kind: 'snapshot', artifact, transportBytes: raw.bytes, ...(result.checks ? { checks: result.checks } : {}), ...(result.risks ? { risks: result.risks } : {}) };
     }
@@ -941,10 +1088,12 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
     if (result.status === 'needs_input') return { kind: 'needs_input', question: result.question, ...(result.options ? { options: result.options } : {}) };
     if (result.status === 'failed') return stop ? { kind: 'cancelled', code: 'aborted' } : { kind: 'failed', code: result.reason };
     if (result.status === 'unknown') return settled.terminal ? { kind: 'failed', code: 'task_worker_lost' } : { kind: 'unknown', code: 'stop_unconfirmed' };
+    // 다시 보낼 수 있으면 세션이 한도 대기(재개 턴) 또는 닫힘(첫 턴, 새 세대)이고 job이 대기열에 있다. change-runtime이 다음 바퀴에 잇는다.
+    if (result.status === 'not_run') return settled.terminal ? { kind: 'failed', code: 'task_worker_not_run' } : { kind: 'unknown', code: 'not_run' };
     return { kind: 'unknown', code: result.status === 'limited' ? 'model_limit' : 'auth_expired' };
   }
-  private async settled(job: Job, session: SessionRow, result: Exclude<TaskV2TurnResult, { status: 'snapshot' }>, stop?: 'cancel', questionBlocked = false) {
-    const settled = await this.deps.bridge.settleChangeTurn(job, session, result, stop, questionBlocked);
+  private async settled(job: Job, session: SessionRow, result: TaskV2TurnResult, stop?: 'cancel', questionBlocked = false, lost = false) {
+    const settled = await this.deps.bridge.settleChangeTurn(job, session, result, stop, questionBlocked, lost);
     if (settled.terminal) await this.deps.bridge.finalizeChangeSession(job.id).catch(() => {});
     return settled;
   }

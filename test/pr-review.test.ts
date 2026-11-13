@@ -19,6 +19,9 @@ import { archiveContract } from '../src/worker.js';
 import { HttpReviewWorker, reviewWorkerServer } from '../src/review-http.js';
 import { controlText } from '../src/control-format.js';
 import { parseAdminArgs, runAdmin } from '../src/admin.js';
+import { MethodRouter, installMethods, methodRoutingView } from '../src/method-routing.js';
+import { recordAccount, switchAccount } from '../src/model-accounts.js';
+import { Runtime } from '../src/runtime.js';
 import { captureControls, event, fixture, localDatabase, thread } from './helpers.js';
 
 const SECRET = 'fixture-webhook-secret';
@@ -120,7 +123,8 @@ let controls: ReturnType<typeof captureControls>;
 before(async () => { database = await localDatabase(); controls = captureControls(); });
 beforeEach(async () => {
   await database.pg.exec(`TRUNCATE events,conversations,jobs,results,outbox,schedules,denied_actors,controls,audit,incidents,
-    github_deliveries,pr_reviews,review_deliveries,model_limit_state,model_accounts RESTART IDENTITY CASCADE`);
+    github_deliveries,pr_reviews,review_deliveries,model_limit_state,model_accounts,method_routing,method_subscription,method_api,method_runs,model_pauses
+    RESTART IDENTITY CASCADE`);
   f = await fixture(database.db);
   r = await setup();
 });
@@ -2020,6 +2024,117 @@ test('C22 계정 전환 전에 시작한 리뷰 실행의 한도 경고는 새 �
   assert.equal(await r.runtime.tick(), true);
   assert.equal(await f.store.reviewDeferredUntil(), resetsAt);
 });
+// C40 한도 뒤 API 사용의 PR 리뷰 경로(AC-39). 경계 S1: 리뷰 runtime의 claim 순서·가짜 시계. 리뷰 작업자는 C39 ReviewWorker이고
+// 모델 자리는 실행 선택(run.selection)의 방식을 보고 답한다.
+async function autoInstalled() {
+  await recordAccount(f.store.db, 'main', 'subscription', f.now());
+  await recordAccount(f.store.db, 'main', 'api', f.now());
+  await f.store.atomic(s => switchAccount(s, 'main', 'subscription', 'cli', 'cli'));
+  await f.store.atomic(s => installMethods(s, 'main', 'rev-1'));
+}
+function methodReviewer(answer: (method: string | undefined) => Awaited<ReturnType<ReviewerModel>>) {
+  const runs: (string | undefined)[] = [];
+  const model: ReviewerModel = async (_input, _signal, run) => { runs.push(run.selection?.method); return answer(run.selection?.method); };
+  const worker = new ReviewWorker(f.verifier, async url => r.archives.get(url.split('/').at(-1)!)!, model, 50);
+  const router = new MethodRouter(f.store, { enabled: true, supported: () => true });
+  return { runs, router, runtime: new ReviewRuntime(f.store, r.source, r.queue, r.gh, worker, f.signer, 5, { methods: router }) };
+}
+const subscriptionLimited = (resetsAt: number) => ({ status: 'limited' as const, rateLimit: { stop: { cause: 'rate_limit' as const, resetsAt } }, subscriptionLimit: true });
+// 대화 작업자 자리의 v3 답. 구독은 넘어갈 근거가 있는 한도, API는 api 인자대로 답한다.
+const chatByMethod = (resetsAt: number, api: 'succeeded' | 'billing') => async (request: WorkerRequestShape) => {
+  const method = request.execution?.method;
+  const execution = request.execution ? { execution: { ...request.execution, subscriptionLimit: method === 'subscription' } } : {};
+  if (method === 'subscription') return { status: 'limited', stopped: true, rateLimit: { stop: { cause: 'rate_limit', resetsAt } }, ...execution } as never;
+  if (api === 'billing') return { status: 'limited', stopped: true, rateLimit: { stop: { cause: 'billing' } }, ...execution } as never;
+  return { status: 'succeeded', stopped: true, rateLimit: null, output: { reply: '답했어요.', proposal: null, ack_only: false }, ...execution } as never;
+};
+type WorkerRequestShape = { version: number; execution?: { method: string } } & Record<string, any>;
+test('AC-39 PR 리뷰도 구독 한도 실패 뒤 같은 리뷰를 같은 계정의 API로 한 번 이어서 하고 게시까지 간다', async () => {
+  await autoInstalled();
+  const resetsAt = Math.floor((f.now() + HOUR) / 1000);
+  const m = methodReviewer(method => method === 'subscription' ? subscriptionLimited(resetsAt) : { status: 'succeeded', output: OUTPUT });
+  await opened();
+  assert.equal(await m.runtime.tick(), true);
+  // 자리 비움 안내 없이 같은 리뷰가 대기열로 돌아간다.
+  assert.deepEqual((await reviewJobs()).map(j => j.state), ['queued']);
+  assert.equal((await rows('outbox')).length, 0);
+  assert.equal(await m.runtime.tick(), true);
+  assert.deepEqual((await reviewJobs()).map(j => j.state), ['succeeded']);
+  assert.deepEqual(m.runs, ['subscription', 'api']);
+  await r.publisher.deliver();
+  assert.equal(r.gh.writes.length, 1);
+});
+test('AC-39 고를 방식이 API인 동안은 구독 경고로 미룬 PR 리뷰도 집고, API가 잠긴 뒤 구독으로 돌아오면 미룬 기한이 다시 적용된다', async () => {
+  await autoInstalled();
+  const limitResets = Math.floor((f.now() + HOUR) / 1000);
+  const warned = Math.floor((f.now() + 5 * HOUR) / 1000) * 1000;
+  // 구독을 쓰던 대화가 한도 경고를 받아 새 PR 리뷰를 미룬다.
+  await f.store.observeRateLimit(warning(warned), null);
+  const m = methodReviewer(() => ({ status: 'succeeded', output: OUTPUT }));
+  const chatRuntime = new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, undefined, { methods: m.router });
+  f.setRun(chatByMethod(limitResets, 'succeeded'));
+  await chat('limited-chat');
+  await chatRuntime.tick();
+  await chatRuntime.tick();
+  await opened();
+  assert.equal(await m.runtime.tick(), true);
+  assert.deepEqual(m.runs, ['api']);
+  // API가 잠긴다(두 방식 다 막혀 멈춤). 구독 확인 시각 뒤 확인이 성공해 구독으로 돌아오면 미루기가 다시 산다.
+  f.setRun(chatByMethod(limitResets, 'billing'));
+  await chat('locked-chat');
+  await chatRuntime.tick();
+  f.advance(limitResets * 1000 + 60_000 - f.now());
+  assert.equal(await f.store.resumeDue(), 1);
+  f.setRun(async () => ({ status: 'succeeded', stopped: true, rateLimit: null, output: { reply: '돌아왔어요.', proposal: null, ack_only: false } }));
+  await chatRuntime.tick();
+  assert.equal((await methodRoutingView(database.db)).subscription!.state, 'available');
+  r.gh.pulls.set(8, pull({ number: 8, updated_at: '2026-10-29T02:00:00Z' }));
+  assert.equal((await hook('pull_request', prEvent('opened', pull({ number: 8, updated_at: '2026-10-29T02:00:00Z' })))).outcome, 'queued');
+  assert.equal(await m.runtime.tick(), false);
+  f.advance(warned - f.now());
+  assert.equal(await m.runtime.tick(), true);
+  assert.deepEqual(m.runs, ['api', 'subscription']);
+});
+test('AC-39 구독 확인 시각이 리뷰 미루기 기한보다 이르면, 그 시각 뒤 미룬 PR 리뷰는 구독 확인으로 집히지 않고 기다린다', async () => {
+  await autoInstalled();
+  const limitResets = Math.floor((f.now() + HOUR) / 1000);
+  const warned = Math.floor((f.now() + 5 * HOUR) / 1000) * 1000;
+  await f.store.observeRateLimit(warning(warned), null);
+  const m = methodReviewer(() => ({ status: 'succeeded', output: OUTPUT }));
+  const chatRuntime = new Runtime(f.store, f.gate, f.worker, f.signer, f.reader, undefined, { methods: m.router });
+  f.setRun(chatByMethod(limitResets, 'succeeded'));
+  await chat('limited-chat');
+  await chatRuntime.tick();
+  await chatRuntime.tick();
+  // 구독 확인 시각(풀리는 시각 + 1분)은 지났고 미루기 기한(5시간)은 남았다. API는 잠기지 않았다.
+  f.advance(limitResets * 1000 + 60_000 - f.now());
+  await opened();
+  assert.equal(await m.runtime.tick(), false);
+  assert.deepEqual(m.runs, []);
+  assert.deepEqual((await reviewJobs()).map(j => j.state), ['queued']);
+});
+// 게시 서버 조립(main)은 스위치가 꺼져도 라우터를 리뷰 runtime에 넘긴다. 그 조립에서도 claim 뒤 다른 레인이 남긴 리뷰 미루기는
+// 이미 집은 리뷰를 되돌리지 않는다(라우터 없는 기준판과 같은 실행).
+for (const assembly of ['라우터 없음(기준판)', '꺼진 라우터', '켜졌지만 설치 없는 라우터'] as const) {
+  test(`AC-32 ${assembly}: claim과 전송 사이에 리뷰 미루기가 생겨도 이미 집은 PR 리뷰를 그대로 실행한다`, async () => {
+    const methods = assembly === '라우터 없음(기준판)' ? undefined
+      : new MethodRouter(f.store, { enabled: assembly === '켜졌지만 설치 없는 라우터', supported: () => assembly === '켜졌지만 설치 없는 라우터' });
+    const runtime = new ReviewRuntime(f.store, r.source, r.queue, r.gh, r.worker, f.signer, 5, methods ? { methods } : {});
+    await opened();
+    const read = r.gh.pullRequest.bind(r.gh);
+    let warned = false;
+    // claim 뒤 GitHub 조회 동안 작업 레인의 구독 실행이 한도 경고를 남긴다.
+    r.gh.pullRequest = async (repository: string, number: number) => {
+      if (!warned) { warned = true; await f.store.observeRateLimit(warning(f.now() + 5 * HOUR), null); }
+      return read(repository, number);
+    };
+    assert.equal(await runtime.tick(), true);
+    assert.ok(warned);
+    assert.notEqual(await f.store.reviewDeferredUntil(), null);
+    assert.equal(r.inputs.length, 1);
+    assert.deepEqual((await reviewJobs()).map(j => j.state), ['succeeded']);
+  });
+}
 test('AC-16 리뷰가 한도로 멈추면 풀리는 시각 1분 뒤 리뷰를 저절로 이어서 하고 게시까지 간다', async () => {
   const resetsAt = Math.floor((f.now() + HOUR) / 1000);
   r.reply({ status: 'limited', rateLimit: { stop: { cause: 'rate_limit', resetsAt } } });
