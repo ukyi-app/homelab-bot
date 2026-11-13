@@ -100,7 +100,7 @@ test('AC-38 세션이 남지 않은 첫 턴의 구독 한도는 API로 새로 �
 });
 
 for (const gap of [0, 1]) {
-  test(`AC-37 세션을 남기지 못한 첫 작업 턴의 옛 계정 API 실패가 account use 뒤(${gap ? '1ms 뒤' : '같은 밀리초'}) 와도 새 계정의 scheduler를 닫지 않고 작업만 보존해 곧 다시 고른다`, async () => {
+  test(`AC-37 세션을 남기지 못한 첫 작업 턴의 옛 계정 API 실패가 account use 뒤(${gap ? '1ms 뒤' : '같은 밀리초'}) 와도 새 계정의 scheduler를 닫지 않고 작업만 시간 재개 없이 보존한다`, async () => {
     const local = await autoLane();
     await recordAccount(database.db, 'other', 'subscription', f.now());
     // 구독은 한도(확인 시각 전)라 첫 턴이 API로 간다.
