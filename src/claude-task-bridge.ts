@@ -594,8 +594,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
         let hold = false;
         if (request.execution && this.methods) {
           // 한도 뒤 API 사용: 같은 세션을 다음 턴(--resume)으로 다른 방식에 잇는다. 이어 갈 세션이 남지 않았으면(첫 턴이 세션을 만들기 전에
-          // 끝남) 스스로 새로 시작하지 않는다. 구독 한도면 지금처럼 기다리고(다른 경로는 API를 쓸 수 있으니 작업 레인만 막는다), API 실패나
-          // 옛 설치의 결과면 아래 held로 보존한다.
+          // 끝남) 스스로 새로 시작하지 않고 아래 held로 보존한다(넘어갈 근거가 있는 구독 한도, API 실패, 옛 설치의 결과).
           const routed = await this.methods.settle(job, request.execution, { status: response.status, rateLimit, resumable: facts.retained === true,
             subscriptionLimit: response.execution?.subscriptionLimit === true }, { within: store });
           if (routed.action === 'requeued') {
@@ -606,9 +605,8 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
             return { terminal: false };
           }
           if (routed.action === 'wait') { reason = 'model_limit'; rateLimit = routed.rateLimit; laneOnly = false; }
-          // 이을 세션 없이 끝난 턴이 지금 계정의 구독 한도를 말하지 않는다(API 실패, 옛 계정·옛 설치의 결과). 세션이 없어 어느 방식으로도
-          // 이어 갈 수 없으므로 시간으로 다시 돌리지 않고 작업 레인에서 owner 판단까지 보존한다(COLLEAGUE_SPEC §4.11 "작업 이어가기").
-          // 그 결과의 결제·풀리는 시각으로 지금 계정의 scheduler를 닫지 않는다.
+          // 이을 세션 없이 끝난 턴이다. 세션이 없어 어느 방식으로도 이어 갈 수 없으므로 시간으로 다시 돌리지 않고 작업 레인에서
+          // owner 판단까지 보존한다(COLLEAGUE_SPEC §4.11 "작업 이어가기"). 그 결과의 결제·풀리는 시각으로 지금 계정의 scheduler를 닫지 않는다.
           else if (routed.action === 'held') { reason = 'model_limit'; rateLimit = null; laneOnly = true; hold = true; }
           else if (reason === 'model_limit' && await this.methods.apiChosen(store.db, 'task', { probe: false })) laneOnly = true;
         } else if (reason === 'model_limit' && this.methods && await this.methods.routesOthers(store.db)) {

@@ -37,8 +37,8 @@ export interface RoutedOutcome {
 }
 // requeued: 이 일을 다시 대기열에 넣었다(다른 방식으로 이어서 하거나, 옛 판으로 다시 보내려고). 호출자는 더 쓰지 않는다.
 // wait: 두 방식이 다 막혀 모델 멈춤이다. 호출자는 이 rateLimit(구독 확인 시각)으로 waitForUser를 부른다.
-// held: 이을 세션이 없는(resumable: false) 일의 결과가 지금 계정의 구독 한도를 말하지 않는다
-// (옛 계정의 결과, 옛 설치의 API 실패, 지금 설치의 API 실패).
+// held: 이을 세션이 없는(resumable: false) 일이 넘어갈 근거가 있는 구독 한도, 옛 계정의 결과, 옛 설치·지금 설치의 API 실패로 끝났다.
+// 구독 한도의 상태 전이(한도·확인 시각)는 이미 했다.
 // 호출자는 지금 계정의 전역 대기를 만들지 않고, 그 일만 작업 레인에서 owner 판단까지 보존한다(시간으로 다시 돌리지 않는다.
 // 세션이 없어 다시 돌려도 이어 갈 수 없다, COLLEAGUE_SPEC §4.11 "작업 이어가기").
 // default: 지금 동작 그대로 처리한다.
@@ -274,8 +274,10 @@ export class MethodRouter {
     requeue: () => Promise<Settlement>, first: boolean): Promise<Settlement> {
     const now = s.now();
     if (!first) {
-      // 회수의 재진입: 상태는 이미 귀속했다. 그 일만 같은 규칙으로 잇는다(API를 쓸 수 있으면 다시 넣고, 아니면 지금 동작).
-      return outcome.status === 'limited' && outcome.subscriptionLimit === true && row.api_state === 'eligible' ? requeue() : DEFAULT;
+      // 회수의 재진입: 상태는 이미 귀속했다. 그 일만 같은 규칙으로 잇는다(이을 세션이 없으면 보존, API를 쓸 수 있으면 다시 넣고, 아니면 지금 동작).
+      if (outcome.status !== 'limited' || outcome.subscriptionLimit !== true) return DEFAULT;
+      if (outcome.resumable === false) return HELD;
+      return row.api_state === 'eligible' ? requeue() : DEFAULT;
     }
     if (outcome.status === 'succeeded') {
       // 돌아옴은 예약 시각이 아니라 구독 실행 성공을 확인한 뒤에만 기록한다(풀린 뒤에도 주간 한도가 남을 수 있다).
@@ -306,6 +308,9 @@ export class MethodRouter {
       // 구독 확인이 다시 한도다: 다음 확인 시각만 바꾼다.
       await s.db.query(`UPDATE method_subscription SET until=$2,next_probe_at=$3,updated_at=$4 WHERE account=$1`, [run.account, until, next, now]);
     }
+    // 이을 세션이 없는 일은 풀린 뒤 다시 돌려도 이어 가지 못해 그 일만 보존한다(settleApi와 같은 규칙). 구독 상태 전이는 위에서 마쳤고,
+    // API가 잠겼으면 다음 실행의 고르기(select)가 구독 확인 시각까지 모델 멈춤을 건다.
+    if (outcome.resumable === false) return HELD;
     // 같은 한도를 먼저 보고한 실행이 이미 넘겼으면 상태는 그대로 두고 이 일만 잇는다.
     if (row.api_state !== 'eligible') return DEFAULT;
     return requeue();

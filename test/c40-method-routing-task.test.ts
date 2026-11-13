@@ -5,6 +5,7 @@ import { CHAT_TASK_TEXT } from '../src/chat-task-text.js';
 import { MethodRouter, installMethods, methodRoutingView } from '../src/method-routing.js';
 import { recordAccount, switchAccount } from '../src/model-accounts.js';
 import type { TaskRequest, TaskResponse, TaskWorkerIdentity } from '../src/task-contracts.js';
+import { MODEL_RESUME } from '../src/store.js';
 import { localDatabase, fixture } from './helpers.js';
 import { allRows, jobs, lane, reply, task } from './task-lane-fixture.js';
 import type { Fixture, Script } from './task-lane-fixture.js';
@@ -84,20 +85,57 @@ test('AC-38 작업 경로 칸이 꺼져 있으면 스위치가 켜져도 작업 
   assert.equal((await jobs(database.db))[0]!.state, 'waiting_user');
 });
 
-test('AC-38 세션이 남지 않은 첫 턴의 구독 한도는 API로 새로 시작하지 않고 작업을 보존한 채 지금처럼 기다리며, 대화 쪽 scheduler는 닫지 않는다', async () => {
-  const local = await autoLane();
-  await task(f, database.db);
-  local.worker.scripts = [subscriptionLimited(false)];
-  await local.runtime.tickTask();
-  assert.equal((await jobs(database.db))[0]!.state, 'waiting_user');
-  assert.equal(local.worker.executes.length, 1);
-  assert.equal(await local.runtime.tickTask(), false);
-  assert.equal(local.worker.executes.length, 1);
-  // 자리 비움 안내가 남는다(지금 규칙). 다른 경로는 API로 갈 수 있어 전역 scheduler는 열려 있다.
-  assert.equal((await allRows(database.db, 'outbox')).filter(row => row.payload.content === CHAT_TASK_TEXT.away).length, 1);
-  assert.notEqual((await allRows(database.db, 'controls')).find(row => row.key === 'scheduler')?.value, true);
-  assert.equal((await methodRoutingView(database.db)).subscription!.state, 'limited');
-});
+for (const api of ['eligible', 'billing_blocked'] as const) {
+  test(`AC-38 세션이 남지 않은 첫 턴의 구독 한도(넘어갈 근거 있음, API ${api === 'eligible' ? '쓸 수 있음' : '잠김'})는 구독 한도·확인 시각만 적고 작업은 API로 새로 시작하지 않고 시간 재개 없이 보존한다`, async () => {
+    const local = await autoLane();
+    if (api !== 'eligible') await database.db.query(`UPDATE method_api SET state='billing_blocked',blocked_at=$1`, [f.now()]);
+    await task(f, database.db);
+    const until = resetsAt() * 1000;
+    local.worker.scripts = [subscriptionLimited(false)];
+    await local.runtime.tickTask();
+    assert.equal(local.worker.executes[0]!.execution?.method, 'subscription');
+    // 구독 상태 전이는 그대로다: 한도와 확인 시각(풀리는 시각 + 1분).
+    const [subscription] = await allRows(database.db, 'method_subscription');
+    assert.deepEqual([subscription!.state, Number(subscription!.next_probe_at)], ['limited', until + MODEL_RESUME.afterResetMs]);
+    // 다른 일의 방식: API를 쓸 수 있으면 API, 잠겼으면 다음 실행의 고르기가 구독 확인 시각까지 모델 멈춤을 낸다.
+    const router = new MethodRouter(f.store, { enabled: true, task: true, supported: () => true });
+    const next = await router.select({ id: 'fixture-chat-job', budget: { timeoutMs: 1000, toolCalls: 1 }, lease_token: 'fixture-chat-lease' }, 'chat');
+    if (api === 'eligible') assert.ok(next && 'method' in next && next.method === 'api');
+    else assert.deepEqual(next, { wait: { stop: { cause: 'rate_limit', resetsAt: until / 1000 } } });
+    // "돌아오면 이어서 할게요"는 나가지 않는다(세션이 없어 돌아와도 잇지 못한다).
+    assert.equal((await allRows(database.db, 'outbox')).filter(row => row.payload.content === CHAT_TASK_TEXT.away).length, 0);
+    await assertHeld(local);
+  });
+}
+
+// 선택이 없는 실행(스위치 꺼짐·두 방식 미설치)은 210079d 그대로다: 풀리는 시각까지 기다리며 자리 비움을 알리고, 재개되면 준비가 세션 없음으로 닫는다.
+for (const mode of ['off', 'uninstalled'] as const) {
+  test(`AC-38 한도 뒤 API 사용이 ${mode === 'off' ? '꺼져' : '설치되지 않아'} 있으면 세션이 남지 않은 첫 턴의 구독 한도는 지금처럼 풀리는 시각까지 기다린 뒤 재개돼 세션 없음으로 닫힌다`, async () => {
+    await recordAccount(database.db, 'main', 'subscription', f.now());
+    await recordAccount(database.db, 'main', 'api', f.now());
+    await f.store.atomic(s => switchAccount(s, 'main', 'subscription', 'cli', 'cli'));
+    if (mode === 'off') await f.store.atomic(s => installMethods(s, 'main', 'rev-1'));
+    const local = lane(f);
+    local.bridge.useMethods(new MethodRouter(f.store, { enabled: mode !== 'off', task: true, supported: () => true }));
+    await task(f, database.db);
+    const until = resetsAt() * 1000;
+    local.worker.scripts = [(r, w) => ({ ...reply.limited()(r, w), rateLimit: { stop: { cause: 'rate_limit', resetsAt: until / 1000 } }, sessionRetained: false })];
+    await local.runtime.tickTask();
+    assert.equal(local.worker.executes[0]!.execution, undefined);
+    assert.deepEqual(await allRows(database.db, 'method_runs'), []);
+    const [pause] = await allRows(database.db, 'model_pauses');
+    assert.deepEqual([Number(pause!.retry_at), pause!.lane_only_at], [until + MODEL_RESUME.afterResetMs, null]);
+    assert.equal(await modelPaused(database.db), true);
+    assert.equal((await allRows(database.db, 'outbox')).filter(row => row.payload.content === CHAT_TASK_TEXT.away).length, 1);
+    assert.equal((await allRows(database.db, 'outbox')).filter(row => row.payload.content === CHAT_TASK_TEXT.awayFinal).length, 0);
+    f.advance(2 * 3_600_000);
+    assert.equal(await f.store.resumeDue(), 1);
+    await local.runtime.tickTask();
+    const [closed] = await jobs(database.db);
+    assert.deepEqual([closed!.state, closed!.wait_reason], ['failed', 'task_session_missing']);
+    assert.equal(local.worker.executes.length, 1);
+  });
+}
 
 for (const gap of [0, 1]) {
   test(`AC-37 세션을 남기지 못한 첫 작업 턴의 옛 계정 API 실패가 account use 뒤(${gap ? '1ms 뒤' : '같은 밀리초'}) 와도 새 계정의 scheduler를 닫지 않고 작업만 시간 재개 없이 보존한다`, async () => {

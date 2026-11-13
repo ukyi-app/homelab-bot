@@ -664,12 +664,20 @@ test('AC-38 변경 작성 턴: 작업 경로 칸이 꺼져 있으면 선택 칸 
   assert.deepEqual(await runs(h), []);
 });
 
-test('AC-38 변경 작성 턴: 세션이 남지 않은 첫 턴의 구독 한도는 API로 새로 시작하지 않고 지금처럼 기다린다', async () => {
+test('AC-38 변경 작성 턴: 세션이 남지 않은 첫 턴의 구독 한도는 구독 한도만 적고, API로 새로 시작하지 않고 시간 재개 없이 작업 레인에서 보존한다', async () => {
   const h = await routedAuthor();
   await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
   routedEnds(h, [subscriptionLimitEnd(h, false)]);
   const { receiptId } = await h.author.start(startInput(h));
   assert.deepEqual(await pollAuthor(h, receiptId), { kind: 'unknown', code: 'model_limit' });
+  assert.equal(h.calls.sent[0]!.execution.method, 'subscription');
+  assert.deepEqual((await h.db.query<{ state: string }>('SELECT state FROM method_subscription')).rows.map(row => row.state), ['limited']);
+  assert.equal((await statesOf(h)).job, 'waiting_user');
+  const pause = (await h.db.query<{ retry_at: string | null; lane_only_at: string | null; paused_at: string }>('SELECT retry_at,lane_only_at,paused_at FROM model_pauses')).rows[0]!;
+  assert.deepEqual([pause.retry_at, Number(pause.lane_only_at)], [null, Number(pause.paused_at)]);
+  assert.notEqual((await h.db.query<{ value: unknown }>(`SELECT value FROM controls WHERE key='scheduler'`)).rows[0]?.value, true);
+  h.app.advance(6 * 3_600_000);
+  assert.equal(await h.app.store.resumeDue(), 0);
   assert.equal((await statesOf(h)).job, 'waiting_user');
   assert.equal(h.calls.sent.length, 1);
 });
