@@ -2113,6 +2113,28 @@ test('AC-39 구독 확인 시각이 리뷰 미루기 기한보다 이르면, 그
   assert.deepEqual(m.runs, []);
   assert.deepEqual((await reviewJobs()).map(j => j.state), ['queued']);
 });
+// 게시 서버 조립(main)은 스위치가 꺼져도 라우터를 리뷰 runtime에 넘긴다. 그 조립에서도 claim 뒤 다른 레인이 남긴 리뷰 미루기는
+// 이미 집은 리뷰를 되돌리지 않는다(라우터 없는 기준판과 같은 실행).
+for (const assembly of ['라우터 없음(기준판)', '꺼진 라우터', '켜졌지만 설치 없는 라우터'] as const) {
+  test(`AC-32 ${assembly}: claim과 전송 사이에 리뷰 미루기가 생겨도 이미 집은 PR 리뷰를 그대로 실행한다`, async () => {
+    const methods = assembly === '라우터 없음(기준판)' ? undefined
+      : new MethodRouter(f.store, { enabled: assembly === '켜졌지만 설치 없는 라우터', supported: () => assembly === '켜졌지만 설치 없는 라우터' });
+    const runtime = new ReviewRuntime(f.store, r.source, r.queue, r.gh, r.worker, f.signer, 5, methods ? { methods } : {});
+    await opened();
+    const read = r.gh.pullRequest.bind(r.gh);
+    let warned = false;
+    // claim 뒤 GitHub 조회 동안 작업 레인의 구독 실행이 한도 경고를 남긴다.
+    r.gh.pullRequest = async (repository: string, number: number) => {
+      if (!warned) { warned = true; await f.store.observeRateLimit(warning(f.now() + 5 * HOUR), null); }
+      return read(repository, number);
+    };
+    assert.equal(await runtime.tick(), true);
+    assert.ok(warned);
+    assert.notEqual(await f.store.reviewDeferredUntil(), null);
+    assert.equal(r.inputs.length, 1);
+    assert.deepEqual((await reviewJobs()).map(j => j.state), ['succeeded']);
+  });
+}
 test('AC-16 리뷰가 한도로 멈추면 풀리는 시각 1분 뒤 리뷰를 저절로 이어서 하고 게시까지 간다', async () => {
   const resetsAt = Math.floor((f.now() + HOUR) / 1000);
   r.reply({ status: 'limited', rateLimit: { stop: { cause: 'rate_limit', resetsAt } } });

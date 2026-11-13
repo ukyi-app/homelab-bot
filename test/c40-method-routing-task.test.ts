@@ -98,6 +98,35 @@ test('AC-38 세션이 남지 않은 첫 턴의 구독 한도는 API로 새로 �
   assert.equal((await methodRoutingView(database.db)).subscription!.state, 'limited');
 });
 
+for (const gap of [0, 1]) {
+  test(`AC-37 세션을 남기지 못한 첫 작업 턴의 옛 계정 API 실패가 account use 뒤(${gap ? '1ms 뒤' : '같은 밀리초'}) 와도 새 계정의 scheduler를 닫지 않고 작업만 보존해 곧 다시 고른다`, async () => {
+    const local = await autoLane();
+    await recordAccount(database.db, 'other', 'subscription', f.now());
+    // 구독은 한도(확인 시각 전)라 첫 턴이 API로 간다.
+    await database.db.query(`UPDATE method_subscription SET state='limited',limited_at=$1,next_probe_at=$2`, [f.now(), f.now() + 3_600_000]);
+    await task(f, database.db);
+    local.worker.scripts = [async (r, w) => {
+      f.advance(gap);
+      await f.store.atomic(s => switchAccount(s, 'other', 'subscription', 'cli', 'cli'));
+      return selected(reply.limited(), false, { rateLimit: { stop: { cause: 'billing' } }, sessionRetained: false } as Partial<TaskResponse>)(r, w);
+    }];
+    await local.runtime.tickTask();
+    assert.equal(local.worker.executes[0]!.execution?.method, 'api');
+    assert.notEqual((await allRows(database.db, 'controls')).find(row => row.key === 'scheduler')?.value, true);
+    const [row] = await jobs(database.db);
+    assert.deepEqual([row!.state, row!.wait_reason], ['waiting_user', 'model_limit']);
+    const [pause] = await allRows(database.db, 'model_pauses');
+    assert.equal(pause!.kind, 'rate_limit');
+    assert.equal(Number(pause!.retry_at), f.now() + 60_000);
+    assert.equal(Number(pause!.lane_only_at), Number(pause!.paused_at));
+    // A의 그 revision은 잠겼다. 작업은 1분 뒤 새 계정으로 다시 고른다.
+    assert.deepEqual((await allRows(database.db, 'method_api')).map(api => [api.account, api.revision, api.state]), [['main', 'rev-1', 'billing_blocked']]);
+    f.advance(60_000);
+    assert.equal(await f.store.resumeDue(), 1);
+    assert.equal((await jobs(database.db))[0]!.state, 'queued');
+  });
+}
+
 test('C39 넘김: 작업 턴의 실행 안 됨(not_run)은 첫 턴이면 새 세대로, 재개 턴이면 다음 턴 번호로 선택 없이 다시 보낸다', async () => {
   const notRun = (retained: boolean): Script => (r, w) => ({ version: 1, job: r.job, lease: r.lease, generation: r.generation, sessionId: r.sessionId, turn: r.turn,
     worker: w, usage: { toolCalls: 0, model: null }, status: 'not_run', stopped: true, sessionRetained: retained, cleanupPending: false, refusal: 'bundle_mismatch' });

@@ -455,3 +455,34 @@ for (const gap of [0, 1]) {
     assert.equal(f.requests.at(-1)!.version, 2);
   });
 }
+
+test('AC-36 account use B 뒤 도착한 계정 A의 API 결제 실패도 A의 그 revision에 잠금으로 남아, A의 같은 revision을 다시 설치해도 API를 다시 부르지 않는다', async () => {
+  await installed();
+  await recordAccount(f.store.db, 'other', 'subscription', f.now());
+  const runtime = runtimeWith(router());
+  await queued();
+  f.setRun(limited(limitInfo(secondsFromNow(60 * MINUTE))));
+  await runtime.tick();
+  f.setRun(async request => {
+    await f.store.atomic(s => switchAccount(s, 'other', 'subscription', 'cli', 'cli'));
+    return limited(billing)(request);
+  });
+  await runtime.tick();
+  // B(지금 계정)는 멈추지 않는다.
+  assert.notEqual(await scheduler(), true);
+  assert.deepEqual(await rows('model_pauses'), []);
+  assert.deepEqual((await rows('method_api')).map(row => [row.account, row.revision, row.state]), [['main', 'rev-1', 'billing_blocked']]);
+  assert.equal((await rows('audit')).filter(row => row.kind === 'method_route_api_locked').length, 1);
+  f.setRun(answered);
+  await runtime.tick();
+  assert.equal((await job()).state, 'succeeded');
+  // 구독 확인 시각 전에 owner가 A로 돌아와 같은 묶음을 다시 설치한다. 잠금은 owner 해제나 새 revision으로만 풀린다.
+  await f.store.atomic(s => switchAccount(s, 'main', 'subscription', 'cli', 'cli'));
+  assert.equal((await f.store.atomic(s => installMethods(s, 'main', 'rev-1'))).result, 'installed');
+  assert.equal((await view()).api!.state, 'billing_blocked');
+  await queued('again');
+  const sent = f.requests.length;
+  await runtime.tick();
+  assert.equal(f.requests.length, sent);
+  assert.deepEqual(methodsSent(), ['subscription', 'api', null]);
+});

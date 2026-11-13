@@ -37,9 +37,13 @@ export interface RoutedOutcome {
 }
 // requeued: 이 일을 다시 대기열에 넣었다(다른 방식으로 이어서 하거나, 옛 판으로 다시 보내려고). 호출자는 더 쓰지 않는다.
 // wait: 두 방식이 다 막혀 모델 멈춤이다. 호출자는 이 rateLimit(구독 확인 시각)으로 waitForUser를 부른다.
+// held: 이을 세션이 없는(resumable: false) 일의 결과가 지금 설치의 것이 아니고 지금 계정의 구독 한도도 말하지 않는다
+// (옛 계정의 결과이거나 옛 설치의 API 실패).
+// 호출자는 지금 계정의 전역 대기를 만들지 않고, 그 일만 작업 레인 대기로 보존해 곧(1분 뒤) 다시 고르게 한다.
 // default: 지금 동작 그대로 처리한다.
-export type Settlement = { action: 'requeued' } | { action: 'wait'; rateLimit: RateLimitInfo | null } | { action: 'default' };
+export type Settlement = { action: 'requeued' } | { action: 'wait'; rateLimit: RateLimitInfo | null } | { action: 'held' } | { action: 'default' };
 const DEFAULT: Settlement = { action: 'default' };
+const HELD: Settlement = { action: 'held' };
 // 구독은 한도이고 API는 잠겼으며 구독 확인 자리도 없다(확인 시각 전이거나 다른 실행이 확인 중). 어느 방식으로도 보내지 않는다.
 // 호출자는 이 rateLimit으로 모델 멈춤(waitForUser)에 넣는다. 다시 시도는 구독 확인 시각, 이미 지났으면 최소 1분 뒤다.
 export type MethodWait = { wait: RateLimitInfo | null };
@@ -193,7 +197,8 @@ export class MethodRouter {
   }
 
   // 작업자 결과(멈춤이 확인된 것)를 그 실행의 고정된 선택으로 귀속하고, 필요하면 같은 트랜잭션에서 이 일을 다시 대기열에 넣는다.
-  // 같은 실행의 두 번째 보고는 아무것도 바꾸지 않는다(default).
+  // 같은 실행의 두 번째 보고는 아무것도 바꾸지 않는다(default). 단 저장 결과 회수(recovered)가 같은 결과를 다시 가져오면
+  // 상태는 다시 바꾸지 않되 후속 결정(재큐·대기)은 지금 상태로 다시 낸다: 귀속을 커밋한 뒤 대기 저장이 실패한 일은 그 결정이 필요하다.
   // recovered: 저장 결과 회수로 받은 결과다. 그 job은 실행 중이 아니라 unknown(또는 멈춤 확인 뒤 failed)이라 그 상태에서 되돌린다.
   // within: 호출자가 이미 연 트랜잭션의 Store(작업 레인의 턴 확정). 그 트랜잭션이 scheduler 행을 잡았거나 잡을 순서여야 한다.
   // record: 확인된 API 실패의 잠금만 적는다(취소·종료가 그 일의 끝을 정한 경우). API 실행이 아니면 아무것도 하지 않고, 다시 넣지도 기다리지도 않는다.
@@ -204,40 +209,73 @@ export class MethodRouter {
       // (모델 대기 Store.waitForUser·계정 전환과 같은 순서).
       await s.lockScheduler();
       const now = s.now();
-      const run = (await s.db.query<RunRow>('SELECT * FROM method_runs WHERE run_id=$1 FOR UPDATE', [selection.runId])).rows[0];
-      if (!run || run.settled_at !== null || run.job_id !== job.id) return DEFAULT;
-      if (options.record && (run.method !== 'api' || (outcome.status !== 'limited' && outcome.status !== 'auth_expired'))) return DEFAULT;
-      await s.db.query('UPDATE method_runs SET outcome=$2,subscription_limit=$3,settled_at=$4 WHERE run_id=$1',
-        [run.run_id, outcome.status, outcome.subscriptionLimit === true, now]);
-      await s.db.query(`UPDATE method_subscription SET probe_run=NULL,probe_until=NULL WHERE probe_run=$1`, [run.run_id]);
+      const run = (await s.db.query<RunRow & { outcome: string | null }>('SELECT * FROM method_runs WHERE run_id=$1 FOR UPDATE', [selection.runId])).rows[0];
+      if (!run || run.job_id !== job.id) return DEFAULT;
+      const apiFailure = run.method === 'api' && (outcome.status === 'limited' || outcome.status === 'auth_expired');
+      if (options.record && !apiFailure) return DEFAULT;
+      // first: 이 보고가 귀속한다. 아니면 회수의 같은 결과일 때만 결정을 다시 내고(상태는 그대로), 그 밖은 아무것도 하지 않는다.
+      const first = run.settled_at === null;
+      if (!first && (options.recovered !== true || options.record || run.outcome !== outcome.status)) return DEFAULT;
+      if (first) {
+        await s.db.query('UPDATE method_runs SET outcome=$2,subscription_limit=$3,settled_at=$4 WHERE run_id=$1',
+          [run.run_id, outcome.status, outcome.subscriptionLimit === true, now]);
+        await s.db.query(`UPDATE method_subscription SET probe_run=NULL,probe_until=NULL WHERE probe_run=$1`, [run.run_id]);
+      }
       const row = await routing(s.db, true);
-      // 고를 때의 설치와 지금 설치가 같은 계정·revision이고 켜져 있으며 그 계정이 실제 지금 계정일 때만 상태를 바꾼다.
-      // 옛 계정(owner의 account use 뒤)·옛 revision의 늦은 결과는 지금 상태·API 잠금·리뷰 미룸·scheduler를 건드리지 않는다.
+      // 고를 때의 설치와 지금 설치가 같은 계정·revision이고 켜져 있으며 그 계정이 실제 지금 계정일 때만 지금 상태를 바꾼다.
+      // 옛 계정(owner의 account use 뒤)·옛 revision의 늦은 결과는 지금 상태·리뷰 미룸·scheduler를 건드리지 않고,
       // 그 일은 지금 설치(또는 옛 판)로 다시 고르도록 대기열로 돌린다.
       const current = row !== undefined && row.install_state === 'active' && row.current_account && row.account === run.account && row.revision === run.revision;
-      const requeue = async (): Promise<Settlement> => !options.record && outcome.resumable !== false && await this.requeue(s, job, options.recovered === true)
-        ? { action: 'requeued' } : DEFAULT;
+      // 확인된 API 실패는 지금 설치 여부와 무관하게 그 실행에 고정된 계정·revision의 API 상태에 남긴다.
+      // 남기지 않으면 owner가 같은 계정·revision을 다시 설치했을 때 실패한 API를 다시 부른다(해제는 owner 동작과 새 revision뿐).
+      if (first && apiFailure) await this.lockApi(s, run, outcome, current);
+      // hold: 다시 넣을 수 없는 일(이을 세션 없음)의 옛 설치 결과가 지금 계정의 구독 한도를 말하지 않으면, 호출자가 전역 대기 대신 그 일만 보존한다.
+      const requeue = async (hold = false): Promise<Settlement> => {
+        if (options.record) return DEFAULT;
+        if (outcome.resumable === false) return hold ? HELD : DEFAULT;
+        return await this.requeue(s, job, options.recovered === true) ? { action: 'requeued' } : DEFAULT;
+      };
       if (outcome.status === 'not_run') {
-        if (current) {
+        if (first && current) {
           await s.db.query(`UPDATE method_routing SET install_state='refused',refused_reason=$1,epoch=epoch+1,updated_at=$2 WHERE id='current'`,
             [outcome.refusal ?? 'not_run', now]);
           await s.audit('method_route_refused', run.job_id, { account: run.account, revision: run.revision, run: run.run_id, refusal: outcome.refusal ?? null });
         }
         return requeue();
       }
-      if (!current) return outcome.status === 'limited' || outcome.status === 'auth_expired' ? requeue() : DEFAULT;
+      if (!current) {
+        if (outcome.status !== 'limited' && outcome.status !== 'auth_expired') return DEFAULT;
+        const foreign = !(await s.db.query('SELECT 1 FROM model_accounts WHERE name=$1 AND current', [run.account])).rows.length;
+        return requeue(apiFailure || foreign);
+      }
       // 대기가 아닌 결과의 한도 경고는 그 구독 실행의 계정·revision이 지금 설치일 때만 계정 기록에 남긴다(리뷰 미루기).
       // 실행 시작 시각과 전환 시각의 비교(옛 요청 경로)는 쓰지 않는다: 같은 계정의 새 revision 설치는 그 시각을 바꾸지 않는다.
-      if ((outcome.status === 'succeeded' || outcome.status === 'failed') && run.method === 'subscription') await s.observeRateLimit(outcome.rateLimit, null, s.db);
-      if (run.method === 'subscription') return this.settleSubscription(s, job, run, row!, outcome, requeue);
-      const settled = await this.settleApi(s, run, row!, outcome, requeue);
+      if (first && (outcome.status === 'succeeded' || outcome.status === 'failed') && run.method === 'subscription') await s.observeRateLimit(outcome.rateLimit, null, s.db);
+      if (run.method === 'subscription') return this.settleSubscription(s, job, run, row!, outcome, requeue, first);
+      const settled = await this.settleApi(s, row!, outcome, requeue);
       return options.record ? DEFAULT : settled;
     });
   }
 
-  private async settleSubscription(s: Store, job: Pick<Job, 'id'>, run: RunRow, row: RoutingRow, outcome: RoutedOutcome,
-    requeue: () => Promise<Settlement>): Promise<Settlement> {
+  // 확인된 API 실패를 그 실행의 계정·revision에 잠금으로 적는다. 이미 잠겼으면 바꾸지 않는다.
+  // 방식 상태가 바뀌었다는 표시(epoch)는 지금 설치의 잠금일 때만 올린다.
+  private async lockApi(s: Store, run: RunRow, outcome: RoutedOutcome, current: boolean): Promise<void> {
     const now = s.now();
+    const state = outcome.status === 'auth_expired' ? 'auth_blocked' : 'billing_blocked';
+    const locked = (await s.db.query(`UPDATE method_api SET state=$3,blocked_at=$4,updated_at=$4 WHERE account=$1 AND revision=$2 AND state='eligible' RETURNING account`,
+      [run.account, run.revision, state, now])).rows.length > 0;
+    if (!locked) return;
+    if (current) await bump(s.db, now);
+    await s.audit('method_route_api_locked', run.job_id, { account: run.account, revision: run.revision, run: run.run_id, reason: state });
+  }
+
+  private async settleSubscription(s: Store, job: Pick<Job, 'id'>, run: RunRow, row: RoutingRow, outcome: RoutedOutcome,
+    requeue: () => Promise<Settlement>, first: boolean): Promise<Settlement> {
+    const now = s.now();
+    if (!first) {
+      // 회수의 재진입: 상태는 이미 귀속했다. 그 일만 같은 규칙으로 잇는다(API를 쓸 수 있으면 다시 넣고, 아니면 지금 동작).
+      return outcome.status === 'limited' && outcome.subscriptionLimit === true && row.api_state === 'eligible' ? requeue() : DEFAULT;
+    }
     if (outcome.status === 'succeeded') {
       // 돌아옴은 예약 시각이 아니라 구독 실행 성공을 확인한 뒤에만 기록한다(풀린 뒤에도 주간 한도가 남을 수 있다).
       // 한도로 넘어가기 전에 고른 실행의 늦은 성공은 확인이 아니다.
@@ -272,21 +310,13 @@ export class MethodRouter {
     return requeue();
   }
 
-  private async settleApi(s: Store, run: RunRow, row: RoutingRow, outcome: RoutedOutcome,
-    requeue: () => Promise<Settlement>): Promise<Settlement> {
-    const now = s.now();
-    // API 결제(보수 분류한 API 429 포함)·API 인증 실패 → API 잠금. 다시 두드리지 않는다. 과부하·실패·성공은 지금 동작이다.
+  // API 결제(보수 분류한 API 429 포함)·API 인증 실패의 후속 결정. 잠금은 settle이 이미 적었다(lockApi). 과부하·실패·성공은 지금 동작이다.
+  private async settleApi(s: Store, row: RoutingRow, outcome: RoutedOutcome, requeue: () => Promise<Settlement>): Promise<Settlement> {
     if (outcome.status !== 'limited' && outcome.status !== 'auth_expired') return DEFAULT;
-    if (row.api_state === 'eligible') {
-      const state = outcome.status === 'auth_expired' ? 'auth_blocked' : 'billing_blocked';
-      await s.db.query(`UPDATE method_api SET state=$3,blocked_at=$4,updated_at=$4 WHERE account=$1 AND revision=$2`, [run.account, run.revision, state, now]);
-      await bump(s.db, now);
-      await s.audit('method_route_api_locked', run.job_id, { account: run.account, revision: run.revision, run: run.run_id, reason: state });
-    }
     // 구독이 쓸 수 있으면 그 일을 구독으로 잇는다. 구독도 한도면 모델 멈춤이고, 재시도는 구독 확인 시각이다(구독 복귀 예약은 잠금과 따로 남는다).
     if (row.subscription_state === 'available') return requeue();
     // 확인 시각이 이미 지났으면 recordPause가 최소 1분 뒤로 잡는다. 시각을 모르면 30분 뒤다.
-    return { action: 'wait', rateLimit: probeWait(row, now) };
+    return { action: 'wait', rateLimit: probeWait(row, s.now()) };
   }
 
   // 실행 중이던 작업을 같은 행 그대로 대기열로 되돌린다. 한도·거부로 끝난 실행은 시도로 세지 않는다(멈춤 기록과 같은 규칙).

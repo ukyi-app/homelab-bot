@@ -213,16 +213,28 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
   }
   // 이 실행이 아직 job을 쥐고 있고 읽어 둔 세션 상태가 그대로일 때만 job을 정리한다. 그 사이 lease가 끝났거나 다른 실행이 턴을 시작했으면 어떤 행도 건드리지 않는다.
   // act가 돌았으면 그 결과를, 아니면 undefined를 돌려준다.
+  // 잠금은 턴 시작·확정과 같은 대화 → scheduler → 레인 → job → 세션 순서다. act의 모델 대기(waitForUser)가 scheduler 행을 잡으므로,
+  // job을 먼저 잡으면 scheduler → job 순서인 비상 정지와 서로 기다린다.
   private async unchanged<T>(job: Job, session: SessionRow | undefined, act: (store: Store) => Promise<T>): Promise<T | undefined> {
     return this.store.atomic(async store => {
-      await store.db.query('SELECT id FROM conversations WHERE id=$1 FOR UPDATE', [job.conversation_id]);
+      await store.lockTaskControl(job.conversation_id);
       const held = (await store.db.query<{ state: string; lease_token: string; lease_until: string }>(
         'SELECT state,lease_token,lease_until FROM jobs WHERE id=$1 FOR UPDATE', [job.id])).rows[0];
       if (!held || held.lease_token !== job.lease_token || Number(held.lease_until) <= store.now() || !HELD.has(held.state)) return undefined;
-      const now = (await store.db.query<{ state: string; turn: number }>('SELECT state,turn FROM codex_sessions WHERE job_id=$1 FOR UPDATE', [job.id])).rows[0];
-      if (session ? now?.state !== session.state || now.turn !== session.turn : !!now) return undefined;
+      if (!await this.sessionKept(store, job.id, session)) return undefined;
       return act(store);
     });
+  }
+  // 준비 때 읽은 세션이 그대로인가. 아니면 다른 게시 서버가 같은 job·lease로 그 사이 턴을 시작했거나 끝냈다. 호출자가 job 행까지 잠근 뒤 부른다.
+  private async sessionKept(store: Store, jobId: string, session: SessionRow | undefined): Promise<boolean> {
+    const now = (await store.db.query<{ state: string; turn: number; generation: number | null }>(
+      'SELECT state,turn,generation FROM codex_sessions WHERE job_id=$1 FOR UPDATE', [jobId])).rows[0];
+    return session ? now?.state === session.state && now.turn === session.turn && now.generation === session.generation : !now;
+  }
+  // 변경 작성 턴을 띄우지 않고 구독 확인 시각까지 모델 멈춤에 넣는다(구독 한도·API 잠김·확인 자리 없음).
+  // 준비 때 읽은 세션이 그대로일 때만이다: 다른 게시 서버가 같은 lease로 이미 턴을 시작했으면 그 job을 대기로 바꾸지 않는다.
+  async waitChangeTurn(job: Job, session: SessionRow | undefined, rateLimit: RateLimitInfo | null): Promise<void> {
+    await this.unchanged(job, session, store => store.waitForUser(job, 'model_limit', { rateLimit }));
   }
   // act는 job을 끝냈으면 참을 돌려준다. 그 사이의 /cancel로 failed가 아니라 cancelled가 될 수 있고 lease가 끝나 막힐 수도 있어, 끝은 DB 값으로 적는다.
   private async giveUp(job: Job, session: SessionRow | undefined, reason: string,
@@ -338,6 +350,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
   // 선택을 실은 턴은 같은 트랜잭션(scheduler 행 잠금 아래)에서 그 선택을 다시 확인하고, CAS에 이긴 턴의 선택만 시작한 실행으로 적는다.
   // 두 게시 서버가 같은 job·lease로 각각 골라도 결과 대조·회수는 실제로 시작한 턴의 선택을 쓴다.
   // reroute: 고른 뒤 그 사이 API가 잠기거나 구독이 한도가 됐다. 턴을 띄우지 않고 선택을 버린 뒤 job을 대기열로 되돌렸다(세션은 그대로).
+  // 다른 게시 서버가 같은 lease로 이미 턴을 시작했으면 reroute하지 않고 conflict다: 되돌리면 실행 중인 그 턴의 job·lease·시도 수를 바꾼다.
   private async begin(job: Job, request: TaskRequest | TaskV2Request, session: SessionRow | undefined, capabilities: object = { version: 1, lane: 'task', tool_approval_relay: false }): Promise<'started' | 'stale' | 'conflict' | 'reroute'> {
     return this.store.atomic(async store => {
       await store.lockTaskControl(job.conversation_id);
@@ -345,6 +358,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
         'SELECT state,lease_token,lease_until FROM jobs WHERE id=$1 FOR UPDATE', [job.id])).rows[0];
       if (!row || row.lease_token !== job.lease_token || Number(row.lease_until) <= store.now() || row.state !== 'running') return 'stale';
       if (request.execution && this.methods && !await this.methods.admit(job, request.execution, store)) {
+        if (!await this.sessionKept(store, job.id, session)) return 'conflict';
         await this.methods.reroute(job, request.execution, store);
         await store.syncTaskLane();
         return 'reroute';
@@ -577,6 +591,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
         let reason: 'model_limit' | 'auth_expired' = response.status === 'limited' ? 'model_limit' : 'auth_expired';
         let rateLimit = response.rateLimit ?? null;
         let laneOnly = reason === 'auth_expired';
+        let stale = false;
         if (request.execution && this.methods) {
           // 한도 뒤 API 사용: 같은 세션을 다음 턴(--resume)으로 다른 방식에 잇는다. 이어 갈 세션이 남지 않았으면(첫 턴이 세션을 만들기 전에
           // 끝남) 스스로 새로 시작하지 않고 지금처럼 기다린다. 다른 경로는 API를 쓸 수 있으니 그때는 작업 레인만 막는다.
@@ -590,6 +605,9 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
             return { terminal: false };
           }
           if (routed.action === 'wait') { reason = 'model_limit'; rateLimit = routed.rateLimit; laneOnly = false; }
+          // 이을 세션 없이 끝난 턴의 옛 설치 결과가 지금 계정의 구독 한도가 아니다(옛 계정 결과·옛 설치의 API 실패). 작업을 스스로 새로 시작하지 않고
+          // 작업 레인 대기로만 보존해 1분 뒤 지금 설치로 다시 고른다. 그 결과의 결제·풀리는 시각으로 지금 계정의 scheduler를 닫지 않는다.
+          else if (routed.action === 'held') { reason = 'model_limit'; rateLimit = null; laneOnly = true; stale = true; }
           else if (reason === 'model_limit' && await this.methods.apiChosen(store.db, 'task', { probe: false })) laneOnly = true;
         } else if (reason === 'model_limit' && this.methods && await this.methods.routesOthers(store.db)) {
           // 선택 없이 구독으로 돈 턴(작업 경로 칸 꺼짐)은 넘어가지 않고 기다린다. 다른 경로가 넘어갈 수 있으면 작업 레인만 세운다.
@@ -597,7 +615,7 @@ export class ClaudeTaskBridge extends TaskBridge implements TaskLane {
         }
         // 계정 한도는 대화·리뷰도 같은 계정이라 양쪽을 막고, 인증 만료는 레인 토큰의 일이라 작업 레인만 막는다.
         // 한도 정보가 없으면(옛 작업자) 멈춤 기록은 시각을 모르는 한도로 남아 30분마다 다시 시도한다.
-        await store.waitForUser(job, reason, { laneOnly, rateLimit });
+        await store.waitForUser(job, reason, { laneOnly, rateLimit, ...(stale ? { stale } : {}) });
         const now = (await store.db.query<{ state: string; attempt: number }>('SELECT state,attempt FROM jobs WHERE id=$1', [job.id])).rows[0]!;
         if (now.state !== 'waiting_user') return skipped('waiting_user');
         // 한도·인증 대기 턴은 진행이 없어 턴 예산에서 뺀다. 결제는 저절로 재개하지 않고 owner가 풀 때마다 한 턴을 써서 센다.
@@ -916,8 +934,9 @@ export class ClaudeChangeAuthor implements ChangeAuthorPort {
     // 방식을 고를 수 있으면 요청 끝에 선택 칸을 싣는다(작업 턴 v1과 같은 규칙). 턴·도구·실행 시간 예산은 세션에서 이어 온 값 그대로다.
     const routed = await this.deps.bridge.selectChangeTurn(job);
     // 구독은 한도, API는 잠김, 구독 확인 자리도 없다: 턴을 띄우지 않고 구독 확인 시각까지 모델 멈춤이다. 호출자는 시작하지 못한 턴으로 다룬다.
+    // 다른 게시 서버가 그 사이 같은 lease로 턴을 시작했으면 대기에 넣지 않는다(waitChangeTurn이 세션을 다시 본다).
     if (methodWait(routed)) {
-      await this.deps.store.waitForUser(job, 'model_limit', { rateLimit: routed.wait });
+      await this.deps.bridge.waitChangeTurn(job, session, routed.wait);
       throw new Error('change_turn_stale');
     }
     const request = routed ? TASK_V2_ENDPOINTS['/v2/task'].request.parse({ ...unrouted, execution: routed }) : unrouted;

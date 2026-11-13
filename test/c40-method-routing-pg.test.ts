@@ -8,6 +8,7 @@ import { MethodRouter, installMethods, methodRoutingView } from '../src/method-r
 import type { MethodPath } from '../src/method-routing.js';
 import { recordAccount, switchAccount } from '../src/model-accounts.js';
 import { fixture } from './helpers.js';
+import { lane, task } from './task-lane-fixture.js';
 
 // AC-37 경합과 늦은 결과(COLLEAGUE_SPEC §4.11). 실제 PostgreSQL 두 연결에서 본다(PGlite는 트랜잭션을 직렬화해 겹친 보고를 만들 수 없다).
 // 두 게시 서버는 같은 DB를 쓰는 두 MethodRouter로 흉내 낸다. HOMELAB_TEST_PG_SOCKET이 없으면 건너뛴다.
@@ -83,7 +84,7 @@ test('AC-37 두 게시 서버가 같은 구독 한도를 동시에 보고해도 
   });
 });
 
-test('AC-37 옛 revision·옛 계정 실행의 늦은 실패는 지금 상태·API 잠금을 바꾸지 않고 그 일만 다시 고르게 한다', { skip }, async () => {
+test('AC-37 옛 revision 실행의 늦은 API 실패는 그 revision만 잠그고 지금 설치의 상태는 바꾸지 않으며 그 일만 다시 고르게 한다', { skip }, async () => {
   await freshDatabase(async db => {
     const f = await fixture(db);
     await recordAccount(db, 'main', 'subscription', f.now());
@@ -102,7 +103,8 @@ test('AC-37 옛 revision·옛 계정 실행의 늦은 실패는 지금 상태·A
     assert.equal((await router.settle(late, api, { status: 'limited', rateLimit: { stop: { cause: 'billing' } } })).action, 'requeued');
     const state = await methodRoutingView(db);
     assert.deepEqual([state.api!.state, state.subscription!.state, state.revision], ['eligible', 'limited', 'rev-2']);
-    assert.equal((await db.query("SELECT 1 FROM audit WHERE kind='method_route_api_locked'")).rows.length, 0);
+    assert.deepEqual((await db.query<{ revision: string; state: string }>('SELECT revision,state FROM method_api ORDER BY revision')).rows.map(row => [row.revision, row.state]),
+      [['rev-1', 'billing_blocked'], ['rev-2', 'eligible']]);
     // 지금 revision의 API 결제 실패는 잠근다.
     const current = await running(db, 'c', f.now());
     const fresh = await pick(router, current);
@@ -146,6 +148,60 @@ test('AC-36 API 잠금과 고른 API 실행의 시작 확인이 두 연결에서
       const next = await servers[round % 2]!.select(after, 'chat');
       assert.ok(next === null || 'wait' in next || next.method !== 'api');
     }
+  });
+});
+
+// 이 DB에서 행 잠금을 기다리는 연결 수. 장벽 순서를 잠금 대기 사실로 확인한다.
+async function lockWaiters(db: Postgres, count: number): Promise<void> {
+  for (let attempt = 0; attempt < 500; attempt++) {
+    const rows = (await db.query<{ n: string }>(`SELECT count(*) AS n FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock'`)).rows;
+    if (Number(rows[0]!.n) >= count) return;
+    await sleep(10);
+  }
+  throw new Error(`lock_waiters_${count}`);
+}
+
+test('AC-37 작업 턴의 구독 확인 대기와 다른 대화의 비상 정지가 두 연결에서 겹쳐도 같은 잠금 순서라 둘 다 오류 없이 끝난다', { skip }, async () => {
+  await freshDatabase(async db => {
+    const f = await fixture(db);
+    const router = await routedLimited(db, f, Math.floor((f.now() + 3_600_000) / 1000));
+    const locker = await running(db, 'locker', f.now());
+    assert.equal((await router.settle(locker, await pick(router, locker), { status: 'limited', rateLimit: { stop: { cause: 'billing' } } })).action, 'wait');
+    await db.query(`UPDATE jobs SET state='failed',lease_token=NULL WHERE id IN ('limited','locker')`);
+    // 작업 턴의 선택이 대기({ wait })로 끝난 바로 뒤에 장벽을 세운다: 다른 연결이 scheduler 행을 쥐고, 다른 대화의 비상 정지가 그 뒤에 줄 선다.
+    const methods = new MethodRouter(f.store, { enabled: true, task: true, supported: () => true });
+    const select = methods.select.bind(methods);
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let holder: Promise<void> | undefined;
+    let stopping: Promise<unknown> | undefined;
+    let arranged = false;
+    methods.select = async (job, path) => {
+      const routed = await select(job, path);
+      if (!arranged) {
+        arranged = true;
+        let locked!: () => void;
+        const holding = new Promise<void>(resolve => { locked = resolve; });
+        holder = f.store.atomic(async s => { await s.db.query(`SELECT * FROM controls WHERE key='scheduler' FOR UPDATE`); locked(); await held; });
+        await holding;
+        stopping = f.store.control('fixture-owner', 'other-conversation', 'emergency-stop');
+        await lockWaiters(db, 1);
+      }
+      return routed;
+    };
+    const local = lane(f, { monitorMs: 3_600_000 });
+    local.bridge.useMethods(methods);
+    await task(f, db);
+    const claimed = (await f.store.claim('task'))!;
+    const waiting = local.bridge.run(claimed);
+    // 대기 경로도 scheduler 행에서 기다린다. 비상 정지가 먼저 그 행을 얻는다.
+    await lockWaiters(db, 2);
+    release();
+    const settled = await Promise.allSettled([waiting, stopping!, holder!]);
+    assert.deepEqual(settled.map(result => result.status === 'rejected' ? String(result.reason) : result.status), ['fulfilled', 'fulfilled', 'fulfilled']);
+    // 비상 정지가 실행 중이던 작업을 취소 요청으로 바꾼 뒤 대기 경로가 그것을 보고 취소로 닫는다.
+    assert.equal((await db.query<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [claimed.id])).rows[0]!.state, 'cancelled');
+    assert.equal((await db.query<{ value: boolean }>(`SELECT value FROM controls WHERE key='scheduler_emergency'`)).rows[0]!.value, true);
   });
 });
 

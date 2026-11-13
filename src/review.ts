@@ -582,6 +582,8 @@ export function classify(output: Pick<ReviewOutput, 'findings' | 'open_questions
 }
 const asJob = (row: Record<string, unknown>) => row as unknown as Job;
 const MAX_DEFERS = 10;
+// claim이 리뷰 미루기를 고를 방식(API) 때문에 건너뛴 job에 붙이는 표시. 열거되지 않아 job 행 값·서명에 섞이지 않는다.
+const DEFERRAL_EXEMPT = Symbol('review_deferral_exempt');
 export const notificationScope = (policy: Policy): Scope => ({ guild: policy.guild, channel: policy.notificationChannel, parent: null, kind: 'channel' });
 
 // v2 요청(방식 선택 칸)에는 v2 응답이 온다. v1 요청에는 v1 응답만 온다.
@@ -644,13 +646,17 @@ export class ReviewRuntime {
       // 미게시 후보 리뷰는 owner가 시킨 변경 작업의 한 단계라 작업처럼 계속한다.
       // 한도 뒤 API 사용: 고를 방식이 API인 동안(구독이 실제 한도이고 API가 잠기지 않음)은 구독 경고로 미룬 리뷰도 집는다.
       // API가 잠기거나 구독으로 돌아오면 남아 있는 미루기 기한이 다시 적용된다.
-      const deferred = await this.store.reviewDeferredUntil(tx) === null || await this.methods?.apiChosen(tx, 'review') ? ''
+      // exempt: 미루기 기한이 있는데 고를 방식이 API라 건너뛰었다. 이런 claim만 보내기 전에 실제 선택을 다시 맞춘다(tick).
+      const until = await this.store.reviewDeferredUntil(tx);
+      const exempt = until !== null && await this.methods?.apiChosen(tx, 'review') === true;
+      const deferred = until === null || exempt ? ''
         : `AND EXISTS (SELECT 1 FROM change_child_jobs c WHERE c.job_id=jobs.id AND c.role='review')`;
       const row = (await tx.query<{ id: string }>(`SELECT id FROM jobs WHERE type='review' AND state='queued' AND available_at<=$1 ${unassigned} ${deferred}
         ORDER BY priority,created_at FOR UPDATE SKIP LOCKED LIMIT 1`, [this.store.now()])).rows[0];
       if (!row) return;
-      return (await tx.query<Job & Record<string, unknown>>(`UPDATE jobs SET state='running',attempt=attempt+1,lease_token=$2,
+      const claimed = (await tx.query<Job & Record<string, unknown>>(`UPDATE jobs SET state='running',attempt=attempt+1,lease_token=$2,
         lease_until=$3,started_at=$4 WHERE id=$1 RETURNING *`, [row.id, randomUUID(), this.store.now() + DEFAULTS.leaseMs, this.store.now()])).rows[0];
+      return claimed && exempt ? Object.defineProperty(claimed, DEFERRAL_EXEMPT, { value: true }) : claimed;
     });
   }
   async tick(): Promise<boolean> {
@@ -726,7 +732,8 @@ export class ReviewRuntime {
       if (methodWait(routed)) { await this.store.waitForUser(asJob(job), 'model_limit', { rateLimit: routed.wait }); await this.away(job, context); return true; }
       selection = routed;
       // 리뷰 미루기의 예외(고를 방식이 API)는 실제 선택과 같아야 한다. claim 뒤 구독 확인 시각이 지나 구독을 골랐으면 미루기 기한까지 되돌린다.
-      if (this.methods && selection?.method !== 'api' && await this.store.reviewDeferredUntil() !== null) {
+      // 그 예외로 집은 리뷰만 다시 본다. 미루기 없이 집은 리뷰는 그 뒤 생긴 미루기로 되돌리지 않는다(스위치 꺼짐과 같은 동작).
+      if (this.methods && (job as unknown as Record<symbol, unknown>)[DEFERRAL_EXEMPT] === true && selection?.method !== 'api' && await this.store.reviewDeferredUntil() !== null) {
         if (selection) await this.methods.abandon(selection);
         await this.store.defer(asJob(job), 'review_deferred');
         return true;

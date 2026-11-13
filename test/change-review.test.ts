@@ -877,6 +877,43 @@ test('AC-39 v2 변경 자체 리뷰가 성공한 뒤 저장이 실패해도 재�
   assert.equal(await h.results.get(job.id, job.lease_token), null);
 });
 
+test('AC-39 변경 자체 리뷰의 API 실패를 귀속한 뒤 대기 저장이 실패해도, 회수는 결제 대기가 아니라 구독 확인 시각의 대기를 다시 만든다', async () => {
+  const methods: (string | undefined)[] = [];
+  const resetsAt = Math.floor((f.now() + 60 * MINUTE) / 1000);
+  const h = harness({ reply: run => {
+    methods.push(run.selection?.method);
+    return run.selection?.method === 'subscription'
+      ? { status: 'limited' as const, rateLimit: { stop: { cause: 'rate_limit' as const, resetsAt } }, subscriptionLimit: true }
+      : { status: 'limited' as const, rateLimit: { stop: { cause: 'billing' as const } } };
+  } });
+  await methodsInstalled(h);
+  const input = await reviewing();
+  await h.service.submit(portInput(input));
+  await h.runtime.tick();
+  assert.equal(await h.service.fetchReceipt(input.key), null);
+  assert.equal((await jobOf(input.key)).state, 'queued');
+  // API 실행의 결제 실패를 잠금으로 귀속한 뒤, 이어지는 모델 대기 저장만 실패한다.
+  const wait = f.store.waitForUser;
+  f.store.waitForUser = async () => { throw new Error('store_down'); };
+  try {
+    await h.runtime.tick();
+    const job = await jobOf(input.key);
+    assert.equal(job.state, 'unknown');
+    assert.equal((await database.db.query<{ state: string }>('SELECT state FROM method_api')).rows[0]!.state, 'billing_blocked');
+    assert.equal((await database.db.query<{ settled_at: string | null }>(`SELECT settled_at FROM method_runs WHERE method='api'`)).rows[0]!.settled_at !== null, true);
+  } finally { f.store.waitForUser = wait; }
+  assert.equal(await h.service.fetchReceipt(input.key), null);
+  const job = await jobOf(input.key);
+  assert.deepEqual([job.state, job.wait_reason], ['waiting_user', 'model_limit']);
+  const next = (await database.db.query<{ next_probe_at: string }>('SELECT next_probe_at FROM method_subscription')).rows[0]!.next_probe_at;
+  const pause = (await database.db.query<{ kind: string; retry_at: string | null }>('SELECT kind,retry_at FROM model_pauses WHERE job_id=$1', [job.id])).rows[0]!;
+  assert.deepEqual([pause.kind, pause.retry_at === null ? null : Number(pause.retry_at)], ['rate_limit', Number(next)]);
+  assert.deepEqual(methods, ['subscription', 'api']);
+  f.advance(Number(next) - f.now());
+  assert.equal(await f.store.resumeDue(), 1);
+  assert.equal((await jobOf(input.key)).state, 'queued');
+});
+
 test('T19 B2 출처를 알 수 없는 job은 dispatcher가 받아도 모델 없이 실패로 닫는다', async () => {
   const h = harness();
   const job = randomUUID();
