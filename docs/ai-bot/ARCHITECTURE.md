@@ -2371,7 +2371,7 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 | 귀속 | 실행마다 한 번(`settled_at` 없음) | 결과·확인 자리 놓기, 확인된 API 실패의 `lockApi(실행의 계정·revision)`, 지금 설치면 구독 상태 전이·`not_run` 거부·한도 경고 |
 | 결정 | 귀속 때, 그리고 회수(`recovered`)가 같은 결과를 다시 가져올 때 | 지금 설치·실제 지금 계정 여부로 `requeued`·`wait`·`held`·`default` |
 
-**`held`.** `resumable:false`인 옛 설치 결과(옛 계정이거나 API 실패)에 나온다(3회차부터 지금 설치의 API 실패도). 이 값을 받는 호출자는 작업 턴 확정뿐이다(다른 경로는 `resumable`을 넘기지 않는다). 작업 턴의 처리는 3회차의 `hold`다.
+**`held`.** `resumable:false`인 옛 설치 결과(옛 계정이거나 API 실패)에 나온다(3회차부터 지금 설치의 API 실패와 넘어갈 근거가 있는 구독 한도도). 이 값을 받는 호출자는 작업 턴 확정뿐이다(다른 경로는 `resumable`을 넘기지 않는다). 작업 턴의 처리는 3회차의 `hold`다.
 
 **작업 레인 잠금 순서.** 세션·질문·작업 job을 바꾸는 경로(`begin`·턴 확정·`unchanged`)는 모두 `lockTaskControl`(대화 → scheduler → 레인)로 시작해 job → 세션 순서다. 늦은 준비의 판정(`sessionKept`)은 job 행을 잡은 뒤 세션 행을 잡고 준비 때의 상태·턴·세대와 비교한다. `begin`은 `admit` 거절에서 세션이 바뀌었으면 `reroute` 없이 `conflict`다.
 
@@ -2396,3 +2396,5 @@ CHANGE 질문의 `/answer`는 `label=public | <답>` 서식이다. label이 없�
 **두 방식이 모두 막힌 경우의 모델 멈춤.** 세션 없는 작업은 멈춤의 주인이 아니다. 전역 멈춤은 다음 실행의 `select` → `{ wait }` → 그 경로의 `waitForUser(model_limit, 구독 확인 시각)`이 건다(대화 `runtime.ts`, PR 리뷰 `review.ts`, 변경 자체 리뷰, 작업 턴의 `unchanged`).
 
 **턴 충돌의 처리 자리.** `ClaudeChangeAuthor.send`는 지금처럼 `change_turn_conflict`를 던진다. `ChangeRuntime.resumeAuthor`만 이 코드를 비종료로 받는다(`wait` 뒤 `false`, job 미루기 없음). 다음 바퀴의 `authoring`·`amendAuthor`는 세션이 `running`이라 `pollAuthor`로 이긴 턴을 읽는다.
+
+**구독 한도의 `held`(3회차 마무리, DECISIONS 18).** `settleSubscription`은 넘어갈 근거가 있는 구독 한도의 상태 전이(`limited`·확인 시각·epoch)를 마친 뒤, `resumable:false`면 API 상태와 무관하게 `held`다(재큐하지 않는다). 회수 재진입(`first=false`)도 같은 조건에서 `held`다. 작업 턴 확정의 처리는 위 `hold`와 같다. 선택이 없는 턴(스위치 꺼짐·미설치·작업 경로 칸 꺼짐)은 `settle`을 지나지 않아 지금처럼 `waitForUser(model_limit, 풀리는 시각)`이다.
