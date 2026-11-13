@@ -2954,3 +2954,17 @@ owner 결정(명세 질문 Q1 = C24 할 일 1a)의 구현. 결정은 [DECISIONS]
 - **재검토 수정(RR7-N1, 작업 unknown의 실행 칸):** `change-artifact` "C39 결과 유실·재시작"(선택이 실린 v2 턴의 결과 파일을 지운 뒤 재조회, 재시작 뒤 재조회, 실행 중(`hang`) 재시작 + 결과 없음 모두 HTTP 200 `unknown`에 원래 실행 칸. 칸 없는 요청은 같은 유실에도 칸 없는 `unknown`이고 선택 기록 파일을 만들지 않음. 옛 이미지 `55cb3cb`가 읽는 이름 `^[0-9a-f-]{36}\.json$`의 파일은 모두 옛 strict 키 집합 그대로이고 선택 기록은 그 이름에 걸리지 않음. 선택 기록이 깨져도 기동·접수는 그대로이고 칸 없는 `unknown`), "C39 턴 예외"(실행이 돈 뒤 턴이 예외로 끝나면 v2 재조회 `unknown`과 v1 즉시 응답 `unknown`에 원래 실행 칸, 칸 없는 v1은 옛 모양). 고치기 전 `5003054`에서 두 시험 모두 실행 칸 `undefined`로 실패했다.
 - **재검토 수정(RR7-N2, 대화 v3 선택 불일치):** `c39-execution-selection` "C39 대화 v3 HTTP"(계정·revision·방식·실행 ID를 하나씩 바꾼 응답 넷을, 모양이 맞는 `failed`와 출력 모양이 틀린 `succeeded` 두 모양으로 보내면 모두 `worker_response_uncertain`. 같은 실행의 출력 모양 오류는 지금처럼 확정 실패). 고치기 전에는 첫 응답이 거부되지 않아 실패했다.
 - **재검토 수정 실행:** 위 세 시험과, 바뀐 모듈(`worker-http`·`task-worker`·`execution-auth`)과 시험 도구를 읽는 시험 22개 파일을 `--pg`로 727개 실행, 통과 727·실패 0·skip 0.
+
+## 대화 답에 내부 목록을 싣지 않기, "관리자" 호칭 (2026-11-13, 로컬)
+
+결정은 [DECISIONS](DECISIONS.md) "대화 답에 내부 목록을 싣지 않기", 계약은 [ARCHITECTURE](ARCHITECTURE.md) "신뢰 문맥의 답 규칙". 경계는 S2(작업자 HTTP → 가짜 Claude CLI의 stdin)와 S1(고정 문구)이다.
+
+| 완료 조건 | 근거 |
+|---|---|
+| 신뢰 문맥에 namespace가 없고 서비스 ID·읽기 템플릿 ID는 있다 | `worker-contract-v2` "신뢰 문맥의 답 규칙"(두 surface), `s16-display` "S16 문맥: 작업자 프롬프트 …"(`app-homelab-bot` 없음, 짐작 금지 줄 있음) |
+| 답 규칙(관리자 호칭, 두세 문장, 목록 금지, 원문 비공개)이 두 surface에 있다 | `worker-contract-v2` "신뢰 문맥의 답 규칙" |
+| `slash`만 제안이 버려진다고 알리고, `speech`만 템플릿을 말로 풀라고 한다 | 같은 시험 |
+| `speech`에 '/' 명령 이름이 여전히 없다(AC-11) | 기존 `worker-contract-v2` "C02 신뢰 문맥", "C36 F-10", `s16-display` "C11 대화 요청" |
+| Discord 고정 문구의 "owner"가 "관리자"다 | `c14-remaining-actions`·`publisher-review`의 리뷰 제어 거부 문구 |
+
+- **못 잡는 범위:** 실제 모델이 답 규칙을 지키는지(작업자 재배포 뒤 Discord에서 "뭘 할 수 있어?", "누구야?"로 확인한다). 이미 게시된 옛 답이 대화 기록으로 다시 들어가 반복되는 경우.

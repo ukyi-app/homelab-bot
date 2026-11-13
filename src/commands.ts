@@ -56,9 +56,9 @@ export const MEMORY_COMMAND_DEFINITIONS = Object.freeze([
   command('memory-delete', '기억 삭제(백업 최대 14일, 이미 게시된 Discord 사본은 남음)', [target('기억 ID', 100)]),
 ]);
 export const REVIEW_COMMAND_DEFINITIONS = Object.freeze([
-  command('review-status', '리뷰 작업 상태(owner, 알림 채널)'),
-  command('review-resume', '한도·인증 대기 리뷰 작업 재개(owner, 알림 채널)', [target('리뷰 작업 ID')]),
-  command('review-cancel', '리뷰 작업 취소(owner, 알림 채널)', [target('리뷰 작업 ID')]),
+  command('review-status', '리뷰 작업 상태(관리자, 알림 채널)'),
+  command('review-resume', '한도·인증 대기 리뷰 작업 재개(관리자, 알림 채널)', [target('리뷰 작업 ID')]),
+  command('review-cancel', '리뷰 작업 취소(관리자, 알림 채널)', [target('리뷰 작업 ID')]),
 ]);
 // /task의 요청 글은 작업 계약의 untrusted 상한 안이다. /answer 2,000자는 Discord 메시지 한도이자 CLAUDE_TASK_DEFAULTS.answerChars다.
 export const TASK_COMMAND_DEFINITIONS = Object.freeze([
@@ -66,7 +66,7 @@ export const TASK_COMMAND_DEFINITIONS = Object.freeze([
   command('answer', '작업 질문에 답하기(질문이 게시된 스레드에서)', [option('question', '질문 ID', 100), text('답', 2000)]),
   command('task-status', '작업 상태(이 대화의 작업)', [target('작업 ID')]),
   command('task-cancel', '작업 취소 요청(이 대화의 작업)', [target('작업 ID')]),
-  command('task-release', '종료 미확인(unknown) 작업 해제(owner, 프로세스 소멸 확인 뒤)', [target('작업 ID')]),
+  command('task-release', '종료 미확인(unknown) 작업 해제(관리자, 프로세스 소멸 확인 뒤)', [target('작업 ID')]),
 ]);
 // /attach의 옵션도 문자열뿐이라 실행기와 요약 동의를 text 하나에 받는다(서식은 external-task-commands.ts).
 export const EXTERNAL_TASK_COMMAND_DEFINITIONS = Object.freeze([

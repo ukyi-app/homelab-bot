@@ -394,7 +394,7 @@ const detachHandler: RunHandler = {
 };
 // 말로 한 변경 요청을 '/change'의 text 서식으로 옮긴다. 요약은 owner 원문 그대로이고, 인수 조건은 서버 고정 문구, 출처는
 // DECISIONS "동료 봇 전환" 15의 공개 표시(label=public)다. 접수 때 공개 검사(scanBrief)와 출처 label 규칙은 '/change' 그대로다.
-export const SPOKEN_CHANGE_ACCEPTANCE = '요약에 적힌 owner의 요청이 반영돼 있다';
+export const SPOKEN_CHANGE_ACCEPTANCE = '요약에 적힌 관리자의 요청이 반영돼 있다';
 export const spokenChangeText = (text: string) => `${text} | accept=${SPOKEN_CHANGE_ACCEPTANCE} | label=public`;
 const changeHandler: RunHandler = {
   kind: 'run',

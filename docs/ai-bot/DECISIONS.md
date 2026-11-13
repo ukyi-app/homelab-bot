@@ -1019,7 +1019,7 @@ homelab 쪽(spec, 설계, 플랫폼 프롬프트, 티켓)은 homelab `rebuild` �
 - **값의 출처:** 변경 요청 내용은 owner 원문(멘션 표기 제거)이고 모델은 저장소(변경 정책의 `fullName`이나 저장소 ID)와 동작만 고른다. 모델의 `content`는 쓰지 않는다. 기억 저장·정정 내용은 모델이 골라낸 글(`content`)이라 `proposals.value`에 두고 확인 글에 줄이지 않고 싣는다. 버튼 때 digest(`[동작, 대상, 내용]`)가 같은 그 글만 저장한다. 기억 검색어도 모델 `content`다(읽기라 확인 없이 '/'와 같은 처리기를 부른다). 나머지 대상(작업·변경·기억·연결 ID, 템플릿 ID, 출처 키)은 모델 `target`이고 서버가 대조한다.
 - **기억의 출처는 원 메시지:** 기억 저장·정정의 대화 출처는 owner가 말한 원 메시지 이벤트(Discord 메시지 ID)다. 버튼 상호작용 이벤트가 아니다. 그래서 근거 판정(`memory.ts` 출처 확인: provider `discord`, 받은 입력, 같은 owner, 지금 닿는 채널)이 '/memory-save'와 같이 "owner 대화"가 된다. 출처 제외 `here`도 그 스레드다.
 - **이벤트 원문 규칙과 말로 한 기억:** "기억 명령 처리"의 "진술·검색어를 `events`에 넣지 않는다"는 '/' 명령의 입력 칸에 대한 규칙이다. 말로 한 기억·검색 요청은 owner가 이미 일반 메시지로 보낸 글이라 그 메시지가 `events`에 남고 다음 대화 맥락에 들어간다(명세 §4.3 "기억 원문": 따로 봉인하지 않는다, 원문 7일 정리는 그대로). 이 규칙은 그 메시지에는 해당하지 않는다. 서버가 따로 만드는 값(모델이 골라낸 진술)은 `events`에 넣지 않고 `proposals.value`에만 두며, 처리·거절·만료로 끝나면 비운다.
-- **말로 한 변경 요청의 서식:** '/change'의 text 서식(`요약 | accept=… | label=…`)은 인수 조건이 하나 이상 있어야 받는다. 말에는 인수 조건 칸이 없으므로 서버 고정 문구 `SPOKEN_CHANGE_ACCEPTANCE`("요약에 적힌 owner의 요청이 반영돼 있다") 하나를 붙이고, 출처는 결정 15의 공개 표시 `label=public`이다. 요약은 원문 그대로라 원문에 서식 글자(` | `, 앞머리 `goal=` 등)가 있거나 길이·제어 문자 상한에 걸리면 제안을 버린다(owner는 '/change'로 할 수 있다). 명세는 인수 조건을 정하지 않았다.
+- **말로 한 변경 요청의 서식:** '/change'의 text 서식(`요약 | accept=… | label=…`)은 인수 조건이 하나 이상 있어야 받는다. 말에는 인수 조건 칸이 없으므로 서버 고정 문구 `SPOKEN_CHANGE_ACCEPTANCE`("요약에 적힌 관리자의 요청이 반영돼 있다") 하나를 붙이고, 출처는 결정 15의 공개 표시 `label=public`이다. 요약은 원문 그대로라 원문에 서식 글자(` | `, 앞머리 `goal=` 등)가 있거나 길이·제어 문자 상한에 걸리면 제안을 버린다(owner는 '/change'로 할 수 있다). 명세는 인수 조건을 정하지 않았다.
 - **변경 요청 확인 글은 원문을 싣지 않는다:** 결정 15의 문구 그대로 "<저장소>에 이 변경 PR을 준비할까요?" 한 줄이다. 무엇을 바꿀지는 바로 위 대화 답과 owner 자신의 말이 보여 준다. 그래서 확인 글 공개 검사에 원문이 걸려 문구가 바뀌는 일이 없다.
 - **처리기 배선은 같은 `Store`에 묶는다:** 읽기 요청과 제안 준비는 `Runtime`의 대화 성공 분기에서 일어나는데, '/' 처리기는 Gateway 준비 뒤에 만드는 수신(`DiscordIngress`)이 갖고 있다. `Runtime`·`main.ts`(이 티켓 소유 밖)를 고치지 않고 수신 생성자가 같은 `Store`에 처리기를 묶는다(`bindProposalHandlers`, WeakMap). 수신이 아직 없을 때 끝난 대화의 기억·변경·연결 제안은 "연결 안 됨"으로 버린다(대화 답은 나간다). 생성 인수로 넘기는 편이 더 드러나지만 `Runtime` 시그니처를 바꿔야 한다.
 - **커밋 뒤 실행:** 기억·변경·세션 연결 처리기는 버튼 트랜잭션 커밋 뒤 한 번 부른다. 제안은 그 전에 `confirmed`가 되므로, 처리기가 거절해도(입력 오류·권한) 제안은 `confirmed`로 남고 결과는 버튼 응답 문장으로만 보인다. `confirmed`는 "owner가 확인해 '/'와 같은 처리기에 넘겼다"는 뜻이다. 작업 취소·재시도·리뷰 제어는 '/'처럼 트랜잭션 안에서 실행하고 제어가 거절하면(`ok: false`) `refused`(`control_refused`)다.
@@ -1591,3 +1591,19 @@ owner 결정(2026-11-11 "좋아 그렇게해", 전체 리뷰 1차 명세 질문 
 - **반사 검사의 실행 뒤 재읽기**는 스냅샷이 아니라 지금 파일을 읽는다. 검사할 비밀이 늘 수 있을 뿐 줄지 않는다.
 
 **C40이 쓸 진입점.** `execution-auth.ts`(`ExecutionSelectionSchema`·`ExecutionAuthSchema`·`NotRunSchema`·`SELECTION_REFUSALS`·`WORKER_CONTRACTS_PATH`), 대화 `workerRequestV3`·`HttpWorker.execute`(v3 겹쳐 쓰기)·`HttpWorker.contracts()`, PR 리뷰 `ReviewTaskV2Schema`·`HttpReviewWorker.review`(v2), 변경 자체 리뷰 `ChangeReviewTaskV2Schema`·`HttpChangeReviewWorker.review`(v2)·`HttpChangeReviewWorker.lookup(요청, capability, 기대 선택)`, 작업 `TaskRequestSchema`·`TaskV2RequestSchema`의 `execution` 칸·`taskWorkerExecutionSelection()`. 운영 경로(`runtime.ts`·`review.ts`·`claude-task-bridge.ts`·`change-review.ts` 게시 서버 쪽)는 아직 옛 판만 보낸다.
+
+## 대화 답에 내부 목록을 싣지 않기, owner를 "관리자"로 부르기 (사용자 2026-11-13)
+
+**배경.** Discord에서 "뭘 할 수 있어?", "누구야?"라고 물으면 모델이 신뢰 문맥(`botFacts`)의 서비스 카탈로그(이름·namespace·deployment·읽기 템플릿 ID)와 '/' 명령 목록(비상 중지·모델 재개 포함)을 답에 통째로 옮겼다. 스위치가 꺼진 동안에는 게시 서버가 제안을 버리는데도 "제안하면 owner가 확인한 뒤 실행된다"고 답했다.
+
+**결정(사용자, 2026-11-13).** 등록된 서비스와 명령은 답에 보이지 않게 한다. 답에서는 "owner" 대신 "관리자"라고 쓴다.
+
+**구현 선택.**
+
+- **문맥을 줄인다:** namespace·deployment를 신뢰 문맥에서 뺐다. 읽기 제안은 템플릿 ID만 고르므로 모델에 필요 없는 값이다. S16의 짐작 문제는 "없는 Kubernetes 이름·주소는 짐작하지 않고 모른다고 답한다" 줄로 막는다.
+- **답 규칙을 더한다:** [ARCHITECTURE](ARCHITECTURE.md) "신뢰 문맥의 답 규칙". 서비스 ID와 템플릿 ID는 제안에 필요해 문맥에 남기고 답에 목록으로 옮기지 말라고 적는다. 관리자가 먼저 말한 이름은 답에 써도 된다.
+- **꺼짐 판의 제안 설명:** `slash` 문맥에 제안이 실행되지 않는다는 줄을 넣어 "확인하면 실행된다"는 틀린 안내를 없앤다. 지시문(`SYSTEM_INSTRUCTIONS_V2`)은 계약 literal이라 바꾸지 않았다.
+- **고정 문구:** Discord에 보이는 고정 문구와 '/' 명령 설명의 "owner"를 "관리자"로 바꿨다(`reviewControlDenied`, `LABEL_HELP`, 리뷰·작업 해제 명령 설명, 작업 상태의 확인 요청 표시, `SPOKEN_CHANGE_ACCEPTANCE`). 코드·문서·감사의 용어는 owner 그대로다([GLOSSARY](../../GLOSSARY.md)).
+- **하지 않은 것:** 답에 든 내부 이름을 게시 서버가 결정적으로 막는 검사는 넣지 않았다. 서비스 ID가 봇 이름과 같아 정상 답까지 막고, 값 자체는 공개 저장소에 있어 비밀이 아니다. 수정 차례 커밋 제목(`AMENDMENT_COMMIT_TITLE`)의 "owner"는 GitHub 글이고 진행 중인 수정의 대조에 쓰일 수 있어 그대로 뒀다.
+
+**알려진 한계.** 답 규칙은 모델 지시라 어길 수 있다. 이미 게시된 옛 답(목록이 든 글)은 그 대화의 기록으로 7일 동안 모델에 다시 들어간다. 작업자 이미지를 다시 배포해야 적용된다.

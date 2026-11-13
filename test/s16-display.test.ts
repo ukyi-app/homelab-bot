@@ -48,9 +48,12 @@ test('S16 문맥: 작업자 프롬프트에 봇 명령·카탈로그 공개 값�
   assert.ok(history > 0);
   const trusted = prompt.slice(0, history);
   for (const text of ['/revoke', '/read target:<서비스 ID> text:<질의 템플릿 ID>', '/list', '/model-status',
-    'homelab-bot', 'namespace app-homelab-bot', 'deployment homelab-bot', 'homelab-bot-logs', '멘션 없이']) {
+    'homelab-bot', 'homelab-bot-logs', '멘션 없이']) {
     assert.ok(trusted.includes(text), text);
   }
+  // 배치 이름은 모델이 답에 옮길 수 있어 넣지 않는다. 대신 없는 이름을 짐작하지 말라고 적는다.
+  assert.ok(!trusted.includes('app-homelab-bot'));
+  assert.match(trusted, /짐작해서 말하지 않는다/);
   // 수집 경로 플래그를 근거로 답하지 않게, 기록의 모든 owner 메시지가 봇에게 한 말이라고 적는다.
   assert.match(trusted, /봇에게 한 말/);
   assert.ok(trusted.startsWith(SYSTEM_INSTRUCTIONS));
