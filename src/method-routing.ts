@@ -37,9 +37,10 @@ export interface RoutedOutcome {
 }
 // requeued: 이 일을 다시 대기열에 넣었다(다른 방식으로 이어서 하거나, 옛 판으로 다시 보내려고). 호출자는 더 쓰지 않는다.
 // wait: 두 방식이 다 막혀 모델 멈춤이다. 호출자는 이 rateLimit(구독 확인 시각)으로 waitForUser를 부른다.
-// held: 이을 세션이 없는(resumable: false) 일의 결과가 지금 설치의 것이 아니고 지금 계정의 구독 한도도 말하지 않는다
-// (옛 계정의 결과이거나 옛 설치의 API 실패).
-// 호출자는 지금 계정의 전역 대기를 만들지 않고, 그 일만 작업 레인 대기로 보존해 곧(1분 뒤) 다시 고르게 한다.
+// held: 이을 세션이 없는(resumable: false) 일의 결과가 지금 계정의 구독 한도를 말하지 않는다
+// (옛 계정의 결과, 옛 설치의 API 실패, 지금 설치의 API 실패).
+// 호출자는 지금 계정의 전역 대기를 만들지 않고, 그 일만 작업 레인에서 owner 판단까지 보존한다(시간으로 다시 돌리지 않는다.
+// 세션이 없어 다시 돌려도 이어 갈 수 없다, COLLEAGUE_SPEC §4.11 "작업 이어가기").
 // default: 지금 동작 그대로 처리한다.
 export type Settlement = { action: 'requeued' } | { action: 'wait'; rateLimit: RateLimitInfo | null } | { action: 'held' } | { action: 'default' };
 const DEFAULT: Settlement = { action: 'default' };
@@ -313,6 +314,9 @@ export class MethodRouter {
   // API 결제(보수 분류한 API 429 포함)·API 인증 실패의 후속 결정. 잠금은 settle이 이미 적었다(lockApi). 과부하·실패·성공은 지금 동작이다.
   private async settleApi(s: Store, row: RoutingRow, outcome: RoutedOutcome, requeue: () => Promise<Settlement>): Promise<Settlement> {
     if (outcome.status !== 'limited' && outcome.status !== 'auth_expired') return DEFAULT;
+    // 이을 세션이 없는 일은 어느 방식으로도 잇지 못해 그 일만 보존한다. 이 실패는 API의 사실이라 지금 계정의 전역 대기를 만들지 않는다:
+    // 구독을 쓸 수 있으면 다른 일은 구독으로 돌고, 구독도 한도면 다음 실행의 고르기(select)가 구독 확인 시각까지 모델 멈춤을 건다.
+    if (outcome.resumable === false) return HELD;
     // 구독이 쓸 수 있으면 그 일을 구독으로 잇는다. 구독도 한도면 모델 멈춤이고, 재시도는 구독 확인 시각이다(구독 복귀 예약은 잠금과 따로 남는다).
     if (row.subscription_state === 'available') return requeue();
     // 확인 시각이 이미 지났으면 recordPause가 최소 1분 뒤로 잡는다. 시각을 모르면 30분 뒤다.

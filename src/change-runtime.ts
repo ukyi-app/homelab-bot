@@ -476,6 +476,13 @@ export class ChangeRuntime {
       return true;
     } catch (error) {
       const code = error instanceof Error ? error.message : '';
+      // 다른 게시 서버가 같은 job·lease로 그 사이 턴을 시작했다(세션이 준비 때와 다르다). 그 턴이 이 작성의 진행이라 부모·job을 건드리지 않고
+      // 다음 바퀴에 그 턴의 결과를 읽는다. 미루기(defer)도 하지 않는다: 그 job의 lease는 이긴 턴의 것이다.
+      if (code === 'change_turn_conflict') {
+        this.deps.log('change_author_turn_conflict', {});
+        this.wait(`step:${request.id}`, this.periods.authorPollMs);
+        return false;
+      }
       if (code.startsWith('change_') && code !== 'change_turn_stale' && code !== 'change_job_not_claimed') return this.authorEnd(request, round, { to: 'failed', reason: code });
       const row = (await this.db.query<Job>('SELECT * FROM jobs WHERE id=$1', [child.id])).rows[0];
       if (row && WAITING_SESSION.has(await this.sessionState(child.id) ?? '')) await this.deps.store.defer(row, 'change_resume_deferred');

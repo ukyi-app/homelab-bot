@@ -674,6 +674,26 @@ test('AC-38 변경 작성 턴: 세션이 남지 않은 첫 턴의 구독 한도�
   assert.equal(h.calls.sent.length, 1);
 });
 
+test('AC-36 변경 작성 턴: 세션이 남지 않은 첫 턴이 API 결제로 끝나면 API만 잠그고, 그 작업은 시간 재개 없이 작업 레인에서 보존하며 전역 scheduler는 열어 둔다', async () => {
+  const h = await routedAuthor();
+  await h.db.query(`UPDATE method_subscription SET state='limited',limited_at=$1,next_probe_at=$2`, [h.app.now(), h.app.now() + 3_600_000]);
+  await h.f.script([writeStep({ 'src/app.txt': 'two\n' })]);
+  routedEnds(h, [(response, request) => ({ ...turnEnd(response, 'limited'), sessionRetained: false, rateLimit: { stop: { cause: 'billing' } },
+    execution: { ...request.execution, subscriptionLimit: false } })]);
+  const { receiptId } = await h.author.start(startInput(h));
+  assert.deepEqual(await pollAuthor(h, receiptId), { kind: 'unknown', code: 'model_limit' });
+  assert.equal(h.calls.sent[0]!.execution.method, 'api');
+  assert.deepEqual((await h.db.query<{ state: string }>('SELECT state FROM method_api')).rows.map(row => row.state), ['billing_blocked']);
+  assert.equal((await statesOf(h)).job, 'waiting_user');
+  const pause = (await h.db.query<{ retry_at: string | null; lane_only_at: string | null; paused_at: string }>('SELECT retry_at,lane_only_at,paused_at FROM model_pauses')).rows[0]!;
+  assert.deepEqual([pause.retry_at, Number(pause.lane_only_at)], [null, Number(pause.paused_at)]);
+  assert.notEqual((await h.db.query<{ value: unknown }>(`SELECT value FROM controls WHERE key='scheduler'`)).rows[0]?.value, true);
+  h.app.advance(6 * 3_600_000);
+  assert.equal(await h.app.store.resumeDue(), 0);
+  assert.equal((await statesOf(h)).job, 'waiting_user');
+  assert.equal(h.calls.sent.length, 1);
+});
+
 test('C39 넘김: 변경 작성 턴의 실행 안 됨(not_run)은 재개 턴이면 다음 턴 번호로, 첫 턴이면 새 세대로 선택 없이 다시 보낸다', async () => {
   const h = await routedAuthor();
   await h.f.script([writeStep({ 'src/app.txt': 'two\n' }), writeStep({ 'src/app.txt': 'three\n' }), writeStep({ 'src/app.txt': 'four\n' })]);

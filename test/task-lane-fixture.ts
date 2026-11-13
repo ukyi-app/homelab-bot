@@ -40,7 +40,8 @@ export class FakeTaskWorker implements TaskWorkerPort {
   finalizeOverride: Partial<TaskFinalizeResponse> | undefined;
   // 제어 호출이 작업자에 닿은 시점에 끼어든다. DB 트랜잭션 밖 네트워크 구간의 경합을 만든다.
   onControl: ((endpoint: TaskEndpoint) => void | Promise<void>) | undefined;
-  private readonly sessions = new Map<string, 'waiting' | 'finalized'>();
+  // absent: 멈췄고 세션 공간을 남기지 않았다고 답한 턴(sessionRetained: false). 실제 작업자처럼 status가 absent·세션 없음이다.
+  private readonly sessions = new Map<string, 'waiting' | 'finalized' | 'absent'>();
   private readonly turns = new Map<string, number>();
   async call<E extends TaskEndpoint>(endpoint: E, body: TaskEndpointRequest<E>, signal?: AbortSignal): Promise<TaskEndpointResponse<E>> {
     TASK_ENDPOINTS[endpoint].request.parse(body);
@@ -52,7 +53,8 @@ export class FakeTaskWorker implements TaskWorkerPort {
       this.executes.push(request);
       const script = this.scripts.shift() ?? reply.completed();
       const answer = await script(request, this.identity, signal);
-      this.sessions.set(request.sessionId, 'waiting');
+      const ended = answer as { stopped?: boolean; sessionRetained?: boolean } | null;
+      this.sessions.set(request.sessionId, ended?.stopped === true && ended.sessionRetained === false ? 'absent' : 'waiting');
       this.turns.set(request.sessionId, request.turn);
       return answer;
     }

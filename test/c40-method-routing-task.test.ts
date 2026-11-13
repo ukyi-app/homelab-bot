@@ -1,5 +1,6 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { modelPaused } from '../src/away.js';
 import { CHAT_TASK_TEXT } from '../src/chat-task-text.js';
 import { MethodRouter, installMethods, methodRoutingView } from '../src/method-routing.js';
 import { recordAccount, switchAccount } from '../src/model-accounts.js';
@@ -113,17 +114,55 @@ for (const gap of [0, 1]) {
     await local.runtime.tickTask();
     assert.equal(local.worker.executes[0]!.execution?.method, 'api');
     assert.notEqual((await allRows(database.db, 'controls')).find(row => row.key === 'scheduler')?.value, true);
-    const [row] = await jobs(database.db);
-    assert.deepEqual([row!.state, row!.wait_reason], ['waiting_user', 'model_limit']);
-    const [pause] = await allRows(database.db, 'model_pauses');
-    assert.equal(pause!.kind, 'rate_limit');
-    assert.equal(Number(pause!.retry_at), f.now() + 60_000);
-    assert.equal(Number(pause!.lane_only_at), Number(pause!.paused_at));
-    // A의 그 revision은 잠겼다. 작업은 1분 뒤 새 계정으로 다시 고른다.
+    // A의 그 revision은 잠겼다.
     assert.deepEqual((await allRows(database.db, 'method_api')).map(api => [api.account, api.revision, api.state]), [['main', 'rev-1', 'billing_blocked']]);
-    f.advance(60_000);
-    assert.equal(await f.store.resumeDue(), 1);
-    assert.equal((await jobs(database.db))[0]!.state, 'queued');
+    await assertHeld(local);
+  });
+}
+
+// 세션 없는 작업의 보존(§4.11 "작업 이어가기", AC-38): 시간 기반 재개에 넣지 않고 작업 레인만 막으며, 이어 갈 수 없다는 기존 안내를 한 번 낸다.
+// owner가 재개하면 준비가 세션 없음을 확인하고 모델을 부르지 않고 닫는다(owner 판단 뒤의 끝).
+async function assertHeld(local: Awaited<ReturnType<typeof autoLane>>) {
+  const [row] = await jobs(database.db);
+  assert.deepEqual([row!.state, row!.wait_reason], ['waiting_user', 'model_limit']);
+  const [pause] = await allRows(database.db, 'model_pauses');
+  assert.equal(pause!.retry_at, null);
+  assert.equal(Number(pause!.lane_only_at), Number(pause!.paused_at));
+  assert.notEqual((await allRows(database.db, 'controls')).find(row => row.key === 'scheduler')?.value, true);
+  assert.equal(await modelPaused(database.db), false);
+  assert.equal((await allRows(database.db, 'outbox')).filter(item => item.payload.content === CHAT_TASK_TEXT.awayFinal).length, 1);
+  f.advance(6 * 3_600_000);
+  assert.equal(await f.store.resumeDue(), 0);
+  assert.equal(await local.runtime.tickTask(), false);
+  assert.equal((await jobs(database.db))[0]!.state, 'waiting_user');
+  assert.equal(local.worker.executes.length, 1);
+  assert.equal(await f.store.adminResumeJob(row!.id, 'fixture-admin'), 'resumed');
+  await local.runtime.tickTask();
+  const [closed] = await jobs(database.db);
+  assert.deepEqual([closed!.state, closed!.wait_reason], ['failed', 'task_session_missing']);
+  assert.equal(local.worker.executes.length, 1);
+}
+
+for (const subscription of ['available', 'limited'] as const) {
+  test(`AC-36 지금 설치의 세션 없는 첫 작업 턴이 API 결제로 끝나면 API만 잠그고 작업은 보존하며, 구독이 ${subscription === 'available' ? '돌아와 있으면 다른 일은 구독으로 돈다' : '한도면 다른 일은 구독 확인 시각까지 기다린다'}`, async () => {
+    const local = await autoLane();
+    const probeAt = f.now() + 3_600_000;
+    await database.db.query(`UPDATE method_subscription SET state='limited',limited_at=$1,next_probe_at=$2`, [f.now(), probeAt]);
+    await task(f, database.db);
+    local.worker.scripts = [async (r, w) => {
+      // 이 API 실행이 도는 사이 다른 실행 자리의 구독 확인이 성공했다.
+      if (subscription === 'available') await database.db.query(`UPDATE method_subscription SET state='available',limited_at=NULL,until=NULL,next_probe_at=NULL`);
+      return selected(reply.limited(), false, { rateLimit: { stop: { cause: 'billing' } }, sessionRetained: false } as Partial<TaskResponse>)(r, w);
+    }];
+    await local.runtime.tickTask();
+    assert.equal(local.worker.executes[0]!.execution?.method, 'api');
+    assert.deepEqual((await allRows(database.db, 'method_api')).map(api => api.state), ['billing_blocked']);
+    // 다른 일의 방식: 구독이 돌아왔으면 구독, 아니면 구독 확인 시각까지 모델 멈춤(그 일이 waitForUser로 전역을 닫는다).
+    const router = new MethodRouter(f.store, { enabled: true, task: true, supported: () => true });
+    const next = await router.select({ id: 'fixture-chat-job', budget: { timeoutMs: 1000, toolCalls: 1 }, lease_token: 'fixture-chat-lease' }, 'chat');
+    if (subscription === 'available') assert.ok(next && 'method' in next && next.method === 'subscription');
+    else assert.deepEqual(next, { wait: { stop: { cause: 'rate_limit', resetsAt: Math.floor((probeAt - 60_000) / 1000) } } });
+    await assertHeld(local);
   });
 }
 

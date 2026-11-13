@@ -7,7 +7,9 @@ import type { ArtifactSaveResult, AuthorResult, ChangeArtifactPort, EffectStage 
 import { ChangePublisher } from '../src/change-publisher.js';
 import { readFile } from 'node:fs/promises';
 import { MIGRATIONS, Postgres, migrationVersion } from '../src/database.js';
+import { MethodRouter, installMethods } from '../src/method-routing.js';
 import { runMigrations } from '../src/migrate-main.js';
+import { recordAccount, switchAccount } from '../src/model-accounts.js';
 import { REQUEST_TEXT, WRITE_STEP, changeHarness } from './change-assembly-harness.js';
 import type { Harness } from './change-assembly-harness.js';
 import { OWNER, driveTo, git, hex, ok, seedConversation } from './change-store-fixture.js';
@@ -226,6 +228,70 @@ test('T19 B5 EVENT-02 실제 PostgreSQL: 게시 서버 둘이 같은 부모를 �
     assert.equal(h.reviewInputs.length, 1);
     assert.equal(h.env.github.pulls.length, 1);
     for (const stage of ['tree', 'commit', 'ref', 'pull'] as const) assert.equal(h.env.github.count(ROUTES[stage]), 1, stage);
+  } finally { await h.close(); await d.close(); }
+});
+// C40(AC-37·AC-38). 구독 한도로 대기열에 돌아온 작성 job을 두 게시 서버가 함께 재개 준비한다. B가 집고 API를 고른 뒤 턴 시작 직전에
+// A가 같은 job·lease의 대기 세션을 읽어 API로 다음 턴을 시작하고, 이어서 다른 실행의 API 결제 실패로 API가 잠긴다. B의 시작은 거절되고
+// 세션이 바뀐 것을 본다(change_turn_conflict). 그 경합이 부모를 닫거나 A의 턴을 취소하면 안 된다.
+test('C40 AC-37 실제 PostgreSQL: 두 게시 서버의 변경 작성 재개 준비가 겹쳐 늦은 쪽 턴 시작이 그 사이 잠긴 API로 거절돼도 부모는 작성 단계에 남고, 먼저 시작한 턴이 저장·시험·리뷰를 거쳐 승인 대기까지 간다', { skip }, async () => {
+  const d = await bare();
+  await runMigrations(d.raw);
+  const turnEnds = new Set(['snapshot', 'needs_input', 'limited', 'auth_expired', 'failed', 'unknown']);
+  const resetsAt = Math.floor((Date.now() + 3_600_000) / 1000);
+  // 첫 턴은 구독 한도(세션 남음), 그 뒤 턴은 그 요청의 선택으로 돈 결과다.
+  const methods = { sent: [] as Record<string, any>[], result: (response: any, sent: Record<string, any>[]) => {
+    const request = sent.at(-1);
+    if (!turnEnds.has(response.status) || !request?.execution) return response;
+    if (sent.length === 1) return { version: response.version, job: response.job, lease: response.lease, generation: response.generation, sessionId: response.sessionId, worker: response.worker,
+      turn: response.turn, usage: { toolCalls: 0, model: null }, status: 'limited', stopped: true, sessionRetained: true, cleanupPending: false,
+      rateLimit: { stop: { cause: 'rate_limit', resetsAt } }, execution: { ...request.execution, subscriptionLimit: true } };
+    return { ...response, execution: { ...request.execution, subscriptionLimit: false } };
+  } };
+  const h = await changeHarness(d.db, { methods, steps: [WRITE_STEP, WRITE_STEP] });
+  try {
+    await recordAccount(h.db, 'main', 'subscription', Date.now());
+    await recordAccount(h.db, 'main', 'api', Date.now());
+    await h.store.atomic(s => switchAccount(s, 'main', 'subscription', 'cli', 'cli'));
+    assert.equal((await h.store.atomic(s => installMethods(s, 'main', 'rev-1'))).result, 'installed');
+    const router = new MethodRouter(h.store, { enabled: true, task: true, supported: () => true });
+    h.bridge.useMethods(router);
+    await h.command('100', 'change', { target: REPO.fullName, text: REQUEST_TEXT });
+    const id = await h.changeId();
+    const child = async () => (await h.db.query<{ id: string; state: string; lease_token: string | null; attempt: number; session: string | null }>(`SELECT j.id,j.state,j.lease_token,j.attempt,s.state AS session
+      FROM jobs j JOIN change_child_jobs c ON c.job_id=j.id LEFT JOIN codex_sessions s ON s.job_id=j.id WHERE c.change_id=$1 AND c.role='author'`, [id])).rows[0];
+    await h.pump(async () => { const row = await child(); return row?.state === 'queued' && row.session === 'waiting_model'; });
+    const a = h.runtime;
+    h.restart();
+    const b = h.runtime;
+    h.bridge.useMethods(router);
+    const begin = h.bridge.beginChangeTurn.bind(h.bridge);
+    let raced = false;
+    // 장벽: B가 고른 뒤 턴 시작 직전에 A의 재개 준비를 끝까지 돌리고 API를 잠근다.
+    h.bridge.beginChangeTurn = async (job, request, session) => {
+      if (!raced) {
+        raced = true;
+        await a.laneTick();
+        await h.db.query(`UPDATE method_api SET state='billing_blocked',blocked_at=$1`, [Date.now()]);
+      }
+      return begin(job, request, session);
+    };
+    await b.laneTick();
+    assert.ok(raced);
+    assert.deepEqual(methods.sent.map(request => [request.operation, request.execution?.method]), [['start', 'subscription'], ['resume', 'api']]);
+    const during = (await child())!;
+    assert.deepEqual([await h.phase(id), during.state, during.session], ['authoring', 'running', 'running']);
+    assert.equal(h.logs.some(entry => entry.event === 'change_closed'), false);
+    const runs = (await h.db.query<{ outcome: string | null; started: boolean }>('SELECT outcome,started_at IS NOT NULL AS started FROM method_runs WHERE method=$1 ORDER BY selected_at', ['api'])).rows;
+    assert.deepEqual(runs.map(run => [run.started, run.outcome]).sort(), [[false, 'unstarted'], [true, null]]);
+    const both = async () => { await Promise.allSettled([a.childrenTick(), b.childrenTick(), a.laneTick(), b.laneTick(), a.publishTick(), b.publishTick(), h.reviewRuntime.tick()]); };
+    for (let round = 0; round < 400 && await h.phase(id) !== 'awaiting_publish_approval'; round++) { await both(); await new Promise(resolve => setTimeout(resolve, 3)); }
+    assert.equal(await h.phase(id), 'awaiting_publish_approval');
+    const after = (await child())!;
+    assert.deepEqual([after.state, after.session, after.attempt], ['succeeded', 'completed', during.attempt]);
+    assert.equal((await h.f.calls()).length, 2);
+    assert.equal(methods.sent.length, 2);
+    assert.equal(h.runs.verify, 1);
+    assert.equal(h.reviewInputs.length, 1);
   } finally { await h.close(); await d.close(); }
 });
 // C36 묶음 D(F-8). 한 게시 서버가 앞 차례 작성 결과를 받아 들고 있는 동안 다른 게시 서버가 저장·시험·리뷰를 마치고 고치기 차례를 연다.

@@ -4,9 +4,11 @@ import type { PresenceStatus } from './gateway.js';
 // 자리 비움(COLLEAGUE_SPEC §4.5, GLOSSARY "자리 비움"). 모델 멈춤 동안 Discord에 보이는 봇의 상태·💤·한 줄을 정한다.
 // 멈춤인지는 C19 멈춤 기록(model_pauses)과 그 작업의 대기 상태에서 읽는다. 비상 정지는 모델 멈춤이 아니라 보지 않는다.
 // 작업 레인 토큰의 인증 만료는 작업 레인만 막고(대화는 계속 답한다) scheduler도 켜지 않으므로 자리 비움이 아니다
-// (Store.releaseScheduler와 같은 구분).
+// (Store.releaseScheduler와 같은 구분). 작업 레인만 막은 멈춤(멈춤 기록의 lane_only_at이 그 멈춤 시각, 한도 뒤 API 사용에서 다른 경로는
+// API·구독으로 도는 동안의 작업 대기)도 자리 비움이 아니다.
 const PAUSED = `SELECT 1 FROM model_pauses p JOIN jobs j ON j.id=p.job_id WHERE j.state='waiting_user'
-  AND j.wait_reason IN ('model_limit','auth_expired') AND NOT (j.type='task' AND j.wait_reason='auth_expired') LIMIT 1`;
+  AND j.wait_reason IN ('model_limit','auth_expired') AND NOT (j.type='task' AND j.wait_reason='auth_expired')
+  AND p.lane_only_at IS DISTINCT FROM p.paused_at LIMIT 1`;
 // 회차 기록은 마이그레이션 없이 controls 한 행에 둔다. 자리 비움 한 줄의 멱등 키(away:<채널>:<회차>)가 이 회차를 쓴다.
 const KEY = 'model_away';
 // 멈춤 기록이 이만큼 비어 있어야 회차를 닫는다. 재개 예약 루프가 작업을 다시 돌리는 동안(멈춤 기록을 지우고 곧 다시 멈춤)

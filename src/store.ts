@@ -451,14 +451,14 @@ export class Store {
   }
   // laneOnly: 그 레인만 막는 대기다. scheduler를 켜지 않고 waiting_user 행이 laneBusy로 자기 레인만 막는다(작업 레인 토큰의 인증 만료).
   // rateLimit: 작업자가 그 실행에서 본 한도 정보(C03). 멈춤 기록(model_pauses)의 종류·풀리는 시각·다음 재시도 시각을 정한다.
-  // stale: 이 멈춤이 지금 계정·설치의 사실이 아님을 호출자가 이미 안다(한도 뒤 API 사용의 귀속이 옛 계정·API 실패로 판정).
-  // 시각 비교 없이 옛 자격의 멈춤으로 적어 1분 뒤 다시 고르게 한다(recordPause).
-  async waitForUser(job: Job, reason: string, options: { laneOnly?: boolean; rateLimit?: RateLimitInfo | null; stale?: boolean } = {}): Promise<void> {
+  // hold: 이을 세션 없이 끝난 작업을 owner 판단까지 보존한다(한도 뒤 API 사용의 귀속이 held로 판정). 다시 시도 시각을 두지 않아
+  // 재개 예약 루프가 고르지 않는다. owner의 재개·취소로만 움직인다(recordPause).
+  async waitForUser(job: Job, reason: string, options: { laneOnly?: boolean; rateLimit?: RateLimitInfo | null; hold?: boolean } = {}): Promise<void> {
     await this.db.transaction(async tx => {
       await this.lockConversation(job, tx);
       await this.lockScheduler(tx);
       if (await this.complete(job, 'waiting_user', reason, tx) !== 'waiting_user') return;
-      await this.recordPause(job.id, reason, options.rateLimit ?? null, tx, options.laneOnly === true, options.stale === true);
+      await this.recordPause(job.id, reason, options.rateLimit ?? null, tx, options.laneOnly === true, options.hold === true);
       if (!options.laneOnly) await tx.query(`UPDATE controls SET value='true' WHERE key='scheduler'`);
       const away = await this.syncAwayIn(tx);
       // task는 작업 레인(codex.ts)이 따로 알린다. 여기서는 chat만. 자리 비움 한 줄이라 원인·시각·'/' 명령이 없다.
@@ -490,14 +490,15 @@ export class Store {
   // claim과 전환은 같은 밀리초에 차례로 커밋될 수 있고, 그 새 계정의 결제 멈춤을 옛 것으로 버리면 owner가 풀기 전에 다시 돈다.
   // 반대로 틀리면(정말 옛 실행) 옛 계정의 결제로 owner 재개를 기다리는데, 결제 멈춤을 잘못 재개하는 쪽보다 낫다.
   // laneOnly: 그 레인만 막는 대기다. 멈춤 기록에 남겨(lane_only_at = paused_at) 전역 scheduler 해제가 이 대기를 기다리지 않게 한다.
-  // known: 호출자가 이미 옛 자격의 멈춤으로 판정했다(waitForUser의 stale). 같은 밀리초 전환도 옛 것으로 본다.
-  async recordPause(job: string, reason: string, rateLimit: RateLimitInfo | null, tx: Database, laneOnly = false, known = false): Promise<void> {
+  // hold: owner 판단까지 보존하는 멈춤이다(waitForUser의 hold). 다시 시도 시각이 없고 원인 관측도 적지 않는다(호출자는 한도 정보를 넘기지 않는다).
+  // 결제가 아니라 시도로 세지 않는다.
+  async recordPause(job: string, reason: string, rateLimit: RateLimitInfo | null, tx: Database, laneOnly = false, hold = false): Promise<void> {
     const now = this.now();
-    const stale = known || await this.startedBeforeSwitch(job, tx, false);
+    const stale = hold || await this.startedBeforeSwitch(job, tx, false);
     const seen = stale ? null : rateLimit;
     const kind: ModelPauseKind = reason === 'auth_expired' ? 'auth_expired' : seen?.stop?.cause === 'billing' ? 'billing' : 'rate_limit';
     const resetsAt = kind === 'rate_limit' && seen?.stop?.resetsAt !== undefined ? seen.stop.resetsAt * 1000 : null;
-    const retryAt = kind === 'billing' ? null : stale ? now + MODEL_RESUME.minDelayMs
+    const retryAt = kind === 'billing' || hold ? null : stale ? now + MODEL_RESUME.minDelayMs
       : resetsAt !== null ? Math.max(resetsAt + MODEL_RESUME.afterResetMs, now + MODEL_RESUME.minDelayMs) : now + MODEL_RESUME.retryMs;
     await tx.query(`INSERT INTO model_pauses(job_id,kind,resets_at,rate_limit_type,utilization,retry_at,paused_at,lane_only_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
       ON CONFLICT (job_id) DO UPDATE SET kind=EXCLUDED.kind,resets_at=EXCLUDED.resets_at,rate_limit_type=EXCLUDED.rate_limit_type,
