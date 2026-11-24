@@ -13,3 +13,9 @@ export const CLOCK_SKEW_MS = 1_000;
 export const NONCE_RETENTION_MS = 2 * (MESSAGE_TTL_MAX_MS + CLOCK_SKEW_MS);
 // 봉투 하나의 바이트 상한. 이 모듈은 집행하지 않는다: 바이트 틀이 JSON 해석 전에 잘라야 한다.
 export const MAX_MESSAGE_BYTES = 64 * 1024;
+
+// 후보 내용(candidate_fetch·candidate_chunk)의 받는 쪽 경계. 조각 하나는 base64url로 4/3배가 되어도 봉투 하나(MAX_MESSAGE_BYTES)에
+// 드는 가장 큰 2의 거듭제곱이다(48KiB는 base64url만으로 64KiB). 전체와 조각 수는 관리자 결정(2026-11-19): 1MiB, 32조각.
+export const CANDIDATE_CHUNK_MAX_BYTES = 32 * 1024;
+export const CANDIDATE_MAX_BYTES = 1024 * 1024;
+export const CANDIDATE_MAX_CHUNKS = CANDIDATE_MAX_BYTES / CANDIDATE_CHUNK_MAX_BYTES;

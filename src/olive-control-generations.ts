@@ -1,6 +1,7 @@
 // 효과 동작의 세대 규칙. 세대 값은 머리가 아니라 본문 맨 위 칸(stop_generation, execution_generation)에 있어 body_digest로
 // 서명에 묶인다. 받는 쪽은 칸(있고 없음과 꼴)을 먼저 보고, 그다음 권위 값과 대조한다. 둘 다 정지 → 실행 순서다.
 import { isPlainObject } from './olive-control-schema.js';
+import type { NoAnswerCause } from './olive-control-schema.js';
 
 export const GENERATION_RULES = ['not_applicable', 'current', 'next', 'newer', 'prepared_newer', 'prepared_current'] as const;
 export type GenerationRule = (typeof GENERATION_RULES)[number];
@@ -63,6 +64,25 @@ export function generationValueFault(rule: GenerationRule, value: number, author
       break;
   }
   return fits ? null : 'generation_mismatch';
+}
+
+// 현관이 실행 세대의 권위 값을 얻는 두 길(풀기 확정 released의 execution_generation, execution_generation_reply)의 한 번의 결과.
+export type ExecutionGenerationOutcome = { answered: true; generation: number } | { answered: false; cause: NoAnswerCause };
+
+// 현관의 generations.execution을 감독이 알려 준 값으로 고친다. 두 길 모두 이 함수로만 넣어, 값이 어긋나면 큰 값이 남는다.
+// - 실행 세대는 풀 때만 오른다. 아는 값보다 작은 답은 늦게 온 옛 답이거나 감독 장부의 되돌림이라 낮추지 않는다(regressed). 낮추면
+//   옛 실행의 후보가 다시 통과한다.
+// - 감독 장부의 실행 세대는 1에서 시작한다. 0, 음수, 정수가 아닌 값, 답 없음은 아는 값을 그대로 둔다. 모르던 값을 지어내지 않는다.
+// - 현관은 실행 세대의 준비를 받지 않지만, 아는 값의 prepared는 이 함수가 바꿀 칸이 아니라 그대로 둔다.
+export function adoptExecutionGeneration(previous: GenerationAuthority, outcome: ExecutionGenerationOutcome):
+  { authority: GenerationAuthority; regressed: boolean } {
+  const kept = { authority: previous, regressed: false };
+  if (!isPlainObject(outcome) || outcome.answered !== true) return kept;
+  const value: unknown = outcome.generation;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) return kept;
+  if (!previous.known) return { authority: { known: true, current: value, prepared: null }, regressed: false };
+  if (value < previous.current) return { authority: previous, regressed: true };
+  return { authority: { known: true, current: value, prepared: previous.prepared }, regressed: false };
 }
 
 // generationFieldFault를 지난 본문에만 부른다.

@@ -1,8 +1,16 @@
-// v2의 동작 표: 스물넷 모두의 방향·분류·접수·정책·세대·답 관계를 안다. 본문 해석기는 공통부와 정지 묶음만 있고, 나머지 묶음
-// (입력·이벤트, 출력, 후보 내용)은 parse가 null이다. 그 동작의 봉투는 공통 검사를 모두 거친 뒤 해석 단계에서 받아들이지 않는다.
-import { parseHandshake, parseHandshakeReply, parseJobLookup, parseJobStatus } from './olive-control-common.js';
+// v2의 동작 표: 스물넷 모두의 방향·분류·접수·정책·세대·답 관계와 본문·확정 결과의 해석기.
+import { chunkAnswersFetch, parseCandidateChunk, parseCandidateFetch } from './olive-control-candidates.js';
+import { parseHandshake, parseHandshakeReply, parseJobLookup, parseJobStatus, sameJob } from './olive-control-common.js';
 import { GENERATION_RULES } from './olive-control-generations.js';
 import type { GenerationRule, GenerationRules } from './olive-control-generations.js';
+import {
+  eventResult, inputCancelResult, inputSubmitResult, parseApprovalChanged, parseInputCancel, parseInputSubmit, parseMergeObserved,
+  parsePublicationChanged, parseSourceForgotten,
+} from './olive-control-inputs.js';
+import {
+  cardResult, parseApprovalCardRequest, parseExecutionGenerationLookup, parseExecutionGenerationReply, parseProgressUpdate,
+  parsePublicationCandidate, parseReplyCandidate, progressResult, publicationResult, replyResult,
+} from './olive-control-outputs.js';
 import { ACTION_NAME } from './olive-control-schema.js';
 import type { Parser } from './olive-control-schema.js';
 import {
@@ -17,7 +25,7 @@ export type Bundle = 'common' | 'stop' | 'input' | 'output' | 'candidate';
 
 export interface EffectView {
   readonly from: readonly Party[];
-  readonly parseResult: Parser<unknown> | null;
+  readonly parseResult: Parser<unknown>;
 }
 
 // 본문 해석기가 받는 문맥. job_lookup·job_status가 가리키는 효과 동작의 방향과 결과 꼴을 표에서 찾는다.
@@ -28,6 +36,10 @@ export interface ParseContext {
 }
 
 export type BodyParser = (body: unknown, pc: ParseContext) => unknown;
+
+// 기다리는 요청(이 연결에서 실어 보낸 것)과 해석을 지난 답 본문이 같은 것을 가리키는가. 어긋나면 reply_mismatch다.
+export type ReplyMatch = (awaited: { readonly job: unknown; readonly body?: unknown }, reply: Readonly<Record<string, unknown>>) =>
+  boolean;
 
 export interface ActionSpec {
   readonly name: string;
@@ -40,7 +52,9 @@ export interface ActionSpec {
   readonly generations: GenerationRules | null;
   // 답 동작이 가리킬 수 있는 요청 동작. 답이 아니면 null.
   readonly answers: readonly string[] | null;
-  readonly parse: BodyParser | null;
+  // 답이 기다리는 요청의 작업이나 본문을 되풀이해야 하는 동작(job_status, candidate_chunk)의 대조. 그 밖은 null.
+  readonly matches: ReplyMatch | null;
+  readonly parse: BodyParser;
   // 효과의 확정 결과(job_status의 confirmed.result) 해석기.
   readonly parseResult: Parser<unknown> | null;
 }
@@ -66,21 +80,23 @@ interface Row extends Omit<ActionSpec, 'answers'> {
 
 const handshake = (name: string, from: readonly Party[], answers: readonly string[] | null, parse: BodyParser): Row => ({
   name, bundle: 'common', class: 'handshake', from, duringClosedIntake: true, duringPolicyMismatch: false, generations: null, answers,
-  parse, parseResult: null,
+  matches: null, parse, parseResult: null,
 });
 
 const query = (name: string, bundle: Bundle, from: readonly Party[], duringPolicyMismatch: boolean,
-  answers: readonly string[] | typeof ALL_JOBS | null, parse: BodyParser | null): Row => ({
-  name, bundle, class: 'query', from, duringClosedIntake: true, duringPolicyMismatch, generations: null, answers, parse,
+  answers: readonly string[] | typeof ALL_JOBS | null, parse: BodyParser, matches: ReplyMatch | null = null): Row => ({
+  name, bundle, class: 'query', from, duringClosedIntake: true, duringPolicyMismatch, generations: null, answers, matches, parse,
   parseResult: null,
 });
 
 const effect = (name: string, bundle: Bundle, from: readonly Party[], duringClosedIntake: boolean,
-  [stop, execution]: readonly [GenerationRule, GenerationRule], parse: BodyParser | null,
-  parseResult: Parser<unknown> | null): Row => ({
+  [stop, execution]: readonly [GenerationRule, GenerationRule], parse: BodyParser, parseResult: Parser<unknown>): Row => ({
   name, bundle, class: 'effect', from, duringClosedIntake, duringPolicyMismatch: EFFECTS_DURING_POLICY_MISMATCH.includes(name),
-  generations: { stop, execution }, answers: null, parse, parseResult,
+  generations: { stop, execution }, answers: null, matches: null, parse, parseResult,
 });
+
+const fetchMatch: ReplyMatch = (awaited, reply) => chunkAnswersFetch(awaited.body, reply);
+const jobMatch: ReplyMatch = (awaited, reply) => sameJob(awaited.job, reply);
 
 const NA = 'not_applicable';
 
@@ -88,28 +104,30 @@ const ROWS: readonly Row[] = [
   handshake('handshake', FD, null, parseHandshake),
   handshake('handshake_reply', SV, ['handshake'], parseHandshakeReply),
   query('job_lookup', 'common', BOTH, true, null, parseJobLookup),
-  query('job_status', 'common', BOTH, true, ALL_JOBS, parseJobStatus),
+  query('job_status', 'common', BOTH, true, ALL_JOBS, parseJobStatus, jobMatch),
   query('stop_record_lookup', 'stop', SV, true, null, parseStopRecordLookup),
   query('stop_record', 'stop', FD, true, ['stop_record_lookup'], parseStopRecord),
   effect('stop_prepare', 'stop', FD, true, ['newer', NA], parseStopStep, stopPrepareResult),
   effect('stop_commit', 'stop', FD, true, ['prepared_newer', NA], parseStopStep, stopCommitResult),
   effect('release_prepare', 'stop', FD, true, ['current', NA], parseStopStep, releasePrepareResult),
   effect('release_commit', 'stop', FD, true, ['prepared_current', 'next'], parseReleaseCommit, releaseCommitResult),
-  effect('input_submit', 'input', FD, false, ['current', NA], null, null),
-  effect('input_cancel', 'input', FD, true, [NA, NA], null, null),
-  effect('approval_changed', 'input', FD, true, ['current', NA], null, null),
-  effect('publication_changed', 'input', FD, true, [NA, NA], null, null),
-  effect('merge_observed', 'input', FD, true, [NA, NA], null, null),
-  effect('source_forgotten', 'input', FD, true, [NA, NA], null, null),
-  effect('reply_candidate', 'output', SV, false, ['current', 'current'], null, null),
-  effect('approval_card_request', 'output', SV, false, ['current', 'current'], null, null),
-  effect('publication_candidate', 'output', SV, false, ['current', 'current'], null, null),
-  effect('progress_update', 'output', SV, false, ['current', 'current'], null, null),
-  query('execution_generation_lookup', 'output', FD, true, null, null),
-  query('execution_generation_reply', 'output', SV, true, ['execution_generation_lookup'], null),
+  // 입력은 새 일이라 닫힌 접수에서 받지 않는다. 취소와 사실 넷은 정지 중에도 받는다. 승인 변화는 한 정지 세대 안의 사실이다.
+  effect('input_submit', 'input', FD, false, ['current', NA], parseInputSubmit, inputSubmitResult),
+  effect('input_cancel', 'input', FD, true, [NA, NA], parseInputCancel, inputCancelResult),
+  effect('approval_changed', 'input', FD, true, ['current', NA], parseApprovalChanged, eventResult),
+  effect('publication_changed', 'input', FD, true, [NA, NA], parsePublicationChanged, eventResult),
+  effect('merge_observed', 'input', FD, true, [NA, NA], parseMergeObserved, eventResult),
+  effect('source_forgotten', 'input', FD, true, [NA, NA], parseSourceForgotten, eventResult),
+  // 감독의 출력 후보는 현관의 지금 정지·실행 세대에서만 받는다: 정지를 건너온 후보와 풀기 전 실행의 늦은 후보를 닫는다.
+  effect('reply_candidate', 'output', SV, false, ['current', 'current'], parseReplyCandidate, replyResult),
+  effect('approval_card_request', 'output', SV, false, ['current', 'current'], parseApprovalCardRequest, cardResult),
+  effect('publication_candidate', 'output', SV, false, ['current', 'current'], parsePublicationCandidate, publicationResult),
+  effect('progress_update', 'output', SV, false, ['current', 'current'], parseProgressUpdate, progressResult),
+  query('execution_generation_lookup', 'output', FD, true, null, parseExecutionGenerationLookup),
+  query('execution_generation_reply', 'output', SV, true, ['execution_generation_lookup'], parseExecutionGenerationReply),
   // 후보의 내용은 계약 판이 뜻을 고정한 사실이 아니라 정책이 어긋난 연결에서 받지 않는 조회다.
-  query('candidate_fetch', 'candidate', FD, false, null, null),
-  query('candidate_chunk', 'candidate', SV, false, ['candidate_fetch'], null),
+  query('candidate_fetch', 'candidate', FD, false, null, parseCandidateFetch),
+  query('candidate_chunk', 'candidate', SV, false, ['candidate_fetch'], parseCandidateChunk, fetchMatch),
 ];
 
 // 표의 모양을 만들 때 한 번 확인한다. 어긋나면 모듈을 읽는 순간 던진다. 행과 그 안의 배열·세대 객체는 복사해 동결한다.
@@ -130,12 +148,13 @@ function defineTable(rows: readonly Row[]): Map<string, ActionSpec> {
       const none = stop === NA && execution === NA;
       if (none !== EFFECTS_WITHOUT_GENERATIONS.includes(row.name)) fail('generation-free list');
       if (row.answers !== null) fail('effect with answers');
-      if (row.parse !== null && row.parseResult === null) fail('effect without result parser');
+      if (row.parseResult === null) fail('effect without result parser');
     } else {
       if (!row.duringClosedIntake) fail('handshake or query closed by intake');
       if (row.generations !== null) fail('generation rules outside effects');
       if (row.parseResult !== null) fail('result parser outside effects');
     }
+    if (row.matches !== null && row.answers === null) fail('reply match outside answers');
     const answers = row.answers === ALL_JOBS ? [...effects, 'job_lookup'] : row.answers;
     table.set(row.name, Object.freeze({
       ...row,

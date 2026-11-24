@@ -1,5 +1,5 @@
 // 공통부 동작의 본문: 인사 둘과 작업 조회 둘.
-import { BundleNotImplemented, byTag, literal, object, present, revision, SchemaError, sha256, uuid } from './olive-control-schema.js';
+import { byTag, isPlainObject, literal, object, present, revision, SchemaError, sha256, uuid } from './olive-control-schema.js';
 import type { Parser } from './olive-control-schema.js';
 import type { ParseContext, Party } from './olive-control-table.js';
 
@@ -24,15 +24,15 @@ export type JobStatus = { state: 'confirmed'; result: unknown } | { state: 'pend
 export function parseJobStatus(body: unknown, pc: ParseContext) {
   const top = object({ in_reply_to: uuid, job_id: uuid, action: jobAction(pc, pc.recipient), request_digest: sha256, status: present })(
     body, 'body');
-  const parseResult = pc.effect(top.action)!.parseResult;
-  const result: Parser<unknown> = (value, path) => {
-    if (parseResult === null) throw new BundleNotImplemented(top.action);
-    return parseResult(value, path);
-  };
   const status = byTag<JobStatus>('state', {
-    confirmed: object({ state: literal('confirmed'), result }),
+    confirmed: object({ state: literal('confirmed'), result: pc.effect(top.action)!.parseResult }),
     pending: object({ state: literal('pending') }),
     unknown: object({ state: literal('unknown') }),
   })(top.status, 'body.status');
   return { ...top, status };
+}
+
+// 작업 결과의 답은 기다리는 요청의 작업(job_id, action, request_digest)과 셋 다 같아야 한다.
+export function sameJob(job: unknown, body: Readonly<Record<string, unknown>>): boolean {
+  return isPlainObject(job) && job.job_id === body.job_id && job.action === body.action && job.request_digest === body.request_digest;
 }

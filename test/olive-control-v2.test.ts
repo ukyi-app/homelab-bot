@@ -9,7 +9,7 @@ import { afterHandshake, canonicalJson, digestOf, verify } from '../src/olive-co
 import type { AwaitedRequest, Generations, HandshakeState, Party, VerifyContext, VerifyOutcome } from '../src/olive-control.js';
 
 // olive-control/v2(후보) 표본 재생. olive 저장소의 표본 사본(test/fixtures/olive-control-v2/SOURCE.md)을 받는 쪽 문맥 그대로
-// 검증하고 expect와 맞춘다. node --test는 시험이 0개인 파일도 통과시키므로 재생한 수와 F1b로 남긴 수를 정확한 수로 단언한다.
+// 검증하고 expect와 맞춘다. node --test는 시험이 0개인 파일도 통과시키므로 재생한 수를 정확한 수로 단언한다(139개 전부, 남김 0).
 const ROOT = fileURLToPath(new URL('../../test/fixtures/olive-control-v2/', import.meta.url));
 
 interface Fixture {
@@ -77,13 +77,27 @@ function replay(fx: Fixture): { outcome: VerifyOutcome; consumed: number } {
 const F1_ACTIONS = new Set(['handshake', 'handshake_reply', 'job_lookup', 'job_status', 'stop_record_lookup', 'stop_record',
   'stop_prepare', 'stop_commit', 'release_prepare', 'release_commit']);
 const STOP_EFFECTS = new Set(['stop_prepare', 'stop_commit', 'release_prepare', 'release_commit']);
-// 본문 해석 단계와 그 뒤의 사유. F1b로 남긴 표본의 기대는 이 가운데 하나이거나 통과여야 한다(공통 단계에서 갈리는 표본은 F1이 재생).
+// 본문 해석 단계와 그 뒤의 사유.
 const AFTER_BODY_PARSE = new Set(['body_malformed', 'unknown_field', 'reply_mismatch', 'replayed']);
+// 입력·이벤트·출력·후보 내용 묶음의 해석기가 판정을 정하는 표본: 그 묶음의 동작이거나 그 효과의 확정 결과를 실은 job_status이고,
+// 기대가 통과이거나 본문 해석 뒤의 사유다. 세대 칸 단계(해석 전)의 body_malformed 하나는 공통 검사가 정한다.
+const GENERATION_FIELD_STAGE = new Set(['reject/input-cancel-with-stop-generation.json']);
+function needsBundleParsers({ rel, fx }: Loaded): boolean {
+  const action = String(fx.message.header.action);
+  const body = fx.message.body as { action?: string; status?: { state?: string } };
+  const late = fx.expect.ok || AFTER_BODY_PARSE.has(fx.expect.reason);
+  const bundleAction = !F1_ACTIONS.has(action)
+    || (action === 'job_status' && body.status?.state === 'confirmed' && !STOP_EFFECTS.has(String(body.action)));
+  return late && bundleAction && !GENERATION_FIELD_STAGE.has(rel);
+}
 
 const results = loaded.map((item) => ({ ...item, ...replay(item.fx) }));
-const replayed = results.filter((result) => !('unsupported' in result.outcome));
-const remaining = results.filter((result) => 'unsupported' in result.outcome);
+const bundled = results.filter(needsBundleParsers);
 const accepts = (list: typeof results) => list.filter((result) => result.fx.expect.ok).length;
+const matches = (result: (typeof results)[number]): boolean => {
+  const { fx, outcome } = result;
+  return fx.expect.ok ? outcome.ok : !outcome.ok && outcome.reason === fx.expect.reason;
+};
 
 test('표본 사본은 SOURCE.md의 목록·SHA-256과 같다(통과 46, 거절 93)', () => {
   const source = readFileSync(join(ROOT, 'SOURCE.md'), 'utf8');
@@ -115,38 +129,28 @@ test('독립 정규화가 표본 139개의 서명 입력과 본문 digest를 같
   assert.deepEqual(digestDiffers, ['reject/body-changed-after-signing.json']);
 });
 
-test('재생 수: F1 84개(통과 21, 거절 63), F1b로 남김 55개(통과 25, 거절 30), 합 139', () => {
+test('재생 수: 139개 전부가 expect와 같다(통과 46, 거절 93), 남김 0', () => {
   assert.equal(results.length, 139);
-  assert.equal(replayed.length, 84);
-  assert.equal(accepts(replayed), 21);
-  assert.equal(replayed.length - accepts(replayed), 63);
-  assert.equal(remaining.length, 55);
-  assert.equal(accepts(remaining), 25);
-  assert.equal(remaining.length - accepts(remaining), 30);
+  const mismatched = results.filter((result) => !matches(result)).map((result) => result.rel);
+  assert.deepEqual(mismatched, []);
+  assert.equal(results.filter((result) => result.outcome.ok).length, 46);
+  assert.equal(results.filter((result) => !result.outcome.ok).length, 93);
+  // 결과는 통과나 거절 사유 둘뿐이다(해석기 없는 동작의 "받지 않음" 갈래가 없다).
+  for (const { rel, outcome } of results) assert.ok(outcome.ok || Object.keys(outcome).join() === 'ok,reason', rel);
 });
 
-test('공통부·정지 묶음 동작의 표본은 남김 없이 재생된다', () => {
-  for (const { rel, fx, outcome } of remaining) {
-    const action = String(fx.message.header.action);
-    const body = fx.message.body as { action?: string; status?: { state?: string } };
-    // F1 동작인데 남은 것은 다른 묶음 효과의 확정 결과(job_status confirmed)뿐이다.
-    if (F1_ACTIONS.has(action)) {
-      assert.equal(action, 'job_status', rel);
-      assert.equal(body.status?.state, 'confirmed', rel);
-      assert.equal(STOP_EFFECTS.has(String(body.action)), false, rel);
-      assert.deepEqual(outcome, { ok: false, unsupported: body.action }, rel);
-    } else {
-      assert.deepEqual(outcome, { ok: false, unsupported: action }, rel);
-    }
-    if (!fx.expect.ok) assert.ok(AFTER_BODY_PARSE.has(fx.expect.reason), `${rel}: ${fx.expect.reason}`);
-  }
+test('입력·이벤트·출력·후보 내용 묶음의 해석기가 정하는 표본 55개(통과 25, 거절 30), 공통부·정지 묶음 84개(통과 21)', () => {
+  assert.equal(bundled.length, 55);
+  assert.equal(accepts(bundled), 25);
+  const reasons: Record<string, number> = {};
+  for (const { fx } of bundled) if (!fx.expect.ok) reasons[fx.expect.reason] = (reasons[fx.expect.reason] ?? 0) + 1;
+  assert.deepEqual(reasons, { body_malformed: 20, unknown_field: 7, reply_mismatch: 3 });
+  for (const result of bundled) assert.ok(matches(result), result.rel);
+  assert.equal(results.length - bundled.length, 84);
+  assert.equal(accepts(results) - accepts(bundled), 21);
 });
 
-test('F1b로 남긴 표본은 nonce를 쓰지 않는다', () => {
-  for (const { rel, consumed } of remaining) assert.equal(consumed, 0, rel);
-});
-
-for (const { rel, fx, outcome, consumed } of replayed) {
+for (const { rel, fx, outcome, consumed } of results) {
   test(`재생 ${rel}`, () => {
     if (fx.expect.ok) {
       assert.equal(outcome.ok, true, `${rel}: ${JSON.stringify(outcome)}`);

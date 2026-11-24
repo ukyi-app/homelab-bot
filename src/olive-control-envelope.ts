@@ -7,7 +7,7 @@ import { findForbidden } from './olive-control-forbidden.js';
 import { generationFieldFault, generationsFault } from './olive-control-generations.js';
 import type { Generations } from './olive-control-generations.js';
 import { CLOCK_SKEW_MS, CONTRACT, MESSAGE_TTL_MAX_MS, MESSAGE_TTL_MS } from './olive-control-limits.js';
-import { ACTION_NAME, BundleNotImplemented, int, isPlainObject, literal, NONCE, object, oneOf, pattern, SchemaError, sha256, UUID,
+import { ACTION_NAME, int, isPlainObject, literal, NONCE, object, oneOf, pattern, SchemaError, sha256, UUID,
   uuid } from './olive-control-schema.js';
 import { PARTIES, specOf } from './olive-control-table.js';
 import type { ActionClass, ActionSpec, ParseContext, Party } from './olive-control-table.js';
@@ -49,9 +49,11 @@ export interface Job {
 }
 
 // 이 연결에서 실제로 실어 보내고 답을 기다리는 요청. 답을 받아들이면 지우고, 연결이 끝나면 모두 버린다.
+// body는 답이 요청 본문의 값을 되풀이하는 동작(candidate_fetch)에만 쓴다: 그 요청에 실어 보낸 본문이다. 없으면 그 답은 reply_mismatch다.
 export interface AwaitedRequest {
   action: string;
   job: Job | null;
+  body?: unknown;
 }
 
 export interface NonceLedger {
@@ -86,12 +88,7 @@ export interface Rejected {
   ok: false;
   reason: RejectReason;
 }
-// 공통 검사는 모두 지났지만 이 조각에 본문(또는 확정 결과)의 해석기가 없는 동작이다. 받아들이지 않는다(거절과 같이 다룬다).
-export interface Unsupported {
-  ok: false;
-  unsupported: string;
-}
-export type VerifyOutcome = Verified | Rejected | Unsupported;
+export type VerifyOutcome = Verified | Rejected;
 
 const SIGNATURE = /^[A-Za-z0-9_-]{86}$/;
 const signingBytes = (header: Header): Buffer => Buffer.from(canonicalJson(header), 'utf8');
@@ -108,7 +105,7 @@ function parseContext(sender: Party, recipient: Party): ParseContext {
     recipient,
     effect(action) {
       const spec = specOf(action);
-      return spec?.class === 'effect' ? { from: spec.from, parseResult: spec.parseResult } : undefined;
+      return spec?.class === 'effect' ? { from: spec.from, parseResult: spec.parseResult! } : undefined;
     },
   };
 }
@@ -117,10 +114,6 @@ function topUuid(body: unknown, field: string): string | null {
   if (!isPlainObject(body)) return null;
   const value = body[field];
   return typeof value === 'string' && UUID.test(value) ? value : null;
-}
-
-function sameJob(job: Job | null, body: Record<string, unknown>): boolean {
-  return job !== null && job.job_id === body.job_id && job.action === body.action && job.request_digest === body.request_digest;
 }
 
 // 칸 단계(공통 칸 → 세대 칸)와 해석. verify와 seal이 같은 순서로 쓴다.
@@ -199,20 +192,18 @@ export function verify(raw: unknown, ctx: VerifyContext): VerifyOutcome {
     const valueFault = generationsFault(spec.generations, record, ctx.generations);
     if (valueFault !== null) return reject(valueFault);
   }
-  if (spec.parse === null) return { ok: false, unsupported: spec.name };
   let parsed: unknown;
   try {
     parsed = spec.parse(body, parseContext(header.sender, header.recipient));
   } catch (error) {
-    if (error instanceof BundleNotImplemented) return { ok: false, unsupported: error.action };
     return reject(schemaReason(error, 'body_malformed'));
   }
 
   if (spec.answers !== null) {
     const awaited = ctx.awaiting(record.in_reply_to as string);
     if (awaited === undefined || !spec.answers.includes(awaited.action)) return reject('reply_mismatch');
-    // 작업 결과의 답은 기다리는 요청의 작업(job_id, action, request_digest)과 셋 다 같아야 한다.
-    if (spec.name === 'job_status' && !sameJob(awaited.job, record)) return reject('reply_mismatch');
+    // job_status는 기다리는 작업(job_id, action, request_digest), candidate_chunk는 물은 digest·위치를 되풀이해야 한다.
+    if (spec.matches !== null && !spec.matches(awaited, record)) return reject('reply_mismatch');
   }
 
   if (!ctx.nonces.consume(header.sender, header.nonce, header.expires_at)) return reject('replayed');
@@ -237,7 +228,7 @@ export interface SealInput {
 }
 
 export class SealError extends Error {
-  constructor(readonly reason: RejectReason | 'unsupported') {
+  constructor(readonly reason: RejectReason) {
     super(`seal: ${reason}`);
   }
 }
@@ -249,7 +240,6 @@ export class SealError extends Error {
 export function seal(input: SealInput, privateKey: KeyObject): Envelope {
   const spec = specOf(input.action);
   if (spec === undefined) throw new SealError('unknown_action');
-  if (spec.parse === null) throw new SealError('unsupported');
   let digest: string;
   try {
     digest = digestOf(input.body);
@@ -276,7 +266,6 @@ export function seal(input: SealInput, privateKey: KeyObject): Envelope {
   try {
     spec.parse(input.body, parseContext(header.sender, header.recipient));
   } catch (error) {
-    if (error instanceof BundleNotImplemented) throw new SealError('unsupported');
     throw new SealError(schemaReason(error, 'body_malformed'));
   }
   return { header, signature: sign(null, signingBytes(header), privateKey).toString('base64url'), body: input.body };
