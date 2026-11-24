@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { ChangeBriefSchema, CommandIdSchema, EvidenceBundleSchema, GenerationSchema, PublicMetadataSchema, ProvenanceLabelSchema, REVIEW_RISK_CATEGORIES, ChangeIdSchema, labelAllowsAuthorInput, propagateLabel } from './change-contracts.js';
 import type { AmendmentKey, ArtifactFile, ChangeBrief, ChangeKey, ChangeNote, EvidenceBundle, ProvenanceLabel, PublicMetadata } from './change-contracts.js';
 import { CHANGE_NOTE_LIMITS, ChangeNoteSchema } from './task-contracts.js';
+import type { Database } from './database.js';
 import type { PublicScan } from './outbound.js';
 
 // 공개 제목·본문·commit 메시지와 봇 PR 안내 리뷰 글을 만드는 유일한 곳이다. 승인 brief, 구조화된 수치·SHA·시험 상태,
@@ -21,12 +22,19 @@ export function neutralizePublicText(text: string): string {
     .replaceAll('://', `:${ZWSP}//`);
 }
 
-// GitHub에 싣는 추적 ID. 내부 값(작업 UUID, change ID·세대·차례)의 sha256 앞 24자라 공개 글에서 내부 값을 되찾지 못한다.
-// 같은 내부 값이면 같은 ID라 재시도·회수 대조가 새 칸 없이 그대로 된다. 공개 ID → 내부 값은 감사 행(github_public_id)과
-// 그 내부 값을 가진 DB 행에만 있다. kind가 접두라 리뷰·안내·PR의 ID가 서로 겹치지 않는다.
+// GitHub에 싣는 추적 ID. 내부 값(작업 UUID, change ID·세대·차례)의 sha256 앞 24자다. 같은 내부 값이면 같은 ID라 재시도·회수 대조가
+// 새 칸 없이 그대로 된다. 공개 ID → 내부 값은 감사 행(github_public_id)과 그 내부 값을 가진 DB 행에만 있다. kind가 접두라 리뷰·안내·PR의 ID가 서로 겹치지 않는다.
+// 되찾지 못하는 것은 리뷰(입력이 작업 UUID)뿐이다. change·안내는 입력의 change ID가 브랜치 이름(bot/change/<change ID>/g<세대>)으로
+// 공개돼 있어, 세대·차례를 대입하면 그 PR 표식과 안내 표식을 계산할 수 있다(새로 드러나는 내부 값은 없다).
 export type PublicTraceKind = 'review' | 'guidance' | 'change';
 export const publicTraceId = (kind: PublicTraceKind, internal: string): string =>
   `${kind.slice(0, 1)}${createHash('sha256').update(`homelab-bot/${kind}\0${internal}`).digest('hex').slice(0, 24)}`;
+// 감사 행은 추적 ID마다 하나다. audit에는 (kind, subject) 유일 제약이 없어, 같은 ID를 동시에 넣는 두 호출이 서로의 미커밋 행을 못 보지 않게
+// 같은 transaction 안에서 그 ID의 advisory lock을 먼저 잡는다. 잠금은 commit 때 풀리고, 뒤 호출의 INSERT는 앞 행을 본다.
+export async function recordPublicTrace(tx: Pick<Database, 'query'>, id: string, detail: Record<string, unknown>, at: number): Promise<void> {
+  await tx.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`github_public_id:${id}`]);
+  await tx.query(`INSERT INTO audit(kind,subject,detail,created_at) SELECT 'github_public_id',$1,$2,$3 WHERE NOT EXISTS (SELECT 1 FROM audit WHERE kind='github_public_id' AND subject=$1)`, [id, JSON.stringify(detail), at]);
+}
 // 대조용 표식이다. 제목·Discord ID·change ID를 넣지 않는다.
 export const publicationMarker = (key: ChangeKey): string => `homelab-bot-change:${publicTraceId('change', `${key.changeId}:g${key.generation}`)}`;
 // 공개 ID와 내부 값의 대응. 감사 행의 detail로만 남긴다(PR 본문·커밋에는 싣지 않는다).
@@ -168,9 +176,12 @@ export function renderGuidance(input: GuidanceInput, scan: ScanPolicy & { identi
 // metadata는 사설 주소·이메일·로컬 경로·긴 숫자 ID 패턴이다. 리뷰처럼 공개 diff의 코드 값을 인용하는 글에는 끈다(평범한 인용이 막힌다).
 export function publicScan(policy: ScanPolicy & { metadata: boolean }): PublicScan {
   const markers = [...policy.internalMarkers];
-  return texts => {
-    if (texts.some(hasSecret)) return 'secret_detected';
-    if (texts.some(text => hasMarker(text, markers)) || hasMarker(texts.join(''), markers)) return 'internal_marker';
+  return (texts, parts) => {
+    // 칸 사이에 쪼개 실은 값을 잇는다: 칸 이름을 뺀 값 전체와, 같은 칸 이름의 값끼리(리뷰 본문 + 댓글 본문들, 경로들).
+    // base64로 감싼 토큰·전각 숫자 같은 바꾼 꼴은 탐지기 한계라 잡지 못한다(출처 label 차단이 우선이다).
+    const joined = parts ? [parts.values.join(''), ...parts.fields.map(field => field.join(''))] : [texts.join('')];
+    if (texts.some(hasSecret) || joined.some(hasSecret)) return 'secret_detected';
+    if (texts.some(text => hasMarker(text, markers)) || joined.some(text => hasMarker(text, markers))) return 'internal_marker';
     if (policy.metadata && texts.map(stripInvisible).some(text => METADATA_PATTERNS.some(pattern => pattern.test(text)))) return 'metadata_sensitive';
     return null;
   };
@@ -184,16 +195,19 @@ export type ScanResult = { ok: true; receipt: PublicReceipt } | { ok: false; rea
 // scanPublicPayload가 산출물 전체(파일 경계에 걸친 표식 포함)를 한 번 본 결과를 writer의 쓰기 바이트에 묶는다.
 // writer는 쓰기를 blob·tree·commit·ref·PR로 나누고 blob은 base64라, 쓰기마다 검사를 다시 돌리면 글을 보지 못하거나 파일 경계 검사를 잃는다.
 // 그래서 영수증에는 통과한 글·경로·파일 내용의 sha256만 두고, writer는 쓰기 바이트의 문자열마다 영수증에 있는지만 본다(publicReceiptScan).
-export interface PublicReceipt { readonly texts: ReadonlySet<string>; readonly files: ReadonlySet<string> }
-const issuedReceipts = new WeakSet<PublicReceipt>();
+// 영수증은 내용 없는 토큰이다. digest 집합은 이 파일 안 WeakMap에만 있어, 영수증을 쥔 코드가 집합에 digest를 더하거나 빼지 못한다.
+declare const receiptBrand: unique symbol;
+export interface PublicReceipt { readonly [receiptBrand]: true }
+interface ReceiptDigests { readonly texts: ReadonlySet<string>; readonly files: ReadonlySet<string> }
+const issuedReceipts = new WeakMap<PublicReceipt, ReceiptDigests>();
 const digestOf = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
 function receiptOf(payload: PublicPayload): PublicReceipt {
   const { publication } = payload;
   // 이메일·시각은 검사하지 않지만 스키마가 noreply·초 단위 시각으로 고정한 값이라 함께 둔다.
   const texts = [...payload.paths, publication.title, publication.body, publication.commitMessage, publication.author.name, publication.committer.name,
     publication.author.email, publication.committer.email, publication.author.date, publication.committer.date, payload.branch, payload.marker];
-  const receipt = Object.freeze({ texts: new Set(texts.map(digestOf)), files: new Set(payload.files.map(file => digestOf(file.content))) });
-  issuedReceipts.add(receipt);
+  const receipt = Object.freeze({}) as PublicReceipt;
+  issuedReceipts.set(receipt, { texts: new Set(texts.map(digestOf)), files: new Set(payload.files.map(file => digestOf(file.content))) });
   return receipt;
 }
 // 쓰기 본문의 칸 이름과 구조 값(git 객체 ID·인코딩·종류·모드). 글을 실을 수 없는 꼴만 둔다.
@@ -207,14 +221,15 @@ const decodedBase64 = (text: string): Buffer | null => {
 // 발송 한 길(checkOutbound)의 scan 고리. 영수증이 없거나, 칸 이름·구조 값·영수증의 글·refs/heads/ + 영수증의 글·
 // base64로 풀어 영수증의 파일 내용과 같은 값 어느 것도 아닌 문자열이 하나라도 있으면 막는다. extra는 검사 밖에서 정해진 값(정책의 base 브랜치)이다.
 export function publicReceiptScan(receipt: PublicReceipt | undefined, extra: readonly string[] = []): PublicScan {
+  const digests = receipt === undefined ? undefined : issuedReceipts.get(receipt);
   return texts => {
-    if (!receipt || !issuedReceipts.has(receipt)) return 'unscanned';
-    const covered = (text: string) => WRITE_KEYS.has(text) || STRUCTURAL.test(text) || extra.includes(text) || receipt.texts.has(digestOf(text))
-      || (text.startsWith('refs/heads/') && receipt.texts.has(digestOf(text.slice('refs/heads/'.length))));
+    if (!digests) return 'unscanned';
+    const covered = (text: string) => WRITE_KEYS.has(text) || STRUCTURAL.test(text) || extra.includes(text) || digests.texts.has(digestOf(text))
+      || (text.startsWith('refs/heads/') && digests.texts.has(digestOf(text.slice('refs/heads/'.length))));
     return texts.every(text => {
       if (covered(text)) return true;
       const bytes = decodedBase64(text);
-      return bytes !== null && receipt.files.has(digestOf(bytes));
+      return bytes !== null && digests.files.has(digestOf(bytes));
     }) ? null : 'unscanned';
   };
 }

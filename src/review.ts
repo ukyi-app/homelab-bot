@@ -11,7 +11,7 @@ import { DRAIN_MS } from './runtime.js';
 import type { Store } from './store.js';
 import { checkOutbound, finalPayload, OutboundRefused } from './outbound.js';
 import type { OutboundCheck, OutboundPayload, OutboundPorts, PublicScan } from './outbound.js';
-import { publicScan, publicTraceId } from './change-publication.js';
+import { publicScan, publicTraceId, recordPublicTrace } from './change-publication.js';
 import type { CancelRequest, WorkerSigner } from './worker.js';
 import { archiveContract } from './worker.js';
 import { CoverageSchema, FindingSchema, InputLimitsSchema, REVIEW_INSTRUCTIONS, REVIEW_INSTRUCTIONS_V2, ReviewOutputSchema, ReviewTaskSchema,
@@ -591,7 +591,7 @@ const PositionsSchema = z.array(z.strictObject({ path: z.string(), lines: z.arra
 // 리뷰는 공개 diff의 코드 값(사설 주소·이메일 등)을 인용하므로 metadata 패턴은 걸지 않는다(classify와 같은 범위).
 export function reviewPublicScan(review: ReviewPolicy, internal: readonly string[]): PublicScan {
   const common = publicScan({ internalMarkers: [...review.internalMarkers, ...internal], metadata: false });
-  return texts => texts.some(text => SECRET_PATTERNS.some(pattern => pattern.test(text))) ? 'secret_detected' : common(texts);
+  return (texts, parts) => texts.some(text => SECRET_PATTERNS.some(pattern => pattern.test(text))) ? 'secret_detected' : common(texts, parts);
 }
 // DATA-01: 운영 비밀·내부 표식이 모델 출력에 섞이면 공개 PR에 올리지 않는다. 마스킹이 아니라 게시 차단이다.
 export function classify(output: Pick<ReviewOutput, 'findings' | 'open_questions' | 'public_summary'>, review: ReviewPolicy): ReviewResult['output_classification'] {
@@ -914,7 +914,7 @@ export const reviewMarker = (key: string) => `<!-- homelab-bot-review:${publicTr
 const legacyReviewMarker = (key: string) => `<!-- homelab-bot-review:${key} -->`;
 // 공개 추적 ID와 내부 값의 대응은 이 감사 행에만 남긴다.
 async function recordReviewTrace(tx: Database, job: string, attempt: number, key: string, at: number): Promise<void> {
-  await tx.query(`INSERT INTO audit(kind,subject,detail,created_at) SELECT 'github_public_id',$1,$2,$3 WHERE NOT EXISTS (SELECT 1 FROM audit WHERE kind='github_public_id' AND subject=$1)`, [publicTraceId('review', key), json({ kind: 'review', job, attempt, key }), at]);
+  await recordPublicTrace(tx, publicTraceId('review', key), { kind: 'review', job, attempt, key }, at);
 }
 // 모델 칸 하나를 문단 안의 문장 하나로 만든다. 빈 줄이 문단을 끊지 못하게 줄바꿈을 공백으로 접고,
 // 문장 끝 없이 끝난 칸(v1 지시문으로 저장된 결과의 "…일 때" 같은 조각)에는 마침표를 붙인다.

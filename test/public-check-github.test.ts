@@ -1,11 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { changeBranchName, gitBlobSha } from '../src/change-contracts.js';
-import { publicationMarker, PublicReceipts, publicReceiptScan, publicTraceId, renderAmendmentCommit, renderPublication, scanPublicPayload } from '../src/change-publication.js';
+import { publicationMarker, PublicReceipts, publicReceiptScan, publicScan, publicTraceId, recordPublicTrace, renderAmendmentCommit, renderPublication, scanPublicPayload } from '../src/change-publication.js';
+import type { PublicReceipt } from '../src/change-publication.js';
+import { guidanceKey } from '../src/change-guidance.js';
+import { guidanceMarker } from '../src/github-review-io.js';
+import { localDatabase } from './helpers.js';
 import { createGitHubWriter } from '../src/github-writer.js';
 import type { PublicationInput } from '../src/change-publication.js';
-import { OutboundRefused, sendOutbound } from '../src/outbound.js';
+import { checkOutbound, finalPayload, OutboundRefused, sendOutbound } from '../src/outbound.js';
 import { outboundOf, RestrictedGitHub, reviewMarker, reviewPublicScan, ReviewPolicySchema } from '../src/review.js';
 import type { GitHubTransport, ReviewGuard, ReviewPolicy } from '../src/review.js';
 import { FAKE_APP_KEY, FakeGitHub, REPO as WRITER_REPO } from './change-github-fake.js';
@@ -222,7 +226,7 @@ test('P3-6 영수증: 쓰기 바이트의 문자열이 모두 검사한 글·경
   assert.equal(publicReceiptScan(receipt)(of(passing[4])), 'unscanned');
   // 영수증이 없거나 이 파일이 내지 않은 영수증은 아무것도 통과시키지 않는다.
   assert.equal(publicReceiptScan(undefined, ['main'])(of(passing[0])), 'unscanned');
-  const forged = { texts: new Set(receipt.texts), files: new Set(receipt.files) };
+  const forged = Object.freeze(Object.create(null)) as PublicReceipt;
   assert.equal(publicReceiptScan(forged, ['main'])(of(passing[0])), 'unscanned');
   assert.throws(() => new PublicReceipts().record(W_KEY, forged), /public_receipt_unissued/);
 });
@@ -283,4 +287,72 @@ test('F7a 훑기 writer: 영수증 책·인가·fetch의 읽기·호출마다 �
     assert.equal(violations, 0);
   }
   for (const line of lines) console.log(`sweep-writer ${line}`);
+});
+
+// ---- 리뷰 PR #162 후속 ----
+
+test('F7a 영수증: 발급한 영수증은 내용 없는 얼린 토큰이라 쥔 코드가 digest를 더해도 writer 대조를 지나지 못한다', () => {
+  const receipt = scannedReceipt();
+  const scan = publicReceiptScan(receipt, ['main']);
+  const planted = { message: `${W_META.commitMessage}${TOKEN}`, tree: 'a'.repeat(40), parents: ['a'.repeat(40)], author: W_IDENTITY, committer: W_IDENTITY };
+  const of = (body: unknown) => texts(JSON.parse(JSON.stringify(body)));
+  assert.equal(scan(of(planted)), 'unscanned');
+  assert.ok(Object.isFrozen(receipt));
+  assert.deepEqual(Reflect.ownKeys(receipt), []);
+  // 리뷰 탐침 A17·A18: 영수증에 칸을 덧붙여 digest 집합을 바꾸려는 시도. 얼린 객체라 던지고, 대조 결과도 그대로다.
+  const digest = createHash('sha256').update(planted.message).digest('hex');
+  assert.throws(() => { (receipt as unknown as { texts: Set<string> }).texts = new Set([digest]); }, TypeError);
+  assert.throws(() => Object.defineProperty(receipt, 'texts', { value: new Set([digest]) }), TypeError);
+  assert.equal(scan(of(planted)), 'unscanned');
+  const book = new PublicReceipts();
+  book.record(W_KEY, receipt);
+  assert.equal(book.scanFor(W_KEY, ['main'])(of(planted)), 'unscanned');
+});
+
+const splitAt = (value: string, at: number) => [value.slice(0, at), value.slice(at)] as const;
+test('F7a F-1 이어 보기: 리뷰 본문과 인라인 댓글(경로를 사이에 두고)에 쪼개 실은 작업 UUID·토큰도 전송 0', async () => {
+  for (const planted of [JOB, TOKEN, KEY]) {
+    for (const at of [4, 18, planted.length - 4]) {
+      const [head, rest] = splitAt(planted, at);
+      for (const write of [
+        request(`${clean}\n끝 ${head}`, [{ path: 'src/a.ts', line: 1, side: 'RIGHT', body: `${rest} 근거` }]),
+        request(clean, [{ path: 'src/a.ts', line: 1, side: 'RIGHT', body: `근거 ${head}` }, { path: 'src/b.ts', line: 2, side: 'RIGHT', body: `${rest} 근거` }]),
+      ]) {
+        const { sent, github } = sealedTransport();
+        await assert.rejects(github.createReview(write, expected, guard()), (error: unknown) => error instanceof OutboundRefused && error.reason === 'public_check', `${planted} ${at}`);
+        assert.deepEqual(sent, []);
+      }
+    }
+  }
+  // 대조군: 쪼개지 않은 평범한 두 칸은 그대로 나간다.
+  const { sent, github } = sealedTransport();
+  await github.createReview(request(`${clean}\n끝 문장`, [{ path: 'src/a.ts', line: 1, side: 'RIGHT', body: '근거 문장' }]), expected, guard());
+  assert.equal(sent.length, 1);
+});
+
+test('F7a F-1 이어 보기: 안내 리뷰의 최종 바이트 검사도 본문·댓글 사이에 쪼갠 안내 키를 잡는다', () => {
+  const key = guidanceKey(CHANGE, 1);
+  const scan = publicScan({ internalMarkers: [key], metadata: true });
+  const path = '/repos/fixture-org/fixture-repo/pulls/7/reviews';
+  const [head, rest] = splitAt(key, 20);
+  const body = (text: string, comment: string) => ({ commit_id: HEAD, event: 'COMMENT', body: text, comments: [{ path: 'src/a.ts', line: 1, side: 'RIGHT', body: comment }] });
+  assert.throws(() => checkOutbound(finalPayload({ kind: 'github', method: 'POST', path }, body(`${guidanceMarker(key)}\n안내 ${head}`, `${rest} 근거`)), { policyRevision: 'fixture-v1', scan }),
+    (error: unknown) => error instanceof OutboundRefused && error.reason === 'public_check');
+  assert.ok(checkOutbound(finalPayload({ kind: 'github', method: 'POST', path }, body(`${guidanceMarker(key)}\n안내`, '근거')), { policyRevision: 'fixture-v1', scan }));
+});
+
+test('F7a 감사 행: 추적 ID의 advisory lock을 같은 transaction에서 INSERT보다 먼저 잡고, 같은 ID를 여러 번 넣어도 행은 하나다', async () => {
+  const seen: { sql: string; params: unknown[] }[] = [];
+  await recordPublicTrace({ query: async (sql: string, params: unknown[] = []) => { seen.push({ sql, params }); return { rows: [] } as never; } }, 'cfixture', { kind: 'change' }, 1);
+  assert.equal(seen.length, 2);
+  assert.match(seen[0]!.sql, /^SELECT pg_advisory_xact_lock\(hashtext\(\$1\)\)$/);
+  assert.deepEqual(seen[0]!.params, ['github_public_id:cfixture']);
+  assert.match(seen[1]!.sql, /^INSERT INTO audit/);
+  assert.equal(seen[1]!.params[0], 'cfixture');
+  const { db, pg } = await localDatabase();
+  try {
+    await Promise.all([1, 2, 3].map(at => db.transaction(tx => recordPublicTrace(tx, 'cfixture', { kind: 'change', at }, at))));
+    await db.transaction(tx => recordPublicTrace(tx, 'cother', { kind: 'change' }, 4));
+    assert.deepEqual((await db.query<{ subject: string; n: number }>(`SELECT subject, count(*)::int AS n FROM audit WHERE kind='github_public_id' GROUP BY subject ORDER BY subject`)).rows, [{ subject: 'cfixture', n: 1 }, { subject: 'cother', n: 1 }]);
+  } finally { await pg.close(); }
 });

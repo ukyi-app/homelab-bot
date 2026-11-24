@@ -1,6 +1,6 @@
 import type { ChangeKey, ChangeNote, WriterOutcome } from './change-contracts.js';
 import type { ChangeRepositoryPolicy } from './change-policy.js';
-import { noteLine, publicTraceId, renderGuidance } from './change-publication.js';
+import { noteLine, publicTraceId, recordPublicTrace, renderGuidance } from './change-publication.js';
 import { isCurrentAuthorJob } from './change-store.js';
 import type { ChangeStore } from './change-store.js';
 import type { Database } from './database.js';
@@ -236,8 +236,7 @@ export class ChangeGuidance {
       return this.settle(round, 'pending', 'skipped', reason, null, outside);
     }
     // 안내 표식에는 추적 ID만 나간다. 그 ID와 안내 키의 대응은 이 감사 행에만 남긴다(보내기 전, 한 번).
-    await this.options.db.query(`INSERT INTO audit(kind,subject,detail,created_at) SELECT 'github_public_id',$1,$2,$3 WHERE NOT EXISTS (SELECT 1 FROM audit WHERE kind='github_public_id' AND subject=$1)`,
-      [publicTraceId('guidance', guidanceKey(key, round.round)), JSON.stringify({ kind: 'guidance', changeId: key.changeId, generation: key.generation, round: round.round }), this.now()]);
+    await this.options.db.transaction(tx => recordPublicTrace(tx, publicTraceId('guidance', guidanceKey(key, round.round)), { kind: 'guidance', changeId: key.changeId, generation: key.generation, round: round.round }, this.now()));
     const claimed = await this.options.db.query<{ attempts: number }>(`UPDATE change_guidance SET state='sending',attempts=attempts+1,updated_at=$4 WHERE change_id=$1 AND generation=$2 AND round=$3 AND state='pending' RETURNING attempts`,
       [key.changeId, key.generation, round.round, this.now()]);
     // 다른 호출이 먼저 집었다.

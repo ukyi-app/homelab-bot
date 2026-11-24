@@ -6,7 +6,7 @@ import { evaluateCi, readCiSnapshot } from './change-ci-policy.js';
 import { readChangeNotes } from './change-guidance.js';
 import { compilePathPolicy, gitCommitSha, inspectCandidate } from './change-policy.js';
 import type { BaseLeaf, ChangeRepositoryPolicy, PublishPlan } from './change-policy.js';
-import { publicationMarker, publicationTrace, renderAmendmentCommit, renderPublication, scanPublicPayload } from './change-publication.js';
+import { publicationMarker, publicationTrace, recordPublicTrace, renderAmendmentCommit, renderPublication, scanPublicPayload } from './change-publication.js';
 import type { PublicReceipts } from './change-publication.js';
 import type { AmendmentEffect, AmendmentRound, ChangeRequest, ChangeStore, EffectKey, EffectRecord, GenerationRecord } from './change-store.js';
 import { Denied, PolicyUnavailable } from './contracts.js';
@@ -198,7 +198,7 @@ export class ChangePublisher {
     if (prepared.ok) {
       // PR 본문·커밋에는 추적 ID만 싣는다. 그 ID와 내부 값(change ID·세대·정책·검증기 판·산출물 digest)의 대응은 이 감사 행에만 남긴다.
       const trace = publicationTrace(key, bundle.value);
-      await this.store.database.query(`INSERT INTO audit(kind,subject,detail,created_at) SELECT 'github_public_id',$1,$2,$3 WHERE NOT EXISTS (SELECT 1 FROM audit WHERE kind='github_public_id' AND subject=$1)`, [trace.id, JSON.stringify({ kind: 'change', ...trace.detail }), this.now()]);
+      await this.store.database.transaction(tx => recordPublicTrace(tx, trace.id, { kind: 'change', ...trace.detail }, this.now()));
     }
     return prepared.ok ? { ok: true, digest: prepared.value.digest, subject: prepared.value.subject } : { ok: false, reason: prepared.reason };
   }
