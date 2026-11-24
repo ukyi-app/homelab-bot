@@ -4,6 +4,8 @@ import { publicAlias } from './public-alias.js';
 // 제어 명령 결과(Store.control·reviewControl의 반환값)를 스레드에 게시할 짧은 한국어 문장으로 바꾼다.
 // JSON.stringify 그대로면 /list가 {"ref":...,"data":[...]}로 보인다(S16).
 // 작업 ID(UUID)는 공개 별칭으로만 싣는다(F-4). 모르는 상태 값·결과 모양은 원래 값 대신 고정 문구로 적는다(F-5).
+// 함정: 별칭은 어느 입구에서도 작업을 가리키지 못한다. '/' 명령은 없고, 말로 한 제어(모델 제안의 cancel·retry·review-resume·
+// review-cancel·task-status)는 대상을 jobs.id 정확 일치로 찾으므로 목록의 별칭을 대상으로 낸 제안은 조회에서 떨어져 버려진다(proposals.ts).
 // colleague는 동료 기능 스위치다(chat-task-text.ts). 켜지면 '/' 명령 이름을 안내하지 않는다.
 const LIST_LIMIT = 20;
 type Row = Record<string, unknown>;
@@ -19,6 +21,7 @@ export const CONTROL_TEXT = Object.freeze({
   running: '지금은 멈춘 것이 없어요.',
   unknownState: '확인 필요',
   unknownResult: '처리 결과를 여기서 보여 드릴 수 없어요. `homelab` CLI에서 확인해 주세요.',
+  laneClosed: '새 작업 접수가 닫혀 있어요. 확인은 `homelab` CLI에서 해 주세요.',
 });
 // 표에 없는 값은 원래 값을 돌려받는다. 그 값은 내부 이름이라 싣지 않는다.
 const known = (text: (value: string) => string, value: string) => text(value) === value ? CONTROL_TEXT.unknownState : text(value);
@@ -42,6 +45,8 @@ function modelStatusText(result: Row, waiting: number): string {
   else if (result.paused === true || waiting) lines.push(T.away);
   if (waiting) lines.push(CONTROL_TEXT.waiting(waiting));
   if (result.executionPending === true) lines.push(CONTROL_TEXT.executionPending);
+  // 작업 레인(execution_lanes)이 닫힌 사유는 내부 상태 이름이라 싣지 않는다.
+  if (typeof result.taskLaneClosed === 'string' && result.taskLaneClosed) lines.push(CONTROL_TEXT.laneClosed);
   return lines.length ? lines.join('\n') : CONTROL_TEXT.running;
 }
 

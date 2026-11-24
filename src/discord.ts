@@ -832,7 +832,7 @@ export class DiscordPublisher {
       const payload = finalPayload(target, row.payload.kind === 'thread' ? await this.threadBody(row, marker) : this.messageBody(row, marker));
       // 공개 검사는 이 행을 인가한 그 정책의 표식으로 한다. 결과는 같은 판에 묶여, 보내기 전에 판이 바뀌면 다시 검사된다.
       // 저장된 라벨(safe_summary)은 통과 근거가 아니다. 걸리면 blocked이고 사유 코드만 감사에 남는다.
-      const check = checkOutbound(payload, { policyRevision: row.policy_revision, scan: discordScan(policy) });
+      const check = checkOutbound(payload, { policyRevision: row.policy_revision, scan: discordScan(policy, await this.wholeMessage(row)) });
       // authorized() 뒤의 대기 사이에 커밋된 /revoke·구독 끄기는 여기서 막힌다(발송 시작 기준점, store.dispatchDelivery).
       const dispatch = await this.store.dispatchDelivery(row);
       if (dispatch === 'gap') throw new HistoryGap();
@@ -854,6 +854,8 @@ export class DiscordPublisher {
       } else if (error instanceof OutboundRefused && error.reason === 'policy_changed') await this.store.pauseDelivery(row, 'policy_changed');
       else if (error instanceof OutboundRefused && error.reason === 'public_check') await this.store.atomic(async store => {
         await store.deliveryState(row, 'blocked');
+        // 뒤 쪽은 이 쪽이 sent가 아니라 게시되지 않지만, pending으로 두면 원문 정리(끝 상태만 고른다)가 걸린 본문을 비우지 못한다.
+        await store.db.query("UPDATE outbox SET state='blocked' WHERE message_key=$1 AND page_index>$2 AND state='pending'", [row.message_key, row.page_index]);
         await store.audit('delivery_public_check_blocked', row.id, { attempt: row.attempt });
       });
       else if (error instanceof DiscordRejected) await this.store.atomic(async store => {
@@ -882,6 +884,14 @@ export class DiscordPublisher {
       ledger: { admit: target => target.kind === 'discord-edit' ? this.store.admitEdit(target.channel, target.message) : Promise.resolve(false) },
       wire: this.rest,
     });
+  }
+  // 여러 쪽으로 나뉜 글(같은 message_key)의 모든 쪽을 차례대로 이은 원래 본문. 쪽은 원래 본문을 자른 조각이라 빈 문자열로 이으면 되살아난다.
+  // 모든 쪽이 같은 전체를 보므로 한 쪽이 걸리면 그 글의 모든 쪽이 막힌다. 한 쪽짜리 글은 undefined다.
+  private async wholeMessage(row: Delivery): Promise<string | undefined> {
+    if (row.payload.kind !== 'message') return;
+    const pages = (await this.store.db.query<{ content: string }>(`SELECT payload->>'content' AS content FROM outbox
+      WHERE message_key=$1 ORDER BY page_index`, [row.message_key])).rows;
+    return pages.length > 1 ? pages.map(page => page.content).join('') : undefined;
   }
   private async laterPageButtons(row: Delivery): Promise<OutboxButton[] | undefined> {
     if (row.payload.kind !== 'message') return;

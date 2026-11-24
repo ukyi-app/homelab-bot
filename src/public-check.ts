@@ -43,15 +43,24 @@ export function freeTextRisk(text: string, policy: MarkerPolicy): string | null 
 export function assembledRisk(text: string, policy: MarkerPolicy): string | null {
   return common(text, markers(policy));
 }
+// 게시 직전 검사의 표식. 표식은 막는 쪽으로만 작용하므로 리뷰 표식 목록이 스키마를 벗어나도(4자 미만·200자 초과 항목, 100개 초과)
+// 그 안의 문자열은 모두 쓴다. 스키마 통과를 요구하면 잘못된 항목 하나가 온전한 리뷰 표식까지 빼서, 이미 큐에 든 글의 새 표식이 나간다.
+// 함정: 아주 짧은 항목도 그대로 쓰므로 흔한 글자열이면 많은 글이 막힌다(닫히는 쪽). 공백뿐인 항목은 모든 글에 맞으므로 뺀다.
+// 목록이 아니면 쓸 표식이 없어 CHANGE 표식만 본다. 리뷰 정책이 깨지면 리뷰 경로만 닫혀야 하는데(policy.ts) 여기서 닫으면
+// 모든 Discord 글이 멈춘다. 그때 닫는 검사는 글을 만든 쪽(대화 답, 브리핑, 외부 세션 요약)이 한다.
+function scanMarkers(policy: MarkerPolicy): string[] {
+  const change = policy.change?.repositories.flatMap(repository => repository.internalMarkers) ?? [];
+  const review = (policy.review as { internalMarkers?: unknown } | null | undefined)?.internalMarkers;
+  if (!Array.isArray(review)) return change;
+  return [...change, ...review.filter((marker): marker is string => typeof marker === 'string' && marker.trim() !== '')];
+}
 // 게시 직전 검사(발송 한 길 checkOutbound의 scan). 나갈 바이트를 다시 푼 모든 문자열을 하나씩 본다.
 // 메타데이터 꼴은 보지 않는다: 본문의 구조 칸(답장 대상, 호출할 사용자)에 Discord ID(긴 숫자)가 늘 들어간다.
-// 여러 쪽으로 나뉜 글은 쪽마다 따로 보이므로 쪽 경계에 걸친 값은 여기서 못 잡는다. 나누기 전 검사는 글을 만든 쪽이 한다.
-// 표식은 읽을 수 있는 것만 쓴다. 리뷰 정책이 깨지면 리뷰 경로만 닫혀야 하는데(policy.ts) 여기서 닫으면 모든 Discord 글이 멈춘다.
-// 표식을 모르면 닫는 검사는 글을 만든 쪽(대화 답, 브리핑, 외부 세션 요약)이 한다.
-export function discordScan(policy: MarkerPolicy): PublicScan {
-  const list = readMarkers(policy) ?? readMarkers({ change: policy.change }) ?? [];
+// whole은 여러 쪽으로 나뉜 글의 모든 쪽을 이은 원래 본문이다. 쪽마다 보면 쪽 경계에 걸친 값이 두 글로 나뉘어 지나간다.
+export function discordScan(policy: MarkerPolicy, whole?: string): PublicScan {
+  const list = scanMarkers(policy);
   return texts => {
-    for (const text of texts) {
+    for (const text of whole === undefined ? texts : [...texts, whole]) {
       const reason = common(text, list);
       if (reason) return reason;
     }

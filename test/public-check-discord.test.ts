@@ -12,7 +12,8 @@ import { FIXED_SUMMARY } from '../src/external-task-receiver.js';
 import type { MemoryService, MemoryView } from '../src/memory.js';
 import type { OutboundBytes } from '../src/outbound.js';
 import { publicAlias } from '../src/public-alias.js';
-import { PUBLIC_WITHHELD } from '../src/public-check.js';
+import { messagePages } from '../src/format.js';
+import { discordScan, PUBLIC_WITHHELD } from '../src/public-check.js';
 import { ReadAdapter, readSummary } from '../src/read.js';
 import type { ReadResult } from '../src/read.js';
 import { repositoryPolicy } from './change-github-fake.js';
@@ -26,7 +27,8 @@ const TOKEN = `ghp_${'Q'.repeat(36)}`;
 const MARKER = 'fixture-internal-codename';
 const TAILNET = ['fixture-node', 'fixture-tail', 'ts', 'net'].join('.');
 const INTERNAL_UUID = '6f1d2c3b-4a5e-4f60-9b7c-8d9e0a1b2c3d';
-const SECRETS = [TOKEN, MARKER, TAILNET, INTERNAL_UUID];
+const REVIEW_MARKER = 'fixture-review-codename';
+const SECRETS = [TOKEN, MARKER, TAILNET, INTERNAL_UUID, REVIEW_MARKER];
 const notifications = { guild: 'fixture-guild', channel: 'fixture-notifications', parent: null, kind: 'channel' as const };
 const seoul = { time: '08:50', timezone: 'Asia/Seoul' };
 
@@ -46,6 +48,8 @@ async function outbox() {
   return (await database.db.query<{ id: string; state: string; payload: { content: string }; message_key: string }>(
     'SELECT id,state,payload,message_key FROM outbox ORDER BY created_at,page_index')).rows;
 }
+const enqueueSafe = (key: string, content: string) => f.store.enqueue({ key, actor: f.policy.owner, scope: notifications, revision: f.policy.revision,
+  payload: { kind: 'message', channel: notifications.channel, content, classification: 'safe_summary' } });
 const audits = async (kind: string) => (await database.db.query('SELECT 1 FROM audit WHERE kind=$1', [kind])).rows.length;
 
 // 기억 서비스 가짜: 다시 확인할 기억(recheckDue)과 작성 중 삭제 여부(live)만 쓴다.
@@ -111,6 +115,59 @@ test('AC-06 게시 직전 검사: 라벨이 safe_summary여도 비밀·지금 �
   assert.equal(await audits('delivery_public_check_blocked'), 3);
 });
 
+test('AC-06 게시 직전 검사: 리뷰 표식도 보고, 리뷰 표식 목록에 스키마를 벗어난 항목이 섞여도 남은 리뷰 표식을 빼지 않는다', async () => {
+  const policy = f.policy as { review?: unknown };
+  policy.review = { internalMarkers: [REVIEW_MARKER] };
+  await enqueueSafe('valid', `관측 결과: ${REVIEW_MARKER} 정상`);
+  await deliverAll();
+  // 4자 미만 항목 하나로 목록이 스키마를 벗어난다. 리뷰 경로는 정책 판단으로 닫히고, 그 전에 큐에 든 글은 여기서 막혀야 한다.
+  // 짧은 항목은 16진 문자가 아닌 값이라 행 ID·표식 칸과 우연히 겹치지 않는다.
+  policy.review = { internalMarkers: ['짧은값', REVIEW_MARKER] };
+  await enqueueSafe('broken', `관측 결과: ${REVIEW_MARKER} 정상 2`);
+  await enqueueSafe('clean', '공개 글');
+  await deliverAll();
+  const states = Object.fromEntries((await outbox()).map(row => [row.message_key, row.state]));
+  assert.deepEqual(states, { valid: 'blocked', broken: 'blocked', clean: 'sent' });
+  assert.equal(f.rest.wires.length, 1);
+  assert.deepEqual(leaked(sentBytes()), []);
+  // 길이 상한·개수 상한을 벗어난 목록도 그 안의 리뷰 표식은 그대로 쓴다. 목록이 아닌 값이면 CHANGE 표식만 본다.
+  const text = [`x ${REVIEW_MARKER} y`];
+  for (const internalMarkers of [['짧은값', REVIEW_MARKER], ['x'.repeat(201), REVIEW_MARKER], [...Array.from({ length: 100 }, (_, i) => `fixture-filler-${i}`), REVIEW_MARKER], [7, REVIEW_MARKER]]) {
+    assert.equal(discordScan({ review: { internalMarkers } } as never)(text), 'internal_marker', String(internalMarkers.length));
+  }
+  assert.equal(discordScan({ review: { internalMarkers: REVIEW_MARKER } } as never)(text), null);
+});
+
+test('AC-06 게시 직전 검사: 여러 쪽으로 나뉜 글은 쪽을 합친 전체도 보고, 쪽 경계에 걸친 토큰이 든 글은 어느 쪽도 보내지 않는다', async () => {
+  const content = `${'a '.repeat(895)}${TOKEN} ${'b'.repeat(100)}`;
+  const pages = messagePages(content);
+  // 전제: 한 줄이 쪽 상한보다 길어 토큰 한가운데서 잘리고, 쪽 하나만 보면 어느 쪽도 걸리지 않는다.
+  assert.equal(pages.length, 2);
+  for (const page of pages) assert.equal(discordScan({} as never)([page]), null);
+  await enqueueSafe('split', content);
+  await enqueueSafe('long-clean', 'c '.repeat(1000));
+  await deliverAll();
+  const rows = await outbox();
+  // 가짜 시계라 두 글의 넣은 시각이 같아 행 차례가 섞인다. 차례 없이 비교한다.
+  assert.deepEqual(rows.map(row => `${row.message_key}:${row.state}`).sort(), ['long-clean:sent', 'long-clean:sent', 'split:blocked', 'split:blocked']);
+  assert.equal(f.rest.wires.length, 2);
+  assert.ok(!sentBytes().includes('ghp_'), '토큰의 앞 조각도 나가지 않는다');
+  // 첫 쪽이 걸리면 뒤 쪽은 잡히기 전에 함께 막혀 감사는 첫 쪽 하나다.
+  assert.equal(await audits('delivery_public_check_blocked'), 1);
+});
+
+test('AC-06 별칭: 고정 접두사를 붙인 SHA-256 앞 8자리이고 원래 UUID의 어떤 8자 조각과도 같지 않다', () => {
+  assert.equal(publicAlias(INTERNAL_UUID), '2c93f91d');
+  assert.equal(publicAlias('00000000-0000-4000-8000-000000000000'), 'e3bca3c5');
+  for (const id of [INTERNAL_UUID, '00000000-0000-4000-8000-000000000000', '11111111-2222-4333-8444-555555555555']) {
+    const alias = publicAlias(id);
+    assert.match(alias, /^[0-9a-f]{8}$/);
+    for (const raw of [id, id.replaceAll('-', '')]) {
+      for (let at = 0; at + 8 <= raw.length; at++) assert.notEqual(alias, raw.slice(at, at + 8), `${id} @${at}`);
+    }
+  }
+});
+
 test('AC-06 F-3 외부 세션 완료: 원시 세션 ID·연결 ID 대신 별칭, 동의한 요약도 지금 정책의 공통 검사에 걸리면 싣지 않는다', async () => {
   const ctx = await receiverFixture({ connectionBurst: 100 });
   try {
@@ -160,11 +217,22 @@ test('AC-06 F-4 내부 식별자: 작업 목록·리뷰 작업·모델 상태에
 test('AC-06 F-5 고정 안내: 모델 멈춤·비상 정지·종료 모르는 작업은 필요한 상태와 다음 행동만, 모르는 상태 이름은 싣지 않는다', () => {
   const status = (result: Record<string, unknown>) => controlText('model-status', { paused: false, emergency: false, executionPending: false, waiting: [],
     taskLaneClosed: 'retention_full', status: `내부 상태 ${MARKER}`, ...result });
-  assert.equal(status({}), CONTROL_TEXT.running);
-  assert.equal(status({ paused: true }), CHAT_TASK_TEXT.away);
+  // 작업 레인이 닫혀 있으면 닫혔다는 것과 다음 행동만 싣는다. 닫힌 사유(내부 상태 이름)는 싣지 않는다.
+  const laneClosed = '새 작업 접수가 닫혀 있어요. 확인은 `homelab` CLI에서 해 주세요.';
+  assert.equal(status({}), laneClosed);
+  assert.equal(status({ paused: true }), [CHAT_TASK_TEXT.away, laneClosed].join('\n'));
   assert.equal(status({ emergency: true, paused: true, executionPending: true, waiting: [{ id: 'j', wait_reason: 'model_limit' }] }),
-    [CONTROL_TEXT.emergency, CONTROL_TEXT.waiting(1), CONTROL_TEXT.executionPending].join('\n'));
-  assert.equal(status({ executionPending: true }), CONTROL_TEXT.executionPending);
+    [CONTROL_TEXT.emergency, CONTROL_TEXT.waiting(1), CONTROL_TEXT.executionPending, laneClosed].join('\n'));
+  assert.equal(status({ executionPending: true }), [CONTROL_TEXT.executionPending, laneClosed].join('\n'));
+  for (const reason of ['unknown', 'cleanup_pending', 'future_reason']) {
+    const text = status({ taskLaneClosed: reason });
+    assert.equal(text, laneClosed);
+    assert.ok(!text.includes(reason) && !text.includes(MARKER), text);
+  }
+  // 레인이 열려 있으면 그 줄이 없다.
+  assert.equal(status({ taskLaneClosed: null }), CONTROL_TEXT.running);
+  assert.equal(status({ taskLaneClosed: null, paused: true }), CHAT_TASK_TEXT.away);
+  assert.equal(status({ taskLaneClosed: null, executionPending: true }), CONTROL_TEXT.executionPending);
   assert.equal(controlText('list', [{ id: 'j', state: 'future_state', wait_reason: 'future_reason' }]),
     `작업 1건\n- \`${publicAlias('j')}\` ${CONTROL_TEXT.unknownState}(${CONTROL_TEXT.unknownState})`);
 });
