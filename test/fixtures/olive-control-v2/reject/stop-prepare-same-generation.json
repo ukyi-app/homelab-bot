@@ -1,0 +1,57 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/stop-prepare-same-generation",
+  "description": "감독의 지금 정지 세대(7)와 같은 세대의 준비. 새 정지가 아니다",
+  "status": "candidate",
+  "base": "accept/stop-prepare",
+  "changed": [
+    "message.body.stop_generation"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "generation_mismatch"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 7,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 3,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "12a1f93aaf428e7a80f46c69d1eb502784a74de5488089435059aeef887c9907",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "stop_prepare",
+      "request_id": "00000000-0000-4000-8000-000000000023",
+      "nonce": "00000000000000000000000000000023"
+    },
+    "signature": "5WQEJbjVZfEQKX_kYO1kraIpb-awYI8vH64s0Y4v3FLkdINZtgZ07sp-YHdL4kvhTHLBriiCi3XtWV5JoFFnCQ",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000031",
+      "stop_generation": 7
+    }
+  },
+  "signing_input": "{\"action\":\"stop_prepare\",\"body_digest\":\"12a1f93aaf428e7a80f46c69d1eb502784a74de5488089435059aeef887c9907\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000023\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000023\",\"sender\":\"front-door\"}"
+}

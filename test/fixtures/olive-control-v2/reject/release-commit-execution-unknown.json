@@ -1,0 +1,56 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/release-commit-execution-unknown",
+  "description": "감독이 실행 세대를 모를 때 온 풀기 확정. 모르면 닫는다",
+  "status": "candidate",
+  "base": "accept/release-commit",
+  "changed": [
+    "context.generations.execution"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "generation_unknown"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": 8
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "e5572bbf48824c4a4437e2f49add9bebe6b330ffce749011a9c43a3853b39373",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "release_commit",
+      "request_id": "00000000-0000-4000-8000-00000000002b",
+      "nonce": "0000000000000000000000000000002b"
+    },
+    "signature": "ZQscMNtB__ihAil7N1ssyIv5jz6CF7s0VK8yLknHdKlVnw8G3zysQT-3qBfLkU3o-LSwA38ytgl3loBzrhiCCQ",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000034",
+      "stop_generation": 8,
+      "execution_generation": 4
+    }
+  },
+  "signing_input": "{\"action\":\"release_commit\",\"body_digest\":\"e5572bbf48824c4a4437e2f49add9bebe6b330ffce749011a9c43a3853b39373\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"0000000000000000000000000000002b\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-00000000002b\",\"sender\":\"front-door\"}"
+}

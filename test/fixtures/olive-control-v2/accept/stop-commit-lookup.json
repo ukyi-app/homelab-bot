@@ -1,0 +1,56 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/stop-commit-lookup",
+  "description": "확정의 답을 잃은 현관이 같은 작업 ID·동작·요청 digest로 묻는다. 감독은 이미 8로 올렸고, 정책이 어긋난 연결이어도 받는다(이미 보낸 작업의 결과)",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "policy_mismatch",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 3,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "9fcbc130fd21ec8a4f820fabd1fb072ccc452f5418f58faf4eb00af2c219c52c",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "job_lookup",
+      "request_id": "00000000-0000-4000-8000-000000000027",
+      "nonce": "00000000000000000000000000000027"
+    },
+    "signature": "xsRsuDSuhTdQKR7B70RqQ0AHrpXfOGUjKNaty9_1DCAbouDDU1PU5kj8JJCMRTRkMR71kTTZ45-HIjNIFOJPBg",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000032",
+      "action": "stop_commit",
+      "request_digest": "e2f03a37dc33410028b14a21c631029a7dea50a1c9b93658ab3a23b4668f6500"
+    }
+  },
+  "signing_input": "{\"action\":\"job_lookup\",\"body_digest\":\"9fcbc130fd21ec8a4f820fabd1fb072ccc452f5418f58faf4eb00af2c219c52c\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000027\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000027\",\"sender\":\"front-door\"}"
+}

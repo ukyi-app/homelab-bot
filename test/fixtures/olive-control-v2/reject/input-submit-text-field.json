@@ -1,0 +1,64 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/input-submit-text-field",
+  "description": "입력 본문에 글 칸(text). 입력은 원문을 싣지 않는다",
+  "status": "candidate",
+  "base": "accept/input-submit",
+  "changed": [
+    "message.body.text"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "unknown_field"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": true,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 7,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 3,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "c7517e7e0c1bd80970363729b3295841180cbc7ba57dcdae84d64e119c00a7d5",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "input_submit",
+      "request_id": "00000000-0000-4000-8000-000000000060",
+      "nonce": "00000000000000000000000000000060"
+    },
+    "signature": "Y38XL-ts4fu6aIcad40vmBzOayAmwtPJUMlSjl59rlC2Pm3hX5_Sqsov34h7RInyCAV1sffcNAH00kDORTWCCQ",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000070",
+      "stop_generation": 7,
+      "source": "admin",
+      "source_ref": {
+        "ref": "originals/00000000-0000-4000-8000-00000000007e",
+        "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "expires_at": 1795651199000
+      },
+      "text": "배포가 왜 죽었는지 봐 줘"
+    }
+  },
+  "signing_input": "{\"action\":\"input_submit\",\"body_digest\":\"c7517e7e0c1bd80970363729b3295841180cbc7ba57dcdae84d64e119c00a7d5\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000060\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000060\",\"sender\":\"front-door\"}"
+}

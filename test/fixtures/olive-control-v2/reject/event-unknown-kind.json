@@ -1,0 +1,61 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/event-unknown-kind",
+  "description": "이벤트 넷(승인·게시 변화, 병합 관측, 잊기) 밖의 종류",
+  "status": "candidate",
+  "base": "accept/approval-changed",
+  "changed": [
+    "message.header.action"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "unknown_action"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 7,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 3,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "8a5654f5211c2107315ffc3e1e2e890591946d7cc9bdbe6e3ffb4d6cc0adb1cf",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "label_changed",
+      "request_id": "00000000-0000-4000-8000-000000000065",
+      "nonce": "00000000000000000000000000000065"
+    },
+    "signature": "4PHOtX1MFyfumOvb_uRHtVBYpIblUjYQBGOEY9D1o_Lt9eRzScRLtNsQdsD0elKckezb3_Okee4lxh9HFBqMDw",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000073",
+      "stop_generation": 7,
+      "card_job_id": "00000000-0000-4000-8000-00000000007a",
+      "candidate_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "seq": 2,
+      "state": "approved"
+    }
+  },
+  "signing_input": "{\"action\":\"label_changed\",\"body_digest\":\"8a5654f5211c2107315ffc3e1e2e890591946d7cc9bdbe6e3ffb4d6cc0adb1cf\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000065\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000065\",\"sender\":\"front-door\"}"
+}

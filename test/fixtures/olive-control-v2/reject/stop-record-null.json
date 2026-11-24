@@ -1,0 +1,58 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/stop-record-null",
+  "description": "기록 칸이 null인 답. '기록 없음'으로 읽지 않는다(확인된 부재는 state absent뿐)",
+  "status": "candidate",
+  "base": "accept/stop-record-recorded",
+  "changed": [
+    "message.body.record"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "body_malformed"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "policy_mismatch",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {
+      "00000000-0000-4000-8000-000000000020": {
+        "action": "stop_record_lookup",
+        "job": null
+      }
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "fc283b036d50924da39d52e7a71bc3a915b6dcb6e2b3c797a0ceea9b2bb11d16",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "stop_record",
+      "request_id": "00000000-0000-4000-8000-000000000021",
+      "nonce": "00000000000000000000000000000021"
+    },
+    "signature": "ADsJ9YKs6je6wrTnTlbNnM3S78S90eq-4G1XHOmQDd7LI3Nb5hvglCWQdXffZJjnbe-HY6YmsCAfrFIzYPWTDA",
+    "body": {
+      "in_reply_to": "00000000-0000-4000-8000-000000000020",
+      "record": null
+    }
+  },
+  "signing_input": "{\"action\":\"stop_record\",\"body_digest\":\"fc283b036d50924da39d52e7a71bc3a915b6dcb6e2b3c797a0ceea9b2bb11d16\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000021\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000021\",\"sender\":\"front-door\"}"
+}

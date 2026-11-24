@@ -1,0 +1,60 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/progress-update-stopped",
+  "description": "진행 표시의 멈춤: stopped 단계에만 닫힌 목록의 이유(verification_failed = 검증 실패) 하나가 반드시 있다. \"멈췄어요(이유 한 마디)\"의 문구는 현관이 만든다",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": true,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 4,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "64d14e9516f44c271647ed3ce45f46299b5709a63e402ec6cc2296fea72eadde",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "progress_update",
+      "request_id": "00000000-0000-4000-8000-00000000006b",
+      "nonce": "0000000000000000000000000000006b"
+    },
+    "signature": "SdpsqsMlmAshCtlMzo92g4VTf5RWes_lLRIvqa5zdGPe3JKGgCtstPHvqfOjN-nGGwTqJO7Z6IpSIJH23SBFCw",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000074",
+      "input_job_id": "00000000-0000-4000-8000-00000000007a",
+      "stage": "stopped",
+      "seq": 4,
+      "stop_cause": "verification_failed",
+      "stop_generation": 8,
+      "execution_generation": 4
+    }
+  },
+  "signing_input": "{\"action\":\"progress_update\",\"body_digest\":\"64d14e9516f44c271647ed3ce45f46299b5709a63e402ec6cc2296fea72eadde\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"0000000000000000000000000000006b\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-00000000006b\",\"sender\":\"supervisor\"}"
+}

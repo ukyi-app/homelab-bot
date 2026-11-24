@@ -1,0 +1,61 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/input-submit-alert",
+  "description": "자동 경보의 접수. 출처 이름만 다르다(장부는 이름을 분류하지 않는다)",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": true,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 7,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 3,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "96d92af51ac4350c144fce8c558eea9088c834c269a47a82a8bb260183bcf78d",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "input_submit",
+      "request_id": "00000000-0000-4000-8000-000000000061",
+      "nonce": "00000000000000000000000000000061"
+    },
+    "signature": "fGVWN2ClznvYkttJUrOhTCBnj-YszUdUTmgJR8Lr7aL2WO-5ALOBV5v8ViUtj37Uei7kmRvUSLnhfmDc47dWCQ",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000071",
+      "stop_generation": 7,
+      "source": "alert",
+      "source_ref": {
+        "ref": "originals/00000000-0000-4000-8000-00000000007d",
+        "digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "expires_at": 1795651199000
+      }
+    }
+  },
+  "signing_input": "{\"action\":\"input_submit\",\"body_digest\":\"96d92af51ac4350c144fce8c558eea9088c834c269a47a82a8bb260183bcf78d\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000061\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000061\",\"sender\":\"front-door\"}"
+}

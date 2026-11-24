@@ -1,0 +1,55 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/execution-generation-reply-not-awaited",
+  "description": "묻지 않은 연결에 온 실행 세대 답. 현관은 이 값을 쓰지 않는다",
+  "status": "candidate",
+  "base": "accept/execution-generation-reply",
+  "changed": [
+    "context.awaiting"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "reply_mismatch"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": null
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "f21b9daf19d7f0f8417b0a5f159964efbf87f6b9841ef62bcbf81a5bb97a1734",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "execution_generation_reply",
+      "request_id": "00000000-0000-4000-8000-00000000006a",
+      "nonce": "0000000000000000000000000000006a"
+    },
+    "signature": "3Y4dmiNop45bcvFo1QMrTiNOkfpXjWZt9dLiSU_FLkP9hHkI5-flYwr1fxGQNV518y04X4l0pT24bqXmZXERBQ",
+    "body": {
+      "in_reply_to": "00000000-0000-4000-8000-000000000069",
+      "generation": 4
+    }
+  },
+  "signing_input": "{\"action\":\"execution_generation_reply\",\"body_digest\":\"f21b9daf19d7f0f8417b0a5f159964efbf87f6b9841ef62bcbf81a5bb97a1734\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"0000000000000000000000000000006a\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-00000000006a\",\"sender\":\"supervisor\"}"
+}

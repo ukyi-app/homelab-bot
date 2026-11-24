@@ -1,0 +1,60 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/execution-generation-reply-negative",
+  "description": "실행 세대가 음수인 답",
+  "status": "candidate",
+  "base": "accept/execution-generation-reply",
+  "changed": [
+    "message.body.generation"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "body_malformed"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": null
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {
+      "00000000-0000-4000-8000-000000000069": {
+        "action": "execution_generation_lookup",
+        "job": null
+      }
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "c0881769abe511353788b1b6695199c3cb80a0c678d0f584cd653fe0fcd0f896",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "execution_generation_reply",
+      "request_id": "00000000-0000-4000-8000-00000000006a",
+      "nonce": "0000000000000000000000000000006a"
+    },
+    "signature": "28B4MOzMyCVv5-KRalvaZP4kD34cDs9Uko6TIRQDt5-h3Wlwyp_8jasPqzUqGAfTQct0EjKaMD6P2fR4vn3vCw",
+    "body": {
+      "in_reply_to": "00000000-0000-4000-8000-000000000069",
+      "generation": -1
+    }
+  },
+  "signing_input": "{\"action\":\"execution_generation_reply\",\"body_digest\":\"c0881769abe511353788b1b6695199c3cb80a0c678d0f584cd653fe0fcd0f896\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"0000000000000000000000000000006a\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-00000000006a\",\"sender\":\"supervisor\"}"
+}

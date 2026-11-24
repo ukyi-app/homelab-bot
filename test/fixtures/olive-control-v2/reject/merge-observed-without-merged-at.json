@@ -1,0 +1,54 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/merge-observed-without-merged-at",
+  "description": "병합 관측에 병합 시각이 없다. 봉투의 발급 시각은 보낼 때마다 새로 정해져 병합 뒤 확인의 기준이 될 수 없다",
+  "status": "candidate",
+  "base": "accept/merge-observed",
+  "changed": [
+    "message.body.merged_at"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "body_malformed"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "75f07b11499b095d82bf9b9c54475914e8d39af9bcde87dbfb1cc4be13342d70",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "merge_observed",
+      "request_id": "00000000-0000-4000-8000-000000000068",
+      "nonce": "00000000000000000000000000000068"
+    },
+    "signature": "9-Q546KeefhsdSsqXQjh4i6GR4Sh5rSWAwChoLKVvo9THxSE1fHtIGT5-K9YdQSBYvgaHLHgNWPjzmp_LHhZCA",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000075",
+      "publication_job_id": "00000000-0000-4000-8000-00000000007b",
+      "merge_commit": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
+  },
+  "signing_input": "{\"action\":\"merge_observed\",\"body_digest\":\"75f07b11499b095d82bf9b9c54475914e8d39af9bcde87dbfb1cc4be13342d70\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000068\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000068\",\"sender\":\"front-door\"}"
+}

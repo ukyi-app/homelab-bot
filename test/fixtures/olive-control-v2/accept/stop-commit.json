@@ -1,0 +1,55 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/stop-commit",
+  "description": "받아 둔 준비(8)의 확정(규칙 prepared)",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 7,
+        "prepared": 8
+      },
+      "execution": {
+        "known": true,
+        "current": 3,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "e2f03a37dc33410028b14a21c631029a7dea50a1c9b93658ab3a23b4668f6500",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "stop_commit",
+      "request_id": "00000000-0000-4000-8000-000000000025",
+      "nonce": "00000000000000000000000000000025"
+    },
+    "signature": "ieDxhhRWyv5ugRqKUl89CICLT1mem-04HTMj1dweAWmGsR-TI4fQAgMYwy5Mwd5kjnzWI6phMAyxtvi2tbIPCg",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000032",
+      "stop_generation": 8
+    }
+  },
+  "signing_input": "{\"action\":\"stop_commit\",\"body_digest\":\"e2f03a37dc33410028b14a21c631029a7dea50a1c9b93658ab3a23b4668f6500\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000025\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000025\",\"sender\":\"front-door\"}"
+}

@@ -1,0 +1,71 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/release-prepare-execution-generation-one",
+  "description": "풀기 준비의 답이 약속한 다음 실행 세대가 1. 감독 장부의 실행 세대는 1에서 시작하고 풀기가 1 올리므로 2 이상만 받는다",
+  "status": "candidate",
+  "base": "accept/release-prepare-confirmed",
+  "changed": [
+    "message.body.status.result.execution_generation"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "body_malformed"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {
+      "00000000-0000-4000-8000-000000000029": {
+        "action": "release_prepare",
+        "job": {
+          "job_id": "00000000-0000-4000-8000-000000000033",
+          "action": "release_prepare",
+          "request_digest": "71dbb45d4f518ec3448cc60822d3fa3fdcddbe9f5d73dfab68d7774ea36b88e3"
+        }
+      }
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "7b2e5389fef4950849de3e5fc9c5c2b50f41d08f336652f20d8cb5cd5dbc9bfa",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "job_status",
+      "request_id": "00000000-0000-4000-8000-00000000002a",
+      "nonce": "0000000000000000000000000000002a"
+    },
+    "signature": "tn8H8lmSYriZw0u1b9v-H7LaahGx8OZwCntDg18SPYmtNDmiH9Qz43EQV4F9ZIjFwlengcYyciPeu9z5IGbKDg",
+    "body": {
+      "in_reply_to": "00000000-0000-4000-8000-000000000029",
+      "job_id": "00000000-0000-4000-8000-000000000033",
+      "action": "release_prepare",
+      "request_digest": "71dbb45d4f518ec3448cc60822d3fa3fdcddbe9f5d73dfab68d7774ea36b88e3",
+      "status": {
+        "state": "confirmed",
+        "result": {
+          "outcome": "prepared",
+          "execution_generation": 1
+        }
+      }
+    }
+  },
+  "signing_input": "{\"action\":\"job_status\",\"body_digest\":\"7b2e5389fef4950849de3e5fc9c5c2b50f41d08f336652f20d8cb5cd5dbc9bfa\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"0000000000000000000000000000002a\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-00000000002a\",\"sender\":\"supervisor\"}"
+}
