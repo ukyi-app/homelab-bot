@@ -1335,7 +1335,7 @@ test('대조 재개: 한 건의 인가 오류가 뒤의 건을 막지 않는다'
     await h.command('103', 'change-publish', { target: second, text: await digestOf(h, second) });
     const seen: string[] = [];
     const logs: string[] = [];
-    const publisher = new ChangePublisher({ store: h.changes, writer: h.env.writerIO.writer, preflight: h.env.writerIO.preflight, policy: async () => h.env.policy.current, now: Date.now, log: event => { logs.push(event); },
+    const publisher = new ChangePublisher({ store: h.changes, receipts: h.env.writerIO.receipts, writer: h.env.writerIO.writer, preflight: h.env.writerIO.preflight, policy: async () => h.env.policy.current, now: Date.now, log: event => { logs.push(event); },
       authorize: async () => { seen.push('call'); if (seen.length === 1) throw new Error('fixture_database_down'); } });
     const report = await publisher.reconcile();
     assert.ok(logs.includes('change_publish_resume_failed'));

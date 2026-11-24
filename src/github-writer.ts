@@ -10,7 +10,8 @@ import type { ChangeRepositoryPolicy } from './change-policy.js';
 import { Denied, PolicyUnavailable } from './contracts.js';
 import { REFRESH_MARGIN_MS, TokenResponse, appJwt, grantedExactly } from './github-app.js';
 import type { GitHubAppCredentials } from './github-app.js';
-import { checkOutbound, finalPayload, openOutbound, OUTBOUND_RULES_REVISION, sendOutbound } from './outbound.js';
+import { checkOutbound, finalPayload, openOutbound, OUTBOUND_RULES_REVISION, OutboundRefused, sendOutbound } from './outbound.js';
+import type { PublicReceipts } from './change-publication.js';
 
 // 봇이 공개 저장소에 쓰는 유일한 경로다. 네트워크 호출은 createGitHubWriter 안의 exchange 한 곳이고, 밖으로는 도메인 메서드만 나간다.
 // URL·method·token을 받는 함수가 없어서 표에 없는 API를 부를 방법이 코드에 없다. 키가 새면 이 경계는 우회되고, 남는 상한은 설치 저장소와 서버 ruleset이다.
@@ -80,6 +81,9 @@ export interface GitHubWriterOptions {
   app: GitHubAppCredentials; repositories: WriterRepositoryLookup;
   // 지금 이 쓰기를 보내도 되는가. 철회면 Denied, 부모가 끝났거나 승인이 무효면 PublicationStopped, 정책을 못 읽으면 PolicyUnavailable을 던진다. 필수값이라 빼먹은 writer를 만들 수 없다.
   authorizeWrite: (target: ChangeTarget) => Promise<void>;
+  // 게시자가 산출물 공개 검사(scanPublicPayload)를 통과시킨 영수증의 책. 쓰기마다 그 바이트가 영수증 안의 글·경로·파일 내용인지 본다.
+  // 게시자(ChangePublisher)와 같은 책이어야 한다. 필수값이라 영수증 대조 없는 writer를 만들 수 없다.
+  receipts: PublicReceipts;
   send?: typeof fetch; now?: () => number;
 }
 
@@ -136,9 +140,10 @@ export interface GitHubWriterPort extends ChangeWriterPort {
   // 응답 유실·409·422는 브랜치를 다시 읽어 sha면 confirmed, 다른 SHA·없음이면 rejected(head_changed), 그대로면 원래 결과다.
   fastForwardBranch(input: { target: ChangeTarget; branch: string; expectedHead: string; sha: string }): Promise<WriterOutcome<{ ref: string; sha: string }>>;
 }
-export interface GitHubWriterIO { writer: GitHubWriterPort; preflight: ChangePreflightPort }
+// receipts는 받은 책 그대로다. 게시자에 같은 책을 넘기는 자리(change-assembly)가 이 값을 쓴다.
+export interface GitHubWriterIO { writer: GitHubWriterPort; preflight: ChangePreflightPort; receipts: PublicReceipts }
 export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO {
-  const { app, repositories, authorizeWrite } = options;
+  const { app, repositories, authorizeWrite, receipts } = options;
   const send = options.send ?? fetch;
   const now = options.now ?? Date.now;
   const tokens = new Map<string, { token: string; expiresAt: number }>();
@@ -190,11 +195,12 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
   // 이 확인과 전송 사이의 아주 짧은 틈은 남는다. 이미 나간 요청과 같게 대조로 다룬다.
   // 본문은 발송 한 길에서 바이트로 굳혀 검사하고 이 경로(저장소·대상)에 묶는다. 인가 확인이 그 길의 발송함 대조 자리다.
   // 이 저장소 쓰기에는 Discord 정책 판이 없어 검사 규칙의 판에 묶는다.
-  const sendWrite = async (target: ChangeTarget, path: string, token: string, body: unknown, limit: number, method: 'POST' | 'PATCH' = 'POST'): Promise<Exchange> => {
+  // extra: 공개 검사 밖에서 정해진 값(PR의 base 브랜치는 정책 값). 영수증 대조에서 그 값만 더 받는다.
+  const sendWrite = async (target: ChangeTarget, path: string, token: string, body: unknown, limit: number, method: 'POST' | 'PATCH' = 'POST', extra: readonly string[] = []): Promise<Exchange> => {
     let refused: string | undefined;
     try {
       const payload = finalPayload({ kind: 'github', method, path }, body);
-      return await sendOutbound(payload, checkOutbound(payload, { policyRevision: OUTBOUND_RULES_REVISION }), {
+      return await sendOutbound(payload, checkOutbound(payload, { policyRevision: OUTBOUND_RULES_REVISION, scan: receipts.scanFor(target.key, extra) }), {
         revision: () => OUTBOUND_RULES_REVISION,
         ledger: { admit: async () => {
           try { await authorizeWrite(target); return true; }
@@ -205,7 +211,7 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
         } },
         wire: { wire: (wireMethod, wirePath, bytes) => exchange(wireMethod, wirePath, token, bytes, limit) },
       }) as Exchange;
-    } catch { return { kind: 'not_sent', code: refused ?? 'route_denied' }; }
+    } catch (error) { return { kind: 'not_sent', code: refused ?? (error instanceof OutboundRefused && error.reason === 'public_check' ? 'public_check_unbound' : 'route_denied') }; }
   };
 
   const resolve = async (repoId: number): Promise<WriterRepository | { denied: string }> => {
@@ -358,7 +364,7 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
       if (!ownsBranch(raw.target, parsed.branch)) return notSent('branch_not_allowed');
       return withWriteAccess(raw.target, 'pull', async (repo, token) => {
         const body = { title: parsed.title, body: parsed.body, head: parsed.branch, base: parsed.baseBranch, draft: parsed.draft, maintainer_can_modify: false };
-        return classify(await sendWrite(raw.target, `/repos/${repo.fullName}/pulls`, token, body, LIMIT.pull), json => {
+        return classify(await sendWrite(raw.target, `/repos/${repo.fullName}/pulls`, token, body, LIMIT.pull, 'POST', [parsed.baseBranch]), json => {
           const created = PullRow.safeParse(json);
           return created.success && created.data.base.repo.id === repo.id && created.data.head.repo?.id === repo.id ? { kind: 'confirmed', value: snapshot(created.data) } : invalid;
         });
@@ -556,5 +562,5 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
       return { blobSha: parsed.data.sha, text: bytes.toString('utf8') };
     },
   };
-  return { writer: port, preflight };
+  return { writer: port, preflight, receipts };
 }

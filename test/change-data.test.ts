@@ -22,10 +22,17 @@ const blocked = (overrides: Partial<PublicPayload>, reason: string) => {
   assert.deepEqual(result, { ok: false, reason });
 };
 const inFile = (text: string) => ({ files: [{ path: 'src/a.ts', content: Buffer.from(text) }] });
+// 통과 결과에는 writer가 쓰기마다 대조할 영수증(검사한 글·경로·파일 내용의 sha256)이 붙는다. 있는지 본 뒤 나머지를 그대로 비교한다.
+const withoutReceipt = (result: ReturnType<typeof scanPublicPayload>) => {
+  if (!result.ok) return result;
+  const { receipt, ...rest } = result;
+  assert.ok(receipt.texts.size > 0 && receipt.files.size > 0);
+  return rest;
+};
 const inBody = (body: string) => ({ publication: { ...fixtureMetadata(), body } });
 
 test('T19 B3 DATA-01: 깨끗한 공개 payload는 지난다', () => {
-  assert.deepEqual(scanPublicPayload(payload(), POLICY), { ok: true });
+  assert.deepEqual(withoutReceipt(scanPublicPayload(payload(), POLICY)), { ok: true });
 });
 
 test('T19 B3 DATA-01: 비밀·내부 표식이 파일·경로·문구 어디에 있든 마스킹 없이 전체를 막는다', () => {
@@ -68,9 +75,9 @@ test('T19 B3 DATA-01: 공개 metadata·경로에는 사용자·내부 식별자�
   blocked({ paths: ['docs/123456789012345678.md'] }, 'metadata_sensitive');
   blocked({ branch: 'bot/change/123456789012345678/g1' }, 'metadata_sensitive');
   // 코드 안의 긴 숫자·사설 IP는 파일 내용이라 metadata 규칙이 아니다.
-  assert.deepEqual(scanPublicPayload(payload(inFile('const limit = 123456789012345678;\nconst ip = "10.1.2.3";\n')), POLICY), { ok: true });
+  assert.deepEqual(withoutReceipt(scanPublicPayload(payload(inFile('const limit = 123456789012345678;\nconst ip = "10.1.2.3";\n')), POLICY)), { ok: true });
   // 고정 bot 신원의 noreply 주소는 막지 않는다.
-  assert.deepEqual(scanPublicPayload(payload(), POLICY), { ok: true });
+  assert.deepEqual(withoutReceipt(scanPublicPayload(payload(), POLICY)), { ok: true });
 });
 
 test('T19 B3 DATA-01: 실패 값에 감지한 값을 담지 않는다', () => {

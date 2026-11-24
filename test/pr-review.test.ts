@@ -14,6 +14,7 @@ import type { ArchiveFetcher, ReviewerInput, ReviewerModel, ReviewTask } from '.
 import { GitHubError, GitHubIngress, githubWebhook, pullRequest, RestrictedGitHub, restrictGitHubWrite, ReviewPolicySource,
   ReviewPublisher, ReviewQueue, ReviewReconciler, ReviewRuntime, reviewMarker, reviewRevision, outboundOf } from '../src/review.js';
 import { sendOutbound } from '../src/outbound.js';
+import { publicTraceId } from '../src/change-publication.js';
 import type { GitHubReader, GitHubTransport, GitHubWrite, ReviewPolicy, ReviewResult } from '../src/review.js';
 import { REVIEW_NOTICE_TEXT } from '../src/review.js';
 import { archiveContract } from '../src/worker.js';
@@ -323,7 +324,7 @@ test('REVIEW-04 제한 게시: COMMENT·검토 SHA·대상 PR만 통과하고 �
     { method: 'POST', path: `/repos/${REPO.fullName}/dispatches`, body: { event_type: 'deploy' } },
     { ...ok, body: { ...ok.body, comments: [{ path: 'src/app.ts', line: 2, side: 'LEFT', body: 'x' }] } },
   ];
-  const guard = { policyRevision: 'fixture-v1', revision: () => 'fixture-v1', ledger: { admit: async () => true } };
+  const guard = { policyRevision: 'fixture-v1', revision: () => 'fixture-v1', ledger: { admit: async () => true }, scan: () => null };
   for (const request of denied) await assert.rejects(github.createReview(request, expected, guard), Denied);
   assert.equal(transport.length, 0);
   await github.createReview(ok, expected, guard);
@@ -363,9 +364,13 @@ test('AC-13 PR 리뷰 말투: 심각도·한 문단 지적·승인·병합 아�
   const write = r.gh.writes[0]!;
   const body = write.body.body;
   const lines = body.split('\n');
-  assert.match(lines[0]!, /^<!-- homelab-bot-review:github-review:[0-9a-f-]+:1 -->$/);
+  // F-8: 첫 줄 표식은 시도 키의 추적 ID다. 작업 UUID·시도 키·리뷰 정책 판은 본문 어디에도 없다.
+  const [delivery] = await deliveries();
+  assert.equal(lines[0], reviewMarker(delivery!.idempotency_key));
+  assert.match(lines[0]!, /^<!-- homelab-bot-review:r[0-9a-f]{24} -->$/);
+  for (const internal of [delivery!.idempotency_key, delivery!.job_id, delivery!.policy_revision]) assert.ok(!body.includes(internal), internal);
   assert.equal(lines[1], '참고용 자동 리뷰예요. 승인·병합 판단이 아니고 안전을 보증하지도 않아요.');
-  assert.match(lines[2]!, new RegExp(`^검토를 마쳤어요\\. 파일 1개를 봤어요\\. 리비전 head \`${HEAD}\` · 기준 \`${BASE}\` · 정책 \`rp-[0-9a-f]{16}\`$`));
+  assert.match(lines[2]!, new RegExp(`^검토를 마쳤어요\\. 파일 1개를 봤어요\\. 리비전 head \`${HEAD}\` · 기준 \`${BASE}\`$`));
   // 조건·영향·근거·개선이 네 줄 양식이 아니라 심각도 줄 아래 한 문단으로 이어진다. 심각도 순서(P1 먼저)는 그대로다.
   const p1 = 'count가 0일 때. NaN·Infinity가 호출자로 전파된다. return total / count; count 0을 먼저 거부한다.';
   const p3 = 'count가 0인 경우를 시험하지 않아요. 같은 버그가 다시 들어와도 못 잡아요. 바뀐 파일에 시험이 없어요. count 0 시험을 하나 더해 주세요.';
@@ -889,7 +894,7 @@ test('DATA-01 게시 직전 현재 내부 표식으로 다시 분류하고, 모�
   const body = r.gh.writes[0]!.body.body;
   assert.ok(body.includes('@​fixture-org/admins'));
   assert.equal(body.match(/<!--/g)!.length, 1);
-  assert.ok(body.startsWith('<!-- homelab-bot-review:github-review:'));
+  assert.ok(body.startsWith(`${reviewMarker((await deliveries())[0]!.idempotency_key)}\n`));
   await database.pg.exec('TRUNCATE jobs,events,pr_reviews,review_deliveries,github_deliveries,outbox,audit CASCADE');
   r.gh.writes = [];
   const hostile = 'x`@fixture-org/admins\n<!--.bin';
@@ -1096,7 +1101,9 @@ test('REVIEW-02 실행 중 닫힘·draft로 밀려 게시하지 못한 세대는
   await r.publisher.deliver();
   assert.equal(r.gh.writes.length, 1);
   assert.equal(r.inputs.length, 1);
-  assert.match(r.gh.writes[0]!.body.body, /homelab-bot-review:github-review:[0-9a-f-]+:1 -->/);
+  const [resumed] = await deliveries();
+  assert.match(resumed!.idempotency_key, /^github-review:[0-9a-f-]+:1$/);
+  assert.ok(r.gh.writes[0]!.body.body.startsWith(`${reviewMarker(resumed!.idempotency_key)}\n`));
   assert.deepEqual((await reviewJobs()).map(j => [j.state, j.review_outcome]), [['succeeded', 'completed']]);
   assert.equal((await hook('pull_request', prEvent('reopened', pull({ updated_at: '2026-10-29T01:22:00Z' })))).outcome, 'duplicate_generation');
 });
@@ -2123,4 +2130,67 @@ test('F6 리뷰 게시: 보내기 직전 발송함 대조 쿼리가 실패하면
   await s.publisher.deliver();
   assert.equal(s.h.sent.length, 1);
   assert.deepEqual((await deliveries()).map(d => d.state), ['sent']);
+});
+
+// O08 F7a F-1(AC-06): classify가 보지 않는 칸(못 본 파일 경로·사유, 상한)과 이 게시 행의 내부 값을 저장 결과에 심는다.
+// 렌더가 덧붙인 최종 본문은 발송 한 길의 공개 검사에 걸려 나가지 않고, 게시 행은 막히며 Discord에는 고정 안내만 간다.
+async function plantResult(change: (result: Record<string, any>, internal: { job: string; key: string; revision: string; row: string }) => void) {
+  const [delivery] = await deliveries();
+  const row = (await database.db.query<{ result: unknown }>('SELECT result FROM pr_reviews WHERE job_id=$1', [delivery!.job_id])).rows[0]!;
+  const result = (typeof row.result === 'string' ? JSON.parse(row.result) : structuredClone(row.result)) as Record<string, any>;
+  change(result, { job: delivery!.job_id, key: delivery!.idempotency_key, revision: delivery!.policy_revision, row: delivery!.id });
+  await database.db.query('UPDATE pr_reviews SET result=$2 WHERE job_id=$1', [delivery!.job_id, JSON.stringify(result)]);
+  return delivery!;
+}
+const PLANTED_TOKEN = `ghp_${'B'.repeat(36)}`;
+const F1_PLANTS: [string, (result: Record<string, any>, internal: { job: string; key: string; revision: string; row: string }) => string][] = [
+  ['못 본 파일 경로의 토큰 꼴', result => { result.coverage.omitted_files_with_reasons = [{ path: `src/${PLANTED_TOKEN}.ts`, reason: 'file_limit' }]; return PLANTED_TOKEN; }],
+  ['못 본 파일 사유의 작업 UUID', (result, internal) => { result.coverage.omitted_files_with_reasons = [{ path: 'src/x.ts', reason: `job ${internal.job}` }]; return internal.job; }],
+  ['상한 칸의 시도 키', (result, internal) => { result.coverage.limits_hit = [internal.key]; return internal.key; }],
+  ['상한 칸의 게시 행 ID', (result, internal) => { result.coverage.limits_hit = [internal.row]; return internal.row; }],
+  ['못 본 파일 사유의 리뷰 정책 판', (result, internal) => { result.coverage.omitted_files_with_reasons = [{ path: 'src/x.ts', reason: internal.revision }]; return internal.revision; }],
+  ['상한 칸의 정책 내부 표식', result => { result.coverage.limits_hit = ['fixture-internal-host']; return 'fixture-internal-host'; }],
+];
+for (const [name, plant] of F1_PLANTS) {
+  test(`F7a F-1 AC-06 ${name}: 최종 본문 검사에 걸려 전송 0, 게시 행 blocked(outbound_public_check), Discord에는 고정 안내만`, async () => {
+    await opened(); await r.runtime.tick();
+    let planted = '';
+    const delivery = await plantResult((result, internal) => { planted = plant(result, internal); });
+    const s = sealedPublisher();
+    await s.publisher.deliver();
+    assert.deepEqual(s.h.sent, []);
+    assert.equal(r.gh.writes.length, 0);
+    assert.deepEqual((await deliveries()).map(d => [d.state, d.reason]), [['blocked', 'outbound_public_check']]);
+    const notices = (await rows('outbox')).map(o => o.payload.content as string);
+    assert.deepEqual(notices, [REVIEW_NOTICE_TEXT.restricted(REPO.fullName, 7)]);
+    assert.ok(notices.every(text => !text.includes(planted) && !text.includes(delivery.job_id)));
+  });
+}
+test('F7a F-1 AC-06 대조군: 같은 경로에 심지 않으면 한 번 나가고, 나간 본문에 내부 값이 없다', async () => {
+  await opened(); await r.runtime.tick();
+  await plantResult(result => { result.coverage.omitted_files_with_reasons = [{ path: 'src/x.ts', reason: 'file_limit' }]; result.coverage.limits_hit = ['max_files']; });
+  const s = sealedPublisher();
+  await s.publisher.deliver();
+  assert.equal(s.h.sent.length, 1);
+  assert.deepEqual((await deliveries()).map(d => d.state), ['sent']);
+});
+test('F7a F-8: 게시 행을 만들 때 추적 ID와 내부 값(작업·시도·키)의 대응을 감사 행 하나로 남기고, 보낸 본문에는 추적 ID만 있다', async () => {
+  await opened(); await r.runtime.tick();
+  const [delivery] = await deliveries();
+  const trace = publicTraceId('review', delivery!.idempotency_key);
+  const audit = (await rows('audit')).filter(a => a.kind === 'github_public_id');
+  assert.deepEqual(audit.map(a => [a.subject, a.detail]), [[trace, { kind: 'review', job: delivery!.job_id, attempt: 1, key: delivery!.idempotency_key }]]);
+  await r.publisher.deliver();
+  const sent = JSON.stringify(r.gh.writes[0]!.body);
+  assert.ok(sent.includes(trace));
+  for (const internal of [delivery!.job_id, delivery!.idempotency_key, delivery!.policy_revision, delivery!.id]) assert.ok(!sent.includes(internal), internal);
+});
+test('F7a F-8: 추적 ID 전에 옛 표식(시도 키 그대로)으로 게시한 리뷰도 재시도 전 대조에서 찾아 다시 게시하지 않는다', async () => {
+  await opened(); await r.runtime.tick();
+  const key = (await deliveries())[0]!.idempotency_key;
+  r.gh.remote.push({ id: 778, commit_id: HEAD, body: `<!-- homelab-bot-review:${key} -->\n옛 본문` });
+  await database.db.query(`UPDATE review_deliveries SET state='pending',attempt=1,dispatch_started=false,available_at=0`);
+  await r.publisher.deliver();
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.external_id]), [['sent', '778']]);
+  assert.equal(r.gh.writes.length, 0);
 });

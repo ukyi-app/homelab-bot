@@ -7,8 +7,14 @@ import type { ChangeTarget, ChangeWriterPort } from '../src/change-contracts.js'
 import { Denied, PolicyUnavailable } from '../src/contracts.js';
 import { assertAllowed } from '../src/github-app.js';
 import { PublicationStopped, createGitHubWriter, writerRouteAllowed } from '../src/github-writer.js';
+import { PublicReceipts } from '../src/change-publication.js';
+import type { PublicScan } from '../src/outbound.js';
 import type { WriterRepository } from '../src/github-writer.js';
 import { FAKE_APP_KEY, FakeGitHub, REPO, BOT_USER } from './change-github-fake.js';
+
+// 이 파일은 경로·본문 모양·토큰·인가를 본다. 공개 검사 영수증 대조는 실제 책으로 test/public-check-github.test.ts와 게시자 시험(change-github-fake)이 본다.
+class OpenReceipts extends PublicReceipts { override scanFor(): PublicScan { return () => null; } }
+const OPEN_RECEIPTS = new OpenReceipts();
 
 const CHANGE = '0123456789abcdef0123456789abcdef';
 const OTHER_CHANGE = 'fedcba9876543210fedcba9876543210';
@@ -24,7 +30,7 @@ const TREE_ENTRY = { path: 'src/a.ts', mode: '100644' as const, blobSha: FILE.bl
 const ALLOW = async () => {};
 function setup(lookup: (id: number) => Promise<WriterRepository> = async id => { if (id !== REPO.id) throw new Denied(); return REPOSITORY; }, authorizeWrite: (target: ChangeTarget) => Promise<void> = ALLOW) {
   const github = new FakeGitHub();
-  const io = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: lookup, authorizeWrite, send: github.send, now: () => github.clock });
+  const io = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, receipts: OPEN_RECEIPTS, repositories: lookup, authorizeWrite, send: github.send, now: () => github.clock });
   return { github, ...io };
 }
 function seeded() {
@@ -354,7 +360,7 @@ test('T19 B3 writer: blob은 내용 대조하고 일부 실패를 그대로 알�
   assert.deepEqual(await rejected.writer.createBlobs({ target: TARGET, files: [second] }), { kind: 'rejected', status: 422, code: 'http_422' });
   const wrong = setup();
   const send = wrong.github.send;
-  const odd = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => wrong.github.clock,
+  const odd = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, receipts: OPEN_RECEIPTS, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => wrong.github.clock,
     send: async (input, init) => String(input).endsWith('/git/blobs') ? new Response(JSON.stringify({ sha: sha('e') }), { status: 201 }) : send(input, init) });
   assert.deepEqual(await odd.writer.createBlobs({ target: TARGET, files: [FILE] }), { kind: 'rejected', status: 201, code: 'blob_sha_mismatch' });
   const ok = seeded();
@@ -393,7 +399,7 @@ test('T19 B3 writer: 대조 읽기는 PR 토큰을 쓰고 내용 쓰기 토큰�
 test('T19 B3 writer: 읽기 응답을 믿지 않는다', async () => {
   const lying = (body: unknown) => {
     const s = seeded();
-    const writerIO = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => s.github.clock,
+    const writerIO = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, receipts: OPEN_RECEIPTS, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => s.github.clock,
       send: async (input, init) => init?.method === 'GET' ? new Response(JSON.stringify(body), { status: 200 }) : s.github.send(input, init) });
     return writerIO;
   };
@@ -435,7 +441,7 @@ test('T19 B3 writer: findPulls는 정확한 head·base만 돌려주고 상한을
   assert.match(list.path, new RegExp(`state=all&head=fixture-org:${BRANCH.replaceAll('/', '/')}&base=main&per_page=100$`));
   // 응답이 섞여 와도(다른 브랜치·포크) 정확한 것만 남긴다.
   const send = github.send;
-  const mixed = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => github.clock, send: async (input, init) => {
+  const mixed = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, receipts: OPEN_RECEIPTS, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => github.clock, send: async (input, init) => {
     if (String(input).includes('state=all')) {
       const row = (ref: string, baseRef: string, headRepo: number | null, baseRepo: number) => ({ number: 1, state: 'open', merged_at: null, title: 't', body: 'b', user: { id: BOT_USER }, head: { ref, sha: sha('a'), repo: headRepo === null ? null : { id: headRepo } }, base: { ref: baseRef, repo: { id: baseRepo } } });
       return new Response(JSON.stringify([row(`${BRANCH}-x`, 'main', REPO.id, REPO.id), row(BRANCH, 'dev', REPO.id, REPO.id), row(BRANCH, 'main', 5, REPO.id), row(BRANCH, 'main', null, REPO.id), row(BRANCH, 'main', REPO.id, REPO.id)]), { status: 200 });
@@ -444,7 +450,7 @@ test('T19 B3 writer: findPulls는 정확한 head·base만 돌려주고 상한을
   } });
   const found = await mixed.writer.findPulls({ target: TARGET, headBranch: BRANCH, baseBranch: 'main' });
   assert.equal(found.length, 1);
-  const full = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => github.clock, send: async (input, init) => {
+  const full = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, receipts: OPEN_RECEIPTS, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => github.clock, send: async (input, init) => {
     if (String(input).includes('state=all')) return new Response(JSON.stringify(Array.from({ length: 100 }, () => ({ number: 1, state: 'open', merged_at: null, title: 't', body: 'b', user: { id: BOT_USER }, head: { ref: BRANCH, sha: sha('a'), repo: { id: REPO.id } }, base: { ref: 'main', repo: { id: REPO.id } } }))), { status: 200 });
     return send(input, init);
   } });
@@ -468,7 +474,7 @@ test('쓰기 경계: blob은 하나마다 확인해 철회 뒤의 blob을 보내
   let revoked = false;
   const s = setup(undefined, async () => { if (revoked) throw new Denied(); });
   const send = s.github.send;
-  const counted = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: async () => { if (revoked) throw new Denied(); }, now: () => s.github.clock,
+  const counted = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, receipts: OPEN_RECEIPTS, repositories: async () => REPOSITORY, authorizeWrite: async () => { if (revoked) throw new Denied(); }, now: () => s.github.clock,
     send: async (input, init) => { const response = await send(input, init); if (String(input).endsWith('/git/blobs')) revoked = true; return response; } });
   assert.deepEqual(await counted.writer.createBlobs({ target: TARGET, files: [FILE, second] }), { kind: 'not_sent', code: 'authorization_revoked' });
   assert.equal(s.github.count(WRITE_POST), 1);
@@ -481,7 +487,7 @@ test('쓰기 경계: blob은 하나마다 확인해 철회 뒤의 blob을 보내
 test('쓰기 경계: 읽기는 확인을 부르지 않아 철회 뒤에도 대조가 돈다', async () => {
   const s = seeded();
   let checks = 0;
-  const io = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: async () => { checks++; throw new Denied(); }, send: s.github.send, now: () => s.github.clock });
+  const io = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, receipts: OPEN_RECEIPTS, repositories: async () => REPOSITORY, authorizeWrite: async () => { checks++; throw new Denied(); }, send: s.github.send, now: () => s.github.clock });
   assert.deepEqual(await io.writer.readBranchHead({ target: TARGET, branch: 'main' }), { sha: s.base.sha });
   assert.ok(await io.writer.readCommit({ target: TARGET, sha: s.base.sha }));
   assert.deepEqual(await io.writer.findPulls({ target: TARGET, headBranch: BRANCH, baseBranch: 'main' }), []);
@@ -571,7 +577,7 @@ test('C26 writer: 응답 유실·422는 정확한 ref를 다시 읽어 대조하
     s.github.fail(PATCH_REF, mode);
     const move = interfere?.(s);
     // 갱신 요청이 끝난 직후 사람이 브랜치를 옮긴 상황을 만든다.
-    const io = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => s.github.clock, send: async (input, init) => {
+    const io = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, receipts: OPEN_RECEIPTS, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => s.github.clock, send: async (input, init) => {
       try { return await s.github.send(input, init); } finally { if (init?.method === 'PATCH') move?.(); }
     } });
     const outcome = await io.writer.fastForwardBranch({ target: TARGET, branch: BRANCH, expectedHead: s.from, sha: s.to });
@@ -583,7 +589,7 @@ test('C26 writer: 응답 유실·422는 정확한 ref를 다시 읽어 대조하
 test('C26 writer: 응답의 ref·SHA가 요청과 다르면 확정하지 않는다', async () => {
   const s = branchAhead();
   const send = s.github.send;
-  const io = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => s.github.clock, send: async (input, init) => {
+  const io = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, receipts: OPEN_RECEIPTS, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => s.github.clock, send: async (input, init) => {
     const response = await send(input, init);
     if (init?.method !== 'PATCH') return response;
     // 적용은 됐지만 응답이 다른 브랜치를 말한다. 다시 읽어 실제 브랜치로 판정한다.
@@ -592,7 +598,7 @@ test('C26 writer: 응답의 ref·SHA가 요청과 다르면 확정하지 않는�
   assert.deepEqual(await io.writer.fastForwardBranch({ target: TARGET, branch: BRANCH, expectedHead: s.from, sha: s.to }), { kind: 'confirmed', value: { ref: `refs/heads/${BRANCH}`, sha: s.to } });
   // 적용되지 않았는데 응답이 다른 SHA를 말하면 브랜치가 그대로라 unknown으로 남는다.
   const t = branchAhead();
-  const stale = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => t.github.clock, send: async (input, init) => {
+  const stale = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, receipts: OPEN_RECEIPTS, repositories: async () => REPOSITORY, authorizeWrite: ALLOW, now: () => t.github.clock, send: async (input, init) => {
     if (init?.method !== 'PATCH') return t.github.send(input, init);
     t.github.sent.push({ method: 'PATCH', path: new URL(String(input)).pathname, authorization: '', body: undefined, init: init ?? {} });
     return new Response(JSON.stringify({ ref: `refs/heads/${BRANCH}`, object: { type: 'commit', sha: sha('f') } }), { status: 200 });
@@ -603,7 +609,7 @@ test('C26 writer: 응답의 ref·SHA가 요청과 다르면 확정하지 않는�
 
 test('C26 writer: 쓰기 직전 권한 확인이 실패하면 갱신을 보내지 않는다', async () => {
   const s = branchAhead();
-  const io = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPOSITORY, authorizeWrite: async () => { throw new Denied(); }, send: s.github.send, now: () => s.github.clock });
+  const io = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, receipts: OPEN_RECEIPTS, repositories: async () => REPOSITORY, authorizeWrite: async () => { throw new Denied(); }, send: s.github.send, now: () => s.github.clock });
   assert.deepEqual(await io.writer.fastForwardBranch({ target: TARGET, branch: BRANCH, expectedHead: s.from, sha: s.to }), { kind: 'not_sent', code: 'authorization_revoked' });
   assert.equal(s.github.mutations(PATCH_REF).length, 0);
 });

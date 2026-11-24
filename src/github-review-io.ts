@@ -5,6 +5,7 @@ import { GitHubApi, GitHubAppAuth, GitHubTokenError, TokenResponse, appJwt, asse
 import type { BoundRepository, GitHubAppCredentials } from './github-app.js';
 import { GitHubError, outboundOf, pullRequest, requestedRepository, restrictGitHubWrite, ReviewQueue, ReviewRequests } from './review.js';
 import { checkOutbound, finalPayload, OUTBOUND_RULES_REVISION, OutboundRefused, sendOutbound } from './outbound.js';
+import { publicScan, publicTraceId } from './change-publication.js';
 import type { OutboundWire } from './outbound.js';
 import type { GitHubReader, GitHubTransport, ReviewPolicySource, ReviewTarget, ReviewTargetReader } from './review.js';
 import type { Change } from './review-input.js';
@@ -136,8 +137,10 @@ const RemoteIssueComment = z.object({ id: z.number().int().positive(), user: Aut
 
 // ---- 안내 리뷰 게시 ----
 
-// 자동 참고 리뷰(reviewMarker)와 접두가 달라 서로의 회수에 걸리지 않는다.
-export const guidanceMarker = (key: string) => `<!-- homelab-bot-guidance:${key} -->`;
+// 자동 참고 리뷰(reviewMarker)와 접두가 달라 서로의 회수에 걸리지 않는다. 공개 표식에는 안내 키(change ID·세대·차례)가 아니라 그 추적 ID만 싣는다.
+export const guidanceMarker = (key: string) => `<!-- homelab-bot-guidance:${publicTraceId('guidance', key)} -->`;
+// 추적 ID 전에 게시한 안내의 표식. 회수 대조(find)에서 읽기만 한다.
+const legacyGuidanceMarker = (key: string) => `<!-- homelab-bot-guidance:${key} -->`;
 export interface GuidanceReview {
   repository: string; pr: number; head: string; key: string; body: string;
   comments: readonly { path: string; line: number; body: string }[];
@@ -367,8 +370,9 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
       let sealed: { payload: ReturnType<typeof finalPayload>; check: ReturnType<typeof checkOutbound> };
       try {
         const payload = finalPayload({ kind: 'github', method: 'POST', path: write.path }, write.body);
-        sealed = { payload, check: checkOutbound(payload, { policyRevision: OUTBOUND_RULES_REVISION }) };
-      } catch { return notSent('input_invalid'); }
+        // 최종 바이트(표식·경로·댓글 포함)를 본다. 안내 키가 표식 밖 어디에든 남으면 막는다. 걸리면 input_invalid가 아니라 public_check다.
+        sealed = { payload, check: checkOutbound(payload, { policyRevision: OUTBOUND_RULES_REVISION, scan: publicScan({ internalMarkers: [key], metadata: true }) }) };
+      } catch (error) { return notSent(error instanceof OutboundRefused && error.reason === 'public_check' ? 'outbound_public_check' : 'input_invalid'); }
       let created: unknown;
       // 안내 글의 중복은 호출자의 효과 기록과 표식 대조(find)가 막는다. 여기 발송함 대조는 그 앞 단계를 다시 보지 않는다.
       try { created = await sendOutbound(sealed.payload, sealed.check,
@@ -394,7 +398,7 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
       for (let page = 1; page <= DEFAULTS.recoveryPages; page++) {
         const rows = parse(z.array(RecoveredReview), await read(repository, `/pulls/${pr}/reviews?per_page=${PAGE_SIZE}&page=${page}`));
         if (!rows.every(row => row.pull_request_url === pullUrl)) throw new Error('github_pull_mismatch');
-        const found = rows.find(row => row.commit_id === head && row.body?.includes(guidanceMarker(key)));
+        const found = rows.find(row => row.commit_id === head && (row.body?.includes(guidanceMarker(key)) || row.body?.includes(legacyGuidanceMarker(key))));
         if (found) return { id: found.id };
         if (rows.length < PAGE_SIZE) break;
       }

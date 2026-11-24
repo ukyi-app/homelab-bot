@@ -10,7 +10,8 @@ import type { Policy, PolicyGate } from './policy.js';
 import { DRAIN_MS } from './runtime.js';
 import type { Store } from './store.js';
 import { checkOutbound, finalPayload, OutboundRefused } from './outbound.js';
-import type { OutboundCheck, OutboundPayload, OutboundPorts } from './outbound.js';
+import type { OutboundCheck, OutboundPayload, OutboundPorts, PublicScan } from './outbound.js';
+import { publicScan, publicTraceId } from './change-publication.js';
 import type { CancelRequest, WorkerSigner } from './worker.js';
 import { archiveContract } from './worker.js';
 import { CoverageSchema, FindingSchema, InputLimitsSchema, REVIEW_INSTRUCTIONS, REVIEW_INSTRUCTIONS_V2, ReviewOutputSchema, ReviewTaskSchema,
@@ -163,8 +164,8 @@ export function restrictGitHubWrite(request: unknown, expected: { repository: st
 }
 // 리뷰 게시의 발송 한 길 묶음(src/outbound.ts). 실제 전송(github-review-io)은 이 묶음으로만 보낸다.
 export interface ReviewOutbound { payload: OutboundPayload; check: OutboundCheck; revision: OutboundPorts['revision']; ledger: OutboundPorts['ledger'] }
-// 게시자가 넘기는 묶음 조건: 검사 때의 정책 판, 보낼 때 다시 읽을 판, 발송함 대조.
-export interface ReviewGuard { policyRevision: string; revision: OutboundPorts['revision']; ledger: OutboundPorts['ledger'] }
+// 게시자가 넘기는 묶음 조건: 검사 때의 정책 판, 보낼 때 다시 읽을 판, 발송함 대조, 최종 바이트의 공개 검사(reviewPublicScan).
+export interface ReviewGuard { policyRevision: string; revision: OutboundPorts['revision']; ledger: OutboundPorts['ledger']; scan: PublicScan }
 const reviewOutbound = new WeakMap<GitHubWrite, ReviewOutbound>();
 export const outboundOf = (write: GitHubWrite): ReviewOutbound | undefined => reviewOutbound.get(write);
 export class RestrictedGitHub {
@@ -173,7 +174,7 @@ export class RestrictedGitHub {
   async createReview(request: unknown, expected: { repository: string; pr: number; head: string }, guard: ReviewGuard): Promise<{ id: number }> {
     const write = restrictGitHubWrite(request, expected);
     const payload = finalPayload({ kind: 'github', method: write.method, path: write.path }, write.body);
-    reviewOutbound.set(write, { payload, check: checkOutbound(payload, { policyRevision: guard.policyRevision }), revision: guard.revision, ledger: guard.ledger });
+    reviewOutbound.set(write, { payload, check: checkOutbound(payload, { policyRevision: guard.policyRevision, scan: guard.scan }), revision: guard.revision, ledger: guard.ledger });
     return this.transport(write);
   }
 }
@@ -281,11 +282,15 @@ export class ReviewQueue {
         available_at=$2,lease_token=NULL,lease_until=NULL WHERE id=(SELECT id FROM review_deliveries WHERE job_id=$1 AND state='superseded'
         ORDER BY created_at DESC LIMIT 1) RETURNING id`, [existing.job_id, now]);
       // 실행 중 밀려 게시 행이 없었으면 새로 만든다. 본문은 게시 직전 현재 정책으로 다시 렌더링된다.
-      if (!reopened.rows.length) await tx.query(`INSERT INTO review_deliveries(id,job_id,idempotency_key,repo_id,repo_full_name,pr_number,
-        head_sha,comparison_revision,policy_revision,body,comments,state,available_at,created_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'','[]','pending',$10,$10) ON CONFLICT (idempotency_key) DO NOTHING`,
-      [randomUUID(), existing.job_id, `github-review:${existing.job_id}:${existing.attempt}`, repo.id, repo.fullName, pr.number,
-        existing.head_sha, existing.comparison_revision, existing.policy_revision, now]);
+      const deliveryKey = `github-review:${existing.job_id}:${existing.attempt}`;
+      if (!reopened.rows.length) {
+        const inserted = await tx.query(`INSERT INTO review_deliveries(id,job_id,idempotency_key,repo_id,repo_full_name,pr_number,
+          head_sha,comparison_revision,policy_revision,body,comments,state,available_at,created_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'','[]','pending',$10,$10) ON CONFLICT (idempotency_key) DO NOTHING RETURNING id`,
+        [randomUUID(), existing.job_id, deliveryKey, repo.id, repo.fullName, pr.number,
+          existing.head_sha, existing.comparison_revision, existing.policy_revision, now]);
+        if (inserted.rows.length) await recordReviewTrace(tx, existing.job_id, existing.attempt, deliveryKey, now);
+      }
       return { outcome: 'resumed', key, job: existing.job_id };
     }
     if (existing) {
@@ -581,6 +586,13 @@ export const ReviewResultSchema = z.strictObject({
 });
 export type ReviewResult = z.infer<typeof ReviewResultSchema>;
 const PositionsSchema = z.array(z.strictObject({ path: z.string(), lines: z.array(z.number().int().positive()).max(100_000) })).max(1000);
+// F-1: 게시할 최종 바이트(본문·인라인 댓글·경로, 렌더가 덧붙인 못 본 파일·사유·상한·표식 포함)의 공개 검사. 발송 한 길(checkOutbound)에서 돈다.
+// classify는 모델 칸만 본다. 이 검사는 그 밖의 칸과 이 게시 행의 내부 값(작업 UUID·시도 키·행 ID·리뷰 정책 판)까지 본다.
+// 리뷰는 공개 diff의 코드 값(사설 주소·이메일 등)을 인용하므로 metadata 패턴은 걸지 않는다(classify와 같은 범위).
+export function reviewPublicScan(review: ReviewPolicy, internal: readonly string[]): PublicScan {
+  const common = publicScan({ internalMarkers: [...review.internalMarkers, ...internal], metadata: false });
+  return texts => texts.some(text => SECRET_PATTERNS.some(pattern => pattern.test(text))) ? 'secret_detected' : common(texts);
+}
 // DATA-01: 운영 비밀·내부 표식이 모델 출력에 섞이면 공개 PR에 올리지 않는다. 마스킹이 아니라 게시 차단이다.
 export function classify(output: Pick<ReviewOutput, 'findings' | 'open_questions' | 'public_summary'>, review: ReviewPolicy): ReviewResult['output_classification'] {
   // JSON 문자열화는 따옴표를 이스케이프해 패턴을 피해 가므로 원문 문자열을 그대로 모은다.
@@ -866,6 +878,7 @@ export class ReviewRuntime {
         ON CONFLICT (idempotency_key) DO NOTHING`, [randomUUID(), job.id, key, review.repo_id, review.repo_full_name,
         review.pr_number, task.head, task.base, task.policyRevision, rendered ? rendered.body : '', json(rendered ? rendered.comments : []),
         rendered ? 'pending' : 'blocked', rendered ? null : context.review.publish ? 'publish_limit_exceeded' : 'publish_limits_unset', this.store.now()]);
+      await recordReviewTrace(tx, job.id, job.attempt, key, this.store.now());
     });
   }
   // GitHub 일시 장애는 Retry-After와 지수 백오프로 기다리고, 상한을 넘으면 실패로 닫는다(새 push·댓글로 다시 시작).
@@ -895,7 +908,14 @@ const SEVERITY = ['P0', 'P1', 'P2', 'P3'];
 const inert = (value: string) => value.replace(/@(?=[A-Za-z0-9_-])/g, '@\u200b').replace(/<!--/g, '&lt;!--');
 // 파일 경로도 PR 작성자가 정한 자료다. 코드 칸을 깨거나 줄을 바꾸지 못하게 한다.
 const code = (value: string) => `\`${inert(value.replace(/[`\r\n]/g, '?'))}\``;
-export const reviewMarker = (key: string) => `<!-- homelab-bot-review:${key} -->`;
+// F-8: 공개 표식에는 시도 키(작업 UUID·시도)가 아니라 그 추적 ID만 싣는다. 같은 키면 같은 ID라 회수 대조가 그대로 된다.
+export const reviewMarker = (key: string) => `<!-- homelab-bot-review:${publicTraceId('review', key)} -->`;
+// 추적 ID 전에 게시한 리뷰의 표식. 회수 대조에서 읽기만 한다(새로 게시하는 글에는 쓰지 않는다).
+const legacyReviewMarker = (key: string) => `<!-- homelab-bot-review:${key} -->`;
+// 공개 추적 ID와 내부 값의 대응은 이 감사 행에만 남긴다.
+async function recordReviewTrace(tx: Database, job: string, attempt: number, key: string, at: number): Promise<void> {
+  await tx.query(`INSERT INTO audit(kind,subject,detail,created_at) SELECT 'github_public_id',$1,$2,$3 WHERE NOT EXISTS (SELECT 1 FROM audit WHERE kind='github_public_id' AND subject=$1)`, [publicTraceId('review', key), json({ kind: 'review', job, attempt, key }), at]);
+}
 // 모델 칸 하나를 문단 안의 문장 하나로 만든다. 빈 줄이 문단을 끊지 못하게 줄바꿈을 공백으로 접고,
 // 문장 끝 없이 끝난 칸(v1 지시문으로 저장된 결과의 "…일 때" 같은 조각)에는 마침표를 붙인다.
 const sentence = (value: string) => {
@@ -920,7 +940,7 @@ export function render(result: ReviewResult, positions: { path: string; lines: n
   const lines = [reviewMarker(key), '참고용 자동 리뷰예요. 승인·병합 판단이 아니고 안전을 보증하지도 않아요.',
     `${result.review_outcome === 'partial' ? '부분 검토예요' : '검토를 마쳤어요'}. 파일 ${result.coverage.checked_files.length}개를 봤어요`
       + (omitted.length ? `, ${omitted.length}개는 못 봤어요` : '') + `${limitsHit}. `
-      + `리비전 head \`${result.head_sha}\` · 기준 \`${result.comparison_revision}\` · 정책 \`${result.policy_revision}\``,
+      + `리비전 head \`${result.head_sha}\` · 기준 \`${result.comparison_revision}\``,
     ...omitted.slice(0, 20).map(o => `- 못 본 파일 ${code(o.path)}: ${o.reason}`),
     ...(omitted.length > 20 ? [`- 못 본 파일이 ${omitted.length - 20}개 더 있어요`] : []),
     '', inert(result.public_summary), ''];
@@ -960,6 +980,8 @@ export class ReviewPublisher {
     });
     if (!row) return false;
     let dispatched = false;
+    // 공개 검사에 걸렸을 때 고정 안내를 보낼 정책. 검사는 보내기 직전(createReview)에 돈다.
+    let noticeContext: ReviewContext | undefined;
     // 게시 전 PR·비교 기준·기존 리뷰 조회 합계가 lease(30초)보다 길어질 수 있어 그동안에도 이 lease만 늘린다.
     // 만료됐거나 다른 lease로 넘어간 행은 건드리지 않는다(Store.heartbeat와 같은 조건).
     const keepalive = setInterval(() => {
@@ -1006,10 +1028,12 @@ export class ReviewPublisher {
       if (!(await this.store.db.query(`UPDATE review_deliveries SET dispatch_started=true WHERE id=$1 AND lease_token=$2
         AND state='sending' AND lease_until>$3 RETURNING id`, [row.id, row.lease_token, this.store.now()])).rows.length) return true;
       dispatched = true;
+      noticeContext = context;
       // 본문은 이 정책 판·저장소·PR에 묶여 검사한 바이트로만 나간다(src/outbound.ts). 보낼 때 정책을 다시 읽고,
       // 발송함 대조는 이 lease로 전송을 시작한 행인지 본다.
       // 정책을 읽지 못하면 보내지 않고 다시 시도한다(정책 판 바뀜과 같이 다룬다). 보낸 것이 없어 결과 불명으로 두지 않는다.
       const sent = await this.github.createReview(request, expected, { policyRevision: context.revision,
+        scan: reviewPublicScan(context.review, [row.job_id, row.idempotency_key, row.id, row.policy_revision, context.revision]),
         revision: async () => {
           try { return (await this.policy.current()).revision; } catch { throw new OutboundRefused('policy_changed'); }
         },
@@ -1025,7 +1049,11 @@ export class ReviewPublisher {
       // 발송 한 길의 거절은 전송 전에 난다. 보낸 것이 없으니 결과 불명으로 두지 않는다. 정책 판이 바뀌었으면 다시 시도한다.
       if (error instanceof OutboundRefused) {
         if (error.reason === 'policy_changed' || error.reason === 'outbox_unavailable') await this.pause(row, error.reason);
-        else await this.state(row, 'blocked', `outbound_${error.reason}`);
+        else {
+          await this.state(row, 'blocked', `outbound_${error.reason}`);
+          // 공개 검사에 걸린 리뷰는 고정 안내로 바꾼다. 무엇이 걸렸는지는 싣지 않는다.
+          if (error.reason === 'public_check' && noticeContext) await this.restricted(row, noticeContext);
+        }
       } else if (dispatched && !(error instanceof GitHubError && error.status < 500 && error.status !== 408)) {
         // 응답을 잃은 게시는 다시 보내지 않고 기존 리뷰를 대조한다(EVENT-02).
         await this.state(row, 'unknown', 'response_lost');
@@ -1100,7 +1128,8 @@ export class ReviewPublisher {
   private async existing(row: DeliveryRow): Promise<boolean> {
     for (let page = 1; page <= DEFAULTS.recoveryPages; page++) {
       const reviews = z.array(RemoteReview).parse(await this.reader.reviews(row.repo_full_name, row.pr_number, page));
-      const found = reviews.find(r => r.commit_id === row.head_sha && r.body?.includes(reviewMarker(row.idempotency_key)));
+      const found = reviews.find(r => r.commit_id === row.head_sha
+        && (r.body?.includes(reviewMarker(row.idempotency_key)) || r.body?.includes(legacyReviewMarker(row.idempotency_key))));
       if (found) { await this.sent(row, String(found.id), await this.policy.current()); return true; }
       if (reviews.length < 100) break;
     }
@@ -1119,6 +1148,11 @@ export class ReviewPublisher {
       await this.store.enqueue({ key: `review-summary:${row.id}`, actor: context.base.owner, scope, revision: context.base.revision,
         payload: { kind: 'message', channel: scope.channel, content, classification: 'safe_summary' } }, tx);
     });
+  }
+  private async restricted(row: DeliveryRow, context: ReviewContext): Promise<void> {
+    const scope = notificationScope(context.base);
+    await this.store.enqueue({ key: `review-restricted:${row.job_id}`, actor: context.base.owner, scope, revision: context.base.revision,
+      payload: { kind: 'message', channel: scope.channel, content: REVIEW_NOTICE_TEXT.restricted(row.repo_full_name, row.pr_number), classification: 'safe_summary' } });
   }
   private async state(row: DeliveryRow, state: string, reason: string): Promise<void> {
     await this.store.db.query(`UPDATE review_deliveries SET state=$3,reason=$4,available_at=CASE WHEN $3='unknown' THEN $5 ELSE available_at END

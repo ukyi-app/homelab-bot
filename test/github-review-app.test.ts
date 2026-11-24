@@ -6,7 +6,7 @@ import { ConfigError, REVIEW_APP_KEYS, loadPublisherConfig } from '../src/config
 import { Denied, PolicyUnavailable } from '../src/contracts.js';
 import { GitHubAppAuth, GitHubApi, GitHubTokenError, REFRESH_MARGIN_MS, RESPONSE_LIMIT_BYTES, appJwt } from '../src/github-app.js';
 import type { BoundRepository } from '../src/github-app.js';
-import { MAX_CHANGES, diffTrees, githubReviewIO, policyRepositories } from '../src/github-review-io.js';
+import { MAX_CHANGES, diffTrees, githubReviewIO, guidanceMarker, policyRepositories } from '../src/github-review-io.js';
 import { GitHubError, ReviewDisabled, RestrictedGitHub, ReviewPolicySource } from '../src/review.js';
 import type { GitHubTransport, GitHubWrite, ReviewContext, ReviewPolicy } from '../src/review.js';
 import { ReviewTaskSchema } from '../src/review-input.js';
@@ -418,7 +418,7 @@ const write = (overrides: Partial<GitHubWrite> = {}, body: Record<string, unknow
   path: `/repos/${REPO.fullName}/pulls/5/reviews`, ...overrides,
   body: { commit_id: HEAD, event: 'COMMENT', body: '자동 참고 리뷰', comments: [{ path: 'a.ts', line: 3, side: 'RIGHT', body: '지적' }], ...body } }) as GitHubWrite;
 // 실제 transport는 발송 한 길의 묶음(RestrictedGitHub.createReview가 만든다)이 있는 쓰기만 보낸다. 묶음 조건은 시험용 고정값이다.
-const GUARD = { policyRevision: 'fixture-v1', revision: () => 'fixture-v1', ledger: { admit: async () => true } };
+const GUARD = { policyRevision: 'fixture-v1', revision: () => 'fixture-v1', ledger: { admit: async () => true }, scan: () => null };
 const post = (transport: GitHubTransport, request: unknown = write(), repository = REPO.fullName) =>
   new RestrictedGitHub(transport).createReview(request, { repository, pr: 5, head: HEAD }, GUARD);
 
@@ -799,8 +799,11 @@ test('안내 리뷰 게시: 봇 PR의 현재 head에 COMMENT 리뷰 하나(인�
   assert.deepEqual(await fake.io().guidance.post(GUIDANCE), { kind: 'confirmed', value: { id: 9000 } });
   const [post, ...more] = fake.posts;
   assert.equal(more.length, 0);
-  assert.deepEqual(post!.body, { commit_id: HEAD, event: 'COMMENT', body: `<!-- homelab-bot-guidance:${KEY} -->\n확인할 곳 두 군데예요.`,
+  // F-8: 표식은 안내 키의 추적 ID다. 안내 키 자체는 본문에 없다.
+  assert.deepEqual(post!.body, { commit_id: HEAD, event: 'COMMENT', body: `${guidanceMarker(KEY)}\n확인할 곳 두 군데예요.`,
     comments: [{ path: 'src/a.ts', line: 3, side: 'RIGHT', body: '여기는 가정했어요.' }] });
+  assert.match(guidanceMarker(KEY), /^<!-- homelab-bot-guidance:g[0-9a-f]{24} -->$/);
+  assert.ok(!JSON.stringify(post!.body).includes(KEY));
   const tokens = fake.sent.filter(s => s.path.endsWith('/access_tokens')).map(s => (s.body as { permissions: object }).permissions);
   assert.deepEqual(tokens, [{ contents: 'read', pull_requests: 'read' }, { pull_requests: 'write' }]);
   assert.equal(post!.authorization, `Bearer ${TOKEN}-2`);
@@ -1001,4 +1004,61 @@ test('C30 접수 조립: 정책 목록 밖 비공개·internal 저장소 요청�
     }
     assert.deepEqual((await database.db.query('SELECT job_id FROM pr_reviews')).rows, []);
   } finally { await database.pg.close(); }
+});
+
+// O08 F7a AC-06: 안내 리뷰의 최종 바이트(표식·경로·댓글)에 심은 가짜 비밀·안내 키·로컬 경로는 발송 한 길의 공개 검사에 걸려 리뷰 POST가 나가지 않는다.
+test('F7a 안내 리뷰 AC-06: 댓글·경로·본문에 심은 토큰 꼴·안내 키·로컬 경로는 공개 검사에 걸려 리뷰 POST 0', async () => {
+  const token = `ghp_${'A'.repeat(36)}`;
+  const cases = [
+    { ...GUIDANCE, comments: [{ path: 'src/a.ts', line: 3, body: `토큰 ${token}` }] },
+    { ...GUIDANCE, comments: [{ path: `src/${token}.ts`, line: 3, body: '여기' }] },
+    { ...GUIDANCE, body: `안내 ${KEY}` },
+    { ...GUIDANCE, comments: [{ path: 'src/a.ts', line: 3, body: '/home/fixture/work 경로' }] },
+  ];
+  for (const input of cases) {
+    const fake = new GuidanceFake();
+    assert.deepEqual(await fake.io().guidance.post(input), { kind: 'not_sent', code: 'outbound_public_check' }, JSON.stringify(input));
+    assert.equal(fake.posts.filter(s => s.path.endsWith('/reviews')).length, 0);
+  }
+});
+test('F7a 안내 리뷰 F-8: 추적 ID 전에 게시한 옛 표식(안내 키 그대로)의 글도 회수 대조에서 찾는다', async () => {
+  const fake = new GuidanceFake();
+  fake.posted.push({ id: 9100, commit_id: HEAD, body: `<!-- homelab-bot-guidance:${KEY} -->\n옛 안내`, user: REVIEW_BOT, state: 'COMMENTED', author_association: 'NONE', pull_request_url: `${API_REPO}/pulls/5` });
+  assert.deepEqual(await fake.io().guidance.find({ repository: REPO.fullName, pr: 5, head: HEAD, key: KEY }), { id: 9100 });
+  assert.equal(await fake.io().guidance.find({ repository: REPO.fullName, pr: 5, head: HEAD, key: 'change-guidance:fixture-2' }), null);
+});
+
+// 훑기: 안내 리뷰 게시 경로의 fetch 호출마다 한 번 던진다. 심은 글은 어느 실행에서도 리뷰 POST 0, 깨끗한 글은 많아야 한 번이고 그 본문은 검사한 바이트 그대로다.
+test('F7a 훑기 안내 리뷰: fetch 호출마다 던져도 검사하지 않은 리뷰 POST 0', async () => {
+  const lines: string[] = [];
+  const expectedBody = JSON.stringify({ commit_id: HEAD, event: 'COMMENT', body: `${guidanceMarker(KEY)}\n확인할 곳 두 군데예요.`,
+    comments: [{ path: 'src/a.ts', line: 3, side: 'RIGHT', body: '여기는 가정했어요.' }] });
+  const run = async (input: typeof GUIDANCE, throwAt: number) => {
+    const fake = new GuidanceFake();
+    const original = fake.send;
+    let calls = 0;
+    (fake as unknown as { send: typeof fetch }).send = async (url, init) => {
+      if (calls++ === throwAt) throw new TypeError('injected fetch');
+      return original(url, init);
+    };
+    try { await fake.io().guidance.post(input); } catch { /* 결과로 센다 */ }
+    const posts = fake.sent.filter(s => s.method === 'POST' && s.path.endsWith('/reviews'));
+    return { calls, posts: posts.length, unscanned: posts.filter(s => JSON.stringify(s.body) !== expectedBody).length };
+  };
+  const planted = { ...GUIDANCE, comments: [{ path: 'src/a.ts', line: 3, body: `ghp_${'D'.repeat(36)}` }] };
+  for (const [scenario, input] of [['clean', GUIDANCE], ['planted', planted]] as const) {
+    const baseline = await run(input, -1);
+    let violations = 0;
+    for (let at = 0; at < baseline.calls; at++) {
+      const result = await run(input, at);
+      const bad = result.unscanned > 0 || result.posts > 1 || (scenario === 'planted' && result.posts > 0);
+      if (bad) violations++;
+      lines.push(`${scenario} | call fetch#${at} | throw | posts=${result.posts} unscanned=${result.unscanned}${bad ? ' | VIOLATION' : ''}`);
+    }
+    lines.push(`${scenario} summary: points=${baseline.calls} runs=${baseline.calls} baseline_posts=${baseline.posts} violations=${violations}`);
+    assert.equal(baseline.posts, scenario === 'clean' ? 1 : 0);
+    assert.equal(baseline.unscanned, 0);
+    assert.equal(violations, 0);
+  }
+  for (const line of lines) console.log(`sweep-guidance ${line}`);
 });

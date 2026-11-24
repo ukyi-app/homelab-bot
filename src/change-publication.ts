@@ -1,7 +1,9 @@
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { ChangeBriefSchema, CommandIdSchema, EvidenceBundleSchema, GenerationSchema, PublicMetadataSchema, ProvenanceLabelSchema, REVIEW_RISK_CATEGORIES, ChangeIdSchema, labelAllowsAuthorInput, propagateLabel } from './change-contracts.js';
 import type { AmendmentKey, ArtifactFile, ChangeBrief, ChangeKey, ChangeNote, EvidenceBundle, ProvenanceLabel, PublicMetadata } from './change-contracts.js';
 import { CHANGE_NOTE_LIMITS, ChangeNoteSchema } from './task-contracts.js';
+import type { PublicScan } from './outbound.js';
 
 // 공개 제목·본문·commit 메시지와 봇 PR 안내 리뷰 글을 만드는 유일한 곳이다. 승인 brief, 구조화된 수치·SHA·시험 상태,
 // 작성 모델의 확인할 것·남은 위험(항목 글과 위치)만 받는다. raw 로그·대화·리뷰 자유문(자체 리뷰 findings 포함)을 받을 자리가 스키마에 없다.
@@ -19,16 +21,27 @@ export function neutralizePublicText(text: string): string {
     .replaceAll('://', `:${ZWSP}//`);
 }
 
-// 대조용 표식이다. 제목·Discord ID를 넣지 않는다. change ID는 무작위 값이다.
-export const publicationMarker = (key: ChangeKey): string => `homelab-bot-change:${key.changeId}:g${key.generation}`;
+// GitHub에 싣는 추적 ID. 내부 값(작업 UUID, change ID·세대·차례)의 sha256 앞 24자라 공개 글에서 내부 값을 되찾지 못한다.
+// 같은 내부 값이면 같은 ID라 재시도·회수 대조가 새 칸 없이 그대로 된다. 공개 ID → 내부 값은 감사 행(github_public_id)과
+// 그 내부 값을 가진 DB 행에만 있다. kind가 접두라 리뷰·안내·PR의 ID가 서로 겹치지 않는다.
+export type PublicTraceKind = 'review' | 'guidance' | 'change';
+export const publicTraceId = (kind: PublicTraceKind, internal: string): string =>
+  `${kind.slice(0, 1)}${createHash('sha256').update(`homelab-bot/${kind}\0${internal}`).digest('hex').slice(0, 24)}`;
+// 대조용 표식이다. 제목·Discord ID·change ID를 넣지 않는다.
+export const publicationMarker = (key: ChangeKey): string => `homelab-bot-change:${publicTraceId('change', `${key.changeId}:g${key.generation}`)}`;
+// 공개 ID와 내부 값의 대응. 감사 행의 detail로만 남긴다(PR 본문·커밋에는 싣지 않는다).
+export const publicationTrace = (key: ChangeKey, bundle: Pick<EvidenceBundle, 'policyRevision' | 'verifierRevision' | 'artifactDigest'>) => ({
+  id: publicTraceId('change', `${key.changeId}:g${key.generation}`),
+  detail: { changeId: key.changeId, generation: key.generation, policyRevision: bundle.policyRevision, verifierRevision: bundle.verifierRevision, artifactDigest: bundle.artifactDigest },
+});
 // 수정 차례(C27)의 커밋 메타데이터. 모델 글 없이 코드가 만든 고정 문구와 차례 번호만 싣는다. 시각은 차례 시작 시각(초)이라 재시도해도 같은 커밋 SHA다.
 // PR 제목·본문은 처음 게시 때만 쓰고 수정 차례는 고치지 않는다(AC-27). title·body 칸은 공개 검사(scanPublicPayload)에 넣으려고 커밋 메시지로 채운다.
 export const AMENDMENT_COMMIT_TITLE = (round: number) => `수정 차례 ${round}: owner 요청과 PR 리뷰 반영`;
-export function renderAmendmentCommit(input: { key: AmendmentKey; pullNumber: number; identity: { name: string; email: string }; at: number; bundle: Pick<EvidenceBundle, 'baseCommit' | 'resultTree' | 'artifactDigest'> }): PublicMetadata {
+export function renderAmendmentCommit(input: { key: AmendmentKey; pullNumber: number; identity: { name: string; email: string }; at: number; bundle: Pick<EvidenceBundle, 'baseCommit' | 'resultTree'> }): PublicMetadata {
   const date = new Date(Math.floor(input.at / 1000) * 1000).toISOString().replace('.000Z', 'Z');
   const identity = { name: input.identity.name, email: input.identity.email, date };
   const title = AMENDMENT_COMMIT_TITLE(input.key.round);
-  const commitMessage = `${title}\n\nChange: ${input.key.changeId}/g${input.key.generation}\nPull: #${input.pullNumber}\nRound: ${input.key.round}\nBase: ${input.bundle.baseCommit}\nTree: ${input.bundle.resultTree}\nArtifact: ${input.bundle.artifactDigest}\n`;
+  const commitMessage = `${title}\n\nChange: ${publicTraceId('change', `${input.key.changeId}:g${input.key.generation}`)}\nPull: #${input.pullNumber}\nRound: ${input.key.round}\nBase: ${input.bundle.baseCommit}\nTree: ${input.bundle.resultTree}\n`;
   return PublicMetadataSchema.parse({ title, body: commitMessage, commitMessage, author: identity, committer: identity, draft: false });
 }
 
@@ -75,8 +88,9 @@ function renderBody(input: PublicationInput, brief: ChangeBrief, bundle: Evidenc
     '## 검증', ...input.verifications.map(item => `- \`${item.commandId}\`: ${item.status}`), '',
     ...noteSection('확인할 것', input.checks), ...noteSection('남은 위험', input.risks),
     '## 사전 리뷰', `- 판정: ${input.review.verdict}, 범위 complete`, ...riskLines(input.review.risks), '',
-    '## 고정 리비전', `- base commit: ${bundle.baseCommit}`, `- base tree: ${bundle.baseTree}`, `- result tree: ${bundle.resultTree}`, `- artifact: ${bundle.artifactDigest}`,
-    `- policy: ${bundle.policyRevision}`, `- verifier: ${bundle.verifierRevision}`, `- 출처 label: ${label}`, '',
+    // 공개 검토에 쓰는 git 리비전만 싣는다. 정책·검증기 판과 산출물 digest는 내부 값이라 추적 ID의 감사 행에만 있다.
+    '## 고정 리비전', `- base commit: ${bundle.baseCommit}`, `- base tree: ${bundle.baseTree}`, `- result tree: ${bundle.resultTree}`,
+    `- 추적 ID: ${publicTraceId('change', `${input.key.changeId}:g${input.key.generation}`)}`, `- 출처 label: ${label}`, '',
     '봇이 만든 제안 PR이다. 사람이 검토해 병합한다.', '',
     `<!-- ${marker} -->`,
   ].join('\n');
@@ -94,13 +108,15 @@ export function renderPublication(raw: PublicationInput, scan: ScanPolicy): Publ
   const title = neutralizePublicText(firstLine);
   const date = new Date(Math.floor(input.at / 1000) * 1000).toISOString().replace('.000Z', 'Z');
   const identity = { name: input.identity.name, email: input.identity.email, date };
-  const commitMessage = `${title}\n\nChange: ${input.key.changeId}/g${input.key.generation}\nBase: ${input.bundle.baseCommit}\nTree: ${input.bundle.resultTree}\nArtifact: ${input.bundle.artifactDigest}\n`;
+  const commitMessage = `${title}\n\nChange: ${publicTraceId('change', `${input.key.changeId}:g${input.key.generation}`)}\nBase: ${input.bundle.baseCommit}\nTree: ${input.bundle.resultTree}\n`;
   const candidate = { title, body: renderBody(input, input.brief, input.bundle, label, marker), commitMessage, author: identity, committer: identity, draft: false };
   // 넘친다고 자르면 승인한 문구와 다른 말이 된다.
   if (title.length > 256 || candidate.body.length > 16000 || commitMessage.length > 4000) return { ok: false, reason: 'publication_too_long' };
   const publication = PublicMetadataSchema.safeParse(candidate);
   if (!publication.success) return { ok: false, reason: 'publication_invalid' };
-  const scanned = scanPublicPayload({ paths: [], files: [], publication: publication.data, branch: input.branch, marker }, scan);
+  // 내부 판·digest가 공개 글 어디에도 남지 않게 이 PR의 값도 표식으로 본다. change ID는 브랜치 이름에 있어 넣지 않는다.
+  const internal = [input.bundle.policyRevision, input.bundle.verifierRevision, input.bundle.artifactDigest].filter(value => value.length >= 8);
+  const scanned = scanPublicPayload({ paths: [], files: [], publication: publication.data, branch: input.branch, marker }, { internalMarkers: [...scan.internalMarkers, ...internal] });
   if (!scanned.ok) return { ok: false, reason: scanned.reason };
   return { ok: true, publication: publication.data, marker };
 }
@@ -148,9 +164,69 @@ export function renderGuidance(input: GuidanceInput, scan: ScanPolicy & { identi
 
 // ---- 공개 payload 검사 ----
 
+// 발송 한 길(checkOutbound)의 scan 고리. GitHub으로 나가는 최종 바이트의 모든 문자열(덧붙인 경로·표식·고정 문구 포함)을 본다.
+// metadata는 사설 주소·이메일·로컬 경로·긴 숫자 ID 패턴이다. 리뷰처럼 공개 diff의 코드 값을 인용하는 글에는 끈다(평범한 인용이 막힌다).
+export function publicScan(policy: ScanPolicy & { metadata: boolean }): PublicScan {
+  const markers = [...policy.internalMarkers];
+  return texts => {
+    if (texts.some(hasSecret)) return 'secret_detected';
+    if (texts.some(text => hasMarker(text, markers)) || hasMarker(texts.join(''), markers)) return 'internal_marker';
+    if (policy.metadata && texts.map(stripInvisible).some(text => METADATA_PATTERNS.some(pattern => pattern.test(text)))) return 'metadata_sensitive';
+    return null;
+  };
+}
+
 export interface ScanPolicy { internalMarkers: readonly string[] }
 export interface PublicPayload { paths: readonly string[]; files: readonly ArtifactFile[]; publication: PublicMetadata; branch: string; marker: string }
-export type ScanResult = { ok: true } | { ok: false; reason: 'secret_detected' | 'internal_marker' | 'metadata_sensitive' };
+export type ScanResult = { ok: true; receipt: PublicReceipt } | { ok: false; reason: 'secret_detected' | 'internal_marker' | 'metadata_sensitive' };
+
+// ---- 공개 검사 영수증 ----
+// scanPublicPayload가 산출물 전체(파일 경계에 걸친 표식 포함)를 한 번 본 결과를 writer의 쓰기 바이트에 묶는다.
+// writer는 쓰기를 blob·tree·commit·ref·PR로 나누고 blob은 base64라, 쓰기마다 검사를 다시 돌리면 글을 보지 못하거나 파일 경계 검사를 잃는다.
+// 그래서 영수증에는 통과한 글·경로·파일 내용의 sha256만 두고, writer는 쓰기 바이트의 문자열마다 영수증에 있는지만 본다(publicReceiptScan).
+export interface PublicReceipt { readonly texts: ReadonlySet<string>; readonly files: ReadonlySet<string> }
+const issuedReceipts = new WeakSet<PublicReceipt>();
+const digestOf = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
+function receiptOf(payload: PublicPayload): PublicReceipt {
+  const { publication } = payload;
+  // 이메일·시각은 검사하지 않지만 스키마가 noreply·초 단위 시각으로 고정한 값이라 함께 둔다.
+  const texts = [...payload.paths, publication.title, publication.body, publication.commitMessage, publication.author.name, publication.committer.name,
+    publication.author.email, publication.committer.email, publication.author.date, publication.committer.date, payload.branch, payload.marker];
+  const receipt = Object.freeze({ texts: new Set(texts.map(digestOf)), files: new Set(payload.files.map(file => digestOf(file.content))) });
+  issuedReceipts.add(receipt);
+  return receipt;
+}
+// 쓰기 본문의 칸 이름과 구조 값(git 객체 ID·인코딩·종류·모드). 글을 실을 수 없는 꼴만 둔다.
+const WRITE_KEYS = new Set(['content', 'encoding', 'base_tree', 'tree', 'path', 'mode', 'type', 'sha', 'message', 'parents', 'author', 'committer',
+  'name', 'email', 'date', 'ref', 'title', 'body', 'head', 'base', 'draft', 'maintainer_can_modify', 'force']);
+const STRUCTURAL = /^(?:[0-9a-f]{40}|base64|blob|100644|100755)$/;
+const decodedBase64 = (text: string): Buffer | null => {
+  const bytes = Buffer.from(text, 'base64');
+  return bytes.toString('base64') === text ? bytes : null;
+};
+// 발송 한 길(checkOutbound)의 scan 고리. 영수증이 없거나, 칸 이름·구조 값·영수증의 글·refs/heads/ + 영수증의 글·
+// base64로 풀어 영수증의 파일 내용과 같은 값 어느 것도 아닌 문자열이 하나라도 있으면 막는다. extra는 검사 밖에서 정해진 값(정책의 base 브랜치)이다.
+export function publicReceiptScan(receipt: PublicReceipt | undefined, extra: readonly string[] = []): PublicScan {
+  return texts => {
+    if (!receipt || !issuedReceipts.has(receipt)) return 'unscanned';
+    const covered = (text: string) => WRITE_KEYS.has(text) || STRUCTURAL.test(text) || extra.includes(text) || receipt.texts.has(digestOf(text))
+      || (text.startsWith('refs/heads/') && receipt.texts.has(digestOf(text.slice('refs/heads/'.length))));
+    return texts.every(text => {
+      if (covered(text)) return true;
+      const bytes = decodedBase64(text);
+      return bytes !== null && receipt.files.has(digestOf(bytes));
+    }) ? null : 'unscanned';
+  };
+}
+// 게시자가 검사를 통과시킨 영수증을 change 세대마다 둔다. 게시자와 writer가 같은 책을 써야 한다(change-assembly가 하나를 만들어 둘에 준다).
+export class PublicReceipts {
+  readonly #latest = new Map<string, PublicReceipt>();
+  record(key: ChangeKey, receipt: PublicReceipt): void {
+    if (!issuedReceipts.has(receipt)) throw new Error('public_receipt_unissued');
+    this.#latest.set(`${key.changeId}:g${key.generation}`, receipt);
+  }
+  scanFor(key: ChangeKey, extra: readonly string[] = []): PublicScan { return publicReceiptScan(this.#latest.get(`${key.changeId}:g${key.generation}`), extra); }
+}
 
 // 탐지기는 완전성 증거가 아니다. 출처 label 차단이 우선이고 이 검사는 추가 방어다.
 const SECRET_PATTERNS = [/\b(?:ghp|gho|ghs|ghu|ghr|github_pat)_[A-Za-z0-9_]{20,}/, /\bsk-[A-Za-z0-9_-]{20,}/, /-----BEGIN [A-Z ]*PRIVATE KEY-----/, /\b[a-z0-9-]+\.ts\.net\b/i,
@@ -205,5 +281,5 @@ export function scanPublicPayload(payload: PublicPayload, policy: ScanPolicy): S
   if (everything.some(text => hasMarker(text, policy.internalMarkers)) || hasMarker(contents.join(''), policy.internalMarkers)) return { ok: false, reason: 'internal_marker' };
   const visible = [...payload.paths, ...metadata].map(stripInvisible);
   if (visible.some(text => METADATA_PATTERNS.some(pattern => pattern.test(text)))) return { ok: false, reason: 'metadata_sensitive' };
-  return { ok: true };
+  return { ok: true, receipt: receiptOf(payload) };
 }

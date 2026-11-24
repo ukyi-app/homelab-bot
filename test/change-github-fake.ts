@@ -5,6 +5,7 @@ import type { ArtifactFile, ArtifactManifest, ChangeBrief, ChangeKey, ChangeTarg
 import { evaluateCi } from '../src/change-ci-policy.js';
 import { ChangeRepositoryPolicySchema, gitCommitSha, gitTreeSha } from '../src/change-policy.js';
 import type { BaseLeaf, ChangeRepositoryPolicy } from '../src/change-policy.js';
+import { PublicReceipts } from '../src/change-publication.js';
 import { ChangePublisher } from '../src/change-publisher.js';
 import { ChangeStore } from '../src/change-store.js';
 import type { Database } from '../src/database.js';
@@ -318,8 +319,8 @@ export async function publishEnv(db: Database, options: { files?: Record<string,
   const source = async () => policy.current;
   const syncedNow = () => { github.clock = clock.now; return clock.now; };
   const writeGuard: PublishEnv['writeGuard'] = { check: async () => {} };
-  const writerIO = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: policyWriterRepositories(source), authorizeWrite: target => writeGuard.check(target), send: github.send, now: syncedNow });
-  const newPublisher = () => new ChangePublisher({ store, writer: writerIO.writer, preflight: writerIO.preflight, policy: source, authorize: async () => {}, now: () => clock.now, retryMs: 60_000 });
+  const writerIO = createGitHubWriter({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: policyWriterRepositories(source), authorizeWrite: target => writeGuard.check(target), receipts: new PublicReceipts(), send: github.send, now: syncedNow });
+  const newPublisher = () => new ChangePublisher({ store, receipts: writerIO.receipts, writer: writerIO.writer, preflight: writerIO.preflight, policy: source, authorize: async () => {}, now: () => clock.now, retryMs: 60_000 });
   const newRequest = async () => {
     const request = ok(await store.createRequest({ eventId: newEvent(), ownerId: OWNER, conversationId: CONVERSATION, scope: { guild: 'fixture-guild', channel: 'fixture-thread', parent: 'fixture-chat', kind: 'thread' },
       repoId: REPO.id, baseBranch: 'main', label: 'public', input: { text: '공개 요청문' } }));
