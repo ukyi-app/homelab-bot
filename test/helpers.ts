@@ -7,8 +7,9 @@ import { Store } from '../src/store.js';
 import { PolicyGate } from '../src/policy.js';
 import type { Policy } from '../src/policy.js';
 import { DiscordIngress, DiscordPublisher } from '../src/discord.js';
-import type { DiscordRest } from '../src/discord.js';
-import { DiscordRejected } from '../src/contracts.js';
+import type { DiscordEditBody, DiscordMessageBody, DiscordRest, DiscordThreadBody } from '../src/discord.js';
+import { Denied, DiscordRejected } from '../src/contracts.js';
+import { OutboundBytes } from '../src/outbound.js';
 import type { EventInput, Scope } from '../src/contracts.js';
 import { SerialWorker, WorkerSigner, WorkerVerifier } from '../src/worker.js';
 import type { WorkerRequest, WorkerResult, WorkerResultV2 } from '../src/worker.js';
@@ -54,16 +55,22 @@ export async function localDatabase(path?: string): Promise<{ db: Database; pg: 
   await pg.exec(await readFile('migrations/026_change_self_fix.sql', 'utf8'));
   await pg.exec(await readFile('migrations/027_change_amendment.sql', 'utf8'));
   await pg.exec(await readFile('migrations/028_model_accounts.sql', 'utf8'));
+  await pg.exec(await readFile('migrations/029_outbound_digest.sql', 'utf8'));
   return { db, pg };
 }
 export const thread: Scope = { guild: 'fixture-guild', channel: 'fixture-thread', parent: 'fixture-chat', kind: 'thread' };
+// 전송층 가짜가 받은 본문. 글을 만드는 쓰기는 발송 한 길의 바이트(OutboundBytes)로 오므로 풀어서 본다.
+export const wireBody = (body: unknown): unknown => body instanceof OutboundBytes ? JSON.parse(body.bytes) : body;
 export const event = (id: string, options: Partial<EventInput> = {}): EventInput => ({
   id, actor: 'fixture-owner', scope: thread, kind: 'message', text: '상태 알려줘', mention: true, ...options,
 });
 export class MockDiscord implements DiscordRest {
   acks: { event: EventInput; options: unknown }[] = [];
-  messages: { id: string; channel: string; body: Parameters<DiscordRest['sendMessage']>[1] }[] = [];
-  threads: { id: string; channel: string; body: Parameters<DiscordRest['createThread']>[1]; from?: string }[] = [];
+  messages: { id: string; channel: string; body: DiscordMessageBody }[] = [];
+  threads: { id: string; channel: string; body: DiscordThreadBody; from?: string }[] = [];
+  edits: { channel: string; message: string; body: DiscordEditBody }[] = [];
+  // 전송 자리에 닿은 그대로의 요청(발송 한 길 시험이 바이트를 본다).
+  wires: { method: string; path: string; bytes: string }[] = [];
   pages: EventInput[][] = [];
   failAck = false;
   loseResponse = false;
@@ -72,15 +79,32 @@ export class MockDiscord implements DiscordRest {
     if (this.failAck) throw new Error('ack_lost');
     this.acks.push({ event: e, options });
   }
+  // 실제 전송층(discordHttpApi)처럼 발송 한 길을 지난 바이트만 받는다. 경로를 풀어 아래 기록 함수로 보낸다.
+  // 시험은 sendMessage·createThread를 바꿔 끼워 실패를 흉내 낸다. 그래서 this의 메서드를 부른다.
+  async wire(method: 'POST' | 'PATCH', path: string, body: OutboundBytes): Promise<unknown> {
+    if (!(body instanceof OutboundBytes)) throw new Denied();
+    this.wires.push({ method, path, bytes: body.bytes });
+    const parsed = JSON.parse(body.bytes);
+    const parts = path.split('/').map(decodeURIComponent);
+    if (method === 'POST' && parts.length === 4 && parts[3] === 'messages') return this.sendMessage(parts[2]!, parsed);
+    if (method === 'POST' && parts.length === 4 && parts[3] === 'threads') return this.createThread(parts[2]!, parsed);
+    if (method === 'POST' && parts.length === 6 && parts[3] === 'messages' && parts[5] === 'threads') return this.createThread(parts[2]!, parsed, parts[4]);
+    if (method === 'PATCH' && parts.length === 5 && parts[3] === 'messages') return this.editMessage(parts[2]!, parts[4]!, parsed);
+    throw new Error(`unexpected_discord_write ${method} ${path}`);
+  }
+  async editMessage(channel: string, message: string, body: DiscordEditBody) {
+    this.edits.push({ channel, message, body });
+    return { id: message };
+  }
   // 메시지에서 연 스레드는 Discord처럼 ID가 그 메시지 ID이고, 같은 메시지로 두 번 열면 거부한다.
-  async createThread(channel: string, body: Parameters<DiscordRest['createThread']>[1], from?: string) {
+  async createThread(channel: string, body: DiscordThreadBody, from?: string) {
     if (from !== undefined && this.threads.some(t => t.from === from)) throw new DiscordRejected(400);
     const record = from === undefined ? { id: `fixture-new-thread-${this.threads.length}`, channel, body } : { id: from, channel, body, from };
     this.threads.push(record);
     if (this.loseResponse) { this.loseResponse = false; throw new Error('response_lost'); }
     return record;
   }
-  async sendMessage(channel: string, body: Parameters<DiscordRest['sendMessage']>[1]) {
+  async sendMessage(channel: string, body: DiscordMessageBody) {
     if (this.rateLimit) { const error = this.rateLimit; this.rateLimit = undefined; throw error; }
     const old = this.messages.find(m => m.body.nonce === body.nonce);
     if (old) return old;

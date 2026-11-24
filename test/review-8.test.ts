@@ -66,9 +66,9 @@ test('4316099207 HTTP callback도 절대 마감의 남은 시간만 사용하고
   t.mock.method(AbortSignal, 'timeout', (ms: number) => { timeouts.push(ms); return new AbortController().signal; });
   const api = discordHttpApi('fixture-token', async () => { calls++; return new Response(null, { status: 204 }); }, f.now);
   const expiresAt = f.now() + 300;
-  await api.request('POST', '/interactions/fixture/token/callback', {}, { expiresAt });
+  await api.request('POST', '/interactions/fixture/token/callback', undefined, { expiresAt });
   assert.deepEqual(timeouts, [300]); f.advance(300);
-  await assert.rejects(api.request('POST', '/interactions/fixture/token/callback', {}, { expiresAt }), /interaction_expired/);
+  await assert.rejects(api.request('POST', '/interactions/fixture/token/callback', undefined, { expiresAt }), /interaction_expired/);
   assert.equal(calls, 1);
 });
 

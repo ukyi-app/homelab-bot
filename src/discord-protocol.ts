@@ -3,6 +3,7 @@ import { Denied, DiscordRejected, DiscordUnauthorized, RateLimited } from './con
 import type { Clock, EventInput } from './contracts.js';
 import { gatewayMessage, hasMarker } from './discord.js';
 import type { AckOutcome, DiscordRest } from './discord.js';
+import { checkOutbound, finalPayload, OUTBOUND_RULES_REVISION, OutboundBytes, sendOutbound } from './outbound.js';
 import { PROPOSAL_BUTTONS } from './proposals.js';
 import { QUESTION_PICK_BUTTON } from './question-pick.js';
 import { PUBLISH_BUTTON } from './change-commands.js';
@@ -20,8 +21,9 @@ export const DISCORD_DISPATCH_REST_TIMEOUT_MS = 1000;
 // expiresAt: 상호작용 callback의 절대 기한. 남은 시간 전체가 제한이다(상한 없음, 기한 자체가 상한).
 // timeoutMs: 기한 없는 요청의 짧은 제한. 둘 다 없으면 DISCORD_REST_TIMEOUT_MS.
 export interface DiscordRequestOptions { expiresAt?: number; timeoutMs?: number }
+// POST·PATCH 본문은 OutboundBytes(발송 한 길 src/outbound.ts를 지난 바이트)만 받는다. 다른 본문은 discordHttpApi가 보내지 않는다.
 export interface DiscordApi {
-  request(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, options?: DiscordRequestOptions): Promise<unknown>;
+  request(method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE', path: string, body?: unknown, options?: DiscordRequestOptions): Promise<unknown>;
 }
 const ChannelSchema = z.object({ id: z.string(), type: z.number(), parent_id: z.string().nullable().optional(), guild_id: z.string().optional() });
 const MessageSchema = z.object({ id: z.string(), channel_id: z.string(), guild_id: z.string().optional(),
@@ -44,7 +46,6 @@ export function requestFrame(frame: Pick<z.infer<typeof MessageSchema>, 'type' |
   if (frame.message_reference?.type === FORWARD_REFERENCE) return false;
   return !frame.message_snapshots?.length;
 }
-const IdSchema = z.object({ id: z.string() });
 const SourceSchema = z.object({ id: z.string(), thread: z.object({ id: z.string() }).nullable().optional() });
 // 버튼 custom_id 허용 목록. custom_id는 `이름` 또는 `이름:대상`이고 parts는 ':'로 나눈 칸 수다(정확히 그 수만 받는다).
 // route는 수신(DiscordIngress.receive)의 처리 분기다: control은 '/' 제어와 같은 경로, proposal은 실행 확인(src/proposals.ts),
@@ -107,8 +108,13 @@ export class DiscordProtocol implements DiscordRest {
       // 403/404는 채널에 Add Reactions·Read Message History가 없거나 원문이 지워진 경우다. 수신 신호가 아예 없지 않게
       // 기존 텍스트 ACK로 한 번만 대체한다. 429·일시 오류는 그대로 던져 호출자가 rate limit을 기록하게 한다.
       if (!(error instanceof DiscordRejected) || error.status === 400) throw error;
-      await this.api.request('POST', `/channels/${part(event.scope.channel)}/messages`,
-        { content, nonce: event.id, enforce_nonce: true, ...options }, DISPATCH);
+      // 대체 글도 발송 한 길로 간다. 영속 행이 없는 글이라 정책 판은 호출자가 방금 본 판(options.revision, 없으면 검사 규칙의 판)이고,
+      // 같은 글 두 번은 Discord의 enforce_nonce(수신 이벤트 ID)가 막는다.
+      const { revision = OUTBOUND_RULES_REVISION, ...shown } = options;
+      const payload = finalPayload({ kind: 'discord-message', channel: event.scope.channel },
+        { content, nonce: event.id, enforce_nonce: true, ...shown });
+      await sendOutbound(payload, checkOutbound(payload, { policyRevision: revision }), { revision: () => revision,
+        ledger: { admit: async () => true }, wire: { wire: (method, path, body) => this.api.request(method, path, body, DISPATCH) } });
       return { fallback: error.status };
     }
   }
@@ -120,15 +126,10 @@ export class DiscordProtocol implements DiscordRest {
   async removeOwnReaction(channel: string, message: string, emoji: string): Promise<void> {
     await this.api.request('DELETE', ownReaction(channel, message, emoji));
   }
-  // 메시지에서 연 스레드의 ID는 그 메시지 ID와 같고, 한 메시지에는 스레드를 하나만 열 수 있다
-  // (Discord 문서 "Start Thread from Message", ARCHITECTURE §11 확인 기록). 이 경로의 본문에는 type이 없다.
-  async createThread(channel: string, body: Parameters<DiscordRest['createThread']>[1], from?: string) {
-    if (from === undefined) return IdSchema.parse(await this.api.request('POST', `/channels/${part(channel)}/threads`, body));
-    return IdSchema.parse(await this.api.request('POST', `/channels/${part(channel)}/messages/${part(from)}/threads`,
-      { name: body.name, auto_archive_duration: body.auto_archive_duration }));
-  }
-  async sendMessage(channel: string, body: Parameters<DiscordRest['sendMessage']>[1]) {
-    return IdSchema.parse(await this.api.request('POST', `/channels/${part(channel)}/messages`, body));
+  // 발송 한 길(src/outbound.ts)의 전송 자리. 경로와 바이트는 그 파일이 정하고 여기서는 그대로 넘긴다.
+  async wire(method: 'POST' | 'PATCH', path: string, body: OutboundBytes): Promise<unknown> {
+    if (!(body instanceof OutboundBytes)) throw new Denied();
+    return this.api.request(method, path, body);
   }
   async findDelivery(channel: string, marker: string, kind: 'message' | 'thread', from?: string): Promise<{ id: string } | undefined> {
     // 메시지에서 여는 스레드는 그 메시지에 이미 스레드가 달렸는지(message.thread)로 대조한다. 원문이 지워졌으면 404가 그대로 올라간다.
@@ -166,6 +167,8 @@ export function discordHttpApi(token: string, send: typeof fetch, now: Clock = D
   return { async request(method, path, body, options) {
     if (halted) throw new DiscordUnauthorized();
     if (!path.startsWith('/') || path.includes('..')) throw new Denied();
+    // 글을 만드는 쓰기(POST·PATCH 본문)는 발송 한 길을 지난 바이트만 보낸다. typing처럼 본문 없는 POST는 그대로다.
+    if ((method === 'POST' || method === 'PATCH') && body !== undefined && !(body instanceof OutboundBytes)) throw new Denied();
     let limit = options?.timeoutMs ?? DISCORD_REST_TIMEOUT_MS;
     if (options?.expiresAt !== undefined) {
       limit = Math.floor(options.expiresAt - now());
@@ -173,7 +176,7 @@ export function discordHttpApi(token: string, send: typeof fetch, now: Clock = D
     }
     const response = await send(`https://discord.com/api/v10${path}`, { method, redirect: 'error',
       headers: { authorization: `Bot ${token}`, 'content-type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(limit) });
+      body: body === undefined ? undefined : body instanceof OutboundBytes ? body.bytes : JSON.stringify(body), signal: AbortSignal.timeout(limit) });
     if (response.status === 401) { halted = true; throw new DiscordUnauthorized(); }
     if (response.status === 429) {
       const error = z.object({ retry_after: z.number().finite().nonnegative(), global: z.boolean().optional() }).parse(await response.json());

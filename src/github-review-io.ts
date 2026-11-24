@@ -3,7 +3,9 @@ import type { WriterOutcome } from './change-contracts.js';
 import { DEFAULTS, Denied, PolicyUnavailable } from './contracts.js';
 import { GitHubApi, GitHubAppAuth, GitHubTokenError, TokenResponse, appJwt, assertAllowed, grantedExactly } from './github-app.js';
 import type { BoundRepository, GitHubAppCredentials } from './github-app.js';
-import { GitHubError, pullRequest, requestedRepository, restrictGitHubWrite, ReviewQueue, ReviewRequests } from './review.js';
+import { GitHubError, outboundOf, pullRequest, requestedRepository, restrictGitHubWrite, ReviewQueue, ReviewRequests } from './review.js';
+import { checkOutbound, finalPayload, OUTBOUND_RULES_REVISION, OutboundRefused, sendOutbound } from './outbound.js';
+import type { OutboundWire } from './outbound.js';
 import type { GitHubReader, GitHubTransport, ReviewPolicySource, ReviewTarget, ReviewTargetReader } from './review.js';
 import type { Change } from './review-input.js';
 import { bindReviewRequests, REVIEW_REQUEST_ORGANIZATION } from './review-request.js';
@@ -248,6 +250,9 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
     const target = /^\/repos\/([^/]+\/[^/]+)\/pulls\/(\d+)\/reviews$/.exec(String(path));
     if (!target) throw new Denied();
     const write = restrictGitHubWrite(request, { repository: target[1]!, pr: Number(target[2]), head: request.body?.commit_id });
+    // 발송 한 길의 묶음이 없는 쓰기는 보내지 않는다. 묶음의 목적지가 이 경로와 같아야 한다.
+    const sealed = outboundOf(request);
+    if (!sealed || sealed.payload.target.kind !== 'github' || sealed.payload.target.path !== write.path) throw new Denied();
     // deliver는 transport를 부르기 직전에 dispatched로 표시하고, 그 뒤의 예외를 응답 유실(unknown)로 본다.
     // 정책 조회는 아무것도 보내기 전이라 그렇게 잃으면 안 된다. 일시 불가는 나중에 다시(429),
     // 정책에서 빠진 저장소는 보내지 않고 막는다(403, 재시도 없음).
@@ -260,7 +265,8 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
       throw error;
     }
     try {
-      return parse(ReviewCreated, await auth.withToken(repo, 'write', token => api.call('POST', write.path, token, write.body)));
+      return parse(ReviewCreated, await auth.withToken(repo, 'write', token => sendOutbound(sealed.payload, sealed.check,
+        { revision: sealed.revision, ledger: sealed.ledger, wire: githubWire(token) })));
     } catch (error) {
       // deliver는 전송 시작 뒤의 5xx를 응답 유실로 보고 다시 보내지 않는다. 토큰 단계 실패는 POST 전이라 그렇게 잃으면 안 된다.
       if (error instanceof GitHubTokenError && (error.status >= 500 || error.status === 408)) throw new GitHubError(429, Math.max(error.retryAfterMs, NOT_SENT_RETRY_MS));
@@ -326,6 +332,9 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
     },
   };
   const notSent = (code: string) => ({ kind: 'not_sent', code }) as const;
+  // 발송 한 길의 GitHub 전송 자리. 저장소 쓰기는 POST만이다.
+  const githubWire = (token: string): OutboundWire => ({
+    wire: (method, path, body) => method === 'POST' ? api.call('POST', path, token, body) : Promise.reject(new Denied()) });
   const guidance: GuidanceReviewPort = {
     async post(raw) {
       const parsed = GuidanceInput.safeParse(raw);
@@ -355,9 +364,17 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
       } catch (error) {
         return notSent(error instanceof GitHubError && error.status === 429 ? 'rate_limited' : error instanceof GitHubError ? `read_http_${error.status}` : 'read_failed');
       }
+      let sealed: { payload: ReturnType<typeof finalPayload>; check: ReturnType<typeof checkOutbound> };
+      try {
+        const payload = finalPayload({ kind: 'github', method: 'POST', path: write.path }, write.body);
+        sealed = { payload, check: checkOutbound(payload, { policyRevision: OUTBOUND_RULES_REVISION }) };
+      } catch { return notSent('input_invalid'); }
       let created: unknown;
-      try { created = await auth.withToken(repo, 'write', token => api.call('POST', write.path, token, write.body)); }
+      // 안내 글의 중복은 호출자의 효과 기록과 표식 대조(find)가 막는다. 여기 발송함 대조는 그 앞 단계를 다시 보지 않는다.
+      try { created = await auth.withToken(repo, 'write', token => sendOutbound(sealed.payload, sealed.check,
+        { revision: () => OUTBOUND_RULES_REVISION, ledger: { admit: async () => true }, wire: githubWire(token) })); }
       catch (error) {
+        if (error instanceof OutboundRefused) return notSent(`outbound_${error.reason}`);
         if (error instanceof GitHubTokenError) return notSent(error.status >= 500 || error.status === 408 || error.status === 429 ? 'token_unavailable' : error.message);
         // 연결 실패도 GitHubApi가 503으로 올려 보냈는지 알 수 없다. 그래서 unknown이다.
         if (error instanceof GitHubError && error.status === 429) return notSent('rate_limited');

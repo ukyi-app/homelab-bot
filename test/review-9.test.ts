@@ -10,7 +10,7 @@ import { ReadAdapter } from '../src/read.js';
 import type { ReadTransport } from '../src/read.js';
 import { MODEL_QUEUE_LIMIT, Store } from '../src/store.js';
 import type { Delivery } from '../src/store.js';
-import { event, fixture, localDatabase, service, template, thread } from './helpers.js';
+import { event, fixture, localDatabase, service, template, thread, wireBody } from './helpers.js';
 
 // 끝 줄 marker·검색 backoff·응답 섹션·read 시간 초과·/retry 상한과 accept 잠금 순서(ARCHITECTURE §12 변경 요청 6번)의 회귀 시험이다.
 let database: Awaited<ReturnType<typeof localDatabase>>;
@@ -53,7 +53,7 @@ test('4316750293 실제 Protocol 대조는 JSON 본문의 marker 필드로 찾�
     payload: { kind: 'message', channel: thread.channel, content: JSON.stringify([{ id: 'job-1', state: 'queued' }]), classification: 'safe_summary' } });
   let sent = ''; let sends = 0; let includeBot = false;
   const protocol = new DiscordProtocol({ request: async (method, _path, input) => {
-    if (method === 'POST') { sends++; sent = (input as { content: string }).content; throw new Error('response_lost'); }
+    if (method === 'POST') { sends++; sent = (wireBody(input) as { content: string }).content; throw new Error('response_lost'); }
     return [{ id: 'intruder-copy', channel_id: thread.channel, author: { id: 'intruder' }, content: sent },
       { id: 'other-marker', channel_id: thread.channel, author: { id: 'fixture-bot' }, content: JSON.stringify({ ref: 'other', data: [] }) },
       ...(includeBot ? [{ id: 'actual', channel_id: thread.channel, author: { id: 'fixture-bot' }, content: sent }] : [])];

@@ -12,6 +12,7 @@ import { MemoryService } from '../src/memory.js';
 import { PolicyGate, loadRuntimePolicy } from '../src/policy.js';
 import { Store } from '../src/store.js';
 import { FakeGateway } from './fake-gateway.js';
+import { wireBody } from './helpers.js';
 
 // 기동 장벽 시험 도구. 실제 Discord에는 닿지 않는다(loopback 가짜 Gateway + 메모리 REST 대역).
 export const GUILD = 'fixture-guild', CHAT = 'fixture-chat', NOTIFY = 'fixture-notifications', OWNER = 'fixture-owner';
@@ -39,7 +40,7 @@ export class Rest implements DiscordApi {
       throw new DiscordRejected(404);
     }
     if (method === 'POST' && (m = path.match(/^\/channels\/([^/]+)\/messages$/))) {
-      const content = String((body as { content?: unknown }).content ?? '');
+      const content = String((wireBody(body) as { content?: unknown }).content ?? '');
       this.sent.push({ channel: decodeURIComponent(m[1]!), content });
       this.trace.push('discord_send', { content });
       return { id: `fixture-message-${++this.next}` };

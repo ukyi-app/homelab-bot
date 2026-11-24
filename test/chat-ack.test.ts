@@ -6,7 +6,7 @@ import { DiscordIngress } from '../src/discord.js';
 import type { DiscordRest } from '../src/discord.js';
 import { DiscordProtocol, discordHttpApi } from '../src/discord-protocol.js';
 import type { DiscordApi } from '../src/discord-protocol.js';
-import { event, fixture, localDatabase, thread } from './helpers.js';
+import { event, fixture, localDatabase, thread, wireBody } from './helpers.js';
 
 // 개선안 v2 C2: 일반 메시지 수신 표시는 👀 리액션. 권한 거부면 텍스트 ACK로 한 번 대체한다.
 type Call = { method: string; path: string; body?: unknown };
@@ -15,7 +15,7 @@ function fakeApi(fail?: (call: Call) => Error | undefined) {
   const calls: Call[] = [];
   const api: DiscordApi = {
     async request(method, path, body) {
-      const call = { method, path, body };
+      const call = { method, path, body: wireBody(body) };
       calls.push(call);
       const error = fail?.(call);
       if (error) throw error;

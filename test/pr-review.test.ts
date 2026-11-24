@@ -322,9 +322,10 @@ test('REVIEW-04 제한 게시: COMMENT·검토 SHA·대상 PR만 통과하고 �
     { method: 'POST', path: `/repos/${REPO.fullName}/dispatches`, body: { event_type: 'deploy' } },
     { ...ok, body: { ...ok.body, comments: [{ path: 'src/app.ts', line: 2, side: 'LEFT', body: 'x' }] } },
   ];
-  for (const request of denied) await assert.rejects(github.createReview(request, expected), Denied);
+  const guard = { policyRevision: 'fixture-v1', revision: () => 'fixture-v1', ledger: { admit: async () => true } };
+  for (const request of denied) await assert.rejects(github.createReview(request, expected, guard), Denied);
   assert.equal(transport.length, 0);
-  await github.createReview(ok, expected);
+  await github.createReview(ok, expected, guard);
   assert.equal(transport.length, 1);
   assert.throws(() => restrictGitHubWrite({ ...ok, body: { ...ok.body, event: 'comment' } }, expected), Denied);
 });

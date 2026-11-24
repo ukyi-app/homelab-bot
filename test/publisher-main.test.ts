@@ -18,7 +18,7 @@ import type { Publisher } from '../src/main.js';
 import { loadRuntimePolicy } from '../src/policy.js';
 import { Store } from '../src/store.js';
 import { FakeGateway, until } from './fake-gateway.js';
-import { localDatabase } from './helpers.js';
+import { localDatabase, wireBody } from './helpers.js';
 
 // 게시 서버 진입점 배선 시험(local_integration). 실제 Discord·Grafana·Argo CD·클러스터에는 연결하지 않는다.
 // Gateway는 loopback 가짜 서버, Discord REST는 메모리 대역, 그 밖 HTTP(Kubernetes API·healthchecks·작업자)는 loopback 가짜 서버다.
@@ -42,7 +42,7 @@ class FakeRest implements DiscordApi {
   globalCommands: unknown[] = [{ name: 'task', type: 1, description: '이전 등록' }];
   private next = 0;
   async request(method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown): Promise<unknown> {
-    this.calls.push({ method, path, body });
+    this.calls.push({ method, path, body: wireBody(body) });
     let m: RegExpMatchArray | null;
     if (method === 'GET' && (m = path.match(/^\/channels\/([^/?]+)$/))) {
       const id = decodeURIComponent(m[1]!);

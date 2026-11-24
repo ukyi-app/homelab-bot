@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { DEFAULTS } from '../src/contracts.js';
 import { DiscordProtocol } from '../src/discord-protocol.js';
 import type { DiscordApi } from '../src/discord-protocol.js';
+import { checkOutbound, finalPayload, OutboundBytes, OutboundRefused, sendOutbound, sentId } from '../src/outbound.js';
 import { event, fixture, localDatabase, thread } from './helpers.js';
 
 // C07 (AC-12): 답장·owner 호출·멘션 스레드 제목·작은 대조 표식. 경계는 S1(게시·대조, 가짜 Discord REST)이다.
@@ -152,7 +153,12 @@ test('AC-12 protocol: 메시지에서 스레드를 열고, 대조는 그 메시�
   } };
   const protocol = new DiscordProtocol(api, 'fixture-bot');
   assert.equal(await protocol.findDelivery('fixture-chat', 'd'.repeat(24), 'thread', '7301'), undefined);
-  assert.deepEqual((await protocol.createThread('fixture-chat', { name: '제목', type: 11, auto_archive_duration: 1440 }, '7301')).id, '7301');
+  // 스레드 본문은 게시자가 만들고 발송 한 길이 보낸다. 메시지에서 여는 스레드에 type을 실으면 검사가 막는다.
+  const typed = finalPayload({ kind: 'discord-thread', channel: 'fixture-chat', from: '7301' }, { name: '제목', type: 11, auto_archive_duration: 1440 });
+  assert.throws(() => checkOutbound(typed, { policyRevision: 'fixture-v1' }), (error: unknown) => error instanceof OutboundRefused && error.reason === 'shape');
+  const payload = finalPayload({ kind: 'discord-thread', channel: 'fixture-chat', from: '7301' }, { name: '제목', auto_archive_duration: 1440 });
+  assert.deepEqual(sentId(await sendOutbound(payload, checkOutbound(payload, { policyRevision: 'fixture-v1' }),
+    { revision: () => 'fixture-v1', ledger: { admit: async () => true }, wire: protocol })).id, '7301');
   attached = '7301';
   assert.equal((await protocol.findDelivery('fixture-chat', 'd'.repeat(24), 'thread', '7301'))?.id, '7301');
   assert.deepEqual(calls.map(c => [c.method, c.path]), [
@@ -160,5 +166,6 @@ test('AC-12 protocol: 메시지에서 스레드를 열고, 대조는 그 메시�
     ['POST', '/channels/fixture-chat/messages/7301/threads'],
     ['GET', '/channels/fixture-chat/messages/7301'],
   ]);
-  assert.deepEqual(calls[1]!.body, { name: '제목', auto_archive_duration: 1440 });
+  assert.ok(calls[1]!.body instanceof OutboundBytes);
+  assert.deepEqual(JSON.parse(calls[1]!.body.bytes), { name: '제목', auto_archive_duration: 1440 });
 });
