@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { Denied, DiscordRejected, DiscordUnauthorized, RateLimited } from './contracts.js';
 import type { Clock, EventInput } from './contracts.js';
 import { gatewayMessage, hasMarker } from './discord.js';
-import type { AckOutcome, DiscordIngress, DiscordRest, GatewayFrame } from './discord.js';
+import type { AckOutcome, DiscordRest } from './discord.js';
 import { PROPOSAL_BUTTONS } from './proposals.js';
 import { QUESTION_PICK_BUTTON } from './question-pick.js';
 import { PUBLISH_BUTTON } from './change-commands.js';
@@ -28,15 +28,24 @@ const MessageSchema = z.object({ id: z.string(), channel_id: z.string(), guild_i
   author: z.object({ id: z.string(), bot: z.boolean().optional() }), webhook_id: z.string().optional(),
   content: z.string().optional(), mentions: z.array(z.object({ id: z.string() })).optional(),
   // 답장 참조는 ID와 작성자만 읽는다. 본문은 Discord가 준 사본이 아니라 outbox의 게시 확정 본문을 쓴다(ARCHITECTURE §13).
-  referenced_message: z.object({ id: z.string(), author: z.object({ id: z.string() }) }).nullable().optional() });
+  referenced_message: z.object({ id: z.string(), author: z.object({ id: z.string() }) }).nullable().optional(),
+  // 관리자 요청인지 가르는 칸(requestFrame). 값은 읽기만 하고 본문 사본(message_snapshots의 message)은 쓰지 않는다.
+  type: z.number().optional(), message_reference: z.object({ type: z.number().optional() }).nullable().optional(),
+  message_snapshots: z.array(z.unknown()).nullable().optional() });
+// Discord 메시지 종류 DEFAULT 0·REPLY 19만 사람이 쓴 글이다. 고정·스레드 생성·스레드 시작 글 같은 시스템 글은 요청이 아니다.
+const REQUEST_TYPES: ReadonlySet<number> = new Set([0, 19]);
+// 메시지 참조 종류 FORWARD(1). 전달은 다른 글을 그 시점 사본(message_snapshots)으로 싣는다. type이 없으면 DEFAULT(0, 답장)다.
+// 근거: Discord 문서 Message Resource의 Message Reference Types·Message Snapshot Object.
+const FORWARD_REFERENCE = 1;
+// 사람이 직접 쓴 글만 관리자 요청 후보다. 전달 글은 쓴 사람이 관리자여도 남의 글을 옮긴 자료라 요청으로 보지 않는다.
+// 다른 사람 글에 단 답장(참조 type 0)은 요청이다.
+export function requestFrame(frame: Pick<z.infer<typeof MessageSchema>, 'type' | 'message_reference' | 'message_snapshots'>): boolean {
+  if (frame.type !== undefined && !REQUEST_TYPES.has(frame.type)) return false;
+  if (frame.message_reference?.type === FORWARD_REFERENCE) return false;
+  return !frame.message_snapshots?.length;
+}
 const IdSchema = z.object({ id: z.string() });
 const SourceSchema = z.object({ id: z.string(), thread: z.object({ id: z.string() }).nullable().optional() });
-const InteractionSchema = z.object({ id: z.string(), token: z.string(), type: z.union([z.literal(2), z.literal(3)]),
-  channel_id: z.string(), guild_id: z.string().optional(),
-  user: z.object({ id: z.string() }).optional(), member: z.object({ user: z.object({ id: z.string() }) }).optional(),
-  data: z.object({ name: z.string().optional(), custom_id: z.string().optional(),
-    options: z.array(z.object({ name: z.string(), value: z.string() })).optional() }),
-});
 // 버튼 custom_id 허용 목록. custom_id는 `이름` 또는 `이름:대상`이고 parts는 ':'로 나눈 칸 수다(정확히 그 수만 받는다).
 // route는 수신(DiscordIngress.receive)의 처리 분기다: control은 '/' 제어와 같은 경로, proposal은 실행 확인(src/proposals.ts),
 // publish는 변경 게시 승인(src/change-commands.ts, '/change-publish'와 같은 승인 경로),
@@ -73,50 +82,23 @@ const ownReaction = (channel: string, message: string, emoji: string) =>
 const RECEIVED = '👀';
 const DISPATCH = { timeoutMs: DISCORD_DISPATCH_REST_TIMEOUT_MS };
 export class DiscordProtocol implements DiscordRest {
-  private readonly interactions = new Map<string, { token: string; expires: number }>();
   constructor(private readonly api: DiscordApi, private readonly botId: string, private readonly now: Clock = Date.now) {}
   private async channel(id: string, options?: DiscordRequestOptions) {
     const c = ChannelSchema.parse(await this.api.request('GET', `/channels/${part(id)}`, undefined, options));
     if (c.id !== id) throw new Denied();
     return { type: c.type, parent_id: c.parent_id ?? undefined, guild_id: c.guild_id };
   }
-  async gateway(type: 'MESSAGE_CREATE' | 'INTERACTION_CREATE', raw: unknown, ingress: Pick<DiscordIngress, 'receive'>): Promise<void> {
-    const receivedAt = this.now();
-    if (type === 'MESSAGE_CREATE') {
-      const frame = MessageSchema.parse(raw);
-      if (frame.author.bot || frame.webhook_id) return;
-      await ingress.receive(await gatewayMessage(frame, this.botId, id => this.channel(id, DISPATCH)));
-      return;
-    }
-    const interaction = InteractionSchema.parse(raw);
-    const actor = interaction.member?.user.id ?? interaction.user?.id;
-    if (!actor) throw new Denied();
-    const frame: GatewayFrame = { id: interaction.id, channel_id: interaction.channel_id,
-      guild_id: interaction.guild_id, author: { id: actor } };
-    const normalized = await gatewayMessage(frame, this.botId, id => this.channel(id, DISPATCH));
-    const options = new Map(interaction.data.options?.map(o => [o.name, o.value]));
-    const button = interaction.type === 3 ? parseButton(interaction.data.custom_id) : undefined;
-    if (interaction.type === 3 && !button) throw new Denied();
-    const custom = button?.parts;
-    const input: EventInput = { ...normalized, kind: interaction.type === 2 ? 'command' : 'button',
-      command: interaction.type === 2 ? interaction.data.name : custom![0],
-      urgent: interaction.type === 2 && interaction.data.name === 'urgent',
-      text: options.get('text') ?? '', target: options.get('target') ?? options.get('project') ?? options.get('question') ?? custom?.[1] };
-    this.interactions.set(input.id, { token: interaction.token, expires: receivedAt + 2500 });
-    try { await ingress.receive(input); } finally { this.interactions.delete(input.id); }
+  // 현관의 Discord 수신. 메시지만 받고 '/' 명령·버튼 상호작용(INTERACTION_CREATE)은 받지 않는다(D-02, F-7).
+  // 상호작용은 내용·토큰을 읽기 전에 닫아 어느 처리기에도 닿지 않고 응답(callback)도 나가지 않는다.
+  async gateway(type: 'MESSAGE_CREATE' | 'INTERACTION_CREATE', raw: unknown, intake: { receive(input: EventInput): Promise<unknown> }): Promise<void> {
+    if (type !== 'MESSAGE_CREATE') throw new Denied();
+    const frame = MessageSchema.parse(raw);
+    if (frame.author.bot || frame.webhook_id || !requestFrame(frame)) return;
+    await intake.receive(await gatewayMessage(frame, this.botId, id => this.channel(id, DISPATCH)));
   }
   async acknowledge(event: EventInput, content: string, options: Parameters<DiscordRest['acknowledge']>[2]): Promise<AckOutcome | void> {
-    if (event.kind !== 'message') {
-      const interaction = this.interactions.get(event.id);
-      if (!interaction || this.now() >= interaction.expires) throw new Error('interaction_expired');
-      const { update, ...rest } = options;
-      // update는 버튼이 달린 글 자체를 바꾸고 버튼을 없앤다(UPDATE_MESSAGE 7). 글은 공개 그대로라 EPHEMERAL을 붙이지 않는다.
-      const body = update && event.kind === 'button' ? { type: 7, data: { content, allowed_mentions: rest.allowed_mentions, components: [] } }
-        // 그 밖의 상호작용 응답은 늘 본인만 보는 메시지(EPHEMERAL 64)다. 호출자가 준 플래그(미리보기 끄기)는 더하기만 한다.
-        : { type: 4, data: { content, ...rest, flags: 64 | (rest.flags ?? 0) } };
-      await this.api.request('POST', `/interactions/${part(event.id)}/${part(interaction.token)}/callback`, body, { expiresAt: interaction.expires });
-      return;
-    }
+    // 상호작용 응답 경로는 없다. 상호작용을 받지 않으므로 답할 토큰도 없다.
+    if (event.kind !== 'message') throw new Denied();
     // 일반 메시지는 원문에 👀만 단다. 텍스트 ACK는 대화를 덮는다. 같은 봇·메시지·emoji의 PUT은 다시 해도 하나다.
     try {
       await this.api.request('PUT', ownReaction(event.scope.channel, event.id, RECEIVED), undefined, DISPATCH);

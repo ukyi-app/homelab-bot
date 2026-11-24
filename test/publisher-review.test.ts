@@ -11,6 +11,7 @@ import { REVIEW_INSTRUCTIONS_V2 } from '../src/review-input.js';
 import { Store } from '../src/store.js';
 import { FakeGateway } from './fake-gateway.js';
 import { localDatabase } from './helpers.js';
+import { sendToHandlers } from './legacy-interaction-protocol.js';
 import { CHAT, GUILD, NOTIFY, OWNER, Rest, Trace, waitFor } from './t20-harness.js';
 
 // 게시 서버 조립 시험. 네트워크를 쓰지 않는다. GitHub·작업자는 send 주입 가짜, Discord는 loopback 가짜 Gateway다. 값은 모두 가짜다.
@@ -140,7 +141,7 @@ async function boot(cfg: PublisherConfig, deps: Partial<PublisherDeps> = {}) {
     stopTimeoutMs: 3000, reviewWorkerProbeMs: 30, log: (event, detail) => logs.push({ event, detail }), ...deps });
   return publisher;
 }
-const registered = () => waitFor(() => rest.puts > 0);
+const registered = () => waitFor(() => logs.some(l => l.event === 'commands_registered'));
 let delivery = 0;
 async function webhook(p: Publisher, payload: unknown, event = 'pull_request') {
   const body = JSON.stringify(payload);
@@ -162,7 +163,17 @@ function command(name: string, channel: string, options: Record<string, string> 
     member: { user: { id: actor } }, data: { name, options: Object.entries(options).map(([key, value]) => ({ name: key, value })) } });
   return id;
 }
+// 운영 진입점은 '/' 명령을 받지 않는다(O08 F5). 운영 조립이 만든 처리기 묶음(리뷰 제어는 Store.control)을 운영과 같은 조립 함수로
+// 묶어 부른다. 결과 글은 조립된 게시자가, 취소는 조립된 리뷰 runtime이 처리한다.
+function handlerCommand(name: string, channel: string, options: Record<string, string> = {}, actor = OWNER) {
+  const id = String(++interactions);
+  void sendToHandlers(rest, publisher?.handlers(), { id, token: `fixture-token-${id}`, type: 2, channel_id: channel, guild_id: GUILD,
+    member: { user: { id: actor } }, data: { name, options: Object.entries(options).map(([key, value]) => ({ name: key, value })) } }).catch(() => {});
+  return id;
+}
 const gate = () => logs.filter(l => l.event === 'review_gate').map(l => l.detail);
+// 리뷰가 열렸다는 신호. '/' 명령을 등록하지 않아 명령 목록으로는 알 수 없다(O08 F5).
+const reviewOpen = () => gate().some(detail => (detail as { state?: string }).state === 'open');
 
 test('T17 열림 조건: 스위치·자격·정책 조합', () => {
   const closed = (extra: Partial<PublisherConfig>) => reviewPrecondition(config(extra));
@@ -213,7 +224,7 @@ for (const [name, make, reason] of STATIC_CLOSED) {
     await registered();
     assert.equal(await webhook(p, opened()), 202);
     assert.deepEqual(await lastDelivery(), { outcome: 'ignored', reason: 'review_disabled' });
-    assert.deepEqual(rest.names(), [...FOUNDATION_COMMANDS].sort());
+    assert.deepEqual(rest.names(), []);
     command('review-status', NOTIFY);
     await new Promise(resolve => setTimeout(resolve, 100));
     assert.equal(await count('events'), 0);
@@ -232,7 +243,7 @@ for (const [name, setup] of [['옛 이미지(404)', (w: World) => { w.routed = f
     await waitFor(() => world.probes >= 3);
     assert.equal(await webhook(p, opened()), 202);
     assert.deepEqual(await lastDelivery(), { outcome: 'ignored', reason: 'review_disabled' });
-    assert.deepEqual(rest.names(), [...FOUNDATION_COMMANDS].sort());
+    assert.deepEqual(rest.names(), []);
     assert.deepEqual([world.github, world.tasks, await count('jobs')], [[], [], 0]);
     assert.deepEqual(gate(), [{ state: 'waiting_worker', publishLimitsSet: true, reviewSinceSet: true }]);
   });
@@ -240,8 +251,8 @@ for (const [name, setup] of [['옛 이미지(404)', (w: World) => { w.routed = f
 
 test('T17 열림 조립: opened → 작업 생성 → 작업자 → COMMENT 게시 → Discord 요약, 리뷰 명령 등록', async () => {
   const p = await boot(config());
-  await waitFor(() => rest.names().includes('review-status'));
-  assert.deepEqual(rest.names(), [...FOUNDATION_COMMANDS, ...REVIEW_COMMANDS].sort());
+  await waitFor(() => reviewOpen());
+  assert.deepEqual(rest.names(), []);
   assert.equal(await webhook(p, opened()), 202);
   assert.deepEqual((await lastDelivery()).outcome, 'queued');
   await waitFor(() => world.posted.length === 1);
@@ -264,7 +275,7 @@ test('T17 열림 조립: opened → 작업 생성 → 작업자 → COMMENT 게�
 
 test('T17 열림: publish:null은 모델 호출을 끄지 않고 게시만 막음', async () => {
   const p = await boot(config({}, { ...REVIEW, publish: null }));
-  await waitFor(() => rest.names().includes('review-status'));
+  await waitFor(() => reviewOpen());
   assert.equal(gate()[0]!.publishLimitsSet, false);
   assert.equal(await webhook(p, opened()), 202);
   await waitFor(async () => (await deliveries()).length === 1);
@@ -280,9 +291,9 @@ test('T17 늦은 열림: 작업자가 나중에 준비되면 명령을 다시 �
   await registered();
   assert.equal(await webhook(p, opened()), 202);
   assert.deepEqual(await lastDelivery(), { outcome: 'ignored', reason: 'review_disabled' });
-  assert.deepEqual(rest.names(), [...FOUNDATION_COMMANDS].sort());
+  assert.deepEqual(rest.names(), []);
   world.routed = true;
-  await waitFor(() => rest.names().includes('review-status'));
+  await waitFor(() => reviewOpen());
   await waitFor(() => world.posted.length === 1);
   const jobs = await reviewJobs();
   assert.deepEqual(jobs.map(j => j.trigger), ['reconcile']);
@@ -299,7 +310,7 @@ test('B5 레인: 작업 레인을 켜면 리뷰가 대화 슬롯만 보고, 켜�
   const heartbeat = setInterval(() => { void database.db.query(`UPDATE jobs SET lease_until=$1 WHERE type='task'`, [Date.now() + 60_000]); }, 200);
   try {
     const off = await boot(config());
-    await waitFor(() => rest.names().includes('review-status'));
+    await waitFor(() => reviewOpen());
     assert.equal(await webhook(off, opened()), 202);
     await new Promise(resolve => setTimeout(resolve, 150));
     assert.deepEqual(world.tasks, [], '단일 슬롯이면 작업 job이 리뷰를 막는다');
@@ -326,7 +337,7 @@ test('T17 첫 READY 전: webhook은 대기열에 넣지만 claim은 장벽 뒤�
 
 test('T17 열린 뒤 작업자 후퇴: 새 claim만 멈추고 webhook·명령은 유지, 복구되면 이어서 실행', async () => {
   const p = await boot(config());
-  await waitFor(() => rest.names().includes('review-status'));
+  await waitFor(() => reviewOpen());
   world.routed = false;
   const seen = world.probes;
   await waitFor(() => world.probes >= seen + 2);
@@ -335,7 +346,7 @@ test('T17 열린 뒤 작업자 후퇴: 새 claim만 멈추고 webhook·명령은
   await new Promise(resolve => setTimeout(resolve, 150));
   assert.deepEqual((await reviewJobs()).map(j => j.state), ['queued']);
   assert.deepEqual(world.tasks, []);
-  assert.ok(rest.names().includes('review-status'));
+  assert.ok(reviewOpen());
   world.routed = true;
   await waitFor(() => world.posted.length === 1);
 });
@@ -345,7 +356,7 @@ test('T17 종료 drain: 드레인 안에 끝나면 결과를 저장하고 cancel
   const held = new Promise<void>(resolve => { release = resolve; });
   world.reply = async () => { await held; return SUCCEEDED; };
   const p = await boot(config(), { drainMs: 5000 });
-  await waitFor(() => rest.names().includes('review-status'));
+  await waitFor(() => reviewOpen());
   assert.equal(await webhook(p, opened()), 202);
   await waitFor(() => world.tasks.length === 1);
   const stopping = p.stop();
@@ -362,7 +373,7 @@ test('T17 종료 drain: 드레인 안에 끝나면 결과를 저장하고 cancel
 test('T17 종료 drain: 기한을 넘기면 cancel을 한 번 보내고 멈춤 확인 시 failed, 대기 작업은 claim하지 않음', async () => {
   world.reply = hang;
   const p = await boot(config(), { drainMs: 50 });
-  await waitFor(() => rest.names().includes('review-status'));
+  await waitFor(() => reviewOpen());
   assert.equal(await webhook(p, opened()), 202);
   await waitFor(() => world.tasks.length === 1);
   // 슬롯이 하나라 다음 PR은 대기한다. 앞 작업이 끝나 슬롯이 비어도 종료 중에는 집지 않는다.
@@ -380,7 +391,7 @@ test('T17 종료 drain: 멈춤을 확인하지 못하면 unknown(publisher_shutd
   world.reply = hang;
   world.cancelStopped = false;
   const p = await boot(config(), { drainMs: 50 });
-  await waitFor(() => rest.names().includes('review-status'));
+  await waitFor(() => reviewOpen());
   assert.equal(await webhook(p, opened()), 202);
   await waitFor(() => world.tasks.length === 1);
   await p.stop();
@@ -392,7 +403,7 @@ test('T17 종료 drain: 멈춤을 확인하지 못하면 unknown(publisher_shutd
 test('T17 종료: dispatch 전 GitHub 조회 중이면 기다리지 않고 대기열로 되돌림(시도 소모·모델 호출 없음)', async () => {
   world.holdPull = new Promise(() => {});
   const p = await boot(config(), { drainMs: 5000 });
-  await waitFor(() => rest.names().includes('review-status'));
+  await waitFor(() => reviewOpen());
   assert.equal(await webhook(p, opened()), 202);
   const pulls = `GET /repos/${REPO.full_name}/pulls/7`;
   await waitFor(() => world.github.includes(pulls));
@@ -420,21 +431,21 @@ test('T17 종료: 신호 뒤 runtime·publisher·reconciler는 저장소와 GitH
 test('T17 제어 명령: owner가 알림 채널에서만 동작, 다른 채널·다른 사용자는 작업을 바꾸지 못함', async () => {
   world.reply = hang;
   const p = await boot(config());
-  await waitFor(() => rest.names().includes('review-status'));
+  await waitFor(() => reviewOpen());
   assert.equal(await webhook(p, opened()), 202);
   await waitFor(() => world.tasks.length === 1);
   const job = (await reviewJobs())[0]!;
-  command('review-status', NOTIFY);
+  handlerCommand('review-status', NOTIFY);
   await waitFor(() => rest.sent.some(m => m.channel === NOTIFY && m.content.includes(job.id)));
-  command('review-cancel', CHAT, { target: job.id });
+  handlerCommand('review-cancel', CHAT, { target: job.id });
   await waitFor(() => rest.sent.some(m => m.channel === CHAT && m.content.includes('관리자가 알림 채널에서만')));
   const before = await count('events');
-  command('review-cancel', NOTIFY, { target: job.id }, 'fixture-intruder');
+  handlerCommand('review-cancel', NOTIFY, { target: job.id }, 'fixture-intruder');
   await new Promise(resolve => setTimeout(resolve, 100));
   assert.equal(await count('events'), before);
   assert.deepEqual((await reviewJobs()).map(j => j.state), ['running']);
   assert.equal(world.cancels, 0);
-  command('review-cancel', NOTIFY, { target: job.id });
+  handlerCommand('review-cancel', NOTIFY, { target: job.id });
   await waitFor(async () => (await reviewJobs())[0]!.state === 'cancelled');
   assert.equal(world.cancels, 1);
   await p.stop();

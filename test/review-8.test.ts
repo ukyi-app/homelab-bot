@@ -46,24 +46,20 @@ async function failOnce(match: (sql: string) => boolean, run: () => Promise<unkn
   try { await run(); } finally { database.db.transaction = transaction; }
   assert.equal(injected, true);
 }
-for (const type of [2, 3]) for (const elapsed of [2499, 2500, 2600]) test(`4316099207 type=${type} 수신 후 ${elapsed}ms는 metadata·저장 시간을 합산해 callback 결정`, async () => {
-  if (type === 3) await f.ingress.receive(event('seed'));
-  const received = f.now(); let callbacks = 0; let expires = 0;
-  const protocol = new DiscordProtocol({ request: async (method, path, _body, options) => {
-    if (method === 'GET') { f.advance(1200); return { id: thread.channel, type: 11, parent_id: thread.parent, guild_id: thread.guild }; }
-    if (path.endsWith('/callback')) { callbacks++; expires = options!.expiresAt!; return; }
+for (const type of [2, 3]) test(`4316099207 type=${type} 상호작용은 metadata 조회·저장·callback 없이 수신에서 닫힘(O08 F5)`, async () => {
+  let callbacks = 0; let lookups = 0;
+  const protocol = new DiscordProtocol({ request: async (method, path) => {
+    if (method === 'GET') { lookups++; return { id: thread.channel, type: 11, parent_id: thread.parent, guild_id: thread.guild }; }
+    if (path.endsWith('/callback')) { callbacks++; return; }
     throw new Error('unexpected');
   } }, 'fixture-bot', f.now);
-  const save = f.store.save.bind(f.store);
-  f.store.save = async (...args) => { const result = await save(...args); f.advance(elapsed - 1200); return result; };
-  await protocol.gateway('INTERACTION_CREATE', { id: 'fixture-interaction', token: 'fixture-ephemeral-token', type,
+  await assert.rejects(protocol.gateway('INTERACTION_CREATE', { id: 'fixture-interaction', token: 'fixture-ephemeral-token', type,
     channel_id: thread.channel, guild_id: thread.guild, member: { user: { id: f.policy.owner } }, data: type === 2 ? { name: 'chat' } : { custom_id: 'list' } },
-  new DiscordIngress(f.store, f.gate, protocol));
-  assert.equal(callbacks, elapsed < 2500 ? 1 : 0);
-  if (callbacks) assert.equal(expires, received + 2500);
-  assert.equal((await rows('events')).find(e => e.delivery_id === 'fixture-interaction')!.accepted, true); assert.equal((await rows('jobs')).length, 1);
-  assert.equal((await rows('outbox')).filter(o => o.idempotency_key.startsWith('ack-notice:')).length, callbacks ? 0 : 1);
-  assert.ok(!JSON.stringify(await rows('events')).includes('fixture-ephemeral-token'));
+  new DiscordIngress(f.store, f.gate, protocol)), Denied);
+  assert.equal(callbacks, 0);
+  assert.equal(lookups, 0);
+  assert.equal((await rows('events')).length, 0); assert.equal((await rows('jobs')).length, 0);
+  assert.equal((await rows('outbox')).length, 0);
 });
 test('4316099207 HTTP callback도 절대 마감의 남은 시간만 사용하고 만료 후 호출하지 않음', async t => {
   const timeouts: number[] = []; let calls = 0;

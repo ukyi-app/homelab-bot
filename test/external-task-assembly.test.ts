@@ -19,6 +19,7 @@ import { PORTS } from '../src/http.js';
 import { startPublisher } from '../src/main.js';
 import type { Publisher, PublisherDeps } from '../src/main.js';
 import { Store } from '../src/store.js';
+import { sendToHandlers } from './legacy-interaction-protocol.js';
 import { ENVIRONMENT, SESSION, eventBody, raw, request, seedConversation, signedHeaders } from './external-task-fixture.js';
 import type { Sender } from './external-task-fixture.js';
 import { FakeGateway } from './fake-gateway.js';
@@ -142,13 +143,21 @@ const boot = async (extra: Partial<PublisherConfig>, deps: Partial<PublisherDeps
 };
 const ON: Partial<PublisherConfig> = { externalTask: { environment: ENVIRONMENT } };
 const seedThread = async () => seedConversation(database.db, new Store(database.db), Date.now(), SCOPE);
-const registered = () => waitFor(() => rest.guild.length > 0);
+const registered = () => waitFor(() => logs.some(l => l.event === 'commands_registered'));
 const settle = (ms = 150) => new Promise(resolve => setTimeout(resolve, ms));
 let interactions = 9000;
 function command(name: string, channel: string, options: Record<string, string> = {}) {
   const id = String(++interactions);
   gw.dispatch(gw.latest, interactions, 'INTERACTION_CREATE', { id, token: `fixture-token-${id}`, type: 2, channel_id: channel, guild_id: GUILD,
     member: { user: { id: OWNER } }, data: { name, options: Object.entries(options).map(([key, value]) => ({ name: key, value })) } });
+  return id;
+}
+// 운영 진입점은 '/' 명령을 받지 않는다(O08 F5). 운영 조립이 만든 연결 명령 처리기를 운영과 같은 조립 함수로 묶어 부른다.
+// 응답(callback)은 시험용 옛 해석기가 같은 가짜 Discord로 보내 rest.callbacks에 남는다.
+function handlerCommand(name: string, channel: string, options: Record<string, string> = {}) {
+  const id = String(++interactions);
+  void sendToHandlers(rest, publisher?.handlers(), { id, token: `fixture-token-${id}`, type: 2, channel_id: channel, guild_id: GUILD,
+    member: { user: { id: OWNER } }, data: { name, options: Object.entries(options).map(([key, value]) => ({ name: key, value })) } }).catch(() => {});
   return id;
 }
 const reply = async (id: string) => {
@@ -169,7 +178,7 @@ test('R08 조립 꺼짐: 리스너·명령·지표·보관 정리가 없고 /att
   await seedThread();
   const p = await boot({}, { externalPurgeMs: 10 });
   await registered();
-  assert.deepEqual(rest.names(), [...FOUNDATION_COMMANDS].sort());
+  assert.deepEqual(rest.names(), []);
   assert.deepEqual(Object.keys(p.ports).sort(), ['alerts', 'app']);
   assert.deepEqual(logs.filter(l => l.event === 'external_task_gate').map(l => l.detail), [{ state: 'closed', reason: 'switch_off' }]);
   command('attach', THREAD, { target: SESSION, text: 'claude' });
@@ -187,11 +196,11 @@ test('R08 조립 켜짐: /attach → 8082 수신 → Discord 게시 → 해제 �
   await seedThread();
   const p = await boot(ON);
   await registered();
-  assert.deepEqual(rest.names(), [...FOUNDATION_COMMANDS, ...EXTERNAL_TASK_COMMANDS].sort(), '작업 레인이 꺼져 있어도 연결 명령은 열린다');
+  assert.deepEqual(rest.names(), []);
   const port = p.ports.externalEvents!;
   assert.ok(port > 0);
 
-  const attached = await reply(command('attach', THREAD, { target: SESSION, text: 'claude' }));
+  const attached = await reply(handlerCommand('attach', THREAD, { target: SESSION, text: 'claude' }));
   // 상호작용 응답으로만, 본인에게만, 멘션·미리보기 없이 나간다.
   assert.equal(attached.body.type, 4);
   assert.equal(attached.body.data.flags & 64, 64);
@@ -227,11 +236,11 @@ test('R08 조립 켜짐: /attach → 8082 수신 → Discord 게시 → 해제 �
   // 메시지를 보낸 뒤 게시 확정이 커밋된다.
   await waitFor(async () => /homelab_bot_external_task_unposted 0/.test(await metrics()));
 
-  const listed = (await reply(command('attach-list', THREAD))).body.data.content;
+  const listed = (await reply(handlerCommand('attach-list', THREAD))).body.data.content;
   assert.ok(listed.includes(who.connectionId));
   assert.match(listed, /활성/);
 
-  const detached = (await reply(command('detach', THREAD, { target: who.connectionId }))).body.data.content;
+  const detached = (await reply(handlerCommand('detach', THREAD, { target: who.connectionId }))).body.data.content;
   assert.ok(detached.startsWith(ATTACH_COMMAND_TEXT.detached(false, 0).split('.')[0]!));
   assert.equal((await post(port, who)).status, 401);
 
@@ -256,12 +265,12 @@ test('R08 seed 비노출(실행 경로): 응답 말고는 DB 전체·로그·채
   await seedThread();
   const p = await boot(ON);
   await registered();
-  const content = (await reply(command('attach', THREAD, { target: SESSION, text: 'claude' }))).body.data.content;
+  const content = (await reply(handlerCommand('attach', THREAD, { target: SESSION, text: 'claude' }))).body.data.content;
   const who = senderFrom(content);
   assert.match(who.seed, /^[A-Za-z0-9_-]{43}$/);
   assert.equal((await post(p.ports.externalEvents!, who)).status, 202);
   await waitFor(() => rest.sent.length === 1);
-  const list = (await reply(command('attach-list', THREAD))).body.data.content;
+  const list = (await reply(handlerCommand('attach-list', THREAD))).body.data.content;
   const dump = await dumpTables(database.db);
   // 수집기가 실제로 그 행을 보고 있다는 대조.
   assert.ok(dump.includes(who.connectionId) && dump.includes(who.keyId));
@@ -280,7 +289,7 @@ test('R08 전달 실패(실행 경로): 상호작용 응답이 실패하면 키�
   let seed = '';
   // 전송 계층 오류에 요청 본문이 실리는 최악의 경우를 만든다.
   rest.failCallback = content => { seed = field(content, 'seed') ?? seed; return new Error(`callback failed: ${content}`); };
-  command('attach', THREAD, { target: SESSION, text: 'claude' });
+  handlerCommand('attach', THREAD, { target: SESSION, text: 'claude' });
   await waitFor(async () => (await rows<{ revoked_reason: string | null }>('SELECT revoked_reason FROM external_task_connections'))[0]?.revoked_reason === 'delivery_failed');
   await waitFor(() => rest.sent.some(m => m.content.includes(COMMAND_INGRESS_TEXT.attachAckLost(false))));
   assert.match(seed, /^[A-Za-z0-9_-]{43}$/);
@@ -289,7 +298,7 @@ test('R08 전달 실패(실행 경로): 상호작용 응답이 실패하면 키�
   }
   // 닫혔으니 같은 세션을 바로 다시 연결할 수 있다.
   rest.failCallback = undefined;
-  const again = (await reply(command('attach', THREAD, { target: SESSION, text: 'claude' }))).body.data.content;
+  const again = (await reply(handlerCommand('attach', THREAD, { target: SESSION, text: 'claude' }))).body.data.content;
   assert.ok(field(again, 'seed'));
 });
 

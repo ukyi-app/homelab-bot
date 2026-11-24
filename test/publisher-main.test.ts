@@ -12,7 +12,7 @@ import { DiscordRejected } from '../src/contracts.js';
 import type { PublisherConfig } from '../src/config.js';
 import type { Database } from '../src/database.js';
 import type { DiscordApi } from '../src/discord-protocol.js';
-import { FOUNDATION_COMMANDS } from '../src/commands.js';
+import { FRONT_TEXT } from '../src/front-intake.js';
 import { startPublisher } from '../src/main.js';
 import type { Publisher } from '../src/main.js';
 import { loadRuntimePolicy } from '../src/policy.js';
@@ -186,13 +186,14 @@ test('T16b 진입점 8081: 경보 수신은 Discord 연결 전에도 저장, 그
   assert.equal(gw.connections.length, 0); assert.equal(rest.calls.length, 0);
 });
 
-test('T16b 진입점: READY 뒤 guild 명령을 FOUNDATION 12개로 맞추고 전역 명령은 비움, 같으면 다시 쓰지 않음', async () => {
+test('T16b 진입점(O08 F5): READY 뒤 guild·전역 명령을 모두 빈 목록으로 맞추고, 같으면 다시 쓰지 않음', async () => {
+  rest.guildCommands = [{ name: 'chat', type: 1, description: '이전 등록' }, { name: 'emergency-stop', type: 1, description: '이전 등록' }];
   const p = await boot();
   await ready();
   await until(() => rest.calls.some(c => c.method === 'PUT' && c.path === '/applications/fixture-app/commands'));
-  const names = (rest.guildCommands as { name: string }[]).map(c => c.name).sort();
-  assert.deepEqual(names, [...FOUNDATION_COMMANDS].sort());
-  for (const closed of ['task', 'review-status', 'review-resume', 'review-cancel']) assert.ok(!(names as string[]).includes(closed));
+  await until(() => rest.calls.some(c => c.method === 'PUT' && c.path === `/applications/fixture-app/guilds/${GUILD}/commands`));
+  assert.deepEqual(rest.calls.filter(c => c.method === 'PUT').map(c => c.body), [[], []]);
+  assert.deepEqual(rest.guildCommands, []);
   assert.deepEqual(rest.globalCommands, []);
   assert.equal(p.gateway.state.connected, true);
   assert.match(await (await app(p, '/metrics')).text(), /^homelab_bot_gateway_connected 1$/m);
@@ -203,210 +204,64 @@ test('T16b 진입점: READY 뒤 guild 명령을 FOUNDATION 12개로 맞추고 �
   assert.equal(rest.calls.filter(c => c.method === 'PUT').length, puts);
 });
 
+
 test('T16b 진입점: 명령 등록이 한 번 실패해도 다음 READY를 기다리지 않고 다시 시도', async () => {
+  rest.guildCommands = [{ name: 'chat', type: 1, description: '이전 등록' }];
   rest.failCommandReads = 1;
   await boot();
   await until(() => rest.calls.some(c => c.method === 'PUT' && c.path === `/applications/fixture-app/guilds/${GUILD}/commands`));
   assert.equal(rest.calls.filter(c => c.method === 'GET' && c.path === `/applications/fixture-app/guilds/${GUILD}/commands`).length, 2);
+  assert.deepEqual(rest.guildCommands, []);
   assert.equal(gw.connections.length, 1);
 });
 
-test('T16b 진입점: /chat은 저장 뒤 ACK, /task·/review-status는 수신에서 닫혀 저장·ACK 없음', async () => {
+
+test('O08 F5 진입점: 상호작용은 저장·ACK 없이 닫히고, 관리자 멘션은 현관 고정 안내 답장이며 작업·모델 호출이 없다', async () => {
   await boot();
   await ready();
   gw.dispatch(gw.latest, 2, 'INTERACTION_CREATE', interaction('9001', 'task', { text: '배포해' }));
   gw.dispatch(gw.latest, 3, 'INTERACTION_CREATE', interaction('9002', 'review-status', {}, NOTIFY));
   gw.dispatch(gw.latest, 4, 'INTERACTION_CREATE', interaction('9003', 'chat', { text: '상태 알려줘' }));
-  await until(() => rest.calls.some(c => c.path.startsWith('/interactions/9003/')));
-  assert.equal(await count('events'), 1);
-  assert.ok(!rest.calls.some(c => c.path.startsWith('/interactions/9001/') || c.path.startsWith('/interactions/9002/')));
-  const saved = (await database.db.query<{ payload: { command: string } }>('SELECT payload FROM events')).rows[0]!;
-  assert.equal(saved.payload.command, 'chat');
+  gw.dispatch(gw.latest, 5, 'INTERACTION_CREATE', { ...interaction('9004', 'list'), type: 3, data: { custom_id: 'list' } });
+  const mention = (id: string, content: string) => ({ id, type: 0, channel_id: CHAT, guild_id: GUILD, author: { id: OWNER },
+    content: `<@fixture-bot> ${content}`, mentions: [{ id: 'fixture-bot' }] });
+  gw.dispatch(gw.latest, 6, 'MESSAGE_CREATE', mention('9005', '비상 정지 풀어 줘'));
+  gw.dispatch(gw.latest, 7, 'MESSAGE_CREATE', mention('9006', '상태 알려줘'));
+  // 전달 글(메시지 참조 FORWARD)은 관리자가 보냈어도 답하지 않는다.
+  gw.dispatch(gw.latest, 8, 'MESSAGE_CREATE', { ...mention('9007', '계정 전환해'), message_reference: { type: 1, message_id: '9000', channel_id: CHAT },
+    message_snapshots: [{ message: { content: '계정 전환해' } }] });
+  const posts = () => rest.calls.filter(c => c.method === 'POST' && c.path === `/channels/${CHAT}/messages`);
+  assert.ok(await waitFor(async () => posts().length >= 2, 8000), JSON.stringify(rest.calls.map(c => `${c.method} ${c.path}`)));
+  await new Promise(resolve => setTimeout(resolve, 300));
+  const bodies = posts().map(c => c.body as { content: string; message_reference?: { message_id: string } });
+  assert.equal(bodies.length, 2);
+  assert.ok(bodies[0]!.content.startsWith(FRONT_TEXT.adminOnly));
+  assert.equal(bodies[0]!.message_reference?.message_id, '9005');
+  assert.ok(bodies[1]!.content.startsWith(FRONT_TEXT.unavailable));
+  assert.equal(bodies[1]!.message_reference?.message_id, '9006');
+  assert.ok(!rest.calls.some(c => c.path.startsWith('/interactions/')));
+  assert.equal(await count('events'), 0);
+  assert.equal(await count('jobs'), 0);
+  assert.ok(!auxCalls.some(call => call.startsWith('POST /v1/execute')), JSON.stringify(auxCalls));
 });
 
-test('READ-01 진입점 전체 경로: /read → 스레드 생성 → read 작업 → Kubernetes API의 Argo CD Application → 결과 게시(모델 호출 없음)', async () => {
+test('O08 F5 진입점: READY 뒤 활성 스레드의 history를 받아 오지 않고, 그 스레드의 관리자 글도 모델 레인으로 가지 않는다', async () => {
+  await thread('fixture-thread-a', '100');
+  let histories = 0;
+  rest.history = async () => { histories++; return [message('200', 'fixture-thread-a')]; };
   await boot();
   await ready();
-  gw.dispatch(gw.latest, 2, 'INTERACTION_CREATE', interaction('9101', 'read', { target: 'homelab-bot', text: 'homelab-bot-argocd' }));
-  await until(() => rest.calls.some(c => c.method === 'POST' && /^\/channels\/fixture-new-thread-\d+\/messages$/.test(c.path)), 8000);
-  const posted = rest.calls.find(c => c.method === 'POST' && /^\/channels\/fixture-new-thread-\d+\/messages$/.test(c.path))!;
-  const content = (posted.body as { content: string }).content;
-  assert.match(content, /대상: homelab-bot/); assert.match(content, /출처: homelab-bot-argocd/); assert.match(content, /사실: 상태: healthy/);
-  assert.deepEqual((posted.body as { allowed_mentions: unknown }).allowed_mentions, { parse: [] });
-  // D9: argocd-server API가 아니라 Kubernetes API 경로, Argo CD 토큰이 아니라 SA 토큰이다.
-  assert.ok(auxCalls.includes('GET /apis/argoproj.io/v1alpha1/namespaces/argocd/applications/homelab-bot Bearer fixture-sa-token'),
-    JSON.stringify(auxCalls));
-  assert.ok(!auxCalls.some(call => call.includes('/api/v1/applications')));
-  assert.ok(!auxCalls.some(call => call.startsWith('POST /v1/execute')));
-});
-
-test('EVENT-03 진입점: 새 IDENTIFY(READY) 뒤 활성 스레드를 checkpoint 다음부터 history로 대조', async () => {
-  const scope = { kind: 'thread', guild: GUILD, channel: 'fixture-thread', parent: CHAT };
-  await database.db.query(`INSERT INTO conversations(id,owner_id,scope,channel_id,created_at,active,checkpoint)
-    VALUES ($1,$2,$3,$4,$5,true,'100')`, [`thread:${GUILD}:fixture-thread`, OWNER, JSON.stringify(scope), 'fixture-thread', Date.now()]);
-  await boot();
-  await until(() => rest.calls.some(c => c.path === '/channels/fixture-thread/messages?limit=100&after=100'));
-  // 빈 페이지면 대조가 끝나 gap과 복구 토큰을 푼다.
-  const deadline = Date.now() + 4000;
-  let row: { gap: boolean; recovery_token: string | null } | undefined;
-  do {
-    row = (await database.db.query<{ gap: boolean; recovery_token: string | null }>('SELECT gap,recovery_token FROM conversations')).rows[0];
-    if (row && !row.gap && row.recovery_token === null) break;
-    await new Promise(resolve => setTimeout(resolve, 10));
-  } while (Date.now() < deadline);
-  assert.deepEqual(row, { gap: false, recovery_token: null });
-});
-
-test('P1-1 새 READY: 모든 활성 스레드를 live 입력보다 먼저 막아, 복구 차례를 기다리는 스레드의 단절 중 메시지를 잃지 않음', async () => {
-  await thread('fixture-thread-a', '100', 0);
-  await thread('fixture-thread-b', '100', 1);
-  let release!: () => void;
-  const held = new Promise<void>(resolve => { release = resolve; });
-  rest.history = async (channel, after) => {
-    if (channel === 'fixture-thread-a') { await held; return []; }
-    // 200은 단절 중 메시지, 300은 아래 live로도 들어온다.
-    return [message('200', channel), message('300', channel)].filter(m => BigInt(m.id) > BigInt(after));
-  };
-  await boot();
-  await until(() => rest.calls.some(c => c.path.startsWith('/channels/fixture-thread-a/messages?')));
-  gw.dispatch(gw.latest, 2, 'MESSAGE_CREATE', message('300', 'fixture-thread-b'));
-  assert.ok(await waitFor(async () => (await event('300')) !== undefined), 'live 메시지 저장');
-  release();
-  const recovered = await waitFor(async () => !!(await event('200'))?.accepted && !(await conversation('fixture-thread-b')).gap
-    && !(await conversation('fixture-thread-a')).gap);
-  const historyB = rest.calls.filter(c => c.path.startsWith('/channels/fixture-thread-b/messages?')).map(c => c.path);
-  assert.deepEqual(historyB, ['/channels/fixture-thread-b/messages?limit=100&after=100']);
-  assert.ok(recovered, '단절 중 메시지 200 복구');
-  assert.equal((await event('300'))!.accepted, true);
-  assert.equal((await conversation('fixture-thread-b')).checkpoint, '300');
-});
-
-test('R2-1 진입점: history 대기 중 새 READY가 오면 이전 복구가 새 장벽을 풀지 않고 새 세대가 단절 중 메시지를 다시 읽음', async () => {
-  await thread('fixture-thread-a', '100');
-  let release!: () => void;
-  const held = new Promise<void>(resolve => { release = resolve; });
-  const calls: string[] = [];
-  rest.history = async (channel, after) => {
-    calls.push(after);
-    if (calls.length === 1) { await held; return []; }
-    return [message('200', channel)].filter(m => BigInt(m.id) > BigInt(after));
-  };
-  await boot();
-  await until(() => calls.length === 1);
-  // 세션을 잃고 새 IDENTIFY → 새 READY(새 장벽). 그 뒤 이전 history 응답이 늦게 돌아온다.
-  gw.latest.send({ op: 9, d: false });
-  await until(() => gw.connections.length === 2 && gw.latest.received.some(p => p.op === 2), 8000);
-  assert.ok(await waitFor(async () => rest.calls.filter(c => c.method === 'GET' && c.path.endsWith('/commands')).length >= 2, 8000), '두 번째 READY');
-  release();
-  const recovered = await waitFor(async () => !!(await event('200'))?.accepted && !(await conversation('fixture-thread-a')).gap, 8000);
-  assert.ok(recovered, `history ${JSON.stringify(calls)}, 대화 ${JSON.stringify(await conversation('fixture-thread-a'))}`);
-  assert.equal((await conversation('fixture-thread-a')).checkpoint, '200');
-});
-
-test('P1-2 일시적인 history 조회 실패 뒤 새 READY 없이 대화별로 다시 시도해 버퍼를 처리', async () => {
-  await thread('fixture-thread-a', '100');
-  let calls = 0;
-  rest.history = async () => { calls++; if (calls === 1) throw new Error('fixture_transient_history_timeout'); return []; };
-  await boot();
-  await until(() => calls >= 1);
-  // 실패 뒤 gap이 남아 있는 동안 들어온 live 메시지는 버퍼에 들어간다.
-  assert.ok(await waitFor(async () => (await conversation('fixture-thread-a')).recovery_token === null));
-  gw.dispatch(gw.latest, 2, 'MESSAGE_CREATE', message('400', 'fixture-thread-a'));
-  const processed = await waitFor(async () => !!(await event('400'))?.accepted && !(await conversation('fixture-thread-a')).gap, 8000);
-  assert.ok(processed, `history 호출 ${calls}회, 대화 ${JSON.stringify(await conversation('fixture-thread-a'))}, 이벤트 ${JSON.stringify(await event('400'))}`);
-  assert.ok(calls >= 2); assert.equal(gw.connections.length, 1);
-});
-
-test('P1-2 영속 Discord pause 동안은 history를 부르지 않고, pause가 끝난 뒤 READY 없이 복구', async () => {
-  await thread('fixture-thread-a', '100');
-  const pauseUntil = Date.now() + 1500;
-  await database.db.query(`INSERT INTO controls VALUES ('discord_global_after',to_jsonb($1::bigint))`, [pauseUntil]);
-  let calledAt: number | undefined;
-  rest.history = async () => { calledAt ??= Date.now(); return []; };
-  await boot();
-  assert.ok(await waitFor(async () => calledAt !== undefined && !(await conversation('fixture-thread-a')).gap, 8000), 'pause 뒤 복구');
-  assert.ok(calledAt !== undefined && calledAt >= pauseUntil, `history ${calledAt} / pause ${pauseUntil}`);
-  assert.equal(gw.connections.length, 1);
-});
-
-// 활성 스레드 메시지가 일시 장애로 실패하면 그 이벤트는 RESUME으로도 다시 오지 않는다.
-// 다음 메시지가 checkpoint를 올리면 history 복구도 그 메시지를 건너뛴다.
-for (const failure of ['channel_rest', 'database'] as const) {
-  test(`PR12 활성 스레드 메시지가 일시 장애(${failure === 'channel_rest' ? '채널 REST 조회' : 'DB 쓰기'})로 실패해도 다음 메시지가 checkpoint를 넘기지 못하고, 복구가 실패한 메시지를 결국 수락`, async () => {
-    await thread('fixture-thread-a', '100');
-    const posted: ReturnType<typeof message>[] = [];
-    rest.history = async (channel, after) => posted.filter(m => m.channel_id === channel && BigInt(m.id) > BigInt(after));
-    let failInsert = false;
-    const wrap = (inner: Database): Database => ({
-      query: async <T>(sql: string, params?: unknown[]) => {
-        if (failInsert && sql.startsWith('INSERT INTO events') && params?.[1] === '201') { failInsert = false; throw new Error('fixture_connection_lost'); }
-        return inner.query<T>(sql, params);
-      },
-      transaction: (fn, deadline) => inner.transaction(tx => fn(wrap(tx)), deadline),
-    });
-    await boot({ db: wrap(database.db) });
-    // 첫 READY의 복구가 끝난 뒤(gap 해제) live 메시지를 보낸다.
-    assert.ok(await waitFor(async () => rest.calls.some(c => c.path.startsWith('/channels/fixture-thread-a/messages?'))
-      && !(await conversation('fixture-thread-a')).gap));
-    if (failure === 'channel_rest') rest.failChannelReads.set('fixture-thread-a', 1); else failInsert = true;
-    let seq = 2;
-    for (const id of ['201', '202']) {
-      posted.push(message(id, 'fixture-thread-a'));
-      gw.dispatch(gw.latest, seq++, 'MESSAGE_CREATE', message(id, 'fixture-thread-a'));
-    }
-    const recovered = await waitFor(async () => !!(await event('201'))?.accepted && !!(await event('202'))?.accepted
-      && !(await conversation('fixture-thread-a')).gap, 8000);
-    assert.ok(recovered, `201 ${JSON.stringify(await event('201'))}, 202 ${JSON.stringify(await event('202'))}, 대화 ${JSON.stringify(await conversation('fixture-thread-a'))}`);
-    assert.equal((await conversation('fixture-thread-a')).checkpoint, '202');
-  });
-}
-
-test('PR12 장벽 UPDATE도 일시 실패하면 설 때까지 다시 시도하고, 그동안 다음 메시지를 먼저 처리하지 않음', async () => {
-  await thread('fixture-thread-a', '100');
-  const posted: ReturnType<typeof message>[] = [];
-  rest.history = async (channel, after) => posted.filter(m => m.channel_id === channel && BigInt(m.id) > BigInt(after));
-  let failInsert = false, failGuard = false;
-  const wrap = (inner: Database): Database => ({
-    query: async <T>(sql: string, params?: unknown[]) => {
-      if (failInsert && sql.startsWith('INSERT INTO events') && params?.[1] === '201') { failInsert = false; throw new Error('fixture_connection_lost'); }
-      if (failGuard && sql.includes('WHERE channel_id=$1 AND active=true')) { failGuard = false; throw new Error('fixture_connection_lost'); }
-      return inner.query<T>(sql, params);
-    },
-    transaction: (fn, deadline) => inner.transaction(tx => fn(wrap(tx)), deadline),
-  });
-  await boot({ db: wrap(database.db) });
-  assert.ok(await waitFor(async () => rest.calls.some(c => c.path.startsWith('/channels/fixture-thread-a/messages?'))
-    && !(await conversation('fixture-thread-a')).gap));
-  failInsert = true; failGuard = true;
-  let seq = 2;
-  for (const id of ['201', '202']) {
-    posted.push(message(id, 'fixture-thread-a'));
-    gw.dispatch(gw.latest, seq++, 'MESSAGE_CREATE', message(id, 'fixture-thread-a'));
-  }
-  // 장벽 재시도(1초) 동안 202가 먼저 처리돼 checkpoint를 올리면 안 된다.
+  gw.dispatch(gw.latest, 2, 'MESSAGE_CREATE', message('300', 'fixture-thread-a'));
+  assert.ok(await waitFor(async () => rest.calls.some(c => c.method === 'POST' && c.path === '/channels/fixture-thread-a/messages'), 8000));
   await new Promise(resolve => setTimeout(resolve, 300));
-  assert.equal((await conversation('fixture-thread-a')).checkpoint, '100');
-  assert.equal(await event('202'), undefined);
-  const recovered = await waitFor(async () => !!(await event('201'))?.accepted && !!(await event('202'))?.accepted
-    && !(await conversation('fixture-thread-a')).gap, 8000);
-  assert.ok(recovered, `201 ${JSON.stringify(await event('201'))}, 202 ${JSON.stringify(await event('202'))}`);
-  assert.equal((await conversation('fixture-thread-a')).checkpoint, '202');
+  assert.equal(histories, 0);
+  assert.ok(!rest.calls.some(c => c.path.startsWith('/channels/fixture-thread-a/messages?')));
+  assert.equal(await count('events'), 0);
+  assert.equal(await count('jobs'), 0);
+  const posted = rest.calls.find(c => c.method === 'POST' && c.path === '/channels/fixture-thread-a/messages')!;
+  assert.ok((posted.body as { content: string }).content.startsWith(FRONT_TEXT.unavailable));
 });
 
-test('PR12 확정 거부(허용되지 않은 사용자)는 장벽을 세우지 않고 다음 메시지가 그대로 처리됨', async () => {
-  await thread('fixture-thread-a', '100');
-  await boot();
-  assert.ok(await waitFor(async () => rest.calls.some(c => c.path.startsWith('/channels/fixture-thread-a/messages?'))
-    && !(await conversation('fixture-thread-a')).gap));
-  const histories = () => rest.calls.filter(c => c.path.startsWith('/channels/fixture-thread-a/messages?')).length;
-  const before = histories();
-  gw.dispatch(gw.latest, 2, 'MESSAGE_CREATE', { ...message('301', 'fixture-thread-a'), author: { id: 'fixture-intruder' } });
-  gw.dispatch(gw.latest, 3, 'MESSAGE_CREATE', message('302', 'fixture-thread-a'));
-  assert.ok(await waitFor(async () => !!(await event('302'))?.accepted));
-  assert.equal(await event('301'), undefined);
-  assert.deepEqual([(await conversation('fixture-thread-a')).gap, (await conversation('fixture-thread-a')).checkpoint], [false, '302']);
-  assert.equal(histories(), before);
-});
 
 // 재시작 때 queued 작업이 첫 READY의 복구 장벽보다 먼저 claim되면,
 // 중단 중 메시지를 history로 복구하기 전에 이전 입력으로 모델을 부른다.
@@ -430,17 +285,6 @@ test('PR12-2 Gateway가 붙기 전(첫 READY 장벽 전)에는 남아 있던 que
   assert.ok(!auxCalls.some(call => call.startsWith('POST /v1/execute')), JSON.stringify(auxCalls));
 });
 
-test('PR12-2 재시작 뒤 첫 READY 복구가 중단 중 메시지를 먼저 읽어 이전 queued 작업을 supersede(모델 호출 없음)', async () => {
-  await thread('fixture-thread-a', '100');
-  const old = await queuedChat('fixture-thread-a', '100');
-  // 중단 중에 들어온 최신 메시지 150. 첫 READY의 history 복구가 읽는다.
-  rest.history = async (channel, after) => [message('150', channel)].filter(m => BigInt(m.id) > BigInt(after));
-  await boot();
-  assert.ok(await waitFor(async () => !!(await event('150'))?.accepted, 8000), '150 복구');
-  assert.equal(await jobState(old), 'superseded');
-  // 실행됐다면 새 작업(150) 하나뿐이다. 이전 작업은 모델에 가지 않았다.
-  assert.ok(auxCalls.filter(call => call.startsWith('POST /v1/execute')).length <= 1, JSON.stringify(auxCalls));
-});
 
 // 복구 대기 항목이 없는 RecoveryScheduler.runDue()는 DB 없이 false를 돌려준다.
 // 그 루프가 하트비트 생존을 기록하면 DB 장애 중에도 healthchecks에 정상 ping이 나간다.
