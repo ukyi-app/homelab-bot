@@ -10,7 +10,7 @@ import type { ChangeRepositoryPolicy } from './change-policy.js';
 import { Denied, PolicyUnavailable } from './contracts.js';
 import { REFRESH_MARGIN_MS, TokenResponse, appJwt, grantedExactly } from './github-app.js';
 import type { GitHubAppCredentials } from './github-app.js';
-import { checkOutbound, finalPayload, OUTBOUND_RULES_REVISION, OutboundBytes, sendOutbound } from './outbound.js';
+import { checkOutbound, finalPayload, openOutbound, OUTBOUND_RULES_REVISION, sendOutbound } from './outbound.js';
 
 // 봇이 공개 저장소에 쓰는 유일한 경로다. 네트워크 호출은 createGitHubWriter 안의 exchange 한 곳이고, 밖으로는 도메인 메서드만 나간다.
 // URL·method·token을 받는 함수가 없어서 표에 없는 API를 부를 방법이 코드에 없다. 키가 새면 이 경계는 우회되고, 남는 상한은 설치 저장소와 서버 ruleset이다.
@@ -147,15 +147,16 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
   // 이 파일에서 네트워크로 나가는 유일한 지점이다. redirect를 따라가지 않아 자격이 다른 주소로 가지 않는다.
   const exchange = async (method: 'GET' | 'POST' | 'PATCH', path: string, credential: string | null, body: unknown, limit: number): Promise<Exchange> => {
     // 저장소 쓰기는 발송 한 길(src/outbound.ts)을 지난 바이트만 보낸다. 토큰 발급(/app/...)만 일반 본문이다.
-    if (method !== 'GET' && path.startsWith('/repos/') && !(body instanceof OutboundBytes)) return { kind: 'not_sent', code: 'route_denied' };
-    const shape = body instanceof OutboundBytes ? JSON.parse(body.bytes) as unknown : body;
+    const sealed = method === 'GET' ? undefined : openOutbound(body, method, path);
+    if (method !== 'GET' && path.startsWith('/repos/') && sealed === undefined) return { kind: 'not_sent', code: 'route_denied' };
+    const shape = sealed === undefined ? body : JSON.parse(sealed) as unknown;
     if (!writerRouteAllowed(method, path) || !bodyAllowed(method, path, shape)) return { kind: 'not_sent', code: 'route_denied' };
     let response: Response;
     try {
       response = await send(`${API}${path}`, { method, redirect: 'manual', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         headers: { accept: 'application/vnd.github+json', 'user-agent': 'homelab-bot', 'x-github-api-version': API_VERSION,
           ...(credential === null ? {} : { authorization: `Bearer ${credential}` }), ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
-        ...(body === undefined ? {} : { body: body instanceof OutboundBytes ? body.bytes : JSON.stringify(body) }) });
+        ...(body === undefined ? {} : { body: sealed ?? JSON.stringify(body) }) });
     } catch (error) {
       const code = (error as { cause?: { code?: unknown } } | null)?.cause?.code;
       if (typeof code === 'string' && BEFORE_REQUEST.has(code)) return { kind: 'not_sent', code: code === 'ECONNREFUSED' ? 'connection_refused' : 'connection_failed' };

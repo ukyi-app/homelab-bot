@@ -473,6 +473,18 @@ test('GitHubTransport 금지 요청: 토큰 발급도 전송도 하기 전에 �
   const fake = new Fake(() => json({ id: 1 }));
   await assert.rejects(new RestrictedGitHub(fake.io().transport).createReview(write(), { repository: REPO.fullName, pr: 5, head: BASE }, GUARD), Denied);
   assert.deepEqual(fake.sent, []);
+  // 묶은 뒤 요청 객체를 바꿔 넘기면 transport의 자체 검사(assertAllowed·restrictGitHubWrite)가 막는다. 묶음 대조(경로)만으로는 이 경우를 가리지 못한다.
+  const tampered: [string, (request: GitHubWrite) => void][] = [
+    ['묶은 뒤 PATCH', request => { (request as { method: string }).method = 'PATCH'; }],
+    ['묶은 뒤 APPROVE', request => { (request.body as Record<string, unknown>).event = 'APPROVE'; }],
+    ['묶은 뒤 본문에 다른 필드', request => { (request.body as Record<string, unknown>).merge_method = 'squash'; }],
+  ];
+  for (const [name, change] of tampered) {
+    const changed = new Fake(() => json({ id: 1 }));
+    const transport = changed.io().transport;
+    await assert.rejects(post(async request => { change(request); return transport(request); }), Denied, name);
+    assert.deepEqual(changed.sent, [], name);
+  }
 });
 
 test('GitHubApi 허용 목록: 정해진 메서드·경로 밖은 인증 값이 있어도 보내지 않는다', async () => {

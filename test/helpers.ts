@@ -9,7 +9,7 @@ import type { Policy } from '../src/policy.js';
 import { DiscordIngress, DiscordPublisher } from '../src/discord.js';
 import type { DiscordEditBody, DiscordMessageBody, DiscordRest, DiscordThreadBody } from '../src/discord.js';
 import { Denied, DiscordRejected } from '../src/contracts.js';
-import { OutboundBytes } from '../src/outbound.js';
+import { openOutbound, OutboundBytes } from '../src/outbound.js';
 import type { EventInput, Scope } from '../src/contracts.js';
 import { SerialWorker, WorkerSigner, WorkerVerifier } from '../src/worker.js';
 import type { WorkerRequest, WorkerResult, WorkerResultV2 } from '../src/worker.js';
@@ -82,7 +82,7 @@ export class MockDiscord implements DiscordRest {
   // 실제 전송층(discordHttpApi)처럼 발송 한 길을 지난 바이트만 받는다. 경로를 풀어 아래 기록 함수로 보낸다.
   // 시험은 sendMessage·createThread를 바꿔 끼워 실패를 흉내 낸다. 그래서 this의 메서드를 부른다.
   async wire(method: 'POST' | 'PATCH', path: string, body: OutboundBytes): Promise<unknown> {
-    if (!(body instanceof OutboundBytes)) throw new Denied();
+    if (openOutbound(body, method, path) === undefined) throw new Denied();
     this.wires.push({ method, path, bytes: body.bytes });
     const parsed = JSON.parse(body.bytes);
     const parts = path.split('/').map(decodeURIComponent);

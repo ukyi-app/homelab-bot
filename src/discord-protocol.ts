@@ -3,7 +3,8 @@ import { Denied, DiscordRejected, DiscordUnauthorized, RateLimited } from './con
 import type { Clock, EventInput } from './contracts.js';
 import { gatewayMessage, hasMarker } from './discord.js';
 import type { AckOutcome, DiscordRest } from './discord.js';
-import { checkOutbound, finalPayload, OUTBOUND_RULES_REVISION, OutboundBytes, sendOutbound } from './outbound.js';
+import { checkOutbound, finalPayload, openOutbound, OUTBOUND_RULES_REVISION, sendOutbound } from './outbound.js';
+import type { OutboundBytes } from './outbound.js';
 import { PROPOSAL_BUTTONS } from './proposals.js';
 import { QUESTION_PICK_BUTTON } from './question-pick.js';
 import { PUBLISH_BUTTON } from './change-commands.js';
@@ -128,7 +129,7 @@ export class DiscordProtocol implements DiscordRest {
   }
   // 발송 한 길(src/outbound.ts)의 전송 자리. 경로와 바이트는 그 파일이 정하고 여기서는 그대로 넘긴다.
   async wire(method: 'POST' | 'PATCH', path: string, body: OutboundBytes): Promise<unknown> {
-    if (!(body instanceof OutboundBytes)) throw new Denied();
+    if (openOutbound(body, method, path) === undefined) throw new Denied();
     return this.api.request(method, path, body);
   }
   async findDelivery(channel: string, marker: string, kind: 'message' | 'thread', from?: string): Promise<{ id: string } | undefined> {
@@ -168,7 +169,8 @@ export function discordHttpApi(token: string, send: typeof fetch, now: Clock = D
     if (halted) throw new DiscordUnauthorized();
     if (!path.startsWith('/') || path.includes('..')) throw new Denied();
     // 글을 만드는 쓰기(POST·PATCH 본문)는 발송 한 길을 지난 바이트만 보낸다. typing처럼 본문 없는 POST는 그대로다.
-    if ((method === 'POST' || method === 'PATCH') && body !== undefined && !(body instanceof OutboundBytes)) throw new Denied();
+    const sealed = openOutbound(body, method, path);
+    if ((method === 'POST' || method === 'PATCH') && body !== undefined && sealed === undefined) throw new Denied();
     let limit = options?.timeoutMs ?? DISCORD_REST_TIMEOUT_MS;
     if (options?.expiresAt !== undefined) {
       limit = Math.floor(options.expiresAt - now());
@@ -176,7 +178,7 @@ export function discordHttpApi(token: string, send: typeof fetch, now: Clock = D
     }
     const response = await send(`https://discord.com/api/v10${path}`, { method, redirect: 'error',
       headers: { authorization: `Bot ${token}`, 'content-type': 'application/json' },
-      body: body === undefined ? undefined : body instanceof OutboundBytes ? body.bytes : JSON.stringify(body), signal: AbortSignal.timeout(limit) });
+      body: body === undefined ? undefined : sealed ?? JSON.stringify(body), signal: AbortSignal.timeout(limit) });
     if (response.status === 401) { halted = true; throw new DiscordUnauthorized(); }
     if (response.status === 429) {
       const error = z.object({ retry_after: z.number().finite().nonnegative(), global: z.boolean().optional() }).parse(await response.json());

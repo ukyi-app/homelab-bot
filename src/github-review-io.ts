@@ -265,8 +265,7 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
       throw error;
     }
     try {
-      return parse(ReviewCreated, await auth.withToken(repo, 'write', token => sendOutbound(sealed.payload, sealed.check,
-        { revision: sealed.revision, ledger: sealed.ledger, wire: githubWire(token) })));
+      return parse(ReviewCreated, await sendOutbound(sealed.payload, sealed.check, { revision: sealed.revision, ledger: sealed.ledger, wire: githubWire(repo) }));
     } catch (error) {
       // deliver는 전송 시작 뒤의 5xx를 응답 유실로 보고 다시 보내지 않는다. 토큰 단계 실패는 POST 전이라 그렇게 잃으면 안 된다.
       if (error instanceof GitHubTokenError && (error.status >= 500 || error.status === 408)) throw new GitHubError(429, Math.max(error.retryAfterMs, NOT_SENT_RETRY_MS));
@@ -333,8 +332,9 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
   };
   const notSent = (code: string) => ({ kind: 'not_sent', code }) as const;
   // 발송 한 길의 GitHub 전송 자리. 저장소 쓰기는 POST만이다.
-  const githubWire = (token: string): OutboundWire => ({
-    wire: (method, path, body) => method === 'POST' ? api.call('POST', path, token, body) : Promise.reject(new Denied()) });
+  // 토큰은 전송 자리 안에서 받는다. 검사 결과는 한 번만 쓰이므로 401 뒤 새 토큰으로 다시 보내는 일(withToken)도 이 호출 안에서 끝나야 한다.
+  const githubWire = (repo: BoundRepository): OutboundWire => ({
+    wire: (method, path, body) => method === 'POST' ? auth.withToken(repo, 'write', token => api.call('POST', path, token, body)) : Promise.reject(new Denied()) });
   const guidance: GuidanceReviewPort = {
     async post(raw) {
       const parsed = GuidanceInput.safeParse(raw);
@@ -371,8 +371,8 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
       } catch { return notSent('input_invalid'); }
       let created: unknown;
       // 안내 글의 중복은 호출자의 효과 기록과 표식 대조(find)가 막는다. 여기 발송함 대조는 그 앞 단계를 다시 보지 않는다.
-      try { created = await auth.withToken(repo, 'write', token => sendOutbound(sealed.payload, sealed.check,
-        { revision: () => OUTBOUND_RULES_REVISION, ledger: { admit: async () => true }, wire: githubWire(token) })); }
+      try { created = await sendOutbound(sealed.payload, sealed.check,
+        { revision: () => OUTBOUND_RULES_REVISION, ledger: { admit: async () => true }, wire: githubWire(repo) }); }
       catch (error) {
         if (error instanceof OutboundRefused) return notSent(`outbound_${error.reason}`);
         if (error instanceof GitHubTokenError) return notSent(error.status >= 500 || error.status === 408 || error.status === 429 ? 'token_unavailable' : error.message);

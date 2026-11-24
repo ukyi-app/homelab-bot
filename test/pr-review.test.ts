@@ -12,7 +12,8 @@ import type { Scope } from '../src/contracts.js';
 import { ArchiveError, MODEL_OMITTED_MAX, readArchive, REVIEW_INSTRUCTIONS, REVIEW_INSTRUCTIONS_V2, ReviewWorker, unifiedDiff } from '../src/review-input.js';
 import type { ArchiveFetcher, ReviewerInput, ReviewerModel, ReviewTask } from '../src/review-input.js';
 import { GitHubError, GitHubIngress, githubWebhook, pullRequest, RestrictedGitHub, restrictGitHubWrite, ReviewPolicySource,
-  ReviewPublisher, ReviewQueue, ReviewReconciler, ReviewRuntime, reviewMarker, reviewRevision } from '../src/review.js';
+  ReviewPublisher, ReviewQueue, ReviewReconciler, ReviewRuntime, reviewMarker, reviewRevision, outboundOf } from '../src/review.js';
+import { sendOutbound } from '../src/outbound.js';
 import type { GitHubReader, GitHubTransport, GitHubWrite, ReviewPolicy, ReviewResult } from '../src/review.js';
 import { REVIEW_NOTICE_TEXT } from '../src/review.js';
 import { archiveContract } from '../src/worker.js';
@@ -2037,4 +2038,89 @@ test('AC-16 리뷰가 한도로 멈추면 풀리는 시각 1분 뒤 리뷰를 �
   assert.deepEqual((await reviewJobs()).map(j => j.state), ['succeeded']);
   assert.equal(r.gh.writes.length, 1);
   assert.deepEqual((await rows('audit')).filter(a => a.kind === 'review_wait_resumed').map(a => a.detail.actor), ['auto_resume']);
+});
+
+// O08 F6 리뷰 게시의 보내기 직전 묶음(정책 판 재확인·발송함 대조). FakeGitHub.transport는 묶음을 돌리지 않으므로
+// 실제 전송층(github-review-io)처럼 묶음의 sendOutbound를 지나는 transport로 게시자를 따로 만든다.
+function sealedPublisher() {
+  const h = { sent: [] as string[], mode: 'normal' as 'normal' | 'bump' | 'fail', failLedger: false, onSend: async () => {} };
+  const transport: GitHubTransport = async request => {
+    const sealed = outboundOf(request);
+    if (!sealed) throw new Denied();
+    await h.onSend();
+    return await sendOutbound(sealed.payload, sealed.check, { revision: sealed.revision, ledger: sealed.ledger,
+      wire: { wire: async (method, path, body) => { h.sent.push(`${method} ${path} ${body.bytes.length}`); return { id: 3001 }; } } }) as { id: number };
+  };
+  const policy = { current: async () => {
+    if (h.mode === 'fail') throw new Error('policy_read_failed');
+    const context = await r.source.current();
+    return h.mode === 'bump' ? { ...context, revision: `${context.revision}-next` } : context;
+  } } as unknown as ReviewPolicySource;
+  const db = new Proxy(f.store.db, { get(target, key) {
+    const value = Reflect.get(target, key, target) as unknown;
+    if (key === 'query') return (sql: string, params?: unknown[]) => {
+      if (h.failLedger && sql.startsWith('SELECT 1 FROM review_deliveries')) throw new Error('connection_lost');
+      return (value as (sql: string, params?: unknown[]) => unknown).call(target, sql, params);
+    };
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  const store = new Proxy(f.store, { get(target, key) {
+    if (key === 'db') return db;
+    const value = Reflect.get(target, key, target) as unknown;
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  return { h, publisher: new ReviewPublisher(store, policy, r.gh, new RestrictedGitHub(transport), r.queue, 5) };
+}
+async function nextRound() { f.advance(60_000); f.policy.confirmedAt = f.now(); }
+
+test('F6 리뷰 게시: 검사 뒤 보내기 직전 리뷰 정책 판이 바뀌면 보내지 않고 pending(시도 수 그대로), 다음 바퀴에 한 번 게시', async () => {
+  await opened(); await r.runtime.tick();
+  const s = sealedPublisher();
+  s.h.onSend = async () => { s.h.mode = 'bump'; };
+  await s.publisher.deliver();
+  assert.deepEqual(s.h.sent, []);
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason, d.attempt]), [['pending', 'policy_changed', 0]]);
+  s.h.mode = 'normal'; s.h.onSend = async () => {};
+  await nextRound();
+  await s.publisher.deliver();
+  assert.equal(s.h.sent.length, 1);
+  assert.deepEqual((await deliveries()).map(d => d.state), ['sent']);
+});
+
+test('F6 리뷰 게시: 보내기 직전 리뷰 정책을 읽지 못하면 보내지 않고 pending(unknown 아님), 다음 바퀴에 한 번 게시', async () => {
+  await opened(); await r.runtime.tick();
+  const s = sealedPublisher();
+  s.h.onSend = async () => { s.h.mode = 'fail'; };
+  await s.publisher.deliver();
+  assert.deepEqual(s.h.sent, []);
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason, d.attempt]), [['pending', 'policy_changed', 0]]);
+  s.h.mode = 'normal'; s.h.onSend = async () => {};
+  await nextRound();
+  await s.publisher.deliver();
+  assert.equal(s.h.sent.length, 1);
+  assert.deepEqual((await deliveries()).map(d => d.state), ['sent']);
+});
+
+test('F6 리뷰 게시: 보내기 직전 발송함 대조에서 lease를 잃었으면 보내지 않는다', async () => {
+  await opened(); await r.runtime.tick();
+  const s = sealedPublisher();
+  const other = randomUUID();
+  s.h.onSend = async () => { await database.db.query('UPDATE review_deliveries SET lease_token=$1', [other]); };
+  await s.publisher.deliver();
+  assert.deepEqual(s.h.sent, []);
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.lease_token]), [['sending', other]]);
+});
+
+test('F6 리뷰 게시: 보내기 직전 발송함 대조 쿼리가 실패하면 보내지 않았으므로 unknown이 아니라 pending, 다음 바퀴에 한 번 게시', async () => {
+  await opened(); await r.runtime.tick();
+  const s = sealedPublisher();
+  s.h.onSend = async () => { s.h.failLedger = true; };
+  await s.publisher.deliver();
+  assert.deepEqual(s.h.sent, []);
+  assert.deepEqual((await deliveries()).map(d => [d.state, d.reason, d.attempt]), [['pending', 'outbox_unavailable', 0]]);
+  s.h.failLedger = false; s.h.onSend = async () => {};
+  await nextRound();
+  await s.publisher.deliver();
+  assert.equal(s.h.sent.length, 1);
+  assert.deepEqual((await deliveries()).map(d => d.state), ['sent']);
 });

@@ -1013,13 +1013,18 @@ export class ReviewPublisher {
         revision: async () => {
           try { return (await this.policy.current()).revision; } catch { throw new OutboundRefused('policy_changed'); }
         },
-        ledger: { admit: async () => (await this.store.db.query(`SELECT 1 FROM review_deliveries WHERE id=$1 AND lease_token=$2
-          AND state='sending' AND dispatch_started AND lease_until>$3`, [row.id, row.lease_token, this.store.now()])).rows.length === 1 } });
+        // 대조 쿼리의 오류도 보내기 전이다. 결과 불명(unknown)으로 두면 대조할 리뷰가 없어 기한 뒤 막히므로 다시 시도한다.
+        ledger: { admit: async () => {
+          try {
+            return (await this.store.db.query(`SELECT 1 FROM review_deliveries WHERE id=$1 AND lease_token=$2
+              AND state='sending' AND dispatch_started AND lease_until>$3`, [row.id, row.lease_token, this.store.now()])).rows.length === 1;
+          } catch { throw new OutboundRefused('outbox_unavailable'); }
+        } } });
       await this.sent(row, String(sent.id), context);
     } catch (error) {
       // 발송 한 길의 거절은 전송 전에 난다. 보낸 것이 없으니 결과 불명으로 두지 않는다. 정책 판이 바뀌었으면 다시 시도한다.
       if (error instanceof OutboundRefused) {
-        if (error.reason === 'policy_changed') await this.pause(row, 'policy_changed');
+        if (error.reason === 'policy_changed' || error.reason === 'outbox_unavailable') await this.pause(row, error.reason);
         else await this.state(row, 'blocked', `outbound_${error.reason}`);
       } else if (dispatched && !(error instanceof GitHubError && error.status < 500 && error.status !== 408)) {
         // 응답을 잃은 게시는 다시 보내지 않고 기존 리뷰를 대조한다(EVENT-02).

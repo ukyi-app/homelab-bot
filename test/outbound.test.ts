@@ -206,16 +206,79 @@ test('고치기(PATCH): 같은 채널에 봇이 보낸 글만 고치고, 모르�
   assert.equal(f.rest.edits.length, 1);
 });
 
+// P2-1·P3-1: 전송층 표지는 이 파일 밖에서 만들 수 없고, 만든 method·path와 그 전송 자리 호출 안에서만 열린다.
+const okResponse = () => new Response(JSON.stringify({ id: '9' }), { status: 200 });
+function forged(bytes: string): unknown[] {
+  const out: unknown[] = [Object.create(OutboundBytes.prototype, { bytes: { value: bytes } })];
+  try { out.push(Reflect.construct(OutboundBytes, [bytes])); } catch (error) { assert.ok(error instanceof OutboundRefused, 'Reflect.construct는 표지를 만들지 못한다'); }
+  return out;
+}
+test('전송층 표지: Object.create·Reflect.construct로 흉내 낸 본문은 Discord·GitHub 전송층이 fetch 전에 거절한다', async () => {
+  const sent: string[] = [];
+  const send = (async (url: string | URL | Request) => { sent.push(String(url)); return okResponse(); }) as typeof fetch;
+  const api = discordHttpApi('fixture-token', send);
+  const github = new GitHubApi(send);
+  const everyone = JSON.stringify({ content: '@everyone 위조', allowed_mentions: { parse: ['everyone'] } });
+  assert.throws(() => Reflect.construct(OutboundBytes, [everyone]), refused('unchecked'));
+  for (const body of forged(everyone)) {
+    await assert.rejects(api.request('POST', '/channels/fixture-chat/messages', body), Denied);
+    await assert.rejects(api.request('PATCH', '/channels/fixture-chat/messages/1', body), Denied);
+    await assert.rejects(github.call('POST', '/repos/fixture-org/fixture-repo/pulls/1/reviews', 'fixture-token', body), Denied);
+  }
+  assert.deepEqual(sent, []);
+});
+test('전송층 표지: 한 길이 준 바이트도 다른 경로로는, 전송 자리 호출이 끝난 뒤에는 보내지 못하고, 같은 검사 결과는 한 번만 쓴다', async () => {
+  const sent: string[] = [];
+  const send = (async (url: string | URL | Request) => { sent.push(String(url)); return okResponse(); }) as typeof fetch;
+  const api = discordHttpApi('fixture-token', send);
+  const payload = finalPayload(target, message());
+  let kept: OutboundBytes | undefined;
+  await assert.rejects(sendOutbound(payload, checkOutbound(payload, { policyRevision: 'fixture-v1' }), ports({
+    wire: { wire: (method, _path, body) => { kept = body; return api.request(method, '/channels/OTHER-chan/messages', body); } } })), Denied);
+  assert.ok(kept);
+  await assert.rejects(api.request('POST', '/channels/fixture-chat/messages', kept), Denied);
+  assert.deepEqual(sent, []);
+  const check = checkOutbound(payload, { policyRevision: 'fixture-v1' });
+  const twice = ports({ wire: { wire: async (method, path, body) => { kept = body; return api.request(method, path, body); } } });
+  assert.deepEqual(await sendOutbound(payload, check, twice), { id: '9' });
+  assert.deepEqual(sent, ['https://discord.com/api/v10/channels/fixture-chat/messages']);
+  await assert.rejects(api.request('POST', '/channels/fixture-chat/messages', kept), Denied);
+  await assert.rejects(sendOutbound(payload, check, twice), refused('unchecked'));
+  assert.equal(sent.length, 1);
+  const github = new GitHubApi(send);
+  const review = finalPayload({ kind: 'github', method: 'POST', path: '/repos/fixture-org/fixture-repo/pulls/1/reviews' }, { body: 'x' });
+  await sendOutbound(review, checkOutbound(review, { policyRevision: 'fixture-v1' }), ports({
+    wire: { wire: async (_method, path, body) => { kept = body; return github.call('POST', path, 'fixture-token', body); } } }));
+  await assert.rejects(github.call('POST', '/repos/fixture-org/fixture-repo/pulls/1/reviews', 'fixture-token', kept), Denied);
+  assert.equal(sent.length, 2);
+});
+test('모양: allowed_mentions는 parse(빈 배열)·users(한 명)·replied_user(false)만 받는다', () => {
+  for (const mentions of [{ parse: [], roles: ['111'] }, { parse: [], replied_user: true }, { parse: [], users: ['1', '2'] },
+    { parse: [], users: [7] }, { parse: [], everyone: true }]) {
+    assert.throws(() => checkOutbound(finalPayload(target, { content: '<@&111>', allowed_mentions: mentions }), { policyRevision: 'fixture-v1' }),
+      refused('shape'), JSON.stringify(mentions));
+  }
+  checkOutbound(finalPayload(target, { content: 'x', allowed_mentions: { parse: [], users: ['1'], replied_user: false } }), { policyRevision: 'fixture-v1' });
+});
+
 // 정적 시험: src/에서 바깥 쓰기를 부르는 자리를 정확한 문자열로 세어 허용 목록과 정확히 맞춘다.
 // 글을 만드는 쓰기(Discord 글·스레드·고치기, GitHub 저장소 쓰기)의 경로·바이트는 outbound.ts만 만들고,
 // 나머지 자리는 그 바이트를 넘기기만 하는 전송 자리이거나 글이 없는 쓰기(리액션·typing·명령 동기화·토큰 발급)다.
 const NEEDLES = ["request('POST'", "request('PUT'", "request('PATCH'", "request('DELETE'", 'request(method', '.wire(',
   ".call('POST'", 'api.call(', "exchange('POST'", "exchange('PATCH'", 'exchange(method', 'exchange(wireMethod',
-  'new OutboundBytes(', 'sendOutbound(', "method: 'POST'", "method: 'PATCH'", 'discord.com/api', 'api.github.com'] as const;
+  'new OutboundBytes(', 'sendOutbound(', "method: 'POST'", "method: 'PATCH'", 'discord.com/api', 'api.github.com',
+  // 표지를 우회하는 꼴과 전송층의 판정 자리.
+  'Reflect.construct(', 'OutboundBytes.prototype', 'Object.create(', 'openOutbound(', 'instanceof OutboundBytes'] as const;
 const ALLOWED: Record<string, number> = {
   // 발송 한 길 본체: 경로를 만드는 route(POST 넷·PATCH 하나, 꼴 선언 둘), 바이트를 만드는 자리, 전송 자리 호출, 정의와 머리 주석.
   'outbound.ts: .wire(': 1,
   'outbound.ts: new OutboundBytes(': 1,
+  // 표지 판정: 정의 하나, 전송층 셋(discordHttpApi·DiscordProtocol.wire, GitHubApi.call, writer exchange). 원형은 얼린다.
+  'outbound.ts: openOutbound(': 1,
+  'outbound.ts: OutboundBytes.prototype': 1,
+  'discord-protocol.ts: openOutbound(': 2,
+  'github-app.ts: openOutbound(': 1,
+  'github-writer.ts: openOutbound(': 1,
   'outbound.ts: sendOutbound(': 2,
   "outbound.ts: method: 'POST'": 5,
   "outbound.ts: method: 'PATCH'": 1,
@@ -260,6 +323,11 @@ const ALLOWED: Record<string, number> = {
   "main.ts: method: 'POST'": 1,
   "read-transports.ts: method: 'POST'": 1,
   "external-task-receiver.ts: method: 'POST'": 1,
+  // 원형 없는 사전(Object.create(null)). 바깥 쓰기와 무관하다.
+  'change-ci-policy.ts: Object.create(': 1,
+  'change-artifact.ts: Object.create(': 2,
+  'codex-workspace.ts: Object.create(': 1,
+  'task-workspace.ts: Object.create(': 1,
 };
 test('정적: Discord·GitHub 쓰기 자리는 허용 목록과 정확히 같고, 전송층의 막음이 그대로다', async () => {
   const found: Record<string, number> = {};
@@ -272,9 +340,10 @@ test('정적: Discord·GitHub 쓰기 자리는 허용 목록과 정확히 같고
   }
   assert.deepEqual(found, ALLOWED);
   const guards: [string, string][] = [
-    ['discord-protocol.ts', "if ((method === 'POST' || method === 'PATCH') && body !== undefined && !(body instanceof OutboundBytes)) throw new Denied();"],
-    ['github-app.ts', "if (method === 'POST' && path.startsWith('/repos/') && !(body instanceof OutboundBytes)) throw new Denied();"],
-    ['github-writer.ts', "if (method !== 'GET' && path.startsWith('/repos/') && !(body instanceof OutboundBytes)) return { kind: 'not_sent', code: 'route_denied' };"],
+    ['discord-protocol.ts', "if ((method === 'POST' || method === 'PATCH') && body !== undefined && sealed === undefined) throw new Denied();"],
+    ['discord-protocol.ts', 'if (openOutbound(body, method, path) === undefined) throw new Denied();'],
+    ['github-app.ts', "if (method === 'POST' && path.startsWith('/repos/') && sealed === undefined) throw new Denied();"],
+    ['github-writer.ts', "if (method !== 'GET' && path.startsWith('/repos/') && sealed === undefined) return { kind: 'not_sent', code: 'route_denied' };"],
   ];
   for (const [name, guard] of guards) assert.equal((await readFile(`src/${name}`, 'utf8')).split(guard).length - 1, 1, name);
 });
