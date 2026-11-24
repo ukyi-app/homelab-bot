@@ -8,11 +8,14 @@ export interface Service {
   id: string; repository: string; namespace: string; deployment: string;
   internalDomain: string | null; externalDomain: string | null; documentation: string[];
 }
+// label은 글에 싣는 공개 표시명이다(F-6). 템플릿 ID는 내부 이름이라 글에 싣지 않는다. 없으면 종류의 이름을 쓴다.
 export interface QueryTemplate {
   id: string; service: string; datasource: string; namespace: string;
   kind: 'status' | 'metrics' | 'logs'; query: string;
-  maxWindowSeconds: number; maxBytes: number; maxRows: number;
+  maxWindowSeconds: number; maxBytes: number; maxRows: number; label?: string;
 }
+const KIND_LABEL: Record<QueryTemplate['kind'], string> = { status: '상태 조회', metrics: '지표 조회', logs: '로그 조회' };
+export const templateLabel = (template: QueryTemplate): string => template.label ?? KIND_LABEL[template.kind];
 // timeoutMs가 지나면 ReadAdapter가 signal을 abort한다. 구현은 signal로 실제 요청·연결을 끊어야 한다.
 // 끊지 않으면 Runtime은 다음 작업으로 넘어가도 조회가 직렬성 밖에 남는다.
 export interface ReadTransport {
@@ -24,8 +27,9 @@ const RequestSchema = z.strictObject({ service: z.string(), template: z.string()
 const ObservationSchema = z.strictObject({ observedAt: z.number().finite(),
   rows: z.array(z.strictObject({ status: z.enum(['healthy', 'degraded', 'unknown']).optional(),
     value: z.number().finite().optional(), text: z.string().max(1000).optional() })) });
+// source는 기록용 템플릿 ID, sourceLabel은 글에 싣는 공개 표시명이다.
 export interface ReadResult {
-  service: string; source: string | null; window: { from: number; to: number };
+  service: string; source: string | null; sourceLabel?: string | null; window: { from: number; to: number };
   observedAt: number | null; status: 'unregistered' | 'unobservable' | 'observed';
   facts: string[]; hypotheses: string[]; unknowns: string[]; checks: string[];
   untrusted: string[];
@@ -42,7 +46,8 @@ export class ReadAdapter {
       if (!service || service.namespace !== t.namespace || !Number.isFinite(t.maxWindowSeconds)
         || t.maxWindowSeconds < 1 || t.maxWindowSeconds > maxWindow
         || t.maxRows < 1 || t.maxRows > 200 || t.maxBytes < 1 || t.maxBytes > 65536
-        || t.query.length > 2000 || !t.query || !t.datasource) throw new Denied();
+        || t.query.length > 2000 || !t.query || !t.datasource
+        || (t.label !== undefined && (!t.label.trim() || Array.from(t.label).length > 40 || /[\p{Cc}`]/u.test(t.label)))) throw new Denied();
       return [t.id, structuredClone(t)];
     }));
   }
@@ -70,6 +75,7 @@ export class ReadAdapter {
     }
     if (r.from >= r.to || r.to > this.now() || r.to - r.from > t.maxWindowSeconds * 1000) throw new Denied();
     base.source = t.id;
+    base.sourceLabel = templateLabel(t);
     try {
       let timeout: ReturnType<typeof setTimeout> | undefined;
       let bytes: Uint8Array;
@@ -108,7 +114,7 @@ export function isoSeconds(ms: number): string {
   return Number.isNaN(date.getTime()) ? String(ms) : date.toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
 export function readSummary(result: ReadResult): string {
-  return [`대상: ${bounded(result.service, 120)}`, `출처: ${bounded(result.source ?? '없음', 120)}`,
+  return [`대상: ${bounded(result.service, 120)}`, `출처: ${bounded(result.sourceLabel ?? '없음', 120)}`,
     `시간창: ${isoSeconds(result.window.from)}~${isoSeconds(result.window.to)}`,
     `관측 시각: ${result.observedAt === null ? '미확인' : isoSeconds(result.observedAt)}`, `사실: ${summaryItems(result.facts, 600)}`,
     '가설: 없음', `미확인: ${summaryItems(result.unknowns, 350)}`, `권장 확인: ${summaryItems(result.checks, 350)}`].join('\n');

@@ -16,6 +16,7 @@ import { Postgres } from '../src/database.js';
 import { ReadAdapter, readSummary } from '../src/read.js';
 import { Runtime } from '../src/runtime.js';
 import { messagePages } from '../src/format.js';
+import { publicAlias } from '../src/public-alias.js';
 import { event, fixture, localDatabase, service, template, thread } from './helpers.js';
 
 let database: Awaited<ReturnType<typeof localDatabase>>;
@@ -209,12 +210,15 @@ test('4313740796 큰 read도 미확인·권장 확인을 보존한 완결 요약
 test('4313740796 큰 list는 한 메시지에 전체 건수와 최근 20건(S16 사람 읽는 형식)', async () => {
   for (let i = 0; i < 45; i++) await f.ingress.receive(event(`history-${i}`));
   const ids = new Set((await rows('jobs')).map(job => job.id));
+  // 작업은 UUID 대신 공개 별칭으로 보인다(O08 F7b, F-4).
+  const aliases = new Set([...ids].map(id => publicAlias(id)));
   await f.ingress.receive(event('list', { kind: 'command', command: 'list', text: '' }));
   while (await f.publisher.deliver()) { /* Drain every independently idempotent page. */ }
   assert.equal(f.rest.messages.length, 1);
   const [head, ...lines] = f.rest.messages[0]!.body.content.split('\n').slice(0, -1);
   assert.ok(f.rest.messages[0]!.body.content.length <= 2000);
   assert.equal(head, `작업 ${ids.size}건(최근 20건만 표시)`); assert.equal(lines.length, 20);
-  for (const line of lines) assert.ok(ids.has(/^- `([^`]+)` /.exec(line)![1]!), line);
+  for (const line of lines) assert.ok(aliases.has(/^- `([^`]+)` /.exec(line)![1]!), line);
+  for (const id of ids) assert.ok(!f.rest.messages[0]!.body.content.includes(id), id);
   const text = '안내😀'.repeat(1000); assert.equal(messagePages(text).join(''), text);
 });

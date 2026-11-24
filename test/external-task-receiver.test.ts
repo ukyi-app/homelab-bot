@@ -4,6 +4,7 @@ import { generateKeyPairSync } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { connect } from 'node:net';
 import type { AddressInfo } from 'node:net';
+import { publicAlias } from '../src/public-alias.js';
 import { EXTERNAL_NOTICE_TEXT, externalTaskServer, EXTERNAL_TASK_PATH, FIXED_SUMMARY, ProcessingExpired, RECEIVER_LIMITS, Slots, SlotsFull, formatNotice, kstTime, signatureInput, suspectSummary } from '../src/external-task-receiver.js';
 import { thread } from './helpers.js';
 import { SESSION, atomicityScenario, eventBody, listen, raw, rawClient, receiverFixture, request, sender, shut, signedHeaders } from './external-task-fixture.js';
@@ -222,7 +223,9 @@ test('R08 게시: 고정 문구·시각·지연을 쓰고, 멘션과 링크 미�
     assert.equal(message.channel, thread.channel);
     assert.deepEqual(message.body.allowed_mentions, { parse: [] });
     const { content } = message.body;
-    assert.ok(content.startsWith(EXTERNAL_NOTICE_TEXT.head('claude', `\`${SESSION}\``)));
+    // 원시 세션 ID·연결 ID 대신 연결의 공개 별칭이 보인다(F-3).
+    assert.ok(content.startsWith(EXTERNAL_NOTICE_TEXT.head('claude', `\`${publicAlias(who.connectionId)}\``)));
+    assert.ok(!content.includes(SESSION) && !content.includes(who.connectionId));
     assert.ok(content.includes(`발생 ${kstTime(occurred)}`));
     assert.ok(content.includes(`수신 ${kstTime(ctx.f.now())}`));
     assert.ok(content.includes('지연 1분 30초'));
@@ -234,7 +237,7 @@ test('R08 게시: 고정 문구·시각·지연을 쓰고, 멘션과 링크 미�
     assert.equal((content.match(/`/g) ?? []).length % 2, 0);
     assert.equal((await ctx.db.query<{ post_state: string }>('SELECT post_state FROM external_task_events')).rows[0]!.post_state, 'posted');
     assert.equal(kstTime(Date.UTC(2026, 10, 4, 15, 0, 1)), '2026-11-05 00:00:01 KST');
-    assert.equal(formatNotice({ executor: 'codex', externalTaskId: 'x', summary: FIXED_SUMMARY, occurredAt: 1000, receivedAt: 500 }).includes('지연 0초'), true);
+    assert.equal(formatNotice({ executor: 'codex', connectionId: 'x', summary: FIXED_SUMMARY, occurredAt: 1000, receivedAt: 500 }).includes('지연 0초'), true);
   } finally { await ctx.close(); }
 });
 
@@ -601,6 +604,7 @@ test('R08 경계: 수신·연결·명령 모듈은 모델·작업·제어 코드
   const files = ['src/external-task-receiver.ts', 'src/external-task-links.ts', 'src/external-task-commands.ts'];
   const source = (await Promise.all(files.map(file => readFile(file, 'utf8')))).join('\n');
   for (const match of source.matchAll(/from '\.\/([a-z-]+)\.js'/g)) {
-    assert.ok(['contracts', 'database', 'external-task-links', 'external-task-receiver', 'log', 'store'].includes(match[1]!), match[1]);
+    // public-alias·public-check는 완료 알림의 별칭과 공통 공개 검사(F-3)다. 둘 다 모델·작업·제어 코드를 import하지 않는다.
+    assert.ok(['contracts', 'database', 'external-task-links', 'external-task-receiver', 'log', 'public-alias', 'public-check', 'store'].includes(match[1]!), match[1]);
   }
 });
