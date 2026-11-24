@@ -5,6 +5,8 @@ import type { KeyObject } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { SyntaxKind } from 'typescript/unstable/ast';
+import { createScanner } from 'typescript/unstable/ast/scanner';
 import {
   ACTIONS, afterHandshake, CanonicalError, canonicalJson, CLOCK_SKEW_MS, COMMON_FORBIDDEN_FIELD_NAMES, CONTRACT, digestOf,
   EFFECTS_DURING_POLICY_MISMATCH, EFFECTS_WITHOUT_GENERATIONS, freshIds, generationValueFault, MAX_DEPTH, MESSAGE_TTL_MAX_MS,
@@ -432,6 +434,26 @@ test('정지 기록 답: 읽기 실패에서는 답을 만들지 않는다(absen
   assert.equal(stopRecordReply('not-a-uuid', { state: 'absent' }), null);
 });
 
+test('정지 기록 답: 칸 집합이 갈래와 다른 모순된 행은 읽기 실패와 같이 답하지 않는다', () => {
+  const request = uuidOf(41);
+  const rows: unknown[] = [
+    { state: 'absent', generation: 7, stopped: true },
+    { state: 'absent', stopped: false },
+    { state: 'recorded', generation: 7, stopped: true, extra: 1 },
+    { state: 'recorded', generation: 7 },
+    { state: 'unreadable', generation: 7, stopped: true },
+    null,
+    [],
+    'absent',
+  ];
+  for (const row of rows) {
+    assert.equal(stopRecordReply(request, row as StopLedgerRead), null, JSON.stringify(row));
+  }
+  // 프로토타입이 없는 객체도 평범한 객체로 읽는다(칸 집합만 본다).
+  const bare = Object.assign(Object.create(null) as Record<string, unknown>, { state: 'absent' });
+  assert.deepEqual(stopRecordReply(request, bare as StopLedgerRead), { in_reply_to: request, record: { state: 'absent' } });
+});
+
 test('정지 기록 답: 만든 본문은 감독의 검증을 그대로 지나고, 꼴이 틀린 기록은 거절된다', () => {
   const lookup = sealed('supervisor', 'stop_record_lookup', {});
   const awaiting = (id: string): AwaitedRequest | undefined =>
@@ -598,6 +620,30 @@ test('확정 결과의 꼴: 정지 확정에는 거절이 없고, 풀기 준비�
   assert.equal(result('release_commit', { outcome: 'not_posted' }), 'body_malformed');
 });
 
+test('확정 결과의 꼴: 갈래가 하나인 정지 결과도 모르는 칸이 outcome 값보다 먼저다(verify·seal 같은 사유)', () => {
+  const job = (action: string) => ({ job_id: uuidOf(72), action, request_digest: SHA });
+  const body = (action: string, value: unknown) => ({ in_reply_to: uuidOf(73), ...job(action), status: { state: 'confirmed', result: value } });
+  const viaVerify = (action: string, value: unknown) => reasonOf(verify(signedRaw('supervisor', { action: 'job_status' }, body(action, value)),
+    context('front-door', { awaiting: () => ({ action, job: job(action) }) })));
+  const viaSeal = (action: string, value: unknown) => sealFault(() => sealed('supervisor', 'job_status', body(action, value)));
+  const cases: [string, unknown, string][] = [
+    ['stop_commit', { outcome: 'other', note: 1 }, 'unknown_field'],
+    ['stop_commit', { note: 1 }, 'unknown_field'],
+    ['stop_commit', { outcome: 'stopped', note: 1 }, 'unknown_field'],
+    ['stop_commit', { outcome: 'other' }, 'body_malformed'],
+    ['stop_commit', {}, 'body_malformed'],
+    ['stop_commit', null, 'body_malformed'],
+    ['stop_prepare', { outcome: 'other', note: 1 }, 'unknown_field'],
+    ['stop_prepare', { note: 1 }, 'unknown_field'],
+    ['stop_prepare', { outcome: 'prepared', note: 1 }, 'unknown_field'],
+    ['stop_prepare', { outcome: 'stopped' }, 'body_malformed'],
+  ];
+  for (const [action, value, reason] of cases) {
+    assert.equal(viaVerify(action, value), reason, action + ' verify ' + JSON.stringify(value));
+    assert.equal(viaSeal(action, value), reason, action + ' seal ' + JSON.stringify(value));
+  }
+});
+
 // ---- 이 조각 밖의 묶음 ----
 
 test('F1b 묶음의 동작은 공통 검사를 모두 거친 뒤 Unsupported로 받지 않고 nonce를 쓰지 않는다', () => {
@@ -675,6 +721,26 @@ test('동작 표: 스물넷의 분류·방향·접수·정책·세대가 v2 문�
   assert.equal(ACTIONS.get('job_status')!.answers!.length, 15);
 });
 
+test('동작 표: 공개한 표와 그 행·배열·세대 객체는 동결되어 검증이 보는 표를 바꿀 수 없다', () => {
+  assert.ok(Object.isFrozen(ACTIONS));
+  for (const [name, spec] of ACTIONS) {
+    assert.ok(Object.isFrozen(spec), name);
+    assert.ok(Object.isFrozen(spec.from), name);
+    if (spec.generations !== null) assert.ok(Object.isFrozen(spec.generations), name);
+    if (spec.answers !== null) assert.ok(Object.isFrozen(spec.answers), name);
+  }
+  const table = ACTIONS as unknown as Record<string, unknown>;
+  assert.throws(() => Map.prototype.set.call(ACTIONS, 'stop_commit', ACTIONS.get('handshake')), TypeError);
+  assert.throws(() => Map.prototype.delete.call(ACTIONS, 'stop_commit'), TypeError);
+  assert.throws(() => { table.get = () => undefined; }, TypeError);
+  const commit = ACTIONS.get('stop_commit') as unknown as { from: string[]; generations: Record<string, string> };
+  assert.throws(() => { commit.from.push('supervisor'); }, TypeError);
+  assert.throws(() => { commit.generations.stop = 'not_applicable'; }, TypeError);
+  // 시도 뒤에도 검증은 같은 표를 본다: 감독은 여전히 stop_commit을 낼 수 없다.
+  assert.deepEqual([...ACTIONS.get('stop_commit')!.from], ['front-door']);
+  assert.equal(sealFault(() => sealed('supervisor', 'stop_commit', { job_id: uuidOf(74), stop_generation: 8 })), 'wrong_direction');
+});
+
 test('인사 뒤 상태: 정책 revision이 글자 그대로 같을 때만 agreed', () => {
   const at = atNone();
   const handshake = verify(sealed('front-door', 'handshake', { policy_revision: 'policy-7' }), at);
@@ -694,15 +760,66 @@ test('인사 뒤 상태: 정책 revision이 글자 그대로 같을 때만 agree
 
 // ---- 정적 ----
 
+// import·export의 from 뒤 문자열과 부수 효과 import의 문자열. 인용부호 종류·줄바꿈과 상관없이 TypeScript의 토큰 분석기로 뽑는다.
+// 정규식 리터럴과 템플릿 안의 글자가 문자열 토큰으로 읽히지 않게 그 둘은 다시 훑는다.
+function moduleSpecifiers(source: string): string[] {
+  const valueEnds = new Set<SyntaxKind>([
+    SyntaxKind.Identifier, SyntaxKind.NumericLiteral, SyntaxKind.BigIntLiteral, SyntaxKind.StringLiteral,
+    SyntaxKind.NoSubstitutionTemplateLiteral, SyntaxKind.TemplateTail, SyntaxKind.RegularExpressionLiteral, SyntaxKind.CloseParenToken,
+    SyntaxKind.CloseBracketToken, SyntaxKind.ThisKeyword, SyntaxKind.TrueKeyword, SyntaxKind.FalseKeyword, SyntaxKind.NullKeyword,
+    SyntaxKind.PlusPlusToken, SyntaxKind.MinusMinusToken,
+  ]);
+  const scanner = createScanner(true);
+  scanner.setText(source);
+  const found: string[] = [];
+  // 열린 중괄호마다 템플릿 치환을 닫는 것인지 적는다.
+  const braces: boolean[] = [];
+  let previous: SyntaxKind = SyntaxKind.Unknown;
+  for (let token = scanner.scan(); token !== SyntaxKind.EndOfFile; token = scanner.scan()) {
+    if ((token === SyntaxKind.SlashToken || token === SyntaxKind.SlashEqualsToken) && !valueEnds.has(previous)) {
+      token = scanner.reScanSlashToken();
+    }
+    if (token === SyntaxKind.TemplateHead || token === SyntaxKind.OpenBraceToken) {
+      braces.push(token === SyntaxKind.TemplateHead);
+    } else if (token === SyntaxKind.CloseBraceToken && braces.pop() === true) {
+      token = scanner.reScanTemplateToken(false);
+      if (token === SyntaxKind.TemplateMiddle) braces.push(true);
+    }
+    if (token === SyntaxKind.StringLiteral && (previous === SyntaxKind.FromKeyword || previous === SyntaxKind.ImportKeyword)) {
+      found.push(scanner.getTokenValue());
+    }
+    previous = token;
+  }
+  return found;
+}
+
+test('정적: 모듈 지정자는 인용부호 종류와 상관없이 뽑히고, 정규식·템플릿·주석 속 글자는 뽑히지 않는다', () => {
+  const source = [
+    'import "pg";',
+    "import 'node:http';",
+    'import type { A } from "./olive-control-a.js";',
+    "export { b }\n  from './olive-control-b.js';",
+    'export * from "node:fs";',
+    'const re = /from \'x\'/g;',
+    'const t = `${re} from "y" ${`import "z"`}`;',
+    '// import "w";',
+    "const k = { from: 'v' };",
+  ].join('\n');
+  assert.deepEqual(moduleSpecifiers(source), ['pg', 'node:http', './olive-control-a.js', './olive-control-b.js', 'node:fs']);
+});
+
 test('정적: src/olive-control*.ts는 node:crypto와 서로만 읽고 환경·시계·네트워크·파일에 닿지 않는다', () => {
   const dir = fileURLToPath(new URL('../../src/', import.meta.url));
   const files = readdirSync(dir).filter((name) => /^olive-control(-[a-z]+)?\.ts$/.test(name)).sort();
   assert.deepEqual(files, ['olive-control-canonical.ts', 'olive-control-common.ts', 'olive-control-envelope.ts',
     'olive-control-forbidden.ts', 'olive-control-generations.ts', 'olive-control-limits.ts', 'olive-control-nonces.ts',
     'olive-control-schema.ts', 'olive-control-stop.ts', 'olive-control-table.ts', 'olive-control.ts']);
+  // 분석기가 아무것도 뽑지 못하면 검사가 헛돈다: import가 없는 파일을 정확히 단언한다.
+  const withoutImports: string[] = [];
   for (const name of files) {
     const source = readFileSync(join(dir, name), 'utf8');
-    const specifiers = [...source.matchAll(/\bfrom\s+'([^']+)'/g), ...source.matchAll(/^\s*import\s+'([^']+)'/gm)].map((m) => m[1]!);
+    const specifiers = moduleSpecifiers(source);
+    if (specifiers.length === 0) withoutImports.push(name);
     for (const specifier of specifiers) {
       const local = /^\.\/([a-z-]+)\.js$/.exec(specifier);
       assert.ok(specifier === 'node:crypto' || (local !== null && files.includes(local[1] + '.ts')), name + ': ' + specifier);
@@ -712,4 +829,5 @@ test('정적: src/olive-control*.ts는 node:crypto와 서로만 읽고 환경·�
       assert.doesNotMatch(source, banned, name);
     }
   }
+  assert.deepEqual(withoutImports, ['olive-control-limits.ts', 'olive-control-schema.ts']);
 });

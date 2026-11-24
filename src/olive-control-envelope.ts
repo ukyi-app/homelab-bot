@@ -9,7 +9,7 @@ import type { Generations } from './olive-control-generations.js';
 import { CLOCK_SKEW_MS, CONTRACT, MESSAGE_TTL_MAX_MS, MESSAGE_TTL_MS } from './olive-control-limits.js';
 import { ACTION_NAME, BundleNotImplemented, int, isPlainObject, literal, NONCE, object, oneOf, pattern, SchemaError, sha256, UUID,
   uuid } from './olive-control-schema.js';
-import { ACTIONS, PARTIES } from './olive-control-table.js';
+import { PARTIES, specOf } from './olive-control-table.js';
 import type { ActionClass, ActionSpec, ParseContext, Party } from './olive-control-table.js';
 
 export const REJECT_REASONS = [
@@ -107,7 +107,7 @@ function parseContext(sender: Party, recipient: Party): ParseContext {
     sender,
     recipient,
     effect(action) {
-      const spec = ACTIONS.get(action);
+      const spec = specOf(action);
       return spec?.class === 'effect' ? { from: spec.from, parseResult: spec.parseResult } : undefined;
     },
   };
@@ -146,7 +146,7 @@ export function verify(raw: unknown, ctx: VerifyContext): VerifyOutcome {
   const rawHeader = raw.header;
   if (!isPlainObject(rawHeader)) return reject('malformed');
   if (rawHeader.contract !== CONTRACT) return reject('contract_mismatch');
-  const spec = typeof rawHeader.action === 'string' ? ACTIONS.get(rawHeader.action) : undefined;
+  const spec = typeof rawHeader.action === 'string' ? specOf(rawHeader.action) : undefined;
   if (spec === undefined) return reject('unknown_action');
   let header: Header;
   try {
@@ -192,7 +192,8 @@ export function verify(raw: unknown, ctx: VerifyContext): VerifyOutcome {
   if (findForbidden(body, header.sender) !== undefined) return reject('forbidden_field');
   const fault = bodyFault(spec, body);
   if (fault !== null) return reject(fault);
-  // bodyFault를 지났으면 본문은 평범한 객체다(효과는 job_id, 답은 in_reply_to를 읽었다).
+  // 효과와 답 동작은 bodyFault를 지났으면 본문이 평범한 객체다(효과는 job_id, 답은 in_reply_to를 읽었다). 아래에서 record를 읽는
+  // 자리는 이 둘뿐이다. 인사·조회 요청의 본문은 여기서 객체라는 보장이 없고 해석기가 꼴을 본다.
   const record = body as Record<string, unknown>;
   if (spec.generations !== null) {
     const valueFault = generationsFault(spec.generations, record, ctx.generations);
@@ -241,11 +242,12 @@ export class SealError extends Error {
   }
 }
 
-// 받는 쪽이 모양·방향·시한·본문 때문에 거절할 봉투는 서명하기 전에 막는다. 인사 상태·접수·기다리는 요청·세대의 권위 값은 받는
-// 쪽의 상태라 보지 않는다(세대는 칸의 있고 없음과 꼴만 본다). 본문은 받은 값 그대로 싣는다: digest가 그 값에 묶이므로 내보낸 뒤
+// 받는 쪽이 모양·방향·수명 범위(0 초과 30초 이하)·본문 때문에 거절할 봉투는 서명하기 전에 막는다. 받는 때의 시계는 모르므로
+// 발급 시각을 과거로 주면 받는 쪽에서 이미 만료일 수 있다. 인사 상태·접수·기다리는 요청·세대의 권위 값은 받는 쪽의 상태라 보지
+// 않는다(세대는 칸의 있고 없음과 꼴만 본다). 본문은 받은 값 그대로 싣는다: digest가 그 값에 묶이므로 내보낸 뒤
 // 바꾸면 받는 쪽에서 digest_mismatch다.
 export function seal(input: SealInput, privateKey: KeyObject): Envelope {
-  const spec = ACTIONS.get(input.action);
+  const spec = specOf(input.action);
   if (spec === undefined) throw new SealError('unknown_action');
   if (spec.parse === null) throw new SealError('unsupported');
   let digest: string;

@@ -112,8 +112,8 @@ const ROWS: readonly Row[] = [
   query('candidate_chunk', 'candidate', SV, false, ['candidate_fetch'], null),
 ];
 
-// 표의 모양을 만들 때 한 번 확인한다. 어긋나면 모듈을 읽는 순간 던진다.
-function defineTable(rows: readonly Row[]): ReadonlyMap<string, ActionSpec> {
+// 표의 모양을 만들 때 한 번 확인한다. 어긋나면 모듈을 읽는 순간 던진다. 행과 그 안의 배열·세대 객체는 복사해 동결한다.
+function defineTable(rows: readonly Row[]): Map<string, ActionSpec> {
   const effects = rows.filter((row) => row.class === 'effect').map((row) => row.name);
   const table = new Map<string, ActionSpec>();
   for (const row of rows) {
@@ -136,8 +136,13 @@ function defineTable(rows: readonly Row[]): ReadonlyMap<string, ActionSpec> {
       if (row.generations !== null) fail('generation rules outside effects');
       if (row.parseResult !== null) fail('result parser outside effects');
     }
-    const answers = row.answers === ALL_JOBS ? Object.freeze([...effects, 'job_lookup']) : row.answers;
-    table.set(row.name, Object.freeze({ ...row, answers }));
+    const answers = row.answers === ALL_JOBS ? [...effects, 'job_lookup'] : row.answers;
+    table.set(row.name, Object.freeze({
+      ...row,
+      from: Object.freeze([...row.from]),
+      generations: row.generations === null ? null : Object.freeze({ ...row.generations }),
+      answers: answers === null ? null : Object.freeze([...answers]),
+    }));
   }
   for (const name of [...EFFECTS_DURING_POLICY_MISMATCH, ...EFFECTS_WITHOUT_GENERATIONS]) {
     if (table.get(name)?.class !== 'effect') throw new Error(`olive-control table: ${name}: closed list names a non-effect`);
@@ -145,4 +150,23 @@ function defineTable(rows: readonly Row[]): ReadonlyMap<string, ActionSpec> {
   return table;
 }
 
-export const ACTIONS: ReadonlyMap<string, ActionSpec> = defineTable(ROWS);
+// 검증이 보는 표는 이 모듈 안의 Map 하나다. 밖에는 조회만 하는 동결한 객체를 준다: ReadonlyMap 타입은 빌드한 JS에서 사라지고,
+// Object.freeze(map)은 Map 항목의 set·delete를 막지 못한다.
+const TABLE = defineTable(ROWS);
+
+export const specOf = (name: string): ActionSpec | undefined => TABLE.get(name);
+
+export const ACTIONS: ReadonlyMap<string, ActionSpec> = Object.freeze({
+  get size() {
+    return TABLE.size;
+  },
+  get: (name: string) => TABLE.get(name),
+  has: (name: string) => TABLE.has(name),
+  keys: () => TABLE.keys(),
+  values: () => TABLE.values(),
+  entries: () => TABLE.entries(),
+  forEach(callback: (spec: ActionSpec, name: string, map: ReadonlyMap<string, ActionSpec>) => void, thisArg?: unknown) {
+    TABLE.forEach((spec, name) => callback.call(thisArg, spec, name, ACTIONS));
+  },
+  [Symbol.iterator]: () => TABLE.entries(),
+});
