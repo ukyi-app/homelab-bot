@@ -1,0 +1,73 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/stop-prepare-status-from-front-door",
+  "description": "현관이 감독에게 낸 정지 준비의 결과 답. 정지 작업은 현관이 낸 것이라 그 결과는 감독만 답한다",
+  "status": "candidate",
+  "base": "accept/stop-prepare-confirmed",
+  "changed": [
+    "message.header.sender",
+    "message.header.recipient",
+    "context.expected_recipient",
+    "keys"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "body_malformed"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {
+      "00000000-0000-4000-8000-000000000023": {
+        "action": "stop_prepare",
+        "job": {
+          "job_id": "00000000-0000-4000-8000-000000000031",
+          "action": "stop_prepare",
+          "request_digest": "4fe5dacfdaca08af6531e5b8a71a0a1d2e9461d01d6d93039ef99f07e1b102e1"
+        }
+      }
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "7bf0a797292e24961d4d8aee678d9bbed9c9a88fd6e0785c9148ab8790c02ea3",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "job_status",
+      "request_id": "00000000-0000-4000-8000-000000000024",
+      "nonce": "00000000000000000000000000000024"
+    },
+    "signature": "OkqVqLXk3jKcW0e_--D_d_7V7STfM9jkpfvbdg2bNYZxBVMHOiWTGpZZE4QMP-VhgSa4R55wkAhJg9QkfIhMAg",
+    "body": {
+      "in_reply_to": "00000000-0000-4000-8000-000000000023",
+      "job_id": "00000000-0000-4000-8000-000000000031",
+      "action": "stop_prepare",
+      "request_digest": "4fe5dacfdaca08af6531e5b8a71a0a1d2e9461d01d6d93039ef99f07e1b102e1",
+      "status": {
+        "state": "confirmed",
+        "result": {
+          "outcome": "prepared"
+        }
+      }
+    }
+  },
+  "signing_input": "{\"action\":\"job_status\",\"body_digest\":\"7bf0a797292e24961d4d8aee678d9bbed9c9a88fd6e0785c9148ab8790c02ea3\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000024\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000024\",\"sender\":\"front-door\"}"
+}

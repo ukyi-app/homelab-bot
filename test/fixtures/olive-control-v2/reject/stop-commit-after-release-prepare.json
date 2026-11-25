@@ -1,0 +1,57 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/stop-commit-after-release-prepare",
+  "description": "감독이 지금 정지 세대 8에서 풀기 준비(8)만 받아 둔 때 온 정지 확정(8). 번호가 같아도 정지 확정은 정지 준비(지금보다 큰 번호)에만 묶인다",
+  "status": "candidate",
+  "base": "accept/stop-commit",
+  "changed": [
+    "context.generations.stop.current"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "generation_mismatch"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": 8
+      },
+      "execution": {
+        "known": true,
+        "current": 3,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "e2f03a37dc33410028b14a21c631029a7dea50a1c9b93658ab3a23b4668f6500",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "stop_commit",
+      "request_id": "00000000-0000-4000-8000-000000000025",
+      "nonce": "00000000000000000000000000000025"
+    },
+    "signature": "ieDxhhRWyv5ugRqKUl89CICLT1mem-04HTMj1dweAWmGsR-TI4fQAgMYwy5Mwd5kjnzWI6phMAyxtvi2tbIPCg",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000032",
+      "stop_generation": 8
+    }
+  },
+  "signing_input": "{\"action\":\"stop_commit\",\"body_digest\":\"e2f03a37dc33410028b14a21c631029a7dea50a1c9b93658ab3a23b4668f6500\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000025\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000025\",\"sender\":\"front-door\"}"
+}

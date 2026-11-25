@@ -1,0 +1,64 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/candidate-chunk-unavailable",
+  "description": "감독이 이 digest의 내용을 주지 않는다. 모르는 digest와 지워짐·만료를 가르지 않는 한 값이다. 답이 없는 것(시간 초과)과는 다른 값이다",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": true,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {
+      "00000000-0000-4000-8000-000000000080": {
+        "action": "candidate_fetch",
+        "job": null,
+        "body": {
+          "candidate_digest": "f7919ba32b7f4a663c289e59c9663c5f0a95c33439919106ad541ad1ae39e8b2",
+          "offset": 0
+        }
+      }
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "4ff135f2cc065665d67719756f2646e72a26a5149c32298e64a5589646b6e941",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "candidate_chunk",
+      "request_id": "00000000-0000-4000-8000-000000000082",
+      "nonce": "00000000000000000000000000000082"
+    },
+    "signature": "95L0Trn8JknOy75M0Rzaf4gdVBfQilBs1GUd7AwaEQ79GfxxV_JMY4PcUecJLF9KCYpNXltu74v4KwComIS2Cg",
+    "body": {
+      "in_reply_to": "00000000-0000-4000-8000-000000000080",
+      "candidate_digest": "f7919ba32b7f4a663c289e59c9663c5f0a95c33439919106ad541ad1ae39e8b2",
+      "offset": 0,
+      "piece": {
+        "state": "unavailable"
+      }
+    }
+  },
+  "signing_input": "{\"action\":\"candidate_chunk\",\"body_digest\":\"4ff135f2cc065665d67719756f2646e72a26a5149c32298e64a5589646b6e941\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000082\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000082\",\"sender\":\"supervisor\"}"
+}

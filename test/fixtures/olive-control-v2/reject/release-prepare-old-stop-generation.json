@@ -1,0 +1,57 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/release-prepare-old-stop-generation",
+  "description": "옛 정지 세대(7)의 풀기 준비. 감독은 8에서 정지 중이다",
+  "status": "candidate",
+  "base": "accept/release-prepare",
+  "changed": [
+    "message.body.stop_generation"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "generation_mismatch"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 3,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "75169b5877d80cb8ef89d02ecd885c38c32d234ee3e3a1df5a86c1bfc44c6d64",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "release_prepare",
+      "request_id": "00000000-0000-4000-8000-000000000029",
+      "nonce": "00000000000000000000000000000029"
+    },
+    "signature": "qVxhOFCLs_qvRcsxjRF0rfhWcUb9FdhJyl-Qr2FIlHDnLBY6Rc012w5nO-1lPbyBYjuSQTrAiBvf0FVdZBg_BQ",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000033",
+      "stop_generation": 7
+    }
+  },
+  "signing_input": "{\"action\":\"release_prepare\",\"body_digest\":\"75169b5877d80cb8ef89d02ecd885c38c32d234ee3e3a1df5a86c1bfc44c6d64\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000029\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000029\",\"sender\":\"front-door\"}"
+}

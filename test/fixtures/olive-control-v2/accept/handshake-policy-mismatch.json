@@ -1,0 +1,50 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/handshake-policy-mismatch",
+  "description": "정책 revision이 다른 인사. 봉투는 받지만 이 연결은 policy_mismatch(정지의 준비·확정 밖의 효과 동작을 받지 않음)",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": "policy_mismatch"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "none",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "60c73a9d20700ff04001ae48beb658bc33f56e58829265aef77e92f75c2b6182",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "handshake",
+      "request_id": "00000000-0000-4000-8000-000000000010",
+      "nonce": "00000000000000000000000000000001"
+    },
+    "signature": "Dv0Izv9qZR4Nis49QJdhrSypM01vHfcyQzn7hwXWiS-8lfBD_0hK7X5JH9MZeNx1dwuY8jDjz4QFZ9Adjs1AAw",
+    "body": {
+      "policy_revision": "policy-8"
+    }
+  },
+  "signing_input": "{\"action\":\"handshake\",\"body_digest\":\"60c73a9d20700ff04001ae48beb658bc33f56e58829265aef77e92f75c2b6182\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000001\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000010\",\"sender\":\"front-door\"}"
+}

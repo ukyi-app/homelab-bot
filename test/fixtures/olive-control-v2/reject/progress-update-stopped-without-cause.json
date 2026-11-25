@@ -1,0 +1,61 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/progress-update-stopped-without-cause",
+  "description": "멈춤 단계인데 이유 칸이 없다. stopped에서는 이유가 필수다",
+  "status": "candidate",
+  "base": "accept/progress-update-stopped",
+  "changed": [
+    "message.body.stop_cause"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "body_malformed"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": true,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 4,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "4af050b1b315cf1fac518f8948c563c12f84e1ab57346278789cf590e6e1c0e4",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "progress_update",
+      "request_id": "00000000-0000-4000-8000-00000000006b",
+      "nonce": "0000000000000000000000000000006b"
+    },
+    "signature": "_jdxOrpWi01b8a3D-fn9e-h2EkI7tZZ7OairnMz2McCwzfpCRDVzsoUDzJT5er9B0C-MR8b8xLAxWxJnyKYSCw",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000074",
+      "input_job_id": "00000000-0000-4000-8000-00000000007a",
+      "stage": "stopped",
+      "seq": 4,
+      "stop_generation": 8,
+      "execution_generation": 4
+    }
+  },
+  "signing_input": "{\"action\":\"progress_update\",\"body_digest\":\"4af050b1b315cf1fac518f8948c563c12f84e1ab57346278789cf590e6e1c0e4\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"0000000000000000000000000000006b\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-00000000006b\",\"sender\":\"supervisor\"}"
+}

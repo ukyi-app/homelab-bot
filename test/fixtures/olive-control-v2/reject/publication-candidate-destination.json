@@ -1,0 +1,63 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/publication-candidate-destination",
+  "description": "모델이 고른 최종 목적지 칸. 보낼 곳은 현관이 정한다",
+  "status": "candidate",
+  "base": "accept/publication-candidate",
+  "changed": [
+    "message.body.destination"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "forbidden_field"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": true,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 4,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "3dc646934bac74cc9e9c4f11b0b5be2b0d1fda73a22a8583e27eb34530aefc17",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "publication_candidate",
+      "request_id": "00000000-0000-4000-8000-000000000064",
+      "nonce": "00000000000000000000000000000064"
+    },
+    "signature": "11ewypEOHbmwoRSycEjE990Y0uxZSHzXXOeHLt_uSobImwjdZCW-JdQdziyNE15o3R8ujeu32DeJobeG8esPCw",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000072",
+      "kind": "pull_request",
+      "candidate_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "run_id": "00000000-0000-4000-8000-00000000007b",
+      "input_job_id": "00000000-0000-4000-8000-00000000007a",
+      "stop_generation": 8,
+      "execution_generation": 4,
+      "destination": "https://github.example/ukyi-app/homelab"
+    }
+  },
+  "signing_input": "{\"action\":\"publication_candidate\",\"body_digest\":\"3dc646934bac74cc9e9c4f11b0b5be2b0d1fda73a22a8583e27eb34530aefc17\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000064\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000064\",\"sender\":\"supervisor\"}"
+}

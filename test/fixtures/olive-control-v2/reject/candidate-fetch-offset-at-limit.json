@@ -1,0 +1,53 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/candidate-fetch-offset-at-limit",
+  "description": "전체 상한(1,048,576)과 같은 위치를 묻는다. 위치는 상한 미만이어야 한다",
+  "status": "candidate",
+  "base": "accept/candidate-fetch-last-byte",
+  "changed": [
+    "message.body.offset"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "body_malformed"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": true,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "6ca80550338727b8ea552a8abdbc2242b037d05cab95ba566cb98c395f6277de",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "candidate_fetch",
+      "request_id": "00000000-0000-4000-8000-000000000083",
+      "nonce": "00000000000000000000000000000083"
+    },
+    "signature": "WNXAEr_R3B72nlhBZoL5W5f-FJIqdVSfOmcuNlrs-rsdkyPEMA9DVd9CXNfWR0eIU6qRvJhOfxNhozUYxiDWAA",
+    "body": {
+      "candidate_digest": "9bc1b2a288b26af7257a36277ae3816a7d4f16e89c1e7e77d0a5c48bad62b360",
+      "offset": 1048576
+    }
+  },
+  "signing_input": "{\"action\":\"candidate_fetch\",\"body_digest\":\"6ca80550338727b8ea552a8abdbc2242b037d05cab95ba566cb98c395f6277de\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000083\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000083\",\"sender\":\"front-door\"}"
+}

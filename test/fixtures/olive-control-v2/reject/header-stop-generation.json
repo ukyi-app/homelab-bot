@@ -1,0 +1,53 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/header-stop-generation",
+  "description": "머리에 정지 세대 칸. v2의 머리에는 세대 칸이 없다",
+  "status": "candidate",
+  "base": "accept/handshake",
+  "changed": [
+    "message.header.stop_generation"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "unknown_field"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "none",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "e9efa21fbd3b8d9d4da9a246d88afa74fd05c702c4f4185a933e13b91c291abf",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "handshake",
+      "request_id": "00000000-0000-4000-8000-000000000010",
+      "nonce": "00000000000000000000000000000001",
+      "stop_generation": 3
+    },
+    "signature": "iNsogljuVHbJjOs1uo4KWNMYtuMtyYyr-Y5a6uMf_AY_VCLfTtkGpGG2VS1szxiZajMhQoHhSHjiSwXrxAmHCA",
+    "body": {
+      "policy_revision": "policy-7"
+    }
+  },
+  "signing_input": "{\"action\":\"handshake\",\"body_digest\":\"e9efa21fbd3b8d9d4da9a246d88afa74fd05c702c4f4185a933e13b91c291abf\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000001\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000010\",\"sender\":\"front-door\",\"stop_generation\":3}"
+}

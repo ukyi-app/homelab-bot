@@ -1,0 +1,53 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/body-unknown-field",
+  "description": "인사 본문에 모르는 칸",
+  "status": "candidate",
+  "base": "accept/handshake",
+  "changed": [
+    "message.body.profile_revision"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "unknown_field"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "none",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "b82203a34ea17cb3d9e5f857dc316a77b78618d566187e0ead0518f68f059b16",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "handshake",
+      "request_id": "00000000-0000-4000-8000-000000000010",
+      "nonce": "00000000000000000000000000000001"
+    },
+    "signature": "4v64AFWmmpA3nNVC5Y0IenBAnou_xDSeh46ryvsVPZIeo01yYwFbilYkZGtxokesaRSrMf5iMJ272o4xwnF5Dg",
+    "body": {
+      "policy_revision": "policy-7",
+      "profile_revision": "profile-1"
+    }
+  },
+  "signing_input": "{\"action\":\"handshake\",\"body_digest\":\"b82203a34ea17cb3d9e5f857dc316a77b78618d566187e0ead0518f68f059b16\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000001\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000010\",\"sender\":\"front-door\"}"
+}

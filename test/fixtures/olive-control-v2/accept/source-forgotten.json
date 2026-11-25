@@ -1,0 +1,51 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/source-forgotten",
+  "description": "잊기: 원문 참조 하나만 가리킨다. 정지 중에도 받는다",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "2b7e93fa4b22c688d44a8ac3382a70ea930ca8b74d24e11803d11e55f9936305",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "source_forgotten",
+      "request_id": "00000000-0000-4000-8000-000000000069",
+      "nonce": "00000000000000000000000000000069"
+    },
+    "signature": "0MzTm3OByCIy0FK6cl8w1uRFEAC4uijF41um_ckzE_pwjJ8uc-yWVMbI2sS3CRSurs3P3ea9Q9j2T8mUQjwYBQ",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000076",
+      "source_ref": "originals/00000000-0000-4000-8000-00000000007e"
+    }
+  },
+  "signing_input": "{\"action\":\"source_forgotten\",\"body_digest\":\"2b7e93fa4b22c688d44a8ac3382a70ea930ca8b74d24e11803d11e55f9936305\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000069\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000069\",\"sender\":\"front-door\"}"
+}

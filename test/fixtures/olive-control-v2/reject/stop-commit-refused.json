@@ -1,0 +1,70 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/stop-commit-refused",
+  "description": "정지 확정의 결과가 refused. 정지에는 거절 결과가 없다(적지 못하면 확정하지 않는다)",
+  "status": "candidate",
+  "base": "accept/stop-commit-confirmed",
+  "changed": [
+    "message.body.status.result.outcome"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "body_malformed"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {
+      "00000000-0000-4000-8000-000000000025": {
+        "action": "stop_commit",
+        "job": {
+          "job_id": "00000000-0000-4000-8000-000000000032",
+          "action": "stop_commit",
+          "request_digest": "e2f03a37dc33410028b14a21c631029a7dea50a1c9b93658ab3a23b4668f6500"
+        }
+      }
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "4db25e7df4aad3a00b7b570e87d0c0cdbd7d166cedcbee8ae21ffef11d51a5b8",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "job_status",
+      "request_id": "00000000-0000-4000-8000-000000000026",
+      "nonce": "00000000000000000000000000000026"
+    },
+    "signature": "nSKr05w_xjbuFIXQaRWUsSkbIrnO8t9jZKEXwF9WYumGGh5YYmHc7IkSL_3ZQy-u6vxQuc4RVVaSIyoOwq2JAA",
+    "body": {
+      "in_reply_to": "00000000-0000-4000-8000-000000000025",
+      "job_id": "00000000-0000-4000-8000-000000000032",
+      "action": "stop_commit",
+      "request_digest": "e2f03a37dc33410028b14a21c631029a7dea50a1c9b93658ab3a23b4668f6500",
+      "status": {
+        "state": "confirmed",
+        "result": {
+          "outcome": "refused"
+        }
+      }
+    }
+  },
+  "signing_input": "{\"action\":\"job_status\",\"body_digest\":\"4db25e7df4aad3a00b7b570e87d0c0cdbd7d166cedcbee8ae21ffef11d51a5b8\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000026\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000026\",\"sender\":\"supervisor\"}"
+}

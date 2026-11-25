@@ -1,0 +1,54 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/input-cancel-with-stop-generation",
+  "description": "세대와 무관한 취소에 정지 세대 칸. 검사되지 않는 세대 값을 처리기에 넘기지 않는다",
+  "status": "candidate",
+  "base": "accept/input-cancel",
+  "changed": [
+    "message.body.stop_generation"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "body_malformed"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "0e7e0d16f46733b4a803c3e3b101deeaf2b636236d6ca4fa426bf3930824abb3",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "input_cancel",
+      "request_id": "00000000-0000-4000-8000-000000000063",
+      "nonce": "00000000000000000000000000000063"
+    },
+    "signature": "XqZmLXo3XWYGr1EQKyVGJLU-NY3m0ty_BZpCzVY2mvbz2ZG5mQ2n9n06MGGG0rmNbkgjF3njB-oH8Xk0ZFkbAQ",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000072",
+      "input_job_id": "00000000-0000-4000-8000-000000000070",
+      "stop_generation": 7
+    }
+  },
+  "signing_input": "{\"action\":\"input_cancel\",\"body_digest\":\"0e7e0d16f46733b4a803c3e3b101deeaf2b636236d6ca4fa426bf3930824abb3\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000063\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000063\",\"sender\":\"front-door\"}"
+}
