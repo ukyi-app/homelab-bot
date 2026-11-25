@@ -1,0 +1,48 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/stop-record-lookup",
+  "description": "감독의 권위 정지 기록 조회(복원 1단계). 정책이 어긋난 연결, 닫힌 접수에서도 받는다. 세대를 싣지 않는다",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "policy_mismatch",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "stop_record_lookup",
+      "request_id": "00000000-0000-4000-8000-000000000020",
+      "nonce": "00000000000000000000000000000020"
+    },
+    "signature": "mkEV4IpSxLj3_v0tuUwLTC_PSMZwa1-J8CzHxbEjAD8YJ-kh2XIFvlegkwLQEee3c-kKF-d0hEm57DQm-AtSBA",
+    "body": {}
+  },
+  "signing_input": "{\"action\":\"stop_record_lookup\",\"body_digest\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000020\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000020\",\"sender\":\"supervisor\"}"
+}

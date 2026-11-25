@@ -1,0 +1,62 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/progress-update-free-text",
+  "description": "진행 표시에 임의 문구 칸. 진행은 단계 이름과 순번뿐이다",
+  "status": "candidate",
+  "base": "accept/progress-update",
+  "changed": [
+    "message.body.text"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "unknown_field"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": true,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 4,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "446bf63a80c81a229328a08d457d04400ef29674d8e0b20b5e2d064ce4b8ed71",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "progress_update",
+      "request_id": "00000000-0000-4000-8000-000000000068",
+      "nonce": "00000000000000000000000000000068"
+    },
+    "signature": "ItJzDWpXxuehn-i-TO8R2AJCe1ki_zCmfRoE8JVkpGjMLjlkzUx04SQroiho4f_QrZhasMbhlwcep7Ta9LKKBA",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000073",
+      "input_job_id": "00000000-0000-4000-8000-00000000007a",
+      "stage": "verify",
+      "seq": 3,
+      "stop_generation": 8,
+      "execution_generation": 4,
+      "text": "검증 중이에요. 거의 다 됐어요"
+    }
+  },
+  "signing_input": "{\"action\":\"progress_update\",\"body_digest\":\"446bf63a80c81a229328a08d457d04400ef29674d8e0b20b5e2d064ce4b8ed71\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000068\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000068\",\"sender\":\"supervisor\"}"
+}

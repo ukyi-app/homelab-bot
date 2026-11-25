@@ -1,0 +1,53 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/delivered-to-front-door",
+  "description": "감독 앞으로 낸 현관의 봉투가 현관에 닿음. 현관은 감독의 키만 믿으므로 현관 이름의 봉투는 서명 단계에서 거절된다",
+  "status": "candidate",
+  "base": "accept/handshake",
+  "changed": [
+    "context.expected_recipient",
+    "keys"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "unknown_sender"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "none",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "e9efa21fbd3b8d9d4da9a246d88afa74fd05c702c4f4185a933e13b91c291abf",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "handshake",
+      "request_id": "00000000-0000-4000-8000-000000000010",
+      "nonce": "00000000000000000000000000000001"
+    },
+    "signature": "uSjQHj9RgeedfIIB8WH14RFq3395ifbIC6iJK46PXSmYujLoItsS5KN5GOByxif2-LcN6BRB-qMBYsdS3kxWBw",
+    "body": {
+      "policy_revision": "policy-7"
+    }
+  },
+  "signing_input": "{\"action\":\"handshake\",\"body_digest\":\"e9efa21fbd3b8d9d4da9a246d88afa74fd05c702c4f4185a933e13b91c291abf\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000001\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000010\",\"sender\":\"front-door\"}"
+}

@@ -1,0 +1,52 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/executor-sender",
+  "description": "실행기 이름의 낸 쪽. v2의 당사자는 현관과 감독뿐이다",
+  "status": "candidate",
+  "base": "accept/handshake",
+  "changed": [
+    "message.header.sender"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "malformed"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "none",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "e9efa21fbd3b8d9d4da9a246d88afa74fd05c702c4f4185a933e13b91c291abf",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+      "recipient": "supervisor",
+      "action": "handshake",
+      "request_id": "00000000-0000-4000-8000-000000000010",
+      "nonce": "00000000000000000000000000000001"
+    },
+    "signature": "nNXluOyx2LnKCMi0X29hH5EYMN-hMzpEXojQ04v-UNbP0E0yTkjnINm11Gqnr2Zycyc-sa-c9JW7OUSOoRXzCA",
+    "body": {
+      "policy_revision": "policy-7"
+    }
+  },
+  "signing_input": "{\"action\":\"handshake\",\"body_digest\":\"e9efa21fbd3b8d9d4da9a246d88afa74fd05c702c4f4185a933e13b91c291abf\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000001\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000010\",\"sender\":\"executor/diagnosis/olive-diagnosis-0/st-d1a9\"}"
+}

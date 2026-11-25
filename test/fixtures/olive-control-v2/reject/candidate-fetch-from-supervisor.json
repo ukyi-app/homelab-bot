@@ -1,0 +1,56 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/candidate-fetch-from-supervisor",
+  "description": "감독이 자기 키로 서명해 현관에게 낸 내용 묻기. 묻는 쪽은 현관뿐이다",
+  "status": "candidate",
+  "base": "accept/candidate-fetch",
+  "changed": [
+    "message.header.sender",
+    "message.header.recipient",
+    "context.expected_recipient",
+    "keys"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "wrong_direction"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "c33544c7fe719b37ffdd7a32669a50134fa6be9e8a939c27648c9673950ba615",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "candidate_fetch",
+      "request_id": "00000000-0000-4000-8000-000000000080",
+      "nonce": "00000000000000000000000000000080"
+    },
+    "signature": "xVwPQ1t3giq-A8X_WfdwcR3WtvK-CytgipEm62zxlf6f637o_jD3AMnzsEyNYyLZA2G48buuga75b6vym4bcDg",
+    "body": {
+      "candidate_digest": "f7919ba32b7f4a663c289e59c9663c5f0a95c33439919106ad541ad1ae39e8b2",
+      "offset": 0
+    }
+  },
+  "signing_input": "{\"action\":\"candidate_fetch\",\"body_digest\":\"c33544c7fe719b37ffdd7a32669a50134fa6be9e8a939c27648c9673950ba615\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000080\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000080\",\"sender\":\"supervisor\"}"
+}

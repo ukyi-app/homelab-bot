@@ -1,0 +1,63 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/input-submit-intake-closed",
+  "description": "감독의 접수가 닫혔을 때 온 입력(정지 중·복원 중). 새 일은 닫힌 접수에서 받지 않는다",
+  "status": "candidate",
+  "base": "accept/input-submit",
+  "changed": [
+    "context.intake_open"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "intake_closed"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 7,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 3,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "73a5b145d13f28b7c7dd46e4cce36c3a952cec7217287d5d5c4fedf9fca7b78c",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "input_submit",
+      "request_id": "00000000-0000-4000-8000-000000000060",
+      "nonce": "00000000000000000000000000000060"
+    },
+    "signature": "Vkgsy8_htCQaHpQg3_InTBP8If2JSzkNAjeJDCFQCxOFUAGzAQ_39rOuMiPIQT01dmzcTP1IAlbN3R_yGEnnAA",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000070",
+      "stop_generation": 7,
+      "source": "admin",
+      "source_ref": {
+        "ref": "originals/00000000-0000-4000-8000-00000000007e",
+        "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "expires_at": 1795651199000
+      }
+    }
+  },
+  "signing_input": "{\"action\":\"input_submit\",\"body_digest\":\"73a5b145d13f28b7c7dd46e4cce36c3a952cec7217287d5d5c4fedf9fca7b78c\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000060\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000060\",\"sender\":\"front-door\"}"
+}

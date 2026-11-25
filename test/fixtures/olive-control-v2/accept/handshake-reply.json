@@ -1,0 +1,56 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/handshake-reply",
+  "description": "감독의 인사 답. 현관이 보내고 기다리는 인사를 가리킨다",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": "agreed"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "none",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {
+      "00000000-0000-4000-8000-000000000010": {
+        "action": "handshake",
+        "job": null
+      }
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "735ea240546057f2dc69f38f1303a5e64102272805cf9f9acf4daa4758d20bb8",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "handshake_reply",
+      "request_id": "00000000-0000-4000-8000-000000000011",
+      "nonce": "00000000000000000000000000000002"
+    },
+    "signature": "xBAngwWRg4WG3aSoDlwUNVxSMTzplqcjzb5GjMf8XDXlQ_Quyv5giy_Msi0jTwzExWjHgEw3ivTN7wV7-EgZBg",
+    "body": {
+      "in_reply_to": "00000000-0000-4000-8000-000000000010",
+      "policy_revision": "policy-7"
+    }
+  },
+  "signing_input": "{\"action\":\"handshake_reply\",\"body_digest\":\"735ea240546057f2dc69f38f1303a5e64102272805cf9f9acf4daa4758d20bb8\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000002\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000011\",\"sender\":\"supervisor\"}"
+}

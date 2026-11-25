@@ -1,0 +1,60 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/stop-record-recorded",
+  "description": "현관의 원장에 정지 기록이 있음(세대 7, 정지). 감독이 정지 세대를 모르는 복원 1단계, 정책이 어긋난 연결에서도 받는다",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "policy_mismatch",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {
+      "00000000-0000-4000-8000-000000000020": {
+        "action": "stop_record_lookup",
+        "job": null
+      }
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "911d4125b195dbd6a446ccb067191465976f4abac7e77f219805713e04ff0b88",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "stop_record",
+      "request_id": "00000000-0000-4000-8000-000000000021",
+      "nonce": "00000000000000000000000000000021"
+    },
+    "signature": "buMLOJVpupSeGIyB4_x85eUxmdIX6p-XlozxVIf4084JIOH9vjW1DKvKQMK74W09KQq5XKU8C17zgQ8RpCujCQ",
+    "body": {
+      "in_reply_to": "00000000-0000-4000-8000-000000000020",
+      "record": {
+        "state": "recorded",
+        "generation": 7,
+        "stopped": true
+      }
+    }
+  },
+  "signing_input": "{\"action\":\"stop_record\",\"body_digest\":\"911d4125b195dbd6a446ccb067191465976f4abac7e77f219805713e04ff0b88\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000021\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000021\",\"sender\":\"front-door\"}"
+}

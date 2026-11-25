@@ -1,0 +1,58 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/reply-to-other-request",
+  "description": "인사 답이 기다리지 않는 요청을 가리킴",
+  "status": "candidate",
+  "base": "accept/handshake-reply",
+  "changed": [
+    "message.body.in_reply_to"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "reply_mismatch"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "none",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {
+      "00000000-0000-4000-8000-000000000010": {
+        "action": "handshake",
+        "job": null
+      }
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "da03bce0e4a876abc965c1deda58e27526c81f605e4a18da6c410faaeeb50f39",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "handshake_reply",
+      "request_id": "00000000-0000-4000-8000-000000000011",
+      "nonce": "00000000000000000000000000000002"
+    },
+    "signature": "4pZLgQHLPRuHryBxKbZLfrzuTc5Sn6SlhOhl2Jbfv5Pn8PTWpPnp3Z32Te-h0XBkwT4ytLWXGgjB_PK6cUidDA",
+    "body": {
+      "in_reply_to": "00000000-0000-4000-8000-000000000099",
+      "policy_revision": "policy-7"
+    }
+  },
+  "signing_input": "{\"action\":\"handshake_reply\",\"body_digest\":\"da03bce0e4a876abc965c1deda58e27526c81f605e4a18da6c410faaeeb50f39\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000002\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000011\",\"sender\":\"supervisor\"}"
+}

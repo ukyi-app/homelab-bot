@@ -1,0 +1,54 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/source-forgotten-raw-text",
+  "description": "잊기에 원문 칸(raw_text). 잊기는 참조만 가리킨다",
+  "status": "candidate",
+  "base": "accept/source-forgotten",
+  "changed": [
+    "message.body.raw_text"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "forbidden_field"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "0f5f2a110cdc2950e97c8fc0b11c59d19b0346e7b902851e060d59827347bb5c",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "source_forgotten",
+      "request_id": "00000000-0000-4000-8000-000000000069",
+      "nonce": "00000000000000000000000000000069"
+    },
+    "signature": "Rca2f1RVwMDyKb-SOLG54Mc-jCjBOB1mzo_CnRfsj-67K2bVTEciZxRqimAJCOF7fKjSGTRT-H2SWj8d-05RDQ",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000076",
+      "source_ref": "originals/00000000-0000-4000-8000-00000000007e",
+      "raw_text": "지울 글"
+    }
+  },
+  "signing_input": "{\"action\":\"source_forgotten\",\"body_digest\":\"0f5f2a110cdc2950e97c8fc0b11c59d19b0346e7b902851e060d59827347bb5c\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000069\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000069\",\"sender\":\"front-door\"}"
+}

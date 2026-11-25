@@ -1,0 +1,71 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/candidate-chunk-from-front-door",
+  "description": "현관이 자기 키로 서명해 감독에게 낸 조각 답. 답하는 쪽은 감독뿐이다",
+  "status": "candidate",
+  "base": "accept/candidate-chunk",
+  "changed": [
+    "message.header.sender",
+    "message.header.recipient",
+    "context.expected_recipient",
+    "keys"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "wrong_direction"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": true,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {
+      "00000000-0000-4000-8000-000000000080": {
+        "action": "candidate_fetch",
+        "job": null,
+        "body": {
+          "candidate_digest": "f7919ba32b7f4a663c289e59c9663c5f0a95c33439919106ad541ad1ae39e8b2",
+          "offset": 0
+        }
+      }
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "815304bcca95e5496e5499d64526939b00c6ce71c2879288aa90e236ed4e8d1b",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "candidate_chunk",
+      "request_id": "00000000-0000-4000-8000-000000000081",
+      "nonce": "00000000000000000000000000000081"
+    },
+    "signature": "PPDmg0IbuPYoDA-Fj7uRvVrppBXf1irXnR1LOxhibsXDbTLF0_xAsfHu_laJzQ7NklDGpXwEIx4e2gX_Aq2NAg",
+    "body": {
+      "in_reply_to": "00000000-0000-4000-8000-000000000080",
+      "candidate_digest": "f7919ba32b7f4a663c289e59c9663c5f0a95c33439919106ad541ad1ae39e8b2",
+      "offset": 0,
+      "piece": {
+        "state": "chunk",
+        "total": 44,
+        "chunk_b64url": "7Iuc7ZeY7Jqp7Jy866GcIOq-uOupsCDrgrgg64u1IOq4gOydtOyXkOyalC4"
+      }
+    }
+  },
+  "signing_input": "{\"action\":\"candidate_chunk\",\"body_digest\":\"815304bcca95e5496e5499d64526939b00c6ce71c2879288aa90e236ed4e8d1b\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000081\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000081\",\"sender\":\"front-door\"}"
+}

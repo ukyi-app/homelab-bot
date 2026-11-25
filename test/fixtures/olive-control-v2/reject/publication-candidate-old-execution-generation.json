@@ -1,0 +1,62 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/publication-candidate-old-execution-generation",
+  "description": "풀기 전 실행 세대(3)의 늦은 게시 후보. 현관의 실행 세대는 4다",
+  "status": "candidate",
+  "base": "accept/publication-candidate",
+  "changed": [
+    "message.body.execution_generation"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "generation_mismatch"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": true,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 4,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "38f4cd1f08ccd8edee5e33d5d27d5a62c435a8019a33985fb19c821802a82b8f",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "publication_candidate",
+      "request_id": "00000000-0000-4000-8000-000000000064",
+      "nonce": "00000000000000000000000000000064"
+    },
+    "signature": "6HYuoZnjnPGhK2DKZlRVtf6NgYFnA8f-fMNgHkuTqCRODE_4iytlpYqB2wY6S3AhjzRvUvC3VLfff2LRyU3qBw",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000072",
+      "kind": "pull_request",
+      "candidate_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "run_id": "00000000-0000-4000-8000-00000000007b",
+      "input_job_id": "00000000-0000-4000-8000-00000000007a",
+      "stop_generation": 8,
+      "execution_generation": 3
+    }
+  },
+  "signing_input": "{\"action\":\"publication_candidate\",\"body_digest\":\"38f4cd1f08ccd8edee5e33d5d27d5a62c435a8019a33985fb19c821802a82b8f\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000064\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000064\",\"sender\":\"supervisor\"}"
+}

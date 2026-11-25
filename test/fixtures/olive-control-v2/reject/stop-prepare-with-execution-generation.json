@@ -1,0 +1,58 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/stop-prepare-with-execution-generation",
+  "description": "실행 세대와 무관한 정지 준비에 실행 세대 칸. 검사되지 않는 세대 값은 받지 않는다",
+  "status": "candidate",
+  "base": "accept/stop-prepare",
+  "changed": [
+    "message.body.execution_generation"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "body_malformed"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 7,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 3,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "b77db4b1ad52c9992c4961dbe6a3f1c1adf55670a524f8031831869e5715faea",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "stop_prepare",
+      "request_id": "00000000-0000-4000-8000-000000000023",
+      "nonce": "00000000000000000000000000000023"
+    },
+    "signature": "EXchSfA1Magyu2WHLSCSwwbttwQ8W3d1BHkExDhWc24Mc9rXbu94A5aRB4zw_pRNo8vXdulw2PYmc7Sx0J3YBA",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000031",
+      "stop_generation": 8,
+      "execution_generation": 3
+    }
+  },
+  "signing_input": "{\"action\":\"stop_prepare\",\"body_digest\":\"b77db4b1ad52c9992c4961dbe6a3f1c1adf55670a524f8031831869e5715faea\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000023\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000023\",\"sender\":\"front-door\"}"
+}

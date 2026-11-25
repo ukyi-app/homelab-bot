@@ -1,0 +1,55 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/release-prepare",
+  "description": "정지 세대 8의 풀기 준비(규칙 current). 감독은 8에서 정지 중이고 접수가 닫혀 있다",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 3,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "71dbb45d4f518ec3448cc60822d3fa3fdcddbe9f5d73dfab68d7774ea36b88e3",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "release_prepare",
+      "request_id": "00000000-0000-4000-8000-000000000029",
+      "nonce": "00000000000000000000000000000029"
+    },
+    "signature": "-tScwjyajngOIAkbYbJcgn7Tryio4z7gY79GBX0gE1tvvXLmqt66kedxIoYjdC3QHdsZbDZ_gLWu-zVSVDe5CQ",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000033",
+      "stop_generation": 8
+    }
+  },
+  "signing_input": "{\"action\":\"release_prepare\",\"body_digest\":\"71dbb45d4f518ec3448cc60822d3fa3fdcddbe9f5d73dfab68d7774ea36b88e3\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000029\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000029\",\"sender\":\"front-door\"}"
+}

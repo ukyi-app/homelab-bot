@@ -1,0 +1,58 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/release-commit-stale-execution-generation",
+  "description": "실행 세대를 올리지 않는(지금 3) 풀기 확정",
+  "status": "candidate",
+  "base": "accept/release-commit",
+  "changed": [
+    "message.body.execution_generation"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "generation_mismatch"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": 8
+      },
+      "execution": {
+        "known": true,
+        "current": 3,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "2f27de7de92e015e96a1d5193509ac2adaab8fcaddd6b2925948bc78345ac7fe",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "release_commit",
+      "request_id": "00000000-0000-4000-8000-00000000002b",
+      "nonce": "0000000000000000000000000000002b"
+    },
+    "signature": "8l7y0tSJrvN0KNssjeW-51siF1u5wtUIXn813JbbBKq3wNE8uHIX9KKYc-d3ZbyXuXtp0zMg_wNsr-2nYVWcDQ",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000034",
+      "stop_generation": 8,
+      "execution_generation": 3
+    }
+  },
+  "signing_input": "{\"action\":\"release_commit\",\"body_digest\":\"2f27de7de92e015e96a1d5193509ac2adaab8fcaddd6b2925948bc78345ac7fe\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"0000000000000000000000000000002b\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-00000000002b\",\"sender\":\"front-door\"}"
+}
