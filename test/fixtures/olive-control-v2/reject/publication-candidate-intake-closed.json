@@ -1,0 +1,62 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/publication-candidate-intake-closed",
+  "description": "현관의 접수가 닫혔을 때(정지 중 게시·승인 닫힘) 온 게시 후보",
+  "status": "candidate",
+  "base": "accept/publication-candidate",
+  "changed": [
+    "context.intake_open"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "intake_closed"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 4,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "e89176618e18b59b4bf97ef5ac0c08684769acd2402a4abe3ec05c143898faf3",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "publication_candidate",
+      "request_id": "00000000-0000-4000-8000-000000000064",
+      "nonce": "00000000000000000000000000000064"
+    },
+    "signature": "RCBtrI1a3igoWaBRxMVL6tPof278K-0tPc5gY2qZ4UyO7WXUT_u6WCdYSiJGqTsZb1Q0NKJFXyBxW1VzeeAtCg",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000072",
+      "kind": "pull_request",
+      "candidate_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "run_id": "00000000-0000-4000-8000-00000000007b",
+      "input_job_id": "00000000-0000-4000-8000-00000000007a",
+      "stop_generation": 8,
+      "execution_generation": 4
+    }
+  },
+  "signing_input": "{\"action\":\"publication_candidate\",\"body_digest\":\"e89176618e18b59b4bf97ef5ac0c08684769acd2402a4abe3ec05c143898faf3\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000064\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000064\",\"sender\":\"supervisor\"}"
+}

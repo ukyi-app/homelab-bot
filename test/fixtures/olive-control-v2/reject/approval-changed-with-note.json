@@ -1,0 +1,62 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/approval-changed-with-note",
+  "description": "승인 변화에 글 칸(모델이 '승인한 것으로 보인다'고 쓴 글 등). 승인 변화에는 글 칸이 없다",
+  "status": "candidate",
+  "base": "accept/approval-changed",
+  "changed": [
+    "message.body.note"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "unknown_field"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 7,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 3,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "ee6e8e9da3517cb46fde64f6b01b2056276f2767d024f5a0835629e5f4c5ec76",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "approval_changed",
+      "request_id": "00000000-0000-4000-8000-000000000065",
+      "nonce": "00000000000000000000000000000065"
+    },
+    "signature": "N0fDfpOxoLhVMO1xP0RN4_kW3ZDM60t9LH31AA8tSAVRu5fzBrz5Q59f87Jpd5sqw49FxLgbSGI5fD5lJ0ejCw",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000073",
+      "stop_generation": 7,
+      "card_job_id": "00000000-0000-4000-8000-00000000007a",
+      "candidate_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "seq": 2,
+      "state": "approved",
+      "note": "관리자가 승인한 것으로 보임"
+    }
+  },
+  "signing_input": "{\"action\":\"approval_changed\",\"body_digest\":\"ee6e8e9da3517cb46fde64f6b01b2056276f2767d024f5a0835629e5f4c5ec76\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000065\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000065\",\"sender\":\"front-door\"}"
+}

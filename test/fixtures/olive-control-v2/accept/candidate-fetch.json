@@ -1,0 +1,51 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/candidate-fetch",
+  "description": "현관이 출력 효과의 candidate_digest로 그 내용의 첫 조각(offset 0)을 묻는다. 감독의 접수가 닫혀 있어도 받는다(조회)",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "c33544c7fe719b37ffdd7a32669a50134fa6be9e8a939c27648c9673950ba615",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "candidate_fetch",
+      "request_id": "00000000-0000-4000-8000-000000000080",
+      "nonce": "00000000000000000000000000000080"
+    },
+    "signature": "tMPqT1UlGMQT_8VcYD0w12cuqeNYkvg52cLD38hpjLhizBFqs2EHES-UfZyUrNKr1mFq_S1zAVUcMtyDepPEBA",
+    "body": {
+      "candidate_digest": "f7919ba32b7f4a663c289e59c9663c5f0a95c33439919106ad541ad1ae39e8b2",
+      "offset": 0
+    }
+  },
+  "signing_input": "{\"action\":\"candidate_fetch\",\"body_digest\":\"c33544c7fe719b37ffdd7a32669a50134fa6be9e8a939c27648c9673950ba615\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000080\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000080\",\"sender\":\"front-door\"}"
+}

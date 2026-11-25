@@ -1,0 +1,71 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/publication-status-unknown-as-result",
+  "description": "모름을 확정 결과에 숨긴 답(outcome unknown). 게시의 확정 결과는 posted·not_posted뿐이다",
+  "status": "candidate",
+  "base": "accept/publication-candidate-posted",
+  "changed": [
+    "message.body.status.result.outcome"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "body_malformed"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": true,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {
+      "00000000-0000-4000-8000-000000000064": {
+        "action": "publication_candidate",
+        "job": {
+          "job_id": "00000000-0000-4000-8000-000000000072",
+          "action": "publication_candidate",
+          "request_digest": "e89176618e18b59b4bf97ef5ac0c08684769acd2402a4abe3ec05c143898faf3"
+        }
+      }
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "ce6148dda7a343c2d52319b92d79c1444b09522db9e0d7a990055439e16ef714",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "job_status",
+      "request_id": "00000000-0000-4000-8000-000000000065",
+      "nonce": "00000000000000000000000000000065"
+    },
+    "signature": "Y4kSDsUcqWP4dsiD3XnCM1jCg5GgVPjUzt6MB2U3jQ0LA9j9M1wAyi1XwxvTN80KvZwCJXTN7Rs40axrZqe-Bg",
+    "body": {
+      "in_reply_to": "00000000-0000-4000-8000-000000000064",
+      "job_id": "00000000-0000-4000-8000-000000000072",
+      "action": "publication_candidate",
+      "request_digest": "e89176618e18b59b4bf97ef5ac0c08684769acd2402a4abe3ec05c143898faf3",
+      "status": {
+        "state": "confirmed",
+        "result": {
+          "outcome": "unknown",
+          "pr_number": 17
+        }
+      }
+    }
+  },
+  "signing_input": "{\"action\":\"job_status\",\"body_digest\":\"ce6148dda7a343c2d52319b92d79c1444b09522db9e0d7a990055439e16ef714\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000065\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000065\",\"sender\":\"front-door\"}"
+}

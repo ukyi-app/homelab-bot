@@ -1,0 +1,55 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/publication-changed-without-seq",
+  "description": "게시 변화에 순번이 없다. 순서가 뜻을 갖는 사실은 순번을 싣는다",
+  "status": "candidate",
+  "base": "accept/publication-changed",
+  "changed": [
+    "message.body.seq"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "body_malformed"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "07c3894246a9f3f152bde57a52bf23a00da6e89821df28e6f7f54e1e42718acb",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "publication_changed",
+      "request_id": "00000000-0000-4000-8000-000000000067",
+      "nonce": "00000000000000000000000000000067"
+    },
+    "signature": "5urHn7RhlcQelDwv2W0WCctV-TdcvSpV26aO1slnZqjoiUkvI2c8A--aPFNFAJX1exdvZVbvGMN9FdDuq8esDQ",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000074",
+      "publication_job_id": "00000000-0000-4000-8000-00000000007b",
+      "candidate_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "state": "posted"
+    }
+  },
+  "signing_input": "{\"action\":\"publication_changed\",\"body_digest\":\"07c3894246a9f3f152bde57a52bf23a00da6e89821df28e6f7f54e1e42718acb\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000067\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000067\",\"sender\":\"front-door\"}"
+}

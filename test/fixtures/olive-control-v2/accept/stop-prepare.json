@@ -1,0 +1,55 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/stop-prepare",
+  "description": "새 정지 세대 8의 준비(감독의 지금 7, 규칙 newer). 감독의 접수가 닫혀 있어도 받는다",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 7,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 3,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "4fe5dacfdaca08af6531e5b8a71a0a1d2e9461d01d6d93039ef99f07e1b102e1",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "stop_prepare",
+      "request_id": "00000000-0000-4000-8000-000000000023",
+      "nonce": "00000000000000000000000000000023"
+    },
+    "signature": "iPhALcpYCDMc7WmtsNvhpVv1o-V3omk0N5C5Qsn5A3rTjJBgvXHyUTaEWYLsUTzGXDlDELPrqwALNnUSvfXpDg",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000031",
+      "stop_generation": 8
+    }
+  },
+  "signing_input": "{\"action\":\"stop_prepare\",\"body_digest\":\"4fe5dacfdaca08af6531e5b8a71a0a1d2e9461d01d6d93039ef99f07e1b102e1\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000023\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000023\",\"sender\":\"front-door\"}"
+}

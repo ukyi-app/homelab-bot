@@ -1,0 +1,52 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/reflected-own-message",
+  "description": "감독 이름으로 감독의 키로 서명해 감독에게 되돌린 봉투. 받는 쪽은 자기 키를 믿지 않는다",
+  "status": "candidate",
+  "base": "accept/handshake",
+  "changed": [
+    "message.header.sender"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "unknown_sender"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "none",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "e9efa21fbd3b8d9d4da9a246d88afa74fd05c702c4f4185a933e13b91c291abf",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "supervisor",
+      "action": "handshake",
+      "request_id": "00000000-0000-4000-8000-000000000010",
+      "nonce": "00000000000000000000000000000001"
+    },
+    "signature": "R0GYL-VAn7OpImP86cy2Bk3hu7vG01JKgj0vzaJ_a2J8UD1xEIO80Lmo6yMjS1lWifp37jTPezixZ1GmpPtlDg",
+    "body": {
+      "policy_revision": "policy-7"
+    }
+  },
+  "signing_input": "{\"action\":\"handshake\",\"body_digest\":\"e9efa21fbd3b8d9d4da9a246d88afa74fd05c702c4f4185a933e13b91c291abf\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000001\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000010\",\"sender\":\"supervisor\"}"
+}

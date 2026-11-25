@@ -1,0 +1,53 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/body-with-transcript",
+  "description": "본문에 금지 칸(원문 기록)",
+  "status": "candidate",
+  "base": "accept/handshake",
+  "changed": [
+    "message.body.transcript"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "forbidden_field"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "none",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "aab47a42f488d8e1d9d9ff612c6b65c8ac724968310d62199d48d3d52df28277",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "handshake",
+      "request_id": "00000000-0000-4000-8000-000000000010",
+      "nonce": "00000000000000000000000000000001"
+    },
+    "signature": "vdZgtyZ5Pghw3t11hH8z35wXtZ8DC8lJyOEZun9czk_Jkn6AKu6O4PN8Ee92plL5uIx3YpejB31itb0h3rEMCg",
+    "body": {
+      "policy_revision": "policy-7",
+      "transcript": "…"
+    }
+  },
+  "signing_input": "{\"action\":\"handshake\",\"body_digest\":\"aab47a42f488d8e1d9d9ff612c6b65c8ac724968310d62199d48d3d52df28277\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000001\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000010\",\"sender\":\"front-door\"}"
+}

@@ -1,0 +1,62 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/reply-candidate-channel-id",
+  "description": "답 글 후보에 모델이 고른 채널 칸",
+  "status": "candidate",
+  "base": "accept/reply-candidate",
+  "changed": [
+    "message.body.channel_id"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "forbidden_field"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": true,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 4,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "4168db40e0e8fbc450235db04a9d566c5f28b321ba974ef1eca9cb6bb8baa8b3",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "reply_candidate",
+      "request_id": "00000000-0000-4000-8000-000000000060",
+      "nonce": "00000000000000000000000000000060"
+    },
+    "signature": "YuSR8b3-kvobMFtn5F5FZbMMXsSsaN_bLjMIF8KQeCzElNzX5yK7XJOAPgfiCqjwO3vcihXwCYdR_t5g0feCCA",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000070",
+      "input_job_id": "00000000-0000-4000-8000-00000000007a",
+      "purpose": "answer",
+      "candidate_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "stop_generation": 8,
+      "execution_generation": 4,
+      "channel_id": "1300000000000000000"
+    }
+  },
+  "signing_input": "{\"action\":\"reply_candidate\",\"body_digest\":\"4168db40e0e8fbc450235db04a9d566c5f28b321ba974ef1eca9cb6bb8baa8b3\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000060\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000060\",\"sender\":\"supervisor\"}"
+}

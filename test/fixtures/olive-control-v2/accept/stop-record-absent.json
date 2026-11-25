@@ -1,0 +1,58 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/stop-record-absent",
+  "description": "현관이 원장을 읽고 기록이 없다고 확인함. '기록 없음'은 이 답에서만 나온다(시간 초과·끊김·거절된 답은 모름)",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "policy_mismatch",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {
+      "00000000-0000-4000-8000-000000000020": {
+        "action": "stop_record_lookup",
+        "job": null
+      }
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "701fca128746b49c1d443a7821e8ffb29c72b4d489dca3d726c9ab54b1ce2983",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "stop_record",
+      "request_id": "00000000-0000-4000-8000-000000000022",
+      "nonce": "00000000000000000000000000000022"
+    },
+    "signature": "gzA46wnl47zj9vE41Z1LvcQTaKO9cnhGJPSbCutidaQ8U_ylsijI96DKw6YA_kj24iVWQRPepVKsv84Q_u50BQ",
+    "body": {
+      "in_reply_to": "00000000-0000-4000-8000-000000000020",
+      "record": {
+        "state": "absent"
+      }
+    }
+  },
+  "signing_input": "{\"action\":\"stop_record\",\"body_digest\":\"701fca128746b49c1d443a7821e8ffb29c72b4d489dca3d726c9ab54b1ce2983\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000022\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000022\",\"sender\":\"front-door\"}"
+}

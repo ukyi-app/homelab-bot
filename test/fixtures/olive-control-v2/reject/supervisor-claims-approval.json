@@ -1,0 +1,59 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/supervisor-claims-approval",
+  "description": "감독이 낸 본문에 승인 주장 칸",
+  "status": "candidate",
+  "base": "accept/handshake-reply",
+  "changed": [
+    "message.body.approved"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "forbidden_field"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "none",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {
+      "00000000-0000-4000-8000-000000000010": {
+        "action": "handshake",
+        "job": null
+      }
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "7ca288816dd98820462757b7a6b1ea831b98b2708dae80473f0cc4f622278512",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "handshake_reply",
+      "request_id": "00000000-0000-4000-8000-000000000011",
+      "nonce": "00000000000000000000000000000002"
+    },
+    "signature": "Ue6kIhp2aAahXFRDE2LT0Axiy4h8gysJsim78Kk3_TVvBmG0rmNYZb-S7JUV0tN5BrBhDO9b5TVc5RmMbhCeBw",
+    "body": {
+      "in_reply_to": "00000000-0000-4000-8000-000000000010",
+      "policy_revision": "policy-7",
+      "approved": true
+    }
+  },
+  "signing_input": "{\"action\":\"handshake_reply\",\"body_digest\":\"7ca288816dd98820462757b7a6b1ea831b98b2708dae80473f0cc4f622278512\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000002\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000011\",\"sender\":\"supervisor\"}"
+}

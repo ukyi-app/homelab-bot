@@ -1,0 +1,56 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/handshake-reply-policy-mismatch",
+  "description": "감독의 정책 revision이 현관과 다름. 현관 쪽 연결도 policy_mismatch",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": "policy_mismatch"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "none",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {
+      "00000000-0000-4000-8000-000000000010": {
+        "action": "handshake",
+        "job": null
+      }
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "81aa5df47133176d290a3567b5181df1b974ad2fb49e0bee0224959aefffb487",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "handshake_reply",
+      "request_id": "00000000-0000-4000-8000-000000000011",
+      "nonce": "00000000000000000000000000000002"
+    },
+    "signature": "nBNgU8vk8praKuQ9QVBw_VF9w2NOYznlDrVx88rxZaY-kQSNeOUErVvq93oBrpGtjyI82xa08cFbeFp5sRERBg",
+    "body": {
+      "in_reply_to": "00000000-0000-4000-8000-000000000010",
+      "policy_revision": "policy-8"
+    }
+  },
+  "signing_input": "{\"action\":\"handshake_reply\",\"body_digest\":\"81aa5df47133176d290a3567b5181df1b974ad2fb49e0bee0224959aefffb487\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000002\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000011\",\"sender\":\"supervisor\"}"
+}

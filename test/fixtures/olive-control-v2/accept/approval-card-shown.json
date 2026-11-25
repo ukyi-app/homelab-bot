@@ -1,0 +1,68 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/approval-card-shown",
+  "description": "카드 요청의 바로 답: 확정 shown. 카드를 띄웠다는 것이지 승인이 아니다(승인은 현관의 이벤트로만 온다)",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": true,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {
+      "00000000-0000-4000-8000-000000000062": {
+        "action": "approval_card_request",
+        "job": {
+          "job_id": "00000000-0000-4000-8000-000000000071",
+          "action": "approval_card_request",
+          "request_digest": "b1b5c5750d9930cd231e67157ce41ad684840cfba8815f8f22f76f4717542370"
+        }
+      }
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "0a143d72c4f032ef2b3d6f0be2eb41ce8b8cb6e44b895521d3633096c114db6d",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "job_status",
+      "request_id": "00000000-0000-4000-8000-000000000063",
+      "nonce": "00000000000000000000000000000063"
+    },
+    "signature": "iBEi5EOidGY5H2qKYD6cGgmcteZGrDYVGLVjdXA_IAfKccd_fJDCmHvlCPi1CANLo69KUi9VYLiEx4kM_DnHAQ",
+    "body": {
+      "in_reply_to": "00000000-0000-4000-8000-000000000062",
+      "job_id": "00000000-0000-4000-8000-000000000071",
+      "action": "approval_card_request",
+      "request_digest": "b1b5c5750d9930cd231e67157ce41ad684840cfba8815f8f22f76f4717542370",
+      "status": {
+        "state": "confirmed",
+        "result": {
+          "outcome": "shown"
+        }
+      }
+    }
+  },
+  "signing_input": "{\"action\":\"job_status\",\"body_digest\":\"0a143d72c4f032ef2b3d6f0be2eb41ce8b8cb6e44b895521d3633096c114db6d\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000063\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000063\",\"sender\":\"front-door\"}"
+}
