@@ -149,11 +149,17 @@ async function bootWith(db: Database) {
   return rest;
 }
 const gatewayTyping = (s: number, d: Record<string, unknown>) => gw.dispatch(gw.latest, s, 'TYPING_START', d);
+// 옛 레인의 queued chat. 진입점 메시지는 현관 고정 안내로 끝나 작업을 만들지 않으므로(O08 F5) 저장소로 직접 만든다.
+async function queuedChat(id: string) {
+  const store = new Store(database.db);
+  const saved = await store.save({ id, actor: OWNER, scope: { kind: 'thread', guild: GUILD, channel: THREAD, parent: 'fixture-chat' },
+    text: `fixture-${id}`, kind: 'message', mention: false }, 'fixture-v1', false);
+  await store.accept(saved.id, 'chat', 'fixture-v1');
+}
 
 test('TYP-09 진입점: Gateway TYPING_START가 queued chat을 미룸', async () => {
   await bootWith(database.db);
-  gw.dispatch(gw.latest, 2, 'MESSAGE_CREATE', { id: '1000', channel_id: THREAD, guild_id: GUILD, author: { id: OWNER }, content: 'fixture-message' });
-  assert.ok(await waitFor(async () => (await jobs()).length === 1));
+  await queuedChat('1000');
   const job = (await jobs())[0]!;
   gatewayTyping(3, { channel_id: THREAD, guild_id: GUILD, user_id: OWNER, timestamp: Math.floor(Date.now() / 1000) });
   assert.ok(await waitFor(async () => (await jobs())[0]!.available_at > job.available_at));
@@ -163,9 +169,8 @@ test('TYP-09 진입점: Gateway TYPING_START가 queued chat을 미룸', async ()
 test('TYP-10 진입점: typing 처리 DB 오류는 삼키고 guard를 부르지 않으며 다음 이벤트는 그대로 처리', async () => {
   let fail = false;
   const broken = failing(database.db, sql => fail && /UPDATE jobs/.test(sql));
-  await bootWith(broken);
-  gw.dispatch(gw.latest, 2, 'MESSAGE_CREATE', { id: '1000', channel_id: THREAD, guild_id: GUILD, author: { id: OWNER }, content: 'fixture-message' });
-  assert.ok(await waitFor(async () => (await jobs()).length === 1));
+  const rest = await bootWith(broken);
+  await queuedChat('1000');
   fail = true;
   gatewayTyping(3, { channel_id: THREAD, guild_id: GUILD, user_id: OWNER, timestamp: Math.floor(Date.now() / 1000) });
   // 잘못된 모양도 같은 경로로 버린다.
@@ -173,7 +178,9 @@ test('TYP-10 진입점: typing 처리 DB 오류는 삼키고 guard를 부르지 
   assert.ok(await waitFor(() => logs.some(l => l.event === 'typing_hint_failed')));
   fail = false;
   gw.dispatch(gw.latest, 5, 'MESSAGE_CREATE', { id: '1001', channel_id: THREAD, guild_id: GUILD, author: { id: OWNER }, content: 'fixture-message-2' });
-  assert.ok(await waitFor(async () => (await jobs()).length === 2));
+  // 다음 메시지는 현관 입구가 받아 고정 안내를 단다(O08 F5: 작업을 만들지 않는다).
+  assert.ok(await waitFor(() => rest.calls.some(c => c.method === 'POST' && c.path === `/channels/${THREAD}/messages`)));
+  assert.equal((await jobs()).length, 1);
   assert.equal(logs.some(l => l.event === 'recovery_guard' || l.event === 'recovery_guard_failed' || l.event === 'discord_event_failed'), false);
   const gap = (await database.db.query<{ gap: boolean }>('SELECT gap FROM conversations WHERE channel_id=$1', [THREAD])).rows[0]!.gap;
   assert.equal(gap, false);
@@ -216,18 +223,18 @@ test('TYP-11 진입점: typing DB가 느려도 뒤 MESSAGE_CREATE·상호작용�
   gatewayTyping(2, { channel_id: THREAD, guild_id: GUILD, user_id: OWNER, timestamp: Math.floor(Date.now() / 1000) });
   await slow.paused;
   try {
+    // 힌트 뒤에 생긴 옛 레인 작업. 진입점 메시지는 작업을 만들지 않아(O08 F5) 저장소로 만든다.
+    await queuedChat('999');
     gw.dispatch(gw.latest, 3, 'MESSAGE_CREATE', { id: '1000', channel_id: THREAD, guild_id: GUILD, author: { id: OWNER }, content: 'fixture-message' });
     gw.dispatch(gw.latest, 4, 'INTERACTION_CREATE', { id: '9001', token: 'fixture-token-9001', type: 2, channel_id: THREAD, guild_id: GUILD,
       member: { user: { id: OWNER } }, data: { name: 'chat', options: [{ name: 'text', value: 'fixture-command' }] } });
-    // 힌트가 붙잡혀 있는 동안 둘 다 처리된다(Gateway 직렬 처리를 막지 않는다).
-    // 상호작용 응답 기한(3초)보다 짧게 본다. 힌트가 Gateway 직렬 처리를 막으면 풀어 줄 때까지 영영 막힌다.
-    assert.ok(await waitFor(async () => (await jobs()).length >= 1, 2000), 'MESSAGE_CREATE가 typing 뒤에서 막힘');
-    assert.ok(await waitFor(() => rest.calls.some(c => c.path.startsWith('/interactions/9001/')), 2000), '상호작용 응답이 typing 뒤에서 막힘');
+    // 힌트가 붙잡혀 있는 동안 메시지는 현관 고정 안내까지 간다(Gateway 직렬 처리를 막지 않는다). 상호작용은 닫혀 응답이 없다.
+    assert.ok(await waitFor(() => rest.calls.some(c => c.method === 'POST' && c.path === `/channels/${THREAD}/messages`), 2000), 'MESSAGE_CREATE가 typing 뒤에서 막힘');
   } finally { slow.release(); }
   await slow.finished;
   await new Promise(resolve => setTimeout(resolve, 50));
-  // 늦게 끝난 힌트는 자기 뒤에 도착한 메시지의 작업을 늘리지 않는다(기본 2초 그대로).
-  // /chat이 앞 메시지 작업을 대체하므로 남은 queued 작업(둘 다 힌트 뒤에 생김)을 본다.
+  assert.equal(rest.calls.some(c => c.path.startsWith('/interactions/')), false);
+  // 늦게 끝난 힌트는 자기 뒤에 생긴 작업을 늘리지 않는다(기본 2초 그대로).
   const queued = (await jobs()).filter(job => job.state === 'queued');
   assert.equal(queued.length, 1);
   assert.equal(queued[0]!.available_at, queued[0]!.created_at + DEFAULTS.debounceMs);

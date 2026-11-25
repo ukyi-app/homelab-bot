@@ -1,4 +1,5 @@
 import { after, afterEach, before, beforeEach, test } from 'node:test';
+import { sendToHandlers } from './legacy-interaction-protocol.js';
 import assert from 'node:assert/strict';
 import { mkdir, rm } from 'node:fs/promises';
 import { closeLedgers, initLedger, ledgerAt } from './ledger-fixture.js';
@@ -61,20 +62,27 @@ async function send(booted: Awaited<ReturnType<typeof start>>, name: string, opt
   booted.gw.dispatch(booted.gw.latest, ++seq, 'INTERACTION_CREATE', payload);
   return payload.id;
 }
+// 운영 진입점은 '/' 명령을 받지 않는다(O08 F5). 운영 조립이 만든 기억 처리기를 운영과 같은 조립 함수로 묶어 부른다.
+async function sendHandler(booted: Awaited<ReturnType<typeof start>>, name: string, options: Record<string, string>) {
+  const payload = interaction(name, options);
+  await waitFor(() => !!booted.publisher.handlers());
+  void sendToHandlers(booted.rest, booted.publisher.handlers(), payload).catch(() => {});
+  return payload.id;
+}
 const reply = (rest: RecordingRest, id: string) => rest.callbacks.find(c => c.id === id);
 
 test('T20 명령 [원장 꺼짐] MEMORY_LEDGER_DIR이 없으면 기억 명령을 등록하지 않고, 와도 응답·기록 없이 닫음', async () => {
   const trace = new Trace();
   const booted = await start(trace, false);
   await waitFor(() => trace.index('commands_registered') >= 0);
-  assert.equal(booted.rest.registered.length, 1);
-  assert.equal(booted.rest.registered[0]!.some(name => name.startsWith('memory-')), false);
+  // '/' 명령은 원장과 상관없이 하나도 등록하지 않는다(O08 F5).
+  assert.equal(booted.rest.registered.flat().length, 0);
   seq = 1;
   const id = await send(booted, 'memory-search', { text: '아무거나' });
   const control = await send(booted, 'model-status', {});
-  // 뒤에 보낸 명령의 응답이 왔으면 앞의 기억 명령은 이미 처리(거부)됐다(이벤트는 차례로 처리된다).
-  await waitFor(() => !!reply(booted.rest, control));
+  await new Promise(resolve => setTimeout(resolve, 300));
   assert.equal(reply(booted.rest, id), undefined);
+  assert.equal(reply(booted.rest, control), undefined);
   assert.equal((await database.db.query("SELECT 1 FROM events WHERE payload->>'command'='memory-search'")).rows.length, 0);
 });
 
@@ -82,17 +90,17 @@ test('T20 명령 [원장 켜짐] 기억 명령 다섯 개를 등록하고, 상�
   const trace = new Trace();
   const booted = await start(trace, true);
   await waitFor(() => trace.index('t20_barrier_passed') >= 0 && trace.index('commands_registered') >= 0);
-  assert.deepEqual(booted.rest.registered[0]!.filter(name => name.startsWith('memory-')),
-    ['memory-save', 'memory-search', 'memory-correct', 'memory-exclude', 'memory-delete']);
+  // '/' 명령은 원장과 상관없이 등록하지 않는다(O08 F5).
+  assert.equal(booted.rest.registered.flat().length, 0);
   seq = 1;
-  const saved = await send(booted, 'memory-save', { target: 'decision', text: '봇 DB 백업은 R2 한 곳 @everyone | applies=봇 DB' });
+  const saved = await sendHandler(booted, 'memory-save', { target: 'decision', text: '봇 DB 백업은 R2 한 곳 @everyone | applies=봇 DB' });
   await waitFor(() => !!reply(booted.rest, saved));
   const save = reply(booted.rest, saved)!.body;
   // 본인만 보는 응답(64) + 링크 미리보기 끔(4). 기억 응답의 문서 링크에 미리보기가 붙지 않게 한다.
   assert.equal(save.type, 4); assert.equal(save.data.flags, 64 | 4);
   assert.deepEqual(save.data.allowed_mentions, { parse: [] });
   assert.match(save.data.content, new RegExp(`^${MEMORY_TEXT.saved}: \`[0-9a-f-]{36}\` · 상태 active\\(확정\\)$`));
-  const searched = await send(booted, 'memory-search', { text: '백업' });
+  const searched = await sendHandler(booted, 'memory-search', { text: '백업' });
   await waitFor(() => !!reply(booted.rest, searched));
   const search = reply(booted.rest, searched)!.body.data;
   assert.equal(search.flags, 64 | 4);
@@ -104,7 +112,7 @@ test('T20 명령 [원장 켜짐] 기억 명령 다섯 개를 등록하고, 상�
   assert.deepEqual(trace.events.filter(e => e.name === 'memory_command').map(e => e.detail), [
     { command: 'memory-save', outcome: 'ok' }, { command: 'memory-search', outcome: 'ok' }]);
   // 기억 명령이 아닌 명령의 응답은 그대로 64만(미리보기 끄기는 기억 응답에만).
-  const status = await send(booted, 'model-status', {});
+  const status = await sendHandler(booted, 'model-status', {});
   await waitFor(() => !!reply(booted.rest, status));
   assert.equal(reply(booted.rest, status)!.body.data.flags, 64);
 });
@@ -115,7 +123,7 @@ test('T20 명령 [장벽 전] 원장을 여는 중에 온 기억 명령은 "지�
   const booted = await start(trace, true, { hold: new Promise(resolve => { release = resolve; }) });
   await waitFor(() => trace.index('ledger_open') >= 0);
   seq = 1;
-  const id = await send(booted, 'memory-save', { target: 'preference', text: '장벽 전 | expires=1d | end=x' });
+  const id = await sendHandler(booted, 'memory-save', { target: 'preference', text: '장벽 전 | expires=1d | end=x' });
   await waitFor(() => !!reply(booted.rest, id));
   assert.equal(reply(booted.rest, id)!.body.data.content, UNAVAILABLE);
   release();
@@ -130,7 +138,7 @@ for (const colleague of [false, true]) {
     const booted = await start(trace, true, { colleague });
     await waitFor(() => trace.index('t20_barrier_passed') >= 0 && trace.index('commands_registered') >= 0);
     seq = 1;
-    const id = await send(booted, 'memory-exclude', { target: 'here' });
+    const id = await sendHandler(booted, 'memory-exclude', { target: 'here' });
     await waitFor(() => !!reply(booted.rest, id));
     const content = reply(booted.rest, id)!.body.data.content as string;
     const want = colleague ? MEMORY_GUIDE.colleague.deleteExcluded : MEMORY_GUIDE.slash.deleteExcluded;

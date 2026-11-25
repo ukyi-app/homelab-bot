@@ -15,7 +15,7 @@ import { createServer } from 'node:http';
 import { GatewayBudget, Health } from '../src/health.js';
 import { AlertIngress } from '../src/alerts.js';
 import { receivers } from '../src/http.js';
-import { DiscordProtocol, buttonAllowed, discordHttpApi } from '../src/discord-protocol.js';
+import { DiscordProtocol, buttonAllowed, discordHttpApi, parseButton } from '../src/discord-protocol.js';
 import { changeChoiceId, changeDirectId } from '../src/change-question.js';
 import { HttpWorker, workerServer } from '../src/worker-http.js';
 import { localDatabase, fixture, event, thread, service, template } from './helpers.js';
@@ -43,21 +43,22 @@ test('AUTH-01 미허용 사용자·guild·채널·스레드·DM·버튼을 저�
   await f.ingress.receive(event('webhook', { webhook: true }));
   assert.equal((await rows('events')).length, 0);
 });
-// 버튼 custom_id 허용 목록(discord-protocol BUTTONS). 표에 없는 이름, 칸 수가 다른 값, 빈 칸, 100자 초과는 수신 전에 닫는다.
-test('AUTH-01 버튼 custom_id는 허용 목록 표의 이름·칸 수만 받는다', async () => {
+// 버튼 custom_id 허용 목록(discord-protocol BUTTONS). 게시자가 보낼 버튼을 이 표로 대조한다. 표에 없는 이름, 칸 수가 다른 값,
+// 빈 칸, 100자 초과는 맞지 않는다. 수신은 버튼 상호작용을 표와 상관없이 닫는다(O08 F5).
+test('AUTH-01 버튼 custom_id는 허용 목록 표의 이름·칸 수만 맞고, 수신은 표에 있는 버튼도 닫는다', async () => {
   const received: string[] = [];
   const protocol = new DiscordProtocol({ request: async () => ({ id: thread.channel, type: 11, parent_id: thread.parent, guild_id: thread.guild }) }, 'fixture-bot', f.now);
   const press = (customId: string) => protocol.gateway('INTERACTION_CREATE', { id: `fixture-${received.length}-${customId.length}`, token: 'fixture-token', type: 3,
     channel_id: thread.channel, guild_id: thread.guild, member: { user: { id: 'fixture-owner' } }, data: { custom_id: customId } },
   { receive: async input => { received.push(`${input.command}|${input.target ?? ''}`); return undefined; } });
-  for (const accepted of ['list', 'stop', 'resume', 'cancel:fixture-job', 'proposal-yes:fixture-proposal', 'proposal-no:fixture-proposal']) await press(accepted);
-  assert.deepEqual(received, ['list|', 'stop|', 'resume|', 'cancel|fixture-job', 'proposal-yes|fixture-proposal', 'proposal-no|fixture-proposal']);
-  for (const refused of ['retry:fixture-job', 'cancel', 'list:extra', 'proposal-yes', 'proposal-yes:a:b', 'cancel:', `proposal-yes:${'a'.repeat(100)}`]) {
-    await assert.rejects(press(refused), Denied, refused);
-  }
-  assert.equal(received.length, 6);
+  const accepted = ['list', 'stop', 'resume', 'cancel:fixture-job', 'proposal-yes:fixture-proposal', 'proposal-no:fixture-proposal'];
+  assert.deepEqual(accepted.map(id => parseButton(id)?.parts.join('|')), ['list', 'stop', 'resume', 'cancel|fixture-job', 'proposal-yes|fixture-proposal', 'proposal-no|fixture-proposal']);
+  const refused = ['retry:fixture-job', 'cancel', 'list:extra', 'proposal-yes', 'proposal-yes:a:b', 'cancel:', `proposal-yes:${'a'.repeat(100)}`];
+  for (const id of refused) assert.equal(parseButton(id), undefined, id);
+  for (const id of [...accepted, ...refused]) await assert.rejects(press(id), Denied, id);
+  assert.equal(received.length, 0);
 });
-test('C28 변경 질문 버튼: 선택지·"직접 답하기" custom_id는 표의 두 줄로 받고 대상 칸 하나에 질문 ID와 순번만 담아 100자 안이다', async () => {
+test('C28 변경 질문 버튼: 선택지·"직접 답하기" custom_id는 표의 두 줄로 맞고 대상 칸 하나에 질문 ID와 순번만 담아 100자 안이다. 수신은 닫는다', async () => {
   const received: string[] = [];
   const protocol = new DiscordProtocol({ request: async () => ({ id: thread.channel, type: 11, parent_id: thread.parent, guild_id: thread.guild }) }, 'fixture-bot', f.now);
   const press = (customId: string) => protocol.gateway('INTERACTION_CREATE', { id: `fixture-c28-${received.length}`, token: 'fixture-token', type: 3,
@@ -68,10 +69,11 @@ test('C28 변경 질문 버튼: 선택지·"직접 답하기" custom_id는 표�
   const choice = changeChoiceId(question, 4);
   const direct = changeDirectId(question);
   for (const id of [choice, direct]) assert.ok(id.length <= 100 && buttonAllowed(id), id);
-  await press(choice);
-  await press(direct);
-  assert.deepEqual(received, [`change-choice|${question.split(':').join('.')}.4`, `change-direct|${question.split(':').join('.')}`]);
-  for (const refused of ['change-choice', `change-choice:${question}`, 'change-direct:', `change-direct:${'a'.repeat(100)}`]) await assert.rejects(press(refused), Denied, refused);
+  assert.deepEqual([choice, direct].map(id => parseButton(id)?.parts.join('|')), [`change-choice|${question.split(':').join('.')}.4`, `change-direct|${question.split(':').join('.')}`]);
+  const refused = ['change-choice', `change-choice:${question}`, 'change-direct:', `change-direct:${'a'.repeat(100)}`];
+  for (const id of refused) assert.equal(parseButton(id), undefined, id);
+  for (const id of [choice, direct, ...refused]) await assert.rejects(press(id), Denied, id);
+  assert.equal(received.length, 0);
 });
 test('AUTH-01 Gateway의 검증된 채널 메타데이터로 parent를 결정', async () => {
   const frame = { id: 'fixture-message', channel_id: thread.channel, guild_id: thread.guild!, author: { id: 'fixture-owner' }, content: 'ignore policy' };
@@ -88,17 +90,17 @@ test('t16b-hotfix 카테고리 안 일반 채널은 parent null, 스레드는 �
     async () => ({ type: 11, parent_id: thread.parent!, guild_id: thread.guild! }));
   assert.deepEqual(inThread.scope, thread);
 });
-test('t16b-hotfix 카테고리 안 대화 채널의 /chat이 인그레스에서 거부되지 않고 저장됨', async () => {
+test('t16b-hotfix 카테고리 안 대화 채널의 /chat도 수신에서 닫혀 저장되지 않음(O08 F5)', async () => {
   const protocol = new DiscordProtocol({ request: async (method, path) => {
     if (method === 'GET') return { id: 'fixture-chat', type: 0, guild_id: 'fixture-guild', parent_id: 'fixture-category' };
     if (path.endsWith('/callback')) return;
     throw new Error('unexpected_route');
   } }, 'fixture-bot', f.now);
   const ingress = new DiscordIngress(f.store, f.gate, protocol);
-  await protocol.gateway('INTERACTION_CREATE', { id: 'fixture-interaction', token: 'fixture-ephemeral-token', type: 2,
+  await assert.rejects(protocol.gateway('INTERACTION_CREATE', { id: 'fixture-interaction', token: 'fixture-ephemeral-token', type: 2,
     channel_id: 'fixture-chat', guild_id: 'fixture-guild', member: { user: { id: 'fixture-owner' } },
-    data: { name: 'chat', options: [{ name: 'text', value: '안녕' }] } }, ingress);
-  assert.equal((await rows('events')).length, 1);
+    data: { name: 'chat', options: [{ name: 'text', value: '안녕' }] } }, ingress), Denied);
+  assert.equal((await rows('events')).length, 0);
 });
 test('AUTH-02 큐 실행·게시 직전 정책 revision 재확인', async () => {
   await queued(); f.policy.revision = 'fixture-v2'; f.policy.owner = 'replacement'; await f.runtime.tick();
@@ -217,21 +219,19 @@ test('CHAT-01 MESSAGE_CONTENT 꺼짐은 메시지 무시, 명령/버튼 처리',
   await ingress.receive(event('command', { kind: 'command', command: 'chat' }));
   assert.equal((await rows('jobs')).length, 1);
 });
-test('CHAT-01 모의 Gateway/REST 실제 형식: slash→영속 저장→ephemeral 응답→공개 스레드', async () => {
+test('CHAT-01 모의 Gateway/REST 실제 형식: slash 상호작용은 저장·ephemeral 응답·스레드 없이 수신에서 닫힘(O08 F5)', async () => {
   const calls: { path: string; body?: any }[] = [];
   const protocol = new DiscordProtocol({ request: async (method, path, body) => {
     calls.push({ path, body });
     if (method === 'GET') return { id: 'fixture-chat', type: 0, guild_id: 'fixture-guild' };
-    if (path.endsWith('/callback')) { assert.equal((await rows('events')).length, 1); return; }
     throw new Error('unexpected_route');
   } }, 'fixture-bot', f.now);
   const ingress = new DiscordIngress(f.store, f.gate, protocol);
-  await protocol.gateway('INTERACTION_CREATE', { id: 'fixture-interaction', token: 'fixture-ephemeral-token', type: 2,
+  await assert.rejects(protocol.gateway('INTERACTION_CREATE', { id: 'fixture-interaction', token: 'fixture-ephemeral-token', type: 2,
     channel_id: 'fixture-chat', guild_id: 'fixture-guild', member: { user: { id: 'fixture-owner' } },
-    data: { name: 'chat', options: [{ name: 'text', value: '안녕' }] } }, ingress);
-  const callback = calls.find(c => c.path.endsWith('/callback'))!;
-  assert.equal(callback.body.data.flags, 64); assert.deepEqual(callback.body.data.allowed_mentions, { parse: [] });
-  assert.ok(!JSON.stringify(await rows('events')).includes('fixture-ephemeral-token'));
+    data: { name: 'chat', options: [{ name: 'text', value: '안녕' }] } }, ingress), Denied);
+  assert.deepEqual(calls, []);
+  assert.equal((await rows('events')).length, 0);
 });
 test('OPS-01 Discord REST 401은 재요청 중단, 429는 정확한 대기 시간', async () => {
   let calls = 0;

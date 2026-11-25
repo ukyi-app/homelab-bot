@@ -1,4 +1,5 @@
 import { DEFAULTS } from '../src/contracts.js';
+import { LegacyInteractionProtocol } from './legacy-interaction-protocol.js';
 import type { Proposal } from '../src/contracts.js';
 import type { Database } from '../src/database.js';
 import { ALL_COMMANDS, DiscordIngress } from '../src/discord.js';
@@ -20,7 +21,7 @@ export async function harness(db: Database, options: { colleague?: boolean } = {
   const local = lane(f);
   const handler = new TaskCommands(f.store, f.gate, local.bridge, () => ({ routed: true, open: true, reasons: [] }), () => {}, () => {});
   const callbacks: { path: string; body: { type: number; data: Record<string, unknown> } }[] = [];
-  const protocol = new DiscordProtocol({ request: async (method, path, body) => {
+  const protocol = new LegacyInteractionProtocol({ request: async (method, path, body) => {
     if (method === 'GET' && path === `/channels/${thread.channel}`) return { id: thread.channel, type: 11, parent_id: thread.parent, guild_id: thread.guild };
     if (method === 'PUT') return undefined;
     if (method === 'POST' && path.endsWith('/callback')) { callbacks.push({ path, body: body as never }); return undefined; }

@@ -1,6 +1,6 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULTS, DiscordRejected, RateLimited } from '../src/contracts.js';
+import { DEFAULTS, Denied, DiscordRejected, RateLimited } from '../src/contracts.js';
 import type { EventInput } from '../src/contracts.js';
 import { DiscordIngress } from '../src/discord.js';
 import type { DiscordRest } from '../src/discord.js';
@@ -119,15 +119,14 @@ test('수신: history 복구로 받은 메시지에는 표시하지 않음', asy
   assert.equal(texts(calls).length, 0);
 });
 
-test('수신: 상호작용 ACK는 ephemeral 콜백 그대로', async () => {
+test('수신: 상호작용은 ACK(callback) 없이 수신에서 닫히고, 일반 메시지의 👀는 그대로(O08 F5)', async () => {
   const { protocol, calls } = wire();
   const ingress = new DiscordIngress(f.store, f.gate, protocol);
   await f.ingress.receive(event('6020'));
-  await protocol.gateway('INTERACTION_CREATE', { id: '6021', token: 'fixture-token', type: 2, channel_id: thread.channel,
-    guild_id: thread.guild, member: { user: { id: f.policy.owner } }, data: { name: 'list' } }, ingress);
-  const callback = calls.find(c => c.path === '/interactions/6021/fixture-token/callback');
-  assert.ok(callback);
-  assert.equal((callback.body as { type: number; data: { flags: number } }).data.flags, 64);
+  await assert.rejects(protocol.gateway('INTERACTION_CREATE', { id: '6021', token: 'fixture-token', type: 2, channel_id: thread.channel,
+    guild_id: thread.guild, member: { user: { id: f.policy.owner } }, data: { name: 'list' } }, ingress), Denied);
+  await assert.rejects(protocol.acknowledge({ ...event('6021'), kind: 'command', command: 'list' }, '받았어요', { allowed_mentions: { parse: [] } }), Denied);
+  assert.equal(calls.filter(c => c.path.includes('/interactions/')).length, 0);
   assert.equal(reactions(calls).length, 1);
 });
 
