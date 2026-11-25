@@ -10,6 +10,7 @@ import type { ChangeRepositoryPolicy } from './change-policy.js';
 import { Denied, PolicyUnavailable } from './contracts.js';
 import { REFRESH_MARGIN_MS, TokenResponse, appJwt, grantedExactly } from './github-app.js';
 import type { GitHubAppCredentials } from './github-app.js';
+import { checkOutbound, finalPayload, openOutbound, OUTBOUND_RULES_REVISION, sendOutbound } from './outbound.js';
 
 // 봇이 공개 저장소에 쓰는 유일한 경로다. 네트워크 호출은 createGitHubWriter 안의 exchange 한 곳이고, 밖으로는 도메인 메서드만 나간다.
 // URL·method·token을 받는 함수가 없어서 표에 없는 API를 부를 방법이 코드에 없다. 키가 새면 이 경계는 우회되고, 남는 상한은 설치 저장소와 서버 ruleset이다.
@@ -145,13 +146,17 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
 
   // 이 파일에서 네트워크로 나가는 유일한 지점이다. redirect를 따라가지 않아 자격이 다른 주소로 가지 않는다.
   const exchange = async (method: 'GET' | 'POST' | 'PATCH', path: string, credential: string | null, body: unknown, limit: number): Promise<Exchange> => {
-    if (!writerRouteAllowed(method, path) || !bodyAllowed(method, path, body)) return { kind: 'not_sent', code: 'route_denied' };
+    // 저장소 쓰기는 발송 한 길(src/outbound.ts)을 지난 바이트만 보낸다. 토큰 발급(/app/...)만 일반 본문이다.
+    const sealed = method === 'GET' ? undefined : openOutbound(body, method, path);
+    if (method !== 'GET' && path.startsWith('/repos/') && sealed === undefined) return { kind: 'not_sent', code: 'route_denied' };
+    const shape = sealed === undefined ? body : JSON.parse(sealed) as unknown;
+    if (!writerRouteAllowed(method, path) || !bodyAllowed(method, path, shape)) return { kind: 'not_sent', code: 'route_denied' };
     let response: Response;
     try {
       response = await send(`${API}${path}`, { method, redirect: 'manual', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         headers: { accept: 'application/vnd.github+json', 'user-agent': 'homelab-bot', 'x-github-api-version': API_VERSION,
           ...(credential === null ? {} : { authorization: `Bearer ${credential}` }), ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+        ...(body === undefined ? {} : { body: sealed ?? JSON.stringify(body) }) });
     } catch (error) {
       const code = (error as { cause?: { code?: unknown } } | null)?.cause?.code;
       if (typeof code === 'string' && BEFORE_REQUEST.has(code)) return { kind: 'not_sent', code: code === 'ECONNREFUSED' ? 'connection_refused' : 'connection_failed' };
@@ -183,12 +188,24 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
   // 공개 저장소로 나가는 쓰기는 모두 여기를 지난다. 게시자의 단계 입구 검사 뒤에도 GitHub 조회·토큰 발급을 기다리므로 그사이의 /revoke·/change-cancel은 여기서만 잡힌다.
   // 확인이 실패해도 보내지 않는다. 읽기는 이 길을 지나지 않아 보냈을 수 있는 effect의 대조가 철회로 막히지 않는다.
   // 이 확인과 전송 사이의 아주 짧은 틈은 남는다. 이미 나간 요청과 같게 대조로 다룬다.
+  // 본문은 발송 한 길에서 바이트로 굳혀 검사하고 이 경로(저장소·대상)에 묶는다. 인가 확인이 그 길의 발송함 대조 자리다.
+  // 이 저장소 쓰기에는 Discord 정책 판이 없어 검사 규칙의 판에 묶는다.
   const sendWrite = async (target: ChangeTarget, path: string, token: string, body: unknown, limit: number, method: 'POST' | 'PATCH' = 'POST'): Promise<Exchange> => {
-    try { await authorizeWrite(target); }
-    catch (error) {
-      return { kind: 'not_sent', code: error instanceof Denied ? 'authorization_revoked' : error instanceof PublicationStopped ? 'publication_stopped' : error instanceof PolicyUnavailable ? 'policy_unavailable' : 'authorization_check_failed' };
-    }
-    return exchange(method, path, token, body, limit);
+    let refused: string | undefined;
+    try {
+      const payload = finalPayload({ kind: 'github', method, path }, body);
+      return await sendOutbound(payload, checkOutbound(payload, { policyRevision: OUTBOUND_RULES_REVISION }), {
+        revision: () => OUTBOUND_RULES_REVISION,
+        ledger: { admit: async () => {
+          try { await authorizeWrite(target); return true; }
+          catch (error) {
+            refused = error instanceof Denied ? 'authorization_revoked' : error instanceof PublicationStopped ? 'publication_stopped' : error instanceof PolicyUnavailable ? 'policy_unavailable' : 'authorization_check_failed';
+            return false;
+          }
+        } },
+        wire: { wire: (wireMethod, wirePath, bytes) => exchange(wireMethod, wirePath, token, bytes, limit) },
+      }) as Exchange;
+    } catch { return { kind: 'not_sent', code: refused ?? 'route_denied' }; }
   };
 
   const resolve = async (repoId: number): Promise<WriterRepository | { denied: string }> => {

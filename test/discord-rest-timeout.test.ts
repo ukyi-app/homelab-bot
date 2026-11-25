@@ -4,6 +4,7 @@ import { Denied, DiscordRejected, DiscordUnauthorized, RateLimited } from '../sr
 import { DiscordIngress, ackFailureReason } from '../src/discord.js';
 import { DISCORD_DISPATCH_REST_TIMEOUT_MS, DISCORD_REST_TIMEOUT_MS, DiscordProtocol, discordHttpApi } from '../src/discord-protocol.js';
 import type { DiscordApi, DiscordRequestOptions } from '../src/discord-protocol.js';
+import { checkOutbound, finalPayload, sendOutbound } from '../src/outbound.js';
 import { event, fixture, localDatabase, thread } from './helpers.js';
 
 // S16: REST 제한은 경로마다 다르다. 상호작용 callback은 그 상호작용 기한까지, 나머지 REST는 5초,
@@ -19,12 +20,12 @@ function slowSend(delayMs: number): typeof fetch {
 
 test('discordHttpApi: 상호작용 callback은 1초를 넘겨도 기한 안이면 성공한다', async () => {
   const api = discordHttpApi('fixture-token', slowSend(1200));
-  assert.equal(await api.request('POST', '/interactions/1/t/callback', {}, { expiresAt: Date.now() + 2500 }), undefined);
+  assert.equal(await api.request('POST', '/interactions/1/t/callback', undefined, { expiresAt: Date.now() + 2500 }), undefined);
 });
 
 test('discordHttpApi: 상호작용 callback이 기한을 넘기면 시간 초과로 실패한다', async () => {
   const api = discordHttpApi('fixture-token', slowSend(1200));
-  await assert.rejects(api.request('POST', '/interactions/1/t/callback', {}, { expiresAt: Date.now() + 300 }),
+  await assert.rejects(api.request('POST', '/interactions/1/t/callback', undefined, { expiresAt: Date.now() + 300 }),
     (error: unknown) => (error as { name?: string }).name === 'TimeoutError');
 });
 
@@ -35,11 +36,11 @@ test('discordHttpApi: 기한 없는 요청은 5초, timeoutMs를 주면 그 값,
   const api = discordHttpApi('fixture-token', async () => new Response(null, { status: 204 }), () => time);
   await api.request('GET', '/channels/1');
   await api.request('PUT', '/channels/1/messages/2/reactions/x/@me', undefined, { timeoutMs: 1000 });
-  await api.request('POST', '/interactions/1/t/callback', {}, { expiresAt: time + 2500 });
+  await api.request('POST', '/interactions/1/t/callback', undefined, { expiresAt: time + 2500 });
   assert.equal(DISCORD_REST_TIMEOUT_MS, 5000);
   assert.deepEqual(timeouts, [5000, 1000, 2500]);
   time += 2500;
-  await assert.rejects(api.request('POST', '/interactions/1/t/callback', {}, { expiresAt: time }), /interaction_expired/);
+  await assert.rejects(api.request('POST', '/interactions/1/t/callback', undefined, { expiresAt: time }), /interaction_expired/);
 });
 
 test('protocol: Gateway dispatch 안의 채널 조회·리액션은 짧은 제한, history·게시는 기본 제한', async () => {
@@ -57,7 +58,8 @@ test('protocol: Gateway dispatch 안의 채널 조회·리액션은 짧은 제�
   const dispatch = seen.splice(0);
   assert.deepEqual(dispatch.map(s => s.options), [{ timeoutMs: DISCORD_DISPATCH_REST_TIMEOUT_MS }, { timeoutMs: DISCORD_DISPATCH_REST_TIMEOUT_MS }]);
   await protocol.history(thread.channel, null, 100);
-  await protocol.sendMessage(thread.channel, { content: 'x', nonce: 'n', enforce_nonce: true, allowed_mentions: { parse: [] } });
+  const payload = finalPayload({ kind: 'discord-message', channel: thread.channel }, { content: 'x', nonce: 'n', enforce_nonce: true, allowed_mentions: { parse: [] } });
+  await sendOutbound(payload, checkOutbound(payload, { policyRevision: 'fixture-v1' }), { revision: () => 'fixture-v1', ledger: { admit: async () => true }, wire: protocol });
   // 반응 상태 동기화(⏳·지우기)는 게시 루프에서 돈다. dispatch 밖이라 기본 제한이다.
   await protocol.addReaction(thread.channel, '7001', '⏳');
   await protocol.removeOwnReaction(thread.channel, '7001', '👀');

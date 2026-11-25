@@ -7,6 +7,7 @@ import type { Clock, EventInput, Job, RateLimitInfo, Scope, State } from './cont
 import { remaining } from './database.js';
 import type { Database, TransactionDeadline } from './database.js';
 import { BUTTON_PAGE_SIZE, messagePages } from './format.js';
+import type { OutboundTarget } from './outbound.js';
 import { awayKey, syncAway } from './away.js';
 import { moveReactions, settleReactions, sleepReactions } from './reactions.js';
 import { TASK_RETENTION } from './task-contracts.js';
@@ -35,6 +36,8 @@ export interface Delivery {
     // 같은 message_key의 쪽 순서만으로는 다른 글 사이의 순서가 지켜지지 않는다(앞 글의 뒤 쪽이 늦어지면 뒤 글이 먼저 나간다).
     after?: string };
   state: string; external_id: string | null; lease_token: string; attempt: number;
+  // 발송 한 길이 이 행으로 보낸 최종 payload의 sha256(admitOutbound).
+  sent_digest?: string | null;
 }
 export interface DeliveryNotice { ownerCall?: boolean }
 export interface OutboxButton { id: string; label: string; style: 'primary' | 'secondary' }
@@ -730,6 +733,25 @@ export class Store {
     RETURNING gate.reason`, [row.id, row.lease_token, this.now()])).rows[0];
     if (!result) return 'lost';
     return result.reason === 'ok' ? 'dispatched' : result.reason === 'gap' ? 'gap' : 'blocked';
+  }
+  // 발송 한 길의 발송함 대조(src/outbound.ts). 이 lease로 발송을 시작했고 아직 외부 ID가 없는 이 행이, 행 자신의 목적지
+  // (글·스레드, 채널, 스레드를 여는 원글)로, 같은 목적지에 다른 행이 보낸 적 없는 바이트(digest)를 보낼 때만 true다.
+  // 원글에서 여는 스레드는 본문이 제목뿐이라 원글이 다르면 바이트가 같아도 다른 글이다. 그래서 목적지까지 같아야 중복이다.
+  async admitOutbound(row: Pick<Delivery, 'id' | 'lease_token'>, target: OutboundTarget, digest: string): Promise<boolean> {
+    if (target.kind !== 'discord-message' && target.kind !== 'discord-thread') return false;
+    const kind = target.kind === 'discord-thread' ? 'thread' : 'message';
+    const from = target.kind === 'discord-thread' ? target.from ?? '' : '';
+    return (await this.db.query(`UPDATE outbox o SET sent_digest=$3 WHERE o.id=$1 AND o.lease_token=$2 AND o.state='sending'
+      AND o.dispatch_started AND o.external_id IS NULL AND o.lease_until>$7
+      AND o.payload->>'kind'=$4 AND o.payload->>'channel'=$5 AND COALESCE(o.payload->>'fromMessage','')=$6
+      AND NOT EXISTS (SELECT 1 FROM outbox other WHERE other.sent_digest=$3 AND other.id<>o.id AND other.payload->>'kind'=$4
+        AND other.payload->>'channel'=$5 AND COALESCE(other.payload->>'fromMessage','')=$6) RETURNING o.id`,
+    [row.id, row.lease_token, digest, kind, target.channel, from, this.now()])).rows.length === 1;
+  }
+  // 고치기의 발송함 대조. 같은 채널에 봇이 보낸 기존 글(sent 메시지)만 고친다.
+  async admitEdit(channel: string, message: string): Promise<boolean> {
+    return (await this.db.query(`SELECT 1 FROM outbox WHERE external_id=$2 AND payload->>'channel'=$1
+      AND payload->>'kind'='message' AND state='sent' LIMIT 1`, [channel, message])).rows.length === 1;
   }
   async deliveryState(row: Delivery, state: string, externalId: string | null = null, delay = 0): Promise<void> {
     await this.db.query(`UPDATE outbox SET state=$3,external_id=COALESCE($4,external_id),available_at=$5,pause_reason=NULL,pause_count=0,

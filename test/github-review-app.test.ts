@@ -8,7 +8,7 @@ import { GitHubAppAuth, GitHubApi, GitHubTokenError, REFRESH_MARGIN_MS, RESPONSE
 import type { BoundRepository } from '../src/github-app.js';
 import { MAX_CHANGES, diffTrees, githubReviewIO, policyRepositories } from '../src/github-review-io.js';
 import { GitHubError, ReviewDisabled, RestrictedGitHub, ReviewPolicySource } from '../src/review.js';
-import type { GitHubWrite, ReviewContext, ReviewPolicy } from '../src/review.js';
+import type { GitHubTransport, GitHubWrite, ReviewContext, ReviewPolicy } from '../src/review.js';
 import { ReviewTaskSchema } from '../src/review-input.js';
 import { reviewRequestsOf } from '../src/review-request.js';
 import { fixture, localDatabase } from './helpers.js';
@@ -417,12 +417,16 @@ test('응답 크기 상한: 선언·실제 크기 모두 넘으면 해석하지 
 const write = (overrides: Partial<GitHubWrite> = {}, body: Record<string, unknown> = {}) => ({ method: 'POST',
   path: `/repos/${REPO.fullName}/pulls/5/reviews`, ...overrides,
   body: { commit_id: HEAD, event: 'COMMENT', body: '자동 참고 리뷰', comments: [{ path: 'a.ts', line: 3, side: 'RIGHT', body: '지적' }], ...body } }) as GitHubWrite;
+// 실제 transport는 발송 한 길의 묶음(RestrictedGitHub.createReview가 만든다)이 있는 쓰기만 보낸다. 묶음 조건은 시험용 고정값이다.
+const GUARD = { policyRevision: 'fixture-v1', revision: () => 'fixture-v1', ledger: { admit: async () => true } };
+const post = (transport: GitHubTransport, request: unknown = write(), repository = REPO.fullName) =>
+  new RestrictedGitHub(transport).createReview(request, { repository, pr: 5, head: HEAD }, GUARD);
 
 test('GitHubTransport: COMMENT와 commit_id를 그대로 쓰기 토큰으로 게시하고 id를 돌려준다', async () => {
   const fake = new Fake(() => json({ id: 4242, state: 'COMMENTED' }, 200));
   const { transport } = fake.io();
   const github = new RestrictedGitHub(transport);
-  const result = await github.createReview(write(), { repository: REPO.fullName, pr: 5, head: HEAD });
+  const result = await github.createReview(write(), { repository: REPO.fullName, pr: 5, head: HEAD }, GUARD);
   assert.deepEqual(result, { id: 4242 });
   const [issue, post] = fake.sent as [Sent, Sent];
   assert.deepEqual(issue.body, { repository_ids: [77], permissions: { pull_requests: 'write' } });
@@ -454,6 +458,7 @@ test('GitHubTransport 금지 요청: 토큰 발급도 전송도 하기 전에 �
     ['다른 호스트 모양', write({ path: `//evil.example/repos/${REPO.fullName}/pulls/5/reviews` })],
     ['쿼리 붙임', write({ path: `/repos/${REPO.fullName}/pulls/5/reviews?x=1` })],
     ['본문 없음', { method: 'POST', path: `/repos/${REPO.fullName}/pulls/5/reviews` }],
+    ['발송 한 길의 묶음 없음', write()],
   ];
   for (const [name, request] of bad) {
     const fake = new Fake(() => json({ id: 1 }));
@@ -462,12 +467,24 @@ test('GitHubTransport 금지 요청: 토큰 발급도 전송도 하기 전에 �
   }
   // 정책 밖 저장소는 모양 검사를 지나 정책 조회에서 막힌다. 보내지 않고 403(재시도 없음)으로 올린다.
   const outside = new Fake(() => json({ id: 1 }));
-  await rejectsWith(outside.io().transport(write({ path: '/repos/fixture-org/not-allowed/pulls/5/reviews' }) as GitHubWrite), 403);
+  await rejectsWith(post(outside.io().transport, write({ path: '/repos/fixture-org/not-allowed/pulls/5/reviews' }), 'fixture-org/not-allowed'), 403);
   assert.deepEqual(outside.sent, []);
   // RestrictedGitHub을 거치면 검토 SHA가 다른 요청도 막힌다.
   const fake = new Fake(() => json({ id: 1 }));
-  await assert.rejects(new RestrictedGitHub(fake.io().transport).createReview(write(), { repository: REPO.fullName, pr: 5, head: BASE }), Denied);
+  await assert.rejects(new RestrictedGitHub(fake.io().transport).createReview(write(), { repository: REPO.fullName, pr: 5, head: BASE }, GUARD), Denied);
   assert.deepEqual(fake.sent, []);
+  // 묶은 뒤 요청 객체를 바꿔 넘기면 transport의 자체 검사(assertAllowed·restrictGitHubWrite)가 막는다. 묶음 대조(경로)만으로는 이 경우를 가리지 못한다.
+  const tampered: [string, (request: GitHubWrite) => void][] = [
+    ['묶은 뒤 PATCH', request => { (request as { method: string }).method = 'PATCH'; }],
+    ['묶은 뒤 APPROVE', request => { (request.body as Record<string, unknown>).event = 'APPROVE'; }],
+    ['묶은 뒤 본문에 다른 필드', request => { (request.body as Record<string, unknown>).merge_method = 'squash'; }],
+  ];
+  for (const [name, change] of tampered) {
+    const changed = new Fake(() => json({ id: 1 }));
+    const transport = changed.io().transport;
+    await assert.rejects(post(async request => { change(request); return transport(request); }), Denied, name);
+    assert.deepEqual(changed.sent, [], name);
+  }
 });
 
 test('GitHubApi 허용 목록: 정해진 메서드·경로 밖은 인증 값이 있어도 보내지 않는다', async () => {
@@ -490,7 +507,7 @@ test('GitHubTransport 실패 분류: 게시 전 실패는 다시 보낼 수 있�
   for (const token of [() => json({}, 502), () => { throw new TypeError('connect'); }] as (() => Response)[]) {
     const fake = new Fake(() => json({ id: 1 }));
     fake.token = token;
-    await assert.rejects(fake.io().transport(write()), (error: unknown) => {
+    await assert.rejects(post(fake.io().transport), (error: unknown) => {
       assert.ok(error instanceof GitHubError);
       assert.deepEqual([error.status, error.retryAfterMs], [429, 60_000]);
       return true;
@@ -500,15 +517,15 @@ test('GitHubTransport 실패 분류: 게시 전 실패는 다시 보낼 수 있�
   // 토큰 단계 거부는 영구 실패로 그대로 간다.
   const denied = new Fake(() => json({ id: 1 }));
   denied.token = () => json({}, 404);
-  await rejectsWith(denied.io().transport(write()), 404);
+  await rejectsWith(post(denied.io().transport), 404);
   assert.deepEqual(denied.requests, []);
   // POST 뒤 5xx·연결 실패·깨진 응답은 게시됐을 수 있다. GitHubError(5xx) 또는 일반 오류여야 deliver가 unknown으로 둔다.
-  await rejectsWith(new Fake(() => json({}, 502)).io().transport(write()), 502);
-  await rejectsWith(new Fake(() => { throw new TypeError('reset'); }).io().transport(write()), 503);
-  await assert.rejects(new Fake(() => json({ nope: true })).io().transport(write()), (error: unknown) => !(error instanceof GitHubError));
+  await rejectsWith(post(new Fake(() => json({}, 502)).io().transport), 502);
+  await rejectsWith(post(new Fake(() => { throw new TypeError('reset'); }).io().transport), 503);
+  await assert.rejects(post(new Fake(() => json({ nope: true })).io().transport), (error: unknown) => !(error instanceof GitHubError));
   // 422·429·403 한도는 게시되지 않은 것이라 그대로 올린다.
-  await rejectsWith(new Fake(() => json({}, 422)).io().transport(write()), 422);
-  await rejectsWith(new Fake(() => json({}, 429)).io().transport(write()), 429);
+  await rejectsWith(post(new Fake(() => json({}, 422)).io().transport), 422);
+  await rejectsWith(post(new Fake(() => json({}, 429)).io().transport), 429);
 });
 
 test('GitHubTransport [PR #38 리뷰 P2]: 게시 직전 정책 조회 실패는 보내기 전 실패로 올린다(unknown으로 잃지 않음)', async () => {
@@ -521,7 +538,7 @@ test('GitHubTransport [PR #38 리뷰 P2]: 게시 직전 정책 조회 실패는 
   ];
   for (const [name, fail, status, retry] of cases) {
     const fake = new Fake(() => json({ id: 1 }));
-    await assert.rejects(fake.io(async () => fail()).transport(write()), (error: unknown) => {
+    await assert.rejects(post(fake.io(async () => fail()).transport), (error: unknown) => {
       assert.ok(error instanceof GitHubError, name);
       assert.deepEqual([error.status, error.retryAfterMs], [status, retry], name);
       return true;

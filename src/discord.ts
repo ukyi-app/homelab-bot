@@ -21,6 +21,8 @@ import { chooseNextAnswer, deferInGap, offerAnswer, pressQuestionPick, sealsNext
 import { CHANGE_DIRECT_BUTTON, pressChangeQuestion } from './change-question.js';
 import type { ChangeQuestionPress } from './change-question.js';
 import { moveReactions, ReactionSync, recordReceived, settleReactions } from './reactions.js';
+import { checkOutbound, finalPayload, OutboundRefused, sendOutbound, sentId } from './outbound.js';
+import type { OutboundBytes, OutboundTarget } from './outbound.js';
 import { LaneClosed } from './store.js';
 import type { Delivery, OutboxButton, Store } from './store.js';
 import type { TaskCommandHandler } from './task-commands.js';
@@ -32,13 +34,18 @@ export interface AckOutcome { fallback: 403 | 404 }
 export interface AllowedMentions { parse: never[]; users?: [string]; replied_user?: false }
 // 버튼 한 줄(Discord action row type 1, button type 2). style 1 primary, 2 secondary.
 export interface ButtonRow { type: 1; components: { type: 2; style: 1 | 2; label: string; custom_id: string }[] }
+// 게시자가 만드는 최종 본문의 꼴. 바이트로 굳혀 발송 한 길(src/outbound.ts)로만 보낸다.
+// 메시지에서 여는 스레드(from)는 Discord가 type을 받지 않는다. 그 스레드의 ID는 원 메시지 ID와 같고 한 메시지에 하나만 열린다.
+export type DiscordThreadBody = { name: string; type: 11; auto_archive_duration: 1440 } | { name: string; auto_archive_duration: 1440 };
+export interface DiscordMessageBody { content: string; nonce: string; enforce_nonce: true; allowed_mentions: AllowedMentions;
+  message_reference?: { message_id: string; fail_if_not_exists: false }; components?: ButtonRow[] }
+export interface DiscordEditBody { content: string; allowed_mentions: { parse: never[] } }
 export interface DiscordRest {
   // update: 버튼 상호작용에 답하며 그 버튼이 달린 글을 content로 바꾸고 버튼을 모두 없앤다(callback type 7). 버튼에만 쓴다.
-  acknowledge(event: EventInput, content: string, options: { allowed_mentions: { parse: never[] }; flags?: typeof SUPPRESS_EMBEDS; update?: true }): Promise<AckOutcome | void>;
-  // from이 있으면 그 메시지에서 스레드를 연다(스레드 ID = 메시지 ID). 없으면 채널에 독립 스레드를 만든다.
-  createThread(channel: string, body: { name: string; type: 11; auto_archive_duration: 1440 }, from?: string): Promise<{ id: string }>;
-  sendMessage(channel: string, body: { content: string; nonce: string; enforce_nonce: true; allowed_mentions: AllowedMentions;
-    message_reference?: { message_id: string; fail_if_not_exists: false }; components?: ButtonRow[] }): Promise<{ id: string }>;
+  // revision: 호출자가 응답 직전에 본 정책 판. 대체 글이 발송 한 길에서 이 판에 묶인다. 없으면 검사 규칙의 판에만 묶인다.
+  acknowledge(event: EventInput, content: string, options: { allowed_mentions: { parse: never[] }; flags?: typeof SUPPRESS_EMBEDS; update?: true; revision?: string }): Promise<AckOutcome | void>;
+  // 발송 한 길의 전송 자리. src/outbound.ts의 sendOutbound에 전송 자리로 넘겨서만 쓴다. 본문은 그 함수가 만든 OutboundBytes다.
+  wire(method: 'POST' | 'PATCH', path: string, body: OutboundBytes): Promise<unknown>;
   // kind=thread이고 from이 있으면 그 메시지에 이미 달린 스레드로 대조한다. 없으면 표식 이름으로 찾는다.
   findDelivery(channel: string, marker: string, kind: 'message' | 'thread', from?: string): Promise<{ id: string } | undefined>;
   history(channel: string, after: string | null, limit: 100): Promise<EventInput[]>;
@@ -496,8 +503,8 @@ export class DiscordIngress {
   // 오류는 고정 사유 코드로만 남긴다. 전송 계층 오류에 요청 본문이 실려도 여기서 끊긴다.
   private async deliverPrivate(event: z.infer<typeof EventSchema>, id: string, content: string): Promise<boolean> {
     try {
-      await this.beforeReply(event);
-      await this.rest.acknowledge(event, content, { ...noMentions, flags: SUPPRESS_EMBEDS });
+      const revision = await this.beforeReply(event);
+      await this.rest.acknowledge(event, content, { ...noMentions, flags: SUPPRESS_EMBEDS, revision });
       return true;
     } catch (error) {
       try {
@@ -509,11 +516,11 @@ export class DiscordIngress {
   }
   // 상호작용 응답·👀·대체 게시 직전의 확인. outbox와 달리 영속 표시가 없으므로 철회 확인(authorize의 denied_actors 조회)을
   // REST 전 마지막 DB 읽기로 둔다. 그 조회 전에 커밋된 /revoke면 보내지 않는다. 그 뒤의 철회는 이미 시작한 요청을 막지 못한다.
-  private async beforeReply(event: EventInput): Promise<void> {
+  private async beforeReply(event: EventInput): Promise<string> {
     const pause = await this.store.discordPauseUntil(event.scope.channel);
     if (pause > this.store.now()) throw new Error('discord_global_pause');
     await this.store.ownedConversation(event.scope, event.actor);
-    await this.gate.authorize(event.actor, event.scope);
+    return (await this.gate.authorize(event.actor, event.scope)).revision;
   }
   // 처리는 이미 영속됐다. 여기서 나는 오류(ACK 실패를 기록하는 DB 쓰기 포함)는 수신 결과를 바꾸지 않는다.
   // 메시지 이벤트에서 던지면 main의 guard()가 그 대화에 history gap 장벽을 세운다.
@@ -529,11 +536,11 @@ export class DiscordIngress {
     let delivered = false;
     try {
       try {
-        await this.beforeReply(event);
+        const revision = await this.beforeReply(event);
         // 일반 메시지는 👀 리액션이고 이 문구는 권한 거부 때의 대체 텍스트로만 쓰인다.
         outcome = await this.rest.acknowledge(event, shown
           ?? (this.messageContent ? '받아서 기록해 뒀어요. 처리 상태는 따로 알려 드릴게요.' : '받아서 기록해 뒀어요. 지금은 명령과 버튼으로만 받아요.'),
-        direct?.update ? { ...noMentions, update: true } : direct ? { ...noMentions, flags: SUPPRESS_EMBEDS } : noMentions);
+        direct?.update ? { ...noMentions, update: true, revision } : direct ? { ...noMentions, flags: SUPPRESS_EMBEDS, revision } : { ...noMentions, revision });
       } catch (error) {
         if (error instanceof RateLimited) await this.store.recordRateLimit(error, event.scope.channel);
         await this.store.atomic(async store => {
@@ -795,6 +802,7 @@ export class DiscordPublisher {
   }
   private async deliverRow(row: Delivery): Promise<boolean> {
     let dispatched = false;
+    let wired = false;
     let remoteId: string | null = null;
     try {
       await this.authorized(row);
@@ -815,23 +823,32 @@ export class DiscordPublisher {
       if (pause > this.store.now()) { await this.store.pauseDelivery(row, 'discord_global_pause'); return true; }
       const marker = deliveryMarker(row);
       if (row.payload.kind === 'message' && row.payload.content.length > 1900) throw new Denied();
+      // 최종 본문을 바이트로 굳혀 검사하고 정책 판·목적지에 묶는다. 이 뒤로는 그 바이트만 나간다(src/outbound.ts).
+      const target: OutboundTarget = row.payload.kind === 'thread'
+        ? { kind: 'discord-thread', channel: row.payload.channel, ...(row.payload.fromMessage ? { from: row.payload.fromMessage } : {}) }
+        : { kind: 'discord-message', channel: row.payload.channel };
+      const payload = finalPayload(target, row.payload.kind === 'thread' ? await this.threadBody(row, marker) : this.messageBody(row, marker));
+      const check = checkOutbound(payload, { policyRevision: row.policy_revision });
       // authorized() 뒤의 대기 사이에 커밋된 /revoke·구독 끄기는 여기서 막힌다(발송 시작 기준점, store.dispatchDelivery).
       const dispatch = await this.store.dispatchDelivery(row);
       if (dispatch === 'gap') throw new HistoryGap();
       if (dispatch === 'blocked') await this.store.audit('delivery_blocked_before_dispatch', row.id, { attempt: row.attempt });
       if (dispatch !== 'dispatched') return true;
       dispatched = true;
-      const sent = row.payload.kind === 'thread'
-        ? await this.rest.createThread(row.payload.channel, { name: await this.threadName(row, marker), type: 11, auto_archive_duration: 1440 },
-          row.payload.fromMessage)
-        : await this.rest.sendMessage(row.payload.channel, this.messageBody(row, marker));
+      const sent = sentId(await sendOutbound(payload, check, {
+        // 검사 뒤 정책 판이 바뀌었으면 보내지 않는다. 행은 다시 잡혀 새 판으로 인가·검사된다.
+        revision: async () => (await this.gate.authorize(row.owner_id, row.scope)).revision,
+        ledger: { admit: (target, digest) => this.store.admitOutbound(row, target, digest) },
+        wire: { wire: (method, path, body) => { wired = true; return this.rest.wire(method, path, body); } },
+      }));
       remoteId = sent.id;
       await this.confirm(row, sent.id);
     } catch (error) {
       if (remoteId !== null) await this.store.deliveryState(row, 'unknown', remoteId);
       else if (error instanceof PolicyUnavailable || error instanceof DiscordUnauthorized || error instanceof HistoryGap) {
         await this.store.pauseDelivery(row, error.message);
-      } else if (error instanceof DiscordRejected) await this.store.atomic(async store => {
+      } else if (error instanceof OutboundRefused && error.reason === 'policy_changed') await this.store.pauseDelivery(row, 'policy_changed');
+      else if (error instanceof DiscordRejected) await this.store.atomic(async store => {
         await store.deliveryState(row, 'blocked');
         await store.audit('discord_delivery_rejected', row.id, { status: error.status });
       });
@@ -841,10 +858,22 @@ export class DiscordPublisher {
         await this.store.deliveryState(row, row.attempt > DEFAULTS.maxRetries ? 'blocked' : 'pending', null, Math.max(1000, error.retryAfterMs));
         await this.store.audit('discord_rate_limit', row.id, { attempt: row.attempt, retryAfterMs: error.retryAfterMs, global: error.global, bucket: error.bucket });
       }
-      else if (!dispatched) await this.store.pauseDelivery(row, 'before_dispatch');
+      // 전송 자리에 닿기 전의 실패(발송함 대조의 DB 오류 등)는 보낸 것이 없다. 닿은 뒤의 실패만 결과 불명이다.
+      else if (!dispatched || !wired) await this.store.pauseDelivery(row, 'before_dispatch');
       else await this.store.deliveryState(row, 'unknown');
     }
     return true;
+  }
+  // 봇이 이미 보낸 글을 고친다(카드 상태 표시 등). 같은 채널에 보낸 글(outbox의 sent 메시지)에만 가고, 본문은 발송 한 길의 검사를 지난다.
+  async edit(input: { owner: string; scope: Scope; message: string; content: string }): Promise<void> {
+    const policy = await this.gate.authorize(input.owner, input.scope);
+    const body: DiscordEditBody = { content: input.content, allowed_mentions: { parse: [] } };
+    const payload = finalPayload({ kind: 'discord-edit', channel: input.scope.channel, message: input.message }, body);
+    await sendOutbound(payload, checkOutbound(payload, { policyRevision: policy.revision }), {
+      revision: async () => (await this.gate.authorize(input.owner, input.scope)).revision,
+      ledger: { admit: target => target.kind === 'discord-edit' ? this.store.admitEdit(target.channel, target.message) : Promise.resolve(false) },
+      wire: this.rest,
+    });
   }
   private async laterPageButtons(row: Delivery): Promise<OutboxButton[] | undefined> {
     if (row.payload.kind !== 'message') return;
@@ -863,7 +892,7 @@ export class DiscordPublisher {
   }
   // 답장·owner 호출은 첫 쪽에만 건다. 뒤 쪽까지 걸면 한 답에 알림·답장 줄이 쪽 수만큼 붙는다.
   // 답장 대상이 지워졌으면(fail_if_not_exists=false) Discord가 일반 글로 게시해 답이 막히지 않는다.
-  private messageBody(row: Delivery, marker: string): Parameters<DiscordRest['sendMessage']>[1] {
+  private messageBody(row: Delivery, marker: string): DiscordMessageBody {
     const first = row.page_index === 0;
     const call = first && row.payload.ownerCall === true;
     const reply = first ? row.payload.replyTo : undefined;
@@ -875,6 +904,10 @@ export class DiscordPublisher {
       ...(reply ? { message_reference: { message_id: reply, fail_if_not_exists: false as const } } : {}),
       ...(buttons?.length ? { components: [{ type: 1 as const, components: buttons.map(button => ({ type: 2 as const,
         style: button.style === 'primary' ? 1 as const : 2 as const, label: button.label, custom_id: button.id })) }] } : {}) };
+  }
+  private async threadBody(row: Delivery, marker: string): Promise<DiscordThreadBody> {
+    const name = await this.threadName(row, marker);
+    return row.payload.fromMessage ? { name, auto_archive_duration: 1440 } : { name, type: 11, auto_archive_duration: 1440 };
   }
   // 메시지에서 여는 스레드는 owner 원문으로 제목을 짓는다. 원문은 outbox에 두지 않고 게시 때 events에서 읽는다
   // (outbox 본문 보존 정리가 이 칸을 모른다). 경보·'/' 스레드는 표식 이름이고 대조도 그 이름으로 한다.

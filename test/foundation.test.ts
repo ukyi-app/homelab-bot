@@ -201,7 +201,7 @@ test('CHAT-01 채널 명령은 공개 스레드 1440분, 새 스레드에 첫 �
   await f.ingress.receive(event('start', { kind: 'command', command: 'chat', scope: { ...thread, kind: 'channel', channel: 'fixture-chat', parent: null } }));
   assert.equal((await rows('jobs')).length, 0);
   await f.publisher.deliver(); f.advance(DEFAULTS.debounceMs + 50); await f.runtime.tick(); await f.publisher.deliver();
-  assert.equal(f.rest.threads[0]!.body.type, 11); assert.equal(f.rest.threads[0]!.body.auto_archive_duration, 1440);
+  assert.equal((f.rest.threads[0]!.body as { type?: number }).type, 11); assert.equal(f.rest.threads[0]!.body.auto_archive_duration, 1440);
   assert.equal(f.rest.messages[0]!.channel, f.rest.threads[0]!.id);
 });
 test('CHAT-01 후속 메시지 debounce와 대화·DM 맥락 격리', async () => {

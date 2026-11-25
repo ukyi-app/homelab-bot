@@ -17,7 +17,7 @@ import { PolicyGate } from '../src/policy.js';
 import { AlertIngress } from '../src/alerts.js';
 import { Health } from '../src/health.js';
 import { receivers } from '../src/http.js';
-import { event, fixture, localDatabase, service, thread } from './helpers.js';
+import { event, fixture, localDatabase, service, thread, wireBody } from './helpers.js';
 
 let database: Awaited<ReturnType<typeof localDatabase>>;
 let f: Awaited<ReturnType<typeof fixture>>;
@@ -217,7 +217,7 @@ test('R1-07 unknown 100건이 신규 경보를 막지 않고 초과/기한은 �
 test('R1-08/EVENT-02 실제 Protocol.findDelivery는 다른 작성자의 marker를 무시하고 대조', async () => {
   await enqueue(); let content = ''; let sends = 0; let includeBot = false;
   const protocol = new DiscordProtocol({ request: async (method, _path, input) => {
-    if (method === 'POST') { sends++; content = (input as { content: string }).content; throw new Error('response_lost'); }
+    if (method === 'POST') { sends++; content = (wireBody(input) as { content: string }).content; throw new Error('response_lost'); }
     return [{ id: 'fake', channel_id: thread.channel, author: { id: 'intruder' }, content },
       ...(includeBot ? [{ id: 'actual', channel_id: thread.channel, author: { id: 'fixture-bot' }, content }] : [])];
   } }, 'fixture-bot', f.now);

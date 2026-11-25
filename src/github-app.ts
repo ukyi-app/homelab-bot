@@ -2,6 +2,7 @@ import { sign } from 'node:crypto';
 import type { KeyObject } from 'node:crypto';
 import { z } from 'zod';
 import { Denied } from './contracts.js';
+import { openOutbound } from './outbound.js';
 import { GitHubError } from './review.js';
 
 // 게시 서버가 리뷰 App으로 GitHub을 부르는 맨 아래 층. 작업자에는 두지 않는다(D-15).
@@ -81,12 +82,15 @@ export class GitHubApi {
   // redirect는 따라가지 않는다. 자격을 다른 주소로 넘기지 않고, 이름 바뀐 저장소도 정책 대조 없이 쓰지 않는다.
   async call(method: 'GET' | 'POST', path: string, credential: string, body?: unknown): Promise<unknown> {
     assertAllowed(method, path);
+    // 저장소에 쓰는 POST는 발송 한 길(src/outbound.ts)을 지난 바이트만 보낸다. 토큰 발급(/app/...)만 일반 본문이다.
+    const sealed = openOutbound(body, method, path);
+    if (method === 'POST' && path.startsWith('/repos/') && sealed === undefined) throw new Denied();
     let response: Response;
     try {
       response = await this.send(`${API}${path}`, { method, redirect: 'manual', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         headers: { accept: 'application/vnd.github+json', authorization: `Bearer ${credential}`, 'user-agent': 'homelab-bot',
           'x-github-api-version': API_VERSION, ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+        ...(body === undefined ? {} : { body: sealed ?? JSON.stringify(body) }) });
     } catch { throw new GitHubError(503); }
     if (!response.ok) {
       await response.body?.cancel().catch(() => {});

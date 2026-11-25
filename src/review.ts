@@ -9,6 +9,8 @@ import type { Database } from './database.js';
 import type { Policy, PolicyGate } from './policy.js';
 import { DRAIN_MS } from './runtime.js';
 import type { Store } from './store.js';
+import { checkOutbound, finalPayload, OutboundRefused } from './outbound.js';
+import type { OutboundCheck, OutboundPayload, OutboundPorts } from './outbound.js';
 import type { CancelRequest, WorkerSigner } from './worker.js';
 import { archiveContract } from './worker.js';
 import { CoverageSchema, FindingSchema, InputLimitsSchema, REVIEW_INSTRUCTIONS, REVIEW_INSTRUCTIONS_V2, ReviewOutputSchema, ReviewTaskSchema,
@@ -159,10 +161,20 @@ export function restrictGitHubWrite(request: unknown, expected: { repository: st
     || parsed.data.body.commit_id !== expected.head) throw new Denied();
   return parsed.data;
 }
+// 리뷰 게시의 발송 한 길 묶음(src/outbound.ts). 실제 전송(github-review-io)은 이 묶음으로만 보낸다.
+export interface ReviewOutbound { payload: OutboundPayload; check: OutboundCheck; revision: OutboundPorts['revision']; ledger: OutboundPorts['ledger'] }
+// 게시자가 넘기는 묶음 조건: 검사 때의 정책 판, 보낼 때 다시 읽을 판, 발송함 대조.
+export interface ReviewGuard { policyRevision: string; revision: OutboundPorts['revision']; ledger: OutboundPorts['ledger'] }
+const reviewOutbound = new WeakMap<GitHubWrite, ReviewOutbound>();
+export const outboundOf = (write: GitHubWrite): ReviewOutbound | undefined => reviewOutbound.get(write);
 export class RestrictedGitHub {
   constructor(private readonly transport: GitHubTransport) {}
-  async createReview(request: unknown, expected: { repository: string; pr: number; head: string }): Promise<{ id: number }> {
-    return this.transport(restrictGitHubWrite(request, expected));
+  // 모양 검사를 지난 값을 바이트로 굳혀 검사하고 묶는다. 전송층은 그 묶음의 바이트만 보낸다.
+  async createReview(request: unknown, expected: { repository: string; pr: number; head: string }, guard: ReviewGuard): Promise<{ id: number }> {
+    const write = restrictGitHubWrite(request, expected);
+    const payload = finalPayload({ kind: 'github', method: write.method, path: write.path }, write.body);
+    reviewOutbound.set(write, { payload, check: checkOutbound(payload, { policyRevision: guard.policyRevision }), revision: guard.revision, ledger: guard.ledger });
+    return this.transport(write);
   }
 }
 
@@ -994,10 +1006,27 @@ export class ReviewPublisher {
       if (!(await this.store.db.query(`UPDATE review_deliveries SET dispatch_started=true WHERE id=$1 AND lease_token=$2
         AND state='sending' AND lease_until>$3 RETURNING id`, [row.id, row.lease_token, this.store.now()])).rows.length) return true;
       dispatched = true;
-      const sent = await this.github.createReview(request, expected);
+      // 본문은 이 정책 판·저장소·PR에 묶여 검사한 바이트로만 나간다(src/outbound.ts). 보낼 때 정책을 다시 읽고,
+      // 발송함 대조는 이 lease로 전송을 시작한 행인지 본다.
+      // 정책을 읽지 못하면 보내지 않고 다시 시도한다(정책 판 바뀜과 같이 다룬다). 보낸 것이 없어 결과 불명으로 두지 않는다.
+      const sent = await this.github.createReview(request, expected, { policyRevision: context.revision,
+        revision: async () => {
+          try { return (await this.policy.current()).revision; } catch { throw new OutboundRefused('policy_changed'); }
+        },
+        // 대조 쿼리의 오류도 보내기 전이다. 결과 불명(unknown)으로 두면 대조할 리뷰가 없어 기한 뒤 막히므로 다시 시도한다.
+        ledger: { admit: async () => {
+          try {
+            return (await this.store.db.query(`SELECT 1 FROM review_deliveries WHERE id=$1 AND lease_token=$2
+              AND state='sending' AND dispatch_started AND lease_until>$3`, [row.id, row.lease_token, this.store.now()])).rows.length === 1;
+          } catch { throw new OutboundRefused('outbox_unavailable'); }
+        } } });
       await this.sent(row, String(sent.id), context);
     } catch (error) {
-      if (dispatched && !(error instanceof GitHubError && error.status < 500 && error.status !== 408)) {
+      // 발송 한 길의 거절은 전송 전에 난다. 보낸 것이 없으니 결과 불명으로 두지 않는다. 정책 판이 바뀌었으면 다시 시도한다.
+      if (error instanceof OutboundRefused) {
+        if (error.reason === 'policy_changed' || error.reason === 'outbox_unavailable') await this.pause(row, error.reason);
+        else await this.state(row, 'blocked', `outbound_${error.reason}`);
+      } else if (dispatched && !(error instanceof GitHubError && error.status < 500 && error.status !== 408)) {
         // 응답을 잃은 게시는 다시 보내지 않고 기존 리뷰를 대조한다(EVENT-02).
         await this.state(row, 'unknown', 'response_lost');
       } else if (error instanceof Denied) await this.state(row, 'blocked', 'authorization_revoked');
