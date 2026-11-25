@@ -85,7 +85,7 @@ function signedRaw(sender: Party, header: Record<string, unknown>, body: unknown
 }
 
 const reasonOf = (outcome: VerifyOutcome): string =>
-  outcome.ok ? 'ok' : 'reason' in outcome ? outcome.reason : 'unsupported:' + outcome.unsupported;
+  outcome.ok ? 'ok' : outcome.reason;
 const sealFault = (fn: () => unknown): string => {
   try {
     fn();
@@ -644,49 +644,24 @@ test('확정 결과의 꼴: 갈래가 하나인 정지 결과도 모르는 칸�
   }
 });
 
-// ---- 이 조각 밖의 묶음 ----
-
-test('F1b 묶음의 동작은 공통 검사를 모두 거친 뒤 Unsupported로 받지 않고 nonce를 쓰지 않는다', () => {
-  const body = {
-    job_id: uuidOf(80), stop_generation: 7, source: 'admin',
-    source_ref: { ref: 'raw/' + uuidOf(81), digest: SHA, expires_at: NOW + 1_000 },
-  };
-  const submit = signedRaw('front-door', { action: 'input_submit' }, body);
-  const ctx = context('supervisor');
-  assert.deepEqual(verify(submit, ctx), { ok: false, unsupported: 'input_submit' });
-  assert.deepEqual(ctx.consumed, []);
-  assert.equal(reasonOf(verify(submit, context('supervisor', { intakeOpen: false }))), 'intake_closed');
-  assert.equal(reasonOf(verify(submit, context('supervisor', { handshake: 'policy_mismatch' }))), 'policy_mismatch');
-  const old = signedRaw('front-door', { action: 'input_submit' }, { ...body, stop_generation: 6 });
-  assert.equal(reasonOf(verify(old, context('supervisor'))), 'generation_mismatch');
-  assert.equal(sealFault(() => sealed('front-door', 'input_submit', body)), 'unsupported');
-  // 다른 묶음 효과의 확정 결과도 해석기가 없다. 확정이 아닌 답은 공통부만으로 받는다.
-  const job = { job_id: uuidOf(82), action: 'publication_candidate', request_digest: SHA };
-  const answer = (status: unknown) => signedRaw('front-door', { action: 'job_status' }, { in_reply_to: uuidOf(83), ...job, status });
-  const waiting = context('supervisor', { awaiting: () => ({ action: 'job_lookup', job }) });
-  assert.deepEqual(verify(answer({ state: 'confirmed', result: { outcome: 'not_posted' } }), waiting),
-    { ok: false, unsupported: 'publication_candidate' });
-  assert.equal(reasonOf(verify(answer({ state: 'unknown' }), waiting)), 'ok');
-});
-
 // ---- 동작 표 ----
 
 test('동작 표: 스물넷의 분류·방향·접수·정책·세대가 v2 문서의 전체 동작 표와 같다', () => {
   const NA = 'not_applicable';
   const FD = 'front-door';
   const SV = 'supervisor';
-  // [동작, 분류, 보내는 쪽, 접수가 닫혀도, 정책이 어긋나도(인사는 null), 정지 세대, 실행 세대, 이 조각의 본문 해석기]
+  // [동작, 분류, 보내는 쪽, 접수가 닫혀도, 정책이 어긋나도(인사는 null), 정지 세대, 실행 세대, 답의 대조(matches)]
   const rows: [string, string, string[], boolean, boolean | null, string | null, string | null, boolean][] = [
-    ['handshake', 'handshake', [FD], true, null, null, null, true],
-    ['handshake_reply', 'handshake', [SV], true, null, null, null, true],
-    ['job_lookup', 'query', [FD, SV], true, true, null, null, true],
+    ['handshake', 'handshake', [FD], true, null, null, null, false],
+    ['handshake_reply', 'handshake', [SV], true, null, null, null, false],
+    ['job_lookup', 'query', [FD, SV], true, true, null, null, false],
     ['job_status', 'query', [FD, SV], true, true, null, null, true],
-    ['stop_record_lookup', 'query', [SV], true, true, null, null, true],
-    ['stop_record', 'query', [FD], true, true, null, null, true],
-    ['stop_prepare', 'effect', [FD], true, true, 'newer', NA, true],
-    ['stop_commit', 'effect', [FD], true, true, 'prepared_newer', NA, true],
-    ['release_prepare', 'effect', [FD], true, false, 'current', NA, true],
-    ['release_commit', 'effect', [FD], true, false, 'prepared_current', 'next', true],
+    ['stop_record_lookup', 'query', [SV], true, true, null, null, false],
+    ['stop_record', 'query', [FD], true, true, null, null, false],
+    ['stop_prepare', 'effect', [FD], true, true, 'newer', NA, false],
+    ['stop_commit', 'effect', [FD], true, true, 'prepared_newer', NA, false],
+    ['release_prepare', 'effect', [FD], true, false, 'current', NA, false],
+    ['release_commit', 'effect', [FD], true, false, 'prepared_current', 'next', false],
     ['input_submit', 'effect', [FD], false, false, 'current', NA, false],
     ['input_cancel', 'effect', [FD], true, false, NA, NA, false],
     ['approval_changed', 'effect', [FD], true, false, 'current', NA, false],
@@ -700,18 +675,20 @@ test('동작 표: 스물넷의 분류·방향·접수·정책·세대가 v2 문�
     ['execution_generation_lookup', 'query', [FD], true, true, null, null, false],
     ['execution_generation_reply', 'query', [SV], true, true, null, null, false],
     ['candidate_fetch', 'query', [FD], true, false, null, null, false],
-    ['candidate_chunk', 'query', [SV], true, false, null, null, false],
+    ['candidate_chunk', 'query', [SV], true, false, null, null, true],
   ];
   assert.equal(ACTIONS.size, 24);
   assert.deepEqual([...ACTIONS.keys()], rows.map((row) => row[0]));
-  for (const [name, kind, from, closed, policy, stop, execution, parsed] of rows) {
+  for (const [name, kind, from, closed, policy, stop, execution, matched] of rows) {
     const spec = ACTIONS.get(name)!;
     assert.equal(spec.class, kind, name);
     assert.deepEqual([...spec.from], from, name);
     assert.equal(spec.duringClosedIntake, closed, name);
     if (policy !== null) assert.equal(spec.duringPolicyMismatch, policy, name);
     assert.deepEqual(spec.generations === null ? [null, null] : [spec.generations.stop, spec.generations.execution], [stop, execution], name);
-    assert.equal(spec.parse !== null, parsed, name);
+    assert.equal(typeof spec.parse, 'function', name);
+    assert.equal(spec.class === 'effect', typeof spec.parseResult === 'function', name);
+    assert.equal(spec.matches !== null, matched, name);
   }
   assert.deepEqual([...EFFECTS_DURING_POLICY_MISMATCH], ['stop_prepare', 'stop_commit']);
   assert.deepEqual([...EFFECTS_WITHOUT_GENERATIONS], ['input_cancel', 'publication_changed', 'merge_observed', 'source_forgotten']);
@@ -811,9 +788,10 @@ test('정적: 모듈 지정자는 인용부호 종류와 상관없이 뽑히고,
 test('정적: src/olive-control*.ts는 node:crypto와 서로만 읽고 환경·시계·네트워크·파일에 닿지 않는다', () => {
   const dir = fileURLToPath(new URL('../../src/', import.meta.url));
   const files = readdirSync(dir).filter((name) => /^olive-control(-[a-z]+)?\.ts$/.test(name)).sort();
-  assert.deepEqual(files, ['olive-control-canonical.ts', 'olive-control-common.ts', 'olive-control-envelope.ts',
-    'olive-control-forbidden.ts', 'olive-control-generations.ts', 'olive-control-limits.ts', 'olive-control-nonces.ts',
-    'olive-control-schema.ts', 'olive-control-stop.ts', 'olive-control-table.ts', 'olive-control.ts']);
+  assert.deepEqual(files, ['olive-control-candidates.ts', 'olive-control-canonical.ts', 'olive-control-common.ts',
+    'olive-control-envelope.ts', 'olive-control-forbidden.ts', 'olive-control-generations.ts', 'olive-control-inputs.ts',
+    'olive-control-limits.ts', 'olive-control-nonces.ts', 'olive-control-outputs.ts', 'olive-control-schema.ts',
+    'olive-control-stop.ts', 'olive-control-table.ts', 'olive-control.ts']);
   // 분석기가 아무것도 뽑지 못하면 검사가 헛돈다: import가 없는 파일을 정확히 단언한다.
   const withoutImports: string[] = [];
   for (const name of files) {

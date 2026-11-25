@@ -10,13 +10,6 @@ export class SchemaError extends Error {
   }
 }
 
-// 이 조각에 본문 해석기가 없는 동작(입력·이벤트·출력·후보 내용 묶음)에 닿았다. 받는 쪽은 거절로 다룬다.
-export class BundleNotImplemented extends Error {
-  constructor(readonly action: string) {
-    super(`body parser not implemented: ${action}`);
-  }
-}
-
 export type Parser<T> = (value: unknown, path: string) => T;
 
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -25,6 +18,13 @@ export const NONCE = /^[0-9a-f]{32}$/;
 export const ACTION_NAME = /^[a-z_]{1,40}$/;
 // 정책 revision의 꼴. v2 문서에 꼴이 적혀 있지 않아 감독 구현과 같은 값을 쓴다(빈 글은 거절).
 export const REVISION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+// 원문 참조: 원문 저장소가 발행한 `<저장소 이름>/<UUID>`. v2 문서는 저장소 이름의 꼴을 적지 않아 감독 장부와 같은 값을 쓴다.
+// 글(공백, 한글, 대문자)은 이 꼴이 될 수 없어 원문이 참조 자리로 새지 않는다.
+export const SOURCE_REF = /^[a-z][a-z0-9-]{0,31}\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+// 묻는 쪽이 한 번의 물음에서 답을 받지 못한 까닭. 셋 모두 "없다"가 아니라 "모른다"다.
+export const NO_ANSWER_CAUSES = ['timeout', 'disconnected', 'reply_rejected'] as const;
+export type NoAnswerCause = (typeof NO_ANSWER_CAUSES)[number];
 
 const malformed = (path: string): never => {
   throw new SchemaError('malformed', path);
@@ -43,6 +43,7 @@ export function pattern(re: RegExp): Parser<string> {
 export const uuid = pattern(UUID);
 export const sha256 = pattern(SHA256_HEX);
 export const revision = pattern(REVISION);
+export const sourceRef = pattern(SOURCE_REF);
 
 // 정수 칸. -0은 정규화가 0으로 쓰므로(서명이 0에 묶임) 0으로 받는다.
 export function int(min: number, max = Number.MAX_SAFE_INTEGER): Parser<number> {
@@ -50,6 +51,10 @@ export function int(min: number, max = Number.MAX_SAFE_INTEGER): Parser<number> 
     if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < min || value > max) return malformed(path);
     return value === 0 ? 0 : value;
   };
+}
+
+export function nullable<T>(parser: Parser<T>): Parser<T | null> {
+  return (value, path) => (value === null ? null : parser(value, path));
 }
 
 export const bool: Parser<boolean> = (value, path) => (typeof value === 'boolean' ? value : malformed(path));
@@ -91,4 +96,12 @@ export function byTag<T>(tag: string, cases: Readonly<Record<string, Parser<T>>>
     if (typeof chosen !== 'string' || !Object.hasOwn(cases, chosen)) return malformed(`${path}.${tag}`);
     return cases[chosen]!(value, path);
   };
+}
+
+// 칸이 outcome 하나뿐인 갈래 여럿의 확정 결과. 갈래가 여럿이면 outcome 값을 먼저 고른다(목록 밖이면 malformed). 갈래가 하나인 결과는
+// 이것이 아니라 object({ outcome: literal(...) })로 둔다: 모르는 칸을 outcome 값보다 먼저 본다.
+export function byOutcome<T extends { outcome: string }>(names: readonly T['outcome'][]): Parser<T> {
+  const cases: Record<string, Parser<T>> = {};
+  for (const name of names) cases[name] = object({ outcome: literal(name) }) as Parser<unknown> as Parser<T>;
+  return byTag<T>('outcome', cases);
 }
