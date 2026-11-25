@@ -1,6 +1,6 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { DiscordRejected, DiscordUnauthorized, RateLimited } from '../src/contracts.js';
+import { Denied, DiscordRejected, DiscordUnauthorized, RateLimited } from '../src/contracts.js';
 import { DiscordIngress, ackFailureReason } from '../src/discord.js';
 import { DISCORD_DISPATCH_REST_TIMEOUT_MS, DISCORD_REST_TIMEOUT_MS, DiscordProtocol, discordHttpApi } from '../src/discord-protocol.js';
 import type { DiscordApi, DiscordRequestOptions } from '../src/discord-protocol.js';
@@ -97,21 +97,18 @@ for (const [name, error, reason] of [
   assert.deepEqual((await audits()).map(a => a.detail), [{ processing: 'durable', reason }]);
 });
 
-test('수신: 실제 protocol에서 기한이 지난 상호작용은 callback 없이 reason=expired', async () => {
+test('수신: 실제 protocol은 상호작용을 받지 않아 callback·저장·감사가 없다(O08 F5)', async () => {
   let callbacks = 0;
+  let lookups = 0;
   const protocol = new DiscordProtocol({ async request(method, path) {
     if (path.endsWith('/callback')) { callbacks++; return undefined; }
-    if (method === 'GET') return { id: thread.channel, type: 11, parent_id: thread.parent, guild_id: thread.guild };
+    if (method === 'GET') { lookups++; return { id: thread.channel, type: 11, parent_id: thread.parent, guild_id: thread.guild }; }
     throw new Error('unexpected');
   } }, 'fixture-bot', f.now);
-  const save = f.store.save.bind(f.store);
-  f.store.save = async (...args) => { const result = await save(...args); f.advance(1400); return result; };
   const ingress = new DiscordIngress(f.store, f.gate, protocol);
-  // 저장은 inbox 마감(1500ms) 안에 끝나고, ACK 직전 확인이 늦어져 상호작용 기한(2500ms)을 넘긴다.
-  const pause = f.store.discordPauseUntil.bind(f.store);
-  f.store.discordPauseUntil = async channel => { const result = await pause(channel); f.advance(1200); return result; };
-  await protocol.gateway('INTERACTION_CREATE', { id: 'fixture-late', token: 'fixture-ephemeral-token', type: 2, channel_id: thread.channel,
-    guild_id: thread.guild, member: { user: { id: f.policy.owner } }, data: { name: 'chat' } }, ingress);
+  await assert.rejects(protocol.gateway('INTERACTION_CREATE', { id: 'fixture-late', token: 'fixture-ephemeral-token', type: 2, channel_id: thread.channel,
+    guild_id: thread.guild, member: { user: { id: f.policy.owner } }, data: { name: 'chat' } }, ingress), Denied);
   assert.equal(callbacks, 0);
-  assert.deepEqual((await audits()).map(a => a.detail), [{ processing: 'durable', reason: 'expired' }]);
+  assert.equal(lookups, 0);
+  assert.deepEqual(await audits(), []);
 });

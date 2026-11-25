@@ -1,4 +1,5 @@
 import { after, afterEach, before, beforeEach, test } from 'node:test';
+import { sendToHandlers } from './legacy-interaction-protocol.js';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
@@ -130,10 +131,17 @@ function command(name: string, channel: string, options: Record<string, string> 
     member: { user: { id: OWNER } }, data: { name, options: Object.entries(options).map(([key, value]) => ({ name: key, value })) } });
   return id;
 }
+// 운영 진입점은 '/' 명령을 받지 않는다(O08 F5). 운영 조립이 만든 작업 처리기를 운영과 같은 조립 함수로 묶어 부른다.
+function handlerCommand(name: string, channel: string, options: Record<string, string> = {}) {
+  const id = String(++interactions);
+  void sendToHandlers(rest, publisher?.handlers(), { id, token: `fixture-token-${id}`, type: 2, channel_id: channel, guild_id: GUILD,
+    member: { user: { id: OWNER } }, data: { name, options: Object.entries(options).map(([key, value]) => ({ name: key, value })) } }).catch(() => {});
+  return id;
+}
 const rows = async <T = Record<string, any>>(sql: string, params: unknown[] = []) => (await database.db.query<T>(sql, params)).rows;
 const metrics = async (p: Publisher) => (await fetch(`http://127.0.0.1:${p.ports.app}/metrics`)).text();
 const taskGate = () => logs.filter(l => l.event === 'task_gate').map(l => l.detail);
-const registered = () => waitFor(() => rest.guild.length > 0);
+const registered = () => waitFor(() => logs.some(l => l.event === 'commands_registered'));
 const settle = (ms = 100) => new Promise(resolve => setTimeout(resolve, ms));
 
 test('B5 명령 목록: 작업 레인을 열 때만 다섯 명령, 안내 문구와 이름이 맞음', () => {
@@ -179,7 +187,7 @@ test('B5 호환(새 게시 서버 + 옛 작업자, 둘 다 새 + task off): 명�
   // 정책에 task 절이 있어도 스위치가 없으면 닫힌다.
   const p = await boot({ policy: policyWith(TASK_POLICY), taskLane: null });
   await registered();
-  assert.deepEqual(rest.names(), [...FOUNDATION_COMMANDS].sort());
+  assert.deepEqual(rest.names(), []);
   assert.deepEqual(taskGate(), [{ state: 'closed', reason: 'switch_off' }]);
   command('task', CHAT, { project: 'fixture', text: '고쳐줘' });
   command('answer', CHAT, { question: 'q', text: '답' });
@@ -223,7 +231,7 @@ test('B5 닫힘: task 절이 없거나 틀리면 작업 레인만 닫히고 작�
   await boot({ policy: policyWith({ projects: [] }), taskLane: { workerUrl: 'http://127.0.0.1:9/' } });
   await registered();
   await settle();
-  assert.deepEqual(rest.names(), [...FOUNDATION_COMMANDS].sort());
+  assert.deepEqual(rest.names(), []);
   assert.deepEqual(sends.filter(s => s.url.includes('/v1/task')), []);
   assert.deepEqual(taskGate(), [{ state: 'closed', reason: 'policy_invalid' }]);
 });
@@ -248,7 +256,7 @@ test('B5 호환(게시 서버 gate on + 옛 작업자 이미지): 명령을 열�
     await registered();
     await waitFor(() => sends.some(s => s.url.endsWith('/v1/task/intake')));
     await settle(150);
-    assert.deepEqual(rest.names(), [...FOUNDATION_COMMANDS].sort());
+    assert.deepEqual(rest.names(), []);
     assert.deepEqual(sends.filter(s => s.method === 'POST' && s.url.includes('/v1/task')), []);
   } finally { old.closeAllConnections(); old.close(); }
 });
@@ -261,11 +269,11 @@ test('B5 수직 흐름(둘 다 새 + gate on): /task → needs_input → /answer
   await worker.restart();
   await worker.script([QUESTION, { ...COMPLETED, write: { 'src/app.txt': 'two\n' } }]);
   const p = await boot({ policy: policyWith(TASK_POLICY), taskLane: { workerUrl: `${worker.url}/` }, workerKey: keys.privateKey });
-  await waitFor(() => rest.names().includes('task'));
-  assert.deepEqual(rest.names(), [...FOUNDATION_COMMANDS, ...TASK_COMMANDS].sort());
+  await waitFor(() => taskGate().some(detail => (detail as { state?: string }).state === 'open'));
+  assert.deepEqual(rest.names(), []);
   await waitFor(async () => (await metrics(p)).includes('homelab_bot_task_worker_intake_open 1'));
   assert.deepEqual(taskGate().at(-1), { state: 'open' });
-  command('task', CHAT, { project: 'fixture', text: '실패하는 시험을 고쳐줘' });
+  handlerCommand('task', CHAT, { project: 'fixture', text: '실패하는 시험을 고쳐줘' });
   await waitFor(() => rest.threads.length === 1);
   const channel = rest.threads[0]!;
   await waitFor(() => rest.threadText(channel).includes(T.taskQuestion));
@@ -283,7 +291,7 @@ test('B5 수직 흐름(둘 다 새 + gate on): /task → needs_input → /answer
   const metric = await metrics(p);
   assert.match(metric, /homelab_bot_lane_jobs\{lane="task",state="waiting_user"\} 1/);
   assert.match(metric, /homelab_bot_task_sessions_retained 1/);
-  command('answer', channel, { question, text: 'src/app.txt 하나만' });
+  handlerCommand('answer', channel, { question, text: 'src/app.txt 하나만' });
   await waitFor(() => rest.threadText(channel).includes(T.taskCompleted(false, job!.id)));
   const calls = await worker.calls();
   assert.equal(calls.length, 2);
@@ -305,13 +313,13 @@ test('B5 수직 흐름(둘 다 새 + gate on): /task → needs_input → /answer
   assert.match(await metrics(p), /homelab_bot_task_sessions_retained 0/);
   // 작업 레인의 턴 중에도 대화 레인이 돈다. 작업이 끝나지 않는 동안 /urgent 작업이 처리된다(대역 작업자는 거부).
   await worker.script([{ kind: 'hang' }]);
-  command('task', CHAT, { project: 'fixture', text: '오래 걸리는 작업' });
+  handlerCommand('task', CHAT, { project: 'fixture', text: '오래 걸리는 작업' });
   await waitFor(async () => (await rows(`SELECT id FROM jobs WHERE type='task' AND state='running'`)).length === 1 && (await worker!.calls()).length === 3);
-  command('urgent', channel, { text: '지금 상태?' });
+  handlerCommand('urgent', channel, { text: '지금 상태?' });
   await waitFor(async () => (await rows(`SELECT id FROM jobs WHERE type='chat' AND state NOT IN ('queued','running')`)).length === 1);
   const [running] = await rows<{ id: string }>(`SELECT id FROM jobs WHERE type='task' AND state='running'`);
   await waitFor(() => rest.threads.length === 2);
-  command('task-cancel', rest.threads[1]!, { target: running!.id });
+  handlerCommand('task-cancel', rest.threads[1]!, { target: running!.id });
   await waitFor(async () => (await rows<{ state: string }>('SELECT state FROM jobs WHERE id=$1', [running!.id]))[0]!.state === 'cancelled');
 });
 

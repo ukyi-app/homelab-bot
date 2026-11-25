@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { changeChildFailed, changeRestart } from '../src/change-advice.js';
 import { changePrecondition, changeTaskPathsMatch } from '../src/change-assembly.js';
+import { sendToHandlers } from './legacy-interaction-protocol.js';
 import { CHANGE_TEXT, discussionMaterials, parseChangeRequest } from '../src/change-commands.js';
 import { amendmentMaterialsDigest } from '../src/change-contracts.js';
 import { CHANGE_NOTICE_TEXT } from '../src/change-runtime.js';
@@ -180,7 +181,7 @@ async function bootPublisher(overrides: Partial<PublisherConfig>, workers: { v2:
   const publisher: Publisher = await startPublisher(config, { db: database.db, send, discord: rest, gatewayUrl: async () => ({ url: gw.url }), allowGatewayUrl: target => target.hostname === '127.0.0.1', serviceAccount: { tokenFile: join(dir, 'token'), caFile: null },
     ports: { app: 0, alerts: 0 }, idleMs: 20, identifySpacingMs: 250, recoveryBackoff: () => 200, registerDelaysMs: [0, 20, 20], heartbeatEveryMs: 60_000, stopTimeoutMs: 3000, log: (event, fields) => { logs.push({ event, fields }); }, reviewWorkerProbeMs: 20, taskWorkerProbeMs: 20,
     change: { createWriter: options => { writers++; return createGitHubWriter(options); } } });
-  await until(() => rest.guildCommands.length > 0, 6000);
+  await until(() => logs.some(entry => entry.event === 'commands_registered'), 6000);
   return { publisher, rest, gw, logs, github, calls, url, workers, writers: () => writers, async close() { await publisher.stop(); await gw.close(); aux.closeAllConnections(); aux.close(); await rm(dir, { recursive: true, force: true }); } };
 }
 const interaction = (id: string, name: string, options: Record<string, string> = {}, channel = 'fixture-thread') => ({ id, token: `fixture-token-${id}`, type: 2, channel_id: channel, guild_id: 'fixture-guild', member: { user: { id: OWNER } }, data: { name, options: Object.entries(options).map(([key, value]) => ({ name: key, value })) } });
@@ -189,7 +190,7 @@ const gate = (logs: { event: string; fields: unknown }[]) => logs.find(entry => 
 test('호환 진입점: 스위치 false면 명령·writer·루프·GitHub 호출·변경 행이 모두 0이고 새 Secret 없이 뜬다', async () => {
   const b = await bootPublisher({ changePr: null });
   try {
-    assert.deepEqual(b.rest.guildCommands.map(item => item.name).sort(), [...FOUNDATION_COMMANDS].sort());
+    assert.deepEqual(b.rest.guildCommands, []);
     assert.deepEqual(gate(b.logs), { state: 'closed', reason: 'switch_off' });
     assert.equal(b.writers(), 0);
     await new Promise(resolve => setTimeout(resolve, 120));
@@ -209,9 +210,8 @@ test('호환 진입점: 스위치를 꺼도 남은 CHANGE 질문의 답은 event
     const b = await bootPublisher({ changePr: null }, undefined, { task }, {});
     try {
       assert.deepEqual(gate(b.logs), { state: 'closed', reason: 'switch_off' });
-      await until(() => b.rest.guildCommands.some(item => item.name === 'answer'), 6000);
-      b.gw.dispatch(b.gw.latest, 2, 'INTERACTION_CREATE', interaction('905', 'answer', { target: question, text: `label=private | ${CANARY}` }));
-      await new Promise(resolve => setTimeout(resolve, 400));
+      // 운영 진입점은 '/' 명령을 받지 않는다(O08 F5). 스위치를 끈 운영 조립이 만든 작업 처리기를 운영과 같은 조립 함수로 묶어 부른다.
+      await sendToHandlers(b.rest, b.publisher.handlers(), interaction('905', 'answer', { target: question, text: `label=private | ${CANARY}` }));
       // 음성 대조: 명령이 실제로 저장됐다. 저장 전에 막혀 원문이 없는 것과 가른다.
       assert.ok((await h.db.query(`SELECT 1 FROM events WHERE payload->>'command'='answer'`)).rows.length > 0, '명령이 events에 저장됐다');
       assert.ok(!(await eventsText(h)).includes(CANARY), 'events에 원문이 없다');
@@ -222,13 +222,13 @@ test('호환 진입점: 켰는데 키가 없으면 CHANGE만 닫힌다. 명령�
   const b = await bootPublisher({ changePr: { writerApp: null } }, undefined, { change: { repositories: [repositoryPolicy()] } });
   try {
     assert.deepEqual(gate(b.logs), { state: 'closed', reason: 'writer_key_missing' });
-    assert.ok(CHANGE_COMMANDS.every(name => b.rest.guildCommands.some(item => item.name === name)));
+    assert.deepEqual(b.rest.guildCommands, []);
     assert.equal(b.writers(), 0);
-    b.gw.dispatch(b.gw.latest, 2, 'INTERACTION_CREATE', interaction('902', 'change', { project: REPO.fullName, text: REQUEST_TEXT }));
+    // 운영 진입점은 '/' 명령을 받지 않는다(O08 F5). 운영 조립이 만든 변경 처리기를 운영과 같은 조립 함수로 묶어 부른다.
+    await sendToHandlers(b.rest, b.publisher.handlers(), interaction('902', 'change', { project: REPO.fullName, text: REQUEST_TEXT }));
     await until(() => b.rest.interactions.some(text => text.includes('writer_key_missing')));
     assert.equal(Number((await database.db.query<{ count: string }>('SELECT count(*) FROM change_requests')).rows[0]!.count), 0);
     assert.deepEqual(b.github, []);
-    assert.ok(b.rest.guildCommands.some(item => item.name === 'chat'));
   } finally { await b.close(); }
 });
 test('호환 진입점: 정책·작업 레인·리뷰가 없으면 writer를 만들지 않고 CHANGE 사유만 다르다', async () => {
@@ -249,13 +249,14 @@ test('호환 진입점: 조건이 다 맞아도 옛 작업자면 접수만 닫�
     assert.deepEqual(gate(b.logs), { state: 'waiting_worker' });
     assert.equal(b.writers(), 1, '조건이 맞으면 writer 객체는 하나다');
     await until(() => b.logs.some(entry => entry.event === 'change_workers') || b.calls.some(call => call.includes('/v1/change-review')), 4000);
-    b.gw.dispatch(b.gw.latest, 2, 'INTERACTION_CREATE', interaction('903', 'change', { project: REPO.fullName, text: REQUEST_TEXT }));
+    // 운영 진입점은 '/' 명령을 받지 않는다(O08 F5). 운영 조립이 만든 변경 처리기를 운영과 같은 조립 함수로 묶어 부른다.
+    await sendToHandlers(b.rest, b.publisher.handlers(), interaction('903', 'change', { project: REPO.fullName, text: REQUEST_TEXT }));
     await until(() => b.rest.interactions.some(text => text.includes('task_worker_unsupported')), 4000);
     assert.equal(Number((await database.db.query<{ count: string }>('SELECT count(*) FROM change_requests')).rows[0]!.count), 0);
     assert.ok(!b.github.some(url => /\/git\/(blobs|trees|commits|refs)/.test(url)));
     workers.v2 = true;
     await until(() => b.logs.some(entry => entry.event === 'change_workers' && (entry.fields as { task: boolean }).task), 4000);
-    b.gw.dispatch(b.gw.latest, 3, 'INTERACTION_CREATE', interaction('904', 'change', { project: REPO.fullName, text: REQUEST_TEXT }));
+    await sendToHandlers(b.rest, b.publisher.handlers(), interaction('904', 'change', { project: REPO.fullName, text: REQUEST_TEXT }));
     await until(() => b.rest.interactions.some(text => /^변경 [0-9a-f]{32}을 받았어요/.test(text)), 4000);
     assert.equal(Number((await database.db.query<{ count: string }>('SELECT count(*) FROM change_requests')).rows[0]!.count), 1);
   } finally { await b.close(); }

@@ -6,6 +6,7 @@ import type { Scope } from '../src/contracts.js';
 import { startPublisher } from '../src/main.js';
 import type { Publisher } from '../src/main.js';
 import { Store } from '../src/store.js';
+import { sendToHandlers } from './legacy-interaction-protocol.js';
 import { seedConversation } from './external-task-fixture.js';
 import { FakeGateway } from './fake-gateway.js';
 import { localDatabase } from './helpers.js';
@@ -46,10 +47,11 @@ const boot = async (extra: Partial<PublisherConfig>) => {
     ports: { app: 0, alerts: 0 }, idleMs: 20, identifySpacingMs: 250, registerDelaysMs: [0], heartbeatEveryMs: 60_000, stopTimeoutMs: 3000, log: () => {} });
 };
 let interactions = 7000;
+// 운영 진입점은 '/' 명령을 받지 않는다(O08 F5). 운영 조립이 만든 처리기 묶음(조립된 Store 포함)을 운영과 같은 조립 함수로 묶어 부른다.
 function command(name: string) {
   const id = String(++interactions);
-  gw.dispatch(gw.latest, interactions, 'INTERACTION_CREATE', { id, token: `fixture-token-${id}`, type: 2, channel_id: THREAD, guild_id: GUILD,
-    member: { user: { id: OWNER } }, data: { name, options: [] } });
+  void sendToHandlers(rest, publisher?.handlers(), { id, token: `fixture-token-${id}`, type: 2, channel_id: THREAD, guild_id: GUILD,
+    member: { user: { id: OWNER } }, data: { name, options: [] } }).catch(() => {});
 }
 const posted = async (count: number) => {
   await waitFor(() => rest.sent.filter(m => m.channel === THREAD).length >= count);
@@ -59,7 +61,7 @@ const posted = async (count: number) => {
 for (const colleague of [false, true]) test(`동료 스위치 ${colleague ? '켜짐' : '꺼짐'}: 조립을 거친 제어 결과가 ${colleague ? "'/' 이름 없는" : "'/' 안내"} 판으로 게시된다`, async () => {
   await seedConversation(database.db, new Store(database.db), Date.now(), SCOPE);
   await boot({ colleagueEnabled: colleague });
-  await waitFor(() => rest.registered);
+  await waitFor(() => !!publisher?.handlers());
   command('stop');
   const [stopped] = await posted(1);
   assert.ok(stopped!.startsWith(CHAT_TASK_TEXT.subscriptionStopped(colleague)), stopped);
@@ -70,4 +72,10 @@ for (const colleague of [false, true]) test(`동료 스위치 ${colleague ? '켜
     if (colleague) assert.doesNotMatch(text, /(^|\s)\/[a-z]/, text);
     else assert.match(text, /\/(resume|resume-model)\b/, text);
   }
+});
+
+for (const colleague of [false, true]) test(`O08 F5 배선: 설정의 동료 스위치(${colleague ? '켜짐' : '꺼짐'})가 조립된 처리기 묶음의 Store까지 간다`, async () => {
+  await boot({ colleagueEnabled: colleague });
+  await waitFor(() => !!publisher?.handlers());
+  assert.equal(publisher!.handlers()!.store.colleague, colleague);
 });

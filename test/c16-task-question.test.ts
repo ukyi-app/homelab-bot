@@ -1,4 +1,5 @@
 import { after, before, beforeEach, test } from 'node:test';
+import { LegacyInteractionProtocol } from './legacy-interaction-protocol.js';
 import assert from 'node:assert/strict';
 import { CHAT_TASK_TEXT as T } from '../src/chat-task-text.js';
 import { guardedTaskCommands } from '../src/change-assembly.js';
@@ -38,7 +39,7 @@ async function harness(db: Database, options: { colleague?: boolean } = {}) {
   const handler = guardedTaskCommands(new TaskCommands(f.store, f.gate, local.bridge, () => ({ routed: true, open: true, reasons: [] }), () => {}, () => {}),
     new ChangePrivateInputs(db, f.now), f.gate);
   const callbacks: { body: { type: number; data: Record<string, unknown> } }[] = [];
-  const protocol = new DiscordProtocol({ request: async (method, path, body) => {
+  const protocol = new LegacyInteractionProtocol({ request: async (method, path, body) => {
     if (method === 'GET' && path === `/channels/${thread.channel}`) return { id: thread.channel, type: 11, parent_id: thread.parent, guild_id: thread.guild };
     if (method === 'GET' && path === '/channels/fixture-other-thread') return { id: 'fixture-other-thread', type: 11, parent_id: thread.parent, guild_id: thread.guild };
     // history 복구가 읽는 기록. gap 동안 받은 메시지는 이미 버퍼에 있어 새로 읽을 것이 없다.

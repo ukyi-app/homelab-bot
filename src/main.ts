@@ -13,12 +13,12 @@ import { assembleChange, assembleChangeReview, changeCommandHandler, changePreco
 import type { ChangeAssemblyOptions } from './change-assembly.js';
 import { CHANGE_PERIODS } from './change-runtime.js';
 import { ChangePrivateInputs, ChangeStore, purgeExpiredChangeContentRounds } from './change-store.js';
-import { CHANGE_COMMANDS, EXTERNAL_TASK_COMMANDS, FOUNDATION_COMMANDS, MEMORY_COMMANDS, REVIEW_COMMANDS, TASK_COMMANDS, commandDefinitions, registerCommands } from './commands.js';
+import { CHANGE_COMMANDS, EXTERNAL_TASK_COMMANDS, FOUNDATION_COMMANDS, MEMORY_COMMANDS, REVIEW_COMMANDS, TASK_COMMANDS, registerCommands } from './commands.js';
 import { ConfigError, databasePoolConfig, loadPublisherConfig } from './config.js';
 import type { PublisherConfig } from './config.js';
 import { z } from 'zod';
 import { Denied, DiscordRejected, RateLimited } from './contracts.js';
-import type { Clock, Scope } from './contracts.js';
+import type { Clock } from './contracts.js';
 import { MIGRATIONS, Postgres, appliedMigrations, migrationVersion } from './database.js';
 import { withConnectRetry } from './db-connect.js';
 import type { Database } from './database.js';
@@ -27,8 +27,12 @@ import type { DeletionLedger, LedgerStatus } from './deletion-ledger.js';
 import { DiscordIngress, DiscordPublisher } from './discord.js';
 import { githubDocuments } from './document-source.js';
 import { DiscordProtocol, discordHttpApi } from './discord-protocol.js';
+import { FrontIntake } from './front-intake.js';
 import type { DiscordApi } from './discord-protocol.js';
 import { ExternalTaskCommands } from './external-task-commands.js';
+import type { ExternalTaskCommandHandler } from './external-task-commands.js';
+import type { ChangeCommandHandler } from './change-commands.js';
+import type { DiscordRest } from './discord.js';
 import { ExternalTaskLinks } from './external-task-links.js';
 import { ExternalTaskReceiver, externalTaskServer } from './external-task-receiver.js';
 import { GatewaySession, discordGatewayUrl } from './gateway.js';
@@ -40,6 +44,7 @@ import { advisoryLedgerLock, lockClient } from './ledger-lock.js';
 import { MemoryService } from './memory.js';
 import type { DocumentSource } from './memory.js';
 import { MemoryCommands } from './memory-commands.js';
+import type { MemoryCommandHandler } from './memory-commands.js';
 import type { TaskGateClosedReason } from './ops-metrics.js';
 import { PORTS, receivers } from './http.js';
 import { errorInfo, jsonLog } from './log.js';
@@ -59,6 +64,7 @@ import { Runtime } from './runtime.js';
 import { Store } from './store.js';
 import { TASK_ANSWER_PURGE_EVERY_MS, purgeExpiredTaskAnswers } from './task-bridge.js';
 import { TaskCommands } from './task-commands.js';
+import type { TaskCommandHandler } from './task-commands.js';
 import { TaskWorkerSigner } from './task-contracts.js';
 import { HttpTaskV2Worker, HttpTaskWorker, TASK_INTAKE_UNREACHED, taskWorkerChangeContract, taskWorkerIntake } from './task-http.js';
 import type { TaskIntakeStatus } from './task-http.js';
@@ -171,8 +177,19 @@ export interface PublisherDeps {
 export interface Publisher {
   // externalEvents는 R08을 켰을 때만 있다.
   health: Health; gateway: GatewaySession; ports: { app: number; alerts: number; externalEvents?: number };
+  // 첫 READY 뒤 조립된 옛 명령 처리기 묶음. 그 전에는 undefined다. Discord 수신은 이 처리기를 부르지 않는다(O08 F5).
+  handlers(): CommandHandlers | undefined;
   stop(): Promise<void>;
 }
+// 옛 수신(DiscordIngress)을 이루는 처리기와 그 처리기가 쓰는 Store·정책. 처리기는 O07 표대로 남아 다른 입구가 부를 수 있다.
+export interface CommandHandlers {
+  store: Store; gate: PolicyGate; log: Log;
+  memory: MemoryCommandHandler | undefined; tasks: TaskCommandHandler | undefined;
+  external: ExternalTaskCommandHandler | undefined; changes: ChangeCommandHandler | undefined;
+}
+// 처리기 묶음으로 옛 수신을 만든다. 운영 조립(startPublisher)이 이 함수로 만든다.
+export const commandIngress = (handlers: CommandHandlers, rest: DiscordRest, commands: ReadonlySet<string>) =>
+  new DiscordIngress(handlers.store, handlers.gate, rest, true, commands, handlers.log, handlers.memory, handlers.tasks, handlers.external, handlers.changes);
 const listen = (server: Server, port: number) => new Promise<number>((resolve, reject) => {
   server.once('error', reject);
   server.listen(port, () => { server.off('error', reject); resolve((server.address() as { port: number }).port); });
@@ -307,7 +324,8 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
 
   // Discord 쪽은 첫 READY에서 봇 사용자 ID를 받은 뒤 만든다. 그 전에는 수신·게시를 하지 않는다(경보·webhook 수신은 계속).
   const api = deps.discord ?? discordHttpApi(config.discordToken, send, now);
-  let discord: { ingress: DiscordIngress; publisher: DiscordPublisher } | undefined;
+  let discord: { ingress: DiscordIngress; front: FrontIntake; publisher: DiscordPublisher } | undefined;
+  let handlers: CommandHandlers | undefined;
   let protocol: DiscordProtocol | undefined;
   let runtimeStarted = false;
   // 수신 허용 목록. 리뷰가 열리면 같은 Set에 더한다(DiscordIngress는 이 참조를 본다).
@@ -331,9 +349,11 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       }
     }
   })());
-  const recovery = new RecoveryScheduler(store, (scope: Scope, owner: string) => {
-    if (!discord) throw new Error('discord_not_ready');
-    return discord.ingress.recover(scope, owner);
+  // 현관은 놓친 메시지를 history로 받아 오지 않는다. 받아 오면 옛 수신(DiscordIngress.recover)이 그 글을 모델 레인으로 넘긴다.
+  // 메울 것이 없으니 READY 장벽이 세운 gap을 바로 푼다. gap이 남으면 이미 접수된 옛 작업의 claim과 게시가 멈춘 채 남는다.
+  const recovery = new RecoveryScheduler(store, async scope => {
+    await store.db.query('UPDATE conversations SET gap=false,recovery_token=NULL,recovery_until=NULL WHERE id=$1', [store.scopeId(scope)]);
+    return 'done' as const;
   }, log, deps.recoveryBackoff);
   // 새 READY의 복구 장벽. live 이벤트는 이 처리 뒤에 차례로 들어오므로(Gateway 이벤트 순서) 장벽이 서기 전에 처리되지 않는다.
   // DB가 잠시 안 되면 장벽이 설 때까지 다시 시도한다(그동안 이벤트는 기다린다).
@@ -485,7 +505,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       for (const delay of deps.registerDelaysMs ?? [0, 5000, 30_000, 120_000, 300_000]) {
         if (delay) await pause(delay);
         if (stop.signal.aborted) return;
-        try { log('commands_registered', await registerCommands(api, applicationId, config.policy.guild, commandDefinitions(!!t20, reviewOpened, taskOpened, !!external, !!config.changePr))); return; }
+        try { log('commands_registered', await registerCommands(api, applicationId, config.policy.guild)); return; }
         catch (error) {
           log('commands_register_failed', errorInfo(error));
           if (error instanceof RateLimited) await pause(error.retryAfterMs);
@@ -532,7 +552,8 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
       // 입력 중 힌트. 기다리지 않고(뒤 이벤트를 막지 않게) 백그라운드로 돌린다. 오류를 스스로 삼키므로 guard로 가지 않는다.
       if (type === 'TYPING_START') { typingHint(data); return; }
       if (!discord || (type !== 'MESSAGE_CREATE' && type !== 'INTERACTION_CREATE')) return;
-      try { await protocol!.gateway(type, data, discord.ingress); }
+      // 메시지는 현관 입구(FrontIntake)로만 간다. 상호작용은 프로토콜이 Denied로 닫는다.
+      try { await protocol!.gateway(type, data, discord.front); }
       catch (error) {
         // 확정 거부(권한·채널 종류, 잘못된 payload·입력, 채널 403/404)는 다시 해도 같다. 버린다.
         if (error instanceof Denied || error instanceof z.ZodError || error instanceof DiscordRejected) return;
@@ -551,8 +572,9 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
         const plainTaskCommands = taskBridge && new TaskCommands(store, gate, taskBridge, () => taskIntake, track, log);
         // 답 봉인은 스위치와 무관하다. 켰다가 끈 뒤에도 남은 CHANGE 질문의 답이 events로 들어가면 대화 모델에 샌다.
         const taskCommands = plainTaskCommands && guardedTaskCommands(plainTaskCommands, change?.inputs ?? new ChangePrivateInputs(deps.db, now), gate);
-        discord = { ingress: new DiscordIngress(store, gate, protocol, true, acceptedCommands, log, memoryCommands || undefined, taskCommands, external?.commands, changeCommands),
-          publisher: new DiscordPublisher(store, gate, protocol) };
+        handlers = { store, gate, log, memory: memoryCommands || undefined, tasks: taskCommands, external: external?.commands, changes: changeCommands };
+        discord = { ingress: commandIngress(handlers, protocol, acceptedCommands),
+          front: new FrontIntake(store, gate), publisher: new DiscordPublisher(store, gate, protocol) };
         const publisher = discord.publisher;
         const publish = () => {
           let reconciled = 0;
@@ -642,7 +664,7 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
   log('publisher_started', { ports, policyRevision: config.policy.revision, services: SERVICES.length });
 
   let stopped: Promise<void> | undefined;
-  return { health, gateway, ports, stop: () => stopped ??= (async () => {
+  return { health, gateway, ports, handlers: () => handlers, stop: () => stopped ??= (async () => {
     // 전체 종료 기한 하나(기본 20초, kubelet 유예 30초 안). 단계별 대기를 차례로 더하지 않고 남은 시간을 나눈다.
     // 최악: Gateway 정리(≤4초)·수신 서버(≤5초)는 runtime의 드레인(10초)+cancel(대화 5초·리뷰 10초)과 동시에 돌아 기한 안에 끝난다.
     // 전역 슬롯이 하나라 대화와 리뷰가 함께 드레인하지 않는다.

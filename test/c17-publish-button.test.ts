@@ -1,4 +1,5 @@
 import { after, before, beforeEach, test } from 'node:test';
+import { LegacyInteractionProtocol } from './legacy-interaction-protocol.js';
 import assert from 'node:assert/strict';
 import { PUBLISH_TEXT, publishButton } from '../src/change-commands.js';
 import { changeDirectId } from '../src/change-question.js';
@@ -37,7 +38,7 @@ const toAwaiting = async (h: Harness) => {
 };
 // 버튼 상호작용은 Gateway INTERACTION_CREATE(type 3) 프레임으로 넣어 custom_id 허용 목록·칸 나눔까지 거친다.
 const BOT = '900000000000000001';
-const protocol = new DiscordProtocol({ request: async (method, path) => {
+const protocol = new LegacyInteractionProtocol({ request: async (method, path) => {
   if (method === 'GET' && path === `/channels/${THREAD.channel}`) return { id: THREAD.channel, type: 11, parent_id: THREAD.parent, guild_id: THREAD.guild };
   throw new Error(`unexpected_route ${method} ${path}`);
 } }, BOT);

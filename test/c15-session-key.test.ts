@@ -1,4 +1,5 @@
 import { after, before, beforeEach, test } from 'node:test';
+import { LegacyInteractionProtocol } from './legacy-interaction-protocol.js';
 import assert from 'node:assert/strict';
 import { DEFAULTS, Denied, RateLimited } from '../src/contracts.js';
 import type { Proposal } from '../src/contracts.js';
@@ -41,7 +42,7 @@ async function harness(db: Database, options: Options = {}) {
   }, ENVIRONMENT, log);
   const callbacks: { body: { type: number; data: Record<string, unknown> } }[] = [];
   let failCallback: (content: string) => boolean = () => false;
-  const protocol = new DiscordProtocol({ request: async (method, path, body) => {
+  const protocol = new LegacyInteractionProtocol({ request: async (method, path, body) => {
     if (method === 'GET' && path === `/channels/${thread.channel}`) return { id: thread.channel, type: 11, parent_id: thread.parent, guild_id: thread.guild };
     if (method === 'PUT') return undefined;
     if (method === 'POST' && path.endsWith('/callback')) {

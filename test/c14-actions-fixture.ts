@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { LegacyInteractionProtocol } from './legacy-interaction-protocol.js';
 import { mkdir, rm } from 'node:fs/promises';
 import { ChangeCommands } from '../src/change-commands.js';
 import type { AmendmentDiscussionReader } from '../src/change-commands.js';
@@ -49,7 +50,7 @@ export async function actions(db: Database, options: { colleague?: boolean; disc
   const callbacks: { body: { type: number; data: Record<string, unknown> } }[] = [];
   // 상호작용 응답 직전에 부른다. 끝나지 않는 약속을 주면 응답 전에 멈춘 게시 서버, 던지면 응답 실패가 된다.
   const hooks: { beforeCallback?: () => Promise<void> } = {};
-  const protocol = new DiscordProtocol({ request: async (method, path, body) => {
+  const protocol = new LegacyInteractionProtocol({ request: async (method, path, body) => {
     const scope = method === 'GET' ? channels.get(path.replace('/channels/', '')) : undefined;
     if (scope) return { id: scope.channel, type: 11, parent_id: scope.parent, guild_id: scope.guild };
     if (method === 'GET' && path === `/channels/${notifyChannel.channel}`) return { id: notifyChannel.channel, type: 0, guild_id: thread.guild };

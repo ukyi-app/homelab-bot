@@ -84,7 +84,10 @@ export const CHANGE_COMMAND_DEFINITIONS = Object.freeze([
   command('change-cancel', '변경 취소(요청한 스레드에서, 공개된 객체는 기록만 남음)', [target('변경 ID', 32)]),
   command('change-publish', '미리보기의 승인 digest를 승인해 게시(요청한 스레드에서)', [target('변경 ID', 32), text('승인 digest', 64)]),
 ]);
-// 등록할 명령 목록. 원장·리뷰·작업 레인·R08·변경 PR이 꺼져 있으면 FOUNDATION 목록과 같다.
+// Discord에 등록하는 '/' 명령. 현관은 '/' 명령을 받지 않아(D-02, F-7) 빈 목록이고, 기동 때 registerCommands가
+// guild·전역 등록을 모두 이 빈 목록으로 맞춘다. 위아래의 옛 명령 표는 등록하지 않는다(남은 옛 처리기의 시험과 문구 대조만 쓴다).
+export const REGISTERED_COMMANDS: readonly unknown[] = Object.freeze([]);
+// 옛 명령 표를 스위치별로 모은 목록. 등록에는 쓰지 않는다.
 export const commandDefinitions = (memory: boolean, review = false, task = false, external = false, change = false) => !memory && !review && !task && !external && !change ? COMMAND_DEFINITIONS
   : Object.freeze([...COMMAND_DEFINITIONS, ...(memory ? MEMORY_COMMAND_DEFINITIONS : []), ...(review ? REVIEW_COMMAND_DEFINITIONS : []),
     ...(task ? TASK_COMMAND_DEFINITIONS : []), ...(external ? EXTERNAL_TASK_COMMAND_DEFINITIONS : []), ...(change ? CHANGE_COMMAND_DEFINITIONS : [])]);
@@ -104,10 +107,10 @@ const canonical = (commands: z.infer<typeof Remote>) => JSON.stringify(commands.
   options: (c.options ?? []).map(o => ({ type: o.type, name: o.name, description: o.description, required: o.required ?? false,
     max_length: o.max_length ?? null })) })).sort((a, b) => a.name.localeCompare(b.name)));
 const part = encodeURIComponent;
-// guild 명령을 주어진 목록(기본 FOUNDATION)으로 맞추고 전역 명령은 비운다. 같으면 쓰지 않는다(재시작마다 덮어쓰지 않게).
-// 원장을 끄고 재기동하면 같은 PUT이 기억 명령을 목록에서 뺀다.
+// guild 명령을 주어진 목록(기본 REGISTERED_COMMANDS, 빈 목록)으로 맞추고 전역 명령은 비운다. 같으면 쓰지 않는다(재시작마다 덮어쓰지 않게).
+// 옛 이미지가 등록해 둔 명령이 남아 있으면 기동 때 guild·전역 모두 PUT []이 나간다(외부 효과).
 export async function registerCommands(api: DiscordApi, applicationId: string, guildId: string,
-  definitions: readonly unknown[] = COMMAND_DEFINITIONS): Promise<{ guild: 'unchanged' | 'updated'; global: 'unchanged' | 'cleared' }> {
+  definitions: readonly unknown[] = REGISTERED_COMMANDS): Promise<{ guild: 'unchanged' | 'updated'; global: 'unchanged' | 'cleared' }> {
   const guildPath = `/applications/${part(applicationId)}/guilds/${part(guildId)}/commands`;
   const desired = canonical(Remote.parse(definitions));
   const guild = canonical(Remote.parse(await api.request('GET', guildPath))) === desired ? 'unchanged' as const : 'updated' as const;
