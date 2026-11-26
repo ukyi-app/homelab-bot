@@ -6,6 +6,7 @@ import { ConfigError, REVIEW_APP_KEYS, loadPublisherConfig } from '../src/config
 import { Denied, PolicyUnavailable } from '../src/contracts.js';
 import { GitHubAppAuth, GitHubApi, GitHubTokenError, REFRESH_MARGIN_MS, RESPONSE_LIMIT_BYTES, appJwt } from '../src/github-app.js';
 import type { BoundRepository } from '../src/github-app.js';
+import { publicTraceId } from '../src/change-publication.js';
 import { MAX_CHANGES, diffTrees, githubReviewIO, guidanceMarker, policyRepositories } from '../src/github-review-io.js';
 import { GitHubError, ReviewDisabled, RestrictedGitHub, ReviewPolicySource } from '../src/review.js';
 import type { GitHubTransport, GitHubWrite, ReviewContext, ReviewPolicy } from '../src/review.js';
@@ -769,7 +770,7 @@ test('PR 자료 읽기: 리뷰 정책 목록 밖 저장소와 잘못된 번호�
 });
 
 const KEY = 'change-guidance:fixture-1';
-const GUIDANCE = { repository: REPO.fullName, pr: 5, head: HEAD, key: KEY, body: '확인할 곳 두 군데예요.', comments: [{ path: 'src/a.ts', line: 3, body: '여기는 가정했어요.' }] };
+const GUIDANCE = { repository: REPO.fullName, pr: 5, head: HEAD, key: KEY, markers: [] as string[], body: '확인할 곳 두 군데예요.', comments: [{ path: 'src/a.ts', line: 3, body: '여기는 가정했어요.' }] };
 const pullRow = (overrides: Record<string, unknown> = {}) => ({ number: 5, state: 'open', draft: false, title: 't', body: 'b', user: WRITER_BOT, author_association: 'NONE',
   updated_at: '2026-11-09T00:00:00Z', head: { sha: HEAD, ref: 'bot/change/x/g1', repo: { id: REPO.id, full_name: REPO.fullName } },
   base: { sha: BASE, ref: 'main', repo: { id: REPO.id, full_name: REPO.fullName } }, ...overrides });
@@ -1014,6 +1015,8 @@ test('F7a 안내 리뷰 AC-06: 댓글·경로·본문에 심은 토큰 꼴·안�
     { ...GUIDANCE, comments: [{ path: `src/${token}.ts`, line: 3, body: '여기' }] },
     { ...GUIDANCE, body: `안내 ${KEY}` },
     { ...GUIDANCE, comments: [{ path: 'src/a.ts', line: 3, body: '/home/fixture/work 경로' }] },
+    // 포트가 붙이는 표식 안에만 있는 호출자 금지 값.
+    { ...GUIDANCE, markers: [publicTraceId('guidance', KEY).slice(1, 9)] },
   ];
   for (const input of cases) {
     const fake = new GuidanceFake();

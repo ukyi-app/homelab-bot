@@ -211,7 +211,8 @@ const receiptOf = (child: Pick<ChildRow, 'id' | 'session_generation'>) => `v2:${
 const blockedAuthorCode = (code: string) => /^(artifact_|baseline_|label_|task_artifact_|task_baseline_|task_question_)/.test(code);
 // prepareApproval이 돌려주는 값 중 다시 해도 같은 것들. 그 밖의 읽기 실패는 다음 바퀴에 다시 본다.
 const SELF_FIX_UNAVAILABLE = new Set(['self_fix_findings_missing']);
-const FINAL_APPROVAL =/^(label_blocked|review_mismatch|review_incomplete|policy_revoked|policy_changed|publication_|secret_detected|internal_marker|metadata_sensitive|base_tree_incomplete|evidence_missing|ci_(?!unreadable))/;
+// branch_read_only: 030 전에 만든 옛 꼴 세대는 새 공개 글을 만들 수 없어 다시 해도 같다.
+const FINAL_APPROVAL =/^(label_blocked|review_mismatch|review_incomplete|policy_revoked|policy_changed|publication_|secret_detected|internal_marker|metadata_sensitive|base_tree_incomplete|evidence_missing|branch_read_only$|ci_(?!unreadable))/;
 
 export class ChangeRuntime {
   private readonly periods: ChangePeriods;

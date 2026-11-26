@@ -56,6 +56,7 @@ export async function localDatabase(path?: string): Promise<{ db: Database; pg: 
   await pg.exec(await readFile('migrations/027_change_amendment.sql', 'utf8'));
   await pg.exec(await readFile('migrations/028_model_accounts.sql', 'utf8'));
   await pg.exec(await readFile('migrations/029_outbound_digest.sql', 'utf8'));
+  await pg.exec(await readFile('migrations/030_change_branch_trace.sql', 'utf8'));
   return { db, pg };
 }
 export const thread: Scope = { guild: 'fixture-guild', channel: 'fixture-thread', parent: 'fixture-chat', kind: 'thread' };

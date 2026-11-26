@@ -1,12 +1,12 @@
 import {
-  EFFECT_LEASE_MS, EFFECT_STAGES, artifactDigest, effectRequestDigest, evidenceBundleDigest, labelAllowsAuthorInput, propagateLabel, reviewReceiptDigest, sha256Hex,
+  EFFECT_LEASE_MS, EFFECT_STAGES, artifactDigest, effectRequestDigest, evidenceBundleDigest, isWritableChangeBranch, labelAllowsAuthorInput, propagateLabel, reviewReceiptDigest, sha256Hex,
 } from './change-contracts.js';
 import type { AmendmentKey, ApprovalSubject, ChangeKey, ChangeTarget, ChangeWriterPort, EffectExpected, EffectResult, EffectStage, EvidenceBundle, PublicMetadata, ReviewReceipt, WriterCommitMetadata, WriterOutcome, WriterPullSnapshot } from './change-contracts.js';
 import { evaluateCi, readCiSnapshot } from './change-ci-policy.js';
 import { readChangeNotes } from './change-guidance.js';
 import { compilePathPolicy, gitCommitSha, inspectCandidate } from './change-policy.js';
 import type { BaseLeaf, ChangeRepositoryPolicy, PublishPlan } from './change-policy.js';
-import { publicationMarker, publicationTrace, recordPublicTrace, renderAmendmentCommit, renderPublication, scanPublicPayload } from './change-publication.js';
+import { changeMarkers, publicationMarker, publicationTrace, recordPublicTrace, renderAmendmentCommit, renderPublication, scanPublicPayload } from './change-publication.js';
 import type { PublicReceipts } from './change-publication.js';
 import type { AmendmentEffect, AmendmentRound, ChangeRequest, ChangeStore, EffectKey, EffectRecord, GenerationRecord } from './change-store.js';
 import { Denied, PolicyUnavailable } from './contracts.js';
@@ -197,7 +197,7 @@ export class ChangePublisher {
     const prepared = await this.store.prepareApproval({ ...key, publication: rendered.publication, ciFingerprint: fingerprint });
     if (prepared.ok) {
       // PR 본문·커밋에는 추적 ID만 싣는다. 그 ID와 내부 값(change ID·세대·정책·검증기 판·산출물 digest)의 대응은 이 감사 행에만 남긴다.
-      const trace = publicationTrace(key, bundle.value);
+      const trace = publicationTrace(key, generation.value.branch, bundle.value);
       await this.store.database.transaction(tx => recordPublicTrace(tx, trace.id, { kind: 'change', ...trace.detail }, this.now()));
     }
     return prepared.ok ? { ok: true, digest: prepared.value.digest, subject: prepared.value.subject } : { ok: false, reason: prepared.reason };
@@ -231,7 +231,11 @@ export class ChangePublisher {
     const publication = subject.publication;
     if (publication.author.name !== policy.identity.name || publication.author.email !== policy.identity.email
       || publication.committer.name !== policy.identity.name || publication.committer.email !== policy.identity.email) await block('identity_mismatch');
-    const marker = publicationMarker(key);
+    // 옛 꼴 브랜치는 찾기·읽기만 한다. 여기 오기 전에 settlePrevious가 보냈을 수 있는 effect(unknown)를 읽기로 대조했고, 확정된 PR은 run이 회수했다.
+    // 그래서 남은 것은 아직 안 보낸 stage나 확실히 안 나간 pending뿐이다. 하나라도 보내면 옛 승인 문구(커밋 Change:)와 객체가 새로 나가므로 보내지 않고 닫는다.
+    // 끝 상태로 옮길 때 pending effect는 안 나간 것으로 해소된다(settleTerminal).
+    if (!isWritableChangeBranch(generation.branch)) await block('branch_read_only');
+    const marker = publicationMarker(key, generation.branch);
     if (!publication.body.includes(`<!-- ${marker} -->`)) await block('marker_missing');
     if (subject.branch !== generation.branch || subject.baseBranch !== generation.baseBranch) await block('branch_mismatch');
     if (evidenceBundleDigest(subject.bundle) !== evidenceBundleDigest(bundle)) await block('evidence_mismatch');
@@ -261,7 +265,8 @@ export class ChangePublisher {
 
     const inspected = inspectCandidate({ base: { sha: generation.baseTree, complete: leaves.complete, leaves: leaves.leaves }, manifest, files: artifact.files, policies: [repoRules.policy, briefRules.policy] });
     if (!inspected.ok) return block(inspected.reason);
-    const scanned = scanPublicPayload({ paths: inspected.plan.changedPaths, files: artifact.files, publication, branch: generation.branch, marker }, { internalMarkers: policy.internalMarkers });
+    // 경로·파일 바이트도 이 change의 금지 값(change ID와 앞 8자)으로 본다. 영수증은 이 검사를 지난 바이트만 덮는다.
+    const scanned = scanPublicPayload({ paths: inspected.plan.changedPaths, files: artifact.files, publication, branch: generation.branch, marker }, { internalMarkers: [...policy.internalMarkers, ...changeMarkers(key)] });
     if (!scanned.ok) return block(scanned.reason);
     // 이 검사가 본 글·경로·파일 내용만 writer가 보낸다. 쓰기는 이 뒤 stage에서 나뉘어 나간다.
     this.receipts.record(key, scanned.receipt);
@@ -624,6 +629,8 @@ export class ChangePublisher {
     const effects = (await this.store.amendmentEffects({ changeId: key.changeId })).filter(effect => effect.generation === key.generation && effect.round === key.round);
     const ref = effects.find(effect => effect.stage === 'ref');
     if (ref?.state === 'confirmed' && ref.result?.stage === 'ref') return { kind: 'committed', commitSha: ref.result.sha };
+    const generation = await this.store.generationRecord(key);
+    if (generation.ok && !isWritableChangeBranch(generation.value.branch)) return this.closeReadOnlyAmendment(key, generation.value, effects);
     const plan = await this.amendmentPlan(key, effects);
     if ('kind' in plan) return plan;
     for (const stage of ['blob', 'tree', 'commit', 'ref'] as const) {
@@ -685,10 +692,10 @@ export class ChangePublisher {
     const inspected = inspectCandidate({ base: { sha: round.value.baseTree, complete: leaves.complete, leaves: leaves.leaves }, manifest, files: artifact.value.files,
       policies: [repoRules.policy, briefRules.policy] });
     if (!inspected.ok) return failed(inspected.reason);
-    const marker = publicationMarker(key);
-    const metadata = renderAmendmentCommit({ key, pullNumber: round.value.pullNumber, identity: policy.identity, at: round.value.startedAt ?? round.value.createdAt, bundle: bundle.value });
+    const marker = publicationMarker(key, generation.value.branch);
+    const metadata = renderAmendmentCommit({ key, branch: generation.value.branch, pullNumber: round.value.pullNumber, identity: policy.identity, at: round.value.startedAt ?? round.value.createdAt, bundle: bundle.value });
     const scanned = scanPublicPayload({ paths: inspected.plan.changedPaths, files: artifact.value.files, publication: metadata, branch: generation.value.branch, marker },
-      { internalMarkers: policy.internalMarkers });
+      { internalMarkers: [...policy.internalMarkers, ...changeMarkers(key)] });
     if (!scanned.ok) return failed(scanned.reason);
     this.receipts.record(target.key, scanned.receipt);
     let snapshot: Awaited<ReturnType<typeof readCiSnapshot>>;
@@ -840,6 +847,23 @@ export class ChangePublisher {
     }
   }
   private deferredAmendment(reason: string): AmendmentPublishOutcome { return { kind: 'deferred', reason, retryAt: this.now() + this.retryMs }; }
+  // 옛 꼴 브랜치의 수정 차례는 새 쓰기 없이 닫는다. 보냈을 수 있는 effect(unknown)만 읽기로 대조하고, ref가 이미 내 커밋이면 committed로 회수한다.
+  // 확실히 안 나간 pending은 안 나간 것으로 해소한다. 보내는 중(sending)이거나 대조가 안 끝났으면 failed를 내지 않는다(보낸 것이 남은 채 차례를 닫지 않는다).
+  private async closeReadOnlyAmendment(key: AmendmentKey, generation: GenerationRecord, effects: readonly AmendmentEffect[]): Promise<AmendmentPublishOutcome> {
+    const plan = { key, target: { key: { changeId: key.changeId, generation: key.generation }, repoId: generation.repoId }, generation };
+    // ref를 먼저 본다. 브랜치가 이미 내 커밋이면 앞 stage의 대조와 무관하게 이 차례는 올라간 것이다.
+    for (const effect of [...effects].sort((a, b) => Number(b.stage === 'ref') - Number(a.stage === 'ref'))) {
+      if (effect.state === 'sending') return this.deferredAmendment('busy');
+      if (effect.state === 'blocked' && !effect.resolution) return { kind: 'blocked', reason: effect.blockedReason ?? 'effect_blocked' };
+      if (effect.state !== 'unknown') continue;
+      const verdict = await this.reconcileAmendmentEffect(plan, effect);
+      if (verdict === 'blocked') return { kind: 'blocked', reason: 'head_changed' };
+      if (verdict === 'unresolved') return { kind: 'unknown', stage: effect.stage };
+      if (effect.expected.stage === 'ref') return { kind: 'committed', commitSha: effect.expected.sha };
+    }
+    for (const effect of effects) if (effect.state === 'pending') await this.store.abandonUnsentAmendmentEffect({ ...key, stage: effect.stage, leaseId: null });
+    return { kind: 'failed', reason: 'branch_read_only' };
+  }
 
   // ---- 공통 ----
 

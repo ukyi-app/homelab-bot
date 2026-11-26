@@ -143,6 +143,8 @@ export const guidanceMarker = (key: string) => `<!-- homelab-bot-guidance:${publ
 const legacyGuidanceMarker = (key: string) => `<!-- homelab-bot-guidance:${key} -->`;
 export interface GuidanceReview {
   repository: string; pr: number; head: string; key: string; body: string;
+  // 최종 본문(표식 포함)에 없어야 하는 값. 표식은 안내 키의 해시라 우연히 change ID 앞부분과 겹칠 수 있다. 회수(find)는 받지 않는다.
+  markers: readonly string[];
   comments: readonly { path: string; line: number; body: string }[];
 }
 // 봇 PR에 COMMENT 리뷰를 단다. 게시 상태(outbox·재시도)는 부르는 쪽이 맡는다.
@@ -154,7 +156,7 @@ export interface GuidanceReviewPort {
 const GuidanceKey = z.string().regex(/^[A-Za-z0-9_.:-]{1,128}$/);
 const GuidanceTarget = { repository: z.string(), pr: z.number().int().positive(), head: Sha, key: GuidanceKey };
 // 인라인 개수(50)·본문 길이·event·side는 restrictGitHubWrite가 본다. 여기서는 그 밖의 필드가 끼지 못하게만 한다.
-const GuidanceInput = z.strictObject({ ...GuidanceTarget, body: z.string().min(1),
+const GuidanceInput = z.strictObject({ ...GuidanceTarget, body: z.string().min(1), markers: z.array(z.string().min(1)),
   comments: z.array(z.strictObject({ path: z.string().min(1), line: z.number().int().positive(), body: z.string().min(1) })) });
 const GuidanceLookup = z.strictObject(GuidanceTarget);
 const RecoveredReview = z.object({ id: z.number().int().positive(), commit_id: z.string().nullable(), body: z.string().nullable(), pull_request_url: z.string() });
@@ -343,7 +345,7 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
       const parsed = GuidanceInput.safeParse(raw);
       // 호출자 본문이 표식을 흉내 내면 다른 글의 회수에 걸릴 수 있다.
       if (!parsed.success || parsed.data.body.includes('<!-- homelab-bot-')) return notSent('input_invalid');
-      const { repository, pr, head, key, body, comments } = parsed.data;
+      const { repository, pr, head, key, markers, body, comments } = parsed.data;
       const request = { method: 'POST', path: `/repos/${repository}/pulls/${pr}/reviews`,
         body: { commit_id: head, event: 'COMMENT', body: `${guidanceMarker(key)}\n${body}`, comments: comments.map(c => ({ path: c.path, line: c.line, side: 'RIGHT', body: c.body })) } };
       let write: ReturnType<typeof restrictGitHubWrite>;
@@ -370,8 +372,9 @@ export function githubReviewIO(options: { app: GitHubAppCredentials; repositorie
       let sealed: { payload: ReturnType<typeof finalPayload>; check: ReturnType<typeof checkOutbound> };
       try {
         const payload = finalPayload({ kind: 'github', method: 'POST', path: write.path }, write.body);
-        // 최종 바이트(표식·경로·댓글 포함)를 본다. 안내 키가 표식 밖 어디에든 남으면 막는다. 걸리면 input_invalid가 아니라 public_check다.
-        sealed = { payload, check: checkOutbound(payload, { policyRevision: OUTBOUND_RULES_REVISION, scan: publicScan({ internalMarkers: [key], metadata: true }) }) };
+        // 최종 바이트(표식·경로·댓글 포함)를 본다. 안내 키가 표식 밖 어디에든 남거나 호출자의 금지 값이 표식까지 어디에든 있으면 막는다.
+        // 걸리면 input_invalid가 아니라 public_check다.
+        sealed = { payload, check: checkOutbound(payload, { policyRevision: OUTBOUND_RULES_REVISION, scan: publicScan({ internalMarkers: [key, ...markers], metadata: true }) }) };
       } catch (error) { return notSent(error instanceof OutboundRefused && error.reason === 'public_check' ? 'outbound_public_check' : 'input_invalid'); }
       let created: unknown;
       // 안내 글의 중복은 호출자의 효과 기록과 표식 대조(find)가 막는다. 여기 발송함 대조는 그 앞 단계를 다시 보지 않는다.

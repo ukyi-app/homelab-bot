@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import {
-  ARTIFACT_LIMITS, BranchNameSchema, ChangeIdSchema, ChangePathSchema, GenerationSchema, GitShaSchema, PublicMetadataSchema, RepoIdSchema, gitBlobSha, parseChangeBranch,
+  ARTIFACT_LIMITS, BranchNameSchema, ChangeIdSchema, ChangePathSchema, GenerationSchema, GitShaSchema, PublicMetadataSchema, RepoIdSchema, gitBlobSha, isWritableChangeBranch, parseChangeBranch,
 } from './change-contracts.js';
 import type { ChangeTarget, ChangeWriterPort, WriterOutcome, WriterPullSnapshot } from './change-contracts.js';
 import { REUSABLE_USES } from './change-ci-policy.js';
@@ -33,8 +33,8 @@ const SHA = '[0-9a-f]{40}';
 const ROUTES: readonly RegExp[] = Object.freeze([
   'POST /app/installations/[1-9][0-9]{0,15}/access_tokens',
   `POST ${REPO}/git/blobs`, `POST ${REPO}/git/trees`, `POST ${REPO}/git/commits`, `POST ${REPO}/git/refs`, `POST ${REPO}/pulls`,
-  // 갱신은 변경 브랜치 모양만 연다. 어느 change·generation인지는 도메인 메서드가 ownsBranch로 다시 본다.
-  `PATCH ${REPO}/git/refs/heads/bot/change/[0-9a-f]{32}/g[1-9][0-9]{0,2}`,
+  // 갱신은 새 꼴 변경 브랜치 모양만 연다(옛 꼴은 읽기만). 어느 change·generation인지는 도메인 메서드가 ownsBranch로 다시 본다.
+  `PATCH ${REPO}/git/refs/heads/bot/change/c[0-9a-f]{24}`,
   `GET ${REPO}/git/ref/heads/${BRANCH}`, `GET ${REPO}/git/commits/${SHA}`, `GET ${REPO}/git/blobs/${SHA}`,
   `GET ${REPO}/git/trees/${SHA}`, String.raw`GET ${REPO}/git/trees/${SHA}\?recursive=1`,
   String.raw`GET ${REPO}/pulls\?state=all&head=${SEGMENT}:${BRANCH}&base=${BRANCH}&per_page=100`,
@@ -290,9 +290,15 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
     return parsed.success ? parsed.data : null;
   };
   const notSent = (code: string) => ({ kind: 'not_sent', code }) as const;
-  const ownsBranch = (target: ChangeTarget, branch: string) => {
+  // 쓰기는 새 꼴 브랜치에만 하고, 그 이름이 이 change·세대의 공개 검사 영수증이 본 브랜치와 같아야 한다. 새 꼴 이름에는 키가 없어
+  // 이름만으로는 어느 change의 것인지 알 수 없다. 영수증의 브랜치는 게시자가 세대 행(change_generations.branch)에서 읽어 검사한 값이다.
+  const ownsBranch = (target: ChangeTarget, branch: string) => isWritableChangeBranch(branch) && receipts.branchOf(target.key) === branch;
+  // 읽기(PR 찾기)는 회수·멱등 판정이라 옛 꼴도 받고, 재시작 뒤 영수증이 없어도 된다. 옛 꼴은 이름의 키가 대상과 같아야 한다.
+  // 새 꼴 이름에는 키가 없어 모양만 보고, 찾은 PR이 세대 행의 브랜치인지는 게시자가 대조한다.
+  const readsBranch = (target: ChangeTarget, branch: string) => {
     const parsed = parseChangeBranch(branch);
-    return parsed !== null && parsed.changeId === target.key.changeId && parsed.generation === target.key.generation;
+    return parsed?.form === 'trace'
+      || (parsed?.form === 'legacy' && parsed.key.changeId === target.key.changeId && parsed.key.generation === target.key.generation);
   };
 
   const writer: Pick<ChangeWriterPort, 'createBlobs' | 'createTree' | 'createCommit' | 'createRef' | 'createPull'> = {
@@ -523,7 +529,7 @@ export function createGitHubWriter(options: GitHubWriterOptions): GitHubWriterIO
     readTreeLeaves: signed.readTreeLeaves,
     readBlobExists: async ({ target, sha }) => (await signed.blobRow(target, sha)) !== null,
     findPulls: async ({ target, headBranch, baseBranch }) => {
-      if (!ownsBranch(target, headBranch)) throw readFailure('read_input_invalid');
+      if (!readsBranch(target, headBranch)) throw readFailure('read_input_invalid');
       const repo = await signed.repoFor(target);
       if (!repo.baseBranches.includes(baseBranch) || !safeBranchPath(baseBranch)) throw readFailure('read_input_invalid');
       const owner = repo.fullName.split('/')[0]!;

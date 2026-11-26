@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { changeBranchName, gitBlobSha } from '../src/change-contracts.js';
+import { gitBlobSha } from '../src/change-contracts.js';
 import { publicationMarker, PublicReceipts, publicReceiptScan, publicScan, publicTraceId, recordPublicTrace, renderAmendmentCommit, renderPublication, scanPublicPayload } from '../src/change-publication.js';
 import type { PublicReceipt } from '../src/change-publication.js';
 import { guidanceKey } from '../src/change-guidance.js';
@@ -81,10 +81,11 @@ test('F7a F-8: 리뷰 표식은 시도 키의 추적 ID다(같은 키면 같은 
 });
 
 const CHANGE = { changeId: 'fedcba9876543210fedcba9876543210', generation: 3 };
+const C_BRANCH = 'bot/change/c5a5a5a5a5a5a5a5a5a5a5a5a';
 const BUNDLE = fixtureBundle({ generation: 3, policyRevision: 'fixture-policy-77', verifierRevision: 'fixture-verifier-77' });
 const publicationInput = (overrides: Partial<PublicationInput> = {}): PublicationInput => ({
   key: CHANGE, label: 'public', brief: fixtureBrief({ summary: '요약 제목', goal: '목표 문장', acceptanceCriteria: ['기준 하나'] }),
-  bundle: BUNDLE, branch: `bot/change/${CHANGE.changeId}/g3`, verifications: [{ commandId: 'smoke-unit', status: 'passed' }],
+  bundle: BUNDLE, branch: C_BRANCH, verifications: [{ commandId: 'smoke-unit', status: 'passed' }],
   review: { verdict: 'pass', risks: [] }, identity: { name: 'fixture-writer[bot]', email: 'fixture-writer[bot]@users.noreply.github.com' },
   at: Date.UTC(2026, 0, 2), ...overrides,
 });
@@ -95,9 +96,11 @@ test('F7a F-8: PR 본문·커밋 메시지에는 git 리비전과 추적 ID만, 
   const result = renderPublication(publicationInput(), SCAN);
   assert.equal(result.ok, true, JSON.stringify(result));
   const { publication, marker } = result as Extract<typeof result, { ok: true }>;
-  const trace = publicTraceId('change', `${CHANGE.changeId}:g3`);
+  // 새 꼴 브랜치의 추적 ID는 브랜치 이름의 무작위 값이다. change ID의 해시(옛 꼴의 값)가 아니다.
+  const trace = C_BRANCH.slice('bot/change/'.length);
+  assert.notEqual(trace, publicTraceId('change', `${CHANGE.changeId}:g3`));
   assert.equal(marker, `homelab-bot-change:${trace}`);
-  assert.equal(publicationMarker(CHANGE), marker);
+  assert.equal(publicationMarker(CHANGE, C_BRANCH), marker);
   assert.ok(publication.body.includes(`<!-- ${marker} -->`));
   assert.ok(publication.body.includes(`- 추적 ID: ${trace}`));
   for (const kept of [BUNDLE.baseCommit, BUNDLE.baseTree, BUNDLE.resultTree]) assert.ok(publication.body.includes(kept), kept);
@@ -106,7 +109,7 @@ test('F7a F-8: PR 본문·커밋 메시지에는 git 리비전과 추적 ID만, 
     assert.ok(!publication.body.includes(internal), internal);
     assert.ok(!publication.commitMessage.includes(internal), internal);
   }
-  const amendment = renderAmendmentCommit({ key: { ...CHANGE, round: 2 }, pullNumber: 9, identity: publicationInput().identity, at: Date.UTC(2026, 0, 3), bundle: BUNDLE });
+  const amendment = renderAmendmentCommit({ key: { ...CHANGE, round: 2 }, branch: C_BRANCH, pullNumber: 9, identity: publicationInput().identity, at: Date.UTC(2026, 0, 3), bundle: BUNDLE });
   assert.ok(amendment.commitMessage.includes(`\nChange: ${trace}\n`));
   for (const internal of INTERNAL_CHANGE) assert.ok(!amendment.commitMessage.includes(internal), internal);
 });
@@ -187,13 +190,13 @@ test('F7a 훑기: 리뷰 게시 검사 경로의 포트 읽기·호출마다 던
 // ---- P3-6: 산출물 공개 검사 영수증과 writer 쓰기 바이트의 묶음 ----
 
 const W_KEY = { changeId: 'abcdefabcdefabcdefabcdefabcdef01', generation: 1 };
-const W_BRANCH = changeBranchName(W_KEY.changeId, 1);
+const W_BRANCH = `bot/change/c${'ab'.repeat(12)}`;
 const W_FILE = Buffer.from('export const a = 1;\n');
 const W_IDENTITY = { name: 'fixture-writer[bot]', email: 'fixture-writer[bot]@users.noreply.github.com', date: '2026-01-02T03:04:05Z' };
-const W_META = { title: '요약', body: '본문', commitMessage: `요약\n\nChange: ${publicTraceId('change', `${W_KEY.changeId}:g1`)}\n`, author: W_IDENTITY, committer: W_IDENTITY, draft: false };
+const W_META = { title: '요약', body: '본문', commitMessage: `요약\n\nChange: ${W_BRANCH.slice('bot/change/'.length)}\n`, author: W_IDENTITY, committer: W_IDENTITY, draft: false };
 const PLANTED_FILE = Buffer.from(`const token = "${TOKEN}";\n`);
 function scannedReceipt() {
-  const result = scanPublicPayload({ paths: ['src/a.ts'], files: [{ path: 'src/a.ts', content: W_FILE }], publication: W_META, branch: W_BRANCH, marker: publicationMarker(W_KEY) }, SCAN);
+  const result = scanPublicPayload({ paths: ['src/a.ts'], files: [{ path: 'src/a.ts', content: W_FILE }], publication: W_META, branch: W_BRANCH, marker: publicationMarker(W_KEY, W_BRANCH) }, SCAN);
   assert.equal(result.ok, true, JSON.stringify(result));
   return (result as Extract<typeof result, { ok: true }>).receipt;
 }
@@ -331,7 +334,7 @@ test('F7a F-1 이어 보기: 리뷰 본문과 인라인 댓글(경로를 사이�
 });
 
 test('F7a F-1 이어 보기: 안내 리뷰의 최종 바이트 검사도 본문·댓글 사이에 쪼갠 안내 키를 잡는다', () => {
-  const key = guidanceKey(CHANGE, 1);
+  const key = guidanceKey(CHANGE, C_BRANCH, 1);
   const scan = publicScan({ internalMarkers: [key], metadata: true });
   const path = '/repos/fixture-org/fixture-repo/pulls/7/reviews';
   const [head, rest] = splitAt(key, 20);

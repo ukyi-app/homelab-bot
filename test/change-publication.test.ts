@@ -1,15 +1,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PublicMetadataSchema } from '../src/change-contracts.js';
-import { neutralizePublicText, publicationMarker, renderGuidance, renderPublication } from '../src/change-publication.js';
+import { CHANGE_AMENDMENT } from '../src/change-contracts.js';
+import { neutralizePublicText, publicTraceId, publicationMarker, renderGuidance, renderPublication } from '../src/change-publication.js';
 import type { PublicationInput } from '../src/change-publication.js';
 import { fixtureBrief, fixtureBundle } from './change-store-fixture.js';
 
 const KEY = { changeId: '0123456789abcdef0123456789abcdef', generation: 2 };
+// 추적 ID는 change ID와 독립인 값이다. change ID 앞부분을 품은 이름은 pinBase가 다시 뽑고 공개 검사가 막는다(아래 D-122 시험).
+const BRANCH = 'bot/change/cfedcba98fedcba98fedcba98';
+const SHARED_BRANCH = 'bot/change/c89abcdef0123456789abcdef';
 const SCAN = { internalMarkers: ['fixture-internal-host'] };
 const input = (overrides: Partial<PublicationInput> = {}): PublicationInput => ({
   key: KEY, label: 'public', brief: fixtureBrief({ summary: '요약 제목\n둘째 줄 설명', goal: '목표 문장', acceptanceCriteria: ['기준 하나', '기준 둘'] }),
-  bundle: fixtureBundle({ generation: 2 }), branch: `bot/change/${KEY.changeId}/g2`,
+  bundle: fixtureBundle({ generation: 2 }), branch: BRANCH,
   verifications: [{ commandId: 'smoke-unit', status: 'passed' }],
   review: { verdict: 'pass_with_warnings', risks: [{ priority: 'P2', category: 'correctness' }, { priority: 'P3', category: 'other' }] },
   identity: { name: 'fixture-writer[bot]', email: 'fixture-writer[bot]@users.noreply.github.com' }, at: Date.UTC(2026, 0, 2, 3, 4, 5, 678), ...overrides,
@@ -27,11 +31,36 @@ test('T19 B3 공개 문구: 승인 brief와 구조화 값만으로 만들고 계
   assert.equal(publication.draft, false);
   assert.equal(publication.author.date, '2026-01-02T03:04:05Z', '초 아래를 버려 형식을 고정한다');
   assert.deepEqual(publication.author, publication.committer);
-  for (const expected of ['목표 문장', '기준 둘', '`smoke-unit`', 'passed', fixtureBundle().baseCommit, fixtureBundle().resultTree, 'pass_with_warnings', 'P2', 'correctness', publicationMarker(KEY)]) {
+  for (const expected of ['목표 문장', '기준 둘', '`smoke-unit`', 'passed', fixtureBundle().baseCommit, fixtureBundle().resultTree, 'pass_with_warnings', 'P2', 'correctness', publicationMarker(KEY, BRANCH)]) {
     assert.ok(publication.body.includes(expected), expected);
   }
   assert.ok(publication.commitMessage.endsWith('\n'));
   assert.ok(publication.commitMessage.startsWith('요약 제목\n\n'));
+});
+
+test('D-122 공개 문구: change ID 앞 8·12·16자가 추적 ID·요약에 들어가면 internal_marker로 막고, 독립 추적 ID의 글에는 앞부분이 없다', () => {
+  const pieces = [8, 12, 16, 24, 32].map(length => KEY.changeId.slice(0, length));
+  // 추적 ID가 change ID 앞 16자를 품은 고정 입력. 제목·본문·커밋 모두에 실리는 값이다.
+  assert.deepEqual(renderPublication(input({ branch: SHARED_BRANCH }), SCAN), { ok: false, reason: 'internal_marker' });
+  for (const piece of pieces.slice(0, 3)) {
+    assert.deepEqual(renderPublication(input({ brief: fixtureBrief({ summary: `요약 ${piece}`, goal: '목표 문장', acceptanceCriteria: ['기준 하나'] }) }), SCAN), { ok: false, reason: 'internal_marker' }, piece);
+  }
+  const publication = rendered(input());
+  for (const text of [publication.title, publication.body, publication.commitMessage]) {
+    for (const piece of pieces) assert.ok(!text.toLowerCase().includes(piece), piece);
+  }
+});
+
+// 종전 공식(change ID·세대·차례의 해시)으로 계산되는 이 change의 공개 추적 ID는 앞 세대·마지막 차례까지 새 글에 싣지 않는다. 다른 change의 값은 막지 않는다.
+test('D-122 공개 문구: 이 change의 종전 change·안내 추적 ID를 품은 요약은 internal_marker로 막는다', () => {
+  const { changeId, generation } = KEY;
+  const values = [publicTraceId('change', `${changeId}:g${generation}`), publicTraceId('change', `${changeId}:g1`),
+    publicTraceId('guidance', `${changeId}:g${generation}:r0`), publicTraceId('guidance', `${changeId}:g1:r${CHANGE_AMENDMENT.maxRounds}`)];
+  for (const value of values) {
+    assert.deepEqual(renderPublication(input({ brief: fixtureBrief({ summary: `이전 참조 ${value}` }) }), SCAN), { ok: false, reason: 'internal_marker' }, value);
+  }
+  const other = publicTraceId('change', `${'f'.repeat(32)}:g${generation}`);
+  assert.equal(renderPublication(input({ brief: fixtureBrief({ summary: `이전 참조 ${other}` }) }), SCAN).ok, true);
 });
 
 test('T19 B3 공개 문구: 같은 입력은 같은 결과다(재시도·승인 digest 고정)', () => {
@@ -68,10 +97,10 @@ test('T19 B3 공개 문구: mention·자동 연결·숨은 문구를 무력화�
 });
 
 test('T19 B3 공개 문구: 본문이 marker를 위조하지 못한다', () => {
-  const forged = `<!-- ${publicationMarker({ changeId: 'f'.repeat(32), generation: 1 })} -->`;
+  const forged = `<!-- ${publicationMarker({ changeId: 'f'.repeat(32), generation: 1 }, `bot/change/c${'f'.repeat(24)}`)} -->`;
   const publication = rendered(input({ brief: fixtureBrief({ goal: forged }) }));
   assert.equal(publication.body.split('<!--').length, 2, 'marker 주석은 서버가 넣은 하나뿐이다');
-  assert.ok(publication.body.includes(`<!-- ${publicationMarker(KEY)} -->`));
+  assert.ok(publication.body.includes(`<!-- ${publicationMarker(KEY, BRANCH)} -->`));
 });
 
 test('T19 B3 공개 문구: 넘치는 값은 자르지 않고 막는다', () => {

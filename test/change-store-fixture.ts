@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
-  ApprovalSubjectSchema, EffectExpectedSchema, artifactDigest, changeBranchName, gitBlobSha, sha256Hex,
+  ApprovalSubjectSchema, EffectExpectedSchema, artifactDigest, gitBlobSha, sha256Hex,
 } from '../src/change-contracts.js';
 import type {
   ApprovalSubject, ArtifactFile, ArtifactManifest, ChangeBrief, ChangePhase, EffectExpected, EffectResult, EffectStage, EvidenceBundle, PublicMetadata, ReviewReceipt,
   VerificationReceipt,
 } from '../src/change-contracts.js';
-import type { ChangeRequest, ChangeStore, StoreResult } from '../src/change-store.js';
+import { ChangeStore } from '../src/change-store.js';
+import type { ChangeRequest, StoreResult } from '../src/change-store.js';
 import type { Database } from '../src/database.js';
 
 // 값은 모두 합성이다. 같은 씨앗이면 같은 SHA가 나와 시험끼리 대조할 수 있다.
@@ -18,6 +19,20 @@ export const CONVERSATION = 'fixture-conversation';
 export const REPO_ID = 4242;
 export const COMMAND = 'smoke-unit';
 const CONTENT = Buffer.from('export const value = 1;\n');
+
+// 브랜치 이름은 세대 행을 만들 때(pinBase) 무작위로 정해진다. 시험이 그 이름을 동기로 쓰게, 이 시험 프로세스에서 고정한 이름을 적어 둔다.
+const pinned = new Map<string, string>();
+const realPinBase = ChangeStore.prototype.pinBase;
+ChangeStore.prototype.pinBase = async function pinBase(this: ChangeStore, input) {
+  const result = await realPinBase.call(this, input);
+  if (result.ok) pinned.set(`${result.value.changeId}:g${result.value.generation}`, result.value.branch);
+  return result;
+};
+export function pinnedBranch(changeId: string, generation = 1): string {
+  const branch = pinned.get(`${changeId}:g${generation}`);
+  if (branch === undefined) throw new Error(`branch_not_pinned:${changeId}:g${generation}`);
+  return branch;
+}
 const PATCH = Buffer.from('--- a/src/new.ts\n+++ b/src/new.ts\n');
 
 export function fixtureManifestFiles(): ArtifactFile[] { return [{ path: 'src/new.ts', content: CONTENT }]; }
@@ -47,8 +62,8 @@ export function fixtureReview(overrides: Partial<ReviewReceipt> = {}): ReviewRec
   return { instructionRevision: 'fixture-instructions-1', sessionId: '11111111-1111-4111-8111-111111111111', jobId: 'fixture-review-job', bundle: fixtureBundle(),
     coverage: 'complete', verdict: 'pass', risks: [], findingsDigest: hex('findings'), ...overrides };
 }
-export function fixtureApprovalSubject(changeId: string): ApprovalSubject {
-  return ApprovalSubjectSchema.parse({ changeId, bundle: fixtureBundle(), baseBranch: 'main', branch: changeBranchName(changeId, 1),
+export function fixtureApprovalSubject(changeId: string, branch = pinnedBranch(changeId, 1)): ApprovalSubject {
+  return ApprovalSubjectSchema.parse({ changeId, bundle: fixtureBundle(), baseBranch: 'main', branch,
     verifications: [{ commandId: COMMAND, status: 'passed', receiptDigest: hex('receipt') }],
     review: { receiptDigest: hex('review'), coverage: 'complete', verdict: 'pass' }, publication: fixtureMetadata(), ciFingerprint: hex('ci') });
 }
@@ -56,20 +71,21 @@ export function fixtureBrief(overrides: Partial<ChangeBrief> = {}): ChangeBrief 
   return { summary: '공개 요약', goal: '공개 목표', acceptanceCriteria: ['시험 통과'], repoId: REPO_ID, baseBranch: 'main', allowedPaths: ['src/**'], deniedPaths: [],
     verificationCommandIds: [COMMAND], label: 'public', ...overrides };
 }
+// ref·pull 단계만 그 세대의 고정된 브랜치 이름을 읽는다(다른 단계는 세대 행이 없어도 만든다).
 export const fixtureExpected = (stage: EffectStage, changeId: string, generation = 1): EffectExpected => EffectExpectedSchema.parse({
-  blob: { stage: 'blob', shas: [gitBlobSha(CONTENT)] },
-  tree: { stage: 'tree', baseTree: git('t0'), treeSha: git('t1') },
-  commit: { stage: 'commit', treeSha: git('t1'), parent: git('b'), commitSha: git('h') },
-  ref: { stage: 'ref', ref: `refs/heads/${changeBranchName(changeId, generation)}`, sha: git('h') },
-  pull: { stage: 'pull', headBranch: changeBranchName(changeId, generation), baseBranch: 'main', headSha: git('h'), marker: 'fixture-marker' },
-}[stage]);
+  blob: () => ({ stage: 'blob', shas: [gitBlobSha(CONTENT)] }),
+  tree: () => ({ stage: 'tree', baseTree: git('t0'), treeSha: git('t1') }),
+  commit: () => ({ stage: 'commit', treeSha: git('t1'), parent: git('b'), commitSha: git('h') }),
+  ref: () => ({ stage: 'ref', ref: `refs/heads/${pinnedBranch(changeId, generation)}`, sha: git('h') }),
+  pull: () => ({ stage: 'pull', headBranch: pinnedBranch(changeId, generation), baseBranch: 'main', headSha: git('h'), marker: 'fixture-marker' }),
+}[stage]());
 export const fixtureResult = (stage: EffectStage, changeId: string, generation = 1): EffectResult => ({
-  blob: { stage: 'blob', shas: [gitBlobSha(CONTENT)] },
-  tree: { stage: 'tree', treeSha: git('t1') },
-  commit: { stage: 'commit', commitSha: git('h'), treeSha: git('t1'), parents: [git('b')] },
-  ref: { stage: 'ref', ref: `refs/heads/${changeBranchName(changeId, generation)}`, sha: git('h') },
-  pull: { stage: 'pull', number: 7, headBranch: changeBranchName(changeId, generation), baseBranch: 'main', headSha: git('h') },
-} as Record<EffectStage, EffectResult>)[stage];
+  blob: () => ({ stage: 'blob', shas: [gitBlobSha(CONTENT)] }),
+  tree: () => ({ stage: 'tree', treeSha: git('t1') }),
+  commit: () => ({ stage: 'commit', commitSha: git('h'), treeSha: git('t1'), parents: [git('b')] }),
+  ref: () => ({ stage: 'ref', ref: `refs/heads/${pinnedBranch(changeId, generation)}`, sha: git('h') }),
+  pull: () => ({ stage: 'pull', number: 7, headBranch: pinnedBranch(changeId, generation), baseBranch: 'main', headSha: git('h') }),
+} as Record<EffectStage, () => EffectResult>)[stage]();
 
 export function ok<T>(result: StoreResult<T>): T {
   if (!result.ok) assert.fail(`store_failure:${result.reason}:${result.detail ?? ''}`);

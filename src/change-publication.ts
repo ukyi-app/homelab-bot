@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { ChangeBriefSchema, CommandIdSchema, EvidenceBundleSchema, GenerationSchema, PublicMetadataSchema, ProvenanceLabelSchema, REVIEW_RISK_CATEGORIES, ChangeIdSchema, labelAllowsAuthorInput, propagateLabel } from './change-contracts.js';
+import { CHANGE_AMENDMENT, ChangeBriefSchema, CommandIdSchema, EvidenceBundleSchema, GenerationSchema, PublicMetadataSchema, ProvenanceLabelSchema, REVIEW_RISK_CATEGORIES, ChangeIdSchema, changeIdPrefix, labelAllowsAuthorInput, parseChangeBranch, propagateLabel } from './change-contracts.js';
 import type { AmendmentKey, ArtifactFile, ChangeBrief, ChangeKey, ChangeNote, EvidenceBundle, ProvenanceLabel, PublicMetadata } from './change-contracts.js';
 import { CHANGE_NOTE_LIMITS, ChangeNoteSchema } from './task-contracts.js';
 import type { Database } from './database.js';
@@ -22,10 +22,9 @@ export function neutralizePublicText(text: string): string {
     .replaceAll('://', `:${ZWSP}//`);
 }
 
-// GitHub에 싣는 추적 ID. 내부 값(작업 UUID, change ID·세대·차례)의 sha256 앞 24자다. 같은 내부 값이면 같은 ID라 재시도·회수 대조가
-// 새 칸 없이 그대로 된다. 공개 ID → 내부 값은 감사 행(github_public_id)과 그 내부 값을 가진 DB 행에만 있다. kind가 접두라 리뷰·안내·PR의 ID가 서로 겹치지 않는다.
-// 되찾지 못하는 것은 리뷰(입력이 작업 UUID)뿐이다. change·안내는 입력의 change ID가 브랜치 이름(bot/change/<change ID>/g<세대>)으로
-// 공개돼 있어, 세대·차례를 대입하면 그 PR 표식과 안내 표식을 계산할 수 있다(새로 드러나는 내부 값은 없다).
+// GitHub에 싣는 추적 ID. 입력 값의 sha256 앞 24자다. 같은 입력이면 같은 ID라 재시도·회수 대조가 새 칸 없이 그대로 된다.
+// 공개 ID → 내부 값은 감사 행(github_public_id)과 그 내부 값을 가진 DB 행에만 있다. kind가 접두라 리뷰·안내·PR의 ID가 서로 겹치지 않는다.
+// 리뷰의 입력은 작업 UUID다. change·안내의 입력은 changeTraceId를 본다.
 export type PublicTraceKind = 'review' | 'guidance' | 'change';
 export const publicTraceId = (kind: PublicTraceKind, internal: string): string =>
   `${kind.slice(0, 1)}${createHash('sha256').update(`homelab-bot/${kind}\0${internal}`).digest('hex').slice(0, 24)}`;
@@ -35,21 +34,51 @@ export async function recordPublicTrace(tx: Pick<Database, 'query'>, id: string,
   await tx.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`github_public_id:${id}`]);
   await tx.query(`INSERT INTO audit(kind,subject,detail,created_at) SELECT 'github_public_id',$1,$2,$3 WHERE NOT EXISTS (SELECT 1 FROM audit WHERE kind='github_public_id' AND subject=$1)`, [id, JSON.stringify(detail), at]);
 }
+// change 세대의 공개 추적 ID(PR 본문·커밋·표식·안내 키에 싣는 값). 새 꼴 브랜치는 이름의 무작위 c<24 hex> 그대로라 change ID로 계산되지 않고
+// 공개 글에서 change ID를 되찾을 수도 없다. 옛 꼴 브랜치는 이름에 change ID가 이미 공개돼 있고, 그 브랜치로 이미 낸 PR 표식·안내 표식을
+// 찾으려면 같은 값이어야 해서 예전 계산(change ID·세대의 해시)을 그대로 쓴다. 키와 맞지 않는 이름이면 null이다.
+export function changeTraceId(key: ChangeKey, branch: string): string | null {
+  const parsed = parseChangeBranch(branch);
+  if (parsed?.form === 'trace') return parsed.traceId;
+  if (parsed?.form === 'legacy' && parsed.key.changeId === key.changeId && parsed.key.generation === key.generation) return legacyChangeTrace(key.changeId, key.generation);
+  return null;
+}
+// 030 전 옛 꼴 세대의 공개 추적 ID 공식. 옛 PR 표식·안내 표식을 찾는 읽기와 새 쓰기의 금지 값(changeMarkers)이 같은 공식을 써야 한다.
+const legacyChangeTrace = (changeId: string, generation: number): string => publicTraceId('change', `${changeId}:g${generation}`);
+export const legacyGuidanceKey = (changeId: string, generation: number, round: number): string => `${changeId}:g${generation}:r${round}`;
+const requireTrace = (key: ChangeKey, branch: string): string => {
+  const id = changeTraceId(key, branch);
+  if (id === null) throw new Error('change_branch_invalid');
+  return id;
+};
+// change 하나의 공개 금지 값. 처음 게시·수정 차례의 PR 글·커밋(작성자·커미터 신원 포함)·경로·파일 바이트와 안내 댓글 글·최종 표식 검사가 모두 이 목록을 더한다.
+// change ID 전체와 앞 8자, 그리고 종전 공식으로 이 change에서 계산되는 공개 추적 ID다(세대마다 change 추적 ID 하나와 차례 0~상한의 안내 추적 ID).
+// 종전 값은 옛 꼴 PR·안내에 이미 공개됐을 수 있어 새 글에 다시 실리면 새 세대가 그 change와 이어진다. 앞 세대 PR 글을 옮겨 쓸 수 있어 세대 1부터 넣는다.
+// 옛 게시물을 찾는 읽기 대조(publicationMarker·안내 find)는 이 목록을 쓰지 않는다. 값 수는 세대 수 × 12라 세대가 많을수록 검사가 느려진다.
+// 정책·검증기 판은 여기 넣지 않는다. 검증기 판은 봇 소스의 고정 문자열이라 파일 바이트에 넣으면 봇 저장소를 고치는 변경이 막힌다(PR 글 검사에만 더한다).
+export function changeMarkers(key: ChangeKey): string[] {
+  const legacy: string[] = [];
+  for (let generation = 1; generation <= key.generation; generation++) {
+    legacy.push(legacyChangeTrace(key.changeId, generation));
+    for (let round = 0; round <= CHANGE_AMENDMENT.maxRounds; round++) legacy.push(publicTraceId('guidance', legacyGuidanceKey(key.changeId, generation, round)));
+  }
+  return [key.changeId, changeIdPrefix(key.changeId), ...legacy];
+}
 // 대조용 표식이다. 제목·Discord ID·change ID를 넣지 않는다.
-export const publicationMarker = (key: ChangeKey): string => `homelab-bot-change:${publicTraceId('change', `${key.changeId}:g${key.generation}`)}`;
+export const publicationMarker = (key: ChangeKey, branch: string): string => `homelab-bot-change:${requireTrace(key, branch)}`;
 // 공개 ID와 내부 값의 대응. 감사 행의 detail로만 남긴다(PR 본문·커밋에는 싣지 않는다).
-export const publicationTrace = (key: ChangeKey, bundle: Pick<EvidenceBundle, 'policyRevision' | 'verifierRevision' | 'artifactDigest'>) => ({
-  id: publicTraceId('change', `${key.changeId}:g${key.generation}`),
+export const publicationTrace = (key: ChangeKey, branch: string, bundle: Pick<EvidenceBundle, 'policyRevision' | 'verifierRevision' | 'artifactDigest'>) => ({
+  id: requireTrace(key, branch),
   detail: { changeId: key.changeId, generation: key.generation, policyRevision: bundle.policyRevision, verifierRevision: bundle.verifierRevision, artifactDigest: bundle.artifactDigest },
 });
 // 수정 차례(C27)의 커밋 메타데이터. 모델 글 없이 코드가 만든 고정 문구와 차례 번호만 싣는다. 시각은 차례 시작 시각(초)이라 재시도해도 같은 커밋 SHA다.
 // PR 제목·본문은 처음 게시 때만 쓰고 수정 차례는 고치지 않는다(AC-27). title·body 칸은 공개 검사(scanPublicPayload)에 넣으려고 커밋 메시지로 채운다.
 export const AMENDMENT_COMMIT_TITLE = (round: number) => `수정 차례 ${round}: owner 요청과 PR 리뷰 반영`;
-export function renderAmendmentCommit(input: { key: AmendmentKey; pullNumber: number; identity: { name: string; email: string }; at: number; bundle: Pick<EvidenceBundle, 'baseCommit' | 'resultTree'> }): PublicMetadata {
+export function renderAmendmentCommit(input: { key: AmendmentKey; branch: string; pullNumber: number; identity: { name: string; email: string }; at: number; bundle: Pick<EvidenceBundle, 'baseCommit' | 'resultTree'> }): PublicMetadata {
   const date = new Date(Math.floor(input.at / 1000) * 1000).toISOString().replace('.000Z', 'Z');
   const identity = { name: input.identity.name, email: input.identity.email, date };
   const title = AMENDMENT_COMMIT_TITLE(input.key.round);
-  const commitMessage = `${title}\n\nChange: ${publicTraceId('change', `${input.key.changeId}:g${input.key.generation}`)}\nPull: #${input.pullNumber}\nRound: ${input.key.round}\nBase: ${input.bundle.baseCommit}\nTree: ${input.bundle.resultTree}\n`;
+  const commitMessage = `${title}\n\nChange: ${requireTrace(input.key, input.branch)}\nPull: #${input.pullNumber}\nRound: ${input.key.round}\nBase: ${input.bundle.baseCommit}\nTree: ${input.bundle.resultTree}\n`;
   return PublicMetadataSchema.parse({ title, body: commitMessage, commitMessage, author: identity, committer: identity, draft: false });
 }
 
@@ -88,7 +117,7 @@ const riskLines = (risks: PublicationInput['review']['risks']) => {
   for (const risk of risks) counts.set(`${risk.priority} ${risk.category}`, (counts.get(`${risk.priority} ${risk.category}`) ?? 0) + 1);
   return [...counts.entries()].sort(([a], [b]) => a < b ? -1 : 1).map(([name, count]) => `- 남은 위험: ${name} ${count}건`);
 };
-function renderBody(input: PublicationInput, brief: ChangeBrief, bundle: EvidenceBundle, label: ProvenanceLabel, marker: string): string {
+function renderBody(input: PublicationInput, brief: ChangeBrief, bundle: EvidenceBundle, label: ProvenanceLabel, trace: string, marker: string): string {
   return [
     '## 요약', neutralizePublicText(brief.summary), '',
     '## 목표', neutralizePublicText(brief.goal), '',
@@ -98,7 +127,7 @@ function renderBody(input: PublicationInput, brief: ChangeBrief, bundle: Evidenc
     '## 사전 리뷰', `- 판정: ${input.review.verdict}, 범위 complete`, ...riskLines(input.review.risks), '',
     // 공개 검토에 쓰는 git 리비전만 싣는다. 정책·검증기 판과 산출물 digest는 내부 값이라 추적 ID의 감사 행에만 있다.
     '## 고정 리비전', `- base commit: ${bundle.baseCommit}`, `- base tree: ${bundle.baseTree}`, `- result tree: ${bundle.resultTree}`,
-    `- 추적 ID: ${publicTraceId('change', `${input.key.changeId}:g${input.key.generation}`)}`, `- 출처 label: ${label}`, '',
+    `- 추적 ID: ${trace}`, `- 출처 label: ${label}`, '',
     '봇이 만든 제안 PR이다. 사람이 검토해 병합한다.', '',
     `<!-- ${marker} -->`,
   ].join('\n');
@@ -111,19 +140,23 @@ export function renderPublication(raw: PublicationInput, scan: ScanPolicy): Publ
   // 모델이 낮출 수 없다. 기록된 label과 brief 신고 중 제한적인 값이 이긴다.
   const label = propagateLabel([input.label, input.brief.label]);
   if (!labelAllowsAuthorInput(label)) return { ok: false, reason: 'label_blocked' };
-  const marker = publicationMarker(input.key);
+  // 새 공개 글은 새 꼴 브랜치에만 쓴다. 옛 꼴은 이름에 change ID가 있어 찾기·읽기만 한다.
+  const branch = parseChangeBranch(input.branch);
+  if (branch?.form !== 'trace') return { ok: false, reason: branch ? 'branch_read_only' : 'publication_input_invalid' };
+  const trace = branch.traceId;
+  const marker = publicationMarker(input.key, input.branch);
   const firstLine = input.brief.summary.split('\n')[0]!.trim();
   const title = neutralizePublicText(firstLine);
   const date = new Date(Math.floor(input.at / 1000) * 1000).toISOString().replace('.000Z', 'Z');
   const identity = { name: input.identity.name, email: input.identity.email, date };
-  const commitMessage = `${title}\n\nChange: ${publicTraceId('change', `${input.key.changeId}:g${input.key.generation}`)}\nBase: ${input.bundle.baseCommit}\nTree: ${input.bundle.resultTree}\n`;
-  const candidate = { title, body: renderBody(input, input.brief, input.bundle, label, marker), commitMessage, author: identity, committer: identity, draft: false };
+  const commitMessage = `${title}\n\nChange: ${trace}\nBase: ${input.bundle.baseCommit}\nTree: ${input.bundle.resultTree}\n`;
+  const candidate = { title, body: renderBody(input, input.brief, input.bundle, label, trace, marker), commitMessage, author: identity, committer: identity, draft: false };
   // 넘친다고 자르면 승인한 문구와 다른 말이 된다.
   if (title.length > 256 || candidate.body.length > 16000 || commitMessage.length > 4000) return { ok: false, reason: 'publication_too_long' };
   const publication = PublicMetadataSchema.safeParse(candidate);
   if (!publication.success) return { ok: false, reason: 'publication_invalid' };
-  // 내부 판·digest가 공개 글 어디에도 남지 않게 이 PR의 값도 표식으로 본다. change ID는 브랜치 이름에 있어 넣지 않는다.
-  const internal = [input.bundle.policyRevision, input.bundle.verifierRevision, input.bundle.artifactDigest].filter(value => value.length >= 8);
+  // 내부 판·digest와 change ID(앞 8자 포함)가 공개 글 어디에도 남지 않게 이 PR의 값도 표식으로 본다. 새 꼴 브랜치 이름에는 change ID가 없다.
+  const internal = [...changeMarkers(input.key), input.bundle.policyRevision, input.bundle.verifierRevision, input.bundle.artifactDigest].filter(value => value.length >= 8);
   const scanned = scanPublicPayload({ paths: [], files: [], publication: publication.data, branch: input.branch, marker }, { internalMarkers: [...scan.internalMarkers, ...internal] });
   if (!scanned.ok) return { ok: false, reason: scanned.reason };
   return { ok: true, publication: publication.data, marker };
@@ -198,16 +231,17 @@ export type ScanResult = { ok: true; receipt: PublicReceipt } | { ok: false; rea
 // 영수증은 내용 없는 토큰이다. digest 집합은 이 파일 안 WeakMap에만 있어, 영수증을 쥔 코드가 집합에 digest를 더하거나 빼지 못한다.
 declare const receiptBrand: unique symbol;
 export interface PublicReceipt { readonly [receiptBrand]: true }
-interface ReceiptDigests { readonly texts: ReadonlySet<string>; readonly files: ReadonlySet<string> }
+// branch는 검사한 payload의 브랜치 이름이다. writer가 쓰기 대상 브랜치가 이 change·세대의 것인지 이 값으로 본다(새 꼴 이름에는 키가 없다).
+interface ReceiptDigests { readonly texts: ReadonlySet<string>; readonly files: ReadonlySet<string>; readonly branch: string }
 const issuedReceipts = new WeakMap<PublicReceipt, ReceiptDigests>();
 const digestOf = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
 function receiptOf(payload: PublicPayload): PublicReceipt {
   const { publication } = payload;
-  // 이메일·시각은 검사하지 않지만 스키마가 noreply·초 단위 시각으로 고정한 값이라 함께 둔다.
+  // 시각은 검사하지 않지만 스키마가 초 단위로 고정한 값이라 함께 둔다. 이메일은 scanPublicPayload가 비밀·금지 값을 본다.
   const texts = [...payload.paths, publication.title, publication.body, publication.commitMessage, publication.author.name, publication.committer.name,
     publication.author.email, publication.committer.email, publication.author.date, publication.committer.date, payload.branch, payload.marker];
   const receipt = Object.freeze({}) as PublicReceipt;
-  issuedReceipts.set(receipt, { texts: new Set(texts.map(digestOf)), files: new Set(payload.files.map(file => digestOf(file.content))) });
+  issuedReceipts.set(receipt, { texts: new Set(texts.map(digestOf)), files: new Set(payload.files.map(file => digestOf(file.content))), branch: payload.branch });
   return receipt;
 }
 // 쓰기 본문의 칸 이름과 구조 값(git 객체 ID·인코딩·종류·모드). 글을 실을 수 없는 꼴만 둔다.
@@ -241,6 +275,11 @@ export class PublicReceipts {
     this.#latest.set(`${key.changeId}:g${key.generation}`, receipt);
   }
   scanFor(key: ChangeKey, extra: readonly string[] = []): PublicScan { return publicReceiptScan(this.#latest.get(`${key.changeId}:g${key.generation}`), extra); }
+  // 그 change·세대의 마지막 영수증이 검사한 브랜치 이름. 영수증이 없으면 undefined라 writer가 어느 브랜치에도 쓰지 않는다.
+  branchOf(key: ChangeKey): string | undefined {
+    const receipt = this.#latest.get(`${key.changeId}:g${key.generation}`);
+    return receipt === undefined ? undefined : issuedReceipts.get(receipt)?.branch;
+  }
 }
 
 // 탐지기는 완전성 증거가 아니다. 출처 label 차단이 우선이고 이 검사는 추가 방어다.
@@ -287,10 +326,12 @@ export function scanPublicText(text: { title: string; body: string }, policy: Sc
 }
 export function scanPublicPayload(payload: PublicPayload, policy: ScanPolicy): ScanResult {
   const { publication } = payload;
-  // 신원 이메일은 스키마가 noreply로 고정한다. 그래서 여기에는 넣지 않는다.
   const metadata = [publication.title, publication.body, publication.commitMessage, publication.author.name, publication.committer.name, payload.branch, payload.marker];
+  // 신원 이메일도 커밋에 그대로 실린다. noreply 꼴은 스키마가 정하고 그 꼴 자체가 이메일 metadata 패턴에 걸리므로 metadata 검사에서만 뺀다.
+  // 계정 번호·이름 칸은 설정 값이라 우연히 change ID 앞 8자와 같을 수 있어 비밀·금지 값 검사는 다른 글과 같이 한다.
+  const identities = [publication.author.email, publication.committer.email];
   const contents = payload.files.map(file => Buffer.from(file.content).toString('utf8'));
-  const everything = [...payload.paths, ...metadata, ...contents];
+  const everything = [...payload.paths, ...metadata, ...identities, ...contents];
   if (everything.some(hasSecret)) return { ok: false, reason: 'secret_detected' };
   // 파일 경계에 걸쳐 나눈 조각까지 잇는다.
   if (everything.some(text => hasMarker(text, policy.internalMarkers)) || hasMarker(contents.join(''), policy.internalMarkers)) return { ok: false, reason: 'internal_marker' };

@@ -5,14 +5,16 @@ import {
   ARTIFACT_LIMITS, ApprovalSubjectSchema, ArtifactManifestSchema, CHANGE_AMENDMENT, CHANGE_PHASES, CHANGE_PHASE_TRANSITIONS, ChangeBriefSchema, DEPLOYMENT_STATES,
   DeploymentObservationSchema, EFFECT_STAGES, EFFECT_STATES, EFFECT_TRANSITIONS, EffectExpectedSchema, EffectResultSchema, EvidenceBundleSchema, GENERATION_RESTART,
   PROVENANCE_LABELS, PublicMetadataSchema, ReviewReceiptSchema, TERMINAL_CHANGE_PHASES, UNKNOWN_RECONCILE_MS, VerificationReceiptSchema,
-  approvalDigest, artifactDigest, canTransition, canTransitionEffect, canonicalJson, changeBranchName, changeBranchRef, effectResultMatches,
-  evidenceBundleDigest, gitBlobSha, isTerminalPhase, labelAllowsAuthorInput, labelIsLowering, newChangeId, nextEffectStage, parseChangeBranch,
+  approvalDigest, artifactDigest, canTransition, canTransitionEffect, canonicalJson, effectResultMatches,
+  evidenceBundleDigest, gitBlobSha, isTerminalPhase, isWritableChangeBranch, labelAllowsAuthorInput, labelIsLowering, newChangeBranchName, newChangeId, nextEffectStage, parseChangeBranch,
   propagateLabel, raiseLabel, sha256Hex, validateArtifactFiles,
 } from '../src/change-contracts.js';
 import type { ApprovalSubject, ArtifactManifest, ChangePhase, ProvenanceLabel } from '../src/change-contracts.js';
 import { fixtureApprovalSubject, fixtureBundle, fixtureManifest, fixtureManifestFiles, fixtureMetadata, fixtureReview, fixtureVerification, git, hex } from './change-store-fixture.js';
 
 const CHANGE = 'a'.repeat(32);
+// 새 꼴 브랜치 이름의 고정 예. 실제 이름은 세대 행을 만들 때 무작위로 정해진다.
+const BRANCH = 'bot/change/c0123456789abcdef01234567';
 
 test('T19 B0 전이 표는 phase를 모두 덮고 정확히 이 모양이다', () => {
   const terminal = ['superseded', 'blocked', 'cancelled', 'failed'];
@@ -96,9 +98,9 @@ test('T19 B0 canonicalJson은 키 순서에 흔들리지 않고 배열 순서는
 
 // 승인 digest 대상 필드를 하나씩 바꾼다. 빠진 필드가 있으면 디지스트가 같게 나와 실패한다.
 const SUBJECT_CHANGES: Record<string, (subject: ApprovalSubject) => ApprovalSubject> = {
-  changeId: s => ({ ...s, changeId: 'b'.repeat(32), branch: changeBranchName('b'.repeat(32), s.bundle.generation) }),
+  changeId: s => ({ ...s, changeId: 'b'.repeat(32) }),
   repoId: s => ({ ...s, bundle: { ...s.bundle, repoId: s.bundle.repoId + 1 } }),
-  generation: s => ({ ...s, bundle: { ...s.bundle, generation: 2 }, branch: changeBranchName(s.changeId, 2) }),
+  generation: s => ({ ...s, bundle: { ...s.bundle, generation: 2 } }),
   baseCommit: s => ({ ...s, bundle: { ...s.bundle, baseCommit: git('other-base') } }),
   baseTree: s => ({ ...s, bundle: { ...s.bundle, baseTree: git('other-t0') } }),
   resultTree: s => ({ ...s, bundle: { ...s.bundle, resultTree: git('other-t1') } }),
@@ -106,7 +108,7 @@ const SUBJECT_CHANGES: Record<string, (subject: ApprovalSubject) => ApprovalSubj
   policyRevision: s => ({ ...s, bundle: { ...s.bundle, policyRevision: 'fixture-policy-2' } }),
   verifierRevision: s => ({ ...s, bundle: { ...s.bundle, verifierRevision: 'fixture-verifier-2' } }),
   baseBranch: s => ({ ...s, baseBranch: 'develop' }),
-  branch: s => ({ ...s, branch: changeBranchName('c'.repeat(32), s.bundle.generation), changeId: 'c'.repeat(32) }),
+  branch: s => ({ ...s, branch: `bot/change/c${'f'.repeat(24)}` }),
   verificationReceipt: s => ({ ...s, verifications: [{ ...s.verifications[0]!, receiptDigest: hex('other-receipt') }] }),
   verificationCommand: s => ({ ...s, verifications: [{ ...s.verifications[0]!, commandId: 'other-unit' }] }),
   reviewReceipt: s => ({ ...s, review: { ...s.review, receiptDigest: hex('other-review') } }),
@@ -123,7 +125,7 @@ const SUBJECT_CHANGES: Record<string, (subject: ApprovalSubject) => ApprovalSubj
 };
 
 test('T19 B0 승인 digest는 대상 필드가 하나만 바뀌어도 달라진다', () => {
-  const base = fixtureApprovalSubject(CHANGE);
+  const base = fixtureApprovalSubject(CHANGE, BRANCH);
   const digest = approvalDigest(base);
   assert.match(digest, /^[0-9a-f]{64}$/);
   const seen = new Set([digest]);
@@ -142,7 +144,7 @@ test('T19 B0 승인 digest 시험은 스키마의 모든 필드를 덮는다', (
     if (value && typeof value === 'object') return Object.entries(value).flatMap(([key, item]) => leaves(item, prefix ? `${prefix}.${key}` : key));
     return [prefix];
   };
-  assert.deepEqual(leaves(fixtureApprovalSubject(CHANGE), '').sort(), [
+  assert.deepEqual(leaves(fixtureApprovalSubject(CHANGE, BRANCH), '').sort(), [
     'baseBranch', 'branch', 'bundle.artifactDigest', 'bundle.baseCommit', 'bundle.baseTree', 'bundle.generation', 'bundle.policyRevision', 'bundle.repoId',
     'bundle.resultTree', 'bundle.verifierRevision', 'changeId', 'ciFingerprint', 'publication.author.date', 'publication.author.email', 'publication.author.name',
     'publication.body', 'publication.commitMessage', 'publication.committer.date', 'publication.committer.email', 'publication.committer.name', 'publication.draft',
@@ -151,7 +153,7 @@ test('T19 B0 승인 digest 시험은 스키마의 모든 필드를 덮는다', (
 });
 
 test('T19 B0 승인 digest는 필드 순서·시험 나열 순서에 흔들리지 않는다', () => {
-  const a = fixtureApprovalSubject(CHANGE);
+  const a = fixtureApprovalSubject(CHANGE, BRANCH);
   const reversedKeys = <T>(value: T): T => {
     if (Array.isArray(value)) return value.map(reversedKeys) as T;
     if (value && typeof value === 'object') {
@@ -168,10 +170,13 @@ test('T19 B0 승인 digest는 필드 순서·시험 나열 순서에 흔들리�
 });
 
 test('T19 B0 승인 대상은 브랜치·시험·리뷰가 게시 가능한 모양일 때만 받는다', () => {
-  const base = fixtureApprovalSubject(CHANGE);
+  const base = fixtureApprovalSubject(CHANGE, BRANCH);
   const rejected: Record<string, unknown> = {
-    otherBranch: { ...base, branch: changeBranchName('b'.repeat(32), 1) },
-    otherGenerationBranch: { ...base, branch: changeBranchName(CHANGE, 2) },
+    otherBranch: { ...base, branch: `bot/change/${'b'.repeat(32)}/g1` },
+    otherGenerationBranch: { ...base, branch: `bot/change/${CHANGE}/g2` },
+    shortTraceBranch: { ...base, branch: `bot/change/c${'0'.repeat(23)}` },
+    upperTraceBranch: { ...base, branch: `bot/change/c${'A'.repeat(24)}` },
+    traceBranchWithGeneration: { ...base, branch: `${BRANCH}/g1` },
     failedTest: { ...base, verifications: [{ ...base.verifications[0]!, status: 'failed' }] },
     noTest: { ...base, verifications: [] },
     duplicateTest: { ...base, verifications: [base.verifications[0]!, base.verifications[0]!] },
@@ -211,17 +216,24 @@ test('T19 B0 공개 metadata는 고정 신원·시각만 받고 토큰 자리가
   for (const [name, value] of Object.entries(rejected)) assert.equal(PublicMetadataSchema.safeParse(value).success, false, name);
 });
 
-test('T19 B0 브랜치 이름은 bot/change/<opaque-id>/g<n>만 만들고 받는다', () => {
-  assert.equal(changeBranchName(CHANGE, 1), `bot/change/${CHANGE}/g1`);
-  assert.equal(changeBranchRef(CHANGE, 12), `refs/heads/bot/change/${CHANGE}/g12`);
-  assert.deepEqual(parseChangeBranch(`bot/change/${CHANGE}/g12`), { changeId: CHANGE, generation: 12 });
+test('T19 B0 브랜치 이름: 새로는 bot/change/c<24 hex>만 만들고, 옛 꼴 bot/change/<change ID>/g<n>은 읽기로만 받는다', () => {
+  const made = new Set(Array.from({ length: 64 }, () => newChangeBranchName()));
+  assert.equal(made.size, 64, '무작위라 겹치지 않는다');
+  for (const name of made) {
+    assert.match(name, /^bot\/change\/c[0-9a-f]{24}$/);
+    assert.deepEqual(parseChangeBranch(name), { form: 'trace', traceId: name.slice('bot/change/'.length) });
+    assert.equal(isWritableChangeBranch(name), true, name);
+  }
+  assert.deepEqual(parseChangeBranch(`bot/change/${CHANGE}/g12`), { form: 'legacy', key: { changeId: CHANGE, generation: 12 } });
+  assert.equal(isWritableChangeBranch(`bot/change/${CHANGE}/g12`), false, '옛 꼴은 쓰기 대상이 아니다');
+  const trace = '0'.repeat(24);
   for (const bad of ['main', 'deploy/x', `botx/change/${CHANGE}/g1`, `bot/change/${CHANGE}`, `bot/change/${CHANGE}/g0`, `bot/change/${CHANGE}/g01`,
     `bot/change/${CHANGE}/g1/x`, `refs/heads/bot/change/${CHANGE}/g1`, `bot/change/${CHANGE.toUpperCase()}/g1`, 'bot/change/123456789012345678/g1',
-    `bot/change/${CHANGE}/g1000`, `bot/change/../g1`, `bot/change/${CHANGE}/g1\n`]) {
+    `bot/change/${CHANGE}/g1000`, `bot/change/../g1`, `bot/change/${CHANGE}/g1\n`,
+    `bot/change/c${trace.slice(1)}`, `bot/change/c${trace}0`, `bot/change/C${trace}`, `bot/change/c${'A'.repeat(24)}`, `bot/change/c${trace}/g1`,
+    `bot/change/${trace}`, `refs/heads/bot/change/c${trace}`, `bot/change/c${trace}\n`, `botx/change/c${trace}`]) {
     assert.equal(parseChangeBranch(bad), null, bad);
-  }
-  for (const [id, generation] of [['123456789012345678', 1], ['제목', 1], [CHANGE, 0], [CHANGE, 1.5], [CHANGE, 1000]] as const) {
-    assert.throws(() => changeBranchName(id, generation), /change_branch_invalid/);
+    assert.equal(isWritableChangeBranch(bad), false, bad);
   }
 });
 
@@ -229,8 +241,8 @@ test('T19 B0 생성한 브랜치는 ruleset의 refs/heads/bot/**/*에 들어맞�
   // 저장소 ruleset의 fnmatch 의미(** 는 경로 구분자를 넘는다)를 정규식으로 옮겼다.
   const botRule = /^refs\/heads\/bot\/(?:[^/]+\/)*[^/]+$/;
   const protectedRule = /^refs\/heads\/(?:main|deploy(?:\/.*)?)$|^refs\/tags\//;
-  for (const generation of [1, 2, 999]) {
-    const ref = changeBranchRef(newChangeId(), generation);
+  for (let index = 0; index < 3; index++) {
+    const ref = `refs/heads/${newChangeBranchName()}`;
     assert.match(ref, botRule);
     assert.doesNotMatch(ref, protectedRule);
   }
@@ -408,8 +420,10 @@ test('T19 B0 effect 기대값 대조는 식별자가 하나라도 다르면 거�
   assert.equal(effectResultMatches(expectedRef, { stage: 'ref', ref, sha: git('h') }), true);
   assert.equal(effectResultMatches(expectedRef, { stage: 'ref', ref, sha: git('other') }), false);
   assert.equal(EffectExpectedSchema.safeParse({ stage: 'ref', ref: 'refs/heads/main', sha: git('h') }).success, false);
-  const pull = EffectExpectedSchema.parse({ stage: 'pull', headBranch: changeBranchName(CHANGE, 1), baseBranch: 'main', headSha: git('h'), marker: 'fixture-marker' });
-  const result = { stage: 'pull' as const, number: 7, headBranch: changeBranchName(CHANGE, 1), baseBranch: 'main', headSha: git('h') };
+  // 옛 꼴 ref는 이미 저장된 effect 행을 읽으려고 계속 받는다.
+  assert.equal(EffectExpectedSchema.safeParse({ stage: 'ref', ref: `refs/heads/${BRANCH}`, sha: git('h') }).success, true);
+  const pull = EffectExpectedSchema.parse({ stage: 'pull', headBranch: BRANCH, baseBranch: 'main', headSha: git('h'), marker: 'fixture-marker' });
+  const result = { stage: 'pull' as const, number: 7, headBranch: BRANCH, baseBranch: 'main', headSha: git('h') };
   assert.equal(effectResultMatches(pull, result), true);
   assert.equal(effectResultMatches(pull, { ...result, headSha: git('human') }), false);
   assert.equal(effectResultMatches(pull, { ...result, baseBranch: 'develop' }), false);
