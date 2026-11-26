@@ -352,7 +352,9 @@ test('CHANGE-01 local_integration: /change → v2 작성 → 무자격 검증 �
     const commit = h.env.github.commits.get(pull.head.sha)!;
     assert.equal(commit.tree, row.result_tree, 'H.tree = T1');
     assert.deepEqual(commit.parents, [row.base_commit], 'H.parents = [B]');
-    assert.match(h.env.github.refs.has(`heads/${pull.head.ref}`) ? pull.head.ref : '', /^bot\/change\/[0-9a-f]{32}\/g1$/);
+    // 새 꼴 이름(무작위 추적 ID)이고 change ID를 담지 않는다.
+    assert.match(h.env.github.refs.has(`heads/${pull.head.ref}`) ? pull.head.ref : '', /^bot\/change\/c[0-9a-f]{24}$/);
+    assert.ok(!pull.head.ref.includes(id.slice(0, 8)), pull.head.ref);
     // 슬롯은 부모가 아니라 자식만 잡았다.
     assert.equal(await h.store.laneBusy('task'), false);
     assert.equal((await childOf(h.db, id))!.state, 'succeeded');

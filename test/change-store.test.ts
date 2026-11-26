@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import { PGlite } from '@electric-sql/pglite';
 import {
-  CHANGE_AMENDMENT, CHANGE_PHASES, CHANGE_SELF_FIX, EFFECT_STAGES, EFFECT_STATES, UNKNOWN_RECONCILE_MS, approvalDigest, canTransition, canTransitionEffect, changeBranchName, gitBlobSha, sha256Hex,
+  CHANGE_AMENDMENT, CHANGE_PHASES, CHANGE_SELF_FIX, EFFECT_STAGES, EFFECT_STATES, UNKNOWN_RECONCILE_MS, approvalDigest, canTransition, canTransitionEffect, gitBlobSha, newChangeBranchName, sha256Hex,
 } from '../src/change-contracts.js';
 import type { ChangePhase, EffectExpected, EffectResult, EffectStage, EffectState } from '../src/change-contracts.js';
 import { ChangePrivateInputs, ChangeStore } from '../src/change-store.js';
@@ -12,8 +12,10 @@ import { MIGRATIONS, migrate } from '../src/database.js';
 import { localDatabase } from './helpers.js';
 import {
   CONVERSATION, COMMAND, OWNER, PATH, REPO_ID, confirmThrough, driveTo, failure, fixtureBrief, fixtureBundle, fixtureExpected, fixtureManifest, fixtureManifestFiles, fixtureMetadata,
-  fixturePatch, fixtureResult, fixtureReview, fixtureVerification, git, hex, insertChildJob, newEvent, newRequest, ok, seedConversation,
+  fixturePatch, fixtureResult, fixtureReview, fixtureVerification, git, hex, insertChildJob, newEvent, newRequest, ok, pinnedBranch, seedConversation,
 } from './change-store-fixture.js';
+// 새 브랜치 이름 꼴. 이름에 change ID·세대가 없다.
+const TRACE_BRANCH = /^bot\/change\/c[0-9a-f]{24}$/;
 
 async function setup(start = 1_800_000_000_000) {
   const { db, pg } = await localDatabase();
@@ -48,7 +50,9 @@ test('T19 B0 정상 경로: requested부터 observing_deploy까지 돌고 부모
     const done = await driveTo(s.store, 'observing_deploy');
     const bundle = ok(await s.store.evidenceBundle({ changeId: done.id, generation: 1 }));
     assert.deepEqual(bundle, fixtureBundle());
-    assert.equal(ok(await s.store.generationRecord({ changeId: done.id, generation: 1 })).branch, changeBranchName(done.id, 1));
+    const doneBranch = ok(await s.store.generationRecord({ changeId: done.id, generation: 1 })).branch;
+    assert.match(doneBranch, TRACE_BRANCH);
+    assert.ok(!doneBranch.includes(done.id) && !doneBranch.includes(done.id.slice(0, 8)), doneBranch);
     // jobs에 있는 것은 fixture가 넣은 리뷰 자식 job뿐이다. 승인 대기 부모가 slot을 잡지 않는다.
     const parents = await count(s.db, `jobs WHERE id = ANY($1)`, [[first.id, done.id]]);
     assert.equal(parents, 0);
@@ -327,7 +331,7 @@ test('T19 B0 리뷰·승인 대상: 시험 없음·범위 부족·차단 판정�
     const { digest, subject } = ok(await s.store.approvalSubject(goodKey));
     assert.equal(digest, approvalDigest(subject));
     assert.deepEqual(subject.bundle, fixtureBundle());
-    assert.equal(subject.branch, changeBranchName(good.id, 1));
+    assert.equal(subject.branch, ok(await s.store.generationRecord({ changeId: good.id, generation: 1 })).branch);
     assert.deepEqual(subject.publication, fixtureMetadata());
     await rawError(s.db.query(`UPDATE change_approval_subjects SET approval_digest=$2 WHERE change_id=$1`, [good.id, hex('x')]), /change_evidence_immutable/);
   } finally { await s.close(); }
@@ -399,8 +403,9 @@ test('T19 B0 새 generation: superseded에서만 requested로 열고 이전 증�
 
     const second = await driveTo(s.store, 'verifying', next, 2);
     assert.equal(second.generation, 2);
-    assert.equal(ok(await s.store.generationRecord({ changeId: r.id, generation: 2 })).branch, changeBranchName(r.id, 2));
-    assert.notEqual(ok(await s.store.generationRecord({ changeId: r.id, generation: 1 })).branch, changeBranchName(r.id, 2));
+    const secondBranch = ok(await s.store.generationRecord({ changeId: r.id, generation: 2 })).branch;
+    assert.match(secondBranch, TRACE_BRANCH);
+    assert.notEqual(ok(await s.store.generationRecord({ changeId: r.id, generation: 1 })).branch, secondBranch);
     // generation 1의 receipt는 새 묶음과 달라 인정되지 않는다.
     failure(await s.store.recordVerification({ changeId: r.id, generation: 2, receipt: fixtureVerification() }), 'bundle_mismatch');
     failure(await s.store.finishVerification({ changeId: r.id, generation: 2 }), 'verification_incomplete');
@@ -432,7 +437,9 @@ test('T19 B0 effect intent: 게시 단계·살아 있는 승인·앞 stage 확�
     // ref는 자기 generation 브랜치만 기대할 수 있다.
     const ref = await driveTo(s.store, 'publishing');
     await confirmThrough(s.store, ref.id, 1, 'commit');
-    failure(await s.store.recordEffectIntent({ ...stageKey(ref.id, 'ref'), requestDigest: hex('r'), expected: { stage: 'ref', ref: `refs/heads/${changeBranchName(ref.id, 2)}`, sha: git('h') } }), 'branch_mismatch');
+    failure(await s.store.recordEffectIntent({ ...stageKey(ref.id, 'ref'), requestDigest: hex('r'), expected: { stage: 'ref', ref: `refs/heads/${newChangeBranchName()}`, sha: git('h') } }), 'branch_mismatch');
+    // 같은 change·세대의 옛 꼴 이름도 세대 행의 이름이 아니라 받지 않는다.
+    failure(await s.store.recordEffectIntent({ ...stageKey(ref.id, 'ref'), requestDigest: hex('r'), expected: { stage: 'ref', ref: `refs/heads/bot/change/${ref.id}/g1`, sha: git('h') } }), 'branch_mismatch');
     failure(await s.store.recordEffectIntent({ ...stageKey(ref.id, 'pull'), requestDigest: hex('r'), expected: fixtureExpected('pull', ref.id) }), 'predecessor_unconfirmed');
   } finally { await s.close(); }
 });
@@ -455,7 +462,7 @@ test('T19 B0 effect 기대값은 고정 증거와 같아야 한다: 다른 blob�
     ok(await put('commit', fixtureExpected('commit', r.id)));
     const commitClaim = ok(await s.store.claimEffect(stageKey(r.id, 'commit')));
     ok(await s.store.confirmEffect({ ...stageKey(r.id, 'commit'), leaseId: commitClaim.leaseId, result: fixtureResult('commit', r.id) }));
-    failure(await put('ref', { stage: 'ref', ref: `refs/heads/${changeBranchName(r.id, 1)}`, sha: git('other') }), 'evidence_mismatch');
+    failure(await put('ref', { stage: 'ref', ref: `refs/heads/${pinnedBranch(r.id, 1)}`, sha: git('other') }), 'evidence_mismatch');
     ok(await put('ref', fixtureExpected('ref', r.id)));
     const refClaim = ok(await s.store.claimEffect(stageKey(r.id, 'ref')));
     ok(await s.store.confirmEffect({ ...stageKey(r.id, 'ref'), leaseId: refClaim.leaseId, result: fixtureResult('ref', r.id) }));
@@ -804,7 +811,7 @@ test('T19 B0 migration: 016 DB에 017만 더하고 기존 표·제약·행을 �
   try {
     const db = migrationDatabase(pg);
     const upTo016 = MIGRATIONS.filter(file => Number.parseInt(file, 10) <= 16);
-    assert.equal(upTo016.length, MIGRATIONS.length - 13);
+    assert.equal(upTo016.length, MIGRATIONS.length - 14);
     for (const file of upTo016) await pg.exec(await readFile(`migrations/${file}`, 'utf8'));
     await seedConversation(db);
     await insertChildJob(db, 'existing-job', 'task');
@@ -812,7 +819,7 @@ test('T19 B0 migration: 016 DB에 017만 더하고 기존 표·제약·행을 �
     const constraints = await constraintsOf(db);
     const jobs = JSON.stringify((await db.query('SELECT * FROM jobs')).rows);
 
-    assert.deepEqual(await migrate(db), [17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]);
+    assert.deepEqual(await migrate(db), [17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]);
     assert.equal(await schemaOf(db), schema);
     const added = (await db.query<{ table_name: string; column_name: string; is_nullable: string; column_default: string | null }>(`SELECT table_name,column_name,is_nullable,column_default
       FROM information_schema.columns WHERE ${OLD_TABLES} AND NOT (${T27_COLUMNS}) ORDER BY table_name,column_name`)).rows;
@@ -1090,13 +1097,13 @@ const roundExpected = (stage: EffectStage, changeId: string, base = HEAD): Effec
   blob: { stage: 'blob', shas: [gitBlobSha(ROUND_CONTENT)] },
   tree: { stage: 'tree', baseTree: git('t1'), treeSha: git('t2') },
   commit: { stage: 'commit', treeSha: git('t2'), parent: base, commitSha: git('h2') },
-  ref: { stage: 'ref', ref: `refs/heads/${changeBranchName(changeId, 1)}`, sha: git('h2') },
+  ref: { stage: 'ref', ref: `refs/heads/${pinnedBranch(changeId, 1)}`, sha: git('h2') },
 } as Record<string, EffectExpected>)[stage]!;
 const roundResult = (stage: EffectStage, changeId: string, base = HEAD) => ({
   blob: { stage: 'blob', shas: [gitBlobSha(ROUND_CONTENT)] },
   tree: { stage: 'tree', treeSha: git('t2') },
   commit: { stage: 'commit', commitSha: git('h2'), treeSha: git('t2'), parents: [base] },
-  ref: { stage: 'ref', ref: `refs/heads/${changeBranchName(changeId, 1)}`, sha: git('h2') },
+  ref: { stage: 'ref', ref: `refs/heads/${pinnedBranch(changeId, 1)}`, sha: git('h2') },
 } as unknown as Record<string, EffectResult>)[stage]!;
 // 차례 하나를 시험·리뷰 통과까지 민다.
 async function roundEvidence(s: Awaited<ReturnType<typeof setup>>, key: { changeId: string; generation: number; round: number }) {
@@ -1232,7 +1239,7 @@ test('C27 차례 effect 유실: unknown이면 다시 보내지 않고 대조로�
       if (stage === 'ref') ok(await s.store.markAmendmentEffectUnknown({ ...otherKey, stage, leaseId: lease.leaseId, code: 'response_lost' }));
       else ok(await s.store.confirmAmendmentEffect({ ...otherKey, stage, leaseId: lease.leaseId, result: roundResult(stage, other.id) }));
     }
-    failure(await s.store.confirmAmendmentEffect({ ...otherKey, stage: 'ref', leaseId: null, result: { stage: 'ref', ref: `refs/heads/${changeBranchName(other.id, 1)}`, sha: git('human') } }), 'result_mismatch');
+    failure(await s.store.confirmAmendmentEffect({ ...otherKey, stage: 'ref', leaseId: null, result: { stage: 'ref', ref: `refs/heads/${pinnedBranch(other.id, 1)}`, sha: git('human') } }), 'result_mismatch');
     ok(await s.store.confirmAmendmentEffect({ ...otherKey, stage: 'ref', leaseId: null, result: roundResult('ref', other.id) }));
     ok(await s.store.finishAmendment({ ...otherKey, outcome: { state: 'committed', commitSha: git('h2') } }));
   } finally { await s.close(); }

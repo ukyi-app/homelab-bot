@@ -8,7 +8,7 @@ import { publicTraceId, renderPublication } from '../src/change-publication.js';
 import { CHANGE_RETENTION_MS, ChangeReviewFindings, purgeExpiredChangeContent } from '../src/change-store.js';
 import { guidanceMarker } from '../src/github-review-io.js';
 import type { GuidanceReview, GuidanceReviewPort } from '../src/github-review-io.js';
-import { DEFAULT_CHANGES, REPO, publishEnv } from './change-github-fake.js';
+import { DEFAULT_CHANGES, REPO, branchOf, publishEnv } from './change-github-fake.js';
 import type { PublishEnv } from './change-github-fake.js';
 import type { Database } from '../src/database.js';
 import { OWNER, newEvent, ok } from './change-store-fixture.js';
@@ -27,6 +27,8 @@ const OUTSIDE_FILE: ChangeNote = { text: '읽어보기도 맞는지 봐 주세�
 const NOWHERE: ChangeNote = { text: '배포 순서를 가정했어요' };
 const RISK: ChangeNote = { text: '새 파일을 아무도 부르지 않을 수 있어요', location: { path: 'src/new.ts', line: 1 } };
 const NOTES = { checks: [INSIDE, OUTSIDE_LINE, OUTSIDE_FILE, NOWHERE], risks: [RISK] };
+// 세대의 공개 추적 ID. 새 꼴 브랜치 이름의 무작위 값이고 안내 키는 이 값과 차례 번호다(change ID가 없다).
+const traceOf = (key: ChangeKey) => branchOf(key).slice('bot/change/'.length);
 
 type Mode = WriterOutcome<{ id: number }> | 'lose_response';
 // 안내 리뷰 포트의 대역. 표식·head로 회수하는 find는 C26 규칙과 같다.
@@ -95,7 +97,8 @@ test('AC-27 처음 게시: diff 안 위치의 항목만 COMMENT 리뷰 줄 댓�
     const outcome = posted(await guidance.afterPublish(key));
     assert.equal(port.reviews.length, 1);
     const review = port.reviews[0]!;
-    assert.deepEqual({ repository: review.repository, pr: review.pr, head: review.head, key: review.key }, { repository: REPO.fullName, pr, head, key: `${key.changeId}:g${key.generation}:r0` });
+    assert.deepEqual({ repository: review.repository, pr: review.pr, head: review.head, key: review.key }, { repository: REPO.fullName, pr, head, key: `${traceOf(key)}:r0` });
+    assert.ok(!review.key.includes(key.changeId.slice(0, 8)), review.key);
     assert.deepEqual(review.comments, [
       { path: 'src/a.ts', line: 1, body: '**확인할 것** 상수 값을 2로 가정했어요' },
       { path: 'src/new.ts', line: 1, body: '**남은 위험** 새 파일을 아무도 부르지 않을 수 있어요' },
@@ -200,7 +203,7 @@ test('AC-27 한 번만: 보내는 중에 끊긴 기록(sending)은 다시 보내
     const { key, pr, head } = await publishWith(env, NOTES);
     // 앞 프로세스가 전송을 시작하고 기록 전에 죽은 상태. 요청은 GitHub에 닿았다.
     await env.db.query(`INSERT INTO change_guidance(change_id,generation,round,head_sha,state,attempts,created_at,updated_at) VALUES ($1,$2,0,$3,'sending',1,$4,$4)`, [key.changeId, key.generation, head, env.clock.now]);
-    port.reviews.push({ repository: REPO.fullName, pr, head, key: `${key.changeId}:g${key.generation}:r0`, body: 'x', comments: [], id: 7000 });
+    port.reviews.push({ repository: REPO.fullName, pr, head, key: `${traceOf(key)}:r0`, body: 'x', comments: [], id: 7000 });
     const outcome = posted(await guidance.afterPublish(key));
     assert.equal(outcome.reviewId, 7000);
     assert.equal(port.posts, 0);
@@ -295,7 +298,7 @@ test('AC-27 수정 차례 진입점: 같은 함수가 그 차례의 head·diff·
     assert.equal(second.reviewId, first.reviewId);
     assert.equal(port.reviews.length, 2, '처음 게시 하나와 수정 차례 하나');
     const review = port.reviews[1]!;
-    assert.deepEqual([review.head, review.key, review.comments.map(comment => comment.line)], [head, `${key.changeId}:g${key.generation}:r1`, [2]]);
+    assert.deepEqual([review.head, review.key, review.comments.map(comment => comment.line)], [head, `${traceOf(key)}:r1`, [2]]);
     assert.match(review.body, /수정 1번째/);
     assert.ok(!review.body.includes(guidanceMarker(review.key)), '표식은 포트가 붙인다');
     // 같은 차례를 다른 head로 부르면 보내지 않는다.
@@ -409,7 +412,8 @@ test('F7a F-8: PR 본문·커밋에는 change ID·정책·검증기 판·산출�
     const bundle = await env.store.evidenceBundle(key);
     assert.ok(bundle.ok);
     const internal = [key.changeId, bundle.value.policyRevision, bundle.value.verifierRevision, bundle.value.artifactDigest];
-    const changeTrace = publicTraceId('change', `${key.changeId}:g${key.generation}`);
+    const changeTrace = traceOf(key);
+    assert.notEqual(changeTrace, publicTraceId('change', `${key.changeId}:g${key.generation}`), '추적 ID는 change ID로 계산되지 않는다');
     const pull = env.github.pulls[0]!;
     const messages = env.github.sent.filter(s => s.method === 'POST' && s.path.endsWith('/git/commits')).map(s => (s.body as { message: string }).message);
     assert.equal(messages.length, 1);
@@ -420,7 +424,7 @@ test('F7a F-8: PR 본문·커밋에는 change ID·정책·검증기 판·산출�
       .map(row => [row.subject, row.detail]).sort((a, b) => String(a[0]) < String(b[0]) ? -1 : 1);
     assert.deepEqual(audit, [
       [changeTrace, { kind: 'change', changeId: key.changeId, generation: key.generation, policyRevision: bundle.value.policyRevision, verifierRevision: bundle.value.verifierRevision, artifactDigest: bundle.value.artifactDigest }],
-      [publicTraceId('guidance', `${key.changeId}:g${key.generation}:r0`), { kind: 'guidance', changeId: key.changeId, generation: key.generation, round: 0 }],
+      [publicTraceId('guidance', `${changeTrace}:r0`), { kind: 'guidance', changeId: key.changeId, generation: key.generation, round: 0 }],
     ].sort((a, b) => String(a[0]) < String(b[0]) ? -1 : 1));
   } finally { await close(); }
 });

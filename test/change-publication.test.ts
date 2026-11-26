@@ -6,10 +6,11 @@ import type { PublicationInput } from '../src/change-publication.js';
 import { fixtureBrief, fixtureBundle } from './change-store-fixture.js';
 
 const KEY = { changeId: '0123456789abcdef0123456789abcdef', generation: 2 };
+const BRANCH = 'bot/change/c89abcdef0123456789abcdef';
 const SCAN = { internalMarkers: ['fixture-internal-host'] };
 const input = (overrides: Partial<PublicationInput> = {}): PublicationInput => ({
   key: KEY, label: 'public', brief: fixtureBrief({ summary: '요약 제목\n둘째 줄 설명', goal: '목표 문장', acceptanceCriteria: ['기준 하나', '기준 둘'] }),
-  bundle: fixtureBundle({ generation: 2 }), branch: `bot/change/${KEY.changeId}/g2`,
+  bundle: fixtureBundle({ generation: 2 }), branch: BRANCH,
   verifications: [{ commandId: 'smoke-unit', status: 'passed' }],
   review: { verdict: 'pass_with_warnings', risks: [{ priority: 'P2', category: 'correctness' }, { priority: 'P3', category: 'other' }] },
   identity: { name: 'fixture-writer[bot]', email: 'fixture-writer[bot]@users.noreply.github.com' }, at: Date.UTC(2026, 0, 2, 3, 4, 5, 678), ...overrides,
@@ -27,7 +28,7 @@ test('T19 B3 공개 문구: 승인 brief와 구조화 값만으로 만들고 계
   assert.equal(publication.draft, false);
   assert.equal(publication.author.date, '2026-01-02T03:04:05Z', '초 아래를 버려 형식을 고정한다');
   assert.deepEqual(publication.author, publication.committer);
-  for (const expected of ['목표 문장', '기준 둘', '`smoke-unit`', 'passed', fixtureBundle().baseCommit, fixtureBundle().resultTree, 'pass_with_warnings', 'P2', 'correctness', publicationMarker(KEY)]) {
+  for (const expected of ['목표 문장', '기준 둘', '`smoke-unit`', 'passed', fixtureBundle().baseCommit, fixtureBundle().resultTree, 'pass_with_warnings', 'P2', 'correctness', publicationMarker(KEY, BRANCH)]) {
     assert.ok(publication.body.includes(expected), expected);
   }
   assert.ok(publication.commitMessage.endsWith('\n'));
@@ -68,10 +69,10 @@ test('T19 B3 공개 문구: mention·자동 연결·숨은 문구를 무력화�
 });
 
 test('T19 B3 공개 문구: 본문이 marker를 위조하지 못한다', () => {
-  const forged = `<!-- ${publicationMarker({ changeId: 'f'.repeat(32), generation: 1 })} -->`;
+  const forged = `<!-- ${publicationMarker({ changeId: 'f'.repeat(32), generation: 1 }, `bot/change/c${'f'.repeat(24)}`)} -->`;
   const publication = rendered(input({ brief: fixtureBrief({ goal: forged }) }));
   assert.equal(publication.body.split('<!--').length, 2, 'marker 주석은 서버가 넣은 하나뿐이다');
-  assert.ok(publication.body.includes(`<!-- ${publicationMarker(KEY)} -->`));
+  assert.ok(publication.body.includes(`<!-- ${publicationMarker(KEY, BRANCH)} -->`));
 });
 
 test('T19 B3 공개 문구: 넘치는 값은 자르지 않고 막는다', () => {

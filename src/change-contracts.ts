@@ -121,18 +121,23 @@ const compareText = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 
 export const CHANGE_ID = /^[0-9a-f]{32}$/;
 export const ChangeIdSchema = z.string().regex(CHANGE_ID);
-const BRANCH = /^bot\/change\/([0-9a-f]{32})\/g([1-9][0-9]{0,2})$/;
-// 무작위 값이라 Discord ID·제목이 브랜치 이름으로 공개되지 않는다.
+// 새 꼴은 bot/change/c<24 hex>다. 무작위 값이라 change ID·세대·Discord ID·제목이 이름으로 공개되지 않고, 이름과 내부 키의 대응은
+// change_generations.branch 행에만 있다(migrations/030). 이름의 c<24 hex>가 그 세대의 공개 추적 ID다(change-publication.ts changeTraceId).
+const TRACE_BRANCH = /^bot\/change\/(c[0-9a-f]{24})$/;
+// 옛 꼴 bot/change/<change ID>/g<세대>는 030 전에 만든 행·브랜치를 찾고 읽는 데만 받는다. 이 꼴을 만드는 함수는 두지 않는다.
+const LEGACY_BRANCH = /^bot\/change\/([0-9a-f]{32})\/g([1-9][0-9]{0,2})$/;
 export const newChangeId = (): string => randomBytes(16).toString('hex');
-export function changeBranchName(changeId: string, generation: number): string {
-  if (!CHANGE_ID.test(changeId) || !Number.isInteger(generation) || generation < 1 || generation > MAX_GENERATION) throw new Error('change_branch_invalid');
-  return `bot/change/${changeId}/g${generation}`;
+// 세대 행을 만들 때 한 번만 부른다(ChangeStore.pinBase). 같은 이름이 또 나오면 change_generations.branch UNIQUE가 막는다.
+export const newChangeBranchName = (): string => `bot/change/c${randomBytes(12).toString('hex')}`;
+export type ChangeBranch = { form: 'trace'; traceId: string } | { form: 'legacy'; key: ChangeKey };
+export function parseChangeBranch(name: string): ChangeBranch | null {
+  const trace = TRACE_BRANCH.exec(name);
+  if (trace) return { form: 'trace', traceId: trace[1]! };
+  const legacy = LEGACY_BRANCH.exec(name);
+  return legacy ? { form: 'legacy', key: { changeId: legacy[1]!, generation: Number(legacy[2]) } } : null;
 }
-export const changeBranchRef = (changeId: string, generation: number): string => `refs/heads/${changeBranchName(changeId, generation)}`;
-export function parseChangeBranch(name: string): ChangeKey | null {
-  const match = BRANCH.exec(name);
-  return match ? { changeId: match[1]!, generation: Number(match[2]) } : null;
-}
+// ref 만들기·PR 열기·fast-forward는 새 꼴에만 한다. 옛 꼴은 찾기·읽기(회수·정리·멱등 판정)만 한다.
+export const isWritableChangeBranch = (name: string): boolean => parseChangeBranch(name)?.form === 'trace';
 
 // ---- 공개 brief ----
 
@@ -319,7 +324,10 @@ export const ApprovalSubjectSchema = z.strictObject({
   ciFingerprint: Sha256Schema,
 }).superRefine((subject, context) => {
   const parsed = parseChangeBranch(subject.branch);
-  if (!parsed || parsed.changeId !== subject.changeId || parsed.generation !== subject.bundle.generation) context.addIssue({ code: 'custom', message: 'approval_branch_mismatch' });
+  // 새 꼴 이름에는 키가 없어 세대 행의 브랜치와 같은지는 저장 계층·게시자가 본다(branch_mismatch). 옛 꼴은 이름의 키까지 맞아야 한다.
+  if (!parsed || (parsed.form === 'legacy' && (parsed.key.changeId !== subject.changeId || parsed.key.generation !== subject.bundle.generation))) {
+    context.addIssue({ code: 'custom', message: 'approval_branch_mismatch' });
+  }
 });
 export type ApprovalSubject = z.infer<typeof ApprovalSubjectSchema>;
 // 시험 나열 순서는 의미가 없어 정렬해서 묶는다.

@@ -22,7 +22,7 @@ async function previewWithDigestAt(target: number, files: number): Promise<strin
   const deps = {
     // 리뷰 receipt만 답한다. 확인할 것 기록(change_notes)은 없는 옛 판 결과다.
     store: { now: () => 0, db: { query: async (sql: string) => ({ rows: sql.includes('change_reviews') ? [{ receipt: fixtureReview() }] : [] }) } },
-    changes: { approvalSubject: async () => ({ ok: true, value: { subject: fixtureApprovalSubject(request.id), digest } }),
+    changes: { approvalSubject: async () => ({ ok: true, value: { subject: fixtureApprovalSubject(request.id, `bot/change/${request.id}/g1`), digest } }),
       loadArtifact: async () => ({ ok: true, value: { manifest: { entries } } }) },
   } as unknown as ChangeRuntimeDeps;
   const runtime = new ChangeRuntime(deps) as unknown as { preview(request: ChangeRequest): Promise<string> };
@@ -82,7 +82,7 @@ async function previewRows(colleague: boolean, approval: string) {
     const deps = {
       store: new Store(db, () => 0, colleague),
       gate: { current: async () => ({ revision: 'fixture-v1' }) },
-      changes: { approvalSubject: async () => ({ ok: true, value: { subject: fixtureApprovalSubject(request.id), digest: approval } }),
+      changes: { approvalSubject: async () => ({ ok: true, value: { subject: fixtureApprovalSubject(request.id, `bot/change/${request.id}/g1`), digest: approval } }),
         loadArtifact: async () => ({ ok: true, value: { manifest: { entries } } }) },
     } as unknown as ChangeRuntimeDeps;
     const runtime = new ChangeRuntime(deps) as unknown as { notifyPhase(request: ChangeRequest): Promise<void> };

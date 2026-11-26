@@ -176,7 +176,8 @@ test('T19 B3 DATA-01: 승인 준비는 저장된 리뷰와 다른 receipt를 받
 });
 
 test('T19 B3 DATA-01: 렌더러가 만든 문구도 같은 검사를 지나고 마스킹하지 않는다', () => {
-  const base = { key: KEY, label: 'public' as const, bundle: fixtureBundle(), branch: `bot/change/${KEY.changeId}/g1`,
+  // 새 공개 글은 새 꼴 브랜치에서만 만든다(옛 꼴은 branch_read_only). 검사 사유를 보려고 새 꼴 이름을 준다.
+  const base = { key: KEY, label: 'public' as const, bundle: fixtureBundle(), branch: `bot/change/c${'0123456789ab'.repeat(2)}`,
     verifications: [{ commandId: 'smoke-unit', status: 'passed' as const }], review: { verdict: 'pass' as const, risks: [] },
     identity: { name: 'fixture-writer[bot]', email: 'fixture-writer[bot]@users.noreply.github.com' }, at: Date.UTC(2026, 0, 2) };
   assert.deepEqual(renderPublication({ ...base, brief: fixtureBrief({ goal: `연결 ${TOKEN}` }) }, POLICY), { ok: false, reason: 'secret_detected' });

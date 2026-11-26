@@ -1810,7 +1810,7 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 | `ChangeWriterPort` | B3 | blob·tree·commit·ref·PR 생성과 대조용 읽기. 결과는 `confirmed`·`not_sent`·`rejected`·`unknown` |
 | `ChangeDeploymentPort` | B4 | 병합 사실 읽기, H·M·K·D 관측 |
 
-브랜치는 `changeBranchName`만 만들고 `bot/change/<32자리 hex>/g<n>` 외에는 `parseChangeBranch`가 거부한다.
+새 브랜치는 세대 행을 만들 때 `newChangeBranchName`만 만든다. 꼴은 `bot/change/c<24자리 hex>`(무작위)이고 이 값이 그 세대의 공개 추적 ID다. change ID·세대는 이름에 없고 이름과 키의 대응은 `change_generations.branch`에만 있다(migration 030). 030 전의 옛 꼴 `bot/change/<32자리 hex>/g<n>`은 찾기·읽기(회수·멱등 판정)만 받고 쓰지 않는다(D-122). 그 밖의 이름은 `parseChangeBranch`가 거부한다.
 
 ### 16.1 배포 읽기 (B4)
 
@@ -1926,8 +1926,8 @@ requested → admitted → authoring → snapshot_ready → verifying → review
 | `POST …/git/blobs` | contents 토큰 | 계산한 blob SHA와 일치하는 바이트만, 합계 1 MiB까지(넘으면 토큰 발급 전에 거부), 응답 SHA 대조 |
 | `POST …/git/trees` | contents 토큰 | `base_tree` 필수, `type` 항상 `blob`, 보호 경로 거부. subtree·gitlink 자리 없음 |
 | `POST …/git/commits` | contents 토큰 | `parents` 하나, 고정 author·committer·date·메시지 |
-| `POST …/git/refs` | contents 토큰 | 자기 change·generation의 `refs/heads/bot/change/…/g<n>`만. `force` 필드 없음 |
-| `PATCH …/git/refs/heads/bot/change/{id}/g{n}` (C26) | contents 토큰 | `fastForwardBranch`만 부른다. 자기 change·generation 브랜치, body는 `sha`와 `force:false`뿐. 보내기 전에 브랜치 head가 호출자의 기대 head인지, 새 커밋의 부모가 그 head 하나인지 PR 토큰으로 읽어 보고 다르면 보내지 않는다(`head_changed`·`not_fast_forward`). 응답 유실·409·422는 정확한 ref를 다시 읽어 새 SHA면 확정, 다른 SHA·없음이면 `rejected(head_changed)`, 그대로면 원래 결과(unknown·`http_422`)다. `ChangeWriterPort`가 아니라 `GitHubWriterPort`에 있고 아직 부르는 곳이 없다(C27이 쓴다) |
+| `POST …/git/refs` | contents 토큰 | 새 꼴이고 그 change·generation의 공개 검사 영수증이 본 브랜치(`refs/heads/bot/change/c…`)만. `force` 필드 없음 |
+| `PATCH …/git/refs/heads/bot/change/c{24 hex}` (C26) | contents 토큰 | `fastForwardBranch`만 부른다. 새 꼴이고 영수증이 본 그 change·generation 브랜치(옛 꼴은 갱신하지 않는다), body는 `sha`와 `force:false`뿐. 보내기 전에 브랜치 head가 호출자의 기대 head인지, 새 커밋의 부모가 그 head 하나인지 PR 토큰으로 읽어 보고 다르면 보내지 않는다(`head_changed`·`not_fast_forward`). 응답 유실·409·422는 정확한 ref를 다시 읽어 새 SHA면 확정, 다른 SHA·없음이면 `rejected(head_changed)`, 그대로면 원래 결과(unknown·`http_422`)다. `ChangeWriterPort`가 아니라 `GitHubWriterPort`에 있고 아직 부르는 곳이 없다(C27이 쓴다) |
 | `POST …/pulls` | PR 토큰 | 자기 브랜치, 정책의 base, `maintainer_can_modify:false`, 제목·본문·draft만 |
 | `GET …/git/ref/heads/{branch}`, `git/commits/{sha}`, `git/trees/{sha}`, `git/trees/{sha}?recursive=1` | 없음(선행 읽기) 또는 PR 토큰(대조) | 정확한 이름·SHA. 응답의 이름·SHA를 다시 대조 |
 | `GET …/git/blobs/{sha}` | 없음(workflow 읽기) 또는 PR 토큰(대조) | 내용·SHA 대조 |

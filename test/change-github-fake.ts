@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
-import { changeBranchName, gitBlobSha, sha256Hex } from '../src/change-contracts.js';
+import { gitBlobSha, sha256Hex } from '../src/change-contracts.js';
 import type { ArtifactFile, ArtifactManifest, ChangeBrief, ChangeKey, ChangeTarget, ManifestChangeKind, ReviewReceipt } from '../src/change-contracts.js';
 import { evaluateCi } from '../src/change-ci-policy.js';
 import { ChangeRepositoryPolicySchema, gitCommitSha, gitTreeSha } from '../src/change-policy.js';
@@ -10,7 +10,7 @@ import { ChangePublisher } from '../src/change-publisher.js';
 import { ChangeStore } from '../src/change-store.js';
 import type { Database } from '../src/database.js';
 import { createGitHubWriter, policyWriterRepositories } from '../src/github-writer.js';
-import { CONVERSATION, OWNER, fixtureReview, fixtureVerification, hex, insertChildJob, newEvent, ok, seedConversation } from './change-store-fixture.js';
+import { CONVERSATION, OWNER, fixtureReview, fixtureVerification, hex, insertChildJob, newEvent, ok, pinnedBranch, seedConversation } from './change-store-fixture.js';
 
 // GitHub 흉내. 객체를 실제 git 형식 SHA로 저장해 게시자가 미리 계산한 값과 대조된다. 키·토큰·ID는 모두 합성이다.
 export const { privateKey: FAKE_APP_KEY } = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -363,4 +363,4 @@ export async function reapprove(env: PublishEnv, key: ChangeKey, changes: FileCh
   const next = ok(await env.store.startNextGeneration(key));
   return approveKeyFor.get(env.store)!({ changeId: next.id, generation: next.generation }, changes);
 }
-export const branchOf = (key: ChangeKey) => changeBranchName(key.changeId, key.generation);
+export const branchOf = (key: ChangeKey) => pinnedBranch(key.changeId, key.generation);

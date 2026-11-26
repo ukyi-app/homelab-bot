@@ -2,8 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { inspect } from 'node:util';
-import { changeBranchName, gitBlobSha } from '../src/change-contracts.js';
-import type { ChangeTarget, ChangeWriterPort } from '../src/change-contracts.js';
+import { gitBlobSha } from '../src/change-contracts.js';
+import type { ChangeKey, ChangeTarget, ChangeWriterPort } from '../src/change-contracts.js';
 import { Denied, PolicyUnavailable } from '../src/contracts.js';
 import { assertAllowed } from '../src/github-app.js';
 import { PublicationStopped, createGitHubWriter, writerRouteAllowed } from '../src/github-writer.js';
@@ -13,13 +13,20 @@ import type { WriterRepository } from '../src/github-writer.js';
 import { FAKE_APP_KEY, FakeGitHub, REPO, BOT_USER } from './change-github-fake.js';
 
 // 이 파일은 경로·본문 모양·토큰·인가를 본다. 공개 검사 영수증 대조는 실제 책으로 test/public-check-github.test.ts와 게시자 시험(change-github-fake)이 본다.
-class OpenReceipts extends PublicReceipts { override scanFor(): PublicScan { return () => null; } }
+// 쓰기 대상 브랜치는 영수증이 본 브랜치여야 한다. 이 책은 TARGET(change·세대 3)에만 BRANCH를 묶는다.
+class OpenReceipts extends PublicReceipts {
+  override scanFor(): PublicScan { return () => null; }
+  override branchOf(key: ChangeKey): string | undefined { return key.changeId === CHANGE && key.generation === 3 ? BRANCH : undefined; }
+}
 const OPEN_RECEIPTS = new OpenReceipts();
 
 const CHANGE = '0123456789abcdef0123456789abcdef';
 const OTHER_CHANGE = 'fedcba9876543210fedcba9876543210';
 const TARGET: ChangeTarget = { key: { changeId: CHANGE, generation: 3 }, repoId: REPO.id };
-const BRANCH = changeBranchName(CHANGE, 3);
+const BRANCH = `bot/change/c${'0123456789ab'.repeat(2)}`;
+const OTHER_BRANCH = `bot/change/c${'fedcba987654'.repeat(2)}`;
+// 같은 change·세대의 옛 꼴 이름. 찾기·읽기만 하고 쓰지 않는다.
+const LEGACY_BRANCH = `bot/change/${CHANGE}/g3`;
 const sha = (seed: string) => seed.repeat(40).slice(0, 40);
 const REPOSITORY: WriterRepository = { ...REPO, baseBranches: ['main'] };
 const IDENTITY = { name: 'fixture-writer[bot]', email: 'fixture-writer[bot]@users.noreply.github.com', date: '2026-01-02T03:04:05Z' };
@@ -57,6 +64,8 @@ test('T19 B3 writer: 허용 route 표가 정확하다', () => {
     ['GET', `${R}/git/trees/${sha('a')}`], ['GET', `${R}/git/trees/${sha('a')}?recursive=1`], ['GET', `${R}/pulls?state=all&head=fixture-org:${BRANCH}&base=main&per_page=100`],
     ['GET', '/repos/fixture-org/fixture-platform/contents/.github/workflows/app-build.yaml?ref=app-build-v1.0.1'],
     ['PATCH', `${R}/git/refs/heads/${BRANCH}`],
+    // 옛 꼴 브랜치는 읽기 경로로 계속 찾는다.
+    ['GET', `${R}/git/ref/heads/${LEGACY_BRANCH}`], ['GET', `${R}/pulls?state=all&head=fixture-org:${LEGACY_BRANCH}&base=main&per_page=100`],
   ] as const) assert.equal(writerRouteAllowed(method, path), true, `${method} ${path}`);
 });
 
@@ -69,6 +78,7 @@ test('T19 B3 writer: D-24 거부 사례는 route 표에 없다(encoded·method �
     // 갱신은 변경 브랜치 모양 하나만 열린다.
     ['PATCH', `${R}/git/refs/heads/deploy/app`], ['PATCH', `${R}/git/refs/heads/bot/anything`], ['PATCH', `${R}/git/refs/tags/v1`], ['PATCH', `${R}/git/refs/heads/${BRANCH}/x`],
     ['PATCH', `${R}/git/refs/heads/${BRANCH}?force=true`], ['PATCH', `${R}/git/refs/heads/bot%2Fchange%2F${CHANGE}%2Fg3`], ['PATCH', `${R}/git/refs/heads/bot/change/${CHANGE}/../main`],
+    ['PATCH', `${R}/git/refs/heads/${LEGACY_BRANCH}`], ['PATCH', `${R}/git/refs/heads/bot/change/C${'0'.repeat(24)}`], ['PATCH', `${R}/git/refs/heads/bot/change/c${'0'.repeat(23)}`],
     ['PATCH', `${R}/git/ref/heads/${BRANCH}`], ['PUT', `${R}/git/refs/heads/${BRANCH}`],
     ['DELETE', `${R}/git/refs/heads/${BRANCH}`], ['POST', `${R}/issues/1/comments`], ['PUT', `${R}/contents/src/a.ts`], ['DELETE', `${R}/contents/src/a.ts`],
     ['POST', `${R}%2Fpulls%2F1%2Fmerge`], ['POST', `${R}/pulls%2F1%2Fmerge`], ['POST', `${R}/git/blobs/../../merges`], ['POST', `${R}/git/blobs/%2e%2e/%2e%2e/merges`], ['POST', `${R}//git/blobs`],
@@ -158,7 +168,7 @@ test('T19 B3 writer: 코드 구조. fetch는 closure 한 곳이고 범용 API가
 
 for (const [name, branch] of Object.entries({
   main: 'main', 'deploy 브랜치': 'deploy/app', tag: 'refs/tags/v1', 'refs 접두': `refs/heads/${BRANCH}`, 'botx 접두': `botx/change/${CHANGE}/g3`, 'bot 임의 이름': 'bot/anything',
-  '다른 change': changeBranchName(OTHER_CHANGE, 3), '다른 generation': changeBranchName(CHANGE, 4), 'encoded 슬래시': `bot%2Fchange%2F${CHANGE}%2Fg3`, '이중 인코딩': `bot%252Fchange/${CHANGE}/g3`,
+  '영수증에 없는 새 꼴': OTHER_BRANCH, '옛 꼴(같은 change·세대)': LEGACY_BRANCH, '옛 꼴 다른 change': `bot/change/${OTHER_CHANGE}/g3`, '옛 꼴 다른 generation': `bot/change/${CHANGE}/g4`, 'encoded 슬래시': `bot%2Fchange%2F${CHANGE}%2Fg3`, '이중 인코딩': `bot%252Fchange/${CHANGE}/g3`,
   '점 세그먼트': `bot/change/${CHANGE}/../main`, '대문자 G': `bot/change/${CHANGE}/G3`, '빈 값': '', '개행': `${BRANCH}\n`,
 })) {
   test(`T19 B3 writer: createRef·createPull이 잘못된 브랜치를 거부한다: ${name}`, async () => {
@@ -527,7 +537,7 @@ test('C26 writer: 자기 변경 브랜치를 기대 head에서 새 커밋으로 
 test('C26 writer: 다른 브랜치·강제 갱신·추가 필드는 아무것도 보내지 않는다', async () => {
   const { github, writer, from, to } = branchAhead();
   const valid = { target: TARGET, branch: BRANCH, expectedHead: from, sha: to };
-  for (const branch of ['main', 'deploy/app', changeBranchName(OTHER_CHANGE, 3), changeBranchName(CHANGE, 4), `refs/heads/${BRANCH}`, 'bot/anything', `bot%2Fchange%2F${CHANGE}%2Fg3`]) {
+  for (const branch of ['main', 'deploy/app', OTHER_BRANCH, LEGACY_BRANCH, `bot/change/${OTHER_CHANGE}/g3`, `bot/change/${CHANGE}/g4`, `refs/heads/${BRANCH}`, 'bot/anything', `bot%2Fchange%2F${CHANGE}%2Fg3`]) {
     await refused(github, () => writer.fastForwardBranch({ ...valid, branch }), 'branch_not_allowed');
   }
   for (const extra of [{ force: true }, { force: false }, { ref: 'refs/heads/main' }, { method: 'PUT' }]) {

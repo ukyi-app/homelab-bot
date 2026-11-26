@@ -1,3 +1,4 @@
+import { parseChangeBranch } from './change-contracts.js';
 import type { ChangeKey, ChangeNote, WriterOutcome } from './change-contracts.js';
 import type { ChangeRepositoryPolicy } from './change-policy.js';
 import { noteLine, publicTraceId, recordPublicTrace, renderGuidance } from './change-publication.js';
@@ -143,7 +144,14 @@ export interface ChangeGuidanceOptions {
 }
 interface Row { head_sha: string; state: GuidanceState; attempts: number; retry_at: string | number | null; review_id: string | number | null; reason: string | null; created_at: string | number }
 
-export const guidanceKey = (key: ChangeKey, round: number) => `${key.changeId}:g${key.generation}:r${round}`;
+// 안내 표식(guidanceMarker)의 입력. 새 꼴 브랜치는 그 세대의 공개 추적 ID에서 만들어 change ID로 계산되지 않는다.
+// 옛 꼴 브랜치는 이미 단 안내를 같은 표식으로 찾아야 해서 예전 키(change ID·세대·차례) 그대로다.
+export function guidanceKey(key: ChangeKey, branch: string, round: number): string {
+  const parsed = parseChangeBranch(branch);
+  if (parsed?.form === 'trace') return `${parsed.traceId}:r${round}`;
+  if (parsed?.form === 'legacy' && parsed.key.changeId === key.changeId && parsed.key.generation === key.generation) return `${key.changeId}:g${key.generation}:r${round}`;
+  throw new Error('change_branch_invalid');
+}
 // 줄 댓글 상한은 PR 리뷰 게시와 같은 값(publish.maxInlineComments)이다. 리뷰 정책이 없거나 게시를 닫았으면 null이다.
 export function guidanceLimit(policy: Pick<Policy, 'review'>): number | null {
   const parsed = ReviewPolicySchema.safeParse(policy.review);
@@ -214,6 +222,13 @@ export class ChangeGuidance {
     return this.resume(round, row, outside);
   }
 
+  // 브랜치 이름은 세대 행에만 있다. 읽지 못하면 던져 보내지 않는다(회수는 다음 호출이 다시 읽는다).
+  private async traceKey(key: ChangeKey, round: number): Promise<string> {
+    const generation = await this.options.changes.generationRecord(key);
+    if (!generation.ok) throw new Error('guidance_evidence_missing');
+    return guidanceKey(key, generation.value.branch, round);
+  }
+
   private async resume(round: GuidanceRound, row: Row, outside: ChangeNotes): Promise<GuidanceOutcome> {
     switch (row.state) {
       case 'posted': return this.result('posted', null, Number(row.review_id), outside);
@@ -236,7 +251,8 @@ export class ChangeGuidance {
       return this.settle(round, 'pending', 'skipped', reason, null, outside);
     }
     // 안내 표식에는 추적 ID만 나간다. 그 ID와 안내 키의 대응은 이 감사 행에만 남긴다(보내기 전, 한 번).
-    await this.options.db.transaction(tx => recordPublicTrace(tx, publicTraceId('guidance', guidanceKey(key, round.round)), { kind: 'guidance', changeId: key.changeId, generation: key.generation, round: round.round }, this.now()));
+    const traceKey = await this.traceKey(key, round.round);
+    await this.options.db.transaction(tx => recordPublicTrace(tx, publicTraceId('guidance', traceKey), { kind: 'guidance', changeId: key.changeId, generation: key.generation, round: round.round }, this.now()));
     const claimed = await this.options.db.query<{ attempts: number }>(`UPDATE change_guidance SET state='sending',attempts=attempts+1,updated_at=$4 WHERE change_id=$1 AND generation=$2 AND round=$3 AND state='pending' RETURNING attempts`,
       [key.changeId, key.generation, round.round, this.now()]);
     // 다른 호출이 먼저 집었다.
@@ -244,7 +260,7 @@ export class ChangeGuidance {
     const attempts = Number(claimed.rows[0].attempts);
     let outcome: WriterOutcome<{ id: number }>;
     try {
-      outcome = await this.options.port.post({ repository: policy.fullName, pr: round.pr, head: round.headSha, key: guidanceKey(key, round.round), body: rendered.body, comments: rendered.comments });
+      outcome = await this.options.port.post({ repository: policy.fullName, pr: round.pr, head: round.headSha, key: traceKey, body: rendered.body, comments: rendered.comments });
     } catch {
       // 포트는 값으로 답한다. 던졌으면 어디까지 갔는지 모른다.
       outcome = { kind: 'unknown', code: 'guidance_send_failed' };
@@ -277,7 +293,7 @@ export class ChangeGuidance {
     const policy = await this.options.policy(round.repoId);
     if (policy) {
       try {
-        const found = await this.options.port.find({ repository: policy.fullName, pr: round.pr, head: round.headSha, key: guidanceKey(round.key, round.round) });
+        const found = await this.options.port.find({ repository: policy.fullName, pr: round.pr, head: round.headSha, key: await this.traceKey(round.key, round.round) });
         if (found) return this.settle(round, row.state, 'posted', null, found.id, outside);
       } catch { /* 다음 호출이 다시 읽는다 */ }
     }

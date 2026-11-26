@@ -2,8 +2,8 @@ import { randomUUID } from 'node:crypto';
 import {
   AMENDMENT_MATERIAL_ID, ARTIFACT_LIMITS, ApprovalSubjectSchema, ArtifactManifestSchema, CHANGE_AMENDMENT, CHANGE_ID, CHANGE_SELF_FIX, ChangeBriefSchema, DeploymentObservationSchema, EFFECT_LEASE_MS, EFFECT_STAGES,
   EffectExpectedSchema, EffectResultSchema, EvidenceBundleSchema, GENERATION_RESTART, GIT_SHA, MAX_GENERATION, SHA256_HEX, ReasonCodeSchema, ReviewReceiptSchema, RevisionSchema, UNKNOWN_RECONCILE_MS,
-  VerificationReceiptSchema, amendmentEvidenceDigest, approvalDigest, artifactDigest, briefDigest, canTransition, changeBranchName, effectResultMatches, evidenceBundleDigest, isTerminalPhase,
-  labelAllowsAuthorInput, newChangeId, previousEffectStage, propagateLabel, raiseLabel, reviewReceiptDigest, sha256Hex, validateArtifactFiles, verificationReceiptDigest,
+  VerificationReceiptSchema, amendmentEvidenceDigest, approvalDigest, artifactDigest, briefDigest, canTransition, effectResultMatches, evidenceBundleDigest, isTerminalPhase,
+  labelAllowsAuthorInput, newChangeBranchName, newChangeId, previousEffectStage, propagateLabel, raiseLabel, reviewReceiptDigest, sha256Hex, validateArtifactFiles, verificationReceiptDigest,
 } from './change-contracts.js';
 import type {
   AmendmentKey, ApprovalSubject, ArtifactBundle, ArtifactFile, ArtifactManifest, ChangeBrief, ChangeKey, ChangeNote, ChangePhase, DeploymentObservation, EffectExpected, EffectResolution, EffectResult,
@@ -300,7 +300,7 @@ export class ChangeStore {
       const now = this.now();
       const row = (await tx.query<Record<string, unknown>>(`INSERT INTO change_generations(change_id,generation,repo_id,base_branch,branch,base_commit,base_tree,policy_revision,created_at)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [request.id, request.generation, request.repoId, request.baseBranch, changeBranchName(request.id, request.generation), input.baseCommit, input.baseTree, request.policyRevision, now])).rows[0]!;
+      [request.id, request.generation, request.repoId, request.baseBranch, newChangeBranchName(), input.baseCommit, input.baseTree, request.policyRevision, now])).rows[0]!;
       await this.step(tx, request, 'authoring', now);
       return success(generationRow(row));
     });

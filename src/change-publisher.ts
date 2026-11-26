@@ -1,5 +1,5 @@
 import {
-  EFFECT_LEASE_MS, EFFECT_STAGES, artifactDigest, effectRequestDigest, evidenceBundleDigest, labelAllowsAuthorInput, propagateLabel, reviewReceiptDigest, sha256Hex,
+  EFFECT_LEASE_MS, EFFECT_STAGES, artifactDigest, effectRequestDigest, evidenceBundleDigest, isWritableChangeBranch, labelAllowsAuthorInput, propagateLabel, reviewReceiptDigest, sha256Hex,
 } from './change-contracts.js';
 import type { AmendmentKey, ApprovalSubject, ChangeKey, ChangeTarget, ChangeWriterPort, EffectExpected, EffectResult, EffectStage, EvidenceBundle, PublicMetadata, ReviewReceipt, WriterCommitMetadata, WriterOutcome, WriterPullSnapshot } from './change-contracts.js';
 import { evaluateCi, readCiSnapshot } from './change-ci-policy.js';
@@ -197,7 +197,7 @@ export class ChangePublisher {
     const prepared = await this.store.prepareApproval({ ...key, publication: rendered.publication, ciFingerprint: fingerprint });
     if (prepared.ok) {
       // PR 본문·커밋에는 추적 ID만 싣는다. 그 ID와 내부 값(change ID·세대·정책·검증기 판·산출물 digest)의 대응은 이 감사 행에만 남긴다.
-      const trace = publicationTrace(key, bundle.value);
+      const trace = publicationTrace(key, generation.value.branch, bundle.value);
       await this.store.database.transaction(tx => recordPublicTrace(tx, trace.id, { kind: 'change', ...trace.detail }, this.now()));
     }
     return prepared.ok ? { ok: true, digest: prepared.value.digest, subject: prepared.value.subject } : { ok: false, reason: prepared.reason };
@@ -231,7 +231,11 @@ export class ChangePublisher {
     const publication = subject.publication;
     if (publication.author.name !== policy.identity.name || publication.author.email !== policy.identity.email
       || publication.committer.name !== policy.identity.name || publication.committer.email !== policy.identity.email) await block('identity_mismatch');
-    const marker = publicationMarker(key);
+    // 옛 꼴 브랜치는 찾기·읽기만 한다. 아직 effect를 하나도 남기지 않았으면(승인만 됐거나 publishing에 막 들어옴) 보낸 것이 없어 여기서 닫는다.
+    // 남긴 effect가 있으면 이미 보냈을 수 있는 것을 대조로 회수해야 해서 닫지 않고, 아직 안 보낸 ref·PR 쓰기는 writer가 거절한다(branch_not_allowed).
+    if (!isWritableChangeBranch(generation.branch) && !(await this.store.database.query('SELECT 1 FROM change_delivery_effects WHERE change_id=$1 AND generation=$2 LIMIT 1',
+      [key.changeId, key.generation])).rows.length) await block('branch_read_only');
+    const marker = publicationMarker(key, generation.branch);
     if (!publication.body.includes(`<!-- ${marker} -->`)) await block('marker_missing');
     if (subject.branch !== generation.branch || subject.baseBranch !== generation.baseBranch) await block('branch_mismatch');
     if (evidenceBundleDigest(subject.bundle) !== evidenceBundleDigest(bundle)) await block('evidence_mismatch');
@@ -645,6 +649,9 @@ export class ChangePublisher {
     if (!bundle.ok || !artifact.ok || round.value.baseCommit === null || round.value.baseTree === null) return failed('evidence_missing');
     const brief = request.value.brief;
     if (!brief) return failed('brief_missing');
+    // 옛 꼴 브랜치는 찾기·읽기만 한다. 이 차례가 아직 아무 effect도 남기지 않았을 때만 닫는다. 남긴 effect가 있으면 대조로 회수해야 하고,
+    // 안 보낸 쓰기는 writer가 거절한다(branch_not_allowed).
+    if (!effects.length && !isWritableChangeBranch(generation.value.branch)) return failed('branch_read_only');
     const label = propagateLabel([request.value.label, artifact.value.label, brief.label, round.value.label]);
     if (!labelAllowsAuthorInput(label)) return failed('label_blocked');
     const policy = await this.policy(generation.value.repoId);
@@ -685,8 +692,8 @@ export class ChangePublisher {
     const inspected = inspectCandidate({ base: { sha: round.value.baseTree, complete: leaves.complete, leaves: leaves.leaves }, manifest, files: artifact.value.files,
       policies: [repoRules.policy, briefRules.policy] });
     if (!inspected.ok) return failed(inspected.reason);
-    const marker = publicationMarker(key);
-    const metadata = renderAmendmentCommit({ key, pullNumber: round.value.pullNumber, identity: policy.identity, at: round.value.startedAt ?? round.value.createdAt, bundle: bundle.value });
+    const marker = publicationMarker(key, generation.value.branch);
+    const metadata = renderAmendmentCommit({ key, branch: generation.value.branch, pullNumber: round.value.pullNumber, identity: policy.identity, at: round.value.startedAt ?? round.value.createdAt, bundle: bundle.value });
     const scanned = scanPublicPayload({ paths: inspected.plan.changedPaths, files: artifact.value.files, publication: metadata, branch: generation.value.branch, marker },
       { internalMarkers: policy.internalMarkers });
     if (!scanned.ok) return failed(scanned.reason);
