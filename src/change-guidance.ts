@@ -1,7 +1,7 @@
 import { isWritableChangeBranch, parseChangeBranch } from './change-contracts.js';
 import type { ChangeKey, ChangeNote, WriterOutcome } from './change-contracts.js';
 import type { ChangeRepositoryPolicy } from './change-policy.js';
-import { changeMarkers, noteLine, publicTraceId, recordPublicTrace, renderGuidance } from './change-publication.js';
+import { changeMarkers, legacyGuidanceKey, noteLine, publicTraceId, recordPublicTrace, renderGuidance } from './change-publication.js';
 import { isCurrentAuthorJob } from './change-store.js';
 import type { ChangeStore } from './change-store.js';
 import type { Database } from './database.js';
@@ -149,7 +149,7 @@ interface Row { head_sha: string; state: GuidanceState; attempts: number; retry_
 export function guidanceKey(key: ChangeKey, branch: string, round: number): string {
   const parsed = parseChangeBranch(branch);
   if (parsed?.form === 'trace') return `${parsed.traceId}:r${round}`;
-  if (parsed?.form === 'legacy' && parsed.key.changeId === key.changeId && parsed.key.generation === key.generation) return `${key.changeId}:g${key.generation}:r${round}`;
+  if (parsed?.form === 'legacy' && parsed.key.changeId === key.changeId && parsed.key.generation === key.generation) return legacyGuidanceKey(key.changeId, key.generation, round);
   throw new Error('change_branch_invalid');
 }
 // 줄 댓글 상한은 PR 리뷰 게시와 같은 값(publish.maxInlineComments)이다. 리뷰 정책이 없거나 게시를 닫았으면 null이다.
@@ -269,7 +269,8 @@ export class ChangeGuidance {
     const attempts = Number(claimed.rows[0].attempts);
     let outcome: WriterOutcome<{ id: number }>;
     try {
-      outcome = await this.options.port.post({ repository: policy.fullName, pr: round.pr, head: round.headSha, key: traceKey, body: rendered.body, comments: rendered.comments });
+      // 포트가 붙이는 표식은 renderGuidance가 보지 못한 바이트라 change별 금지 값을 함께 넘겨 최종 본문에서 다시 보게 한다.
+      outcome = await this.options.port.post({ repository: policy.fullName, pr: round.pr, head: round.headSha, key: traceKey, markers: changeMarkers(key), body: rendered.body, comments: rendered.comments });
     } catch {
       // 포트는 값으로 답한다. 던졌으면 어디까지 갔는지 모른다.
       outcome = { kind: 'unknown', code: 'guidance_send_failed' };

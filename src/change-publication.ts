@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { ChangeBriefSchema, CommandIdSchema, EvidenceBundleSchema, GenerationSchema, PublicMetadataSchema, ProvenanceLabelSchema, REVIEW_RISK_CATEGORIES, ChangeIdSchema, changeIdPrefix, labelAllowsAuthorInput, parseChangeBranch, propagateLabel } from './change-contracts.js';
+import { CHANGE_AMENDMENT, ChangeBriefSchema, CommandIdSchema, EvidenceBundleSchema, GenerationSchema, PublicMetadataSchema, ProvenanceLabelSchema, REVIEW_RISK_CATEGORIES, ChangeIdSchema, changeIdPrefix, labelAllowsAuthorInput, parseChangeBranch, propagateLabel } from './change-contracts.js';
 import type { AmendmentKey, ArtifactFile, ChangeBrief, ChangeKey, ChangeNote, EvidenceBundle, ProvenanceLabel, PublicMetadata } from './change-contracts.js';
 import { CHANGE_NOTE_LIMITS, ChangeNoteSchema } from './task-contracts.js';
 import type { Database } from './database.js';
@@ -40,17 +40,30 @@ export async function recordPublicTrace(tx: Pick<Database, 'query'>, id: string,
 export function changeTraceId(key: ChangeKey, branch: string): string | null {
   const parsed = parseChangeBranch(branch);
   if (parsed?.form === 'trace') return parsed.traceId;
-  if (parsed?.form === 'legacy' && parsed.key.changeId === key.changeId && parsed.key.generation === key.generation) return publicTraceId('change', `${key.changeId}:g${key.generation}`);
+  if (parsed?.form === 'legacy' && parsed.key.changeId === key.changeId && parsed.key.generation === key.generation) return legacyChangeTrace(key.changeId, key.generation);
   return null;
 }
+// 030 전 옛 꼴 세대의 공개 추적 ID 공식. 옛 PR 표식·안내 표식을 찾는 읽기와 새 쓰기의 금지 값(changeMarkers)이 같은 공식을 써야 한다.
+const legacyChangeTrace = (changeId: string, generation: number): string => publicTraceId('change', `${changeId}:g${generation}`);
+export const legacyGuidanceKey = (changeId: string, generation: number, round: number): string => `${changeId}:g${generation}:r${round}`;
 const requireTrace = (key: ChangeKey, branch: string): string => {
   const id = changeTraceId(key, branch);
   if (id === null) throw new Error('change_branch_invalid');
   return id;
 };
-// change 하나의 공개 금지 값: change ID 전체와 앞 8자. 처음 게시·수정 차례의 PR 글·커밋·경로·파일 바이트와 안내 댓글 검사가 모두 이 목록을 더한다.
+// change 하나의 공개 금지 값. 처음 게시·수정 차례의 PR 글·커밋(작성자·커미터 신원 포함)·경로·파일 바이트와 안내 댓글 글·최종 표식 검사가 모두 이 목록을 더한다.
+// change ID 전체와 앞 8자, 그리고 종전 공식으로 이 change에서 계산되는 공개 추적 ID다(세대마다 change 추적 ID 하나와 차례 0~상한의 안내 추적 ID).
+// 종전 값은 옛 꼴 PR·안내에 이미 공개됐을 수 있어 새 글에 다시 실리면 새 세대가 그 change와 이어진다. 앞 세대 PR 글을 옮겨 쓸 수 있어 세대 1부터 넣는다.
+// 옛 게시물을 찾는 읽기 대조(publicationMarker·안내 find)는 이 목록을 쓰지 않는다. 값 수는 세대 수 × 12라 세대가 많을수록 검사가 느려진다.
 // 정책·검증기 판은 여기 넣지 않는다. 검증기 판은 봇 소스의 고정 문자열이라 파일 바이트에 넣으면 봇 저장소를 고치는 변경이 막힌다(PR 글 검사에만 더한다).
-export const changeMarkers = (key: Pick<ChangeKey, 'changeId'>): string[] => [key.changeId, changeIdPrefix(key.changeId)];
+export function changeMarkers(key: ChangeKey): string[] {
+  const legacy: string[] = [];
+  for (let generation = 1; generation <= key.generation; generation++) {
+    legacy.push(legacyChangeTrace(key.changeId, generation));
+    for (let round = 0; round <= CHANGE_AMENDMENT.maxRounds; round++) legacy.push(publicTraceId('guidance', legacyGuidanceKey(key.changeId, generation, round)));
+  }
+  return [key.changeId, changeIdPrefix(key.changeId), ...legacy];
+}
 // 대조용 표식이다. 제목·Discord ID·change ID를 넣지 않는다.
 export const publicationMarker = (key: ChangeKey, branch: string): string => `homelab-bot-change:${requireTrace(key, branch)}`;
 // 공개 ID와 내부 값의 대응. 감사 행의 detail로만 남긴다(PR 본문·커밋에는 싣지 않는다).
@@ -224,7 +237,7 @@ const issuedReceipts = new WeakMap<PublicReceipt, ReceiptDigests>();
 const digestOf = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
 function receiptOf(payload: PublicPayload): PublicReceipt {
   const { publication } = payload;
-  // 이메일·시각은 검사하지 않지만 스키마가 noreply·초 단위 시각으로 고정한 값이라 함께 둔다.
+  // 시각은 검사하지 않지만 스키마가 초 단위로 고정한 값이라 함께 둔다. 이메일은 scanPublicPayload가 비밀·금지 값을 본다.
   const texts = [...payload.paths, publication.title, publication.body, publication.commitMessage, publication.author.name, publication.committer.name,
     publication.author.email, publication.committer.email, publication.author.date, publication.committer.date, payload.branch, payload.marker];
   const receipt = Object.freeze({}) as PublicReceipt;
@@ -313,10 +326,12 @@ export function scanPublicText(text: { title: string; body: string }, policy: Sc
 }
 export function scanPublicPayload(payload: PublicPayload, policy: ScanPolicy): ScanResult {
   const { publication } = payload;
-  // 신원 이메일은 스키마가 noreply로 고정한다. 그래서 여기에는 넣지 않는다.
   const metadata = [publication.title, publication.body, publication.commitMessage, publication.author.name, publication.committer.name, payload.branch, payload.marker];
+  // 신원 이메일도 커밋에 그대로 실린다. noreply 꼴은 스키마가 정하고 그 꼴 자체가 이메일 metadata 패턴에 걸리므로 metadata 검사에서만 뺀다.
+  // 계정 번호·이름 칸은 설정 값이라 우연히 change ID 앞 8자와 같을 수 있어 비밀·금지 값 검사는 다른 글과 같이 한다.
+  const identities = [publication.author.email, publication.committer.email];
   const contents = payload.files.map(file => Buffer.from(file.content).toString('utf8'));
-  const everything = [...payload.paths, ...metadata, ...contents];
+  const everything = [...payload.paths, ...metadata, ...identities, ...contents];
   if (everything.some(hasSecret)) return { ok: false, reason: 'secret_detected' };
   // 파일 경계에 걸쳐 나눈 조각까지 잇는다.
   if (everything.some(text => hasMarker(text, policy.internalMarkers)) || hasMarker(contents.join(''), policy.internalMarkers)) return { ok: false, reason: 'internal_marker' };

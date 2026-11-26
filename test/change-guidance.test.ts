@@ -203,7 +203,7 @@ test('AC-27 한 번만: 보내는 중에 끊긴 기록(sending)은 다시 보내
     const { key, pr, head } = await publishWith(env, NOTES);
     // 앞 프로세스가 전송을 시작하고 기록 전에 죽은 상태. 요청은 GitHub에 닿았다.
     await env.db.query(`INSERT INTO change_guidance(change_id,generation,round,head_sha,state,attempts,created_at,updated_at) VALUES ($1,$2,0,$3,'sending',1,$4,$4)`, [key.changeId, key.generation, head, env.clock.now]);
-    port.reviews.push({ repository: REPO.fullName, pr, head, key: `${traceOf(key)}:r0`, body: 'x', comments: [], id: 7000 });
+    port.reviews.push({ repository: REPO.fullName, pr, head, key: `${traceOf(key)}:r0`, markers: [], body: 'x', comments: [], id: 7000 });
     const outcome = posted(await guidance.afterPublish(key));
     assert.equal(outcome.reviewId, 7000);
     assert.equal(port.posts, 0);

@@ -10,14 +10,14 @@ import { ChangePublisher } from '../src/change-publisher.js';
 import { ChangeRuntime } from '../src/change-runtime.js';
 import type { ChangeRuntimeDeps } from '../src/change-runtime.js';
 import type { ChangeStore } from '../src/change-store.js';
-import { PublicReceipts, changeTraceId, publicTraceId, publicationMarker, renderPublication, scanPublicPayload } from '../src/change-publication.js';
+import { PublicReceipts, changeMarkers, changeTraceId, publicTraceId, publicationMarker, renderPublication, scanPublicPayload } from '../src/change-publication.js';
 import { MIGRATIONS } from '../src/database.js';
 import type { Database } from '../src/database.js';
 import { createGitHubWriter } from '../src/github-writer.js';
-import { guidanceMarker } from '../src/github-review-io.js';
-import { DEFAULT_CHANGES, FAKE_APP_KEY, FIXTURE_TIME, FakeGitHub, REPO, publishEnv } from './change-github-fake.js';
+import { githubReviewIO, guidanceMarker } from '../src/github-review-io.js';
+import { DEFAULT_CHANGES, FAKE_APP_KEY, FIXTURE_TIME, FakeGitHub, REPO, buildCandidate, publishEnv } from './change-github-fake.js';
 import type { FileChange, PublishEnv } from './change-github-fake.js';
-import { OWNER, fixtureBrief, fixtureBundle, newEvent, ok, pinnedBranch, seedConversation } from './change-store-fixture.js';
+import { OWNER, fixtureBrief, fixtureBundle, fixtureReview, fixtureVerification, insertChildJob, newEvent, ok, pinnedBranch, seedConversation } from './change-store-fixture.js';
 import { localDatabase } from './helpers.js';
 
 // D-122: 새 변경 브랜치 이름은 무작위 추적 ID 꼴(bot/change/c<24 hex>)이고, 옛 꼴(bot/change/<change ID>/g<세대>)은 찾기·읽기만 한다.
@@ -38,6 +38,114 @@ async function insertRequest(db: Database, id: string) {
 const insertGeneration = (db: Database, id: string, generation: number, branch: string) => db.query(
   `INSERT INTO change_generations(change_id,generation,repo_id,base_branch,branch,base_commit,base_tree,policy_revision,created_at) VALUES ($1,$2,4242,'main',$3,$4,$4,'fixture-policy',1)`,
   [id, generation, branch, 'a'.repeat(40)]);
+
+// 수정 차례(C27) 영수증도 change별 금지 값으로 검사한다. 수정 파일에 change ID 앞 8자가 있으면 영수증 없이 실패하고 blob·tree·commit·ref 어느 것도 보내지 않는다.
+// 이 검사가 빠지면 같은 입력이 committed와 쓰기 4회(blob·tree·commit·ref)가 된다.
+test('D-122 수정 차례: 수정 파일에 change ID 앞 8자가 있으면 failed(internal_marker), 쓰기 0', async () => {
+  const { db, pg } = await localDatabase();
+  try {
+    const env = await publishEnv(db);
+    const id = await env.approve();
+    const pr = await env.publisher.publish(id);
+    if (pr.kind !== 'proposed') throw new Error(`처음 게시 실패: ${JSON.stringify(pr)}`);
+    ok(await env.store.requestAmendment({ ...id, eventId: newEvent(), actor: OWNER, pullNumber: pr.prNumber, head: pr.headSha,
+      materials: [], materialsDigest: 'e'.repeat(64), instruction: '확인', label: 'public' }));
+    const key = { ...id, round: ok(await env.store.startAmendment(id)).round };
+    const tree = env.github.commits.get(pr.headSha)!.tree;
+    ok(await env.store.pinAmendmentBase({ ...key, baseCommit: pr.headSha, baseTree: tree }));
+    const candidate = buildCandidate(env.github.leaves(tree), pr.headSha, tree, [{ path: 'src/fixture.ts', kind: 'added', content: `sample ${id.changeId.slice(0, 8)}` }]);
+    ok(await env.store.recordAmendmentSnapshot({ ...key, ...candidate, transportBytes: 2048 }));
+    const bundle = ok(await env.store.startAmendmentVerification({ ...key, verifierRevision: 'fixture-verifier-1' }));
+    ok(await env.store.recordAmendmentVerification({ ...key, receipt: fixtureVerification({ bundle, runId: 'fixture-amend' }) }));
+    await insertChildJob(db, 'amendment-marker-review');
+    ok(await env.store.linkChildJob({ ...key, jobId: 'amendment-marker-review', role: 'review' }));
+    ok(await env.store.recordAmendmentReview({ ...key, receipt: fixtureReview({ bundle, jobId: 'amendment-marker-review' }) }));
+    const before = env.github.mutations().length;
+    const outcome = await env.publisher.publishAmendment(key, { pullOpen: async () => true });
+    const writes = env.github.mutations().slice(before).map(write => `${write.method} ${write.path}`);
+    assert.deepEqual([outcome, writes], [{ kind: 'failed', reason: 'internal_marker' }, []]);
+  } finally { await pg.close(); }
+});
+
+// 커밋 작성자·커미터 이메일도 커밋에 그대로 실린다. noreply 꼴은 그대로 받고, 그 계정 번호가 change ID 앞 8자와 같으면 승인 준비와 영수증 발급에서 막는다.
+test('D-122 커밋 신원: 이메일에 change ID 앞 8자가 있으면 승인 준비·영수증이 internal_marker, noreply 꼴 자체는 통과', async () => {
+  const email = '12345678+fixture[bot]@users.noreply.github.com';
+  const { db, pg } = await localDatabase();
+  try {
+    const env = await publishEnv(db);
+    env.policy.current = { ...env.policy.current!, identity: { name: 'fixture[bot]', email } };
+    for (const [changeId, expected] of [[`12345678${'ac'.repeat(12)}`, 'internal_marker'], [`87654321${'ac'.repeat(12)}`, null]] as const) {
+      const key = { changeId, generation: 1 };
+      await insertRequest(db, key.changeId);
+      const review = await env.driveToReview(key, DEFAULT_CHANGES);
+      const prepared = await env.publisher.prepareApproval(key, { review, at: FIXTURE_TIME });
+      assert.equal(prepared.ok ? null : prepared.reason, expected, changeId);
+    }
+  } finally { await pg.close(); }
+  const identity = { name: 'fixture[bot]', email, date: '2026-01-02T03:04:05Z' };
+  const publication: PublicMetadata = { title: '제목', body: '본문', commitMessage: '제목\n', author: identity, committer: identity, draft: false };
+  const payload = { paths: [], files: [], publication, branch: 'bot/change/cfedcba98fedcba98fedcba98', marker: 'homelab-bot-change:cfedcba98fedcba98fedcba98' };
+  assert.deepEqual(scanPublicPayload(payload, { internalMarkers: changeMarkers({ changeId: `12345678${'ac'.repeat(12)}`, generation: 1 }) }), { ok: false, reason: 'internal_marker' });
+  assert.equal(scanPublicPayload(payload, { internalMarkers: changeMarkers({ changeId: `87654321${'ac'.repeat(12)}`, generation: 1 }) }).ok, true);
+});
+
+// 안내 표식은 포트가 렌더링 뒤에 붙이는 안내 키의 해시다. 그 마지막 바이트에 change ID 앞 8자가 우연히 나와도 리뷰 POST가 나가지 않는다.
+test('D-122 안내 최종 표식: 실제 포트가 붙인 표식에 change ID 앞 8자가 있으면 POST 0, 없으면 게시', async () => {
+  const branch = 'bot/change/cfedcba98fedcba98fedcba98';
+  const prefix = publicTraceId('guidance', `${branch.slice('bot/change/'.length)}:r1`).slice(1, 9);
+  assert.ok(!branch.includes(prefix));
+  for (const [changeId, expected] of [[`${prefix}${'ab'.repeat(12)}`, { state: 'skipped', reason: 'outbound_public_check', posts: 0 }],
+    [`${'ab'.repeat(16)}`, { state: 'posted', reason: null, posts: 1 }]] as const) {
+    const key = { changeId, generation: 1 };
+    const { db, pg } = await localDatabase();
+    try {
+      const env = await publishEnv(db);
+      await insertRequest(db, key.changeId);
+      await insertGeneration(db, key.changeId, 1, branch);
+      const headSha = 'a'.repeat(40);
+      const repo = { id: REPO.id, full_name: REPO.fullName };
+      const reviews: string[] = [];
+      const io = githubReviewIO({ app: { appId: '12345', privateKey: FAKE_APP_KEY }, repositories: async () => REPO, now: () => FIXTURE_TIME,
+        send: async (input, init = {}) => {
+          const path = new URL(String(input)).pathname;
+          if (path.startsWith('/app/')) {
+            const permissions = JSON.parse(String(init.body)).permissions;
+            return Response.json({ token: 'fixture', expires_at: new Date(FIXTURE_TIME + 3600000).toISOString(), permissions,
+              repository_selection: 'selected', repositories: [repo] }, { status: 201 });
+          }
+          if (init.method === 'GET' && path.endsWith('/pulls/7')) return Response.json({ number: 7, state: 'open', title: 'fixture', body: '',
+            user: { id: 1, login: 'fixture', type: 'Bot' }, author_association: 'NONE', updated_at: new Date(FIXTURE_TIME).toISOString(),
+            head: { sha: headSha, ref: branch, repo }, base: { sha: headSha, ref: 'main', repo } });
+          if (init.method === 'POST' && path.endsWith('/pulls/7/reviews')) {
+            reviews.push(JSON.parse(String(init.body)).body);
+            return Response.json({ id: 55 });
+          }
+          throw new Error('unexpected fixture route');
+        } });
+      const guidance = new ChangeGuidance({ db, changes: env.store, policy: async () => env.policy.current, limit: async () => 5, port: io.guidance });
+      const patch = ['diff --git a/src/a.ts b/src/a.ts', '--- a/src/a.ts', '+++ b/src/a.ts', '@@ -1 +1 @@', '-old', '+new', ''].join('\n');
+      const outcome = await guidance.post({ key, round: 1, pr: 7, headSha, repoId: REPO.id, patch, checks: [{ text: '확인', location: { path: 'src/a.ts', line: 1 } }], risks: [] });
+      assert.deepEqual({ state: outcome.state, reason: outcome.reason, posts: reviews.length }, expected, changeId);
+      assert.equal(reviews.filter(body => body.includes(changeId.slice(0, 8))).length, 0);
+    } finally { await pg.close(); }
+  }
+});
+
+// 종전 공식으로 계산되는 이 change의 공개 추적 ID(옛 꼴 세대의 change 추적 ID·안내 추적 ID)가 새 요약에 들어오면 승인 준비에서 막는다.
+test('D-122 종전 추적값: 같은 change의 종전 change·안내 추적 ID를 품은 요약은 승인 준비가 internal_marker', async () => {
+  const { db, pg } = await localDatabase();
+  try {
+    const env = await publishEnv(db);
+    for (const value of [(key: ChangeKey) => publicTraceId('change', `${key.changeId}:g${key.generation}`),
+      (key: ChangeKey) => publicTraceId('guidance', `${key.changeId}:g${key.generation}:r0`)]) {
+      const key = await env.newRequest();
+      const review = await env.driveToReview(key, DEFAULT_CHANGES, { brief: { summary: `이전 참조 ${value(key)}` } });
+      const prepared = await env.publisher.prepareApproval(key, { review, at: FIXTURE_TIME });
+      assert.deepEqual(prepared.ok ? 'ok' : prepared.reason, 'internal_marker', value(key));
+      assert.equal(env.github.mutations().length, 0);
+    }
+  } finally { await pg.close(); }
+});
 
 test('D-122 migration 030: 옛 행은 그대로 지나고 새 꼴 행을 받으며, 그 밖의 꼴은 거절한다', async () => {
   const { pg, db } = await rawDatabase(29);

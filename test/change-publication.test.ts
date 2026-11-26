@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PublicMetadataSchema } from '../src/change-contracts.js';
-import { neutralizePublicText, publicationMarker, renderGuidance, renderPublication } from '../src/change-publication.js';
+import { CHANGE_AMENDMENT } from '../src/change-contracts.js';
+import { neutralizePublicText, publicTraceId, publicationMarker, renderGuidance, renderPublication } from '../src/change-publication.js';
 import type { PublicationInput } from '../src/change-publication.js';
 import { fixtureBrief, fixtureBundle } from './change-store-fixture.js';
 
@@ -48,6 +49,18 @@ test('D-122 공개 문구: change ID 앞 8·12·16자가 추적 ID·요약에 �
   for (const text of [publication.title, publication.body, publication.commitMessage]) {
     for (const piece of pieces) assert.ok(!text.toLowerCase().includes(piece), piece);
   }
+});
+
+// 종전 공식(change ID·세대·차례의 해시)으로 계산되는 이 change의 공개 추적 ID는 앞 세대·마지막 차례까지 새 글에 싣지 않는다. 다른 change의 값은 막지 않는다.
+test('D-122 공개 문구: 이 change의 종전 change·안내 추적 ID를 품은 요약은 internal_marker로 막는다', () => {
+  const { changeId, generation } = KEY;
+  const values = [publicTraceId('change', `${changeId}:g${generation}`), publicTraceId('change', `${changeId}:g1`),
+    publicTraceId('guidance', `${changeId}:g${generation}:r0`), publicTraceId('guidance', `${changeId}:g1:r${CHANGE_AMENDMENT.maxRounds}`)];
+  for (const value of values) {
+    assert.deepEqual(renderPublication(input({ brief: fixtureBrief({ summary: `이전 참조 ${value}` }) }), SCAN), { ok: false, reason: 'internal_marker' }, value);
+  }
+  const other = publicTraceId('change', `${'f'.repeat(32)}:g${generation}`);
+  assert.equal(renderPublication(input({ brief: fixtureBrief({ summary: `이전 참조 ${other}` }) }), SCAN).ok, true);
 });
 
 test('T19 B3 공개 문구: 같은 입력은 같은 결과다(재시도·승인 digest 고정)', () => {
