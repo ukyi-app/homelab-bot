@@ -80,7 +80,7 @@ for (const stage of ['blob', 'tree', 'commit', 'ref', 'pull'] as const) {
       const sent = d.env.github.count(ROUTES[stage]);
 
       // 임대가 살아 있는 동안에는 아무도 대조·재전송하지 않는다.
-      assert.deepEqual(await new ChangePublisher({ store: d.env.store, writer: d.env.writerIO.writer, preflight: d.env.writerIO.preflight, policy: async () => d.env.policy.current, authorize: async () => {}, now: () => d.env.clock.now, retryMs: 60_000 }).publish(key), { kind: 'busy' });
+      assert.deepEqual(await new ChangePublisher({ store: d.env.store, receipts: d.env.writerIO.receipts, writer: d.env.writerIO.writer, preflight: d.env.writerIO.preflight, policy: async () => d.env.policy.current, authorize: async () => {}, now: () => d.env.clock.now, retryMs: 60_000 }).publish(key), { kind: 'busy' });
 
       d.env.clock.now += EFFECT_LEASE_MS + 1;
       const outcomes = await Promise.all(Array.from({ length: CONCURRENCY }, () => d.env.newPublisher().publish(key)));

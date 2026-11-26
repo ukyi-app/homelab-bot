@@ -1,6 +1,6 @@
 import type { ChangeKey, ChangeNote, WriterOutcome } from './change-contracts.js';
 import type { ChangeRepositoryPolicy } from './change-policy.js';
-import { noteLine, renderGuidance } from './change-publication.js';
+import { noteLine, publicTraceId, recordPublicTrace, renderGuidance } from './change-publication.js';
 import { isCurrentAuthorJob } from './change-store.js';
 import type { ChangeStore } from './change-store.js';
 import type { Database } from './database.js';
@@ -235,6 +235,8 @@ export class ChangeGuidance {
       const reason = !policy ? 'repository_not_allowed' : limit === null ? 'review_publish_closed' : rendered && !rendered.ok ? rendered.reason : 'no_inline_items';
       return this.settle(round, 'pending', 'skipped', reason, null, outside);
     }
+    // 안내 표식에는 추적 ID만 나간다. 그 ID와 안내 키의 대응은 이 감사 행에만 남긴다(보내기 전, 한 번).
+    await this.options.db.transaction(tx => recordPublicTrace(tx, publicTraceId('guidance', guidanceKey(key, round.round)), { kind: 'guidance', changeId: key.changeId, generation: key.generation, round: round.round }, this.now()));
     const claimed = await this.options.db.query<{ attempts: number }>(`UPDATE change_guidance SET state='sending',attempts=attempts+1,updated_at=$4 WHERE change_id=$1 AND generation=$2 AND round=$3 AND state='pending' RETURNING attempts`,
       [key.changeId, key.generation, round.round, this.now()]);
     // 다른 호출이 먼저 집었다.

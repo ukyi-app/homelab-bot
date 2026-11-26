@@ -6,6 +6,7 @@ import type { AmendmentDiscussionReader } from './change-commands.js';
 import type { ChangeKey, ChangeTarget } from './change-contracts.js';
 import { DeploymentReader } from './change-deployment.js';
 import { compilePathPolicy, taskPathRules } from './change-policy.js';
+import { PublicReceipts } from './change-publication.js';
 import { ChangePublisher } from './change-publisher.js';
 import { ChangeReviewService, HttpChangeReviewWorker } from './change-review.js';
 import { ChangeRuntime, changeAuthorSource, changeRepositoryPolicies } from './change-runtime.js';
@@ -120,8 +121,9 @@ export function assembleChange(options: ChangeAssemblyOptions): ChangeAssembly {
     if (!publishing && !amending) throw new PublicationStopped();
     await authorize(request.value);
   };
-  const io = (options.createWriter ?? createGitHubWriter)({ app: options.app, repositories: policyWriterRepositories(policy), authorizeWrite, send, now });
-  const publisher = new ChangePublisher({ store: changes, writer: io.writer, preflight: io.preflight, policy, authorize, now, log });
+  // 게시자가 공개 검사로 낸 영수증을 writer가 쓰기마다 대조한다. 둘에 같은 책 하나를 준다.
+  const io = (options.createWriter ?? createGitHubWriter)({ app: options.app, repositories: policyWriterRepositories(policy), authorizeWrite, receipts: new PublicReceipts(), send, now });
+  const publisher = new ChangePublisher({ store: changes, writer: io.writer, preflight: io.preflight, policy, authorize, receipts: io.receipts, now, log });
   const artifacts = new ChangeStoreArtifacts(changes);
   const inputs = new ChangePrivateInputs(store.db, now);
   const source = changeAuthorSource({ store, gate, preflight: io.preflight, policy });

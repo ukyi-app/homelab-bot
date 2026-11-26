@@ -4,7 +4,7 @@ import { approvalDigest } from '../src/change-contracts.js';
 import type { ChangeKey, ChangeNote, WriterOutcome } from '../src/change-contracts.js';
 import { ChangeGuidance, guidanceDiffLines, readChangeNotes, recordChangeNotes } from '../src/change-guidance.js';
 import type { GuidanceOutcome } from '../src/change-guidance.js';
-import { renderPublication } from '../src/change-publication.js';
+import { publicTraceId, renderPublication } from '../src/change-publication.js';
 import { CHANGE_RETENTION_MS, ChangeReviewFindings, purgeExpiredChangeContent } from '../src/change-store.js';
 import { guidanceMarker } from '../src/github-review-io.js';
 import type { GuidanceReview, GuidanceReviewPort } from '../src/github-review-io.js';
@@ -397,5 +397,30 @@ test('C29 보존: 다른 원문을 이미 비우고 목록만 남은 변경도 �
     await assert.rejects(env.db.query(`UPDATE change_notes SET checks=$3::jsonb WHERE change_id=$1 AND generation=$2`, [...where, JSON.stringify(NOTES.checks)]));
     await assert.rejects(env.db.query(`UPDATE change_notes SET purged_at=purged_at+1 WHERE change_id=$1 AND generation=$2`, where));
     assert.equal(await purgeExpiredChangeContent(env.db, endedAt + 30 * 86_400_000), 0, '다 비운 건은 다시 고르지 않는다');
+  } finally { await close(); }
+});
+
+// O08 F7a F-8: 공개로 나간 PR 본문·커밋 메시지에는 git 리비전과 추적 ID만 있고, 추적 ID와 내부 값의 대응은 감사 행에만 있다.
+test('F7a F-8: PR 본문·커밋에는 change ID·정책·검증기 판·산출물 digest가 없고, PR·안내 추적 ID와 내부 값의 대응은 github_public_id 감사 행에만 있다', async () => {
+  const { env, guidance, close } = await setup();
+  try {
+    const { key } = await publishWith(env, NOTES);
+    posted(await guidance.afterPublish(key));
+    const bundle = await env.store.evidenceBundle(key);
+    assert.ok(bundle.ok);
+    const internal = [key.changeId, bundle.value.policyRevision, bundle.value.verifierRevision, bundle.value.artifactDigest];
+    const changeTrace = publicTraceId('change', `${key.changeId}:g${key.generation}`);
+    const pull = env.github.pulls[0]!;
+    const messages = env.github.sent.filter(s => s.method === 'POST' && s.path.endsWith('/git/commits')).map(s => (s.body as { message: string }).message);
+    assert.equal(messages.length, 1);
+    for (const text of [pull.title, pull.body ?? '', ...messages]) for (const value of internal) assert.ok(!text.includes(value), value);
+    assert.ok((pull.body ?? '').includes(`<!-- homelab-bot-change:${changeTrace} -->`));
+    assert.ok(messages[0]!.includes(`Change: ${changeTrace}`));
+    const audit = (await env.db.query<{ subject: string; detail: Record<string, unknown> }>(`SELECT subject,detail FROM audit WHERE kind='github_public_id'`)).rows
+      .map(row => [row.subject, row.detail]).sort((a, b) => String(a[0]) < String(b[0]) ? -1 : 1);
+    assert.deepEqual(audit, [
+      [changeTrace, { kind: 'change', changeId: key.changeId, generation: key.generation, policyRevision: bundle.value.policyRevision, verifierRevision: bundle.value.verifierRevision, artifactDigest: bundle.value.artifactDigest }],
+      [publicTraceId('guidance', `${key.changeId}:g${key.generation}:r0`), { kind: 'guidance', changeId: key.changeId, generation: key.generation, round: 0 }],
+    ].sort((a, b) => String(a[0]) < String(b[0]) ? -1 : 1));
   } finally { await close(); }
 });

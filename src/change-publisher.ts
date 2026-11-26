@@ -6,7 +6,8 @@ import { evaluateCi, readCiSnapshot } from './change-ci-policy.js';
 import { readChangeNotes } from './change-guidance.js';
 import { compilePathPolicy, gitCommitSha, inspectCandidate } from './change-policy.js';
 import type { BaseLeaf, ChangeRepositoryPolicy, PublishPlan } from './change-policy.js';
-import { publicationMarker, renderAmendmentCommit, renderPublication, scanPublicPayload } from './change-publication.js';
+import { publicationMarker, publicationTrace, recordPublicTrace, renderAmendmentCommit, renderPublication, scanPublicPayload } from './change-publication.js';
+import type { PublicReceipts } from './change-publication.js';
 import type { AmendmentEffect, AmendmentRound, ChangeRequest, ChangeStore, EffectKey, EffectRecord, GenerationRecord } from './change-store.js';
 import { Denied, PolicyUnavailable } from './contracts.js';
 import type { ChangePreflightPort } from './github-writer.js';
@@ -33,6 +34,8 @@ export interface ChangePublisherOptions {
   policy: (repoId: number) => Promise<ChangeRepositoryPolicy | null>;
   // 요청자의 지금 권한. 정책 조회는 /revoke의 거부 목록을 보지 않아 따로 물어야 한다. 전송 직전 확인은 writer의 authorizeWrite가 맡고, 이 값은 부모를 닫을지 정한다. 철회면 Denied, 정책을 못 읽으면 PolicyUnavailable을 던진다.
   authorize: (request: Pick<ChangeRequest, 'ownerId' | 'scope'>) => Promise<unknown>;
+  // 공개 검사 영수증의 책. writer와 같은 책이어야 쓰기가 나간다(writer는 이 책에 없는 바이트를 보내지 않는다).
+  receipts: PublicReceipts;
   now?: () => number; log?: Log; retryMs?: number; leaseRenewMs?: number;
 }
 export interface ReconcileReport {
@@ -72,12 +75,14 @@ export class ChangePublisher {
   private readonly preflight: ChangePreflightPort;
   private readonly policy: ChangePublisherOptions['policy'];
   private readonly authorize: ChangePublisherOptions['authorize'];
+  private readonly receipts: PublicReceipts;
   private readonly now: () => number;
   private readonly log: Log;
   private readonly retryMs: number;
   private readonly leaseRenewMs: number;
   constructor(options: ChangePublisherOptions) {
     this.store = options.store; this.writer = options.writer; this.preflight = options.preflight; this.policy = options.policy; this.authorize = options.authorize;
+    this.receipts = options.receipts;
     this.now = options.now ?? Date.now; this.log = options.log ?? (() => {});
     this.retryMs = options.retryMs ?? DEFAULT_RETRY_MS; this.leaseRenewMs = options.leaseRenewMs ?? Math.floor(EFFECT_LEASE_MS / 3);
   }
@@ -190,6 +195,11 @@ export class ChangePublisher {
       fingerprint = ci.fingerprint;
     } catch (error) { return { ok: false, reason: this.code(error) }; }
     const prepared = await this.store.prepareApproval({ ...key, publication: rendered.publication, ciFingerprint: fingerprint });
+    if (prepared.ok) {
+      // PR 본문·커밋에는 추적 ID만 싣는다. 그 ID와 내부 값(change ID·세대·정책·검증기 판·산출물 digest)의 대응은 이 감사 행에만 남긴다.
+      const trace = publicationTrace(key, bundle.value);
+      await this.store.database.transaction(tx => recordPublicTrace(tx, trace.id, { kind: 'change', ...trace.detail }, this.now()));
+    }
     return prepared.ok ? { ok: true, digest: prepared.value.digest, subject: prepared.value.subject } : { ok: false, reason: prepared.reason };
   }
 
@@ -253,6 +263,8 @@ export class ChangePublisher {
     if (!inspected.ok) return block(inspected.reason);
     const scanned = scanPublicPayload({ paths: inspected.plan.changedPaths, files: artifact.files, publication, branch: generation.branch, marker }, { internalMarkers: policy.internalMarkers });
     if (!scanned.ok) return block(scanned.reason);
+    // 이 검사가 본 글·경로·파일 내용만 writer가 보낸다. 쓰기는 이 뒤 stage에서 나뉘어 나간다.
+    this.receipts.record(key, scanned.receipt);
 
     let snapshot: Awaited<ReturnType<typeof readCiSnapshot>>;
     try { snapshot = await readCiSnapshot(this.preflight, target, leaves.leaves, policy.ci); }
@@ -678,6 +690,7 @@ export class ChangePublisher {
     const scanned = scanPublicPayload({ paths: inspected.plan.changedPaths, files: artifact.value.files, publication: metadata, branch: generation.value.branch, marker },
       { internalMarkers: policy.internalMarkers });
     if (!scanned.ok) return failed(scanned.reason);
+    this.receipts.record(target.key, scanned.receipt);
     let snapshot: Awaited<ReturnType<typeof readCiSnapshot>>;
     try { snapshot = await readCiSnapshot(this.preflight, target, leaves.leaves, policy.ci); }
     catch (error) {

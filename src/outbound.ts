@@ -53,7 +53,10 @@ export function openOutbound(body: unknown, method: string, path: string): strin
 }
 
 // 공개 검사 하나. 본문의 모든 문자열 값을 받아 걸린 사유를 돌려준다. 경로별 검사(F-1~F-8)는 여기에 끼운다.
-export type PublicScan = (texts: readonly string[]) => string | null;
+// texts는 칸 이름까지 포함한 모든 문자열(나오는 순서), parts는 이어 보기용이다: values는 칸 이름을 뺀 값만,
+// fields는 같은 칸 이름 아래 값끼리(리뷰 본문과 댓글 본문들이 한 묶음) 모은 것이다. 쪼개 실은 값이 칸 사이에서 이어지는지 볼 때 쓴다.
+export interface PublicScanParts { readonly values: readonly string[]; readonly fields: readonly (readonly string[])[] }
+export type PublicScan = (texts: readonly string[], parts?: PublicScanParts) => string | null;
 export interface OutboundPorts {
   // 지금 정책 판. 검사 때의 판과 다르면 보내지 않는다.
   revision(): string | Promise<string>;
@@ -112,6 +115,17 @@ function strings(value: unknown, out: string[] = []): string[] {
   else if (value !== null && typeof value === 'object') for (const [key, item] of Object.entries(value)) { out.push(key); strings(item, out); }
   return out;
 }
+function scanParts(body: unknown): PublicScanParts {
+  const values: string[] = [];
+  const fields = new Map<string, string[]>();
+  const walk = (value: unknown, field: string | null) => {
+    if (typeof value === 'string') { values.push(value); if (field !== null) fields.set(field, [...fields.get(field) ?? [], value]); }
+    else if (Array.isArray(value)) for (const item of value) walk(item, field);
+    else if (value !== null && typeof value === 'object') for (const [key, item] of Object.entries(value)) walk(item, key);
+  };
+  walk(body, null);
+  return Object.freeze({ values: Object.freeze(values), fields: Object.freeze([...fields.values()].map(list => Object.freeze(list))) });
+}
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 // Discord 상한(글 2000자, 스레드 이름 100자, custom_id 100자)과 알림 막기. parse는 늘 비어 있어야 하고(everyone·역할 없음),
 // 사용자 호출은 한 사람까지다. allowed_mentions의 칸은 parse·users·replied_user(false)만 받는다(roles 명시 목록이면 역할 알림이 울린다). 버튼 이름 허용 목록은 게시자(DiscordPublisher.messageBody)가 BUTTONS 표로 본다.
@@ -143,6 +157,7 @@ export function finalPayload(target: OutboundTarget, body: unknown): OutboundPay
 }
 
 // 바이트를 다시 풀어 검사한다(본문 객체가 아니라 나갈 바이트가 기준이다). 결과는 얼린 값이고 이 파일만 진짜로 인정한다.
+// GitHub은 공개 저장소로 나가므로 scan이 없으면 모양 거절이다. 새 GitHub 쓰기 자리가 공개 검사 없이 열리지 않게 한다.
 export function checkOutbound(payload: OutboundPayload, options: { policyRevision: string; scan?: PublicScan }): OutboundCheck {
   const bytes = payload.bytes;
   const target = copyTarget(payload.target);
@@ -151,7 +166,8 @@ export function checkOutbound(payload: OutboundPayload, options: { policyRevisio
   try { body = JSON.parse(bytes); } catch { throw new OutboundRefused('shape'); }
   if (!record(body)) throw new OutboundRefused('shape');
   if (target.kind !== 'github' && !discordShape(target, body)) throw new OutboundRefused('shape');
-  if (options.scan?.(Object.freeze(strings(body))) != null) throw new OutboundRefused('public_check');
+  if (target.kind === 'github' && typeof options.scan !== 'function') throw new OutboundRefused('shape');
+  if (options.scan?.(Object.freeze(strings(body)), scanParts(body)) != null) throw new OutboundRefused('public_check');
   const check = Object.freeze({ target, digest: sha256(bytes), policyRevision: options.policyRevision, rules: OUTBOUND_RULES_REVISION });
   issued.add(check);
   return check;

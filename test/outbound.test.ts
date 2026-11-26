@@ -65,7 +65,7 @@ test('묶음: 목적지를 바꾸면 보내지 않는다(채널·스레드 원�
   ];
   for (const [checked, moved, body] of cases) {
     const payload = finalPayload(checked, body);
-    const check = checkOutbound(payload, { policyRevision: 'fixture-v1' });
+    const check = checkOutbound(payload, { policyRevision: 'fixture-v1', scan: () => null });
     const p = ports();
     await assert.rejects(sendOutbound({ target: moved, bytes: payload.bytes }, check, p), refused('target_changed'), moved.kind);
     assert.deepEqual(p.wired, [], moved.kind);
@@ -95,7 +95,8 @@ test('검사: 모양(상한·알림·고치기 칸·경로)과 공개 검사 고
     [{ kind: 'github', method: 'POST', path: '/repos/o/../pulls/1/reviews' }, { body: 'x' }],
     [{ kind: 'github', method: 'POST', path: '/graphql' }, { query: 'x' }],
   ];
-  for (const [where, body] of bad) assert.throws(() => checkOutbound(finalPayload(where, body), { policyRevision: 'fixture-v1' }), refused('shape'), JSON.stringify(where));
+  // 통과하는 scan을 넘겨, GitHub 사례도 scan이 없어서가 아니라 모양 때문에 걸리는지 본다.
+  for (const [where, body] of bad) assert.throws(() => checkOutbound(finalPayload(where, body), { policyRevision: 'fixture-v1', scan: () => null }), refused('shape'), JSON.stringify(where));
   const scan = (texts: readonly string[]) => texts.some(text => text.includes('ghp_')) ? 'secret' : null;
   assert.throws(() => checkOutbound(finalPayload(target, message('토큰 ghp_x')), { policyRevision: 'fixture-v1', scan }), refused('public_check'));
   assert.ok(checkOutbound(finalPayload(target, message('깨끗')), { policyRevision: 'fixture-v1', scan }));
@@ -247,10 +248,18 @@ test('전송층 표지: 한 길이 준 바이트도 다른 경로로는, 전송 
   assert.equal(sent.length, 1);
   const github = new GitHubApi(send);
   const review = finalPayload({ kind: 'github', method: 'POST', path: '/repos/fixture-org/fixture-repo/pulls/1/reviews' }, { body: 'x' });
-  await sendOutbound(review, checkOutbound(review, { policyRevision: 'fixture-v1' }), ports({
+  await sendOutbound(review, checkOutbound(review, { policyRevision: 'fixture-v1', scan: () => null }), ports({
     wire: { wire: async (_method, path, body) => { kept = body; return github.call('POST', path, 'fixture-token', body); } } }));
   await assert.rejects(github.call('POST', '/repos/fixture-org/fixture-repo/pulls/1/reviews', 'fixture-token', kept), Denied);
   assert.equal(sent.length, 2);
+});
+test('검사: GitHub 목적지는 공개 검사(scan) 없이는 모양 거절이다. Discord는 scan 없이도 된다', () => {
+  const github: OutboundTarget = { kind: 'github', method: 'POST', path: '/repos/fixture-org/fixture-repo/pulls/1/reviews' };
+  assert.throws(() => checkOutbound(finalPayload(github, { body: 'x' }), { policyRevision: 'fixture-v1' }), refused('shape'));
+  assert.throws(() => checkOutbound(finalPayload(github, { body: 'x' }), { policyRevision: 'fixture-v1', scan: undefined }), refused('shape'));
+  assert.throws(() => checkOutbound(finalPayload(github, { body: 'x' }), { policyRevision: 'fixture-v1', scan: 'skip' as never }), refused('shape'));
+  assert.ok(checkOutbound(finalPayload(github, { body: 'x' }), { policyRevision: 'fixture-v1', scan: () => null }));
+  assert.ok(checkOutbound(finalPayload(target, message('깨끗')), { policyRevision: 'fixture-v1' }));
 });
 test('모양: allowed_mentions는 parse(빈 배열)·users(한 명)·replied_user(false)만 받는다', () => {
   for (const mentions of [{ parse: [], roles: ['111'] }, { parse: [], replied_user: true }, { parse: [], users: ['1', '2'] },
