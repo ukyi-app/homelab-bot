@@ -147,6 +147,19 @@ export class ExternalTaskLinks {
     });
   }
   async detach(connectionId: string, owner: string): Promise<{ blocked: number }> { return this.revoke(connectionId, owner, 'detach'); }
+  // R08을 끈 기동이 부른다(main.ts). 연결마다 해제하던 '/detach'가 없으므로 끄면 남은 연결을 모두 닫고 아직 게시하지 않은 알림을 막는다.
+  // 처음 닫은 사유는 덮어쓰지 않는다. 다시 켜도 닫힌 연결은 되살아나지 않는다(복원으로 되살아난 행은 다시 켤 때 복원 울타리가 닫는다).
+  async detachAll(): Promise<{ revoked: number; blocked: number }> {
+    return this.store.atomic(async store => {
+      const revoked = (await store.db.query<{ id: string }>(`UPDATE external_task_connections SET revoked_at=$1,revoked_reason='detach'
+        WHERE revoked_at IS NULL RETURNING id`, [store.now()])).rows.length;
+      const pending = (await store.db.query<{ connection_id: string }>(
+        "SELECT DISTINCT connection_id FROM external_task_events WHERE post_state='pending'")).rows.map(row => row.connection_id);
+      const blocked = pending.length ? await this.blockUnposted(store, pending) : 0;
+      if (revoked || blocked) await store.audit('external_task_detached_all', 'all', { revoked, blocked });
+      return { revoked, blocked };
+    });
+  }
   // 동의를 거두면 그 뒤 고정 문구가 아닌 요약은 수신에서 거절된다. 이미 큐에 든 게시 행은 owner가 받기로 했던 것이라 그대로 둔다.
   // 이 트랜잭션이 잡는 연결 행 잠금으로 수신의 수락과 직렬화한다. 철회가 끝난 뒤 새로 저장되는 요약은 없다.
   async setSummaryConsent(connectionId: string, owner: string, consent: boolean): Promise<void> {

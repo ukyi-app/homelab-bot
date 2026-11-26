@@ -8,6 +8,7 @@ import { tokenExpiresAt } from './model-accounts.js';
 import type { MemoryService, MemoryView } from './memory.js';
 import type { TaskGateClosedReason } from './ops-metrics.js';
 import type { Policy, PolicyGate } from './policy.js';
+import { assembledRisk, freeTextRisk } from './public-check.js';
 import type { Store } from './store.js';
 import type { ExecutionLaneClosedReason } from './task-contracts.js';
 
@@ -37,6 +38,9 @@ export const BRIEFING_TEXT = Object.freeze({
   tokenExpiring: (account: string, days: number) => days > 0
     ? `- Claude 토큰(${account})이 ${days}일 뒤 만료돼요.` : `- Claude 토큰(${account})이 하루 안에 만료돼요.`,
   tokenExpired: (account: string) => `- Claude 토큰(${account})이 만료됐어요. 새 토큰을 등록해 주세요.`,
+  // 공개 검사(큐에 넣는 그 정책)에 걸린 기억 줄과 브리핑 대신 싣는 고정 문구. 걸린 글은 한 글자도 싣지 않는다.
+  memoryWithheld: (kind: string) => `- [${kind}] 밖에 보이면 안 되는 내용이 섞여 있어 이 기억은 싣지 않았어요.`,
+  withheld: (date: string) => `[일일 브리핑] ${date}\n밖에 보이면 안 되는 내용이 섞여 있어 오늘 브리핑은 싣지 않았어요. 상태는 \`homelab\` CLI에서 확인해 주세요.`,
 });
 // 토큰 만료 알림을 시작하는 남은 기간(COLLEAGUE_SPEC §4.7). 남은 날수는 인증서 만료 칸과 같이 내림이다.
 const TOKEN_NOTICE_MS = 30 * 86_400_000;
@@ -113,6 +117,23 @@ class StaleBriefing extends Error { constructor() { super('briefing_stale_memory
 const target = (policy: Policy): Scope => ({ guild: policy.guild, channel: policy.notificationChannel, parent: null, kind: 'channel' });
 const KIND: Record<MemoryView['kind'], string> = { configuration: '설정', decision: '결정', incident: '장애', preference: '선호' };
 const OBSERVED: Record<ObservationSource['kind'], string> = { backup: '백업', certificate: '인증서', scheduled_job: '예약 작업' };
+interface MemoryDue { failure: string | null; items: MemoryView[]; total: number; services: string[] }
+// 기억 문장은 예전에 safe_summary로 저장됐어도 큐에 넣는 그 정책으로 다시 본다(F-2). 걸린 기억은 종류만 남긴다.
+function memoryText(memory: MemoryDue, policy: Policy, zone: string): string[] {
+  if (memory.failure) return [memory.failure];
+  if (!memory.items.length) return ['- 없음'];
+  const lines = memory.items.map(item => freeTextRisk(item.statement, policy) !== null ? BRIEFING_TEXT.memoryWithheld(KIND[item.kind])
+    : `- [${KIND[item.kind]}] ${bounded(item.statement.replace(/\s+/g, ' '), 200)}`
+      + `${item.observedAt !== null ? ` · 확인 ${clock(item.observedAt, zone)}` : ''} · 현재 조회로 다시 확인 필요`);
+  if (memory.total > memory.items.length) lines.push(`- 외 ${memory.total - memory.items.length}건`);
+  return lines;
+}
+// 최종 브리핑 전체도 같은 정책으로 본다. 관측 요약처럼 코드 밖에서 온 줄이 섞이므로, 걸리면 날짜와 고정 안내만 보낸다.
+// 표식을 읽지 못하면 PolicyUnavailable로 미룬다(작성한 글을 검사 없이 넣지 않는다).
+function briefingContent(date: string, body: readonly string[], memory: MemoryDue, policy: Policy, zone: string): string {
+  const content = [...body, ...memoryText(memory, policy, zone)].join('\n');
+  return assembledRisk(content, policy) === null ? content : BRIEFING_TEXT.withheld(date);
+}
 // bigint 열에 들어가므로 정수 ms만 받는다. 형식이 틀린 관측은 읽기 불가로 다룬다.
 function valid(value: Observation, now: number): boolean {
   return Number.isSafeInteger(value?.observedAt) && value.observedAt <= now && ['ok', 'problem'].includes(value.status)
@@ -289,13 +310,13 @@ export class BriefingScheduler {
           await store.audit('briefing_target_updated', schedule.id, { owner: owner !== schedule.owner_id, channel: scope.channel !== schedule.scope.channel });
         });
       }
-      const memory = await this.memoryLines(owner, scope, schedule.timezone);
-      const content = [
+      const memory = await this.memoryLines(owner, scope);
+      const body = [
         ...this.header(claim), ...await this.history(claim), '',
         ...await this.observations(schedule.timezone), '',
         '■ 모델·작업', ...await this.modelLines(), await this.taskLaneLine(), '',
-        '■ 다시 확인할 기억', ...memory.lines,
-      ].join('\n');
+        '■ 다시 확인할 기억',
+      ];
       return await this.db.transaction(async tx => {
         // 예약 끄기(ensure)와 줄 세운다. 끄기가 먼저 끝났으면 이 회차의 lease가 이미 지워졌거나 여기서 막는다.
         // 큐 확정이 먼저 끝났으면 끄기가 이 잠금을 기다렸다가 방금 넣은 사본을 막는다.
@@ -311,6 +332,7 @@ export class BriefingScheduler {
         const latest = await this.gate.current();
         if (latest.owner !== owner || latest.guild !== scope.guild || latest.notificationChannel !== scope.channel) throw new StaleBriefing();
         const current = await this.gate.withDatabase(tx).authorize(owner, scope);
+        const content = briefingContent(claim.date, body, memory, current, schedule.timezone);
         // 작성하는 동안 지우거나 대체한 기억이 있으면 다시 작성한다. FOR SHARE가 그 행의 삭제 정리와 직렬화한다.
         if (!await this.memory.live(tx, owner, memory.items)) throw new StaleBriefing();
         // 기억 정정·제외·삭제로 다시 작성한 회차는 새 멱등 키를 쓴다. 막은 이전 사본과 겹치지 않게 한다.
@@ -465,17 +487,14 @@ export class BriefingScheduler {
     const external = connections === undefined ? '' : ` · R08 연결 ${connections === null ? '미확인' : `${connections}건`}`;
     return `- 작업 레인: ${taskLaneState(gate, counts)} · ${numbers} · 도구 승인 대기: 지원 안 함${external}`;
   }
-  private async memoryLines(owner: string, scope: Scope, zone: string): Promise<{ lines: string[]; items: MemoryView[]; services: string[] }> {
+  private async memoryLines(owner: string, scope: Scope): Promise<MemoryDue> {
     try {
       const { items, total } = await this.memory.recheckDue(owner, scope);
-      if (!items.length) return { lines: ['- 없음'], items: [], services: [] };
-      const lines = items.map(item => `- [${KIND[item.kind]}] ${bounded(item.statement.replace(/\s+/g, ' '), 200)}`
-        + `${item.observedAt !== null ? ` · 확인 ${clock(item.observedAt, zone)}` : ''} · 현재 조회로 다시 확인 필요`);
-      if (total > items.length) lines.push(`- 외 ${total - items.length}건`);
-      return { lines, items, services: [...new Set(items.flatMap(item => item.service ? [item.service] : []))].sort() };
+      return { failure: null, items, total, services: [...new Set(items.flatMap(item => item.service ? [item.service] : []))].sort() };
     } catch (error) {
       if (error instanceof Denied || error instanceof PolicyUnavailable) throw error;
-      return { lines: [error instanceof MemoryNotReady ? '- 삭제 원장 재적용 전이라 조회하지 않음 · 미확인' : '- 기억 조회 실패 · 미확인'], items: [], services: [] };
+      return { failure: error instanceof MemoryNotReady ? '- 삭제 원장 재적용 전이라 조회하지 않음 · 미확인' : '- 기억 조회 실패 · 미확인',
+        items: [], total: 0, services: [] };
     }
   }
 }

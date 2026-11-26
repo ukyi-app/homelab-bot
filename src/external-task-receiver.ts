@@ -11,6 +11,9 @@ import { EXTERNAL_TASK_ID, connectionRow, outboxKey } from './external-task-link
 import type { ExternalConnection, ExternalTaskLinks } from './external-task-links.js';
 import { errorInfo } from './log.js';
 import type { Log } from './log.js';
+import { publicAlias } from './public-alias.js';
+import { freeTextRisk, PUBLIC_WITHHELD } from './public-check.js';
+import type { MarkerPolicy } from './public-check.js';
 import type { Store } from './store.js';
 
 // R08 수신 처리(ARCHITECTURE §15). 경로·포트·노출 방식과 무관하다. 이 모듈은 listen하지 않고 조립과 포트는 main.ts가 맡는다.
@@ -156,16 +159,18 @@ function delayText(ms: number): string {
 // Discord가 링크·마크다운·멘션으로 해석하지 않고, 이 밖에는 고정 문구와 시각뿐이다. 멘션은 게시자의 allowed_mentions.parse=[]가 한 번 더 막는다.
 const codeSpan = (text: string) => `\`${text.replaceAll('`', "'")}\``;
 // R08 턴 완료 알림의 고정 문구(동료 말투). '/' 이름이 없어 스위치와 상관없이 같다.
+// 세션 자리에는 원시 세션 ID 대신 연결의 공개 별칭을 싣는다(F-3). 세션 ID는 사람이 지은 값일 수 있어 그 값의 별칭도 쓰지 않는다.
 export const EXTERNAL_NOTICE_TEXT = Object.freeze({
-  head: (executor: string, sessionSpan: string) => `사람 세션이 턴을 끝냈다고 알려 왔어요 (${executor} ${sessionSpan})`,
+  head: (executor: string, aliasSpan: string) => `사람 세션이 턴을 끝냈다고 알려 왔어요 (${executor} 연결 ${aliasSpan})`,
   // 자기 보고라 성공·완료를 단정하지 않는다.
   unverified: '결과를 제가 확인한 건 아니에요.',
 });
-export function formatNotice(input: { executor: string; externalTaskId: string; summary: string; occurredAt: number; receivedAt: number }): string {
+// summary가 null이면 공개 검사에 걸린 요약이다. 그 글은 싣지 않고 자리 표시만 남긴다.
+export function formatNotice(input: { executor: string; connectionId: string; summary: string | null; occurredAt: number; receivedAt: number }): string {
   return [
-    EXTERNAL_NOTICE_TEXT.head(input.executor, codeSpan(input.externalTaskId)),
+    EXTERNAL_NOTICE_TEXT.head(input.executor, codeSpan(publicAlias(input.connectionId))),
     `발생 ${kstTime(input.occurredAt)} · 수신 ${kstTime(input.receivedAt)} · 지연 ${delayText(input.receivedAt - input.occurredAt)}`,
-    `요약: ${codeSpan(input.summary)}`,
+    `요약: ${input.summary === null ? PUBLIC_WITHHELD : codeSpan(input.summary)}`,
     EXTERNAL_NOTICE_TEXT.unverified,
   ].join('\n');
 }
@@ -175,7 +180,8 @@ export interface ExternalReceiverOptions {
   links: Pick<ExternalTaskLinks, 'enforceRestoreFence'>;
   // PolicyGate.authorize와 같은 뜻이다. 거부면 Denied, 정책을 못 읽으면 PolicyUnavailable을 던진다.
   // db는 처리 기한이 걸린 트랜잭션이다. gate.withDatabase(db)로 넘겨야 DB가 느릴 때 이 조회도 기한 안에서 끊긴다.
-  authorize: (owner: string, scope: Scope, db: Database) => Promise<{ revision: string }>;
+  // change·review는 요약의 공개 검사가 읽는 내부 표식의 자리다(없으면 표식 없음).
+  authorize: (owner: string, scope: Scope, db: Database) => Promise<{ revision: string } & Partial<MarkerPolicy>>;
   environment: string;
   log?: Log;
   limits?: Partial<ReceiverLimits>;
@@ -275,15 +281,19 @@ export class ExternalTaskReceiver {
       if (suspectSummary(event.summary)) return { status: 422, outcome: 'summary_rejected' };
     }
     let revision: string;
+    let summary: string | null = event.summary;
     try {
-      revision = (await this.store.atomic(store => this.options.authorize(row.owner_id, row.scope, store.db), this.deadline(budget))).revision;
+      const policy = await this.store.atomic(store => this.options.authorize(row.owner_id, row.scope, store.db), this.deadline(budget));
+      revision = policy.revision;
+      // 동의한 요약도 지금 정책의 공통 검사를 지난 것만 싣는다. 걸려도 받기는 한다(재전송을 부르지 않게). 고정 문구는 코드의 값이다.
+      if (summary !== FIXED_SUMMARY && freeTextRisk(summary, policy) !== null) summary = null;
     } catch (error) {
       if (error instanceof Denied) return { status: 403, outcome: 'scope_denied' };
       if (error instanceof PolicyUnavailable) return this.limited('unavailable', 503, 30);
       throw error;
     }
     budget?.signal.throwIfAborted();
-    return this.store.atomic(store => this.accept(store, row, event, bodySha256, revision), this.deadline(budget));
+    return this.store.atomic(store => this.accept(store, row, event, bodySha256, revision, summary), this.deadline(budget));
   }
   private parse(raw: Buffer): z.infer<typeof EventSchema> | undefined {
     try {
@@ -295,7 +305,8 @@ export class ExternalTaskReceiver {
   }
   // 수락과 outbox 생성을 한 트랜잭션으로 한다. 연결 행을 잠가 폐기·재발급·동의 변경과 직렬화한다. 잠근 뒤 상태와 시각을 다시 본다.
   // FOR NO KEY UPDATE: 그쪽의 FOR UPDATE와는 부딪히고, 게시 행을 잡을 때의 KEY SHARE와는 부딪히지 않아 수신이 게시를 미루지 않는다.
-  private async accept(store: Store, seen: ExternalConnection, event: z.infer<typeof EventSchema>, bodySha256: string, revision: string): Promise<Reply> {
+  private async accept(store: Store, seen: ExternalConnection, event: z.infer<typeof EventSchema>, bodySha256: string, revision: string,
+    summary: string | null): Promise<Reply> {
     const locked = (await store.db.query<ExternalConnection>('SELECT * FROM external_task_connections WHERE id=$1 FOR NO KEY UPDATE', [seen.id])).rows[0];
     const now = store.now();
     const row = locked ? connectionRow(locked) : undefined;
@@ -317,7 +328,7 @@ export class ExternalTaskReceiver {
       VALUES ($1,$2,$3,$4,$5,$6,$7)`, [row.id, event.event_id, bodySha256, row.key_id, event.occurred_at, now, key]);
     await store.enqueue({ key, conversation: row.conversation_id, actor: row.owner_id, scope: row.scope, revision,
       payload: { kind: 'message', channel: row.scope.channel, classification: 'safe_summary',
-        content: formatNotice({ executor: row.executor, externalTaskId: row.external_task_id, summary: event.summary, occurredAt: event.occurred_at, receivedAt: now }) } });
+        content: formatNotice({ executor: row.executor, connectionId: row.id, summary, occurredAt: event.occurred_at, receivedAt: now }) } });
     await store.db.query('UPDATE external_task_connections SET last_event_at=$2 WHERE id=$1', [row.id, now]);
     return { status: 202, outcome: 'accepted' };
   }

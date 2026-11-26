@@ -1,6 +1,7 @@
 import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { CHAT_TASK_TEXT } from '../src/chat-task-text.js';
+import { CONTROL_TEXT } from '../src/control-format.js';
 import type { PublisherConfig } from '../src/config.js';
 import type { Scope } from '../src/contracts.js';
 import { startPublisher } from '../src/main.js';
@@ -67,11 +68,11 @@ for (const colleague of [false, true]) test(`동료 스위치 ${colleague ? '켜
   assert.ok(stopped!.startsWith(CHAT_TASK_TEXT.subscriptionStopped(colleague)), stopped);
   command('model-status');
   const [, status] = await posted(2);
-  assert.match(status!, /`homelab bot` CLI|\/resume-model/);
-  for (const text of [stopped!, status!]) {
-    if (colleague) assert.doesNotMatch(text, /(^|\s)\/[a-z]/, text);
-    else assert.match(text, /\/(resume|resume-model)\b/, text);
-  }
+  // 모델 상태는 스위치와 상관없이 필요한 상태·다음 행동만 싣는 고정 안내다(O08 F7b, F-5). 스위치 배선은 stop 문구가 본다.
+  assert.ok(status!.startsWith(`${CONTROL_TEXT.running}\n`), status);
+  assert.doesNotMatch(status!, /(^|\s)\/[a-z]/, status);
+  if (colleague) assert.doesNotMatch(stopped!, /(^|\s)\/[a-z]/, stopped);
+  else assert.match(stopped!, /\/(resume|resume-model)\b/, stopped);
 });
 
 for (const colleague of [false, true]) test(`O08 F5 배선: 설정의 동료 스위치(${colleague ? '켜짐' : '꺼짐'})가 조립된 처리기 묶음의 Store까지 간다`, async () => {

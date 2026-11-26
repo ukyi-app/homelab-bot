@@ -378,8 +378,17 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
     }
     return false;
   };
-  const externalFenced = external ? externalFence() : undefined;
-  if (externalFenced) loops.push(externalFenced.then(() => {}));
+  // R08을 끈 기동은 남은 연결을 닫고 미게시 알림을 막은 뒤에 게시자를 연다. 끄기 전에 하던 '/detach'가 없어서 끄는 것만으로 닫히게 한다.
+  const externalClose = async (): Promise<boolean> => {
+    const links = new ExternalTaskLinks(store);
+    for (let attempt = 0; !stop.signal.aborted; attempt++) {
+      try { log('external_task_closed', await links.detachAll()); return true; }
+      catch (error) { log('external_task_close_failed', errorInfo(error)); await pause(Math.min(30_000, 1000 * 2 ** Math.min(attempt, 5))); }
+    }
+    return false;
+  };
+  const externalFenced = external ? externalFence() : externalClose();
+  loops.push(externalFenced.then(() => {}));
   // 기동 장벽(DECISIONS T20 기동 순서): 원장 열기·재적용(memory.open) → 예약 반영(ensure) → 첫 tick → 게시자.
   // 첫 tick이 지난 회차·12시간 넘은 대기 브리핑을 막기 전에 게시자가 그것을 보내지 않게 한다.
   let memoryOpen = false;
@@ -585,10 +594,9 @@ export async function startPublisher(config: PublisherConfig, deps: PublisherDep
         };
         // 기억·브리핑이 켜져 있으면 게시자(reconcile·deliver 모두)는 기동 장벽 뒤에 연다. 대화 수신·복구 장벽·runtime claim은 기다리지 않는다
         // (그동안 나온 답은 outbox에 쌓였다가 게시자가 열리면 나간다). 장벽은 이벤트 순서 밖에서 돌아 Gateway 이벤트를 막지 않는다.
-        // R08 복원 장벽도 같은 자리에서 게시자 앞에 선다.
-        if (!t20 && !externalFenced) publish();
-        else loops.push((async () => {
-          if (externalFenced && !await externalFenced) return;
+        // R08 복원 장벽(끈 기동은 연결 닫기)도 같은 자리에서 게시자 앞에 선다.
+        loops.push((async () => {
+          if (!await externalFenced) return;
           if (t20 && !await t20Barrier()) return;
           if (stop.signal.aborted) return;
           publish();
