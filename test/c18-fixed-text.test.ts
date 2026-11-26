@@ -8,6 +8,7 @@ import { CHANGE_NOTICE_TEXT } from '../src/change-runtime.js';
 import { commandDefinitions } from '../src/commands.js';
 import { ATTACH_COMMAND_TEXT } from '../src/external-task-commands.js';
 import { EXTERNAL_NOTICE_TEXT, formatNotice } from '../src/external-task-receiver.js';
+import { publicAlias } from '../src/public-alias.js';
 import { REVIEW_NOTICE_TEXT } from '../src/review.js';
 import { ALL_COMMANDS, COMMAND_INGRESS_TEXT, DiscordIngress } from '../src/discord.js';
 import type { ChangeCommandHandler } from '../src/change-commands.js';
@@ -36,7 +37,7 @@ const OBSERVATION = { state: 'observed' as const, reason: null, headSha: 'a'.rep
 const fixed = () => [...Object.values(DEPLOYMENT_TEXT.state), DEPLOYMENT_TEXT.scope, describeDeployment(OBSERVATION),
   REVIEW_NOTICE_TEXT.unpublished('ukyi-app/fixture', 7, 'c'.repeat(12)), REVIEW_NOTICE_TEXT.restricted('ukyi-app/fixture', 7),
   REVIEW_NOTICE_TEXT.summary('ukyi-app/fixture', 7, 'c'.repeat(12), false, 2, 1), ALERT_TEXT.relayed('firing', 2),
-  formatNotice({ executor: 'codex', externalTaskId: 'fixture-session', summary: '턴 완료', occurredAt: 0, receivedAt: 1000 }),
+  formatNotice({ executor: 'codex', connectionId: 'fixture-connection', summary: '턴 완료', occurredAt: 0, receivedAt: 1000 }),
   ...Object.values(PUBLISH_TEXT).map(text => typeof text === 'function' ? text('fixture-id') : text)];
 
 test("C18 스위치 켜짐: 변경·세션 연결 고정 문구 어디에도 '/' 명령 이름이 없다", () => {
@@ -148,7 +149,9 @@ test('C18 안전 문장: 경보는 원문을 싣지 않는다고 말하고, 리�
   assert.match(REVIEW_NOTICE_TEXT.summary('ukyi-app/fixture', 7, 'c'.repeat(12), true, 0, 0), /승인·병합 판단이 아니에요/);
   // 리뷰 요약은 숫자·리비전·고정 낱말만 받는다(모델 문장을 받을 문자열 인자가 저장소·head뿐이다).
   assert.equal(REVIEW_NOTICE_TEXT.summary.length, 6);
-  const notice = formatNotice({ executor: 'claude', externalTaskId: 'fixture-session', summary: '빌드 끝', occurredAt: 0, receivedAt: 0 });
+  const notice = formatNotice({ executor: 'claude', connectionId: 'fixture-connection', summary: '빌드 끝', occurredAt: 0, receivedAt: 0 });
   assert.ok(notice.includes(EXTERNAL_NOTICE_TEXT.unverified));
-  assert.ok(notice.includes('`fixture-session`') && notice.includes('`빌드 끝`'), '사용자 값은 코드 스팬에 둔다');
+  // 연결은 공개 별칭으로만 보인다(F-3). 별칭과 요약 모두 코드 스팬 안이다.
+  assert.ok(notice.includes(`\`${publicAlias('fixture-connection')}\``) && notice.includes('`빌드 끝`'), '사용자 값은 코드 스팬에 둔다');
+  assert.ok(!notice.includes('fixture-connection'));
 });

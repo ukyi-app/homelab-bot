@@ -1,0 +1,60 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/stop-prepare-from-supervisor",
+  "description": "감독이 자기 키로 서명해 현관에 낸 정지 준비. 정지·풀기는 현관만 낸다",
+  "status": "candidate",
+  "base": "accept/stop-prepare",
+  "changed": [
+    "message.header.sender",
+    "message.header.recipient",
+    "context.expected_recipient",
+    "keys"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "wrong_direction"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 7,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 3,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "4fe5dacfdaca08af6531e5b8a71a0a1d2e9461d01d6d93039ef99f07e1b102e1",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "stop_prepare",
+      "request_id": "00000000-0000-4000-8000-000000000023",
+      "nonce": "00000000000000000000000000000023"
+    },
+    "signature": "RaPJ-jpITWsyWe66Ahuw8GQs4okXkBEvegyVwcJ8AB-Q3aUKU-YZTgi24WqWOpRzCN_dDYyxsgCYHbcGBChDAw",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000031",
+      "stop_generation": 8
+    }
+  },
+  "signing_input": "{\"action\":\"stop_prepare\",\"body_digest\":\"4fe5dacfdaca08af6531e5b8a71a0a1d2e9461d01d6d93039ef99f07e1b102e1\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000023\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000023\",\"sender\":\"supervisor\"}"
+}

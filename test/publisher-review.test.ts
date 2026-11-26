@@ -6,6 +6,7 @@ import type { PublisherConfig } from '../src/config.js';
 import { reviewPrecondition, reviewWorkerRouted, startPublisher } from '../src/main.js';
 import type { Publisher, PublisherDeps } from '../src/main.js';
 import { loadRuntimePolicy } from '../src/policy.js';
+import { publicAlias } from '../src/public-alias.js';
 import { REVIEW_NOTICE_TEXT, ReviewPublisher, ReviewReconciler, ReviewRuntime } from '../src/review.js';
 import { REVIEW_INSTRUCTIONS_V2 } from '../src/review-input.js';
 import { Store } from '../src/store.js';
@@ -436,7 +437,8 @@ test('T17 제어 명령: owner가 알림 채널에서만 동작, 다른 채널·
   await waitFor(() => world.tasks.length === 1);
   const job = (await reviewJobs())[0]!;
   handlerCommand('review-status', NOTIFY);
-  await waitFor(() => rest.sent.some(m => m.channel === NOTIFY && m.content.includes(job.id)));
+  // 리뷰 작업은 UUID 대신 공개 별칭으로 보인다(F-4).
+  await waitFor(() => rest.sent.some(m => m.channel === NOTIFY && m.content.includes(publicAlias(job.id)) && !m.content.includes(job.id)));
   handlerCommand('review-cancel', CHAT, { target: job.id });
   await waitFor(() => rest.sent.some(m => m.channel === CHAT && m.content.includes('관리자가 알림 채널에서만')));
   const before = await count('events');

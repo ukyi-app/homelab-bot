@@ -13,9 +13,10 @@ import type { Database } from '../src/database.js';
 import { ALL_COMMANDS, COMMAND_INGRESS_TEXT, DiscordIngress } from '../src/discord.js';
 import { ATTACH_COMMAND_TEXT, ExternalTaskCommands } from '../src/external-task-commands.js';
 import type { ExternalTaskCommandHandler } from '../src/external-task-commands.js';
-import { EXTERNAL_LINK_TTL_MS, ExternalTaskLinks, OneTimeSeed } from '../src/external-task-links.js';
+import { EXTERNAL_LINK_TTL_MS, ExternalTaskLinks, OneTimeSeed, outboxKey } from '../src/external-task-links.js';
 import { EXTERNAL_NOTICE_TEXT, EXTERNAL_TASK_PATH, ExternalTaskReceiver, FIXED_SUMMARY } from '../src/external-task-receiver.js';
 import { PORTS } from '../src/http.js';
+import { publicAlias } from '../src/public-alias.js';
 import { startPublisher } from '../src/main.js';
 import type { Publisher, PublisherDeps } from '../src/main.js';
 import { Store } from '../src/store.js';
@@ -189,7 +190,29 @@ test('R08 조립 꺼짐: 리스너·명령·지표·보관 정리가 없고 /att
   assert.equal((await rows('SELECT id FROM external_task_connections')).length, 0);
   assert.deepEqual(rest.callbacks, []);
   assert.doesNotMatch(await (await fetch(`http://127.0.0.1:${p.ports.app}/metrics`)).text(), /external_task/);
-  assert.equal(logs.some(l => l.event.startsWith('external_task_') && l.event !== 'external_task_gate'), false);
+  // 끈 기동은 남은 연결 닫기(F7b) 한 번만 돈다. 닫을 것이 없으면 바꾼 것 없이 끝나고 보관 정리 루프는 없다.
+  assert.deepEqual(logs.filter(l => l.event.startsWith('external_task_') && l.event !== 'external_task_gate'),
+    [{ event: 'external_task_closed', detail: { revoked: 0, blocked: 0 } }]);
+});
+
+test('R08 조립 꺼짐: 남은 연결은 기동이 닫고 미게시 알림은 게시자가 열리기 전에 막힌다(/detach 없이 끄기만으로 풀림)', async () => {
+  await seedThread();
+  const store = new Store(database.db);
+  const links = new ExternalTaskLinks(store);
+  const link = await links.attach({ owner: OWNER, scope: SCOPE, externalTaskId: SESSION, executor: 'claude' });
+  const key = outboxKey(link.connectionId, 'event-bbbbbbbbbbbbbbbb');
+  await database.db.query(`INSERT INTO external_task_events(connection_id,event_id,body_sha256,accepted_key_id,occurred_at,received_at,outbox_key)
+    VALUES ($1,'event-bbbbbbbbbbbbbbbb',$2,$3,$4,$4,$5)`, [link.connectionId, 'b'.repeat(64), link.keyId, Date.now(), key]);
+  await store.enqueue({ key, conversation: store.scopeId(SCOPE), actor: OWNER, scope: SCOPE, revision: 'fixture-v1',
+    payload: { kind: 'message', channel: THREAD, content: 'R08 미게시 알림', classification: 'safe_summary' } });
+  await boot({});
+  await waitFor(() => logs.some(l => l.event === 'external_task_closed'));
+  assert.deepEqual(logs.find(l => l.event === 'external_task_closed')!.detail, { revoked: 1, blocked: 1 });
+  await registered();
+  await settle();
+  assert.deepEqual((await rows('SELECT revoked_reason FROM external_task_connections')).map(row => row.revoked_reason), ['detach']);
+  assert.deepEqual((await rows('SELECT state FROM outbox')).map(row => row.state), ['blocked']);
+  assert.equal(rest.sent.some(m => m.channel === THREAD), false);
 });
 
 test('R08 조립 켜짐: /attach → 8082 수신 → Discord 게시 → 해제 뒤 거절, 8080·8081에는 경로가 없고 8082에는 다른 경로가 없음', async () => {
@@ -227,7 +250,9 @@ test('R08 조립 켜짐: /attach → 8082 수신 → Discord 게시 → 해제 �
   assert.equal(accepted.status, 202);
   await waitFor(() => rest.sent.some(m => m.channel === THREAD));
   const posted = rest.sent.find(m => m.channel === THREAD)!.content;
-  assert.ok(posted.startsWith(EXTERNAL_NOTICE_TEXT.head('claude', `\`${SESSION}\``)));
+  // 원시 세션 ID·연결 ID 대신 연결의 공개 별칭이 보인다(F-3).
+  assert.ok(posted.startsWith(EXTERNAL_NOTICE_TEXT.head('claude', `\`${publicAlias(who.connectionId)}\``)));
+  assert.ok(!posted.includes(SESSION) && !posted.includes(who.connectionId));
   assert.match(posted, new RegExp(FIXED_SUMMARY));
   assert.ok(posted.includes(EXTERNAL_NOTICE_TEXT.unverified));
 

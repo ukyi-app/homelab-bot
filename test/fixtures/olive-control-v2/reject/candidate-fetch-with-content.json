@@ -1,0 +1,54 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/candidate-fetch-with-content",
+  "description": "묻기에 내용 칸을 실음. 내용은 감독의 조각 답(piece) 한 자리로만 오간다",
+  "status": "candidate",
+  "base": "accept/candidate-fetch",
+  "changed": [
+    "message.body.chunk_b64url"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "unknown_field"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "fd17509a11aabbf30e9d1c28c784c8bbdd60e030f1143adef99da8b09dea212d",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "candidate_fetch",
+      "request_id": "00000000-0000-4000-8000-000000000080",
+      "nonce": "00000000000000000000000000000080"
+    },
+    "signature": "_SbHWNhXpv0iy43PJDy05wN-Kf3dFnONvBKZQ70jYoGMLrKuACfQxcClfmww1Mvg51XPStjCDNvgunxRUhkvBg",
+    "body": {
+      "candidate_digest": "f7919ba32b7f4a663c289e59c9663c5f0a95c33439919106ad541ad1ae39e8b2",
+      "offset": 0,
+      "chunk_b64url": "YQ"
+    }
+  },
+  "signing_input": "{\"action\":\"candidate_fetch\",\"body_digest\":\"fd17509a11aabbf30e9d1c28c784c8bbdd60e030f1143adef99da8b09dea212d\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000080\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000080\",\"sender\":\"front-door\"}"
+}

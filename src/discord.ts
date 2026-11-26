@@ -22,6 +22,7 @@ import { CHANGE_DIRECT_BUTTON, pressChangeQuestion } from './change-question.js'
 import type { ChangeQuestionPress } from './change-question.js';
 import { moveReactions, ReactionSync, recordReceived, settleReactions } from './reactions.js';
 import { checkOutbound, finalPayload, OutboundRefused, sendOutbound, sentId } from './outbound.js';
+import { discordScan } from './public-check.js';
 import type { OutboundBytes, OutboundTarget } from './outbound.js';
 import { LaneClosed } from './store.js';
 import type { Delivery, OutboxButton, Store } from './store.js';
@@ -769,7 +770,7 @@ export class DiscordPublisher {
     const wait = new Promise<void>(resolve => { timer = setTimeout(resolve, REACTION_WAIT_MS); timer.unref?.(); });
     try { await Promise.race([this.reactionRound, wait]); } finally { clearTimeout(timer); }
   }
-  private async authorized(row: Delivery): Promise<void> {
+  private async authorized(row: Delivery): Promise<Policy> {
     // Alert coalescing may have replaced the scope since this delivery was claimed.
     const current = (await this.store.db.query<{ service_ids: string[] }>('SELECT service_ids FROM outbox WHERE id=$1', [row.id])).rows[0];
     if (!current) throw new Denied();
@@ -785,6 +786,7 @@ export class DiscordPublisher {
       if (row.conversation_id && !conversation?.active) throw new Denied();
       if (row.conversation_id && conversation?.gap) throw new HistoryGap();
     }
+    return policy;
   }
   // 예약 브리핑 사본은 그 예약이 지금 켜져 있을 때만 보낸다. 예약 끄기가 막지 못한 행(발송 중에 끈 뒤 429로 돌아온 행)을 여기서 막는다.
   // 이 확인 뒤에 끄기가 끝나도 발송 전 sending은 끄기가 blocked로 바꾸고 dispatch 표시가 lost로 실패한다.
@@ -805,7 +807,7 @@ export class DiscordPublisher {
     let wired = false;
     let remoteId: string | null = null;
     try {
-      await this.authorized(row);
+      const policy = await this.authorized(row);
       await this.scheduled(row);
       // 켜짐 때 저장한 버튼 글을 스위치를 끈 게시 서버가 보낸다(AC-23). 지금 스위치로 다시 고르고, 꺼짐 판이 없는 글은 막는다.
       if (!this.store.colleague) {
@@ -828,7 +830,9 @@ export class DiscordPublisher {
         ? { kind: 'discord-thread', channel: row.payload.channel, ...(row.payload.fromMessage ? { from: row.payload.fromMessage } : {}) }
         : { kind: 'discord-message', channel: row.payload.channel };
       const payload = finalPayload(target, row.payload.kind === 'thread' ? await this.threadBody(row, marker) : this.messageBody(row, marker));
-      const check = checkOutbound(payload, { policyRevision: row.policy_revision });
+      // 공개 검사는 이 행을 인가한 그 정책의 표식으로 한다. 결과는 같은 판에 묶여, 보내기 전에 판이 바뀌면 다시 검사된다.
+      // 저장된 라벨(safe_summary)은 통과 근거가 아니다. 걸리면 blocked이고 사유 코드만 감사에 남는다.
+      const check = checkOutbound(payload, { policyRevision: row.policy_revision, scan: discordScan(policy, await this.wholeMessage(row)) });
       // authorized() 뒤의 대기 사이에 커밋된 /revoke·구독 끄기는 여기서 막힌다(발송 시작 기준점, store.dispatchDelivery).
       const dispatch = await this.store.dispatchDelivery(row);
       if (dispatch === 'gap') throw new HistoryGap();
@@ -848,6 +852,12 @@ export class DiscordPublisher {
       else if (error instanceof PolicyUnavailable || error instanceof DiscordUnauthorized || error instanceof HistoryGap) {
         await this.store.pauseDelivery(row, error.message);
       } else if (error instanceof OutboundRefused && error.reason === 'policy_changed') await this.store.pauseDelivery(row, 'policy_changed');
+      else if (error instanceof OutboundRefused && error.reason === 'public_check') await this.store.atomic(async store => {
+        await store.deliveryState(row, 'blocked');
+        // 뒤 쪽은 이 쪽이 sent가 아니라 게시되지 않지만, pending으로 두면 원문 정리(끝 상태만 고른다)가 걸린 본문을 비우지 못한다.
+        await store.db.query("UPDATE outbox SET state='blocked' WHERE message_key=$1 AND page_index>$2 AND state='pending'", [row.message_key, row.page_index]);
+        await store.audit('delivery_public_check_blocked', row.id, { attempt: row.attempt });
+      });
       else if (error instanceof DiscordRejected) await this.store.atomic(async store => {
         await store.deliveryState(row, 'blocked');
         await store.audit('discord_delivery_rejected', row.id, { status: error.status });
@@ -869,11 +879,19 @@ export class DiscordPublisher {
     const policy = await this.gate.authorize(input.owner, input.scope);
     const body: DiscordEditBody = { content: input.content, allowed_mentions: { parse: [] } };
     const payload = finalPayload({ kind: 'discord-edit', channel: input.scope.channel, message: input.message }, body);
-    await sendOutbound(payload, checkOutbound(payload, { policyRevision: policy.revision }), {
+    await sendOutbound(payload, checkOutbound(payload, { policyRevision: policy.revision, scan: discordScan(policy) }), {
       revision: async () => (await this.gate.authorize(input.owner, input.scope)).revision,
       ledger: { admit: target => target.kind === 'discord-edit' ? this.store.admitEdit(target.channel, target.message) : Promise.resolve(false) },
       wire: this.rest,
     });
+  }
+  // 여러 쪽으로 나뉜 글(같은 message_key)의 모든 쪽을 차례대로 이은 원래 본문. 쪽은 원래 본문을 자른 조각이라 빈 문자열로 이으면 되살아난다.
+  // 모든 쪽이 같은 전체를 보므로 한 쪽이 걸리면 그 글의 모든 쪽이 막힌다. 한 쪽짜리 글은 undefined다.
+  private async wholeMessage(row: Delivery): Promise<string | undefined> {
+    if (row.payload.kind !== 'message') return;
+    const pages = (await this.store.db.query<{ content: string }>(`SELECT payload->>'content' AS content FROM outbox
+      WHERE message_key=$1 ORDER BY page_index`, [row.message_key])).rows;
+    return pages.length > 1 ? pages.map(page => page.content).join('') : undefined;
   }
   private async laterPageButtons(row: Delivery): Promise<OutboxButton[] | undefined> {
     if (row.payload.kind !== 'message') return;

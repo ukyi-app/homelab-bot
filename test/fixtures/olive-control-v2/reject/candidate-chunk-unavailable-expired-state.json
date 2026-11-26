@@ -1,0 +1,66 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/candidate-chunk-unavailable-expired-state",
+  "description": "줄 수 없음을 따로 나눈 상태(expired). 상태는 chunk·unavailable 둘뿐이다",
+  "status": "candidate",
+  "base": "accept/candidate-chunk-unavailable",
+  "changed": [
+    "message.body.piece.state"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "body_malformed"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": true,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {
+      "00000000-0000-4000-8000-000000000080": {
+        "action": "candidate_fetch",
+        "job": null,
+        "body": {
+          "candidate_digest": "f7919ba32b7f4a663c289e59c9663c5f0a95c33439919106ad541ad1ae39e8b2",
+          "offset": 0
+        }
+      }
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "6996b3978e3c5d97a3c27e67febb3c58fcab28bc8cda0b42aeb86b1bbd81dfe5",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "candidate_chunk",
+      "request_id": "00000000-0000-4000-8000-000000000082",
+      "nonce": "00000000000000000000000000000082"
+    },
+    "signature": "iWWKwm48INV2efxHMBO6OBUhhU08y7U0M0PZ_1nQtwMS-u4kQVzUfNXP9shdWZbss4nUQjvv1hEk_u5hBF3fBQ",
+    "body": {
+      "in_reply_to": "00000000-0000-4000-8000-000000000080",
+      "candidate_digest": "f7919ba32b7f4a663c289e59c9663c5f0a95c33439919106ad541ad1ae39e8b2",
+      "offset": 0,
+      "piece": {
+        "state": "expired"
+      }
+    }
+  },
+  "signing_input": "{\"action\":\"candidate_chunk\",\"body_digest\":\"6996b3978e3c5d97a3c27e67febb3c58fcab28bc8cda0b42aeb86b1bbd81dfe5\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000082\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000082\",\"sender\":\"supervisor\"}"
+}

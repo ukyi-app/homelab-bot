@@ -1,0 +1,51 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/input-cancel",
+  "description": "입력 취소. 정지 중(접수 닫힘)이고 감독이 정지 세대를 모르는 복원 1단계여도 받는다(세대를 싣지 않는다)",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "0bb3c9d4b35c89156e9365a854a9ed08ac8c379ae04ad07b9661929f2b2e11b2",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "input_cancel",
+      "request_id": "00000000-0000-4000-8000-000000000063",
+      "nonce": "00000000000000000000000000000063"
+    },
+    "signature": "v5ButreEfkcMXWmqg9BDKLRwZ1UMrcvpRbe_l3ahsWX3brjOHbNTXFx1-Y-9YTY5sPFNv9vJ0lONMR2DBRG6Cg",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000072",
+      "input_job_id": "00000000-0000-4000-8000-000000000070"
+    }
+  },
+  "signing_input": "{\"action\":\"input_cancel\",\"body_digest\":\"0bb3c9d4b35c89156e9365a854a9ed08ac8c379ae04ad07b9661929f2b2e11b2\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000063\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000063\",\"sender\":\"front-door\"}"
+}

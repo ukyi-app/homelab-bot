@@ -1,0 +1,63 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/publication-candidate-claims-approval",
+  "description": "모델이 만든 후보에 승인 주장 칸. 승인은 현관이 검증한 관리자 이벤트에서만 생긴다",
+  "status": "candidate",
+  "base": "accept/publication-candidate",
+  "changed": [
+    "message.body.approved"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "forbidden_field"
+  },
+  "keys": {
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": true,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 4,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "fde032c7969928f268657d8cf88888668e3cd2357f3523ac156f41f38c385d32",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "publication_candidate",
+      "request_id": "00000000-0000-4000-8000-000000000064",
+      "nonce": "00000000000000000000000000000064"
+    },
+    "signature": "XGxD0ENBla-iq3G5-jzk3ovTkAf7AUUJI_gbaTGc3fM52LtCrCJly6kdIL_M6Pf4OHhkw2vFT-Mn4ZkYHL5VAQ",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000072",
+      "kind": "pull_request",
+      "candidate_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "run_id": "00000000-0000-4000-8000-00000000007b",
+      "input_job_id": "00000000-0000-4000-8000-00000000007a",
+      "stop_generation": 8,
+      "execution_generation": 4,
+      "approved": true
+    }
+  },
+  "signing_input": "{\"action\":\"publication_candidate\",\"body_digest\":\"fde032c7969928f268657d8cf88888668e3cd2357f3523ac156f41f38c385d32\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000064\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000064\",\"sender\":\"supervisor\"}"
+}

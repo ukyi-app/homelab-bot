@@ -1,0 +1,61 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/approval-changed-unknown-state",
+  "description": "승인 상태가 목록(approved, declined, expired, invalidated) 밖",
+  "status": "candidate",
+  "base": "accept/approval-changed",
+  "changed": [
+    "message.body.state"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "body_malformed"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 7,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 3,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "97c16aad346e11ed5f3cc1c1476890b684ffcaf662881155a0721b604bc78ab7",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "approval_changed",
+      "request_id": "00000000-0000-4000-8000-000000000065",
+      "nonce": "00000000000000000000000000000065"
+    },
+    "signature": "3S8eDcp-PGEPM9wF49pkj_L6oaH_UY5NKHrb6ELUA1MNhuriKm05jVlzHGMKlhD7E5LDnFopImgY_O2g4IKaBA",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000073",
+      "stop_generation": 7,
+      "card_job_id": "00000000-0000-4000-8000-00000000007a",
+      "candidate_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "seq": 2,
+      "state": "likely_approved"
+    }
+  },
+  "signing_input": "{\"action\":\"approval_changed\",\"body_digest\":\"97c16aad346e11ed5f3cc1c1476890b684ffcaf662881155a0721b604bc78ab7\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000065\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000065\",\"sender\":\"front-door\"}"
+}

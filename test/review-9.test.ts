@@ -1,6 +1,7 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DEFAULTS } from '../src/contracts.js';
+import { CONTROL_TEXT } from '../src/control-format.js';
 import type { Database } from '../src/database.js';
 import { DiscordIngress, DiscordPublisher, deliveryMarker } from '../src/discord.js';
 import type { DiscordRest } from '../src/discord.js';
@@ -42,7 +43,8 @@ test('4316750293 제어 결과·일반 문장 모두 끝 줄 marker 유지', asy
   await queue(); await f.ingress.receive(event('status', { kind: 'command', command: 'model-status', text: '' }));
   await f.runtime.tick();
   while (await f.publisher.deliver()) { /* 제어 결과와 모델 결과를 모두 보낸다 */ }
-  const control = f.rest.messages.find(message => message.body.content.startsWith('모델 호출: 정상\n'))!;
+  // 모델 상태는 필요한 상태·다음 행동만 싣는 고정 안내다(F-5).
+  const control = f.rest.messages.find(message => message.body.content.startsWith(`${CONTROL_TEXT.running}\n`))!;
   assert.ok(control.body.content.endsWith(`\n-# ref:${control.body.nonce}`));
   // 대화 답은 라벨 없는 reply 문장이다(C11). fixture 기본 답은 '조회 전이에요.'다.
   const answer = f.rest.messages.find(message => message.body.content.startsWith('조회 전이에요.'))!;

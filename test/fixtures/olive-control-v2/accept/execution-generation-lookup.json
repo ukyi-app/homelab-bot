@@ -1,0 +1,48 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/execution-generation-lookup",
+  "description": "실행 세대를 모르는 현관(첫 설치, 기록 유실)이 감독의 지금 실행 세대를 묻는다. 세대 없이, 정책이 어긋난 연결과 닫힌 접수에서도 받는다",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "policy_mismatch",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "execution_generation_lookup",
+      "request_id": "00000000-0000-4000-8000-000000000069",
+      "nonce": "00000000000000000000000000000069"
+    },
+    "signature": "smP7KIv7QOL4I1DR_8tjykHp-eRXUN7WmRAFSYOABDyQpACVsYIIRQHUTB-ADnzPYsnQfbJGlXd3Aw1a-7zyDA",
+    "body": {}
+  },
+  "signing_input": "{\"action\":\"execution_generation_lookup\",\"body_digest\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000069\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000069\",\"sender\":\"front-door\"}"
+}

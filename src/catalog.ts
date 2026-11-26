@@ -1,7 +1,7 @@
 import type { QueryTemplate, Service } from './read.js';
 
 // 읽기 서비스·질의 템플릿은 코드에 둔다(공개 가능한 값만). 어떤 서비스를 실제로 열지는 런타임 정책의
-// services(Infisical)가 정한다. 새 서비스는 이 목록과 정책 둘 다에 넣어야 읽힌다.
+// services(Infisical)가 정한다. 새 서비스는 이 목록과 정책 둘 다에 넣어야 읽힌다. 글에 싣는 이름은 템플릿의 label(공개 표시명)이다.
 // datasource는 transport 경로 이름이다: kubernetes(SA bot-reader, Deployment·StatefulSet),
 // argocd(같은 SA로 Kubernetes API의 Argo CD Application CR, D9), Grafana 데이터소스 uid
 // victoriametrics·victorialogs(platform/observability/stack/grafana/datasources.yaml).
@@ -12,15 +12,15 @@ export const SERVICES: readonly Service[] = Object.freeze([
 ]);
 export const TEMPLATES: readonly QueryTemplate[] = Object.freeze([
   { id: 'homelab-bot-deployment', service: 'homelab-bot', datasource: 'kubernetes', namespace: 'app-homelab-bot', kind: 'status',
-    query: 'deployment/homelab-bot', maxWindowSeconds: 300, maxRows: 1, maxBytes: 4096 },
+    query: 'deployment/homelab-bot', maxWindowSeconds: 300, maxRows: 1, maxBytes: 4096, label: '배포 상태' },
   { id: 'homelab-bot-argocd', service: 'homelab-bot', datasource: 'argocd', namespace: 'app-homelab-bot', kind: 'status',
-    query: 'homelab-bot', maxWindowSeconds: 300, maxRows: 1, maxBytes: 4096 },
+    query: 'homelab-bot', maxWindowSeconds: 300, maxRows: 1, maxBytes: 4096, label: '배포 동기화 상태' },
   { id: 'homelab-bot-available', service: 'homelab-bot', datasource: 'victoriametrics', namespace: 'app-homelab-bot', kind: 'metrics',
     query: 'kube_deployment_status_replicas_available{namespace="app-homelab-bot",deployment="homelab-bot"}',
-    maxWindowSeconds: 3600, maxRows: 10, maxBytes: 8192 },
+    maxWindowSeconds: 3600, maxRows: 10, maxBytes: 8192, label: '사용 가능한 파드 수' },
   // 로그 스트림 필드는 {container, namespace, pod, stream}이라 namespace 스트림 선택자로 이 앱 로그만 고른다(실측).
   { id: 'homelab-bot-logs', service: 'homelab-bot', datasource: 'victorialogs', namespace: 'app-homelab-bot', kind: 'logs',
-    query: '{namespace="app-homelab-bot"}', maxWindowSeconds: 3600, maxRows: 100, maxBytes: 65536 },
+    query: '{namespace="app-homelab-bot"}', maxWindowSeconds: 3600, maxRows: 100, maxBytes: 65536, label: '최근 로그' },
 ]);
 // Kubernetes transport가 읽을 수 있는 Argo CD Application 이름. argocd 템플릿의 query(앱 이름)만이다.
 export const ARGOCD_APPLICATIONS: readonly string[] = Object.freeze(TEMPLATES.filter(t => t.datasource === 'argocd').map(t => t.query));

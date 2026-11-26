@@ -1,0 +1,54 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/publication-changed",
+  "description": "게시의 변화: 현관이 게시를 마쳤다(그 게시의 첫 사실, seq 1). 바깥의 사실이라 세대를 싣지 않고 정지 중에도 받는다",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "1cfc00b8856cbce3c6fda9095d50293f93e9901a5f3400283ae18d0c0414eb28",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "publication_changed",
+      "request_id": "00000000-0000-4000-8000-000000000067",
+      "nonce": "00000000000000000000000000000067"
+    },
+    "signature": "-xDI0F59JWvOPwQ51jgIh8XS8pWU9OgZQmB6tnWz43cBfIQe2GyeIDQeY1zyUSftOEQcQuFD10TAXWw07va0BA",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000074",
+      "publication_job_id": "00000000-0000-4000-8000-00000000007b",
+      "candidate_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "seq": 1,
+      "state": "posted"
+    }
+  },
+  "signing_input": "{\"action\":\"publication_changed\",\"body_digest\":\"1cfc00b8856cbce3c6fda9095d50293f93e9901a5f3400283ae18d0c0414eb28\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000067\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000067\",\"sender\":\"front-door\"}"
+}

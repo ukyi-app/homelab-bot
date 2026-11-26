@@ -1,0 +1,56 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/stop-prepare-generation-missing",
+  "description": "정지 세대 칸이 없는 정지 준비",
+  "status": "candidate",
+  "base": "accept/stop-prepare",
+  "changed": [
+    "message.body.stop_generation"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "generation_missing"
+  },
+  "keys": {
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 7,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 3,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "6780e372102ab41137738fb688f41b28ff01de61a1ff5bea6bd3e60313cd5016",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "stop_prepare",
+      "request_id": "00000000-0000-4000-8000-000000000023",
+      "nonce": "00000000000000000000000000000023"
+    },
+    "signature": "v3AsthRih-uKrxVrgbn8v0fY5HREaL4XsMlCwCuHKERych0aJcvXkPP8NgagqnMBeY-pWobHd6TK0ARToB8RCQ",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000031"
+    }
+  },
+  "signing_input": "{\"action\":\"stop_prepare\",\"body_digest\":\"6780e372102ab41137738fb688f41b28ff01de61a1ff5bea6bd3e60313cd5016\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000023\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000023\",\"sender\":\"front-door\"}"
+}

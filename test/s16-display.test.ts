@@ -4,7 +4,8 @@ import { randomUUID } from 'node:crypto';
 import { DEFAULTS, SYSTEM_INSTRUCTIONS, SYSTEM_INSTRUCTIONS_V2 } from '../src/contracts.js';
 import { chatPrompt } from '../src/chat-lane.js';
 import { CHAT_TASK_TEXT as T } from '../src/chat-task-text.js';
-import { controlText } from '../src/control-format.js';
+import { CONTROL_TEXT, controlText } from '../src/control-format.js';
+import { publicAlias } from '../src/public-alias.js';
 import { readSummary } from '../src/read.js';
 import type { ReadResult } from '../src/read.js';
 import { event, fixture, localDatabase, service, template, thread } from './helpers.js';
@@ -93,7 +94,9 @@ test('S16 제어 결과: /list는 JSON이 아니라 짧은 한국어 목록', as
   const content = await control('list');
   assert.throws(() => JSON.parse(content));
   assert.equal(job.state, 'failed');
-  assert.ok(content.startsWith(`작업 1건\n- \`${job.id}\` 실패`), content);
+  // 작업 UUID는 공개 별칭으로만 보인다(F-4).
+  assert.ok(content.startsWith(`작업 1건\n- \`${publicAlias(job.id)}\` 실패`), content);
+  assert.ok(!content.includes(job.id), content);
 });
 
 test('S16 제어 결과: stop·resume·cancel·retry·model-status·없는 목록도 사람이 읽는 문장', async () => {
@@ -109,9 +112,8 @@ test('S16 제어 결과: stop·resume·cancel·retry·model-status·없는 목�
   assert.equal(retry, T.controlFailed(false, T.retryRefused));
   const status = await control('model-status');
   assert.throws(() => JSON.parse(status));
-  assert.match(status, /^모델 호출: 정상\n비상 정지: 꺼짐\n실행 중이거나 끝났는지 모르는 작업: 없음\n한도·인증 대기: 없음\n/);
-  assert.ok(status.endsWith(T.modelStatus(false)));
-  assert.match(status, /\/resume-model target:emergency-stop/);
+  // 모델 상태는 필요한 상태·다음 행동만 싣는다(F-5). 멈춘 것이 없으면 그 한 줄이다.
+  assert.equal(status, CONTROL_TEXT.running);
   for (const content of [empty, cancel, retry, status]) assert.ok(!content.startsWith('{'));
 });
 
@@ -119,20 +121,22 @@ test('S16 제어 결과 형식: 대기 목록·리뷰 목록·정지 표시·많
   const id = '1c841086-0000-4000-8000-000000000000';
   assert.equal(controlText('model-status', { paused: true, emergency: true, executionPending: true,
     waiting: [{ id, wait_reason: 'model_limit' }], status: '안내' }),
-  `모델 호출: 멈춤\n비상 정지: 켜짐\n실행 중이거나 끝났는지 모르는 작업: 있음\n한도·인증 대기 1건\n- \`${id}\` 모델 사용 한도\n안내`);
+  [CONTROL_TEXT.emergency, CONTROL_TEXT.waiting(1), CONTROL_TEXT.executionPending].join('\n'));
   assert.equal(controlText('review-status', { ok: true, jobs: [{ id, state: 'waiting_user', wait_reason: 'auth_expired', target: { x: 1 } }], status: '안내' }),
-    `리뷰 작업 1건\n- \`${id}\` 확인 기다림(모델 인증 만료)\n안내`);
+    `리뷰 작업 1건\n- \`${publicAlias(id)}\` 확인 기다림(모델 인증 만료)\n안내`);
   assert.equal(controlText('review-status', { ok: true, jobs: [], status: '안내' }), '리뷰 작업: 없음\n안내');
   assert.equal(controlText('resume-model', { ok: true, paused: true, status: '재개했습니다.' }), '재개했습니다.');
   assert.equal(controlText('emergency-stop', { status: '새 모델 호출 차단' }), '새 모델 호출 차단');
   const many = Array.from({ length: 25 }, (_, i) => ({ id: `job-${i}`, state: 'succeeded', wait_reason: null }));
   const text = controlText('list', many);
   assert.ok(text.startsWith('작업 25건(최근 20건만 표시)\n'));
-  assert.ok(!text.includes('`job-4`')); assert.ok(text.includes('`job-5`')); assert.ok(text.endsWith('`job-24` 완료'));
-  // 모르는 상태·사유 코드는 버리지 않고 그대로 보인다.
-  assert.equal(controlText('list', [{ id: 'job-x', state: 'future_state', wait_reason: 'future_reason' }]), '작업 1건\n- `job-x` future_state(future_reason)');
-  // 모르는 모양은 정보를 버리지 않고 JSON 그대로 둔다(새 제어를 더하고 형식을 잊어도 답이 비지 않게).
-  assert.equal(controlText('future', { odd: 1 }), '{"odd":1}');
+  const span = (job: string) => `\`${publicAlias(job)}\``;
+  assert.ok(!text.includes(span('job-4'))); assert.ok(text.includes(span('job-5'))); assert.ok(text.endsWith(`${span('job-24')} 완료`));
+  // 모르는 상태·사유 코드는 내부 이름이라 싣지 않고 고정 문구로 적는다(F-5).
+  assert.equal(controlText('list', [{ id: 'job-x', state: 'future_state', wait_reason: 'future_reason' }]),
+    `작업 1건\n- ${span('job-x')} ${CONTROL_TEXT.unknownState}(${CONTROL_TEXT.unknownState})`);
+  // 모르는 모양은 답이 비지 않게 고정 안내로 답하되, 원래 값(JSON)은 싣지 않는다(내부 ID가 섞일 수 있다).
+  assert.equal(controlText('future', { odd: 1 }), CONTROL_TEXT.unknownResult);
 });
 
 test('S16 read 요약: 시간창·관측 시각을 ISO-8601 UTC 초 단위로', () => {
