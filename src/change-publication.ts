@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { ChangeBriefSchema, CommandIdSchema, EvidenceBundleSchema, GenerationSchema, PublicMetadataSchema, ProvenanceLabelSchema, REVIEW_RISK_CATEGORIES, ChangeIdSchema, labelAllowsAuthorInput, parseChangeBranch, propagateLabel } from './change-contracts.js';
+import { ChangeBriefSchema, CommandIdSchema, EvidenceBundleSchema, GenerationSchema, PublicMetadataSchema, ProvenanceLabelSchema, REVIEW_RISK_CATEGORIES, ChangeIdSchema, changeIdPrefix, labelAllowsAuthorInput, parseChangeBranch, propagateLabel } from './change-contracts.js';
 import type { AmendmentKey, ArtifactFile, ChangeBrief, ChangeKey, ChangeNote, EvidenceBundle, ProvenanceLabel, PublicMetadata } from './change-contracts.js';
 import { CHANGE_NOTE_LIMITS, ChangeNoteSchema } from './task-contracts.js';
 import type { Database } from './database.js';
@@ -48,6 +48,9 @@ const requireTrace = (key: ChangeKey, branch: string): string => {
   if (id === null) throw new Error('change_branch_invalid');
   return id;
 };
+// change 하나의 공개 금지 값: change ID 전체와 앞 8자. 처음 게시·수정 차례의 PR 글·커밋·경로·파일 바이트와 안내 댓글 검사가 모두 이 목록을 더한다.
+// 정책·검증기 판은 여기 넣지 않는다. 검증기 판은 봇 소스의 고정 문자열이라 파일 바이트에 넣으면 봇 저장소를 고치는 변경이 막힌다(PR 글 검사에만 더한다).
+export const changeMarkers = (key: Pick<ChangeKey, 'changeId'>): string[] => [key.changeId, changeIdPrefix(key.changeId)];
 // 대조용 표식이다. 제목·Discord ID·change ID를 넣지 않는다.
 export const publicationMarker = (key: ChangeKey, branch: string): string => `homelab-bot-change:${requireTrace(key, branch)}`;
 // 공개 ID와 내부 값의 대응. 감사 행의 detail로만 남긴다(PR 본문·커밋에는 싣지 않는다).
@@ -139,8 +142,8 @@ export function renderPublication(raw: PublicationInput, scan: ScanPolicy): Publ
   if (title.length > 256 || candidate.body.length > 16000 || commitMessage.length > 4000) return { ok: false, reason: 'publication_too_long' };
   const publication = PublicMetadataSchema.safeParse(candidate);
   if (!publication.success) return { ok: false, reason: 'publication_invalid' };
-  // 내부 판·digest와 change ID가 공개 글 어디에도 남지 않게 이 PR의 값도 표식으로 본다. 새 꼴 브랜치 이름에는 change ID가 없다.
-  const internal = [input.key.changeId, input.bundle.policyRevision, input.bundle.verifierRevision, input.bundle.artifactDigest].filter(value => value.length >= 8);
+  // 내부 판·digest와 change ID(앞 8자 포함)가 공개 글 어디에도 남지 않게 이 PR의 값도 표식으로 본다. 새 꼴 브랜치 이름에는 change ID가 없다.
+  const internal = [...changeMarkers(input.key), input.bundle.policyRevision, input.bundle.verifierRevision, input.bundle.artifactDigest].filter(value => value.length >= 8);
   const scanned = scanPublicPayload({ paths: [], files: [], publication: publication.data, branch: input.branch, marker }, { internalMarkers: [...scan.internalMarkers, ...internal] });
   if (!scanned.ok) return { ok: false, reason: scanned.reason };
   return { ok: true, publication: publication.data, marker };

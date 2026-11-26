@@ -4,13 +4,19 @@ import { readFile, readdir } from 'node:fs/promises';
 import { PGlite } from '@electric-sql/pglite';
 import { newChangeBranchName, newChangeId } from '../src/change-contracts.js';
 import type { ChangeKey, PublicMetadata } from '../src/change-contracts.js';
-import { guidanceKey } from '../src/change-guidance.js';
+import { ChangeGuidance, guidanceKey, recordChangeNotes } from '../src/change-guidance.js';
+import type { ChangeNotes } from '../src/change-guidance.js';
+import { ChangePublisher } from '../src/change-publisher.js';
+import { ChangeRuntime } from '../src/change-runtime.js';
+import type { ChangeRuntimeDeps } from '../src/change-runtime.js';
+import type { ChangeStore } from '../src/change-store.js';
 import { PublicReceipts, changeTraceId, publicTraceId, publicationMarker, renderPublication, scanPublicPayload } from '../src/change-publication.js';
 import { MIGRATIONS } from '../src/database.js';
 import type { Database } from '../src/database.js';
 import { createGitHubWriter } from '../src/github-writer.js';
 import { guidanceMarker } from '../src/github-review-io.js';
 import { DEFAULT_CHANGES, FAKE_APP_KEY, FIXTURE_TIME, FakeGitHub, REPO, publishEnv } from './change-github-fake.js';
+import type { FileChange, PublishEnv } from './change-github-fake.js';
 import { OWNER, fixtureBrief, fixtureBundle, newEvent, ok, pinnedBranch, seedConversation } from './change-store-fixture.js';
 import { localDatabase } from './helpers.js';
 
@@ -79,7 +85,7 @@ test('D-122 정적: src에서 변경 브랜치 이름을 만드는 곳은 newCha
   assert.match(makers[0]!, /^change-contracts\.ts:/);
   const store = await readFile('src/change-store.ts', 'utf8');
   const insert = store.slice(store.indexOf('INSERT INTO change_generations'));
-  assert.match(insert.slice(0, 400), /newChangeBranchName\(\)/, '세대 행의 이름은 새 꼴로만 만든다');
+  assert.match(insert.slice(0, 400), /newChangeBranchName\(request\.id\)/, '세대 행의 이름은 새 꼴로만 만들고 그 change ID의 앞부분을 품은 이름은 다시 뽑는다');
   const contracts = await readFile('src/change-contracts.ts', 'utf8');
   assert.doesNotMatch(contracts, /export (?:function|const) changeBranchName\b/);
 });
@@ -221,4 +227,221 @@ test('D-122 옛 꼴: 030 전에 만든 옛 이름 세대는 새 공개 글을 �
     assert.equal(env.github.mutations().length, 0);
     assert.equal(ok(await env.store.get(key.changeId)).phase, 'blocked');
   } finally { await pg.close(); }
+});
+
+// ---- 030으로 넘어온 옛 꼴 세대(리뷰 재현 입력) ----
+
+// 030 전 코드가 만든 옛 꼴 세대를 흉내 낸다. 세대 행은 만든 뒤 고칠 수 없어 이 store 인스턴스의 pinBase만 한 번 옛 꼴 INSERT로 바꿔 끼운다.
+async function legacyReview(env: PublishEnv, key: ChangeKey, changes: FileChange[] = DEFAULT_CHANGES, patch?: string) {
+  const legacy = `bot/change/${key.changeId}/g${key.generation}`;
+  const store = env.store as ChangeStore & { pinBase: ChangeStore['pinBase'] };
+  store.pinBase = async input => {
+    await env.db.query(`INSERT INTO change_generations(change_id,generation,repo_id,base_branch,branch,base_commit,base_tree,policy_revision,created_at)
+      SELECT id,generation,repo_id,base_branch,$2,$3,$4,policy_revision,$5 FROM change_requests WHERE id=$1`, [input.changeId, legacy, input.baseCommit, input.baseTree, env.clock.now]);
+    await env.db.query("UPDATE change_requests SET phase='authoring',updated_at=$2 WHERE id=$1", [input.changeId, env.clock.now]);
+    return env.store.generationRecord(input);
+  };
+  try {
+    const review = await env.driveToReview(key, changes, patch === undefined ? {} : { patch });
+    assert.equal(ok(await env.store.generationRecord(key)).branch, legacy);
+    return { legacy, review };
+  } finally { delete (store as Partial<typeof store>).pinBase; }
+}
+// 030 전 코드가 승인한 옛 꼴 세대: 본문·커밋의 추적 ID와 표식이 옛 값이다.
+async function legacyApproved(env: PublishEnv, key: ChangeKey, options: { changes?: FileChange[]; patch?: string; notes?: ChangeNotes } = {}) {
+  const { legacy } = await legacyReview(env, key, options.changes, options.patch);
+  if (options.notes) assert.equal(await recordChangeNotes(env.db, key, options.notes), 'recorded');
+  const placeholder = newChangeBranchName();
+  const rendered = renderPublication({ key, label: 'public', brief: ok(await env.store.get(key.changeId)).brief!, bundle: ok(await env.store.evidenceBundle(key)), branch: placeholder,
+    verifications: [{ commandId: 'smoke-unit', status: 'passed' }], review: { verdict: 'pass', risks: [] }, identity: env.policy.current!.identity, at: FIXTURE_TIME, ...options.notes }, { internalMarkers: [] });
+  assert.equal(rendered.ok, true, JSON.stringify(rendered));
+  const publication = JSON.parse(JSON.stringify((rendered as Extract<typeof rendered, { ok: true }>).publication).replaceAll(changeTraceId(key, placeholder)!, changeTraceId(key, legacy)!)) as PublicMetadata;
+  const prepared = ok(await env.store.prepareApproval({ ...key, publication, ciFingerprint: env.policy.current!.ci.approvedFingerprint! }));
+  ok(await env.store.approve({ ...key, approvalDigest: prepared.digest, eventId: newEvent(), actor: OWNER }));
+  return { legacy, publication };
+}
+type EffectRow = { stage: string; state: string; request_digest: string; expected: unknown; result: unknown };
+const json = (value: unknown) => typeof value === 'string' ? JSON.parse(value) as unknown : value;
+
+test('D-122 옛 꼴 재개(029에서 blob 확정·tree 미룸): 030은 tree·commit을 보내지 않고 blocked(branch_read_only)로 닫으며 안 나간 tree는 해소된다', async () => {
+  const { db, pg } = await localDatabase();
+  try {
+    const env = await publishEnv(db);
+    // 같은 파일·base의 새 꼴 change로 029가 남겼을 effect 값(blob·tree 요청 digest와 기대값)을 만든다. blob·tree 값은 브랜치 이름과 무관하다.
+    const twin = await env.approve();
+    env.github.fail(/POST .*\/git\/trees$/, 'refused');
+    assert.equal((await env.publisher.publish(twin)).kind, 'deferred');
+    const rows = (await db.query<EffectRow>('SELECT stage,state,request_digest,expected,result FROM change_delivery_effects WHERE change_id=$1', [twin.changeId])).rows;
+    assert.deepEqual(rows.map(row => `${row.stage}:${row.state}`).sort(), ['blob:confirmed', 'tree:pending']);
+    const key = await env.newRequest();
+    await legacyApproved(env, key);
+    // 029의 게시 흐름처럼 publishing으로 옮기고 blob은 보내 확정, tree는 의도만 남긴다.
+    ok(await env.store.transition({ ...key, from: 'approved', to: 'publishing', reason: null }));
+    for (const stage of ['blob', 'tree'] as const) {
+      const row = rows.find(item => item.stage === stage)!;
+      ok(await env.store.recordEffectIntent({ ...key, stage, requestDigest: row.request_digest, expected: json(row.expected) as never }));
+      if (row.state !== 'confirmed') continue;
+      const claim = ok(await env.store.claimEffect({ ...key, stage }));
+      ok(await env.store.confirmEffect({ ...key, stage, leaseId: claim.leaseId, result: json(row.result) as never }));
+    }
+    env.clock.now += 900_000;
+    const before = env.github.mutations().length;
+    const outcome = await env.newPublisher().publish(key);
+    const writes = env.github.mutations().slice(before).map(item => item.path.split('/').at(-1));
+    assert.deepEqual(writes, [], 'old generation should need reads only');
+    assert.deepEqual(outcome, { kind: 'blocked', reason: 'branch_read_only' });
+    assert.equal(ok(await env.store.get(key.changeId)).phase, 'blocked');
+    // 확실히 안 나간 tree는 사람 해소 없이 안 나간 것으로 끝난다(정리·새 세대를 막지 않는다).
+    assert.deepEqual(await env.store.unresolvedEffects({ changeId: key.changeId }), []);
+    // 다시 불러도 쓰기가 없다.
+    await env.newPublisher().publish(key);
+    assert.equal(env.github.mutations().length, before);
+  } finally { await pg.close(); }
+});
+
+test('D-122 옛 꼴 PR 안내(029에서 게시 끝, 안내 전): 새 차례·pending은 보내지 않고 닫고, sending·unknown만 옛 키로 찾아 회수한다', async () => {
+  const { db, pg } = await localDatabase();
+  try {
+    const env = await publishEnv(db);
+    const patch = ['diff --git a/src/a.ts b/src/a.ts', '--- a/src/a.ts', '+++ b/src/a.ts', '@@ -1 +1 @@', '-old', '+new', ''].join('\n');
+    const notes = { checks: [{ text: '확인', location: { path: 'src/a.ts', line: 1 } }], risks: [] };
+    const headSha = 'c'.repeat(40);
+    const found: string[] = [];
+    let posts = 0;
+    const guidance = new ChangeGuidance({ db, changes: env.store, now: () => env.clock.now, policy: async () => env.policy.current, limit: async () => 5,
+      port: { post: async () => { posts++; return { kind: 'confirmed', value: { id: 50 } }; }, find: async input => { found.push(input.key); return { id: 51 }; } } });
+    for (const state of [null, 'pending', 'sending', 'unknown'] as const) {
+      const key = await env.newRequest();
+      const { publication } = await legacyApproved(env, key, { patch, notes });
+      if (state) await db.query('INSERT INTO change_guidance(change_id,generation,round,head_sha,state,created_at,updated_at) VALUES ($1,$2,0,$3,$4,$5,$5)', [key.changeId, key.generation, headSha, state, env.clock.now]);
+      const outcome = await guidance.post({ key, round: 0, repoId: REPO.id, pr: 7, headSha, patch, ...notes, approvedBody: publication.body });
+      if (state === null || state === 'pending') assert.deepEqual([outcome.state, outcome.reason], ['skipped', 'branch_read_only'], String(state));
+      else {
+        assert.deepEqual([outcome.state, outcome.reviewId], ['posted', 51], state);
+        assert.equal(found.at(-1), `${key.changeId}:g${key.generation}:r0`, '회수는 이미 낸 옛 표식으로 찾는다');
+      }
+    }
+    assert.equal(posts, 0, 'old proposed guidance should need reads only');
+  } finally { await pg.close(); }
+});
+
+test('D-122 승인 준비 중인 옛 꼴 세대: 런타임 첫 시도에 blocked(branch_read_only)로 닫고 다시 준비하지 않는다', async () => {
+  const { db, pg } = await localDatabase();
+  try {
+    const env = await publishEnv(db);
+    const key = await env.newRequest();
+    const { review } = await legacyReview(env, key);
+    let prepares = 0;
+    const publisher = env.newPublisher();
+    const counted = Object.assign(Object.create(publisher) as ChangePublisher, { prepareApproval: (...args: Parameters<ChangePublisher['prepareApproval']>) => { prepares++; return publisher.prepareApproval(...args); } });
+    const logs: string[] = [];
+    const runtime = new ChangeRuntime({ store: { db, now: () => env.clock.now }, changes: env.store, publisher: counted, gate: { authorize: async () => {} },
+      review: { fetchReceipt: async () => review }, log: (event: string, fields: Record<string, unknown> = {}) => logs.push(`${event}/${String(fields.reason ?? fields.message ?? '')}`) } as unknown as ChangeRuntimeDeps);
+    const step = runtime as unknown as { guarded(request: unknown, run: () => Promise<boolean>): Promise<boolean>; publishStep(request: unknown): Promise<boolean> };
+    for (let tick = 0; tick < 2; tick++) {
+      const request = ok(await env.store.get(key.changeId));
+      await step.guarded(request, () => step.publishStep(request));
+      env.clock.now += 600_000;
+    }
+    const row = (await db.query<{ phase: string; phase_reason: string | null }>('SELECT phase,phase_reason FROM change_requests WHERE id=$1', [key.changeId])).rows[0]!;
+    assert.deepEqual([row.phase, row.phase_reason], ['blocked', 'branch_read_only'], logs.join(','));
+    assert.equal(prepares, 1);
+  } finally { await pg.close(); }
+});
+
+test('D-122 옛 꼴 수정 차례: 남은 stage를 보내지 않고 pending을 해소해 failed로 닫고, 보냈을 수 있는 ref만 읽기로 회수한다', async () => {
+  const key = { changeId: newChangeId(), generation: 1, round: 1 };
+  const legacy = `bot/change/${key.changeId}/g1`;
+  const baseCommit = 'a'.repeat(40);
+  const mine = 'd'.repeat(40);
+  const generation = { changeId: key.changeId, generation: 1, repoId: REPO.id, baseBranch: 'main', branch: legacy, baseCommit, baseTree: 'b'.repeat(40), policyRevision: 'fixture-policy', resultTree: null, artifactDigest: null, verifierRevision: null, fixRound: 0 };
+  const effect = (stage: string, state: string, expected: Record<string, unknown> = {}) => ({ ...key, stage, state, expected: { stage, ...expected }, resolution: null, blockedReason: null, result: null });
+  const run = async (effects: ReturnType<typeof effect>[], head: string | null) => {
+    const calls: string[] = [];
+    const abandoned: string[] = [];
+    const confirmed: string[] = [];
+    const writer = new Proxy({}, { get: (_target, name) => async () => {
+      calls.push(String(name));
+      if (name === 'readBranchHead') return head === null ? null : { sha: head };
+      return String(name).startsWith('read') ? null : { kind: 'not_sent', code: 'unexpected' };
+    } });
+    const impl: Record<string, unknown> = {
+      expireSendingAmendmentEffects: async () => [], amendmentEffects: async () => effects, generationRecord: async () => ({ ok: true, value: generation }),
+      amendment: async () => ({ ok: true, value: { baseCommit } }),
+      confirmAmendmentEffect: async (input: { stage: string }) => { confirmed.push(input.stage); return { ok: true, value: {} }; },
+      abandonUnsentAmendmentEffect: async (input: { stage: string }) => { abandoned.push(input.stage); return { ok: true, value: {} }; },
+    };
+    // 옛 꼴에서 쓰기 준비(정책·산출물·공개 검사)로 들어가면 여기서 드러난다.
+    const store = new Proxy(impl, { get: (target, name) => name in target ? target[name as string] : () => { throw new Error(`unexpected_store_call:${String(name)}`); } });
+    const publisher = new ChangePublisher({ store: store as unknown as ChangeStore, receipts: new PublicReceipts(), writer: writer as never, preflight: writer as never, policy: async () => null, authorize: async () => {} });
+    const outcome = await publisher.publishAmendment(key, { pullOpen: async () => true });
+    return { outcome, writes: calls.filter(name => !/^(read|find)/.test(name)), abandoned, confirmed };
+  };
+  // 029에서 blob만 확정하고 tree가 미룬 채 남았다.
+  const pendingTree = await run([effect('blob', 'confirmed', { shas: [] }), effect('tree', 'pending', { baseTree: 'b'.repeat(40), treeSha: 'e'.repeat(40) })], baseCommit);
+  assert.deepEqual(pendingTree, { outcome: { kind: 'failed', reason: 'branch_read_only' }, writes: [], abandoned: ['tree'], confirmed: [] });
+  // fast-forward 응답을 잃었고 브랜치가 이미 내 커밋이다.
+  const lostRef = await run([effect('blob', 'confirmed'), effect('tree', 'confirmed'), effect('commit', 'confirmed'), effect('ref', 'unknown', { ref: `refs/heads/${legacy}`, sha: mine })], mine);
+  assert.deepEqual(lostRef, { outcome: { kind: 'committed', commitSha: mine }, writes: [], abandoned: [], confirmed: ['ref'] });
+  // 아직 base 그대로라 보냈는지 모른다. 실패로 닫지 않고 대조를 기다린다.
+  const unknownRef = await run([effect('commit', 'confirmed'), effect('ref', 'unknown', { ref: `refs/heads/${legacy}`, sha: mine })], baseCommit);
+  assert.deepEqual(unknownRef, { outcome: { kind: 'unknown', stage: 'ref' }, writes: [], abandoned: [], confirmed: [] });
+});
+
+test('D-122 change별 금지 값: 경로·파일 바이트에 change ID 앞 8자가 있으면 영수증을 발급하지 않고 아무것도 보내지 않는다', async () => {
+  const { db, pg } = await localDatabase();
+  try {
+    const env = await publishEnv(db);
+    const cases: [string, (prefix: string) => FileChange][] = [
+      ['파일 바이트', prefix => ({ path: 'src/trace.ts', kind: 'added', content: `export const t = '${prefix}';\n` })],
+      ['경로', prefix => ({ path: `src/${prefix}.ts`, kind: 'added', content: 'export const t = 1;\n' })],
+    ];
+    for (const [label, planted] of cases) {
+      const key = await env.newRequest();
+      const review = await env.driveToReview(key, [...DEFAULT_CHANGES, planted(key.changeId.slice(0, 8))]);
+      const prepared = await env.publisher.prepareApproval(key, { review, at: FIXTURE_TIME });
+      assert.equal(prepared.ok, true, label);
+      ok(await env.store.approve({ ...key, approvalDigest: (prepared as { digest: string }).digest, eventId: newEvent(), actor: OWNER }));
+      const before = env.github.mutations().length;
+      assert.deepEqual(await env.publisher.publish(key), { kind: 'blocked', reason: 'internal_marker' }, label);
+      assert.equal(env.github.mutations().length, before, label);
+      assert.equal(env.writerIO.receipts.branchOf(key), undefined, label);
+    }
+  } finally { await pg.close(); }
+});
+
+test('D-122 change별 금지 값: 안내 댓글의 글·경로에 change ID 앞 8자가 있으면 보내지 않는다', async () => {
+  const { db, pg } = await localDatabase();
+  try {
+    const env = await publishEnv(db);
+    let posts = 0;
+    const guidance = new ChangeGuidance({ db, changes: env.store, now: () => env.clock.now, policy: async () => env.policy.current, limit: async () => 5,
+      port: { post: async () => { posts++; return { kind: 'confirmed', value: { id: 50 } }; }, find: async () => null } });
+    for (const where of ['글', '경로'] as const) {
+      const key = await env.newRequest();
+      await env.driveToReview(key, DEFAULT_CHANGES);
+      const prefix = key.changeId.slice(0, 8);
+      const path = where === '경로' ? `src/${prefix}.ts` : 'src/a.ts';
+      const patch = [`diff --git a/${path} b/${path}`, `--- a/${path}`, `+++ b/${path}`, '@@ -1 +1 @@', '-old', '+new', ''].join('\n');
+      const outcome = await guidance.post({ key, round: 1, repoId: REPO.id, pr: 7, headSha: 'c'.repeat(40), patch,
+        checks: [{ text: where === '글' ? `확인 ${prefix}` : '확인', location: { path, line: 1 } }], risks: [] });
+      assert.deepEqual([outcome.state, outcome.reason], ['skipped', 'internal_marker'], where);
+    }
+    assert.equal(posts, 0);
+  } finally { await pg.close(); }
+});
+
+test('D-122 새 이름: change ID 앞 8자를 품은 추적 ID는 다시 뽑는다(고정 입력)', () => {
+  const changeId = '0123456789abcdef0123456789abcdef';
+  const draws = (values: string[]) => { const queue = [...values]; return () => queue.shift()!; };
+  const independent = 'fedcba98fedcba98fedcba98';
+  // 리뷰가 본 기존 고정 입력(change ID 앞 16자를 추적 ID 안에 품음)과, 'c' 머리와 이어 붙어 앞 8자가 되는 값.
+  assert.equal(newChangeBranchName(changeId, draws(['89abcdef0123456789abcdef', independent])), `bot/change/c${independent}`);
+  assert.equal(newChangeBranchName('c1234567' + '0'.repeat(24), draws(['1234567' + 'f'.repeat(17), independent])), `bot/change/c${independent}`);
+  // 정상 독립 값은 한 번에 받는다.
+  assert.equal(newChangeBranchName(changeId, draws([independent, '89abcdef0123456789abcdef'])), `bot/change/c${independent}`);
+  for (let i = 0; i < 32; i++) {
+    const id = newChangeId();
+    assert.ok(!newChangeBranchName(id).includes(id.slice(0, 8)));
+  }
 });

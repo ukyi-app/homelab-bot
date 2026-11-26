@@ -177,11 +177,13 @@ test('T19 B3 DATA-01: 승인 준비는 저장된 리뷰와 다른 receipt를 받
 
 test('T19 B3 DATA-01: 렌더러가 만든 문구도 같은 검사를 지나고 마스킹하지 않는다', () => {
   // 새 공개 글은 새 꼴 브랜치에서만 만든다(옛 꼴은 branch_read_only). 검사 사유를 보려고 새 꼴 이름을 준다.
-  const base = { key: KEY, label: 'public' as const, bundle: fixtureBundle(), branch: `bot/change/c${'0123456789ab'.repeat(2)}`,
+  // 추적 ID는 change ID와 독립인 값이어야 한다. change ID 앞 8자를 품으면 그 자체로 internal_marker다(D-122 시험).
+  const base = { key: KEY, label: 'public' as const, bundle: fixtureBundle(), branch: `bot/change/c${'fedcba98'.repeat(3)}`,
     verifications: [{ commandId: 'smoke-unit', status: 'passed' as const }], review: { verdict: 'pass' as const, risks: [] },
     identity: { name: 'fixture-writer[bot]', email: 'fixture-writer[bot]@users.noreply.github.com' }, at: Date.UTC(2026, 0, 2) };
   assert.deepEqual(renderPublication({ ...base, brief: fixtureBrief({ goal: `연결 ${TOKEN}` }) }, POLICY), { ok: false, reason: 'secret_detected' });
   assert.deepEqual(renderPublication({ ...base, brief: fixtureBrief({ goal: `연결 ${MARKER}` }) }, POLICY), { ok: false, reason: 'internal_marker' });
-  assert.deepEqual(renderPublication({ ...base, brief: fixtureBrief({ acceptanceCriteria: ['123456789012345678 사용자에게 알림'] }) }, POLICY), { ok: false, reason: 'metadata_sensitive' });
+  // 숫자 표본도 change ID 앞 8자(01234567)를 품지 않게 고른다. 품으면 internal_marker가 먼저 걸린다.
+  assert.deepEqual(renderPublication({ ...base, brief: fixtureBrief({ acceptanceCriteria: ['987654321098765432 사용자에게 알림'] }) }, POLICY), { ok: false, reason: 'metadata_sensitive' });
   assert.equal(renderPublication({ ...base, brief: fixtureBrief() }, POLICY).ok, true);
 });

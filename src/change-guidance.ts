@@ -1,7 +1,7 @@
-import { parseChangeBranch } from './change-contracts.js';
+import { isWritableChangeBranch, parseChangeBranch } from './change-contracts.js';
 import type { ChangeKey, ChangeNote, WriterOutcome } from './change-contracts.js';
 import type { ChangeRepositoryPolicy } from './change-policy.js';
-import { noteLine, publicTraceId, recordPublicTrace, renderGuidance } from './change-publication.js';
+import { changeMarkers, noteLine, publicTraceId, recordPublicTrace, renderGuidance } from './change-publication.js';
 import { isCurrentAuthorJob } from './change-store.js';
 import type { ChangeStore } from './change-store.js';
 import type { Database } from './database.js';
@@ -192,7 +192,7 @@ export class ChangeGuidance {
     const policy = await this.options.policy(round.repoId);
     const limit = await this.options.limit();
     const rendered = policy ? renderGuidance({ checks: round.checks, risks: round.risks, positions: guidanceDiffLines(round.patch), limit: limit ?? 0, round: round.round },
-      { internalMarkers: policy.internalMarkers, identity: policy.identity }) : null;
+      { internalMarkers: [...policy.internalMarkers, ...changeMarkers(round.key)], identity: policy.identity }) : null;
     const outcome = await this.place(round, policy, limit, rendered);
     return rendered?.ok ? { ...outcome, cleared: { checks: [...round.checks], risks: [...round.risks] } } : outcome;
   }
@@ -222,6 +222,14 @@ export class ChangeGuidance {
     return this.resume(round, row, outside);
   }
 
+  // 옛 꼴 브랜치의 PR에는 새 안내를 보내지 않는다. 옛 안내 키는 change ID·세대·차례라 새 표식을 change ID로 계산할 수 있다.
+  // 새 차례도 pending 행을 거쳐 send에 오므로 send 한 곳에서 닫는다(branch_read_only). 보냈을 수 있는 sending·unknown만 옛 키로 찾아 회수한다(recover).
+  private async readOnly(key: ChangeKey): Promise<boolean> {
+    const generation = await this.options.changes.generationRecord(key);
+    if (!generation.ok) throw new Error('guidance_evidence_missing');
+    return !isWritableChangeBranch(generation.value.branch);
+  }
+
   // 브랜치 이름은 세대 행에만 있다. 읽지 못하면 던져 보내지 않는다(회수는 다음 호출이 다시 읽는다).
   private async traceKey(key: ChangeKey, round: number): Promise<string> {
     const generation = await this.options.changes.generationRecord(key);
@@ -240,12 +248,13 @@ export class ChangeGuidance {
 
   private async send(round: GuidanceRound, row: Row, outside: ChangeNotes): Promise<GuidanceOutcome> {
     const { key } = round;
+    if (await this.readOnly(key)) return this.settle(round, 'pending', 'skipped', 'branch_read_only', null, outside);
     if (row.retry_at !== null && Number(row.retry_at) > this.now()) return this.result('deferred', row.reason ?? 'retry_pending', null, outside);
     // 정책·글을 다시 본다. 미룬 사이에 정책에서 빠졌거나 공개 검사가 바뀌었을 수 있다.
     const policy = await this.options.policy(round.repoId);
     const limit = await this.options.limit();
     const rendered = policy && limit !== null ? renderGuidance({ checks: round.checks, risks: round.risks, positions: guidanceDiffLines(round.patch), limit, round: round.round },
-      { internalMarkers: policy.internalMarkers, identity: policy.identity }) : null;
+      { internalMarkers: [...policy.internalMarkers, ...changeMarkers(key)], identity: policy.identity }) : null;
     if (!policy || !rendered?.ok || rendered.comments.length === 0) {
       const reason = !policy ? 'repository_not_allowed' : limit === null ? 'review_publish_closed' : rendered && !rendered.ok ? rendered.reason : 'no_inline_items';
       return this.settle(round, 'pending', 'skipped', reason, null, outside);

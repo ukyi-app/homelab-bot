@@ -300,7 +300,7 @@ export class ChangeStore {
       const now = this.now();
       const row = (await tx.query<Record<string, unknown>>(`INSERT INTO change_generations(change_id,generation,repo_id,base_branch,branch,base_commit,base_tree,policy_revision,created_at)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [request.id, request.generation, request.repoId, request.baseBranch, newChangeBranchName(), input.baseCommit, input.baseTree, request.policyRevision, now])).rows[0]!;
+      [request.id, request.generation, request.repoId, request.baseBranch, newChangeBranchName(request.id), input.baseCommit, input.baseTree, request.policyRevision, now])).rows[0]!;
       await this.step(tx, request, 'authoring', now);
       return success(generationRow(row));
     });

@@ -122,13 +122,23 @@ const compareText = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 export const CHANGE_ID = /^[0-9a-f]{32}$/;
 export const ChangeIdSchema = z.string().regex(CHANGE_ID);
 // 새 꼴은 bot/change/c<24 hex>다. 무작위 값이라 change ID·세대·Discord ID·제목이 이름으로 공개되지 않고, 이름과 내부 키의 대응은
-// change_generations.branch 행에만 있다(migrations/030). 이름의 c<24 hex>가 그 세대의 공개 추적 ID다(change-publication.ts changeTraceId).
+// change_generations.branch 행이 처음 고정한다(migrations/030, 승인 대상과 감사 행에 사본). 이름의 c<24 hex>가 그 세대의 공개 추적 ID다(change-publication.ts changeTraceId).
 const TRACE_BRANCH = /^bot\/change\/(c[0-9a-f]{24})$/;
 // 옛 꼴 bot/change/<change ID>/g<세대>는 030 전에 만든 행·브랜치를 찾고 읽는 데만 받는다. 이 꼴을 만드는 함수는 두지 않는다.
 const LEGACY_BRANCH = /^bot\/change\/([0-9a-f]{32})\/g([1-9][0-9]{0,2})$/;
 export const newChangeId = (): string => randomBytes(16).toString('hex');
+// change ID는 앞 8자부터 공개 바이트에 나오면 안 된다(AC-06: 앞 8·12·16·24·32자). 더 긴 앞부분은 모두 앞 8자를 품어서 이 값 하나로 다 잡힌다.
+export const CHANGE_ID_PUBLIC_PREFIX = 8;
+export const changeIdPrefix = (changeId: string): string => changeId.slice(0, CHANGE_ID_PUBLIC_PREFIX);
 // 세대 행을 만들 때 한 번만 부른다(ChangeStore.pinBase). 같은 이름이 또 나오면 change_generations.branch UNIQUE가 막는다.
-export const newChangeBranchName = (): string => `bot/change/c${randomBytes(12).toString('hex')}`;
+// changeId를 주면 그 change ID의 앞 8자를 품은 이름은 다시 뽑는다. 그 이름의 추적 ID가 PR 글·커밋·표식에 실려 공개 검사(internal_marker)에 걸리기 때문이다.
+// 앞 글자와 이어 붙어 생기는 겹침(예: 표식의 "change:" 끝 글자 + 추적 ID)은 여기서 보지 않고 공개 검사가 막는다(새지 않고 게시가 멈춘다).
+export function newChangeBranchName(changeId?: string, draw: () => string = () => randomBytes(12).toString('hex')): string {
+  for (;;) {
+    const trace = `c${draw()}`;
+    if (changeId === undefined || !trace.includes(changeIdPrefix(changeId))) return `bot/change/${trace}`;
+  }
+}
 export type ChangeBranch = { form: 'trace'; traceId: string } | { form: 'legacy'; key: ChangeKey };
 export function parseChangeBranch(name: string): ChangeBranch | null {
   const trace = TRACE_BRANCH.exec(name);
